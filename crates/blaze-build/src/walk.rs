@@ -400,6 +400,9 @@ enum Task {
     Cast(ExprId),
     /// Store the value on top into the aggregate place under it, `off` bytes in.
     InitAt { off: u32, repr: Repr },
+    /// Every part of the aggregate literal on top (laid out as row `l`) is stored: it is one
+    /// value from now on, owned whole (walk/val_stack.rs `literal_built`).
+    LitBuilt { l: u32 },
     /// Base-less struct expression `e` (`S { a: 1, .. }`, RFC 3681), its place on top, every
     /// written field stored: each unwritten field stored from its default's value.
     InitDefaults(ExprId),
@@ -482,9 +485,12 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     break_target: Vec<bool, A>,
     work: Vec<Task, A>,
     vals: Vec<V, A>,
-    /// Beside each of `vals`, pushed and popped with it (walk/val_stack.rs): the ground type of
-    /// a value the walk owns whose type needs drop, else `None`.
-    val_tys: Vec<Option<PTy>, A>,
+    /// Beside each of `vals`, pushed and popped with it (walk/val_stack.rs): what the walk owns
+    /// of it that needs drop.
+    val_tys: Vec<val_stack::Owns, A>,
+    /// The parts stored so far that need drop of the aggregate literals being built, each
+    /// `(offset in the literal, ground type)`, one LIFO list for all (walk/val_stack.rs).
+    lit_parts: Vec<(u32, PTy), A>,
     targets: Vec<Target, A>,
     matches: Vec<MatchState, A>,
     arm_blocks: Vec<Block, A>,
@@ -733,6 +739,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         work: Vec::new_in(alloc.clone()),
         vals: Vec::new_in(alloc.clone()),
         val_tys: Vec::new_in(alloc.clone()),
+        lit_parts: Vec::new_in(alloc.clone()),
         targets: Vec::new_in(alloc.clone()),
         matches: Vec::new_in(alloc.clone()),
         arm_blocks: Vec::new_in(alloc.clone()),
@@ -3575,7 +3582,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     return Err(malformed("an aggregate literal without its place"));
                 };
                 self.store(v, repr, (p, at + off as i32))?;
+                // The literal owns it now (walk/val_stack.rs).
+                self.stored_part(off, repr)?;
             }
+            Task::LitBuilt { l } => self.literal_built(l)?,
             Task::StructBase(e) => self.struct_update_base(e)?,
             Task::InitDefaults(e) => self.init_defaults(e)?,
             // A field of an unsized place: of a struct ending in a slice or `str`, reached
@@ -4069,9 +4079,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 let at = self.temp(repr);
                 self.write_tag(tag, variant, at);
-                // Partly built while its arguments run (walk/val_stack.rs).
-                let parts = Self::literal_place(self.fields_need_drop(first, len));
-                self.push_val(V::Place(at.0, at.1), parts);
+                // Partly built while its arguments run, owned part by part (walk/val_stack.rs).
+                self.push_literal(at);
+                self.work.push(Task::LitBuilt { l });
                 for (i, &a) in args.iter().enumerate().rev() {
                     let (_, off, repr) = self.layout_fields[first as usize + i];
                     self.work.push(Task::InitAt { off, repr });
@@ -5060,10 +5070,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         }
                         let at = self.temp(repr);
                         self.write_tag(tag, variant, at);
-                        // Partly built while its fields run: refused by a call that may unwind
-                        // when a stored field may need drop (walk/val_stack.rs).
-                        let parts = Self::literal_place(self.fields_need_drop(first, len));
-                        self.push_val(V::Place(at.0, at.1), parts);
+                        // Partly built while its fields run, owned part by part
+                        // (walk/val_stack.rs); one value once the last is stored.
+                        self.push_literal(at);
+                        self.work.push(Task::LitBuilt { l });
                         // Runs last: the defaults are constants, stored once every written
                         // field's expression has run (as their operands are in MIR).
                         if defaults {
@@ -5096,10 +5106,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Repr::Agg(l) => {
                         let shape = self.layouts[l as usize].shape;
                         let at = self.temp(repr);
-                        // Partly built while its elements run: a tuple or array needs drop exactly
-                        // when an element does (walk/val_stack.rs).
-                        let parts = Self::literal_place(self.layouts[l as usize].needs_drop);
-                        self.push_val(V::Place(at.0, at.1), parts);
+                        // Partly built while its elements run, owned element by element
+                        // (walk/val_stack.rs).
+                        self.push_literal(at);
+                        self.work.push(Task::LitBuilt { l });
                         for (i, &x) in list.iter().enumerate().rev() {
                             let (off, repr) = match shape {
                                 Shape::Fields { first, len } if (i as u32) < len => {

@@ -705,7 +705,14 @@ fn record_words<'f>(error: &SourceError<'_>, readers: &[Reader<'_>], packs: &[Pa
 struct Checker<'n> {
     records: &'n Records<'n>,
     load: &'n StoreLoad<'n>,
-    world: &'n mut ProjectWorld<'n, &'n Records<'n>>,
+    /// The owner's front end, OWNED here so it is dropped with the checker when the file job
+    /// ends: its impl buckets and head store are maps on the global heap, which no frame reset
+    /// frees. Leaked into the job's frame (`Box::leak`, as it was until 2026-11-17), every file
+    /// job's buckets stayed for the rest of the command: tempo's malloc history at 240 s
+    /// (port27/tempo-deps/mem-g081341-msl/calltree-240.txt) had 7.9 GB of 17.9 GB of the heap
+    /// under `pooled_bodies`, 8.1 GB of it filed by `Buckets::admit_asked`/`put`/`push`, and
+    /// growing with every job (1.0 -> 1.7 -> 3.4 GB at 150, 195, 240 s for `admit_asked`).
+    world: blaze_own::Box<ProjectWorld<'n, &'n Records<'n>>, &'n Frame>,
     by_chain: ByChain<'n>,
     /// The file's index in the owner's items record.
     file: u32,
@@ -913,7 +920,7 @@ impl<'n> FileTypes<'n> {
             // every_body.rs's work list): each one's types, then (when they were checked clean)
             // its moves and borrows over the same lowered body and `Checked` record (front2/
             // borrows.rs `check_borrows`).
-            let reached = covered::each_covered(checker.world, root, g, |w, body| {
+            let reached = covered::each_covered(&mut checker.world, root, g, |w, body| {
                 let _checking = cx.span("body types: check a body");
                 w.check_borrows(body, g)
             });
@@ -1176,7 +1183,9 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
         let _from = cx.span("body types: the world from records");
         ProjectWorld::from_records(records, frame, owner.lang, g).map_err(|e| words(format_args!("the front end over records: {e}")))?
     };
-    let world: &'n mut ProjectWorld<'n, &'n Records<'n>> = blaze_own::Box::leak(blaze_own::Box::new_in(world, frame));
+    // On the frame, owned by the checker: dropped (its global-heap maps freed) when the job's
+    // checker is, never leaked (`Checker::world`).
+    let mut world = blaze_own::Box::new_in(world, frame);
     // A body's macro calls expand with the same texts, environment and proc-macro runner as
     // its crate's item-level expansion (front2 body_host.rs; pm-call-expand), set before any body.
     world.set_body_sources(opened.sources);

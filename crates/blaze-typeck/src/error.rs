@@ -64,6 +64,11 @@ pub enum Malformed {
     NoRecord(Question),
     /// A body-local type (a closure, a hole) in an item's record.
     BodyTypeInRecord(Question),
+    /// A closure or async block term (`node`, its handle) that a walk of a resolved type met
+    /// and the context can name by nothing it holds: neither made by it (`TyView::Closure`,
+    /// `TyView::ClosureOf`, ..) nor an opaque's hidden body it read (infer/mod.rs `adopt`), or
+    /// one whose term is not of its identity's shape.
+    UnseenBodyType { node: u32 },
     /// The solver asked for a `where const` condition (its anonymous constant) at arguments
     /// that do not export as ground types.
     NotGround { cond: ItemKey },

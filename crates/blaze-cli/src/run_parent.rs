@@ -54,8 +54,9 @@ use blaze_code::record::Symbol as CodeSymbol;
 use blaze_emit::{Isa, Os};
 use blaze_hash::ByHash;
 use blaze_ids::producer::{CodeBuilder, ProducerId};
-use blaze_ladder::body_ids::{self, BodyIds, DeclaredList, Form, How, Make, Scratch, Unkeyed, Walk, WalkError};
-use blaze_ladder::code_records::{Builder, CodeKey, CodeRecordError, CodeStore, EntryError, EntryView, NotEmitting, Settings, StoreError, TierName, content_key};
+use blaze_ladder::body_ids::{self, BodyIds, DeclaredList, Form, How, Make, RowKind, Scratch, Unkeyed, Walk, WalkError};
+use blaze_ladder::code_records::{Builder, CodeKey, CodeRecordError, CodeStore, EntryError, NotEmitting, Settings, StoreError, TierName, content_key};
+use blaze_launch::wire::data::Datum;
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords};
 use blaze_ladder::run::special::{self, Roots, RootsError, SpecialMade, StartHead, make_special, special_of};
 use blaze_ladder::run::{OverflowChecks, RunError};
@@ -143,6 +144,21 @@ pub enum ParentError {
     NotChecked { function: ItemKey, symbol: [u8; 32], why: Option<Checked> },
     /// The resolver was asked twice for `symbol` (`Needs` asks once: a bug).
     ResolvedTwice { symbol: [u8; 32] },
+    /// The special record of `symbol` (the shim, the getter, the ender) names a static: the
+    /// specials are made by run/special.rs over no program, so none may (run.md, "Statics in
+    /// the run").
+    SpecialStatic { symbol: [u8; 32] },
+    /// A static row of the walk (`symbol`) was served once already and is not told: a bug of
+    /// `Lazy::resolve`'s statics.
+    StaticServed { symbol: [u8; 32] },
+    /// Record `record` names static `symbol` (a `Space::Static` target of its own, or of a
+    /// datum sent with it), and no `Data` of this run sent it: refused before its `Publish`
+    /// ([`Needs::publish`]). The thread-local descriptor is one such: no `static` item backs
+    /// it, and the run does not place thread-locals yet (run.md, "Statics in the run", step 4).
+    StaticUnsent { record: [u8; 32], symbol: [u8; 32] },
+    /// Record `record` was published again as one published before, and never was (a bug of
+    /// `Needs`'s answers).
+    NotCleared { record: [u8; 32] },
     /// The store refused the entry of `symbol`.
     Store { symbol: [u8; 32], why: StoreError },
     /// The walk found the entry of `symbol` and the store has none under its key.
@@ -195,6 +211,21 @@ impl fmt::Display for ParentError {
                 write!(f, "; the gate before the start leaves every body the program reaches `Clean`, and the parent never checks or builds one another way")
             }
             ParentError::ResolvedTwice { symbol } => write!(f, "{rule}: the symbol {} was resolved twice (run_parent.rs `Needs` asks once a symbol)", Hex(symbol)),
+            ParentError::SpecialStatic { symbol } => write!(f, "{rule}: the run's special record {} names a static, and the specials are made over no program (run.md, \"Statics in the run\")", Hex(symbol)),
+            ParentError::StaticServed { symbol } => write!(f, "{rule}: the static {} was served once and is not among the statics told (run_parent.rs `Lazy::resolve`)", Hex(symbol)),
+            ParentError::StaticUnsent { record, symbol } if *symbol == blaze_ladder::symbols::tls_desc_symbol().0 => write!(
+                f,
+                "{rule}: record {} touches a thread-local (it names the thread-local descriptor {}), and the run does not place thread-locals yet (run.md, \"Statics in the run\", step 4)",
+                Hex(record),
+                Hex(symbol)
+            ),
+            ParentError::StaticUnsent { record, symbol } => write!(
+                f,
+                "{rule}: record {} names static {}, which no `Data` of this run sent; refused before its `Publish` (run_parent.rs `Needs::publish`; run.md, \"Statics in the run\")",
+                Hex(record),
+                Hex(symbol)
+            ),
+            ParentError::NotCleared { record } => write!(f, "{rule}: record {} was published again and never published first (run_parent.rs `Needs::publish`)", Hex(record)),
             ParentError::Store { symbol, why } => write!(f, "{rule}: the code entry of symbol {}: {why}", Hex(symbol)),
             ParentError::NotStored { symbol } => write!(f, "{rule}: the record walk found symbol {} and the store holds no entry under its key", Hex(symbol)),
             ParentError::Entry { symbol, why } => write!(f, "{rule}: the code entry of symbol {} does not read: {why}", Hex(symbol)),
@@ -291,8 +322,13 @@ pub(crate) enum Resolved<'r> {
     /// The symbol's code record: ALREADY FILED in the records folder by the resolver
     /// ([`Folder::file`]), its code key then (the start list's row), its id, and the symbols the
     /// record declares (its targets: each is told its slot before the record is published, so
-    /// placing it never meets a symbol without a slot).
-    Record { key: CodeKey, record: RecordId, declares: &'r [Symbol] },
+    /// placing it never meets a symbol without a slot), and the statics the record reaches that
+    /// this run has not told yet: each datum ALREADY FILED too, sent in one `Down::Data` before
+    /// the record's `Publish` (a static has no stub; run.md, "Statics in the run").
+    /// `named`: every static the record and those data name, read from their own targets
+    /// ([`Front::statics_named`]), sorted, each once: [`Needs::publish`] refuses the record
+    /// unless each is on the child before it, and a record naming any is no start-list row.
+    Record { key: CodeKey, record: RecordId, declares: &'r [Symbol], data: &'r [Datum], named: &'r [Symbol] },
     /// No function of the program by that symbol: the need is answered `Failed` with
     /// `Failure::Unresolved`, naming it.
     Unknown,
@@ -376,9 +412,15 @@ pub(crate) trait Front {
     fn form(&self) -> &dyn Form {
         &body_ids::EntryForm
     }
-    /// The code record an entry holds: what the launcher maps.
+    /// The record an entry holds, what the launcher maps: a code record, or a static's datum.
     fn record_of<'e>(&self, entry: &'e [u8]) -> Result<&'e [u8], EntryError> {
-        Ok(EntryView::read(entry)?.record.bytes())
+        blaze_ladder::code_records::statics::entry_record(entry)
+    }
+    /// Each static the entry's RECORD names (its `Space::Static` targets, read from the record:
+    /// code_records.rs `statics::each_static_named`), onto `out`: what [`Needs::publish`] checks
+    /// is on the child before the record.
+    fn statics_named(&self, entry: &[u8], out: &mut AVec<'_, Symbol>) -> Result<(), EntryError> {
+        blaze_ladder::code_records::statics::each_static_named(entry, |symbol| out.push(Symbol(symbol.0)))
     }
 }
 
@@ -527,6 +569,17 @@ pub(crate) struct Lazy<'r, 'a, F: Front, D: Folder> {
     /// The rows stepped walking forward from the roots to reach a callee no placed row led to
     /// (answer (c)): not handed to the program yet, so each is served when the program asks.
     ahead: AVec<'a, Ahead<'a>>,
+    /// The statics told (or being told in the answer at hand), by symbol, sorted: each is sent
+    /// once a run, with the first record that reaches it.
+    told: AVec<'a, [u8; 32]>,
+    /// The last record's statics not told before, handed out in [`Resolved::Record`].
+    data: AVec<'a, Datum>,
+    /// The static rows of the answer at hand still to serve (a work list: a static's value may
+    /// name another).
+    statics: AVec<'a, usize>,
+    /// The statics the answer at hand's record and data name, handed out in
+    /// [`Resolved::Record`].
+    named: AVec<'a, Symbol>,
     tally: Tally,
 }
 
@@ -542,7 +595,23 @@ struct Ahead<'a> {
 impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
     /// Nothing of `front` is made here.
     pub(crate) fn new(cx: &'r Cx, front: F, folder: D, store: &'r mut dyn CodeStore, builder: Builder, alloc: Alloc<'a>) -> Lazy<'r, 'a, F, D> {
-        Lazy { cx, front, folder, store, builder, alloc, started: None, placed: Vec::new_in(alloc), declares: Vec::new_in(alloc), ahead: Vec::new_in(alloc), tally: Tally::default() }
+        Lazy {
+            cx,
+            front,
+            folder,
+            store,
+            builder,
+            alloc,
+            started: None,
+            placed: Vec::new_in(alloc),
+            declares: Vec::new_in(alloc),
+            ahead: Vec::new_in(alloc),
+            told: Vec::new_in(alloc),
+            data: Vec::new_in(alloc),
+            statics: Vec::new_in(alloc),
+            named: Vec::new_in(alloc),
+            tally: Tally::default(),
+        }
     }
 
     /// The start's head from the roots (made now if they are not yet).
@@ -634,13 +703,66 @@ fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F:
     Ok((how, key))
 }
 
+/// Row `row` served once: stepped now if it is waiting, else taken from what its step ahead
+/// answered (`twice`: the refusal when it is neither, a row served already).
+#[expect(clippy::too_many_arguments, reason = "the resolver's parts, borrowed apart")]
+fn serve<'a, F: Front>(
+    cx: &Cx,
+    front: &mut F,
+    started: &mut Started<'a, F::Start, F::Ids, F::Maker>,
+    store: &mut dyn CodeStore,
+    builder: &Builder,
+    ahead: &mut AVec<'a, Ahead<'a>>,
+    row: usize,
+    twice: ParentError,
+) -> Result<(How, Option<CodeKey>, Option<AVec<'a, u8>>), ParentError> {
+    if started.walk.how(row) == How::Waiting {
+        let (how, key) = step(cx, front, started, store, builder, row)?;
+        return Ok((how, key, None));
+    }
+    let Some(i) = ahead.iter().position(|one| one.row == row) else { return Err(twice) };
+    let one = ahead.swap_remove(i);
+    Ok((one.how, one.key, one.bytes))
+}
+
+/// The rows `row`'s entry declares, split by kind: an instance's symbol onto `declares` (its
+/// slot is told before the record is published); a static not told yet onto `statics`, and
+/// into `told` at once (so a cycle of statics is one batch, each once).
+fn callees(walk: &Walk<'_>, row: usize, declares: &mut AVec<'_, Symbol>, told: &mut AVec<'_, [u8; 32]>, statics: &mut AVec<'_, usize>) {
+    for &callee in walk.declared(row) {
+        let callee = callee as usize;
+        let symbol = walk.symbol(callee).0;
+        match walk.kind(callee) {
+            RowKind::Instance => declares.push(Symbol(symbol)),
+            RowKind::Static => {
+                if let Err(at) = told.binary_search(&symbol) {
+                    told.insert(at, symbol);
+                    statics.push(callee);
+                }
+            }
+        }
+    }
+}
+
+fn count(tally: &mut Tally, how: How) {
+    tally.reached += 1;
+    match how {
+        How::Found => tally.found += 1,
+        How::Made => tally.made += 1,
+        How::Unkeyed(_) | How::Waiting => tally.unkeyed += 1,
+    }
+}
+
 impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
-        let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, tally } = self;
+        let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, told, data, statics, named, tally } = self;
         let started = ensure(started, front, *alloc)?;
         let builder = *builder;
         let code = CodeSymbol(symbol.0);
         declares.clear();
+        data.clear();
+        statics.clear();
+        named.clear();
         let mut row = started.walk.row_of(&code);
         // A callee of a record placed from today's list: the placed rows on the way are stepped
         // (found in the store, their files already there) until the walk reaches it; no row the
@@ -664,6 +786,12 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             let id = folder.file(record)?;
             started.list.clear();
             front.form().declared(entry, &mut started.list).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
+            if !started.list.statics().is_empty() {
+                return Err(ParentError::SpecialStatic { symbol: symbol.0 });
+            }
+            front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
+            named.sort_unstable();
+            named.dedup();
             for i in 0..started.list.len() {
                 let callee = started.walk.root::<RunError>(started.list.row(i), MOST_WALKED).map_err(|why| ParentError::Walk { symbol: symbol.0, why })?;
                 declares.push(Symbol(started.walk.symbol(callee).0));
@@ -673,7 +801,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
                 true => tally.found += 1,
                 false => tally.made += 1,
             }
-            return Ok(Resolved::Record { key: made.key, record: id, declares: declares.as_slice() });
+            return Ok(Resolved::Record { key: made.key, record: id, declares: declares.as_slice(), data: &[], named: named.as_slice() });
         }
         // Still unreached (the start list's cap broke the chain to it): walk forward from the
         // roots, stepping each row still waiting in walk order, at most `MOST_WALKED`, until the
@@ -702,16 +830,13 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             at += 1;
         }
         let Some(row) = row else { return Ok(Resolved::Unknown) };
+        // A static is no call target: its symbol is never a need (the child binds its word).
+        if started.walk.kind(row) == RowKind::Static {
+            return Ok(Resolved::Unknown);
+        }
         // A row stepped ahead is served once, from what its step answered; any other row that is
         // not waiting was served already.
-        let (how, key, held) = if started.walk.how(row) == How::Waiting {
-            let (how, key) = step(cx, front, started, &mut **store, &builder, row)?;
-            (how, key, None)
-        } else {
-            let Some(i) = ahead.iter().position(|one| one.row == row) else { return Err(ParentError::ResolvedTwice { symbol: symbol.0 }) };
-            let one = ahead.swap_remove(i);
-            (one.how, one.key, one.bytes)
-        };
+        let (how, key, held) = serve(cx, front, started, &mut **store, &builder, ahead, row, ParentError::ResolvedTwice { symbol: symbol.0 })?;
         let entry: &[u8] = match (&held, how) {
             (Some(bytes), _) => bytes.as_slice(),
             (None, How::Found) => {
@@ -725,16 +850,35 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         let id = folder.file(record)?;
         // An unkeyed instance's row in the next list: its entry's content key.
         let key = key.unwrap_or_else(|| content_key(entry));
-        for &callee in started.walk.declared(row) {
-            declares.push(Symbol(started.walk.symbol(callee as usize).0));
+        front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
+        callees(&started.walk, row, declares, told, statics);
+        count(tally, how);
+        // The statics the record reaches and this run has not told, each served once and its
+        // datum filed; their own callees after them (a static's value names statics, and fns
+        // from step 2 on: those are declared like the record's own).
+        let mut next = 0;
+        while next < statics.len() {
+            let at = statics[next];
+            next += 1;
+            let static_ = started.walk.symbol(at).0;
+            let (how, key, held) = serve(cx, front, started, &mut **store, &builder, ahead, at, ParentError::StaticServed { symbol: static_ })?;
+            let entry: &[u8] = match (&held, how) {
+                (Some(bytes), _) => bytes.as_slice(),
+                (None, How::Found) => {
+                    let key = key.ok_or(ParentError::NotStored { symbol: static_ })?;
+                    store.get(key).map_err(|why| ParentError::Store { symbol: static_, why })?.ok_or(ParentError::NotStored { symbol: static_ })?
+                }
+                (None, How::Made | How::Unkeyed(_) | How::Waiting) => started.scratch.made(),
+            };
+            let datum = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: static_, why })?;
+            data.push(Datum { symbol: Symbol(static_), record: folder.file(datum)? });
+            front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: static_, why })?;
+            callees(&started.walk, at, declares, told, statics);
+            count(tally, how);
         }
-        tally.reached += 1;
-        match how {
-            How::Found => tally.found += 1,
-            How::Made => tally.made += 1,
-            How::Unkeyed(_) | How::Waiting => tally.unkeyed += 1,
-        }
-        Ok(Resolved::Record { key, record: id, declares: declares.as_slice() })
+        named.sort_unstable();
+        named.dedup();
+        Ok(Resolved::Record { key, record: id, declares: declares.as_slice(), data: data.as_slice(), named: named.as_slice() })
     }
 }
 
@@ -797,13 +941,91 @@ pub(crate) struct Needs<'a> {
     pairs: AVec<'a, Declared>,
     /// The first answers with a record, in order, up to the start list's cap (the window).
     first: start_list::Rows<'a>,
+    /// The statics on the child (each in a `Data` sent), by symbol, sorted.
+    sent: AVec<'a, [u8; 32]>,
+    /// The records published, by id, sorted: every static each names was on the child before
+    /// it, so publishing one again needs nothing more.
+    cleared: AVec<'a, [u8; 32]>,
+    /// The data of the `Data` at hand (those not sent before), reused.
+    batch: AVec<'a, Datum>,
     /// The next message's id.
     next_id: u64,
 }
 
+/// What a `Publish` stands on ([`Needs::publish`]): how the statics its record names are on the
+/// child before it.
+#[derive(Clone, Copy)]
+enum Stands<'n> {
+    /// A record answered now: `data` (its datums and theirs, each sent in one `Data` before it
+    /// unless sent already) and `named`, every static the record and those datums name: each
+    /// must be on the child once `data` is, or the publish is refused by name.
+    Answered { named: &'n [Symbol], data: &'n [Datum] },
+    /// A record published before in this run: what it names went then.
+    Again,
+    /// A start-list row: the list's form (start_list.rs, version 3) holds no record naming a
+    /// static, as [`Needs::answer`] keeps none.
+    StartRow,
+}
+
 impl<'a> Needs<'a> {
     pub(crate) fn new(alloc: Alloc<'a>) -> Needs<'a> {
-        Needs { met: ByHash::new_in(alloc), slots: Vec::new_in(alloc), pairs: Vec::new_in(alloc), first: start_list::Rows::new_in(alloc), next_id: 0 }
+        Needs {
+            met: ByHash::new_in(alloc),
+            slots: Vec::new_in(alloc),
+            pairs: Vec::new_in(alloc),
+            first: start_list::Rows::new_in(alloc),
+            sent: Vec::new_in(alloc),
+            cleared: Vec::new_in(alloc),
+            batch: Vec::new_in(alloc),
+            next_id: 0,
+        }
+    }
+
+    /// THE ONE WRITER OF `Publish` (rule 76; run.md, "Statics in the run"): the pairs not yet
+    /// told in one `Declare`, then what the record stands on ([`Stands`]): the data not sent
+    /// yet in one `Data` (a cycle of statics is one batch: the child gives every datum of a
+    /// batch its room before it fills any), each static the record or a datum names checked to
+    /// be on the child, and only then `slot`'s `Publish` of `record`. A static named and never
+    /// sent is refused by name, before any `Publish`: the child would stop on it
+    /// (run_mode.rs `StaticNotTold`).
+    fn publish<A: Allocator>(&mut self, slot: Slot, record: RecordId, stands: Stands<'_>, out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+        self.declare(out)?;
+        match stands {
+            Stands::Answered { named, data } => {
+                self.batch.clear();
+                for datum in data {
+                    if let Err(at) = self.sent.binary_search(&datum.symbol.0) {
+                        self.sent.insert(at, datum.symbol.0);
+                        self.batch.push(*datum);
+                    }
+                }
+                if !self.batch.is_empty() {
+                    let id = self.id();
+                    Down::Data { data: List::of(self.batch.as_slice()) }.encode(id, out)?;
+                }
+                for static_ in named {
+                    if self.sent.binary_search(&static_.0).is_err() {
+                        return Err(ParentError::StaticUnsent { record: record.0, symbol: static_.0 });
+                    }
+                }
+                if let Err(at) = self.cleared.binary_search(&record.0) {
+                    self.cleared.insert(at, record.0);
+                }
+            }
+            Stands::Again => {
+                if self.cleared.binary_search(&record.0).is_err() {
+                    return Err(ParentError::NotCleared { record: record.0 });
+                }
+            }
+            Stands::StartRow => {
+                if let Err(at) = self.cleared.binary_search(&record.0) {
+                    self.cleared.insert(at, record.0);
+                }
+            }
+        }
+        let id = self.id();
+        Down::Publish { slot, tier: Tier::Zero, record }.encode(id, out)?;
+        Ok(())
     }
 
     fn id(&mut self) -> u64 {
@@ -905,8 +1127,7 @@ impl<'a> Needs<'a> {
             let Some(Seen { answer: Answer::Record { record, slot }, .. }) = self.met.get(&row.symbol.0).copied() else {
                 return Err(ParentError::UndeclaredSymbol { symbol: row.symbol.0 });
             };
-            let id = self.id();
-            Down::Publish { slot, tier: Tier::Zero, record }.encode(id, out)?;
+            self.publish(slot, record, Stands::StartRow, out)?;
         }
         Ok(())
     }
@@ -932,29 +1153,33 @@ impl<'a> Needs<'a> {
             Needed::Symbol(symbol) => symbol,
             Needed::Slot(slot) => *self.slots.get(slot.0 as usize).ok_or(ParentError::UndeclaredSlot { slot: slot.0 })?,
         };
-        let (record, slot) = match self.meet(symbol)?.answer {
-            Answer::Record { record, slot } => (record, slot),
-            Answer::Unknown => return self.failed(need, out),
+        match self.meet(symbol)?.answer {
+            Answer::Record { record, slot } => self.publish(slot, record, Stands::Again, out),
+            Answer::Unknown => self.failed(need, out),
             Answer::NotAsked => match resolve.resolve(&symbol)? {
                 Resolved::Unknown => {
                     self.settle(symbol, Answer::Unknown);
-                    return self.failed(need, out);
+                    self.failed(need, out)
                 }
-                Resolved::Record { key, record, declares } => {
+                Resolved::Record { key, record, declares, data, named } => {
                     let slot = self.slot_of(symbol)?;
                     for each in declares {
                         self.slot_of(*each)?;
                     }
                     self.settle(symbol, Answer::Record { record, slot });
-                    self.first_answer(Row { symbol, key, record })?;
-                    (record, slot)
+                    // A record that names a static is not a start-list row: the list places a
+                    // row's record alone, before any need and any `Data`, so its statics would
+                    // not be on the child first. That holds for a static sent by an EARLIER
+                    // answer of this run too: the next run's list has no such answer before the
+                    // row (start_list.rs's form has no static rows yet; run.md, "Statics in the
+                    // run").
+                    if named.is_empty() {
+                        self.first_answer(Row { symbol, key, record })?;
+                    }
+                    self.publish(slot, record, Stands::Answered { named, data }, out)
                 }
             },
-        };
-        self.declare(out)?;
-        let id = self.id();
-        Down::Publish { slot, tier: Tier::Zero, record }.encode(id, out)?;
-        Ok(())
+        }
     }
 
     fn failed<A: Allocator>(&mut self, need: Needed, out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {

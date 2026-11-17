@@ -45,6 +45,11 @@ pub mod procs;
 mod list;
 pub mod panic;
 mod script;
+pub mod script_setting;
+#[cfg(test)]
+mod script_setting_tests;
+#[cfg(feature = "std")]
+mod stored_files;
 mod toolchain;
 #[cfg(test)]
 mod tests;
@@ -67,6 +72,8 @@ use blaze_unit_graph::sources::Records;
 pub use checkout::Checkout;
 pub use list::{Listed, Side, crate_list, needs, open_list, world};
 pub use script::{ScriptRecords, ScriptRecordsError, joined, script_subject};
+#[cfg(feature = "std")]
+pub use stored_files::StoredFiles;
 pub use toolchain::{Needs, Toolchain, ToolchainCrate};
 
 /// A tree of files a crate is read from: a path is `/`-separated, relative to the tree's root,

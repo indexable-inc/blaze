@@ -1,0 +1,32 @@
+[package]
+name = "blaze-engine"
+description = "The execution engine (docs/v2/plan/design/engine.md, D131) as a sans-IO core: a plan made from text in phases, a phase's results merged in bulk sorted by key, an edit dirtying forward by cell, one generation per moved cell for what a scoped request does not run, the certificate when nothing moved"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Vec, BTreeMap, BTreeSet with the allocator always named: the crate's only collections.
+blaze-own.workspace = true
+# `ContentId`: every out and cell digest.
+blaze-id = { path = "../blaze-id" }
+# Names, kinds, keys, tools and cells (key.rs, cells.rs): kept, not rewritten (engine.md "What
+# stays"). Depended on until the old machine is deleted, then moved here with their files.
+blaze-drive.workspace = true
+
+[dev-dependencies]
+# `check` and `control`: the history simulations and their planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

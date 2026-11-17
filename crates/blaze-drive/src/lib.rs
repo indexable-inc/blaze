@@ -63,6 +63,8 @@ mod sim_cells;
 #[cfg(test)]
 mod sim_given;
 #[cfg(test)]
+mod sim_scope_cells;
+#[cfg(test)]
 mod sim_lints;
 #[cfg(test)]
 mod sim_owners;
@@ -102,6 +104,11 @@ pub enum Plant {
     /// A job waiting on answer-table pages is woken by each page as it comes, not by the last
     /// of them (request.rs `Job::pages_due`): it walks its whole shape again per page.
     WakePerPage,
+    /// A reader the walk dirtied and did not run again keeps its row as it was (request.rs
+    /// `finish`, `STALE_READ`): its recorded answer for a moved read is taken for today's later.
+    StaleReaderKept,
+    /// A row's recorded answer is taken for a read the walk DID enter this request.
+    RecordedForEntered,
     /// A settled record whose out digest changed does not dirty its readers: the validity check
     /// skips a changed read.
     SkipChangedRead,

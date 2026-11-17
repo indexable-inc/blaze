@@ -82,6 +82,12 @@ edition.workspace = true
 # `tempo_scripts`: the graph of a workspace (blaze-unit-graph, a dependency, over the lock
 # and the manifests) and its packages' files from the fetch store's records.
 blaze-manifest = { workspace = true, default-features = false }
+# `tempo_scripts`: the build scripts' shared setup `blaze check` opens too (blaze-world
+# script_setting.rs `ScriptSetup`: the probe tables over the graph's world, the spawn setting,
+# the native runner), over the pinned toolchain read from the shelf. A dev-dependency cycle,
+# which Cargo allows: the example links the one library both name.
+blaze-world = { workspace = true, features = ["procs-run"] }
+blaze-toolchain.workspace = true
 # `tempo_pipeline`: the real expansion pipeline (`lower_file`, `ByName::with_procs`) over a
 # checkout, the hook behind it. By path, as blaze-real takes it.
 blaze-lower = { path = "../blaze-lower" }

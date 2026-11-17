@@ -21,8 +21,8 @@
 //!   that reads every claim's age.
 //!
 //! Sans-IO: no clock (the caller passes `now`, so a simulation's virtual clock drives it), no
-//! thread, no allocation after `new_in`. NEVER COMPILED as written (writer W1-12,
-//! 2026-11-16): the command-crates integrator compiles it.
+//! thread, no allocation after `new_in`. Its tests pass (green b13ac2dcb9,
+//! 2026-11-17).
 
 #![blaze::sans_io]
 

@@ -136,6 +136,51 @@ pub extern \"C\" fn main() -> i32 {
     assert_eq!(got, Ok(10));
 }
 
+/// core's `partition` (slice/sort/unstable/quicksort.rs, census class 32): a `const { .. }`
+/// block calling a `const fn` generic over a closure type `F`, whose body holds a local
+/// constant and returns one of two fn items at `<T, F>` as a fn pointer, then called. At `u8`
+/// (1 byte, the first) the pointer's fn answers 3, at `[u64; 16]` (128 bytes) the second, 4.
+///
+/// Still refused, by name, and asserted so: the constant evaluates (its record holds a fn
+/// pointer, `DataTarget::Fn(key)`), but the record names the fn only by its instance key, a
+/// hash with no inverse, and the build's `Adts::const_fn_instance` (run.rs) finds only a
+/// non-generic fn by that key; `small::<u8, {closure}>` is generic. The fix is the record
+/// carrying the instance it keyed (item and ground arguments), not a wider search.
+#[test]
+fn a_const_block_choosing_a_fn_pointer_over_a_closure_type_is_refused_by_name() {
+    let got = run("
+const fn inst<T, F: FnMut(&T, &T) -> bool>() -> fn(&T, &mut F) -> usize {
+    const MOST: usize = 96;
+    if size_of::<T>() <= MOST { small::<T, F> } else { large::<T, F> }
+}
+
+fn small<T, F: FnMut(&T, &T) -> bool>(v: &T, less: &mut F) -> usize {
+    if less(v, v) { 0 } else { 3 }
+}
+
+fn large<T, F: FnMut(&T, &T) -> bool>(v: &T, less: &mut F) -> usize {
+    if less(v, v) { 0 } else { 4 }
+}
+
+fn partition<T, F: FnMut(&T, &T) -> bool>(v: &T, mut less: F) -> usize {
+    (const { inst::<T, F>() })(v, &mut less)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a = partition(&1u8, |_: &u8, _: &u8| false);
+    let b = partition(&[0u64; 16], |_: &[u64; 16], _: &[u64; 16]| false);
+    (a * 10 + b) as i32
+}
+");
+    println!("PARTITION'S CONST BLOCK: {got:?}");
+    // Runs 34 once the record carries its fn targets' instances.
+    assert!(
+        matches!(&got, Err(e) if e.contains("a constant's value holds a fn pointer to instance") && e.contains("`Adts` does not give")),
+        "partition's const block: the generic fn pointer's instance is not given yet, got {got:?}"
+    );
+}
+
 /// The control: a closure in a const block capturing the fn's parameter `x`, a value no
 /// constant may use (E0435): refused, never built.
 #[test]
@@ -156,5 +201,5 @@ pub extern \"C\" fn main() -> i32 {
     println!("CONST BLOCK CAPTURING A LOCAL: {got:?}");
     // The check names the parameter as not in the const block's scope (front2's E0425 where
     // rustc says E0435): the fn is refused before any build.
-    assert!(matches!(&got, Err(e) if e.contains("cannot find `x`")), "a const block may not use the fn's parameter (E0435), got {got:?}");
+    assert!(matches!(&got, Err(e) if e.contains("cannot find value `x`")), "a const block may not use the fn's parameter (E0435), got {got:?}");
 }

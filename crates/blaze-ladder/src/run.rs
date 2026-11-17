@@ -130,6 +130,9 @@ pub enum RunError {
     /// `why` names the cause (a front end that checks only the whole program, a fn with no
     /// checked body, the maker's own state).
     OneBody { key: ItemKey, why: &'static str },
+    /// Static `static_`'s value has no run record (code_records.rs `statics`; run.md, "Statics
+    /// in the run"): `error` names what of it is refused.
+    StaticRecord { static_: Box<str>, error: crate::code_records::statics::StaticRecordError },
     /// A lang item the back half asks for that the front end refused to answer.
     Lang(crate::seam::LangRefusal),
     /// `main`'s signature is not one the skeleton calls.
@@ -260,6 +263,7 @@ impl core::fmt::Display for RunError {
             RunError::Place(error) => write!(f, "{error}"),
             RunError::NoMain => write!(f, "the crate root has no `main`"),
             RunError::OneBody { key, why } => write!(f, "fn {:#x}: {why} (D106: the record walk makes one instance at a time)", key.0),
+            RunError::StaticRecord { static_, error } => write!(f, "the static `{static_}`: {error}"),
             RunError::Lang(l) => write!(f, "the lang item {:?}: {} (rule no-fallback: no build without it)", l.item, l.why),
             RunError::MainShape { main, what } => write!(f, "`{main}`: {what}"),
             RunError::NoHost { start } => {
@@ -380,6 +384,7 @@ impl RunError {
             | RunError::OverflowDisagrees { .. }
             | RunError::NoMain
             | RunError::OneBody { .. }
+            | RunError::StaticRecord { .. }
             | RunError::Lang(_)
             | RunError::Statics { .. }
             | RunError::Tls { .. }
@@ -494,12 +499,16 @@ impl ClosureTable {
 
 /// The front end's normalization as the builder asks it: an answer not given is the builder's
 /// own refusal naming the projection.
-/// Whether `e` is an instance question's `Missing`: an answer no check made, which the
-/// front end can make (`FrontEnd::make_asked`) before the step is taken again.
-fn asks_again(e: &RunError) -> bool {    matches!(
+/// Whether `e` is a need the front end can fill (`FrontEnd::make_asked`) before the step is
+/// taken again: an instance question's `Missing` (an answer no check made), or an ADT whose
+/// row is not made (`NoAdt`: the lazy program's `adt` noted its head). A front end that noted
+/// nothing makes nothing, and `e` is the refusal.
+fn asks_again(e: &RunError) -> bool {
+    matches!(
         e,
-        RunError::Build { error: BuildError::Select(blaze_typeck::ResolveError::Missing(_)), .. }
+        RunError::Build { error: BuildError::Select(blaze_typeck::ResolveError::Missing(_)) | BuildError::NoAdt { .. }, .. }
             | RunError::Resolve { error: blaze_typeck::ResolveError::Missing(_), .. }
+            | RunError::NoAdt { .. }
     )
 }
 
@@ -523,6 +532,18 @@ fn closure_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, gr
         return None;
     }
     program.fn_index(of.owner)
+}
+
+/// The tabled index `called` runs as where the LANGUAGE gives its trait's method and no impl
+/// is selected: an async block's `Future::poll` (its owner's, front2/coroutines.rs), a
+/// closure's `Fn*` method (its owner's, [`closure_owner`]), a fn item's or pointer's `Fn*`
+/// method (its shim, fn_shim.rs; a pointer's at `caller`). One answer for a call's callee and
+/// for a vtable's method word (census g091226: 467 words "NoImpl at a closure" while calls
+/// found the closure's body).
+fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>, caller: usize) -> Option<usize> {
+    crate::front2::coroutines::owner_of(program, adts, called, ground)
+        .or_else(|| closure_owner(program, adts, called, ground))
+        .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
 }
 
 /// The lang ADTs the builder asks for ([`blaze_build::Adts::lang_adt`]), asked of the front end
@@ -1775,12 +1796,14 @@ fn filed(sink: &mut Sink<'_>, e: RunError) -> Result<(), RunError> {
             (function, Box::from(said.char_indices().nth(240).map_or(&*said, |(i, _)| &said[..i])))
         }
         // By the constant and the evaluator's reason, so each refused constant is one class.
+        // Cut at 480: the need and the place take some 200 characters before the reason
+        // (census g054702 cut "a body it needs: .." at its first letters, 32 rows).
         RunError::ConstAt { function, refusal, path } => {
             let said = match path {
                 Some(path) => format!("const at the instance: `{path}`: {refusal}"),
                 None => format!("const at the instance: {refusal}"),
             };
-            (function, Box::from(said.char_indices().nth(240).map_or(&*said, |(i, _)| &said[..i])))
+            (function, Box::from(said.char_indices().nth(480).map_or(&*said, |(i, _)| &said[..i])))
         }
         // By the error's variant chain (`Check(Solve(Overflow`) and the callee's name, so each
         // cause at each trait fn is one class and the cause is not cut at its first field.
@@ -2608,9 +2631,7 @@ fn build_from<P: FrontEnd>(
                     }
                     continue;
                 }
-                None => crate::front2::coroutines::owner_of(program, &adts, called, &ground)
-                    .or_else(|| closure_owner(program, &adts, called, &ground))
-                    .or_else(|| crate::fn_shim::fn_shim_owner(program, &adts, called, &ground, i)),
+                None => language_owner(program, &adts, called, &ground, i),
             };
             if let Some(c) = tabled_as {
                 match key_of(program, c, called, &mut ground, &adts) {
@@ -2714,34 +2735,17 @@ fn build_from<P: FrontEnd>(
                 }
             }
         }
-        if ask_again {
-            // A coroutine's function was taken from its stash: put back for the step again.
-            if let Some((of, part)) = coroutine
-                && let Some(n) = coroutine_stash.iter().position(|b| b.owner == of.owner && b.ordinal == of.ordinal && b.args[..] == args[..])
-            {
-                coroutine_stash[n].parts[part.index()] = Some(built);
-            }
-            let rounds = if asked_rounds.0 == at { asked_rounds.1 } else { 0 };
-            asked_rounds = match program_mut.make_asked(i) {
-                Ok(true) => (at, rounds + 1),
-                // Nothing to make: the step once more, its `Missing` then filed as it is.
-                Ok(false) => (at, crate::front2::check::MOST_ROUNDS),
-                Err(made) => {
-                    filed(&mut survey, made)?;
-                    continue;
-                }
-            };
-            at -= 1;
-            continue;
-        }
-        if broken {
-            continue;
-        }
         // Each vtable the body names, made once for the program (`Shape::of`, `Vtable::build`):
         // the tables of its supertraits off the first chain first, by a stack; each method word
         // the impl's fn, resolved and reached as a call is; the drop word `drop_in_place::<T>`.
+        // A word's selection that met an answer no check made asks again as a call's does
+        // (`dyn Debug` of an ADT: `ImplsOf(Debug, ..)`, census g091226's 347 + 146 rows).
         let mut table_of = Vec::with_capacity_in(built.vtables.len(), Global);
-        for &want in built.vtables.iter() {
+        let vtables: &[VtableRef] = match ask_again || broken {
+            true => &[],
+            false => &built.vtables,
+        };
+        for &want in vtables.iter() {
             let made = (|| -> Result<u32, RunError> {
                 let fail = |why| RunError::Vtable { function: name(), principal: want.principal, why };
                 let full = || fail(VtableFail::Build(BuildError::Malformed { what: "the ground table is full" }));
@@ -2782,10 +2786,20 @@ fn build_from<P: FrontEnd>(
                         .map_err(|e| fail(VtableFail::Build(e)))?;
                     let mut words = Vec::with_capacity_in(table.relocs.len(), Global);
                     for &(offset, to) in table.relocs.iter() {
+                        // A fn item of a trait's method as the word's self: the body that runs,
+                        // as for a call (fn_item_resolve.rs).
+                        let to = match to {
+                            VtableTarget::Fn(f) => VtableTarget::Fn(crate::fn_item_resolve::resolved_shim_self(program, &adts, i, f, &mut ground).map_err(|error| {
+                                RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
+                            })?),
+                            to => to,
+                        };
                         let word = match to {
-                            // A coroutine's own `Future::poll` or drop (`dyn Future` of an
-                            // async block): the coroutine's function, tabled as its owner.
-                            VtableTarget::Fn(f) if let Some(c) = crate::front2::coroutines::owner_of(program, &adts, f, &ground) => {
+                            // A coroutine's own `Future::poll` or drop (`dyn Future` of an async
+                            // block), a closure's `Fn*` method (`&dyn FnMut` of a closure), a fn
+                            // item's or pointer's (its shim): what the language gives, as a
+                            // call's callee (`language_owner`), never a selected impl.
+                            VtableTarget::Fn(f) if let Some(c) = language_owner(program, &adts, f, &ground, i) => {
                                 let key = key_of(program, c, f, &mut ground, &adts)?;
                                 VtableWord::Slot(reached.slot(f, c, key)?)
                             }
@@ -2822,11 +2836,35 @@ fn build_from<P: FrontEnd>(
             })();
             match made {
                 Ok(n) => table_of.push(n),
+                Err(e) if may_ask && asks_again(&e) => {
+                    ask_again = true;
+                    break;
+                }
                 Err(e) => {
                     filed(&mut survey, e)?;
                     broken = true;
                 }
             }
+        }
+        if ask_again {
+            // A coroutine's function was taken from its stash: put back for the step again.
+            if let Some((of, part)) = coroutine
+                && let Some(n) = coroutine_stash.iter().position(|b| b.owner == of.owner && b.ordinal == of.ordinal && b.args[..] == args[..])
+            {
+                coroutine_stash[n].parts[part.index()] = Some(built);
+            }
+            let rounds = if asked_rounds.0 == at { asked_rounds.1 } else { 0 };
+            asked_rounds = match program_mut.make_asked(i) {
+                Ok(true) => (at, rounds + 1),
+                // Nothing to make: the step once more, its `Missing` then filed as it is.
+                Ok(false) => (at, crate::front2::check::MOST_ROUNDS),
+                Err(made) => {
+                    filed(&mut survey, made)?;
+                    continue;
+                }
+            };
+            at -= 1;
+            continue;
         }
         if broken {
             continue;
@@ -2835,7 +2873,7 @@ fn build_from<P: FrontEnd>(
         // `via`), put under its key with the instances it reaches declared.
         if let (Some(run), Some((parts, key))) = (records.as_deref_mut(), record_key) {
             use crate::code_records::{Callee, CodeRecordError, Declared, InstanceNames};
-            use crate::symbols::{encode_instance, fn_symbol_of_name, static_symbol, tls_symbol, vtable_symbol};
+            use crate::symbols::{encode_instance, fn_symbol_of_name, tls_symbol, vtable_symbol};
             let fail = |error| RunError::CodeRecord { function: name(), error };
             let sym = |e| fail(CodeRecordError::Symbol(e));
             // Each instance the record reaches by slot: its tabled fn and its name.
@@ -2879,8 +2917,6 @@ fn build_from<P: FrontEnd>(
                     }
                 }
             }
-            let mut statics = Vec::with_capacity_in(built.statics.len(), Global);
-            statics.extend(built.statics.iter().map(|&k| static_symbol(k)));
             let mut tls_names = Vec::with_capacity_in(built.thread_locals.len(), Global);
             tls_names.extend(built.thread_locals.iter().map(|&k| tls_symbol(k)));
             let mut vtables = Vec::with_capacity_in(built.vtables.len(), Global);
@@ -2890,7 +2926,7 @@ fn build_from<P: FrontEnd>(
             // The soft-float routines after the instance's own references, as run/make_one.rs
             // binds them: `make_entry` declares those the emitter says the record calls.
             let routines = bound.bind(&mut funcs).map_err(fail)?;
-            let names = InstanceNames { funcs: &funcs, statics: &statics, vtables: &vtables, tls: &tls_names };
+            let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &tls_names };
             // A census walk (`RecordRun::census`): the instance's LIR and names go to the census,
             // which emits them itself; no record is made. The walk goes on to the slots it filled.
             if let Some(seen) = run.seen.as_deref_mut() {

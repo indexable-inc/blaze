@@ -13,7 +13,7 @@ use std::{
 };
 
 use blaze_build_script::{
-    Env, Outputs,
+    Env, Outputs, OutputsRef,
     env::{DepMetadata, Given, PackageFacts},
     key::{CMode, RunLimits},
     native::Runner,
@@ -374,6 +374,111 @@ pub fn outputs_viewing_on<'a>(
             native_outputs(setting, graph, script, serves, because, tree, root, deps, producers, alloc).map_err(UnitScriptError::Native)
         }
     }
+}
+
+/// One run a reading script is served of: a script of its `links` closure ([`links_closure`]),
+/// handed as its outputs RECORD (read in place), with the tree its package was served and the
+/// root it saw it at. The command hands the `Script` records the drive read for it; an example
+/// hands the records of the runs it made; both through [`outputs_given`], the one function that
+/// turns them into the reader's `DEP_<LINKS>_*` and what its run is served (a wasm run's mounts,
+/// a native run's laid folders), so the two never drift (rule 30).
+pub struct GivenRun<'r> {
+    pub script: UnitId,
+    /// The `links` of the unit it serves.
+    pub links: &'r str,
+    pub outputs: OutputsRef<'r>,
+    pub tree: Tree,
+    pub root: ScriptRoot,
+    /// A `links` input of the reader itself (its metadata is the reader's `DEP_<LINKS>_*`), not
+    /// only upstream of one (whose files serve a forwarded path, brief S1b).
+    pub direct: bool,
+}
+
+/// What a reading script is given of its closure's runs ([`served_links`]): its `DEP_<LINKS>_*`
+/// pairs as the producers' records hold them, and each direct producer, with its own closure
+/// upstream, by its `links`.
+pub struct ServedLinks<'g> {
+    pub deps: Vec<DepMetadata<'g>>,
+    pub producers: Vec<(&'g str, DepProducer)>,
+}
+
+/// The scripts whose runs `script` is served of: each of its [`links_inputs`] and, walked from
+/// those, each of theirs (the transitive closure brief S1b serves a forwarded path from), with
+/// the `links` each serves and whether it is a direct input. A work list, no recursion; sorted
+/// by unit, each once (a script reached directly and upstream is direct).
+pub fn links_closure<'g>(graph: &'g UnitGraph<'_>, script: UnitId) -> Vec<(UnitId, &'g str, bool)> {
+    let mut found: Vec<(UnitId, &'g str, bool)> = Vec::new();
+    let mut stack: Vec<(UnitId, &'g str, bool)> = links_inputs(graph, script).into_iter().map(|(unit, links)| (unit, links, true)).collect();
+    while let Some((unit, links, direct)) = stack.pop() {
+        match found.iter_mut().find(|(seen, _, _)| *seen == unit) {
+            Some(seen) => seen.2 |= direct,
+            None => {
+                found.push((unit, links, direct));
+                stack.extend(links_inputs(graph, unit).into_iter().map(|(up, links)| (up, links, false)));
+            }
+        }
+    }
+    found.sort_unstable_by_key(|(unit, _, _)| *unit);
+    found
+}
+
+/// The `links` metadata and producers build-script unit `script` is served from `given`, the
+/// runs of its [`links_closure`]: each producer made from its record upstream first, so each
+/// takes its own inputs' closures ([`DepProducer::closure`], one flatten); the metadata of each
+/// direct one is a pair of the reader's environment. A direct `links` input of `script` that
+/// `given` lacks is refused naming it ([`UnitScriptError::Dependency`]): a script is never run
+/// without a `DEP_<LINKS>_*` cargo gives it (rule 3).
+pub fn served_links<'g, 'r: 'g>(graph: &UnitGraph<'_>, script: UnitId, given: &'g [GivenRun<'r>]) -> Result<ServedLinks<'g>, UnitScriptError> {
+    let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
+    for (input, links) in links_inputs(graph, script) {
+        if !given.iter().any(|run| run.script == input && run.direct) {
+            return Err(UnitScriptError::Dependency { package: package(unit), dependency: package(&graph.units[input.index()]), links: links.to_owned() });
+        }
+    }
+    let mut ids: Vec<UnitId> = given.iter().map(|run| run.script).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let inputs: Vec<Vec<UnitId>> = ids.iter().map(|id| links_inputs(graph, *id).into_iter().map(|(up, _)| up).collect()).collect();
+    let order = order_after(&ids, &inputs).map_err(|_| UnitScriptError::LinksCycle { package: package(unit) })?;
+    let mut deps: Vec<DepMetadata<'g>> = Vec::new();
+    let mut made: Vec<(UnitId, DepProducer)> = Vec::with_capacity(order.len());
+    for id in order {
+        let Some(run) = given.iter().find(|run| run.script == id) else { continue };
+        if run.direct {
+            deps.extend(run.outputs.metadata().map(|(key, value)| DepMetadata { links: run.links, key, value }));
+        }
+        let ups: Vec<(&str, &DepProducer)> =
+            links_inputs(graph, id).into_iter().filter_map(|(up, links)| made.iter().find(|(s, _)| *s == up).map(|(_, producer)| (links, producer))).collect();
+        let upstream = DepProducer::closure(&ups);
+        made.push((id, DepProducer::of_record(run.tree.clone(), run.root.clone(), &run.outputs).with_upstream(upstream)));
+    }
+    let producers = given
+        .iter()
+        .filter(|run| run.direct)
+        .filter_map(|run| made.iter().find(|(s, _)| *s == run.script).map(|(_, producer)| (run.links, producer.clone())))
+        .collect();
+    Ok(ServedLinks { deps, producers })
+}
+
+/// `script`'s outputs for the side whose cfg is `side_cfg` ([`outputs_viewing_on`]), served the
+/// runs `given` of its `links` closure ([`served_links`]): THE run a command's `Script` task and
+/// the census's exporter both make, wasm or native as [`placed`] says, the producers' files
+/// served to either alike.
+#[allow(clippy::too_many_arguments)]
+pub fn outputs_given<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
+    tree: Tree,
+    root: ScriptRoot,
+    given: &[GivenRun<'_>],
+    alloc: Alloc<'a>,
+) -> Result<ScriptRun<'a>, UnitScriptError> {
+    let served = served_links(graph, script, given)?;
+    let producers: Vec<(&str, &DepProducer)> = served.producers.iter().map(|(links, producer)| (*links, producer)).collect();
+    outputs_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &served.deps, &producers, alloc)
 }
 
 /// The build-script units whose metadata `script` is given: for each direct dependency of the

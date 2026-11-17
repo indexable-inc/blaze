@@ -1,5 +1,5 @@
 //! The form of a `CrateScope` record's payload (drive.md, "End state", piece 3, NAMES AND ITEMS
-//! FILED): one head, then seven sections, each found by its place in the head.
+//! FILED): one head, then eight sections, each found by its place in the head.
 //!
 //! - `exports`: the exports record, what a dependent reads and keys on (the task's out is its
 //!   digest alone);
@@ -20,6 +20,11 @@
 //!   from the names this job already holds (rule 77). The record lists it as the crate's
 //!   `Links` part, located by the table's digest, so the program's native image reads a table,
 //!   not the whole scope. EMPTY only in a failed crate's record.
+//! - `cells`: the crate's cell table ([`blaze_scope::names_cells::crate_table`], drive.md
+//!   "Names at module grain" point 3): sorted (cell, digest) rows over the names and items
+//!   records, what a body or head that read the crate BY CELL is checked against, by
+//!   [`cell_of`], the kind's part lookup the drive is given. EMPTY in a failed crate's record
+//!   (every cell then reads absent).
 //!
 //! The head, [`HEAD`] bytes, little-endian: [`MAGIC`] (4), [`FORM`] (u32), the crate's
 //! unresolved count (u32), 4 zero bytes, then per section in the order above its place (u64)
@@ -30,7 +35,7 @@
 //!
 //! Older forms (the 16-byte head of exports then inner, before 2026-11-16; form 2, four
 //! sections without the tests; form 3, five without the expansions; form 4, six without the
-//! link table) are records under other
+//! link table; form 5, seven without the cell table) are records under other
 //! names: names.rs's subject and source
 //! domains moved with each form, so an old home's records are never found and are made again;
 //! one read anyway is [`SectionsError::Form`].
@@ -40,12 +45,12 @@ use super::Global;
 /// The payload's first bytes.
 pub(crate) const MAGIC: [u8; 4] = *b"BZCS";
 /// This form's number. Bump it, and names.rs's domains, at any change of the layout.
-pub(crate) const FORM: u32 = 5;
+pub(crate) const FORM: u32 = 6;
 /// How many sections a payload of this form holds.
-pub(crate) const SECTIONS: usize = 7;
-/// Where the seven (place, length) pairs start.
+pub(crate) const SECTIONS: usize = 8;
+/// Where the eight (place, length) pairs start.
 const PLACES: usize = 16;
-/// The head's length: the fixed words, then seven pairs of u64.
+/// The head's length: the fixed words, then eight pairs of u64.
 pub(crate) const HEAD: usize = PLACES + SECTIONS * 16;
 /// What each section's place is rounded up to.
 const ALIGN: usize = 16;
@@ -60,11 +65,12 @@ pub(crate) enum Section {
     Tests,
     Expansions,
     Links,
+    Cells,
 }
 
 impl Section {
     pub(crate) const ALL: [Section; SECTIONS] =
-        [Section::Exports, Section::Inner, Section::Names, Section::Items, Section::Tests, Section::Expansions, Section::Links];
+        [Section::Exports, Section::Inner, Section::Names, Section::Items, Section::Tests, Section::Expansions, Section::Links, Section::Cells];
 
     fn says(self) -> &'static str {
         match self {
@@ -75,6 +81,7 @@ impl Section {
             Section::Tests => "the tests record",
             Section::Expansions => "the expansion texts",
             Section::Links => "the link table",
+            Section::Cells => "the cell table",
         }
     }
 
@@ -89,6 +96,7 @@ impl Section {
             Section::Tests => "tests",
             Section::Expansions => "expansions",
             Section::Links => "links",
+            Section::Cells => "cells",
         }
     }
 }
@@ -107,6 +115,8 @@ pub(crate) struct Sections<'p> {
     /// The crate's link table ([`blaze_ladder::native_links::open_table`] reads it); empty only
     /// in a failed crate's record.
     pub links: &'p [u8],
+    /// The crate's cell table; empty only in a failed crate's record.
+    pub cells: &'p [u8],
     /// The crate's unresolved paths, counted when it was made.
     #[cfg_attr(not(test), expect(dead_code, reason = "read back by the payload tests; the command counts a crate's unresolved paths when it makes it (scope.rs)"))]
     pub unresolved: u32,
@@ -124,6 +134,7 @@ impl<'p> Sections<'p> {
             Section::Tests => self.tests,
             Section::Expansions => self.expansions,
             Section::Links => self.links,
+            Section::Cells => self.cells,
         }
     }
 }
@@ -139,7 +150,7 @@ pub(crate) enum SectionsError {
     Misplaced { section: Section, at: u64, want: u64 },
     /// A section runs past the payload's end: the payload was cut short.
     Short { section: Section, end: u64, len: usize },
-    /// Bytes after the link table (the last section).
+    /// Bytes after the cell table (the last section).
     Trailing { end: u64, len: usize },
 }
 
@@ -232,8 +243,19 @@ pub(crate) fn sections(payload: &[u8]) -> Result<Sections<'_>, SectionsError> {
     if end != payload.len() as u64 {
         return Err(SectionsError::Trailing { end, len: payload.len() });
     }
-    let [exports, inner, names, items, tests, expansions, links] = parts;
-    Ok(Sections { exports, inner, names, items, tests, expansions, links, unresolved })
+    let [exports, inner, names, items, tests, expansions, links, cells] = parts;
+    Ok(Sections { exports, inner, names, items, tests, expansions, links, cells, unresolved })
+}
+
+/// The `CrateScope` kind's part lookup ([`blaze_drive::CellOf`]): the cell's digest in the
+/// payload's cell table, one binary search, or absent.
+pub(crate) fn cell_of(payload: &[u8], cell: blaze_drive::Cell) -> Result<blaze_drive::Seen, blaze_drive::CellRefused> {
+    let parts = sections(payload).map_err(|_| blaze_drive::CellRefused { what: "a `CrateScope` payload whose sections do not read (names/sections.rs)" })?;
+    match blaze_scope::names_cells::seen_in(parts.cells, cell.0) {
+        Ok(Some(digest)) => Ok(blaze_drive::Seen::Is(digest)),
+        Ok(None) => Ok(blaze_drive::Seen::Absent),
+        Err(_) => Err(blaze_drive::CellRefused { what: "a `CrateScope` cell table that is not whole rows (names/sections.rs)" }),
+    }
 }
 
 /// Tests: the one crate whose dependency payload, as a dependent read it from the store, is

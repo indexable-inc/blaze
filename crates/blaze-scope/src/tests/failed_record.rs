@@ -57,9 +57,9 @@ fn the_failed_calls_reason_round_trips_through_the_names_record() {
     assert_eq!((row.call, row.path, row.implicit), (call, path, implicit));
     assert_eq!(row.path, "make");
     assert!(!row.implicit);
-    assert_eq!(row.failed, failed, "the reason read back is the solve's");
-    assert_eq!(format!("{}", row.failed), format!("{failed}"));
-    assert!(format!("{}", row.failed).contains("no rule of the macro's 1 matched"), "{}", row.failed);
+    assert_eq!(row.why, crate::call_refusal::CallRefusal::Failed(failed), "the reason read back is the solve's");
+    assert_eq!(format!("{}", row.why), format!("{failed}"));
+    assert!(format!("{}", row.why).contains("no rule of the macro's 1 matched"), "{}", row.why);
 
     // The control of the lookup: a key that is no failed call.
     assert!(record.failed(c.root, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")).is_none());

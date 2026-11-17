@@ -66,6 +66,69 @@ impl OwnedNativeSetting<'_> {
     }
 }
 
+/// What [`NativeRun::new`] opens the native runner from: a resolved setting
+/// ([`command_native_setting`], or [`native_setting`] for a named shelf), the fact shim binary
+/// to place in its work folder (D112, N7) and the worker count the native runs' children share.
+pub struct NativeRunOpts<'a, 's> {
+    pub setting: OwnedNativeSetting<'a>,
+    /// The fact shim binary (`blaze-fact-shim`), as the edge found it.
+    pub shim: &'s str,
+    pub workers: core::num::NonZeroU32,
+}
+
+/// The native runner, open for one command: its setting, the fact shim placed in its work
+/// folder and the command's jobserver (its fifo under that folder, `workers - 1` tokens). Made
+/// once a command by [`NativeRun::new`], the one place both a command and an example open it;
+/// [`NativeRun::end`] removes the fifo when the command's scripts are over.
+pub struct NativeRun<'a> {
+    pub owned: OwnedNativeSetting<'a>,
+    /// The placed shim's real path.
+    pub shim: std::string::String,
+    pub jobs: crate::jobserver::Jobserver,
+}
+
+/// Why the native runner could not be opened; each names the path.
+#[derive(Debug)]
+pub enum NativeRunError {
+    /// The fact shim could not be placed (D112, N7).
+    Shim(crate::native_facts::NativeFactsError),
+    /// The jobserver could not be made.
+    Jobs(crate::jobserver::JobserverError),
+}
+
+impl core::fmt::Display for NativeRunError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NativeRunError::Shim(error) => write!(f, "the native runner's fact shim (D112, N7): {error}"),
+            NativeRunError::Jobs(error) => write!(f, "the native runner's jobserver (D112): {error}"),
+        }
+    }
+}
+
+impl core::error::Error for NativeRunError {}
+
+impl<'a> NativeRun<'a> {
+    /// The runner over `opts.setting`: the shim copied into the work folder, then the
+    /// jobserver made there. A failure of either is typed and names the path; nothing is left
+    /// open by a failure (the jobserver is made last).
+    pub fn new(opts: NativeRunOpts<'a, '_>) -> Result<NativeRun<'a>, NativeRunError> {
+        let NativeRunOpts { setting, shim, workers } = opts;
+        let shim = crate::native_facts::place_shim(setting.work.as_str(), shim).map_err(NativeRunError::Shim)?;
+        let jobs = crate::jobserver::Jobserver::new(crate::jobserver::JobserverOpts { work: setting.work.as_str(), workers, id: std::process::id() }).map_err(NativeRunError::Jobs)?;
+        Ok(NativeRun { owned: setting, shim, jobs })
+    }
+
+    /// The setting `script_unit::Setting::native` takes.
+    pub fn setting(&self) -> NativeSetting<'_> {
+        self.owned.setting(&self.jobs)
+    }
+
+    /// The jobserver ended: its descriptor closed, its fifo removed.
+    pub fn end(&self) -> Result<(), crate::jobserver::JobserverError> {
+        self.jobs.end()
+    }
+}
+
 /// Why the command has no native setting; each names the path or the pin row.
 #[derive(Debug)]
 pub enum NativeSettingError<'a> {

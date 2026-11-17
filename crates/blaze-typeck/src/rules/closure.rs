@@ -379,11 +379,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             // The stack pops last-pushed first: `cond` is pushed last so its `let` marks its
             // bindings bound before `then` (which uses them) is visited.
+            // A branch's value is the `if`'s or the `match`'s: taken by value when it is (as a
+            // block's tail).
             Expr::If { cond, then, else_ } => {
+                let branch = if usage == USE_MOVE { USE_MOVE } else { 0 };
                 if let Some(e) = else_ {
-                    exprs.push((e, 0));
+                    exprs.push((e, branch));
                 }
-                exprs.push((then, 0));
+                exprs.push((then, branch));
                 exprs.push((cond, 0));
             }
             Expr::Let { pat, init } => {
@@ -401,7 +404,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     if let Some(g) = arm.guard {
                         exprs.push((g, 0));
                     }
-                    exprs.push((arm.body, 0));
+                    exprs.push((arm.body, if usage == USE_MOVE { USE_MOVE } else { 0 }));
                 }
             }
             Expr::Loop { body } => exprs.push((body, 0)),
@@ -452,15 +455,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             // An inline constant sees no local of the body: it captures nothing.
             Expr::ConstBlock { .. } => {}
             Expr::Cast { operand, .. } => exprs.push((operand, 0)),
+            // The Reference, "Place expressions and value expressions": the operands of a tuple
+            // or array expression and a struct expression's field initializers are value
+            // expressions, so a place there is moved (copied when `Copy`) into the aggregate,
+            // whatever the aggregate's own context (`&(s, 1)` moves `s` too). Walked as reads,
+            // `move || (1u8, s)` was not `FnOnce` and its body moved out of `&mut self`
+            // (tempo vsock-proxy main.rs:210, a false E0507).
             Expr::Tuple { elems } | Expr::Array { elems } => {
                 for &a in el(elems)? {
-                    exprs.push((a, 0));
+                    exprs.push((a, USE_MOVE));
                 }
             }
             Expr::Repeat { elem, .. } => exprs.push((elem, 0)),
             Expr::Struct { fields, base, .. } => {
                 for fi in self.body.field_init_list(fields)? {
-                    exprs.push((fi.expr, 0));
+                    exprs.push((fi.expr, USE_MOVE));
                 }
                 if let Some(b) = base.expr() {
                     exprs.push((b, 0));

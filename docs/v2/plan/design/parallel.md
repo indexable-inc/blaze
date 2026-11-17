@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: How one command uses every core and holds little memory. The end state (architect, 2026-11-16) first: one work-stealing thread pool, item-grain tasks that never block (a missing record parks the task on a per-key claim and it is re-entered), no global interner, a frame per worker reset per item, records as the only thing that outlives a task, footprint as the one measure, a refused allocation as a typed failure of one job, determinism by sorting at record boundaries; then the gap against today's code and the pieces in build order. Below them, the 2026-11-15 audit of the older layer, kept as a record.
-date: 2026-11-16
+date: 2026-11-17
 ---
 # Parallelism on 128 cores, and on a Mac
 
@@ -15,17 +15,35 @@ heap 2,309 MB live after them; 20,000 bodies of one crate 31.2 s (640 a second);
 1. **One scheduler: bstd's `Threads` pool; threads, work stealing, no fibers** (task/threads.rs
    stands: a worker per core of every level, LIFO slot, Chase-Lev deque, injection per LLC
    group). A parked fiber costs a stack per wait (hundreds of thousands of them) and carries
-   thread-bound values across it (rule 27). A task here is restartable: its key fixes the
-   questions it asks (rule 21), so re-entering costs its prefix, whose reads are hits.
+   thread-bound values across it (rule 27). A task never waits and is sans-IO (bottom.md), and
+   it is NEVER STARTED OVER: as built, a task that answers `Need` is run again from its first
+   line, 3.0 entries a `Signature`, 3.1 a `BodyCheck`, 2.9 a `CrateScope` (tempo cold g080231:
+   51,396 / 17,132; 50,330 / 16,041; 3,531 / 1,208). (a) PLAN FROM TEXT: what a task can be
+   seen to need from its text and the outlines (a body's paths and the heads they name, a
+   signature's types, a crate's dependencies' scopes) is asked and settled before its first
+   entry, in phases over shared tables (outlines, names, signatures, the impl index, bodies:
+   the shape Sorbet and Pyrefly get their throughput from), so the common case has entries ==
+   made. (b) A need found only while running (a method on an inferred type, a const in a type,
+   an opaque's hidden type) is made inline by the same worker when its key is unclaimed (point
+   3). Claimed by another worker: a CHEAP kind is made again (a head, a signature, a const:
+   about 0.5 ms; equal bytes by key, rule 25, so the duplicate is correct, bounded and rare); a
+   DEAR kind (a crate's scope, 20 ms and its frame; a body's hidden type) yields as a state
+   machine that KEEPS its state (its frame stays its own while parked) and resumes at the
+   question, never at line one. Every kind reports entries per made; the target is 1.0.
 2. **Grain.** One item a task: a file's outline, a module's names (a glob cycle one `Group`), a
    signature, a body, an instance. The driver hands out batches of about 1 ms of predicted cost
    (learned per code identity; text length the first time), the items of one file; each item
-   keeps its own key, record and failure. Dispatch stays under 1%.
+   keeps its own key, record and failure. Dispatch stays under 1%. THE COORDINATOR IS NOT ON
+   THE HOT PATH: today one thread makes every task's job and steps the machine once a batch
+   (g044908: `jobs made` 33.2 s, steps 13.6 s of a 152 s run; g080231: 26.9 s and 13.0 s, puts
+   7.1 s, of 168 s). A worker makes its own task's job; batches are planned in bulk and results
+   merged in bulk, sorted at the boundary (point 8), so the serial part is a small constant
+   per phase, not a step per task.
 3. **Waiting without a graph.** A record being written has a claim: a slot in a fixed lock-free
    table by key (`blaze_core::claims`): empty, claimed by a task, or done with its address. A
    task needing key k claims it and runs it inline if free (help first: no restart), reads it if
-   done, else parks: it joins k's waiter list, its frame is reset, and the publisher pushes the
-   waiters onto its own deque. Each slot knows its owner and each parked task its one slot;
+   done, else (point 1 b, by kind) makes it again or parks: it joins k's waiter list keeping
+   its state, and the publisher pushes the waiters onto its own deque. Each slot knows its owner and each parked task its one slot;
    before parking a task walks owner, owner's wait, ... (at most `live` steps): reaching itself
    is a cycle, found at the edge that closes it (SeqCst: of two tasks closing one cycle at once,
    one sees it). A module-scope cycle becomes one `Group`; any other is `Failure::MadeCycle`
@@ -36,6 +54,13 @@ heap 2,309 MB live after them; 20,000 bodies of one crate 31.2 s (640 a second);
    frame; a record carries its own canonical table in the first-use order its key fixes; a
    reader re-interns what it touches (stands: typeck-store.md, "The type tables", option A,
    "process-global" read as "per task"). No shard lock, no id counter, no stop-the-world.
+   NOTHING PRIVATE PER JOB: every global fact a body reads (names, heads and signatures, the
+   impl index, lang items) is an immutable record read in place by every worker (impl buckets
+   on blaze-surface/blaze-impls records, lane BK; heads frozen, piece 9); a body task's own
+   state is only its inference tables, in its frame. Today each file job builds a private
+   world per owner and makes again every head it reads (blaze-cli body_types.rs `Checker`,
+   `FileTypes::new`). rustc's parallel front end scales poorly past 16 threads on shared
+   mutable state: that is not rebuilt here.
 5. **Memory by lifetime.** A frame per worker, reset per item; reserve is address space
    (`FRAME_RESERVE`, 4 GiB), committed pages are footprint. What outlives an item leaves as a
    record, never a pointer into a frame. The command's frame holds the request's rows and what
@@ -79,35 +104,48 @@ heap 2,309 MB live after them; 20,000 bodies of one crate 31.2 s (640 a second);
 | Roc, Carbon | an arena per module or check unit, canonical exposed types; blaze the same at item grain |
 | salsa | blocking waits, cycles from an in-memory graph; blaze keeps no graph |
 
-### Gap (tree of 2026-11-16, by search)
+### Gap (tree of 2026-11-17 09:09, green b13ac2dcb9, by search)
+
+Paths are under crates/; front2 is blaze-ladder/src/front2. Profile: tempo cold check g080231
+(port27/tempo-deps/check-g080231.profile.txt, 168.2 s request).
 
 | End state needs | Today, with evidence | Missing | In `blaze check`? |
 |---|---|---|---|
-| Body checks on every core | One thread. `ProjectWorld::check(&mut self, ..)` (blaze-ladder front2/project.rs:187); `Records` holds `keys: &mut Keys`, `store: &mut Store`, `buckets: &mut Option<Buckets>`, `consts` (front2/check.rs:106); a body's missing heads are made in place into the one `Store` (`make_round`, check.rs:225); `Store::tys` is one `PortableTys` for every head (front2/heads.rs:401) over `Alloc`, a `NonNull` word, so `!Send` and `!Sync` (blaze-own alloc_ref.rs:169); `BodyWorld.fills`/`gaps` are `RefCell` (front2/world_items.rs:174) | a frozen, `Sync` view of published heads plus a per-task overlay; heads made by claim | No: the command's `BodyCheck` is a syntax pass (`pooled` -> `body_syntax`, blaze-cli work.rs:998) |
-| Names on every core | One thread. `resolve_crates_with` runs `for &id in wave` serially (blaze-scope resolve.rs:734); `Par::map<T, F: Fn(usize) -> T>` has no `Send`/`Sync` bound (blaze-scope task/fill.rs:27), so only `Serial` is sound, and the tests' threaded `Par` needs `unsafe impl Send for OnGlobal<T>` (tests/per_crate.rs:30); the command passes `&Serial` (blaze-cli names.rs:582) and runs `CrateScope` on the coordinator (`run_one`, work.rs:469) | `Par` bounded by `Send + Sync`; a crate per task; module rounds through a bstd scope | Yes, serially |
-| Names leave as records, not a live heap | Each crate's `CrateNames` is `Box::leak`ed into the global heap (resolve.rs, after `resolve_one`); the command's names world leaks a 4 GiB frame and a decoded graph (names.rs:338-345); tempo: 2,309 MB live after names | the solve in its task's frame, its record read back mapped | Partly (records written; the heap kept too) |
-| A command frame sized for the request, nothing per task in it | Root `cx.frame()` of `TASK_FRAME` = 64 MiB (blaze-std mem.rs:35; main.rs:280); `job_of` copies every pooled task's path into it (work.rs:668); failures' paths and words too (work.rs:386,390); `Settled` grows into it | reserve `FRAME_RESERVE`; jobs by file index; try_ growth | Yes: the 52-byte refusal on blaze's workspace |
-| A refusal is a typed failure | `blaze_own::error::fail` panics (blaze-own error.rs:49); the cli's hook makes std's refusals panics (work.rs:452-457); `pooled` reports `Why::Panicked { used, limit }` (work.rs:1009) | `FrameFull` typed; `A: NeverRefuses` on infallible growth; the lint | Yes, as a panic |
-| Tasks run on the pool | bstd `Threads` exists (work stealing, task/threads.rs); the command pools only `FileItems` and `BodyCheck` (`may_overlap`, work.rs:297); every other kind runs on the coordinator thread | every kind on the pool | Partly |
-| Waiting for a record in flight | The driver's `Need` re-enters a task once its wants are answered; bstd `Flight` scans under one lock and blocks the asker's thread, and a self-wait ends only at the deadline (blaze-std sync/flight.rs:1-25) | a lock-free claim table with waiter lists and the cycle walk | No |
-| No global heap per item | `check_body_counted` makes `InferCtx::new_in(Alloc::global())` and round vectors on `Global` each round (check.rs:142-150) | the task's frame through `check_body`'s `alloc` | No (not wired) |
-| Deterministic merges | `BuildOrder::Reversed` test exists (check.rs:119); the gap list is kept sorted by `format!("{g:?}")`, a format per comparison (check.rs:170-178) | sort by key | n/a |
+| Body checks on every core | A file's bodies run one after another in one pool job (`for (name, place, handed) in job.bodies`, blaze-cli work.rs:2137) over one world: `FileTypes::check` runs `each_covered(&mut checker.world, ..)` (blaze-cli body_types.rs:923); `ProjectWorld::check(&mut self, ..)` (front2 project.rs:258); `Records.store: &'r mut Store` (front2 check.rs:128); missing heads are made in place (`make_round`, check.rs:327); `Store.tys` is one `PortableTys` (front2 heads.rs:554) over `Alloc`, a `NonNull<Header>` (blaze-own alloc_ref.rs:169-171), so `!Send`, `!Sync`; `fills`/`gaps` are `RefCell` (front2 world_items.rs:213-214). Sample g082400: the main thread parked on a `PooledBodies` join, one worker in `FileTypes::check` | frozen `Sync` heads and an overlay; heads by claim; a file's bodies across workers | Yes, typed, one file a worker |
+| Names on every core | The library's `resolve_crates_with` runs `for &id in wave` serially (blaze-scope resolve.rs:875); `Par::map<T, F: Fn(usize) -> T>` has no `Send`/`Sync` bound (blaze-scope task/fill.rs:28). The command resolves a crate per pool task (`may_overlap("crate scope", ..)`, work.rs:714; `pooled_scope`, work.rs:2519), its job made on the main thread (`scope_job`, work.rs:2478); a crate with no job runs there too (`Spawned::Here`, work.rs:718). g080231: `CrateScope` on main 2,323x 7.0 s, pooled 1,074x 21.9 s | `Par` bounded; the job made on the worker | Yes, a crate a task |
+| Names leave as records, not a live heap | `Box::leak(Box::new_in(done, alloc))` per crate (blaze-scope resolve.rs:880); the command's names world leaks its reader, frame and decoded graph (blaze-cli names.rs:622-632) | the solve in its task's frame, its record read back mapped | Partly |
+| A command frame sized for the request, nothing per task in it | Root frame `MAIN_SCRATCH = TASK_FRAME` = 64 MiB (blaze-std entry.rs:51, mem.rs:62); `job_of` copies each task's path into the round's `jobs` frame (work.rs:1656) | reserve `FRAME_RESERVE`; jobs by file index | Yes |
+| A refusal is a typed failure | `blaze_own::error::fail` panics (blaze-own error.rs:49); the hook makes std's refusals panics (work.rs:1318); `pooled` reports `Why::Panicked { used, limit }` (work.rs:2373); no `FrameFull` or `NeverRefuses` in the tree | `FrameFull`; `A: NeverRefuses`; the lint | Yes, as a panic |
+| Tasks run on the pool | Pooled: outlines (work.rs:704), crate scopes (714), build scripts (745), a file's bodies (838), a file's lints (848), opens (2315). On the main thread: each task's JOB (below), and `Spawned::Here` (work.rs:718, 828) | jobs made on workers; every kind pooled | Partly |
+| Waiting for a record in flight | `blaze_core::claim_table` is built and tested (blaze-core lib.rs:43; 9 tests with `claim_watch`, ask 090947-PAR-cbfbe9) and used nowhere outside blaze-core. A body waits by the driver's `Need`: `prepare` answers `Need` for the unit graph and owners (blaze-cli body_types.rs:514, 545), then for the owners' scopes (589) and heads (630), and the task is entered again. g080231: `BodyCheck` made 16,041, entered 50,330; `Signature` 17,132 / 51,396; `CrateScope` 1,208 / 3,531 | claims in the command; no re-entry | No |
+| The coordinator's cost per event | One thread does three things per round (`run_batches`, work.rs:644-861; `answer_batch`, 934-1128). (1) JOBS MADE: for every task of every batch it makes the task's job: a body's `body_types::prepare` (work.rs:772) reads its graph, owners and scope inputs and builds its `TypesJob`, about 0.35 ms each, three times a body (the `Need` row above); a crate's `scope_job`; a script's `scripts::job`. (2) A STEP per batch: `req.step(Event::Ran ..)` (work.rs:1116) -> `Request::step` (blaze-drive request.rs:1477) -> `ran_batch` -> `pump`, about 0.26 ms. (3) The step's puts. g080231: jobs made 554x 26.9 s (Signature 36,616x 13.8 s, BodyCheck 36,432x 12.2 s, CrateScope 3,397x 0.77 s); machine step 49,703x 13.0 s; effect put 101,463x 7.05 s; 47 s serial of 168 s; the main thread waited on joins 113 s. g044908: jobs made 33.2 s, steps 13.7 s | a task makes its own job on its worker; claims instead of re-entry (a third of the steps); puts off the main thread | Yes |
+| No global heap per item | `check_rounds_as` takes the store's allocator (`r.store.tys.alloc()`, front2 check.rs:202) for `InferCtx::new_in` (213) and its round vectors, `all_gaps` on `Global` (204) | the worker's frame, reset per body | No |
+| Deterministic merges | `BuildOrder::Reversed` (front2 check.rs:141, used at 246); gaps kept sorted by `format!("{g:?}")`, a format per comparison (262-263); `make_round` picks a refusal by `format!` (336) | sort by key; a 1-vs-8-worker test of the command | n/a |
 
-### Pieces, in build order (one writer each; A = can be written at the same time as the others marked A)
+### Pieces, in build order (A = can be written at the same time as the others marked A)
 
-1. **A. Command frame** (DRIVER runner 10, owns it; design sent): root frame reserve `FRAME_RESERVE`; `Job` names its file by index; try_ growth; `CliError` naming the frame. Test: a check of a few thousand generated files under a small command frame finishes; with the copy back it fails typed, not by panic.
-2. **A. `blaze_core::claims`** (this architect, written, NEVER COMPILED): the claim table, waiter lists, the cycle walk. Test: two-thread schedules (`world::threads::two`) with oracles, and three planted bugs caught.
-3. **A. Typed refusal at the job seam** (blaze-cli work.rs `pooled`, the hook; blaze-drive `Why::FrameFull`, additive): the hook writes the refused layout into the running job's slot; the seam reports it. Test: a job planted to over-ask its frame fails with `FrameFull` naming the bytes; the scope is not cancelled.
-4. **A. `Par` bounded** (NAMES runner 22; blaze-scope task/fill.rs and its four impls, one batch): `fn map<T: Send, F: Fn(usize) -> T + Sync>`; the test `Threads` loses `OnGlobal`. Test: per_crate's threaded run equals `Serial` and `Reversed` bytes.
-5. **A. Frame per body** (RECORDS SWITCH writer; front2 check.rs `check_body_counted`): `InferCtx` and round vectors in the caller's frame; gaps sorted by key. Test: a counting allocator sees zero global allocations per checked body.
-6. **A. `NeverRefuses`** (blaze-own, a new file; the lint in blaze-lints): the marker on `Global`, `Kept`, `Erased<Global>`; the lint on infallible growth over a frame. Test: lint UI cases (a frame `push` denied, `try_push` allowed, `Global` `push` allowed).
-7. **A. Footprint per task** (blaze-cli profile rows; blaze-core footprint.rs read once per batch): each task's frame peak and the process footprint at batch end into the profile. Test: a planted 8 MB task shows a peak at least 8 MB on its row.
-8. **Names, a crate per task** (NAMES runner 22; blaze-scope resolve.rs, blaze-cli names.rs), after 4: each crate of a wave a `may_overlap` task in its own frame, its `CrateNames` written as the record and read back mapped, the frame reset. Test: 4 workers equal 1 in bytes; live heap after the run is not the sum of crates (a planted keep-alive fails it).
-9. **Frozen heads and an overlay** (RECORDS SWITCH writer; front2 heads.rs `Store`, check.rs `Records`), after 5: published heads are `Sync` (each head with its own portable table); a body's fills go to its overlay. Test: the determinism test under both orders, and 2 workers equal 1.
-10. **Heads by claim** (same writer), after 2 and 9: a body's fill of head k claims k: mine, make and publish; done, read; claimed, return `Need`. Test: the simulation of two bodies needing one head makes it once (a planted double-claim is caught).
-11. **Bodies on the pool** (the front-end writer; front2 project.rs, tempo_front's `bodies`), after 10: bodies of a file as one batch, a worker frame reset per body, results sorted by item key. Test: tempo_front with 1 and 8 workers prints the same body table.
-12. **Typed `BodyCheck` in the command** (DRIVER), after 11: the command's `BodyCheck` runs the typed check. Test: a type error in a ladder rung is printed by `blaze check`.
-13. **Watchdog over claims** (DRIVER), after 2: a claim past its kind's deadline named as `Hung`. Test: the simulation's virtual clock, a planted stuck owner.
+Status of 2026-11-17 09:09 (green b13ac2dcb9). engine.md (D131) replaces 9 and 10 (E2, the
+view: frozen heads, the overlay), 11 (engine point 4), 14 and the coordinator row (E1, point 5),
+and the re-entry (E5); it uses 2 and 13 as built (point 3). The order test is
+blaze-cli src/tests/order_tests.rs: 1 and 8 workers answer alike today; reversed order does not
+(`reversed_order_answers_alike`, ignored until E2: three impl fns' `Signature` outs move with
+the order in the old per-job `Store`). Its fixture: `BodyCheck` 84 entries / 21 made,
+`Signature` 72 / 24, `CrateScope` 17 / 7, `FileItems` 4 / 4.
+
+1. **A. Command frame**: root frame reserve `FRAME_RESERVE`; `Job` names its file by index; try_ growth; `CliError` naming the frame. Test: a check of a few thousand generated files under a small command frame finishes; with the copy back it fails typed, not by panic. NOT BUILT (root frame still 64 MiB; paths copied per round).
+2. **A. `blaze_core::claim_table`**: the claim table, waiter lists, the cycle walk. Test: two-thread schedules with oracles, three planted bugs caught. BUILT: `claims_waits_and_cycles_hold_on_drawn_schedules` and its controls pass (ask 090947-PAR-cbfbe9); used nowhere yet.
+3. **A. Typed refusal at the job seam** (`Why::FrameFull`): the hook writes the refused layout into the running job's slot. Test: a job planted to over-ask its frame fails with `FrameFull` naming the bytes; the scope is not cancelled. NOT BUILT.
+4. **A. `Par` bounded**: `fn map<T: Send, F: Fn(usize) -> T + Sync>`. Test: per_crate's threaded run equals `Serial` and `Reversed` bytes. NOT BUILT (task/fill.rs:28).
+5. **A. Frame per body**: `InferCtx` and round vectors in the caller's frame; gaps sorted by key. Test: a counting allocator sees zero global allocations per checked body. NOT BUILT.
+6. **A. `NeverRefuses`** and the lint on infallible growth over a frame. Test: lint UI cases. NOT BUILT.
+7. **A. Footprint per task**: each task's frame peak and the process footprint at batch end into the profile. PARTLY: frame peaks per job and batch (work.rs:869, 876, 2367); no footprint per batch.
+8. **Names, a crate per task**: each crate a pool task in its own frame, its record read back mapped. PARTLY: pooled per crate, `pooled_scope_tests::a_pooled_check_writes_the_records_a_serial_one_does` (and its control); the solve still leaked to the heap, the job made on main.
+9. **Frozen heads and an overlay**: published heads are `Sync`; a body's fills go to its overlay. Test: the determinism test under both orders, and 8 workers equal 1. NOT BUILT.
+10. **Heads by claim**, after 2 and 9: a body's fill of head k claims k: mine, make and publish; done, read; claimed, park on it or help, never re-enter the whole task. Test: two bodies needing one head make it once (a planted double-claim is caught). NOT BUILT.
+11. **Bodies on the pool**, after 10: a file's bodies as batches across workers, a worker frame reset per body, results sorted by item key. Test: `blaze check` of a fixture with 1 and 8 workers gives equal answers and record keys. NOT BUILT (a file a job, work.rs:838).
+12. **Typed `BodyCheck` in the command**. Test: a type error is printed by `blaze check`. BUILT: blaze-cli tests/check_written_bodies.rs `every_written_body_is_checked_by_the_command` (a planted E0308).
+13. **Watchdog over claims**, after 2: a claim past its kind's deadline named as `Hung`. Test: virtual clock, a planted stuck owner. PARTLY: `blaze_core::claim_watch` built and tested (`one_stuck_owner_is_named_once_at_its_deadline`, ask 090947-PAR-cbfbe9); nothing calls it.
+14. **Jobs made on the worker** (new; the coordinator row): a task's `prepare` runs on its worker, the main thread only steps; with 10 no task is entered more than once. Test: the fixture's profile shows entries equal to made for `BodyCheck` and `Signature`. NOT BUILT.
 
 ## Audit of the older layer (record, 2026-11-15)
 

@@ -140,37 +140,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
 /// clause, or (a trait) its supertraits (`trait Tr: 'static`, a bound on `Self`). A header the
 /// lexer cannot read is refused (the caller then relates no call through it).
 pub fn container_declares_type_outlives<A: Allocator + Clone>(text: &str, alloc: A) -> Result<bool, SigRefusal> {
-    let cut = text.find('{').unwrap_or(text.len());
-    let head = text.get(..cut).unwrap_or(text);
-    let mut toks: Vec<Tok, A> = Vec::new_in(alloc.clone());
-    lex(head, &mut toks)?;
-    // Brackets paired as `Reader::pair_brackets` does, over the header alone.
-    let mut mate: Vec<u32, A> = Vec::new_in(alloc.clone());
-    mate.resize(toks.len(), u32::MAX);
-    let mut open: Vec<u32, A> = Vec::new_in(alloc);
-    for i in 0..toks.len() {
-        let Tk::P(c) = toks[i].k else { continue };
-        let want = match c {
-            b'(' | b'[' | b'<' => {
-                open.push(i as u32);
-                continue;
-            }
-            b')' => b'(',
-            b']' => b'[',
-            b'>' => b'<',
-            _ => continue,
-        };
-        match open.pop() {
-            Some(o) if toks[o as usize].k == Tk::P(want) => {
-                mate[o as usize] = i as u32;
-                mate[i] = o;
-            }
-            _ => return Err(SigRefusal::Token { at: toks[i].lo }),
-        }
-    }
-    if let Some(o) = open.pop() {
-        return Err(SigRefusal::Token { at: toks[o as usize].lo });
-    }
+    let (head, toks, mate) = header(text, alloc)?;
     let word = |i: u32| -> &str {
         match toks.get(i as usize) {
             Some(t) => head.get(t.lo as usize..t.hi as usize).unwrap_or(""),
@@ -208,4 +178,97 @@ pub fn container_declares_type_outlives<A: Allocator + Clone>(text: &str, alloc:
         scan(&toks, &mate, head, where_at + 1, end, &mut said)?;
     }
     Ok(any)
+}
+
+/// Whether a trait's header (`text`: its item text) declares a lifetime parameter
+/// (`trait Visitor<'de>`): any lifetime in its generics list. Such a trait's associated types
+/// may hold that lifetime, which no type argument of a projection onto it carries (the
+/// Reference, "Implementations", "Generic implementations": an impl's lifetime is constrained
+/// by appearing in the implemented trait as well as in the self type). Not a trait: refused.
+pub fn trait_declares_lifetime<A: Allocator + Clone>(text: &str, alloc: A) -> Result<bool, SigRefusal> {
+    let (head, toks, mate) = header(text, alloc)?;
+    let end = toks.len() as u32;
+    let mut i = 0u32;
+    while i < end && !(toks[i as usize].k == Tk::Ident && head.get(toks[i as usize].lo as usize..toks[i as usize].hi as usize) == Some("trait")) {
+        i = step(&mate, i);
+    }
+    let at = i + 2;
+    if at > end {
+        return Err(SigRefusal::NoFn);
+    }
+    if at == end || toks[at as usize].k != Tk::P(b'<') {
+        return Ok(false);
+    }
+    let close = mate[at as usize];
+    Ok(toks[at as usize..close as usize].iter().any(|t| t.k == Tk::Life))
+}
+
+/// Whether an associated type's declaration (`text`: its member text, `type Name<..> ..;`) has
+/// generics of its own (a generic associated type): its lifetime parameters are erased from a
+/// projection's arguments, so a projection onto it holds lifetimes no argument carries.
+pub fn assoc_declares_generics<A: Allocator + Clone>(text: &str, alloc: A) -> Result<bool, SigRefusal> {
+    let mut toks: Vec<Tok, A> = Vec::new_in(alloc);
+    lex(text, &mut toks)?;
+    let word = |t: &Tok| text.get(t.lo as usize..t.hi as usize).unwrap_or("");
+    let mut depth = 0i32;
+    for (i, t) in toks.iter().enumerate() {
+        match t.k {
+            Tk::P(b'(') | Tk::P(b'[') => depth += 1,
+            Tk::P(b')') | Tk::P(b']') => depth -= 1,
+            Tk::Ident if depth == 0 && word(t) == "type" => {
+                return match (toks.get(i + 1), toks.get(i + 2)) {
+                    (Some(n), next) if n.k == Tk::Ident => Ok(next.is_some_and(|x| x.k == Tk::P(b'<'))),
+                    _ => Err(SigRefusal::NoFn),
+                };
+            }
+            _ => {}
+        }
+    }
+    Err(SigRefusal::NoFn)
+}
+
+/// A container's header: the text to its first `{` outside `(..)` and `[..]` as the lexer
+/// reads it (a `{` inside a string of an attribute, `#[rustc_on_unimplemented(label =
+/// "`{Self}` is not an iterator")]`, is no cut), its tokens, and its brackets paired as
+/// `Reader::pair_brackets` pairs them.
+fn header<A: Allocator + Clone>(text: &str, alloc: A) -> Result<(&str, Vec<Tok, A>, Vec<u32, A>), SigRefusal> {
+    let mut toks: Vec<Tok, A> = Vec::new_in(alloc.clone());
+    lex(text, &mut toks)?;
+    // The cut as `impl_header_end` makes it: the header's `{`, or (the lexer stopped at a
+    // `fn` type's `{`) the end of the last token.
+    let at = super::impl_life::header_cut(&toks);
+    let cut = match toks.get(at) {
+        Some(t) => t.lo as usize,
+        None => toks.last().map_or(0, |t| t.hi as usize),
+    };
+    toks.truncate(at);
+    let head = text.get(..cut).unwrap_or(text);
+    // Brackets paired as `Reader::pair_brackets` does, over the header alone.
+    let mut mate: Vec<u32, A> = Vec::new_in(alloc.clone());
+    mate.resize(toks.len(), u32::MAX);
+    let mut open: Vec<u32, A> = Vec::new_in(alloc);
+    for i in 0..toks.len() {
+        let Tk::P(c) = toks[i].k else { continue };
+        let want = match c {
+            b'(' | b'[' | b'<' => {
+                open.push(i as u32);
+                continue;
+            }
+            b')' => b'(',
+            b']' => b'[',
+            b'>' => b'<',
+            _ => continue,
+        };
+        match open.pop() {
+            Some(o) if toks[o as usize].k == Tk::P(want) => {
+                mate[o as usize] = i as u32;
+                mate[i] = o;
+            }
+            _ => return Err(SigRefusal::Token { at: toks[i].lo }),
+        }
+    }
+    if let Some(o) = open.pop() {
+        return Err(SigRefusal::Token { at: toks[o as usize].lo });
+    }
+    Ok((head, toks, mate))
 }

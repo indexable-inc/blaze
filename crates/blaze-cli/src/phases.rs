@@ -293,11 +293,14 @@ impl fmt::Display for Phases {
 fn held_line(f: &mut fmt::Formatter<'_>, s: &blaze_mem::tag::Snapshot) -> fmt::Result {
     write!(
         f,
-        "memory       held (bytes): regions committed most {} now {} purged {} · global heap outside tags now {} · global allocator committed {}",
+        "memory       held (bytes): regions committed most {} now {} purged {} · global heap outside tags most {} now {} (allocated {} freed {}) · global allocator committed {}",
         s.committed_high_water,
         s.committed,
         s.purged,
+        blaze_mem::tag::heap_outside_high_water(),
         s.heap_outside,
+        s.heap_outside_allocated,
+        s.heap_outside_freed,
         s.heap_committed.map_or(-1, i128::from),
     )?;
     write!(f, " · by tag (most in regions, most in the heap):")?;

@@ -759,31 +759,22 @@ fn trait_object_tables_are_made_over_names_records() {
 
 /// The x0-dyn-01 rung WALKED over names records: its vtables' words are tabled on demand
 /// (make_one.rs `vtable_rows` files a word no row tables, `drop_in_place` first, as an untabled
-/// callee: checked, then the instance made again). The walk's next stop (2026-11-17, open): a
-/// word's impl no check selected (`impl Base for Two`, under `dyn Sub`'s table) reads as "no
-/// impl of trait holds": instance-time selection (blaze-typeck instance.rs `select_impl`,
-/// `resolve_instance`, `normalize_projection`, drop_impl.rs) reads a hole (a bucket not
-/// answered yet) as an empty impl list, where it must answer `Missing` and the lazy program
-/// fill it (lane UZ's instance-time fill); `holds` alone checks its holes today.
+/// callee: checked, then the instance made again), and a word's impl no check selected (`impl
+/// Base for Two`, under `dyn Sub`'s table) is made at instance time (lane UZ: a hole is
+/// `Missing`, `make_asked` fills it). Every instance is made; a second walk finds every one.
 ///
-/// Prints: `d106 dyn walk over names records: <the stop, or every instance made>`
+/// Prints: `d106 dyn walk over names records: first <counts>; again <counts>`
 #[test]
 fn a_dyn_walks_vtable_words_are_tabled() {
     let f = fixture_of(&dyn_rung(), blaze_build::Panic::Abort);
     let entry = fn_named(&f, "main");
     let mut store = MemoryStore::new_in(alloc());
     let b = builder_with(blaze_build::Panic::Abort);
-    let mut maker = Maker::new(reader(&f), Some(entry), &b, alloc());
-    let stop = match walk_records(entry, &EveryItem, &mut store, &b, &producer(), &mut maker, alloc()) {
-        Ok((_, counts)) => {
-            println!("d106 dyn walk over names records: every instance made: {counts}");
-            return;
-        }
-        Err(e) => e.to_string(),
-    };
-    println!("d106 dyn walk over names records: {stop}");
-    assert!(!stop.contains("a vtable's method word with no tabled body"), "a vtable word is tabled on demand: {stop}");
-    assert!(!stop.contains("as a trait object sees it"), "every object table is made: {stop}");
+    let (first, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert!(first.reached > 0 && first.made == first.reached && first.found == 0, "every instance reached is made: {first}");
+    let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}");
+    println!("d106 dyn walk over names records: first {first}; again {again}");
 }
 
 /// The entry WRITTEN BY A MACRO at module level (as bstd's `main!` writes `fn main`), calling a
@@ -947,6 +938,127 @@ fn the_personality_routine_is_a_root_over_names_records() {
     println!("d106 personality over names records: named {:x}; refused: {refused}", routine.0);
 }
 
+/// Two structs no body of [`PROGRAM`] names: `Lone`, holding `Inner` by value.
+const LONE: &str = "
+struct Inner {
+    a: u32,
+}
+
+struct Lone {
+    n: u32,
+    inner: Inner,
+}
+";
+
+/// An ADT whose row is not made is a NEED the lazy program fills, never a refusal (hello
+/// world's stop of 2026-11-17 g082011: `start`'s signature, "a type whose ADT definition the
+/// world did not answer, met while listing the coroutines a value holds"). The seam's `adt` of
+/// such a key notes its head; `make_asked` makes it, and the same question is then answered,
+/// its fields read from the answer's own table. Controls: with nothing noted `make_asked` makes
+/// nothing; a fn's key asked as an ADT notes nothing; once answered, nothing is noted again.
+///
+/// Prints: `d106 unmade ADT over names records: Lone made on demand, 2 fields`
+#[test]
+fn an_adt_no_body_named_is_a_need_the_lazy_program_fills() {
+    let f = fixture(&std::format!("{PROGRAM}{LONE}"));
+    let names = reader(&f);
+    let main = fn_named(&f, "main");
+    let mut program = RecordsProgram::from_records(names.records, names.frame, names.lang_crates, Some(main), alloc()).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
+    program.check_one(main).unwrap_or_else(|e| panic!("`main`'s check: {e}")).expect("a fn of the program");
+    let i = program.fn_index(main).expect("`main` has a row");
+    let made = |program: &mut RecordsProgram<'static>| program.make_asked(i).unwrap_or_else(|e| panic!("`make_asked`: {e}"));
+    // Whatever the check left noted, made; then nothing is.
+    made(&mut program);
+    assert!(!made(&mut program), "control: nothing noted, yet something was made");
+    assert!(program.adt(main).is_none(), "a fn is no ADT");
+    assert!(!made(&mut program), "control: a fn's key asked as an ADT was noted as a need");
+    let (lone, inner) = (item_named(&f, ItemKind::Struct, "Lone"), item_named(&f, ItemKind::Struct, "Inner"));
+    assert!(program.adt(lone).is_none(), "control: no body names `Lone`, yet its row was made");
+    assert!(made(&mut program), "`Lone`, asked and not made, was not noted as a need");
+    let adt = program.adt(lone).unwrap_or_else(|| panic!("`Lone` made on demand is not answered: {:?}", logged(names.records)));
+    assert_eq!(adt.fields.len(), 2, "`Lone`'s fields");
+    assert!(matches!(adt.types.node(adt.fields[0].ty), Ok(blaze_typeck::PNode::Uint(_))), "`Lone.n` read from the answer's table: {:?}", adt.types.node(adt.fields[0].ty));
+    assert!(matches!(adt.types.node(adt.fields[1].ty), Ok(blaze_typeck::PNode::Adt(k, _)) if k == inner), "`Lone.inner` read from the answer's table: {:?}", adt.types.node(adt.fields[1].ty));
+    assert!(!made(&mut program), "an answered ADT was noted again");
+    assert!(logged(names.records).is_empty(), "the records filed {:?}", logged(names.records));
+    println!("d106 unmade ADT over names records: Lone made on demand, 2 fields");
+}
+
+/// A fn whose signature holds a struct (`Holder<T, F>`) one of whose fields is a projection
+/// (`<T as Pick>::Out`) that only the instance names, at `T = u8`, as `Hidden`, a struct no body
+/// the walk has checked names when the instance's coroutines are listed; its other field holds
+/// an async block's future by value. Built from [`ASYNC_HEAD`] (`Twice`, `block_on`).
+const HELD_THROUGH_PROJECTION: &str = "
+trait Pick {
+    type Out;
+    fn make() -> Self::Out;
+    fn read(o: &Self::Out) -> u32;
+}
+
+struct Hidden {
+    v: u32,
+}
+
+impl Pick for u8 {
+    type Out = Hidden;
+    fn make() -> Hidden {
+        Hidden { v: 7 }
+    }
+    fn read(o: &Hidden) -> u32 {
+        o.v
+    }
+}
+
+struct Holder<T: Pick, F> {
+    out: T::Out,
+    fut: F,
+}
+
+struct Unreached {
+    w: u32,
+}
+
+fn hold<T: Pick, F: Future<Output = u32>>(_pick: T, fut: F) -> Holder<T, F> {
+    Holder { out: T::make(), fut }
+}
+
+fn finish<T: Pick, F: Future<Output = u32>>(h: Holder<T, F>, polls: &mut u32, wakes: &mut u32) -> u32 {
+    let Holder { out, fut } = h;
+    block_on(fut, polls, wakes) + T::read(&out)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut polls = 0u32;
+    let mut wakes = 0u32;
+    let h = hold(0u8, async { Twice { left: 1, value: 5 }.await });
+    if finish(h, &mut polls, &mut wakes) == 12 { 42 } else { 1 }
+}
+";
+
+/// [`HELD_THROUGH_PROJECTION`] WALKED over names records: every instance is made, `Hidden`
+/// (met grounding `Holder<u8, _>`'s fields while listing the coroutines `main`'s and `finish`'s
+/// values hold) made on demand and answered after the walk. Control: `Unreached`, a struct
+/// nothing reaches, has no row (the lazy program makes only what is asked). A second walk finds
+/// every instance.
+///
+/// Prints: `d106 ADT through a projection over names records: first <counts>; again <counts>`
+#[test]
+fn a_struct_met_through_a_projection_while_listing_coroutines_is_made_over_names_records() {
+    let f = fixture_of(&async_program(HELD_THROUGH_PROJECTION), blaze_build::Panic::Abort);
+    let entry = fn_named(&f, "main");
+    let b = builder_with(blaze_build::Panic::Abort);
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, maker) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert!(first.reached > 0 && first.made == first.reached && first.found == 0, "every instance reached is made: {first}");
+    let program = maker.program().expect("a first run constructs the program");
+    assert!(program.adt(item_named(&f, ItemKind::Struct, "Hidden")).is_some(), "`Hidden` has no row after the walk");
+    assert!(program.adt(item_named(&f, ItemKind::Struct, "Unreached")).is_none(), "control: `Unreached` has a row");
+    let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}");
+    println!("d106 ADT through a projection over names records: first {first}; again {again}");
+}
+
 /// A local fn passed as a value from a macro-written entry ([`LOCAL_FN_VALUE`]) is tabled and
 /// made on demand: before the fix the build refused it, "`main` reaches item .. which no fn row
 /// tables" (a body's check tables the fns it CALLS; one named as a value was owed no row).
@@ -1107,4 +1219,106 @@ fn an_entry_exported_from_a_macro_written_body_is_found_over_names_records() {
     let (cold, _) = walk_keeping(&f, &Salted { salted: is_inner }, entry, &mut store, &b);
     assert_eq!((cold.reached, cold.found, cold.made), (3, 1, 2), "`main` and `inner`, asked cold, are made: {cold}");
     println!("d106 nested entry over names records: first {first}; again {again}; cold {cold}");
+}
+
+/// Statics in the run (run.md, "Statics in the run", steps 1 and 2's static words): `main`
+/// reads `AT`, a `&[u8; 6]` to `GREETING`.
+const STATICS: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+unsafe extern \"C\" {
+    fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+}
+
+static GREETING: [u8; 6] = [104, 101, 108, 108, 111, 10];
+static AT: &[u8; 6] = &GREETING;
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    unsafe { write(1, AT as *const [u8; 6] as *const u8, 6) };
+    0
+}
+";
+
+/// The statics' rows over names records: `main`'s code record DECLARES `AT` (by item key, beside
+/// its instances), `AT` is a row of its own whose entry is a static's (a read-only datum of one
+/// word naming `GREETING`'s symbol, and `GREETING` declared), and `GREETING`'s datum is its six
+/// bytes, read-only, no word. A second run finds all three, evaluating nothing. Control: an edit
+/// of `GREETING`'s initializer makes `GREETING`'s datum alone; `main` and `AT` are found (code
+/// names a static's word, a static's value names another's address, never its bytes).
+/// Prints "d106 statics: first made 3; AT one word to GREETING; GREETING 6 bytes read-only; second found 3; edit made 1".
+#[test]
+fn a_static_is_a_record_of_its_own_named_by_the_code() {
+    use blaze_code::datum::Place;
+    use blaze_code::record::{Space, Target};
+    use blaze_ladder::body_ids::RowKind;
+    use blaze_ladder::code_records::statics::StaticEntryView;
+    use blaze_ladder::code_records::EntryView;
+    use blaze_ladder::symbols::static_symbol;
+
+    let f = fixture(STATICS);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let names = reader(&f);
+    let mut maker = Maker::new(names, Some(main), &builder(), alloc());
+    let (walk, first) = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()).unwrap_or_else(|e| {
+        println!("the record walk: {e}");
+        panic!("the record walk: {e}")
+    });
+    assert!(logged(names.records).is_empty(), "the records filed {:?}", logged(names.records));
+    assert_eq!((first.reached, first.made), (3, 3), "main, AT and GREETING: {first}");
+    let statics: Vec<usize> = (0..walk.len()).filter(|&r| walk.kind(r) == RowKind::Static).collect();
+    assert_eq!(statics.len(), 2, "two static rows");
+    let entry_of = |row: usize| store.get(walk.key(row).expect("keyed")).expect("the store reads").expect("put");
+    let main_entry = EntryView::read(entry_of(0)).expect("main's entry reads");
+    let mut declared = Vec::new();
+    main_entry.each_static(|k| declared.push(k));
+    let (at, greeting) = (walk.tabled(statics[0]), walk.tabled(statics[1]));
+    assert_eq!(declared, [at], "main's record declares the static it reads");
+    let at_view = StaticEntryView::read(entry_of(statics[0])).expect("AT's entry reads");
+    assert_eq!((at_view.datum.place(), at_view.datum.bytes(), at_view.datum.words()), (Place::ReadOnly, &[0u8; 8][..], 1), "AT is one word, its bytes zero");
+    let word = at_view.datum.word(0);
+    assert_eq!((word.at, word.addend), (0, 0));
+    assert_eq!(at_view.datum.target(word.target as usize), Target { space: Space::Static, symbol: static_symbol(greeting) }, "AT's word names GREETING");
+    let mut at_statics = Vec::new();
+    at_view.each_static(|k| at_statics.push(k));
+    assert_eq!(at_statics, [greeting], "AT declares GREETING");
+    let g_view = StaticEntryView::read(entry_of(statics[1])).expect("GREETING's entry reads");
+    assert_eq!((g_view.datum.place(), g_view.datum.bytes(), g_view.datum.words()), (Place::ReadOnly, &b"hello\n"[..], 0));
+    assert_eq!(walk.symbol(statics[1]), static_symbol(greeting), "a static's row is by its symbol");
+
+    let (_, second) = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut Maker::new(reader(&f), Some(main), &builder(), alloc()), alloc()).expect("the second walk");
+    assert_eq!((second.found, second.made), (3, 0), "second run {second}");
+
+    // The edit: GREETING's text moves its key alone (the stand-in keys GREETING by its text).
+    struct Edited(ItemKey);
+    impl BodyIds for Edited {
+        fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+            if item != self.0 {
+                let every: &'static EveryItem = &EveryItem;
+                return every.body_check(item);
+            }
+            Some(BodyId { key: Hasher::new("d106 test every item").part(&item.0.to_le_bytes()[..]).part(b"edited").finish(), reads: &READS })
+        }
+        fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+            EveryItem.today(fact)
+        }
+        fn crate_fact(&self, item: ItemKey) -> Option<Read> {
+            EveryItem.crate_fact(item)
+        }
+    }
+    let edited = fixture(&STATICS.replace("[104, 101, 108, 108, 111, 10]", "[104, 105, 33, 33, 33, 10]"));
+    let (walk, third) = walk_records(main, &Edited(greeting), &mut store, &builder(), &producer(), &mut Maker::new(reader(&edited), Some(main), &builder(), alloc()), alloc()).expect("the edited walk");
+    assert_eq!((third.found, third.made), (2, 1), "edit {third}");
+    let row = (0..walk.len()).find(|&r| walk.tabled(r) == greeting).expect("GREETING's row");
+    let g = StaticEntryView::read(store.get(walk.key(row).expect("keyed")).expect("reads").expect("put")).expect("reads");
+    assert_eq!(g.datum.bytes(), b"hi!!!\n", "the edited value");
+    println!("d106 statics: first made 3; AT one word to GREETING; GREETING 6 bytes read-only; second found {}; edit made {}", second.found, third.made);
 }

@@ -26,6 +26,9 @@ blaze-manifest = { workspace = true, default-features = false }
 # `outline`: each file's items, and the parser's events for bodies and signatures.
 blaze-file-items.workspace = true
 blaze-surface.workspace = true
+# The impl tables' lookups (front2/buckets/records.rs, engine.md E3): `candidates_in` over the
+# records blaze-surface writes.
+blaze-impls.workspace = true
 parser.workspace = true
 # The body form, the checker and its type context (`InferCtx`).
 blaze-typeck = { workspace = true }

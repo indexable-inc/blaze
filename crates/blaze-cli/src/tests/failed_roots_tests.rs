@@ -106,9 +106,40 @@ fn a_name_after_a_refused_macro_call_is_counted_under_the_call() {
     assert!(!out.lines().any(|line| line.contains("error[") && line.contains(blaze_ladder::front2::MACRO_REFUSED)), "no name after a refused call is an error:\n{out}");
     assert_eq!(out.lines().filter(|line| line.contains("error[macro-call-failed]")).count(), 1, "the call's own error, once:\n{out}");
     // One cause line naming the refused call AND why (the matcher's reason), the items under it.
-    let cause = out.lines().find(|line| line.contains("not checked because the call of `make` failed: ")).unwrap_or_else(|| panic!("the cause line names the call:\n{out}"));
+    let cause = out.lines().find(|line| line.contains("not checked because the call of `make` (function-like) in src/lib.rs failed: ")).unwrap_or_else(|| panic!("the cause line names the call:\n{out}"));
     assert!(cause.contains("matched") && cause.contains("`here`") && cause.contains("`there`"), "the reason and both items under the call:\n{out}");
     assert_eq!(out.lines().filter(|line| line.contains("not checked because")).count(), 1, "one cause line:\n{out}");
+    let (_, repeat) = agent(&io);
+    assert_eq!(repeat, out, "the same bytes again");
+}
+
+/// MR (2026-11-17): a call refused for a reason other than a failed match (here an `include!`
+/// whose nested `env!` asks a variable the build does not set) is named with its reason too,
+/// from the names record's row of it (blaze-scope names_record.rs `refused_row`), once: the
+/// items behind it under one line "not checked because the call of `include` (function-like)
+/// in src/lib.rs failed: `env!(\"NOPE\")`: the variable is not set", never "the records hold no note of its reason" (tempo's
+/// check g081341 printed that 62 times, over 261 items).
+///
+/// CONTROL: with `failed_section` writing rows of `ExpandNote::Failed` notes only, the cause
+/// reads "macro call <key> failed, and the records hold no row of it" and the test fails.
+///
+/// Prints `refused include: <the output>`.
+#[test]
+fn a_refused_include_is_named_once_with_its_reason() {
+    let io = Io::simulated(SimWorld::new(79, Limits::USUAL));
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
+    write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "a/src/lib.rs",
+        "#![no_core]\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! env { () => {} }\npub mod ffi {\n    include!(concat!(env!(\"NOPE\"), \"/b.rs\"));\n}\npub fn here() { ffi::x(); }\npub fn there() { ffi::x(); }\n",
+    );
+    let (_, out) = agent(&io);
+    println!("refused include: {out}");
+    assert!(!out.contains("hold no"), "every refused call has its row:\n{out}");
+    let causes: std::vec::Vec<&str> = out.lines().filter(|line| line.contains("not checked because the call of `include` (function-like) in src/lib.rs failed: ")).collect();
+    assert_eq!(causes.len(), 1, "the call's reason once:\n{out}");
+    assert!(causes[0].contains("env!(\"NOPE\")") && causes[0].contains("`here`") && causes[0].contains("`there`"), "the variable named, both items under the call:\n{out}");
     let (_, repeat) = agent(&io);
     assert_eq!(repeat, out, "the same bytes again");
 }

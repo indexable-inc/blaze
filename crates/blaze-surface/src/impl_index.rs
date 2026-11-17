@@ -12,13 +12,21 @@
 //!   lookup is one binary search, and a key with no bucket is a definite miss there. Two keys
 //!   of one hash are a typed refusal ([`ImplIndexError::BucketHashClash`]), so a hash names
 //!   one bucket; the bucket's own key is still compared by the reader.
-//! - **`NoImplsOf`** (`NoImplsRoot`, version 1) is two sorted columns of `u64`: a mark per
+//! - **`NoImplsOf`** (`NoImplsRoot`, version 2) is two sorted columns of `u64`: a mark per
 //!   trait the crate has an impl of ([`trait_mark`]) and a mark per bucket (the first 8 bytes
 //!   of its hash). A mark absent is an exact "none": every impl puts its trait's mark and its
 //!   bucket's mark in. A mark present that is another key's (two keys' marks equal) sends the
 //!   reader to the directory, which answers exactly: the false positive is one wasted probe,
 //!   never a wrong answer. It is 8 bytes a bucket, a seventh of the directory, so the crates a
 //!   lookup cannot use are passed over on a record that stays in the page cache.
+//!
+//! - **What the writer did not read** is filed too, never dropped (bucket version 2,
+//!   `NoImplsOf` version 2; lane BK, 2026-11-17): a trait impl whose trait path did not
+//!   resolve is in [`BucketKey::UnreadTrait`] by its self shape, a header not read to trait or
+//!   inherent in [`BucketKey::Blind`], and a self type not read to a shape is filed as
+//!   [`SelfShape::BLANKET`] with [`ImplFlags::SELF_UNREAD`] or [`ImplFlags::SELF_NO_TYPE`]
+//!   (inherent ones too, under `Inherent { BLANKET }`). While a crate holds an unread row its
+//!   `NoImplsOf` rules no trait out ([`NoImplsOfView::may_hold_trait`]).
 //!
 //! [`build_impl_index`] takes the rows in any order and writes equal bytes for every order.
 //! Adding an impl changes its one bucket, the directory and, when its trait or bucket is new
@@ -45,6 +53,8 @@ const BUCKET_DOMAIN: &str = "blaze-impls bucket key 1";
 const KIND_TRAIT: u32 = 1;
 const KIND_BLANKET: u32 = 2;
 const KIND_INHERENT: u32 = 3;
+const KIND_UNREAD_TRAIT: u32 = 4;
+const KIND_BLIND: u32 = 5;
 
 /// 16 bytes of the hash of a [`BucketKey`]: what the directory is sorted and searched by.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -83,8 +93,16 @@ pub enum BucketKey {
     Trait { trait_: ItemKey, shape: SelfShape },
     /// A trait's blanket impls.
     Blanket { trait_: ItemKey },
-    /// The inherent impls of one self shape.
+    /// The inherent impls of one self shape; under [`SelfShape::BLANKET`], those whose self
+    /// type was not read to a shape ([`ImplFlags::SELF_UNREAD`], [`ImplFlags::SELF_NO_TYPE`]).
     Inherent { shape: SelfShape },
+    /// The trait impls whose trait path the writer did not resolve ([`ImplFlags::TRAIT_UNREAD`]),
+    /// by their self shape ([`SelfShape::BLANKET`] where that was not read either): a
+    /// candidate of every trait question at that shape.
+    UnreadTrait { shape: SelfShape },
+    /// The impls whose header was not read far enough to tell a trait impl from an inherent
+    /// one ([`ImplFlags::BLIND`]): a candidate of every question.
+    Blind,
 }
 
 // SAFETY: keys and a shape, each `Portable`.
@@ -93,6 +111,12 @@ unsafe impl Portable for BucketKey {}
 impl BucketKey {
     /// The bucket `row` is filed in.
     pub fn of(row: &ImplRow) -> BucketKey {
+        if row.flags.contains(ImplFlags::BLIND) {
+            return BucketKey::Blind;
+        }
+        if row.flags.contains(ImplFlags::TRAIT_UNREAD) {
+            return BucketKey::UnreadTrait { shape: row.shape };
+        }
         match row.trait_ {
             Some(trait_) if row.shape.is_blanket() => BucketKey::Blanket { trait_ },
             Some(trait_) => BucketKey::Trait { trait_, shape: row.shape },
@@ -106,6 +130,8 @@ impl BucketKey {
             BucketKey::Trait { trait_, shape } => (KIND_TRAIT, trait_.0.0, shape.to_bytes()),
             BucketKey::Blanket { trait_ } => (KIND_BLANKET, trait_.0.0, SelfShape::BLANKET.to_bytes()),
             BucketKey::Inherent { shape } => (KIND_INHERENT, [0; 32], shape.to_bytes()),
+            BucketKey::UnreadTrait { shape } => (KIND_UNREAD_TRAIT, [0; 32], shape.to_bytes()),
+            BucketKey::Blind => (KIND_BLIND, [0; 32], SelfShape::BLANKET.to_bytes()),
         }
     }
 
@@ -116,27 +142,37 @@ impl BucketKey {
         match kind {
             KIND_TRAIT if !shape.files_no_impl() => Some(BucketKey::Trait { trait_: trait_key, shape }),
             KIND_BLANKET if shape.is_blanket() => Some(BucketKey::Blanket { trait_: trait_key }),
-            KIND_INHERENT if trait_ == [0; 32] && !shape.files_no_impl() => {
+            KIND_INHERENT if trait_ == [0; 32] && shape != SelfShape::PLACEHOLDER => {
                 Some(BucketKey::Inherent { shape })
             }
+            KIND_UNREAD_TRAIT if trait_ == [0; 32] && shape != SelfShape::PLACEHOLDER => {
+                Some(BucketKey::UnreadTrait { shape })
+            }
+            KIND_BLIND if trait_ == [0; 32] && shape.is_blanket() => Some(BucketKey::Blind),
             _ => None,
         }
     }
 
-    /// The trait it files impls of, none for inherent impls.
+    /// The trait it files impls of, none for inherent impls and unread ones.
     pub fn trait_(self) -> Option<ItemKey> {
         match self {
             BucketKey::Trait { trait_, .. } | BucketKey::Blanket { trait_ } => Some(trait_),
-            BucketKey::Inherent { .. } => None,
+            BucketKey::Inherent { .. } | BucketKey::UnreadTrait { .. } | BucketKey::Blind => None,
         }
     }
 
     /// The self shape of its rows.
     pub fn shape(self) -> SelfShape {
         match self {
-            BucketKey::Trait { shape, .. } | BucketKey::Inherent { shape } => shape,
-            BucketKey::Blanket { .. } => SelfShape::BLANKET,
+            BucketKey::Trait { shape, .. } | BucketKey::Inherent { shape } | BucketKey::UnreadTrait { shape } => shape,
+            BucketKey::Blanket { .. } | BucketKey::Blind => SelfShape::BLANKET,
         }
+    }
+
+    /// Whether its rows' trait is not known ([`BucketKey::UnreadTrait`], [`BucketKey::Blind`]):
+    /// a crate holding one is never passed over by its `NoImplsOf`'s trait column alone.
+    pub fn is_unread(self) -> bool {
+        matches!(self, BucketKey::UnreadTrait { .. } | BucketKey::Blind)
     }
 
     /// The hash the directory finds it by: of its kind, trait and shape.
@@ -174,10 +210,15 @@ pub enum ImplIndexError {
     InherentFlags { impl_: ItemKey, flags: ImplFlags },
     /// Two bucket keys with one hash: `first` and `second` are an impl of each.
     BucketHashClash { first: ItemKey, second: ItemKey },
+    /// What the writer read of a header, said in flags that do not go together: a self type
+    /// both read and not read to a shape, an unread row with a trait, a why on a read row.
+    ReadFlags { impl_: ItemKey, flags: ImplFlags },
 }
 
-/// The flags an inherent impl may have: `const impl Type { .. }`.
-const INHERENT_FLAGS: ImplFlags = ImplFlags::CONST;
+/// The flags an inherent impl may have: `const impl Type { .. }`, and a self type not read to a
+/// shape.
+const INHERENT_FLAGS: ImplFlags =
+    ImplFlags::CONST.union(ImplFlags::SELF_UNREAD).union(ImplFlags::SELF_NO_TYPE);
 
 impl fmt::Display for ImplIndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -208,6 +249,11 @@ impl fmt::Display for ImplIndexError {
             ImplIndexError::BucketHashClash { first, second } => write!(
                 f,
                 "the impls {first:x} and {second:x} are filed under two bucket keys of one hash"
+            ),
+            ImplIndexError::ReadFlags { impl_, flags } => write!(
+                f,
+                "the impl {impl_:x} has the flags {:#x}: what its header's writer read does not go together",
+                flags.bits()
             ),
         }
     }
@@ -255,24 +301,31 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy)]
-    struct NoImplsRoot: 1 {
+    struct NoImplsRoot: 2 {
         krate: ContentId,
         traits: Slice<u64>,
         buckets: Slice<u64>,
+        /// How many rows of the crate's are [`ImplFlags::TRAIT_UNREAD`]: while any is, the
+        /// trait column rules no trait out.
+        unread_trait: u32,
+        /// How many rows of the crate's are [`ImplFlags::BLIND`].
+        blind: u32,
     }
 }
 
-/// The schema of an impl bucket's buffer.
+/// The schema of an impl bucket's buffer. Version 2 (lane BK, 2026-11-17): the bucket kinds
+/// [`BucketKey::UnreadTrait`] and [`BucketKey::Blind`], inherent rows under
+/// [`SelfShape::BLANKET`], and the flags of what the writer read ([`ImplFlags::BARE`] on).
 pub const BUCKET_SCHEMA: SchemaHash =
-    schema_of(&[Part::Str("ImplBucket"), Part::U64(1), Part::Schema(BucketRoot::SCHEMA)]);
+    schema_of(&[Part::Str("ImplBucket"), Part::U64(2), Part::Schema(BucketRoot::SCHEMA)]);
 
 /// The schema of an impl directory's buffer.
 pub const DIRECTORY_SCHEMA: SchemaHash =
     schema_of(&[Part::Str("ImplDirectory"), Part::U64(1), Part::Schema(DirectoryRoot::SCHEMA)]);
 
-/// The schema of a `NoImplsOf` buffer.
+/// The schema of a `NoImplsOf` buffer. Version 2: the counts of unread rows.
 pub const NO_IMPLS_SCHEMA: SchemaHash =
-    schema_of(&[Part::Str("NoImplsOf"), Part::U64(1), Part::Schema(NoImplsRoot::SCHEMA)]);
+    schema_of(&[Part::Str("NoImplsOf"), Part::U64(2), Part::Schema(NoImplsRoot::SCHEMA)]);
 
 /// One bucket a build wrote: its content id (what the directory names it by), its key and
 /// its buffer.
@@ -304,8 +357,31 @@ fn check_row(krate: CrateItemKey, row: &ImplRow) -> Result<(), ImplIndexError> {
     if row.shape == SelfShape::PLACEHOLDER {
         return Err(ImplIndexError::PlaceholderSelf { impl_ });
     }
+    let flags = row.flags;
+    let self_unread = flags.contains(ImplFlags::SELF_UNREAD);
+    let self_no_type = flags.contains(ImplFlags::SELF_NO_TYPE);
+    let trait_unread = flags.contains(ImplFlags::TRAIT_UNREAD);
+    let blind = flags.contains(ImplFlags::BLIND);
+    let refused = (self_unread && self_no_type)
+        // A self type not read to a shape is filed as for any type.
+        || ((self_unread || self_no_type) && !row.shape.is_blanket())
+        // An unread row has no trait, and is one kind of unread.
+        || ((trait_unread || blind) && row.trait_.is_some())
+        || (trait_unread && blind)
+        // A blind row has no self shape read either.
+        || (blind && (!row.shape.is_blanket() || self_no_type))
+        // A why only on an unread row.
+        || (flags.why() != 0 && !trait_unread && !blind)
+        // `BARE` is a trait's, read or unread.
+        || (flags.contains(ImplFlags::BARE) && row.trait_.is_none() && !trait_unread);
+    if refused {
+        return Err(ImplIndexError::ReadFlags { impl_, flags });
+    }
+    if trait_unread || blind {
+        return Ok(());
+    }
     if row.trait_.is_none() {
-        if row.shape.is_blanket() {
+        if row.is_param_self() {
             return Err(ImplIndexError::InherentBlanket { impl_ });
         }
         if !INHERENT_FLAGS.contains(row.flags) {
@@ -394,10 +470,15 @@ pub fn build_impl_index<'a>(
     marks.extend(entries.iter().map(|entry| BucketHash(entry.hash).mark()));
     marks.sort_unstable();
     marks.dedup();
+    // At most `MAX_ROWS` rows, checked above: each count fits.
+    let unread = Unread {
+        trait_: rows.iter().filter(|row| row.flags.contains(ImplFlags::TRAIT_UNREAD)).count() as u32,
+        blind: rows.iter().filter(|row| row.flags.contains(ImplFlags::BLIND)).count() as u32,
+    };
 
     Ok(CrateImpls {
         directory: write_directory(krate, &entries, alloc),
-        no_impls_of: write_no_impls(krate, &traits, &marks, alloc),
+        no_impls_of: write_no_impls(krate, &traits, &marks, unread, alloc),
         buckets,
         refused,
     })
@@ -433,7 +514,14 @@ fn write_directory<'a>(krate: CrateItemKey, entries: &[DirEntry], alloc: Alloc<'
     out.finish(at)
 }
 
-fn write_no_impls<'a>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], alloc: Alloc<'a>) -> RecordBytes<'a> {
+/// How many of a crate's rows are unread, by kind ([`NoImplsRoot`]).
+#[derive(Clone, Copy)]
+struct Unread {
+    trait_: u32,
+    blind: u32,
+}
+
+fn write_no_impls<'a>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], unread: Unread, alloc: Alloc<'a>) -> RecordBytes<'a> {
     let mut out = Writer::new_in(NO_IMPLS_SCHEMA, alloc);
     let traits_at = out.push_slice(traits);
     let buckets_at = out.push_slice(buckets);
@@ -442,6 +530,8 @@ fn write_no_impls<'a>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], allo
         krate: krate.0,
         traits: slice_field(at, offset_of!(NoImplsRoot, traits), traits_at, traits.len()),
         buckets: slice_field(at, offset_of!(NoImplsRoot, buckets), buckets_at, buckets.len()),
+        unread_trait: unread.trait_,
+        blind: unread.blind,
     };
     let written = out.push(&root);
     debug_assert_eq!(written, at);
@@ -568,6 +658,8 @@ pub struct NoImplsOfView<'a> {
     krate: CrateItemKey,
     traits: &'a [u64],
     buckets: &'a [u64],
+    unread_trait: u32,
+    blind: u32,
 }
 
 impl<'a> NoImplsOfView<'a> {
@@ -578,6 +670,8 @@ impl<'a> NoImplsOfView<'a> {
             krate: CrateItemKey(root.krate),
             traits: root.traits.follow(buffer)?,
             buckets: root.buckets.follow(buffer)?,
+            unread_trait: root.unread_trait,
+            blind: root.blind,
         })
     }
 
@@ -585,9 +679,21 @@ impl<'a> NoImplsOfView<'a> {
         self.krate
     }
 
-    /// False when the crate has no impl of `trait_`: exact. True when it may.
+    /// False when the crate has no impl of `trait_`: exact. True when it may, and always
+    /// while the crate has an impl whose trait was not read ([`ImplFlags::TRAIT_UNREAD`],
+    /// [`ImplFlags::BLIND`]): that impl may be of `trait_`.
     pub fn may_hold_trait(&self, trait_: ItemKey) -> bool {
-        self.traits.binary_search(&trait_mark(trait_)).is_ok()
+        self.has_unread() || self.traits.binary_search(&trait_mark(trait_)).is_ok()
+    }
+
+    /// Whether the crate has an impl whose trait was not read.
+    pub fn has_unread(&self) -> bool {
+        self.unread_trait != 0 || self.blind != 0
+    }
+
+    /// How many of the crate's impls are [`ImplFlags::TRAIT_UNREAD`] and [`ImplFlags::BLIND`].
+    pub fn unread(&self) -> (u32, u32) {
+        (self.unread_trait, self.blind)
     }
 
     /// False when the crate has no bucket of `hash`: exact. True when it may.

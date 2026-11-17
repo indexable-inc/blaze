@@ -102,6 +102,7 @@ pub mod stalled_goals;
 pub mod start;
 pub mod statics;
 pub mod test_entry;
+pub mod tables;
 pub mod texts;
 mod type_expand;
 pub mod types;

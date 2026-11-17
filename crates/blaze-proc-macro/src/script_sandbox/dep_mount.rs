@@ -74,6 +74,17 @@ impl DepProducer {
         DepProducer { tree, root, out_dir: outputs.out_dir.as_str().to_owned(), out: Arc::new(out), stored: Arc::new(stored), upstream: Arc::new(Vec::new()) }
     }
 
+    /// The producer of a run whose outputs RECORD is `outputs` (read in place: what a reader of
+    /// the store, or of a run kept as its record, is handed), over the `tree` it was served at
+    /// `root`, with nothing upstream. Equal to [`DepProducer::of`] of the outputs the record
+    /// was encoded from: its inline files copied, its stored files named and never read.
+    pub fn of_record(tree: Tree, root: ScriptRoot, outputs: &blaze_build_script::OutputsRef<'_>) -> DepProducer {
+        let mut out: Vec<(String, Vec<u8>)> = outputs.files().map(|(path, bytes)| (path.to_owned(), bytes.to_vec())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        let stored = outputs.stored().map(|file| file.name.to_owned()).collect();
+        DepProducer { tree, root, out_dir: outputs.out_dir().to_owned(), out: Arc::new(out), stored: Arc::new(stored), upstream: Arc::new(Vec::new()) }
+    }
+
     /// This producer with `upstream`, its closure ([`DepProducer::closure`] of its inputs).
     pub fn with_upstream(mut self, upstream: Vec<(String, DepProducer)>) -> DepProducer {
         self.upstream = Arc::new(upstream);

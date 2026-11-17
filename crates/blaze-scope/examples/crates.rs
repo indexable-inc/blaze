@@ -866,6 +866,7 @@ fn note_text(c: &CrateNames<'static>, note: &NamesNote<'static>) -> (String, Str
                 }
                 ExpandNote::ForeignDollarCrate { macro_name, krate } => ("an expansion writes a macro definition holding another crate's `$crate` (token-mark-3)".to_string(), format!("{at}: {macro_name}!: crate {krate:?}")),
                 ExpandNote::RootsLost { macro_name, lost } => ("an expansion writes another crate's root with no marks".to_string(), format!("{at}: {macro_name}!: {lost}")),
+                ExpandNote::ProcModule { macro_name, why } => ("a proc macro whose crate's module cannot run it".to_string(), format!("{at}: {macro_name}: {why:?}")),
         ExpandNote::NestedInput { macro_name, error } => ("a nested call's input is no range of its expansion's tokens".to_string(), format!("{at}: {macro_name}!: {error}")),
                 ExpandNote::NotItems { macro_name, message } => ("an expansion that does not read as items (syntax errors)".to_string(), format!("{at}: {macro_name}!: {message}")),
                 ExpandNote::Failed { path, implicit, failed } => {

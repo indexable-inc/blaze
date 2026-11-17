@@ -65,8 +65,11 @@ use blaze_own::{AVec, Alloc, Vec};
 pub(crate) const MAGIC: [u8; 8] = *b"blzstart";
 
 /// The form's version. A list of another is refused by name ([`ReadError::Version`]): the
-/// run proceeds as with none, says so, and writes today's form at exit.
-pub(crate) const VERSION: u32 = 2;
+/// run proceeds as with none, says so, and writes today's form at exit. Version 3: no row's
+/// record names a static (run_parent.rs, `Resolved::Record`'s `named`); a version-2
+/// list could hold a record naming a static an earlier answer told, which the child then met
+/// before that static's `Data`.
+pub(crate) const VERSION: u32 = 3;
 
 /// The most rows a list holds (run.md stage 7: "a cap of 8,192 rows"); one more is refused by
 /// name ([`CapError::Full`]).

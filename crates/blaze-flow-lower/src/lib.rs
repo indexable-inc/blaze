@@ -161,6 +161,14 @@ pub trait Facts {
     fn shape(&self, _item: ItemKey) -> Option<Shape<'_>> {
         None
     }
+    /// Whether trait `trait_`, the principal of a trait object of the body's record, declares
+    /// a lifetime parameter. `Some(false)` lets an unsized coercion to that object relate the
+    /// source's positions into the object lifetime one way ([`Lower::unsize_to_object`]);
+    /// `None` (not known) or `Some(true)` keeps the coarse relation, every position equal.
+    /// Whoever answers files the read of the trait's text in the body's read list (rule 21).
+    fn object_trait_lifetimes(&self, _trait: ItemKey) -> Option<bool> {
+        None
+    }
     /// The type-outlives bounds callee `item` declares (`T: 'a`; generic_call.rs
     /// [`CallBounds`]). With [`Facts::sig`] and [`Facts::shape`], a call whose type arguments
     /// carry origins, or whose head writes lifetimes, is related by the instantiated
@@ -1246,9 +1254,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let pi = self.info(p);
         if pi.len > 0 && ti.len > 1 {
             if pi.exact && pi.len == ti.len - 1 {
+                // A borrow of a trait object `dyn Tr + 'p` (its one position is the object
+                // lifetime): the borrow may name any shorter `'q`, `&'r mut (dyn Tr + 'q)` with
+                // `'p: 'q`, even when mutable (the Reference, "Type coercions", unsized
+                // coercions: `T: Unsize<U>` holds for `dyn Tr + 'p` to `dyn Tr + 'q`, and
+                // `&mut T` coerces to `&mut U`). Sound: an unsized place cannot be written as a
+                // whole, so nothing of the shorter `'q` can be stored where `'p` is assumed.
+                // Related both ways, every `out.put(..)` through a `&mut dyn Buf` tied its loan to
+                // `out`'s own object lifetime, live for the whole body (tempo class B, E0499).
+                let object = pty.wrap.is_none() && matches!(self.node(pty.ty, e)?, PNode::Dynamic(_));
                 for k in 0..pi.len {
                     let (a, b) = (self.origs[(pi.start + k) as usize], self.origs[(ti.start + 1 + k) as usize]);
                     self.b.subset(a, b);
+                    if object {
+                        continue;
+                    }
                     if kind != BorrowKind::Shared || k > 0 || !matches!(self.node(pty.ty, e)?, PNode::Ref(..)) {
                         self.b.subset(b, a);
                     }
@@ -2284,6 +2304,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     self.b.aggregate(tp, &[Operand::Copy(p)], self.span(e));
                     Val { at: At::Place(tp), ty: out }
                 }
+                // A shared autoref of a constant is a borrow of a `'static` slot, as `&C` is
+                // (`ref_done`, the Reference, "Constant promotion"): no loan of the body's.
+                // Through a temporary, `RNG.with_borrow_mut(..)` (a `thread_local!` is a `const`
+                // `LocalKey` whose methods take `&'static self`) tied the temporary's loan to
+                // `'static` (tempo test_utils.rs:32, a false E0505 and E0597).
+                AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. } if matches!(v.at, At::Const) => {
+                    let t = self.temp(out, e)?;
+                    let tp = self.place_of(t);
+                    self.b.assign(tp, Operand::Const, self.span(e));
+                    Val { at: At::Place(tp), ty: out }
+                }
                 AdjustKind::Borrow { mutbl, two_phase, raw: false } => {
                     let p = self.as_place(v, e)?;
                     let t = self.temp(out, e)?;
@@ -2308,7 +2339,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     let t = self.temp(out, e)?;
                     let tp = self.place_of(t);
                     self.b.aggregate(tp, &[op], self.span(e));
-                    if let At::Place(p) = v.at {
+                    if let At::Place(p) = v.at
+                        && !(kind == AdjustKind::Unsize && self.unsize_to_object(p, v.ty, tp, out, e)?)
+                    {
                         self.relate(p, tp, out, e)?;
                     }
                     Val { at: At::Place(tp), ty: out }
@@ -2344,9 +2377,91 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let (bp, rp) = (self.place_of(bt), self.place_of(rt));
         let op = if m { Operand::Move(bp) } else { Operand::Copy(bp) };
         self.b.call(&[op], rp, self.span(e));
-        let (ob, or) = (self.origs[self.info(bp).start as usize], self.origs[self.info(rp).start as usize]);
+        let (bi, ri) = (self.info(bp), self.info(rp));
+        let (ob, or) = (self.origs[bi.start as usize], self.origs[ri.start as usize]);
         self.b.subset(ob, or);
+        self.target_flow(bi, 1, ri, m);
         self.project(rp, self.local_ty[rt.0 as usize], Proj::Deref, out, false, e)
+    }
+
+    /// The referent positions of an overloaded deref's or index's result `r` (`&Target`,
+    /// `&Output`), related to the positions of `from` past its first `skip` (the receiver's
+    /// referent, or the index operand). SOUNDNESS: they were related to nothing, so a `&local`
+    /// stored through `v.iter_mut()`'s item or into `v[0]` never reached `v: Vec<&u8>`'s
+    /// elements. By E0207 (generic_call.rs, "PROJECTIONS": `Deref` and `Index` declare no
+    /// lifetime, and `Target` and `Output` have no generics) every lifetime of the projection
+    /// is `'static` or one of `Self`'s or the index type's: each of those positions flows into
+    /// each of the result's referent positions, and back when the result is `&mut` (invariant
+    /// in its referent).
+    /// The unsized coercion of `src: from`, a reference, to `dst: to`, a reference to a trait
+    /// object `dyn Tr + 'q` whose every lifetime is its object lifetime (`Tr` declares none,
+    /// per [`Facts::object_trait_lifetimes`], and its arguments and bindings hold no position):
+    /// `&'r T` to `&'s (dyn Tr + 'q)` asks `'r: 's` and `T: Unsize<dyn Tr + 'q>`, so `T: 'q`
+    /// (the Reference, "Type coercions", unsized coercions; "Trait object lifetime bounds"). So
+    /// the source's reference flows into the destination's, and each of `T`'s positions into
+    /// `'q`, one way. Related both ways (`relate`'s coarse path), `&&self.xs` as `&dyn Debug`
+    /// made the loan of the temporary `&self.xs` equal to `'a` of `self: &At<'a>` (tempo class
+    /// E, a derived `Debug`: E0597 and a placeholder error). `false`, relating nothing: not
+    /// such a coercion, and `relate` applies (a trait with lifetimes keeps the object lifetime
+    /// standing for them, every position equal).
+    fn unsize_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<bool, Refusal> {
+        let (s, d) = (self.info(src), self.info(dst));
+        if !s.exact || !d.exact || s.len == 0 || d.len != 2 {
+            return Ok(false);
+        }
+        if !(from.wrap.is_some() || matches!(self.node(from.ty, e)?, PNode::Ref(..))) {
+            return Ok(false);
+        }
+        let obj = match to.wrap {
+            Some(_) => to.ty,
+            None => match self.node(to.ty, e)? {
+                PNode::Ref(_, i) => i,
+                _ => return Ok(false),
+            },
+        };
+        let PNode::Dynamic(preds) = self.node(obj, e)? else {
+            return Ok(false);
+        };
+        let facts: &'b F = self.facts;
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        for &p in self.list(preds, e)? {
+            let (args, term) = match self.node(p, e)? {
+                PNode::ExTrait(k, args) => {
+                    if facts.object_trait_lifetimes(k) != Some(false) {
+                        return Ok(false);
+                    }
+                    (args, None)
+                }
+                PNode::ExProj { args, term, .. } => (args, Some(term)),
+                PNode::ExAuto(_) => continue,
+                _ => return Ok(false),
+            };
+            for &t in self.list(args, e)?.iter().chain(term.as_ref()) {
+                held.clear();
+                if self.npos(t, e)? > 0 || self.unplaced(t, e, &mut held)? || !held.is_empty() {
+                    return Ok(false);
+                }
+            }
+        }
+        let (d0, q) = (self.origs[d.start as usize], self.origs[(d.start + 1) as usize]);
+        self.b.subset(self.origs[s.start as usize], d0);
+        for j in s.start + 1..s.start + s.len {
+            self.b.subset(self.origs[j as usize], q);
+        }
+        Ok(true)
+    }
+
+    fn target_flow(&mut self, from: PInfo, skip: u32, r: PInfo, m: bool) {
+        for k in 1..r.len {
+            let to = self.origs[(r.start + k) as usize];
+            for j in skip..from.len {
+                let b = self.origs[(from.start + j) as usize];
+                self.b.subset(b, to);
+                if m {
+                    self.b.subset(to, b);
+                }
+            }
+        }
     }
 
     fn ref_done(&mut self, e: ExprId, m: Mutbl) -> Result<(), Refusal> {
@@ -2484,8 +2599,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let (btp, rp) = (self.place_of(bt), self.place_of(rt));
         let bop = if m { Operand::Move(btp) } else { Operand::Copy(btp) };
         self.b.call(&[bop, iop], rp, self.span(e));
-        let (ob, or) = (self.origs[self.info(btp).start as usize], self.origs[self.info(rp).start as usize]);
+        let (bi, ri) = (self.info(btp), self.info(rp));
+        let (ob, or) = (self.origs[bi.start as usize], self.origs[ri.start as usize]);
         self.b.subset(ob, or);
+        self.target_flow(bi, 1, ri, m);
+        if let At::Place(ip) = idx.at {
+            let ii = self.info(ip);
+            self.target_flow(ii, 0, ri, m);
+        }
         let p = self.project(rp, self.local_ty[rt.0 as usize], Proj::Deref, ty, false, e)?;
         self.push_place(p, ty);
         Ok(())

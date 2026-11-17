@@ -388,6 +388,12 @@ fn choice(word: &str) -> Result<Choice, CliError> {
 /// manifest static (nobody asks `blaze` for one), no `bstd_hosted_start` (blaze is never
 /// hosted) and reads no run spec on file descriptor 3 (no parent in the tree sets
 /// `BSTD_RUN_SPEC` for it).
+/// Every byte of the command's global heap counted by blaze-mem (rule 50, one memory measure):
+/// what `Global` holds is the `memory held` row's "global heap outside tags", and on macOS the
+/// malloc zones' committed bytes are "global allocator committed" (blaze-mem counted.rs).
+#[global_allocator]
+static HEAP: blaze_mem::counted::Counted = blaze_mem::counted::Counted;
+
 fn main() -> bstd::entry::Exit {
     // The process's heap is a grant bstd's entry hands `main` (D102, D120), never reached for
     // here or below: every allocator under the command is its handle, a frame, or an arena.
@@ -1060,7 +1066,10 @@ fn request<'f>(
     };
     // A body whose types were not checked is the item `check` counts for its status 4
     // (not_checked/items.rs): the same finding keeps `run`'s program from starting.
-    let mut req = Request::planted_in(config, ask, drive_plant, heap.alloc()).with_not_checked(|rule| rule == body_types::TYPES_NOT_CHECKED);
+    // A crate's names are read by cell (names/sections.rs `cell_of`): a body that read cells of
+    // a `CrateScope` is dirtied only when one of them moved.
+    let cells = blaze_drive::Cells::NONE.with(blaze_drive::Kind::CrateScope, names::sections::cell_of);
+    let mut req = Request::planted_in(config, ask, drive_plant, heap.alloc()).with_not_checked(|rule| rule == body_types::TYPES_NOT_CHECKED).with_cells(cells);
     // `run` checks only what its program reaches: the crate roots of its package's member
     // closure (blaze-drive run_scope.rs; run.md "End state (D113)", stage 4).
     if let Some(picked) = picked {
@@ -1824,6 +1833,7 @@ mod tests {
     mod include_data_tests;
     mod include_outside_tests;
     mod lints_tests;
+    mod order_tests;
     mod owners_tests;
     mod pooled_scope_tests;
     mod refused_targets_tests;

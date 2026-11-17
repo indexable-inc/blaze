@@ -651,7 +651,13 @@ fn script_records(
             Err(error) => return Err(LoadError::Read { path, error }),
         }
     }
-    let records = leak(blaze_world::ScriptRecords::new(given, Alloc::global()).map_err(|e| LoadError::Graph(e.to_string()))?);
+    let records = blaze_world::ScriptRecords::new(given, Alloc::global()).map_err(|e| LoadError::Graph(e.to_string()))?;
+    // A native script's stored files are beside the records, in `<dir>/files/<sha256 hex>`
+    // (`tempo_scripts export`): mapped when an `include!` reads one. A folder without them
+    // gives no area, and such an include is refused naming the missing area (`NoArea`).
+    let files = dir.join("files");
+    let area = leak(blaze_world::StoredFiles::new(files.is_dir().then_some(files), records.stored_digests()));
+    let records = leak(records.with_area(area));
     Ok(crates
         .crates
         .iter()

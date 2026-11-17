@@ -66,16 +66,22 @@ use blaze_typeck::ItemKey;
 use crate::front2::body_reads::ReadsDigest;
 use parser::{Edition, LexedStr};
 
-use crate::symbols::{SymbolError, tls_desc_symbol, tls_getter_symbol};
+use crate::symbols::{SymbolError, static_symbol, tls_desc_symbol, tls_getter_symbol};
 
 #[path = "code_reads.rs"]
 pub mod reads;
 
 use reads::ReadList;
 
+/// A static's entry (its datum record and what its words reach): run.md, "Statics in the run".
+#[path = "static_entry.rs"]
+pub mod statics;
+
 /// The version of the entry form and of what a key means: stepped when either changes, so an
-/// old store's entries are never found (and never misread) by a new blaze.
-pub const ENTRY_FORM: u32 = 3;
+/// old store's entries are never found (and never misread) by a new blaze. 4: an entry declares
+/// the statics its record names (by item key), and a static has an entry of its own
+/// ([`statics`]).
+pub const ENTRY_FORM: u32 = 4;
 
 /// The first eight bytes of every entry.
 pub const ENTRY_MAGIC: [u8; 8] = *b"bzcent01";
@@ -332,7 +338,9 @@ pub enum Callee<'n> {
 /// tables, replacing `Target::Slot` and the `via` table.
 pub struct InstanceNames<'n> {
     pub funcs: &'n [Callee<'n>],
-    pub statics: &'n [Symbol],
+    /// The statics, by item key: each is named by its symbol (symbols.rs `static_symbol`) and
+    /// declared by the entry, so the run's parent can send it before the record.
+    pub statics: &'n [ItemKey],
     pub vtables: &'n [Symbol],
     pub tls: &'n [Symbol],
 }
@@ -345,7 +353,7 @@ impl Names for InstanceNames<'_> {
                 Callee::Symbol(symbol) => Named::Symbol(symbol),
                 Callee::C(name) => Named::C(name),
             }),
-            Outside::Static(place) => self.statics.get(at(place)).map(|&s| Named::Symbol(s)),
+            Outside::Static(place) => self.statics.get(at(place)).map(|&s| Named::Symbol(static_symbol(s))),
             Outside::Vtable(place) => self.vtables.get(at(place)).map(|&s| Named::Symbol(s)),
             Outside::Tls(place) => self.tls.get(at(place)).map(|&s| Named::Symbol(s)),
             Outside::TlsDesc => Some(Named::Symbol(tls_desc_symbol())),
@@ -425,7 +433,9 @@ impl core::error::Error for CodeRecordError {}
 /// The form, little-endian: [`ENTRY_MAGIC`], [`ENTRY_FORM`] (4), the bytes of instructions at
 /// the code's start (4), the record's length (4) and bytes (blaze-code `Sealed::encode`), the
 /// count of declared instances (4), and each: its tabled fn's key (16), its name's length (4)
-/// and bytes, sorted by (tabled, name) and each once; then the count of read-list rows (4) and
+/// and bytes, sorted by (tabled, name) and each once; the count of declared statics (4) and
+/// each one's item key (16), ascending and each once: every static `names` holds (form 4: the
+/// parent sends each before the record, run.md "Statics in the run"); then the count of read-list rows (4) and
 /// each: its question's length (4) and bytes, and its answer's digest (32), sorted by question
 /// and each once ([`reads`]). An entry made here reads nothing beyond its key: no row.
 pub fn make_entry<'a, 'd>(
@@ -475,6 +485,7 @@ pub fn make_entry_reading<'a, 'd>(
         out.extend_from_slice(&len(d.name.len(), "declared instance's name")?.to_le_bytes());
         out.extend_from_slice(d.name);
     }
+    put_statics(names.statics, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
     out.extend_from_slice(&len(reads.len(), "entry's read list")?.to_le_bytes());
     for (question, answer) in reads.rows() {
         out.extend_from_slice(&len(question.len(), "read-list question")?.to_le_bytes());
@@ -482,6 +493,21 @@ pub fn make_entry_reading<'a, 'd>(
         out.extend_from_slice(&answer.0);
     }
     Ok(out)
+}
+
+/// The declared statics block onto `out`: their count (4), then each item key (16), ascending
+/// and each once (a record may name one static at two places). `Err` names what is too large.
+pub(crate) fn put_statics(statics: &[ItemKey], out: &mut AVec<'_, u8>, alloc: Alloc<'_>) -> Result<(), &'static str> {
+    let mut sorted: AVec<'_, ItemKey> = Vec::with_capacity_in(statics.len(), alloc);
+    sorted.extend_from_slice(statics);
+    sorted.sort_unstable();
+    sorted.dedup();
+    let count = u32::try_from(sorted.len()).map_err(|_| "entry's declared statics")?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for item in sorted.iter() {
+        out.extend_from_slice(&item.0.to_le_bytes());
+    }
+    Ok(())
 }
 
 const GETTER_DOMAIN: &str = "blaze-ladder thread-local getter body 2";
@@ -533,6 +559,10 @@ pub enum EntryError {
     Record(DecodeError),
     /// The instructions' length is past the record's code.
     Instructions(AddressWord),
+    /// The declared statics are not ascending, or one comes twice.
+    StaticsOrder,
+    /// A static's entry holds a datum that does not read (blaze-code datum.rs).
+    Datum(blaze_code::datum::DatumError),
 }
 
 impl fmt::Display for EntryError {
@@ -546,6 +576,8 @@ impl fmt::Display for EntryError {
             EntryError::ReadsOrder => write!(f, "{rule}'s read list is not sorted by question, each once"),
             EntryError::Record(why) => write!(f, "{rule}'s record does not read: {why}"),
             EntryError::Instructions(why) => write!(f, "{rule}: {why}"),
+            EntryError::StaticsOrder => write!(f, "{rule}'s declared statics are not ascending by item key, each once"),
+            EntryError::Datum(why) => write!(f, "a static's entry (code_records.rs `statics::make_static_entry`) holds a datum that does not read: {why}"),
         }
     }
 }
@@ -560,6 +592,8 @@ pub struct EntryView<'b> {
     /// The declared instances' bytes (checked whole by [`EntryView::read`]).
     declared: &'b [u8],
     count: u32,
+    /// The declared statics' item keys, 16 bytes each (checked ascending by [`EntryView::read`]).
+    statics: &'b [u8],
     /// The read list's rows' bytes (checked whole and in order by [`EntryView::read`]).
     reads: &'b [u8],
     reads_count: u32,
@@ -568,6 +602,20 @@ pub struct EntryView<'b> {
 struct Cursor<'b> {
     bytes: &'b [u8],
     at: usize,
+}
+
+/// A 16-byte little-endian item key.
+fn key_of(bytes: &[u8]) -> u128 {
+    let mut wide = [0u8; 16];
+    wide.copy_from_slice(bytes);
+    u128::from_le_bytes(wide)
+}
+
+/// Each item key of a checked statics block, in order.
+fn each_key(block: &[u8], mut each: impl FnMut(ItemKey)) {
+    for key in block.chunks_exact(16) {
+        each(ItemKey(key_of(key)));
+    }
 }
 
 impl<'b> Cursor<'b> {
@@ -582,12 +630,34 @@ impl<'b> Cursor<'b> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
     fn declared(&mut self) -> Result<Declared<'b>, EntryError> {
-        let key = self.take(16, "declared instance's fn")?;
-        let mut wide = [0u8; 16];
-        wide.copy_from_slice(key);
+        let key = key_of(self.take(16, "declared instance's fn")?);
         let len = self.u32("declared instance's name length")? as usize;
         let name = self.take(len, "declared instance's name")?;
-        Ok(Declared { tabled: ItemKey(u128::from_le_bytes(wide)), name })
+        Ok(Declared { tabled: ItemKey(key), name })
+    }
+    /// The declared instances' block: the count, then each row checked; (its bytes, count).
+    fn declared_block(&mut self) -> Result<(&'b [u8], u32), EntryError> {
+        let count = self.u32("count of declared instances")?;
+        let start = self.at;
+        for _ in 0..count {
+            self.declared()?;
+        }
+        Ok((&self.bytes[start..self.at], count))
+    }
+    /// The declared statics' block ([`put_statics`]): the count, then the keys, checked
+    /// ascending and each once; their bytes.
+    fn statics_block(&mut self) -> Result<&'b [u8], EntryError> {
+        let count = self.u32("count of declared statics")? as usize;
+        let keys = self.take(count.checked_mul(16).ok_or(EntryError::Truncated { what: "declared statics" })?, "declared statics")?;
+        let mut last: Option<u128> = None;
+        for key in keys.chunks_exact(16) {
+            let key = key_of(key);
+            if last.is_some_and(|before| before >= key) {
+                return Err(EntryError::StaticsOrder);
+            }
+            last = Some(key);
+        }
+        Ok(keys)
     }
     fn read_row(&mut self) -> Result<(&'b [u8], ContentId), EntryError> {
         let len = self.u32("read-list question's length")? as usize;
@@ -616,12 +686,8 @@ impl<'b> EntryView<'b> {
         if insts as usize > record.code().len() || insts % 4 != 0 {
             return Err(EntryError::Instructions(AddressWord::Instructions { insts, code: record.code().len() as u32 }));
         }
-        let count = c.u32("count of declared instances")?;
-        let start = c.at;
-        for _ in 0..count {
-            c.declared()?;
-        }
-        let declared = &bytes[start..c.at];
+        let (declared, count) = c.declared_block()?;
+        let statics = c.statics_block()?;
         let reads_count = c.u32("count of read-list rows")?;
         let reads_start = c.at;
         let mut last: Option<&[u8]> = None;
@@ -635,7 +701,12 @@ impl<'b> EntryView<'b> {
         if c.at != bytes.len() {
             return Err(EntryError::Trailing);
         }
-        Ok(EntryView { insts, record, declared, count, reads: &bytes[reads_start..], reads_count })
+        Ok(EntryView { insts, record, declared, count, statics, reads: &bytes[reads_start..], reads_count })
+    }
+
+    /// Each static the record names, by item key, ascending.
+    pub fn each_static(&self, each: impl FnMut(ItemKey)) {
+        each_key(self.statics, each);
     }
 
     /// The count of read-list rows.

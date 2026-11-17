@@ -10,7 +10,19 @@ use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKin
 use blaze_world::Side;
 use edition::PackageEdition;
 
-use super::{MACRO_TARGET, links_closure, pinned_table, side_atoms};
+use super::{MACRO_TARGET, links_closure, side_atoms};
+
+/// A side's pinned rows and ships facts as the shared setup makes them (blaze-world
+/// `script_setting::pinned_table`, which `probe_table` sorts with the feature listings), sorted.
+fn pinned_table<'a, 's>(side: Side, shipped: impl Iterator<Item = &'s str> + Clone, alloc: blaze_own::Alloc<'a>) -> AVec<'a, blaze_build_script::probe::Row> {
+    let triple = match side {
+        Side::Target => crate::graph::TRIPLE,
+        Side::Macro => MACRO_TARGET,
+    };
+    let mut rows = blaze_world::script_setting::pinned_table(triple, shipped, alloc);
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+    rows
+}
 
 fn t(s: &str) -> Text<'static> {
     Text::from_str_in(s, blaze_own::testing::heap().alloc())

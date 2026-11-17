@@ -177,6 +177,15 @@ pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
     check_rounds_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap)
 }
 
+/// The body `owner` finished with the findings `diags`: each filed where its tokens came from,
+/// before it leaves the task that made it (drive.md, ruled 20:57), in `alloc` (the store's).
+fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
+    let lib = r.keys.library_in(r.names, owner);
+    let mut filed = Vec::with_capacity_in(diags.len(), Global);
+    filed.extend(diags.iter().map(|(_, at, _)| super::expansion_origin::file_range(r.names, lib, *at, alloc)));
+    CheckFail::Diags { owner, diags, filed }
+}
+
 /// [`check_rounds`] with the check's entry for an auto-trait goal of an async block's future
 /// that fails only on the superset interior named (front2 stalled_goals.rs `Stalls`): only
 /// `ProjectWorld::check_borrows` passes `Stalls::Decide`, and it decides every stalled row.
@@ -217,6 +226,16 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 if super::opaque_auto::after_auto_gap(r, owner, &error, &mut leaks)? {
                     continue;
                 }
+                // A body with no diagnostic of the checker's that recorded the error type, where
+                // the front end gave it that type for a written type that named nothing (its own,
+                // or its signature's: front2 type_miss.rs): no clean body, and no invariant
+                // broken. Its findings are its own misses (the signature's are its `Signature`
+                // task's); the checker said nothing else.
+                if matches!(error, tc::CheckError::UnknownInCleanBody { .. }) && (!body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) {
+                    let mut diags = Vec::with_capacity_in(body.type_misses.len(), Global);
+                    diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
+                    return Err(said(r, owner, diags, alloc));
+                }
                 return Err(CheckFail::Check { owner, error });
             }
         };
@@ -251,21 +270,13 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             // before the checker's: the body was checked with the error type in its place.
             Outcome::Done(done) if !round_gaps && (!done.diags.is_empty() || !body.type_misses.is_empty()) => {
                 let mut diags = Vec::with_capacity_in(body.type_misses.len() + done.diags.len(), Global);
-                diags.extend(body.type_misses.iter().map(|m| {
-                    let words = super::path_miss_shown::path_miss_words(r, &format!("type `{}`", m.name), m.miss);
-                    (tc::DiagCode::UnresolvedType, m.range(), words.into_boxed_str())
-                }));
+                diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
                 let tys = done.types.view();
-                diags.extend(done.diags.iter().map(|d| (d.code, d.at, diag_about(r, scope.spell, tys, d))));
+                diags.extend(done.diags.iter().map(|d| (d.code, d.at, diag_about(r, scope.spell, tys, &view, d))));
                 if let Some(asked) = asked.as_deref_mut() {
                     asked.finished = Some(done.reads.clone());
                 }
-                // Each filed where its tokens came from, before it leaves the task that made it
-                // (drive.md, ruled 20:57), in the store's allocator as this loop's other three.
-                let lib = r.keys.library_in(r.names, owner);
-                let mut filed = Vec::with_capacity_in(diags.len(), Global);
-                filed.extend(diags.iter().map(|(_, at, _)| super::expansion_origin::file_range(r.names, lib, *at, alloc)));
-                return Err(CheckFail::Diags { owner, diags, filed });
+                return Err(said(r, owner, diags, alloc));
             }
             Outcome::Done(done) if !round_gaps => return Ok(done),
             // A gap answered `Missing`, so a finished check past one is no answer.
@@ -467,7 +478,9 @@ fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, t:
 
 /// What a diagnostic is about, printed: an unmet goal entire, the leaf where-clause first when
 /// the checker names one (`Error: From<Other>` because `Result<u8, Error>: FromResidual<..>`).
-pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> {
+/// `v`: the body, which says whether a path that named nothing is a call's callee (a function,
+/// as rustc says it) or another value.
+pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, v: &BodyView<'_>, d: &tc::Diag) -> Box<str> {
     let ty = |t: Option<tc::PTy>| t.map(|t| ty_shown(r, tys, t));
     let s = match d.because {
         Some(tc::Because::Unmet { goal, leaf }) => {
@@ -502,7 +515,7 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
         }
         Some(tc::Because::NoLangItem(l)) => format!("no lang item {l:?}"),
         // E0425: the segment that named nothing, by its spelling (rule 19).
-        Some(tc::Because::Path(miss)) => super::path_miss_shown::path_miss_shown(r, spell, d.name, miss),
+        Some(tc::Because::Path(miss)) => super::path_miss_shown::path_miss_shown(r, spell, d.name, super::path_miss_shown::kind_at(v, d.at), miss),
         // Every goal's finding (E0277, E0283) carries `Unmet`; what is left is about a node, not a
         // goal: its reason by its content, then its types and the name it looked up, each only
         // where the finding has it (diag-names-something-1: blaze-typeck builds no finding with
@@ -1095,7 +1108,7 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
             // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
             // decides an auto trait's structural rule, and the solver matches it to no positive
             // goal; its refused header is the question's gap, never a wrong `yes`.
-            candidates.extend_from_slice(b.negative_of(trait_));
+            candidates.extend_from_slice(&b.negative_of(trait_, shape, home));
             candidates.sort_unstable();
             candidates.dedup();
             lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;

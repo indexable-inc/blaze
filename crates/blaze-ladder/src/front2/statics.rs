@@ -110,8 +110,9 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
     (Statics { values, kinds }, refused)
 }
 
-/// Static `k`'s record (copied out of the evaluator's arena) and its kind.
-fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(DataRecord<Global>, StaticItem), Box<str>> {
+/// Static `k`'s record (copied out of the evaluator's arena) and its kind. The run's static
+/// rows (lazy/fill.rs `static_value`) ask one static by this, the work list above many.
+pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(DataRecord<Global>, StaticItem), Box<str>> {
     let Some((consts, prepared)) = r.consts.take() else {
         return Err(Box::from("no evaluator: the program's records hold none"));
     };

@@ -386,7 +386,23 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut offs = Vec::new_in(self.alloc.clone());
         self.capture_offsets(closure, g, caps.len(), &mut offs)?;
         for (j, &(p, by)) in caps.iter().enumerate() {
-            let (base, off) = env.ok_or(malformed("a closure that captures with no environment"))?;
+            // A zero-sized environment passed by value (an `FnOnce` body; the environment is
+            // its captures, so each is a by-value capture of a zero-sized value: `move ||
+            // marker` with `marker: PhantomData<T>` or a unit struct, as libc-adjacent
+            // `OrErrno::true_val_or_errno` writes) is passed as nothing: each capture is
+            // bound to its own zero-sized slot, owned as any by-value capture (its `Drop`, if
+            // any, runs at the body's end). A by-reference capture is a pointer, never in a
+            // zero-sized environment.
+            let Some((base, off)) = env else {
+                if by != CaptureKind::ByValue {
+                    return Err(malformed("a by-reference capture in a zero-sized closure environment"));
+                }
+                self.bind(p)?;
+                if parts.kind == FnTrait::FnOnce {
+                    self.own(p, true)?;
+                }
+                continue;
+            };
             let at = (base, off + offs[j] as i32);
             match by {
                 CaptureKind::ByRef | CaptureKind::ByMutRef => {

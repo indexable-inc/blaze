@@ -29,7 +29,7 @@ mod outlives;
 mod value;
 
 pub use impl_life::{AssocWhy, ImplText, impl_header_end, read_impl_signature};
-pub use outlives::container_declares_type_outlives;
+pub use outlives::{assoc_declares_generics, container_declares_type_outlives, trait_declares_lifetime};
 
 pub use value::{CallableRefusal, read_callable_param};
 
@@ -56,7 +56,8 @@ pub struct SigLife<'s> {
     pub regions: &'s [Region],
     /// Per input, where its regions end in `regions`; the output's are the rest.
     pub ends: &'s [u32],
-    /// `(a, b)`: the signature declares `a: b`.
+    /// `(a, b)`: the signature declares `a: b`, or its form implies it (an `async fn`'s inputs
+    /// outlive its future, `read_signature_in`).
     pub bounds: &'s [(Region, Region)],
 }
 
@@ -784,7 +785,9 @@ fn read_signature_in<'t, A: Allocator + Clone>(
     let end = r.toks.len() as u32;
     // The `fn` keyword: the first outside every bracket (attributes are bracketed).
     let mut i = 0u32;
+    let mut is_async = false;
     while i < end && !r.is_word(i, end, "fn") {
+        is_async |= r.is_word(i, end, "async");
         i = r.skip(i);
     }
     let mut i = i + 2;
@@ -893,6 +896,25 @@ fn read_signature_in<'t, A: Allocator + Clone>(
     }
     if out.regions.iter().any(|x| *x == Region::Hidden(u32::MAX)) {
         return Err(SigRefusal::Unaligned { at: r.at(params.0) });
+    }
+    // An `async fn`'s output is the future it returns, an opaque type that captures every
+    // lifetime of the fn (the Reference, "Async functions": `async fn f(x: &u8)` is
+    // `fn f<'a>(x: &'a u8) -> impl Future<Output = ..> + use<'a>`), and an opaque type outlives
+    // a lifetime when each of its captures does (RFC 1214, alias components). So each input
+    // region outlives the future's own position: the body may return a future holding any of
+    // its inputs' borrows (tempo zones/p2p runtime.rs:882, a false "outlives" in
+    // `async fn recv(&mut self)`). Only the inputs' regions are stated, a subset of the
+    // captures; an RPIT's captures (edition, `use<..>`, `+ 'x`) are not read and stay unrelated.
+    if is_async {
+        for k in base as usize..out.regions.len() {
+            let Region::Hidden(h) = out.regions[k] else { continue };
+            for j in 0..base as usize {
+                let x = out.regions[j];
+                if !matches!(x, Region::Hidden(_)) && !out.bounds.contains(&(x, Region::Hidden(h))) {
+                    out.bounds.push((x, Region::Hidden(h)));
+                }
+            }
+        }
     }
     let wheres = if where_at < end { Some((where_at + 1, end)) } else { None };
     r.type_outlives(generics, wheres, &mut out.type_outlives, &mut out.type_outlives_unread)?;

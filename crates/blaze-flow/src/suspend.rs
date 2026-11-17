@@ -211,11 +211,6 @@ fn forward<A: Allocator + Clone>(
     }
 }
 
-/// Some part of `p` (itself or a place below it) may be initialized in `init`.
-fn maybe_init_part<A: Allocator>(flow: &Flow<A>, init: &[u64], p: Place) -> bool {
-    (0..flow.places.len()).any(|q| flow.is_prefix(p, Place(q as u32)) && bits::test(init, q))
-}
-
 /// Live by use, backward through statement `s`: `row` is live after `s` on entry, before on exit.
 fn live_step<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, row: &mut [u64]) {
     let local = |p: Place| flow.place(p).local.index();
@@ -253,7 +248,7 @@ fn live_step<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, row: &mut [
         }
         StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => bits::put(row, l.index(), false),
         StmtKind::Drop(p) => {
-            if init.reached[s.index()] && maybe_init_part(flow, init.init.row(s.index()), p) {
+            if init.drop_may_run(flow, s, p) {
                 bits::put(row, local(p), true);
             }
         }

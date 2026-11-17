@@ -436,7 +436,8 @@ impl Instances {
                     let mut ks: Vec<LibKey, Global> = Vec::new_in(Global);
                     if let Some(b) = r.buckets.as_ref() {
                         ks.extend(b.shapeless_unread());
-                        ks.extend_from_slice(b.negative_of(trait_));
+                        // Narrowed as the `(trait_, Param)` question just answered was.
+                        ks.extend_from_slice(&b.negative_of(trait_, Shape::Param, b.home_of(trait_, Shape::Param)));
                     }
                     let view = r.store.tys.view();
                     let mut lowered: Vec<Shape, Global> = Vec::new_in(Global);

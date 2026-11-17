@@ -176,6 +176,10 @@ pub struct BorrowFacts<'a> {
     /// The generic shape of each callee head whose signature was read (blaze-flow-lower
     /// `read_shape`): a call whose type arguments carry origins is related through it.
     shapes: AVec<'a, (u128, blaze_flow_lower::ShapeBuf<Alloc<'a>>)>,
+    /// Each trait that is the principal of a trait object of the body's types, sorted, and
+    /// whether its header declares a lifetime (`None`: its text not read; sig_impl.rs
+    /// `trait_lifetimes`, its row `trait_read`).
+    object_traits: AVec<'a, (u128, Option<bool>)>,
     /// The body's owner and its callees, sorted: the fns whose heads were asked.
     items: AVec<'a, u128>,
     /// Each ADT whose `Copy` or `Drop` answer was not known (the census takes it as `false`;
@@ -202,6 +206,7 @@ impl<'a> BorrowFacts<'a> {
             sig_refused: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
             shapes: AVec::new_in(alloc),
+            object_traits: AVec::new_in(alloc),
             items: AVec::new_in(alloc),
             unknown: AVec::new_in(alloc),
             unknown_why: AVec::new_in(alloc),
@@ -277,6 +282,10 @@ impl Facts for BorrowFacts<'_> {
     fn shape(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
         let at = self.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
         self.shapes.get(at).map(|(_, s)| s.shape())
+    }
+    fn object_trait_lifetimes(&self, trait_: tc::ItemKey) -> Option<bool> {
+        let at = self.object_traits.binary_search_by_key(&trait_.0, |&(k, _)| k).ok()?;
+        self.object_traits.get(at).and_then(|&(_, l)| l)
     }
 }
 
@@ -650,6 +659,10 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
     // stand among its positions (blaze-flow-lower generic_call.rs). A head whose shape cannot
     // be lined up has none, and a call of it with type arguments that carry origins keeps the
     // one origin.
+    // A projection in a head's output stands for its normalized type's positions when its
+    // trait's text says it is closed (blaze-flow-lower generic_call.rs, "PROJECTIONS"); each
+    // trait asked is a row of the body's read list (sig_impl.rs `trait_read`, rule 21).
+    let asked_traits: core::cell::RefCell<AVec<'a, u128>> = core::cell::RefCell::new(AVec::new_in(alloc));
     for &k in items.iter() {
         if g.sigs.binary_search_by_key(&k, |(x, _)| *x).is_err() {
             continue;
@@ -658,10 +671,34 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         let tys = r.store.tys.view();
         let (keys, names) = (&*r.keys, r.names);
         let adt_lifetimes = |a: tc::ItemKey| Some(adt_head_lifetimes(keys, names, a));
+        let closed = |t: tc::ItemKey, name: tc::Name| {
+            asked_traits.borrow_mut().push(t.0);
+            super::sig_impl::trait_closed(names, keys, t, name, alloc)
+        };
         let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
-        if blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &mut shape, alloc).is_ok() {
+        if blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &closed, &mut shape, alloc).is_ok() {
             g.shapes.push((k, shape));
         }
+    }
+    let mut asked_traits = asked_traits.into_inner();
+    // Each trait object's principal: whether it declares a lifetime decides how an unsized
+    // coercion to it is related (blaze-flow-lower `Lower::unsize_to_object`); its row is the
+    // same trait row.
+    for n in c.types.view().nodes() {
+        if let tc::PNode::ExTrait(t, _) = n {
+            g.object_traits.push((t.0, None));
+        }
+    }
+    g.object_traits.sort_unstable_by_key(|&(k, _)| k);
+    g.object_traits.dedup_by_key(|&mut (k, _)| k);
+    for o in g.object_traits.iter_mut() {
+        o.1 = super::sig_impl::trait_lifetimes(r.names, &*r.keys, tc::ItemKey(o.0), alloc);
+        asked_traits.push(o.0);
+    }
+    asked_traits.sort_unstable();
+    asked_traits.dedup();
+    for &t in asked_traits.iter() {
+        g.reads.push(super::sig_impl::trait_read(r.names, &*r.keys, tc::ItemKey(t), alloc));
     }
     // Each head's declared type-outlives bounds, from the lifetime part just read and its
     // container's header (front2 call_generics.rs), and their read rows (rule 21).
@@ -709,10 +746,14 @@ fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan) -> (&'
     match flow.stmt(s).kind {
         StmtKind::StorageDead(_) => ("E0597", "a borrowed value goes out of scope while the borrow is live"),
         StmtKind::Drop(_) => ("E0505", "a borrowed value is dropped while the borrow is live"),
+        // A two-phase borrow is a mutable one (RFC 2025): under a live mutable loan its
+        // reservation or its activation is a second mutable borrow (E0499), under a shared one
+        // its activation is E0502.
+        StmtKind::Activate(_) if held_mut => ("E0499", "a two-phase mutable borrow is used while a mutable borrow is live"),
         StmtKind::Activate(_) => ("E0502", "a two-phase mutable borrow is used while another borrow is live"),
         StmtKind::Assign { value: Value::Borrow { kind, place, .. }, .. } if place == a.place && a.deep && a.write == (kind == BorrowKind::Mut) => {
             match (kind, held_mut) {
-                (BorrowKind::Mut, true) => ("E0499", "a second mutable borrow while a mutable borrow is live"),
+                (BorrowKind::Mut | BorrowKind::TwoPhase, true) => ("E0499", "a second mutable borrow while a mutable borrow is live"),
                 (BorrowKind::Mut, false) => ("E0502", "a mutable borrow while a shared borrow is live"),
                 _ => ("E0502", "a shared borrow while a mutable borrow is live"),
             }
@@ -757,6 +798,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     done: &tc::Checked<'_>,
     reads: &mut AVec<'a, Read>,
     interiors: &mut AsyncInteriors<'a>,
+    mut show: Option<&mut dyn core::fmt::Write>,
     alloc: Alloc<'a>,
 ) -> BorrowVerdict<'a> {
     let mut verdict = BorrowVerdict::new_in(alloc);
@@ -766,6 +808,14 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     }
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts(r, body.owner, done, langs, alloc);
+    if let Some(out) = show.as_deref_mut() {
+        use core::fmt::Write as _;
+        let _ = show_facts(&facts, out);
+        let (es, ks) = (done.callees.column::<0>(), done.callees.column::<1>());
+        for (e, k) in es.iter().zip(ks.iter()) {
+            let _ = writeln!(out, "call at {e:?}: {:x}", k.0);
+        }
+    }
     // Everything below reads these facts, a refusal included: all of them are the body's reads.
     reads.extend_from_slice(facts.reads());
     reads.extend_from_slice(facts.calls.reads());
@@ -808,6 +858,9 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                 break;
             }
         };
+        if let Some(out) = show.as_deref_mut() {
+            let _ = show_flow(&flow, of, out);
+        }
         let record = match blaze_flow::check(&flow, alloc) {
             Ok(record) => record,
             Err(bound) => {
@@ -860,12 +913,91 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     verdict
 }
 
+/// One lowered flow in the flow's text form, then what that form leaves out: each statement's
+/// item-relative range, the placeholders, which locals mention which origins, the known
+/// relations and each loan's statement. For a test that must show why a finding was made.
+fn show_flow<A: Allocator>(flow: &Flow<A>, of: FlowOf, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    struct W<'w>(&'w mut dyn core::fmt::Write);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0.write_str(s)
+        }
+    }
+    let mut w = W(out);
+    use core::fmt::Write as _;
+    writeln!(w, "flow of {of:?}: {} locals, {} args, {} origins", flow.locals, flow.args, flow.origins)?;
+    flow.print(&mut w)?;
+    w.write_str("spans:")?;
+    for (s, row) in flow.stmts.iter().enumerate() {
+        write!(w, " s{s}={}..{}", row.span.lo, row.span.hi)?;
+    }
+    w.write_str("\nplaceholders:")?;
+    for (o, p) in flow.placeholder.iter().enumerate() {
+        if *p {
+            write!(w, " 'o{o}")?;
+        }
+    }
+    w.write_str("\nmentions:")?;
+    for (l, o) in flow.local_origins.iter() {
+        write!(w, " {l}:{o}")?;
+    }
+    w.write_str("\nknown:")?;
+    for (from, into) in flow.known.iter() {
+        write!(w, " {from}:{into}")?;
+    }
+    w.write_str("\nloans:")?;
+    for (l, row) in flow.loans.iter().enumerate() {
+        write!(w, " L{l}@{}", row.at)?;
+    }
+    w.write_str("\n")
+}
+
+/// What the facts say of each head the body calls: its callee facts, lifetime part, generic
+/// shape and declared bounds, or why its lifetime part was not read.
+fn show_facts(facts: &BorrowFacts<'_>, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    for &k in facts.items() {
+        let key = tc::ItemKey(k);
+        writeln!(out, "head {k:x}: {:?}", Facts::callee(facts, key))?;
+        if let Some(life) = Facts::sig(facts, key) {
+            writeln!(out, "  sig {:?} ends {:?} bounds {:?}", life.regions, life.ends, life.bounds)?;
+        }
+        if let Some(&(_, why)) = facts.sig_refused().iter().find(|(x, _)| *x == k) {
+            writeln!(out, "  sig refused {why:?}")?;
+        }
+        match Facts::shape(facts, key) {
+            Some(s) => writeln!(out, "  shape {:?} ends {:?}", s.marks, s.ends)?,
+            None => writeln!(out, "  no shape")?,
+        }
+        match Facts::call_bounds(facts, key) {
+            Some(b) => writeln!(out, "  bounds {b:?}")?,
+            None => writeln!(out, "  no call bounds")?,
+        }
+    }
+    for &(k, l) in facts.object_traits.iter() {
+        writeln!(out, "object trait {k:x}: declares a lifetime {l:?}")?;
+    }
+    Ok(())
+}
+
 impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
+    /// As [`ProjectWorld::check_borrows`], writing each flow the borrow check ran over to `show`
+    /// ([`show_flow`]'s form) before its check: a test's view of why a finding was made.
+    pub fn check_borrows_shown<'a>(&mut self, body: BodyRef<'n>, show: &mut dyn core::fmt::Write, alloc: Alloc<'a>) -> (BodyVerdict<'a>, BorrowVerdict<'a>) {
+        self.check_borrows_in(body, Some(show), alloc)
+    }
+
+    /// Checks one body's types ([`ProjectWorld::check`]: its verdict unchanged) and then, when
+    /// they were checked clean, its moves and borrows (as [`ProjectWorld::check_borrows_in`]).
+    pub fn check_borrows<'a>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>) -> (BodyVerdict<'a>, BorrowVerdict<'a>) {
+        self.check_borrows_in(body, None, alloc)
+    }
+
     /// Checks one body's types ([`ProjectWorld::check`]: its verdict unchanged) and then, when
     /// they were checked clean, its moves and borrows over the same lowered body and `Checked`
     /// record (nothing lowered or checked twice). A body whose types were not checked clean is
     /// [`BorrowRefused::Untyped`]: not checked, never clean.
-    pub fn check_borrows<'a>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>) -> (BodyVerdict<'a>, BorrowVerdict<'a>) {
+    fn check_borrows_in<'a>(&mut self, body: BodyRef<'n>, show: Option<&mut dyn core::fmt::Write>, alloc: Alloc<'a>) -> (BodyVerdict<'a>, BorrowVerdict<'a>) {
         let mut borrows: Option<BorrowVerdict<'a>> = None;
         let mut reads: AVec<'a, Read> = AVec::new_in(alloc);
         let mut decision: Option<Decision<'a>> = None;
@@ -874,7 +1006,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // rows are decided on the exact interiors of those lowerings (stalled_goals.rs).
         let mut verdict = self.check_then(body, Stalls::Decide, alloc, |r, lowered, done| {
             let mut interiors = AsyncInteriors::new_in(done, alloc);
-            borrows = Some(borrows_of(r, lowered, done, &mut reads, &mut interiors, alloc));
+            borrows = Some(borrows_of(r, lowered, done, &mut reads, &mut interiors, show, alloc));
             decision = Some(decide_stalled_goals(r, lowered, done, &interiors, &mut reads, alloc));
         });
         // What the borrow verdict and the decision read, in the body's read list and its

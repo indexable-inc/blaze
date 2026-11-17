@@ -144,4 +144,19 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         let Some(&(_, world_at, edition)) = self.callers.iter().find(|(at, _, _)| *at == krate) else { return Err(refused) };
         procs.run(world_at, edition, def, call, alloc)
     }
+
+    /// Why a refused run of `def` was refused, by the same steps [`Self::run_proc_macro`]
+    /// takes: no runner in this job, a crate this job was not given as a caller, or the
+    /// runner's reason (proc_runner.rs `unusable`: the macro's crate and its module). Kept in
+    /// the job's frame: the names record's failed-call row holds these words.
+    fn proc_macro_unusable(&self, krate: usize, def: &blaze_expand::MacroDefinition<'_>) -> Option<&'n str> {
+        let words = match self.procs {
+            None => std::string::String::from("this names job has no proc-macro runner (the command made none: proc_runner.rs `make`)"),
+            Some(procs) => match self.callers.iter().find(|(at, _, _)| *at == krate) {
+                None => std::format!("the calling crate (index {krate} of this job) is not one this job was given as a proc-macro caller"),
+                Some(&(_, world_at, _)) => procs.unusable(world_at, def)?,
+            },
+        };
+        Some(held_str(&words, self.frame))
+    }
 }

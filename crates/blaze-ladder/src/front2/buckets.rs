@@ -23,7 +23,7 @@ use std::format;
 use std::string::{String, ToString};
 use std::vec::Vec;
 
-use blaze_hash::HashMap;
+use blaze_hash::{HashMap, HashSet};
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::machine::sig;
 use blaze_lower::{View, form as lf, head};
@@ -41,8 +41,10 @@ use crate::resolve::{Kind, Ns, ResolveError};
 
 mod asked;
 mod by_trait;
+mod records;
 
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
+pub use records::{BucketSource, ImplTables, ItemsIndex, NoTables, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, row_answers, row_digest, trait_cell, write_impl_tables};
 
 /// A candidate impl whose header the store does not hold when the answer is made, or an
 /// inherent impl's fn whose signature it does not.
@@ -127,8 +129,9 @@ enum Filed {
     /// A negative impl `impl !Trait for T` (the trait's key): never a candidate of a goal
     /// `T: Trait`, which no impl can then meet (coherence keeps a positive impl from
     /// overlapping it); for an auto trait it decides that the auto rule does not apply, which
-    /// the checker does not read yet: the caller makes it a gap of such a question.
-    Negative(ItemKey),
+    /// the checker does not read yet: the caller makes it a gap of such a question. With its
+    /// self type's shape where that was read (an impl table files it there: records.rs).
+    Negative(ItemKey, Option<Shape>),
 }
 
 /// Why an impl's header could not be filed by its trait: each impl filed so is a candidate of
@@ -138,7 +141,7 @@ pub enum Unread {
     /// The names library holds no text for the impl.
     NoText,
     /// The names library holds no text for the impl, and its row's tokens say it is a trait
-    /// impl ([`Buckets::put_textless`]).
+    /// impl ([`textless`]).
     NoTextTrait,
     /// The header did not lower.
     Unlowered,
@@ -155,13 +158,32 @@ pub enum Unread {
     /// Where the trait path's tokens are read could not be told (their marks were lost, or
     /// the mark names a site this build does not hold): `why` says which (item_site.rs).
     Site { path: Box<str>, why: Box<str> },
+    /// Read back from an impl table (records.rs): a row holds whether it is a trait impl and
+    /// its class ([`Unread::why_byte`]), not the path or the refusal.
+    Indexed { trait_impl: bool, class: u8 },
 }
 
 impl Unread {
     /// Whether the impl is known to be a trait impl (its trait path was written; only the
     /// path failed).
     fn is_trait_impl(&self) -> bool {
-        matches!(self, Unread::NoTextTrait | Unread::TraitNotAPath | Unread::PathUnread | Unread::Resolve { .. } | Unread::NotATrait { .. } | Unread::Site { .. })
+        matches!(self, Unread::NoTextTrait | Unread::TraitNotAPath | Unread::PathUnread | Unread::Resolve { .. } | Unread::NotATrait { .. } | Unread::Site { .. } | Unread::Indexed { trait_impl: true, .. })
+    }
+
+    /// The class as an impl row's why byte ([`blaze_surface::ImplFlags::why`]): never 0.
+    fn why_byte(&self) -> u8 {
+        match self {
+            Unread::NoText => 1,
+            Unread::NoTextTrait => 2,
+            Unread::Unlowered => 3,
+            Unread::Generics => 4,
+            Unread::TraitNotAPath => 5,
+            Unread::PathUnread => 6,
+            Unread::Resolve { .. } => 7,
+            Unread::NotATrait { .. } => 8,
+            Unread::Site { .. } => 9,
+            Unread::Indexed { class, .. } => *class,
+        }
     }
 
     /// The class, for counting: the variant's name, and for a library refusal its reason.
@@ -302,7 +324,7 @@ fn file<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey) -> (Filed
         Err(lost) => return (Filed::Unread(Unread::Site { path, why: format!("{lost}").into_boxed_str() }, self_shape), None),
     };
     match super::item_site::resolve_written(&crate::resolve::Paths { names }, marks, module, &v, p, abs, &texts, Ns::Type, at) {
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() && v.head[head::FLAGS] & sig::NEGATIVE != 0 => (Filed::Negative(checker_of(f.key)), None),
+        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() && v.head[head::FLAGS] & sig::NEGATIVE != 0 => (Filed::Negative(checker_of(f.key), self_shape), None),
         Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => {
             (Filed::Trait(checker_of(f.key), self_shape, bare), path_self.then(|| PathSelf::Trait { of: names.crate_of(f.key), bare }))
         }
@@ -529,7 +551,7 @@ fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowN
     let blanket = row.head == SelfHead::Param;
     let negative = row.flags.bits() & ImplFlags::NEGATIVE.bits() != 0;
     if negative {
-        return Ok((Filed::Negative(trait_), blanket, None));
+        return Ok((Filed::Negative(trait_, shape), blanket, None));
     }
     Ok((Filed::Trait(trait_, shape, row.bare), blanket, path_self.then_some(PathSelf::Trait { of, bare: row.bare })))
 }
@@ -546,7 +568,7 @@ enum RowSelf {
 /// The self type's head of the impl `row` as the row writes it, resolved in the impl's module:
 /// `Err` where the row does not name it ([`SelfHead::Other`], a path segment that is no plain
 /// identifier). [`file_row`]'s first step, and what files an impl whose text did not read by
-/// the head its row read ([`Buckets::put_textless`]).
+/// the head its row read ([`textless`]).
 fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Result<RowSelf, RowMiss> {
     let paths = crate::resolve::Paths { names };
     let mut path_self = false;
@@ -625,6 +647,108 @@ pub enum RowMiss {
 
 /// The classes of [`RowMiss`], in the order of [`Buckets::row_misses`].
 pub const ROW_MISSES: [&str; 6] = ["header unread", "trait unread", "self type other", "self path not plain", "trait path not plain", "trait not resolved"];
+
+/// One impl as its crate's rows and the names file it: where ([`Filed`]) and the facts its
+/// header gave that judge it as a candidate. What [`Buckets::take`] files in a job's index and
+/// what an impl table's row is written from (records.rs): one reading of a header, two homes
+/// of the result until the impl tables replace the index.
+pub(crate) struct Filing {
+    pub(crate) key: LibKey,
+    filed: Filed,
+    /// A blanket trait impl by its header's tokens ([`written_trait`], [`Homes::blanket`]).
+    blanket: bool,
+    /// Filed by its header text's trait because the lowered header named none
+    /// ([`file_by_text`]).
+    by_text: bool,
+    /// For an unread trait impl: its trait is written with no type or const argument.
+    unread_bare: bool,
+    /// What bounds it when its self path was read to no constructor ([`PathSelf`]).
+    path_self: Option<PathSelf>,
+}
+
+/// What one [`file_rows`] call filed from rows and from text, and why each row missed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileCounts {
+    pub from_rows: u32,
+    pub from_text: u32,
+    /// By [`RowMiss`] as `usize`.
+    pub row_misses: [u32; 6],
+}
+
+/// Files every impl of `rows` (crate `krate`'s rows of its items record), handing each to
+/// `each` once: by its row ([`file_row`]); where the row does not file it, by its header's
+/// text ([`file_text`]); where that text did not read, by what its row read ([`textless`]).
+/// A function of the rows and the names: in the record's order (trait path, module, key)
+/// `file_row` resolves each run of equal (trait path, module) once, and the impls read from
+/// text are filed by key. Every impl of `rows` is handed over exactly once.
+pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], each: &mut dyn FnMut(Filing)) -> FileCounts {
+    let mut counts = FileCounts::default();
+    let mut kept = RowNames { run: None, selves: HashMap::new_in(Global) };
+    let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
+    for row in rows.iter() {
+        match file_row(names, row, &mut kept) {
+            Ok((filed, blanket, path_self)) => {
+                counts.from_rows += 1;
+                each(Filing { key: row.key, filed, blanket, by_text: false, unread_bare: false, path_self });
+            }
+            Err(miss) => {
+                counts.row_misses[miss as usize] += 1;
+                match names.impl_with_header(krate, row.key, row.module) {
+                    Some(at) => impls.push(at),
+                    // Its text did not read (the source filed why): unread, filed by what its
+                    // row read.
+                    None => each(textless(names, row, &mut kept)),
+                }
+            }
+        }
+    }
+    // By key: the order impls are filed in is a function of the records.
+    impls.sort_by_key(|at| at.key);
+    counts.from_text = impls.len() as u32;
+    for at in impls.iter() {
+        each(file_text(names, at));
+    }
+    counts
+}
+
+/// Files the impl `at` by its header as written. The kind as written decides first: an impl
+/// whose text names a trait is filed as that trait's even when its lowered header holds no
+/// trait (`Filed::Inherent`) or did not lower (`NoText`, `Unlowered`, `Generics`): it is then
+/// never a candidate of an inherent question. Only an impl whose header text does not read
+/// stays blind.
+fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) -> Filing {
+    let (written, blanket) = written_trait(names, at);
+    let (filed, path_self, by_text) = match (file(names, at.key, at.module), written) {
+        // Filed by its text's trait, its self type not read: not bounded.
+        ((Filed::Inherent(_), _), Some(t)) => (file_by_text(names, at.module, t), None, true),
+        ((Filed::Unread(why, _), _), Some(t)) if !why.is_trait_impl() => (file_by_text(names, at.module, t), None, true),
+        ((f, path_self), _) => (f, path_self, false),
+    };
+    Filing { key: at.key, filed, blanket, by_text, unread_bare: written.is_some_and(bare_text), path_self }
+}
+
+/// Files the impl of `row` whose row did not file it ([`file_row`]) and whose header text did
+/// not read: unread, by what its row read. A row whose header's tokens read says whether the
+/// impl is a trait impl (the Reference, "Implementations": `impl Trait for Type` against
+/// `impl Type`) and writes its self type's head: a trait impl whose head the row resolves to a
+/// constructor is a candidate of every trait question AT THAT SHAPE only, since a self type
+/// whose outermost constructor is `C` unifies with no type whose outermost constructor is
+/// another (an `impl Tr for Exit` answers nothing of `u8`). Only where the row read that
+/// constructor: a header whose tokens did not read, an inherent impl, and a self head the row
+/// does not name (`SelfHead::Other`, a path of no plain identifiers) stay candidates of every
+/// question, as `file` files an impl with no text.
+fn textless<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Filing {
+    let filing = |filed: Filed, unread_bare: bool| Filing { key: row.key, filed, blanket: false, by_text: false, unread_bare, path_self: None };
+    if row.header_unread || !row.has_trait {
+        return filing(Filed::Unread(Unread::NoText, None), false);
+    }
+    match row_self(names, row, kept) {
+        Ok(RowSelf::Shape(shape, _)) => filing(Filed::Unread(Unread::NoTextTrait, shape), row.bare),
+        // No question the checker asks is at a type it has none for.
+        Ok(RowSelf::NoCheckerType) => filing(Filed::NoCheckerType, false),
+        Err(_) => filing(Filed::Unread(Unread::NoTextTrait, None), row.bare),
+    }
+}
 
 /// The crates an impl must be written in to answer one question, by the coherence rules of the
 /// Reference, "Implementations"; `Any` where they do not narrow it. An impl is filed with its
@@ -893,16 +1017,40 @@ fn inherent_crates<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) 
     }
 }
 
+/// Whether a negative impl filed at `filed` (`None`: any self type) can answer a question at
+/// `asked`: as the positive buckets are filed (`put`), a blanket one always, one at a shape
+/// for that shape, an integer or float one for `{integer}` or `{float}`.
+fn negative_fits(filed: Option<Shape>, asked: Shape) -> bool {
+    match filed {
+        None => true,
+        Some(s) => s == asked || (asked == Shape::AnyInt && matches!(s, Shape::Int(_) | Shape::Uint(_))) || (asked == Shape::AnyFloat && matches!(s, Shape::Float(_))),
+    }
+}
+
 fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, Vec<V, Global>, Global>, k: K, v: V) {
     m.entry(k).or_insert_with(|| Vec::new_in(Global)).push(v);
 }
 
 /// The impls filed by their headers as written, and the answers made so far.
+///
+/// FILING IS CONSTANT TIME PER IMPL, and nothing filed is ever sorted again (lane BK,
+/// 2026-11-17). Each set an impl is looked up in by key (its crate, unread, bare, blanket,
+/// bounded, by text, inherent "any") is a hash set or map, so filing one more impl inserts one
+/// entry and a lookup is one probe. Before, these were vectors kept sorted for a binary search,
+/// and every [`Buckets::admit_asked`] that filed anything sorted ALL of them again: a body job's
+/// N questions cost N sorts of lists that grow with the job's impls, quadratic in its questions
+/// (tempo's cold `blaze check`, sample of g082400 at 08:50: `quicksort<(ItemKey, usize)>` under
+/// `admit_asked` 855 samples, `quicksort<ItemKey>` under `sort_filed` 400, of one busy worker's
+/// 2,361). What a question reads in order is made per question and sorted there, once: its
+/// candidate list ([`Buckets::trait_candidates`], [`Buckets::inherent_candidates`]) and its
+/// read list; a set's iteration order reaches nothing but such a list, so no answer depends on
+/// the order impls were filed in ([`Buckets::bucket_lookups`] and the test
+/// tests/front2_buckets_order.rs).
 pub struct Buckets {
     by_shape: HashMap<(ItemKey, Shape), Vec<LibKey, Global>, Global>,
     any: HashMap<ItemKey, Vec<LibKey, Global>, Global>,
-    /// Every unread impl, sorted ([`Buckets::is_unread`]).
-    unread: Vec<LibKey, Global>,
+    /// Every unread impl ([`Buckets::is_unread`]).
+    unread: HashSet<LibKey, Global>,
     /// Trait impls whose trait path failed, by their self type's shape where it was read
     /// (then also under `AnyInt`/`AnyFloat`), else in `unread_any`: candidates of trait
     /// questions at that shape only, never of inherent ones.
@@ -912,7 +1060,8 @@ pub struct Buckets {
     /// refused): candidates of every question.
     unread_blind: Vec<LibKey, Global>,
     inherent_by_shape: HashMap<Shape, Vec<LibKey, Global>, Global>,
-    inherent_any: Vec<LibKey, Global>,
+    /// Inherent impls whose self type's shape was not read ([`Buckets::is_unsure`]).
+    inherent_any: HashSet<LibKey, Global>,
     answers: HashMap<(ItemKey, Shape), Vec<ItemKey, Global>, Global>,
     /// Per answered trait question, the least-keyed candidate whose header failed: the
     /// question's gap. Only a question that HAS such a candidate is a gap of the body asking it,
@@ -931,30 +1080,33 @@ pub struct Buckets {
     pub failed: Vec<(LibKey, Box<str>), Global>,
     /// Why each unread impl's trait path was not filed (in filing order).
     pub unread_why: Vec<(LibKey, Unread), Global>,
-    /// The negative impls, by trait ([`Filed::Negative`]): no trait question's candidates.
-    negative: HashMap<ItemKey, Vec<LibKey, Global>, Global>,
-    /// Each impl's crate, by key (the index's order): known without reading its header.
-    krates: Vec<(LibKey, usize), Global>,
+    /// The negative impls, by trait ([`Filed::Negative`]), each with its self type's shape
+    /// (`None`: any), in filing order: no trait question's candidates.
+    negative: HashMap<ItemKey, Vec<(LibKey, Option<Shape>), Global>, Global>,
+    /// Each impl's crate, by key: known without reading its header.
+    krates: HashMap<LibKey, usize, Global>,
     /// The home each answered trait question was narrowed to ([`trait_home`]).
     homes: HashMap<(ItemKey, Shape), Homes, Global>,
-    /// The trait impls whose trait path is written with no generic arguments, sorted.
-    bare: Vec<LibKey, Global>,
+    /// The trait impls whose trait path is written with no generic arguments.
+    bare: HashSet<LibKey, Global>,
     /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]).
     incoherent: Vec<bool, Global>,
     /// The trait impls filed by their header's text ([`file_by_text`]) because the lowered
-    /// header did not name their trait, in the index's order: each is a defect of the lowering
-    /// or of the block's module to remove at its home, counted here so it is seen.
-    pub by_text: Vec<LibKey, Global>,
+    /// header did not name their trait: each is a defect of the lowering or of the block's
+    /// module to remove at its home, counted here so it is seen. A set: [`Buckets::answer`]
+    /// asks it of each candidate (it was a vector searched by halves that, over
+    /// [`Buckets::lazy`], was never sorted across crates, so a search could miss a member).
+    pub by_text: HashSet<LibKey, Global>,
     /// The blanket trait impls (`impl<T> Tr<..> for T`, by their header's tokens:
-    /// [`written_trait`]), read or unread, sorted: each is judged by [`Homes::blanket`], so an
+    /// [`written_trait`]), read or unread: each is judged by [`Homes::blanket`], so an
     /// unread one is a candidate only of questions about a trait of its own crate.
-    blanket: Vec<LibKey, Global>,
+    blanket: HashSet<LibKey, Global>,
     /// The impls whose self path was read to no constructor that the coherence rules bound
-    /// to their crate's local types ([`PathSelf`]), each with its crate, sorted by key: filed
-    /// at every shape, but a candidate only of a question whose [`Homes::local`] may be that
-    /// crate's, so a refused one is no gap of a question at a primitive, a parameter or a
-    /// type of another crate.
-    bounded: Vec<(LibKey, usize), Global>,
+    /// to their crate's local types ([`PathSelf`]), each with its crate: filed at every
+    /// shape, but a candidate only of a question whose [`Homes::local`] may be that crate's,
+    /// so a refused one is no gap of a question at a primitive, a parameter or a type of
+    /// another crate.
+    bounded: HashMap<LibKey, usize, Global>,
     /// Over [`Buckets::lazy`]: per crate, whether its impls were filed ([`Buckets::admit`]).
     /// Empty over [`Buckets::new`], which files every crate's.
     lazy_filed: Vec<bool, Global>,
@@ -981,12 +1133,12 @@ impl Buckets {
         Buckets {
             by_shape: HashMap::new_in(Global),
             any: HashMap::new_in(Global),
-            unread: Vec::new_in(Global),
+            unread: HashSet::new_in(Global),
             unread_by_shape: HashMap::new_in(Global),
             unread_any: Vec::new_in(Global),
             unread_blind: Vec::new_in(Global),
             inherent_by_shape: HashMap::new_in(Global),
-            inherent_any: Vec::new_in(Global),
+            inherent_any: HashSet::new_in(Global),
             answers: HashMap::new_in(Global),
             answer_failed: HashMap::new_in(Global),
             inherent: HashMap::new_in(Global),
@@ -996,13 +1148,13 @@ impl Buckets {
             failed: Vec::new_in(Global),
             unread_why: Vec::new_in(Global),
             negative: HashMap::new_in(Global),
-            krates: Vec::new_in(Global),
+            krates: HashMap::new_in(Global),
             homes: HashMap::new_in(Global),
-            bare: Vec::new_in(Global),
+            bare: HashSet::new_in(Global),
             incoherent: Vec::new_in(Global),
-            by_text: Vec::new_in(Global),
-            blanket: Vec::new_in(Global),
-            bounded: Vec::new_in(Global),
+            by_text: HashSet::new_in(Global),
+            blanket: HashSet::new_in(Global),
+            bounded: HashMap::new_in(Global),
             lazy_filed: Vec::new_in(Global),
             filed_from_rows: 0,
             filed_from_text: 0,
@@ -1024,12 +1176,10 @@ impl Buckets {
     pub fn new(names: &Names<'_>, index: &Index<'_>) -> Buckets {
         let mut b = Buckets::empty();
         b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
-        b.krates.sort_unstable_by_key(|k| k.0);
         // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
         // read; a mention anywhere in that text keeps the crate on the wide side.
         b.incoherent.extend(names.crates().iter().map(|c| c.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"))));
         b.file_all(names, &index.impls);
-        b.sort_filed();
         b
     }
 
@@ -1089,81 +1239,51 @@ impl Buckets {
             if !super::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
                 continue;
             }
-            // The impls whose header text is read: every impl of a source with no impl rows,
-            // else only those a row does not file.
-            let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
             let mut rows: Vec<ImplRow<'n>, Global> = Vec::new_in(Global);
             if !self.no_rows && names.each_impl_row(krate, &mut |row| rows.push(row)) {
-                // In the record's order (trait path, module, key): `file_row` resolves each run
-                // of equal (trait path, module) once. Every list a row lands in is sorted
-                // before it is read (`sort_filed`, the candidates), so the order filed in is
-                // not seen.
-                let mut kept = RowNames { run: None, selves: HashMap::new_in(Global) };
-                self.krates.extend(rows.iter().map(|row| (row.key, krate)));
-                for row in rows.iter() {
-                    match file_row(names, row, &mut kept) {
-                        Ok((filed, blanket, path_self)) => {
-                            if blanket {
-                                self.blanket.push(row.key);
-                            }
-                            self.put(row.key, filed, false);
-                            self.bound(names, row.key, krate, path_self);
-                            self.filed_from_rows += 1;
-                        }
-                        Err(miss) => {
-                            self.row_misses[miss as usize] += 1;
-                            match names.impl_with_header(krate, row.key, row.module) {
-                                Some(at) => impls.push(at),
-                                // Its text did not read (the source filed why): unread,
-                                // filed by what its row read ([`Buckets::put_textless`]).
-                                None => self.put_textless(names, row, &mut kept),
-                            }
-                        }
-                    }
-                }
+                let counts = file_rows(names, krate, &rows, &mut |f| self.take(names, krate, f));
+                self.count(counts);
             } else {
+                // Every impl of a source with no impl rows is read from its header's text.
+                let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
                 names.each_impl(krate, &mut |at| impls.push(at));
-                self.krates.extend(impls.iter().map(|at| (at.key, at.krate)));
+                // By key: the order impls are filed in is a function of the records.
+                impls.sort_by_key(|at| at.key);
+                self.filed_from_text += impls.len() as u32;
+                self.file_all(names, &impls);
             }
-            // By key: the order impls are filed in is a function of the records.
-            impls.sort_by_key(|at| at.key);
-            self.filed_from_text += impls.len() as u32;
-            self.file_all(names, &impls);
-        }
-        if filed != 0 {
-            self.krates.sort_unstable_by_key(|k| k.0);
-            self.sort_filed();
         }
         filed
     }
 
-    /// Files each impl of `impls` by its header as written (the lists [`Buckets::sort_filed`]
-    /// sorts are left unsorted).
+    /// Files each impl of `impls` by its header as written.
     fn file_all<'n, S: NamesSource<'n>>(&mut self, names: S, impls: &[super::index::ImplAt<'n>]) {
-        let b = self;
         for at in impls.iter() {
-            // The kind as written decides first: an impl whose text names a trait is filed as
-            // that trait's even when its lowered header holds no trait (`Filed::Inherent`) or
-            // did not lower (`NoText`, `Unlowered`, `Generics`): it is then never a candidate
-            // of an inherent question. Only an impl whose header text does not read stays blind.
-            let (written, blanket) = written_trait(names, at);
-            if blanket {
-                b.blanket.push(at.key);
-            }
-            let (filed, path_self) = match (file(names, at.key, at.module), written) {
-                // Filed by its text's trait, its self type not read: not bounded.
-                ((Filed::Inherent(_), _), Some(t)) => {
-                    b.by_text.push(at.key);
-                    (file_by_text(names, at.module, t), None)
-                }
-                ((Filed::Unread(why, _), _), Some(t)) if !why.is_trait_impl() => {
-                    b.by_text.push(at.key);
-                    (file_by_text(names, at.module, t), None)
-                }
-                (f, _) => f,
-            };
-            b.put(at.key, filed, written.is_some_and(bare_text));
-            b.bound(names, at.key, at.krate, path_self);
+            let f = file_text(names, at);
+            self.take(names, at.krate, f);
+        }
+    }
+
+    /// Files one impl of crate `krate` as [`file_rows`] or [`file_text`] read it: the one
+    /// place a [`Filing`] lands in this index.
+    fn take<'n, S: NamesSource<'n>>(&mut self, names: S, krate: usize, f: Filing) {
+        self.krates.insert(f.key, krate);
+        if f.blanket {
+            self.blanket.insert(f.key);
+        }
+        if f.by_text {
+            self.by_text.insert(f.key);
+        }
+        self.put(f.key, f.filed, f.unread_bare);
+        self.bound(names, f.key, krate, f.path_self);
+    }
+
+    /// Adds what one [`file_rows`] call filed to the counts.
+    fn count(&mut self, counts: FileCounts) {
+        self.filed_from_rows += counts.from_rows;
+        self.filed_from_text += counts.from_text;
+        for (total, n) in self.row_misses.iter_mut().zip(counts.row_misses) {
+            *total += n;
         }
     }
 
@@ -1178,17 +1298,17 @@ impl Buckets {
             Some(PathSelf::Trait { of, bare }) => bare && of.is_some_and(|c| c != krate),
         };
         if bounded {
-            self.bounded.push((key, krate));
+            self.bounded.insert(key, krate);
         }
     }
 
     /// Whether the impl `k` may answer a question whose self type can be local to `local`'s
     /// crates: always, unless `k` is bounded ([`Buckets::bounded`]) to a crate `local` excludes.
     fn may_be_local(&self, k: LibKey, local: Local) -> bool {
-        let Ok(at) = self.bounded.binary_search_by_key(&k, |b| b.0) else { return true };
+        let Some(&krate) = self.bounded.get(&k) else { return true };
         match local {
             Local::Any => true,
-            Local::In(c) => c == self.bounded[at].1,
+            Local::In(c) => c == krate,
             Local::Nowhere => false,
         }
     }
@@ -1200,7 +1320,7 @@ impl Buckets {
     fn put(&mut self, key: LibKey, filed: Filed, unread_bare: bool) {
         let b = self;
         if let Filed::Trait(_, _, true) = filed {
-            b.bare.push(key);
+            b.bare.insert(key);
         }
         match filed {
             Filed::Trait(tr, Some(s), _) => {
@@ -1213,17 +1333,19 @@ impl Buckets {
             }
             Filed::Trait(tr, None, _) => push(&mut b.any, tr, key),
             Filed::Inherent(Some(s)) => push(&mut b.inherent_by_shape, s, key),
-            Filed::Inherent(None) => b.inherent_any.push(key),
+            Filed::Inherent(None) => {
+                b.inherent_any.insert(key);
+            }
             Filed::NoCheckerType => b.no_checker_type += 1,
-            Filed::Negative(tr) => push(&mut b.negative, tr, key),
+            Filed::Negative(tr, shape) => push(&mut b.negative, tr, (key, shape)),
             Filed::Unread(why, shape) => {
-                b.unread.push(key);
+                b.unread.insert(key);
                 // An unread trait impl written with no type or const argument on its trait
                 // is judged by `Homes::bare` as a read one is: if it is of the asked trait
                 // at all, that trait's parameters are at their defaults, so where those
                 // are `Self` only its self type can be its crate's local type.
                 if why.is_trait_impl() && unread_bare {
-                    b.bare.push(key);
+                    b.bare.insert(key);
                 }
                 match (why.is_trait_impl(), shape) {
                     (false, _) => b.unread_blind.push(key),
@@ -1239,45 +1361,6 @@ impl Buckets {
                 }
                 b.unread_why.push((key, why));
             }
-        }
-    }
-
-    /// Files the impl of `row` whose row did not file it ([`file_row`]) and whose header text
-    /// did not read: unread, by what its row read. A row whose header's tokens read says
-    /// whether the impl is a trait impl (the Reference, "Implementations": `impl Trait for
-    /// Type` against `impl Type`) and writes its self type's head: a trait impl whose head the
-    /// row resolves to a constructor is a candidate of every trait question AT THAT SHAPE
-    /// only, since a self type whose outermost constructor is `C` unifies with no type whose
-    /// outermost constructor is another (an `impl Tr for Exit` answers nothing of `u8`). Only
-    /// where the row read that constructor: a header whose tokens did not read, an inherent
-    /// impl, and a self head the row does not name (`SelfHead::Other`, a path of no plain
-    /// identifiers) stay candidates of every question, as `file` files an impl with no text.
-    fn put_textless<'n, S: NamesSource<'n>>(&mut self, names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) {
-        if row.header_unread || !row.has_trait {
-            return self.put(row.key, Filed::Unread(Unread::NoText, None), false);
-        }
-        match row_self(names, row, kept) {
-            Ok(RowSelf::Shape(shape, _)) => self.put(row.key, Filed::Unread(Unread::NoTextTrait, shape), row.bare),
-            // No question the checker asks is at a type it has none for.
-            Ok(RowSelf::NoCheckerType) => self.put(row.key, Filed::NoCheckerType, false),
-            Err(_) => self.put(row.key, Filed::Unread(Unread::NoTextTrait, None), row.bare),
-        }
-    }
-
-    /// Sorts the lists that are searched or read in key order, after impls were filed.
-    fn sort_filed(&mut self) {
-        let b = self;
-        b.unread.sort_unstable();
-        b.bare.sort_unstable();
-        b.blanket.sort_unstable();
-        // Searched by key ([`Buckets::is_unsure`]); over `Buckets::lazy` crates are filed in
-        // the order questions admit them, and a crate's rows before the impls read from text.
-        b.inherent_any.sort_unstable();
-        // Searched by key ([`Buckets::may_be_local`]).
-        b.bounded.sort_unstable();
-        b.bounded.dedup();
-        for v in b.negative.values_mut() {
-            v.sort_unstable();
         }
     }
 
@@ -1304,9 +1387,9 @@ impl Buckets {
             return;
         }
         out.retain(|k| {
-            let h = if self.blanket.binary_search(k).is_ok() {
+            let h = if self.blanket.contains(k) {
                 home.blanket
-            } else if self.bare.binary_search(k).is_ok() {
+            } else if self.bare.contains(k) {
                 home.bare
             } else {
                 home.all
@@ -1327,8 +1410,7 @@ impl Buckets {
 
     /// The crate impl `k` is written in.
     pub fn krate(&self, k: LibKey) -> Option<usize> {
-        let at = self.krates.binary_search_by_key(&k, |e| e.0).ok()?;
-        Some(self.krates[at].1)
+        self.krates.get(&k).copied()
     }
 
     /// The home the answered trait question was narrowed to.
@@ -1336,16 +1418,33 @@ impl Buckets {
         self.homes.get(&(trait_, shape)).copied().unwrap_or(Homes::ANY)
     }
 
-    /// The negative impls of `trait_` (any self type), sorted by key.
-    pub fn negative_of(&self, trait_: ItemKey) -> &[LibKey] {
-        self.negative.get(&trait_).map_or(&[], |v| v.as_slice())
+    /// The negative impls of `trait_` (any self type) written where `home` admits (the orphan
+    /// rules bound a negative impl as they bound a positive one), sorted by key. Narrowed by
+    /// the home like the candidates: before, every negative impl of the trait filed so far was
+    /// one, so a question about `Bee` asked after one about `A` held `a`'s `impl !Tr for
+    /// NotTr` (its crate filed by the first question) and asked first did not: its candidates,
+    /// the headers lowered for it and so its gap depended on what the job asked before it
+    /// (rule 21; tests/front2_buckets_order.rs found it).
+    ///
+    /// And narrowed by the shape, as the positive candidates are: only a negative impl whose
+    /// self type can be `shape` (a blanket one, or one filed at `shape`; every integer width
+    /// for `{integer}`). Over the impl tables a question reads only its shape's buckets, so
+    /// the trait's other negatives are filed only by other questions; read whole, the answer
+    /// depended on what was asked before (rule 21; tests/front2_buckets_order.rs found it).
+    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+        let mut out = Vec::new_in(Global);
+        let filed = self.negative.get(&trait_).map_or(&[][..], |v| v.as_slice());
+        out.extend(filed.iter().filter(|(_, at)| negative_fits(*at, shape)).map(|(k, _)| *k));
+        self.keep_home(&mut out, home);
+        out.sort_unstable();
+        out
     }
 
     /// The candidates for an inherent fn of `shape`, each once.
     pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
         let mut out = Vec::new_in(Global);
         out.extend_from_slice(self.inherent_by_shape.get(&shape).map_or(&[], |v| v.as_slice()));
-        out.extend_from_slice(&self.inherent_any);
+        out.extend(self.inherent_any.iter().copied());
         // A trait impl (its trait written in its header's text, though unread, refused or
         // lost by the lowering: `written_trait`) is never an inherent candidate; `unread_blind`
         // holds only impls whose header text does not read as an impl at all.
@@ -1358,15 +1457,14 @@ impl Buckets {
 
     /// Whether `k` was filed as unread (its trait path names nothing as written).
     pub fn is_unread(&self, k: LibKey) -> bool {
-        self.unread.binary_search(&k).is_ok()
+        self.unread.contains(&k)
     }
 
     /// Whether `k` is a candidate of questions it may not answer: unread, or an inherent impl
     /// whose self type's shape was not read as written (an alias, a qualified path). Such a
     /// candidate's failed header is a listed gap of the body, not the end of its check.
-    /// Both lists are in the index's order (by key).
     pub fn is_unsure(&self, k: LibKey) -> bool {
-        self.is_unread(k) || self.inherent_any.binary_search(&k).is_ok()
+        self.is_unread(k) || self.inherent_any.contains(&k)
     }
 
     /// Records an unread candidate whose header failed.
@@ -1395,7 +1493,7 @@ impl Buckets {
         // The negative impls are candidates too: the solver reads their polarity (a negative
         // impl decides an auto trait's structural rule and never meets a positive goal).
         let mut candidates = self.trait_candidates(trait_, shape, home);
-        candidates.extend_from_slice(self.negative_of(trait_));
+        candidates.extend_from_slice(&self.negative_of(trait_, shape, home));
         candidates.sort_unstable();
         candidates.dedup();
         for k in candidates {
@@ -1406,7 +1504,7 @@ impl Buckets {
             let h = store.impls.get(&checker_of(k)).ok_or(Unfilled::Impl(k))?;
             // A header built WITHOUT the trait its text names answers nothing: it is the
             // question's gap, never an impl left out of the answer unseen.
-            if h.trait_.is_none() && self.by_text.binary_search(&k).is_ok() {
+            if h.trait_.is_none() && self.by_text.contains(&k) {
                 self.fail(k, Box::from("its header's text names a trait; the header as lowered holds none"));
                 first_failed = first_failed.or(Some(k));
                 continue;

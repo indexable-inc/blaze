@@ -1666,6 +1666,10 @@ fn main() {
             }
         }
         let records = blaze_world::ScriptRecords::new(given, g()).unwrap_or_else(|e| panic!("{e}"));
+        // A native script's stored files, beside the records in `<dir>/files/<sha256 hex>`.
+        let files = PathBuf::from(&dir).join("files");
+        let area: &'static blaze_world::StoredFiles = Box::leak(Box::new(blaze_world::StoredFiles::new(files.is_dir().then_some(files), records.stored_digests())));
+        let records = records.with_area(area);
         println!("scripts       {} units given their build script's outputs from {dir}", records.len());
         &*Box::leak(Box::new(records))
     });

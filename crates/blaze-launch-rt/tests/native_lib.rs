@@ -67,6 +67,12 @@ impl Memory for FakeMemory {
     fn carry(&mut self, _step: Step, _placing: &Placing<'_>) -> Result<(), RunModeError> {
         Err(RunModeError::NotBuilt { what: "these tests place no code" })
     }
+    fn static_word(&self, index: u32) -> u64 {
+        0x5800_0000 + 8 * u64::from(index)
+    }
+    fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
+        Err(RunModeError::NotBuilt { what: "these tests place no static" })
+    }
 }
 
 /// `dlopen`/`dlsym` as a table: one image at [`BASE`] with `descriptor` and `rows`; every

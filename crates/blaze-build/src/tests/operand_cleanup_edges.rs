@@ -47,6 +47,8 @@ struct Landing {
     pad: Block,
     /// The slots the landing block's drops take, in the order it calls them.
     drops: Vec<u32, Global>,
+    /// Row for row with `drops`: each drop's slot, offset and type.
+    parts: Vec<PartDrop, Global>,
 }
 
 /// The built function as its edges show it.
@@ -77,6 +79,13 @@ impl Edges {
 
 /// Checks `body` as `main` in `w` and builds it.
 fn build_main(w: &TestWorld, b: &BodyBuf, root: ExprId) -> Result<Built<Global>, BuildError> {
+    let mut ground = PortableTys::new_in(Alloc::global());
+    build_main_in(w, b, root, &mut ground)
+}
+
+/// [`build_main`] over the ground table `ground`, kept so a test can name a drop's type: the
+/// argument list of `drop_in_place::<T>` for a `T` interned again is the one the build made.
+fn build_main_in(w: &TestWorld, b: &BodyBuf, root: ExprId, ground: &mut PortableTys<'static>) -> Result<Built<Global>, BuildError> {
     let view = b.view(MAIN, root);
     let mut cx = InferCtx::new_in(Alloc::global());
     let checked = match blaze_typeck::check(&view, w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
@@ -85,9 +94,14 @@ fn build_main(w: &TestWorld, b: &BodyBuf, root: ExprId) -> Result<Built<Global>,
     };
     assert!(checked.diags.is_empty(), "diagnostics: {:?}", checked.diags);
     let sig = w.sig(MAIN).expect("a signature");
-    let mut ground = PortableTys::new_in(Alloc::global());
-    let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+    let mut subst = Subst { args: &[], ground, scratch: Alloc::global() };
     crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world: w, body: b }, Global)
+}
+
+/// The argument list of `drop_in_place::<t>` in `ground`.
+fn glue_args(ground: &mut PortableTys<'static>, t: PNode) -> List {
+    let ty = ground.intern(t).expect("a type interns");
+    ground.intern_list(&[ty]).expect("a list interns")
 }
 
 /// [`build_main`], which must build and verify.
@@ -97,18 +111,48 @@ fn built(w: &TestWorld, b: &BodyBuf, root: ExprId) -> Built<Global> {
     built
 }
 
-/// The item a function reference `r` names, through `Built::refs`.
-fn callee(built: &Built<Global>, view: &View<'_>, r: RefId, text: &str) -> ItemKey {
+/// The instance a function reference `r` names, through `Built::refs`.
+fn instance(built: &Built<Global>, view: &View<'_>, r: RefId, text: &str) -> Instance {
     let rec = view.reference(r);
     assert!(matches!(RefKind::from_word(rec.kind), Some(RefKind::Func)), "{r} is not a function reference:\n{text}");
-    built.refs.get(rec.place as usize).unwrap_or_else(|| panic!("{r} names place {} past `Built::refs`:\n{text}", rec.place)).item
+    *built.refs.get(rec.place as usize).unwrap_or_else(|| panic!("{r} names place {} past `Built::refs`:\n{text}", rec.place))
 }
 
-/// The slot whose address `v` is: a drop's pointer must be a `slot_addr`.
+/// The item a function reference `r` names, through `Built::refs`.
+fn callee(built: &Built<Global>, view: &View<'_>, r: RefId, text: &str) -> ItemKey {
+    instance(built, view, r, text).item
+}
+
+/// The slot whose address `v` is: a drop's pointer must be a `slot_addr`, or a `ptr_add` of
+/// one and a constant (a part of an aggregate: [`place_of`]).
 fn slot_of(view: &View<'_>, v: Value, text: &str) -> u32 {
+    place_of(view, v, text).0
+}
+
+/// The slot and byte offset whose address `v` is: a `slot_addr`, or a `ptr_add` of one and an
+/// `iconst`.
+fn place_of(view: &View<'_>, v: Value, text: &str) -> (u32, u32) {
     let at = v.index();
-    assert_eq!(view.op(at), Op::SlotAddr, "the drop's pointer {v} is not a slot's address:\n{text}");
-    view.operands(at).slot().0
+    match view.op(at) {
+        Op::SlotAddr => (view.operands(at).slot().0, 0),
+        Op::PtrAdd => {
+            let mut o = view.operands(at);
+            let (base, by) = (o.value(), o.value());
+            assert_eq!(view.op(base.index()), Op::SlotAddr, "the drop's pointer {v} adds to {base}, not a slot's address:\n{text}");
+            assert_eq!(view.op(by.index()), Op::Iconst, "the drop's pointer {v} adds {by}, not a constant:\n{text}");
+            (view.operands(base.index()).slot().0, view.operands(by.index()).imm())
+        }
+        other => panic!("the drop's pointer {v} is a {other:?}, not a slot's address or a part of one:\n{text}"),
+    }
+}
+
+/// One drop a landing block calls: the slot and offset dropped, and the glue's argument list
+/// (its type, compared with [`glue_args`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PartDrop {
+    slot: u32,
+    off: u32,
+    ty: List,
 }
 
 /// Reads every call and invoke of `built`, then each invoke's landing block: it must be a
@@ -138,7 +182,7 @@ fn edges(built: &Built<Global>) -> Edges {
                     } else {
                         callees.push(item);
                     }
-                    landings.push(Landing { callee: item, pad, drops: Vec::new_in(Global) });
+                    landings.push(Landing { callee: item, pad, drops: Vec::new_in(Global), parts: Vec::new_in(Global) });
                 }
                 Op::Call => {
                     let mut o = view.operands(at);
@@ -172,11 +216,13 @@ fn edges(built: &Built<Global>) -> Edges {
         for at in range {
             if view.op(at) == Op::Call {
                 let mut o = view.operands(at);
-                let item = callee(built, &view, o.reference(), &text);
+                let Instance { item, args } = instance(built, &view, o.reference(), &text);
                 let _sig = o.sig();
                 assert_eq!(item, DROP_IN_PLACE, "cleanup {} calls {item:?}, not drop glue:\n{text}", l.pad);
                 let p = o.values().get(0);
-                l.drops.push(slot_of(&view, p, &text));
+                let (slot, off) = place_of(&view, p, &text);
+                l.drops.push(slot);
+                l.parts.push(PartDrop { slot, off, ty: args });
             }
         }
     }
@@ -327,45 +373,224 @@ fn operand_cleanup_a_waiting_borrow_is_not_dropped() {
     println!("operand_cleanup: a waiting borrow joins no cleanup");
 }
 
-/// `fn main() { let h = H { g: G { x: 1 }, n: f() }; }`, `struct H { g: G, n: i32 }`. While
-/// `f()` runs, `h`'s place holds `g` but not yet `n`: dropping the whole `H` would read `n`'s
-/// uninitialized bytes, dropping nothing would skip `g`'s destructor (the Reference,
-/// "Destructors": a struct drops its fields), so under `Unwind` the walk cannot make an exact
-/// cleanup and refuses by name (walk/val_stack.rs: `BuildError::NoCleanup`, "an aggregate
-/// literal being built whose fields need drop"). Under `Abort` nothing unwinds and it builds.
-/// A walk that builds a cleanup for the half-built literal, or refuses some other way, fails.
-/// Prints "operand_cleanup: the half-built literal is refused by name under unwind, built under
-/// abort".
+// Aggregate literals being built (walk/val_stack.rs, `Owns::Parts`). The Reference,
+// "Destructors" (temporaries): an aggregate's operands are temporaries until it is made, and
+// when a later operand panics the earlier ones are dropped in reverse order (the tuple example
+// above). A literal whose place is half written owns exactly the parts stored so far: dropping
+// the whole would read the unwritten parts' bytes (and run the type's own `Drop`, which is only
+// for a value that was made), dropping nothing would skip the stored parts' destructors. bstd's
+// `checked` (`Run { table, limits, heap, later: UnsafeCell::new(..), made: Cell::new(false) }`)
+// is this shape; before the fix every such literal was refused with "an operand evaluated before
+// this call waits on the value stack and the walk could not ground what of it is owned (an
+// aggregate literal being built whose fields need drop, ..)".
+
+/// `struct K { x: i32 }`, with a `Drop` impl of its own (keyed `H_DROP`) beside `G`'s.
+const K_KEY: u128 = 11;
+/// `struct S { g: G, k: K, n: i32 }`.
+const S_KEY: u128 = 12;
+/// `enum E3 { V(G, K, i32) }`; its variant `V` (key 121) is its ctor fn.
+const E3_KEY: u128 = 120;
+
+/// The literal tests' world under `panic`: `main: fn()`, `G`, `K`, `S`, `E3` and
+/// `f: fn() -> i32`; gives `G` and `K`.
+fn literal_world(panic: crate::Panic) -> (TestWorld, PNode, PNode) {
+    let mut w = TestWorld::new();
+    w.panic = panic;
+    w.func(1, "main", &[], UNIT);
+    let g = g_world(&mut w);
+    w.strukt(K_KEY, "K", &[("x", I32)]);
+    w.drops.push((ItemKey(K_KEY), H_DROP));
+    let k = PNode::Adt(ItemKey(K_KEY), List::EMPTY);
+    w.strukt(S_KEY, "S", &[("g", g), ("k", k), ("n", I32)]);
+    w.enum_(E3_KEY, &[("V", CtorKind::Tuple, &[("0", g), ("1", k), ("2", I32)])]);
+    w.func(33, "f", &[], I32);
+    (w, g, k)
+}
+
+/// `K { x: v }`.
+fn k_lit(b: &mut BodyBuf, v: u128) -> ExprId {
+    let x = b.int(v, None);
+    struct_lit(b, "K", &[("x", x)], None)
+}
+
+/// `name { fields.. }`, with `..base` when given.
+fn struct_lit(b: &mut BodyBuf, name: &str, fields: &[(&str, ExprId)], base: Option<ExprId>) -> ExprId {
+    let path = b.path(name);
+    let start = b.field_inits.len() as u32;
+    for &(n, expr) in fields {
+        b.field_inits.push(FieldInit { name: Name::of(n), expr });
+    }
+    let base = match base {
+        Some(x) => blaze_typeck::StructBase::Expr(x),
+        None => blaze_typeck::StructBase::None,
+    };
+    b.e(Expr::Struct { path, fields: List { start, len: fields.len() as u32 }, base })
+}
+
+/// `main` from `root` in `w`, built and verified, with the ground table it built over.
+fn built_from(w: &TestWorld, b: &BodyBuf, root: ExprId) -> Result<(Built<Global>, PortableTys<'static>), BuildError> {
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let built = build_main_in(w, b, root, &mut ground)?;
+    blaze_lir::verify(built.func.view()).unwrap_or_else(|e| panic!("does not verify: {e}"));
+    Ok((built, ground))
+}
+
+/// The drops `p` as `[slot+offset, ..]`, for the printed line.
+fn places(p: &[PartDrop]) -> String {
+    let mut s = String::from("[");
+    for (i, d) in p.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&format!("s{}+{}", d.slot, d.off));
+    }
+    s.push(']');
+    s
+}
+
+/// The literal forms that build their place part by part.
+#[derive(Clone, Copy, Debug)]
+enum LitForm {
+    /// `S { g: G{1}, k: K{2}, n: f() }`
+    Struct,
+    /// `(G{1}, K{2}, f())`
+    Tuple,
+    /// `V(G{1}, K{2}, f())` (an enum variant's ctor: walk.rs `construct`)
+    Ctor,
+}
+
+/// `fn main() { let x = <form>; }` built under `panic`, with its ground table.
+fn half_built(form: LitForm, panic: crate::Panic) -> Result<(Built<Global>, PortableTys<'static>, PNode, PNode), BuildError> {
+    let (w, g, k) = literal_world(panic);
+    let mut b = BodyBuf::new();
+    let x = b.bind("x");
+    let gl = g_lit(&mut b, 1);
+    let kl = k_lit(&mut b, 2);
+    let fc = b.call("f", &[]);
+    let lit = match form {
+        LitForm::Struct => struct_lit(&mut b, "S", &[("g", gl), ("k", kl), ("n", fc)], None),
+        LitForm::Tuple => b.tuple(&[gl, kl, fc]),
+        LitForm::Ctor => b.call("V", &[gl, kl, fc]),
+    };
+    let stmts = [Stmt::Let { pat: x, ty: None, init: Some(lit), else_: None }];
+    let root = b.block(&stmts, None);
+    let (built, ground) = built_from(&w, &b, root)?;
+    Ok((built, ground, g, k))
+}
+
+/// `let x = S { g: G{1}, k: K{2}, n: f() };`, and its tuple and enum-ctor forms, under
+/// `Unwind`. While `f()` runs, `x`'s place holds `g` and `k` but not `n`: `f()` MUST be an
+/// invoke whose cleanup drops exactly the two stored parts, `K` (stored last) first, then `G`,
+/// each at its own offset in the one literal's place, and nothing else (never the whole `S`,
+/// whose `n` is unwritten). The normal path drops `x` once. Under `Abort` each builds with no
+/// unwind edge. A walk that refuses (the state before the fix), drops the whole literal, drops
+/// the parts first-stored first, or misses one fails. Prints "operand_cleanup: a half-built
+/// literal drops its stored parts, last first: Struct [..] Tuple [..] Ctor [..]".
 #[test]
-fn operand_cleanup_a_half_built_literal_is_refused_by_name() {
-    let half_built = |panic: crate::Panic| {
-        let mut w = TestWorld::new();
-        w.panic = panic;
-        w.func(1, "main", &[], UNIT);
-        let g = g_world(&mut w);
-        w.strukt(10, "H", &[("g", g), ("n", I32)]);
-        w.func(33, "f", &[], I32);
-        let mut b = BodyBuf::new();
-        let h = b.bind("h");
-        let gl = g_lit(&mut b, 1);
-        let fc = b.call("f", &[]);
-        let path = b.path("H");
-        let start = b.field_inits.len() as u32;
-        b.field_inits.push(FieldInit { name: Name::of("g"), expr: gl });
-        b.field_inits.push(FieldInit { name: Name::of("n"), expr: fc });
-        let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
-        let stmts = [Stmt::Let { pat: h, ty: None, init: Some(lit), else_: None }];
-        let root = b.block(&stmts, None);
-        build_main(&w, &b, root)
-    };
-    let what = match half_built(crate::Panic::Unwind) {
-        Ok(built) => panic!("built a cleanup for a half-built `H`:\n{}", blaze_lir::print(built.func.view())),
-        Err(BuildError::NoCleanup { what }) => what,
-        Err(other) => panic!("refused, but not as `NoCleanup`: {other}"),
-    };
-    assert!(what.contains("aggregate literal being built"), "the refusal does not name the half-built literal: {what}");
-    let abort = half_built(crate::Panic::Abort).unwrap_or_else(|e| panic!("under abort the build failed: {e}"));
-    blaze_lir::verify(abort.func.view()).unwrap_or_else(|e| panic!("does not verify: {e}"));
-    assert!(!lands(&abort), "no unwind edge under abort:\n{}", blaze_lir::print(abort.func.view()));
-    println!("operand_cleanup: the half-built literal is refused by name under unwind, built under abort");
+fn operand_cleanup_a_half_built_literal_drops_its_stored_parts_last_first() {
+    let mut seen = String::new();
+    for form in [LitForm::Struct, LitForm::Tuple, LitForm::Ctor] {
+        let (built, mut ground, g, k) = half_built(form, crate::Panic::Unwind).unwrap_or_else(|e| panic!("{form:?}: the build failed: {e}"));
+        let (gt, kt) = (glue_args(&mut ground, g), glue_args(&mut ground, k));
+        let e = edges(&built);
+        let text = &e.text;
+        assert_eq!(e.calls(F), 1, "{form:?}: one call of f:\n{text}");
+        let f = e.of(F);
+        assert_eq!(f.len(), 1, "{form:?}: f() lands: G and K are stored in the literal while it runs:\n{text}");
+        let p = &f[0].parts;
+        assert_eq!(p.len(), 2, "{form:?}: f's cleanup drops the two stored parts and nothing else: {p:?}\n{text}");
+        assert_eq!((p[0].ty, p[1].ty), (kt, gt), "{form:?}: K (stored last) drops first, then G: {p:?}\n{text}");
+        assert_eq!(p[0].slot, p[1].slot, "{form:?}: both parts are of the one literal's place: {p:?}\n{text}");
+        assert_ne!(p[0].off, p[1].off, "{form:?}: each part at its own offset: {p:?}\n{text}");
+        assert_eq!(e.normal_drops.len(), 1, "{form:?}: the normal path drops `x` once: {:?}\n{text}", e.normal_drops);
+        let (abort, _, _, _) = half_built(form, crate::Panic::Abort).unwrap_or_else(|e| panic!("{form:?}: under abort the build failed: {e}"));
+        assert!(!lands(&abort), "{form:?}: no unwind edge under abort:\n{}", blaze_lir::print(abort.func.view()));
+        seen.push_str(&format!(" {form:?} {}", places(p)));
+    }
+    println!("operand_cleanup: a half-built literal drops its stored parts, last first:{seen}");
+}
+
+/// `fn main() { let a = G{8}; let t = (G{1}, (K{2}, f()), f()); }` under `Unwind`: literals
+/// nest, and a finished one is one value. At the first `f()` two literals wait: the outer with
+/// `G{1}` stored, the inner (its own place) with `K{2}`; its cleanup drops the inner's `K`, then
+/// the outer's `G`, then the local `a` (the operands' scope is inside the block's). At the
+/// second `f()` the inner tuple is made and stored into the outer: the cleanup drops it as one
+/// `(K, i32)` (its own type: neither `G` nor `K`) at the outer's place, then the outer's `G`
+/// (at the same place and offset as before), then `a`. A walk that keeps the inner literal's
+/// parts after it is made (dropping its `K` twice), loses the outer's `G` under the inner, or
+/// drops the outer whole fails. Prints "operand_cleanup: nested literals: first f() drops [..],
+/// second f() drops [..]".
+#[test]
+fn operand_cleanup_nested_literals_drop_each_part_once_inner_first() {
+    let (w, g, k) = literal_world(crate::Panic::Unwind);
+    let mut b = BodyBuf::new();
+    let a = b.bind("a");
+    let g8 = g_lit(&mut b, 8);
+    let t = b.bind("t");
+    let g1 = g_lit(&mut b, 1);
+    let k2 = k_lit(&mut b, 2);
+    let f1 = b.call("f", &[]);
+    let inner = b.tuple(&[k2, f1]);
+    let f2 = b.call("f", &[]);
+    let outer = b.tuple(&[g1, inner, f2]);
+    let stmts = [Stmt::Let { pat: a, ty: None, init: Some(g8), else_: None }, Stmt::Let { pat: t, ty: None, init: Some(outer), else_: None }];
+    let root = b.block(&stmts, None);
+    let (built, mut ground) = built_from(&w, &b, root).unwrap_or_else(|e| panic!("the build failed: {e}"));
+    let (gt, kt) = (glue_args(&mut ground, g), glue_args(&mut ground, k));
+    let e = edges(&built);
+    let text = &e.text;
+    assert_eq!(e.calls(F), 2, "two calls of f:\n{text}");
+    assert_eq!(e.normal_drops.len(), 2, "the normal path drops `t` then `a`, once each: {:?}\n{text}", e.normal_drops);
+    let sa = e.normal_drops[1];
+    let f = e.of(F);
+    assert_eq!(f.len(), 2, "both f() calls land:\n{text}");
+    let (p1, p2) = (&f[0].parts, &f[1].parts);
+    assert_eq!(p1.len(), 3, "the first f()'s cleanup drops the inner K, the outer G and `a`: {p1:?}\n{text}");
+    assert_eq!((p1[0].ty, p1[1].ty, p1[2].ty), (kt, gt, gt), "the first f(): K, then G, then `a`: {p1:?}\n{text}");
+    assert_ne!(p1[0].slot, p1[1].slot, "the inner literal has a place of its own: {p1:?}\n{text}");
+    assert_eq!(p1[2].slot, sa, "the first f()'s cleanup drops `a` last: {p1:?}\n{text}");
+    assert_eq!(p2.len(), 3, "the second f()'s cleanup drops the made inner tuple, the G and `a`: {p2:?}\n{text}");
+    assert!(p2[0].ty != gt && p2[0].ty != kt, "the made inner tuple drops as one `(K, i32)`, not a part of it: {p2:?}\n{text}");
+    assert_eq!(p2[0].slot, p2[1].slot, "the inner tuple is stored in the outer's place: {p2:?}\n{text}");
+    assert_eq!((p2[1].ty, p2[1].slot, p2[1].off), (gt, p1[1].slot, p1[1].off), "the outer's G, as at the first f(): {p2:?}\n{text}");
+    assert_eq!(p2[2].slot, sa, "the second f()'s cleanup drops `a` last: {p2:?}\n{text}");
+    println!("operand_cleanup: nested literals: first f() drops {}, second f() drops {}", places(p1), places(p2));
+}
+
+/// `fn main() { let s0 = S { g: G{7}, k: K{8}, n: 0 }; let s = S { g: G{1}, k: K{2}, n: f(), ..s0 }; }`
+/// under `Unwind` (walk/moves/struct_update.rs; every field written, so the base gives none and
+/// `s0` keeps no field flags, and its drop is one straight call). While `f()` runs the new
+/// value holds `g` and `k`, and `s0` is whole: the cleanup drops the new value's `K`, then its
+/// `G`, then `s0` as one `S`. A walk that refuses, drops the new value whole or leaves a part
+/// fails. Prints "operand_cleanup: struct update: f() drops [..]".
+#[test]
+fn operand_cleanup_a_half_built_struct_update_drops_its_written_parts() {
+    let (w, g, k) = literal_world(crate::Panic::Unwind);
+    let mut b = BodyBuf::new();
+    let s0 = b.bind("s0");
+    let g7 = g_lit(&mut b, 7);
+    let k8 = k_lit(&mut b, 8);
+    let zero = b.int(0, None);
+    let s0_init = struct_lit(&mut b, "S", &[("g", g7), ("k", k8), ("n", zero)], None);
+    let s = b.bind("s");
+    let g1 = g_lit(&mut b, 1);
+    let k2 = k_lit(&mut b, 2);
+    let fc = b.call("f", &[]);
+    let base = b.local(s0);
+    let update = struct_lit(&mut b, "S", &[("g", g1), ("k", k2), ("n", fc)], Some(base));
+    let stmts = [Stmt::Let { pat: s0, ty: None, init: Some(s0_init), else_: None }, Stmt::Let { pat: s, ty: None, init: Some(update), else_: None }];
+    let root = b.block(&stmts, None);
+    let (built, mut ground) = built_from(&w, &b, root).unwrap_or_else(|e| panic!("the build failed: {e}"));
+    let (gt, kt) = (glue_args(&mut ground, g), glue_args(&mut ground, k));
+    let st = glue_args(&mut ground, PNode::Adt(ItemKey(S_KEY), List::EMPTY));
+    let e = edges(&built);
+    let text = &e.text;
+    let f = e.of(F);
+    assert_eq!(f.len(), 1, "f() lands: the new value's parts and `s0` are live while it runs:\n{text}");
+    let p = &f[0].parts;
+    assert_eq!(p.len(), 3, "f's cleanup drops the written K and G, and `s0`: {p:?}\n{text}");
+    assert_eq!((p[0].ty, p[1].ty, p[2].ty), (kt, gt, st), "the new value's K, its G, then `s0` whole: {p:?}\n{text}");
+    assert_eq!(p[0].slot, p[1].slot, "both parts of the new value's place: {p:?}\n{text}");
+    assert_ne!(p[1].slot, p[2].slot, "the new value has a place of its own: {p:?}\n{text}");
+    println!("operand_cleanup: struct update: f() drops {}", places(p));
 }

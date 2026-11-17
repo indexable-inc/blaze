@@ -1,0 +1,34 @@
+//! The execution engine (docs/v2/plan/design/engine.md, decision D131) as a sans-IO core: phases
+//! over shared tables in place of a machine stepped per task event.
+//!
+//! | module | what |
+//! |---|---|
+//! | [`engine`] | the plan, phases, the bulk merge, an edit's dirtying by cell, the answer |
+//!
+//! A request is: [`Engine::new_in`] with the last [`Answer`] and the [`Edit`] (every planned task
+//! of each changed file, made from its text before anything runs); then, phase by phase,
+//! [`Engine::next_phase`] names the tasks to enter, a [`Pool`] runs them into per-worker
+//! [`Buffer`]s, and [`Engine::merge`] takes the buffers in bulk, sorted by name (rule 25);
+//! [`Engine::finish`] gives the new answer. [`drive`] is that loop.
+//!
+//! Nothing here touches the system, keeps a clock or picks an allocator (rule 75).
+
+#![no_std]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
+
+pub mod engine;
+
+#[cfg(test)]
+mod sim;
+
+pub use crate::engine::{
+    Answer, Buffer, CellId, Done, Edit, Engine, EngineError, Everything, Finished, Gen, Made, Phase, Plant, Planned, Pool,
+    Report, Row, SMap, SSet, SVec, Scope, Stage, Task, View, drive,
+};

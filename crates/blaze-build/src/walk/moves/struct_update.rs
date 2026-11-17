@@ -75,7 +75,6 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
                 let (first, len, tag) = self.variant_rows(l, variant)?;
                 let at = self.temp(repr);
                 self.write_tag(tag, variant, at);
-                let mut written_drop = false;
                 self.work.push(Task::StructBase(e));
                 self.work.push(Task::Place(base));
                 for init in inits.iter().rev() {
@@ -83,13 +82,12 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
                         .find(|&i| self.layout_fields[i as usize].0 == init.name)
                         .ok_or(malformed("a struct update naming a field its struct lacks"))?;
                     let (_, off, frepr) = self.layout_fields[row as usize];
-                    written_drop |= self.repr_needs_drop(frepr);
                     self.work.push(Task::InitAt { off, repr: frepr });
                     self.work.push(Task::Eval(init.expr));
                 }
-                // Partly built while its written fields and its base run: refused by a call that
-                // may unwind when a written field may need drop (walk/val_stack.rs).
-                self.push_val(V::Place(at.0, at.1), Self::literal_place(written_drop));
+                // Partly built while its written fields and its base run, owned field by field
+                // (walk/val_stack.rs); one value once `StructBase` has taken the rest.
+                self.push_literal(at);
             }
             _ => return Err(unsupported(e, "a struct update of other than a struct")),
         }
@@ -142,11 +140,8 @@ impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
             let v = self.load(srepr, (src.0, src.1 + soff as i32));
             self.store(v, drepr, (p, at + doff as i32))?;
         }
-        // Whole now: a call that may unwind while it waits treats it as a literal does.
-        let whole = Self::literal_place(self.fields_need_drop(first, len));
-        let v = self.pop_val();
-        self.push_val(v, whole);
-        Ok(())
+        // Whole now: owned as one value (walk/val_stack.rs).
+        self.literal_built(l)
     }
 
     /// Field `row` of base `base` (of layout `bl`, its place `src`), which needs drop, moves

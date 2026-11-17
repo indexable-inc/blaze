@@ -66,9 +66,31 @@
 //! index past the call's argument list is a malformed record, refused by name
 //! (`Form::CalleeParamPastArgs`).
 //!
+//! PROJECTIONS (piece BW-A: tempo's false findings at every `for` loop and `it.next()`). The
+//! class: `Iterator::next(&mut self) -> Option<Self::Item>` holds a hidden position, so it had
+//! no shape and went through `unify_call`'s one hub: the `&'r mut iter` loan flowed into the
+//! hub, which is `Iter<'a, u8>`'s `'a` and the item's region, so the mutable borrow lived as
+//! long as the iterator: E0499 on the loop's back edge, E0505/E0597 where the collection is
+//! dropped or returned. The rule: the Reference, "Implementations", "Generic implementations"
+//! (E0207): an impl's lifetime used in an associated type must be constrained, appearing in
+//! the self type or the implemented trait; so every lifetime of the type
+//! `<A0 as Tr<A1..>>::Name` normalizes to is `'static` or one held by `A0..An`, when `Tr`
+//! declares no lifetime parameter (whose argument no type argument carries) and `Name` has no
+//! generics of its own (a generic associated type's lifetime arguments are erased from the
+//! projection's arguments: portable types hold no regions). Such a CLOSED projection in the
+//! OUTPUT, over arguments built of the head's type parameters ([`Mark::Hidden`]), stands at a
+//! call for the destination's positions beyond the output's others, each related to every
+//! position of those parameters' arguments: they flow into it, and it into them unless it is
+//! the destination's top reference. That is a superset of the exact relation (equality with
+//! the one true position, or `'static`), so no error is missed; it never relates the `&mut`
+//! receiver's region, which is no argument's. An argument whose lifetimes are not all
+//! positions (a trait object, whose `Item = &'a u8` is no position of it; a closure's
+//! captures) or that holds a type parameter of the body is not taken.
+//!
 //! What this does not take, relating nothing (`Ok(false)`; the caller refuses or keeps its
-//! older path): a hidden region, and any operand whose positions do not line up one for one
-//! with the instantiated parameter.
+//! older path): a hidden region that is not such an output projection (an opaque type, an
+//! input projection, whose demand the impl's text decides: impl_call.rs), and any operand
+//! whose positions do not line up one for one with the instantiated parameter.
 //!
 //! A caller's own type parameter `U` in an argument under a declared `T: 'a` is related by its
 //! placeholder `ρ_U` (param_outlives.rs: `subset(ρ_U, 'a)`), and lib.rs `call_done` sends a
@@ -76,7 +98,7 @@
 
 use blaze_flow::{Origin, Place};
 use blaze_own::Vec;
-use blaze_typeck::{ExprId, ItemKey, List, PNode, PTy, PTys};
+use blaze_typeck::{ExprId, ItemKey, List, Name, PNode, PTy, PTys};
 use core::alloc::Allocator;
 
 use crate::sig::{Region, SigLife, SigRefusal};
@@ -91,6 +113,13 @@ pub enum Mark {
     Own,
     /// The head's generic parameter `i` (`PNode::Param(i)`): the call's `i`th type argument.
     Param(u32),
+    /// A projection `<A0 as Tr<A1..>>::Name` onto a CLOSED associated type (its trait declares
+    /// no lifetime and it has no generics of its own) whose arguments hold no region of the
+    /// head's own: the next region of the lifetime part (a `Region::Hidden`), standing at a
+    /// call for every position of the type it normalizes to there. `Shape::joins[lo..hi]` are
+    /// the head's parameters its arguments name: by E0207 every lifetime of that type is
+    /// `'static` or one of their arguments' (the module doc, "PROJECTIONS").
+    Hidden { lo: u32, hi: u32 },
 }
 
 /// A head's generic shape: per input then the output, its [`Mark`]s.
@@ -99,21 +128,24 @@ pub struct Shape<'s> {
     pub marks: &'s [Mark],
     /// Per input, where its marks end in `marks`; the output's are the rest.
     pub ends: &'s [u32],
+    /// The parameters each [`Mark::Hidden`]'s projection names, sorted and once each per mark.
+    pub joins: &'s [u32],
 }
 
 /// The owned form [`read_shape`] fills.
 pub struct ShapeBuf<A: Allocator + Clone> {
     pub marks: Vec<Mark, A>,
     pub ends: Vec<u32, A>,
+    pub joins: Vec<u32, A>,
 }
 
 impl<A: Allocator + Clone> ShapeBuf<A> {
     pub fn new_in(alloc: A) -> ShapeBuf<A> {
-        ShapeBuf { marks: Vec::new_in(alloc.clone()), ends: Vec::new_in(alloc) }
+        ShapeBuf { marks: Vec::new_in(alloc.clone()), ends: Vec::new_in(alloc.clone()), joins: Vec::new_in(alloc) }
     }
 
     pub fn shape(&self) -> Shape<'_> {
-        Shape { marks: &self.marks, ends: &self.ends }
+        Shape { marks: &self.marks, ends: &self.ends, joins: &self.joins }
     }
 }
 
@@ -141,6 +173,9 @@ enum Slot {
     Sig(Region),
     /// Position `k` of the call's type argument for `Param(p)`.
     Arg(u32, u32),
+    /// One position of the type a [`Mark::Hidden`] projection normalizes to at the call: every
+    /// position of the type arguments of `Shape::joins[lo..hi]` flows into it.
+    Joined(u32, u32),
 }
 
 /// The most nodes one walk visits: a type past it is refused.
@@ -148,19 +183,23 @@ const MOST: u32 = 4096;
 
 /// Reads the generic shape of a head whose erased inputs and output are `inputs` and `output`
 /// in `tys`, counting positions as [`crate::sig::read_signature`] does (`adt_lifetimes`: how many
-/// lifetime parameters an ADT's head declares). Refused: a type whose positions cannot be lined up with a
-/// type argument substituted in (an alias or opaque type: its positions are not its
-/// arguments'), a closure or coroutine node, an unknown ADT.
+/// lifetime parameters an ADT's head declares; `closed`: whether trait `t`'s associated type
+/// `name` is closed, [`Mark::Hidden`]). Refused: a type whose positions cannot be lined up with
+/// a type argument substituted in (an opaque type; a projection that is not closed or whose
+/// arguments hold a region of the head's own), a closure or coroutine node, an unknown ADT.
 pub fn read_shape<A: Allocator + Clone>(
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
     adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
+    closed: &dyn Fn(ItemKey, Name) -> Option<bool>,
     out: &mut ShapeBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
     out.marks.clear();
     out.ends.clear();
+    out.joins.clear();
+    let mut inner: Vec<PTy, A> = Vec::new_in(alloc.clone());
     // A work list in the lowering's order: popped last first, so children go in reversed.
     let mut stack: Vec<PTy, A> = Vec::new_in(alloc);
     for (j, &top) in inputs.iter().chain(core::iter::once(&output)).enumerate() {
@@ -193,7 +232,52 @@ pub fn read_shape<A: Allocator + Clone>(
                 }
                 PNode::Dynamic(_) => out.marks.push(Mark::Own),
                 PNode::Param(i) => out.marks.push(Mark::Param(i)),
-                PNode::Opaque(_, _) | PNode::Alias { .. } => return Err(SigRefusal::TypeNode),
+                PNode::Alias { trait_, name, args } => {
+                    if closed(trait_, name) != Some(true) {
+                        return Err(SigRefusal::TypeNode);
+                    }
+                    // The parameters its arguments name; any region of the head's own in them
+                    // (a reference, a trait object, an ADT with a lifetime) is not a position
+                    // this mark stands for: refused.
+                    let lo = out.joins.len() as u32;
+                    inner.clear();
+                    inner.extend_from_slice(tys.list(args).map_err(|_| SigRefusal::Unknown)?);
+                    while let Some(x) = inner.pop() {
+                        steps += 1;
+                        if steps > MOST {
+                            return Err(SigRefusal::Bound);
+                        }
+                        match tys.node(x).map_err(|_| SigRefusal::Unknown)? {
+                            PNode::Param(i) => out.joins.push(i),
+                            PNode::Adt(k, l) if adt_lifetimes(k).ok_or(SigRefusal::Unknown)? == 0 => {
+                                inner.extend_from_slice(tys.list(l).map_err(|_| SigRefusal::Unknown)?);
+                            }
+                            PNode::Tuple(l) => inner.extend_from_slice(tys.list(l).map_err(|_| SigRefusal::Unknown)?),
+                            PNode::Slice(i) | PNode::Array(i, _) | PNode::Pat(i, _) | PNode::Ptr(_, i) => inner.push(i),
+                            PNode::Bool
+                            | PNode::Char
+                            | PNode::Int(_)
+                            | PNode::Uint(_)
+                            | PNode::Float(_)
+                            | PNode::Str
+                            | PNode::Never
+                            | PNode::ConstValue { .. }
+                            | PNode::ConstParam(_) => {}
+                            _ => return Err(SigRefusal::TypeNode),
+                        }
+                    }
+                    out.joins[lo as usize..].sort_unstable();
+                    let mut kept = lo as usize;
+                    for j in lo as usize..out.joins.len() {
+                        if j == lo as usize || out.joins[j] != out.joins[kept - 1] {
+                            out.joins[kept] = out.joins[j];
+                            kept += 1;
+                        }
+                    }
+                    out.joins.truncate(kept);
+                    out.marks.push(Mark::Hidden { lo, hi: out.joins.len() as u32 });
+                }
+                PNode::Opaque(_, _) => return Err(SigRefusal::TypeNode),
                 PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(SigRefusal::TypeNode),
                 _ => {}
             }
@@ -245,9 +329,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         if shape.ends.len() != vs.len() || life.ends.len() != vs.len() {
             return Ok(false);
         }
-        if life.regions.iter().any(|r| matches!(r, Region::Hidden(_))) {
-            return Ok(false);
-        }
         let args: &'c [PTy] = self.list(g, e)?;
         // Each type argument's position count; where its origins start once made.
         let mut arg_at: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
@@ -284,13 +365,42 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 return Ok(false);
             }
             let mut r = rlo;
+            let part_lo = seq.len();
+            // Where this part's one projection stands in `seq`, its joins, and whether one of
+            // them is not wholly placed (`unplaced`, or a type parameter of the body).
+            let mut joined: Option<(usize, u32, u32, bool)> = None;
             for &m in &shape.marks[mlo..mhi] {
                 match m {
                     Mark::Own => {
-                        if r >= rhi {
+                        // A hidden region not under a projection mark (an opaque type) is
+                        // not taken.
+                        if r >= rhi || matches!(life.regions[r], Region::Hidden(_)) {
                             return Ok(false);
                         }
                         seq.push(Slot::Sig(life.regions[r]));
+                        r += 1;
+                    }
+                    Mark::Hidden { lo, hi } => {
+                        // Only the output's, one per part: an input's demand needs the impl's
+                        // text (impl_call.rs), and two in one place cannot be split.
+                        if i < vs.len() || joined.is_some() || r >= rhi || !matches!(life.regions[r], Region::Hidden(_)) {
+                            return Ok(false);
+                        }
+                        let Some(ps) = shape.joins.get(lo as usize..hi as usize) else { return Ok(false) };
+                        let mut loose = false;
+                        for &p in ps {
+                            let Some(&t) = args.get(p as usize) else {
+                                return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: arg_at.len() as u32 }, e);
+                            };
+                            // An argument whose lifetimes are not all positions (a trait
+                            // object's `Item = &'a u8`, a closure's captures) or that holds a
+                            // type parameter of the body: not taken where the projection
+                            // stands for a position (below, once the destination says).
+                            held.clear();
+                            loose |= self.unplaced(t, e, &mut held)? || !held.is_empty();
+                        }
+                        joined = Some((seq.len(), lo, hi, loose));
+                        seq.push(Slot::Joined(lo, hi));
                         r += 1;
                     }
                     Mark::Param(p) => {
@@ -311,6 +421,34 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
             if r != rhi {
                 return Ok(false);
+            }
+            // The projection stands for as many positions as the destination has beyond the
+            // part's others (its normalized type's: the destination's type is the output's
+            // as the type check normalized it).
+            if let Some((at, lo, hi, loose)) = joined {
+                let d = self.info(dest);
+                let others = (seq.len() - part_lo - 1) as u32;
+                if !d.exact || d.len < others {
+                    return Ok(false);
+                }
+                let n = (d.len - others) as usize;
+                match n {
+                    // The projection's type holds no lifetime here (`Iterator::find` on a
+                    // `Map<_, F>` whose `Item = u32`): it relates nothing, so how its joins
+                    // hold their lifetimes does not matter. Before, a closure in `Self` sent
+                    // the call to `unify_call`'s hub, which put the `&mut self` loan into
+                    // `Self`'s own origin: a false E0505 at the adapter's drop (tempo
+                    // trie-shapes lib.rs:423, `(0..).map(..).find(..)`).
+                    0 => {
+                        seq.remove_shift(at);
+                    }
+                    _ if loose => return Ok(false),
+                    _ => {
+                        for _ in 1..n {
+                            seq.insert_shift(at, Slot::Joined(lo, hi));
+                        }
+                    }
+                }
             }
             map_ends.push(seq.len() as u32);
             mlo = mhi;
@@ -342,10 +480,33 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let mut arg_origs: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
         let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
         let mut map: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
+        // The destination's first position, and whether it is a reference's (then only flowed
+        // into, as every other path relates a destination).
+        let dest_lo = map_ends.get(vs.len().wrapping_sub(1)).copied().unwrap_or(0) as usize;
+        let dest_top_ref = dest_ty.wrap.is_some() || matches!(self.node(dest_ty.ty, e)?, PNode::Ref(..));
         for j in 0..seq.len() {
             let o = match seq[j] {
                 Slot::Sig(region) => self.instance(&mut inst, region),
                 Slot::Arg(p, k) => self.arg_origin(&mut arg_at, &mut arg_origs, p, k),
+                // PROJECTIONS: the true region here is one of the joined arguments' positions
+                // or `'static` (E0207). Each of them flows into it; and, unless it is the
+                // destination's top reference, it flows back into each (a superset of
+                // equality with the true one, for a place written through it).
+                Slot::Joined(lo, hi) => {
+                    let o = self.b.origin(false);
+                    let one_way = j == dest_lo && dest_top_ref;
+                    for q in lo..hi {
+                        let p = shape.joins[q as usize];
+                        for k in 0..arg_at[p as usize].1 {
+                            let a = self.arg_origin(&mut arg_at, &mut arg_origs, p, k);
+                            self.b.subset(a, o);
+                            if !one_way {
+                                self.b.subset(o, a);
+                            }
+                        }
+                    }
+                    o
+                }
             };
             map.push(o);
         }

@@ -6,6 +6,7 @@
 //! | [`record`] | one function instance's code record: position-independent code, a relro part, its targets by (space, symbol), its sites and words, its frame word and landing pads; sealed into one canonical form, encoded, read in place |
 //! | [`unwind`] | the record's unwind rows: what the frame word and the landing pads mean, read in place and checked |
 //! | [`eh`] | the bytes a platform's unwinder reads for one placed record: a CIE, its FDE and the LSDA, as the pinned library's personality routine parses them |
+//! | [`datum`] | one static's data record: its place, alignment, bytes and the words naming targets by (space, symbol); sealed, encoded, read in place, and filled at its address against the run's words |
 //! | [`place`] | one record placed alone in a running program on its first call: its sites completed against the run's slot words, its relro words filled (a function's address is its entry thunk) |
 //! | [`image`] | the segment (records placed together, mapped read-only and executable in place) and the program image (every segment's import words and relro words bound at fixed addresses; an edit appends a segment and rewrites only the words naming what moved) |
 //!
@@ -20,12 +21,15 @@
 #![forbid(unsafe_code)]
 
 pub mod a64;
+pub mod datum;
 pub mod image;
 pub mod place;
 pub mod record;
 pub mod unwind;
 pub mod eh;
 
+#[cfg(test)]
+mod datum_tests;
 #[cfg(test)]
 mod eh_tests;
 #[cfg(test)]

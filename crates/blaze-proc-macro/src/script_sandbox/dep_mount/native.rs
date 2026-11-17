@@ -167,6 +167,118 @@ pub fn lay<'a>(work: &str, rel: &str, producers: &[(&str, &DepProducer)], deps: 
     Ok(Laid { values: resolved.values, folders, shown })
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use blaze_build_script::outputs::{FileLimits, OutputsRef};
+    use blaze_build_script::{Outputs, instr::OutputLimits};
+    use blaze_manifest::lock::LockId;
+    use blaze_own::AVec;
+    use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+
+    use super::lay;
+    use crate::script_sandbox::{ScriptRoot, Tree};
+    use crate::script_unit::{GivenRun, UnitScriptError, served_links};
+
+    const LZ4_OUT: &str = "/target/debug/build/lz4-sys-0123456789abcdef/out";
+    const HEADER: &[u8] = b"#define LZ4_VERSION_MAJOR 1\n";
+
+    fn t(s: &str) -> Text<'static> {
+        Text::from_str_in(s, blaze_own::testing::heap().alloc())
+    }
+
+    fn unit(package: u32, name: &str, kind: UnitKind<'static>, deps: &[u32], build_script: Option<u32>, links: Option<&str>) -> Unit<'static> {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut d = AVec::new_in(alloc.clone());
+        for u in deps {
+            d.push(UnitDep { name: t("dep"), unit: UnitId(*u) });
+        }
+        Unit {
+            package: LockId(package),
+            name: t(name),
+            version: t("1.0.0"),
+            kind,
+            for_host: false,
+            edition: edition::PackageEdition::of_manifest("2021").expect("an edition"),
+            crate_name: t(name),
+            root: t("src/lib.rs"),
+            features: AVec::new_in(alloc.clone()),
+            cfg: AVec::new_in(alloc),
+            deps: d,
+            build_script: build_script.map(UnitId),
+            links: links.map(t),
+            incomplete: false,
+        }
+    }
+
+    /// librocksdb-sys (script 0, its library 1) depends on lz4-sys (`links = "lz4"`, script 2,
+    /// its library 3), as in tempo's graph.
+    fn graph() -> UnitGraph<'static> {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut units = AVec::new_in(alloc.clone());
+        units.push(unit(0, "librocksdb-sys", UnitKind::BuildScript, &[], None, None));
+        units.push(unit(0, "librocksdb-sys", UnitKind::Lib, &[3], Some(0), Some("rocksdb")));
+        units.push(unit(1, "lz4-sys", UnitKind::BuildScript, &[], None, None));
+        units.push(unit(1, "lz4-sys", UnitKind::Lib, &[], Some(2), Some("lz4")));
+        UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V2 }
+    }
+
+    /// Export-9's librocksdb-sys stop ("DEP_lz4_root: the `links = \"lz4\"` package's run was
+    /// not given"): a NATIVE reader of a `links` dependency is given that dependency's run as its
+    /// outputs RECORD through `script_unit::served_links`, the one function blaze-cli's `Script`
+    /// task and tempo_scripts' export both call (`outputs_given`). The reader gets
+    /// `DEP_LZ4_INCLUDE` and `DEP_LZ4_ROOT` from the record's metadata, and the laid folders hold
+    /// lz4's `OUT_DIR` header and its package's `inc/b.h`, read back from disk.
+    /// CONTROL (the cause removed: no run given, as the exporter's native path passed none): the
+    /// reader is refused naming lz4-sys and `links = "lz4"`, never run without its pairs.
+    /// Prints `dep_mount native: librocksdb-sys given lz4's record, lz4.h and b.h laid`.
+    #[test]
+    fn a_native_reader_is_given_its_links_dependency_s_record_and_reads_its_files() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let graph = graph();
+        let printed = format!("cargo:include={LZ4_OUT}/include\ncargo:root=/package/inc\n");
+        let mut outputs = Outputs::read(printed.as_bytes(), LZ4_OUT, OutputLimits::DEFAULT, alloc.clone()).unwrap_or_else(|e| panic!("{e:?}"));
+        outputs.add_file("include/lz4.h", HEADER, FileLimits::DEFAULT, alloc.clone()).unwrap_or_else(|e| panic!("{e:?}"));
+        let mut record = AVec::new_in(alloc.clone());
+        outputs.encode(&mut record);
+        let opened = OutputsRef::open(&record).unwrap_or_else(|e| panic!("{e:?}"));
+        let tree = Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), git: None };
+        let given = [GivenRun { script: UnitId(2), links: "lz4", outputs: opened, tree, root: ScriptRoot::package(), direct: true }];
+
+        let served = served_links(&graph, UnitId(0), &given).unwrap_or_else(|e| panic!("{e}"));
+        let pairs: Vec<(&str, &str, &str)> = served.deps.iter().map(|dep| (dep.links, dep.key, dep.value)).collect();
+        let include = format!("{LZ4_OUT}/include");
+        assert_eq!(pairs, [("lz4", "include", include.as_str()), ("lz4", "root", "/package/inc")], "DEP_LZ4_* from the record");
+        let producers: Vec<(&str, &super::DepProducer)> = served.producers.iter().map(|(links, producer)| (*links, producer)).collect();
+        assert_eq!(producers.iter().map(|(links, _)| *links).collect::<Vec<_>>(), ["lz4"]);
+
+        let root = std::env::temp_dir().join(format!("blaze-xp-lay-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the work folder");
+        let work = root.canonicalize().expect("its real path");
+        let work = work.to_str().expect("a UTF-8 temp path").to_owned();
+        let laid = lay(&work, "deps/k", &producers, &served.deps, alloc.clone());
+        let read = |path: String| std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let (header, b) = match &laid {
+            Ok(laid) => (read(format!("{}/lz4.h", laid.values[0].as_str())), read(format!("{}/b.h", laid.values[1].as_str()))),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+        _ = std::fs::remove_dir_all(&root);
+        let laid = laid.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(laid.values[0].as_str(), format!("{work}/deps/k/lz4/out/include"));
+        assert_eq!(header, HEADER, "lz4's OUT_DIR header, laid from its record");
+        assert_eq!(b, b"int b;\n", "lz4's package file, laid from its served tree");
+
+        match served_links(&graph, UnitId(0), &[]) {
+            Err(UnitScriptError::Dependency { dependency, links, .. }) => assert_eq!((dependency.as_str(), links.as_str()), ("lz4-sys 1.0.0", "lz4")),
+            Err(other) => panic!("refused otherwise: {other}"),
+            Ok(_) => panic!("a reader was served without its `links` dependency's run"),
+        }
+        println!("dep_mount native: librocksdb-sys given lz4's record, lz4.h and b.h laid");
+    }
+}
+
 /// `root` holding nothing: what an earlier run of the same key left there is removed.
 fn empty(root: &str) -> Result<(), LayError> {
     if !Path::new(root).exists() {

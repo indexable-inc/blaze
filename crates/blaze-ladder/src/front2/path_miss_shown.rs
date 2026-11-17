@@ -1,7 +1,8 @@
 //! An E0425 finding's words ([`blaze_typeck::Because::Path`]): the segment that named nothing,
-//! by its spelling and index, why, and what the segments before it named, so `Rc::new` reads
-//! "cannot find `Rc` in this scope (segment 0)" or "cannot find `new` in the type alloc::rc::Rc
-//! (segment 1)", and `crate::a::f` "cannot find `f` in module `wide::a` (segment 2)", never the
+//! by its kind, spelling and index, why, and what the segments before it named, so `Rc::new()`
+//! reads "cannot find function `Rc` in this scope (segment 0)" or "cannot find function `new` in
+//! the type alloc::rc::Rc (segment 1)", and `crate::a::f(1)` "cannot find function `f` in module
+//! `wide::a` (segment 2)" (a path that is no callee: "value"), never the
 //! last segment's hash with "found None, expected None" (rule 19).
 
 use blaze_typeck as tc;
@@ -16,9 +17,12 @@ use super::spell::Spelling;
 /// body_types.rs reads a finding with them as "not checked" under that call, its cause.
 pub const MACRO_REFUSED: &str = "unknown, because a macro call of its module was refused: ";
 
-/// The refused call `call` and why, in words: the call's macro path and the matcher's reason
-/// for a failed expansion (the names' failed-call note, [`NamesSource::failed_call`]), else the
-/// refusal's own words. Never the key alone (rule 19).
+/// The refused call `call` and why, in words: the call's macro path as written, its shape, the
+/// file it is written in (its path in its package; no line, rule 71: these words are the cause
+/// a body's record files) and the typed reason the names record keeps for every refused call
+/// ([`NamesSource::failed_call`], blaze-scope call_refusal.rs), else the refusal's own words.
+/// Never the key (rule 19): two units of one package (its library and its test unit) call one
+/// macro at one place under two keys, and say one cause in equal words.
 fn refused_call<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, call: blaze_id::ItemKey, why: tc::Refusal) -> String {
     match why {
         tc::Refusal::UnknownEnv => "an `env!` of a variable this build could not answer".to_string(),
@@ -26,28 +30,39 @@ fn refused_call<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, call: blaze_id::
         tc::Refusal::Expansion => {
             let alloc = blaze_own::Alloc::global();
             match r.names.failed_call(call, alloc) {
-                Some(row) if row.implicit => format!("the implicit `#[{}]` over `fn main` failed: {}", row.path, row.failed),
-                Some(row) => format!("the call of `{}` failed: {}", row.path, row.failed),
-                None => format!("macro call {call:x} failed, and the records hold no note of its reason"),
+                Some(row) if row.implicit => format!("the implicit `#[{}]` over `fn main` in {} failed: {}", row.path, row.file, row.why),
+                Some(row) => format!("the call of `{}` ({}) in {} failed: {}", row.path, row.shape.name(), row.file, row.why),
+                None => format!("macro call {call:x} failed, and the records hold no row of it (blaze-scope names_record.rs `refused_row`)"),
             }
         }
     }
 }
 
-/// The words of `miss`, whose failing segment the checker named `name`.
-pub(super) fn path_miss_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, name: Option<tc::Name>, miss: tc::PathMiss) -> String {
+/// The words of `miss`, whose failing segment the checker named `name`, a `kind` of path
+/// ([`kind_at`]: `function` or `value`, as rustc says it).
+pub(super) fn path_miss_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, name: Option<tc::Name>, kind: &str, miss: tc::PathMiss) -> String {
     let seg = match name.map(|n| spell.get(n)) {
-        Some(Ok(text)) => format!("`{text}`"),
-        Some(Err(unspelled)) => format!("{unspelled:?}"),
+        Some(Ok(text)) => format!("{kind} `{text}`"),
+        Some(Err(unspelled)) => format!("{kind} {unspelled:?}"),
         None => "a path with no segment".to_string(),
     };
     path_miss_words(r, &seg, miss)
 }
 
-/// The words of `miss`, its failing segment shown as `seg` (`` `f` ``, `` type `T` ``): the one
-/// home of a miss's words, for a value path (E0425, [`path_miss_shown`]) and a written type
-/// (E0412, front2 body.rs `TypeMiss`).
-pub(super) fn path_miss_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, seg: &str, miss: tc::PathMiss) -> String {
+/// What a value path at `at` that named nothing was written as: `function` where it is (inside)
+/// a call's callee (`crate::a::f(1)`), else `value` (rustc's E0425 words: "cannot find function
+/// `f` in module `a`", "cannot find value `x` in this scope").
+pub(super) fn kind_at(v: &tc::BodyView<'_>, at: tc::Range) -> &'static str {
+    let callee = v.exprs.iter().any(|e| match e {
+        tc::Expr::Call { callee, .. } => v.expr_ranges.get(callee.ix()).is_some_and(|r| r.start <= at.start && at.end <= r.end),
+        _ => false,
+    });
+    if callee { "function" } else { "value" }
+}
+
+/// The words of `miss`, its failing segment shown as `seg` (`` `f` ``). A written type's miss
+/// (E0412) is said by front2 type_miss.rs from the names alone, in the same forms.
+fn path_miss_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, seg: &str, miss: tc::PathMiss) -> String {
     let (segment, after, why) = match miss {
         tc::PathMiss::Whole => return format!("{seg}: the path names nothing (this world does not say at which segment)"),
         tc::PathMiss::At { segment, after, why } => (segment, after, why),

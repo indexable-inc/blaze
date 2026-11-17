@@ -29,6 +29,7 @@ use super::item_site::MarksLost;
 use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
 use super::source::NamesSource;
+use super::type_miss::TypeMiss;
 use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHead, Why, intern, intern_list};
 use crate::resolve::Paths;
 
@@ -611,6 +612,11 @@ pub struct Store<'n> {
     /// filed beside `reads`: what the world answers a closure of ANOTHER body from
     /// ([`super::foreign_closures`]).
     pub closures: super::foreign_closures::ClosureRows<Global>,
+    /// Each fn whose signature writes a type that names nothing (E0412, [`TypeMiss`]), by the
+    /// fn's checker key: the type is the error type in its head, so the fn's callers are checked
+    /// against the rest of it; the fn's `Signature` task says the error (blaze-cli
+    /// body_types/heads.rs). Replaced whenever the head is made again.
+    pub type_misses: HashMap<ItemKey, Vec<TypeMiss, Global>, Global>,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -776,6 +782,23 @@ pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys
     Ok(n)
 }
 
+/// The type `t` of a signature, or, where its path names nothing and the names library decided
+/// so (front2 type_miss.rs), the error type, its miss pushed on `misses`: the head is made, its
+/// callers checked against the rest of it, and the fn's `Signature` task says the E0412. `text`
+/// is the text `v`'s ranges are relative to.
+fn ty_or_miss<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, text: &str, misses: &mut Vec<TypeMiss, Global>) -> Result<PTy, Why> {
+    match b.ty(tys, env, v, t) {
+        Err(Why::Resolve(crate::resolve::ResolveError::Path(e), r)) => match TypeMiss::of(b.resolver.names, text, e, r) {
+            Some(miss) => {
+                misses.push(miss);
+                intern(tys, PNode::Error)
+            }
+            None => Err(Why::Resolve(crate::resolve::ResolveError::Path(e), r)),
+        },
+        other => other,
+    }
+}
+
 /// Each own generic parameter's default from index `base`, in order (the Reference, "Generic
 /// parameters": a type parameter's is a type, a const parameter's a constant of its type), read
 /// in `env` (the parameters before it in scope); `None` where none is written.
@@ -884,6 +907,7 @@ impl<'n> Store<'n> {
             sources: None,
             reads: super::body_reads::Digests::new(),
             closures: super::foreign_closures::ClosureRows::new_in(Global),
+            type_misses: HashMap::new_in(Global),
         }
     }
 
@@ -1800,6 +1824,8 @@ impl<'n> Store<'n> {
         };
         let mut inputs = Vec::new_in(Global);
         let mut self_param = false;
+        // The signature's written types that name nothing (E0412): each the error type here.
+        let mut misses: Vec<TypeMiss, Global> = Vec::new_in(Global);
         let list = v.list(head::PARAMS);
         for (k, &n) in v.rows(list)?.iter().enumerate() {
             let prm = lf::Param::decode(n)?;
@@ -1809,7 +1835,7 @@ impl<'n> Store<'n> {
             }
             let r = v.site(v.row_range(list.start + k as u32)?)?;
             let ty = match (prm.self_kind, self_ty) {
-                (lf::SelfKind::No | lf::SelfKind::Typed, _) => b.ty(&mut self.tys, &env, v, prm.ty.ok_or(Why::Unsupported("a parameter with no type", r))?)?,
+                (lf::SelfKind::No | lf::SelfKind::Typed, _) => ty_or_miss(&b, &mut self.tys, &env, v, prm.ty.ok_or(Why::Unsupported("a parameter with no type", r))?, text, &mut misses)?,
                 (lf::SelfKind::Value, Some(s)) => s,
                 (lf::SelfKind::Ref(m), Some(s)) => intern(&mut self.tys, PNode::Ref(m, s))?,
                 (_, None) => return Err(Why::Program("a `self` parameter outside a trait or an impl".into(), r)),
@@ -1818,9 +1844,17 @@ impl<'n> Store<'n> {
             inputs.push(ty);
         }
         let written = match ret {
+            // An expanded return type's ranges are in its expansion's text, not the fn's: a
+            // miss there stays the refusal it was.
+            Some(t) if expanded.is_none() => ty_or_miss(&rb, &mut self.tys, &ret_env, &rv, t, text, &mut misses)?,
             Some(t) => rb.ty(&mut self.tys, &ret_env, &rv, t)?,
             None => intern(&mut self.tys, PNode::Tuple(List::EMPTY))?,
         };
+        if misses.is_empty() {
+            self.type_misses.remove(&key);
+        } else {
+            self.type_misses.insert(key, misses);
+        }
         let whole = Range::new(0, text.len() as u32);
         if flags & sig::GEN != 0 {
             return Err(Why::Unsupported("a `gen fn`", whole));

@@ -274,7 +274,7 @@ pub(crate) fn native<'b>(
                     // area when the link reads them, never read into this task's memory.
                     Ok(opened) => {
                         // Held for the task in its scratch frame, as the store's mappings are.
-                        let area: &crate::scripts::FileArea = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::FileArea::of(home, &opened), scratch));
+                        let area: &blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::file_area(home, &opened), scratch));
                         outputs.push(Some((script.out, opened.with_area(area))));
                     }
                     Err(error) => {

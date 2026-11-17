@@ -96,7 +96,7 @@ struct Body {
     symbol: Symbol,
     func: Func<Global>,
     funcs: Vec<Owned, Global>,
-    statics: Vec<Symbol, Global>,
+    statics: Vec<blaze_typeck::ItemKey, Global>,
     vtables: Vec<Symbol, Global>,
     tls: Vec<Symbol, Global>,
 }
@@ -135,7 +135,11 @@ impl LirSeen for Collect {
             symbol,
             func: func.view().to_func_in(Global),
             funcs,
-            statics: copy(names.statics),
+            statics: {
+                let mut v = Vec::with_capacity_in(names.statics.len(), Global);
+                v.extend_from_slice(names.statics);
+                v
+            },
             vtables: copy(names.vtables),
             tls: copy(names.tls),
         });

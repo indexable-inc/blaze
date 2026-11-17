@@ -124,6 +124,16 @@ pub trait SourceTexts<'a> {
         Err(REFUSED)
     }
 
+    /// Why the proc macro `def`, called in the crate at `krate`, cannot run, when a run of it
+    /// was refused ([`SourceTexts::run_proc_macro`]'s bare `HostError`): the runner's words
+    /// naming the macro's crate and why its module cannot run the macro (not in the store under
+    /// the key asked, does not load, exports no such macro). `None`: nothing about the module
+    /// stops it (the run itself failed), or no runner here (a test's table).
+    fn proc_macro_unusable(&self, krate: usize, def: &MacroDefinition<'_>) -> Option<&'a str> {
+        let _ = (krate, def);
+        None
+    }
+
     /// The environment the crate at `krate` is compiled in ([`crate::crate_env::CrateEnv`]:
     /// one per unit, made by `UnitCrates::env_of`): what `env!` and `option_env!` read, the
     /// same for its items and its bodies. `None`: this source has none, and every `env!` of
@@ -334,6 +344,12 @@ pub struct Expansion<'a> {
     /// The call's expansion was refused ([`crate::refused`]): its module's scope says so, and
     /// a name looked up behind it is unknown, never absent.
     pub refused: Option<crate::refused::Refused<'a>>,
+    /// For a refused call, the note that refused it (the last the solve noted for the call
+    /// before it returned nothing) and the first `env!` variable the host refused during it:
+    /// the reason the names record's failed-call row keeps ([`crate::call_refusal`]). `None`
+    /// for a call that expanded, and for a refused call whose driver noted nothing (a bug,
+    /// kept as [`crate::call_refusal::RefusalKind::Unnoted`]).
+    pub refused_by: Option<(ExpandNote<'a>, Option<&'a str>)>,
 }
 
 /// Which text of a call did not lex.
@@ -386,6 +402,20 @@ pub enum ExpandNote<'a> {
     /// A call written in an expansion whose input is no range of that expansion's tokens
     /// ([`crate::nested_input`]): refused, never lexed from the rendered text.
     NestedInput { macro_name: &'a str, error: crate::nested_input::NestedInputError },
+    /// A proc macro whose crate's module cannot run it, and why ([`SourceTexts::proc_macro_unusable`]):
+    /// the runner's own words in place of the expander's bare `HostError`.
+    ProcModule { macro_name: &'a str, why: ProcUnusable<'a> },
+}
+
+/// Why a proc macro's crate cannot run it ([`ExpandNote::ProcModule`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcUnusable<'a> {
+    /// No runner knows the crate: it has no runner key ([`SourceTexts::proc_macro_key`]), so
+    /// its macros have no definition to run.
+    NoRunner,
+    /// The runner's words: which crate, and why its module cannot run the macro (not in the
+    /// store under the key asked, does not load, exports no such macro).
+    Module(&'a str),
 }
 
 /// Why a call nested in an eager builtin's input is not expanded.
@@ -401,8 +431,6 @@ pub enum EagerRefusal {
     TooDeep,
     /// The builtin asked for its nested calls again after it was given their answers.
     AskedAgain,
-    /// The nested call's expansion has an error diagnostic.
-    Failed,
     /// Its arguments could not be copied out of the input.
     Stream,
 }
@@ -1658,8 +1686,11 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
         // module's scope then holds the refusal (`crate::refused::write_refused`), and a name
         // looked up behind it is unknown because of it, not absent.
         let env = crate::refused::EnvRefusal::new_in(self.base.alloc);
-        let expansion = match expand_decls(self.base, self.run, request, self.part, self.seen, &env) {
-            Some((decls, made)) => Expansion { decls, made, refused: None },
+        // The note that refuses the call: the last the driver notes for it before it returns
+        // nothing (every way it does notes why first), kept for the names record's row.
+        let last = core::cell::Cell::new(None);
+        let expansion = match expand_decls(self.base, self.run, request, self.part, self.seen, &env, &last) {
+            Some((decls, made)) => Expansion { decls, made, refused: None, refused_by: None },
             None => {
                 let src = self.base.tables.calls.get(&request.call).copied().or_else(|| held(self.run.tables.read(), "tables").calls.get(&request.call).copied());
                 // `OUT_DIR` is set for the package (it has a build script) but not known: no
@@ -1667,7 +1698,7 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
                 let out_dir_unknown = self.base.script.is_none()
                     && self.base.sources.crate_env(self.base.index).is_some_and(|e| e.get("OUT_DIR") == Err(crate::crate_env::EnvUnknown));
                 let refused = crate::refused::Refused::of(src.map(|s| (s.module, s.name)), env.first(), out_dir_unknown);
-                Expansion { decls: DeclsBuilder::new_in(self.base.alloc), made: None, refused: Some(refused) }
+                Expansion { decls: DeclsBuilder::new_in(self.base.alloc), made: None, refused: Some(refused), refused_by: last.get().map(|note| (note, env.first())) }
             }
         };
         (self.part)(ExpandPart::Store, "", 0);
@@ -2083,18 +2114,25 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     part: PartMark<'_>,
     seen: &dyn Fn(ItemKey, &str),
     refused_env: &crate::refused::EnvRefusal<'a>,
+    last: &core::cell::Cell<Option<ExpandNote<'a>>>,
 ) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
     let alloc = base.alloc;
     let call = request.call;
     let src = base.tables.calls.get(&call).copied().or_else(|| held(run.tables.read(), "tables").calls.get(&call).copied());
     let Some(src) = src else {
+        last.set(Some(ExpandNote::UnknownCall));
         run.note(NamesNote::Expand { call, at: None, note: ExpandNote::UnknownCall });
         return None;
     };
-    let note = |note: ExpandNote<'a>| run.note(NamesNote::Expand { call, at: Some(src.loc), note });
+    // Every note of the call is kept as its last: a return of nothing follows the note that
+    // says why (`FillCx::expand` keeps it as the refusal's reason).
+    let note = |note: ExpandNote<'a>| {
+        last.set(Some(note));
+        run.note(NamesNote::Expand { call, at: Some(src.loc), note });
+    };
     // A derived item's keep call: no macro, its expansion the item itself (attr-bang-kind-2).
     if request.def == crate::cells::KEEP_ITEM {
-        return keep_item(base, run, call, src, part);
+        return keep_item(base, run, call, src, part, &note);
     }
     let def_key = request.def.key;
     let mac = base.tables.macros.get(&def_key).copied().or_else(|| held(run.tables.read(), "tables").macros.get(&def_key).copied());
@@ -2176,6 +2214,12 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             Ok(def) => {
                 written = def;
                 Kept::Written(&written)
+            }
+            // A proc macro with no runner key has no definition: said as its crate's module
+            // that no runner knows, not as a macro this crate's solve did not read.
+            Err(ExpandNote::NoDefinition { .. }) if matches!(mac.body, MacroBody::Proc { .. }) && runner.is_none() => {
+                note(ExpandNote::ProcModule { macro_name: mac.name, why: ProcUnusable::NoRunner });
+                return None;
             }
             Err(why) => {
                 note(why);
@@ -2357,8 +2401,17 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     };
     let expansion = match expanded {
         Ok(expansion) => expansion,
+        // A proc macro's run the host refused: the runner says why its module cannot run it
+        // (the crate, and the module key asked or the load's error), when the module is why.
         Err(why) => {
-            note(why);
+            let module = match why {
+                ExpandNote::Expand { error: ExpandError::Host(HostError { ask: HostAsk::ProcMacro, .. }), .. } => base.sources.proc_macro_unusable(base.index, def.def()),
+                _ => None,
+            };
+            match module {
+                Some(words) => note(ExpandNote::ProcModule { macro_name: mac.name, why: ProcUnusable::Module(words) }),
+                None => note(why),
+            }
             return None;
         }
     };
@@ -2641,6 +2694,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     call: ItemKey,
     src: CallSrc<'a>,
     part: PartMark<'_>,
+    note: &dyn Fn(ExpandNote<'a>),
 ) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
     let alloc = base.alloc;
     let text = src.input;
@@ -2648,7 +2702,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         crate::nested_input::CallTokens::Text => None,
         crate::nested_input::CallTokens::Expansion(input) => Some(input.of),
         crate::nested_input::CallTokens::Refused(error) => {
-            run.note(NamesNote::Expand { call, at: Some(src.loc), note: ExpandNote::NestedInput { macro_name: KEPT_ITEM_NAME, error } });
+            note(ExpandNote::NestedInput { macro_name: KEPT_ITEM_NAME, error });
             return None;
         }
     };
@@ -2657,7 +2711,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     let origins = crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, alloc);
     let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, base.edition, alloc), origins }, alloc));
     if let Some(error) = made.outline.errors().first() {
-        run.note(NamesNote::Expand { call, at: Some(src.loc), note: ExpandNote::NotItems { macro_name: KEPT_ITEM_NAME, message: made.outline.message(error) } });
+        note(ExpandNote::NotItems { macro_name: KEPT_ITEM_NAME, message: made.outline.message(error) });
         return None;
     }
     let fragment = Fragment {
@@ -2795,7 +2849,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);
-        held(run.expansions.lock(), "expansions").insert(call, Expansion { decls: DeclsBuilder::new_in(alloc), made: Some(made), refused: None });
+        held(run.expansions.lock(), "expansions").insert(call, Expansion { decls: DeclsBuilder::new_in(alloc), made: Some(made), refused: None, refused_by: None });
     }
 }
 
@@ -2874,8 +2928,12 @@ impl<'a> EagerDriver<'_, 'a> {
                 let name = top.name;
                 match result.map_err(|error| ExpandNote::Expand { macro_name: self.macro_name, error })? {
                     Expanded::Expansion(expansion) => {
-                        if expansion.diagnostics.iter().any(Diagnostic::is_error) {
-                            return Err(self.refused(name, EagerRefusal::Failed));
+                        // The nested call failed (`env!` of a variable not set, ..): its own
+                        // reason, as a failed call's (rustc reports the nested call's error).
+                        if let Some(failed) = blaze_expand::Failed::of(&expansion, alloc) {
+                            let mut path = AString::new_in(alloc);
+                            path.push_str(name);
+                            return Err(ExpandNote::Failed { path: Box::leak(path.into_boxed_str()), implicit: false, failed });
                         }
                         let mut tokens = expansion.tokens;
                         tokens.seal(key);

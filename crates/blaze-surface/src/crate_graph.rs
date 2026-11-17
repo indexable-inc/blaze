@@ -105,8 +105,13 @@ impl CrateFlags {
     /// A crate that may define lang items: a crate of the language, or one with
     /// `#![feature(lang_items)]`, from its roots. `blaze_impls::lang_item` reads these alone.
     pub const LANG_ITEMS: CrateFlags = CrateFlags(1 << 2);
+    /// A crate that may write an inherent impl of a type it does not define: its root turns
+    /// on `#![feature(rustc_attrs)]` (for `#[rustc_allow_incoherent_impl]`) or writes
+    /// `#![rustc_coherence_is_core]`, from its roots. An inherent question about a built-in
+    /// type, or a type marked `#[rustc_has_incoherent_inherent_impls]`, asks these crates.
+    pub const INCOHERENT: CrateFlags = CrateFlags(1 << 3);
 
-    const ALL: u16 = (1 << 3) - 1;
+    const ALL: u16 = (1 << 4) - 1;
 
     pub const fn bits(self) -> u16 {
         self.0

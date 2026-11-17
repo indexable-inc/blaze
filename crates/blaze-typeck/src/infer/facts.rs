@@ -152,6 +152,16 @@ enum BodyTy {
     Coroutine,
 }
 
+/// A closure or async block of an opaque's hidden type, by identity: its owner, its ordinal
+/// among the owner's, and how many owner arguments its term holds (a closure's term holds them
+/// before `[kind, sig, upvars]`; an async block's holds none, `[output, interior]`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HiddenBody {
+    pub owner: ItemKey,
+    pub ordinal: u32,
+    pub args: u32,
+}
+
 /// The solver's facts, read through the body's `Reads` (see the module).
 pub struct FactCache<'a> {
     alloc: Alloc<'a>,
@@ -180,6 +190,11 @@ pub struct FactCache<'a> {
     lang: HashMap<Lang, Option<SDef>, Alloc<'a>>,
     /// `assoc_def(trait, name)` back to its trait and name.
     pub names: HashMap<u128, (ItemKey, Name), Alloc<'a>>,
+    /// Each closure and async block an opaque's hidden type holds ([`Self::body_terms`]), by
+    /// its solver def (coroutine_id.rs `closure_of_def`, `coroutine_def`): the solver
+    /// instantiates their terms itself when it reveals the opaque, so the context names them by
+    /// this (infer/mod.rs `adopt`).
+    pub(crate) hidden_bodies: HashMap<u128, HiddenBody, Alloc<'a>>,
     /// Questions filled after the solver stopped on them: each is one repeated evaluation.
     pub retries: u64,
     /// Every impl's `where const` conditions, in the order the impls were read:
@@ -443,6 +458,7 @@ impl<'a> FactCache<'a> {
             opaques: HashMap::new_in(alloc),
             lang: HashMap::new_in(alloc),
             names: HashMap::new_in(alloc),
+            hidden_bodies: HashMap::new_in(alloc),
             retries: 0,
             conditions: Vec::new_in(alloc),
             holds: HashMap::new_in(alloc),
@@ -1221,10 +1237,19 @@ impl<'a> FactCache<'a> {
         }
         for i in 0..found.len() {
             let (n, which, owner, ordinal, args) = found[i];
-            let (t, bq) = match which {
-                BodyTy::Closure => (self.closure_term(q, h, c, owner, ordinal, args, reads)?, Question::Closure(owner, ordinal)),
-                BodyTy::Coroutine => (self.coroutine_term(q, h, owner, ordinal, args, reads)?, Question::Coroutine(owner, ordinal)),
+            let (t, bq, def) = match which {
+                BodyTy::Closure => (
+                    self.closure_term(q, h, c, owner, ordinal, args, reads)?,
+                    Question::Closure(owner, ordinal),
+                    crate::coroutine_id::closure_of_def(owner, ordinal),
+                ),
+                BodyTy::Coroutine => (
+                    self.coroutine_term(q, h, owner, ordinal, args, reads)?,
+                    Question::Coroutine(owner, ordinal),
+                    crate::coroutine_id::coroutine_def(owner, ordinal),
+                ),
             };
+            self.hidden_bodies.insert(def, HiddenBody { owner, ordinal, args: args.len });
             self.memo.insert((c.tab, n), t);
             if !bodies.contains(&bq) {
                 bodies.push(bq);

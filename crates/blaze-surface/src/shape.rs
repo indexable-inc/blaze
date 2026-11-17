@@ -18,6 +18,7 @@
 //! | `MarkerTraitObject` (`dyn Send + Sync`) | `DynMarker` |
 //! | `Closure(_)` (a closure, a coroutine closure, a fn item), `Coroutine(_)`, `CoroutineWitness(_)` | `Closure`, `Coroutine`, `CoroutineWitness`: markers, no def |
 //! | `UnsafeBinder`, `Placeholder` | the variant of the same name |
+//! | a pattern type (`ty::Pat`, which `simplify_type` gives as `Pat`) | `Pat` |
 //! | `None` (a parameter, or an alias under `InstantiateWithInfer`) | `Blanket` |
 //! | `Error` | none: an impl whose self type does not resolve is not filed |
 //!
@@ -103,6 +104,9 @@ pub enum Shape {
     Placeholder,
     /// A type parameter: an impl for any type.
     Blanket,
+    /// A pattern type (`pattern_type!(u32 is 1..)`): its impls are its own (core's pat.rs),
+    /// whatever its base type is.
+    Pat,
 }
 
 /// Why bytes or a key are not a [`SelfShape`].
@@ -152,6 +156,7 @@ const COROUTINE_WITNESS: u8 = 17;
 const UNSAFE_BINDER: u8 = 18;
 const PLACEHOLDER: u8 = 19;
 const BLANKET: u8 = 20;
+const PAT: u8 = 21;
 
 /// The domain of [`SelfShape::stable_hash`].
 const HASH_DOMAIN: &str = "blaze-impls self shape 1";
@@ -213,6 +218,7 @@ impl SelfShape {
             Shape::UnsafeBinder => SelfShape::plain(UNSAFE_BINDER, 0, 0),
             Shape::Placeholder => SelfShape::PLACEHOLDER,
             Shape::Blanket => SelfShape::BLANKET,
+            Shape::Pat => SelfShape::plain(PAT, 0, 0),
         })
     }
 
@@ -340,6 +346,7 @@ fn decode(bytes: &[u8; 32]) -> Result<Shape, ShapeError> {
         UNSAFE_BINDER => no_sub(Shape::UnsafeBinder),
         PLACEHOLDER => no_sub(Shape::Placeholder),
         BLANKET => no_sub(Shape::Blanket),
+        PAT => no_sub(Shape::Pat),
         _ => Err(ShapeError::Bytes { what: "a tag no shape writes" }),
     }
 }

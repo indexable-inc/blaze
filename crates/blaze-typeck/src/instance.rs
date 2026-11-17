@@ -263,6 +263,8 @@ pub(crate) fn export(cx: &mut InferCtx<'_>, t: Ty, ground: &mut PortableTys<'_>,
         return Err(CheckError::Limit(Limit::Export));
     }
     let t = cx.resolve(t)?;
+    // A closure or async block the solver made revealing an opaque is filed first.
+    cx.adopt(t)?;
     let d = depth + 1;
     let n = match cx.view(t) {
         TyView::Bool => PNode::Bool,

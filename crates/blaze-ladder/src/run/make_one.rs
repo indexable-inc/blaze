@@ -54,7 +54,7 @@ use crate::front2::const_at::{ConstTable, Needs};
 use crate::front2::coroutines::{CoroutineTable, Coroutines};
 use crate::front2::program::lazy::LazyRefusal;
 use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
-use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, static_symbol, tls_symbol, vtable_symbol};
+use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, tls_symbol, vtable_symbol};
 
 /// How many bodies were checked for a walk's makes: the claim "a run that finds every record
 /// checks no body" is read here. A plain counter, owned by the maker and read by the test.
@@ -522,8 +522,6 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         return Ok(Step::Table(untabled));
     }
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
-    let mut statics: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.statics.len(), work.alloc);
-    statics.extend(built.statics.iter().map(|&k| static_symbol(k)));
     let mut tls_names: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), work.alloc);
     tls_names.extend(built.thread_locals.iter().map(|&k| tls_symbol(k)));
     let mut vtables: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.vtables.len(), work.alloc);
@@ -533,7 +531,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     // The soft-float routines after the instance's own references: the emitter's one table
     // (front2/builtins_shim.rs); `make_entry` declares those it says the record calls.
     let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
-    let names = InstanceNames { funcs: &funcs, statics: &statics, vtables: &vtables, tls: &tls_names };
+    let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &tls_names };
     let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
     for n in 0..reach.rows.len() {
         let (tabled, name_bytes) = reach.row(n);
@@ -647,10 +645,7 @@ fn name_ref<'p, P: FrontEnd>(
             return Err(RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error });
         }
     };
-    let tabled_as = crate::front2::coroutines::owner_of(program, adts, called, ground)
-        .or_else(|| closure_owner(program, adts, called, ground))
-        .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, i));
-    if let Some(c) = tabled_as {
+    if let Some(c) = language_owner(program, adts, called, ground, i) {
         return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(sym);
     }
     // A ctor is no trait's fn: it runs as itself, with no world asked (build_from's refs loop).
@@ -760,7 +755,16 @@ fn vtable_rows<P: FrontEnd>(
         let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, Global).map_err(|e| fail(VtableFail::Build(e)))?;
         for &(_, to) in table.relocs.iter() {
             let VtableTarget::Fn(f) = to else { continue };
-            if let Some(c) = crate::front2::coroutines::owner_of(program, adts, f, ground) {
+            // As a call's callee (`name_ref` above): a fn item of a trait's method resolved
+            // to the body that runs, then what the language gives (`language_owner`).
+            let f = match crate::fn_item_resolve::resolved_shim_self(program, adts, i, f, ground) {
+                Ok(f) => f,
+                Err(error) => {
+                    let at = crate::callee_shown::self_shown(program, ground.view(), f.args);
+                    return Err(RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at, error });
+                }
+            };
+            if let Some(c) = language_owner(program, adts, f, ground, i) {
                 reach.declare(program.function(c).key, f, ground, alloc).map_err(sym)?;
                 continue;
             }
@@ -884,6 +888,33 @@ impl<'n> Maker<'n> {
 
     /// The program made on the first call, then the one instance.
     fn make_over(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        self.construct(tabled)?;
+        let Some((program, state)) = self.made.as_mut() else {
+            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
+        };
+        make_instance(program, state, &mut self.checks, tabled, name, entry)
+    }
+
+    /// The program made on the first call, then static `item`'s value made its entry
+    /// (code_records.rs `statics`).
+    fn static_over(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        self.construct(item)?;
+        let alloc = self.alloc;
+        let Some((program, _)) = self.made.as_mut() else {
+            return Err(RunError::OneBody { key: item, why: "the maker's program was not made (make_one.rs `Maker::make_static`)" });
+        };
+        let (value, kind) = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        let made = match crate::code_records::statics::make_static_entry(value, kind, alloc) {
+            Ok(made) => made,
+            Err(error) => return Err(RunError::StaticRecord { static_: program.static_shown(item), error }),
+        };
+        entry.extend_from_slice(&made);
+        Ok(())
+    }
+
+    /// The lazy program over the records, made on the first make of either kind (`first`: the
+    /// item that make is of).
+    fn construct(&mut self, tabled: ItemKey) -> Result<(), RunError> {
         if self.made.is_none() {
             let NamesRecords { records, frame, lang_crates, body_sources } = self.names;
             let mut program = RecordsProgram::from_records(records, frame, lang_crates, self.entry, self.alloc).map_err(RunError::Front2)?;
@@ -899,10 +930,7 @@ impl<'n> Maker<'n> {
             let state = MakerState::new(&program, tabled, self.isa, self.overflow, self.panic, self.alloc)?;
             self.made = Some((program, state));
         }
-        let Some((program, state)) = self.made.as_mut() else {
-            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
-        };
-        make_instance(program, state, &mut self.checks, tabled, name, entry)
+        Ok(())
     }
 }
 
@@ -917,6 +945,18 @@ impl Make for Maker<'_> {
         // The log first: a refusal or an entry made over an unanswered question is void, and
         // the records' error is its cause.
         if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        made
+    }
+
+    fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        if let Some(void) = self.void(item) {
+            return Err(void);
+        }
+        let made = self.static_over(item, entry);
+        // As `make`: an entry made over an unanswered question is void.
+        if let Some(void) = self.void(item) {
             return Err(void);
         }
         made

@@ -33,8 +33,9 @@ pub(crate) const MOST_HELD: usize = 4096;
 /// Each coroutine type `roots` (types of `ground`) hold by value, deduplicated, in first-met
 /// order. ADT fields and closure environments are read through `facts` and grounded into
 /// `ground` at the type's own arguments (`blaze_build::ground`, the one grounding, which also
-/// normalizes a field's projection). Refused by name: an ADT or a closure whose facts the
-/// world does not answer, and a node a ground type never holds (a parameter, a hole, an
+/// normalizes a field's projection). An ADT whose row is not made is `BuildError::NoAdt` (a
+/// need the lazy program fills, then the instance is built again). Refused by name: a closure
+/// whose facts the world does not answer, and a node a ground type never holds (a parameter, a hole, an
 /// alias, an opaque type, a future still named by its expression).
 pub(crate) fn held_coroutines<'a>(
     ground: &mut PortableTys<'_>,
@@ -82,9 +83,9 @@ pub(crate) fn held_coroutines<'a>(
             // A pattern type is held as its base.
             PNode::Pat(base, _) => todo.push(base),
             PNode::Adt(key, l) => {
-                let adt = facts.adt(key).ok_or(BuildError::UnsupportedSig {
-                    what: "a type whose ADT definition the world did not answer, met while listing the coroutines a value holds",
-                })?;
+                // An ADT whose row is not made is the build's `NoAdt`, the one form of that
+                // need: a lazy program makes the row and the instance is built again.
+                let adt = facts.adt(key).ok_or(BuildError::NoAdt { adt: key })?;
                 args.clear();
                 args.extend_from_slice(ground.view().list(l).map_err(past)?);
                 // `Adt::fields` holds every variant's fields: an enum holds each by value in

@@ -30,8 +30,8 @@
 //!   reserved spins at most [`SPIN_MOST`] rounds; a push retries at most [`SPIN_MOST`] times;
 //!   the walk takes at most `tasks` steps. Each bound passed is a typed error naming the slot.
 //!
-//! Sans-IO: no clock, no thread, no allocation after `new_in`. NEVER COMPILED as written
-//! (architect lane, 2026-11-16): the build integrator compiles it.
+//! Sans-IO: no clock, no thread, no allocation after `new_in`. Its tests pass (green
+//! b13ac2dcb9, 2026-11-17).
 
 #![blaze::sans_io]
 

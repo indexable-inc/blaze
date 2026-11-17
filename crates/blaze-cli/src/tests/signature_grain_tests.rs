@@ -356,7 +356,7 @@ fn a_module_level_item_removed_and_put_back_is_answered_from_records() {
 fn a_module_level_item_removed_is_its_readers_error() {
     let free = checks_of(86, &[(FREE_F_G, CALLS_FREE_F), (FREE_G, CALLS_FREE_F), (FREE_F_G, CALLS_FREE_F)]);
     assert!(free[1].errors >= 1 && (free[0].errors, free[2].errors) == (0, 0), "h must report the missing free f:\n{}", free[1].all);
-    assert!(free[1].words.contains("E0425\\u{1f}cannot find `f` in module `wide::a` (segment 2)"), "the removal's error is the fresh one:\n{}", free[1].all);
+    assert!(free[1].words.contains("E0425\\u{1f}cannot find function `f` in module `wide::a` (segment 2)"), "the removal's error is the fresh one:\n{}", free[1].all);
     assert_eq!(free[2].made.1, 0, "f put back answers from the first check's records:\n{}", free[2].all);
 }
 
@@ -382,33 +382,43 @@ fn a_private_item_added_makes_itself_alone() {
     assert_eq!(seen[1].made, (1, 1), "the new `z` alone is made:\n{}", seen[1].all);
 }
 
-/// A STRUCT REMOVED FROM A HEAD: `h`'s signature must report the missing `T` as E0412, at the
-/// head, its callers not blamed. IGNORED: the `Signature` task answers a head it cannot name as
-/// a not-checked note ("a head it reads could not be named ... Resolve(Path(.. NotFound))") and
-/// the check stops (`Check(Head ..)`), fresh and after the removal alike; the E0412 belongs to
-/// the `Signature` task (body_types/heads.rs), not to this lane's paths.
+/// A STRUCT REMOVED FROM A HEAD: `h(_t: crate::a::T) -> u8`'s `Signature` task reports the
+/// missing `T` as E0412 at the path in the signature, "cannot find type `T` in module `wide::a`
+/// (segment 2)"; the head is made with the error type there, so its caller `c` (`h(1u8)`) is
+/// checked against the rest of it (`h(loop {})`) and is not blamed: every error is that E0412, no note beside
+/// it. Fresh the same, exit status 1. Before: a not-checked note ("a head it reads could not be
+/// named ... Resolve(Path(.. NotFound))") and the check stopped (`Check(Head ..)`).
 #[test]
-#[ignore = "the Signature task answers an unnamed head as a note, not E0412 (body_types/heads.rs)"]
 fn a_struct_removed_from_a_head_is_its_signature_s_error() {
-    let named = checks_of(87, &[(STRUCT_T_K, NAMES_T), (FREE_K, NAMES_T), (STRUCT_T_K, NAMES_T)]);
-    assert_eq!((named[0].errors, named[1].errors, named[2].errors), (0, 2, 0), "h's head must report the missing T:\n{}", named[1].all);
+    const NAMES_T_CALLED: &str = "pub fn h(_t: crate::a::T) -> u8 {\n    0\n}\npub fn c() -> u8 {\n    h(loop {})\n}\n";
+    let named = checks_of(87, &[(STRUCT_T_K, NAMES_T_CALLED), (FREE_K, NAMES_T_CALLED), (STRUCT_T_K, NAMES_T_CALLED)]);
+    assert_eq!((named[0].errors, named[2].errors), (0, 0), "with T, no error:\n{}\n{}", named[0].all, named[2].all);
+    assert!(named[1].errors >= 1, "h's head must report the missing T:\n{}", named[1].all);
+    assert!(named[1].words.contains("E0412\\u{1f}cannot find type `T` in module `wide::a` (segment 2)"), "{}", named[1].all);
+    assert_eq!(named[1].words.matches("\\u{1f}").count(), named[1].words.matches("E0412\\u{1f}").count(), "the caller is not blamed, nothing but the E0412:\n{}", named[1].all);
+    assert!(!named[1].words.contains("not checked") && !named[1].words.contains("could not be named"), "no note beside the error:\n{}", named[1].all);
+    let fresh = fresh_two_files(103, FREE_K, NAMES_T_CALLED);
+    assert_eq!(fresh.status, Some(1), "{:?}", fresh.words);
+    assert!(!fresh.words.is_empty() && fresh.words.iter().all(|w| w.starts_with("E0412")), "fresh: {:?}", fresh.words);
+    std::println!("head type: E0412 at the signature, caller not blamed");
 }
 
 /// A NAME THAT DOES NOT EXIST, fresh (a home that never held it): its reader's ERROR, never a
 /// not-checked note, exit status 1 (`b.rs` is a module of the library and the binary, whose
 /// equal findings may be merged: the count is at least one, the same after the removal).
-/// - a call of a free fn `crate::a::f` with no `f`: E0425 at `f`, "cannot find `f` in module
+/// - a call of a free fn `crate::a::f` with no `f`: E0425 at `f`, "cannot find function `f` in module
 ///   `wide::a` (segment 2)" (before: a refusal's segment was read without the path's `crate` head, so
 ///   the prefix before it was `crate` alone, `Empty`, and the body a gap: 0 errors);
 /// - `use crate::a::f;` with no `f`: the names' unresolved import (E0432), at the `use`;
-/// - a method `S.f()` with no `f`: E0599.
+/// - a method `S.f()` with no `f`: E0599;
+/// - a value `crate::a::v` (no callee) with no `v`: "cannot find value `v` in module `wide::a`".
 /// Then the name put in and taken out again: the third check answers from the records of the
 /// first, no `BodyCheck` made. Prints `missing names: call E0425 xN, use, method E0599`.
 #[test]
 fn a_name_that_does_not_exist_is_an_error() {
     let call = checks_of(95, &[(FREE_G, CALLS_FREE_F), (FREE_F_G, CALLS_FREE_F), (FREE_G, CALLS_FREE_F)]);
     assert!(call[0].errors >= 1, "h must report the missing f:\n{}", call[0].all);
-    assert!(call[0].words.contains("E0425\\u{1f}cannot find `f` in module `wide::a` (segment 2)"), "the E0425 names `f` and its module as written:\n{}", call[0].all);
+    assert!(call[0].words.contains("E0425\\u{1f}cannot find function `f` in module `wide::a` (segment 2)"), "the E0425 names `f` and its module as written:\n{}", call[0].all);
     assert!(!call[0].words.contains("not checked") && !call[0].words.contains("Empty"), "no gap beside the error:\n{}", call[0].all);
     assert_eq!(call[1].errors, 0, "f put in clears it:\n{}", call[1].all);
     assert_eq!((call[2].errors, call[2].made.1), (call[0].errors, 0), "f taken out again answers from the first check's records:\n{}", call[2].all);
@@ -418,6 +428,9 @@ fn a_name_that_does_not_exist_is_an_error() {
     let method = fresh_two_files(97, "pub struct S;\n", "pub fn h() {\n    crate::a::S.f();\n}\n");
     assert_eq!(method.status, Some(1), "{:?}", method.words);
     assert!(method.errors >= 1 && method.words.iter().all(|w| w.starts_with("E0599")), "{:?}", method.words);
+    // A path that is no callee is a value, as rustc says it.
+    let value = fresh_two_files(105, FREE_G, "pub fn h() -> u8 {\n    crate::a::v\n}\n");
+    assert!(value.words.iter().any(|w| w.contains("cannot find value `v` in module `wide::a` (segment 2)")), "{:?}", value.words);
     let fresh = fresh_two_files(98, FREE_G, CALLS_FREE_F);
     assert_eq!(fresh.status, Some(1), "{:?}", fresh.words);
     std::println!("missing names: call E0425 x{}, use, method E0599", fresh.errors);
@@ -444,6 +457,11 @@ fn a_missing_type_in_a_body_is_e0412() {
     let fresh = fresh_two_files(102, FREE_K, WRITES_T);
     assert_eq!(fresh.status, Some(1), "{:?}", fresh.words);
     assert!(fresh.words.iter().any(|w| w.starts_with("E0412")), "fresh: {:?}", fresh.words);
+    // The miss alone: the checker says nothing else, the body is no clean body (never "check
+    // stopped: UnknownInCleanBody").
+    let alone = fresh_two_files(104, FREE_K, "pub fn h() {\n    let _t: &[crate::a::T];\n}\n");
+    assert_eq!(alone.status, Some(1), "{:?}", alone.words);
+    assert!(!alone.words.is_empty() && alone.words.iter().all(|w| w.starts_with("E0412")), "alone: {:?}", alone.words);
     std::println!("body type: E0412 beside E0308");
 }
 

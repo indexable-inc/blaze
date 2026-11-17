@@ -168,7 +168,8 @@ when printed. The positions lane builds the compiler side.
   toolchain. Everything else (a path, a workspace member, git, a private registry) is under its
   organisation (`kind::namespace_of`), so private code never lands in public. Read lists and
   names never leave their namespace.
-- Remote execution is the same driver with another executor. An action is (kind, key, the keys
+- (Not a goal since 2026-11-17, decision D130: no records shared between machines, no remote cache or
+  execution. What follows is kept as the record.) Remote execution is the same driver with another executor. An action is (kind, key, the keys
   of the records it may read); its task gets only an `exec::ActionReader` over those inputs. The
   driver's rule `stays_local`: key tasks, and every task while fewer than 64 are queued or
   running, stay on the machine; only a cold fan-out goes remote, in batches; results return as

@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::cbor::{Reader, Writer};
-use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, id, native, personality, tier, tier_name, variant};
+use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, data, id, native, personality, tier, tier_name, variant};
 use crate::{Slot, Thread, Tier};
 
 /// The version of the run wire's bodies. A reader of another refuses the message by name
@@ -99,6 +99,10 @@ pub enum Down<'a> {
     /// Sent once, first, before any `Declare` of the entry; each pair declares its slot as a
     /// `Declare` pair does (wire/native.rs).
     Native { library: RecordId, words: List<'a, Declared> },
+    /// These statics, each its symbol and datum record, placed together before anything names
+    /// them: sent before the `Declare` and `Publish` of the record that names them (run.md,
+    /// "Statics in the run"; wire/data.rs).
+    Data { data: List<'a, super::data::Datum> },
 }
 
 impl Listed<'_> for Declared {
@@ -260,6 +264,7 @@ impl<'a> Down<'a> {
             }
             Down::Personality { slot } => personality::write(to, slot),
             Down::Native { library, words } => native::write(to, library, words),
+            Down::Data { data } => data::write(to, data),
             Down::Failed { need, why } => {
                 variant(to, "Failed", 2);
                 to.text("why");
@@ -298,6 +303,7 @@ impl<'a> Down<'a> {
                 let (library, words) = native::read(&mut from)?;
                 Down::Native { library, words }
             }
+            data::NAME => Down::Data { data: data::read(&mut from)? },
             "Failed" => {
                 from.map(2, "Failed, a map of 2")?;
                 from.key("why")?;

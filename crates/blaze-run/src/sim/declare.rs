@@ -261,6 +261,9 @@ impl Sim {
                     words.len()
                 )));
             }
+            Down::Data { data } => {
+                return Err(Broke::Oracle(format!("the parent sent `Data` with {} statics: this simulation's manifest has no static", data.len())));
+            }
         };
         drop(self.down.drain(..took));
         match got {

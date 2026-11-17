@@ -970,7 +970,7 @@ pub struct FileRow<'a> {
 ///
 /// Row, 72 bytes, sorted by call key: call key 32 (an [`At::Expansion`]'s: 7, 19), digest of
 /// the text 32 ([`expansion_id`]: the same proof as a file's), text length u32, pad.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ExpansionRow {
     pub call: ItemKey,
     pub id: ContentId,
@@ -1065,7 +1065,7 @@ pub struct ImplRow<'a> {
 /// Row, 48 bytes, sorted by key: key 32; parent u32 (a module row; `u32::MAX`: none); path
 /// at/len u32 (`krate::a::b`: question 20); flags u32 (listed: one `Names::modules` gives, the
 /// rest being keys other rows name as a home; written by a macro; has a path).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ModuleRow<'a> {
     pub key: ItemKey,
     pub parent: Option<ItemKey>,

@@ -777,6 +777,13 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// The most the global heap held of blocks allocated outside any task (of every block where the
+/// global allocator keeps none by tag): [`Snapshot::heap_outside`]'s high water, as each fold
+/// ([`heap_moved`]) left it.
+pub fn heap_outside_high_water() -> u64 {
+    HEAP_OUTSIDE.high_water.load(Ordering::Relaxed)
+}
+
 /// A heap count as held bytes: one below 0 (a free folded in before its allocation) is 0.
 fn held(count: &AtomicI64) -> u64 {
     u64::try_from(count.load(Ordering::Relaxed)).unwrap_or(0)

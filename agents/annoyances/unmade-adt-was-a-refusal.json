@@ -1,0 +1,15 @@
+{
+ "id": "unmade-adt-was-a-refusal",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane HR",
+ "where": "crates/blaze-ladder/src/front2/coroutine_needs.rs held_coroutines; run/lay_states.rs lay_one; front2/program/lazy/front_end.rs adt; run.rs asks_again",
+ "what": "hello world (g082011) stopped at `start`'s signature: 'a type whose ADT definition the world did not answer, met while listing the coroutines a value holds'. tempo's census has the same class 14 times. The lazy program makes ADT rows only for ADTs that a checked body's types or the head store name when the check ends. An ADT met later, by grounding a field at an instance's arguments or by normalizing a projection whose impl was made at instance time, had no row, and three places turned that into a string refusal.",
+ "cost": "about 30 minutes; the build already had the typed form (BuildError::NoAdt) and the Maker already had the make-and-build-again loop",
+ "cause": "the seam's `adt` answered None for 'not made yet' and for 'no such ADT' alike, and callers outside blaze-build's walk turned None (and layout or needs_drop's NoAdt) into UnsupportedSig strings",
+ "whys": "make_asked (lane UZ) covered impl questions noted by a world; the ADT question goes through `adt`, which noted nothing; also the lazy `adt` answered with the fork of the type table taken at the last check_one, which lacks heads made after it",
+ "class": "a seam question whose 'not made yet' answer is read as a refusal",
+ "prevention": "done: the lazy `adt` notes an unmade ADT key's head (only struct, enum and union keys, by kind_of_key), every caller keeps BuildError::NoAdt, and asks_again treats NoAdt as a need. The lazy `adt` now answers from the head store's own table. Tests: d106_records an_adt_no_body_named_is_a_need_the_lazy_program_fills and a_struct_met_through_a_projection_while_listing_coroutines_is_made_over_names_records",
+ "annoyance": "the runner shows no stdout from passing tests, so a test that prints its stop (the dyn walk) cannot be read; I turned it into an assertion",
+ "workaround": "assert, so that a failure prints",
+ "state": "fixed"
+}

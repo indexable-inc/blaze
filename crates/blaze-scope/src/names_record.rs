@@ -13,9 +13,12 @@
 //! enum rows, sorted by owner, 40 bytes (owner, first variant u32, count u32); variant rows,
 //! 48 bytes (key, name at u32 and length u32 into the strings, record u8, pad); the strings; the
 //! crate's `CrateRoot` record; the blob, each module's blaze-surface `ModuleScope` record; the
-//! failed calls (version 2): per call of the crate whose expansion failed, sorted by call key,
-//! its macro path, whether it is D104's implicit `::std::main`, and the matcher's reason as
-//! blaze-expand's record of [`blaze_expand::Failed`] ([`NamesRecord::failed`]).
+//! refused calls (version 5; failed ones only from version 2): per call of the crate the solve
+//! stored refused, sorted by call key, its macro path as written, its shape, whether it is
+//! D104's implicit `::std::main`, its file in its package, and its reason's kind
+//! ([`crate::call_refusal::RefusalKind`]) with the reason: blaze-expand's record of
+//! [`blaze_expand::Failed`] for a failed expansion, else the words naming what refused it
+//! ([`NamesRecord::failed`]).
 //!
 //! A RECORD IS ITS OWN INDEX (D114 rule 1). The bytes are checked once in a process, whole:
 //! [`Verified::check`] reads every module's scope and the crate root with their own checks,
@@ -38,7 +41,10 @@ use blaze_surface::ScopeBuilder;
 
 use crate::facts::Name;
 use crate::names::{VariantHit, World};
-use crate::resolve::{CrateNames, ExpandNote, NamesNote};
+use blaze_surface::CallShape;
+
+use crate::call_refusal::{CallRefusal, RefusalKind};
+use crate::resolve::{CrateNames, ExpandNote};
 use crate::task::Variant;
 
 const MAGIC: [u8; 4] = *b"BZNM";
@@ -49,10 +55,13 @@ const MAGIC: [u8; 4] = *b"BZNM";
 /// Reading in place (D114 rule 1) changes no byte: the writer is the same, so the version stays.
 /// 4: the crate root it holds is form 4 (blaze-surface `CrateRootRoot`: the root's
 /// `#![feature(..)]` names); a version-3 record is not read, and its names are made again.
-const VERSION: u32 = 4;
-/// A failed call's row: call key, path at and length, record at and length, flags, padding.
+/// 5: a row for EVERY refused call, not only a failed expansion: the flags gain the call's
+/// shape and the reason's kind, the row its file ([`crate::call_refusal`], MR 2026-11-17); a
+/// version-4 record is not read, and its names are made again.
+const VERSION: u32 = 5;
+/// A refused call's row: call key, path at and length, record at and length, flags (bit 0
+/// implicit, byte 1 shape, byte 2 kind), file at and length, padding.
 const FAILED_ROW: usize = 64;
-const FAILED_IMPLICIT: u32 = 1;
 const ALIGN: usize = 16;
 const HEADER: usize = 128;
 const ROW: usize = 48;
@@ -90,57 +99,110 @@ pub enum NamesRecordError {
     FailedPath { call: ItemKey },
     /// A failed call's reason did not read as blaze-expand's record of a failure.
     FailedRecord { call: ItemKey, error: blaze_expand::RecordError },
+    /// A refused call's words are not UTF-8.
+    FailedWords { call: ItemKey },
+    /// A refused call's flags name no call shape or no refusal kind.
+    FailedFlags { call: ItemKey },
 }
 
-/// A failed macro call of the crate, read from its names record: the call, the macro's path as
-/// written (`::std::main` for D104's implicit call over the root `fn main`), and why it failed,
-/// the matcher's own typed reason.
+/// A REFUSED macro call of the crate, read from its names record ([`crate::call_refusal`]):
+/// the call, the macro's path as written (`::std::main` for D104's implicit call over the root
+/// `fn main`), the call's shape, the file it is written in (its path in its package, as
+/// `file!()` shows it), and why it was refused, typed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FailedRow<'a> {
     pub call: ItemKey,
     pub path: &'a str,
+    pub shape: CallShape,
     pub implicit: bool,
-    pub failed: blaze_expand::Failed<'a>,
+    /// The file the call is written in, past its package's directory (`src/lib.rs`); empty for
+    /// a call the lowering does not know.
+    pub file: &'a str,
+    pub why: CallRefusal<'a>,
 }
 
-/// The failed-calls section of `names` (the module doc says its form). A function of the
-/// solve's notes alone, sorted at this boundary (rule 25).
-fn failed_section<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, NamesRecordError> {
-    let mut calls = AVec::new_in(alloc);
-    for note in names.notes.iter() {
-        if let NamesNote::Expand { call, note: ExpandNote::Failed { path, implicit, failed }, .. } = note {
-            calls.push((*call, *path, *implicit, failed.write_record(alloc)));
+/// One refused call of `names` as its row holds it, from the solve's own values: the call's
+/// lowering ([`CrateNames::tables`]) for its path, shape and file, and the note that refused it
+/// ([`crate::resolve::Expansion::refused_by`]) for why. `None`: `call` is no refused call of it.
+/// The one join of the writer ([`failed_section`]) and of a reader of the solve's values (blaze-
+/// ladder's `NamesSource` over `Names`), so the two read alike (rule 30).
+pub fn refused_row<'n, 'b>(names: &CrateNames<'n>, call: ItemKey, alloc: Alloc<'b>) -> Option<FailedRow<'b>>
+where
+    'n: 'b,
+{
+    let expansion = names.expansions.get(&call)?;
+    expansion.refused?;
+    let src = names.tables.calls.get(&call);
+    let (path, shape, implicit) = src.map_or(("", CallShape::FnLike, false), |s| (s.name, s.kind, s.implicit));
+    let file = src.and_then(|s| names.files.get(s.loc.file as usize)).map_or("", |f| f.shown);
+    let why = match expansion.refused_by {
+        Some((ExpandNote::Failed { failed, .. }, _)) => CallRefusal::Failed(failed),
+        Some((note, env)) => {
+            let (kind, words) = crate::call_refusal::words_of(&note, env, alloc);
+            CallRefusal::Refused { kind, words: blaze_own::Box::leak(words.into_boxed_str()) }
         }
+        None => CallRefusal::Refused { kind: RefusalKind::Unnoted, words: "" },
+    };
+    Some(FailedRow { call, path, shape, implicit, file, why })
+}
+
+/// The refused-calls section of `names` (the module doc says its form): a row per call the
+/// solve stored refused, whatever refused it. A function of the solve's values alone, sorted by
+/// call key at this boundary (rule 25).
+fn failed_section<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, NamesRecordError> {
+    let mut keys: AVec<'b, ItemKey> = AVec::new_in(alloc);
+    keys.extend(names.expansions.iter().filter(|(_, e)| e.refused.is_some()).map(|(call, _)| *call));
+    keys.sort_unstable();
+    let mut calls = AVec::with_capacity_in(keys.len(), alloc);
+    for call in keys.iter() {
+        let Some(row) = refused_row(names, *call, alloc) else { continue };
+        let reason = match row.why {
+            CallRefusal::Failed(failed) => failed.write_record(alloc),
+            CallRefusal::Refused { words, .. } => {
+                let mut bytes = RecordBytes::new_in(alloc);
+                bytes.extend_from_slice(words.as_bytes());
+                bytes
+            }
+        };
+        calls.push((row, reason));
     }
-    calls.sort_unstable_by(|a, b| (a.0, &a.3[..]).cmp(&(b.0, &b.3[..])));
-    calls.dedup_by_key(|(call, ..)| *call);
-    let mut paths = RecordBytes::new_in(alloc);
-    for (_, path, ..) in calls.iter() {
-        paths.extend_from_slice(path.as_bytes());
+    let mut texts = RecordBytes::new_in(alloc);
+    for (row, _) in calls.iter() {
+        texts.extend_from_slice(row.path.as_bytes());
+        texts.extend_from_slice(row.file.as_bytes());
     }
-    pad(&mut paths);
-    let records_at = ALIGN + calls.len() * FAILED_ROW + paths.len();
+    pad(&mut texts);
+    let records_at = ALIGN + calls.len() * FAILED_ROW + texts.len();
     let mut out = RecordBytes::new_in(alloc);
     out.extend_from_slice(&u32_of(calls.len(), "failed calls")?.to_le_bytes());
     out.resize(ALIGN, 0);
-    let (mut path_at, mut record_at) = (0usize, records_at);
-    for (call, path, implicit, record) in calls.iter() {
-        out.extend_from_slice(&call.0.0);
-        out.extend_from_slice(&u32_of(path_at, "failed call paths")?.to_le_bytes());
-        out.extend_from_slice(&u32_of(path.len(), "a failed call's path")?.to_le_bytes());
+    let (mut text_at, mut record_at) = (0usize, records_at);
+    for (row, record) in calls.iter() {
+        let flags = u32::from_le_bytes([u8::from(row.implicit), row.shape.byte(), row.why.kind().byte(), 0]);
+        out.extend_from_slice(&row.call.0.0);
+        out.extend_from_slice(&u32_of(text_at, "failed call paths")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(row.path.len(), "a failed call's path")?.to_le_bytes());
         out.extend_from_slice(&u32_of(record_at, "failed call records")?.to_le_bytes());
         out.extend_from_slice(&u32_of(record.len(), "a failed call's record")?.to_le_bytes());
-        out.extend_from_slice(&(if *implicit { FAILED_IMPLICIT } else { 0 }).to_le_bytes());
-        out.extend_from_slice(&[0u8; 12]);
-        path_at += path.len();
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&u32_of(text_at + row.path.len(), "failed call files")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(row.file.len(), "a failed call's file")?.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        text_at += row.path.len() + row.file.len();
         record_at = (record_at + record.len()).next_multiple_of(ALIGN);
     }
-    out.extend_from_slice(&paths);
-    for (.., record) in calls.iter() {
+    out.extend_from_slice(&texts);
+    for (_, record) in calls.iter() {
         out.extend_from_slice(record);
         pad(&mut out);
     }
     Ok(out)
+}
+
+/// A failed-call row's flags: bit 0 D104's implicit call, byte 1 the shape, byte 2 the kind.
+fn row_flags(flags: u32) -> (bool, Option<CallShape>, Option<RefusalKind>) {
+    let [low, shape, kind, _] = flags.to_le_bytes();
+    (low & 1 == 1, CallShape::from_byte(shape), RefusalKind::from_byte(kind))
 }
 
 fn u32_of(n: usize, what: &'static str) -> Result<u32, NamesRecordError> {
@@ -492,23 +554,34 @@ impl<'m> Verified<'m> {
             }
         }
         CrateRootView::read(&bytes[head.root_at..head.root_at + head.root_len]).map_err(NamesRecordError::Root)?;
-        // The failed calls: rows by increasing call key, each path a UTF-8 range of the paths
-        // and each reason a range of the section. The reason's own record is read when asked
-        // ([`NamesRecord::failed`], blaze-expand's check of its record).
+        // The refused calls: rows by increasing call key, each path and file a UTF-8 range of
+        // the texts, its shape and kind known bytes, and each reason a range of the section:
+        // words in UTF-8, or a failure's record, read when asked ([`NamesRecord::failed`],
+        // blaze-expand's check of its record).
         let s = &bytes[head.failed_at..head.failed_at + head.failed_len];
         let count = le32(s, 0) as usize;
         increasing("failed call rows", head.failed_at + ALIGN, count, FAILED_ROW)?;
-        let paths_at = ALIGN + count * FAILED_ROW;
+        let texts_at = ALIGN + count * FAILED_ROW;
+        let text = |at: usize, len: usize| texts_at.checked_add(at).and_then(|start| Some(start..start.checked_add(len)?)).and_then(|r| s.get(r));
         for i in 0..count {
             let row = ALIGN + i * FAILED_ROW;
             let call = key_at(s, row);
-            let (path_at, path_len) = (le32(s, row + 32) as usize, le32(s, row + 36) as usize);
-            let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
-            let path = paths_at.checked_add(path_at).and_then(|start| Some(start..start.checked_add(path_len)?)).and_then(|r| s.get(r));
+            let path = text(le32(s, row + 32) as usize, le32(s, row + 36) as usize);
             let path = path.ok_or(NamesRecordError::Short { what: "a failed call's path", at: head.failed_at + row })?;
             core::str::from_utf8(path).map_err(|_| NamesRecordError::FailedPath { call })?;
-            if record_at.checked_add(record_len).is_none_or(|end| end > s.len()) {
+            let file = text(le32(s, row + 52) as usize, le32(s, row + 56) as usize);
+            let file = file.ok_or(NamesRecordError::Short { what: "a failed call's file", at: head.failed_at + row })?;
+            core::str::from_utf8(file).map_err(|_| NamesRecordError::FailedPath { call })?;
+            let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
+            let Some(record) = record_at.checked_add(record_len).and_then(|end| s.get(record_at..end)) else {
                 return Err(NamesRecordError::Short { what: "a failed call's record", at: head.failed_at + row });
+            };
+            match row_flags(le32(s, row + 48)) {
+                (_, Some(_), Some(RefusalKind::Failed)) => {}
+                (_, Some(_), Some(_)) => {
+                    core::str::from_utf8(record).map_err(|_| NamesRecordError::FailedWords { call })?;
+                }
+                _ => return Err(NamesRecordError::FailedFlags { call }),
             }
         }
         Ok(Verified { bytes, head })
@@ -562,6 +635,19 @@ impl<'m> NamesRecord<'m> {
         None
     }
 
+    /// Every module of the crate by key, in key order: what the cell table
+    /// ([`crate::names_cells::table`]) writes a row of each for.
+    pub fn modules(&self) -> impl ExactSizeIterator<Item = ItemKey> + use<'m> {
+        let (bytes, count) = (self.bytes, self.head.modules);
+        (0..count).map(move |i| key_at(bytes, HEADER + i * ROW))
+    }
+
+    /// Every enum of the crate by key, in key order.
+    pub fn enums(&self) -> impl ExactSizeIterator<Item = ItemKey> + use<'m> {
+        let (bytes, at, count) = (self.bytes, self.head.enums_at, self.head.enums);
+        (0..count).map(move |i| key_at(bytes, at + i * ENUM_ROW))
+    }
+
     /// The module's row: where it starts in the bytes.
     fn row(&self, module: ItemKey) -> Option<usize> {
         self.find(HEADER, ROW, self.head.modules, module).map(|i| HEADER + i * ROW)
@@ -611,12 +697,12 @@ impl<'m> NamesRecord<'m> {
         self.row(module).is_some_and(|row| le16(self.bytes, row + 46) & ANONYMOUS != 0)
     }
 
-    /// The failed call of this crate under `call` (a [`crate::names::Why::Refused`]'s `call`):
-    /// its path, whether it is D104's implicit `::std::main`, and the matcher's reason, read back
-    /// equal to the solve's [`ExpandNote::Failed`]. `None`: no call of this crate failed under
-    /// that key. Found by binary search in place; the path is a slice of the bytes, and the
-    /// reason, the one part with a working form, is decoded into `alloc` (the caller's: the
-    /// record holds no allocator).
+    /// The refused call of this crate under `call` (a [`crate::names::Why::Refused`]'s `call`):
+    /// its path, shape, file, whether it is D104's implicit `::std::main`, and why it was
+    /// refused, read back equal to the solve's ([`refused_row`]). `None`: no call of this crate
+    /// was refused under that key. Found by binary search in place; the path, file and words
+    /// are slices of the bytes, and a failure's reason, the one part with a working form, is
+    /// decoded into `alloc` (the caller's: the record holds no allocator).
     pub fn failed<'b>(&self, call: ItemKey, alloc: Alloc<'b>) -> Result<Option<FailedRow<'b>>, NamesRecordError>
     where
         'm: 'b,
@@ -626,15 +712,30 @@ impl<'m> NamesRecord<'m> {
         let count = le32(s, 0) as usize;
         let Some(i) = self.find(self.head.failed_at + ALIGN, FAILED_ROW, count, call) else { return Ok(None) };
         let row = ALIGN + i * FAILED_ROW;
-        let paths_at = ALIGN + count * FAILED_ROW;
-        let (path_at, path_len) = (paths_at + le32(s, row + 32) as usize, le32(s, row + 36) as usize);
+        let texts_at = ALIGN + count * FAILED_ROW;
+        let text = |at: usize, len: usize| -> &'m str {
+            let start = texts_at + at;
+            // SAFETY: `Verified::check`, the one maker of this record's proof, checked this
+            // row's path and file ranges inside the section and their bytes UTF-8
+            // (`str::from_utf8`), in the same immutable `'m` bytes.
+            unsafe { core::str::from_utf8_unchecked(&s[start..start + len]) }
+        };
+        let path = text(le32(s, row + 32) as usize, le32(s, row + 36) as usize);
+        let file = text(le32(s, row + 52) as usize, le32(s, row + 56) as usize);
         let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
-        // SAFETY: `Verified::check`, the one maker of this record's proof, checked this row's
-        // path range inside the section and its bytes UTF-8 (`str::from_utf8`), in the same
-        // immutable `'m` bytes.
-        let path: &'m str = unsafe { core::str::from_utf8_unchecked(&s[path_at..path_at + path_len]) };
-        let failed = blaze_expand::Failed::read_record(&s[record_at..record_at + record_len], alloc).map_err(|error| NamesRecordError::FailedRecord { call, error })?;
-        Ok(Some(FailedRow { call, path, implicit: le32(s, row + 48) & FAILED_IMPLICIT != 0, failed }))
+        let record = &s[record_at..record_at + record_len];
+        let (implicit, shape, kind) = row_flags(le32(s, row + 48));
+        let (Some(shape), Some(kind)) = (shape, kind) else { return Err(NamesRecordError::FailedFlags { call }) };
+        let why = match kind {
+            RefusalKind::Failed => CallRefusal::Failed(blaze_expand::Failed::read_record(record, alloc).map_err(|error| NamesRecordError::FailedRecord { call, error })?),
+            kind => {
+                // SAFETY: `Verified::check` checked the words of a row of any kind but
+                // `Failed` UTF-8, in the same immutable `'m` bytes.
+                let words: &'m str = unsafe { core::str::from_utf8_unchecked(record) };
+                CallRefusal::Refused { kind, words }
+            }
+        };
+        Ok(Some(FailedRow { call, path, shape, implicit, file, why }))
     }
 
     /// The crate root, viewed in place.

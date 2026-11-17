@@ -137,8 +137,13 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             }
             names.each_member(key, &mut |m| {
                 if m.item == item && m.kind == ItemKind::Function && m.written_by.is_none() {
-                    let filed = m.name.and_then(|name| self.front.keys.filed_member(checker_of(key), crate::front2::keys::MemberKind::Fn, name));
-                    found = filed.map(|f| Want::MemberFn(key, f));
+                    // Its key as COMPUTED from its container and name (keys.rs `member_key_of`),
+                    // never as filed: a member is filed only once its impl's head was made in
+                    // this world, so asking the filed key made the want (and the `Signature`'s
+                    // out) hang on which body the job checked first (rule 25; blaze-cli
+                    // order_tests.rs `reversed_order_answers_alike`, lane FH 2026-11-17). The
+                    // want's making (`Store::step`) makes the impl's head first and files it.
+                    found = m.name.map(|name| Want::MemberFn(key, crate::front2::keys::member_key_of(checker_of(key), crate::front2::keys::MemberKind::Fn, name)));
                 }
             });
         });
@@ -167,6 +172,18 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         });
         let item = item.ok_or(HeadDigestError::Unplaced { want })?;
         Ok(WantPlace { krate: place.krate, file, item })
+    }
+
+    /// The written types of `want`'s fn signature that name nothing (E0412, front2
+    /// type_miss.rs), each made the error type in its head: empty for a want that is no fn's,
+    /// or whose head is not made ([`Self::want_digest`] makes it).
+    pub fn want_type_misses(&self, want: Want) -> &[crate::front2::type_miss::TypeMiss] {
+        let key = match want {
+            Want::Fn(lib) => checker_of(lib),
+            Want::MemberFn(_, f) => f,
+            Want::Head(_) | Want::Adt(_) | Want::Impl(_) | Want::Members(_) => return &[],
+        };
+        self.store.type_misses.get(&key).map_or(&[], |m| m.as_slice())
     }
 
     /// The digest of every head `want` makes (see the module docs), made first when the store

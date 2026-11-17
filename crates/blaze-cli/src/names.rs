@@ -61,14 +61,14 @@ pub(crate) mod metered;
 mod scope;
 pub(crate) mod sections;
 
-// The subject and source domains name the payload's form ([`sections::FORM`] 5) and its producer:
+// The subject and source domains name the payload's form ([`sections::FORM`] 6) and its producer:
 // an old home's records (form 1: exports then inner; form 2: no tests section; "3": form 3 by
 // the old name fill, before blaze-scope's cell core became the writer; "4": form 3, without the
 // expansion texts; "5": an out of the names record alone, see [`OUT_DOMAIN`]; "6": a names
 // section of names record version 1, without the failed calls; "7": form 4, without the link
-// table) are under other names, never found, made again.
-const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 8";
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 8";
+// table; "8": form 5, without the cell table) are under other names, never found, made again.
+const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 9";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 9";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -288,7 +288,11 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
     // the crate fails; an error here is a table that could not be written at all.
     let mut links = blaze_own::AVec::new_in(alloc);
     blaze_ladder::native_links::scope_table(done.names, &mut links, alloc).map_err(|error| unwritten("link table", std::format!("{error:?}")))?;
-    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, &expansions[..], &links[..]]);
+    // The cell table (drive.md, "Names at module grain" point 3): what a reader by cell is
+    // checked against, over the two records above and, whole, the items and expansions.
+    let wholes = [(blaze_scope::names_cells::Section::Items, &items_record[..]), (blaze_scope::names_cells::Section::Expansions, &expansions[..])];
+    let cells = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, alloc).map_err(|error| unwritten("cell table", std::format!("{error:?}")))?;
+    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, &expansions[..], &links[..], &cells[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
     Ok(ScopeRecord { payload, findings, unresolved, tests_refused })

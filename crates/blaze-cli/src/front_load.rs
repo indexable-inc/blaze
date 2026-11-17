@@ -266,7 +266,7 @@ mod tests {
             let i = blaze_scope::items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name));
             let e = crate::names::expansion_texts::write(c).unwrap_or_else(|e| panic!("expansion texts of `{}`: {e}", c.name));
             let e: &[u8] = if texts { &e[..] } else { &[] };
-            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], e, &[]]));
+            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], e, &[], &[]]));
         }
         out
     }

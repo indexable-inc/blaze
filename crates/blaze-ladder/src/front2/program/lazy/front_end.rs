@@ -348,9 +348,31 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     // (4) Types and items.
 
+    /// An ADT whose row is not made yet (a type the build met that no checked body's types
+    /// named: a field's type grounded at an instance's arguments, a projection normalized at
+    /// them) is a NEED, not a refusal: its head is noted for the build's `make_asked`, as a
+    /// world's question notes what it found unmade, and the build's `NoAdt` makes it and builds
+    /// again (run.rs `asks_again`). Only a key of a struct, an enum or a union is noted (by
+    /// `kind_of_key`, the one reading of what a key names): a question about any other key is
+    /// no need, and stays unanswered.
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
-        let a = self.store.adts.get(&key)?;
-        Some(Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.types() })
+        use crate::front2::by_origin::{ItemKind, KeyKind, kind_of_key};
+        use crate::front2::heads::Want;
+        use crate::front2::world_items::Fill;
+        let Some(a) = self.store.adts.get(&key) else {
+            if let Ok(KeyKind::Item(ItemKind::Adt(lib))) = kind_of_key(self.front.names, &self.front.keys, key) {
+                let mut asked = self.asked.borrow_mut();
+                if !asked.iter().any(|f| matches!(f, Fill::Store(Want::Adt(l)) if *l == lib)) {
+                    asked.push(Fill::Store(Want::Adt(lib)));
+                }
+            }
+            return None;
+        };
+        // The head store's own table, which holds every head's types: `types()` is a fork of it
+        // taken at the last `check_one`, which lacks a row made after (by `make_asked`), and
+        // agrees with it on every row made before. Every reader grounds a field's type from
+        // `Adt::types` alone (blaze-build `ground`).
+        Some(Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.store.tys.view() })
     }
 
     fn repr(&self, key: ItemKey) -> ReprAttrs {

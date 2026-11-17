@@ -1066,6 +1066,22 @@
    "recommended": "Lane directories for every lane from 04:40; the shared checkout drains as its lanes finish, then is retired. Rule 36's text is changed when the owner has seen it work.",
    "why": "The owner, 2026-11-17 02:55: \"try to iterate faster on it u can also change things like how it checks/builds\". With fifteen lanes in one directory a cut took whole files, so it carried other lanes' unfinished lines: between 03:30 and 04:35 eight admissions were held up that way (blaze-build closure.rs held four lanes' hunks at once; lib.rs and run.rs two each), two lanes took out another's lines to get through, and three cuts admitted lines their lane did not write. A whole-file cut was also able to revert an admitted change. Per-lane trees with a merge remove the class: a cut holds one lane's changes and nothing else.",
    "state": "built and measured 04:36: a test lane's request was merged onto a green tree that had moved by 31 files, checked and tested in 7 s, and its directory brought up to date; the conflict path and the edited-during-the-wait guard were exercised by hand. In use for lanes started after 04:40."
+  },
+  {
+   "id": "D130",
+   "date": "2026-11-17",
+   "decision": "The goal is revised by the owner: records shared between machines, a remote cache and remote execution are no longer goals (sharing across one machine's checkouts stays); a live process is allowed where it earns its place and is not needed, because records stay the source of truth and a restart must never cost a re-index. The order when two things trade is now: incremental time (after a restart too) with lints as fast, memory, cold time, cleanup that never blocks, disk use.",
+   "recommended": "AGENTS.md's goal, design and scope lines and rule 60's line changed through tools/agents/rules.ts; std and dependencies are compiled on the machine once per toolchain and kept as records; no work on signatures, trust or a network cache for records.",
+   "why": "The owner, 2026-11-17 09:14: \"ok revise our goal; we dont care about shreable across machiens; we CAN have a live process if we want but ideally not because we want tonot have huge reindexing time etc\".",
+   "state": "written into AGENTS.md and the skills (green 41b784b526); docs that plan the remote cache (remote-read.md, trust.md, target.md's remote execution) are not yet marked superseded."
+  },
+  {
+   "id": "D131",
+   "date": "2026-11-17",
+   "decision": "The execution engine is rebuilt and the old one deleted (docs/v2/plan/design/engine.md): a plan made from text; phases over shared immutable tables (outlines, names per module with cells, frozen heads, impl tables, lang items); bodies at body grain on the pool, each reading through a read-only view and recording its cells; a need found while running made inline through the claim table, nothing restarted; the coordinator only plans and merges in bulk; one front end for check, run and the census. Kept: the record store, keys from text, read lists, the certificate, and every semantic function.",
+   "recommended": "New crate blaze-engine beside the old path (rule 79), proven by a history simulation and by equal answers on fixtures and tempo, then `check` switched and the old path deleted: blaze-drive's per-event request machine, blaze-cli's job loop, front2's per-job mutable worlds, whole reads of CrateScope and Surface, the items record's bucket section, the separate eager and lazy programs.",
+   "why": "Tempo's cold check used about 500 s of CPU in 573 s on 18 cores, with 47 s of a 152 s run on the coordinator thread, about 3 entries per result from restart on need, a private world per file job (8.4 GB) and a crate remade for one private fn; edits were already 0.09 to 0.26 s with no process alive, so the record design is right and the engine is not. The owner, 2026-11-17 09:10 and 09:15: \"we should scrap our thign and go compeltly the most sota thing that could exist\"; \"and yea full send the new design u can delete the old code\".",
+   "state": "spec written 09:25; lanes on E1 to E4; nothing switched yet."
   }
  ]
 }

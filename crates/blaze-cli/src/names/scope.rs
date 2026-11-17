@@ -277,7 +277,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
             // nothing of them is read here.
             let opened = match crate::scripts::payload_parts(bytes) {
                 Some((_, record)) => OutputsRef::open(record).map(|outputs| {
-                    let area: &'j crate::scripts::FileArea = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::FileArea::of(env.home, &outputs), round.frame));
+                    let area: &'j blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::file_area(env.home, &outputs), round.frame));
                     outputs.with_area(area)
                 }),
                 None => Err(blaze_build_script::outputs::RecordError::Layout),

@@ -272,6 +272,92 @@ impl<'a> InferCtx<'a> {
         })
     }
 
+    /// Files `t` when it is a closure or async block term the SOLVER made: an opaque's hidden
+    /// type holds it (facts.rs `body_terms`), and revealing the opaque (blaze-solve alias.rs
+    /// `normalize_opaque_type`, a ground resolution's post-analysis mode) instantiates its term
+    /// at the opaque's arguments without passing `mk`, so `view` had no row for it ("a closure
+    /// this context did not make", census g083729). Its row is read off the term by its def:
+    /// owner arguments, then `[kind, rust-call sig, upvars]` for a closure (`closure_term`),
+    /// `[output, interior]` for an async block (`coroutine_term`). Any other term is left as it
+    /// is. A walk of a resolved type it did not build calls this before `view` (instance.rs
+    /// `export`); a closure or async block term it can name by nothing is refused by its handle.
+    pub(crate) fn adopt(&mut self, t: Ty) -> Result<(), CheckError> {
+        use crate::error::Malformed;
+        let unseen = || CheckError::Malformed(Malformed::UnseenBodyType { node: t.0 });
+        // A const (an array's length, a const argument) is no body type.
+        let Some(made) = self.node(t.0).as_ty() else { return Ok(()) };
+        match self.terms.cx.tys.ty_kind(made) {
+            TyKind::Closure(d, l) => {
+                let k = def_of(self.terms.cx.tys.item_key(d));
+                if self.closures.contains_key(&k) || self.foreign.iter().any(|f| f.made == made) || self.foreign_resolved(d, l).is_some() {
+                    return Ok(());
+                }
+                let Some(&facts::HiddenBody { owner, ordinal, args: n }) = self.facts.hidden_bodies.get(&k) else {
+                    return Err(unseen());
+                };
+                let tys = &mut self.terms.cx.tys;
+                if tys.list_len(l) != n + 3 {
+                    return Err(unseen());
+                }
+                let mut owner_args: Vec<blaze_ty::Arg, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+                for i in 0..n {
+                    owner_args.push(tys.list_get(l, i).ok_or_else(unseen)?);
+                }
+                let args = TyList(tys.mk_list(&owner_args).node().bits());
+                use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
+                let kind = match tys.list_get(l, n).and_then(blaze_ty::Arg::konst).map(|c| tys.const_kind(c)) {
+                    Some(ConstKind::Value(_, v)) if v == u128::from(CLOSURE_FN) => crate::ty::ClosureKind::Fn,
+                    Some(ConstKind::Value(_, v)) if v == u128::from(CLOSURE_FN_MUT) => crate::ty::ClosureKind::FnMut,
+                    Some(ConstKind::Value(_, v)) if v == u128::from(CLOSURE_FN_ONCE) => crate::ty::ClosureKind::FnOnce,
+                    _ => return Err(unseen()),
+                };
+                // The signature as typeck makes it, `fn(inputs.., output)`, from the solver's
+                // rust-call `fn((inputs..,)) -> output` (`rust_call_sig` inverted).
+                let Some(TyKind::FnPtr(io, h)) = tys.list_get(l, n + 1).and_then(blaze_ty::Arg::ty).map(|s| tys.ty_kind(s)) else {
+                    return Err(unseen());
+                };
+                let (Some(tupled), Some(out)) = (tys.list_get(io, 0).and_then(blaze_ty::Arg::ty), tys.list_get(io, 1).and_then(blaze_ty::Arg::ty)) else {
+                    return Err(unseen());
+                };
+                let TyKind::Tuple(ins) = tys.ty_kind(tupled) else { return Err(unseen()) };
+                let m = tys.list_len(ins);
+                let mut flat: Vec<blaze_ty::Arg, Alloc<'a>> = Vec::with_capacity_in(m as usize + 1, self.alloc);
+                for i in 0..m {
+                    flat.push(tys.list_get(ins, i).ok_or_else(unseen)?);
+                }
+                flat.push(out.arg());
+                let io = tys.mk_list(&flat);
+                let sig = Ty(tys.fn_ptr(io, h).node().bits());
+                self.foreign.push(ForeignClosure { made, owner, ordinal, args, sig, kind });
+            }
+            TyKind::Coroutine(d, l) => {
+                let k = def_of(self.terms.cx.tys.item_key(d));
+                if self.futures.contains_key(&k) || self.foreign_coroutines.iter().any(|f| f.made == made) {
+                    return Ok(());
+                }
+                let Some(&facts::HiddenBody { owner, ordinal, args: n }) = self.facts.hidden_bodies.get(&k) else {
+                    return Err(unseen());
+                };
+                // The term is `[output, interior]` alone: the owner's arguments, which the
+                // identity `PNode::Coroutine` carries, are not in it.
+                if n != 0 {
+                    return Err(CheckError::Unported(
+                        "an async block of a generic owner revealed from its opaque: the solver's term holds no owner arguments",
+                    ));
+                }
+                let tys = &mut self.terms.cx.tys;
+                let (Some(o), Some(i)) = (tys.list_get(l, 0).and_then(blaze_ty::Arg::ty), tys.list_get(l, 1).and_then(blaze_ty::Arg::ty)) else {
+                    return Err(unseen());
+                };
+                let args = TyList(tys.mk_list(&[]).node().bits());
+                let (output, interior) = (Ty(o.node().bits()), Ty(i.node().bits()));
+                self.foreign_coroutines.push(ForeignCoroutine { made, owner, ordinal, args, output, interior });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// A closure's signature (a `FnPtr`, inputs then output) in the solver's "rust-call" form:
     /// its one input the tuple of the closure's inputs (blaze-solve builtin.rs `callable`).
     fn rust_call_sig(&mut self, sig: Ty) -> Result<blaze_ty::Ty, CheckError> {

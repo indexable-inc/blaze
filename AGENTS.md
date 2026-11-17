@@ -15,20 +15,20 @@ iterate. Rules 28, 62, 66 and 67 say how.
 
 Fast incremental compiles, lints and tests of real Rust in monorepos of millions of lines, enormous
 crates and files included: an edit redoes only what changed. When two trade, the order is:
-incremental time (after a restart too) with lints as fast; records from remote; memory; cold time;
-cleanup that never blocks; disk use. Best on 128 cores, good on a typical Mac, one code path.
+incremental time (after a restart too) with lints as fast; memory; cold time; cleanup that never
+blocks; disk use. Best on 128 cores, good on a typical Mac, one code path.
 
 ## The design ([in full](docs/v2/plan/design/bottom.md))
 
 - Everything kept is a record: keyed from text, written once, read in place, in columns.
-- A command is a process that answers and exits; no daemon holds state between builds.
+- A command answers and exits; a live process may speed it, and a restart re-indexes nothing.
 - A record is valid by its key, or else by its read list checked against today's facts.
 - No dependency graph in memory: candidates are found forward from what changed.
 - Work is at item grain: one body, instance, macro call or script run per task.
 - A program runs from code records in its own process: compiled on first call, no link step.
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
-- Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
+- Records are shared by content across one machine's checkouts; none are made to leave the machine.
 - Decide at run time: a hook, check or optimization is a version swapped into a slot.
 - A lint finding is a record too: errors before the answer, advice after, analyses in the
   background.
@@ -42,15 +42,14 @@ In scope:
 - `run`, `test`, `check`; later `export` (a native file). No `build`. A run compiles what is called.
 - Dependencies and cached records are fully optimized; workspace code is built fast, then tiered up
   in the background, the top tier optimizing across functions at function grain.
-- The shared cache is read without a login. Only CI, and later the remote workers, write to it.
-- Private builds can always stay local: nothing leaves the machine unless an organisation opts in.
+- One machine: std and dependencies are compiled there once per toolchain and kept as records.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
 - blaze's own code is on bstd and our collections: no `std`, `alloc` or third-party crate.
 - A plain Rust project adopts blaze's checks by steps: `rust`, `suggest`, `edition`, `strict`.
 
 Not now:
 - `blaze watch` or building on save; live patching that keeps a program's state (wanted later).
-- Windows, and Buck or Bazel workspaces.
+- Windows; Buck or Bazel workspaces; records shared between machines (a remote cache, remote runs).
 
 ## How work is done
 
@@ -114,7 +113,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 
 ### Speed and tracing (skill `perf-and-tracing`)
 - **16. slow-is-p0-traced**: Anything slow or large is a P0 until the profile names it; the fix quotes before and after.
-- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
+- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, memory, cold, cleanup, disk.
 
 ### Evidence and debugging (skill `debugging`)
 - **17. ask-the-profile-first**: Say why a build was slow, reran or grew from its profile, before guessing or measuring.

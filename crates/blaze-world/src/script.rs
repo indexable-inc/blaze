@@ -100,6 +100,22 @@ impl<'w> ScriptRecords<'w> {
         Ok(ScriptRecords { served })
     }
 
+    /// The digest of every stored file the records name (a native script's `OUT_DIR` files,
+    /// kept beside the records, not in them), with repeats: what a file area for them holds.
+    pub fn stored_digests(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.served.iter().flat_map(|s| s.outputs.stored().map(|file| *file.sha256))
+    }
+
+    /// These records with their stored files read from `area` (`OutputsRef::with_area`): an
+    /// `include!` of one reads it there, and a missing area or file is the reader's typed
+    /// `StoredError`, never an empty file.
+    pub fn with_area(mut self, area: &'w dyn blaze_build_script::outputs::StoredBytes) -> ScriptRecords<'w> {
+        for served in self.served.iter_mut() {
+            served.outputs = served.outputs.with_area(area);
+        }
+        self
+    }
+
     fn find(&self, lib: UnitId) -> Option<&Served<'w>> {
         self.served.binary_search_by_key(&lib, |s| s.unit).ok().map(|at| &self.served[at])
     }

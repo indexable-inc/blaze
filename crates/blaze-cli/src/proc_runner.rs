@@ -152,6 +152,17 @@ mod with_sandbox {
             };
             self.procs.run(def, &call, edition, package, alloc)
         }
+
+        /// Why `def` cannot run, called in the crate at index `krate`, in words naming the
+        /// macro's crate (blaze-proc-macro `ProcMacros::refusal_of`): a caller with no package
+        /// here, or the module the store holds or lacks under the key asked. `None`: nothing
+        /// about the module stops it.
+        pub(crate) fn unusable(&self, krate: usize, def: &MacroDefinition<'_>) -> Option<std::string::String> {
+            if self.callers.of(krate).is_none() {
+                return Some(std::format!("the calling crate (index {krate} of the names world) was given no package, so no proc macro runs for it (proc_env.rs)"));
+            }
+            self.procs.refusal_of(def).map(|finding| finding.to_string())
+        }
     }
 
     /// The runner for `names`' world: each proc-macro crate of a unit registered by its module
@@ -240,6 +251,12 @@ mod without_sandbox {
         }
 
         pub(crate) fn run<'a>(&self, _: usize, _: Edition, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+            match self {
+                ProcRunner::Never(never, _) => match *never {},
+            }
+        }
+
+        pub(crate) fn unusable(&self, _: usize, _: &MacroDefinition<'_>) -> Option<std::string::String> {
             match self {
                 ProcRunner::Never(never, _) => match *never {},
             }

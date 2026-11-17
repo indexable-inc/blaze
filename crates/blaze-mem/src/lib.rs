@@ -61,6 +61,7 @@ pub mod arena;
 pub mod blocks;
 pub mod chunks;
 pub mod column;
+pub mod counted;
 mod error;
 pub mod frame;
 pub mod handle;

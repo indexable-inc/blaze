@@ -41,7 +41,7 @@ pub const UNFILED_LIST: u64 = 1;
 pub const INCOHERENT_FACT: u64 = 2;
 
 /// One impl question.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ask {
     /// `ImplsOf(trait, self shape)`.
     Trait(ItemKey, Shape),
@@ -68,10 +68,14 @@ pub(super) struct Indexed {
     unfiled: HashMap<usize, u64, Global>,
     /// The incoherent fact's digest, once `Buckets::incoherent` holds it.
     incoherent: Option<u64>,
-    trait_reads: HashMap<(ItemKey, Shape), Vec<BucketRead, Global>, Global>,
-    inherent_reads: HashMap<Shape, Vec<BucketRead, Global>, Global>,
+    pub(super) trait_reads: HashMap<(ItemKey, Shape), Vec<BucketRead, Global>, Global>,
+    pub(super) inherent_reads: HashMap<Shape, Vec<BucketRead, Global>, Global>,
     /// How many impls were filed from a bucket: no impl row decoded, no text opened.
-    from_index: u32,
+    pub(super) from_index: u32,
+    /// How many (crate, bucket) were looked up in a crate's record ([`Buckets::bucket_lookups`]).
+    pub(super) lookups: u32,
+    /// How many questions were asked by bucket ([`Buckets::bucket_asks`]).
+    pub(super) asks: u32,
     /// How many unfiled impls were met, by [`NotFiled`] as `usize`.
     not_filed: [u32; 10],
 }
@@ -85,6 +89,8 @@ impl Indexed {
             trait_reads: HashMap::new_in(Global),
             inherent_reads: HashMap::new_in(Global),
             from_index: 0,
+            lookups: 0,
+            asks: 0,
             not_filed: [0; 10],
         }
     }
@@ -236,15 +242,16 @@ impl Buckets {
                     Some(digest) => digest,
                     None => {
                         let mut got: Vec<BucketImpl, Global> = Vec::new_in(Global);
+                        self.indexed.lookups += 1;
                         let Some(digest) = names.bucket(krate, key, &mut |it| got.push(it)) else { continue };
                         for it in got.iter() {
-                            self.krates.push((it.key, krate));
+                            self.krates.insert(it.key, krate);
                             if it.blanket {
-                                self.blanket.push(it.key);
+                                self.blanket.insert(it.key);
                             }
                             let (how, path_self) = match (*under, trait_) {
                                 (Under::Trait(of), Some(t)) => (Filed::Trait(t, of, it.bare), Some(PathSelf::Trait { of: trait_krate, bare: it.bare })),
-                                (Under::Negative, Some(t)) => (Filed::Negative(t), None),
+                                (Under::Negative, Some(t)) => (Filed::Negative(t, None), None),
                                 (Under::Inherent(of), _) | (Under::Trait(of), None) => (Filed::Inherent(of), Some(PathSelf::Inherent)),
                                 (Under::Negative, None) => continue,
                             };
@@ -263,10 +270,10 @@ impl Buckets {
                 reads.push(BucketRead { krate: krate_id, bucket: first8(ContentId::of(KEY_DOMAIN, key.bytes())), answer: digest });
             }
         }
-        if filed != 0 {
-            self.krates.sort_unstable_by_key(|k| k.0);
-            self.sort_filed();
-        }
+        // Nothing filed is sorted here: each set above is a hash set (`Buckets`'s docs). The
+        // one sort is of this question's own read list, whose length is the question's
+        // (crates asked x buckets), never the job's.
+        self.indexed.asks += 1;
         reads.sort_unstable();
         reads.dedup();
         match ask {
@@ -280,35 +287,13 @@ impl Buckets {
     /// [`Buckets::admit`] files a crate's rows: by the row (`file_row`: the reader's names
     /// resolve what the writer's did not), else by the header's text.
     fn file_unfiled<'n, S: NamesSource<'n>>(&mut self, names: S, krate: usize, rows: &[(ImplRow<'n>, NotFiled)]) {
-        let mut impls: Vec<super::super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
-        let mut kept = RowNames { run: None, selves: HashMap::new_in(Global) };
-        self.krates.extend(rows.iter().map(|(row, _)| (row.key, krate)));
+        let mut plain: Vec<ImplRow<'n>, Global> = Vec::with_capacity_in(rows.len(), Global);
         for (row, why) in rows.iter() {
             self.indexed.not_filed[*why as usize] += 1;
-            match file_row(names, row, &mut kept) {
-                Ok((filed, blanket, path_self)) => {
-                    if blanket {
-                        self.blanket.push(row.key);
-                    }
-                    self.put(row.key, filed, false);
-                    self.bound(names, row.key, krate, path_self);
-                    self.filed_from_rows += 1;
-                }
-                Err(miss) => {
-                    self.row_misses[miss as usize] += 1;
-                    match names.impl_with_header(krate, row.key, row.module) {
-                        Some(at) => impls.push(at),
-                        // Its text did not read (the source filed why): unread, filed by
-                        // what its row read (`Buckets::put_textless`).
-                        None => self.put_textless(names, row, &mut kept),
-                    }
-                }
-            }
+            plain.push(*row);
         }
-        // By key: the order impls are filed in is a function of the records.
-        impls.sort_by_key(|at| at.key);
-        self.filed_from_text += impls.len() as u32;
-        self.file_all(names, &impls);
+        let counts = file_rows(names, krate, &plain, &mut |f| self.take(names, krate, f));
+        self.count(counts);
     }
 
     /// What the answered trait question read, sorted: each (crate, bucket) with its digest
@@ -322,10 +307,32 @@ impl Buckets {
         self.indexed.inherent_reads.get(&shape).map_or(&[], |v| v.as_slice())
     }
 
+    /// Every question answered by bucket, sorted: what a real check asked, to be asked again
+    /// of another source (tests/front2_tables_core.rs).
+    pub fn asked(&self) -> Vec<Ask, Global> {
+        let mut out: Vec<Ask, Global> = Vec::with_capacity_in(self.indexed.trait_reads.len() + self.indexed.inherent_reads.len(), Global);
+        out.extend(self.indexed.trait_reads.keys().map(|(t, s)| Ask::Trait(*t, *s)));
+        out.extend(self.indexed.inherent_reads.keys().map(|s| Ask::Inherent(*s)));
+        out.sort_unstable();
+        out
+    }
+
     /// How many impls were filed from a bucket of an items record: no impl row decoded to file
     /// them, no text opened.
     pub fn filed_from_index(&self) -> u32 {
         self.indexed.from_index
+    }
+
+    /// How many (crate, bucket) pairs were looked up in their crate's items record: each at
+    /// most once per [`Buckets`], whatever questions read it, so N questions over one bucket
+    /// look it up once.
+    pub fn bucket_lookups(&self) -> u32 {
+        self.indexed.lookups
+    }
+
+    /// How many questions [`Buckets::admit_asked`] answered by bucket.
+    pub fn bucket_asks(&self) -> u32 {
+        self.indexed.asks
     }
 
     /// How many crates were asked by bucket (each had its unfiled list filed).

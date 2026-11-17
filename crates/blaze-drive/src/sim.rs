@@ -117,6 +117,10 @@ struct World {
     closure: bool,
     /// The files whose bodies the running program may want; `None`: any file's.
     wants_from: Option<StdVec<usize>>,
+    /// As the world a request walks from: the files its answer did not read (a narrower `run`'s
+    /// closure left them out). The cli's leaf table holds only what the answer read, so each is
+    /// handed as changed, as a new file is.
+    unread: BTreeSet<usize>,
     /// A body resolves each call through its callee file's `Surface` first, and reads the
     /// callee's signature only when the file still holds it ([`resolved_body`]): which names it
     /// reads follows from what it read, under one key.
@@ -356,6 +360,7 @@ impl World {
             read_bug: ReadBug::None,
             quiet: false,
             closure: false,
+            unread: BTreeSet::new(),
             wants_from: None,
             resolve_calls: false,
             names_bug: NamesBug::None,
@@ -827,7 +832,7 @@ fn request_with(
         .map(|f| FileEntry {
             path: &paths[f],
             id: ids[f],
-            changed: before.is_none_or(|old| old.files.get(f).is_none_or(|_| old.id(f) != ids[f])),
+            changed: before.is_none_or(|old| old.unread.contains(&f) || old.files.get(f).is_none_or(|_| old.id(f) != ids[f])),
             manifest: false,
         })
         .collect();
@@ -965,7 +970,7 @@ fn request_with(
                         results.push(Outcome { ticket: *ticket, ran, in_place: *in_place, ns: 1_000 });
                     }
                     req.step(Event::Ran { batch: id, results: &results }, &mut out)
-                } else if tape.one_in(2, "the program exits") {
+                } else if bodies.is_empty() || tape.one_in(2, "the program exits") {
                     running = false;
                     exited = true;
                     req.step(Event::Exited { ok: true }, &mut out)
@@ -1130,10 +1135,31 @@ fn fresh(tape: &Tape, world: &World) -> Result<(Store, Ended), Broke> {
 
 fn same_as_fresh(tape: &Tape, world: &World, store: &Store, ended: &Ended) -> Result<(), Broke> {
     let (fresh_store, fresh_ended) = fresh(tape, world)?;
+    equal_to(store, ended, &fresh_store, &fresh_ended, false)
+}
+
+/// `ended`'s answer table and findings against a fresh build's. `within`: every row of the
+/// fresh table is in this one, equal, and this one may hold more (`run`'s table keeps the rows
+/// of bodies an earlier closure reached).
+fn equal_to(store: &Store, ended: &Ended, fresh_store: &Store, fresh_ended: &Ended, within: bool) -> Result<(), Broke> {
+    let there = equal_table(store, ended, fresh_store, fresh_ended, within)?;
+    equal_prints(ended, fresh_ended, within, &there)
+}
+
+/// The answer tables alone ([`equal_to`]); the fresh one is returned.
+fn equal_table(store: &Store, ended: &Ended, fresh_store: &Store, fresh_ended: &Ended, within: bool) -> Result<Table, Broke> {
     let last = ended.last.as_deref().ok_or(Broke::Oracle(String::from("no last written")))?;
     let fresh_last = fresh_ended.last.as_deref().ok_or(Broke::Oracle(String::from("no last written")))?;
-    let here = table(store, last)?;
-    let there = table(&fresh_store, fresh_last)?;
+    let mut here = table(store, last)?;
+    let there = table(fresh_store, fresh_last)?;
+    // Within: a row a narrower request keeps also keeps its readers outside today's reach (a
+    // body an earlier closure reached); each still reads it, so it stays a reader.
+    if within {
+        here.retain(|name, _| there.contains_key(name));
+        for row in here.values_mut() {
+            row.8.retain(|reader| there.contains_key(reader));
+        }
+    }
     oracle(here == there, || {
         let differ: StdVec<String> = here
             .keys()
@@ -1144,8 +1170,19 @@ fn same_as_fresh(tape: &Tape, world: &World, store: &Store, ended: &Ended) -> Re
             .take(3)
             .map(|name| format!("{name}"))
             .collect();
-        format!("the answer table differs from a fresh build at {differ:?}")
+        let first = here.keys().chain(there.keys()).find(|name| here.get(name) != there.get(name));
+        let rows = first.map(|name| format!("here {:?}, fresh {:?}", here.get(name), there.get(name)));
+        format!("the answer table differs from a fresh build at {differ:?}; the first: {rows:?}")
     })?;
+    Ok(there)
+}
+
+/// The findings printed alone ([`equal_to`]), against the fresh table `there`.
+fn equal_prints(ended: &Ended, fresh_ended: &Ended, within: bool, there: &Table) -> Result<(), Broke> {
+    // A narrower request prints no finding of a name it does not reach today: such an error
+    // would hold a start the program never needs.
+    let beyond = ended.prints.iter().find(|print| within && !there.contains_key(&print.0));
+    oracle(beyond.is_none(), || format!("a finding of {:?}, which this request does not reach, was printed", beyond.map(|print| print.0)))?;
     oracle(ended.prints == fresh_ended.prints, || String::from("the findings printed differ from a fresh build"))?;
     // A file's findings are placed in its own text: from 0, never from its `mod` in its home.
     let misplaced = ended.prints.iter().find(|print| print.0.kind == Kind::FileItems && print.6 != 0);
@@ -1883,6 +1920,179 @@ fn scopes(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let added: BTreeSet<usize> = now.difference(&files).copied().collect();
     let (_, again) = finished(request_with(tape, &next, Some(&world), &mut store, first.last.as_deref(), run_setup(tape, plant))?)?;
     reached_checked(&next, &again, &now, &added, errors_in(&now), "the run after the edit")
+}
+
+/// Random histories over one store in which requests reach different subsets: `check` and
+/// `run` (its closure narrower, each its own pointer), edits of a body or a signature, a member
+/// reached anew or left, a removal, and now and then a file that fails its task. Every request
+/// that answers equals a fresh build of its world under its own ask (`run`'s within it), and
+/// every answer a job takes from its own old row for a read the walk did not enter is held to
+/// that read's row as it runs (request.rs `taken_read`; debug builds and this simulation only).
+/// A planted bug is caught: an old row's answer taken for a read the walk DID enter. The other,
+/// a dirtied reader not run again keeping its row unmarked, waits on a known bug (below).
+///
+/// Each history is of one kind: with failing tasks, or with removals; its closure only grows.
+/// Three known bugs, found by these histories and reported 2026-11-17 by lane DR, keep the
+/// rest out, each an ignored test: a failing task among removals runs a body on old text
+/// (`known_bug_a_failing_task_among_removals`); a shrunk closure keeps and prints the findings
+/// it no longer reaches (`known_bug_a_shrunk_closure_prints_what_it_left`; after a shrink a
+/// `run`'s table is held to the fresh one and its prints are not); a part a shrunk closure
+/// held keeps its old row (`known_bug_a_part_held_by_a_shrunk_closure_keeps_its_old_row`).
+fn histories(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let mix = match tape.one_in(2, "a history with failing tasks, not removals") {
+        true => Mix { removals: false, shrink: false, ..Mix::ALL },
+        false => Mix { fails: false, shrink: false, ..Mix::ALL },
+    };
+    histories_of(tape, plant, mix)
+}
+
+/// What a history may hold ([`histories`]).
+#[derive(Clone, Copy)]
+struct Mix {
+    run: bool,
+    check: bool,
+    fails: bool,
+    removals: bool,
+    members: bool,
+    /// A member's dependency dropped: `run`'s closure shrinks.
+    shrink: bool,
+}
+
+impl Mix {
+    const ALL: Mix = Mix { run: true, check: true, fails: true, removals: true, members: true, shrink: true };
+}
+
+fn histories_of(tape: &Tape, plant: Plant, mix: Mix) -> Result<(), Broke> {
+    let mut world = scope_world(tape);
+    let mut store = Store::default();
+    // Each pointer's last answer and the world it answered: `check`'s, then `run`'s.
+    let mut lasts: [Option<(StdVec<u8>, World)>; 2] = [None, None];
+    // A member's dependency was dropped in this history: `run`'s closure shrank once.
+    let mut shrunk = false;
+    for serial in 0..2 + tape.below(10, "requests") {
+        let mut next = world.clone();
+        match tape.index(5, "edit") {
+            0 => next = edit(tape, &world, serial, true),
+            1 => next = edit(tape, &world, serial, false),
+            2 | 3 if !mix.members => {}
+            3 if !mix.shrink => {}
+            4.. if !mix.removals => {}
+            2 => {
+                let reached = closure_of(&world);
+                let unreached: StdVec<usize> = (0..world.members.len()).filter(|k| !reached.contains(k)).collect();
+                if !unreached.is_empty() {
+                    next.members[0].deps.push(unreached[tape.index(unreached.len(), "the member reached anew")]);
+                    next.members[0].version += 1;
+                }
+            }
+            3 => {
+                if next.members[0].deps.pop().is_some() {
+                    next.members[0].version += 1;
+                    shrunk = true;
+                }
+            }
+            _ => {
+                // The removal's text, in this world (its members, its crates).
+                if let Some(removed) = removal(tape, &world, serial) {
+                    next.files = removed.files;
+                    next.items = removed.items;
+                    next.file_subjects = removed.file_subjects;
+                }
+            }
+        }
+        // The program wants no body: a `run` whose certificate stands (an edit outside its
+        // closure) holds no `now` rows, and a want then fails `LateWant` (request.rs `wanted`,
+        // reported to the coordinator 2026-11-17); these histories are about the walk.
+        next.wants_from = Some(StdVec::new());
+        let run = match (mix.run, mix.check) {
+            (true, true) => tape.one_in(2, "run, not check"),
+            (run, _) => run,
+        };
+        let pointer = usize::from(run);
+        let setup = match run {
+            true => run_setup(tape, plant),
+            false => setup(tape, plant),
+        };
+        let mut asked = next.clone();
+        let fails = mix.fails && tape.one_in(4, "a file fails its task");
+        if fails {
+            asked.failing_file = Some(tape.index(asked.files.len(), "the failing file"));
+        }
+        let (last, before) = match &lasts[pointer] {
+            Some((last, before)) => (Some(last.as_slice()), Some(before)),
+            None => (None, None),
+        };
+        let (_, ended) = finished(request_with(tape, &asked, before, &mut store, last, setup)?)?;
+        world = next;
+        // A failed task leaves no last answer: the next request walks from the one before.
+        if fails || ended.last.is_none() {
+            continue;
+        }
+        let mut fresh_store = Store::default();
+        let (_, fresh_ended) = finished(request_with(tape, &asked, None, &mut fresh_store, None, Setup { plant: Plant::None, ..setup })?)?;
+        let there = equal_table(&store, &ended, &fresh_store, &fresh_ended, run)?;
+        // A shrunk closure's prints are the known bug's
+        // (`known_bug_a_shrunk_closure_prints_what_it_left`): its table is held to the fresh one.
+        if !(run && shrunk) {
+            equal_prints(&ended, &fresh_ended, run, &there)?;
+        }
+        let mut read = world.clone();
+        if run {
+            let reached = scope_files(&world);
+            read.unread = (0..world.files.len()).filter(|f| !reached.contains(f)).collect();
+        }
+        lasts[pointer] = ended.last.clone().map(|last| (last, read));
+    }
+    Ok(())
+}
+
+/// Expected: "test sim::histories_over_narrower_and_wider_requests_answer_as_fresh_builds ... ok".
+#[test]
+fn histories_over_narrower_and_wider_requests_answer_as_fresh_builds() {
+    check(SimConfig::cases(300), |tape| histories(tape, Plant::None));
+}
+
+/// A known bug (lane DR, 2026-11-17): `check` histories with failing tasks AND removals run a
+/// `BodyCheck` with a source that is not its text's (seed 16 of 300, before the floor too).
+#[test]
+#[ignore = "known bug: a failing task in a history with removals runs a body on old text"]
+fn known_bug_a_failing_task_among_removals() {
+    check(SimConfig::cases(300), |tape| histories_of(tape, Plant::None, Mix { run: false, fails: true, removals: true, members: false, shrink: false, check: true }));
+}
+
+/// A known bug (lane DR, 2026-11-17): `run` after its closure shrank prints the finding of a
+/// body it no longer reaches (request.rs `finish`: old findings merged unless dropped).
+#[test]
+#[ignore = "known bug: a shrunk closure keeps and prints the findings it no longer reaches"]
+fn known_bug_a_shrunk_closure_prints_what_it_left() {
+    check(SimConfig::cases(300), |tape| histories_of(tape, Plant::None, Mix { check: false, fails: false, removals: false, ..Mix::ALL }));
+}
+
+/// A known bug (lane DR, 2026-11-17): a `run` whose closure shrank re-reads an edited file it no
+/// longer reaches; its parts are held and dropped unmade (request.rs `release`), keeping their
+/// old rows, and when the closure grows again the file's row stands and they are never entered:
+/// a `Signature` keeps its old source and its readers stand on it. The same invariant as
+/// [`Request::taken_read`]'s, broken by held parts rather than dirtied readers.
+#[test]
+#[ignore = "known bug: a part held by a shrunk closure keeps its old row"]
+fn known_bug_a_part_held_by_a_shrunk_closure_keeps_its_old_row() {
+    check(SimConfig::cases(300), |tape| histories_of(tape, Plant::None, Mix { check: false, fails: false, removals: false, ..Mix::ALL }));
+}
+
+/// The dirtied reader `run` leaves unrun is reachable only after its closure shrank (one that
+/// only grows runs every reader it ever reached), which the known bug above blocks: until it is
+/// fixed this control cannot show its plant caught.
+#[test]
+#[ignore = "blocked by known_bug_a_part_held_by_a_shrunk_closure_keeps_its_old_row"]
+fn control_a_dirtied_reader_left_unmarked_is_caught() {
+    control(SimConfig::cases(300), Plant::None, Plant::StaleReaderKept, "", |tape, plant| {
+        histories_of(tape, plant, Mix { fails: false, removals: false, ..Mix::ALL })
+    });
+}
+
+#[test]
+fn control_an_old_answer_taken_for_an_entered_read_is_caught() {
+    control(SimConfig::cases(300), Plant::None, Plant::RecordedForEntered, "", histories);
 }
 
 #[test]

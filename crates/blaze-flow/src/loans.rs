@@ -14,7 +14,7 @@ use crate::flow::{
     BorrowKind, Bound, Flow, Loan, Local, Operand, Origin, Place, Point, Proj, Span, Stmt,
     StmtKind, Value,
 };
-use crate::moves::for_each_operand;
+use crate::moves::{Inits, for_each_operand};
 use crate::record::Plant;
 
 /// An access: a place, read or write, deep or shallow (RFC 2094).
@@ -116,7 +116,7 @@ pub fn kills<A: Allocator>(flow: &Flow<A>, s: Stmt, l: Loan) -> bool {
     }
 }
 
-fn uses_and_def<A: Allocator>(flow: &Flow<A>, s: Stmt, mut used: impl FnMut(Local)) -> Option<Local> {
+fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, mut used: impl FnMut(Local)) -> Option<Local> {
     let local = |p: Place| flow.place(p).local;
     let dest_def =|dest: Place, used: &mut dyn FnMut(Local)| {
         if flow.place(dest).depth == 0 {
@@ -147,9 +147,15 @@ fn uses_and_def<A: Allocator>(flow: &Flow<A>, s: Stmt, mut used: impl FnMut(Loca
             dest_def(dest, &mut used)
         }
         StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => Some(l),
-        // Drop-liveness: every origin of a dropped local is taken as drop-live (no `may_dangle`).
+        // Drop-liveness: every origin of a dropped local is taken as drop-live (no `may_dangle`),
+        // where the drop may run (`Inits::drop_may_run`, as suspend.rs's liveness has it). A
+        // drop of a local moved out on every path is no use: `w.into_inner()` then the scope's
+        // `drop w` kept `w`'s `&mut out` loan live to the move of `out` (tempo
+        // consensus-config tests.rs:29, a false E0505).
         StmtKind::Drop(p) => {
-            used(local(p));
+            if init.drop_may_run(flow, s, p) {
+                used(local(p));
+            }
             None
         }
         StmtKind::Activate(l) => {
@@ -183,6 +189,9 @@ pub struct Facts<A: Allocator> {
 pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, Bound> {
     let (n, nl, o) = (flow.stmts.len(), flow.loans.len(), flow.origins as usize);
     let locals = flow.locals as usize;
+    // Where each drop may run: the move check's dataflow, unplanted (a planted move bug is
+    // the move check's control, not liveness's).
+    let init = crate::moves::inits(flow, Plant::None, alloc.clone())?;
     let mut live_in = Bits::new_in(n, locals, alloc.clone());
     let mut live_out = Bits::new_in(n, locals, alloc.clone());
     let mut scratch_l = Vec::with_capacity_in(live_in.words(), alloc.clone());
@@ -203,10 +212,10 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
                 crate::bits::union_into(&mut scratch_l, live_in.row(t.index()));
             });
             changed |= crate::bits::union_into(live_out.row_mut(s), &scratch_l);
-            if let Some(d) = uses_and_def(flow, Stmt(s as u32), |_| {}) {
+            if let Some(d) = uses_and_def(flow, &init, Stmt(s as u32), |_| {}) {
                 crate::bits::put(&mut scratch_l, d.index(), false);
             }
-            uses_and_def(flow, Stmt(s as u32), |l| crate::bits::put(&mut scratch_l, l.index(), true));
+            uses_and_def(flow, &init, Stmt(s as u32), |l| crate::bits::put(&mut scratch_l, l.index(), true));
             changed |= crate::bits::union_into(live_in.row_mut(s), &scratch_l);
         }
         if !changed {

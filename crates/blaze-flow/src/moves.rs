@@ -63,6 +63,16 @@ pub struct Inits<A: Allocator> {
     pub reached: Vec<bool, A>,
 }
 
+impl<A: Allocator> Inits<A> {
+    /// `drop p` at `s` may run a destructor: `s` is reached and some part of `p` (itself or a
+    /// place below it) may be initialized on entry to it. A drop of a place moved out on every
+    /// path is no use of it (drop elaboration removes it; RFC 2094, "liveness": a variable is
+    /// drop-live only where it may be initialized).
+    pub fn drop_may_run<B: Allocator>(&self, flow: &Flow<B>, s: Stmt, p: Place) -> bool {
+        self.reached[s.index()] && (0..flow.places.len()).any(|q| flow.is_prefix(p, Place(q as u32)) && bits::test(self.init.row(s.index()), q))
+    }
+}
+
 /// Calls `f` on each operand a value reads.
 pub fn for_each_operand<A: Allocator>(flow: &Flow<A>, value: Value, mut f: impl FnMut(Operand)) {
     match value {

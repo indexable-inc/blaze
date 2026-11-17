@@ -386,7 +386,12 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         _ => return Err(BuildError::UnsupportedSig { what: "an async block whose flow was refused: its state recipe was not made" }),
     };
     let points = recipe.points;
-    let refused = |_| BuildError::UnsupportedSig { what: "the layout of an upvar or saved local of a coroutine state was refused" };
+    // An ADT whose row is not made stays `NoAdt` (the need the lazy program fills, then the
+    // instance is built again); any other layout refusal is the state's.
+    let refused = |e: blaze_build::layout::LayoutError| match e.why {
+        blaze_build::layout::Refusal::NoAdt(adt) => BuildError::NoAdt { adt },
+        _ => BuildError::UnsupportedSig { what: "the layout of an upvar or saved local of a coroutine state was refused" },
+    };
     let mut sizes: AVec<'_, (u64, u8)> = AVec::with_capacity_in(types.len(), alloc);
     for &t in types.iter() {
         let mut cx = LayoutCx { ground: &mut *ground, facts: adts.facts(), scratch: alloc };
@@ -401,7 +406,10 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     for &t in types.iter().skip(1) {
         let mut drop_impl = |ty: PTy, g: &mut PortableTys<'_>| adts.drop_impl(ty, g);
         let needs = blaze_build::drop_facts::needs_drop(t, &mut *ground, adts.facts(), manually_drop, &mut drop_impl, alloc)
-            .map_err(|_| BuildError::UnsupportedSig { what: "whether a saved local of a coroutine state needs drop was not answered" })?;
+            .map_err(|e| match e {
+                blaze_build::drop_facts::NeedsDropError::NoAdt { adt } => BuildError::NoAdt { adt },
+                _ => BuildError::UnsupportedSig { what: "whether a saved local of a coroutine state needs drop was not answered" },
+            })?;
         flags.push(needs);
     }
     let (env, saved) = match sizes.split_first() {

@@ -177,7 +177,7 @@ pub fn impl_header_end<A: Allocator + Clone>(text: &str, alloc: A) -> Option<usi
 /// The index of the header's `{`: the first outside `(..)` and `[..]` (attributes are
 /// bracketed). The lexer stops AT that `{` when the header holds a `fn` type (`impl Tr for
 /// fn(u8) {`): then every token is the header's, and the cut is their count.
-fn header_cut(toks: &[Tok]) -> usize {
+pub(super) fn header_cut(toks: &[Tok]) -> usize {
     let mut depth = 0i32;
     for (i, t) in toks.iter().enumerate() {
         match t.k {

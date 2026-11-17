@@ -460,6 +460,7 @@ dependencies = [
  "blaze-blake3",
  "blaze-build-script",
  "blaze-cas",
+ "blaze-code",
  "blaze-core",
  "blaze-deflate",
  "blaze-drive",
@@ -1410,6 +1411,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-apple-sdk",
  "blaze-build-script",
+ "blaze-core",
  "blaze-expand",
  "blaze-fetch",
  "blaze-file-items",

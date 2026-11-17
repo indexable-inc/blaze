@@ -129,6 +129,29 @@ impl World {
         let impl_ = item(self.keys[krate], KIND_IMPL, n);
         let header = ContentId::of("blaze-impls test header", &impl_.0.0);
         let lang = self.flags[krate].contains(CrateFlags::LANG);
+        // What the writer did not read: a blind header, a trait path not resolved (at a shape
+        // the crate can name, or at none), a self type not read to a shape.
+        if tape.one_in(6, "unread") {
+            let why = tape.below(10, "why") as u8;
+            return match tape.below(4, "unread kind") {
+                0 => ImplRow { impl_, trait_: None, shape: SelfShape::BLANKET, flags: ImplFlags::BLIND.with_why(why), header },
+                1 => {
+                    let shape = match tape.coin("unread shape read") {
+                        true => self.draw_filed_shape(tape, &members),
+                        false => SelfShape::BLANKET,
+                    };
+                    let bare = if tape.coin("bare") { ImplFlags::BARE } else { ImplFlags::NONE };
+                    ImplRow { impl_, trait_: None, shape, flags: ImplFlags::TRAIT_UNREAD.union(bare).with_why(why), header }
+                }
+                2 => {
+                    let trait_crate = members[tape.index(members.len(), "trait crate")];
+                    let trait_ = self.trait_of(trait_crate, tape.index(TRAITS, "trait"));
+                    let flags = if tape.coin("no type") { ImplFlags::SELF_NO_TYPE } else { ImplFlags::SELF_UNREAD };
+                    ImplRow { impl_, trait_: Some(trait_), shape: SelfShape::BLANKET, flags, header }
+                }
+                _ => ImplRow { impl_, trait_: None, shape: SelfShape::BLANKET, flags: ImplFlags::SELF_UNREAD, header },
+            };
+        }
         if tape.one_in(4, "inherent") {
             let shape = match lang && tape.coin("primitive") {
                 true => plain_shapes()[tape.index(4, "primitive shape")],
@@ -151,6 +174,17 @@ impl World {
             Err(error) => panic!("the test drew unknown impl flags: {error:?}"),
         };
         ImplRow { impl_, trait_: Some(trait_), shape, flags, header }
+    }
+
+    /// A shape an impl of a crate whose closure is `members` can be filed under.
+    fn draw_filed_shape(&self, tape: &Tape, members: &[usize]) -> SelfShape {
+        match tape.coin("filed shape plain") {
+            true => plain_shapes()[tape.index(4, "filed plain shape")],
+            false => {
+                let adt_crate = members[tape.index(members.len(), "filed adt crate")];
+                shape(Shape::Def(self.adt_of(adt_crate, tape.index(ADTS, "filed adt"))))
+            }
+        }
     }
 
     /// A shape a lookup may ask for: any the world files, a placeholder, or a type of any crate.
@@ -336,12 +370,36 @@ fn naive_candidates(
     goal: SelfShape,
 ) -> Result<Vec<ImplRow>, Broke> {
     let mut found = Vec::new();
+    // An unread row may be of any trait: it is a candidate in every crate that can name
+    // `trait_` (an impl of it is written in its crate's dependents alone).
+    let trait_crate = graph
+        .crate_of_prefix(trait_.crate_prefix())
+        .ok_or_else(|| harness(format!("the trait {trait_} is of no crate of the graph")))?;
+    let names_trait = graph.dependents_row(trait_crate);
+    let exact = |row: &ImplRow| !goal.files_no_impl() && row.shape == goal;
     for krate in world.members(from) {
         let at = index_of(graph, world.keys[krate])?.get();
+        let bit = at as usize;
+        let can_name = names_trait[bit / 64] & (1 << (bit % 64)) != 0;
         for row in &world.impls[krate] {
-            let exact = !goal.files_no_impl() && row.shape == goal;
-            if row.trait_ == Some(trait_) && (exact || row.is_blanket()) {
-                found.push((at, row.is_blanket(), row.impl_, *row));
+            // The documented order within a crate: shape, blanket, unread at the shape,
+            // unread at any shape, blind.
+            let want = if row.flags.contains(ImplFlags::BLIND) {
+                can_name.then_some(4)
+            } else if row.flags.contains(ImplFlags::TRAIT_UNREAD) {
+                match row.shape.is_blanket() {
+                    true => can_name.then_some(3),
+                    false => (can_name && exact(row)).then_some(2),
+                }
+            } else if row.trait_ != Some(trait_) {
+                None
+            } else if row.is_blanket() {
+                Some(1)
+            } else {
+                exact(row).then_some(0)
+            };
+            if let Some(want) = want {
+                found.push((at, want, row.impl_, *row));
             }
         }
     }
@@ -349,24 +407,43 @@ fn naive_candidates(
     Ok(found.into_iter().map(|it| it.3).collect())
 }
 
-/// The inherent impls of `goal` that `from` loads, by a scan.
+/// The inherent impls of `goal` that `from` loads, by a scan: of the crates an inherent
+/// lookup asks (the goal's definition's crate; with no definition the asking crate and the
+/// crates of the language), in the documented order.
 fn naive_inherent(
     world: &World,
     graph: &CrateGraphView<'_>,
     from: usize,
     goal: SelfShape,
 ) -> Result<Vec<ImplRow>, Broke> {
+    let def_crate = goal.def().map(|def| world.keys.iter().position(|k| def.is_of(*k)));
     let mut found = Vec::new();
     for krate in world.members(from) {
+        let asked = match def_crate {
+            Some(def) => def == Some(krate),
+            None => krate == from || world.flags[krate].contains(CrateFlags::LANG),
+        };
+        if !asked {
+            continue;
+        }
         let at = index_of(graph, world.keys[krate])?.get();
         for row in &world.impls[krate] {
-            if row.trait_.is_none() && row.shape == goal && !goal.files_no_impl() {
-                found.push((at, row.impl_, *row));
+            let want = if row.flags.contains(ImplFlags::BLIND) {
+                Some(2)
+            } else if row.trait_.is_some() || row.flags.contains(ImplFlags::TRAIT_UNREAD) {
+                None
+            } else if row.is_blanket() {
+                Some(1)
+            } else {
+                (row.shape == goal && !goal.files_no_impl()).then_some(0)
+            };
+            if let Some(want) = want {
+                found.push((at, want, row.impl_, *row));
             }
         }
     }
-    found.sort_by_key(|it| (it.0, it.1));
-    Ok(found.into_iter().map(|it| it.2).collect())
+    found.sort_by_key(|it| (it.0, it.1, it.2));
+    Ok(found.into_iter().map(|it| it.3).collect())
 }
 
 struct Lookup {
@@ -536,6 +613,69 @@ fn an_inherent_const_impl_is_filed_and_a_refused_impl_fails_alone() {
     let again = build_impl_index(krate, &reversed, blaze_own::testing::heap().alloc()).expect("as above");
     assert_eq!(again.directory, built.directory);
     assert_eq!(again.refused[..], built.refused[..]);
+}
+
+/// What the writer read is filed, and read flags that do not go together are refused, each
+/// alone: an unread row with a trait, a self type both read and not read, a why on a read row,
+/// `BARE` on an inherent impl. An inherent impl whose self type was not read is filed under
+/// `Inherent { BLANKET }`; one for a parameter is still E0118.
+#[test]
+fn unread_rows_are_filed_and_read_flags_that_clash_are_refused() {
+    let krate = crate_key(0);
+    let adt = shape(Shape::Def(item(krate, KIND_ADT, 0)));
+    let tr = item(krate, KIND_TRAIT, 0);
+    let row = |n: usize, trait_: Option<ItemKey>, shape: SelfShape, flags: ImplFlags| ImplRow {
+        impl_: item(krate, KIND_IMPL, n),
+        trait_,
+        shape,
+        flags,
+        header: ContentId::of("blaze-impls test header", &n.to_le_bytes()),
+    };
+    let blind = row(0, None, SelfShape::BLANKET, ImplFlags::BLIND.with_why(3));
+    let unread_at = row(1, None, adt, ImplFlags::TRAIT_UNREAD.union(ImplFlags::BARE).with_why(2));
+    let self_unread = row(2, None, SelfShape::BLANKET, ImplFlags::SELF_UNREAD);
+    let no_type = row(3, Some(tr), SelfShape::BLANKET, ImplFlags::SELF_NO_TYPE.union(ImplFlags::BARE));
+    let refused = [
+        row(4, Some(tr), SelfShape::BLANKET, ImplFlags::BLIND),
+        row(5, Some(tr), SelfShape::BLANKET, ImplFlags::SELF_UNREAD.union(ImplFlags::SELF_NO_TYPE)),
+        row(6, Some(tr), adt, ImplFlags::SELF_UNREAD),
+        row(7, Some(tr), adt, ImplFlags::NONE.with_why(1)),
+        row(8, None, adt, ImplFlags::BARE),
+        row(9, None, adt, ImplFlags::BLIND),
+    ];
+    let param = row(10, None, SelfShape::BLANKET, ImplFlags::NONE);
+    let mut rows = vec![blind, unread_at, self_unread, no_type, param];
+    rows.extend(refused);
+    let built = build_impl_index(krate, &rows, blaze_own::testing::heap().alloc())
+        .unwrap_or_else(|error| panic!("refused rows refused the crate's index: {error}"));
+    let mut expected: Vec<ImplIndexError> =
+        refused.iter().map(|it| ImplIndexError::ReadFlags { impl_: it.impl_, flags: it.flags }).collect();
+    expected.push(ImplIndexError::InherentBlanket { impl_: param.impl_ });
+    let mut got: Vec<ImplIndexError> = built.refused.iter().copied().collect();
+    got.sort_by_key(|it| format!("{it:?}"));
+    expected.sort_by_key(|it| format!("{it:?}"));
+    assert_eq!(got, expected);
+    let keys: Vec<BucketKey> = bucket_ids(&built).into_keys().collect();
+    for (filed, key) in [
+        (blind, BucketKey::Blind),
+        (unread_at, BucketKey::UnreadTrait { shape: adt }),
+        (self_unread, BucketKey::Inherent { shape: SelfShape::BLANKET }),
+        (no_type, BucketKey::Blanket { trait_: tr }),
+    ] {
+        assert_eq!(BucketKey::of(&filed), key);
+        assert!(keys.contains(&key), "{key:?} not built: {keys:?}");
+        let bucket = built.buckets.iter().find(|it| it.key == key).expect("as checked");
+        let bytes = Aligned::copy_from(&bucket.bytes);
+        let view = BucketView::read(&bytes).expect("a built bucket reads back");
+        assert_eq!(view.find(filed.impl_).map(|it| it.expect("reads")), Some(filed));
+    }
+    assert_eq!(blind.flags.why(), 3);
+    assert_eq!(unread_at.flags.why(), 2);
+    // An unread row keeps its crate from being passed over for any trait.
+    let filter_bytes = Aligned::copy_from(&built.no_impls_of);
+    let filter = NoImplsOfView::read(&filter_bytes).expect("reads back");
+    assert_eq!(filter.unread(), (1, 1));
+    assert!(filter.may_hold_trait(item(crate_key(1), KIND_TRAIT, 2)));
 }
 
 /// Each bucket's key and content id, by key.

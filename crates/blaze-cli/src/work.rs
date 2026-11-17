@@ -691,9 +691,16 @@ pub fn run_batches<'f, 'r>(
         // The round's lint jobs, the same way: each file's job and its asked units (each a
         // `Lint` task's name and source), read and outlined once for all of them.
         let mut lint_files: Vec<(Job<'_>, Vec<(Name, Name, ContentId), &Frame>), Global> = Vec::new_in(Global);
-        for batch in batches.iter() {
+        // The order the round's jobs are made in, so the order a file job checks its bodies in:
+        // as handed out, or reversed by the determinism test (`order_tests.rs`). An answer must
+        // not depend on it (parallel.md, point 8).
+        let reversed = reversed_for_test();
+        let pick = |at: usize, len: usize| if reversed { len - 1 - at } else { at };
+        for b in 0..batches.len() {
+            let batch = &batches[pick(b, batches.len())];
             let mut tasks = Vec::with_capacity_in(batch.tasks.len(), Global);
-            for (_, task) in batch.tasks.iter() {
+            for t in 0..batch.tasks.len() {
+                let (_, task) = &batch.tasks[pick(t, batch.tasks.len())];
                 if let Some(on) = failed_input(task) {
                     tasks.push(Spawned::Waited(on));
                     continue;
@@ -830,7 +837,13 @@ pub fn run_batches<'f, 'r>(
                 phases.worked(made_row(task.name.kind), phases.since(made_at));
                 tasks.push(spawned);
             }
+            if reversed {
+                tasks.reverse();
+            }
             pending.push(tasks);
+        }
+        if reversed {
+            pending.reverse();
         }
         groups.try_reserve_exact(files.len() + lint_files.len()).map_err(|_| CliError::Text { what: "the list of a round's body jobs could not be made" })?;
         for (file, bodies, types) in files {
@@ -1101,6 +1114,8 @@ fn answer_batch<'f, 'r>(
         keep_failed(failed, &done, path)?;
         if let Did::Done(made) = &done {
             tally(&mut phases.records, req, facts.names.as_ref(), task, made);
+            #[cfg(test)]
+            answers_for_test::answered(made);
         }
         did.push((*ticket, done));
         took.push(ns);
@@ -1252,6 +1267,63 @@ pub(crate) const BODIES: &str = "pooled BodyCheck (worker ns)";
 
 /// A task kind's row in the profile's frame lines (`Phases::took` for a task run on the main
 /// thread, `Phases::worked` for a pooled one).
+/// Whether a round's jobs are made in reverse order ([`run_batches`]): never in the command;
+/// only the determinism test turns it on (tests/order_tests.rs).
+#[cfg(not(test))]
+const fn reversed_for_test() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn reversed_for_test() -> bool {
+    answers_for_test::REVERSED.with(core::cell::Cell::get)
+}
+
+/// What the determinism test reads of a command (tests/order_tests.rs): each record answered,
+/// on the thread that steps the request (the test's own).
+#[cfg(test)]
+pub(crate) mod answers_for_test {
+    use super::{Allocator, ContentId, Name, Record};
+
+    /// One answered record: its name (its key's task), its out, and digests of its payload, its
+    /// findings with their words, and its read list.
+    pub(crate) type Answer = (Name, ContentId, ContentId, ContentId, ContentId);
+
+    std::thread_local! {
+        pub(crate) static REVERSED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+        pub(crate) static ANSWERED: core::cell::RefCell<std::vec::Vec<Answer>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
+        /// Each body and signature a file job checked, in the order checked: the simulation runs
+        /// pool tasks on the test's thread (bstd task.rs, `Layout::Inline`).
+        /// Each with its file's path and its place there, so a test can name the item.
+        pub(crate) static CHECKED: core::cell::RefCell<std::vec::Vec<(Name, std::string::String, u32)>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
+    }
+
+    pub(crate) fn answered<A: Allocator + Copy>(made: &Record<A>) {
+        let mut findings = std::vec::Vec::new();
+        for &(rule, start, end, from, to) in made.findings.iter() {
+            findings.extend_from_slice(&rule.to_le_bytes());
+            findings.extend_from_slice(&start.to_le_bytes());
+            findings.extend_from_slice(&end.to_le_bytes());
+            findings.extend_from_slice(&((to - from) as u64).to_le_bytes());
+            findings.extend_from_slice(&made.messages[from..to]);
+        }
+        let mut reads = std::vec::Vec::new();
+        for (name, out) in made.reads.iter() {
+            reads.extend_from_slice(&[name.kind as u8]);
+            reads.extend_from_slice(&name.subject.0);
+            reads.extend_from_slice(&out.0);
+        }
+        let row = (
+            made.name,
+            made.out,
+            ContentId::of("blaze-cli order test payload", made.payload_bytes()),
+            ContentId::of("blaze-cli order test findings", &findings),
+            ContentId::of("blaze-cli order test reads", &reads),
+        );
+        ANSWERED.with(|answered| answered.borrow_mut().push(row));
+    }
+}
+
 /// The main thread's time making one task's job, by its kind: the parts of "jobs made".
 fn made_row(kind: Kind) -> &'static str {
     match kind {
@@ -1616,20 +1688,20 @@ fn run<'f, 'b>(
 
 /// What a `FileItems` task needs, apart from the checkout: all of it `Send`, so the task runs
 /// on any worker of the pool.
-struct Job<'a> {
-    name: Name,
+pub(crate) struct Job<'a> {
+    pub(crate) name: Name,
     /// The module slot's path, as the part named it.
-    slot: &'a str,
+    pub(crate) slot: &'a str,
     /// Where the sweep found it (`sweep::Found::flags`).
-    flags: u8,
-    edition: u8,
-    plant: Plant,
+    pub(crate) flags: u8,
+    pub(crate) edition: u8,
+    pub(crate) plant: Plant,
     /// The content id the sweep gave the file, which the task's key holds: the bytes read are
     /// compared with it before any parse (`blaze_drive::verified`).
-    expect: ContentId,
+    pub(crate) expect: ContentId,
     /// Whether the command runs any lint rule (`Facts::lints`): then the file's outline
     /// lists its lint units as parts (lints.rs `parts`). In the `FileItems` kind's tool.
-    lints: bool,
+    pub(crate) lints: bool,
 }
 
 /// Why a task's job could not be made when the frame of one round's jobs is full: the task
@@ -1665,7 +1737,7 @@ fn job_of<'j>(req: &Request<'_>, facts: &Facts<'_, impl crate::sweep::Stamps>, t
 
 /// A file's outline as its `FileItems` record, worked in `scratch` and built in `into`: the
 /// record, or why the task fails (an input this build refuses).
-fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, scratch: &Frame, into: A) -> Result<Result<Record<A>, Why>, Unread> {
+pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, scratch: &Frame, into: A) -> Result<Result<Record<A>, Why>, Unread> {
     let (slot, flags, held) = (job.slot, job.flags, into);
     // A file read as data (`include_str!`, `include_bytes!`; data_include.rs): no Rust, no
     // outline; its record is its bytes' content id, so it moves exactly when they do and every
@@ -2135,6 +2207,8 @@ fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &
     }
     *setup_ns = clock.now().since(set_up).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     for (name, place, handed) in job.bodies.iter().copied() {
+        #[cfg(test)]
+        answers_for_test::CHECKED.with(|checked| checked.borrow_mut().push((name, std::string::String::from(job.file.slot), place)));
         let (used, limit) = (scratch.peak() as u64, scratch.reserved() as u64);
         if name.kind == Kind::Signature {
             let found = heads.binary_search_by_key(&place, |(start, _)| *start).ok().map(|at| blaze_surface::ItemIndex(heads[at].1));

@@ -11,6 +11,14 @@
 //! entry, and only then stores the slot's word (crate::code_unwind::publish's order). Every
 //! thread waiting in the stub is then woken to load the word again.
 //!
+//! **Statics** (run.md, "Statics in the run"): a static has no stub, so the parent sends each
+//! one a record names (`Down::Data`, its symbol and datum record) before that record. One
+//! message is one batch ([`Act::Statics`], [`RunMode::place_statics`]): every datum in it is
+//! read and given its room first, so a word naming another static of the batch resolves; then
+//! each is filled (blaze-code `datum::fill`), copied, and only then its word stored
+//! ([`Memory::publish_static`]). A read-only datum's room is in the code area, read-only in the
+//! run view as a relro part is. A code record's load of a static reads that word.
+//!
 //! Two parts:
 //!
 //! - [`RunMode`], sans-IO: events in ([`Event`]), actions out ([`Act`]), the wire's bytes in an
@@ -28,8 +36,9 @@
 //! symbol (`Needed::Symbol`). The entry is numbered first: slot 0.
 //!
 //! **What is refused by name**, never guessed (rule 3): a record at the optimized tier for a slot
-//! whose fast code is not bound yet (a bound one is promoted: [`Act::Promote`]); a target that is a static, a vtable or a
-//! thread-local (statics come with the run record, piece 8); a record whose pads land placed
+//! whose fast code is not bound yet (a bound one is promoted: [`Act::Promote`]); a target that is a vtable or a
+//! thread-local, or a writable static (run.md, "Statics in the run", steps 3 and 4); a record naming a
+//! static the parent did not send before it ([`RunModeError::StaticNotTold`]); a record whose pads land placed
 //! before the parent's `Down::Personality` named the program's personality routine
 //! ([`EhError::NoPersonality`]; run_mode/personality.rs); an outside name the process
 //! does not have; an entry form none of `unit`, `c-main` and `hosted` ([`Start::parse`]); run
@@ -54,6 +63,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use blaze_code::datum::{self, DatumError, DatumView, FillError, Place as DatumPlace};
 use blaze_code::eh::{self, EhError, Entry, Placed};
 use blaze_code::image::ImageError;
 use blaze_code::place::{At, PlaceError, Words};
@@ -78,6 +88,9 @@ pub const STOPPED: i32 = 125;
 pub const MOST_SLOTS: u32 = 1 << 20;
 /// The most C names one run binds (`dlsym`), each a word.
 pub const MOST_OUTSIDE: u32 = 1 << 14;
+/// The most statics one run places, each a word holding its address (run.md, "Statics in the
+/// run").
+pub const MOST_STATICS: u32 = 1 << 16;
 /// The most threads waiting in stubs at once.
 pub const MOST_WAITERS: u32 = 1 << 12;
 /// How long an ask may go unanswered before its waiters fail (rule 18): the parent's own
@@ -134,6 +147,9 @@ pub enum Act {
     /// Load the program's native library `record` ([`RunMode::load_native`]): its slots are
     /// stubbed, its words and pointer cells filled; its init list goes to the first thread.
     Native { record: RecordId },
+    /// Place the statics the parent's last `Data` told, together ([`RunMode::place_statics`]):
+    /// before the acts after it, so before any record that names them.
+    Statics,
 }
 
 /// Where a record's code is placed: the area in first-call order, or the hot region in the order
@@ -194,6 +210,11 @@ pub trait Memory {
     fn reserve_hot(&mut self, len: usize, align: usize) -> Result<u64, RunModeError>;
     /// One step of a publication (code_unwind's order).
     fn carry(&mut self, step: Step, placing: &Placing<'_>) -> Result<(), RunModeError>;
+    /// The address of static number `index`'s word: what a load of the static's address reads.
+    fn static_word(&self, index: u32) -> u64;
+    /// Copies static number `index`'s filled `bytes` to `at` (room [`Memory::reserve`] gave),
+    /// then stores `at` in its word: nothing names the static before both hold.
+    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8]) -> Result<(), RunModeError>;
 }
 
 /// Why the run mode stopped, naming the thing.
@@ -216,6 +237,16 @@ pub enum RunModeError {
     NotBuilt { what: &'static str },
     /// A record's target of a kind the run mode does not bind yet.
     Target { record: RecordId, space: Space, symbol: CodeSymbol },
+    /// A record names static `symbol`, which no `Data` message sent before it.
+    StaticNotTold { record: RecordId, symbol: CodeSymbol },
+    /// The parent sent static `symbol` twice.
+    StaticTwice { symbol: WireSymbol },
+    /// More statics than [`MOST_STATICS`].
+    StaticsFull,
+    /// A static's datum record does not read.
+    Datum { record: RecordId, why: DatumError },
+    /// A static's datum could not be filled at its address.
+    Fill { record: RecordId, why: FillError },
     /// The store has no record `record`, or its bytes do not read.
     Missing { record: RecordId, errno: i32 },
     /// The bytes read as `record` hash to `got`.
@@ -301,9 +332,20 @@ impl fmt::Display for RunModeError {
             RunModeError::NotBuilt { what } => write!(f, "the launcher's run mode does not do this yet: {what}"),
             RunModeError::Target { record, space, symbol } => write!(
                 f,
-                "record {} names {space:?} {symbol}: the run mode binds functions and C names only (statics come with run.md piece 8)",
+                "record {} names {space:?} {symbol} where the run mode binds no such target: functions, C names and statics are bound; a call of a static, a vtable and a thread-local are not yet (run.md, \"Statics in the run\")",
                 Short(&record.0)
             ),
+            RunModeError::StaticNotTold { record, symbol } => write!(
+                f,
+                "record {} names static {symbol}, which the parent did not send before it (run wire `Data` comes before the record that names a static: run.md, \"Statics in the run\")",
+                Short(&record.0)
+            ),
+            RunModeError::StaticTwice { symbol } => {
+                write!(f, "the parent sent static {} a second time: a static is one allocation for the whole program (run wire, `Data`)", Short(&symbol.0))
+            }
+            RunModeError::StaticsFull => write!(f, "the program places more than {MOST_STATICS} statics (the run's reservation, run.md \"Slot table\")"),
+            RunModeError::Datum { record, why } => write!(f, "static record {}: {why}", Short(&record.0)),
+            RunModeError::Fill { record, why } => write!(f, "static record {}: {why}", Short(&record.0)),
             RunModeError::Missing { record, errno } => {
                 write!(f, "the store has no readable record {} (errno {errno})", Short(&record.0))
             }
@@ -411,7 +453,18 @@ pub struct RunMode<'a> {
     /// The program's native library: waiting for the parent's `Native`, declared, or loaded
     /// (run_mode/native.rs).
     native: native::NativeState<'a>,
+    /// Every static placed or being placed, sorted by symbol: its word's number and its address.
+    statics: AVec<'a, (CodeSymbol, StaticAt)>,
+    /// The statics the parent told and [`Act::Statics`] has not placed yet, in its order.
+    told: AVec<'a, (CodeSymbol, RecordId)>,
     alloc: Alloc<'a>,
+}
+
+/// A static of the run: its word's number ([`Memory::static_word`]) and its first byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct StaticAt {
+    index: u32,
+    at: u64,
 }
 
 impl<'a> RunMode<'a> {
@@ -434,6 +487,8 @@ impl<'a> RunMode<'a> {
             stopped: false,
             personality: None,
             native: native::NativeState::Waiting,
+            statics: Vec::new_in(alloc),
+            told: Vec::new_in(alloc),
             alloc,
         }
     }
@@ -557,6 +612,20 @@ impl<'a> RunMode<'a> {
                 self.carry_dos(&dos, None, out)
             }
             Down::Personality { slot } => self.bind_personality(slot),
+            Down::Data { data } => {
+                for told in data.iter() {
+                    let symbol = CodeSymbol(told.symbol.0);
+                    let placed = self.statics.binary_search_by_key(&symbol, |&(it, _)| it).is_ok();
+                    if placed || self.told.iter().any(|&(it, _)| it == symbol) {
+                        return Err(RunModeError::StaticTwice { symbol: told.symbol });
+                    }
+                    self.told.push((symbol, RecordId(told.record.0)));
+                }
+                if !self.told.is_empty() {
+                    out.push(Act::Statics);
+                }
+                Ok(())
+            }
             Down::Failed { need, why } => {
                 let local = match need {
                     Needed::Slot(slot) => self.slots.local(slot)?,
@@ -688,6 +757,48 @@ impl<'a> RunMode<'a> {
         self.lay(slot, record, source, memory, plant, Region::Hot)
     }
 
+    /// Carries [`Act::Statics`]: every static told since the last one, placed together (the
+    /// module doc, "Statics"). Each datum is read and given its room and its word's number
+    /// first, so a word naming another static of the batch resolves (a cycle included); then
+    /// each is filled against the run's words and published ([`Memory::publish_static`]: the
+    /// bytes, then the word).
+    pub fn place_statics(&mut self, source: &impl RecordSource, memory: &mut impl Memory) -> Result<(), RunModeError> {
+        let mut rows: AVec<'_, (CodeSymbol, RecordId, DatumView<'_>, StaticAt)> = Vec::with_capacity_in(self.told.len(), self.alloc);
+        for i in 0..self.told.len() {
+            let (symbol, record) = self.told[i];
+            let view = DatumView::read(source.bytes(record)?).map_err(|why| RunModeError::Datum { record, why })?;
+            match view.place() {
+                DatumPlace::ReadOnly => {}
+                DatumPlace::Writable | DatumPlace::Zeroed { .. } => {
+                    return Err(RunModeError::NotBuilt { what: "a writable or zeroed static (run.md, \"Statics in the run\", step 3)" });
+                }
+            }
+            let index = u32::try_from(self.statics.len()).ok().filter(|&n| n < MOST_STATICS).ok_or(RunModeError::StaticsFull)?;
+            // `DatumView::read` checked the length fits a u32, and the alignment a page.
+            let at = memory.reserve(view.len() as usize, view.align() as usize)?;
+            let row = StaticAt { index, at };
+            match self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
+                Ok(_) => return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) }),
+                Err(pos) => self.statics.insert_shift(pos, (symbol, row)),
+            }
+            rows.push((symbol, record, view, row));
+        }
+        self.told.clear();
+        for &(symbol, record, view, row) in rows.iter() {
+            let mut bytes: AVec<'_, u8> = Vec::from_elem_in(0, view.bytes().len(), self.alloc);
+            {
+                let mut binder = Binder { slots: &mut self.slots, statics: &self.statics, memory: &mut *memory, names: None, record, refused: None };
+                let filled = datum::fill(&view, symbol, row.at, &mut binder, &mut bytes[..]);
+                if let Some(why) = binder.refused {
+                    return Err(why);
+                }
+                filled.map_err(|why| RunModeError::Fill { record, why })?;
+            }
+            memory.publish_static(row.index, row.at, &bytes[..])?;
+        }
+        Ok(())
+    }
+
     /// Places `record` as `slot`'s code in `region` and publishes it.
     fn lay(
         &mut self,
@@ -710,7 +821,7 @@ impl<'a> RunMode<'a> {
         let mut relro: AVec<'_, u8> = Vec::from_elem_in(0, view.relro().len(), self.alloc);
         let symbol = self.slots.symbol(slot);
         {
-            let mut binder = Binder { slots: &mut self.slots, memory: &mut *memory, view, record, refused: None };
+            let mut binder = Binder { slots: &mut self.slots, statics: &self.statics, memory: &mut *memory, names: Some(view), record, refused: None };
             let placed = blaze_code::place::place(&view, symbol, At { code: code_at, relro: relro_at }, &mut binder, &mut code, &mut relro);
             if let Some(why) = binder.refused {
                 return Err(why);
@@ -754,12 +865,15 @@ impl<'a> RunMode<'a> {
     }
 }
 
-/// The run's words as blaze-code's placement asks for them. A refusal is kept whole in
-/// `refused` (the trait's error type is the image's); the caller returns it.
+/// The run's words as blaze-code's placement and a datum's fill ask for them. A refusal is kept
+/// whole in `refused` (the trait's error type is the image's); the caller returns it.
 struct Binder<'s, 'a, M: Memory> {
     slots: &'s mut Numbering<'a>,
+    /// The statics placed (or given their room in this batch), sorted by symbol.
+    statics: &'s [(CodeSymbol, StaticAt)],
     memory: &'s mut M,
-    view: CodeView<'s>,
+    /// The code record's C names; `None` for a datum, which names none.
+    names: Option<CodeView<'s>>,
     record: RecordId,
     refused: Option<RunModeError>,
 }
@@ -774,10 +888,18 @@ impl<M: Memory> Binder<'_, '_, M> {
     }
 
     fn outside(&mut self, symbol: CodeSymbol) -> Result<Outside, RunModeError> {
-        let Some(name) = self.view.name(symbol) else {
+        let Some(name) = self.names.and_then(|view| view.name(symbol)) else {
             return Err(RunModeError::Outside { symbol, why: "the record keeps no name for it" });
         };
         self.memory.outside(symbol, name)
+    }
+
+    /// Static `symbol`, which the parent sent before the record naming it.
+    fn static_at(&self, symbol: CodeSymbol) -> Result<StaticAt, RunModeError> {
+        match self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
+            Ok(at) => Ok(self.statics[at].1),
+            Err(_) => Err(RunModeError::StaticNotTold { record: self.record, symbol }),
+        }
     }
 
     /// Keeps `why` and gives the image's error naming the target.
@@ -797,6 +919,8 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
                 false => self.memory.address_word(slot),
             }),
             Space::Outside => self.outside(target.symbol).map(|it| it.word),
+            // A load of the static's address reads its word; nothing calls a static.
+            Space::Static if !call => self.static_at(target.symbol).map(|it| self.memory.static_word(it.index)),
             Space::Static | Space::Vtable | Space::Tls => {
                 Err(RunModeError::Target { record: self.record, space: target.space, symbol: target.symbol })
             }
@@ -808,7 +932,8 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
         let found = match target.space {
             Space::Func => self.func(target.symbol).map(|slot| self.memory.thunk(slot)),
             Space::Outside => self.outside(target.symbol).map(|it| it.value),
-            Space::Static | Space::Vtable | Space::Tls => {
+            Space::Static => self.static_at(target.symbol).map(|it| it.at),
+            Space::Vtable | Space::Tls => {
                 Err(RunModeError::Target { record: self.record, space: target.space, symbol: target.symbol })
             }
         };
@@ -1002,6 +1127,8 @@ struct Layout {
     words: usize,
     address_words: usize,
     outside: usize,
+    /// One word a static, holding its address ([`MOST_STATICS`]).
+    statics: usize,
     stubs: usize,
     thunks: usize,
     area: usize,
@@ -1019,7 +1146,8 @@ impl Layout {
         let words = 0;
         let address_words = words + slots * 8;
         let outside = address_words + slots * 8;
-        let stubs = (outside + MOST_OUTSIDE as usize * 8).next_multiple_of(16);
+        let statics = outside + MOST_OUTSIDE as usize * 8;
+        let stubs = (statics + MOST_STATICS as usize * 8).next_multiple_of(16);
         let thunks = (stubs + crate::arch::STUB_HEAD + slots * crate::arch::STUB).next_multiple_of(16);
         let area = (thunks + slots * crate::arch::THUNK).next_multiple_of(page);
         let whole = crate::drive::REACH as usize;
@@ -1027,7 +1155,7 @@ impl Layout {
         if area >= hot {
             return Err(RunModeError::NotBuilt { what: "a slot table larger than the run's reservation" });
         }
-        Ok(Layout { words, address_words, outside, stubs, thunks, area, hot, whole })
+        Ok(Layout { words, address_words, outside, statics, stubs, thunks, area, hot, whole })
     }
 }
 
@@ -1185,6 +1313,21 @@ impl Memory for NativeMemory<'_> {
                 self.code.store(self.layout.words + placing.slot.index() * 8, placing.code_at).map_err(RunModeError::Sys)?;
             }
         }
+        Ok(())
+    }
+
+    fn static_word(&self, index: u32) -> u64 {
+        self.at(self.layout.statics + index as usize * 8)
+    }
+
+    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8]) -> Result<(), RunModeError> {
+        if index >= MOST_STATICS {
+            return Err(RunModeError::StaticsFull);
+        }
+        // The bytes through the write view (the area is read-only in the run view, as a relro
+        // part is), then the word: a load of the address finds the bytes.
+        self.code.copy(self.offset(at), bytes).map_err(RunModeError::Sys)?;
+        self.code.store(self.layout.statics + index as usize * 8, at).map_err(RunModeError::Sys)?;
         Ok(())
     }
 }
@@ -1491,6 +1634,7 @@ fn control<S: RecordSource>(
                 Act::Stub { slot } => memory.stub(slot),
                 Act::Place { slot, record } => mode.place(slot, record, source, &mut memory, Plant::None, &mut acts),
                 Act::Promote { slot, record } => mode.promote(slot, record, source, &mut memory, Plant::None),
+                Act::Statics => mode.place_statics(source, &mut memory),
                 Act::Wake { thread, slot } => {
                     match waiting.iter().position(|(at, who, _)| *at == slot && *who == thread) {
                         Some(index) => {
@@ -1563,5 +1707,7 @@ mod personality;
 mod entry_tests;
 #[cfg(test)]
 mod personality_tests;
+#[cfg(test)]
+mod statics_tests;
 #[cfg(test)]
 mod tests;

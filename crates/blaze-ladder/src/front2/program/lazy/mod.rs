@@ -89,6 +89,9 @@ pub enum LazyRefusal {
     /// itself (the crate, the record, the item); `kept` how many the log kept, `dropped` how
     /// many past its bound it counted.
     RecordsVoid { tabled: ItemKey, first: Box<str>, kept: usize, dropped: u32 },
+    /// Static `item`'s value or kind is missing from the program's sorted tables after it was
+    /// made (fill.rs `static_value`: the two tables are filed together).
+    NoStatic { item: ItemKey },
 }
 
 impl core::fmt::Display for LazyRefusal {
@@ -112,6 +115,7 @@ impl core::fmt::Display for LazyRefusal {
                 "front2 (lazy): the names records did not answer while the instance of fn {:032x} was made, so it is void: {first} ({kept} errors kept, {dropped} more counted)",
                 tabled.0
             ),
+            LazyRefusal::NoStatic { item } => write!(f, "front2 (lazy): the static {:032x} was made, and its value and kind are not both in the program's tables (fill.rs `static_value` files them together)", item.0),
         }
     }
 }

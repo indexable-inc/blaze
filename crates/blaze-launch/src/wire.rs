@@ -20,6 +20,7 @@
 //! ([`List`]) from the frame.
 
 pub mod cbor;
+pub mod data;
 mod native;
 mod personality;
 pub mod run;

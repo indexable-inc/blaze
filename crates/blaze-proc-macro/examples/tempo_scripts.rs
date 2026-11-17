@@ -7,57 +7,76 @@
 //! records, never cargo's caches); each named package's script modules are the bootstrap
 //! builder's records in `<blaze store>/build-script/modules`. A dependency's files are served
 //! from its record; a member's from the checkout, read-only. The checkout is never written.
-//! With `discover` before the packages, each script is run until it asks no try-compile the
-//! pinned table lacks, and every such question is printed whole: the rows to write.
-//! With `native <shelf> <sdk>` first, a script placed native for `check` (D112: toolchain.rs
-//! `NATIVE_EVERY_MODE`, chosen by `native_unit::placed` alone) runs in the Seatbelt native
-//! runner with the pinned clang unpacked on `<shelf>` and the macOS SDK `<sdk>`, its host binary
-//! from the interim builder's `native` mode in `<blaze store>/build-script/modules`, its work under
-//! `<blaze store>/native-work/tempo_scripts`; without it such a script is refused by name.
+//!
+//! Every run is made as `blaze check`'s `Script` task makes it, through the same two shared
+//! functions (rule 30), so the census's records never drift from the command's:
+//! - the setting: blaze-world `script_setting::ScriptSetup::open` over the world of the graph
+//!   (the toolchain from `$HOME/.blaze/v2/toolchain`, `blaze_toolchain::PINNED`): each side's
+//!   probe table (pinned rows, ships facts, the toolchain's library-feature listings), the spawn
+//!   setting and the native runner;
+//! - the run: `script_unit::outputs_given`, served the records of its `links` closure's runs
+//!   made earlier in this process (`DEP_<LINKS>_*` and their files, wasm or native alike).
+//!
+//! With `native <shelf> <sdk> <fact shim>` first, a script placed native for `check` (D112:
+//! toolchain.rs `NATIVE_EVERY_MODE`, chosen by `native_unit::placed` alone) runs in the
+//! Seatbelt native runner with the pinned clang unpacked on `<shelf>` and the macOS SDK
+//! `<sdk>`, its host binary from the interim builder's `native` mode in
+//! `<blaze store>/build-script/modules`, its work under `<blaze store>/native-work/tempo_scripts`;
+//! without it such a script is refused by name.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use blaze_build_script::{
-    env::PackageFacts,
-    key::CMode,
-    probe::{Known, Row, pinned_rows},
-};
-use blaze_build_script::cx::ScriptCx;
 use blaze_build_script::git;
-use blaze_expand::{DefAt, DefSite, Export, ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, Place, PlaceOf, ProcCall, Produced, TokenStream};
+use blaze_build_script::key::CMode;
+use blaze_build_script::native::Runner;
+use blaze_build_script::outputs::OutputsRef;
 use blaze_fetch::{PackView, SourceId};
-use blaze_id::CrateItemKey;
-use blaze_lower::{Cfg, CfgAnswer, ItemRef, Outcome, Sink, Source, What, by_name::ByName, lower_file};
 use blaze_manifest::layout::{Entry, Layout, Need, Pass as LayoutPass};
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{Alloc, Vec as AVec};
 use blaze_proc_macro::{
-    script::{ScriptError, ScriptRuntime, ScriptWhy},
-    script_sandbox::{
-        Refusal, Script, ScriptRoot, SpawnRefusal, Tree,
-        dep_mount::{DepProducer, view},
-        dir_tree, mem_tree,
-    },
-    native_setting::native_setting,
+    native_setting::{NativeRunOpts, native_setting},
     native_unit::placed,
-    script_unit::{Prepared, Setting, links_inputs, links_order, outputs, prepare_viewing},
+    script::ScriptRuntime,
+    script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree},
+    script_unit::{GivenRun, Setting, links_closure, links_order, outputs_given},
 };
-use blaze_build_script::native::Runner;
-use blaze_build_script::env::DepMetadata;
-use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Records, Resolution, Resolver, StoreSources, TargetDesc, UnitId, UnitKind};
+use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Records, Resolution, Resolver, StoreSources, TargetDesc, UnitGraph, UnitId, UnitKind};
+use blaze_world::script_setting::{ScriptSetup, ScriptSetupOpts};
 
 const TARGET: &str = "aarch64-apple-darwin";
+/// The macro side's triple (D89 (a)), as blaze-cli's scripts.rs names it.
+const MACRO_TARGET: &str = "wasm32-wasip1";
 
 /// The runtime over the folder `store` (its compiled modules).
 fn script_runtime(store: &Path) -> ScriptRuntime {
     ScriptRuntime::new(store).unwrap_or_else(|error| panic!("the script runtime: {error}"))
 }
 
-/// The try-compiles the class C scripts make: none. Class A's rows come with their reasons.
-const KNOWN: &[Known] = blaze_build_script::pinned::TEMPO;
+/// The installed toolchain's files (`$HOME/.blaze/v2/toolchain`, by 64-hex name), read whole
+/// and kept for the run, as blaze-world's `names` example reads them.
+struct DirShelf(String);
+
+impl blaze_toolchain::Shelf for DirShelf {
+    type Error = std::io::Error;
+    type Bytes = &'static [u8];
+    fn place(&self) -> &str {
+        &self.0
+    }
+    fn size(&mut self, name: &str) -> Result<Option<u64>, std::io::Error> {
+        match std::fs::metadata(format!("{}/{name}", self.0)) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    fn read(&mut self, name: &str, _size: u64) -> Result<&'static [u8], std::io::Error> {
+        std::fs::read(format!("{}/{name}", self.0)).map(|bytes| &*Box::leak(bytes.into_boxed_slice()))
+    }
+}
 
 /// `rustc --print cfg` for aarch64-apple-darwin, as blaze-unit-graph's example passes it.
 const MAC_CFG: &[(&str, Option<&str>)] = &[
@@ -177,20 +196,14 @@ impl Records<'static> for Folder {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let [_, checkout, fetch_store, store, wanted @ ..] = &args[..] else {
-        eprintln!("usage: tempo_scripts <checkout> <blaze-fetch store> <blaze store> [native <shelf> <sdk>] [discover] <package>...");
+        eprintln!(
+            "usage: tempo_scripts <checkout> <blaze-fetch store> <blaze store> [native <shelf> <sdk> <fact shim>] [dependents] [export <dir>] [<package>...] (no package: every script)"
+        );
         std::process::exit(2);
     };
     let (native_args, wanted) = match wanted {
         [first, shelf, sdk, shim, rest @ ..] if first == "native" => (Some((shelf.as_str(), sdk.as_str(), shim.as_str())), rest),
         _ => (None, wanted),
-    };
-    let (discover, wanted) = match wanted {
-        [first, rest @ ..] if first == "discover" => (true, rest),
-        _ => (false, wanted),
-    };
-    let (outline, wanted) = match wanted {
-        [first, rest @ ..] if first == "outline" => (true, rest),
-        _ => (false, wanted),
     };
     // `export <dir>`: each script's outputs record written as `<dir>/<name>@<version>@<side>.outputs`
     // (side `host` or `target`, the served unit's), what blaze-world's `names --scripts` reads.
@@ -221,11 +234,14 @@ fn main() {
     let mut member_dirs: BTreeMap<LockId, String> = BTreeMap::new();
     let mut roots = AVec::new_in(alloc);
     let mut members = Vec::new();
+    // Each member's folder, checkout-relative: where the world finds a path package's files.
+    let mut paths: Vec<(LockId, &'static str)> = Vec::new();
     for m in ws.members.iter() {
         if let Some(id) = lock.named(&m.name).find(|id| matches!(lock.package(*id).source, LockSource::Path)) {
             roots.push(id);
             member_dirs.insert(id, m.dir.as_str().to_owned());
             members.push((id, Package::from_member(m, alloc)));
+            paths.push((id, Box::leak(m.dir.as_str().to_owned().into_boxed_str())));
         }
     }
     let ask: &'static Ask<'static> =
@@ -238,7 +254,7 @@ fn main() {
     let folder = Folder { records: PathBuf::from(fetch_store).join("records") };
     let mut sources = StoreSources::new(lock, folder, PackView::open_source_put, alloc).unwrap_or_else(|e| panic!("{e}"));
     let mut passes = 0;
-    let graph = loop {
+    let graph: &'static UnitGraph<'static> = Box::leak(Box::new(loop {
         passes += 1;
         assert!(passes <= 64, "no graph after 64 passes");
         match res.pass().unwrap_or_else(|e| panic!("{e}")) {
@@ -250,41 +266,53 @@ fn main() {
                 }
             }
         }
+    }));
+
+    // The world of the graph, as `blaze check` makes it (blaze-world `open_list` and `world`):
+    // the crate list, both sides' toolchain crates from the pinned toolchain, and their texts,
+    // over which the probe tables are made.
+    let home = std::env::var("HOME").unwrap_or_else(|_| panic!("HOME is not set: the pinned toolchain is read from $HOME/.blaze/v2/toolchain"));
+    let checkout: &'static blaze_world::Checkout = Box::leak(Box::new(blaze_world::Checkout::new(root.clone())));
+    let world: &'static blaze_world::World<'static> = {
+        let mut packages = blaze_world::Fetched { store: &mut sources, paths: &paths, lock, alloc };
+        let mut shelf = DirShelf(format!("{home}/.blaze/v2/toolchain"));
+        let listed = blaze_world::open_list(&mut shelf, blaze_toolchain::PINNED, TARGET, graph, lock, &mut packages, alloc).unwrap_or_else(|e| panic!("the crate list: {e}"));
+        let listed: &'static blaze_world::Listed<'static, &'static [u8]> = Box::leak(Box::new(listed));
+        Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, alloc).unwrap_or_else(|e| panic!("the world: {e}"))))
     };
 
     let runtime = script_runtime(&store);
-    let table = Arc::new(pinned_rows(TARGET, KNOWN, alloc).to_vec());
     // `check`'s placement: C requests deferred; the bindgen class (D69's NATIVE_EVERY_MODE)
-    // runs native with `native <shelf> <sdk>` (D112), and is refused by name without it.
+    // runs native with `native <shelf> <sdk> <fact shim>` (D112), and is refused by name
+    // without it. The runner (the shim placed, the jobserver with a token for each core but the
+    // script's own) is opened by the shared setup, as `blaze` opens it.
     let work = store.join("native-work/tempo_scripts");
     let work = work.to_str().unwrap_or_else(|| panic!("{}: not UTF-8", work.display())).to_owned();
-    let native_owned = native_args.map(|(shelf, sdk, shim)| {
-        let owned = native_setting(shelf, sdk, &work, TARGET, alloc).unwrap_or_else(|e| panic!("{e}"));
-        // N7 (D112): the fact shim placed in the work folder, as `blaze` does at its edge.
-        let placed = blaze_proc_macro::native_facts::place_shim(owned.work.as_str(), shim).unwrap_or_else(|e| panic!("{e}"));
-        println!("native: fact shim {placed}");
-        owned
-    });
-    if let Some(owned) = &native_owned {
-        println!("native: shelf {}, SDK {} (version {}), work {}", owned.shelf.as_str(), owned.sdk.as_str(), owned.sdk_version.as_str(), owned.work.as_str());
-    }
-    // The command's jobserver, as `blaze` makes it: one token for each core but the script's own.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let jobs = native_owned.as_ref().map(|owned| {
-        let workers = u32::try_from(cores).ok().and_then(core::num::NonZeroU32::new).expect("a core count of 1 to 2^32 - 1");
-        let opts = blaze_proc_macro::jobserver::JobserverOpts { work: owned.work.as_str(), workers, id: std::process::id() };
-        blaze_proc_macro::jobserver::Jobserver::new(opts).unwrap_or_else(|e| panic!("{e}"))
-    });
+    let workers = u32::try_from(cores).ok().and_then(core::num::NonZeroU32::new).expect("a core count of 1 to 2^32 - 1");
+    let native = match native_args {
+        None => Err("no `native <shelf> <sdk> <fact shim>` was given"),
+        Some((shelf, sdk, shim)) => {
+            let owned = native_setting(shelf, sdk, &work, TARGET, alloc).unwrap_or_else(|e| panic!("{e}"));
+            println!("native: shelf {}, SDK {} (version {}), work {}", owned.shelf.as_str(), owned.sdk.as_str(), owned.sdk_version.as_str(), owned.work.as_str());
+            Ok(NativeRunOpts { setting: owned, shim, workers })
+        }
+    };
+    let setup = ScriptSetup::open(ScriptSetupOpts { world, target: TARGET, macro_target: MACRO_TARGET, native, alloc }).unwrap_or_else(|e| panic!("the scripts' setting: {e}"));
+    println!("probe table: {} rows for {TARGET}, {} for {MACRO_TARGET}", setup.table.len(), setup.macro_table.len());
+    match &setup.native {
+        Ok(run) => println!("native: fact shim {}", run.shim),
+        Err(why) => println!("native: none ({why}): a script placed native is refused by name"),
+    }
     let setting = Setting {
         store: &store,
         target: TARGET,
         host: TARGET,
-        table: Arc::clone(&table),
+        table: Arc::clone(&setup.table),
         c_mode: CMode::Deferred,
         mode: blaze_build_script::toolchain::Mode::Check,
-        native: native_owned.as_ref().zip(jobs.as_ref()).map(|(owned, jobs)| owned.setting(jobs)),
-        // The derived facts' pins (brief P): the host's userland read here, once.
-        spawn_setting: Arc::new(blaze_proc_macro::fact_pins::command_spawn_setting(TARGET, alloc).unwrap_or_else(|e| panic!("{e}"))),
+        native: setup.native.as_ref().ok().map(|run| run.setting()),
+        spawn_setting: Arc::clone(&setup.spawn),
     };
     let units = &graph.units;
     let mut trees: BTreeMap<LockId, (Tree, ScriptRoot)> = BTreeMap::new();
@@ -317,330 +345,149 @@ fn main() {
     } else {
         wanted.to_vec()
     };
-    // Every script in `links` order: a dependency's metadata (`DEP_<LINKS>_*`) is known before
-    // the scripts of its direct dependents run. Each first run's metadata, by script unit.
-    let order = links_order(&graph).unwrap_or_else(|e| panic!("{e}"));
-    let mut metadata: BTreeMap<UnitId, Vec<(String, String)>> = BTreeMap::new();
-    // Each first run of a script whose served unit has `links`: what its dependents' scripts
-    // are served of it (brief S1).
-    let mut producers: BTreeMap<UnitId, DepProducer> = BTreeMap::new();
+    // Every script in `links` order: each run of a script's `links` closure is made before it,
+    // and kept as its outputs RECORD with the tree its package was served, which is what the
+    // command's `Script` task is handed of it.
+    let order = links_order(graph).unwrap_or_else(|e| panic!("{e}"));
+    let mut runs: BTreeMap<UnitId, (Vec<u8>, Tree, ScriptRoot)> = BTreeMap::new();
     for name in &every {
         if !order.iter().any(|s| units[s.index()].name.as_str() == name) {
             println!("{name}: no build-script unit in the graph");
         }
     }
+    let (mut ran_count, mut asked) = (0usize, 0usize);
+    for script in order.iter().copied().filter(|s| every.iter().any(|n| n == units[s.index()].name.as_str())) {
+        asked += 1;
+        let unit = &units[script.index()];
+        let package = format!("{} {}", unit.name.as_str(), unit.version.as_str());
+        let Some(served) = units.iter().find(|u| u.build_script == Some(script)) else {
+            println!("{package}: its script serves no unit");
+            continue;
+        };
+        let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
+        println!("== {package} ({} side, features [{}])", if served.for_host { "host" } else { "target" }, features.join(","));
+        let (tree, folder) = trees
+            .entry(unit.package)
+            .or_insert_with(|| match member_dirs.get(&unit.package) {
+                Some(dir) => (dir_tree(&root), ScriptRoot::member(dir).unwrap_or_else(|e| panic!("{package}: {e}"))),
+                None => {
+                    let (view, dir) = sources.files(unit.package).unwrap_or_else(|e| panic!("{e}"));
+                    // A fetched git source answers `git` from the lock's commit (D54).
+                    let git = match &lock.packages[unit.package.index()].source {
+                        LockSource::Git { commit, .. } => {
+                            Some(git::Oid::parse_hex(commit.as_bytes()).unwrap_or_else(|| panic!("{package}: the lock's commit `{commit}` is not 40 hex digits")))
+                        }
+                        LockSource::Path | LockSource::Registry { .. } => None,
+                    };
+                    (mem_tree(view.files().map(|f| (f.path, f.bytes)), dir.as_str(), git), ScriptRoot::package())
+                }
+            })
+            .clone();
+        // The runs of its `links` closure made so far, read from their records in place; one
+        // that gave no outputs is missing, and `outputs_given` refuses a direct one by name.
+        let mut given: Vec<GivenRun<'_>> = Vec::new();
+        for (input, links, direct) in links_closure(graph, script) {
+            let Some((record, tree, root)) = runs.get(&input) else { continue };
+            let outputs = OutputsRef::open(record).unwrap_or_else(|why| panic!("{package}: the record of its `links = \"{links}\"` input does not read back: {why:?}"));
+            if direct {
+                for (key, value) in outputs.metadata() {
+                    println!("    given DEP_{}_{}={value:?}", links.to_uppercase().replace('-', "_"), key.to_uppercase().replace('-', "_"));
+                }
+            }
+            given.push(GivenRun { script: input, links, outputs, tree: tree.clone(), root: root.clone(), direct });
+        }
+        // The one choice point (D112), made by the run itself: said here for the census.
+        if let Runner::Native { because } = placed(graph, script, setting.mode, alloc) {
+            let because = &units[because.index()];
+            println!("  native (its closure holds {} {}, D112)", because.name.as_str(), because.version.as_str());
+        }
+        let started = Instant::now();
+        let ran = match outputs_given(&runtime, &setting, graph, script, None, tree.clone(), folder.clone(), &given, alloc) {
+            Ok(ran) => ran,
+            Err(error) => {
+                println!("  run: {error}");
+                continue;
+            }
+        };
+        drop(given);
+        ran_count += 1;
+        let o = &ran.outputs;
+        println!("  run: {:?}, fuel {}, peak memory {}, spawns {}", started.elapsed(), ran.fuel, ran.peak_memory, ran.spawns);
+        for (key, value) in o.metadata.iter() {
+            println!("    metadata {}={:?}", key.as_str(), value.as_str());
+        }
+        for (cfg, value) in o.cfgs.iter() {
+            println!("    cfg {}{}", cfg.as_str(), value.as_ref().map_or(String::new(), |v| format!("={:?}", v.as_str())));
+        }
+        for name in o.check_cfgs.iter() {
+            println!("    check-cfg {}", name.as_str());
+        }
+        for (key, value) in o.env.iter() {
+            println!("    env {}={:?}", key.as_str(), value.as_str());
+        }
+        for file in o.files.iter() {
+            println!("    file {} ({} bytes)", file.name.as_str(), file.bytes.len());
+        }
+        for file in o.stored.iter() {
+            println!("    stored file {} ({} bytes)", file.name.as_str(), file.len);
+        }
+        for request in o.c_requests.iter() {
+            println!("    c request {:?}", request.as_str().replace('\0', " "));
+        }
+        for warning in o.warnings.iter() {
+            println!("    warning {:?}", warning.as_str());
+        }
+        println!("    reads {}: {}", ran.reads.len(), ran.reads.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>().join(" "));
+        if served.links.is_some() {
+            let mut record = Vec::new();
+            {
+                let mut encoded = AVec::new_in(alloc);
+                o.encode(&mut encoded);
+                record.extend_from_slice(&encoded);
+            }
+            runs.insert(script, (record, tree.clone(), folder.clone()));
+        }
+        if let Some(dir) = &export {
+            export_record(dir, &store, unit, served.for_host, o, alloc);
+        }
+    }
+    println!("scripts: {ran_count} of {asked} ran");
+    if let Ok(run) = &setup.native
+        && let Err(error) = run.end()
     {
-        let scripts = order.iter().map(|s| s.index()).filter(|i| every.iter().any(|n| n == units[*i].name.as_str()));
-        for at in scripts {
-            let unit = &units[at];
-            let package = format!("{} {}", unit.name.as_str(), unit.version.as_str());
-            let Some(served) = units.iter().find(|u| u.build_script.is_some_and(|s| s.index() == at)) else {
-                println!("{package}: its script serves no unit");
-                continue;
-            };
-            let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-            println!("== {package} ({} side, features [{}])", if served.for_host { "host" } else { "target" }, features.join(","));
-            let (tree, folder) = trees
-                .entry(unit.package)
-                .or_insert_with(|| match member_dirs.get(&unit.package) {
-                    Some(dir) => (dir_tree(&root), ScriptRoot::member(dir).unwrap_or_else(|e| panic!("{package}: {e}"))),
-                    None => {
-                        let (view, dir) = sources.files(unit.package).unwrap_or_else(|e| panic!("{e}"));
-                        // A fetched git source answers `git` from the lock's commit (D54).
-                        let git = match &lock.packages[unit.package.index()].source {
-                            LockSource::Git { commit, .. } => {
-                                Some(git::Oid::parse_hex(commit.as_bytes()).unwrap_or_else(|| panic!("{package}: the lock's commit `{commit}` is not 40 hex digits")))
-                            }
-                            LockSource::Path | LockSource::Registry { .. } => None,
-                        };
-                        (mem_tree(view.files().map(|f| (f.path, f.bytes)), dir.as_str(), git), ScriptRoot::package())
-                    }
-                })
-                .clone();
-            let inputs = links_inputs(&graph, UnitId(at as u32));
-            let mut deps = Vec::new();
-            let mut lacking = None;
-            for (input, links) in &inputs {
-                match metadata.get(input) {
-                    Some(pairs) => deps.extend(pairs.iter().map(|(key, value)| DepMetadata { links: *links, key: key.as_str(), value: value.as_str() })),
-                    None => lacking = Some(format!("{} {} (links {links})", units[input.index()].name.as_str(), units[input.index()].version.as_str())),
-                }
-            }
-            if let Some(dependency) = lacking {
-                println!("  not run: needs the metadata of {dependency}, whose build script gave no outputs in this run");
-                continue;
-            }
-            for dep in &deps {
-                println!("    given DEP_{}_{}={:?}", dep.links.to_uppercase().replace('-', "_"), dep.key.to_uppercase().replace('-', "_"), dep.value);
-            }
-            // The one choice point (D112): a script placed native runs through the real path's
-            // native runner, never as wasm.
-            if let Runner::Native { because } = placed(&graph, UnitId(at as u32), setting.mode, alloc) {
-                let because = &units[because.index()];
-                println!("  native (its closure holds {} {}, D112)", because.name.as_str(), because.version.as_str());
-                // The run's metadata, kept once `deps` (borrowing `metadata`) is done.
-                let mut made_metadata: Option<Vec<(String, String)>> = None;
-                let started = Instant::now();
-                match outputs(&runtime, &setting, &graph, UnitId(at as u32), tree.clone(), folder.clone(), &deps, alloc) {
-                    Ok(ran) => {
-                        let o = &ran.outputs;
-                        println!("  run: {:?}, spawns {}", started.elapsed(), ran.spawns);
-                        made_metadata = Some(o.metadata.iter().map(|(k, v)| (k.as_str().to_owned(), v.as_str().to_owned())).collect());
-                        if served.links.is_some() {
-                            let given: Vec<(&str, &DepProducer)> = inputs.iter().filter_map(|(input, links)| producers.get(input).map(|producer| (*links, producer))).collect();
-                            let upstream = DepProducer::closure(&given);
-                            producers.insert(UnitId(at as u32), DepProducer::of(tree.clone(), folder.clone(), o).with_upstream(upstream));
-                        }
-                        for (key, value) in o.metadata.iter() {
-                            println!("    metadata {}={:?}", key.as_str(), value.as_str());
-                        }
-                        for (cfg, value) in o.cfgs.iter() {
-                            println!("    cfg {}{}", cfg.as_str(), value.as_ref().map_or(String::new(), |v| format!("={:?}", v.as_str())));
-                        }
-                        for (key, value) in o.env.iter() {
-                            println!("    env {}={:?}", key.as_str(), value.as_str());
-                        }
-                        for file in o.files.iter() {
-                            println!("    file {} ({} bytes)", file.name.as_str(), file.bytes.len());
-                        }
-                        println!("    reads {}", ran.reads.len());
-                    }
-                    Err(error) => println!("  run: {error}"),
-                }
-                drop(deps);
-                if let Some(pairs) = made_metadata {
-                    metadata.insert(UnitId(at as u32), pairs);
-                }
-                continue;
-            }
-            // Brief S1: the `links` dependencies' paths as this script sees them, and their
-            // files served read-only.
-            let given: Vec<(&str, &DepProducer)> = inputs.iter().filter_map(|(input, links)| producers.get(input).map(|producer| (*links, producer))).collect();
-            let upstream = DepProducer::closure(&given);
-            let viewed = match view(&tree, &given, &deps, alloc) {
-                Ok(viewed) => viewed,
-                Err(error) => {
-                    println!("  not run: {error}");
-                    continue;
-                }
-            };
-            let deps: Vec<DepMetadata<'_>> =
-                deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
-            for dep in deps.iter().filter(|dep| !metadata.values().flatten().any(|(_, value)| value == dep.value)) {
-                println!("    seen as DEP_{}_{}={:?}", dep.links.to_uppercase().replace('-', "_"), dep.key.to_uppercase().replace('-', "_"), dep.value);
-            }
-            let started = Instant::now();
-            let Prepared { loaded, script, env } = match prepare_viewing(&runtime, &setting, &graph, UnitId(at as u32), tree.clone(), folder.clone(), &deps, viewed.views, alloc) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    println!("  {error}");
-                    continue;
-                }
-            };
-            println!("  load {:?} (compiled now: {})", started.elapsed(), loaded.compiled);
-            if discover {
-                // Every try-compile the script would make: each unanswered one is printed and
-                // then answered "refused" in this run's own table only (its id is in the
-                // record's key, so these runs never answer a real one), up to 64.
-                let mut rows = table.to_vec();
-                for _ in 0..64 {
-                    let asked = Arc::new(Script { table: Arc::new(rows.clone()), ..Script::clone(&script) });
-                    match runtime.run(&loaded, asked, &env, alloc) {
-                        Err(ScriptError { why: ScriptWhy::Refused(Refusal::Spawn(SpawnRefusal::CannotAnswerYet { key, args, snippet, .. })), .. }) => {
-                            println!("  question {:02x?}: rustc {}\n    snippet {snippet:?}", &key.0[..8], args.join(" "));
-                            rows.push(Row { key, accepted: false });
-                            rows.sort_by(|a, b| a.key.cmp(&b.key));
-                        }
-                        Err(error) => {
-                            println!("  discovery ended: {error}");
-                            break;
-                        }
-                        Ok(_) => {
-                            println!("  discovery done");
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-            // One run; `outline` and `export` take its outputs (nothing is kept to answer a
-            // second run).
-            let started = Instant::now();
-            let ran = match runtime.run(&loaded, Arc::clone(&script), &env, alloc) {
-                Ok(ran) => ran,
-                Err(error) => {
-                    println!("  run: {error}");
-                    continue;
-                }
-            };
-            let o = &ran.outputs;
-            println!("  run: {:?}, fuel {}, peak memory {}, spawns {}", started.elapsed(), ran.fuel, ran.peak_memory, ran.spawns);
-            metadata.insert(UnitId(at as u32), o.metadata.iter().map(|(k, v)| (k.as_str().to_owned(), v.as_str().to_owned())).collect());
-            if served.links.is_some() {
-                producers.insert(UnitId(at as u32), DepProducer::of(tree.clone(), folder.clone(), o).with_upstream(upstream.clone()));
-            }
-            for (key, value) in o.metadata.iter() {
-                println!("    metadata {}={:?}", key.as_str(), value.as_str());
-            }
-            for (cfg, value) in o.cfgs.iter() {
-                println!("    cfg {}{}", cfg.as_str(), value.as_ref().map_or(String::new(), |v| format!("={:?}", v.as_str())));
-            }
-            for name in o.check_cfgs.iter() {
-                println!("    check-cfg {}", name.as_str());
-            }
-            for (key, value) in o.env.iter() {
-                println!("    env {}={:?}", key.as_str(), value.as_str());
-            }
-            for file in o.files.iter() {
-                println!("    file {} ({} bytes)", file.name.as_str(), file.bytes.len());
-            }
-            for request in o.c_requests.iter() {
-                println!("    c request {:?}", request.as_str().replace('\0', " "));
-            }
-            for warning in o.warnings.iter() {
-                println!("    warning {:?}", warning.as_str());
-            }
-            println!("    reads {}: {}", ran.reads.len(), ran.reads.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>().join(" "));
-            if outline {
-                outline_root(&script, served, &ran.outputs, alloc);
-            }
-            if let Some(dir) = &export {
-                let mut record = AVec::new_in(alloc);
-                ran.outputs.encode(&mut record);
-                let side = if served.for_host { "host" } else { "target" };
-                let path = dir.join(format!("{}@{}@{side}.outputs", unit.name.as_str(), unit.version.as_str()));
-                std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-                std::fs::write(&path, &record[..]).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                println!("  exported {} ({} bytes)", path.display(), record.len());
-            }
-        }
+        println!("native: {error}");
     }
 }
 
-/// The served unit's root file lowered with the script's outputs laid over its host
-/// ([`ScriptCx`]) and its cfg joined with the script's: every item an expansion made (an
-/// `include!` of `OUT_DIR` among them) is printed with its first line.
-fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaze_build_script::Outputs<'_>, alloc: Alloc<'_>) {
-    let root = served.root.as_str();
-    let folder = script.root.seen().folder();
-    let rel = if folder.is_empty() { root.to_owned() } else { format!("{folder}/{root}") };
-    let Some(bytes) = script.tree.file(&rel) else {
-        println!("  outline: no file {rel}");
-        return;
-    };
-    let Ok(text) = String::from_utf8(bytes) else {
-        println!("  outline: {rel} is not UTF-8");
-        return;
-    };
-    let mut cfg = UnitCfg { atoms: Vec::new() };
-    for atom in served.cfg.iter() {
-        cfg.atoms.push((atom.name.as_str().to_owned(), atom.value.as_ref().map(|v| v.as_str().to_owned())));
-    }
-    for feature in served.features.iter() {
-        cfg.atoms.push(("feature".to_owned(), Some(feature.as_str().to_owned())));
-    }
-    for (name, value) in out.cfgs.iter() {
-        cfg.atoms.push((name.as_str().to_owned(), value.as_ref().map(|v| v.as_str().to_owned())));
-    }
-    let host = Bare { env: script.env.clone() };
-    // `edition::Edition` is `repr(u8)` from 0 in edition order, as blaze-surface's is.
-    let edition = match served.edition.syntax as u8 {
-        0 => blaze_surface::Edition::E2015,
-        1 => blaze_surface::Edition::E2018,
-        2 => blaze_surface::Edition::E2021,
-        _ => blaze_surface::Edition::E2024,
-    };
-    let at = DefAt {
-        site: DefSite { krate: CrateItemKey(blaze_ids::ContentId([1; 32])), module: None },
-        edition,
-        export: Export::Exported,
-        local_inner: LocalInner::No,
-        transparency: None,
-    };
-    let rules: &[(&str, blaze_expand::Prepared<'_>)] = &[];
-    // The outputs as their record's bytes, read in place: what a reader of the store is given.
+/// `export <dir>`: the run's outputs record written as `<dir>/<name>@<version>@<side>.outputs`
+/// (what blaze-world's `ScriptRecords` readers load), and each of its STORED files (a native
+/// script's `OUT_DIR` files, which the record names by digest and does not hold) put beside it
+/// in `<dir>/files/<sha256 hex>`, cloned from the run's file area
+/// (`<blaze store>/build-script/files`, where the native runner renamed them) by
+/// `std::fs::copy`, which clones on APFS; a digest already there is left. A stored file the
+/// area lacks stops the export naming it.
+fn export_record(dir: &Path, store: &Path, unit: &blaze_unit_graph::Unit<'_>, for_host: bool, outputs: &blaze_build_script::Outputs<'_>, alloc: Alloc<'_>) {
     let mut record = AVec::new_in(alloc);
-    out.encode(&mut record);
-    let opened = match blaze_build_script::outputs::OutputsRef::open(&record) {
-        Ok(opened) => opened,
-        Err(why) => {
-            println!("  outline: the outputs record does not read back: {why:?}");
-            return;
-        }
-    };
-    let mut by_name = ByName::new(rules, at, ScriptCx { inner: host, out: opened }, alloc);
-    let mut sink = Made(0, true);
-    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut sink, alloc);
-    println!("  outline of {rel}: {} items, {} made by expansions", stats.items, sink.0);
-    // The control: the same file over the same host with no outputs laid over it.
-    let mut empty = AVec::new_in(alloc);
-    blaze_build_script::Outputs::new_in(script.out_dir(), alloc).encode(&mut empty);
-    let Ok(none) = blaze_build_script::outputs::OutputsRef::open(&empty) else {
-        println!("  outline: an empty outputs record does not read back");
+    outputs.encode(&mut record);
+    let side = if for_host { "host" } else { "target" };
+    let path = dir.join(format!("{}@{}@{side}.outputs", unit.name.as_str(), unit.version.as_str()));
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    std::fs::write(&path, &record[..]).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    println!("  exported {} ({} bytes)", path.display(), record.len());
+    if outputs.stored.is_empty() {
         return;
-    };
-    let mut by_name = ByName::new(rules, at, ScriptCx { inner: Bare { env: script.env.clone() }, out: none }, alloc);
-    let mut quiet = Made(0, false);
-    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut quiet, alloc);
-    println!("  control without the outputs: {} items, {} made by expansions", stats.items, quiet.0);
-}
-
-/// A unit's cfg set: its atoms, its features and its script's cfgs.
-struct UnitCfg {
-    atoms: Vec<(String, Option<String>)>,
-}
-
-impl Cfg for UnitCfg {
-    fn atom(&mut self, name: &str, value: Option<&str>) -> CfgAnswer {
-        if self.atoms.iter().any(|(n, v)| n == name && v.as_deref() == value) { CfgAnswer::Yes } else { CfgAnswer::No }
     }
-}
-
-/// A host with the package's cargo variables and nothing else.
-struct Bare {
-    env: Vec<(String, String)>,
-}
-
-impl ExpandCx for Bare {
-    fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
-        Ok(self.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()))
-    }
-
-    fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
-        Err(HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
-    }
-
-    fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
-        Ok(Included::Missing)
-    }
-
-    fn place(&self, what: PlaceOf) -> Result<Place<'_>, HostError> {
-        Ok(match what {
-            PlaceOf::Line | PlaceOf::Column => Place::Number(1),
-            PlaceOf::File | PlaceOf::ModulePath => Place::Text(""),
-        })
-    }
-
-    fn run_proc_macro<'a>(&self, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'a>) -> Result<Produced<'a>, HostError> {
-        Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused })
-    }
-}
-
-/// Counts each item an expansion made, printing its first line when `.1`.
-struct Made(u64, bool);
-
-impl Sink for Made {
-    fn refused(&mut self, item: &ItemRef<'_>, refusal: blaze_lower::Refusal<'_>) {
-        println!("    refused: {} on {}: {}", refusal.path, item.item_text().lines().next().unwrap_or(""), refusal.bound);
-    }
-
-    fn record(&mut self, item: &ItemRef<'_>, what: What, _: blaze_ids::ContentId, _: Outcome<'_, '_>) {
-        if matches!(item.source, Source::Expansion { .. }) && matches!(what, What::Signature) {
-            self.0 += 1;
-            if self.1 && self.0 <= 3 {
-                let first = item.item_text().lines().next().unwrap_or("");
-                println!("    made: {}", first.chars().take(100).collect::<String>());
-            }
+    let area = store.join(blaze_build_script::outputs::FILE_AREA);
+    let files = dir.join("files");
+    std::fs::create_dir_all(&files).unwrap_or_else(|e| panic!("{}: {e}", files.display()));
+    for file in outputs.stored.iter() {
+        let hex: String = file.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
+        let to = files.join(&hex);
+        if !to.exists() {
+            let from = area.join(&hex);
+            std::fs::copy(&from, &to).unwrap_or_else(|e| panic!("{}: stored file `{}` of {}: {e}", from.display(), file.name.as_str(), path.display()));
         }
+        println!("  exported stored file {} ({} bytes) as {}", file.name.as_str(), file.len, to.display());
     }
 }
+

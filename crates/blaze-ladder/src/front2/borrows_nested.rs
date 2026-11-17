@@ -92,6 +92,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn call_bounds(&self, item: tc::ItemKey) -> Option<CallBounds<'_>> {
         self.facts.call_bounds(item)
     }
+    fn object_trait_lifetimes(&self, trait_: tc::ItemKey) -> Option<bool> {
+        self.facts.object_trait_lifetimes(trait_)
+    }
 }
 
 /// The flow after `at` in the body's order: the owner's first, then each closure and async block

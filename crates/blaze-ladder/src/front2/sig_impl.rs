@@ -87,6 +87,74 @@ fn text(h: &mut StableHasher, s: &str) {
     *h = h.bytes(s.as_bytes());
 }
 
+/// The `detail` of the rows of what a projection's closedness took of a trait's text
+/// ([`trait_closed`], [`trait_read`]).
+pub const TRAIT_DETAIL: u64 = 3;
+
+/// The domain of the trait rows' answers.
+const TRAIT_DOMAIN: &str = "blaze-ladder front2 borrow trait closed read v1";
+
+/// What a trait's text says of its associated types' lifetimes (blaze-flow-lower
+/// generic_call.rs, "PROJECTIONS"): whether its header declares a lifetime parameter, and the
+/// names of its associated types with generics of their own, sorted. `None`: the trait's text
+/// is not given, or does not lex.
+fn trait_assoc<'n, 'a, S: NamesSource<'n>>(names: S, keys: &Keys, trait_: tc::ItemKey, alloc: Alloc<'a>) -> Option<(bool, AVec<'a, &'n str>)> {
+    let lib = keys.library_in(names, trait_)?;
+    let text = names.text_of(lib)?.text;
+    let lifetimes = blaze_flow_lower::sig::trait_declares_lifetime(text, alloc).ok()?;
+    let mut generic: AVec<'a, &'n str> = AVec::new_in(alloc);
+    let mut unread = false;
+    names.each_member(lib, &mut |m| {
+        if m.kind == ItemKind::TypeAlias
+            && let Some(name) = m.name
+        {
+            match blaze_flow_lower::sig::assoc_declares_generics(m.text, alloc) {
+                Ok(true) => generic.push(name),
+                Ok(false) => {}
+                Err(_) => unread = true,
+            }
+        }
+    });
+    if unread {
+        return None;
+    }
+    generic.sort_unstable();
+    Some((lifetimes, generic))
+}
+
+/// Whether trait `trait_`'s associated type `name` is CLOSED: the trait declares no lifetime
+/// parameter and `name` has no generics of its own. `None`: not known (its text not given).
+pub fn trait_closed<'n, S: NamesSource<'n>>(names: S, keys: &Keys, trait_: tc::ItemKey, name: tc::Name, alloc: Alloc<'_>) -> Option<bool> {
+    let (lifetimes, generic) = trait_assoc(names, keys, trait_, alloc)?;
+    Some(!lifetimes && !generic.iter().any(|g| tc::Name::of(g) == name))
+}
+
+/// Whether trait `trait_`'s header declares a lifetime parameter (blaze-flow-lower
+/// `Facts::object_trait_lifetimes`). `None`: not known (its text not given or not read). Its
+/// row is [`trait_read`], the same as [`trait_closed`]'s.
+pub fn trait_lifetimes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, trait_: tc::ItemKey, alloc: Alloc<'_>) -> Option<bool> {
+    trait_assoc(names, keys, trait_, alloc).map(|(lifetimes, _)| lifetimes)
+}
+
+/// The row of what [`trait_closed`] took of trait `trait_`'s text (rule 21), keyed by the
+/// trait: whether its header declares a lifetime and which associated types are generic, or
+/// that its text was not read. A function of the trait alone, so every ask files one answer.
+pub fn trait_read<'n, S: NamesSource<'n>>(names: S, keys: &Keys, trait_: tc::ItemKey, alloc: Alloc<'_>) -> Read {
+    let mut h = StableHasher::new(TRAIT_DOMAIN);
+    match trait_assoc(names, keys, trait_, alloc) {
+        None => h.tag(0),
+        Some((lifetimes, generic)) => {
+            h.tag(1);
+            h.tag(u8::from(lifetimes));
+            h.u32(generic.len() as u32);
+            for g in generic.iter() {
+                text(&mut h, g);
+            }
+        }
+    }
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: trait_.0, detail: TRAIT_DETAIL }, answer: Some(h.finish()) }
+}
+
 /// The row of what the borrow check took of the impl text of the fn `item` (the module doc).
 pub fn impl_read(item: u128, read: &ImplRead<'_, '_>, alloc: Alloc<'_>) -> Read {
     let mut h = StableHasher::new(DOMAIN);

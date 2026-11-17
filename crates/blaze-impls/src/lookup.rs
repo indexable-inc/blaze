@@ -23,8 +23,20 @@
 //! `for_self_ty_in_crate_and_block` do.
 //!
 //! **In what order.** Crate by crate in index order (each crate after what it depends on);
-//! in a crate, the rows of the shape's bucket, then the trait's blanket rows; in a bucket, by
-//! impl key. A row says which it is ([`ImplRow::is_blanket`]).
+//! in a crate, the rows of the shape's bucket, then the trait's blanket rows, then the impls
+//! whose trait was not read at the shape and at any shape, then the blind impls (an inherent
+//! lookup: the shape's, those whose self type was not read, the blind); in a bucket, by impl
+//! key. A row says which it is ([`ImplRow::is_blanket`], and its flags: an unread row has no
+//! trait, and its caller decides from the impl's header whether it answers).
+//!
+//! **What was not read is a candidate too** (lane BK, 2026-11-17): an impl whose trait path the
+//! writer did not resolve, or whose header it did not read, is in its crate's
+//! [`BucketKey::UnreadTrait`] or [`BucketKey::Blind`] bucket, and a crate holding one is never
+//! passed over by its `NoImplsOf` trait column. So a lookup's rows are a superset of the
+//! impls that apply, as the front end's questions need, never a guess.
+//!
+//! [`candidates_in`] and [`inherent_candidates_in`] ask the crates a caller names, with no
+//! crate graph: the front end narrows by the orphan rules' homes, which it reads itself.
 //!
 //! **What is read.** Of each holder: its `NoImplsOf`; where that may hold the trait and the
 //! bucket, its directory; where that names the bucket, the bucket. Every read is handed to
@@ -34,7 +46,7 @@ use core::fmt;
 
 use blaze_format::FormatError;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_int::{Int, idx};
+use blaze_int::Int;
 
 use blaze_surface::{
     BucketHash, BucketKey, BucketView, CrateFlags, CrateGraphView, CrateIndex, DirectoryView, ImplRow,
@@ -156,13 +168,24 @@ impl<E: fmt::Display + fmt::Debug> core::error::Error for ImplLookupError<E> {}
 struct Want {
     key: BucketKey,
     hash: BucketHash,
+    /// Asked only of the crates that can name the goal's shape's definition (its rows are at
+    /// that shape).
+    shaped: bool,
 }
 
 impl Want {
     fn of(key: BucketKey) -> Want {
-        Want { key, hash: key.hash() }
+        Want { key, hash: key.hash(), shaped: false }
+    }
+
+    fn shaped(key: BucketKey) -> Want {
+        Want { key, hash: key.hash(), shaped: true }
     }
 }
+
+/// The most buckets one lookup wants of a crate: a trait lookup's shape, blanket, unread at
+/// the shape, unread at any shape, and blind buckets.
+const WANTS: usize = 5;
 
 /// The crates a lookup asks, a word of a bit row at a time.
 #[derive(Clone, Copy, Debug)]
@@ -172,17 +195,22 @@ enum Reach<'g> {
     /// Of the asking crate's closure: the definition's crate, the asking crate, and with
     /// `lang` the crates of the language.
     Inherent { closure: &'g [u64], def: Option<CrateIndex>, from: Option<CrateIndex>, lang: bool },
+    /// The crates the caller names, in its order, with no crate graph: a caller that narrows
+    /// the crates by rules of its own (the front end's orphan-rule homes).
+    Listed(&'g [CrateItemKey]),
 }
 
 impl<'g> Reach<'g> {
     fn words(&self) -> usize {
         match self {
             Reach::Rows { closure, .. } | Reach::Inherent { closure, .. } => closure.len(),
+            Reach::Listed(_) => 0,
         }
     }
 
     fn word(&self, graph: &CrateGraphView<'g>, w: usize) -> u64 {
         match *self {
+            Reach::Listed(_) => 0,
             Reach::Rows { closure, trait_row } => closure[w] & trait_row[w],
             Reach::Inherent { closure, def, from, lang } => {
                 let (mut bits, mut kept) = (closure[w], 0u64);
@@ -208,6 +236,9 @@ struct InCrate<'c> {
     krate: CrateItemKey,
     filter: NoImplsOfView<'c>,
     directory: Option<DirectoryView<'c>>,
+    /// Whether the crate can name the goal's shape's definition: else its shaped wants are
+    /// passed over.
+    names_shape: bool,
     /// The next of the lookup's wants to look for.
     next_want: usize,
     /// The bucket being read, and its next row.
@@ -217,20 +248,60 @@ struct InCrate<'c> {
 /// The rows a lookup finds, read lazily: an iterator of rows, or of the one error that ends
 /// it. It allocates nothing.
 pub struct Candidates<'g, 'c, C: ImplRecords> {
-    graph: CrateGraphView<'g>,
+    /// None for a [`Reach::Listed`] lookup, which reads no crate graph.
+    graph: Option<CrateGraphView<'g>>,
     cx: &'c C,
     reach: Reach<'g>,
     /// Asked of each crate's `NoImplsOf` before its buckets: the trait, for a trait lookup.
     trait_: Option<ItemKey>,
-    wants: [Option<Want>; 2],
-    /// The crates the first want is asked of, beyond the reach: the dependents of the shape's
-    /// definition's crate, for a trait lookup of a shape with one. None asks it of all.
+    wants: [Option<Want>; WANTS],
+    /// The crates the shaped wants are asked of, beyond the reach: the dependents of the
+    /// shape's definition's crate, for a trait lookup of a shape with one. None asks them of
+    /// all.
     first_in: Option<&'g [u64]>,
-    /// The next word of the reach to load, and what is left of the one before.
+    /// The next word of the reach to load (or, listed, the next crate), and what is left of
+    /// the word before.
     word: usize,
     bits: u64,
     current: Option<InCrate<'c>>,
     done: bool,
+}
+
+/// What a trait lookup wants of each crate, in this order: the shape's bucket, the trait's
+/// blanket bucket, the unread trait impls at the shape and at any shape, and the blind impls.
+/// A shape no impl is filed under (a blanket's, a placeholder's) wants no shaped bucket.
+fn trait_wants(trait_: ItemKey, shape: SelfShape) -> [Option<Want>; WANTS] {
+    let any = |key| Some(Want::of(key));
+    let (by_shape, unread_at) = match shape.files_no_impl() {
+        true => (None, None),
+        false => (
+            Some(Want::shaped(BucketKey::Trait { trait_, shape })),
+            Some(Want::shaped(BucketKey::UnreadTrait { shape })),
+        ),
+    };
+    [
+        by_shape,
+        any(BucketKey::Blanket { trait_ }),
+        unread_at,
+        any(BucketKey::UnreadTrait { shape: SelfShape::BLANKET }),
+        any(BucketKey::Blind),
+    ]
+}
+
+/// What an inherent lookup wants of each crate, in this order: the shape's bucket, the
+/// inherent impls whose self type was not read to a shape, and the blind impls.
+fn inherent_wants(shape: SelfShape) -> [Option<Want>; WANTS] {
+    let by_shape = match shape.files_no_impl() {
+        true => None,
+        false => Some(Want::of(BucketKey::Inherent { shape })),
+    };
+    [
+        by_shape,
+        Some(Want::of(BucketKey::Inherent { shape: SelfShape::BLANKET })),
+        Some(Want::of(BucketKey::Blind)),
+        None,
+        None,
+    ]
 }
 
 /// The crate of `item`, by its key's prefix.
@@ -254,14 +325,30 @@ pub fn candidates<'g, 'c, C: ImplRecords>(
         Some(def) => Some(graph.dependents_row(crate_of(graph, def)?)),
         None => None,
     };
-    let blanket = Some(Want::of(BucketKey::Blanket { trait_ }));
-    let wants = match shape.files_no_impl() {
-        true => [None, blanket],
-        false => [Some(Want::of(BucketKey::Trait { trait_, shape })), blanket],
-    };
     let reach =
         Reach::Rows { closure: graph.closure_row(from), trait_row: graph.dependents_row(trait_crate) };
-    Ok(Candidates::new(*graph, cx, reach, Some(trait_), wants, self_row))
+    Ok(Candidates::new(Some(*graph), cx, reach, Some(trait_), trait_wants(trait_, shape), self_row))
+}
+
+/// [`candidates`] over the crates `crates` names, in its order, with no crate graph: for a
+/// caller that chooses the crates by rules of its own. Every crate named is asked every
+/// want; a crate's `NoImplsOf` and directory still pass over what it does not hold.
+pub fn candidates_in<'g, 'c, C: ImplRecords>(
+    crates: &'g [CrateItemKey],
+    trait_: ItemKey,
+    shape: SelfShape,
+    cx: &'c C,
+) -> Candidates<'g, 'c, C> {
+    Candidates::new(None, cx, Reach::Listed(crates), Some(trait_), trait_wants(trait_, shape), None)
+}
+
+/// [`inherent_candidates`] over the crates `crates` names, in its order, with no crate graph.
+pub fn inherent_candidates_in<'g, 'c, C: ImplRecords>(
+    crates: &'g [CrateItemKey],
+    shape: SelfShape,
+    cx: &'c C,
+) -> Candidates<'g, 'c, C> {
+    Candidates::new(None, cx, Reach::Listed(crates), None, inherent_wants(shape), None)
 }
 
 /// The inherent impls of shape `shape` among the crates `from` loads, crate by crate in
@@ -278,10 +365,7 @@ pub fn inherent_candidates<'g, 'c, C: ImplRecords>(
         Some(def) => Some(crate_of(graph, def)?),
         None => None,
     };
-    let wants = match shape.files_no_impl() {
-        true => [None, None],
-        false => [Some(Want::of(BucketKey::Inherent { shape })), None],
-    };
+    let wants = inherent_wants(shape);
     let reach = Reach::Inherent {
         closure: graph.closure_row(from),
         def,
@@ -291,34 +375,43 @@ pub fn inherent_candidates<'g, 'c, C: ImplRecords>(
         },
         lang: def.is_none() || incoherent == Incoherent::Allowed,
     };
-    Ok(Candidates::new(*graph, cx, reach, None, wants, None))
+    Ok(Candidates::new(Some(*graph), cx, reach, None, wants, None))
 }
 
 impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
     fn new(
-        graph: CrateGraphView<'g>,
+        graph: Option<CrateGraphView<'g>>,
         cx: &'c C,
         reach: Reach<'g>,
         trait_: Option<ItemKey>,
-        wants: [Option<Want>; 2],
+        wants: [Option<Want>; WANTS],
         first_in: Option<&'g [u64]>,
     ) -> Candidates<'g, 'c, C> {
         let done = wants.iter().all(Option::is_none);
         Candidates { graph, cx, reach, trait_, wants, first_in, word: 0, bits: 0, current: None, done }
     }
 
-    /// The next crate of the reach, in index order.
-    fn next_holder(&mut self) -> Option<CrateIndex> {
+    /// The next crate of the reach, in index order (listed: in the caller's order), and
+    /// whether it can name the goal's shape's definition.
+    fn next_holder(&mut self) -> Option<(CrateItemKey, bool)> {
+        if let Reach::Listed(crates) = self.reach {
+            let krate = *crates.get(self.word)?;
+            self.word += 1;
+            return Some((krate, true));
+        }
+        let graph = self.graph?;
         loop {
             if self.bits != 0 {
                 let bit = self.bits.trailing_zeros().widen_to::<usize>();
                 self.bits &= self.bits - 1;
-                return Some(CrateIndex::of_bit((self.word - 1) * 64 + bit));
+                let at = (self.word - 1) * 64 + bit;
+                let names_shape = self.first_in.is_none_or(|row| row[at / 64] & (1 << (at % 64)) != 0);
+                return Some((graph.key(CrateIndex::of_bit(at)), names_shape));
             }
             if self.word >= self.reach.words() {
                 return None;
             }
-            self.bits = self.reach.word(&self.graph, self.word);
+            self.bits = self.reach.word(&graph, self.word);
             self.word += 1;
         }
     }
@@ -342,7 +435,9 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
                 }
                 if let Some(&want) = self.wants.get(current.next_want) {
                     current.next_want += 1;
-                    if let Some(want) = want {
+                    // A crate that cannot name the shape's definition holds none of the
+                    // shape's impls, only those for any shape.
+                    if let Some(want) = want.filter(|want| current.names_shape || !want.shaped) {
                         let opened = open_want(cx, current, want)?;
                         current.bucket = opened;
                     }
@@ -351,8 +446,7 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
                 self.current = None;
                 continue;
             }
-            let Some(at) = self.next_holder() else { return Ok(None) };
-            let krate = self.graph.key(at);
+            let Some((krate, names_shape)) = self.next_holder() else { return Ok(None) };
             let bytes = cx.no_impls_of(krate).map_err(|error| ImplLookupError::Records {
                 krate,
                 record: RecordKind::NoImplsOf,
@@ -377,12 +471,7 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
                     continue;
                 }
             }
-            // A crate that cannot name the shape's definition holds none of the shape's impls,
-            // only blanket ones.
-            let bit = idx(at.get());
-            let names_shape = self.first_in.is_none_or(|row| row[bit / 64] & (1 << (bit % 64)) != 0);
-            let next_want = if names_shape { 0 } else { 1 };
-            self.current = Some(InCrate { krate, filter, directory: None, next_want, bucket: None });
+            self.current = Some(InCrate { krate, filter, directory: None, names_shape, next_want: 0, bucket: None });
         }
     }
 }

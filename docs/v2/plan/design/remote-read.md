@@ -1,9 +1,13 @@
 ---
-status: plan
+status: superseded
 summary: The shared cache's read path (crates/blaze-remote/src/read, blaze-cli's store.rs). A command that misses a record locally reads it by byte range from an origin that lists and writes nothing. It checks each byte against a digest chain that starts at a signed head, writes the record through, and computes nothing the origin holds. Covers the sans-IO reader, the trust steps, what an origin must give, the first numbers, and what is not built.
 date: 2026-11-16
 ---
 # Reading records from an origin
+
+Superseded on 2026-11-17 by decision D130: records shared between machines, a remote cache and remote
+execution are no longer goals (the owner: "we dont care about shreable across machiens"). Kept as the record
+of the design and of crates/blaze-remote's read path; nothing new is built on it.
 
 ## Objects
 

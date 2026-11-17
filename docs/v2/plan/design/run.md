@@ -372,6 +372,53 @@ folder), compiled-behind, the std bundle. Checks: hello world twice in one scrat
 line reads `code records: reached R, found R, made 0, unkeyed 0` or names each unkeyed instance, its
 profile holds no check or resolve span, and it ends inside 100 ms (floor 5 ms: ratio to be quoted).
 
+### Statics in the run (lane HR's spec, 2026-11-17; rule 29: the spec, then the same lane builds it)
+
+Nothing above placed a static: the launcher refused a record's `Static` target with "statics come with
+piece 8", but piece 8 is the run record. Hello world's records name statics (green 515e6f7689: "record
+8959dccaa982 names Static ee9c4409b9c9"). The Reference, "Static items": one allocation for the whole
+program, its initializer evaluated at compile time, never dropped; `static mut` and a type with
+`UnsafeCell` are written in place; every reference to a static is to that one allocation.
+
+- **A static is a record of its own, a DATUM** (NEW blaze-code datum.rs, `bzdata01`, the form blaze-export's
+  `Data` takes): its place (`ReadOnly`: immutable with no interior mutability; `Writable`; `Zeroed { len }`:
+  writable and all zero, no bytes), its alignment (a power of two, at most 4 KiB), its bytes, its targets by
+  (space, symbol) like a code record's (a fn's address is its entry thunk, another static's is its first
+  byte, a vtable's its first word; a thread-local or a C name in a static's value is refused by name until
+  each is built), and its words (`at`, target or the datum's own byte, addend). One datum a static: the
+  value's other allocations (`&[1, 2]`, a string literal) are laid out after its first bytes, each at its
+  own alignment, and a pointer to one is a word naming the datum's own byte. Sealed once, read in place.
+- **Keyed like an instance, a row of the same walk** (body_ids.rs `Walk`): a code record's entry declares
+  the statics its code names, by item key, beside the instances it calls; a datum's entry declares the
+  statics and instances its words name. A static's row is keyed from text before the work: the static's
+  symbol (symbols.rs `static_symbol`), its initializer's `BodyCheck` key and read list, and its crate's
+  fact (rule 65), with the target, toolchain and forms as `record_key` writes them. Found, nothing is
+  evaluated; missed, the maker evaluates that ONE static (front2 statics.rs, the constant evaluator) and
+  puts the datum. An edit of an initializer moves that static's key alone; the code that names it keeps
+  its key (code names a static's word, never its value), so an edit's work is that one datum.
+- **Sent WITH the record that names it, never on demand.** A static has no stub: a load through its word
+  must find its bytes. So when the parent answers a record, each static it declares that the child does
+  not hold is stepped (found or made) and told first, in one `Down::Data { data: [(symbol, record)] }`
+  after the `Declare` of every slot the record and its data name (a fn's address in a datum is its slot's
+  thunk) and before the record's `Publish`; a datum's own statics come in the same message, so a cycle
+  of statics (`static A: N = N(&B); static B: N = N(&A);`) is one batch. Each static is told once a run.
+  A record that brings data is not a start-list row until the list's form carries static rows (a row is
+  placed alone, before any need); until then it is answered at its first call.
+- **Placed by the child before anything names it** (launch-rt run_mode.rs): for one `Data` message, every
+  datum is read and given its address first (so words inside the batch resolve, cycles included), then
+  each is filled (blaze-code `datum::fill`: the bytes, then each word through the run's `Words`) and
+  copied, and only then is its static word stored: one 8-byte word a static in the reservation, as the
+  slot table says. A `ReadOnly` datum goes in the code area (read-only in the run view, written through
+  the write view, as a relro part is); a `Writable` or `Zeroed` one in the run's writable data area. A
+  code record whose `Static` target the child does not hold is refused by name (the parent's order was
+  broken), never stubbed.
+- **Thread-locals** stay refused by name until a program needs them: their template is a datum too, and
+  the getter and descriptor are run/special.rs records already.
+
+Steps, each admitted alone, each ending with hello world's next line: (1) a `ReadOnly` datum of plain
+bytes: declared, keyed, made, sent, placed, read; (2) words: a static holding a fn's or another static's
+address, cycles; (3) `Writable` and `Zeroed`; (4) thread-locals if hello world needs them.
+
 ## The live picture (the run path's wire; the parent is `blaze run`, the socket a pair on descriptor 3)
 
 ```

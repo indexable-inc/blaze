@@ -578,21 +578,13 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         c.path_of(module)
     }
 
-    fn failed_call<'b>(self, call: ItemKey, _alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where
         'n: 'b,
     {
-        use blaze_scope::resolve::{ExpandNote, NamesNote};
-        // Every crate's notes in order, the first failure of the call (blaze-scope
-        // failed_call.rs `FailedCall::of`, the same join).
-        (0..self.crates().len()).find_map(|krate| {
-            self.notes(krate).iter().find_map(|note| match *note {
-                NamesNote::Expand { call: c, note: ExpandNote::Failed { path, implicit, failed }, .. } if c == call => {
-                    Some(blaze_scope::names_record::FailedRow { call, path, implicit, failed })
-                }
-                _ => None,
-            })
-        })
+        // The crate that stored the call refused, joined as its record's writer joins it
+        // (blaze-scope names_record.rs `refused_row`, the one join).
+        (0..self.crates().len()).find_map(|krate| blaze_scope::names_record::refused_row(self.krate(krate), call, alloc))
     }
 
     fn each_item(self, krate: usize, each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool {
@@ -874,6 +866,26 @@ impl<'n> Records<'n> {
     pub fn whole_text(&'n self, krate: usize, at: blaze_scope::resolve::At) -> Option<&'n str> {
         self.items_of(krate)?;
         self.read(krate, self.items.whole(krate, at))
+    }
+
+    /// [`NamesSource::walk`] with every cell the walk consults put in `sink` (blaze-scope
+    /// names_cells.rs `Logged`, the one seam a reader by cell walks through): what the
+    /// read-only view (front2 tables/view.rs) answers a path from.
+    pub fn walk_logged(&'n self, sink: &dyn blaze_scope::names_cells::CellSink, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
+        let logged = blaze_scope::names_cells::Logged { world: &self.paths, log: sink };
+        names::path(&logged, module, ns, self.kept(written), self.alloc)
+    }
+
+    /// [`NamesSource::written_module`] with every cell consulted put in `sink`.
+    pub fn written_module_logged(&'n self, sink: &dyn blaze_scope::names_cells::CellSink, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
+        let logged = blaze_scope::names_cells::Logged { world: &self.paths, log: sink };
+        names::written_module::<&'n str, _>(&logged, module, n)
+    }
+
+    /// [`NamesSource::traits_in_scope`] with every cell consulted put in `sink`.
+    pub fn traits_in_scope_logged<'b>(&'n self, sink: &dyn blaze_scope::names_cells::CellSink, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        let logged = blaze_scope::names_cells::Logged { world: &self.paths, log: sink };
+        names::traits_in_scope::<&'n str, _>(&logged, module, alloc)
     }
 
     /// What was opened and decoded so far.

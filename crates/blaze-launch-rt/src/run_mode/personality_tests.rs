@@ -138,6 +138,14 @@ impl Memory for Sim {
         }
         Ok(())
     }
+
+    fn static_word(&self, index: u32) -> u64 {
+        WORDS - 8 * (u64::from(index) + 1)
+    }
+
+    fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
+        Err(RunModeError::NotBuilt { what: "the personality tests place no static" })
+    }
 }
 
 /// What one run showed: the first placement's result, and the memory.
@@ -198,6 +206,7 @@ fn run(bind: bool) -> Seen {
             Act::Promote { .. } => panic!("the personality tests publish no optimized record"),
             Act::Stop(stop) => panic!("the run stopped: {stop:?}"),
             Act::Native { record } => panic!("the personality tests send no native library: {record:?}"),
+            Act::Statics => panic!("the personality tests send no static"),
         }
     }
     Seen { placed, memory, p_local }

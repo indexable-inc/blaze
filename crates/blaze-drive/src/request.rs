@@ -503,6 +503,11 @@ impl EntryNeeds {
     }
 }
 
+/// The mark of a reader's row whose answers may be old ([`Request::taken_read`]): each of its
+/// recorded reads, in place of the answer. No digest is all ones; it equals no read today, so
+/// such a row never stands and is run again when next entered, which writes a whole row.
+pub(crate) const STALE_READ: ContentId = ContentId([0xff; 32]);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DriveError {
     /// Bytes at `key` are not the record they are stored as.
@@ -563,6 +568,10 @@ pub enum DriveError {
     SpaceNotClosed,
     /// An ask's fact is not a [`Kind::Given`] name ([`key::fact_of`]).
     NotGiven { name: Name },
+    /// Debug builds and the simulation only: `reader`'s row recorded `recorded` for `read`, a
+    /// name this request did not enter, and its own row says `today` ([`Request::taken_read`]):
+    /// the invariant the walk rests on is broken.
+    RecordedRead { reader: Name, read: Name, recorded: ContentId, today: ContentId },
     /// `by` read the given `name` (a file's content, a fact) as `saw`, and this command holds
     /// it as `held` (`None`: absent): the file moved while the command ran, or a path a task
     /// read was not joined to the leaf table, so the sweep did not follow it. Never re-decided:
@@ -649,6 +658,11 @@ impl fmt::Display for DriveError {
                 write!(f, "the request's feature implications are not transitively closed (drive.md, \"One check covers every configuration\")")
             }
             DriveError::NotGiven { name } => write!(f, "the ask's fact {name} is not a Given name (key::fact_of)"),
+            DriveError::RecordedRead { reader, read, recorded, today } => write!(
+                f,
+                "{reader}'s row recorded {:02x}{:02x}{:02x}{:02x} for {read}, which this request did not enter, and {read}'s row holds {:02x}{:02x}{:02x}{:02x}: a moved read's reader kept its row (request.rs `taken_read`)",
+                recorded.0[0], recorded.0[1], recorded.0[2], recorded.0[3], today.0[0], today.0[1], today.0[2], today.0[3]
+            ),
             DriveError::GivenDiffers { name, by, saw, held } => {
                 write!(f, "{by} read {name} as {:02x}{:02x}{:02x}{:02x}, and this command gives ", saw.0[0], saw.0[1], saw.0[2], saw.0[3])?;
                 match held {
@@ -2348,6 +2362,27 @@ impl<'a> Request<'a> {
         }
     }
 
+    /// A job's answer for `read` from its own old row's read list `recorded`, when the walk did
+    /// not enter `read` in this request.
+    ///
+    /// THE INVARIANT (rule 53): a row's recorded answer for a read IS today's answer whenever
+    /// the walk did not enter that read's name in this request. It is the one every standing
+    /// record rests on: candidates are found forward from what changed, and what the walk does
+    /// not enter has not moved since the answer this request walks from. A row is that answer's
+    /// only if its job ran, stood on today's reads, or was found by them when last it was
+    /// entered; a reader the walk dirtied and then did not run again (`run`'s narrower reach, a
+    /// failed or dropped task, a request stopped at its gate) is marked in that same finish,
+    /// each of its answers [`STALE_READ`], which is no answer, so it is never taken.
+    fn taken_read(&self, read: Name, recorded: &[(Name, ContentId)]) -> Option<ContentId> {
+        let entered = self.state(read).is_some() || self.dropped.contains(&read) || read == self.space_name || self.now.get(&read).is_some();
+        if entered && self.plant != Plant::RecordedForEntered {
+            return None;
+        }
+        let at = recorded.binary_search_by_key(&read, |(name, _)| *name).ok()?;
+        let taken = recorded[at].1;
+        (taken != STALE_READ).then_some(taken)
+    }
+
     /// What a read of `read` sees now, or that `waiter` waits for it.
     fn digest(&mut self, read: Name, waiter: Name, out: &mut AVec<'_, Effect<'a>>) -> Digest {
         if read == self.space_name {
@@ -3045,6 +3080,13 @@ impl<'a> Request<'a> {
         // read answers it (`given_read`). Never `ABSENT`: a file the sweep never saw may be there.
         let mut miss = false;
         let mut given_jobs = Vec::new_in(self.alloc);
+        // The job's own old row's answers ([`Request::taken_read`]): a read the walk did not
+        // enter is answered from them, and its page is never loaded (tempo's one body edit read
+        // 819 pages for them, check-g051344-body). Copied out: the loop below steps the machine.
+        let recorded: Vec<(Name, ContentId), Alloc<'a>> = match self.old(name) {
+            Some(row) => row.reads().iter().collect_in(self.alloc),
+            None => Vec::new_in(self.alloc),
+        };
         for read in shape.iter() {
             if read.kind == Kind::Given {
                 match self.state(*read) {
@@ -3059,6 +3101,23 @@ impl<'a> Request<'a> {
                         waiting = true;
                     }
                 }
+                continue;
+            }
+            if let Some(taken) = self.taken_read(*read, &recorded) {
+                // Debug builds and the simulation load the page anyway and hold the taken
+                // answer to it; a release build never does.
+                if cfg!(debug_assertions) {
+                    match self.digest(*read, name, out) {
+                        Digest::Ready(now) => {
+                            let today = now.map_or(ABSENT, |now| now.out);
+                            if today != taken {
+                                return Err(DriveError::RecordedRead { reader: name, read: *read, recorded: taken, today });
+                            }
+                        }
+                        Digest::Wait => waiting = true,
+                    }
+                }
+                reads.push((*read, taken));
                 continue;
             }
             match self.digest(*read, name, out) {
@@ -4367,6 +4426,22 @@ impl<'a> Request<'a> {
                 }
             }
         }
+        // The readers the walk dirtied and did not run again: no row made, none stood on today's
+        // reads, none dropped. Their rows are MARKED, not removed ([`Request::taken_read`]'s
+        // invariant): each recorded answer becomes `STALE_READ`, the reads' names and the rest
+        // of the row kept, so the reverse index, its readers and its parts are as they were and
+        // the next request that enters it runs it. Removing it would drop a name its home still
+        // lists and dirty its readers. Cost: the page of each such row rewritten, and none on a
+        // request that ran what it dirtied (every `check` that answers).
+        let stale: Vec<Name, Alloc<'a>> = match self.plant {
+            Plant::StaleReaderKept => Vec::new_in(a.clone()),
+            _ => self
+                .jobs
+                .iter()
+                .filter(|(name, job)| job.recheck && !job.stood && name.kind != Kind::Given && self.new.get(name).is_none() && !self.dropped.contains(name))
+                .map(|(name, _)| *name)
+                .collect_in(a.clone()),
+        };
         // Every page the update touches must be loaded first.
         let old_rows = self.root.as_ref().map_or(0, |root| root.rows);
         let mut added = 0u64;
@@ -4391,7 +4466,7 @@ impl<'a> Request<'a> {
         match old_bits {
             Some(old_bits) if old_bits != bits => wanted.extend(0..(1u32 << old_bits)),
             Some(old_bits) => {
-                for name in self.new.keys().chain(self.dropped.iter()).chain(updates.iter().map(|(t, _, _)| t)).chain(cell_updates.iter().map(|(t, _, _)| t)) {
+                for name in self.new.keys().chain(self.dropped.iter()).chain(stale.iter()).chain(updates.iter().map(|(t, _, _)| t)).chain(cell_updates.iter().map(|(t, _, _)| t)) {
                     wanted.push(answers::page_of(*name, old_bits));
                 }
             }
@@ -4419,6 +4494,14 @@ impl<'a> Request<'a> {
         }
         if loading {
             return Ok(());
+        }
+        for name in stale.iter() {
+            let Some(row) = self.old(*name) else { continue };
+            let mut row = row.to_row(a.clone());
+            for (_, answer) in row.reads.iter_mut() {
+                *answer = STALE_READ;
+            }
+            self.new.insert(*name, row);
         }
         // A dropped name's readers read it absent now: a watch row keeps them, so the name's
         // coming back reruns them (rule 21: a read that found nothing is a read).

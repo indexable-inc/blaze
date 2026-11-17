@@ -155,6 +155,7 @@ fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::MatchEnd
         | Task::ShortEnd(_)
         | Task::InitAt { .. }
+        | Task::LitBuilt { .. }
         | Task::DerefPlace
         | Task::AsmLabelEnd(_)
         | Task::AsmJoin(_)

@@ -362,6 +362,32 @@ impl<'r> ProcMacros<'r> {
         self.findings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(finding);
     }
 
+    /// Why `def`'s crate cannot run it, when that is why a call of it was refused: the same
+    /// finding [`ProcMacros::run`] files for it (the crate unregistered, its module missing under
+    /// the key asked or unreadable, no such export, a module that does not load), so the caller
+    /// can name the reason at the call (blaze-scope call_refusal.rs). `None`: the module can run
+    /// it (a refusal was the run's own), or `def` is no proc macro. Asks nothing new: a load is
+    /// the runtime's kept answer.
+    pub fn refusal_of(&self, def: &MacroDefinition<'_>) -> Option<Finding> {
+        let MacroKind::ProcMacro { krate, kind } = def.kind() else { return None };
+        let Some(macro_crate) = self.crates.iter().find(|it| it.key == krate) else { return Some(Finding::UnknownCrate { krate }) };
+        let module = match &macro_crate.module {
+            Ok(module) => module,
+            Err(error) => {
+                let (name, version) = macro_crate.label.split_once(' ').unwrap_or((&macro_crate.label, ""));
+                return Some(Finding::MissingModule { name: name.to_owned(), version: version.to_owned(), why: error.to_string() });
+            }
+        };
+        let name = def.proc_name().unwrap_or("");
+        if module.find(kind, name).is_none() {
+            return Some(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
+        }
+        match macro_crate.loaded(self.runtime, module) {
+            Ok(_) => None,
+            Err(error) => Some(Finding::Unloadable { krate: macro_crate.label.clone(), error }),
+        }
+    }
+
     /// Runs the proc macro `def` on `call`, expanded in `package` at `edition`: from its record,
     /// or run and kept. Its error is what blaze-expand takes; the finding it made is kept.
     pub fn run<'a>(&self, def: &MacroDefinition<'_>, call: &ProcCall<'_>, edition: Edition, package: &Arc<Package>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {

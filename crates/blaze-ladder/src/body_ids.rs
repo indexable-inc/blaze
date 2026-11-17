@@ -65,8 +65,9 @@ use blaze_own::{AVec, Alloc, Vec};
 pub use blaze_run::parent::Read;
 use blaze_typeck::ItemKey;
 
+use crate::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView};
 use crate::code_records::{Builder, CodeKey, CodeStore, ENTRY_FORM, EntryError, EntryView, PanicStrategy, StoreError, triple};
-use crate::symbols::fn_symbol_of_name;
+use crate::symbols::{fn_symbol_of_name, static_symbol};
 
 const KEY_DOMAIN: &str = "blaze-ladder code record key 2";
 
@@ -188,20 +189,22 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
 }
 
 /// The instances one entry declares, copied out of its bytes: (tabled fn, name) rows over one
-/// text.
+/// text; and the statics it declares, by item key.
 pub struct DeclaredList<'a> {
     rows: AVec<'a, (ItemKey, u32, u32)>,
     text: AVec<'a, u8>,
+    statics: AVec<'a, ItemKey>,
 }
 
 impl<'a> DeclaredList<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> DeclaredList<'a> {
-        DeclaredList { rows: Vec::new_in(alloc), text: Vec::new_in(alloc) }
+        DeclaredList { rows: Vec::new_in(alloc), text: Vec::new_in(alloc), statics: Vec::new_in(alloc) }
     }
 
     pub fn clear(&mut self) {
         self.rows.clear();
         self.text.clear();
+        self.statics.clear();
     }
 
     pub fn push(&mut self, tabled: ItemKey, name: &[u8]) {
@@ -210,12 +213,24 @@ impl<'a> DeclaredList<'a> {
         self.rows.push((tabled, at, name.len() as u32));
     }
 
+    /// A static the entry declares (its record names it).
+    pub fn push_static(&mut self, item: ItemKey) {
+        self.statics.push(item);
+    }
+
+    /// The declared statics, in the entry's order.
+    pub fn statics(&self) -> &[ItemKey] {
+        &self.statics
+    }
+
+    /// The count of declared instances (the statics are [`DeclaredList::statics`]).
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
+    /// Whether it declares no instance and no static.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.rows.is_empty() && self.statics.is_empty()
     }
 
     /// Row `i`: its tabled fn and its instance name.
@@ -231,11 +246,25 @@ pub trait Form {
     fn declared(&self, entry: &[u8], out: &mut DeclaredList<'_>) -> Result<(), EntryError>;
 }
 
-/// The run path's entry form (code_records.rs `make_entry`, read by `EntryView`).
+/// The run path's entry form: a code record's (code_records.rs `make_entry`, read by
+/// `EntryView`) or a static's (code_records.rs `statics::make_static_entry`, read by
+/// `StaticEntryView`), told by the magic.
 pub struct EntryForm;
 
 impl Form for EntryForm {
     fn declared(&self, entry: &[u8], out: &mut DeclaredList<'_>) -> Result<(), EntryError> {
+        if entry.get(..8) == Some(&STATIC_ENTRY_MAGIC[..]) {
+            let view = StaticEntryView::read(entry)?;
+            view.each_declared(
+                |d| {
+                    out.push(d.tabled, d.name);
+                    Ok(())
+                },
+                |e| e,
+            )?;
+            view.each_static(|item| out.push_static(item));
+            return Ok(());
+        }
         let view = EntryView::read(entry)?;
         view.each_declared(
             |d| {
@@ -243,16 +272,37 @@ impl Form for EntryForm {
                 Ok(())
             },
             |e| e,
-        )
+        )?;
+        view.each_static(|item| out.push_static(item));
+        Ok(())
     }
 }
 
 /// The on-demand side: the front end and the builder, made on first need. One call checks,
-/// lowers, builds, emits and seals ONE instance; nothing else of the program is touched.
+/// lowers, builds, emits and seals ONE instance, or makes ONE static's datum; nothing else of
+/// the program is touched.
 pub trait Make {
     type Error;
     /// Appends to `entry` the entry of the instance `name`, tabled as the fn `tabled`.
     fn make(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
+    /// Appends to `entry` the entry of static `item` (code_records.rs `statics`): its
+    /// initializer evaluated, its value made a datum.
+    fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
+}
+
+/// What a walk row is: a fn instance (its code record) or a static (its datum).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowKind {
+    Instance,
+    Static,
+}
+
+/// A static's row name: its item's key and no arguments (an instance name's form, so
+/// [`each_item`] lists the item and the key takes its crate's fact).
+fn static_name(item: ItemKey) -> [u8; 20] {
+    let mut name = [0u8; 20];
+    name[..16].copy_from_slice(&item.0.to_le_bytes());
+    name
 }
 
 /// Why an instance was made without a key (the module doc).
@@ -364,7 +414,9 @@ pub struct Walk<'a> {
     symbols: AVec<'a, Symbol>,
     /// All zero for an instance with no key ([`How::Unkeyed`]) or not reached yet.
     keys: AVec<'a, CodeKey>,
+    /// A fn instance's tabled fn; a static's own item.
     tabled: AVec<'a, ItemKey>,
+    kinds: AVec<'a, RowKind>,
     /// Each name's (start, length) in `arena`.
     names: AVec<'a, (u32, u32)>,
     how: AVec<'a, How>,
@@ -429,6 +481,7 @@ impl<'a> Walk<'a> {
             symbols: Vec::new_in(alloc),
             keys: Vec::new_in(alloc),
             tabled: Vec::new_in(alloc),
+            kinds: Vec::new_in(alloc),
             names: Vec::new_in(alloc),
             how: Vec::new_in(alloc),
             arena: Vec::new_in(alloc),
@@ -457,7 +510,12 @@ impl<'a> Walk<'a> {
     /// new and [`How::Waiting`] with nothing done for it, or the row it has. At most `most`
     /// instances in the table.
     pub fn root<E>(&mut self, entry: (ItemKey, &[u8]), most: usize) -> Result<usize, WalkError<E>> {
-        self.reach(entry.0, entry.1, most)
+        self.reach(entry.0, entry.1, RowKind::Instance, most)
+    }
+
+    /// Whether row `row` is a fn instance or a static.
+    pub fn kind(&self, row: usize) -> RowKind {
+        self.kinds[row]
     }
 
     /// Instances reached.
@@ -538,12 +596,16 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// The instance `name` tabled as `tabled`, reached: a new row, or the one it has.
-    fn reach<E>(&mut self, tabled: ItemKey, name: &[u8], most: usize) -> Result<usize, WalkError<E>> {
+    /// The instance `name` tabled as `tabled` (or the static `tabled`, named by [`static_name`]),
+    /// reached: a new row, or the one it has.
+    fn reach<E>(&mut self, tabled: ItemKey, name: &[u8], kind: RowKind, most: usize) -> Result<usize, WalkError<E>> {
         if (self.symbols.len() + 1) * 2 > self.slots.len() {
             self.grow();
         }
-        let symbol = fn_symbol_of_name(name);
+        let symbol = match kind {
+            RowKind::Instance => fn_symbol_of_name(name),
+            RowKind::Static => static_symbol(tabled),
+        };
         match self.find(&symbol) {
             Ok(row) if self.tabled[row] == tabled => Ok(row),
             Ok(row) => Err(WalkError::TwoTabled { symbol, first: self.tabled[row], second: tabled }),
@@ -554,6 +616,7 @@ impl<'a> Walk<'a> {
                 self.symbols.push(symbol);
                 self.keys.push(NO_KEY);
                 self.tabled.push(tabled);
+                self.kinds.push(kind);
                 self.names.push((self.arena.len() as u32, name.len() as u32));
                 self.arena.extend_from_slice(name);
                 self.how.push(How::Waiting);
@@ -648,7 +711,11 @@ impl<'a> Walk<'a> {
             }
         }
         if !found {
-            make.make(tabled, name.as_slice(), made).map_err(|why| WalkError::Make { tabled, why })?;
+            match self.kinds[row] {
+                RowKind::Instance => make.make(tabled, name.as_slice(), made),
+                RowKind::Static => make.make_static(tabled, made),
+            }
+            .map_err(|why| WalkError::Make { tabled, why })?;
             form.declared(made.as_slice(), declared).map_err(|why| WalkError::Entry { tabled, found: false, why })?;
             if unkeyed.is_none() {
                 store.put(key, made.as_slice()).map_err(WalkError::Store)?;
@@ -657,9 +724,18 @@ impl<'a> Walk<'a> {
         // The declared rows, reached in the entry's order; on a refusal the row's edges so far
         // are dropped and the row stays waiting.
         let start = self.edges.len();
-        for i in 0..declared.len() {
-            let (callee, callee_name) = declared.row(i);
-            match self.reach(callee, callee_name, most) {
+        for i in 0..declared.len() + declared.statics().len() {
+            let reached = match i.checked_sub(declared.len()) {
+                None => {
+                    let (callee, callee_name) = declared.row(i);
+                    self.reach(callee, callee_name, RowKind::Instance, most)
+                }
+                Some(s) => {
+                    let item = declared.statics()[s];
+                    self.reach(item, &static_name(item), RowKind::Static, most)
+                }
+            };
+            match reached {
                 Ok(callee_row) => self.edges.push(callee_row as u32),
                 Err(why) => {
                     self.edges.truncate(start);
@@ -725,7 +801,14 @@ mod tests {
             while at < entry.len() {
                 let mut wide = [0u8; 16];
                 wide.copy_from_slice(&entry[at..at + 16]);
-                let len = u32::from_le_bytes([entry[at + 16], entry[at + 17], entry[at + 18], entry[at + 19]]) as usize;
+                let len = u32::from_le_bytes([entry[at + 16], entry[at + 17], entry[at + 18], entry[at + 19]]);
+                // The model's static row: its item, the length `u32::MAX`, no name.
+                if len == u32::MAX {
+                    out.push_static(ItemKey(u128::from_le_bytes(wide)));
+                    at += 20;
+                    continue;
+                }
+                let len = len as usize;
                 out.push(ItemKey(u128::from_le_bytes(wide)), &entry[at + 20..at + 20 + len]);
                 at += 20 + len;
             }
@@ -754,6 +837,108 @@ mod tests {
             }
             Ok(())
         }
+
+        fn make_static(&mut self, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            panic!("the five-instance model declares no static");
+        }
+    }
+
+    /// The statics model: `main` (crate `app`) names static `S` (crate `app`), whose value
+    /// points at static `T` (crate `lib`). The maker counts its calls of each kind.
+    struct StaticModel<'a> {
+        fns: usize,
+        statics: AVec<'a, ItemKey>,
+    }
+
+    const S: u128 = 0xA0E1;
+    const T: u128 = 0xB0E2;
+
+    impl Make for StaticModel<'_> {
+        type Error = NameError;
+        fn make(&mut self, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            assert_eq!(tabled.0, MAIN, "the statics model has one fn");
+            self.fns += 1;
+            entry.extend_from_slice(&S.to_le_bytes());
+            entry.extend_from_slice(&u32::MAX.to_le_bytes());
+            Ok(())
+        }
+
+        fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            self.statics.push(item);
+            if item.0 == S {
+                entry.extend_from_slice(&T.to_le_bytes());
+                entry.extend_from_slice(&u32::MAX.to_le_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    /// The statics model's command side: each item's text version, one read of `app`'s scope.
+    struct StaticIds {
+        text: [(u128, u8); 3],
+    }
+
+    impl BodyIds for StaticIds {
+        fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+            let &(_, version) = self.text.iter().find(|(k, _)| *k == item.0)?;
+            let mut text = [0u8; 17];
+            text[..16].copy_from_slice(&item.0.to_le_bytes());
+            text[16] = version;
+            Some(BodyId { key: ContentId::of("d106 test body", &text), reads: core::slice::from_ref(&STATIC_READ) })
+        }
+
+        /// Every fact of the model is unmoved: its digest is zero.
+        fn today(&self, _fact: &[u8; 32]) -> Option<[u8; 32]> {
+            Some([0; 32])
+        }
+
+        fn crate_fact(&self, item: ItemKey) -> Option<Read> {
+            Some(Read { fact: crate_fact_name(item.0), digest: [0; 32] })
+        }
+    }
+
+    /// `app`'s scope, unmoved (the one read each body of the statics model holds).
+    const STATIC_READ: Read = Read { fact: [0xA0; 32], digest: [0; 32] };
+
+    /// A static is a walk row of its own: keyed from its symbol (symbols.rs `static_symbol`),
+    /// its initializer's BodyCheck key and its crate's fact; found on the second run; and an
+    /// edit of its initializer makes that static's datum alone, never the code that names it
+    /// (code names the static's word, not its value). Controls: an edit of `main` makes `main`
+    /// alone; the static's symbol is not the fn symbol of its row name.
+    /// Prints "d106 statics: first made 1+2; second found 3; S edited made S; main edited made main".
+    #[test]
+    fn a_static_is_a_row_keyed_from_its_initializer() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut store = MemoryStore::new_in(alloc);
+        let producer = blaze_ids::producer::Producers::for_tests(b"d106 walk model").get::<CodeBuilder>();
+        let run = |ids: &StaticIds, store: &mut MemoryStore<'_>| {
+            let mut walk = Walk::new_in(alloc);
+            let mut model = StaticModel { fns: 0, statics: Vec::new_in(alloc) };
+            let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+            name_of(MAIN, None, &mut entry);
+            walk.run((ItemKey(MAIN), &entry), ids, store, &builder(), &producer, &mut model, &Toy, 64).expect("the statics model walks");
+            let kinds: std::vec::Vec<(RowKind, Symbol)> = (0..walk.len()).map(|r| (walk.kind(r), walk.symbol(r))).collect();
+            (walk.counts(), model.fns, model.statics.iter().map(|k| k.0).collect::<std::vec::Vec<_>>(), kinds)
+        };
+        let mut ids = StaticIds { text: [(MAIN, 0), (S, 0), (T, 0)] };
+        let (first, fns, statics, kinds) = run(&ids, &mut store);
+        assert_eq!((first.reached, first.made, fns), (3, 3, 1), "{first:?}");
+        assert_eq!(statics, [S, T], "each static made once, in the walk's order");
+        assert_eq!(kinds[1], (RowKind::Static, static_symbol(ItemKey(S))), "S's row is a static's, by its symbol");
+        assert_eq!(kinds[2], (RowKind::Static, static_symbol(ItemKey(T))));
+        assert_ne!(kinds[1].1, fn_symbol_of_name(&static_name(ItemKey(S))), "a static's symbol is not its row name's fn symbol");
+        let (second, fns, statics, _) = run(&ids, &mut store);
+        assert_eq!((second.found, second.made, fns, statics.len()), (3, 0, 0, 0), "{second:?}");
+        ids.text[1].1 = 1;
+        let (edited, fns, statics, _) = run(&ids, &mut store);
+        assert_eq!((edited.found, edited.made, fns), (2, 1, 0), "{edited:?}");
+        assert_eq!(statics, [S], "S's initializer edited: S's datum alone is made");
+        ids.text[0].1 = 1;
+        let (control, fns, statics, _) = run(&ids, &mut store);
+        assert_eq!((control.found, control.made, fns, statics.len()), (2, 1, 1, 0), "main edited: main alone");
+        std::println!("d106 statics: first made 1+2; second found 3; S edited made S; main edited made main");
     }
 
     /// The crate of a model item: `app`'s keys start 0xA0, `lib`'s 0xB0.

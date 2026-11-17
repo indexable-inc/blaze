@@ -205,6 +205,15 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
 }
 
 impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
+    /// The world over a front end its caller made: front2 tables/task.rs makes one per BODY
+    /// over the read-only view (`Tables`), so its key map, head store, impl index, constants
+    /// and prepared macros are the task's own and nothing is kept from one body to the next.
+    pub fn over(front: Front2<'n, S>, alloc: Alloc<'static>) -> ProjectWorld<'n, S> {
+        let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
+        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
+        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None }
+    }
+
     /// Every body of the program's own crate, in key order (free fns, then each container's
     /// fn members), each with where it is written.
     pub fn bodies<'a>(&self, alloc: Alloc<'a>) -> AVec<'a, (BodyRef<'n>, Option<BodyAt>)> {

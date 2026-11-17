@@ -48,5 +48,5 @@ pub use blaze_surface::{
 pub use crate::lang::{LangError, LangItem, LangRead, LangRecords, lang_item};
 pub use crate::lookup::{
     Candidates, ImplLookupError, ImplRead, ImplRecords, Incoherent, Probe, RecordKind, candidates,
-    inherent_candidates,
+    candidates_in, inherent_candidates, inherent_candidates_in,
 };

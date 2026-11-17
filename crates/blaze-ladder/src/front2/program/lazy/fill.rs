@@ -433,6 +433,37 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
+    /// Static `item` as a refusal names it (its path, or its key).
+    pub fn static_shown(&self, item: ItemKey) -> Box<str> {
+        self.refused_shown(item)
+    }
+
+    /// Static `item`'s value and kind, for its run record (code_records.rs `statics`): the one
+    /// this program made when a body named it, or evaluated now, alone (statics.rs
+    /// `one_static`; the statics its value points at are the walk's own rows, each asked by
+    /// its record, never here). A refusal names the static.
+    pub fn static_value(&mut self, item: ItemKey) -> Result<(&blaze_build::data::DataRecord<Global>, blaze_build::StaticItem), LazyRefusal> {
+        if self.statics.kind(item).is_none() {
+            let made = {
+                let mut r = self.records(true);
+                crate::front2::statics::one_static(&mut r, item)
+            };
+            let (record, kind) = made.map_err(|why| {
+                let static_ = self.refused_shown(item);
+                LazyRefusal::Row { function: static_.clone(), refusal: Box::new(Front2Refusal::Static { static_, why }) }
+            })?;
+            if let Err(at) = self.statics.values.binary_search_by_key(&item, |(x, _)| *x) {
+                self.statics.values.insert(at, (item, record));
+            }
+            if let Err(at) = self.statics.kinds.binary_search_by_key(&item, |(x, _)| *x) {
+                self.statics.kinds.insert(at, (item, kind));
+            }
+        }
+        let kind = self.statics.kind(item).ok_or(LazyRefusal::NoStatic { item })?;
+        let at = self.statics.values.binary_search_by_key(&item, |(x, _)| *x).map_err(|_| LazyRefusal::NoStatic { item })?;
+        Ok((&self.statics.values[at].1, kind))
+    }
+
     /// The object table of each `dyn` principal `checked`'s types or the heads' table name
     /// (what `make_from` asks over every body: here over this one) that this program has not
     /// made, with every supertrait under it (program.rs `object_tables`, the one home). A

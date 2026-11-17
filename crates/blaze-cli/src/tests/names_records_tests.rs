@@ -112,7 +112,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
     // 3. Cut short at every section boundary: a typed refusal.
     let start = payload.as_ptr().addr();
     let mut cuts = std::vec::Vec::from([0, HEAD - 1, HEAD]);
-    for part in [parts.exports, parts.inner, parts.names, parts.items, parts.tests, parts.expansions, parts.links] {
+    for part in [parts.exports, parts.inner, parts.names, parts.items, parts.tests, parts.expansions, parts.links, parts.cells] {
         let at = part.as_ptr().addr() - start;
         cuts.extend([at, at + part.len()]);
     }
@@ -123,11 +123,11 @@ fn a_crate_scope_record_files_its_names_and_items() {
             other => panic!("a payload cut at byte {cut} of {} was not refused as short: {other:?}", payload.len()),
         }
     }
-    // The last section is cut: the link table, never empty in a resolved crate's record (its
-    // head at least: blaze-ladder native_links.rs).
+    // The last section is cut: the cell table, never empty in a resolved crate's record (its
+    // root's cell at least: blaze-scope names_cells.rs).
     assert!(
-        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::Links, .. })),
-        "one byte off the end is the link table cut short"
+        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::Cells, .. })),
+        "one byte off the end is the cell table cut short"
     );
     let mut longer = payload.clone();
     longer.push(0);
@@ -209,6 +209,6 @@ fn a_test_units_payload_files_its_tests_record() {
     assert!(record.find("helper").unwrap_or_else(|e| panic!("find: {e}")).is_none(), "`helper` is no test");
 
     // The round trip: the payload written again from its own sections is the same bytes.
-    let again = write_payload(parts.unresolved, [parts.exports, parts.inner, parts.names, parts.items, parts.tests, parts.expansions, parts.links]);
-    assert_eq!(again.as_slice(), payload.as_slice(), "the payload written from its seven sections differs from the one filed");
+    let again = write_payload(parts.unresolved, [parts.exports, parts.inner, parts.names, parts.items, parts.tests, parts.expansions, parts.links, parts.cells]);
+    assert_eq!(again.as_slice(), payload.as_slice(), "the payload written from its eight sections differs from the one filed");
 }

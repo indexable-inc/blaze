@@ -1,0 +1,15 @@
+{
+ "id": "solver-made-closure-unseen",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CLN",
+ "where": "crates/blaze-typeck/src/infer/mod.rs view (the Closure arm) via instance.rs export_list in select_owning; the terms come from infer/facts.rs body_terms and blaze-solve alias.rs normalize_opaque_type",
+ "what": "tempo's census g083729 panicked after reach: 'blaze-typeck: a closure this context did not make'. A ground resolution reveals opaques (Reveal::All). The solver instantiates the hidden type's closure term itself, so the term never passes InferCtx::mk and has no row in `foreign`. The selected impl's arguments then hold that term (`impl<F, B> Get for Mapper<F> where F: Fn() -> B` at F = a fn item returning `impl Fn`), and exporting them views it.",
+ "cost": "about an hour: three test programs (another body's closure, an opaque as Self, a closure over an opaque) did not panic before the fn-item projection did",
+ "cause": "a term typeck must view can be made outside typeck (the solver's opaque reveal), while view finds closures only by the terms typeck made",
+ "whys": "view is &self and keyed by made terms, and the hidden-type facts kept no record of which closures they hold",
+ "class": "a body type (closure, async block) entering a context by solver instantiation rather than import",
+ "prevention": "done: FactCache records each hidden closure and async block by its solver def (HiddenBody), and InferCtx::adopt files the term before export views it, so an unnamed one is a typed Malformed::UnseenBodyType. A generic owner's async block is refused as Unported, because its term holds no owner arguments. Test: front2_survey_unseen_closure. The first admission (b81f802451) itself panicked in two censuses (g090501, g090627: 'node 6 is not a type'), because export also walks consts (an array's length) and adopt read every handle as a type. None of the five admitting tests exported a const. Fixed in 6e125d9b51 with a test that has an array in an impl's arguments",
+ "annoyance": "the census prints a panic's stack but not the instance being built or its arguments, so the program had to be found by guessing shapes",
+ "workaround": "write a survey test per candidate shape",
+ "state": "fixed"
+}

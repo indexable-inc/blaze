@@ -27,8 +27,9 @@
 //!   its ground type when it owns it (walk/val_stack.rs): an owned one that needs drop
 //!   (`g(s, f())`: the caller's copy of `s`) is dropped by the cleanup first, top of the stack
 //!   first, before `drop_from(0)`; a borrow (`v.push(f())`), a scalar or a binding's place is
-//!   not owned and passes. Refused: an aggregate literal being built whose fields need drop
-//!   (`S { a: String::new(), b: f() }`), of which the walk cannot say what is stored.
+//!   not owned and passes. An aggregate literal being built (`S { a: String::new(), b: f() }`)
+//!   is owned part by part: the cleanup drops each part stored so far, the last stored first.
+//!   Refused: an owned waiting value whose type has no layout row, or not held in memory.
 //!
 //! A drop at a scope's normal exit, and each drop of a drop glue, carries its own unwind
 //! ladder (walk/unwind_ladder.rs): a destructor that panics there still drops the rest.

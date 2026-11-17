@@ -644,6 +644,28 @@ impl<'n> FileTypes<'n> {
                 Ok(made_out) => out = Some(made_out),
                 Err(why) => not_checked(&mut made, (0, 0), path, HEAD_NOT_NAMED, why),
             }
+            // A written type of the entry's signatures that names nothing: the E0412 is this
+            // task's, at the path in the signature; the head was made with the error type there,
+            // so each caller is checked against the rest of it and is not blamed.
+            for want in own.iter() {
+                let misses = checker.world.want_type_misses(*want);
+                if misses.is_empty() {
+                    continue;
+                }
+                // The fn's text starts at its own outline entry: a member's is inside the entry.
+                let shift = match checker.world.want_place(*want) {
+                    Ok(place) if place.krate == 0 && place.file == file => outline.items().get(place.item.0 as usize).zip(outline.items().get(at.0 as usize)).and_then(|(fn_item, entry)| fn_item.range.start.checked_sub(entry.range.start)),
+                    _ => None,
+                };
+                let Some(shift) = shift else {
+                    not_checked(&mut made, (0, 0), path, HEAD_NOT_NAMED, "a signature's type names nothing, and where the fn is written in the entry is not known");
+                    continue;
+                };
+                for miss in misses {
+                    let range = (shift + miss.at.start, shift + miss.at.end);
+                    super::covered::find_once(&mut made, super::TYPES, range, "E0412", "", &miss.words);
+                }
+            }
             if let Some(error) = checker.records.errors().get(errors) {
                 let words = super::record_words(error, checker.readers, checker.packs, self.frame, checker.heap);
                 not_checked(&mut made, (0, 0), path, HEAD_RECORDS, words.as_str());
