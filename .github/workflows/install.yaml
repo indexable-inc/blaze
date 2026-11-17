@@ -344,7 +344,7 @@ jobs:
           Set-Content "$env:BLAZE_HOME\default" 'v0'
           $held = [IO.File]::Open("$env:BLAZE_HOME\default", 'Open', 'Read', 'None')
           try {
-            $said = & ./site/install.ps1 *>&1 | Out-String
+            $said = & ./site/install.ps1 *>&1 | Out-String -Width 2048
             if ($said -notmatch 'could not be removed') { throw "the held default was not reported: $said" }
           } finally { $held.Close() }
           $global:LASTEXITCODE = 0
@@ -352,7 +352,7 @@ jobs:
         env:
           BLAZE_ARCHIVE: ""
         run: |
-          $said = & ./site/install.ps1 -Version 0.0.0-none *>&1 | Out-String
+          $said = & ./site/install.ps1 -Version 0.0.0-none *>&1 | Out-String -Width 2048
           Write-Host $said
           if ($said -notmatch [regex]::Escape('there is no blaze release 0.0.0-none')) { throw 'the message is not the one for a missing release' }
           $global:LASTEXITCODE = 0
@@ -360,7 +360,7 @@ jobs:
         env:
           BLAZE_ARCHIVE: ""
         run: |
-          $said = & ./site/install.ps1 -Channel nightly *>&1 | Out-String
+          $said = & ./site/install.ps1 -Channel nightly *>&1 | Out-String -Width 2048
           Write-Host $said
           if ($said -notmatch [regex]::Escape('blaze has no channel nightly')) { throw 'the message is not the one for a missing channel' }
           $global:LASTEXITCODE = 0
@@ -368,7 +368,7 @@ jobs:
         env:
           BLAZE_ARCHIVE: ""
         run: |
-          $said = & ./site/install.ps1 -Detail *>&1 | Out-String
+          $said = & ./site/install.ps1 -Detail *>&1 | Out-String -Width 2048
           Write-Host $said
           if ($LASTEXITCODE) {
             # A release with no Windows archive yet (#1389) is the one failure allowed.
