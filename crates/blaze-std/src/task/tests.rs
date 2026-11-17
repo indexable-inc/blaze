@@ -243,15 +243,30 @@ fn a_thief_tries_its_own_group_first() {
     let pool = running.pool();
     assert_eq!(&pool.victims(0)[..], [1, 3, 2], "worker 0: its group-mate, then the other group");
     assert_eq!(&pool.victims(3)[..], [2, 0, 1], "worker 3: its group-mate, then the other group");
-    // Counted: one task fans out slow tasks onto its worker's deque; the rest steal.
+    // The order a thief's `find` walks is checked on `find` itself, with no threads and a
+    // planted control (threads/find_tests.rs, `a_thief_steals_from_its_own_group_before_another`).
+    // Here, under real threads, one task fans out slow tasks onto its worker's deque and the
+    // rest steal: every item runs once, and the steals are counted and printed, not asserted.
+    // How many there are is the machine's scheduler's to decide (this thread's join steals from
+    // that deque too, and a loaded machine may run no woken worker for the fan's length), and a
+    // count of near steals cannot tell a thief that tries the other group first, which still
+    // steals near while the other group's deques are empty.
+    // Every worker up and parked, and the fan reserved to one of them (`must_overlap`): a
+    // `may_overlap` fan would mostly be run by this thread's own join before a worker woke
+    // (task/help.rs `finish`), and its items, spawned from outside the pool, would go to the
+    // injection queues, from which nothing is stolen.
+    all_parked(pool);
     let io = Io::sim(9);
     let cx = root_on(&io, pool);
     let scope = cx.scope();
-    let outer = scope.may_overlap("fan", TASK_FRAME, |cx| -> Result<(), String> {
-        let xs: Vec<u32> = (0..256).collect();
+    let ran: Vec<AtomicU32> = (0..256).map(|_| AtomicU32::new(0)).collect();
+    let outer = scope.must_overlap("fan", TASK_FRAME, |cx| -> Result<(), String> {
         let inner = cx.scope();
         let grain = Grain::new(NonZeroUsize::new(1).expect("1"), 64 << 10);
-        let done = par::for_each(cx, &inner, &xs[..], grain, |_x: &[u32]| {
+        let done = par::for_each(cx, &inner, &ran[..], grain, |chunk: &[AtomicU32]| {
+            for it in chunk {
+                it.fetch_add(1, Ordering::Relaxed);
+            }
             let until = Instant::now() + Duration::from_micros(50);
             while Instant::now() < until {
                 core::hint::spin_loop();
@@ -260,6 +275,10 @@ fn a_thief_tries_its_own_group_first() {
         inner.join(cx).map_err(|error| error.to_string())?;
         done.map_err(|error| error.to_string())
     });
+    let outer = match outer {
+        Ok(task) => task,
+        Err(refused) => panic!("four parked workers, and must_overlap refused: {refused}"),
+    };
     let fanned = outer.join(&cx);
     let joined = scope.join(&cx);
     fanned.expect("the fan");
@@ -271,7 +290,7 @@ fn a_thief_tries_its_own_group_first() {
         far += f;
     }
     eprintln!("threads steals: {near} from the thief's own group, {far} from another");
-    assert!(near > 0, "a thief stole from its own group at least once ({near} near, {far} far)");
+    assert!(ran.iter().all(|it| it.load(Ordering::Relaxed) == 1), "each fanned item ran exactly once");
     drop(cx);
     stopped(running);
 }

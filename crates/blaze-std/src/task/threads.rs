@@ -161,13 +161,16 @@ impl Plants {
     pub(crate) const NONE: Plants = Plants { deque: DequePlant::None, idle: IdlePlant::None, find: FindPlant::None };
 }
 
-/// A planted bug in [`Pool::find`]'s class order (threads/find_tests.rs's control).
+/// A planted bug in [`Pool::find`]'s order (threads/find_tests.rs's controls).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FindPlant {
     None,
     /// A foreground worker looks at its group's background queue before the foreground one.
     #[cfg_attr(not(test), expect(dead_code, reason = "the test's control"))]
     BackgroundFirst,
+    /// A thief tries the next group's deques before its own group's.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the test's control"))]
+    FarFirst,
 }
 
 #[cfg(all(test, not(blaze_check)))]
@@ -1267,8 +1270,8 @@ impl Pool {
             return Some(job);
         }
         let classes = match (worker.class, self.0.plants.find) {
-            (Class::Foreground, FindPlant::None) => [Class::Foreground, Class::Background],
             (Class::Foreground, FindPlant::BackgroundFirst) => [Class::Background, Class::Foreground],
+            (Class::Foreground, FindPlant::None | FindPlant::FarFirst) => [Class::Foreground, Class::Background],
             (Class::Background, _) => [Class::Background, Class::Foreground],
         };
         if let Some(job) = take(own, classes[0]) {
@@ -1282,8 +1285,11 @@ impl Pool {
         }
         let groups = shared.groups.len();
         let me = worker.group as usize;
+        // The planted control starts one group on: the thief's own group comes last.
+        let first = usize::from(self.0.plants.find == FindPlant::FarFirst);
         for step in 0..groups {
-            let group = &shared.groups[(me + step) % groups];
+            let at_group = (me + first + step) % groups;
+            let group = &shared.groups[at_group];
             // Start past the thief in its own group, so thieves spread over victims.
             for k in 0..group.len {
                 let victim = group.first + (at + 1 + k) % group.len;
@@ -1292,14 +1298,14 @@ impl Pool {
                 }
                 match shared.workers[victim as usize].0.deque.steal_half_into(&worker.deque) {
                     Steal::Taken(job) => {
-                        let counter = if step == 0 { &worker.stole_near } else { &worker.stole_far };
+                        let counter = if at_group == me { &worker.stole_near } else { &worker.stole_far };
                         counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
                         return Some(JobPtr(job));
                     }
                     Steal::Empty | Steal::Lost => {}
                 }
             }
-            if step != 0
+            if at_group != me
                 && let Some(job) = take(group, classes[0])
             {
                 return Some(job);
