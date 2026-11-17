@@ -1580,7 +1580,7 @@ impl Job {
     }
 }
 
-/// Threads, one per core, that stamp [`Effect::Stamp`]'s names with `statx` calls of their own.
+/// Threads, up to one per core, that stamp [`Effect::Stamp`]'s names with `statx` calls of their own.
 /// The ring would prepare each `IORING_OP_STATX` on its one submission thread and run it on a
 /// worker after, two handoffs per name that take longer than the `statx` itself
 /// (the speed of light). A job reaches stamper 0,
@@ -1588,10 +1588,21 @@ impl Job {
 /// chunks for: every core is at work after log2 of them wake-ups, none from the ring's thread
 /// but the first. [`Effect::Entries`]' listings go to one stamper each, in turn, where a thread
 /// of their own would cost as much to start as a listing of a hundred names.
+///
+/// A stamper starts the first time it is sent work, on the ring's thread, so the stampers
+/// started are always the first few: a sweep starts as many as it has chunks (up to one a
+/// core), a listing the one it goes to. A command that stamps one file starts one; one that
+/// stamps nothing starts none. Each started thread costs its stack and, on its first
+/// allocation, a malloc arena of its own (glibc's, a 2 MiB huge page where THP is on): 64 of
+/// them were 130 of a no-op `blaze check`'s 153 MB on a 64-core machine.
 struct Stampers {
+    /// One per core, made with the stampers; a stamper's, though it may not have started.
     inboxes: Arc<[crate::chan::Sender<ToStamp>]>,
+    /// The other ends of the inboxes of the stampers not yet started, in order: the next one
+    /// started takes the first.
+    unstarted: std::vec::IntoIter<crate::chan::Receiver<ToStamp>>,
     /// The stamper the next listing goes to.
-    next: std::cell::Cell<usize>,
+    next: usize,
 }
 
 /// What a stamper is sent.
@@ -1630,36 +1641,65 @@ impl List {
 }
 
 impl Stampers {
-    fn new() -> io::Result<Stampers> {
+    /// One inbox a core, and no stamper started yet.
+    fn new() -> Stampers {
         let count = std::thread::available_parallelism().map_or(1, |it| it.get());
+        // alloc: setup, once per driver: an inbox per stamper it may start.
         let (senders, receivers): (
             Vec<crate::chan::Sender<ToStamp>>,
             Vec<crate::chan::Receiver<ToStamp>>,
         ) = (0..count).map(|_| crate::chan::unbounded()).unzip();
-        let stampers = Stampers { inboxes: senders.into(), next: std::cell::Cell::new(0) };
-        for (me, inbox) in receivers.into_iter().enumerate() {
-            let inboxes = Arc::clone(&stampers.inboxes);
-            // Dropping `stampers` on a failure ends those already started.
+        Stampers { inboxes: senders.into(), unstarted: receivers.into_iter(), next: 0 }
+    }
+
+    /// The stampers started so far: always the first ones.
+    fn started(&self) -> usize {
+        self.inboxes.len() - self.unstarted.len()
+    }
+
+    /// Starts the stampers before the `count`th (up to one a core) that are not started yet.
+    /// A thread the system refuses fails the work that wanted it, naming the stamper; the
+    /// stampers started before it stay.
+    fn start_first(&mut self, count: usize) -> io::Result<()> {
+        while self.started() < count.min(self.inboxes.len()) {
+            let me = self.started();
+            let inbox = self.unstarted.next().expect("fewer started than inboxes");
+            let inboxes = Arc::clone(&self.inboxes);
             std::thread::Builder::new()
                 .name(format!("blaze-stamp-{me}")) // alloc: setup, once per stamper.
-                .spawn(move || stamper(me, &inbox, &inboxes))?;
+                .spawn(move || stamper(me, &inbox, &inboxes))
+                .map_err(|error| {
+                    // alloc: the error of a stamper that could not start.
+                    io::Error::new(
+                        error.kind(),
+                        format!("stamper {me} of the io_uring driver: {error}"),
+                    )
+                })?;
         }
-        Ok(stampers)
+        Ok(())
     }
 
-    fn start(&self, job: Arc<Job>) {
+    /// Hands `job` to stamper 0, having started as many as it has chunks for: stamper `i`
+    /// hands it on only to those below that.
+    fn start(&mut self, job: Arc<Job>) -> io::Result<()> {
+        self.start_first(job.claims.chunks())?;
         _ = self.inboxes[0].send(ToStamp::Sweep(job));
+        Ok(())
     }
 
-    fn list(&self, list: List) {
-        let at = self.next.get();
-        self.next.set((at + 1) % self.inboxes.len());
+    fn list(&mut self, list: List) -> io::Result<()> {
+        let at = self.next;
+        self.start_first(at + 1)?;
+        self.next = (at + 1) % self.inboxes.len();
         _ = self.inboxes[at].send(ToStamp::List(list));
+        Ok(())
     }
 }
 
 impl Drop for Stampers {
-    /// Each stamper ends once it has passed the end on, after the work sent before it.
+    /// Each stamper ends once it has passed the end on, after the work sent before it. The
+    /// started ones are the first, so a stamper not started has none started after it in the
+    /// chain; the end it is sent goes with its inbox's other end, dropped here.
     fn drop(&mut self) {
         _ = self.inboxes[0].send(ToStamp::End);
     }
@@ -2351,17 +2391,10 @@ impl Uring {
         Ok(())
     }
 
-    /// The [`Stampers`], started for the first sweep or listing.
-    fn make_stampers(&mut self) -> io::Result<()> {
-        if self.stampers.is_none() {
-            self.stampers = Some(Stampers::new()?);
-        }
-        Ok(())
-    }
-
-    /// Starts the listing of [`Effect::Entries`] `tag` of `dir` on a stamper.
+    /// Starts the listing of [`Effect::Entries`] `tag` of `dir` on a stamper, the
+    /// [`Stampers`] made for the first sweep or listing. Fails here only where the stamper it
+    /// goes to cannot start.
     fn list(&mut self, tag: Tag, dir: crate::DirName) -> io::Result<()> {
-        self.make_stampers()?;
         let list = List {
             tag,
             root: Arc::clone(&self.root),
@@ -2370,20 +2403,19 @@ impl Uring {
             sender: self.offload.sender.clone(),
             wake: Arc::clone(&self.offload.wake),
         };
+        self.stampers.get_or_insert_with(Stampers::new).list(list)?;
         self.offloaded(tag);
-        self.stampers.as_ref().expect("made above").list(list);
         Ok(())
     }
 
     /// Starts the sweep of [`Effect::Stamp`] `tag` over `names` on the [`Stampers`], made for
-    /// the first. Fails here only where the stampers cannot start; where the root cannot be
-    /// opened, its completion says so.
+    /// the first sweep or listing. Fails here only where a stamper it needs cannot start;
+    /// where the root cannot be opened, its completion says so.
     fn sweep(&mut self, tag: Tag, names: Arc<Names>) -> io::Result<()> {
-        self.make_stampers()?;
         // alloc: one per sweep, shared by the stampers.
         let job = Arc::new(Job::new(tag, Arc::clone(&self.root), names, &self.offload));
+        self.stampers.get_or_insert_with(Stampers::new).start(job)?;
         self.offloaded(tag);
-        self.stampers.as_ref().expect("made above").start(job);
         Ok(())
     }
 
@@ -4272,6 +4304,54 @@ mod tests {
         for gone in GONE {
             assert_eq!(of(gone), Stamp::GONE, "{gone}");
         }
+        assert_eq!(driver.in_flight(), 0);
+        drop(driver);
+        unsweep(&root);
+    }
+
+    /// A stamper starts when it is first sent work, never before: a driver asked no sweep or
+    /// listing starts none, a sweep of one name one, a listing the next one in turn, and a
+    /// sweep of `k` chunks the first `k`, up to one a core. Before 2026-11-17 the first sweep
+    /// started one a core, and on a 64-core machine a no-op `blaze check` held 64 malloc
+    /// arenas for one file's stamp (153 MB peak, 23 MB without them).
+    #[test]
+    fn stampers_start_as_their_work_asks_up_to_one_a_core() {
+        let root = dir("uring-stamp-lazy");
+        let tree = sweep_tree(&root, 5_000);
+        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let first = |count: usize| {
+            let mut names = Names::default();
+            for at in 0..count {
+                assert!(names.push_str(tree.get(at)));
+            }
+            Arc::new(names)
+        };
+        let started = |driver: &Uring| driver.stampers.as_ref().map_or(0, Stampers::started);
+        let mut driver = Uring::new(&root).unwrap();
+        let ask = |driver: &mut Uring, effect: Effect| {
+            let mut effects = vec![effect];
+            let mut seen = Vec::new();
+            run_until_idle(driver, &mut effects, |done, _| seen.push(done))
+                .expect("the effects end");
+            let [Completion { done: Done::Stamped(_) | Done::Entries(_), .. }] = &seen[..] else {
+                panic!("{seen:?}")
+            };
+        };
+        assert_eq!(started(&driver), 0, "a driver asked nothing");
+        ask(&mut driver, Effect::Stamp { files: first(0), tag: Tag(1) });
+        assert_eq!(started(&driver), 0, "a sweep of no names, answered on the ring");
+        ask(&mut driver, Effect::Stamp { files: first(1), tag: Tag(2) });
+        assert_eq!(started(&driver), 1, "a sweep of one name");
+        let src = || FileName::new("src/d0").unwrap().into();
+        ask(&mut driver, Effect::Entries { dir: src(), tag: Tag(3) });
+        assert_eq!(started(&driver), 1, "a listing, on stamper 0");
+        ask(&mut driver, Effect::Entries { dir: src(), tag: Tag(4) });
+        assert_eq!(started(&driver), 2.min(cores), "a second listing, on stamper 1");
+        ask(&mut driver, Effect::Stamp { files: first(3 * STAMP_CHUNK), tag: Tag(5) });
+        assert_eq!(started(&driver), 3.min(cores), "a sweep of three chunks");
+        assert!(tree.len().div_ceil(STAMP_CHUNK) >= 64, "chunks for 64 cores");
+        ask(&mut driver, Effect::Stamp { files: Arc::clone(&tree), tag: Tag(6) });
+        assert_eq!(started(&driver), tree.len().div_ceil(STAMP_CHUNK).min(cores), "every chunk");
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
         unsweep(&root);
