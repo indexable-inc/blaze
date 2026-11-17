@@ -198,6 +198,13 @@ pub(crate) struct Walk {
 }
 
 impl Walk {
+    /// The start of a watch of `dir` into `room`'s tables, still to walk.
+    fn of(mut room: Room, dir: &FileName, nonblocking: bool) -> Walk {
+        room.top.clear();
+        room.top.push_str(dir.as_str());
+        Walk { room, nonblocking }
+    }
+
     /// The watched directory, relative to the root.
     pub(crate) fn dir(&self) -> &str {
         &self.room.top
@@ -379,17 +386,20 @@ impl Tree {
     /// kept when there are any: with fanotify unless the process lacks `CAP_SYS_ADMIN` or
     /// `CAP_DAC_READ_SEARCH` (the call fails with `EPERM`), whose start is a constant number of
     /// system calls; with inotify then, whose start is a [`Walk`] left to the caller. Any other
-    /// failure of fanotify's is the watch's.
+    /// failure of fanotify's is the watch's. An inotify `spare` is of a start fanotify refused,
+    /// and a process gains no privilege after, so its start is inotify's without asking
+    /// fanotify again: an unprivileged `fanotify_init` succeeds (Linux 5.13 on) and only the
+    /// mark after it is refused, so each such ask would make and drop fanotify's tables.
     pub(crate) fn begin(
         spare: Option<Spare>,
         root: &Path,
         dir: &FileName,
         nonblocking: bool,
     ) -> io::Result<Begun> {
-        let (fanotify, inotify) = match spare {
-            Some(Spare::Fanotify(room)) => (Some(room), None),
-            Some(Spare::Inotify(room)) => (None, Some(room)),
-            None => (None, None),
+        let fanotify = match spare {
+            Some(Spare::Fanotify(room)) => Some(room),
+            Some(Spare::Inotify(room)) => return Ok(Begun::Walk(Walk::of(room, dir, nonblocking))),
+            None => None,
         };
         #[cfg(test)]
         let fanotify_refused = FANOTIFY_REFUSED.get();
@@ -402,13 +412,7 @@ impl Tree {
         match started {
             Ok(it) => Ok(Begun::Watching(Tree(Kind::Fanotify(it)))),
             Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                let mut room = match inotify {
-                    Some(room) => room,
-                    None => Room::new()?,
-                };
-                room.top.clear();
-                room.top.push_str(dir.as_str());
-                Ok(Begun::Walk(Walk { room, nonblocking }))
+                Ok(Begun::Walk(Walk::of(Room::new()?, dir, nonblocking)))
             }
             Err(error) => Err(error),
         }
@@ -1208,6 +1212,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A start given an inotify watch's spare, which only a start fanotify refused leaves, is
+    /// inotify's and allocates nothing: it does not ask fanotify again. The control is the
+    /// start before the fix, which made fanotify's tables first (a 2 MiB reservation and a
+    /// table of 2^16 heads), on every watch of an unprivileged process; and which, where
+    /// fanotify is allowed, is fanotify's, so this fails with or without the privilege.
+    #[test]
+    fn a_start_with_an_inotify_spare_is_inotify_s_and_allocates_nothing() {
+        let root = crate::temp::TempDir::for_test("blaze-watch-spare-");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = FileName::new("src").unwrap();
+        let mut room = Room::new().unwrap();
+        // The name's room, as a watch's before it ended has.
+        room.top.push_str("src");
+        let begun = blaze_alloc_count::assert_at_most(0, "a start with an inotify spare", || {
+            Tree::begin(Some(Spare::Inotify(room)), &root, &src, true)
+        });
+        assert!(matches!(begun, Ok(Begun::Walk(ref walk)) if walk.dir() == "src"));
+        drop(begun);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A batch tells each valid name once, sorted, and allocates the names and their vector
