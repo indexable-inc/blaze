@@ -279,6 +279,26 @@ fn a_format_template_made_by_a_macro_is_one_node() {
     assert!(dump.contains("(format-args \"a b\""), "{dump}");
 }
 
+/// A template's escapes are read as escapes before its braces are: `\u{1}` is one character,
+/// not the placeholder `{1}`, so `"a\u{1}b{i}"` captures `i` and has no positional argument to
+/// miss. In a raw string a backslash is a byte like any other, so `r"\u{0}"` is a backslash, a
+/// `u` and the placeholder `{0}`, whose argument is missing.
+#[test]
+fn a_template_s_escapes_hold_no_placeholder() {
+    for text in [
+        "fn f(i: u32) { format_args!(\"a\\0b\\u{1}c_{i}\"); }",
+        "fn f(at: u32) { format_args!(\"\\u{0}input{at}\"); }",
+    ] {
+        let l = expanding(&[], text);
+        let dump = dump_of(&l);
+        assert!(!dump.contains("diag"), "{text}:\n{dump}");
+        assert_eq!(l.view().unhandled().count(), 0, "{text}:\n{dump}");
+    }
+    let l = expanding(&[], "fn f() { format_args!(r\"\\u{0}\"); }");
+    let dump = dump_of(&l);
+    assert!(dump.contains("diag FormatArgMissing"), "a raw string's `{{0}}` is a placeholder:\n{dump}");
+}
+
 /// `unreachable!("m")` in edition 2021: a placeholder whose argument is another
 /// `format_args!`, as core's `unreachable_2021` writes it.
 #[test]
