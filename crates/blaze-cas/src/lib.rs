@@ -7514,7 +7514,7 @@ impl Store {
         // they are a quarter of the pinned bound, so the pins of tasks that ended are given
         // back long before running tasks reach the bound.
         let owned = self.shared.owned(Held::writer(&*self.shared));
-        let pins_most = pool::counts::pinned_bound(pool::counts::budget()) / 4;
+        let pins_most = pool::counts::pins_most(pool::counts::budget());
         if owned.bytes() > OWNED_MOST || owned.pinned() > pins_most {
             let old = self.shared.fresh_owned();
             self.limbo.retire(old);
