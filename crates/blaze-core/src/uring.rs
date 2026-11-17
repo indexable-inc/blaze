@@ -39,7 +39,7 @@
 //! `io_uring_enter` or none (`SQPOLL`). What comes back is checked before it names memory: a
 //! completion's `user_data` is a handle, looked up in the slab by index and generation, never
 //! a pointer; a provided buffer's id is checked against its group (`Provided::buffer`); and a
-//! ring offset against its mapping (`Map::at`), in every build.
+//! ring offset against its mapping (`Mapping::at`), in every build.
 
 mod files;
 mod flight;
@@ -439,7 +439,7 @@ fn register<T>(
 }
 
 /// An anonymous mapping of `len` bytes, page-aligned, unmapped when dropped.
-fn anonymous(len: usize) -> io::Result<Map> {
+fn anonymous(len: usize) -> io::Result<Mapping> {
     // SAFETY: a new private anonymous mapping: no file, no address hint, so it overlaps nothing
     // the program holds; the result is checked against `MAP_FAILED` below.
     let at = unsafe {
@@ -455,7 +455,7 @@ fn anonymous(len: usize) -> io::Result<Map> {
     if at == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    Ok(Map { at: at.cast(), len })
+    Ok(Mapping { at: at.cast(), len })
 }
 
 /// The table of registered files: requests name a slot of it (`IOSQE_FIXED_FILE`), so the
@@ -615,8 +615,8 @@ impl Drop for Fixed {
 /// ring's tail for the batch ([`Provided::publish`]), so the cache line the kernel reads moves
 /// once per reap, not once per buffer.
 struct Provided {
-    ring: Map,
-    buffers: Map,
+    ring: Mapping,
+    buffers: Mapping,
     tail: u16,
     /// The tail the kernel was last shown.
     published: u16,
@@ -832,13 +832,13 @@ fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Er
 }
 
 /// A mapping of the ring's memory, unmapped when dropped.
-struct Map {
+struct Mapping {
     at: *mut u8,
     len: usize,
 }
 
-impl Map {
-    fn new(fd: RawFd, len: usize, offset: libc::off_t) -> io::Result<Map> {
+impl Mapping {
+    fn new(fd: RawFd, len: usize, offset: libc::off_t) -> io::Result<Mapping> {
         // SAFETY: a shared mapping of the ring's file at the offset the kernel names for it.
         let at = unsafe {
             libc::mmap(
@@ -853,7 +853,7 @@ impl Map {
         if at == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Map { at: at.cast(), len })
+        Ok(Mapping { at: at.cast(), len })
     }
 
     /// The `T` at `offset`, which the kernel's offsets say is one. Checked against the mapping
@@ -870,7 +870,7 @@ impl Map {
     }
 }
 
-impl Drop for Map {
+impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: the mapping `new` made, unmapped once.
         unsafe { libc::munmap(self.at.cast(), self.len) };
@@ -901,7 +901,7 @@ struct Ring {
     /// Requests written to the ring since the kernel's thread was last told of them.
     unsubmitted: u32,
     // Dropped after the pointers into them are no longer used.
-    _maps: Vec<Map>,
+    _maps: Vec<Mapping>,
     /// Shared with the [`Table`], whose slots are emptied through it until the last goes.
     fd: Rc<OwnedFd>,
 }
@@ -961,9 +961,9 @@ impl Ring {
         }
         let sq_len = params.sq_off.array as usize + params.sq_entries as usize * size_of::<u32>();
         let cq_len = params.cq_off.cqes as usize + params.cq_entries as usize * size_of::<Cqe>();
-        let rings = Map::new(fd.as_raw_fd(), sq_len.max(cq_len), OFF_SQ_RING)?;
+        let rings = Mapping::new(fd.as_raw_fd(), sq_len.max(cq_len), OFF_SQ_RING)?;
         let sqes =
-            Map::new(fd.as_raw_fd(), params.sq_entries as usize * size_of::<Sqe>(), OFF_SQES)?;
+            Mapping::new(fd.as_raw_fd(), params.sq_entries as usize * size_of::<Sqe>(), OFF_SQES)?;
         let (sq, cq) = (&params.sq_off, &params.cq_off);
         let array: *mut u32 = rings.at(sq.array);
         for index in 0..params.sq_entries {
