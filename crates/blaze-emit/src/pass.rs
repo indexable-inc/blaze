@@ -1306,7 +1306,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::FrameAddress | Op::ReturnAddress | Op::StackPointer => {
                 return Err(unsupported(inst, op, "a machine register read (frame or return address, stack pointer)"));
             }
-            Op::Memcmp => return Err(unsupported(inst, op, "`memcmp`")),
+            Op::Memcmp => self.memcmp(inst, op)?,
         }
         Ok(())
     }

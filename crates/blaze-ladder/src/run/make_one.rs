@@ -24,10 +24,10 @@
 //!   name ([`RunError::OneBody`]).
 //! - `static_image` (every static's bytes): not run. A record names a static, thread-local or
 //!   vtable by symbol; each one's data is its own record (D106 item 6, bzcode03's kinds 1-3).
-//! - `ClosureTable::of` and `CoroutineTable::of` (every checked body): re-made over the bodies
-//!   checked SO FAR, only when a newly checked body has a closure or an async block
-//!   ([`MakerState::ensure`]). The end form is one row added per body (a `ClosureTable::add`
-//!   beside `of`), with piece Y.
+//! - `ClosureTable::of` (every checked body): each newly checked body adds its own closures'
+//!   rows (`ClosureTable::add`, [`MakerState::ensure`]). `CoroutineTable::of`: re-made over the
+//!   bodies checked SO FAR, only when a newly checked body has a closure or an async block; its
+//!   end form is one row added per body as the closures' table, with piece Y.
 //! - coroutine states: run/lay_states.rs `lay_and_build`, the one path (build_from's too): laid
 //!   out from types before the instance is built, each coroutine then built into its state; an
 //!   owner fn the lay needs that is not checked yet is checked ([`Step::Check`]) and the
@@ -225,6 +225,13 @@ impl MakerState {
             Ok(n) => return Ok(self.asked[n].1),
             Err(n) => n,
         };
+        // A ctor has no body to check: its row is made, and its instance built as a fn
+        // ([`build_one`]'s ctor arm).
+        if program.ctor_of(key).is_some() {
+            let at = program.ctor_row(key)?;
+            self.asked.insert_shift(slot, (key, at));
+            return Ok(at);
+        }
         let got = program.check_one(key)?;
         let at = match got {
             None => None,
@@ -241,7 +248,12 @@ impl MakerState {
                 self.checked[i] = Some(done);
                 if refresh {
                     let tables = self.tables.as_mut().ok_or_else(|| tables_gone(key))?;
-                    tables.closures = ClosureTable::of(&*program, &self.checked, self.work.alloc);
+                    // This body's closures, one row each ([`ClosureTable::add`]): the table is
+                    // never re-made over the bodies checked before.
+                    if let (Some((body, _)), Some(done)) = (program.function(i).body, self.checked[i].as_ref()) {
+                        let sig = program.sig(i);
+                        tables.closures.add(&body.view(program.types()), done, sig.parent_count + sig.own_count, self.work.alloc);
+                    }
                     tables.coroutines.table = CoroutineTable::of(&*program, &self.checked, self.work.alloc);
                     // The library's async items, read again with the rows made so far: before the
                     // first check a lazy front end has no `Poll` row yet, so `MakerState::new`'s
@@ -289,13 +301,27 @@ pub fn make_instance<P: FrontEnd>(
     // meets an owner fn not checked yet has it checked and the instance made again (no LIR
     // was built: types only were read); bounded (rule 18).
     let mut owners = 0usize;
+    // An instance-time question that met an answer no check made (`Missing`): the program
+    // makes what its worlds asked (`FrontEnd::make_asked`) and the instance is built again,
+    // as build_from's step is; bounded (rule 18), and nothing made is the `Missing` itself.
+    let mut asked = 0u32;
     loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
         let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, panic: work.panic, alloc: work.alloc };
         let step = build_one(&*program, &bodies, work, i, instance, entry);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
-        match step? {
+        let step = match step {
+            Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
+                asked += 1;
+                if program.make_asked(i)? {
+                    continue;
+                }
+                return Err(e);
+            }
+            step => step?,
+        };
+        match step {
             Step::Entry => break,
             Step::Check(owner) => {
                 owners += 1;
@@ -331,7 +357,8 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     let MakerState { checked, tables, work, .. } = &mut *state;
     work.needs.clear();
     let function = program.function(i);
-    if instance.item != function.key {
+    // A ctor's fn reads no constant: its fields in, its value out.
+    if instance.item != function.key || (function.kind == FnKind::Ctor && function.body.is_none()) {
         return Ok(());
     }
     let (Some((body, _)), Some(done)) = (function.body, checked.get(i).and_then(Option::as_ref)) else {
@@ -352,7 +379,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     }
     let named = function.named();
     let table = tables.as_mut().ok_or_else(|| tables_gone(instance.item))?;
-    if let Err(refusal) = crate::front2::const_at::pull(&mut *program, &work.needs, work.ground.view(), &mut table.const_at) {
+    if let Err(refusal) = crate::front2::const_at::pull(&mut *program, &work.needs, work.ground.view(), &mut table.const_at, &table.closures) {
         let item = refusal.need.item();
         let path = program.item_named(item);
         return Err(RunError::ConstAt { function: named, refusal, path });
@@ -366,8 +393,16 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     let types = program.types();
     let function = program.function(i);
     let name = || function.named();
-    let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(i).and_then(Option::as_ref)) else {
-        return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view()));
+    // A ctor's row has no body: its own instance is built as a fn, and a `Fn*` shim of it
+    // (`.map(S)`) as any fn item's (as run.rs `build_from`).
+    let ctor_row = match (function.kind, function.body) {
+        (FnKind::Ctor, None) => program.ctor_of(function.key).map(|(_, variant)| variant),
+        _ => None,
+    };
+    let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
+        (Some((body, _)), Some(done)) => Some((body, done)),
+        _ if ctor_row.is_some() => None,
+        _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
     let adts = FrontAdts(program, i, &[], &work.langs, bodies);
@@ -431,7 +466,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             return Ok(Step::Check(owner));
         }
     }
-    let view = body.view(types);
+    let view = checked.map(|(body, done)| (body.view(types), done));
     let own = if from_coroutine.is_some() {
         None
     } else {
@@ -441,14 +476,21 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
-        } else if let Some((of, which)) = closure {
-            blaze_build::build_closure(&view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, Global)
-        } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
-            blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, Global)
+        } else if let Some(variant) = ctor_row {
+            // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
+            blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, Global)
+        } else if let Some((view, done)) = view.as_ref() {
+            if let Some((of, which)) = closure {
+                blaze_build::build_closure(view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, Global)
+            } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
+                blaze_build::build_drop_glue(view, done, &program.sig(i), &mut subst, &adts, Global)
+            } else {
+                blaze_build::build(view, done, &program.sig(i), &mut subst, &adts, Global)
+            }
         } else {
-            blaze_build::build(&view, done, &program.sig(i), &mut subst, &adts, Global)
+            Err(BuildError::Malformed { what: "a row with no body built as other than a ctor or its shim" })
         };
-        Some(made.map_err(|error| build_refusal(program, name(), body, error))?)
+        Some(made.map_err(|error| build_refusal(program, name(), checked.map(|(body, _)| body), error))?)
     };
     let built: &blaze_build::Built<Global> = match (&own, from_coroutine) {
         (Some(b), _) => b,
@@ -471,12 +513,13 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             }
         }
     }
-    // Every untabled callee of this build at once: checked, then the instance made again.
+    for &want in built.vtables.iter() {
+        vtable_rows(program, &adts, &mut work.ground, &mut work.layouts, work.alloc, &mut reach, i, instance.args, want, &mut untabled)?;
+    }
+    // Every untabled callee of this build at once (its calls' and its vtables' words): checked,
+    // then the instance made again.
     if !untabled.is_empty() {
         return Ok(Step::Table(untabled));
-    }
-    for &want in built.vtables.iter() {
-        vtable_rows(program, &adts, &mut work.ground, &mut work.layouts, work.alloc, &mut reach, i, instance.args, want)?;
     }
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
     let mut statics: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.statics.len(), work.alloc);
@@ -505,12 +548,13 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     Ok(Step::Entry)
 }
 
-/// build_from's mapping of a build error to the run's refusal, by the body's ranges.
-fn build_refusal<P: FrontEnd>(program: &P, function: Named, body: &blaze_lower::typeck::TypeckBody<'static>, error: BuildError) -> RunError {
+/// build_from's mapping of a build error to the run's refusal, by the body's ranges (a ctor's
+/// fn has no body, so no range).
+fn build_refusal<P: FrontEnd>(program: &P, function: Named, body: Option<&blaze_lower::typeck::TypeckBody<'static>>, error: BuildError) -> RunError {
     let ranges = |all: &[blaze_typeck::Range], i: u32| all.get(i as usize).copied();
     let range = match error {
-        BuildError::Unsupported { expr, .. } | BuildError::UnsupportedType { expr, .. } | BuildError::NoConstBlockValue { expr, .. } => ranges(&body.expr_ranges, expr.0),
-        BuildError::UnsupportedPat { pat, .. } => ranges(&body.pat_ranges, pat.0),
+        BuildError::Unsupported { expr, .. } | BuildError::UnsupportedType { expr, .. } | BuildError::NoConstBlockValue { expr, .. } => body.and_then(|body| ranges(&body.expr_ranges, expr.0)),
+        BuildError::UnsupportedPat { pat, .. } => body.and_then(|body| ranges(&body.pat_ranges, pat.0)),
         BuildError::NoAdt { adt }
         | BuildError::NoAbi { item: adt }
         | BuildError::NoStatic { item: adt, .. }
@@ -599,7 +643,7 @@ fn name_ref<'p, P: FrontEnd>(
     let called = match crate::fn_item_resolve::resolved_shim_self(program, adts, i, called, ground) {
         Ok(c) => c,
         Err(error) => {
-            let at = crate::callee_shown::self_form(ground.view(), called.args);
+            let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
             return Err(RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error });
         }
     };
@@ -610,7 +654,9 @@ fn name_ref<'p, P: FrontEnd>(
         return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(sym);
     }
     // A ctor is no trait's fn: it runs as itself, with no world asked (build_from's refs loop).
-    let is_ctor = program.fn_index(called.item).is_some_and(|c| program.function(c).kind == FnKind::Ctor);
+    // Known by its ADT's head (`ctor_of`), whether or not a row tables it yet: a lazy front end
+    // tables a body's CALLEES, and a ctor used as a value (`let p: fn(..) -> S = S`) is none.
+    let is_ctor = program.ctor_of(called.item).is_some();
     let selected = match is_ctor {
         true => Ok((called.item, called.args)),
         false => program.resolve(i, called.item, called.args, ground),
@@ -618,19 +664,19 @@ fn name_ref<'p, P: FrontEnd>(
     let (item, resolved) = match selected {
         Ok(r) => r,
         Err(error) => {
-            let at = crate::callee_shown::self_form(ground.view(), called.args);
+            let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
             return Err(RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error });
         }
     };
     let callee = Instance { item, args: resolved };
     // `at`: the arguments of the instance whose body makes this call (its `Self` first).
     let Some(c) = program.fn_index(callee.item) else {
+        // Owed a row whatever names it: a ctor's ([`Step::Table`] makes it by the seam's
+        // `ctor_row`), a selected impl's fn, and a fn the body names as a VALUE, which its
+        // caller's check does not table as a callee (bstd `main!`'s `guest::start(table,
+        // hosted)`: the local `hosted` passed as a fn item, hello world's stop of 2026-11-17
+        // g080047). A fn a check of it tables no row for is refused when met again.
         let refusal = callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NotTabled, ground.view());
-        if callee.item == called.item {
-            // The call's own item: its caller's check tabled every callee it names, so no row
-            // is owed by a check of it.
-            return Err(refusal);
-        }
         return Ok(Named1::Untabled(callee.item, refusal));
     };
     let target = program.function(c);
@@ -660,6 +706,10 @@ fn bodied<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], c: usi
 /// build_from's vtable loop for one vtable the body names, by name: the method words and the
 /// drop glue of it and of each table above it (by a work list, no recursion) declared as the
 /// instances they reach. The tables' bytes are data, made by their own record (D106 item 6).
+/// A word whose fn no row tables yet (the drop glue `drop_in_place`, an impl's method no body
+/// called: a lazy front end tables a body's CALLEES, and a vtable's words are no body's) goes
+/// to `untabled`, as an untabled callee of a call does ([`Named1::Untabled`]): checked, then
+/// the instance made again.
 #[allow(clippy::too_many_arguments)]
 fn vtable_rows<P: FrontEnd>(
     program: &P,
@@ -671,6 +721,7 @@ fn vtable_rows<P: FrontEnd>(
     i: usize,
     at: List,
     want: VtableRef,
+    untabled: &mut Vec<(ItemKey, RunError), Global>,
 ) -> Result<(), RunError> {
     let function = program.function(i);
     let name = || function.named();
@@ -718,14 +769,21 @@ fn vtable_rows<P: FrontEnd>(
                 false => match program.resolve(i, f.item, f.args, &mut *ground) {
                     Ok(r) => r,
                     Err(error) => {
-                        let at = crate::callee_shown::self_form(ground.view(), f.args);
+                        let at = crate::callee_shown::self_shown(program, ground.view(), f.args);
                         return Err(RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at, error });
                     }
                 },
             };
-            let Some(c) = program.fn_index(item).filter(|&c| bodied(program, adts.4.checked, c)) else {
-                return Err(callee_refusal(program, name(), at, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view()));
+            let refusal = || callee_refusal(program, name(), at, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view());
+            let Some(c) = program.fn_index(item) else {
+                if !untabled.iter().any(|(k, _)| *k == item) {
+                    untabled.push((item, refusal()));
+                }
+                continue;
             };
+            if !bodied(program, adts.4.checked, c) {
+                return Err(refusal());
+            }
             reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(sym)?;
         }
     }

@@ -7,7 +7,7 @@ use blaze_own::{AVec, Alloc};
 
 use crate::pinned::{THISERROR_2_PROBE, TEMPO};
 use crate::probe::{Row, Table, pinned_rows};
-use crate::probe_ask::{Answered, Ask, By, Compile, Decided, Open, Refused, Rejection, Verdict, Why, answer, classify, decide, ships_rows};
+use crate::probe_ask::{Answered, Ask, By, Compile, Decided, Needs, Open, Refused, Rejection, Verdict, Why, answer, classify, decide, feature_rows, ships_rows};
 
 const WASM: &str = "wasm32-wasip1";
 const HOST: &str = "aarch64-apple-darwin";
@@ -82,7 +82,7 @@ fn probe_ask_tempos_three_real_probes_are_answered_for_the_macro_side() {
     let host_rows = table_for(HOST, SYSROOT, alloc.clone());
     assert!(matches!(answered(THISERROR, THISERROR_2_PROBE, &host_rows, alloc.clone()).verdict, Verdict::Unanswered(_)));
     assert!(matches!(answered(RUSTIX, RUSTIX_SNIPPET, &host_rows, alloc.clone()).verdict, Verdict::Unanswered(_)));
-    assert_eq!(answered(NUM_TRAITS, "", &host_rows, alloc).verdict, Verdict::Unanswered(Open::Sysroot(crate::probe_ask::Needs::Std)));
+    assert_eq!(answered(NUM_TRAITS, "", &host_rows, alloc).verdict, Verdict::Unanswered(Open::Sysroot(Needs::Std)));
     println!("probe_ask: three real probes answered for wasm32-wasip1");
 }
 
@@ -101,11 +101,13 @@ fn probe_ask_a_type_error_is_never_accepted_and_what_blaze_decides_is_exact() {
     assert_eq!(bin.verdict, Verdict::Rejected(Rejection::NoMain));
     let edition = compile(&["--edition", "2017", "--crate-type=lib", "-"], alloc.clone());
     assert_eq!(decide(&edition, b""), Decided::Rejected(Rejection::Edition));
-    assert!(Rejection::Edition.stderr(&edition, alloc.clone()).as_str().contains("(instead was `2017`)"));
+    assert!(Rejection::Edition.stderr(&edition, b"", alloc.clone()).as_str().contains("(instead was `2017`)"));
     // Inner attributes that change nothing are decided; one that does is left, by its byte.
     let c = compile(&lib, alloc.clone());
-    assert_eq!(decide(&c, b"/* a */ #![no_std] //! doc\n#![warn(missing_docs)]"), Decided::Accepted { needs: crate::probe_ask::Needs::Core });
-    assert_eq!(decide(&c, b"#![allow(stable_features)]\n#![feature(core_c_str)]\n"), Decided::Open(Open::Attribute { at: 27 }));
+    assert_eq!(decide(&c, b"/* a */ #![no_std] //! doc\n#![warn(missing_docs)]"), Decided::Accepted { needs: Needs::Core, library: false });
+    assert_eq!(decide(&c, b"#![allow(stable_features)]\n#![feature(core_c_str)]\n"), Decided::Accepted { needs: Needs::Std, library: true });
+    assert_eq!(decide(&c, b"#![cfg_attr(x, feature(a))]\n"), Decided::Open(Open::Attribute { at: 0 }));
+    assert_eq!(decide(&c, b"#![feature(a, a)]\n"), Decided::Open(Open::Attribute { at: 0 }), "a name twice is left");
     assert_eq!(decide(&c, b"/// doc\n"), Decided::Open(Open::Items { at: 0 }));
     assert_eq!(decide(&c, b"/* open"), Decided::Open(Open::Text));
     // A flag it does not model leaves the probe.
@@ -156,32 +158,88 @@ fn probe_ask_the_same_question_is_one_key() {
     println!("probe_ask: one question one key");
 }
 
-/// Every pinned row reads as a try-compile (`pinned_rows` panics otherwise), and wherever blaze
-/// decides a row's snippet itself, it agrees with the row.
-/// Prints "probe_ask: rows read, N decided agree".
+/// Every pinned row reads as a try-compile (`pinned_rows` panics otherwise), its own row
+/// answers it, and none is a probe blaze decides itself: each has items (`Open::Items`), what
+/// only the item probe removes. A row the decider covers is dead and is taken out.
+/// Prints "probe_ask: N rows read, none decided".
+/// Control: put back rustix's `#![feature(core_c_str)]` row and it fails naming it.
 #[test]
 fn pinned_rows_read_as_try_compiles() {
     let alloc = blaze_own::testing::heap().alloc();
     let rows = table_for(WASM, SYSROOT, alloc.clone());
     assert_eq!(rows.len(), TEMPO.len() + SYSROOT.len());
-    let mut agreed = 0;
     for known in TEMPO {
         let mut args = blaze_own::Vec::new_in(alloc.clone());
         args.extend_from_slice(known.args);
         args.push("-");
         let c = compile(&args, alloc.clone());
         assert!(c.target.is_none(), "{}: a row names no --target: it is keyed for its side's", known.probe);
+        // Items, or an inner `cfg_attr` over them (anyhow's): both the item probe's.
+        assert!(matches!(decide(&c, known.snippet.as_bytes()), Decided::Open(Open::Items { .. } | Open::Attribute { .. })), "{}: blaze decides this probe itself; its row is dead", known.probe);
         let got = answer(&c, WASM, known.snippet.as_bytes(), &Table { rows: &rows });
         match got.verdict {
-            Verdict::Accepted(By::Decided) => {
-                assert!(known.accepted, "{}: blaze accepts what the row rejects", known.probe);
-                agreed += 1;
-            }
-            Verdict::Rejected(_) => assert!(!known.accepted, "{}: blaze rejects what the row accepts", known.probe),
             Verdict::Accepted(By::Table) => assert!(known.accepted),
-            Verdict::Unanswered(why) => panic!("{}: its own row does not answer it: {why:?}", known.probe),
+            Verdict::Rejected(Rejection::Table) => assert!(!known.accepted),
+            other => panic!("{}: its own row does not answer it: {other:?}", known.probe),
         }
     }
-    assert_eq!(agreed, 2, "the empty crate and `#![no_std]` are decided by blaze");
-    println!("probe_ask: rows read, {agreed} decided agree");
+    println!("probe_ask: {} rows read, none decided", TEMPO.len());
+}
+
+/// rustix's `can_compile` line for the macro side, as tempo's check printed it.
+const RUSTIX_FEATURE: &str = "#![allow(stable_features)]\n#![feature(wasi_ext)]\n";
+
+/// A side's table with its library listing for a std probe: `declared` and `mentioned` as
+/// blaze-scope's `lib_features` lists them (its tests read std's `os::wasi` under each cfg).
+fn listed_table<'a>(target: &str, declared: &[&str], mentioned: &[&str], alloc: Alloc<'a>) -> AVec<'a, Row> {
+    let mut rows = table_for(target, SYSROOT, alloc.clone());
+    rows.extend_from_slice(&feature_rows(target, Needs::Std, declared, mentioned, alloc));
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+    rows
+}
+
+/// The four kinds of name `#![feature]` gives, each answered as the pinned nightly would:
+/// - a language feature (`default_field_values`, unstable: enabled) is accepted with no
+///   listing at all, and a removed one (`box_syntax`) is E0557;
+/// - a library feature the target's std declares (`wasi_ext`, `os::wasi` of wasm32-wasip1):
+///   rustix's real probe is accepted for the macro side, by blaze;
+/// - the same feature for the host, whose std has no `os::wasi`: E0635 naming it, status 1;
+/// - a name nothing declares: E0635; one only mentioned in a macro's tokens is left open, and
+///   with no listing for the target nothing is claimed.
+/// Prints "probe_ask: four feature kinds answered".
+/// Control: list `wasi_ext` as declared for the host and the third case is accepted.
+#[test]
+fn probe_ask_features_are_answered_from_the_language_list_and_the_library_listing() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let wasm = listed_table(WASM, &["alloc_ffi", "core_c_str", "rust1", "wasi_ext"], &["in_macro_only"], alloc.clone());
+    let host = listed_table(HOST, &["alloc_ffi", "core_c_str", "rust1"], &["in_macro_only"], alloc.clone());
+    let bare = table_for(HOST, SYSROOT, alloc.clone());
+    let lib = ["--crate-type=rlib", "--emit=metadata", "-"];
+
+    // A language feature: decided from the language list alone.
+    let lang = answered(&lib, "#![feature(default_field_values)]\n", &bare, alloc.clone());
+    assert_eq!(lang.verdict, Verdict::Accepted(By::Decided), "a language feature");
+    let removed = answered(&lib, "#![feature(box_syntax)]\n", &bare, alloc.clone());
+    assert_eq!(removed.verdict, Verdict::Rejected(Rejection::RemovedFeature { at: 11, len: 10 }));
+
+    // A library feature the target declares: rustix's probe, its line as the check printed it.
+    let present = answered(RUSTIX, RUSTIX_FEATURE, &wasm, alloc.clone());
+    assert_eq!(present.verdict, Verdict::Accepted(By::Decided), "rustix's wasi_ext probe for wasm32-wasip1");
+    assert_eq!(present.target, WASM);
+
+    // The same feature for the host: E0635, as rustc says it.
+    let absent = answered(&lib, RUSTIX_FEATURE, &host, alloc.clone());
+    let Verdict::Rejected(rejection) = absent.verdict else { panic!("wasi_ext for the host: {absent:?}") };
+    assert_eq!(rejection, Rejection::UnknownFeature { at: 38, len: 8 });
+    let c = compile(&lib, alloc.clone());
+    assert_eq!(rejection.stderr(&c, RUSTIX_FEATURE.as_bytes(), alloc.clone()).as_str(), "error[E0635]: unknown feature `wasi_ext`\n");
+
+    // An unknown name: E0635 wherever the listing is; a mention alone or no listing: open.
+    let unknown = answered(RUSTIX, "#![feature(core_c_str, no_such_feature)]\n", &wasm, alloc.clone());
+    assert_eq!(unknown.verdict, Verdict::Rejected(Rejection::UnknownFeature { at: 23, len: 15 }));
+    let mentioned = answered(RUSTIX, "#![feature(in_macro_only)]\n", &wasm, alloc.clone());
+    assert_eq!(mentioned.verdict, Verdict::Unanswered(Open::Feature { at: 11 }));
+    let unlisted = answered(&lib, RUSTIX_FEATURE, &bare, alloc);
+    assert_eq!(unlisted.verdict, Verdict::Unanswered(Open::Features(Needs::Std)));
+    println!("probe_ask: four feature kinds answered");
 }

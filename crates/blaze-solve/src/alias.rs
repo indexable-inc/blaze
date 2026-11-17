@@ -29,9 +29,11 @@
 //!   declared type);
 //! - the GAT's own where-clauses (`own_clauses_of` with `GoalSource::AliasWellFormed`): `AssocTy`
 //!   carries none;
-//! - `filter_specialized_impls` and specialization parents in `fetch_eligible_assoc_item`: an
-//!   impl's `default type` is never eligible here (rigid in analysis, ambiguous in coherence),
-//!   and an item the impl lacks comes from the trait's default;
+//! - the specialization graph's own walk in `fetch_eligible_assoc_item`: an impl's `default
+//!   type` is never eligible here (rigid in analysis, ambiguous in coherence), and an impl that
+//!   lacks an item and specializes another answers nothing, its ancestors being candidates of
+//!   the same goal (`step_impl`), the nearest one that defines the item kept by the merge's
+//!   `filter_specialized_impls` (assembly.rs);
 //! - `try_assemble_bounds_via_registered_opaques`: no opaque storage; a self type that is a
 //!   variable gives the forced ambiguity that function falls back to.
 
@@ -835,19 +837,52 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
         }
         // A `default` item is not eligible: ambiguous in coherence, rigid elsewhere.
         Some(_) => return not_eligible(cx, alias, term),
+        // The impl does not define the item: it inherits it from the next impl up its
+        // specialization graph that does, and from the trait's default past the root (RFC
+        // 1210, "Specialization": an impl that does not define an item inherits it; rustc's
+        // `fetch_eligible_assoc_item` walks `specialization_graph::assoc_def`'s ancestors, the
+        // trait last). Every ancestor applies wherever this impl does (it is more general), so
+        // each is another impl candidate of this goal: with a parent this candidate answers
+        // nothing and the ancestors answer, the nearest one that defines the item left by the
+        // merge's `filter_specialized_impls` (or the root, with the trait's default). The
+        // pinned core: `impl<I> FuseImpl<I> for Fuse<I> where I: FusedIterator` has no `type
+        // Item` beside `impl<I: Iterator> FuseImpl<I> for Fuse<I> { type Item = <I as
+        // Iterator>::Item; .. }` (core/src/iter/adapters/fuse.rs), and `unsafe impl
+        // StepByBackImpl<Range<u16>> for StepBy<Range<u16>>` none beside the blanket
+        // `StepByBackImpl` impl (step_by.rs).
         None => {
+            if has_parent(cx, trait_, cand.a, cand.d)? {
+                return Ok(Step::No);
+            }
             let td = cx.trait_def(trait_)?;
             match td.assoc.iter().find(|a| a.def == item).and_then(|a| a.default) {
                 // The trait's default, final because the impl is (`translate_args` from the
                 // trait: the goal's own arguments).
                 Some(d) => cx.import(td.portable, d, args)?,
-                // A missing item: `error_response`.
+                // A root impl without the item and no default is the program's E0046 at the
+                // impl, reported there; its projections are the error type, so no second
+                // error follows at each use (`consider_impl_candidate`'s `error_response`).
                 None => cx.mk(TyKind::Error)?,
             }
         }
     };
     let value = normalize(cx, value)?;
     if cx.eq(term, value)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
+}
+
+/// Whether impl `child` of `trait_` specializes another impl of it that may apply to
+/// `self_ty` (its parent is more general, so it is in the self type's bucket or the blanket
+/// one). A self type with no shape has no bucket to look in: then no impl is a candidate
+/// either (assembly forced ambiguity), so this is not asked.
+fn has_parent<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, trait_: Def, self_ty: Ty, child: Def) -> Result<bool, Stop> {
+    let Some(shape) = crate::object_shape::shape_of_ty(&*cx.tys, self_ty) else { return Err(malformed()) };
+    let set = cx.impls(trait_, shape)?;
+    for &p in set.impls {
+        if p != child && cx.specializes(child, p)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `FetchEligibleAssocItemResponse::NotFound`: ambiguous in coherence, rigid elsewhere.
@@ -862,11 +897,23 @@ fn not_eligible<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, alias: Ty, term: Ty
 }
 
 /// Merges a goal's candidates. `NormalizesTo`: assembly/mod.rs `assemble_and_merge_candidates`
-/// after assembly chose its candidates by the proven-via; the others: `try_merge_responses`.
-pub fn merge(m: &mut Merger<'_, '_>, goal: Pred, cands: &[Done]) -> Result<Option<RespId>, SolveError> {
+/// after assembly chose its candidates by the proven-via, the impls another impl candidate
+/// specializes dropped first (`filter_specialized_impls` with inference constraints allowed:
+/// "we drop specialized impls to allow normalization via a final impl"); the others:
+/// `try_merge_responses`.
+pub fn merge(
+    m: &mut Merger<'_, '_>,
+    mode: TypingMode,
+    goal: Pred,
+    cands: &mut Vec<Done, Alloc<'_>>,
+    specializes: &mut dyn FnMut(Def, Def) -> Result<bool, Stop>,
+) -> Result<Option<RespId>, Stop> {
     match goal {
-        Pred::NormalizesTo { .. } => merge_normalizes_to(m, cands),
-        _ => m.merge_responses(cands),
+        Pred::NormalizesTo { .. } => {
+            crate::assembly::filter_specialized_impls(m, mode, crate::assembly::InferenceConstraints::Allowed, cands, specializes)?;
+            Ok(merge_normalizes_to(m, cands)?)
+        }
+        _ => Ok(m.merge_responses(cands)?),
     }
 }
 

@@ -207,7 +207,7 @@ fn goldens() {
     let clean = Closing { counts: Counts::default(), checked: 14, nanos: 480_000, changed: Some(0), fixes: Fixes::ByHand, coverage: None, fix_with: "" };
     let mixed = Closing {
         coverage: None,
-        counts: Counts { errors: 2, warnings: 3, notes: 0, files: 2, fixable: 1 },
+        counts: Counts { failures: 0, errors: 2, warnings: 3, notes: 0, files: 2, fixable: 1 },
         checked: 213,
         nanos: 2_430_000_000,
         changed: Some(12),

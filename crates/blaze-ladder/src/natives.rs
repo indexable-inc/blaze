@@ -100,6 +100,9 @@ pub enum NativeError<'a> {
     LinkLine { package: &'a str, line: &'a str, why: &'static str },
     SearchOutsideOutDir { package: &'a str, path: &'a str },
     StaticNotFound { package: &'a str, name: &'a str },
+    /// The archive the request names is a stored file of the record (a native script's
+    /// `OUT_DIR` file) whose bytes could not be read from the home's file area.
+    StoredArchive { package: &'a str, file: &'a str, why: blaze_build_script::outputs::StoredError },
     LinkArg { package: &'a str, arg: &'a str },
     UnknownModifier { package: &'a str, text: &'a str },
     Resolve(ResolveError<'a>),
@@ -356,9 +359,12 @@ fn names_file(file: &str, dir: &str, name: &str, verbatim: bool) -> bool {
     }
 }
 
-/// The first file under the crate's search directories that `request` names.
-fn find_static<'a>(outputs: &OutputsRef<'a>, dirs: &[&'a str], request: &Request<'_>) -> Option<(&'a str, &'a [u8])> {
-    dirs.iter().find_map(|dir| outputs.files().find(|(file, _)| names_file(file, dir, request.name, request.verbatim)))
+/// The first file under the crate's search directories that `request` names, inline or stored
+/// (a stored archive's bytes read from the file area the record was opened with, only this
+/// one), or why its bytes could not be had.
+fn find_static<'a>(package: &'a str, outputs: &OutputsRef<'a>, dirs: &[&'a str], request: &Request<'_>) -> Option<Result<(&'a str, &'a [u8]), NativeError<'a>>> {
+    let (file, found) = dirs.iter().find_map(|dir| outputs.all_files().find(|(file, _)| names_file(file, dir, request.name, request.verbatim)))?;
+    Some(outputs.bytes_of(found).map(|bytes| (file, bytes)).map_err(|why| NativeError::StoredArchive { package, file, why }))
 }
 
 /// Puts one request on the link line.
@@ -374,7 +380,10 @@ fn take<'a>(
     if (request.whole || request.bundle) && request.kind != LinkKind::Static {
         return Err(NativeError::LinkLine { package, line: written, why: STATIC_ONLY });
     }
-    let found = script.and_then(|(id, outputs)| find_static(outputs, dirs, &request).map(|file| (id, file)));
+    let found = match script.and_then(|(id, outputs)| find_static(package, outputs, dirs, &request).map(|file| (id, file))) {
+        Some((id, found)) => Some((id, found?)),
+        None => None,
+    };
     match (request.kind, found) {
         (LinkKind::Framework, _) => add_library(line, platform, Library { kind: LibraryKind::Framework, name: request.name }),
         (LinkKind::Static, None) => Err(NativeError::StaticNotFound { package, name: request.name }),

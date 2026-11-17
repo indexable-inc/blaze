@@ -88,6 +88,35 @@ fn a_trait_constant_on_a_ground_type_records_it() {
     assert!(holds(&fx, &c, e, &["u8"]), "{:?}", c.const_args);
 }
 
+/// A constant PATTERN records its arguments too (`Checked::pat_const_args`): in `g`,
+/// `match K { <u8>::S => .., x => .. }` holds `[u8]` at the pattern, and nothing at the
+/// expression rows. The builder reads the constant's value at them (blaze-build
+/// walk/matches/forms.rs `const_test`: tempo's `match y_parity.0 { U256::ZERO => .. }`, an
+/// inherent impl's constant over the impl's generics). Fails if `record_const_args` records
+/// expressions only (the old rule: "a pattern's constant has none").
+///
+/// Prints: `test suite::const_path_args::a_constant_pattern_records_its_arguments ... ok`
+#[test]
+fn a_constant_pattern_records_its_arguments() {
+    let (fx, [_, g, _]) = world();
+    let mut b = Bb::new();
+    let u = b.ty(PNode::Uint(UintTy::U8));
+    let k = b.path(&["K"]);
+    let p = b.qpath_pat(u, &["S"]);
+    let x = b.bind("x");
+    let one = b.path(&["K"]);
+    let other = b.local(x);
+    let m = b.match_(k, &[(p, one), (x, other)]);
+    let root = b.block(&[], Some(m));
+    let c = check_body(&fx, &b, g, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
+    let l = c.pat_const_args_of(p).unwrap_or_else(|| panic!("no row at the pattern: {:?}", c.pat_defs));
+    let got = c.types.view().list(l).expect("the pattern's arguments in the body's table");
+    assert_eq!(got.len(), 1);
+    assert_eq!(show(&fx, c.types.view(), got[0]), "u8");
+    assert!(c.const_args.column::<0>().is_empty(), "{:?}", c.const_args);
+}
+
 /// A free constant `K` has no generics: no row, and the path is still `Def::Const` in `expr_defs`.
 ///
 /// Prints: `test suite::const_path_args::a_free_constant_has_no_row ... ok`

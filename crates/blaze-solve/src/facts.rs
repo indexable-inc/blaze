@@ -45,6 +45,8 @@ pub enum Question {
     /// of the caller's arena, valid for the solve that stopped on it: the world reads its terms
     /// before the solve runs again.
     ConstHolds(Def, List),
+    /// Whether the first impl specializes the second (`Facts::specializes`).
+    Specializes(Def, Def),
 }
 
 /// The value of a `where const` condition at ground arguments (`Facts::const_holds`).
@@ -322,6 +324,10 @@ pub trait Facts {
     /// resolved (hash-consed, so equal arguments are equal terms). `Missing` stops the solve
     /// with `Need(Question::ConstHolds(cond, list))`, the list holding these terms.
     fn const_holds(&self, seal: Seal, cond: Def, args: &[Ty]) -> Fetch<ConstHolds>;
+    /// Whether impl `a` specializes impl `b`, both impls of one trait (rustc's
+    /// `impl_specializes`; RFC 1210): every trait reference `a` applies to, `b` applies to,
+    /// `b`'s where-clauses holding under `a`'s. A fact of the two impls alone, never of a goal.
+    fn specializes(&self, seal: Seal, a: Def, b: Def) -> Fetch<bool>;
 }
 
 /// The digest of a lang item's answer (its def, or none).
@@ -417,6 +423,11 @@ impl<'f, F: Facts> Ask<'f, F> {
     pub fn is_local(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, d: Def) -> Result<bool, Stop> {
         let got = self.facts.is_local(Self::seal(), d);
         Self::note(log, Question::IsLocal(d), got, |a| u64::from(*a))
+    }
+
+    pub fn specializes(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, a: Def, b: Def) -> Result<bool, Stop> {
+        let got = self.facts.specializes(Self::seal(), a, b);
+        Self::note(log, Question::Specializes(a, b), got, |s| u64::from(*s))
     }
 
     /// `cond` at the ground `args`, which `list` holds (the question a `Need` names).

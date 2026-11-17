@@ -50,7 +50,7 @@ fn main() -> ExitCode {
     let erased = blaze_own::Erased::new(&frame);
     let alloc: Alloc<'_> = erased.handle();
     let settings = std::string::String::from_utf8(read(sdk, "SDKSettings.json")).expect("a UTF-8 SDKSettings.json");
-    let sdk_version = settings.split("\"Version\":\"").nth(1).and_then(|v| v.split('"').next()).expect("SDKSettings.json's Version");
+    let sdk_version = blaze_proc_macro::native_unit::sdk_version(&settings).expect("SDKSettings.json's Version");
     let sysroot_key = format!("macos-sdk {sdk_version}");
     let (script_dir, script_name) = script.rsplit_once('/').expect("an absolute script path");
     let module = {
@@ -153,7 +153,11 @@ fn main() -> ExitCode {
             macos_min: "11.0",
         };
         // sha3-asm asks no fact (no sw_vers, no pkg-config): no fact shim (N7).
-        let script = NativeScript { program: script, c, env: &env, reads: &[], shown: &[], host_tools: &tools, facts: None, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600) };
+        // The file area beside the out folder (the real path's is `<store>/build-script/files`):
+        // the run's files are renamed there by digest, so it is on their volume.
+        let area = format!("{}/files", out_dir.rsplit_once('/').map_or("", |(parent, _)| parent));
+        std::fs::create_dir_all(&area).unwrap_or_else(|e| panic!("{area}: {e}"));
+        let script = NativeScript { program: script, c, env: &env, reads: &[], shown: &[], host_tools: &tools, facts: None, jobs: None, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600), files: &area };
         let ran = match run_script(&script, alloc) {
             Ok(ran) => ran,
             Err(error) => {
@@ -175,6 +179,9 @@ fn main() -> ExitCode {
         );
         for file in o.files.iter() {
             println!("run {pass}:   out file {} {} bytes", file.name.as_str(), file.bytes.len());
+        }
+        for file in o.stored.iter() {
+            println!("run {pass}:   stored file {} {} bytes {:?} sha256 {}", file.name.as_str(), file.len, file.mode, hex(&file.sha256));
         }
         println!(
             "run {pass}: sysroot headers read {} digest {}; reads outside the grant's folders {}",

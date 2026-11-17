@@ -16,7 +16,7 @@
 //! covers (covered.rs: each fn declared in it at any depth; for the root's `fn main` an
 //! attribute replaced, the body the expansion wrote, the user's body inside). Its diagnostics are
 //! [`TYPES`] findings, entry-relative (rule 71). A body the check could not finish (a refusal,
-//! a gap, a record that did not answer, an expansion not served, a `const` or `static` body) is
+//! a gap, a record that did not answer, an expansion not served, a `cfg` that does not read) is
 //! one [`TYPES_NOT_CHECKED`] finding saying why: never a pass, and the command's closing line
 //! then says "NOT checked: types" (main.rs `check_coverage`).
 //!
@@ -724,13 +724,68 @@ struct Checker<'n> {
     /// is at (covered.rs `written_by`): made at the first entry that can have expansions, once
     /// a job.
     written: Option<AVec<'n, covered::WrittenBy<'n>>>,
+    /// The owner's crate's cfg (its items record's atoms): which entries its crate holds
+    /// ([`Checker::holds`]).
+    cfg: blaze_scope::task::Cfg<'n, 'n>,
     /// The allocator the checker was made on (`FileTypes::heap`): the heads' files and digests too.
     heap: Alloc<'n>,
 }
 
+/// One owner of a file as its job holds it.
+///
+/// An owner is a crate root whose module tree reaches the file in its TEXT (blaze-drive
+/// owners.rs, read from the outlines, under no cfg); its crate is that tree under ITS cfg (the
+/// Reference, "Conditional compilation": an item whose `cfg` is false "is not compiled", and a
+/// `mod` item is one). A library and its test unit own `#[cfg(test)] mod tests;` alike, and only
+/// the test unit's crate holds it: in the library's, the file and its items do not exist, so
+/// that owner has nothing there to check, and the test unit checks them. Whether an owner's crate
+/// holds the file is its items record's answer ([`checker`]); whether it holds an entry, the
+/// entry's and its enclosing entries' `cfg` under the crate's atoms ([`Checker::holds`]).
+enum OwnerCheck<'n> {
+    /// The owner's checker over the file.
+    Checks(Checker<'n>),
+    /// The owner's crate does not hold the file: its items record lists no such file (the `mod`
+    /// that reaches it is left out under the crate's cfg).
+    NotInCrate,
+    /// Why no checker could be made: each entry's note names it.
+    Refused(&'n str),
+}
+
+impl<'n> OwnerCheck<'n> {
+    fn checker(&self) -> Option<&Checker<'n>> {
+        match self {
+            OwnerCheck::Checks(checker) => Some(checker),
+            OwnerCheck::NotInCrate | OwnerCheck::Refused(_) => None,
+        }
+    }
+
+    fn checker_mut(&mut self) -> Option<&mut Checker<'n>> {
+        match self {
+            OwnerCheck::Checks(checker) => Some(checker),
+            OwnerCheck::NotInCrate | OwnerCheck::Refused(_) => None,
+        }
+    }
+}
+
+/// What an owner's crate holds of one outline entry ([`Checker::holds`]).
+enum Holds {
+    /// The entry is in the crate: it is checked.
+    Yes,
+    /// A `cfg` on the entry or an entry it is written in is false under the crate's atoms (or it
+    /// is a `#[test]` fn outside test mode, the Reference `attributes.testing.test.enabled`): it
+    /// is not in this crate, and this owner has nothing to check there.
+    No,
+    /// A `cfg` predicate there does not read (a form blaze-scope's `Cfg::eval` does not know):
+    /// the entry is named, never passed over (rule 3).
+    Unread,
+}
+
+/// The note of an entry whose `cfg` predicate does not read ([`Holds::Unread`]).
+const CFG_UNREAD: &str = "a `cfg` predicate on it or on an item it is written in does not read";
+
 /// A file job's type checks: per owner its checker, or why none could be made.
 pub(crate) struct FileTypes<'n> {
-    owners: std::vec::Vec<Result<Checker<'n>, &'n str>, Global>,
+    owners: std::vec::Vec<OwnerCheck<'n>, Global>,
     /// The job's reads ([`TypesJob::reads`]): each body's read list.
     reads: &'n [(Name, ContentId)],
     frame: &'n Frame,
@@ -752,7 +807,11 @@ impl<'n> FileTypes<'n> {
         let mut owners = std::vec::Vec::with_capacity_in(job.owners.len(), Global);
         for owner in job.owners.iter() {
             let _built = cx.span("body types: build a reader");
-            owners.push(checker(cx, root, job, owner, text, frame, heap));
+            owners.push(match checker(cx, root, job, owner, text, frame, heap) {
+                Ok(Some(checker)) => OwnerCheck::Checks(checker),
+                Ok(None) => OwnerCheck::NotInCrate,
+                Err(why) => OwnerCheck::Refused(why),
+            });
         }
         FileTypes { owners, reads: job.reads, frame, graphless: job.graph.is_none(), cx, left_out: false, heap }
     }
@@ -782,12 +841,10 @@ impl<'n> FileTypes<'n> {
             }
             return;
         }
-        // A `const` or `static` body is a note naming it (front2 checks fn bodies only); what
-        // an attribute at its entry wrote is still covered below.
-        let fn_entry = matches!(item.kind(), ItemKind::Function);
-        if matches!(item.kind(), ItemKind::Const | ItemKind::Static) {
-            crate::not_checked::items::file(made, (0, 0), item_path, "a `const` or `static` body: front2 checks fn bodies only", "");
-        }
+        // An entry with a body of its own: a fn's, or a `const`'s or `static`'s initializer
+        // (the Reference, "Constant items", "Static items": an expression of the declared type,
+        // checked as a fn's body is, its own task keyed by its text like a fn's).
+        let body_entry = matches!(item.kind(), ItemKind::Function | ItemKind::Const | ItemKind::Static);
         // The entry's index in its file's outline: what an expansion's origins name as the
         // entry its call is at (covered.rs `callers`). Only an entry a macro can take
         // (work.rs `may_expand`) asks for the crate's macro-written bodies.
@@ -799,19 +856,30 @@ impl<'n> FileTypes<'n> {
         let (cx, frame) = (self.cx, self.frame);
         for owner in self.owners.iter_mut() {
             let checker = match owner {
-                Ok(checker) => checker,
-                Err(why) => {
+                OwnerCheck::Checks(checker) => checker,
+                // Not this owner's file: another owner's crate holds it (enum doc).
+                OwnerCheck::NotInCrate => continue,
+                OwnerCheck::Refused(why) => {
                     crate::not_checked::items::file(made, (0, 0), item_path, "its owner's front end over records could not be made", why);
                     continue;
                 }
             };
+            match checker.holds(outline, item, text) {
+                Holds::Yes => {}
+                // Not in this owner's crate: nothing of it to check here (enum doc).
+                Holds::No => continue,
+                Holds::Unread => {
+                    crate::not_checked::items::file(made, (0, 0), item_path, CFG_UNREAD, "");
+                    continue;
+                }
+            }
             // Which bodies this entry covers: one home, covered.rs. Its own body (a fn's), then
             // every body an expansion at it wrote at module level (one `BodyCheck` an entry, all
             // its bodies: a macro call's, a derive's impl fns, an attribute's output). An entry
             // with no root and no expansion body is a note naming the item: never a pass.
             let mut roots: AVec<'_, covered::Root<'_>> = AVec::new_in(g);
             let mut no_root = None;
-            if fn_entry {
+            if body_entry {
                 match covered::root_of(checker.records, &checker.by_chain, &checker.mine, checker.file, chain, item, text, checker.root_file) {
                     Ok(root) => roots.push(root),
                     Err(no) => no_root = Some(no),
@@ -893,8 +961,8 @@ impl<'n> FileTypes<'n> {
                 // sealed sorted). A member whose key its world never filed has none to name.
                 let covered = match r.listed.body {
                     blaze_ladder::front2::project::BodyRef::Free(lib) => Some(blaze_ladder::front2::keys::checker_of(lib)),
-                    blaze_ladder::front2::project::BodyRef::Member { container, name, .. } => {
-                        checker.world.front.keys.filed_member(blaze_ladder::front2::keys::checker_of(container), blaze_ladder::front2::keys::MemberKind::Fn, name)
+                    blaze_ladder::front2::project::BodyRef::Member { container, kind, name, .. } => {
+                        checker.world.front.keys.filed_member(blaze_ladder::front2::keys::checker_of(container), kind, name)
                     }
                 };
                 made.covered.extend(covered);
@@ -918,7 +986,22 @@ impl<'n> FileTypes<'n> {
                         None => (0, 0),
                     }
                 };
+                // A name that a refused macro call of its module may have made is no error of
+                // the code: the refusal is its cause, said once, and the body is not checked,
+                // counted under it (not_checked/items.rs), once a body and call however many
+                // names. The cause is the words after the marker: the call and why it was refused
+                // (blaze-ladder front2 path_miss_shown.rs `refused_call`), so one call's items
+                // group under one line that names it.
+                let mut refused_causes: blaze_own::Vec<&str, _> = blaze_own::Vec::new_in(frame);
                 for d in verdict.diagnostics.iter() {
+                    if let Some(at) = d.text.find(blaze_ladder::front2::MACRO_REFUSED) {
+                        let cause = &d.text[at + blaze_ladder::front2::MACRO_REFUSED.len()..];
+                        if !refused_causes.contains(&cause) {
+                            crate::not_checked::items::file(made, at_entry(d.start, d.end), item_path, cause, d.text.as_str());
+                            refused_causes.push(cause);
+                        }
+                        continue;
+                    }
                     covered::find_once(made, TYPES, at_entry(d.start, d.end), d.code, prefix.as_str(), d.text.as_str());
                 }
                 // The typed lints' findings (blaze-typeck rules/args_inline.rs), numbered as the
@@ -979,6 +1062,31 @@ impl<'n> FileTypes<'n> {
 }
 
 impl<'n> Checker<'n> {
+    /// Whether the owner's crate holds the entry `item` of `outline` (over `text`): the
+    /// attributes of it and of each entry it is written in, read under the crate's cfg as the
+    /// names library lowered the crate (blaze-scope `item_attrs`, the one reading of them).
+    /// A walk up the parents, bounded by the outline's length.
+    fn holds(&self, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> Holds {
+        let all = outline.items();
+        let mut at = Some(item);
+        let mut steps = 0usize;
+        while let Some(entry) = at {
+            let attrs = blaze_scope::task::item_attrs(&self.cfg, outline, entry, text, self.heap);
+            if attrs.cfg_unread > 0 {
+                return Holds::Unread;
+            }
+            if !attrs.cfg_ok {
+                return Holds::No;
+            }
+            steps += 1;
+            if steps > all.len() {
+                return Holds::Unread;
+            }
+            at = entry.parent.and_then(|p| all.get(p.0 as usize));
+        }
+        Holds::Yes
+    }
+
     /// covered.rs `written_by` over the owner's crate, once a job.
     fn written_now(&mut self) -> &[covered::WrittenBy<'n>] {
         if self.written.is_none() {
@@ -1047,7 +1155,8 @@ impl<'n> Checker<'n> {
 }
 
 /// One owner's checker, or why none: its records, its world, its file's bodies by chain.
-fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owner: &'n Owner<'n>, text: &'n str, frame: &'n Frame, g: Alloc<'static>) -> Result<Checker<'n>, &'n str> {
+/// `Ok(None)`: the owner's crate does not hold the file ([`OwnerCheck::NotInCrate`]).
+fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owner: &'n Owner<'n>, text: &'n str, frame: &'n Frame, g: Alloc<'static>) -> Result<Option<Checker<'n>>, &'n str> {
     if let Some(missing) = owner.missing {
         return Err(missing);
     }
@@ -1073,11 +1182,21 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
     world.set_body_sources(opened.sources);
     let own = owner.readers.first().ok_or("an owner with no crates")?;
     let items = ItemsRecord::open(own.records.items, g).map_err(|e| words(format_args!("the items record of `{}`: {e:?}", own.crate_name)))?;
-    let file = (0..items.files() as u32)
-        .find(|i| matches!(items.file(*i), Ok(Some(row)) if row.path.in_package(own.package, g).as_deref().and_then(|p| p.strip_prefix("/0/")) == Some(job.path)))
-        .ok_or("the owner's items record no longer lists this file")?;
+    // The items record is the crate under its cfg, the `Owners` record its module tree in text
+    // (`OwnerCheck`'s doc): a file it does not list is no file of this owner's crate, and the
+    // owner whose crate holds it checks it. Both are inputs of this task, made from one snapshot.
+    let Some(file) =
+        (0..items.files() as u32).find(|i| matches!(items.file(*i), Ok(Some(row)) if row.path.in_package(own.package, g).as_deref().and_then(|p| p.strip_prefix("/0/")) == Some(job.path)))
+    else {
+        return Ok(None);
+    };
+    let cfg = match blaze_ladder::front2::source::NamesSource::cfg_atoms(records, 0) {
+        Some(atoms) => blaze_scope::task::Cfg::from_atoms(atoms, g),
+        None => return Err(words(format_args!("the cfg atoms of `{}` are not in its records", own.crate_name))),
+    };
     let mine: AVec<'n, Listed<'n>> = {
-        let listed = world.listed(g);
+        // An entry's own body is a fn's, a `const`'s or a `static`'s (work.rs `checked_body`).
+        let listed = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, g);
         let mut mine = AVec::with_capacity_in(listed.len(), g);
         mine.extend(listed.iter().copied().filter(|l| l.entry.is_some_and(|(f, _)| f == file)));
         mine
@@ -1087,5 +1206,5 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
         let said = record_words(error, owner.readers, job.packs, frame, g);
         return Err(words(format_args!("the records did not answer: {said}")));
     }
-    Ok(Checker { records, load, world, by_chain, file, mine, root_file: owner.root_file, readers: owner.readers, packs: job.packs, heads: heads::Heads::default(), written: None, heap: g })
+    Ok(Some(Checker { records, load, world, by_chain, file, mine, root_file: owner.root_file, readers: owner.readers, packs: job.packs, heads: heads::Heads::default(), written: None, cfg, heap: g }))
 }

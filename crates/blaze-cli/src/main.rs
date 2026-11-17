@@ -48,6 +48,7 @@ mod names;
 mod native_image;
 mod script_modules;
 mod scripts;
+mod sdk;
 mod not_checked;
 mod phases;
 mod print;
@@ -168,6 +169,8 @@ pub enum CliError {
     Pool(bstd::task::TaskError),
     /// A settled input a task needed could not be read (work.rs, `payload`).
     Input { name: blaze_drive::Name, why: work::InputWhy },
+    /// [`CliError::Input`] while the job of `task` was made (work.rs): the task and its input.
+    TaskInput { task: blaze_drive::Name, name: blaze_drive::Name, why: work::InputWhy },
     /// The toolchain's shelf, which gives the target's cfg to the dependency graph (graph.rs),
     /// could not be reached.
     Shelf(toolchain::ShelfError),
@@ -220,6 +223,7 @@ impl fmt::Display for CliError {
             CliError::Producers(error) => write!(f, "{error}"),
             CliError::Pool(error) => write!(f, "{error}"),
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
+            CliError::TaskInput { task, name, why } => write!(f, "the input {name} of the task {task} could not be read while its job was made: {why}"),
             CliError::Shelf(error) => write!(f, "{error}"),
             CliError::Toolchain(error) => write!(f, "the pinned toolchain: {error}"),
             CliError::Panicked { command } => write!(f, "blaze {command} panicked (its message is above); what it had done is in .blaze/v2/profile.txt"),
@@ -260,6 +264,8 @@ fn every_rule(rule: u16) -> bool {
     rule != names::include_outside::INCLUDE_OUTSIDE_PACKAGE
         && rule != body_types::TYPES_NOT_CHECKED
         && rule != body_types::BORROWS_NOT_CHECKED
+        // A task that failed only because one it needs failed: its root is the failure.
+        && rule != work::WAITED
         && (body_types::BORROWS_ARE_ERRORS || rule != body_types::BORROWS)
         // A lint finding's level is the step's, decided when printed (rule 81): every step's is
         // advice today, never an error, so no lint changes the exit status (lints.rs `level_of`).
@@ -271,6 +277,9 @@ struct Flags<'a> {
     dir: Option<&'a str>,
     color: Choice,
     stats: bool,
+    /// `--each`: every consequence finding (a task waiting on a failed one, an item not
+    /// checked) drawn one by one as well as counted under its cause (print.rs `Shown::each`).
+    each: bool,
     origin: Option<&'a str>,
     origin_key: Option<&'a str>,
     /// `--grant name=value`, each a capability the program is given (run.md).
@@ -295,6 +304,7 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
         dir: None,
         color: Choice::Auto,
         stats: false,
+        each: false,
         origin: None,
         origin_key: None,
         grants: std::vec::Vec::new(),
@@ -337,6 +347,7 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
                 flags.grants.push(pair);
             }
             "--stats" => flags.stats = true,
+            "--each" => flags.each = true,
             "-p" | "--package" => flags.select.package = Some(value()?),
             "--bin" => flags.select.bin = Some(value()?),
             _ if arg.starts_with("--package=") => flags.select.package = Some(&arg["--package=".len()..]),
@@ -486,7 +497,8 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         (Some(pwd), None) => bstd::mem::format_in!(frame, "{pwd}"),
         (None, dir) => bstd::mem::format_in!(frame, "{}", dir.unwrap_or(".")),
     };
-    let shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
+    let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
+    shown.each = flags.each;
     phases.mark_in("open checkout", frame);
     let mut ran = None;
     let workers = flags.workers.map_or(u32::try_from(workers).unwrap_or(u32::MAX), |n| n.get());
@@ -507,6 +519,10 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
             None => Err(fetch::ExeDirWhy::NotUtf8),
         },
     };
+    // The macOS SDK, resolved once here at the edge (rule 75; sdk.rs): `SDKROOT`, else what
+    // xcrun prints, by its deadline. A refusal is a value: only a script placed native fails on
+    // it, by name (scripts.rs).
+    let sdk = sdk::resolve(cx, var("SDKROOT"), &sdk::XcrunEnv { path: var("PATH"), developer_dir: var("DEVELOPER_DIR"), home: var("HOME") }, frame);
     // The one store a user (drive.md, "The store under the command"), opened here, outside the
     // request: every record lent from it outlives the request, and its ONE commit, carrying the
     // records and the roots, comes after the answer is printed (below).
@@ -519,7 +535,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         // request asked in full walks, so a second one is blaze's bug, named).
         let mut in_full = false;
         loop {
-            let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, var("SDKROOT"), exe_dir), origin.as_ref(), (&opened.home, &opened.lent, opened.open_ns), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases, heap, in_full);
+            let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, sdk, exe_dir), origin.as_ref(), (&opened.home, &opened.lent, opened.open_ns), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases, heap, in_full);
             if !in_full && matches!(finished, Err(CliError::AnswerInFull { .. })) {
                 in_full = true;
                 continue;
@@ -597,23 +613,36 @@ fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Show
     let mut unchecked = 0u32;
     if ran.is_none() {
         let tail = (command == Command::Test).then_some("tests are not run yet: this build of blaze checks them");
-        // The tasks not run because an input they read could not be made, one line a cause
-        // (not_checked/tasks.rs): the input's own finding was printed once, above.
-        not_checked::tasks::lines(&shown.not_run, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
-        // The items `check` could not check, one line a cause (not_checked/items.rs), before
-        // the closing line.
+        // The items `check` could not check: their lines, one a cause, were drawn with the
+        // other notes (main.rs `draw`), before the findings; here only their count.
         if matches!(command, Command::Check | Command::Run) {
-            unchecked = not_checked::items::lines(&shown.unchecked, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
+            unchecked = not_checked::items::lines(&shown.unchecked, frame, &mut |_| Ok(()))?;
+        }
+        // Each stage the closing line says was NOT checked because this build does not build
+        // it, with its reason (work.rs `CHECK_STAGES`): a body's refusal names its own, but a
+        // stage not built refuses no body, and "NOT checked" must never stand alone (rule 19).
+        if coverage.is_some() {
+            for (stage, built, why) in work::CHECK_STAGES {
+                if !built {
+                    print::note(cx, bstd::mem::format_in!(frame, "NOT checked: {stage}: {why}").as_str(), shown, frame, out)?;
+                }
+            }
         }
         print::closing(cx, shown, finished.checked, in_main, Some(finished.answer.profile.runs()), tail, coverage, frame, out)?;
-        // Its own summary line, beside the closing line's counts (never "0 errors" beside it).
-        if unchecked > 0 {
-            print::note(cx, not_checked::items::summary(unchecked, frame).as_str(), shown, frame, out)?;
+        // Its own summary line, beside the closing line's counts (never "0 errors" beside it):
+        // every item not checked, those behind a failure too. A body not run because an input
+        // failed is an item its cause's line above named.
+        if matches!(command, Command::Check | Command::Run) {
+            let not_run = shown.not_run.iter().filter(|task| task.kind == blaze_drive::Kind::BodyCheck.name()).count();
+            let own = unchecked.saturating_add(u32::try_from(not_run).unwrap_or(u32::MAX));
+            if let Some(words) = not_checked::items::summary(own, shown.behind, frame) {
+                print::note(cx, words.as_str(), shown, frame, out)?;
+            }
         }
     }
     // A task not run because an input failed is not counted as an error, but the command did not
     // do what it was asked: it fails, whatever the input's own finding counted.
-    if shown.counts.errors > 0 || finished.answer.failed > 0 || !shown.not_run.is_empty() {
+    if shown.counts.errors > 0 || shown.counts.failures > 0 || finished.answer.failed > 0 || !shown.not_run.is_empty() {
         // A program that did not run because of what was found is blaze's refusal (L6):
         // `NOT_RUN`, never 1, a status the program itself could have ended with.
         return Ok(match (command, ran) {
@@ -727,7 +756,7 @@ fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> 
 fn check_coverage(names_held: bool, types_whole: bool, borrows_whole: bool, frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
     let mut ran = Vec::new_in(frame);
     let mut not = Vec::new_in(frame);
-    for (stage, built) in work::CHECK_STAGES {
+    for (stage, built, _) in work::CHECK_STAGES {
         match built
             && (names_held || stage != work::NAMES_STAGE)
             && (types_whole || stage != work::TYPES_STAGE)
@@ -754,6 +783,38 @@ struct Finished<'f> {
     /// Whether the answer holds the crates' names: `false` when the stage did not run, which
     /// the closing line then names ("NOT checked: names, ..").
     names_held: bool,
+}
+
+/// A sealed last answer and leaf table (`seal::seal`) as the request reads them: its `Last`
+/// bytes (none when of an older form) and its table. An older or torn record is a notice and
+/// no answer: the request starts cold and writes its own over it.
+fn open_sealed<'m>(held: &'m [u8], notices: &mut Vec<Notice, &Frame>) -> Result<(Option<&'m [u8]>, Leaves<'m>), CliError> {
+    let bytes = match home::current(seal::PATH, held, seal::SEAL_MAGIC) {
+        Ok(bytes) => bytes,
+        Err(older) => {
+            notices.push(Notice::Older(older));
+            return Ok((None, Leaves::EMPTY));
+        }
+    };
+    let (last, leaves) = match seal::open(bytes, seal::Plant::None) {
+        Ok(opened) => opened,
+        Err(torn) => {
+            notices.push(Notice::Torn(torn));
+            return Ok((None, Leaves::EMPTY));
+        }
+    };
+    let (leaves, older) = Leaves::of(leaves)?;
+    if let Some(older) = older {
+        notices.push(Notice::Older(older));
+    }
+    let last = match home::current(LAST, last, blaze_drive::answers::LAST_MAGIC) {
+        Ok(bytes) => Some(bytes),
+        Err(older) => {
+            notices.push(Notice::Older(older));
+            None
+        }
+    };
+    Ok((last, leaves))
 }
 
 /// The rows the answer keeps (the leaf table): each source file the request holds, each absent
@@ -789,8 +850,9 @@ fn request<'f>(
     // then `HOME`, cargo's home (`CARGO_HOME`, else `<HOME>/.cargo`: its archive cache, fetch.rs)
     // and `PWD`, where the toolchain's shelf is (the target's cfg, graph.rs); then the toolchain
     // the command opens (`blaze_toolchain::PINNED` from `main`, a fixture's in tests); then
-    // `SDKROOT`, the macOS SDK folder the native build-script runner is given (scripts.rs); then
-    // the running blaze's folder, where the fact shim is (D112, N7).
+    // the macOS SDK, resolved once at the edge (sdk.rs): the native build-script runner takes its
+    // folder, the scripts' keys its identity (scripts.rs); then the running blaze's folder, where
+    // the fact shim is (D112, N7).
     (checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, sdk, exe_dir): (
         &'f str,
         Option<&'f str>,
@@ -799,7 +861,7 @@ fn request<'f>(
         Option<&'f str>,
         Option<&'f str>,
         blaze_toolchain::ToolchainId,
-        Option<&'f str>,
+        Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>,
         Result<&'f str, fetch::ExeDirWhy>,
     ),
     origin: Option<&store::NamedOrigin>,
@@ -867,37 +929,13 @@ fn request<'f>(
     };
     let ask = Ask { command, args: b"", gate, space: Space::NONE, program, facts: &[] };
     let shape = blaze_drive::request::shape_of(&ask);
-    let last_root = store::last_root(checkout_at, &blaze_drive::pointers::PointerName::of(tool, &shape));
+    let pointer = blaze_drive::pointers::PointerName::of(tool, &shape);
+    let last_root = store::last_root(checkout_at, &pointer);
     // Each a note after the findings (`draw`).
     let mut notices: Vec<Notice, &Frame> = Vec::new_in(frame);
     let (last, leaves) = match store::last(lent, &last_root)? {
         None => (None, Leaves::EMPTY),
-        Some(held) => match home::current(seal::PATH, held.bytes, seal::SEAL_MAGIC) {
-            Err(older) => {
-                notices.push(Notice::Older(older));
-                (None, Leaves::EMPTY)
-            }
-            Ok(bytes) => match seal::open(bytes, seal::Plant::None) {
-                Err(torn) => {
-                    notices.push(Notice::Torn(torn));
-                    (None, Leaves::EMPTY)
-                }
-                Ok((last, leaves)) => {
-                    let (leaves, older) = Leaves::of(leaves)?;
-                    if let Some(older) = older {
-                        notices.push(Notice::Older(older));
-                    }
-                    let last = match home::current(LAST, last, blaze_drive::answers::LAST_MAGIC) {
-                        Ok(bytes) => Some(bytes),
-                        Err(older) => {
-                            notices.push(Notice::Older(older));
-                            None
-                        }
-                    };
-                    (last, leaves)
-                }
-            },
-        },
+        Some(held) => open_sealed(held.bytes, &mut notices)?,
     };
     // A pointer that says another tool or shape than its name does (two (tool, shape)s whose
     // names' 64 bits collide; before the names, another build's or command's `.blaze/v2/last`)
@@ -947,6 +985,27 @@ fn request<'f>(
     phases.mark_in("layout", frame);
     // The units' source: what the layout read. Equal reads, equal layout.
     let units = sweep::units_source(facts.rows.rows.iter().map(|leaf| (facts.rows.path(leaf), leaf)), frame);
+    // A cold checkout another checkout's answer may cover (a second worktree's first command):
+    // the last answer for today's units' source, whichever checkout of this machine wrote it
+    // (`store::seed_root`), followed as this checkout's own table would be. Its reads hashed
+    // here key the certificate, so equal text is a hit that runs and puts nothing (the drive's
+    // `certified`); other text walks forward from that answer. Trusted for nothing its key does
+    // not say: a seed of other text only misses. Before, such a command walked the whole build
+    // from records and wrote its root, page and certificate again (store_worktree_tests.rs:
+    // "written 3").
+    let seed_root = store::seed_root(&units, &pointer);
+    let mut seeded: Option<&[u8]> = None;
+    let (followed, last, cold) = match (cold && !in_full).then(|| store::last(lent, &seed_root)).transpose()?.flatten() {
+        Some(held) => match open_sealed(held.bytes, &mut notices)? {
+            (Some(bytes), seed_leaves) if blaze_drive::request::walks_from(bytes, tool, &shape).map_err(|error| CliError::Drive(DriveError::LastFile(error)))? => {
+                seeded = Some(bytes);
+                (sweep::Follow { stamps, plant: sweep_plant }.follow(&cx, root, home_dir, &seed_leaves, frame)?, Some(bytes), false)
+            }
+            _ => (followed, last, cold),
+        },
+        None => (followed, last, cold),
+    };
+    phases.mark_in("seed (another checkout's last answer)", frame);
     // The dependency graph's job, when a lock was read with the layout: its source needs the
     // units' source and the target's cfg, which the toolchain's shelf states.
     if let Some(laid) = facts.laid.as_mut()
@@ -1046,6 +1105,8 @@ fn request<'f>(
     // while work it asked for before is still queued: what writes (puts, prints, the table, the
     // last answer) is still done, and what would step the answered machine is not asked again.
     let mut answered: Option<Answer> = None;
+    // The drive asked its `WriteLast`: this checkout's root names this answer.
+    let mut wrote_last = false;
     let answer = loop {
         for effect in effects.drain(..) {
             todo.push_back(effect);
@@ -1228,7 +1289,8 @@ fn request<'f>(
                 // and every record it names are committed by the ONE flip after the answer is
                 // printed (blaze-cas plain/root_commit_tests.rs), so no pointer names an absent record.
                 let leaves = Leaves::bytes_in(&kept(&req, &followed, &facts.rows, frame), frame)?;
-                store.set_last(&cx, &last_root, &seal::seal(&bytes, &leaves, frame)?)?;
+                store.set_last(&cx, &[&last_root, &seed_root], &seal::seal(&bytes, &leaves, frame)?)?;
+                wrote_last = true;
                 phases.request.write_last += phases.since(at);
             }
             Effect::Done(mut answer) => {
@@ -1241,6 +1303,17 @@ fn request<'f>(
         phases.took(kind, frame);
     };
     let mut answer = answer;
+    // A seeded hit: its `Last` already names this certificate, so the drive asked no write. This
+    // checkout's own root gets it, sealed with today's stamps, so its next command follows its
+    // own table and hashes nothing its stamps prove. A root and the one sealed record; no
+    // record of the drive's is put.
+    if let Some(bytes) = seeded
+        && !wrote_last
+        && answer.profile.certified
+    {
+        let leaves = Leaves::bytes_in(&kept(&req, &followed, &facts.rows, frame), frame)?;
+        store.set_last(&cx, &[&last_root], &seal::seal(bytes, &leaves, frame)?)?;
+    }
     store.after_answer(&cx, &mut answer.profile)?;
     phases.mark_in("store after answer", frame);
     // A file read that was not the sweep's text (`Why::Changed`): the answer is refused, naming
@@ -1266,20 +1339,9 @@ fn request<'f>(
     // One file's findings at a time, in frames of a task's scratch size: freed a file and a
     // finding, and gone with the drawing.
     let mut scratch = print::Scratch::new(sizes.scratch)?;
-    draw(&cx, root, &req, command, &facts.found, &prints, program.as_ref(), &failed, facts.names.as_ref(), &notices, shown, &mut scratch, frame, out)?;
+    // The names step's note (what it resolved) is drawn there, with the other notes.
+    draw(&cx, root, &req, command, &facts.found, &prints, program.as_ref(), &failed, facts.names.as_ref(), &notices, ran.is_some(), shown, &mut scratch, phases, frame, out)?;
     drop(scratch);
-    // The names step (names.rs): what this command resolved, never printed as errors.
-    // Nothing follows a program that ran (`close`): its output is the command's, and a note
-    // about the check's known gaps is `check`'s to say, not a clean run's.
-    if let Some(names) = facts.names.as_ref().filter(|names| names.unresolved > 0 && ran.is_none()) {
-        let words = bstd::mem::format_in!(
-            frame,
-            "names resolved for {} crates; {} paths unresolved by known gaps (not reported as errors; interim: macros are not run, build scripts' outputs are not given, every record is in the project's store)",
-            names.resolved,
-            names.unresolved
-        );
-        print::note(&cx, words.as_str(), shown, frame, out)?;
-    }
     phases.request.prints += phases.since(at);
     let checked = rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent()).count();
     high.request = frame.peak();
@@ -1348,12 +1410,21 @@ fn draw<'f>(
     failed: &work::Failures<'_>,
     names: Option<&crate::names::Names<'_>>,
     notices: &[Notice],
+    program_ran: bool,
     shown: &mut print::Shown<'f>,
     scratch: &mut print::Scratch,
+    phases: &mut Phases,
     frame: &'f Frame,
     out: &Out,
 ) -> Result<(), CliError> {
     const NO_ROOM: CliError = CliError::Text { what: "the command's frame has no room to list its findings: a finding takes a `Listed`, its words and its path there" };
+    // Each part's time, into the profile's `prints` line (phases.rs `PrintParts`).
+    let mut lap = phases.now();
+    let mut part = |phases: &mut Phases, into: fn(&mut phases::PrintParts) -> &mut u64| {
+        let now = phases.now();
+        *into(&mut phases.request.print_parts) += now.since(lap).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        lap = now;
+    };
     // Each finding placed in today's text with its id and fix (fix.rs): a crate's unresolved
     // path carries its file, item and edition in its message, placed now in the file as it is
     // (names.rs `place_pieces`; rule 71). The id's item is a Rust file's outline item read in
@@ -1371,7 +1442,27 @@ fn draw<'f>(
         copy.extend_from_slice(bytes);
         Ok(copy.leak())
     };
+    // A consequence finding (print.rs `counted_only`, and a task that waited on a failed one) is
+    // counted under its cause, never placed in its file, unless `--each` asks for each.
+    let each = shown.each;
+    let waited = |finding: &Print<'_>| finding.rule == work::WAITED && !each;
+    let counted = |finding: &Print<'_>| print::counted_only(finding.rule) && !each;
     for finding in prints.iter() {
+        if waited(finding) {
+            // Its words are read from the print below (`waits`): nothing copied.
+            wanted.push(print::Wanted { path: None, place: print::Place::Counted, words: &[] });
+            continue;
+        }
+        if counted(finding) {
+            // Only an item not checked is named with its file (not_checked/items.rs `keep`): a
+            // task not run and a borrow check not done are counted by cause alone.
+            let path = match finding.rule == body_types::TYPES_NOT_CHECKED {
+                true => print::file_of(req, found, finding, frame)?,
+                false => None,
+            };
+            wanted.push(print::Wanted { path, place: print::Place::Counted, words: kept(&finding.message)? });
+            continue;
+        }
         let placed = finding.rule == names::UNRESOLVED
             || finding.rule == names::include_outside::INCLUDE_OUTSIDE_PACKAGE
             || finding.rule == names::failed_call::FAILED_CALL;
@@ -1393,40 +1484,51 @@ fn draw<'f>(
     }
     print::list(cx, root, prints, &wanted, scratch, frame, &mut shown.listed)?;
     fix::lengths(&mut shown.listed[first..], frame);
+    part(phases, |p| &mut p.listing);
     // (file, position, the request's finding or the program's refusal, its index).
     let mut order: Vec<(Option<&str>, u32, bool, usize), &Frame> = Vec::try_with_capacity_in(prints.len() + program.map_or(0, |program| program.refusals.len()), frame).map_err(|_| NO_ROOM)?;
+    // The waited tasks (not_checked/waited.rs), and the tasks that failed on their own: each
+    // ROOT drawn last, once, with what hangs from it counted under it.
+    let mut waits: Vec<not_checked::waited::Wait<'_>, &Frame> = Vec::new_in(frame);
+    let mut roots: Vec<usize, &Frame> = Vec::new_in(frame);
     for (i, finding) in prints.iter().enumerate() {
+        // Counted under its root whether or not `--each` draws it too: the summary line counts
+        // every item not checked (not_checked/items.rs `summary`).
+        if finding.rule == work::WAITED {
+            // Under each name whose record held this one wait (blaze-drive `Print::also`: a
+            // library's scope and its test unit's, one label): a task waiting on the other
+            // waits through it to the same root. Under `name` alone, what waited on the other
+            // printed as a cause of its own, "`CrateScope(4509d8507735)` failed: 10 crates ..",
+            // a key and no reason (tempo, 2026-11-17 08:02).
+            let (on, label) = not_checked::waited::read(&finding.message)?;
+            for name in core::iter::once(finding.name).chain(finding.also.iter().copied()) {
+                waits.push(not_checked::waited::Wait { name, on, label, file: finding.file });
+            }
+            if waited(finding) {
+                continue;
+            }
+        }
+        if counted(finding) {
+            // Kept by cause (not_checked/items.rs, tasks.rs) and counted; nothing drawn.
+            let listed = shown.listed[first + i];
+            print::finding(cx, &listed, &[], shown, scratch.one(), out)?;
+            continue;
+        }
+        // A file not text is the user's error, not a failure (print.rs counts it so), but what
+        // waits on it hangs from it the same way.
+        if finding.rule == work::TASK_FAILED || finding.rule == work::FILE_NOT_TEXT {
+            roots.push(first + i);
+            continue;
+        }
         // A finding whose item is no longer in its file is listed at its name, with no file.
         let listed = &shown.listed[first + i];
         let at = if listed.path.is_some() { listed.start } else { finding.place.saturating_add(finding.start) };
         order.push((listed.path, at, false, i));
     }
-    if let Some(program) = program {
-        for (i, refusal) in program.refusals.iter().enumerate() {
-            let path = refusal.file.and_then(|file| program.texts.get(file as usize)).map(|it| it.0);
-            order.push((path, refusal.place.saturating_add(refusal.start), true, i));
-        }
-    }
-    let source = |path: Option<&str>| !path.is_some_and(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
-    // In a file, its lint findings after its type and borrow findings (lint.md: advice after).
-    let lint = |entry: &(Option<&str>, u32, bool, usize)| !entry.2 && lints::is_lint(prints[entry.3].rule);
-    order.sort_by(|a, b| (source(a.0), a.0, lint(a), a.1, a.2).cmp(&(source(b.0), b.0, lint(b), b.1, b.2)));
-    // A file's findings are neighbours in that order: the file is read once for the run.
-    let mut at = 0;
-    while at < order.len() {
-        let (path, _, of_program, i) = order[at];
-        if of_program {
-            // Only a program's refusals are entered so, above.
-            if let Some(program) = program {
-                print::refusal(cx, &program.refusals[i], &program.texts, shown, scratch.one(), out)?;
-            }
-            at += 1;
-            continue;
-        }
-        let run = &order[at..at + order[at..].iter().take_while(|next| !next.2 && next.0 == path).count()];
-        at += run.len();
-        print::file_findings(cx, root, path, run.iter().map(|&(_, _, _, i)| first + i), shown, scratch, out)?;
-    }
+    let groups = not_checked::waited::groups(&mut waits, frame)?;
+    part(phases, |p| &mut p.grouping);
+    // The notes first, the code's findings after them, the failures last: what to fix is what
+    // the eye lands on, above the closing line.
     // A failed task is the tool's, not the code's: named with its file, and the command fails
     // (its answer is not written, so the next command runs the task again). What was not
     // checked because of it is named below by cause, at crate grain (not_checked.rs, D115 (6)).
@@ -1454,6 +1556,98 @@ fn draw<'f>(
     if let Some(unchecked) = program.and_then(|program| program.unchecked.as_deref()) {
         print::note(cx, unchecked, shown, frame, out)?;
     }
+    // Nothing follows a program that ran (`close`): its output is the command's, and a note
+    // about the check's known gaps is `check`'s to say, not a clean run's.
+    if program_ran {
+        // Only the findings, as before; no note of what was not checked.
+    } else {
+        // No note of the names step's own counts ("names resolved for N crates; M paths
+        // unresolved"): it is said only when that step ran, so a no-op repeat, which runs
+        // nothing, printed other bytes than the run it repeats. What is printed is what the
+        // records hold (the findings, the causes), the same bytes for the same tree.
+        // The tasks not run because an input they read could not be made, one line a cause
+        // (not_checked/tasks.rs): the input's own finding is printed once, below.
+        not_checked::tasks::lines(&shown.not_run, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
+        // The items `check` could not check, one line a cause (not_checked/items.rs).
+        if matches!(command, Command::Check | Command::Run) {
+            not_checked::items::lines(&shown.unchecked, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
+        }
+    }
+    part(phases, |p| &mut p.notes);
+    if let Some(program) = program {
+        for (i, refusal) in program.refusals.iter().enumerate() {
+            let path = refusal.file.and_then(|file| program.texts.get(file as usize)).map(|it| it.0);
+            order.push((path, refusal.place.saturating_add(refusal.start), true, i));
+        }
+    }
+    let source = |path: Option<&str>| !path.is_some_and(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
+    // In a file, its lint findings after its type and borrow findings (lint.md: advice after).
+    let lint = |entry: &(Option<&str>, u32, bool, usize)| !entry.2 && lints::is_lint(prints[entry.3].rule);
+    order.sort_by(|a, b| (source(a.0), a.0, lint(a), a.1, a.2).cmp(&(source(b.0), b.0, lint(b), b.1, b.2)));
+    // A file's findings are neighbours in that order: the file is read once for the run.
+    let mut at = 0;
+    while at < order.len() {
+        let (path, _, of_program, i) = order[at];
+        if of_program {
+            // Only a program's refusals are entered so, above.
+            if let Some(program) = program {
+                print::refusal(cx, &program.refusals[i], &program.texts, shown, scratch.one(), out)?;
+            }
+            at += 1;
+            continue;
+        }
+        let run = &order[at..at + order[at..].iter().take_while(|next| !next.2 && next.0 == path).count()];
+        at += run.len();
+        print::file_findings(cx, root, path, run.iter().map(|&(_, _, _, i)| first + i), shown, scratch, out)?;
+    }
+    part(phases, |p| &mut p.findings);
+    // Last, each task that failed on its own, in name order (rule 25), drawn once with what
+    // hangs from it on the line under it.
+    roots.sort_by(|a, b| (shown.listed[*a].about, shown.listed[*a].path, shown.listed[*a].start).cmp(&(shown.listed[*b].about, shown.listed[*b].path, shown.listed[*b].start)));
+    let mut said: Vec<bool, &Frame> = Vec::with_capacity_in(groups.len(), frame);
+    said.extend(groups.iter().map(|_| false));
+    for (n, &at) in roots.iter().enumerate() {
+        let listed = shown.listed[at];
+        print::file_findings(cx, root, listed.path, core::iter::once(at), shown, scratch, out)?;
+        // A root twice (two configurations of one task) has its count under the last.
+        let last_of_name = roots.get(n + 1).is_none_or(|next| shown.listed[*next].about != listed.about);
+        if !last_of_name {
+            continue;
+        }
+        // What waited on it, or on a name whose record held this same failure, printed once
+        // here (blaze-drive `Print::also`: a library and its test unit): one line, the counts
+        // of all of them together.
+        let mut causes: Vec<usize, &Frame> = Vec::new_in(frame);
+        for cause in core::iter::once(&listed.about).chain(prints[at - first].also.iter()) {
+            if let Ok(g) = groups.binary_search_by(|group| group.cause.cmp(cause))
+                && !said[g]
+            {
+                said[g] = true;
+                causes.push(g);
+            }
+        }
+        match causes.as_slice() {
+            [] => {}
+            [one] => {
+                shown.behind.add(groups[*one].items);
+                print::note(cx, not_checked::waited::line(&groups[*one], scratch.one())?.as_str(), shown, frame, out)?;
+            }
+            many => {
+                let merged = not_checked::waited::merged(many.iter().map(|g| &groups[*g]), frame)?;
+                shown.behind.add(merged.items);
+                print::note(cx, not_checked::waited::line(&merged, scratch.one())?.as_str(), shown, frame, out)?;
+            }
+        }
+    }
+    // A cause with no failure of its own printed (it was not filed: the machine's own, or a
+    // hole): named by the drive's name, with its count.
+    for (group, _) in groups.iter().zip(said.iter()).filter(|(_, said)| !**said) {
+        shown.behind.add(group.items);
+        let one = scratch.one();
+        let words = bstd::mem::format_in!(one, "`{}` failed: {}", group.cause, not_checked::waited::line(group, one)?.as_str());
+        print::note(cx, words.as_str(), shown, frame, out)?;
+    }
+    part(phases, |p| &mut p.roots);
     Ok(())
 }
 
@@ -1584,6 +1778,8 @@ mod tests {
         profile: std::string::String,
         /// The errors it found (`Counts.errors`): notes are not counted.
         errors: u32,
+        /// The tasks that failed on their own (`Counts.failures`), apart from the errors.
+        failures: u32,
         /// The exit status `command` returns for it (`close`), `None` where `close` failed.
         status: Option<u8>,
         /// `--fix` refused (its line printed) and wrote nothing.
@@ -1607,6 +1803,7 @@ mod tests {
                 resolved: 0,
                 profile: std::string::String::new(),
                 errors: 0,
+                failures: 0,
                 status: Some(1),
                 refused: true,
                 ids: std::vec::Vec::new(),
@@ -1615,9 +1812,11 @@ mod tests {
         }
     }
 
+    mod check_whole_tests;
     mod draw_tests;
     mod extra_roots_tests;
     mod failed_call_tests;
+    mod failed_roots_tests;
     mod fix_tests;
     mod members_tests;
     mod names_records_tests;
@@ -1736,7 +1935,7 @@ mod tests {
         let opened = store::open_for_command(&cx, io, Some("/h"), &root, "ws", phases.clock(), &err)?;
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
             let workers = WORKERS.with(core::cell::Cell::get);
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, None, Err(fetch::ExeDirWhy::NotRead)), None, (&opened.home, &opened.lent, opened.open_ns), command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases, blaze_own::testing::heap(), false);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, crate::sdk::NONE_IN_TESTS, Err(fetch::ExeDirWhy::NotRead)), None, (&opened.home, &opened.lent, opened.open_ns), command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases, blaze_own::testing::heap(), false);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {
@@ -1774,6 +1973,7 @@ mod tests {
             // The errors as the closing line counts them (`close`): a note (a stage that did not
             // run, its why) is listed but is no error.
             errors: shown.counts.errors,
+            failures: shown.counts.failures,
             refused: false,
             ids: shown.listed.iter().map(|l| (l.code().to_owned(), l.id.as_str().to_owned())).collect(),
             words: shown.listed.iter().map(|l| std::string::String::from_utf8_lossy(l.words).into_owned()).collect(),
@@ -1817,18 +2017,24 @@ mod tests {
             root.publish(&cx, &Path::new("a/src/lib.rs").expect("a path"), Content::bytes(b"pub fn f() -> u8 {\n    1\n}\n// \xff\xfe\n"), Durable::No).expect("write");
         }
         let sizes = work::Sizes { plant, ..work::Sizes::USUAL };
+        // A file blaze cannot read as text is the user's error at that file (work.rs
+        // `FILE_NOT_TEXT`), never only a failure of the tool.
         let first = check(&io, sizes);
         if first.errors == 0 {
             return Err(format!("a module file that is not UTF-8 is no error:\n{}", first.profile));
         }
         let repeat = check(&io, sizes);
-        if !(repeat.certified && repeat.runs == 0 && repeat.errors == first.errors) {
-            return Err(format!("the repeat: certified {}, {} runs, {} errors (first {}):\n{}", repeat.certified, repeat.runs, repeat.errors, first.errors, repeat.profile));
+        if !(repeat.certified && repeat.runs == 0 && (repeat.errors, repeat.failures) == (first.errors, first.failures)) {
+            return Err(format!("the repeat: certified {}, {} runs, {} errors {} failures (first {} {}):\n{}", repeat.certified, repeat.runs, repeat.errors, repeat.failures, first.errors, first.failures, repeat.profile));
         }
         write(&io, "a/src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n");
         let fixed = check(&io, sizes);
-        if fixed.errors != 0 || !fixed.failed.is_empty() {
-            return Err(format!("after the fix: {} errors, failed {:?}:\n{}", fixed.errors, fixed.failed, fixed.profile));
+        // A waited task's record left standing is no error and no failure, but its finding is
+        // still listed (counted under a cause): a stale one is a filed failure that outlived
+        // its input.
+        let waited = fixed.ids.iter().filter(|(code, _)| code == "waited").count();
+        if fixed.errors + fixed.failures != 0 || !fixed.failed.is_empty() || waited != 0 {
+            return Err(format!("after the fix: {} errors {} failures, failed {:?}:\n{}", fixed.errors, fixed.failures, fixed.failed, fixed.profile));
         }
         Ok(())
     }
@@ -2137,6 +2343,11 @@ mod tests {
         // A narrow line keeps what was NOT checked and drops the rest (blaze-report `closing`).
         // Its bodies' types are checked over records (piece 7): only borrows are left out.
         assert!(last.contains("NOT checked: borrows") && !last.contains("types") && !last.contains(" ok"), "{last}");
+        // A "NOT checked" never stands without its reason: no body was refused here, so the
+        // stage's own (work.rs `CHECK_STAGES`) is a note before the closing line. Control: it
+        // names the flag that keeps the stage off, so it goes when the flag flips.
+        let reason = out.lines().find(|line| line.contains("NOT checked: borrows:")).unwrap_or_else(|| panic!("no note says why borrows were not checked:\n{out}"));
+        assert!(reason.contains("BORROWS_ARE_ERRORS"), "{reason}");
         let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\nfn fn\n");

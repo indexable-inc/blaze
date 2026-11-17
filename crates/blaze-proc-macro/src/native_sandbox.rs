@@ -262,7 +262,10 @@ mod linux {
                 ruleset.add(program, EXECUTE | READ_FILE)?;
             }
             for path in grant.write {
-                ruleset.add(path, handled)?;
+                // A folder takes every right; a file (the jobserver's fifo) only a file's, which
+                // is all Landlock lets a rule on a non-folder hold (others are `EINVAL`).
+                let folder = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(true);
+                ruleset.add(path, if folder { handled } else { READ_FILE | WRITE_FILE | TRUNCATE })?;
             }
             // The folders whose programs may be started (D112), as the macOS profile's
             // `exec_under` lets them: started and read.

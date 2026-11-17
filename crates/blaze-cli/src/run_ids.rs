@@ -74,7 +74,7 @@
 
 use core::fmt;
 
-use blaze_drive::key::{ABSENT, task_key, value_key_with_cells};
+use blaze_drive::key::{ABSENT, MOST_SHAPE_STEPS, task_key, value_key_with_cells};
 use blaze_drive::record::{Stored, open};
 use blaze_drive::{Cell, CellRead, Key, Kind, Name, Tool, WireError};
 use blaze_id::CrateItemKey;
@@ -622,8 +622,8 @@ pub(crate) enum RunIdsError<'n> {
     StoodUnread,
     /// A record of `item`'s check does not read as the drive's.
     Record { item: ItemKey, why: WireError },
-    /// The value record found for `item` is a shape.
-    ValueIsShape { item: ItemKey },
+    /// The lookup of `item`'s check followed more than `MOST_SHAPE_STEPS` shapes.
+    ShapeSteps { item: ItemKey },
     /// The store could not be read for `item`.
     Store { item: ItemKey, why: CliError },
     /// The table record's bytes are not a table of this form.
@@ -674,7 +674,7 @@ impl fmt::Display for RunIdsError<'_> {
                 "the request stood on its certificate and holds none of its answer's rows, so no workspace body has a key: blaze-drive has no read of an answer row by name yet {rule}"
             ),
             RunIdsError::Record { item, why } => write!(f, "a `BodyCheck` record of the body {:#034x}: {why} {rule}", item.0),
-            RunIdsError::ValueIsShape { item } => write!(f, "the value key of the body {:#034x}'s check holds a shape, not its record {rule}", item.0),
+            RunIdsError::ShapeSteps { item } => write!(f, "the lookup of the body {:#034x}'s check followed more than {MOST_SHAPE_STEPS} shapes {rule}", item.0),
             RunIdsError::Store { item, why } => write!(f, "the store, reading the check of the body {:#034x}: {why} {rule}", item.0),
             RunIdsError::Table(error) => write!(f, "the body id table: {error}"),
             RunIdsError::TwoDigests { fact } => write!(
@@ -1445,24 +1445,36 @@ fn record_reads<'n>(
     }
     // The value key from today's digests, in the shape's order (sorted by name, cells by (name,
     // cell)), as the request machine computes it. A name the command has no digest for is not
-    // guessed absent.
-    for name in names.iter().copied() {
-        let Some(out) = today.out(name) else { return Ok(Checked::Absent(Missing::NotToday { name })) };
-        seen.push((name, out));
-    }
-    let value = value_key_with_cells(task, &seen[..], &cells[..]);
-    seen.clear();
-    cells.clear();
-    let held = store.get(cx, value).map_err(|why| RunIdsError::Store { item, why })?;
-    let Some(held) = held else { return Ok(Checked::Absent(Missing::NoValue)) };
-    match open(held.bytes).map_err(|why| RunIdsError::Record { item, why })? {
-        Stored::Whole(whole) => {
-            seen.extend(whole.reads());
-            cells.extend(whole.cells());
-            Ok(verdict(&whole))
+    // guessed absent. A shape at the value key names the reads of a record made under those
+    // answers: followed as the request machine's walk does (blaze-drive request.rs `Walk`), at
+    // most `MOST_SHAPE_STEPS` (rule 18).
+    for _ in 0..MOST_SHAPE_STEPS {
+        for name in names.iter().copied() {
+            let Some(out) = today.out(name) else { return Ok(Checked::Absent(Missing::NotToday { name })) };
+            seen.push((name, out));
         }
-        Stored::Shape(_) => Err(RunIdsError::ValueIsShape { item }),
+        let value = value_key_with_cells(task, &seen[..], &cells[..]);
+        seen.clear();
+        cells.clear();
+        names.clear();
+        let held = store.get(cx, value).map_err(|why| RunIdsError::Store { item, why })?;
+        let Some(held) = held else { return Ok(Checked::Absent(Missing::NoValue)) };
+        match open(held.bytes).map_err(|why| RunIdsError::Record { item, why })? {
+            Stored::Whole(whole) => {
+                seen.extend(whole.reads());
+                cells.extend(whole.cells());
+                return Ok(verdict(&whole));
+            }
+            Stored::Shape(shape) => {
+                names.extend(shape.names());
+                for (name, cell) in shape.cells() {
+                    let Some(saw) = today.cell(name, cell) else { return Ok(Checked::Absent(Missing::Cells)) };
+                    cells.push(CellRead { name, cell, saw });
+                }
+            }
+        }
     }
+    Err(RunIdsError::ShapeSteps { item })
 }
 
 /// A cell read's fact: its name and cell as 32 bytes (beside [`fact_of`] for a whole read).

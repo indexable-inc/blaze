@@ -21,15 +21,20 @@ use crate::wire::{NAME_BYTES, Reader, WireError, Writer};
 /// entries in a tail of fixed-width entries. A page of an older form is never fetched: the form
 /// is in the tool's key (crate::FORMATS), so the table is made again.
 pub(crate) const PAGE_MAGIC: &[u8; 4] = b"BDP4";
-pub(crate) const ROOT_MAGIC: &[u8; 4] = b"BDA1";
+/// 2: the root holds the table's page bytes, which size its pages ([`bits_for`]).
+pub(crate) const ROOT_MAGIC: &[u8; 4] = b"BDA2";
 /// The `last` file's form: read at a fixed path, so its caller checks this before
 /// [`read_last`] and rebuilds a file of another form (crate::FORMATS).
 pub const LAST_MAGIC: &[u8; 4] = b"BDL1";
 
-/// The rows a page aims to hold; the root's bit count is the fewest that keep every page at or
-/// under it on average.
-pub const PAGE_ROWS: u64 = 512;
-/// The most bits a root pages by: 65,536 pages, 33 million rows at [`PAGE_ROWS`].
+/// The bytes a page aims to hold; the root's bit count is the fewest that keep every page at or
+/// under it on average. Sized by bytes, not rows: a command reads whole pages to reach the few
+/// rows it needs, and a row's lists (its reads and the reverse index) vary from none to
+/// thousands. At 512 rows a page, tempo's table was 128 pages of about 20 MB each (2.6 GB in
+/// all), and a one-statement edit read all 128: 2.7 GB of footprint and about 3.7 ms of step a
+/// page (check-g044908-body, 2026-11-17). At this size a page is tens of KB.
+pub const PAGE_BYTES: u64 = 64 << 10;
+/// The most bits a root pages by: 65,536 pages (a 2 MiB root), 4 GiB at [`PAGE_BYTES`].
 pub const MOST_BITS: u8 = 16;
 
 /// One name's answer.
@@ -84,13 +89,37 @@ pub fn page_of(name: Name, bits: u8) -> u32 {
     }
 }
 
-/// The bit count for a table of `rows`.
-pub fn bits_for(rows: u64) -> u8 {
+/// The bit count for a table of `bytes` of pages.
+pub fn bits_for(bytes: u64) -> u8 {
     let mut bits = 0;
-    while bits < MOST_BITS && rows > PAGE_ROWS << bits {
+    while bits < MOST_BITS && bytes > PAGE_BYTES << bits {
         bits += 1;
     }
     bits
+}
+
+/// The bits a table of about `bytes` is paged by, given the bits it was paged by: kept while
+/// they are within two of what its size asks (each page between a quarter of and
+/// [`PAGE_BYTES`] on average), so a table near a boundary is not paged again whole each command.
+pub fn bits_kept(bytes: u64, old: Option<u8>) -> u8 {
+    let need = bits_for(bytes);
+    match old {
+        Some(old) if old >= need && old <= need.saturating_add(2) => old,
+        _ => need,
+    }
+}
+
+/// The bytes `row` takes in a page with no readers yet: its table row and its own lists. A
+/// table's size before its pages are written is this over its rows, plus each reader entry.
+pub(crate) fn row_bytes(row: &Row<'_>) -> u64 {
+    let entries = [row.reads.len(), row.cells.len(), row.parts.len(), row.readers.len(), row.cell_readers.len(), usize::from(row.cond.is_some())];
+    let lists: usize = entries.iter().zip(WIDTHS).map(|(n, width)| n * width).sum();
+    (ROW_BYTES + lists) as u64
+}
+
+/// The bytes of `readers` reader entries and `cell_readers` cell reader entries in a page.
+pub(crate) fn reader_bytes(readers: usize, cell_readers: usize) -> u64 {
+    (readers * WIDTHS[READERS] + cell_readers * WIDTHS[CELL_READERS]) as u64
 }
 
 // --- The page form, read in place ----------------------------------------------------------
@@ -244,7 +273,7 @@ fn condition_at(bytes: &[u8]) -> Option<Condition> {
 }
 
 fn put32(page: &mut AVec<'_, u8>, value: usize) {
-    let value = u32::try_from(value).expect("a page's counts fit u32 (a page holds PAGE_ROWS rows on average)");
+    let value = u32::try_from(value).expect("a page's counts fit u32 (a page holds about PAGE_BYTES)");
     page.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -871,6 +900,11 @@ impl<'a> HeldPage<'a> {
         Ok(HeldPage { bytes: Some(Rc::from_slice_in(bytes, alloc)), shape })
     }
 
+    /// Its bytes: 0 for the empty page.
+    pub fn byte_len(&self) -> usize {
+        self.bytes.as_ref().map_or(0, |bytes| bytes.len())
+    }
+
     /// The page in place, with no check again: these bytes are the ones `open_in` checked.
     pub fn view(&self) -> PageView<'_> {
         match &self.bytes {
@@ -1035,6 +1069,8 @@ pub(crate) fn write_page<'b>(rows: &[PageRow<'_, '_>], alloc: Alloc<'b>) -> Opti
 pub struct Root<'a> {
     pub bits: u8,
     pub rows: u64,
+    /// The pages' bytes in all: with `rows`, the mean row the next answer's paging is sized by.
+    pub bytes: u64,
     /// One per page; [`Key::default`] for a page with no row.
     pub pages: AVec<'a, Key>,
 }
@@ -1043,6 +1079,8 @@ pub(crate) fn write_root<'b>(root: &Root<'_>, alloc: Alloc<'b>) -> AVec<'b, u8> 
     let mut w = Writer::new_in(ROOT_MAGIC, alloc);
     w.u8(root.bits);
     w.u32(u32::try_from(root.rows).unwrap_or(u32::MAX));
+    w.u32(root.bytes as u32);
+    w.u32((root.bytes >> 32) as u32);
     w.count(root.pages.len());
     for key in root.pages.iter() {
         w.key(*key);
@@ -1054,6 +1092,7 @@ pub(crate) fn read_root<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Root<'a>, 
     let mut r = Reader::new(bytes, ROOT_MAGIC, "answer root")?;
     let bits = r.u8()?;
     let rows = u64::from(r.u32()?);
+    let bytes = u64::from(r.u32()?) | u64::from(r.u32()?) << 32;
     let n = r.count(32)?;
     if bits > MOST_BITS || n != 1 << bits {
         return Err(r.error(crate::wire::WireWhy::Count(u32::try_from(n).unwrap_or(u32::MAX))));
@@ -1063,7 +1102,7 @@ pub(crate) fn read_root<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Root<'a>, 
         pages.push(r.key()?);
     }
     r.done()?;
-    Ok(Root { bits, rows, pages })
+    Ok(Root { bits, rows, bytes, pages })
 }
 
 /// The checkout's pointer to its last answer: a file of the checkout, written whole after the
@@ -1298,5 +1337,45 @@ mod tests {
         let held = HeldPage::open_in(&bytes, c).unwrap_or_else(|e| panic!("{e}"));
         assert!(counting.inner().allocations() > before, "control: holding a page allocated nothing, so the counter is not the page's");
         assert_eq!(held.view().len(), rows.len());
+    }
+
+    /// Pages are sized by bytes: tempo's table of 2026-11-17 (65,536 rows, 2.6 GB of pages),
+    /// paged by bytes, has pages of at most `PAGE_BYTES` on average (65,536 pages of ~40 KB);
+    /// paged as before by 512 rows it had 128 pages of ~20 MB, of which a one-statement edit
+    /// read all (the control). A table near a boundary keeps its paging (`bits_kept`).
+    /// Expected: "test answers::tests::pages_are_sized_by_bytes ... ok".
+    #[test]
+    fn pages_are_sized_by_bytes() {
+        use super::{MOST_BITS, PAGE_BYTES, bits_for, bits_kept};
+        assert_eq!((bits_for(0), bits_for(PAGE_BYTES), bits_for(PAGE_BYTES + 1)), (0, 0, 1));
+        let tempo: u64 = 2_600_000_000;
+        let bits = bits_for(tempo);
+        assert_eq!(bits, MOST_BITS);
+        assert!(tempo >> bits <= PAGE_BYTES, "tempo's pages average {} bytes", tempo >> bits);
+        // Control: the old rule (fewest bits keeping 512 rows a page) on its 65,536 rows.
+        let mut by_rows = 0u8;
+        while 65_536u64 > 512u64 << by_rows {
+            by_rows += 1;
+        }
+        assert!(tempo >> by_rows > 100 * PAGE_BYTES, "control: by rows, a page averages {} bytes", tempo >> by_rows);
+        // Kept within two of what the size asks, else paged again.
+        assert_eq!(bits_kept(PAGE_BYTES << 4, Some(5)), 5);
+        assert_eq!(bits_kept(PAGE_BYTES << 4, Some(6)), 6);
+        assert_eq!(bits_kept(PAGE_BYTES << 4, Some(7)), 4);
+        assert_eq!(bits_kept(PAGE_BYTES << 4, Some(3)), 4);
+        assert_eq!(bits_kept(PAGE_BYTES << 4, None), 4);
+    }
+
+    /// A root keeps its page bytes past 4 GiB through its bytes.
+    /// Expected: "test answers::tests::a_root_round_trips_its_bytes ... ok".
+    #[test]
+    fn a_root_round_trips_its_bytes() {
+        let g = blaze_own::testing::heap().alloc();
+        let mut pages = Vec::new_in(g.clone());
+        pages.extend([Key(id(1)), Key::default()]);
+        let root = super::Root { bits: 1, rows: 7, bytes: (5u64 << 32) + 9, pages };
+        let bytes = super::write_root(&root, g.clone());
+        let back = super::read_root(&bytes, g).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((back.bits, back.rows, back.bytes, back.pages.as_slice()), (1, 7, (5u64 << 32) + 9, root.pages.as_slice()));
     }
 }

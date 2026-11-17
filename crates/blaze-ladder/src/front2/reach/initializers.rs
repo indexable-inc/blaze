@@ -106,7 +106,7 @@ impl Initializers {
             if self.seen.len() > MOST_STATICS {
                 break;
             }
-            let lowered = match r.keys.library(k) {
+            let lowered = match r.keys.library_in(r.names, k) {
                 Some(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
                 None => lower_member(r.names, prepared, r.keys, r.store, k),
             };

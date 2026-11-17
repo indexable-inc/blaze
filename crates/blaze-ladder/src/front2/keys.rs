@@ -15,8 +15,9 @@ use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
 use blaze_typeck::ItemKey;
 
-/// What a member of a trait or impl is: what its key is made from beside its name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// What a member of a trait or impl is: what its key is made from beside its name. Ordered (in
+/// the order written) so a body that names one sorts (`project::BodyRef`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemberKind {
     Fn,
     Const,
@@ -198,15 +199,10 @@ impl Keys {
         self.origins.get(&key)
     }
 
-    /// The library key of an item key; `None` for a member or an unknown key.
-    pub fn library(&self, key: ItemKey) -> Option<LibKey> {
-        match self.origins.get(&key)? {
-            Origin::Item(k) => Some(*k),
-            Origin::Member { .. } => None,
-        }
-    }
-
-    /// [`Keys::library`] for code that reads its names from a source `S`: a key this map holds
+    /// The library key of an item key; `None` for a member or a key that is no item's. The ONE
+    /// way to ask it (a map-only form was removed 2026-11-17: over records it answered `None`
+    /// for every item whose head no body had made yet, and the lazy program refused
+    /// `core::error::Error`'s vtable for it). A key this map holds
     /// no row for is asked of the source ([`super::source::NamesSource::key_beginning`]). Over
     /// records the map is not filled when the front end is made (`Front2::from_records` files
     /// nothing), so an item's, a module's or a variant's library key is found from the checker

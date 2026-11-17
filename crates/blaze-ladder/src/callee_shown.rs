@@ -9,6 +9,8 @@
 
 use core::fmt;
 use core::fmt::Write as _;
+use std::boxed::Box;
+use std::format;
 
 use blaze_typeck::{ItemKey, List, Mutbl, PNode, PTy, PTys};
 
@@ -70,6 +72,26 @@ pub fn self_form(v: PTys<'_>, args: List) -> &'static str {
         PNode::Opaque(..) => "an opaque type",
         PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer => "a parameter",
         _ => "another form",
+    }
+}
+
+/// [`self_form`], and for an ADT its path (`an ADT `protobuf::reflect::RuntimeTypeI32``, the
+/// key when the program names none): a resolve refusal at an ADT is an impl the instance did
+/// not find for THAT type, so a census classes it by the type (and the callee's path, which
+/// names the trait), never as one row of every ADT (census g054702: 1,068 instances in one
+/// class "NoImpl at an ADT", nothing to tell its causes apart).
+pub fn self_shown<P: crate::seam::FrontEnd>(program: &P, v: PTys<'_>, args: List) -> Box<str> {
+    let form = self_form(v, args);
+    let adt = v.list(args).ok().and_then(|l| l.first().copied()).and_then(|t| match v.node(t) {
+        Ok(PNode::Adt(key, _)) => Some(key),
+        _ => None,
+    });
+    match adt {
+        Some(key) => match program.item_named(key) {
+            Some(path) => format!("{form} `{path}`").into_boxed_str(),
+            None => format!("{form} {:#x}", key.0).into_boxed_str(),
+        },
+        None => Box::from(form),
     }
 }
 

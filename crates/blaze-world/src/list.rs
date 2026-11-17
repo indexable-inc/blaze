@@ -244,7 +244,8 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     while let Some(at) = ready.pop() {
         let at = at as usize;
         let c = &list.crates[at];
-        let side = if at >= list.macro_from { Side::Macro } else { Side::Target };
+        // The list's one answer (a member's proc macro and its harness are the macro side's too).
+        let side = if list.macro_side(at) { Side::Macro } else { Side::Target };
         let mut deps: AVec<'w, (&'w str, CrateItemKey)> = AVec::with_capacity_in(c.deps.len(), alloc.clone());
         for &(name, d) in c.deps.iter() {
             deps.push((name, key_of[d].ok_or(WorldError::Cycle { krate: c.name })?));

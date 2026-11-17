@@ -217,6 +217,50 @@ pub struct BodyWorld<'w, 'n, S = &'n Names<'n>> {
     pub reveal: super::opaque_auto::Reveal,
 }
 
+/// `f` over the world of the ctor `ctor`, a fn row with no body: its types are its ADT's, so
+/// the questions the back half asks while building it (the ADT's `Drop` impl and layout facts,
+/// a selection or a projection at ground arguments, a callee's instance) are asked in the ADT's
+/// own scope. No path is resolved there (no body has paths), no parameter is in scope (every
+/// question is at ground arguments) and every opaque is its hidden type, as in a built body's
+/// world after its check. A key that is no ctor, or whose ADT has no library key, is the
+/// world's own refusal naming the fn: no world is made for it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
+    names: S,
+    keys: &Keys,
+    index: &Index<'n>,
+    store: &Store<'n>,
+    buckets: Option<&Buckets>,
+    ctor: ItemKey,
+    f: impl FnOnce(&BodyWorld<'_, 'n, S>) -> T,
+) -> Result<T, tc::ResolveError> {
+    let refused = tc::ResolveError::Missing(tc::Question::FnSig(ctor));
+    let Some(adt) = store.ctors.get(&ctor).map(|c| c.adt) else { return Err(refused) };
+    let Some(module) = keys.library_in(names, adt) else { return Err(refused) };
+    let spell = Spelling::fixed();
+    let blocks = super::block_traits::BlockTraits::module(store.tys.alloc());
+    let self_ = SelfTy::None;
+    let world = BodyWorld {
+        names,
+        keys,
+        index,
+        store,
+        buckets,
+        owner: ctor,
+        module,
+        params: &[],
+        self_: &self_,
+        spell: &spell,
+        traits: &[],
+        blocks: &blocks,
+        path_marks: &[],
+        fills: RefCell::new(Vec::new_in(Global)),
+        gaps: RefCell::new(Vec::new_in(Global)),
+        reveal: super::opaque_auto::Reveal::All,
+    };
+    Ok(f(&world))
+}
+
 impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
     pub(super) fn resolver(&self) -> Paths<S> {
         Paths { names: self.names }

@@ -226,6 +226,12 @@ impl Entries {
         self.listing.stamp(i).size
     }
 
+    /// Whether entry `i` has an execute bit set (of its own mode, a link not followed).
+    #[track_caller]
+    pub fn executable(&self, i: usize) -> bool {
+        self.listing.stamp(i).executable()
+    }
+
     /// The kinds, in the names' order: a walk that wants the folders reads a byte each.
     pub fn kinds(&self) -> &[EntryKind] {
         self.listing.kinds()

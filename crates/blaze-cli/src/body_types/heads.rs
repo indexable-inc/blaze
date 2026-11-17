@@ -63,7 +63,6 @@ use blaze_ladder::front2::reads::Fact;
 use blaze_ladder::front2::project::BodyVerdict;
 use blaze_ladder::front2::project::head_digest::{HeadDigestError, WantPlace, reads_a_head, want_lib};
 use blaze_ladder::front2::source::NamesSource;
-use blaze_scope::expansion_origins::OriginsView;
 use blaze_scope::items_record::ItemsRecord;
 use blaze_scope::resolve::At;
 use blaze_surface::{Edition, Item, ItemIndex, ItemKind};
@@ -119,36 +118,6 @@ fn want_order(want: Want) -> (u8, blaze_id::ItemKey, u128) {
         Want::Members(k) => (4, k, 0),
         Want::MemberFn(k, f) => (5, k, f.0),
     }
-}
-
-/// The file entry the call `call` of a crate whose expansion texts are `texts` is at: its own
-/// origins' calling text when that is a file, else its caller's, up to a file. Bounded by the
-/// crate's count of calls (a chain longer than it is a loop, refused by name).
-fn top_of(texts: &crate::names::expansion_texts::ExpansionTexts<'_>, call: blaze_id::ItemKey) -> Result<(u32, ItemIndex), &'static str> {
-    let mut at = call;
-    for _ in 0..=texts.len() {
-        let bytes = match texts.origins(at) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Err("a macro call's expansion holds no text in its crate's record (names/expansion_texts.rs)"),
-            Err(_) => return Err("a macro call's expansion origins run past their section (names/expansion_texts.rs)"),
-        };
-        if bytes.is_empty() {
-            // The three texts blaze-scope writes as `Rewritten` (resolve.rs): a kept item's
-            // (`keep_item`: the item a derive's helper attribute keeps, `#[derive(thiserror::
-            // Error)] #[error(..)] struct E`, every ADT of tempo's 114 such notes, 2026-11-17),
-            // a call's statements read as items and a block's module text (both inside a body).
-            // Their origins are refused whole, the calling entry with the column, though the
-            // lowering knows the entry (`CallSrc::place`): the piece owed is blaze-scope writing
-            // the call's part without a column.
-            return Err("the expansion that wrote it keeps no origins: a kept item's text (an item its derives' helper attributes keep, `#[derive(..)] #[helper(..)] struct`: blaze-scope resolve.rs `keep_item`), a call's statements read as items or a block's module text (blaze-scope expansion_origins.rs `Rewritten`), and blaze-scope writes no calling entry without its column, so the entry its call is at is not known");
-        }
-        let view = OriginsView::open(bytes).map_err(|_| "a macro call's expansion origins do not open (blaze-scope expansion_origins.rs)")?;
-        match view.text {
-            At::File(file) => return Ok((file, view.item)),
-            At::Expansion(up) => at = up,
-        }
-    }
-    Err("a macro call's origins name its callers in a loop (body_types/heads.rs `top_of`)")
 }
 
 impl<'n> Checker<'n> {
@@ -349,7 +318,8 @@ impl<'n> Checker<'n> {
             match calls.last_mut() {
                 Some(last) if last.call == call => last.wants.push(want),
                 _ => {
-                    let top = top_of(&reader.records.expansions, call);
+                    // The file entry its call (or its outermost caller) is at: covered.rs's walk.
+                    let top = super::covered::callers(&reader.records.expansions, call, &mut |_| {});
                     let mut wants = std::vec::Vec::new();
                     wants.push(want);
                     calls.push(Expanded { call, top: top.map_err(|why| why as &'n str), wants });
@@ -661,10 +631,11 @@ impl<'n> FileTypes<'n> {
         let path = path.as_str();
         // The owner whose crate makes the entry's heads, else (a macro call, an item a macro
         // rewrote) the first owner: its crate (0) is the one whose expansions are at the entry.
-        let chosen = self.owners.iter().position(|owner| owner.as_ref().is_ok_and(|checker| !own_wants(checker, outline, at).is_empty()));
-        let chosen = chosen.or_else(|| self.owners.iter().position(|owner| owner.is_ok()));
+        // An owner whose crate does not hold the file is never chosen (`OwnerCheck::NotInCrate`).
+        let chosen = self.owners.iter().position(|owner| owner.checker().is_some_and(|checker| !own_wants(checker, outline, at).is_empty()));
+        let chosen = chosen.or_else(|| self.owners.iter().position(|owner| owner.checker().is_some()));
         let mut out = None;
-        if let Some(Ok(checker)) = chosen.and_then(|i| self.owners.get_mut(i)) {
+        if let Some(checker) = chosen.and_then(|i| self.owners.get_mut(i)).and_then(super::OwnerCheck::checker_mut) {
             let own = own_wants(checker, outline, at);
             let errors = checker.records.errors().len();
             // The one making of an entry's out (`Checker::entry_out`): its readers are handed it.

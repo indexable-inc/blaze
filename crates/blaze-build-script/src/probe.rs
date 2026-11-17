@@ -10,6 +10,9 @@
 //!   by blaze from the snippet where it can, else by a table of answers for the pinned nightly
 //!   ([`Table`]). A probe neither answers is the runtime's `CannotAnswerYet`, which fails that
 //!   one script naming the probe.
+//! - `cargo -V` (`--version`, `version`): the pinned nightly's cargo line ([`CARGO_VERSION`]),
+//!   a fact of the pin keyed with the rustc text ([`answers_id`]); any other cargo command is
+//!   routed like any other program.
 //! - Any other program (a C compiler, `git`, `cmake`, `pkg-config`) is routed by the runner
 //!   (blaze-proc-macro `spawn_route`): answered by the C mode or refused. A spawn is never
 //!   answered with an error the script could swallow: a version probe that fails is taken by
@@ -31,6 +34,27 @@ pub const RELEASE: &str = "1.101.0-nightly";
 /// `LLVM version:` of `rustc -vV` of nightly-2026-10-27 (read once from the pinned toolchain
 /// on 2026-11-16; the pin bump records it from then on). portable-atomic reads it.
 pub const LLVM: &str = "23.1.4";
+/// What `cargo -V` of the pinned nightly prints (pins.txt's `cargo` line, which
+/// harness/toolchain_pins.py derives from the channel manifest's cargo version: rustc's
+/// release, then cargo's own commit and date; a test holds them equal). A script that asks the
+/// toolchain's cargo for its version (codspeed) is told this, a fact of the pin, never a
+/// program run.
+pub const CARGO_VERSION: &str = "cargo 1.101.0-nightly (cad07cf8e 2026-10-23)";
+
+/// Whether a spawn of `cargo` with `args` is a version question the pin answers: `-V`,
+/// `--version` or the `version` command, alone. `-vV` and `version --verbose` print the
+/// host's libgit2, curl and OS lines, which are no fact of the pin: not answered here.
+pub fn is_cargo_version(program: &str, args: &[&str]) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    name == "cargo" && matches!(args, ["-V"] | ["--version"] | ["version"])
+}
+
+/// The text `cargo -V` prints.
+pub fn cargo_version<'a>(alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::from_str_in(CARGO_VERSION, alloc);
+    out.push('\n');
+    out
+}
 
 /// The programs of a C toolchain a script spawns through `cc`, `cmake` or by hand: answered
 /// by the C mode ([`crate::key::CMode`]), never refused, never run in `check`.
@@ -149,8 +173,8 @@ impl Table<'_> {
 
 /// The identity of everything a spawn can be answered with.
 pub fn answers_id(table: &Table<'_>) -> ContentId {
-    let mut hasher = Hasher::new("blaze v2 build-script answers 2");
-    hasher.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(LLVM.as_bytes());
+    let mut hasher = Hasher::new("blaze v2 build-script answers 3");
+    hasher.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(LLVM.as_bytes()).part(CARGO_VERSION.as_bytes());
     hasher.part(crate::probe_ask::DECIDER.as_bytes());
     for row in table.rows {
         hasher.id(&row.key).update(&[u8::from(row.accepted)]);

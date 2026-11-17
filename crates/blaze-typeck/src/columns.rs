@@ -58,6 +58,10 @@ pub type ExprDefs<'a> = Soa<(ExprId, Def), Alloc<'a>>;
 /// the impl's arguments. A constant with no generics (a free `const` item) has no row; the
 /// item itself is the expression's `Def::Const` in `expr_defs`.
 pub type ConstArgs<'a> = Soa<(ExprId, List), Alloc<'a>>;
+/// The same for each constant pattern (`Pat::Path` naming a `Def::Const`), by pattern: an
+/// inherent impl's constant at the impl's arguments (`U256::ZERO`). Never over a generic
+/// parameter (E0158). Read with [`Checked::pat_const_args_of`].
+pub type PatConstArgs<'a> = Soa<(PatId, List), Alloc<'a>>;
 /// The same for `Pat::Path`, `Pat::TupleStruct` and `Pat::Struct`, by pattern: the variant a
 /// `match` switches on.
 pub type PatDefs<'a> = Soa<(PatId, Def), Alloc<'a>>;
@@ -95,6 +99,8 @@ pub struct Checked<'a> {
     pub expr_defs: ExprDefs<'a>,
     /// Sorted by expression; read with [`Checked::const_args_of`].
     pub const_args: ConstArgs<'a>,
+    /// Sorted by pattern; read with [`Checked::pat_const_args_of`].
+    pub pat_const_args: PatConstArgs<'a>,
     pub pat_defs: PatDefs<'a>,
     pub fields: Fields<'a>,
     pub captures: Captures<'a>,
@@ -196,6 +202,13 @@ impl<'a> Checked<'a> {
         Some(self.const_args.column::<1>()[at])
     }
 
+    /// The generic arguments the constant pattern `p` is read at (a list of `types`), or
+    /// `None` for a constant with no generics or a pattern that names no constant.
+    pub fn pat_const_args_of(&self, p: PatId) -> Option<List> {
+        let at = self.pat_const_args.column::<0>().binary_search(&p).ok()?;
+        Some(self.pat_const_args.column::<1>()[at])
+    }
+
     /// The future the `.await` at `e` holds while suspended (`<E as IntoFuture>::IntoFuture`,
     /// a type of `types`), or `None` for an expression that is no `.await` or whose future
     /// is not wholly known.
@@ -246,6 +259,7 @@ impl<'a> Checked<'a> {
             && soa3_eq(&self.callees, &other.callees)
             && soa2_eq(&self.expr_defs, &other.expr_defs)
             && soa2_eq(&self.const_args, &other.const_args)
+            && soa2_eq(&self.pat_const_args, &other.pat_const_args)
             && soa2_eq(&self.pat_defs, &other.pat_defs)
             && soa3_eq(&self.fields, &other.fields)
             && soa3_eq(&self.captures, &other.captures)

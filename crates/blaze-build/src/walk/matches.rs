@@ -260,23 +260,42 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let expand = arm.guard.is_some() && self.has_or(arm.pat)?;
         #[cfg(test)]
         let expand = expand && self.adts.planted() != crate::Planted::GuardToNextArm;
-        let expanded = if expand {
-            Some(self.test_alts(arm.pat, at, pass, next)?)
+        // walk/moves.rs: a by-value binding of a part that needs drop moves it out; with a
+        // guard, once the guard passed (`Pending`, applied by `Task::ArmMoves`). Set before the
+        // tests: an or-pattern's alternative binds (and moves) on its own pass, inside them.
+        let from = self.pending_mark();
+        self.move_arm(m, arm.pat, arm.guard.is_some());
+        let tested = if expand {
+            self.test_alts(arm.pat, at, pass, next).map(Some)
         } else {
-            self.test_pat(arm.pat, at, pass, next)?;
-            None
+            self.test_pat(arm.pat, at, pass, next).map(|()| None)
+        };
+        let expanded = match tested {
+            Ok(x) => x,
+            Err(error) => {
+                self.move_arm_end();
+                return Err(error);
+            }
         };
         self.begin(pass);
         self.scope_marks.push(self.scope_pats.len() as u32);
-        // walk/moves.rs: a by-value binding of a part that needs drop moves it out.
-        self.move_arm(m, arm.pat, arm.guard.is_some());
         let bound = self.bind_tested(arm.pat, at);
         self.move_arm_end();
         bound?;
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));
+        // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to `next`.
+        if let Some(g) = arm.guard
+            && self.cond_has_let(g)?
+        {
+            if expanded.is_some() {
+                return Err(unsupported(g, "an `if let` guard on an arm whose or-pattern binds (a guard per alternative)"));
+            }
+            return self.let_guard(g, arm.body, next);
+        }
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {
+            self.work.push(Task::ArmMoves { from });
             self.work.push(match expanded {
                 Some((word, chains, n)) => Task::GuardAlts { word, chains, n },
                 None => Task::Guard { m, i },
@@ -325,7 +344,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     let c = self.float_test(p, at)?;
                     self.br(c, (ok, &[]), (fail, &[]));
                 }
-                Pat::Lit(Lit::Str) => self.str_test(p, at, ok, fail)?,
+                Pat::Lit(Lit::Str | Lit::ByteStr(_)) => self.str_test(p, at, ok, fail)?,
                 Pat::Lit(_) | Pat::NegLit(_) => {
                     let (x, ty, _) = self.scalar_at(p, at)?;
                     let v = self.lit_bits(p, ty.bits(PTR_BITS))?;
@@ -361,13 +380,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     self.br(c, (ok, &[]), (fail, &[]));
                 }
                 // A constant by its value (matches/forms.rs), else a struct or a variant.
-                Pat::Path(_) => match self.const_test(p, at)? {
-                    Some(c) => self.br(c, (ok, &[]), (fail, &[])),
-                    None => match self.variant_test(p, at)? {
-                        Some(c) => self.br(c, (ok, &[]), (fail, &[])),
-                        None => self.jump(ok, &[]),
-                    },
-                },
+                Pat::Path(_) => {
+                    if !self.const_test(p, at, ok, fail)? {
+                        match self.variant_test(p, at)? {
+                            Some(c) => self.br(c, (ok, &[]), (fail, &[])),
+                            None => self.jump(ok, &[]),
+                        }
+                    }
+                }
                 Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Tuple { .. } | Pat::Slice { .. } => {
                     let c = match pat {
                         Pat::TupleStruct { .. } | Pat::Struct { .. } => self.variant_test(p, at)?,
@@ -460,6 +480,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     fn bind_with(&mut self, root: PatId, at: At, alias: &[(Name, PatId)]) -> Result<(), BuildError> {
         let mut todo: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
         let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
+        // An or-alternative's bindings (matches/forms.rs `first_binds`): bound on the
+        // alternative's own pass, where its moves clear their bits; the first bindings own
+        // their parts once, at the arm's pass (the `Pat::Or` row below).
+        let alt = !alias.is_empty();
         todo.push((root, at));
         while let Some((p, at)) = todo.pop() {
             let pat = self.pat(p)?;
@@ -480,9 +504,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         }
                     } else {
                         if self.needs_drop(at.g).map_err(|error| Self::pat_ty_err(p, error))? {
+                            if alt && self.holding_moves() {
+                                // A guarded arm runs its guard per alternative (matches/alts.rs);
+                                // the held moves of one would be applied for all.
+                                return Err(BuildError::UnsupportedPat {
+                                    pat: p,
+                                    what: "a by-value binding of a part that needs drop in an or-pattern of a guarded arm",
+                                });
+                            }
                             // walk/moves.rs: the part moves out of a scrutinee the match owns
                             // (its bit cleared); anywhere else refused by name.
-                            self.move_out(p, at.g)?;
+                            self.move_out(p, at.g, alt)?;
                             moved = true;
                         }
                         let r = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
@@ -490,9 +522,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     };
                     let target = Self::bind_target(alias, name, p);
                     self.bind_slot(target, v)?;
-                    if moved {
-                        // The binding owns the part: dropped at its arm's end unless moved on.
-                        self.own(target, true)?;
+                    if moved && alt {
+                        self.alt_moved(target);
+                    } else if moved {
+                        // The binding owns the part: dropped at its arm's end unless moved on;
+                        // in a guarded arm, once its guard passed (walk/moves.rs `Pending`).
+                        let hold = self.holding_moves();
+                        self.arm_effect(super::moves::Pending::Own(target), hold)?;
                     }
                     if let Some(s) = sub {
                         todo.push((s, at));
@@ -506,7 +542,20 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     a.by_ref = false;
                     todo.push((inner, a));
                 }
-                // Bound by `test_pat` on the pass of the alternative that matched.
+                // Bound by `test_pat` on the pass of the alternative that matched; at the arm's
+                // pass (not inside another alternative), each name whose binding moved its part
+                // owns it, once, by its first binding (every alternative stored there): in
+                // declaration order, as the bindings around it are owned.
+                Pat::Or { .. } if !alt => {
+                    let mut names: Vec<(Name, PatId), A> = Vec::new_in(self.alloc.clone());
+                    self.first_binds(p, &mut names)?;
+                    for &(_, first) in names.iter() {
+                        if self.take_alt_moved(first) {
+                            let hold = self.holding_moves();
+                            self.arm_effect(super::moves::Pending::Own(first), hold)?;
+                        }
+                    }
+                }
                 Pat::Or { .. } => {}
                 Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } => {
                     let a = self.peel(p, at)?;

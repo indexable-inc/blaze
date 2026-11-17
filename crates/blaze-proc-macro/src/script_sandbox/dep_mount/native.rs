@@ -41,7 +41,7 @@ use bstd::{fs::Durable, mem::TASK_FRAME};
 
 use super::{DepProducer, DepViewError, resolve};
 use crate::{
-    native_script::{files_under, remove},
+    native_script::{listed_under, remove},
     record::native_world,
     script_sandbox::Tree,
 };
@@ -118,7 +118,10 @@ pub fn lay<'a>(work: &str, rel: &str, producers: &[(&str, &DepProducer)], deps: 
             return Err(LayError::LinksName { links: links.to_owned() });
         }
         let files: &[(String, Vec<u8>)] = match mount {
-            DepMount::Out { .. } => producer.out.as_slice(),
+            DepMount::Out { .. } => match producer.stored.first() {
+                Some(file) => return Err(LayError::View(DepViewError::StoredOut { links: links.to_owned(), file: file.clone() })),
+                None => producer.out.as_slice(),
+            },
             DepMount::Tree { .. } => match &producer.tree {
                 Tree::Mem { files, .. } => files.as_slice(),
                 // The wasm sight serves a member's workspace as the reader's own tree; a
@@ -170,8 +173,8 @@ fn empty(root: &str) -> Result<(), LayError> {
         return Ok(());
     }
     let failed = |why: String| LayError::Files { folder: root.to_owned(), why };
-    for (name, _) in files_under(root).map_err(|e| failed(e.to_string()))? {
-        remove(root, &name).map_err(|e| failed(e.to_string()))?;
+    for left in listed_under(root).map_err(|e| failed(e.to_string()))? {
+        remove(root, &left.name).map_err(|e| failed(e.to_string()))?;
     }
     Ok(())
 }

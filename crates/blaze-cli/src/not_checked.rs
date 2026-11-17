@@ -18,8 +18,28 @@ use crate::names::Names;
 use crate::work::Failures;
 use crate::CliError;
 
-/// The most crates named under one cause; the count past them stays exact.
-pub(crate) const CRATES_SHOWN: usize = 20;
+/// The most crates (or items) named under one cause; the count past them stays exact. Few: a
+/// line names what to look at first, and tempo's one cause named hundreds on one line at 20
+/// (2026-11-17); `--each` lists every one.
+pub(crate) const CRATES_SHOWN: usize = 5;
+
+/// The items not checked because a task failed, as the lines under the failures counted them
+/// (waited.rs `line`), and how many of those lines counted an item.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Behind {
+    pub items: u32,
+    pub failures: u32,
+}
+
+impl Behind {
+    /// One failure's line, counting `items`.
+    pub(crate) fn add(&mut self, items: u32) {
+        if items > 0 {
+            self.items = self.items.saturating_add(items);
+            self.failures += 1;
+        }
+    }
+}
 
 /// Each line of what was not checked, in cause order, handed to `each` (the caller prints it as
 /// a note). `failures` is the drive's whole list (`Request::failures`: the machine's own
@@ -125,6 +145,9 @@ pub(crate) mod items;
 
 /// The tasks not run because an input they read could not be made, by cause: one line a cause.
 pub(crate) mod tasks;
+
+/// The tasks that failed only because a task they need failed: counted under their root.
+pub(crate) mod waited;
 
 #[cfg(test)]
 #[path = "not_checked_tests.rs"]

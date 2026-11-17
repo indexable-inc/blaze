@@ -40,9 +40,10 @@ pub(crate) struct Unchecked<'f> {
     pub(crate) item: &'f str,
 }
 
-/// Files that the item `item` was not checked because of `cause` (a fixed phrase), with
+/// Files that the item `item` was not checked because of `cause` (a phrase that groups: fixed,
+/// or naming one cause such as the refused macro call and its reason; no 0x1F byte), with
 /// `detail` naming the one case (empty for none), into `made` at `range`.
-pub(crate) fn file<A: Allocator + Copy>(made: &mut Record<A>, range: (u32, u32), item: &str, cause: &'static str, detail: &str) {
+pub(crate) fn file<A: Allocator + Copy>(made: &mut Record<A>, range: (u32, u32), item: &str, cause: &str, detail: &str) {
     let sep = if detail.is_empty() { "" } else { "; " };
     made.find(crate::body_types::TYPES_NOT_CHECKED, range, &[item, "\x1f", cause, "\x1f", sep, detail]);
 }
@@ -99,9 +100,28 @@ pub(crate) fn lines(items: &[Unchecked<'_>], frame: &Frame, each: &mut dyn FnMut
     u32::try_from(distinct.len()).map_err(|_| CliError::Text { what: "more than 2^32 items not checked" })
 }
 
-/// The summary line of a check that could not check `n` items (`n` > 0).
-pub(crate) fn summary(n: u32, frame: &Frame) -> bstd::mem::String<&Frame> {
-    bstd::mem::format_in!(frame, "the check is incomplete: blaze could not check {n} {}", if n == 1 { "item" } else { "items" })
+/// The summary line of a check that could not check some items: `own` for the causes named
+/// above it (this file's [`lines`], and tasks not run), `behind` because a task failed (the
+/// lines under the failures). Every item not checked is in its count, so it never reads better
+/// than the truth: tempo's said 1,061 while 28,678 more were not checked under one failure.
+/// `None` when every item was checked.
+pub(crate) fn summary(own: u32, behind: super::Behind, frame: &Frame) -> Option<bstd::mem::String<&Frame>> {
+    let items = |n: u32| if n == 1 { "item" } else { "items" };
+    let all = own.saturating_add(behind.items);
+    if all == 0 {
+        return None;
+    }
+    let mut words = bstd::mem::format_in!(frame, "the check is incomplete: blaze could not check {all} {}", items(all));
+    if behind.items > 0 {
+        let failures = if behind.failures == 1 { "failure" } else { "failures" };
+        let more = bstd::mem::format_in!(frame, ": {} behind {} {failures}", behind.items, behind.failures);
+        words.push_str(more.as_str());
+        if own > 0 {
+            let more = bstd::mem::format_in!(frame, ", {own} for the reasons above");
+            words.push_str(more.as_str());
+        }
+    }
+    Some(words)
 }
 
 /// The path of the outline entry `item` in its file: each enclosing entry's name, outermost

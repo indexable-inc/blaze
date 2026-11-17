@@ -1,0 +1,14 @@
+{
+ "id": "ex-census-no-builder-rows",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane EX (builder expression shapes)",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/port27/tempo-run/build-census-g*.txt",
+ "what": "The lane's check is 'the rows shrink in the next census', but every census after g042737 (g043439 .. g050933) has no `CLASS builder` rows: the runs stop in the front end (g050349 ends 'stopped: a panic (its place is on stderr, above)'; g050933 holds only its header), so no builder row can be counted before or after a fix. Also the subagent had no Grep tool, so read-only searches went through Bash.",
+ "cost": "the before/after quote is impossible; each fix is proven by its own build-and-run test only",
+ "cause": "the census binary panics or stops before the build stage, and the census file does not say how far it got in a machine-readable line",
+ "whys": "the census writes its builder section only at the end; a panic upstream leaves the file without it",
+ "class": "a progress check that depends on a later stage of a pipeline that an unrelated failure cuts short",
+ "prevention": "wanted: the census writes a 'STAGE builder: not reached (why)' line, and a lane's brief names the census run its check will read",
+ "workaround": "quote g042737 as 'before' and say no 'after' exists yet",
+ "state": "open"
+}

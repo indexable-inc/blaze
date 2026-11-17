@@ -1297,6 +1297,12 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         !self.holes.is_empty()
     }
 
+    /// The first hole this run met: a one-shot question's answer read through it is void
+    /// (instance.rs `unholed`).
+    pub(crate) fn first_hole(&self) -> Option<Question> {
+        self.holes.first().map(|h| h.question)
+    }
+
     /// How many holes this run met so far: a fill compares it before and after.
     pub(crate) fn hole_count(&self) -> usize {
         self.holes.len()

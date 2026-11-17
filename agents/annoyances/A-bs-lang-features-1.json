@@ -1,0 +1,12 @@
+{
+ "id": "A-bs-lang-features-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane BS",
+ "where": "crates/blaze-surface (the new item layer) and crates/blaze-diagnostics",
+ "what": "The new item layer had no list of the pinned nightly's language features: what `#![feature(name)]` means was nowhere to read. The only list was the old diagnostics layer's generated table (blaze-diagnostics src/lints/syntax/attrs/features/table/lang.rs), and this tree has deleted that module, so it was read from another checkout's copy.",
+ "cost": "a search through three crates and a second checkout before the 585 rows could be carried over",
+ "cause": "the list lived in a lint's private table, not in the layer that owns what a crate root's features are",
+ "workaround": "none needed now",
+ "fix": "blaze-surface lang_features (one home, rule 30): the sorted list with LIST_FOR naming rustc 16d1ffac17; a pin bump regenerates it with the toolchain's other facts",
+ "state": "fixed"
+}

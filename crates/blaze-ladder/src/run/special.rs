@@ -132,6 +132,16 @@ impl fmt::Display for EntryLine {
     }
 }
 
+/// What the parent tells the program before its first `Publish`, whether from the roots or
+/// from today's start list (blaze-cli start_list.rs keeps it in the list's head): the entry
+/// line, and the symbol of the personality routine's instance (`None`: built
+/// `panic = "abort"`), whose slot the parent names in `Down::Personality`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StartHead {
+    pub line: EntryLine,
+    pub personality: Option<Symbol>,
+}
+
 /// Why the run has no roots: each a refusal of the start rule or of one root, by name.
 #[derive(Debug)]
 pub enum RootsError {
@@ -144,6 +154,9 @@ pub enum RootsError {
     Symbol { what: &'static str, error: SymbolError },
     /// `lang_start`'s argument list `[T]` did not intern in the head store's table.
     Types(blaze_typeck::CheckError),
+    /// The program unwinds and its lang crates name no one personality routine
+    /// (personality.rs `personality_of`).
+    Personality(crate::personality::PersonalityError),
 }
 
 impl fmt::Display for RootsError {
@@ -153,6 +166,7 @@ impl fmt::Display for RootsError {
             RootsError::Entry(refusal) => write!(f, "the run's roots: {refusal}"),
             RootsError::Symbol { what, error } => write!(f, "the run's roots: {what}'s instance name: {error}"),
             RootsError::Types(error) => write!(f, "the run's roots: `lang_start`'s argument list `[T]`: {error:?}"),
+            RootsError::Personality(error) => write!(f, "the run's roots: {error}"),
         }
     }
 }
@@ -188,12 +202,20 @@ pub struct Roots<'a> {
     symbols: AVec<'a, Symbol>,
     /// Whether the entry is the shim, rows 0 and 1 its callees (`lang_start::<T>`, `main`).
     shim: bool,
+    /// The personality routine's instance symbol, its row the last ([`run_roots`]); `None`
+    /// for a program built `panic = "abort"`, and from [`roots`], which reads the start alone.
+    personality: Option<Symbol>,
 }
 
 impl<'a> Roots<'a> {
     /// The launcher's line for the entry.
     pub fn line(&self) -> EntryLine {
         EntryLine { form: self.form, symbol: self.entry }
+    }
+
+    /// What the parent tells the program before its first `Publish`.
+    pub fn head(&self) -> StartHead {
+        StartHead { line: self.line(), personality: self.personality }
     }
 
     /// How many root instances.
@@ -232,7 +254,37 @@ impl<'a> Roots<'a> {
 ///   here in `frame` with `tables` (the store's type table; dropped with it).
 ///
 /// No body. `alloc` holds the roots (their names and symbols) and the start rule's lists.
+///
+/// The start alone: no personality row ([`Roots::head`] names none). `blaze run`'s parent
+/// takes [`run_roots`].
 pub fn roots<'n, 'a, S: NamesSource<'n>>(names: S, frame: &'n blaze_mem::Frame, tables: Alloc<'static>, alloc: Alloc<'a>) -> Result<Roots<'a>, RootsError> {
+    roots_with(names, None, frame, tables, alloc)
+}
+
+/// THE RUN'S ROOTS as `blaze run`'s parent takes them: [`roots`], and for a program built
+/// `panic = "unwind"` its personality routine (personality.rs `personality_of`, over
+/// `lang_crates`) as the last root row, at no arguments, its symbol in [`Roots::head`]. Nothing
+/// calls the routine (the system's unwinder does, through the slot the parent names), so it is
+/// a root of the walk; a program that unwinds and declares none is refused here, before the
+/// spawn ([`RootsError::Personality`]).
+pub fn run_roots<'n, 'a, S: NamesSource<'n>>(
+    names: S,
+    lang_crates: &[usize],
+    panic: crate::code_records::PanicStrategy,
+    frame: &'n blaze_mem::Frame,
+    tables: Alloc<'static>,
+    alloc: Alloc<'a>,
+) -> Result<Roots<'a>, RootsError> {
+    roots_with(names, Some((lang_crates, panic)), frame, tables, alloc)
+}
+
+fn roots_with<'n, 'a, S: NamesSource<'n>>(
+    names: S,
+    unwinding: Option<(&[usize], crate::code_records::PanicStrategy)>,
+    frame: &'n blaze_mem::Frame,
+    tables: Alloc<'static>,
+    alloc: Alloc<'a>,
+) -> Result<Roots<'a>, RootsError> {
     let start = start_of(names, alloc).map_err(RootsError::Start)?;
     // The `sized` trait is the implied bound of a head's own type parameters; `main` declares
     // none (`rust_start` refuses one that does), so its head needs no lookup of it.
@@ -254,7 +306,14 @@ pub fn roots<'n, 'a, S: NamesSource<'n>>(names: S, frame: &'n blaze_mem::Frame, 
             (EntryForm::Unit, table.push("`main`", checker_of(main), List::EMPTY, store.tys.view())?, false)
         }
     };
-    Ok(Roots { start, form, entry, rows: table.rows, symbols: table.symbols, shim })
+    let personality = match unwinding {
+        None => None,
+        Some((lang_crates, panic)) => match crate::personality::personality_of(names, lang_crates, panic).map_err(RootsError::Personality)? {
+            None => None,
+            Some(routine) => Some(table.push("the personality routine", checker_of(routine), List::EMPTY, store.tys.view())?),
+        },
+    };
+    Ok(Roots { start, form, entry, rows: table.rows, symbols: table.symbols, shim, personality })
 }
 
 /// The root rows as [`roots`] fills them.

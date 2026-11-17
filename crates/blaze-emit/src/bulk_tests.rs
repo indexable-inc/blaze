@@ -33,7 +33,7 @@ fn routine(to: RelocTo) -> u64 {
 
 fn emitted_up_to(func: &Func<Global>, most: u64) -> Code<Global> {
     let mut code = Code::new_in(Global);
-    emit_inline_up_to(func.view(), &[], ISA, most, &mut code).expect("emits");
+    emit_inline_up_to(func.view(), &[], &crate::RoutinePlaces::NONE, ISA, most, &mut code).expect("emits");
     code
 }
 

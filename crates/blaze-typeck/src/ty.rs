@@ -145,6 +145,19 @@ pub struct Obligation {
     pub cause: Cause,
 }
 
+/// A projection normalized now ([`TypeCtx::normalize`]): its type, and whether the selection
+/// that gave it is certain or still holds an undecided nested goal (an impl's where-clause on
+/// a closure whose kind is not settled yet: `impl<T, F> Deref for ScopeGuard<T, F> where F:
+/// FnMut(&mut T)`, hashbrown 0.14's src/scopeguard.rs). An ambiguous answer's type is still
+/// the answer (rustc's new solver applies an ambiguous response's constraints, rustc_next_trait_solver
+/// `instantiate_and_apply_query_response`); its caller keeps the projection as an obligation
+/// so the nested goal is proved once it can be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Normalized {
+    Certain(Ty),
+    Ambiguous(Ty),
+}
+
 /// How an obligation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FulfillErrorKind {
@@ -246,15 +259,17 @@ pub trait TypeCtx {
         goal: Goal,
         reads: &mut Reads<'_, '_, W>,
     ) -> Result<bool, Stop>;
-    /// `<args[0] as trait_<args[1..]>>::name` normalized now, if one impl or bound selects it;
-    /// `None` when ambiguous or unsatisfied. Binds what the selection binds.
+    /// `<args[0] as trait_<args[1..]>>::name` normalized now, if one impl or bound selects it
+    /// ([`Normalized::Certain`]), or selects it with a nested goal still undecided and the type
+    /// decided all the same ([`Normalized::Ambiguous`]); `None` when unsatisfied, when the
+    /// type is not decided, or on overflow. Binds what the selection binds.
     fn normalize<W: World>(
         &mut self,
         trait_: ItemKey,
         args: TyList,
         name: Name,
         reads: &mut Reads<'_, '_, W>,
-    ) -> Result<Option<Ty>, Stop>;
+    ) -> Result<Option<Normalized>, Stop>;
 
     /// The closure-signature hint of `var` from pending obligations
     /// (`deduce_closure_signature`): the inputs and output of the first pending

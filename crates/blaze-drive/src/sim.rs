@@ -117,6 +117,12 @@ struct World {
     closure: bool,
     /// The files whose bodies the running program may want; `None`: any file's.
     wants_from: Option<StdVec<usize>>,
+    /// A body resolves each call through its callee file's `Surface` first, and reads the
+    /// callee's signature only when the file still holds it ([`resolved_body`]): which names it
+    /// reads follows from what it read, under one key.
+    resolve_calls: bool,
+    /// The executor's planted bug for the resolving body ([`NamesBug`]).
+    names_bug: NamesBug,
 }
 
 /// A crate of the names step: its identity (what blaze-world's `UnitInput::key` hashes), the
@@ -351,6 +357,8 @@ impl World {
             quiet: false,
             closure: false,
             wants_from: None,
+            resolve_calls: false,
+            names_bug: NamesBug::None,
         }
     }
 
@@ -554,6 +562,7 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
             };
             done(out, StdVec::new(), parts, findings)
         }
+        Kind::BodyCheck if world.resolve_calls => resolved_body(world, task),
         Kind::Signature | Kind::BodyCheck => {
             // No file holds the item: the machine ran a name no home lists (one dropped and
             // entered again, [`removals`]), its bug, not the harness's.
@@ -661,6 +670,8 @@ struct Ended {
     /// The program: started, stopped, and whether it is still running.
     started: bool,
     stopped: bool,
+    /// The machine's own count at the answer ([`Request::bookkeeping`]).
+    bookkeeping: u64,
 }
 
 /// One request's setup: the workers and the command.
@@ -847,7 +858,8 @@ fn request_with(
     if world.closure {
         req = req.with_member_closure(Name::manifest(&member_path(0)));
     }
-    let table: Settled<Global> = Settled::new_in(1 << 12, Global);
+    // Room for `one_body_reading_many_pages`'s 3,000 files, four names each.
+    let table: Settled<Global> = Settled::new_in(1 << 15, Global);
     let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(blaze_own::testing::heap().alloc());
     let mut ended = Ended {
         answer: None,
@@ -860,6 +872,7 @@ fn request_with(
         in_place: 0,
         started: false,
         stopped: false,
+        bookkeeping: 0,
     };
     let mut gets: StdVec<Key> = StdVec::new();
     let mut batches: StdVec<(BatchId, StdVec<(Ticket, Task<'static>)>)> = StdVec::new();
@@ -1051,6 +1064,7 @@ fn request_with(
             oracle(made <= ended.delivered, || {
                 format!("a batch result applied twice: {made} records made from {} delivered", ended.delivered)
             })?;
+            ended.bookkeeping = req.bookkeeping();
             return Ok(ended);
         }
     }
@@ -1436,6 +1450,48 @@ fn a_one_body_edit_runs_one_file_and_one_body() {
         oracle(store.reads <= 6 + pages, || format!("a one-body edit read the store {} times ({pages} pages)", store.reads))?;
         same_as_fresh(tape, &next, &store, &ended)
     });
+}
+
+/// One body that calls the signature of each of `files - 1` other files, spread over the answer
+/// table's pages, edited: its run walks its shape, asks every page its reads sit on at once,
+/// and walks the shape again once, when the last page is in. The machine's bookkeeping is then
+/// linear in reads plus pages. Woken by each page (`Plant::WakePerPage`, as `Job::parked` did)
+/// it walks the shape once a page: reads times pages (tempo's one body edit, check-g051344-body:
+/// 828 steps in 172.6 ms against 68 in 27.0 ms for a comment). Returns (bookkeeping, pages).
+fn one_body_reading_many_pages(tape: &Tape, plant: Plant) -> Result<(u64, u64), Broke> {
+    const FILES: usize = 3_000;
+    let item = |calls: StdVec<(usize, usize)>| Item { sig: 0, body: 0, uses: None, calls, cfg: StdVec::new() };
+    let files = (0..FILES).map(|f| std::vec![item(if f == 0 { (1..FILES).map(|g| (g, 0)).collect() } else { StdVec::new() })]).collect();
+    let world = World::new(files);
+    let mut store = Store::default();
+    let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+    let mut next = world.clone();
+    next.files[0][0].body = 1_000;
+    let (answer, ended) = finished(request(tape, &next, Some(&world), &mut store, first.last.as_deref(), plant)?)?;
+    let ran = |kind| ended.runs.get(&kind).copied().unwrap_or(0);
+    oracle(ran(Kind::BodyCheck) == 1, || format!("the edit ran {:?}", ended.runs))?;
+    let pages = u64::from(answer.profile.pages);
+    oracle(pages >= 8, || format!("the reads sat on {pages} pages: too few to tell a wake per page"))?;
+    let reads = (FILES - 1) as u64;
+    // The whole request's count: the start's 3,000 files and the finish's table are in it too
+    // (226,248 here, 74 a read and page); a wake per page walks 2,999 reads 64 times on top.
+    oracle(ended.bookkeeping <= 96 * (reads + pages), || {
+        format!("a one-body edit reading {reads} names on {pages} pages kept {} of bookkeeping, over 96 per read and page", ended.bookkeeping)
+    })?;
+    same_as_fresh(tape, &next, &store, &ended)?;
+    Ok((ended.bookkeeping, pages))
+}
+
+/// Expected: "test sim::a_body_reading_many_pages_is_woken_once ... ok".
+#[test]
+fn a_body_reading_many_pages_is_woken_once() {
+    check(SimConfig::cases(1), |tape| one_body_reading_many_pages(tape, Plant::None).map(|_| ()));
+}
+
+/// Control: woken per page, the bound is broken.
+#[test]
+fn control_a_wake_per_page_is_caught() {
+    control(SimConfig::cases(1), Plant::None, Plant::WakePerPage, "of bookkeeping", |tape, plant| one_body_reading_many_pages(tape, plant).map(|_| ()));
 }
 
 #[test]
@@ -2543,4 +2599,180 @@ fn a_checkout_keeps_the_pointers_written_last() {
 #[test]
 fn control_evicting_the_newest_pointer_is_caught() {
     control(SimConfig::cases(60), pointers::Plant::None, pointers::Plant::EvictNewest, "written last", kept_pointers);
+}
+
+// --- What a task reads follows from its key and its answers (request.rs `Walk`) ---------------
+
+/// The rule of a resolving body's call to an item its callee's file no longer holds: rustc's
+/// "cannot find function" at the call, the caller's own error.
+const NO_ITEM_RULE: u16 = 0x51D1;
+
+/// The executor's plant for the resolving body: none, or (`HiddenRead`) a body whose call missed
+/// ALSO reads its callee file's first signature, so its read names follow from an input that is
+/// neither in its key nor among its answers (one builder plants it, the other does not).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NamesBug {
+    None,
+    HiddenRead,
+}
+
+/// A body that resolves its calls (blaze-cli's body check, in small): it reads the `Surface` of
+/// each file it calls into first; then, for each call, the callee's `Signature` when the file
+/// still holds the item, else nothing more and a [`NO_ITEM_RULE`] finding. Whether the file holds
+/// the item follows from its surface (the surface's out digests every signature in the file), so
+/// its read names are a function of its key and its answers, and a removed callee changes them
+/// under one key: the caller's text, and so its key, stands.
+fn resolved_body(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
+    let name = task.name;
+    let (f, i) = world.item_of(task.base).ok_or(Broke::Oracle(format!("{name} ran, and no file holds its item: a dropped name entered again")))?;
+    let item = &world.files[f][i];
+    if body_source(item) != task.source {
+        return Err(Broke::Oracle(format!("{name} ran with a source that is not its text's")));
+    }
+    let callee_files: BTreeSet<usize> = item.calls.iter().map(|(cf, _)| *cf).collect();
+    let mut wanted: StdVec<(Name, Name)> = callee_files.iter().map(|cf| (surface_name(*cf), file_name(*cf))).collect();
+    let failed = |wanted: &[(Name, Name)]| wanted.iter().find(|(n, _)| task.failed.contains(n)).map(|(on, _)| Answered::Failed(TaskFailure { name, why: Why::Waited { on: *on } }));
+    if let Some(failure) = failed(&wanted) {
+        return Ok(failure);
+    }
+    // The surfaces first: which signatures there are follows from them.
+    if let Err(lacking) = reads_of(task, &wanted) {
+        return Ok(Answered::Need(lacking));
+    }
+    let mut missing = StdVec::new();
+    for (cf, ci) in item.calls.iter().copied() {
+        match ci < world.files[cf].len() {
+            true => wanted.push((sig_name(cf, ci), file_name(cf))),
+            false => {
+                missing.push((cf, ci));
+                if world.names_bug == NamesBug::HiddenRead {
+                    wanted.push((sig_name(cf, 0), file_name(cf)));
+                }
+            }
+        }
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    if let Some(failure) = failed(&wanted) {
+        return Ok(failure);
+    }
+    let reads = match reads_of(task, &wanted) {
+        Err(lacking) => return Ok(Answered::Need(lacking)),
+        Ok(reads) => reads,
+    };
+    let out = key::digest("sim resolved body out", format!("{} {reads:?} {missing:?}", item.body).as_bytes());
+    let findings = missing.iter().map(|(cf, ci)| (NO_ITEM_RULE, 0, 1, format!("no item {ci} in file {cf}").into_bytes())).collect();
+    Ok(Answered::Done(Made { name, out, reads, parts: StdVec::new(), findings, paths: StdVec::new() }))
+}
+
+/// A world of crates (so each file has a `Surface`) whose bodies resolve their calls.
+fn resolving_world(tape: &Tape, bug: NamesBug) -> World {
+    let mut world = names_world(tape);
+    world.resolve_calls = true;
+    world.names_bug = bug;
+    world
+}
+
+/// The last item of a file removed while a body other than its own still calls it, the calls
+/// left as written (blaze-cli's "member removed" case: `f` removed, `h` still calls it). A
+/// signature that used it no longer does (its text moves, a key of its own). `None`: no item is
+/// so called.
+fn callee_removal(tape: &Tape, world: &World) -> Option<World> {
+    let called = |f: &usize| {
+        let gone = (*f, world.files[*f].len() - 1);
+        world.files[*f].len() > 1
+            && world.files.iter().enumerate().any(|(g, items)| items.iter().enumerate().any(|(j, item)| (g, j) != gone && item.calls.contains(&gone)))
+    };
+    let candidates: StdVec<usize> = (0..world.files.len()).filter(called).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let f = candidates[tape.index(candidates.len(), "removed callee's file")];
+    let mut files = world.files.clone();
+    let gone = (f, files[f].len() - 1);
+    files[f].pop()?;
+    for item in files.iter_mut().flatten() {
+        if item.uses == Some(gone) {
+            item.uses = None;
+        }
+    }
+    let mut next = World::new(files);
+    next.crates = world.crates.clone();
+    next.macros = world.macros.clone();
+    next.resolve_calls = world.resolve_calls;
+    next.names_bug = world.names_bug;
+    Some(next)
+}
+
+/// One store, three requests: the world, its callee removed, the callee back. After the
+/// removal the request answers (no two values under one key: the callers' keys stood while
+/// their read names moved with their surfaces' answers), equals a fresh build and reports the
+/// missing callee; with it back the answer equals a fresh build again, and no body is checked:
+/// the first records are found through the shapes, by today's answers.
+fn a_removed_callee(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let world = resolving_world(tape, NamesBug::None);
+    let Some(removed) = callee_removal(tape, &world) else { return Ok(()) };
+    tape.reached("a caller's key stood while its callee went");
+    let mut store = Store::default();
+    let (_, first) = finished(request(tape, &world, None, &mut store, None, plant)?)?;
+    let gone = request(tape, &removed, Some(&world), &mut store, first.last.as_deref(), plant)?;
+    if let Some(error) = gone.error {
+        return Err(Broke::Oracle(format!("the removal's request failed: {error}")));
+    }
+    let (_, gone) = finished(gone)?;
+    same_as_fresh(tape, &removed, &store, &gone)?;
+    oracle(gone.prints.iter().any(|print| print.1 == NO_ITEM_RULE), || String::from("no caller reported its removed callee"))?;
+    let (_, back) = finished(request(tape, &world, Some(&removed), &mut store, gone.last.as_deref(), plant)?)?;
+    same_as_fresh(tape, &world, &store, &back)?;
+    oracle(runs(&back, Kind::BodyCheck) == 0, || format!("the callee put back checked bodies again: {:?}", back.runs))
+}
+
+/// The invariant: a removed callee is its callers' finding, the request answers as a fresh
+/// build does, and putting it back finds the first answer in the records.
+#[test]
+fn a_removed_callee_answers_as_a_fresh_build_and_back_from_records() {
+    check(SimConfig::cases(300).must_reach(&["a caller's key stood while its callee went"]), |tape| a_removed_callee(tape, Plant::None));
+}
+
+/// The cause, removed: each record's shape put at its task key (the drive before `Walk`) puts a
+/// second shape under a caller's key when its callee goes, refused as two values.
+#[test]
+fn control_a_shape_at_the_task_key_is_two_values() {
+    control(SimConfig::cases(2000), Plant::None, Plant::ShapeAtTaskKey, "two values under one key", a_removed_callee);
+}
+
+/// Two builders of one history (the world, then its callee removed), each in its own store, as
+/// two CI machines fill one shared cache: every drive record of one, put into the other's
+/// store, is equal bytes where both hold a key (rule 25). Under [`NamesBug::HiddenRead`] the
+/// second builder's caller reads one more name though every answer it shares with the first's
+/// was the same: two records under one key that are two VALUES (rule 21), and the put is refused.
+fn two_builders(tape: &Tape, bug: NamesBug) -> Result<(), Broke> {
+    let world = resolving_world(tape, NamesBug::None);
+    let Some(removed) = callee_removal(tape, &world) else { return Ok(()) };
+    let build = |tape: &Tape, bug: NamesBug| -> Result<Store, Broke> {
+        let (mut one, mut two) = (world.clone(), removed.clone());
+        one.names_bug = bug;
+        two.names_bug = bug;
+        let mut store = Store::default();
+        let (_, first) = finished(request(tape, &one, None, &mut store, None, Plant::None)?)?;
+        finished(request(tape, &two, Some(&one), &mut store, first.last.as_deref(), Plant::None)?)?;
+        Ok(store)
+    };
+    let mut first = build(tape, NamesBug::None)?;
+    let second = build(tape, bug)?;
+    for (key, bytes) in second.records.iter().filter(|(_, bytes)| crate::record::open(bytes).is_ok()) {
+        first.put(*key, bytes)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn two_builders_of_one_history_write_equal_records() {
+    check(SimConfig::cases(300), |tape| two_builders(tape, NamesBug::None));
+}
+
+/// The refusal stays where it belongs: read names that follow from no answer are two values.
+#[test]
+fn control_read_names_from_a_hidden_input_are_two_values() {
+    control(SimConfig::cases(2000), NamesBug::None, NamesBug::HiddenRead, "two values under one key", two_builders);
 }

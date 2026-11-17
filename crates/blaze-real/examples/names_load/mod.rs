@@ -657,7 +657,7 @@ fn script_records(
         .iter()
         .enumerate()
         .map(|(at, c)| match c.origin {
-            Origin::Unit(u) if at < crates.macro_from => records.outputs(u),
+            Origin::Unit(u) if !crates.macro_side(at) => records.outputs(u),
             _ => None,
         })
         .collect())

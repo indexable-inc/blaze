@@ -57,6 +57,7 @@ use crate::work::{Did, Made, held_str};
 pub(crate) mod expansion_texts;
 pub(crate) mod failed_call;
 pub(crate) mod include_outside;
+pub(crate) mod metered;
 mod scope;
 pub(crate) mod sections;
 

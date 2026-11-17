@@ -170,11 +170,14 @@ struct Wanted {
     script: Option<Name>,
 }
 
-/// A `Native` task: the program's image.
+/// A `Native` task: the program's image. `home` (`HOME`, read at the edge) holds the file area
+/// a native script's stored archives are mapped from (`scripts::FileArea`).
+#[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
 pub(crate) fn native<'b>(
     cx: &Cx,
     store: &mut dyn Store<'_>,
     producer: &ProducerId<Whole>,
+    home: Option<&str>,
     task: &Task<'_>,
     scratch: &Frame,
     held: &'b Frame,
@@ -267,7 +270,13 @@ pub(crate) fn native<'b>(
                     return Ok(refused(task, "a crate's `Script` record whose payload is not a build script's run (scripts.rs `payload_parts`)"));
                 };
                 match blaze_build_script::outputs::OutputsRef::open(record) {
-                    Ok(opened) => outputs.push(Some((script.out, opened))),
+                    // Its stored files (a native script's archives) mapped from the home's file
+                    // area when the link reads them, never read into this task's memory.
+                    Ok(opened) => {
+                        // Held for the task in its scratch frame, as the store's mappings are.
+                        let area: &crate::scripts::FileArea = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::FileArea::of(home, &opened), scratch));
+                        outputs.push(Some((script.out, opened.with_area(area))));
+                    }
                     Err(error) => {
                         let said = bstd::mem::format_in!(held, "the build script outputs of `{package}` do not open: {error:?}");
                         return Ok(Did::FailedSaying(

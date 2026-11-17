@@ -17,12 +17,17 @@
 //!   autocfg's numbered crate names and each unit's `OUT_DIR` ask one question. The target is
 //!   keyed once, as the target: a row written for one triple never answers another.
 //! - [`decide`]: the probes blaze decides from the snippet's own text: a crate of inner
-//!   attributes and comments only (autocfg's first probe, the empty crate, and `#![no_std]`),
-//!   whose verdict is the crate type and whether the toolchain ships the crate the snippet
-//!   implies (`std`, or `core` under `no_std`) for the target: a [`ships_key`] row of the
-//!   table, made from the toolchain's sysroot of that side. A snippet with an item, an
-//!   attribute it does not model (`feature`, `cfg_attr`, `deny`), or a flag it does not model
-//!   is [`Decided::Open`], named.
+//!   attributes and comments only (autocfg's first probe, the empty crate, `#![no_std]`, and
+//!   rustix's `#![feature(..)]` probes), whose verdict is the crate type, whether the
+//!   toolchain ships the crate the snippet implies (`std`, or `core` under `no_std`) for the
+//!   target (a [`ships_key`] row of the table, made from the toolchain's sysroot of that
+//!   side), and whether each feature it names exists: a language feature of the pinned
+//!   nightly (blaze-surface `lang_features`; a removed one is E0557), else a library feature
+//!   the crates the probe loads declare for the target ([`feature_key`] rows, listed from the
+//!   library's own text by blaze-scope `lib_features`; a name no row holds while the listing
+//!   is there, [`features_listed_key`], is E0635). A snippet with an item, an attribute it
+//!   does not model (`cfg_attr`, `deny`), or a flag it does not model is [`Decided::Open`],
+//!   named.
 //! - [`answer`]: the one place a try-compile is answered: decided by [`decide`], else by the
 //!   table's row for its key (`pinned::TEMPO`, each row with its reason in the pinned library),
 //!   else unanswered, which the runtime turns into `CannotAnswerYet` naming the key.
@@ -36,15 +41,17 @@
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
+use blaze_surface::lang_features::Lang;
 
 use crate::probe::{COMMIT_HASH, Row, Table, VERSION};
 
 /// The identity of [`decide`]: held in the answers' identity (`probe::answers_id`), so a
 /// change to what blaze decides itself reruns every script that probed.
-pub const DECIDER: &str = "blaze v2 probe decider 1: inner attributes only";
+pub const DECIDER: &str = "blaze v2 probe decider 2: inner attributes and #![feature] (language list at rustc 16d1ffac17, library listings)";
 
 const KEY_DOMAIN: &str = "blaze v2 build-script probe 3";
 const SHIPS_DOMAIN: &str = "blaze v2 build-script ships 1";
+const FEATURE_DOMAIN: &str = "blaze v2 build-script library feature 1";
 
 /// Where a try-compile's snippet comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -439,6 +446,39 @@ pub fn ships_rows<'a, 'c>(target: &str, crates: impl IntoIterator<Item = &'c str
     rows
 }
 
+/// The key of the fact "the crates a probe of `needs` loads for `target` declare the library
+/// feature `name`" (rustc's `lib_features`): a row accepted for a declared name, rejected for
+/// a name only mentioned in a macro's tokens or a body (known neither way).
+pub fn feature_key(target: &str, needs: Needs, name: &str) -> ContentId {
+    let mut h = Hasher::new(FEATURE_DOMAIN);
+    h.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(needs.krate().as_bytes());
+    h.update(&[1]).part(name.as_bytes());
+    h.finish()
+}
+
+/// The key of the fact "the library features of `needs` for `target` are listed": with it, a
+/// name no [`feature_key`] row holds is declared by none of the crates loaded (E0635).
+pub fn features_listed_key(target: &str, needs: Needs) -> ContentId {
+    let mut h = Hasher::new(FEATURE_DOMAIN);
+    h.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(needs.krate().as_bytes());
+    h.update(&[0]);
+    h.finish()
+}
+
+/// The rows of one listing (unsorted: the caller sorts the whole table): the listed fact, each
+/// `declared` name accepted, each `mentioned` one (never declared) rejected.
+pub fn feature_rows<'a, 'n>(target: &str, needs: Needs, declared: &[&'n str], mentioned: &[&'n str], alloc: Alloc<'a>) -> AVec<'a, Row> {
+    let mut rows = Vec::with_capacity_in(1 + declared.len() + mentioned.len(), alloc);
+    rows.push(Row { key: features_listed_key(target, needs), accepted: true });
+    for name in declared {
+        rows.push(Row { key: feature_key(target, needs, name), accepted: true });
+    }
+    for name in mentioned {
+        rows.push(Row { key: feature_key(target, needs, name), accepted: false });
+    }
+    rows
+}
+
 /// The crate a snippet with no items needs from the toolchain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Needs {
@@ -466,11 +506,18 @@ pub enum Rejection {
     NoMain,
     /// A row of the table says the pinned nightly rejects it.
     Table,
+    /// `#![feature(name)]` of a language feature the pinned nightly removed (E0557); `name` is
+    /// the snippet's bytes `at..at + len`.
+    RemovedFeature { at: u32, len: u32 },
+    /// `#![feature(name)]` of a name that is no language feature and that no crate the probe
+    /// loads declares for its target (E0635); `name` is the snippet's bytes `at..at + len`.
+    UnknownFeature { at: u32, len: u32 },
 }
 
 impl Rejection {
-    /// A short stderr naming the first error, as rustc's first line says it.
-    pub fn stderr<'a>(self, compile: &Compile<'_, '_>, alloc: Alloc<'a>) -> AString<'a> {
+    /// A short stderr naming the first error, as rustc's first line says it. `snippet` is the
+    /// probe's, which a feature's range is in.
+    pub fn stderr<'a>(self, compile: &Compile<'_, '_>, snippet: &[u8], alloc: Alloc<'a>) -> AString<'a> {
         let mut out = String::new_in(alloc);
         match self {
             Rejection::Edition => {
@@ -480,6 +527,13 @@ impl Rejection {
             }
             Rejection::NoMain => out.push_str("error[E0601]: `main` function not found in crate\n"),
             Rejection::Table => out.push_str("error: the pinned nightly rejects this probe (blaze's table of answers)\n"),
+            Rejection::RemovedFeature { .. } => out.push_str("error[E0557]: feature has been removed\n"),
+            Rejection::UnknownFeature { at, len } => {
+                let name = snippet.get(at as usize..(at + len) as usize).and_then(|name| core::str::from_utf8(name).ok());
+                out.push_str("error[E0635]: unknown feature `");
+                out.push_str(name.expect("a feature's range is in the snippet decide read as UTF-8"));
+                out.push_str("`\n");
+            }
         }
         out
     }
@@ -491,8 +545,15 @@ pub enum Open {
     /// The snippet has an item (or anything but inner attributes and comments) at this byte:
     /// a names-and-types check of it needs the sysroot crates' scopes.
     Items { at: usize },
-    /// An inner attribute whose effect it does not model (`feature`, `cfg_attr`, `deny`, ...).
+    /// An inner attribute whose effect it does not model (`cfg_attr`, `deny`, ...), or a
+    /// `#![feature(..)]` it does not read (a name twice, a list past [`MOST_FEATURES`]).
     Attribute { at: usize },
+    /// The library feature named at this byte is only mentioned in the loaded crates (inside a
+    /// macro's tokens or a body: declared only once expanded), so known neither way.
+    Feature { at: usize },
+    /// A library feature is named and the table holds no listing of `needs`'s features for the
+    /// target ([`features_listed_key`]).
+    Features(Needs),
     /// A flag it does not model (`-C`, `-Z`, `-D`, `--extern`, `--check-cfg`, `--test`, ...).
     Flag,
     /// A crate type other than `lib`, `rlib` and `bin`, or `bin` under `no_std`.
@@ -509,8 +570,9 @@ pub enum Open {
 /// What [`decide`] makes of a probe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Decided {
-    /// Accepted if the toolchain ships `needs` for the target.
-    Accepted { needs: Needs },
+    /// Accepted if the toolchain ships `needs` for the target and, with `library`, the crates
+    /// it loads declare each library feature `#![feature]` names ([`answer`] reads the table).
+    Accepted { needs: Needs, library: bool },
     Rejected(Rejection),
     Open(Open),
 }
@@ -535,14 +597,25 @@ pub fn decide(compile: &Compile<'_, '_>, snippet: &[u8]) -> Decided {
         return Decided::Open(Open::Flag);
     }
     let Ok(text) = core::str::from_utf8(snippet) else { return Decided::Open(Open::Text) };
-    let no_std = match inner_attributes(text) {
-        Ok(no_std) => no_std,
+    let inner = match inner_attributes(text) {
+        Ok(inner) => inner,
         Err(open) => return Decided::Open(open),
     };
+    let no_std = inner.no_std;
+    // The features are read in expansion, before the crate type's E0601: a removed language
+    // feature is the first error whatever else holds.
+    let mut library = false;
+    for &(at, name) in inner.features() {
+        match blaze_surface::lang_features::lang(name) {
+            Some(Lang::Removed) => return Decided::Rejected(Rejection::RemovedFeature { at: at as u32, len: name.len() as u32 }),
+            Some(Lang::Accepted | Lang::Unstable) => {}
+            None => library = true,
+        }
+    }
     let needs = if no_std { Needs::Core } else { Needs::Std };
     let types: &[&str] = if compile.crate_types.is_empty() { &["bin"] } else { &compile.crate_types };
     if types.iter().all(|kind| matches!(*kind, "lib" | "rlib")) {
-        return Decided::Accepted { needs };
+        return Decided::Accepted { needs, library };
     }
     if types.contains(&"bin") && !no_std && types.iter().all(|kind| matches!(*kind, "lib" | "rlib" | "bin")) {
         return Decided::Rejected(Rejection::NoMain);
@@ -560,17 +633,35 @@ fn plain_cfg(cfg: &str) -> bool {
     ident && value.is_none_or(|v| v.len() >= 2 && v.starts_with('"') && v.ends_with('"') && !v[1..v.len() - 1].contains(['"', '\\']))
 }
 
+/// The most names the `#![feature(..)]` attributes of a probe blaze decides may give.
+pub const MOST_FEATURES: usize = 32;
+
+/// What a crate of inner attributes says.
+struct Inner<'t> {
+    no_std: bool,
+    /// Each name `#![feature(..)]` gives, with its byte, in order, each once.
+    features: [(usize, &'t str); MOST_FEATURES],
+    count: usize,
+}
+
+impl<'t> Inner<'t> {
+    fn features(&self) -> &[(usize, &'t str)] {
+        &self.features[..self.count]
+    }
+}
+
 /// Reads a crate made only of whitespace, comments and inner attributes `#![name]` or
-/// `#![name(..)]`: whether it says `no_std`. An item, an attribute not `no_std` and not in
-/// [`HARMLESS`], or anything else is [`Open`], at its byte.
-fn inner_attributes(text: &str) -> Result<bool, Open> {
+/// `#![name(..)]`: whether it says `no_std`, and the features `#![feature(a, b)]` names. An
+/// item, an attribute not `no_std`, `feature` or in [`HARMLESS`], or anything else is
+/// [`Open`], at its byte.
+fn inner_attributes(text: &str) -> Result<Inner<'_>, Open> {
     let bytes = text.as_bytes();
     let mut at = if text.starts_with('\u{feff}') { 3 } else { 0 };
-    let mut no_std = false;
+    let mut inner = Inner { no_std: false, features: [(0, ""); MOST_FEATURES], count: 0 };
     loop {
         at = skip_trivia(bytes, at)?;
         if at == bytes.len() {
-            return Ok(no_std);
+            return Ok(inner);
         }
         let start = at;
         if !bytes[at..].starts_with(b"#![") {
@@ -584,8 +675,12 @@ fn inner_attributes(text: &str) -> Result<bool, Open> {
         let name = &text[name_start..at];
         at = skip_trivia(bytes, at)?;
         let with_args = bytes.get(at) == Some(&b'(');
+        let args_at = at;
         if with_args {
             at = balanced(bytes, at).ok_or(Open::Text)?;
+        }
+        let args_end = at;
+        if with_args {
             at = skip_trivia(bytes, at)?;
         }
         if bytes.get(at) != Some(&b']') {
@@ -593,11 +688,35 @@ fn inner_attributes(text: &str) -> Result<bool, Open> {
         }
         at += 1;
         match (name, with_args) {
-            ("no_std", false) => no_std = true,
+            ("no_std", false) => inner.no_std = true,
+            ("feature", true) => feature_names(text, args_at + 1, args_end - 1, start, &mut inner)?,
             (name, true) if HARMLESS.contains(&name) => {}
             _ => return Err(Open::Attribute { at: start }),
         }
     }
+}
+
+/// The names of `#![feature(..)]` (the attribute at `attr`), whose list is `text[from..to]`:
+/// identifiers between commas (a trailing comma allowed), each new, into `inner`.
+fn feature_names<'t>(text: &'t str, from: usize, to: usize, attr: usize, inner: &mut Inner<'t>) -> Result<(), Open> {
+    let list = &text[from..to];
+    let pieces = list.split(',').count();
+    let mut offset = from;
+    for (index, piece) in list.split(',').enumerate() {
+        let name = piece.trim_matches(|c: char| c.is_ascii_whitespace());
+        let at = offset + (piece.len() - piece.trim_start_matches(|c: char| c.is_ascii_whitespace()).len());
+        offset += piece.len() + 1;
+        if name.is_empty() && index + 1 == pieces {
+            break;
+        }
+        let ident = !name.is_empty() && name.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()));
+        if !ident || inner.count == MOST_FEATURES || inner.features().iter().any(|(_, seen)| *seen == name) {
+            return Err(Open::Attribute { at: attr });
+        }
+        inner.features[inner.count] = (at, name);
+        inner.count += 1;
+    }
+    Ok(())
 }
 
 /// Past whitespace and comments from `at`. A doc comment is an item's or the crate's
@@ -698,8 +817,13 @@ pub fn answer<'t>(compile: &Compile<'_, 't>, host: &'t str, snippet: &[u8], tabl
     let target = compile.target_or(host);
     let key = compile.key(host, snippet);
     let open = match decide(compile, snippet) {
-        Decided::Accepted { needs } => match table.answer(&ships_key(target, needs.krate())) {
-            Some(true) => return Answered { key, target, verdict: Verdict::Accepted(By::Decided) },
+        Decided::Accepted { needs, library } => match table.answer(&ships_key(target, needs.krate())) {
+            Some(true) if !library => return Answered { key, target, verdict: Verdict::Accepted(By::Decided) },
+            Some(true) => match library_features(snippet, target, needs, table) {
+                Ok(()) => return Answered { key, target, verdict: Verdict::Accepted(By::Decided) },
+                Err(Ok(rejection)) => return Answered { key, target, verdict: Verdict::Rejected(rejection) },
+                Err(Err(open)) => open,
+            },
             // No row says the toolchain ships it for this target: not known here.
             Some(false) | None => Open::Sysroot(needs),
         },
@@ -712,4 +836,35 @@ pub fn answer<'t>(compile: &Compile<'_, 't>, host: &'t str, snippet: &[u8], tabl
         None => Verdict::Unanswered(open),
     };
     Answered { key, target, verdict }
+}
+
+/// Whether the crates a probe of `needs` loads for `target` declare each library feature (a
+/// name no language feature) the snippet's `#![feature]` gives, by the table's listing: all
+/// declared is `Ok`; the first name declared by none while the listing is there is E0635
+/// (`Err(Ok)`), certain whatever the others are; else the first name known neither way
+/// (`Err(Err)`).
+fn library_features(snippet: &[u8], target: &str, needs: Needs, table: &Table<'_>) -> Result<(), Result<Rejection, Open>> {
+    let text = core::str::from_utf8(snippet).map_err(|_| Err(Open::Text))?;
+    let inner = inner_attributes(text).map_err(Err)?;
+    let listed = table.answer(&features_listed_key(target, needs)) == Some(true);
+    let mut open = None;
+    for &(at, name) in inner.features() {
+        if blaze_surface::lang_features::lang(name).is_some() {
+            continue;
+        }
+        match table.answer(&feature_key(target, needs, name)) {
+            Some(true) => {}
+            Some(false) => {
+                open.get_or_insert(Open::Feature { at });
+            }
+            None if listed => return Err(Ok(Rejection::UnknownFeature { at: at as u32, len: name.len() as u32 })),
+            None => {
+                open.get_or_insert(Open::Features(needs));
+            }
+        }
+    }
+    match open {
+        Some(open) => Err(Err(open)),
+        None => Ok(()),
+    }
 }

@@ -12,6 +12,9 @@ use crate::fix::{Change, Id, Listed};
 /// certain fix (its line deleted).
 const BLAZE_MANIFEST: &str = "[package]\nname = \"hello\"\nversion = \"0.1.0\"\nedition = \"blaze-2026.11\"\n\n[dependencies]\nbstd = { package = \"blaze-std\", path = \"/x/blaze-std\" }\n";
 const BSTD_LINE: &str = "bstd = { package = \"blaze-std\", path = \"/x/blaze-std\" }\n";
+/// The note that says why borrows were NOT checked, before every closing line that says so
+/// (main.rs `close`, work.rs `CHECK_STAGES`).
+const BORROWS_WHY: &str = "note: NOT checked: borrows: the move and borrow check ran, but its findings stay notes until the flow census reads none false (`BORROWS_ARE_ERRORS`)";
 
 fn agent(io: &Io, fix: Option<&[&str]>) -> (Checked, std::string::String) {
     let before = stdout(io).len();
@@ -45,7 +48,7 @@ fn the_agent_view_of_a_syntax_error_and_an_unresolved_import() {
     write(&io, "src/lib.rs", "use crate::nope;\nfn f() { let x = ; }\n");
     let (checked, out) = agent(&io, None);
     assert_eq!(checked.status, Some(1), "{out}");
-    assert_eq!(out, "gv7fz  error[unresolved]  src/lib.rs:1:12  no `nope` in `crate`\nxqq2p  error[syntax]  src/lib.rs:2:17  expected expression\nincomplete: NOT checked: borrows\n2 errors: blaze check\n");
+    assert_eq!(out, format!("gv7fz  error[unresolved]  src/lib.rs:1:12  no `nope` in `crate`\nxqq2p  error[syntax]  src/lib.rs:2:17  expected expression\n{BORROWS_WHY}\nincomplete: NOT checked: borrows\n2 errors: blaze check\n"));
     let (_, again) = agent(&io, None);
     assert_eq!(again, out, "an unchanged repeat says the same");
     let before = stdout(&io).len();
@@ -55,6 +58,7 @@ fn the_agent_view_of_a_syntax_error_and_an_unresolved_import() {
         &[
             r#"{"id":"gv7fz","severity":"error","code":"unresolved","path":"src/lib.rs","line":1,"col":12,"end_line":1,"end_col":16,"message":"no `nope` in `crate`","fix":null}"#,
             r#"{"id":"xqq2p","severity":"error","code":"syntax","path":"src/lib.rs","line":2,"col":17,"end_line":2,"end_col":17,"message":"expected expression","fix":null}"#,
+            r#"{"note":"NOT checked: borrows: the move and borrow check ran, but its findings stay notes until the flow census reads none false (`BORROWS_ARE_ERRORS`)"}"#,
             r#"{"errors":2,"warnings":0,"fixes":0,"command":"blaze check","not_checked":["borrows"]}"#,
         ],
     );
@@ -135,6 +139,7 @@ fn fix_deletes_the_toolchain_line_by_id_and_checks_again() {
         &[
             r#"vf9w8  error[toolchain-crate-named]  Cargo.toml:7:1  under edition blaze-2026.11 blaze gives this package `bstd`: this line names another copy"#,
             r#"       fix: delete `bstd = { package = "blaze-std", path = "/x/blaze-std" }` (7:1-8:1): under edition blaze-2026.11 the package is given `bstd` with no line"#,
+            BORROWS_WHY,
             "incomplete: NOT checked: borrows",
             "1 error, 1 fix: blaze check --fix vf9w8",
         ],
@@ -142,7 +147,7 @@ fn fix_deletes_the_toolchain_line_by_id_and_checks_again() {
     let (fixed, out) = agent(&io, Some(&[&id]));
     assert!(!fixed.refused, "{out}");
     assert_eq!(read(&io, "Cargo.toml"), BLAZE_MANIFEST.replace(BSTD_LINE, ""));
-    golden(&out, &["note: applied 1 fix in 1 file: vf9w8", "incomplete: NOT checked: borrows", "0 errors: blaze check"]);
+    golden(&out, &["note: applied 1 fix in 1 file: vf9w8", BORROWS_WHY, "incomplete: NOT checked: borrows", "0 errors: blaze check"]);
 }
 
 fn one(path: &'static str, text: &'static str, needle: &str, id: &str) -> Listed<'static> {

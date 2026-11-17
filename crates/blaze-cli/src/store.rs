@@ -666,6 +666,28 @@ pub fn last_root(checkout: &str, pointer: &blaze_drive::pointers::PointerName) -
     name
 }
 
+/// The root naming the last answer written for one units' source and request shape, by any
+/// checkout on this machine: `seed.<16 hex of the units' source>.<the pointer's 16 hex>`. A
+/// checkout with no last answer of its own (a second worktree's first command) follows it
+/// (main.rs `request`): its reads re-hashed here key the certificate, so equal text is a hit,
+/// other text a miss that walks forward from that answer. No machine's path: a checkout's
+/// layout reads relative paths, so two worktrees of one tree name one seed. `LOCAL`, like
+/// [`last_root`].
+pub fn seed_root(units: &ContentId, pointer: &blaze_drive::pointers::PointerName) -> std::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = std::string::String::with_capacity(5 + 16 + 1 + 16);
+    name.push_str("seed.");
+    for byte in &units.0[..8] {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    name.push('.');
+    for &byte in pointer.bytes() {
+        name.push(char::from(byte));
+    }
+    name
+}
+
 /// The checkout's last answer and leaf table for one request shape, in place: the one record the
 /// root `root` ([`last_root`]) names (main.rs seals it with `seal::seal`). Read before the
 /// request's handle is made and never asked of an origin: a root is `LOCAL`. `None`: no root
@@ -679,13 +701,17 @@ pub fn last<'m, D: Driver>(lent: &'m Lent<D, Global>, root: &str) -> Result<Opti
 
 impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
     /// `sealed` as the checkout's last answer for one request shape: put under its content key
-    /// and named by the root `root`. Both ride the ONE commit after the answer is printed
+    /// and named by each root of `roots` (the checkout's [`last_root`], and the [`seed_root`]
+    /// of its units' source). All ride the ONE commit after the answer is printed
     /// ([`plain_place::after_answer`]): no generation names a pointer whose record is absent
     /// (blaze-cas plain/root_commit_tests.rs).
-    pub fn set_last(&mut self, cx: &Cx, root: &str, sealed: &[u8]) -> Result<(), CliError> {
+    pub fn set_last(&mut self, cx: &Cx, roots: &[&str], sealed: &[u8]) -> Result<(), CliError> {
         let key = Key(ContentId::of("blaze-cli last answer record", sealed));
         self.put(cx, key, sealed)?;
-        Ok(self.place.pin(root, &[key])?)
+        for root in roots {
+            self.place.pin(root, &[key])?;
+        }
+        Ok(())
     }
 }
 

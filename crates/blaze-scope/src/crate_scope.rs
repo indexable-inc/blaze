@@ -195,6 +195,53 @@ pub struct CrateScope<'a> {
     pub(crate) asked: AVec<'a, Question<'a>>,
 }
 
+/// A `CrateScope` record's head read in place: its crate's key and its reach list, the keys'
+/// bytes as the record holds them (32 each), nothing decoded or copied.
+fn head(bytes: &[u8]) -> Result<(CrateItemKey, &[u8]), RecordRead> {
+    let short = RecordRead::Short;
+    let mut r = Reader::starting_at(bytes, 0).map_err(short)?;
+    if *r.array::<4>().map_err(short)? != MAGIC || r.u32().map_err(short)? != VERSION {
+        return Err(RecordRead::NotThisRecord);
+    }
+    let krate = CrateItemKey(ContentId(*r.array::<32>().map_err(short)?));
+    // The root key, edition, has-proc, two pad bytes and the proc key.
+    r.skip(32 + 4 + 32).map_err(short)?;
+    r.str_u32().map_err(short)?;
+    let count = r.u32().map_err(short)? as usize;
+    let rest = r.take_rest();
+    let keys = rest.get(..count.checked_mul(32).ok_or(RecordRead::BadByte { at: bytes.len() - rest.len(), what: "reach count" })?);
+    Ok((krate, keys.ok_or(RecordRead::BadByte { at: bytes.len() - rest.len(), what: "reach count" })?))
+}
+
+/// The crates `deps`' records reach that none of `deps` is, sorted and without repeats: what
+/// [`resolve_crate`] would answer [`CrateScopeError::Need`] for, read from the records' heads
+/// in place before any record is decoded, so a caller asks for them all before its first call
+/// (reach lists are closed, near or far, so one round asks for every one).
+pub fn unmet_reaches<'a>(deps: &[&[u8]], alloc: Alloc<'a>) -> Result<AVec<'a, CrateItemKey>, CrateScopeError<'a>> {
+    let mut heads = AVec::with_capacity_in(deps.len(), alloc);
+    let mut held = AVec::with_capacity_in(deps.len(), alloc);
+    for (at, bytes) in deps.iter().enumerate() {
+        let (krate, keys) = head(bytes).map_err(|error| CrateScopeError::Record { at, error })?;
+        heads.push(keys);
+        held.push(krate.prefix());
+    }
+    held.sort_unstable();
+    let mut need = AVec::new_in(alloc);
+    for keys in heads.iter() {
+        for key in keys.chunks_exact(32) {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(key);
+            let key = CrateItemKey(ContentId(k));
+            if held.binary_search(&key.prefix()).is_err() {
+                need.push(key);
+            }
+        }
+    }
+    need.sort_unstable();
+    need.dedup();
+    Ok(need)
+}
+
 /// Reads a `CrateScope` record (its bytes 16-aligned and living as long as `alloc`'s values).
 pub fn read_record<'a>(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<DepScope<'a>, RecordRead> {
     if bytes.as_ptr() as usize % ALIGN != 0 {

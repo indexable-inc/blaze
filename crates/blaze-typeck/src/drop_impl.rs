@@ -22,8 +22,13 @@ use blaze_own::Alloc;
 /// [`ResolveError::Missing`] naming its header.
 pub fn adt_drop_impl<W: World>(world: &W, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
     let mut reads = Reads::new_in(world, alloc);
+    // An unmade bucket is a hole whose stand-in lists no impl: "no `Drop`" is no answer then.
+    let impls = reads.impls_of(drop_trait, Shape::Adt(adt))?;
+    if let Some(q) = reads.first_hole() {
+        return Err(ResolveError::Missing(q));
+    }
     let mut found: Option<ItemKey> = None;
-    for &imp in reads.impls_of(drop_trait, Shape::Adt(adt))? {
+    for &imp in impls {
         let Some(h) = reads.impl_header(imp)? else { return Err(ResolveError::Missing(Question::ImplHeader(imp))) };
         if h.trait_ != Some(drop_trait) || h.polarity != ImplPolarity::Positive {
             continue;

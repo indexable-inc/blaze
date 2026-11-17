@@ -67,6 +67,17 @@ impl Id {
         Id { full, shown: SHORT as u8 }
     }
 
+    /// The id of a finding never drawn: one only counted under its cause (print.rs
+    /// `Place::Counted`, never under `--each`). No digest is made for it (tempo's no-op made
+    /// 31,797, one a finding, to draw 753 lines); it shows as nothing, no selector's prefix
+    /// matches it, and [`lengths`] leaves it out.
+    pub(crate) const UNSHOWN: Id = Id { full: [0; FULL], shown: 0 };
+
+    /// Whether this id is a drawn finding's ([`Id::UNSHOWN`] is not).
+    pub(crate) fn is_shown(&self) -> bool {
+        self.shown != 0
+    }
+
     /// The id as shown.
     pub(crate) fn as_str(&self) -> &str {
         core::str::from_utf8(&self.full[..usize::from(self.shown)]).unwrap_or("")
@@ -101,7 +112,7 @@ impl core::fmt::Display for Id {
 /// twice (one per configuration): they share their length.
 pub(crate) fn lengths(listed: &mut [Listed<'_>], frame: &Frame) {
     let mut order: Vec<usize, &Frame> = Vec::with_capacity_in(listed.len(), frame);
-    order.extend(0..listed.len());
+    order.extend((0..listed.len()).filter(|&at| listed[at].id.is_shown()));
     order.sort_unstable_by(|&a, &b| listed[a].id.full.cmp(&listed[b].id.full));
     for pair in order.windows(2) {
         let (a, b) = (listed[pair[0]].id.full, listed[pair[1]].id.full);

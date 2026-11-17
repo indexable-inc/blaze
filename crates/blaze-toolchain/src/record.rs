@@ -120,7 +120,7 @@ pub struct UnitIn<'s> {
     pub features: &'s [&'s str],
     /// (extern name, unit index within the same target), the implied sysroot edges included.
     pub deps: &'s [(&'s str, u32)],
-    /// What its root's text gives it from the sysroot (crate::implied::root_facts).
+    /// What its root's text gives it from the sysroot (crate::implied::crate_facts).
     pub sysroot: ImplicitSysroot,
 }
 

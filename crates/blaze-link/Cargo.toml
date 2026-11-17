@@ -25,6 +25,8 @@ blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+# The macOS SDK's one home: its folder (SDKROOT, else xcrun) and version (target.rs `apple`).
+blaze-apple-sdk.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true

@@ -401,6 +401,12 @@ pub fn owned_key(task: Key, graph: ContentId, owners: Name, owners_out: ContentI
     value_key(task, &[(Name::unit_graph(), graph), (owners, owners_out)])
 }
 
+/// The most shapes one lookup follows from a task key (request.rs `Walk`): the task key's, then
+/// each held at a value key its predecessor's names made. A chain grows by one only when a
+/// command's answers to every earlier shape's names are ones a record of other names was made
+/// under, so real chains are short; past this the lookup stops with a typed error (rule 18).
+pub const MOST_SHAPE_STEPS: u32 = 64;
+
 /// [`value_key`] of a record that also read cells (cells.rs): the whole reads, then each cell
 /// read in (name, cell) order with what it saw. With no cell read it is [`value_key`] itself.
 pub fn value_key_with_cells(key: Key, reads: &[(Name, ContentId)], cells: &[crate::cells::CellRead]) -> Key {

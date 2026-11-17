@@ -1,0 +1,15 @@
+{
+ "id": "dep-sources-not-on-disk",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane SV",
+ "where": "census rows of tempo's build (port27/tempo-run/build-census-g044908.txt) whose example bodies live in crates not unpacked anywhere readable",
+ "what": "reducing a census row needs the dependency's source; only a part of tempo's dependency set is unpacked (port27/procs-1116/d58/work2/vendor has hashbrown, mime_guess, ruint and others), and alloy-sol-types, jsonwebtoken, der and the crate defining ArbitraryInt are not on disk: their text is only in blaze's store records. jsonwebtoken's `Enc::deserialize` had to be read on docs.rs; the census example's text excerpt (40 bytes) is not enough to reduce a body",
+ "cost": "about half an hour of searching, and two rows (ArbitraryInt, Result<Length>) left unreduced",
+ "cause": "the census prints a body's item path and a short excerpt, not the crate version or its file; no tool dumps a record's source text by item path",
+ "whys": "the census was built for counting, not for reducing",
+ "class": "evidence a lane needs that only the store holds",
+ "prevention": "wanted: the census names each example's crate, version and file:line, or a `blaze debug source <item path>` that prints a record's text",
+ "annoyance": "Grep and Glob were not available in this lane's tool set, so read-only searches went through Bash",
+ "workaround": "docs.rs source pages for published crates",
+ "state": "open"
+}

@@ -42,11 +42,15 @@ pub mod every_body;
 /// refused ([`Refused::Lengths`]): reach.rs's and the census's `MOST_LENS`.
 pub(super) const MOST_LENS: u32 = 64;
 
-/// One body of the program's own crate: a free fn, or a fn member of an impl or a trait.
+/// One body of the program's own crate: a free fn, `const` or `static` (its initializer), or a
+/// fn or `const` member of an impl or a trait (`kind`: [`MemberKind::Fn`] or
+/// [`MemberKind::Const`]; a member's key is made from its kind and its name, keys.rs
+/// `filed_member`). The Reference, "Constant items" and "Static items": the initializer is an
+/// expression of the declared type, checked as a body is ([`ProjectWorld::check`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BodyRef<'n> {
     Free(LibKey),
-    Member { container: LibKey, is_trait: bool, name: &'n str },
+    Member { container: LibKey, is_trait: bool, kind: MemberKind, name: &'n str },
 }
 
 /// Where a body is written: its item's file (an index into the crate's files) and its start
@@ -217,6 +221,12 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         list_bodies(self.front.names, alloc)
     }
 
+    /// [`ProjectWorld::listed`] holding what `listing` names (project_records.rs `Listing`):
+    /// with `FnsAndInitializers`, each `const` and `static` initializer too.
+    pub fn listed_with<'a>(&self, listing: super::project_records::Listing, alloc: Alloc<'a>) -> AVec<'a, Listed<'n>> {
+        super::project_records::list_with(self.front.names, listing, alloc)
+    }
+
     /// The program's own bodies by (file, item chain), made on the first call in the world's
     /// allocator and kept: each file that holds a body is outlined at most once per world.
     pub fn chains(&mut self) -> Result<&ByChain<'n>, ChainError<'n>> {
@@ -367,7 +377,7 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
 fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, body: BodyRef<'n>) -> Result<Body<'n>, Refused> {
     let target = match body {
         BodyRef::Free(lib) => LowerTarget::Free(lib),
-        BodyRef::Member { container, is_trait, name } => {
+        BodyRef::Member { container, is_trait, kind, name } => {
             // One want, with each constant its heads' array lengths name evaluated, at most
             // `MOST_LENS` of them.
             let made = |r: &mut Records<'_, 'n, S>, w: Want| -> Result<(), Refused> {
@@ -388,10 +398,11 @@ fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares
             for &w in wants {
                 made(&mut *r, w)?;
             }
-            let k = r.keys.filed_member(checker_of(container), MemberKind::Fn, name).ok_or(Refused::MemberNotFiled)?;
+            let k = r.keys.filed_member(checker_of(container), kind, name).ok_or(Refused::MemberNotFiled)?;
             // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`), never made
-            // with its impl's head; its own refusal is its `fn_gaps` row, read just below.
-            if !is_trait {
+            // with its impl's head; its own refusal is its `fn_gaps` row, read just below. An
+            // impl's `const` is made with its impl's head (heads/member_fn.rs `member_head_want`).
+            if !is_trait && kind == MemberKind::Fn {
                 made(&mut *r, Want::MemberFn(container, k))?;
             }
             if r.store.fn_gaps.get(&k).is_some() {

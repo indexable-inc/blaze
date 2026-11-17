@@ -1076,6 +1076,12 @@ impl Facts for World {
         Ok(self.local.contains(&d))
     }
 
+    /// The test world writes no specializing impls: two impls that both apply overlap.
+    fn specializes(&self, _: Seal, _: Def, _: Def) -> Fetch<bool> {
+        self.ask();
+        Ok(false)
+    }
+
     /// By the condition's name (`PredA::Const`), whatever the arguments.
     fn const_holds(&self, _: Seal, cond: Def, _: &[Ty]) -> Fetch<crate::facts::ConstHolds> {
         self.ask();

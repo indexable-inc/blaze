@@ -96,18 +96,20 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
         let Some(src) = found.src else {
             // A procedural macro with no source row: its crate's runner, by the name it is
             // defined under. The last segment is that name unless a `use .. as` renamed it,
-            // which the names do not record for a proc macro yet.
+            // which the names do not record for a proc macro yet. The definition names the
+            // crate by its RUNNER's key, as `definition_of` does (the runner knows a crate by
+            // no other key); a crate no runner holds has no definition.
+            let no_source = || NoMacro::Names(MacroDefError::NoSource { def: found.def, krate: found.krate });
+            let runner = found.proc_key.ok_or_else(no_source)?;
             let name = segments.last().copied().unwrap_or(first);
             let def_at = DefAt {
-                site: DefSite { krate: found.crate_key, module: None },
+                site: DefSite { krate: runner, module: None },
                 edition: found.edition,
                 export: Export::Exported,
                 local_inner: LocalInner::No,
                 transparency: None,
             };
-            return MacroDefinition::proc_macro(found.crate_key, kind, name, &[], def_at, alloc)
-                .map(Resolved::Def)
-                .map_err(|_| NoMacro::Names(MacroDefError::NoSource { def: found.def, krate: found.krate }));
+            return MacroDefinition::proc_macro(runner, kind, name, &[], def_at, alloc).map(Resolved::Def).map_err(|_| no_source());
         };
         // A `macro_rules!` or `macro` is prepared once, by its defining item's key.
         if let (Some(prepared), MacroBody::Rules(_) | MacroBody::Macro2 { .. }) = (self.prepared, src.body) {

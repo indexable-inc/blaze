@@ -69,6 +69,12 @@ fn produce<'a>(home: &str, sdk: &str, alloc: Alloc<'a>) -> Result<OwnedNativeSet
     command_native_setting(home, sdk, "test", HOST, alloc)
 }
 
+/// The command's jobserver under the setting's work folder, two workers.
+fn jobserver(owned: &OwnedNativeSetting<'_>) -> crate::jobserver::Jobserver {
+    let opts = crate::jobserver::JobserverOpts { work: owned.work.as_str(), workers: core::num::NonZeroU32::new(2).expect("2"), id: std::process::id() };
+    crate::jobserver::Jobserver::new(opts).unwrap_or_else(|e| panic!("{e}"))
+}
+
 /// The producer names the pin's shelf, the SDK's version and the command's own work folder.
 /// A producer that ignored the pin table (any other folder name) or the SDK's settings fails.
 #[test]
@@ -81,8 +87,11 @@ fn the_native_setting_names_the_pins_shelf_the_sdks_version_and_the_commands_wor
     assert!(owned.sdk.as_str().ends_with("/MacOSX.sdk"), "{}", owned.sdk.as_str());
     assert!(owned.work.as_str().ends_with(&format!("{NATIVE_WORK_DIR}/test")), "{}", owned.work.as_str());
     assert!(std::fs::metadata(owned.work.as_str()).map(|m| m.is_dir()).unwrap_or(false), "the work folder is made");
-    let setting: NativeSetting<'_> = owned.setting();
+    let jobs = jobserver(&owned);
+    let setting: NativeSetting<'_> = owned.setting(&jobs);
     assert_eq!(setting.deadline, NATIVE_RUN_DEADLINE);
+    assert!(setting.jobs.fifo().starts_with(owned.work.as_str()), "the fifo is the command's own: {}", setting.jobs.fifo());
+    jobs.end().unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -168,7 +177,8 @@ fn a_native_placed_script_with_a_setting_reaches_its_binary_lookup() {
         outputs(&runtime, setting, &graph, UnitId(0), tree, ScriptRoot::package(), &[], alloc)
     };
 
-    let with = match run(&setting_with(Some(owned.setting()))) {
+    let jobs = jobserver(&owned);
+    let with = match run(&setting_with(Some(owned.setting(&jobs)))) {
         Err(UnitScriptError::Native(NativeUnitError::NoModule { package, .. })) => package,
         Err(other) => panic!("with a native setting, not the binary's lookup: {other}"),
         Ok(_) => panic!("a run with no host binary in the store"),
@@ -180,6 +190,7 @@ fn a_native_placed_script_with_a_setting_reaches_its_binary_lookup() {
         Ok(_) => panic!("a native run with no setting"),
     }
     println!("native: with a setting NoModule for {with}, without NoNativeSetting");
+    jobs.end().unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&store);
 }

@@ -293,6 +293,10 @@ pub fn agent_closing(out: &mut AString<'_>, closing: &PlainClosing<'_>) {
         out.str("\n");
     }
     let counts = closing.counts;
+    // A task that failed on its own is no error of the code: counted first, by itself.
+    if counts.failures > 0 {
+        out.int(counts.failures).str(if counts.failures == 1 { " failure, " } else { " failures, " });
+    }
     out.int(counts.errors).str(if counts.errors == 1 { " error" } else { " errors" });
     if counts.warnings > 0 {
         out.str(", ").int(counts.warnings).str(if counts.warnings == 1 { " warning" } else { " warnings" });
@@ -312,7 +316,12 @@ pub fn agent_closing(out: &mut AString<'_>, closing: &PlainClosing<'_>) {
 /// --fix e7k2q","not_checked":["types","borrows"]}`.
 pub fn json_closing(out: &mut AString<'_>, closing: &PlainClosing<'_>) {
     let counts = closing.counts;
-    out.str("{\"errors\":").int(counts.errors).str(",\"warnings\":").int(counts.warnings);
+    out.str("{");
+    // Only when there are any: a run with none keeps its object as before.
+    if counts.failures > 0 {
+        out.str("\"failures\":").int(counts.failures).str(",");
+    }
+    out.str("\"errors\":").int(counts.errors).str(",\"warnings\":").int(counts.warnings);
     out.str(",\"fixes\":").int(closing.fixes.len() as u32).str(",\"command\":\"").str(closing.command);
     if let Some(selector) = fix_command(closing.fixes) {
         out.str(" --fix ").str(selector);

@@ -74,6 +74,7 @@ mod shape;
 mod through;
 mod through_scratch;
 pub mod builtin_attrs;
+pub mod lang_features;
 pub mod tool_attrs;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

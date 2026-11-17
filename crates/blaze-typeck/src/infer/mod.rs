@@ -35,7 +35,7 @@ use blaze_ty::{AliasKind, ConstKind, FnHeader, Node, Region, TyKind};
 
 use crate::error::{CheckError, Stop};
 use crate::ids::{ExprId, ItemKey, Name};
-use crate::ty::{FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
+use crate::ty::{FulfillError, FulfillErrorKind, Goal, Normalized, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 use crate::world::{Reads, World};
 
 /// The most fact-fill rounds one solver call may take (rule 18): each round fills one question
@@ -70,10 +70,18 @@ pub struct InferCtx<'a> {
     solver_reads: Vec<blaze_solve::Read, Alloc<'a>>,
     /// Solver calls repeated after a fact was filled: the Need rounds inside the context.
     pub need_rounds: u64,
+    /// How many `Specializes` questions this context is answering for the contexts above it
+    /// (each is answered in a context of its own, one deeper): bounded by `MAX_SPEC_DEPTH`.
+    spec_depth: u8,
     /// A planted bug of the body suite; `InferPlant::None` in every other test.
     #[cfg(test)]
     pub(crate) plant: InferPlant,
 }
+
+/// The deepest chain of `Specializes` questions asked while one is answered (an impl's
+/// where-clause whose own selection weighs two impls that specialize). Past it the check stops
+/// with `Limit::Specialization` rather than recursing.
+const MAX_SPEC_DEPTH: u8 = 8;
 
 /// The context's planted bugs (`suite`'s controls).
 #[cfg(test)]
@@ -180,6 +188,7 @@ impl<'a> InferCtx<'a> {
             foreign_coroutines: Vec::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
             need_rounds: 0,
+            spec_depth: 0,
             #[cfg(test)]
             plant: InferPlant::None,
         }
@@ -319,6 +328,9 @@ impl<'a> InferCtx<'a> {
     /// are terms of this context: exported as a ground table, which names the condition's
     /// record; every other question is the fact cache's.
     fn fill<W: World>(&mut self, q: blaze_solve::facts::Question, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        if let blaze_solve::facts::Question::Specializes(a, b) = q {
+            return self.fill_specializes(a, b, reads);
+        }
         let blaze_solve::facts::Question::ConstHolds(cond, list) = q else { return self.facts.fill(q, reads) };
         let mut args: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(list.len as usize, self.alloc);
         for i in 0..list.len {
@@ -337,6 +349,46 @@ impl<'a> InferCtx<'a> {
         }
         let got = reads.const_holds(ItemKey(cond.0), &out, ground.view())?;
         self.facts.keep_const_holds(cond, &args, got)?;
+        Ok(())
+    }
+
+    /// Answers the solver's `Specializes(a, b)` (specialize.rs `specializes`, RFC 1210) in a
+    /// context of its own: impl `a`'s parameters are rigid `Param(i)` there and its
+    /// where-clauses the only assumptions, which in this context would name the body's own
+    /// parameters and stand beside the body's where-clauses. The answer is a fact of the two
+    /// impls, kept for the rest of this context.
+    fn fill_specializes<W: World>(&mut self, a: SDef, b: SDef, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        if self.facts.has(blaze_solve::facts::Question::Specializes(a, b)) {
+            return Ok(());
+        }
+        if self.spec_depth >= MAX_SPEC_DEPTH {
+            return Err(CheckError::Limit(crate::error::Limit::Specialization).into());
+        }
+        let (ka, kb) = (ItemKey(a.0), ItemKey(b.0));
+        let Some(ha) = reads.impl_header(ka)? else {
+            return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
+        };
+        let Some(trait_) = ha.trait_ else {
+            return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
+        };
+        let mut inner = InferCtx::new_in(self.alloc);
+        inner.spec_depth = self.spec_depth + 1;
+        let got = crate::specialize::specializes(&mut inner, reads, ka, kb, trait_);
+        self.need_rounds += inner.need_rounds;
+        let v = match got {
+            Ok(v) => v,
+            Err(crate::instance::ResolveError::Missing(q)) => return Err(Stop::Need(q)),
+            Err(crate::instance::ResolveError::Check(e)) => return Err(e.into()),
+            // Two impls of different traits: the solver asks only of two impl candidates of
+            // one goal, so this is a malformed question.
+            Err(crate::instance::ResolveError::NoImpl { item, .. }) => {
+                return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(item))).into());
+            }
+            Err(crate::instance::ResolveError::Overlap { first, .. } | crate::instance::ResolveError::NotGround { item: first }) => {
+                return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(first))).into());
+            }
+        };
+        self.facts.keep_specializes(a, b, v);
         Ok(())
     }
 
@@ -989,7 +1041,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
         args: TyList,
         name: Name,
         reads: &mut Reads<'_, '_, W>,
-    ) -> Result<Option<Ty>, Stop> {
+    ) -> Result<Option<Normalized>, Stop> {
         let s = self.snapshot();
         let alias = self.alias(trait_, name, args);
         let var = self.terms.cx.next_ty_var();
@@ -998,7 +1050,20 @@ impl<'a> TypeCtx for InferCtx<'a> {
             Ok(Answer::Yes) => {
                 self.commit(s);
                 let r = self.terms.cx.resolve_ty(var);
-                Ok(Some(Ty(r.node().bits())))
+                Ok(Some(Normalized::Certain(Ty(r.node().bits()))))
+            }
+            // Selected, with a nested goal undecided: the answer's constraints are applied, so
+            // the term is the answer when they decided it (`Normalized::Ambiguous`). An
+            // overflow's constraints are not kept (rustc's `MaybeCause::Overflow { keep_constraints:
+            // false }` in the root), nor a term still a bare variable (two candidates left).
+            Ok(Answer::Maybe(blaze_solve::term::Certainty::Ambiguous)) => {
+                let r = Ty(self.terms.cx.resolve_ty(var).node().bits());
+                if matches!(self.view(r), TyView::Infer(_)) {
+                    self.rollback_to(s);
+                    return Ok(None);
+                }
+                self.commit(s);
+                Ok(Some(Normalized::Ambiguous(r)))
             }
             Ok(_) => {
                 self.rollback_to(s);

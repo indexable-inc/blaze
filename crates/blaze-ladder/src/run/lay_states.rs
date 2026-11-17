@@ -58,6 +58,18 @@ pub(super) fn unchecked_owner<P: FrontEnd>(program: &P, asking: usize, owner: It
     RunError::ItemRefused { function: program.function(asking).named(), error, item: owner, path: program.item_named(owner) }
 }
 
+/// A build error met ordering, laying or building a state, as the run's refusal: a projection
+/// the seam did not normalize names its why (the seam's `last_projection`: the trait, `Self`'s
+/// form, the solver's error; rule 19), as make_one.rs `build_refusal` names it.
+fn build_error<P: FrontEnd>(program: &P, function: Named, error: BuildError, range: Option<blaze_typeck::Range>) -> RunError {
+    if let BuildError::Projection { .. } = error
+        && let Some(why) = program.last_projection()
+    {
+        return RunError::Projection { function, why };
+    }
+    RunError::Build { function, error, range }
+}
+
 fn refuse(function: Named, what: &'static str) -> RunError {
     RunError::Build { function, error: BuildError::UnsupportedSig { what }, range: None }
 }
@@ -129,7 +141,7 @@ pub(super) fn roots_of_instance<P: FrontEnd>(
             roots.push(g);
         }
     }
-    held_coroutines(ground, &roots, adts.facts(), alloc).map_err(|error| RunError::Build { function: name(), error, range: None })
+    held_coroutines(ground, &roots, adts.facts(), alloc).map_err(|error| build_error(program, name(), error, None))
 }
 
 /// The ground arguments of coroutine `c`'s owner, copied out of the ground table.
@@ -221,7 +233,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                 let error = BuildError::UnsupportedSig { what: HOLDS_ITSELF };
                 return Err(RunError::ItemRefused { function: asking_name(), error, item, path: Some(path.into_boxed_str()) });
             }
-            Err(OrderError::Build(error)) => return Err(RunError::Build { function: asking_name(), error, range: None }),
+            Err(OrderError::Build(error)) => return Err(build_error(program, asking_name(), error, None)),
         };
         pending.clear();
         for &c in order.iter() {
@@ -229,7 +241,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                 return Ok(Lay::Unchecked(unchecked.get().unwrap_or(c.owner)));
             };
             let adts = FrontAdts(program, ci, consts, langs, bodies);
-            let args = args_of(ground, c, alloc).map_err(|error| RunError::Build { function: program.function(ci).named(), error, range: None })?;
+            let args = args_of(ground, c, alloc).map_err(|error| build_error(program, program.function(ci).named(), error, None))?;
             let uses = roots_of_instance(program, bodies, &adts, ci, &args, &mut *ground, alloc)?;
             for &u in uses.iter() {
                 if !all.contains(&u) && !order.contains(&u) && !pending.contains(&u) {
@@ -249,22 +261,52 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
             return Ok(Lay::Unchecked(unchecked.get().unwrap_or(c.owner)));
         };
         let function = program.function(ci);
-        let at_owner = |error| RunError::Build { function: function.named(), error, range: None };
+        let at_owner = |error| build_error(program, function.named(), error, None);
         let adts = FrontAdts(program, ci, consts, langs, bodies);
-        let laid = lay_one(program, bodies, &adts, ci, c, &mut *ground, layouts, alloc).map_err(at_owner)?;
+        let laid =lay_one(program, bodies, &adts, ci, c, &mut *ground, layouts, alloc).map_err(at_owner)?;
         let args = args_of(ground, c, alloc).map_err(at_owner)?;
         states.record(c.owner, c.ordinal, &args, laid.0.shape);
         laid_all.push(laid);
     }
-    // 3. BUILD.
+    // 3. BUILD. A build that stops (a refusal, or a `Missing` the run makes and steps again)
+    // forgets every state recorded above and not built into `stash`: one left recorded would be
+    // skipped as made by the next lay, its functions never built.
+    let before = stash.len();
+    let out = build_laid(program, consts, langs, bodies, ground, stash, &all, &laid_all, &owner_of, &unchecked, alloc);
+    if !matches!(out, Ok(Lay::Done)) {
+        for &c in all.iter().skip(stash.len() - before) {
+            if let Ok(args) = ground.view().list(c.owner_args) {
+                states.forget(c.owner, c.ordinal, args);
+            }
+        }
+    }
+    out
+}
+
+/// Phase 3 of [`lay_and_build`]: each of `all` built into its laid state, in order, its three
+/// functions pushed to `stash`.
+#[expect(clippy::too_many_arguments, reason = "lay_and_build's tables, borrowed apart")]
+fn build_laid<P: FrontEnd>(
+    program: &P,
+    consts: &[(ItemKey, DataRecord<Global>)],
+    langs: &BackLangs,
+    bodies: &Bodies<'_>,
+    ground: &mut PortableTys<'_>,
+    stash: &mut Vec<BuiltParts, Global>,
+    all: &[CoroutineOf],
+    laid_all: &[(LaidState, AVec<'static, StateName>)],
+    owner_of: &dyn Fn(CoroutineOf) -> Option<usize>,
+    unchecked: &Cell<Option<ItemKey>>,
+    alloc: Alloc<'static>,
+) -> Result<Lay, RunError> {
     for (&c, (laid, rows)) in all.iter().zip(laid_all.iter()) {
         let Some(ci) = owner_of(c) else {
             return Ok(Lay::Unchecked(unchecked.get().unwrap_or(c.owner)));
         };
         let function = program.function(ci);
-        let at_owner = |error| RunError::Build { function: function.named(), error, range: None };
+        let at_owner = |error| build_error(program, function.named(), error, None);
         let adts = FrontAdts(program, ci, consts, langs, bodies);
-        let args = args_of(ground, c, alloc).map_err(at_owner)?;
+        let args =args_of(ground, c, alloc).map_err(at_owner)?;
         let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(ci).and_then(Option::as_ref)) else {
             return Err(refuse(function.named(), "an async block whose owner fn has no checked body"));
         };
@@ -282,7 +324,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                 BuildError::UnsupportedPat { pat, .. } => body.pat_ranges.get(pat.0 as usize).copied(),
                 _ => None,
             };
-            RunError::Build { function: function.named(), error, range }
+            build_error(program, function.named(), error, range)
         })?;
         let mut kept = Vec::with_capacity_in(args.len(), Global);
         kept.extend_from_slice(&args);

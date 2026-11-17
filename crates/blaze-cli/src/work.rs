@@ -92,8 +92,24 @@ fn filed_record<'b>(task: &Task<'_>, failure: &TaskFailure, words: Option<&str>,
         Some(words) => bstd::mem::format_in!(held, "{failure}: {words}"),
         None => bstd::mem::format_in!(held, "{failure}"),
     };
-    failed_record(task, TASK_FAILED, said.as_str(), plant, held)
+    // A file whose text this build refuses (not UTF-8, past 4 GiB) is the user's error at that
+    // file, never the tool's failure: its own finding, an error counted with the code's.
+    let rule = match failure.why {
+        Why::Refused { rule, .. } if rule == TEXT_REFUSED_RULE => FILE_NOT_TEXT,
+        _ => TASK_FAILED,
+    };
+    failed_record(task, rule, said.as_str(), plant, held)
 }
+
+/// The rule a [`Why::Refused`] names when the refusal is the task's own file's text ([`Unread::Text`]):
+/// what [`filed_record`] files as [`FILE_NOT_TEXT`]. One home for the words: every
+/// `Unread::Text` conversion here names it.
+pub(crate) const TEXT_REFUSED_RULE: &str = "blaze-cli work.rs, a file's text";
+
+/// The finding number of a file whose text this build refuses (not UTF-8, past 4 GiB): an ERROR
+/// of the user's code at that file, never a task failure; what waits on it is counted under it
+/// like under a failed task (main.rs `draw`). Its one argument is the refusal's words.
+pub const FILE_NOT_TEXT: u16 = 25;
 
 /// The finding number of a task not run because an input it reads could not be made, the
 /// input's own record holding the finding that says why (body_types.rs `Prepared::NotRun`).
@@ -106,6 +122,26 @@ pub const NOT_RUN: u16 = 23;
 /// entered again when the input that stopped it moves.
 fn not_run_record<'b>(task: &Task<'_>, cause: &str, plant: Plant, held: &'b Frame) -> Made<'b> {
     failed_record(task, NOT_RUN, cause, plant, held)
+}
+
+/// The finding number of a task that failed only because a task it needs failed (`Why::Waited`,
+/// filed like any failure: [`filed`]). Its words are the needed task's name and the waiting
+/// crate (not_checked/waited.rs `words`). It is no error of its own: the command prints the
+/// root failure once with a count of what hangs from it (not_checked/waited.rs `groups`).
+pub const WAITED: u16 = 24;
+
+/// A filed failure's record ([`filed_record`]), or for a wait the [`WAITED`] finding naming its
+/// cause and, for a crate's scope, its crate (`names`: the command's names step, when it ran).
+/// `base` gives a fork's base (blaze-drive `Request::base_of`): the cause is named as its own
+/// failure is printed, by its base, and so is the crate.
+fn filed_answer<'b>(task: &Task<'_>, failure: &TaskFailure, words: Option<&str>, names: Option<&crate::names::Names<'_>>, base: &dyn Fn(Name) -> Name, plant: Plant, held: &'b Frame) -> Made<'b> {
+    let Why::Waited { on } = failure.why else { return filed_record(task, failure, words, plant, held) };
+    let label = match task.name.kind {
+        Kind::CrateScope => names.and_then(|names| names.crate_at(base(task.name).subject).map(|at| names.crate_label(at))),
+        _ => None,
+    };
+    let said = crate::not_checked::waited::words(base(on), label, held);
+    failed_record(task, WAITED, said.as_str(), plant, held)
 }
 
 /// A filed failure's record, in `held`: no payload, the out [`failed_out`], the one finding
@@ -307,8 +343,10 @@ pub struct Facts<'f, S> {
     /// The `CrateScope` records the `BodyCheck` tasks read this command (body_types.rs).
     pub bodies: crate::body_types::Kept,
     /// The command's build scripts (scripts.rs): its setting and the graph, made by the first
-    /// `Script` task of the command.
-    pub scripts: Option<crate::scripts::Scripts<'f>>,
+    /// `Script` task of the command; `Err` holds why they could not be set up, said by every
+    /// `Script` task after the first without trying again (each try held the graph record in
+    /// the request's frame, which a failing setup filled on tempo, g054142).
+    pub scripts: Option<Result<crate::scripts::Scripts<'f>, &'f str>>,
     /// The whole tool's producer id (D105), which a `Native` task's image key holds
     /// (native_image.rs).
     pub producer: blaze_ids::producer::ProducerId<blaze_ids::producer::Whole>,
@@ -358,7 +396,14 @@ impl Read<'_> {
 pub(crate) fn payload<'f>(cx: &Cx, store: &mut dyn Store<'_>, input: &Input, into: &'f Frame) -> Result<Read<'f>, CliError> {
     let cx = cx.span("read an input");
     let mut bytes = Bytes::new_in(into, "an input's record");
-    if !store.get_into(&cx, input.at, &mut bytes)? {
+    // A store's refusal here (most often a frame too small for the record) names the input
+    // (rule 19); the caller names the task (`CliError::TaskInput`).
+    let found = match store.get_into(&cx, input.at, &mut bytes) {
+        Ok(found) => found,
+        Err(CliError::Store(failure)) => return Err(CliError::Input { name: input.name, why: InputWhy::Store(failure) }),
+        Err(other) => return Err(other),
+    };
+    if !found {
         return Err(CliError::Input { name: input.name, why: InputWhy::Absent });
     }
     let payload = match blaze_drive::record::open(bytes.as_slice()) {
@@ -372,6 +417,14 @@ pub(crate) fn payload<'f>(cx: &Cx, store: &mut dyn Store<'_>, input: &Input, int
     Ok(Read { bytes, payload })
 }
 
+/// `error` of the job of `task` being made: an input's read names the task too (rule 19).
+fn of_task(task: Name, error: CliError) -> CliError {
+    match error {
+        CliError::Input { name, why } => CliError::TaskInput { task, name, why },
+        other => other,
+    }
+}
+
 /// Why an input's record could not be read ([`CliError::Input`]).
 #[derive(Debug)]
 pub enum InputWhy {
@@ -383,6 +436,9 @@ pub enum InputWhy {
     Shape,
     /// A `UnitGraph` payload not of its form, or a crate list its check refused.
     Graph(crate::graph_payload::PayloadError),
+    /// The store refused the read: its bytes would pass the frame read into, or the read
+    /// itself failed.
+    Store(crate::store::StoreFailure),
 }
 
 impl core::fmt::Display for InputWhy {
@@ -392,6 +448,7 @@ impl core::fmt::Display for InputWhy {
             InputWhy::Malformed(error) => write!(f, "its record is not one: {error}"),
             InputWhy::Shape => f.write_str("its record is a shape, with no payload"),
             InputWhy::Graph(error) => write!(f, "{error}"),
+            InputWhy::Store(failure) => write!(f, "{failure}"),
         }
     }
 }
@@ -576,6 +633,9 @@ pub struct HighWater {
     /// Every task frame's used bytes at its end, by the task's kind: the profile's
     /// `task frame bytes` rows.
     pub tasks: crate::phases::byte_rows::TaskFrames,
+    /// The largest pooled crate scope frame's bytes by the stretch of the solve that took
+    /// them (names/metered.rs): the profile's `scope frame by stretch` row.
+    pub scope_bytes: crate::names::metered::ScopeBytes,
 }
 
 /// Run every task of `batches` (every batch the request has out), then answer the machine once
@@ -657,7 +717,7 @@ pub fn run_batches<'f, 'r>(
                         })),
                         Ok(Ok(None)) => Spawned::Here,
                         Ok(Err(CliError::Text { what })) => Spawned::Refused(what),
-                        Ok(Err(error)) => return Err(error),
+                        Ok(Err(error)) => return Err(of_task(task.name, error)),
                     },
                     // One build script's run on the pool (scripts.rs, D115): its job made here
                     // from record bytes, its files located; the run in its worker's frame.
@@ -669,9 +729,9 @@ pub fn run_batches<'f, 'r>(
                         let members = crate::names::member_dirs(facts.laid.as_ref());
                         // A panic while its job is made (a bug, an allocation a frame refused)
                         // fails this script's task alone, as a crate scope's does (rule 20).
-                        let made = match unwinding(|| crate::scripts::job(&cx, root, store, &mut facts.scripts, &mut facts.names, &facts.fetch_env, lock, members, task, frame, jobs)) {
+                        let made = match unwinding(|| crate::scripts::job(&cx, root, store, &mut facts.scripts, &mut facts.names, &facts.fetch_env, facts.workers, lock, members, task, frame, jobs)) {
                             Err(Panicked) => Err(Spawned::Refused("a build script's job panicked while it was made (its words are on the error stream)")),
-                            Ok(made) => Ok(made?),
+                            Ok(made) => Ok(made.map_err(|error| of_task(task.name, error))?),
                         };
                         match made {
                             Err(spawned) => spawned,
@@ -986,6 +1046,9 @@ fn answer_batch<'f, 'r>(
                 let joined = handle.join(&cx).map_err(CliError::Pool)?;
                 high.scope = high.scope.max(joined.used);
                 high.tasks.ended(task.name.kind, joined.used);
+                if joined.bytes.peak() > high.scope_bytes.peak() {
+                    high.scope_bytes = joined.bytes;
+                }
                 phases.worked(SCOPES, joined.ns);
                 // Filed here, on the main thread: a need is the answer; a made crate is
                 // answered by the serial step, which now finds it made (its surfaces, its record).
@@ -1011,7 +1074,7 @@ fn answer_batch<'f, 'r>(
                 // a function of the text (rule 20); a path or a read that failed stops the command.
                 let did = match joined.did {
                     Ok(did) => did,
-                    Err(Unread::Text(what)) => Err(Why::Refused { what, rule: "blaze-cli work.rs" }),
+                    Err(Unread::Text(what)) => Err(Why::Refused { what, rule: TEXT_REFUSED_RULE }),
                     Err(Unread::Changed) => Err(Why::Changed),
                     Err(Unread::Path(error)) => return Err(CliError::Path(error)),
                     Err(Unread::Fs(error)) => return Err(CliError::Fs(error)),
@@ -1027,8 +1090,8 @@ fn answer_batch<'f, 'r>(
         };
         // A typed failure that is a function of the task's key and inputs is its answer, filed.
         let done = match done {
-            Did::Failed(failure) if filed(&failure, task) => Did::Done(filed_record(task, &failure, None, facts.plant, held)),
-            Did::FailedSaying(failure, words) if filed(&failure, task) => Did::Done(filed_record(task, &failure, Some(words), facts.plant, held)),
+            Did::Failed(failure) if filed(&failure, task) => Did::Done(filed_answer(task, &failure, None, facts.names.as_ref(), &|name| req.base_of(name), facts.plant, held)),
+            Did::FailedSaying(failure, words) if filed(&failure, task) => Did::Done(filed_answer(task, &failure, Some(words), facts.names.as_ref(), &|name| req.base_of(name), facts.plant, held)),
             other => other,
         };
         let path = match req.file_of(task) {
@@ -1360,20 +1423,29 @@ pub(crate) const BORROWS_STAGE: &str = "borrows";
 
 /// The one list of the stages `check` is defined to run, in order, and whether this build runs
 /// each, derived from the kinds this worker builds: the closing line's "NOT checked" and
-/// `blaze explain 3` read it. When all are `true`, `check` can say `ok`.
-pub(crate) const CHECK_STAGES: [(&str, bool); 6] = [
-    ("manifests", builds(Kind::Units) && builds(Kind::UnitGraph)),
-    ("syntax of items", builds(Kind::FileItems)),
-    ("syntax inside bodies", builds(Kind::BodyCheck)),
-    (NAMES_STAGE, builds(Kind::CrateScope)),
+/// `blaze explain 3` read it. When all are `true`, `check` can say `ok`. The third of each is
+/// why a stage is not built, printed as a note before the closing line (main.rs `close`): a
+/// "NOT checked" never stands without its reason (rule 19), even when no body was refused.
+pub(crate) const CHECK_STAGES: [(&str, bool, &str); 6] = [
+    ("manifests", builds(Kind::Units) && builds(Kind::UnitGraph), NOT_BUILT),
+    ("syntax of items", builds(Kind::FileItems), NOT_BUILT),
+    ("syntax inside bodies", builds(Kind::BodyCheck), NOT_BUILT),
+    (NAMES_STAGE, builds(Kind::CrateScope), NOT_BUILT),
     // A body's types are its `BodyCheck` task's, over records, with the heads it reads made
     // in the task (body_types.rs). A body it could not check to the end is a
     // `TYPES_NOT_CHECKED` finding, which turns this stage to "NOT checked" (main.rs `close`).
-    (TYPES_STAGE, builds(Kind::BodyCheck)),
+    (TYPES_STAGE, builds(Kind::BodyCheck), NOT_BUILT),
     // Each body's moves and borrows are checked in its `BodyCheck` task (body_types.rs), as
     // notes until `BORROWS_ARE_ERRORS`: until then this stage is "NOT checked".
-    (BORROWS_STAGE, crate::body_types::BORROWS_ARE_ERRORS && builds(Kind::BodyCheck)),
+    (
+        BORROWS_STAGE,
+        crate::body_types::BORROWS_ARE_ERRORS && builds(Kind::BodyCheck),
+        "the move and borrow check ran, but its findings stay notes until the flow census reads none false (`BORROWS_ARE_ERRORS`)",
+    ),
 ];
+
+/// [`CHECK_STAGES`]'s reason for a stage whose task this worker does not build.
+const NOT_BUILT: &str = "this build of blaze does not build the task that runs it (work.rs `builds`)";
 
 /// Whether `command`'s program runner (blaze_ladder) does `kind`'s work for the code the program
 /// reaches, in the subset of Rust its front end reads: `run` only. Macro expansion and the
@@ -1439,7 +1511,7 @@ fn run<'f, 'b>(
                         record.parts.extend(parts.iter().map(|(name, source)| Part { name: *name, locate: Locate::Source(*source), place: 0 }));
                         // Each crate's build-script run, named with its `CrateScope` part from the
                         // same row (ruling D115 (2)): a side nobody reaches names none.
-                        let scripts = crate::scripts::parts(names.script_keys());
+                        let scripts = crate::scripts::parts(names.script_keys(), crate::scripts::sdk_identity(&facts.fetch_env));
                         record.parts.extend(scripts.iter().map(|(name, source)| Part { name: *name, locate: Locate::Source(*source), place: 0 }));
                         // Each script's module lookup, once a module (script_modules.rs, ruling
                         // D115 (c)): its source holds the graph's, so the module store's listing.
@@ -1537,7 +1609,7 @@ fn run<'f, 'b>(
         // A crate's link table: the `links` section of its `CrateScope` record, read in place.
         Kind::Links => crate::native_image::links(&cx, store, task, held),
         // The program's native image, from its crates' tables and build-script outputs.
-        Kind::Native => crate::native_image::native(&cx, store, &facts.producer, task, scratch, held, alloc),
+        Kind::Native => crate::native_image::native(&cx, store, &facts.producer, facts.fetch_env.home, task, scratch, held, alloc),
         _ => unreachable!("`builds` said yes to {:?} and `run` has no arm for it", task.name.kind),
     }
 }
@@ -2295,7 +2367,7 @@ fn pooled(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, clock: &bstd::clock::Cl
     let (used, limit) = (scratch.peak(), scratch.reserved());
     let did = match ran {
         Ok(Ok(done)) => Ok(done),
-        Ok(Err(Unread::Text(what))) => Ok(Err(Why::Refused { what, rule: "blaze-cli work.rs" })),
+        Ok(Err(Unread::Text(what))) => Ok(Err(Why::Refused { what, rule: TEXT_REFUSED_RULE })),
         Ok(Err(Unread::Changed)) => Ok(Err(Why::Changed)),
         Ok(Err(error)) => Err(error),
         Err(Panicked) => Ok(Err(Why::Panicked { used: used as u64, limit: limit as u64 })),
@@ -2336,7 +2408,7 @@ fn pooled_bodies(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, clock: &bs
     let (used, limit) = (scratch.peak(), scratch.reserved());
     let (rest, stopped) = match ran {
         Ok(Ok(())) => (None, None),
-        Ok(Err(Unread::Text(what))) => (Some(Why::Refused { what, rule: "blaze-cli work.rs" }), None),
+        Ok(Err(Unread::Text(what))) => (Some(Why::Refused { what, rule: TEXT_REFUSED_RULE }), None),
         Ok(Err(Unread::Changed)) => (Some(Why::Changed), None),
         Ok(Err(error)) => (None, Some(error)),
         Err(Panicked) => (Some(Why::Panicked { used: used as u64, limit: limit as u64 }), None),
@@ -2438,6 +2510,8 @@ struct PooledScope {
     did: Result<crate::names::Resolution, Why>,
     used: usize,
     ns: u64,
+    /// What its frame held by stretch (names/metered.rs); none after a panic.
+    bytes: crate::names::metered::ScopeBytes,
 }
 
 /// `job` on a pool worker, in the worker's task frame, as [`pooled`] runs a file's outline: a
@@ -2447,8 +2521,11 @@ fn pooled_scope(cx: &Cx, root: &Dir<ReadWrite>, job: &crate::names::ScopeJob<'_>
     let scratch = cx.frame();
     let ran = unwinding(|| crate::names::resolve(cx, root, job, scratch));
     let (used, limit) = (scratch.peak(), scratch.reserved());
-    let did = ran.map_err(|Panicked| Why::Panicked { used: used as u64, limit: limit as u64 });
-    PooledScope { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) }
+    let (did, bytes) = match ran {
+        Ok((resolution, bytes)) => (Ok(resolution), bytes),
+        Err(Panicked) => (Err(Why::Panicked { used: used as u64, limit: limit as u64 }), crate::names::metered::ScopeBytes::default()),
+    };
+    PooledScope { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)), bytes }
 }
 
 /// What a reader of a parts list sees: the parts' names, how each is found and where.
@@ -2753,6 +2830,45 @@ mod tests {
         }
         assert_eq!(said[SAME_SHOWN], "and 996 more task(s) failed the same way");
         assert_eq!(command.peak(), 0, "the command's frame took a failed task's bytes");
+    }
+
+    /// A build script's refusal with no SDK (scripts.rs `run`, `Shared::no_sdk`: its key holds
+    /// "no SDK") is filed as the task's record: the failure's out and every input it was handed
+    /// as a read. So it stands, the certificate with it, until an SDK resolves and moves the key
+    /// (tempo, check-g043851: this refusal was a hole, so no certificate and 37 s of reruns on a
+    /// no-op). Control: the planted bug files it with no reads.
+    /// Expected: "test work::tests::a_script_refusal_is_filed_with_its_inputs ... ok".
+    #[test]
+    fn a_script_refusal_is_filed_with_its_inputs() {
+        let held = Frame::with_reserve(TASK_FRAME, Tag::Other).expect("a frame");
+        let a = blaze_own::testing::heap().alloc();
+        let name = Name::new(Kind::Script, id(1, 1));
+        let mut inputs = Vec::new_in(a.clone());
+        inputs.push(Input { name: Name::new(Kind::Fetch, id(2, 1)), at: blaze_drive::Key::default(), out: id(3, 1) });
+        let task = Task {
+            name,
+            base: name,
+            condition: blaze_drive::Condition::ANY,
+            key: blaze_drive::Key::default(),
+            source: id(4, 1),
+            class: blaze_drive::Class::Foreground,
+            entry: 0,
+            home: name,
+            place: 0,
+            file: None,
+            edition: 0,
+            inputs,
+            failed: Vec::new_in(a.clone()),
+            members: Vec::new_in(a),
+        };
+        let failure = TaskFailure { name, why: Why::Refused { what: "a native build script with no native setting", rule: crate::scripts::RULE } };
+        assert!(filed(&failure, &task), "a refusal of a task handed no hole is filed");
+        let made = filed_record(&task, &failure, Some("no macOS SDK"), Plant::None, &held);
+        assert_eq!(made.out, failed_out());
+        assert_eq!(made.reads.as_slice(), &[(Name::new(Kind::Fetch, id(2, 1)), id(3, 1))], "the record reads its inputs");
+        // Control: with no reads it would stand after an input moved.
+        let planted = filed_record(&task, &failure, Some("no macOS SDK"), Plant::FiledWithoutReads, &held);
+        assert!(planted.reads.is_empty(), "control: the planted bug kept its reads");
     }
 
     /// Each `mod x;` of `text`, at `path`, to the file it names or the refusal.

@@ -206,6 +206,13 @@ pub struct Row<'n> {
     /// A `use`'s path to what it binds, and whether written with a leading `::`; empty else.
     pub path: &'n [&'n str],
     pub abs: bool,
+    /// A `use`'s path's first segment's mark, when a macro wrote it (the row's text's marks,
+    /// [`LocalHead::marks`]): a `$crate` or opaque `crate` there names the MACRO's crate (the
+    /// Reference, "Macros By Example", "Hygiene"; blaze-scope `to_path_marked`, the one reading,
+    /// as a module's `use` is read). tracing's `debug!` writes `use $crate::__macro_support::
+    /// Callsite as _;` in the block it expands to: `tracing`'s, not the calling crate's. `None`
+    /// for a path written in a file, an unmarked word, and every row but a `use`'s.
+    pub first_mark: Option<blaze_expand::origin_column::TextMark>,
     /// For a struct, enum, union or type alias ([`LocalKind::in_block_module`]) written in
     /// the body's own text: its block's module in the names library, which binds its name
     /// (checked when kept). A path that names the item is resolved AT this module by the one
@@ -501,8 +508,16 @@ impl<'n> Locals<'n> {
                             // lazily, after the block's own items (super::glob_uses).
                             UseForm::Glob => super::glob_uses::GLOB,
                         };
+                        // The first segment's mark, read before the segments are copied: the
+                        // marks are found by where a segment is in the text they are of.
+                        let first_mark = match (marks, leaf.segments.first()) {
+                            (Some(m), Some(first)) => {
+                                m.mark_of(first).map_err(|_| bad(Why::Unsupported("a use path in a block whose first segment is not in the text its marks are of", range)))?
+                            }
+                            _ => None,
+                        };
                         let path: &'n [&'n str] = frame.alloc_slice_copy(&leaf.segments);
-                        rows.push(Row { scope: s as u32, kind, name: bound, key: parent, range, path, abs: leaf.abs, module: None });
+                        rows.push(Row { scope: s as u32, kind, name: bound, key: parent, range, path, abs: leaf.abs, first_mark, module: None });
                     }
                     continue;
                 }
@@ -532,7 +547,7 @@ impl<'n> Locals<'n> {
                         };
                         let ordinal = rows.iter().filter(|r| r.kind == kind && r.name == d.name).count() as u32;
                         let key = super::nested_exports::local_key(crate_key, parent, kind.tag(), d.name, ordinal);
-                        rows.push(Row { scope: s as u32, kind, name: d.name, key, range, path: &[], abs: false, module: None });
+                        rows.push(Row { scope: s as u32, kind, name: d.name, key, range, path: &[], abs: false, first_mark: None, module: None });
                         let ck = keys.local(key, kind).map_err(HeadError::Key)?;
                         self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, marks });
                         self.foreign.insert(ck, LocalForeign { kind: d.kind, abi, safe: d.safe });
@@ -574,7 +589,7 @@ impl<'n> Locals<'n> {
                         b = nested.blocks[here as usize].parent;
                     }
                 }
-                rows.push(Row { scope: s as u32, kind, name, key: parent, range, path: &[], abs: false, module: in_module });
+                rows.push(Row { scope: s as u32, kind, name, key: parent, range, path: &[], abs: false, first_mark: None, module: in_module });
                 // The key: derived from the body's, by kind, name and ordinal among the rows
                 // before it of the same kind and name (text order: no dependence on which body
                 // was checked first).

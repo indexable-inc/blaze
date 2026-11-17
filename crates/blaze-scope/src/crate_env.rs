@@ -226,7 +226,9 @@ impl<'a> CrateEnv<'a> {
     /// This environment copied whole into `alloc`, borrowing nothing of `self`: a reader that
     /// outlives the world's borrow (a pool body job's frame) holds its crates' environments so.
     /// The build script's outputs record is copied byte for byte and opened again; an error
-    /// from that second open says the record's bytes are not what opened before.
+    /// from that second open says the record's bytes are not what opened before. The copy
+    /// borrows nothing, so it has no file area (`OutputsRef::area`): [`EnvLent::copy_in`],
+    /// whose copy lives inside the lender's borrow, attaches it again.
     pub fn clone_in<'b>(&self, alloc: Alloc<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError> {
         let text = |s: &str| AString::from_str_in(s, alloc);
         let mut vars: AVec<'b, (AString<'b>, AString<'b>)> = AVec::with_capacity_in(self.vars.len(), alloc);
@@ -362,7 +364,8 @@ pub struct EnvLent<'e, 'a>(&'e CrateEnv<'a>);
 // env's vectors and strings through shared borrows (their buffers only) and allocates through
 // the `alloc` it is given, never through an `Alloc` handle the env's own collections hold, so
 // no allocator of the lending thread is called from another. The shared borrow `'e` means no
-// thread mutates or drops the env while it is lent. An `OutputsRef` is plain borrowed bytes.
+// thread mutates or drops the env while it is lent. An `OutputsRef` is plain borrowed bytes and
+// at most a borrowed file area, which is `Sync` (`StoredBytes: Sync`).
 unsafe impl Sync for EnvLent<'_, '_> {}
 // SAFETY: as for `Sync`: the value is one shared borrow, used only as described there.
 unsafe impl Send for EnvLent<'_, '_> {}
@@ -372,9 +375,18 @@ impl<'e, 'a> EnvLent<'e, 'a> {
         EnvLent(env)
     }
 
-    /// The lent environment copied whole into `alloc` ([`CrateEnv::clone_in`]).
-    pub fn copy_in<'b>(self, alloc: Alloc<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError> {
-        self.0.clone_in(alloc)
+    /// The lent environment copied whole into `alloc` ([`CrateEnv::clone_in`]), its script
+    /// record's file area (where an `include!` of a stored file reads it) attached again: the
+    /// copy lives inside the lend (`'a: 'b`).
+    pub fn copy_in<'b>(self, alloc: Alloc<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError>
+    where
+        'a: 'b,
+    {
+        let mut copy = self.0.clone_in(alloc)?;
+        if let (Some(record), Some(area)) = (copy.script, self.0.script.and_then(|lent| lent.area())) {
+            copy.script = Some(record.with_area(area));
+        }
+        Ok(copy)
     }
 }
 

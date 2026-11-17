@@ -20,6 +20,10 @@ use super::*;
 #[path = "expansion_bodies_tests.rs"]
 mod expansion_bodies_tests;
 
+/// A kept item's head, read through its keep call's entry (lane KI).
+#[path = "kept_item_heads_tests.rs"]
+mod kept_item_heads_tests;
+
 /// The library root of a crate whose two modules are one file each: the callee's and the
 /// caller's.
 const TWO_FILES: &str = "mod a;\nmod b;\n";
@@ -298,25 +302,180 @@ fn a_member_added_to_an_impl_is_read_at_once() {
 
 /// A MEMBER REMOVED FROM AN IMPL: `f` removed while `h` in `b.rs` still calls it. `h` reports
 /// the real error (no fn `f` on `S`) and the check answers (the drive refused no record as two
-/// values under one key: `TwoValues`); putting `f` back clears it. Prints `member removed:
-/// errors (0, 1, 0)`.
+/// values under one key: `TwoValues`); putting `f` back clears it, and finds every first answer
+/// in the records: no `BodyCheck` is made. Prints `member removed: errors (0, 1, 0); put back
+/// made (S, B)`.
 ///
-/// IGNORED until the drive keys a `BodyCheck` by what its read NAMES follow from: a removal
-/// changes which heads `h` names while `h`'s key (its text, its file's owners, the unit graph:
-/// blaze-drive key.rs `owned_key`) stands, so the drive refuses the new record as two values
-/// under one key, `TwoValues { field: "reads" }`. A free fn removed the same way is refused
-/// alike (control, 2026-11-17 04:43: "held [Signature 270707.., Signature 8bc33c..], put []"):
-/// the cause is the key, not item grain.
+/// Before blaze-drive's walk (request.rs `Walk`), a removal changed which heads `h` names while
+/// `h`'s key (its text, its file's owners, the unit graph: key.rs `owned_key`) stood, and the
+/// drive put a second shape at that key: `TwoValues { field: "reads" }` (2026-11-17 04:43: "held
+/// [Signature 270707.., Signature 8bc33c..], put []"). What a task reads follows from its key
+/// AND its earlier answers, so each shape now sits at the value key of the answers that chose it.
 #[test]
-#[ignore = "blaze-drive: a removal changes a BodyCheck's read names under one key (TwoValues), free fns alike"]
 fn a_member_removed_from_an_impl_is_its_callers_error() {
-    let free = checks_of(86, &[("pub fn f(_x: u8) {}\npub fn g() {}\n", CALLS_FREE_F), ("pub fn g() {}\n", CALLS_FREE_F), ("pub fn f(_x: u8) {}\npub fn g() {}\n", CALLS_FREE_F)]);
-    assert_eq!((free[0].errors, free[1].errors, free[2].errors), (0, 1, 0), "control: h must report the missing free f:\n{}", free[1].all);
     const REMOVED: &str = "pub struct S;\nimpl S {\n    pub fn g(&self) {}\n}\n";
     let seen = checks_of(85, &[(IMPL_FG, CALLS_F), (REMOVED, CALLS_F), (IMPL_FG, CALLS_F)]);
     assert!(!stale(&seen[1].words), "{}", seen[1].all);
     assert_eq!((seen[0].errors, seen[1].errors, seen[2].errors), (0, 1, 0), "h must report the missing f:\n{}", seen[1].all);
-    std::println!("member removed: errors ({}, {}, {})", seen[0].errors, seen[1].errors, seen[2].errors);
+    assert_eq!(seen[2].made.1, 0, "f put back finds every body's first answer in the records:\n{}", seen[2].all);
+    std::println!("member removed: errors ({}, {}, {}); put back made {:?}", seen[0].errors, seen[1].errors, seen[2].errors, seen[2].made);
+}
+
+/// The two module-level removals: a free fn `h` calls, and a struct `h`'s head names.
+const FREE_F_G: &str = "pub fn f(_x: u8) {}\npub fn g() {}\n";
+const FREE_G: &str = "pub fn g() {}\n";
+const STRUCT_T_K: &str = "pub struct T;\npub fn k() {}\n";
+const FREE_K: &str = "pub fn k() {}\n";
+const NAMES_T: &str = "pub fn h(_t: crate::a::T) {}\n";
+
+/// A FREE FN OR A STRUCT, removed from `a.rs` while `h` in `b.rs` still calls or names it: the
+/// drive answers (no record refused as two values under one key; `checks_of` asserts no task
+/// failed), and putting the item back finds every body's first answer in the records, no
+/// `BodyCheck` made. Prints `module-level removal: put back made (S, B) and (S, B)`.
+#[test]
+fn a_module_level_item_removed_and_put_back_is_answered_from_records() {
+    let free = checks_of(86, &[(FREE_F_G, CALLS_FREE_F), (FREE_G, CALLS_FREE_F), (FREE_F_G, CALLS_FREE_F)]);
+    let named = checks_of(87, &[(STRUCT_T_K, NAMES_T), (FREE_K, NAMES_T), (STRUCT_T_K, NAMES_T)]);
+    for seen in [&free, &named] {
+        assert!(!seen[1].all.contains("TwoValues"), "a removal refused as two values:\n{}", seen[1].all);
+        assert_eq!((seen[0].errors, seen[2].errors), (0, 0), "{}", seen[2].all);
+        assert_eq!(seen[2].made.1, 0, "the item put back finds every body's first answer in the records:\n{}", seen[2].all);
+    }
+    std::println!("module-level removal: put back made {:?} and {:?}", free[2].made, named[2].made);
+}
+
+/// The same removal, as its reader's ERROR, the same as fresh: `h` reports the missing `f` as
+/// E0425 (one finding, or one an owner of `b.rs` where the two are not merged), and putting `f`
+/// back answers from the first check's records (no `BodyCheck` made).
+/// Before (lane UN's probe, 2026-11-17 07:58): wide's two `CrateScope`s were remade with a new
+/// payload (`f` gone) but the SAME out, because names/scope.rs `resolve` digested only the
+/// EXPORTS record into it; `f` is private, so no reader's read moved, and `h`'s body was handed
+/// the record at the old value key, which still resolved `crate::a::f`: `ItemStale`. Control:
+/// without the `done.inner` update in `resolve`, check 1 has 0 errors and fails `ItemStale`.
+#[test]
+fn a_module_level_item_removed_is_its_readers_error() {
+    let free = checks_of(86, &[(FREE_F_G, CALLS_FREE_F), (FREE_G, CALLS_FREE_F), (FREE_F_G, CALLS_FREE_F)]);
+    assert!(free[1].errors >= 1 && (free[0].errors, free[2].errors) == (0, 0), "h must report the missing free f:\n{}", free[1].all);
+    assert!(free[1].words.contains("E0425\\u{1f}cannot find `f` in module `wide::a` (segment 2)"), "the removal's error is the fresh one:\n{}", free[1].all);
+    assert_eq!(free[2].made.1, 0, "f put back answers from the first check's records:\n{}", free[2].all);
+}
+
+/// A PRIVATE ITEM ADDED must make itself alone: a private `fn z` added to `a.rs` (six fns, three
+/// a file) makes `z`'s `Signature` and body and nothing that does not name it. IGNORED, measured
+/// 2026-11-17 08:04 (lane UN): the check after the edit makes (Signature, BodyCheck) (7, 7), every
+/// item again; CONTROL without the `done.inner` digest in names/scope.rs `resolve`: (4, 4), the
+/// edited file's three and `z` (the edited file's own are made again by their file's change, a
+/// separate cost). The scope's out covers the whole inner record (rule 21: the crate's own
+/// bodies read it), so a private change moves the out each body reads WHOLE, its value key
+/// holds no record and it is made, not found. The floor needs the scope read by cell (D116).
+/// Prints the two checks' `Signature` and `BodyCheck` rows.
+#[test]
+#[ignore = "a CrateScope is read whole: a private item added makes every body of its crate again (7, 7) where the floor is (1, 1); needs cell reads of the scope"]
+fn a_private_item_added_makes_itself_alone() {
+    const A: &str = "pub fn f(_x: u8) {}\npub fn g() {}\npub fn k() -> u8 {\n    1\n}\n";
+    const A_Z: &str = "pub fn f(_x: u8) {}\npub fn g() {}\npub fn k() -> u8 {\n    1\n}\nfn z() {}\n";
+    const B: &str = "pub fn h() {\n    crate::a::f(1u8);\n}\npub fn i() {\n    crate::a::g();\n}\npub fn j() -> u8 {\n    crate::a::k()\n}\n";
+    let seen = checks_of(100, &[(A, B), (A_Z, B)]);
+    let rows = |s: &Seen| s.all.lines().filter(|l| l.starts_with("Signature") || l.starts_with("BodyCheck")).collect::<std::vec::Vec<_>>().join(" / ");
+    std::println!("private fn added to 6 fns: before: {} || after: {}", rows(&seen[0]), rows(&seen[1]));
+    assert_eq!((seen[0].errors, seen[1].errors), (0, 0), "{}", seen[1].all);
+    assert_eq!(seen[1].made, (1, 1), "the new `z` alone is made:\n{}", seen[1].all);
+}
+
+/// A STRUCT REMOVED FROM A HEAD: `h`'s signature must report the missing `T` as E0412, at the
+/// head, its callers not blamed. IGNORED: the `Signature` task answers a head it cannot name as
+/// a not-checked note ("a head it reads could not be named ... Resolve(Path(.. NotFound))") and
+/// the check stops (`Check(Head ..)`), fresh and after the removal alike; the E0412 belongs to
+/// the `Signature` task (body_types/heads.rs), not to this lane's paths.
+#[test]
+#[ignore = "the Signature task answers an unnamed head as a note, not E0412 (body_types/heads.rs)"]
+fn a_struct_removed_from_a_head_is_its_signature_s_error() {
+    let named = checks_of(87, &[(STRUCT_T_K, NAMES_T), (FREE_K, NAMES_T), (STRUCT_T_K, NAMES_T)]);
+    assert_eq!((named[0].errors, named[1].errors, named[2].errors), (0, 2, 0), "h's head must report the missing T:\n{}", named[1].all);
+}
+
+/// A NAME THAT DOES NOT EXIST, fresh (a home that never held it): its reader's ERROR, never a
+/// not-checked note, exit status 1 (`b.rs` is a module of the library and the binary, whose
+/// equal findings may be merged: the count is at least one, the same after the removal).
+/// - a call of a free fn `crate::a::f` with no `f`: E0425 at `f`, "cannot find `f` in module
+///   `wide::a` (segment 2)" (before: a refusal's segment was read without the path's `crate` head, so
+///   the prefix before it was `crate` alone, `Empty`, and the body a gap: 0 errors);
+/// - `use crate::a::f;` with no `f`: the names' unresolved import (E0432), at the `use`;
+/// - a method `S.f()` with no `f`: E0599.
+/// Then the name put in and taken out again: the third check answers from the records of the
+/// first, no `BodyCheck` made. Prints `missing names: call E0425 xN, use, method E0599`.
+#[test]
+fn a_name_that_does_not_exist_is_an_error() {
+    let call = checks_of(95, &[(FREE_G, CALLS_FREE_F), (FREE_F_G, CALLS_FREE_F), (FREE_G, CALLS_FREE_F)]);
+    assert!(call[0].errors >= 1, "h must report the missing f:\n{}", call[0].all);
+    assert!(call[0].words.contains("E0425\\u{1f}cannot find `f` in module `wide::a` (segment 2)"), "the E0425 names `f` and its module as written:\n{}", call[0].all);
+    assert!(!call[0].words.contains("not checked") && !call[0].words.contains("Empty"), "no gap beside the error:\n{}", call[0].all);
+    assert_eq!(call[1].errors, 0, "f put in clears it:\n{}", call[1].all);
+    assert_eq!((call[2].errors, call[2].made.1), (call[0].errors, 0), "f taken out again answers from the first check's records:\n{}", call[2].all);
+    let used = fresh_two_files(96, FREE_G, "use crate::a::f;\npub fn h() {}\n");
+    assert_eq!((used.errors, used.status), (1, Some(1)), "{:?}\n{:?}", used.ids, used.words);
+    assert!(used.ids.iter().any(|(code, _)| code == "unresolved"), "the import is the names' unresolved finding: {:?}", used.ids);
+    let method = fresh_two_files(97, "pub struct S;\n", "pub fn h() {\n    crate::a::S.f();\n}\n");
+    assert_eq!(method.status, Some(1), "{:?}", method.words);
+    assert!(method.errors >= 1 && method.words.iter().all(|w| w.starts_with("E0599")), "{:?}", method.words);
+    let fresh = fresh_two_files(98, FREE_G, CALLS_FREE_F);
+    assert_eq!(fresh.status, Some(1), "{:?}", fresh.words);
+    std::println!("missing names: call E0425 x{}, use, method E0599", fresh.errors);
+}
+
+/// A TYPE THAT DOES NOT EXIST, WRITTEN IN A BODY: E0412 at the path, and the body checked for
+/// everything else (front2 type_miss.rs: the type converted as the error type). `h` writes
+/// `&[crate::a::T]` and a mismatch of its own (`let _x: u8 = true`, E0308). With `T` the
+/// mismatch alone; `T` removed: E0412 "cannot find type `T` in module `wide::a` (segment 2)"
+/// beside the same E0308; put back: the first check's answer, no `BodyCheck` made. Before:
+/// "lowering refused: .. a written type .. NotFound", a not-checked note, and the E0308 unseen.
+/// Prints `body type: E0412 beside E0308`.
+#[test]
+fn a_missing_type_in_a_body_is_e0412() {
+    const WRITES_T: &str = "pub fn h() {\n    let _t: &[crate::a::T];\n    let _x: u8 = true;\n}\n";
+    let seen = checks_of(101, &[(STRUCT_T_K, WRITES_T), (FREE_K, WRITES_T), (STRUCT_T_K, WRITES_T)]);
+    let codes = |s: &Seen| (s.words.matches("E0412\\u{1f}").count(), s.words.matches("E0308\\u{1f}").count());
+    let (with, without, back) = (codes(&seen[0]), codes(&seen[1]), codes(&seen[2]));
+    assert!(with.0 == 0 && with.1 >= 1, "with T, the mismatch alone:\n{}", seen[0].all);
+    assert!(without.0 >= 1 && without.1 == with.1, "T removed: E0412 beside the same E0308:\n{}", seen[1].all);
+    assert!(seen[1].words.contains("E0412\\u{1f}cannot find type `T` in module `wide::a` (segment 2)"), "{}", seen[1].all);
+    assert!(!seen[1].words.contains("not checked") && !seen[1].words.contains("lowering refused"), "no note beside the error:\n{}", seen[1].all);
+    assert_eq!((back, seen[2].made.1), (with, 0), "T put back answers from the first check's records:\n{}", seen[2].all);
+    let fresh = fresh_two_files(102, FREE_K, WRITES_T);
+    assert_eq!(fresh.status, Some(1), "{:?}", fresh.words);
+    assert!(fresh.words.iter().any(|w| w.starts_with("E0412")), "fresh: {:?}", fresh.words);
+    std::println!("body type: E0412 beside E0308");
+}
+
+/// CONTROL: a name the module's REFUSED macro call may have made is not an error of its reader:
+/// `make!(struct f)` matches no rule of `make`, so `crate::a::f` is unknown. The call's own error
+/// is the one error; `h` is not checked under it (body_types.rs `MACRO_CALL_REFUSED`), no E0425.
+/// Prints `refused call: 1 error, h not checked under it`.
+#[test]
+fn a_name_after_a_refused_macro_call_is_not_an_error() {
+    const NOT_F: &str = "macro_rules! make {\n    (fn $n:ident) => { pub fn $n() {} };\n}\nmake!(struct f);\n";
+    let got = fresh_two_files(99, NOT_F, CALLS_FREE_F);
+    assert_eq!(got.errors, 1, "the call's error alone:\n{:?}\n{:?}", got.ids, got.words);
+    assert!(got.ids.iter().any(|(code, _)| code == "macro-call-failed"), "{:?}", got.ids);
+    assert!(!got.words.iter().any(|w| w.starts_with("E0425")), "no E0425 for a name the refused call may make: {:?}", got.words);
+    assert!(got.words.iter().any(|w| w.contains("a macro call of its module was refused")), "h is not checked under the call: {:?}", got.words);
+    std::println!("refused call: 1 error, h not checked under it");
+}
+
+/// AN IMPL A METHOD CALL RESOLVED TO, removed: `crate::a::S.f()` in `h` while `impl S { fn f }`
+/// goes and `S` stays. The call resolved through the impl; now it finds no method, the caller's
+/// error, and the check answers (no `TwoValues`); the impl put back clears it with no
+/// `BodyCheck` made. Prints `impl removed: errors (0, 1, 0); put back made (S, B)`.
+#[test]
+fn an_impl_a_method_call_resolved_to_removed_is_its_callers_error() {
+    const WITH_IMPL: &str = "pub struct S;\nimpl S {\n    pub fn f(&self) {}\n}\n";
+    const WITHOUT_IMPL: &str = "pub struct S;\n";
+    const CALLS_METHOD: &str = "pub fn h() {\n    crate::a::S.f();\n}\n";
+    let seen = checks_of(88, &[(WITH_IMPL, CALLS_METHOD), (WITHOUT_IMPL, CALLS_METHOD), (WITH_IMPL, CALLS_METHOD)]);
+    assert!(!stale(&seen[1].words), "{}", seen[1].all);
+    assert_eq!((seen[0].errors, seen[1].errors, seen[2].errors), (0, 1, 0), "h must report the method f gone with its impl:\n{}", seen[1].all);
+    assert_eq!(seen[2].made.1, 0, "the impl put back finds every body's first answer in the records:\n{}", seen[2].all);
+    std::println!("impl removed: errors ({}, {}, {}); put back made {:?}", seen[0].errors, seen[1].errors, seen[2].errors, seen[2].made);
 }
 
 /// Whether a check's words hold a head no `Signature` covered (heads.rs `HEAD_NOT_NAMED`,

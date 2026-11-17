@@ -963,6 +963,11 @@ pub(crate) fn repr_parts(args: &str, out: &mut ReprAttrs) -> Result<(), &'static
         let int = |i| Some(IntRepr::Signed(i));
         let uint = |u| Some(IntRepr::Unsigned(u));
         match part {
+            // The default representation written out (the Reference, "Type layout", "The `Rust`
+            // representation"): it sets nothing. core writes it beside a modifier:
+            // `#[repr(Rust, packed)] struct Unaligned<T>(T);` (library/core/src/ptr/mod.rs), which
+            // `read_unaligned` and `write_unaligned` are made of.
+            "Rust" => {}
             "C" => out.c = true,
             "transparent" => out.transparent = true,
             "packed" => out.packed = Some(0),
@@ -2979,5 +2984,19 @@ mod tests {
         assert_eq!(int_value("b'\\n'"), Some(10));
         assert_eq!(int_value("- 7"), Some(7));
         assert_eq!(int_value("x"), None);
+    }
+
+    /// `repr(Rust)` is the default written out and sets nothing; core's `Unaligned` writes it
+    /// beside `packed`. A word that is no representation is still refused.
+    #[test]
+    fn repr_rust_is_the_default_written_out() {
+        use super::{ReprAttrs, repr_parts};
+        let mut packed = ReprAttrs::default();
+        assert_eq!(repr_parts("(Rust, packed)", &mut packed), Ok(()));
+        assert_eq!(packed, ReprAttrs { packed: Some(0), ..ReprAttrs::default() });
+        let mut plain = ReprAttrs::default();
+        assert_eq!(repr_parts("(Rust)", &mut plain), Ok(()));
+        assert_eq!(plain, ReprAttrs::default());
+        assert_eq!(repr_parts("(rust)", &mut ReprAttrs::default()), Err("this `repr`"));
     }
 }

@@ -706,9 +706,13 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let d = facts.discriminant(variant, &code.discrs)?;
                 self.set(b, dst, Out::V(Val::S(Scalar::Int(mask(d as u128, bits)))));
             }
-            Op::Field { dst, src, off } => {
+            Op::Field { dst, src, off, tail } => {
                 let pl = self.place(b, src)?;
-                self.set(b, dst, Out::P(Place::of(pl.ptr.at(off))));
+                // The unsized tail keeps the struct's length: without it a borrow of the tail
+                // (`&self.0` in crypto-bigint's `UintRef`) had no length ("an unsized place with
+                // no length") or, borrowed as written, a thin pointer to a slice.
+                let meta = if tail { pl.meta } else { None };
+                self.set(b, dst, Out::P(Place { ptr: pl.ptr.at(off), meta }));
             }
             Op::Index { dst, base, index, size, len } => {
                 let i = self.val(b, index)?;

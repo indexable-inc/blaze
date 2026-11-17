@@ -297,7 +297,7 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
         // NODE lines): printed only with `FRONT2_DUMP` set.
         if let Some(b) = records.buckets.as_ref().filter(|_| std::env::var_os("FRONT2_DUMP").is_some()) {
             for (t, s, got) in b.answered() {
-                let tn = records.keys.library(t).map_or_else(|| format!("{t:?}"), |k| shown(names, crate_names, k));
+                let tn = records.keys.library_in(names, t).map_or_else(|| format!("{t:?}"), |k| shown(names, crate_names, k));
                 let cands = b.trait_candidates(t, s, b.home_of(t, s));
                 out.push_str(&format!("ASKED {tn} at {s:?}: {} candidates, {} answer\n", cands.len(), got.len()));
                 for k in cands.iter().take(12) {
@@ -305,7 +305,7 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                     let how = match h {
                         None => "no header".to_string(),
                         Some(h) if h.trait_ == Some(t) => format!("trait fits, picked {}", got.contains(&blaze_ladder::front2::keys::checker_of(*k))),
-                        Some(h) => format!("header trait {:?}", h.trait_.and_then(|x| records.keys.library(x)).map(|x| shown(names, crate_names, x))),
+                        Some(h) => format!("header trait {:?}", h.trait_.and_then(|x| records.keys.library_in(names, x)).map(|x| shown(names, crate_names, x))),
                     };
                     out.push_str(&format!("    {} [{how}] unread={} failed={}\n", shown(names, crate_names, *k), b.is_unread(*k), b.has_failed(*k)));
                 }
@@ -494,7 +494,7 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                     let item = match gap {
                         Gap::VariantOfNoEnum(k) => format!("(lang `{}`)", records.index.lang_name_of(*k).unwrap_or("?")),
                         Gap::TypeAlias(k) => shown(names, crate_names, *k),
-                        Gap::WhereConst(k) | Gap::CtorFn(k) | Gap::ImplAssocType(k, _) => match records.keys.library(*k) {
+                        Gap::WhereConst(k) | Gap::CtorFn(k) | Gap::ImplAssocType(k, _) => match records.keys.library_in(names, *k) {
                             Some(lib) => shown(names, crate_names, lib),
                             None => format!("{k:?}"),
                         },

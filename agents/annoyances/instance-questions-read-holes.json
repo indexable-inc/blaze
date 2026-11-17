@@ -1,0 +1,14 @@
+{
+ "id": "instance-questions-read-holes",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane UZ under TEMPO-LANES-0412",
+ "where": "crates/blaze-typeck/src/instance.rs (select_impl, normalize_projection, resolve_instance), drop_impl.rs (adt_drop_impl); crates/blaze-ladder/src/run.rs (normalized, the instance loop); front2 program.rs and program/lazy/front_end.rs (in_world)",
+ "what": "Tempo's census classes 'the solver's step gave no type' (37) and 'not normalized by the seam's normalize' (35) came from core's `<MultiCharEqPattern<IsWhitespace> as Pattern>::Searcher<'a>`, read in a generic body at an instance. The impls of `MultiCharEq` at `IsWhitespace` were never asked while checking. The world turned the unmade bucket into a hole whose stand-in is empty, so the blanket `impl<F: FnMut(char) -> bool> MultiCharEq for F` was missed and the projection was refused as a mismatch. The same hole answered 'no `Drop` impl' for drop glue at any ADT whose bucket no check made.",
+ "cost": "most of a session: the runner shows about 41 lines, so each failing program had to be isolated in its own test; a trial print in a no_std crate also needs `extern crate std`",
+ "cause": "one-shot instance questions had no rule for holes: `Reads` turned `Missing` into an empty stand-in, which is right for a body's run (it makes no result when holed) and wrong for a question whose answer is used at once; run.rs `normalized` then folded every solver error into 'not normalized'",
+ "whys": "holes were built for the check's gather-all-needs rounds; instance questions reused `Reads` without the holed check; the build seam is `&self`, so nothing could make an answer at build time",
+ "class": "a stand-in answer read as a real answer (a silent fallback)",
+ "prevention": "instance.rs `unholed` makes every instance question `Missing(first hole)`; the seam's `make_asked` makes what the worlds asked and the build loop builds the instance again (at most MOST_ROUNDS); `normalized` keeps the solver's error; tests suite/instance_holes.rs (with a control that gives Ok(None) without the fix) and front2_gat_projection.rs",
+ "workaround": "none",
+ "state": "fixed once admitted"
+}

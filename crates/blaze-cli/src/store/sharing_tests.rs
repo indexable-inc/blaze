@@ -70,8 +70,8 @@ fn a_native_script_record_and_its_reader_stay_local() {
 fn two_placements_of_one_subject_are_two_keys() {
     let subject = ContentId([1; 32]);
     let crate_key = ContentId([2; 32]);
-    let wasm = scripts::parts([(subject, crate_key, RanAs::Wasm)].into_iter());
-    let native = scripts::parts([(subject, crate_key, RanAs::Native)].into_iter());
+    let wasm = scripts::parts([(subject, crate_key, RanAs::Wasm)].into_iter(), None);
+    let native = scripts::parts([(subject, crate_key, RanAs::Native)].into_iter(), None);
     assert_eq!(wasm[0].0, native[0].0, "the name is the subject's alone (one subject function)");
     assert_ne!(wasm[0].1, native[0].1, "a native and a wasm run of one subject had one key");
     std::println!("two placements, one name, two keys");

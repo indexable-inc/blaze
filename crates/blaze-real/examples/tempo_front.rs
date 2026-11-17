@@ -810,7 +810,7 @@ fn crates_in(names: &Names<'_>, keys: &Keys, store: &Store<'_>) -> BTreeSet<usiz
     let crate_of_checker = |k: &blaze_typeck::ItemKey| -> Option<usize> {
         let lib = match keys.origin(*k)? {
             Origin::Item(lib) => *lib,
-            Origin::Member { container, .. } => keys.library(*container)?,
+            Origin::Member { container, .. } => keys.library_in(names, *container)?,
         };
         names.crate_of(lib)
     };

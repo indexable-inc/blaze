@@ -32,6 +32,7 @@ use blaze_own::{AVec, Alloc};
 use blaze_scope::resolve::{At, Names};
 use blaze_surface::{Item, ItemIndex, ItemKind};
 
+use super::keys::MemberKind;
 use super::project::{BodyAt, BodyRef};
 use super::source::{self, NamesSource};
 
@@ -93,10 +94,30 @@ pub struct Listed<'n> {
     pub entry: Option<(u32, ItemIndex)>,
 }
 
+/// Which bodies a listing holds (rule 78: one listing, the choice a parameter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// Fns only: what the whole-program walks (`each_body`, the run path) and their tests read.
+    Fns,
+    /// Fns, and each `const` and `static` initializer: free items and `const` members of impls
+    /// and traits (the Reference, "Constant items", "Static items", "Associated constants").
+    /// What `blaze check` checks an outline entry's own body by (blaze-cli body_types.rs).
+    /// A `const` or `static` with no initializer (a trait's `const N: u8;`, an `extern`
+    /// block's `static`) is listed too and refused as `NoBody` if checked: its outline entry
+    /// has no body, so the command never asks for it.
+    FnsAndInitializers,
+}
+
 /// Every body of the program's own crate (crate 0) over `names`, sorted by [`BodyRef`]: each
 /// free fn with a body, then each fn member of each impl and trait. A free fn's row that is
 /// also filed as a member is one body, the member.
 pub fn list_bodies<'n, 'a, S: BodySource<'n>>(names: S, alloc: Alloc<'a>) -> AVec<'a, Listed<'n>> {
+    list_with(names, Listing::Fns, alloc)
+}
+
+/// [`list_bodies`] holding what `listing` names.
+pub fn list_with<'n, 'a, S: BodySource<'n>>(names: S, listing: Listing, alloc: Alloc<'a>) -> AVec<'a, Listed<'n>> {
+    let initializers = listing == Listing::FnsAndInitializers;
     let mut items: AVec<'a, LibKey> = AVec::new_in(alloc);
     names.each_item(0, &mut |key, _module| items.push(key));
     // Each file's text, asked once: a body's start is its text's offset in it.
@@ -116,13 +137,15 @@ pub fn list_bodies<'n, 'a, S: BodySource<'n>>(names: S, alloc: Alloc<'a>) -> AVe
     let mut members: AVec<'a, LibKey> = AVec::new_in(alloc);
     for &key in items.iter() {
         let Some(kind) = names.kind_of_item(key) else { continue };
+        let value = matches!(kind, ItemKind::Const | ItemKind::Static);
         match kind {
-            ItemKind::Function => {
+            ItemKind::Function | ItemKind::Const | ItemKind::Static if !value || initializers => {
                 if !names.has_text(key) {
                     continue;
                 }
                 let Some(it) = names.text_of(key) else { continue };
-                if it.text.trim_end().ends_with(';') {
+                // A fn's declaration with no body; a value's text always ends in `;`.
+                if !value && it.text.trim_end().ends_with(';') {
                     continue;
                 }
                 let place = names.place_of(key);
@@ -143,13 +166,18 @@ pub fn list_bodies<'n, 'a, S: BodySource<'n>>(names: S, alloc: Alloc<'a>) -> AVe
                 let is_trait = kind == ItemKind::Trait;
                 names.each_member(key, &mut |m| {
                     members.push(m.key);
-                    let (ItemKind::Function, Some(name)) = (m.kind, m.name) else { return };
+                    let member = match (m.kind, m.name) {
+                        (ItemKind::Function, Some(name)) => (MemberKind::Fn, name),
+                        (ItemKind::Const, Some(name)) if initializers => (MemberKind::Const, name),
+                        _ => return,
+                    };
+                    let (kind, name) = member;
                     let at = file.and_then(|file| start_in(file, m.text).map(|start| BodyAt { file, start }));
                     let entry = match (at, m.written_by) {
                         (Some(at), None) => Some((at.file, m.item)),
                         _ => None,
                     };
-                    out.push(Listed { body: BodyRef::Member { container: key, is_trait, name }, at, entry });
+                    out.push(Listed { body: BodyRef::Member { container: key, is_trait, kind, name }, at, entry });
                 });
             }
             _ => {}
@@ -169,9 +197,9 @@ pub enum ChainError<'n> {
     NoFile { file: u32, body: BodyRef<'n> },
     /// The file's outline has no entry at the index the names source gave for the body.
     NoEntry { file: u32, entry: u32, body: BodyRef<'n> },
-    /// The entry at the body's index is not a fn: the outline is not the one the names source's
-    /// indexes were made in.
-    NotAFn { file: u32, entry: u32, found: ItemKind, body: BodyRef<'n> },
+    /// The entry at the body's index is not of the body's kind (a fn's, a `const`'s or a
+    /// `static`'s): the outline is not the one the names source's indexes were made in.
+    NotItsKind { file: u32, entry: u32, found: ItemKind, body: BodyRef<'n> },
     /// Two bodies of one file have one chain (rule 21, keys-cover-every-input): the chain
     /// misses what tells them apart.
     Collision { file: u32, chain: ContentId, first: BodyRef<'n>, second: BodyRef<'n> },
@@ -182,7 +210,7 @@ impl core::fmt::Display for ChainError<'_> {
         match self {
             ChainError::NoFile { file, body } => write!(f, "file {file} of the program's crate has no text, and the body {body:?} is placed in it"),
             ChainError::NoEntry { file, entry, body } => write!(f, "file {file} of the program's crate: its outline has no entry {entry}, where the body {body:?} is placed"),
-            ChainError::NotAFn { file, entry, found, body } => write!(f, "file {file} of the program's crate: entry {entry} of its outline is {found:?}, not the fn of the body {body:?}"),
+            ChainError::NotItsKind { file, entry, found, body } => write!(f, "file {file} of the program's crate: entry {entry} of its outline is {found:?}, not the item of the body {body:?}"),
             ChainError::Collision { file, chain, first, second } => {
                 write!(f, "file {file} of the program's crate: the bodies {first:?} and {second:?} have one item chain {chain:?} (rule keys-cover-every-input)")
             }
@@ -249,8 +277,14 @@ pub fn index_by_chain<'n, S: BodySource<'n>>(names: S, listed: &[Listed<'n>], ch
                     refused = Some(ChainError::NoEntry { file, entry, body });
                     return;
                 };
-                if item.kind() != ItemKind::Function {
-                    refused = Some(ChainError::NotAFn { file, entry, found: item.kind(), body });
+                let fits = match body {
+                    BodyRef::Free(_) => matches!(item.kind(), ItemKind::Function | ItemKind::Const | ItemKind::Static),
+                    BodyRef::Member { kind: MemberKind::Fn, .. } => item.kind() == ItemKind::Function,
+                    BodyRef::Member { kind: MemberKind::Const, .. } => item.kind() == ItemKind::Const,
+                    BodyRef::Member { .. } => false,
+                };
+                if !fits {
+                    refused = Some(ChainError::NotItsKind { file, entry, found: item.kind(), body });
                     return;
                 }
                 rows.push((file, chain(outline, item, text), body));

@@ -24,8 +24,10 @@
 //! needs drop and holds no moved part whole, tests the bit of each moved part, and descends
 //! only into parts holding a moved one (an enum by its discriminant, read again: the value does
 //! not change between the arm's test and its drop). Refused by name: a move out of a type that
-//! implements `Drop` (E0509), from behind a reference, inside an or-pattern or a slice, a guard
-//! on an arm that moves, a zero-sized part, and more than 64 parts of one value.
+//! implements `Drop` (E0509), from behind a reference or inside a slice, a zero-sized part,
+//! and more than 64 parts of one value. A guarded arm's moves are held until its guard passed
+//! (`Pending`). An or-pattern's alternative moves on its own pass (its bit cleared there); the
+//! name's first binding, which every alternative stores into, owns the part at the arm's pass.
 //!
 //! The same bits serve a move by a place expression (`let a = t.0;`, `move_field`: the local
 //! gets its word in `scan_field_moves`) and an assignment over a local's part (`assign_over`:
@@ -85,7 +87,25 @@ pub(super) struct Root {
     field: Option<ExprId>,
 }
 
-/// The arm being bound: its pattern, its match's root, and whether it has a guard.
+/// An effect of a guarded arm's bindings held until its guard passed. The Reference, "Match
+/// guards": a by-value binding is moved only after the guard is true; while the guard runs it
+/// is a shared reference to its part. So the bindings are stored (the guard reads those
+/// bytes), but nothing is owned or taken from the scrutinee yet: a false guard leaves the
+/// scrutinee whole for the next arm, and its copies are dropped by no one.
+#[derive(Clone, Copy)]
+pub(super) enum Pending {
+    /// Binding `p` owns its part (`own`).
+    Own(PatId),
+    /// Every binding of pattern `p` owns its part (`own_pat`, the switch's).
+    OwnPat(PatId),
+    /// Bits `bits` of word `mask` cleared: their parts moved out.
+    Clear { mask: SlotId, bits: u64 },
+    /// Local `x` moved whole by `expr` (`moved`).
+    Moved { expr: ExprId, x: PatId },
+}
+
+/// The arm being bound: its pattern, its match's root, and whether it has a guard (its moves
+/// are held: `Pending`).
 #[derive(Clone, Copy)]
 pub(super) struct Cx {
     pat: PatId,
@@ -110,6 +130,12 @@ pub(super) struct Moves<A: Allocator> {
     roots: Vec<Root, A>,
     assigned: Vec<Assigned, A>,
     cx: Option<Cx>,
+    /// The effects guarded arms hold until their guards pass, innermost last.
+    pending: Vec<Pending, A>,
+    /// The first bindings an or-pattern's alternatives moved a part into (each alternative
+    /// cleared its own bits on its pass), owned once at the arm's pass (walk/matches.rs
+    /// `bind_with`).
+    alt_owned: Vec<PatId, A>,
     /// The last `Box` whose first adjustment `box_deref_builtin` built: its expression and the
     /// pointer to it. A move out of a temporary box's contents (walk/moves/boxes.rs
     /// `move_temp_box_contents`) finds the box's held entry by this pointer: the contents'
@@ -123,8 +149,10 @@ impl<A: Allocator + Clone> Moves<A> {
             steps: Vec::new_in(alloc.clone()),
             parts: Vec::new_in(alloc.clone()),
             roots: Vec::new_in(alloc.clone()),
-            assigned: Vec::new_in(alloc),
+            assigned: Vec::new_in(alloc.clone()),
             cx: None,
+            pending: Vec::new_in(alloc.clone()),
+            alt_owned: Vec::new_in(alloc),
             box_self: None,
         }
     }
@@ -236,17 +264,33 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.moves.cx = None;
     }
 
+    /// Or-alternative binding `first` (a name's first binding) took a part by value: owned at
+    /// the arm's pass (`take_alt_moved`).
+    pub(super) fn alt_moved(&mut self, first: PatId) {
+        if !self.moves.alt_owned.contains(&first) {
+            self.moves.alt_owned.push(first);
+        }
+    }
+
+    /// Whether an alternative moved a part into `first`; forgets it.
+    pub(super) fn take_alt_moved(&mut self, first: PatId) -> bool {
+        match self.moves.alt_owned.iter().position(|&q| q == first) {
+            Some(i) => {
+                self.moves.alt_owned.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Binding `p` (of type `g`, needing drop) binds its part by value: the part moves out of
     /// the scrutinee, its bit cleared. Outside a match that owns its scrutinee (an `if let`,
-    /// a `let`-`else`) refused by name.
-    pub(super) fn move_out(&mut self, p: PatId, g: PTy) -> Result<(), BuildError> {
+    /// a `let`-`else`) refused by name. `alt`: `p` is an or-alternative's, bound on that
+    /// alternative's own pass, so its effect is a store on that path (a bit cleared), never a
+    /// fact of the walk (a whole local's move, `moved`, is path-blind: refused there).
+    pub(super) fn move_out(&mut self, p: PatId, g: PTy, alt: bool) -> Result<(), BuildError> {
         let Some(cx) = self.moves.cx else { return Err(BuildError::UnsupportedPat { pat: p, what: MOVE_OUT }) };
-        if cx.guarded {
-            return Err(BuildError::UnsupportedPat {
-                pat: p,
-                what: "a guard on an arm that moves out of its scrutinee (Rust moves only after the guard passes)",
-            });
-        }
+        // A guarded arm's move is held until its guard passed (`Pending`).
         if self.repr(g).map_err(|error| Self::pat_ty_err(p, error))? == Repr::None {
             return Err(BuildError::UnsupportedPat { pat: p, what: "a move out of a zero-sized part that needs drop" });
         }
@@ -275,7 +319,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             (Owner::Local(x), None) if len == 0 => {
                 // The whole local moves (its flag, set by `scan_flags`).
                 self.moves.steps.truncate(start as usize);
-                return self.moved(cx.root.expr, x);
+                if alt {
+                    return Err(BuildError::UnsupportedPat { pat: p, what: "a by-value binding of a whole local scrutinee inside an or-pattern" });
+                }
+                return self.arm_effect(Pending::Moved { expr: cx.root.expr, x }, cx.guarded);
             }
             (Owner::Local(x), None) => self.owned[x.ix()]
                 .and_then(|o| o.rest)
@@ -292,7 +339,49 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let Some(bit) = self.part_bit(mask, start, len, base, Some(cx.root.expr))? else {
             return Err(BuildError::UnsupportedPat { pat: p, what: "a match moving out more than 64 parts of one value (its word)" });
         };
-        self.clear_bit(mask, bit);
+        self.arm_effect(Pending::Clear { mask, bits: 1u64 << bit }, cx.guarded)
+    }
+
+    /// Whether the arm being bound holds its moves until its guard passed (`Pending`).
+    pub(super) fn holding_moves(&self) -> bool {
+        self.moves.cx.is_some_and(|cx| cx.guarded)
+    }
+
+    /// Where the effects held for the next guarded arm start: its `Task::ArmMoves`.
+    pub(super) fn pending_mark(&self) -> u32 {
+        self.moves.pending.len() as u32
+    }
+
+    /// Applies effect `e` of an arm's bindings now, or with `hold` after its guard passed.
+    pub(super) fn arm_effect(&mut self, e: Pending, hold: bool) -> Result<(), BuildError> {
+        if hold {
+            self.moves.pending.push(e);
+            return Ok(());
+        }
+        match e {
+            Pending::Own(p) => self.own(p, true),
+            Pending::OwnPat(p) => self.own_pat(p),
+            Pending::Clear { mask, bits } => {
+                self.clear_bits(mask, bits);
+                Ok(())
+            }
+            Pending::Moved { expr, x } => self.moved(expr, x),
+        }
+    }
+
+    /// An arm's guard passed (`Task::ArmMoves`): the effects its bindings held from `from` on
+    /// are applied in the order they were bound, at the start of its body. A guard's own
+    /// guarded arms held theirs after `from` and applied them first (the work list is a stack).
+    pub(super) fn arm_moves(&mut self, from: u32) -> Result<(), BuildError> {
+        let from = from as usize;
+        if from > self.moves.pending.len() {
+            return Err(malformed("an arm's held moves past the list"));
+        }
+        for i in from..self.moves.pending.len() {
+            let e = self.moves.pending[i];
+            self.arm_effect(e, false)?;
+        }
+        self.moves.pending.truncate(from);
         Ok(())
     }
 
@@ -339,9 +428,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// Clears bit `bit` of word `mask`: its part moved out.
     fn clear_bit(&mut self, mask: SlotId, bit: u32) {
+        self.clear_bits(mask, 1u64 << bit);
+    }
+
+    /// Clears the bits `bits` of word `mask`: their parts moved out.
+    pub(super) fn clear_bits(&mut self, mask: SlotId, bits: u64) {
         let fa = self.b.slot_addr(mask);
         let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
-        let keep = self.b.iconst(Ty::I64, u128::from(!(1u64 << bit)));
+        let keep = self.b.iconst(Ty::I64, u128::from(!bits));
         let left = self.b.binary(Op::And, Flags::NONE, word, keep);
         self.b.store(Flags::NONE, left, fa, 0, MemAttrs::aligned(3));
     }
@@ -375,9 +469,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// The path from pattern `root` (of type `g`) to binding `target`, appended to `steps`
-    /// root first: its start and length. A search by a work list; a reference, an or-pattern
-    /// or a slice is not followed (no move goes through one), so a binding under one is
-    /// refused by name, and so is one under a type that implements `Drop`.
+    /// root first: its start and length. A search by a work list; a reference or a slice is
+    /// not followed (no move goes through one), so a binding under one is refused by name, and
+    /// so is one under a type that implements `Drop`. An or-pattern's alternatives are.
     fn move_path(&mut self, root: PatId, g: PTy, target: PatId) -> Result<(u32, u32), BuildError> {
         let mut seen: Vec<Seen, A> = Vec::new_in(self.alloc.clone());
         let mut todo: Vec<(PatId, PTy, u32, Option<Step>), A> = Vec::new_in(self.alloc.clone());
@@ -394,6 +488,16 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             if let Pat::Bind { sub: Some(s), .. } = pat {
                 seen.push((q, g, parent, step, false));
                 todo.push((s, g, me, None));
+                continue;
+            }
+            // An or-pattern: each alternative is over the same value (no step); the binding is
+            // in one of them, moved on that alternative's own pass (walk/matches.rs `bind_with`).
+            if let Pat::Or { alts } = pat {
+                seen.push((q, g, parent, step, false));
+                let subs = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern's alternatives past `pat_lists`"))?;
+                for &sub in subs {
+                    todo.push((sub, g, me, None));
+                }
                 continue;
             }
             if !matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. }) {
@@ -464,7 +568,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let Some(found) = found else {
             return Err(BuildError::UnsupportedPat {
                 pat: target,
-                what: "a move out of a part behind a reference, inside an or-pattern or a slice, in a match by tests",
+                what: "a move out of a part behind a reference or inside a slice, in a match by tests",
             });
         };
         // Root first: the chain from `found` up, reversed into `steps`.

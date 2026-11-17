@@ -329,6 +329,10 @@ impl core::error::Error for FrameError {}
 /// The counts of findings drawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Counts {
+    /// Tasks that failed on their own (a build script, a module lookup): each a cause printed
+    /// once with what it stopped, never one line a dependent; not counted in `errors`, which are
+    /// the code's.
+    pub failures: u32,
     pub errors: u32,
     pub warnings: u32,
     pub notes: u32,
@@ -525,6 +529,7 @@ pub fn closing(out: &mut AString<'_>, closing: &Closing<'_>, caps: Caps) {
     };
     let mut fits = true;
     for (count, one, many, ink) in [
+        (counts.failures, "failure", "failures", Ink::Error),
         (counts.errors, "error", "errors", Ink::Error),
         (counts.warnings, "warning", "warnings", Ink::Warning),
         (counts.notes, "note", "notes", Ink::Note),
@@ -555,7 +560,7 @@ pub fn closing(out: &mut AString<'_>, closing: &Closing<'_>, caps: Caps) {
         Some(coverage) => {
             // What was NOT checked comes first: a narrow line drops the tail, and the tail must
             // never be the stages a reader would take as passed.
-            let clean = counts.errors + counts.warnings + counts.notes == 0;
+            let clean = counts.failures + counts.errors + counts.warnings + counts.notes == 0;
             if clean {
                 part(&mut pen, 10, &|pen| pen.put(Style { bold: true, ..Style { fg: Ink::Warning.colour(), ..Style::PLAIN } }, "incomplete", 10));
             }
@@ -564,7 +569,7 @@ pub fn closing(out: &mut AString<'_>, closing: &Closing<'_>, caps: Caps) {
                 fits = fits && part(&mut pen, 14 + joined(coverage.ran), &|pen| list(pen, "no errors in: ", coverage.ran));
             }
         }
-        None if counts.errors + counts.warnings + counts.notes == 0 => {
+        None if counts.failures + counts.errors + counts.warnings + counts.notes == 0 => {
             part(&mut pen, 2, &|pen| pen.put(Style { bold: true, ..Style::fg(2) }, "ok", 2));
         }
         None => {}

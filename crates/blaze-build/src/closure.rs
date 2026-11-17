@@ -33,6 +33,11 @@ use crate::layout::LayoutFacts;
 mod ctor_fn;
 pub(crate) use ctor_fn::build_ctor_fn;
 
+// And the `Clone::clone` it gives a tuple, a closure, a fn item and a fn pointer.
+#[path = "clone_fn.rs"]
+mod clone_fn;
+pub(crate) use clone_fn::build_builtin_clone;
+
 /// The closures of `body` with their ORDINALS: a closure's position among its owner body's
 /// closures in expression order (typeck.md, "A closure's identity"). The one place the builder
 /// derives an ordinal, as the checker will record it; the expression id is a fact local to one
@@ -388,12 +393,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     let V::Scalar(ptr) = self.load(Repr::Ptr, at) else {
                         return Err(malformed("a capture's pointer not a scalar"));
                     };
-                    self.bind_at(p, (ptr, 0))?;
+                    self.bind_capture_at(p, (ptr, 0))?;
                 }
                 CaptureKind::ByValue => {
-                    self.bind_at(p, at)?;
+                    self.bind_capture_at(p, at)?;
+                    // The variable alone (not its subpattern's bindings: each is its own capture).
                     if parts.kind == FnTrait::FnOnce {
-                        self.own_pat(p)?;
+                        self.own(p, true)?;
                     }
                 }
             }
@@ -650,6 +656,7 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         callees: blaze_own::Soa::new_in(a),
         expr_defs: blaze_own::Soa::new_in(a),
         const_args: blaze_own::Soa::new_in(a),
+        pat_const_args: blaze_own::Soa::new_in(a),
         pat_defs: blaze_own::Soa::new_in(a),
         fields: blaze_own::Soa::new_in(a),
         captures: blaze_own::Soa::new_in(a),

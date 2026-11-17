@@ -538,7 +538,8 @@ fn a_diagnostic_with_no_place_is_an_internal_error() {
         let unit = m.common.unit;
         m.diag(code, At::Body, crate::diag::About::found(unit));
         match m.writeback() {
-            Ok(c) => Ok(c.diags.len()),
+            Ok(crate::Outcome::Done(c)) => Ok(c.diags.len()),
+            Ok(crate::Outcome::Need(n)) => panic!("writeback met a hole: {:?}", n.missing),
             Err(e) => Err(e),
         }
     };

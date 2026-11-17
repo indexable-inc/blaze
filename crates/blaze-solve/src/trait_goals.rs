@@ -273,14 +273,17 @@ fn merge_impls_or_bail(m: &mut Merger<'_, '_>, marker: bool, cands: &[Done]) -> 
     }
 }
 
-/// `merge_trait_candidates` (trait_goals.rs). `None`: no solution. Specialization is not
-/// ported (`filter_specialized_impls`: solve.md, "Not ported").
+/// `merge_trait_candidates` (trait_goals.rs). `None`: no solution. Specialization drops the
+/// impl candidates another impl candidate specializes (`filter_specialized_impls`, with no
+/// inference constraints allowed), as the reference does past the where-bounds and alias
+/// bounds; `specializes` answers `Facts::specializes`.
 pub fn merge(
     m: &mut Merger<'_, '_>,
     mode: TypingMode,
     st: &State,
     cands: &mut Vec<Done, Alloc<'_>>,
-) -> Result<Option<(RespId, Via)>, SolveError> {
+    specializes: &mut dyn FnMut(Def, Def) -> Result<bool, Stop>,
+) -> Result<Option<(RespId, Via)>, Stop> {
     if cands.is_empty() {
         return Ok(None);
     }
@@ -305,6 +308,7 @@ pub fn merge(
         cands.retain(|c| matches!(c.cand.source, Source::AliasBound { .. }));
         return Ok(Some(merge_or_bail(m, cands, Via::AliasBound)?));
     }
+    crate::assembly::filter_specialized_impls(m, mode, crate::assembly::InferenceConstraints::NotAllowed, cands, specializes)?;
     // `unsound_prefer_builtin_dyn_impl`.
     if cands.iter().find(|c| c.cand.source == Source::Builtin(BuiltinSource::Object)).is_some_and(|c| m.no_constraints(c.resp)) {
         cands.retain(|c| !matches!(c.cand.source, Source::Impl(_)));

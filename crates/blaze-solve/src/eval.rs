@@ -627,7 +627,7 @@ impl<'a> Solver<'a> {
                 self.nested(tys, facts, snaps, probes, top)?;
             }
             Phase::Merge => {
-                let ans = self.merge(top)?;
+                let ans = self.merge(facts, top)?;
                 return self.finish(tys, snaps, probes, top, ans);
             }
         }
@@ -1127,17 +1127,22 @@ impl<'a> Solver<'a> {
         Ok(Got::Pushed)
     }
 
-    fn merge(&mut self, top: usize) -> Result<Ans, Stop> {
+    fn merge<F: Facts>(&mut self, facts: &F, top: usize) -> Result<Ans, Stop> {
         let f = self.frames[top];
         let mut dones: Vec<Done, Alloc<'a>> = Vec::new_in(self.alloc);
         dones.extend_from_slice(&self.dones[f.dones_lo as usize..]);
         let mut m = Merger { resps: &mut self.resps, vars: f.vars };
+        // Specialization between two impl candidates, a fact of the impls read like any other
+        // (the frame's read list keeps it).
+        let ask = Ask::new(facts);
+        let reads = &mut self.reads;
+        let mut specializes = |a: Def, b: Def| ask.specializes(reads, a, b);
         Ok(match f.kind {
-            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, &mut dones)? {
+            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, &mut dones, &mut specializes)? {
                 Some((r, via)) => Some(m.with_via(r, via)?),
                 None => None,
             },
-            Kind::Alias => crate::alias::merge(&mut m, f.goal.pred, &dones)?,
+            Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, &mut dones, &mut specializes)?,
             Kind::WellFormed | Kind::Other => m.merge_responses(&dones)?,
         })
     }

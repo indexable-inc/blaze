@@ -94,6 +94,7 @@ pub(super) fn add_macro_side<'a>(
     crates: &mut AVec<'a, UnitCrate<'a>>,
     build_scripts: &mut usize,
     refused: &mut AVec<'a, RefusedCrate<'a>>,
+    built_for_macro: &mut AVec<'a, usize>,
     alloc: Alloc<'a>,
 ) -> Result<(), UnitsError<'a>> {
     let units = &graph.units;
@@ -198,9 +199,27 @@ pub(super) fn add_macro_side<'a>(
         });
     }
 
-    // Each member proc macro's dependencies are the macro side's copies.
+    // Each member proc macro (and its library test harness) is built for the macro side: its
+    // dependencies are the macro side's copies, its cfg the side's target atoms (never the host
+    // unit's platform atoms) with its features and its own `test`/`proc_macro` flags, and its
+    // index is listed in `built_for_macro`, so the world gives it the macro side (its
+    // build-script run, rule 21) though it sits before `macro_from`.
     for &at in macros.iter() {
         let u = &units[at];
+        let flag = |name: &str| u.cfg.iter().any(|a| a.name.as_str() == name && a.value.is_none());
+        let own = &crates[at_of[at]];
+        let mut cfg = AVec::with_capacity_in(target_cfg.len() + own.features.len() + 2, alloc);
+        cfg.extend(target_cfg.iter().copied());
+        cfg.extend(own.features.iter().map(|f| ("feature", Some(*f))));
+        for name in ["proc_macro", "test"] {
+            if flag(name) {
+                cfg.push((name, None));
+            }
+        }
+        cfg.sort_unstable();
+        cfg.dedup();
+        crates[at_of[at]].cfg = cfg;
+        built_for_macro.push(at_of[at]);
         let mut deps = AVec::with_capacity_in(u.deps.len() + 4, alloc);
         for d in u.deps.iter() {
             let to = side_at[d.unit.index()];

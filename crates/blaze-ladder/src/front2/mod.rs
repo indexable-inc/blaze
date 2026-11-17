@@ -61,6 +61,7 @@ mod gat_bounds;
 pub mod glob_uses;
 pub mod foreign_closures;
 pub mod foreign_locals;
+mod foreign_head;
 pub mod llvm_intrinsic;
 pub mod head_record;
 pub mod head_text;
@@ -112,6 +113,9 @@ mod std_is_bstd;
 pub mod world_paths;
 /// An E0425 finding's words.
 mod path_miss_shown;
+pub use path_miss_shown::MACRO_REFUSED;
+/// A written type that names nothing (E0412).
+pub mod type_miss;
 mod adt_paths;
 mod static_shown;
 mod written;

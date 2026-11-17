@@ -199,7 +199,7 @@ impl<'w, 'a, W: World, C: TypeCtx> Machine<'_, 'w, '_, 'a, W, C> {
                 let def = self.defs.iter().rev().find(|(at, _)| matches!(at, At::Expr(y) if *y == x)).map(|&(_, def)| def);
                 match def {
                     Some(Def::TyParam(j)) => self.mk(TyView::ConstParam(j)),
-                    Some(Def::Const(item)) if !self.const_args.iter().any(|c| c.0 == x) => match self.reads.const_value(item)? {
+                    Some(Def::Const(item)) if !self.const_args.iter().any(|c| c.0 == At::Expr(x)) => match self.reads.const_value(item)? {
                         Some(v) => self.mk(TyView::ConstValue { ty: d, bits: u128::from(v) }),
                         None => Err(CheckError::Unported("a constant passed as a legacy const generic whose value the world does not give").into()),
                     },

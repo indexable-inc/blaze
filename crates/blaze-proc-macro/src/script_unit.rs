@@ -274,7 +274,7 @@ pub fn prepare_viewing_on<'a>(
         package,
         tree,
         root,
-        env: owned_env(&env),
+        env: owned_env(&env, alloc),
         target: setting.target.to_owned(),
         host: setting.host.to_owned(),
         c_mode: setting.c_mode,

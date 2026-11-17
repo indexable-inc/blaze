@@ -372,7 +372,7 @@ fn primitive_self_operator_impls_answer_their_goals_in_a_dependency() {
         roots.push(found.whole(1).unwrap_or_else(|| panic!("`app::{name}` names no fn")).key);
     }
     let mut left_out = Vec::new_in(Global);
-    let _program = Front2Program::survey_from(names, frame, &[], &roots, &mut left_out, a()).unwrap_or_else(|e| panic!("no survey: {e}"));
+    let _program = Front2Program::survey_from(names, frame, &[], &roots, &mut left_out, None, a()).unwrap_or_else(|e| panic!("no survey: {e}"));
     let left: Vec<(String, String)> = left_out.iter().map(|(f, class)| (f.to_string(), class.to_string())).collect();
     for (f, class) in left.iter() {
         println!("LEFT {f}: {class}");

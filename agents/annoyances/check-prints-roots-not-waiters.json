@@ -1,0 +1,15 @@
+{
+ "id": "check-prints-roots-not-waiters",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RP",
+ "where": "crates/blaze-cli/src/main.rs draw, print.rs finding, work.rs filed_answer, not_checked/waited.rs; crates/blaze-drive/src/request.rs Print::also, Request::base_of",
+ "what": "tempo's check printed 30,017 errors, 29,283 of them `error[task-failed] .. needs X, which failed` from 8 roots, and 4,958 per-item `types-not-checked` notes; a no-op check spent 601 ms of its time printing them",
+ "cost": "a lane's afternoon; two runner rounds were lost because the simulated home runs no build script for a workspace member, so the build-script fixture had no failure at all",
+ "cause": "a waited task was filed as a TASK_FAILED error like a root, and every consequence finding was placed in its file (a read and an outline a file) before being drawn",
+ "whys": "the filing reused one rule for a cause and its consequences; the drive dedups a crate's finding held by a library and its test unit into one print, so a waiter's cause can be a name that is never printed (the test unit's scope printed, the library's waited on)",
+ "class": "a consequence counted as an error; a cause named by a name the printer dropped",
+ "prevention": "done: WAITED (Cli 24) carries its cause's base name and crate in its words, never placed, grouped under its root; Print::also names the dropped copies; failures are counted apart from errors (Counts::failures); `--each` lists every consequence",
+ "annoyance": "the runner's test filter is a substring list, so a filter that misses a test module admits a tree its tests were never run on; a build-script failure cannot be made in the sim without a registry dependency",
+ "workaround": "the fixture's root is a source file that is not UTF-8 (a filed FileItems refusal) and a crate whose root cannot be read",
+ "state": "fixed"
+}

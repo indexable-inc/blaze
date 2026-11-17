@@ -57,6 +57,9 @@ blaze-typeck.workspace = true
 edition.workspace = true
 # `ContentId`: file and item digests. By path: the workspace entry turns on serde adapters.
 blaze-ids = { path = "../blaze-ids" }
+# The macOS SDK, resolved once at the command's edge (`SDKROOT`, else xcrun): the native
+# build-script runner takes its folder, and the scripts' keys its identity (sdk.rs, scripts.rs).
+blaze-apple-sdk.workspace = true
 # Vec, SortedMap, VecDeque in the command's frame.
 blaze-own.workspace = true
 # `syscalls::snapshot`: the memory layer's own system calls, counted and timed, for the profile's

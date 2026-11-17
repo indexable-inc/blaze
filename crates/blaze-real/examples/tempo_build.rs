@@ -346,6 +346,9 @@ fn main() {
         }
     };
     let names = loaded.names;
+    // What a body's macro calls expand with: the texts, environment and proc-macro runner the
+    // names' items were expanded with (as `blaze build`'s program has them).
+    let body_sources = loaded.body_sources();
     let names_s = t0.elapsed().as_secs_f64();
     println!("names: {} crates in {names_s:.1}s", names.crates().len());
     let roots = if only.is_empty() {
@@ -374,10 +377,10 @@ fn main() {
     let t1 = Instant::now();
     let got = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let walked = if only.is_empty() {
-            Front2Program::survey_from(names, &frame, &[], roots.as_slice(), &mut left_out, alloc)
+            Front2Program::survey_from(names, &frame, &[], roots.as_slice(), &mut left_out, Some(body_sources), alloc)
         } else {
             let within = reach::Within { crates: Some(only_at.as_slice()), most_fns: None };
-            Front2Program::survey_within(names, &frame, &[], roots.as_slice(), within, &mut left_out, alloc)
+            Front2Program::survey_within(names, &frame, &[], roots.as_slice(), within, &mut left_out, Some(body_sources), alloc)
         };
         let mut program = match walked {
             Ok(p) => p,

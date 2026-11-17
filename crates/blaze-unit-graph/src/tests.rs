@@ -673,6 +673,37 @@ fn proc_macro_dependencies_are_decoupled() {
     assert!(graph.units[1].cfg.iter().any(|c| c.name.as_str() == "proc_macro"));
 }
 
+/// A member proc macro's library test harness is built for the host with the host side's
+/// features, as the proc macro is (cargo compiles a host target, a proc macro's, for the host
+/// whatever `--target` says): `app` turns on `s/asm` for the target, `m` (a member proc macro)
+/// depends on `s` and has `v` as a dev-dependency with `dev`; `m`'s harness and `m` itself
+/// share the host's `s`, never with the target's `asm`, and only the harness has `v` (with
+/// `dev`); the build-dependency `b` of `app` is the host's too, on the host's `s`, without
+/// `asm`. Before: the harness was a target unit on the target's `s` with `asm` (tempo's
+/// precompiles-macros harness reached alloy-primitives with the node's `asm-keccak`,
+/// check-g044908). CONTROL: without tests, no harness and no `v`.
+#[test]
+fn a_proc_macro_test_harness_is_on_the_host_side() {
+    let world = [
+        pkg("app").member().build().dep(dep("m")).dep(dep("s").features(&["asm"])).dep(dep("b").build()),
+        pkg("m").member().proc_macro().dep(dep("s")).dep(dep("v").dev().features(&["dev"])),
+        pkg("s").feature("asm", &[]),
+        pkg("v").feature("dev", &[]),
+        pkg("b").dep(dep("s")),
+    ];
+    let got = ok(&world, &Opts { tests: true, ..opts(Resolver::V2) });
+    for line in ["m 1.0.0 proc-macro host [] -> s=s", "s 1.0.0 lib host [] -> ", "s 1.0.0 lib target [asm] -> ", "v 1.0.0 lib host [dev] -> ", "b 1.0.0 lib host [] -> s=s"] {
+        assert!(got.iter().any(|l| l == line), "no `{line}` in {got:#?}");
+    }
+    let harness: StdVec<&StdString> = got.iter().filter(|l| l.starts_with("m 1.0.0 test ")).collect();
+    assert_eq!(harness.len(), 1, "one harness: {got:#?}");
+    assert!(harness[0].starts_with("m 1.0.0 test host [] -> ") && harness[0].contains("s=s") && harness[0].contains("v=v"), "the harness is a host unit on `s` and `v`: {got:#?}");
+    assert_eq!(got.iter().filter(|l| l.starts_with("s 1.0.0 lib host")).count(), 1, "one host `s`, shared by m, its harness and b: {got:#?}");
+    assert!(!got.iter().any(|l| l.contains(" host ") && l.contains("asm")), "no host unit has `asm`: {got:#?}");
+    let without = ok(&world, &opts(Resolver::V2));
+    assert!(!without.iter().any(|l| l.starts_with("m 1.0.0 test") || l.starts_with("v ")), "CONTROL: no harness, no `v`: {without:#?}");
+}
+
 /// Rule 7 under resolver 2: a dependency for another platform takes no part, its features
 /// included; resolver 1 counts its features though it builds nothing for it.
 #[test]

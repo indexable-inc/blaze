@@ -52,6 +52,8 @@ mod items_grain;
 mod items_head_free;
 mod items_owners;
 mod items_buckets;
+mod kept_item_origins;
+mod kept_item_shared_places;
 mod impl_roots;
 mod more;
 mod builtin_attrs_reach_cells;

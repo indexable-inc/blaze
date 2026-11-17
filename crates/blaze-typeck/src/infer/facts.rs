@@ -190,6 +190,9 @@ pub struct FactCache<'a> {
     /// a hash of the terms; a second set of arguments under one key is refused (rule 21).
     holds: HashMap<(u128, u64), (Span, ConstHolds), Alloc<'a>>,
     cond_args: Vec<STy, Alloc<'a>>,
+    /// Whether the first impl specializes the second (`Facts::specializes`), as
+    /// `InferCtx::fill` decided it.
+    specializes: HashMap<(u128, u128), bool, Alloc<'a>>,
     /// What `table` did, for the tally (asks.rs `Tally`): read by `fill`.
     counted: Converted,
     /// The record tables this call has converted from, each to its number in `memo`.
@@ -444,6 +447,7 @@ impl<'a> FactCache<'a> {
             conditions: Vec::new_in(alloc),
             holds: HashMap::new_in(alloc),
             cond_args: Vec::new_in(alloc),
+            specializes: HashMap::new_in(alloc),
             counted: Converted::default(),
             seen: HashMap::new_in(alloc),
             memo: HashMap::new_in(alloc),
@@ -475,6 +479,11 @@ impl<'a> FactCache<'a> {
         self.cond_args.extend_from_slice(args);
         self.holds.insert(key, (Span::of(&self.cond_args, start), v));
         Ok(())
+    }
+
+    /// Keeps whether impl `a` specializes impl `b`.
+    pub fn keep_specializes(&mut self, a: SDef, b: SDef, v: bool) {
+        self.specializes.insert((a.0, b.0), v);
     }
 
     /// The `i`th impl `where const` condition read, with its impl's trait.
@@ -518,6 +527,7 @@ impl<'a> FactCache<'a> {
             SQ::IsLocal(_) => false,
             // Its arguments are terms of the context: `InferCtx::fill` reads it.
             SQ::ConstHolds(..) => false,
+            SQ::Specializes(a, b) => self.specializes.contains_key(&(a.0, b.0)),
         }
     }
 
@@ -609,6 +619,8 @@ impl<'a> FactCache<'a> {
             SQ::IsLocal(d) => Err(CheckError::Malformed(Malformed::NoRecord(Question::Attrs(ItemKey(d.0)))).into()),
             // `InferCtx::fill` answers it: its arguments are terms of the context.
             SQ::ConstHolds(cond, _) => Err(CheckError::Malformed(Malformed::NotGround { cond: ItemKey(cond.0) }).into()),
+            // `InferCtx::fill` answers it: the answer is a solve of its own.
+            SQ::Specializes(a, _) => Err(CheckError::Malformed(Malformed::NoRecord(Question::ImplHeader(ItemKey(a.0)))).into()),
         }
     }
 
@@ -1436,5 +1448,9 @@ impl Facts for FactCache<'_> {
             // Absent, or other arguments under the key: the fill refuses the second.
             _ => Err(Missing),
         }
+    }
+
+    fn specializes(&self, _: Seal, a: SDef, b: SDef) -> Fetch<bool> {
+        self.specializes.get(&(a.0, b.0)).copied().ok_or(Missing)
     }
 }

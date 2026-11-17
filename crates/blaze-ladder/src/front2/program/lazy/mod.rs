@@ -243,6 +243,8 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// The program's entry row: set by the first `check_one` of the key given as the entry.
     entry_key: Option<ItemKey>,
     projection_why: RefCell<Option<Box<str>>>,
+    /// What the instance questions' worlds asked and found unmade (the seam's `make_asked`).
+    asked: RefCell<Vec<crate::front2::world_items::Fill, Global>>,
     /// Each crate's members keyed as their containers' heads key them, made the first time a
     /// key of the crate is asked that the key map does not know (lazy/locate.rs).
     member_rows: HashMap<usize, locate::MemberIndex<'n>, Global>,
@@ -313,6 +315,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             langs,
             entry_key: entry,
             projection_why: RefCell::new(None),
+            asked: RefCell::new(Vec::new_in(Global)),
             member_rows: HashMap::new_in(Global),
             counts: LazyCounts::default(),
             alloc,

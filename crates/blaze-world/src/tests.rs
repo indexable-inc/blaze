@@ -351,7 +351,7 @@ fn a_build_scripts_cfg_joins_its_library_at_task_time() {
     assert!(input.cfg.windows(2).all(|pair| pair[0] < pair[1]), "the joined cfg is not sorted and each once");
     // The record is the task's input: its generated file and env pair are what expansion reads.
     let record = input.script.unwrap_or_else(|| panic!("the joined input has no script record"));
-    assert_eq!(record.file("gen.rs"), Some(&b"pub fn made() {}\n"[..]));
+    assert_eq!(record.file("gen.rs"), Some(blaze_build_script::outputs::OutFileRef::Inline(&b"pub fn made() {}\n"[..])));
     assert_eq!(record.env().collect::<StdVec<_>>(), [("VERSION", "1")]);
     assert_eq!(input.key, util.input.key, "the join moved the crate's key");
     // Only a crate with a script reads one.

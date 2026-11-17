@@ -53,6 +53,7 @@ pub(super) fn routine_at(routine: blaze_emit::Routine) -> u64 {
         R::Fixsfti => __fixsfti as usize as u64,
         R::Fixunssfti => __fixunssfti as usize as u64,
         R::UnwindResume => panic!("no wide-integer test calls `_Unwind_Resume`"),
+        R::Memcmp => panic!("no wide-integer test calls `memcmp`"),
     }
 }
 

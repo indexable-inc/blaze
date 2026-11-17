@@ -180,10 +180,11 @@ pub struct FetchEnv<'f> {
     pub toolchain: blaze_toolchain::ToolchainId,
     /// The command's files: the toolchain's shelf and the names step read through them.
     pub fs: bstd::fs::Fs,
-    /// `SDKROOT`, read at the edge (rule 75): the macOS SDK folder the native build-script
-    /// runner (D112) is given (scripts.rs); `None` when it is not set, and a script placed
-    /// native then fails naming it.
-    pub sdk: Option<&'f str>,
+    /// The macOS SDK, resolved once at the edge (rule 75; sdk.rs, blaze-apple-sdk): `SDKROOT`,
+    /// else what xcrun prints. The native build-script runner (D112) takes its folder and the
+    /// scripts' keys its identity (scripts.rs); a refusal fails only a script placed native,
+    /// with its words.
+    pub sdk: Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>,
     /// The folder of the running blaze, read once at the edge (rule 75; main's ruling for N7):
     /// the fact shim (`blaze-fact-shim`) is looked for beside it (scripts.rs). A native script
     /// is refused naming why when it is not known.

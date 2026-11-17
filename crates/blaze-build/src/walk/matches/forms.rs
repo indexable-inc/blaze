@@ -6,9 +6,9 @@
 //!   754 equality): a NaN scrutinee matches no float pattern, and `-0.0` matches `0.0`.
 //! - "Path patterns": "Path patterns are irrefutable when they refer to structs or an enum
 //!   variant ... They are refutable when they refer to refutable constants or enum variants
-//!   for enums with multiple variants." A constant of an integer, `char` or `bool` type is
-//!   compared with its evaluated value; a constant of a struct or enum type (a structural
-//!   match) is refused by name.
+//!   for enums with multiple variants." A constant is compared with its evaluated value, leaf
+//!   by leaf (a structural match: an ADT's, a tuple's, an array's too; `const_test`); one
+//!   holding a reference or a pointer is refused by name.
 //! - "Or-patterns": "every binding in each pattern [alternative] must have the same type and
 //!   binding mode" and each alternative binds the same set of names. The lowering resolves a
 //!   use of such a name to its first binding in the pattern (blaze-lower machine.rs
@@ -24,42 +24,178 @@ use core::alloc::Allocator;
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::{Block, Flags, FloatCond, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
-use blaze_typeck::{Def, Name, PNode, Pat, PatId};
+use blaze_typeck::{Def, Name, PNode, PTy, Pat, PatId};
 
-use super::super::{PTR_BITS, Repr, Walk, malformed};
+use super::super::{PTR_BITS, Repr, Shape, Walk, malformed};
+use crate::layout::Variants;
 use super::At;
 use crate::BuildError;
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
-    /// The test that the value at `at` equals the constant path pattern `p` names; none when
-    /// `p` names no constant (a struct or a variant: walk/matches.rs `variant_test`).
-    pub(super) fn const_test(&mut self, p: PatId, at: At) -> Result<Option<Value>, BuildError> {
-        let Some(Def::Const(item)) = self.pat_def(p) else { return Ok(None) };
-        let repr = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
-        match repr {
-            Repr::Int { .. } | Repr::Bool => {}
-            Repr::Float(_) => {
-                return Err(BuildError::UnsupportedPat { pat: p, what: "a constant of a float type as a pattern" });
-            }
-            _ => {
-                let what = match self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? {
-                    PNode::Adt(..) => "a structural match of an ADT constant",
-                    _ => "a constant of other than an integer, a `char` or a `bool` type as a pattern (a tuple, an array, a reference)",
-                };
-                return Err(BuildError::UnsupportedPat { pat: p, what });
-            }
+    /// The tests that the value at `at` equals the constant path pattern `p` names, from the
+    /// current block: to `ok` when it does, else to `fail`. `false` (nothing emitted) when `p`
+    /// names no constant (a struct or a variant: walk/matches.rs `variant_test`).
+    ///
+    /// The comparison is structural (the Reference, "Patterns", "Path patterns", and
+    /// `[patterns.path.const]`; rustc's `const_to_pat` makes the same pattern): a scalar leaf
+    /// compares with the constant's bytes there, a float by `==` (`FloatCond::Oeq`), an enum
+    /// by its variant first, then that variant's fields, a struct, tuple or array by every
+    /// part. The leaves come from the type's walk row, so padding is never compared, and a
+    /// variant's fields are read only once the variant test passed. A constant holding a
+    /// pointer (a `&str` field, a reference) is refused by name: its pointee would be compared,
+    /// which no row here holds.
+    pub(super) fn const_test(&mut self, p: PatId, at: At, ok: Block, fail: Block) -> Result<bool, BuildError> {
+        let Some(Def::Const(item)) = self.pat_def(p) else { return Ok(false) };
+        let root = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let structural = matches!(self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Adt(..));
+        let refuse = |what| BuildError::UnsupportedPat { pat: p, what };
+        if root == Repr::Ptr {
+            return Err(refuse("a constant of a reference or pointer type as a pattern (compared by its pointee)"));
         }
-        let (x, ty, _) = self.scalar_at(p, at)?;
-        let v = self.const_bits(p, item, ty.bits(PTR_BITS))?;
-        let k = self.b.iconst(ty, v);
-        Ok(Some(self.b.icmp(IntCond::Eq, x, k)))
+        let args = self.pat_const_args(p)?;
+        let adts = self.adts;
+        let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoPatConstValue { pat: p, item })?;
+        record.check().map_err(|_| malformed("a const's record that breaks the data form"))?;
+        let bytes = &record.allocs.first().ok_or(malformed("a const's record with no allocation"))?.bytes[..];
+        let word = |off: u32, n: u32| -> Result<u128, BuildError> {
+            let start = off as usize;
+            let part = bytes.get(start..start + n as usize).ok_or(malformed("a const's bytes shorter than its type"))?;
+            Ok(part.iter().enumerate().fold(0u128, |v, (i, &byte)| v | (u128::from(byte) << (8 * i))))
+        };
+        let mut all: Option<Value> = None;
+        let mut todo: Vec<(Repr, u32), A> = Vec::new_in(self.alloc.clone());
+        todo.push((root, 0));
+        while let Some((repr, off)) = todo.pop() {
+            let place = i32::try_from(off).ok().and_then(|o| at.at.1.checked_add(o)).ok_or(refuse("a constant pattern past an `i32` offset"))?;
+            let hit = match repr {
+                Repr::None => continue,
+                Repr::Int { ty, .. } | Repr::Float(ty) => {
+                    let k = word(off, ty.bits(PTR_BITS).div_ceil(8))?;
+                    let attrs = self.mem(repr);
+                    let x = self.b.load(ty, Flags::NONE, at.at.0, place, attrs);
+                    if let Repr::Float(_) = repr {
+                        // rustc's `const_to_pat` refuses a NaN ("cannot use NaN in patterns"):
+                        // it equals nothing, so the arm could never match.
+                        let width = ty.bits(PTR_BITS);
+                        let exp = match width {
+                            16 => 5,
+                            32 => 8,
+                            64 => 11,
+                            _ => 15,
+                        };
+                        let mantissa = width - 1 - exp;
+                        let exp_mask = ((1u128 << exp) - 1) << mantissa;
+                        if k & exp_mask == exp_mask && k & ((1u128 << mantissa) - 1) != 0 {
+                            return Err(refuse("a NaN constant as a pattern (rustc: \"cannot use NaN in patterns\")"));
+                        }
+                        let k = self.b.fconst(ty, k);
+                        self.b.fcmp(FloatCond::Oeq, x, k)
+                    } else {
+                        let k = self.b.iconst(ty, k);
+                        self.b.icmp(IntCond::Eq, x, k)
+                    }
+                }
+                Repr::Bool => {
+                    let k = word(off, 1)?;
+                    let attrs = self.mem(repr);
+                    let x = self.b.load(Ty::I8, Flags::NONE, at.at.0, place, attrs);
+                    let k = self.b.iconst(Ty::I8, k);
+                    self.b.icmp(IntCond::Eq, x, k)
+                }
+                Repr::Ptr => {
+                    return Err(refuse(if structural {
+                        "a structural match of an ADT constant holding a reference or a pointer (compared by its pointee)"
+                    } else {
+                        "a constant holding a reference or a pointer as a pattern (compared by its pointee)"
+                    }));
+                }
+                Repr::Agg(l) => {
+                    if self.layouts[l as usize].is_union {
+                        return Err(malformed("a constant pattern of a union type (E0158 refuses it)"));
+                    }
+                    match self.layouts[l as usize].shape {
+                        Shape::Fields { first, len } => {
+                            for i in first..first + len {
+                                let (_, at_off, part) = self.layout_fields[i as usize];
+                                todo.push((part, off + at_off));
+                            }
+                        }
+                        Shape::Array { elem, len, stride } => {
+                            for i in 0..len {
+                                todo.push((elem, off + i * stride));
+                            }
+                        }
+                        Shape::Enum { id, .. } => {
+                            // The constant's variant, decoded from its tag bytes as `ls` encodes it.
+                            let variant = match self.ls.read_tag(id) {
+                                None => self.ls.variant_of_tag(id, 0),
+                                Some((tag_at, tag)) => {
+                                    let tag_at = u32::try_from(tag_at).map_err(|_| malformed("an enum's tag past a u32 offset"))?;
+                                    let bits = word(off + tag_at, tag.prim.bits() / 8)?;
+                                    self.ls.variant_of_tag(id, bits)
+                                }
+                            }
+                            .ok_or(malformed("a constant whose tag names no variant of its enum"))?;
+                            if let Variants::Multiple { .. } = self.ls.get(id).variants {
+                                // Everything compared so far, then the variant, before any of
+                                // its fields is read.
+                                if let Some(c) = all.take() {
+                                    let mid = self.create();
+                                    self.br(c, (mid, &[]), (fail, &[]));
+                                    self.begin(mid);
+                                }
+                                let d = self.read_discriminant(id, (at.at.0, place))?;
+                                let case = self.discriminant_case(id, variant)?;
+                                let k = self.b.iconst(Ty::I64, case);
+                                all = Some(self.b.icmp(IntCond::Eq, d, k));
+                            }
+                            let (first, len, _) = self.variant_rows(l, variant)?;
+                            for i in first..first + len {
+                                let (_, at_off, part) = self.layout_fields[i as usize];
+                                todo.push((part, off + at_off));
+                            }
+                            continue;
+                        }
+                    }
+                    continue;
+                }
+            };
+            all = Some(match all {
+                Some(prev) => self.b.binary(Op::And, Flags::NONE, prev, hit),
+                None => hit,
+            });
+        }
+        match all {
+            Some(c) => self.br(c, (ok, &[]), (fail, &[])),
+            // A constant of no bytes (a unit struct): the type alone matches.
+            None => self.jump(ok, &[]),
+        }
+        Ok(true)
     }
 
-    /// The value of const `item`, named by path pattern `p`, as `width` bits: its evaluated
-    /// record's root bytes, little-endian (walk.rs `const_value` reads a scalar the same way).
+    /// The generic arguments the check recorded for constant pattern `p`
+    /// (`Checked::pat_const_args_of`: an inherent impl's constant, `U256::ZERO`), grounded:
+    /// they never name a generic parameter (E0158), so grounding only resolves them. Empty for
+    /// a constant with no generics.
+    fn pat_const_args(&mut self, p: PatId) -> Result<Vec<PTy, A>, BuildError> {
+        let Some(list) = self.checked.pat_const_args_of(p) else {
+            return Ok(Vec::new_in(self.alloc.clone()));
+        };
+        let tys = self.types.list(list).map_err(|_| malformed("a constant pattern's arguments past the record's types"))?;
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        for &t in tys {
+            grounded.push(self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?);
+        }
+        Ok(grounded)
+    }
+
+    /// The value of const `item`, named by path pattern `p` (a range's end), as `width` bits:
+    /// its evaluated record's root bytes, little-endian (walk.rs `const_value` reads a scalar
+    /// the same way).
     pub(super) fn const_bits(&mut self, p: PatId, item: blaze_typeck::ItemKey, width: u32) -> Result<u128, BuildError> {
+        let args = self.pat_const_args(p)?;
         let adts = self.adts;
-        let record = adts.const_value(item, &[]).ok_or(BuildError::NoPatConstValue { pat: p, item })?;
+        let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoPatConstValue { pat: p, item })?;
         record.check().map_err(|_| malformed("a const's record that breaks the data form"))?;
         let root = record.allocs.first().ok_or(malformed("a const's record with no allocation"))?;
         if !root.relocs.is_empty() {
@@ -95,23 +231,57 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// literal pattern `p`, from the current block: the length, then the bytes, a word at a
     /// time; to `ok` when all are equal, else to `fail`. No byte is read before the length
     /// test passed.
+    ///
+    /// A byte string literal pattern (`b".."`, the Reference, "Literal patterns": its type is
+    /// `&[u8; N]`, or `&[u8]` / `[u8; N]` where the scrutinee is one) the same way over a
+    /// `&[u8]`; over a `&[u8; N]` or a `[u8; N]` in place the type fixes the length, so only
+    /// the bytes are compared.
     pub(super) fn str_test(&mut self, p: PatId, at: At, ok: Block, fail: Block) -> Result<(), BuildError> {
-        let refuse = BuildError::UnsupportedPat { pat: p, what: "a string literal pattern over other than `&str`" };
-        let PNode::Ref(_, inner) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else { return Err(refuse) };
-        let PNode::Str = self.ground_node(inner).map_err(|error| Self::pat_ty_err(p, error))? else { return Err(refuse) };
+        let byte_str = matches!(self.pat(p)?, Pat::Lit(blaze_typeck::Lit::ByteStr(_)));
+        let refuse = BuildError::UnsupportedPat {
+            pat: p,
+            what: if byte_str {
+                "a byte string literal pattern over other than `&[u8]`, `&[u8; N]` or `[u8; N]`"
+            } else {
+                "a string literal pattern over other than `&str`"
+            },
+        };
+        let node = |w: &mut Self, g| w.ground_node(g).map_err(|error| Self::pat_ty_err(p, error));
+        // Where the bytes are: behind the pointer at `at` (with the length after it for a
+        // wide one), or at `at` itself (an array in place).
+        let (behind, wide) = match node(self, at.g)? {
+            PNode::Ref(_, inner) => match node(self, inner)? {
+                PNode::Str if !byte_str => (true, true),
+                PNode::Slice(e) if byte_str && node(self, e)? == PNode::Uint(blaze_typeck::UintTy::U8) => (true, true),
+                PNode::Array(e, _) if byte_str && node(self, e)? == PNode::Uint(blaze_typeck::UintTy::U8) => (true, false),
+                _ => return Err(refuse),
+            },
+            PNode::Array(e, _) if byte_str && node(self, e)? == PNode::Uint(blaze_typeck::UintTy::U8) => (false, false),
+            _ => return Err(refuse),
+        };
         let adts = self.adts;
-        let bytes = adts.str_pat(self.body.owner, p).ok_or(BuildError::NoPatValue { pat: p })?.as_bytes();
-        let len = self.b.load(Ty::I64, Flags::NONE, at.at.0, at.at.1 + 8, MemAttrs::aligned(3));
-        let n = self.b.iconst(Ty::I64, bytes.len() as u128);
-        let same_len = self.b.icmp(IntCond::Eq, len, n);
-        if bytes.is_empty() {
-            self.br(same_len, (ok, &[]), (fail, &[]));
+        let bytes = adts.str_pat(self.body.owner, p).ok_or(BuildError::NoPatValue { pat: p })?;
+        if wide {
+            let len = self.b.load(Ty::I64, Flags::NONE, at.at.0, at.at.1 + 8, MemAttrs::aligned(3));
+            let n = self.b.iconst(Ty::I64, bytes.len() as u128);
+            let same_len = self.b.icmp(IntCond::Eq, len, n);
+            if bytes.is_empty() {
+                self.br(same_len, (ok, &[]), (fail, &[]));
+                return Ok(());
+            }
+            let mid = self.create();
+            self.br(same_len, (mid, &[]), (fail, &[]));
+            self.begin(mid);
+        } else if bytes.is_empty() {
+            // `[u8; 0]`: the type alone matches.
+            self.jump(ok, &[]);
             return Ok(());
         }
-        let mid = self.create();
-        self.br(same_len, (mid, &[]), (fail, &[]));
-        self.begin(mid);
-        let ptr = self.b.load(Ty::PTR, Flags::NONE, at.at.0, at.at.1, MemAttrs::aligned(3));
+        let (ptr, base) = if behind {
+            (self.b.load(Ty::PTR, Flags::NONE, at.at.0, at.at.1, MemAttrs::aligned(3)), 0)
+        } else {
+            at.at
+        };
         let mut all: Option<Value> = None;
         let mut i = 0usize;
         while i < bytes.len() {
@@ -125,8 +295,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             for (j, &byte) in bytes[i..i + w].iter().enumerate() {
                 word |= u128::from(byte) << (8 * j);
             }
-            let off = i32::try_from(i).map_err(|_| BuildError::UnsupportedPat { pat: p, what: "a string literal pattern past an `i32` offset" })?;
-            // The bytes of a `str` have no alignment past one.
+            let off = i32::try_from(i)
+                .ok()
+                .and_then(|i| base.checked_add(i))
+                .ok_or(BuildError::UnsupportedPat { pat: p, what: "a string literal pattern past an `i32` offset" })?;
+            // The bytes of a `str` or a `[u8]` have no alignment past one.
             let x = self.b.load(ty, Flags::NONE, ptr, off, MemAttrs::aligned(0));
             let k = self.b.iconst(ty, word);
             let hit = self.b.icmp(IntCond::Eq, x, k);

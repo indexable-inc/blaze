@@ -299,6 +299,15 @@ pub trait NamesSource<'n>: Copy {
     /// has no path (a block's module), or its crate is not read.
     fn module_path(self, module: ItemKey) -> Option<&'n str>;
 
+    /// Question 20b: the macro call `call` whose expansion failed (a [`Why::Refused`]'s `call`
+    /// with `RefusedWhy::Expansion`): the macro's path as written, whether it is D104's implicit
+    /// `::std::main`, and the matcher's reason, decoded into `alloc`. `None`: no crate's notes
+    /// hold a failure of that call (over records, a row that did not decode is filed in the
+    /// log). Read only on an error's path, for its words (path_miss_shown.rs).
+    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    where
+        'n: 'b;
+
     /// Every item of crate `krate` that has text (question 7's rows), each given to `each` as
     /// (key, the module its names are read in), in key order. `false`: the crate is not read.
     /// Opens the crate's items record and reads every item row: for a whole-crate walk (the
@@ -567,6 +576,23 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     fn module_path(self, module: ItemKey) -> Option<&'n str> {
         let c: &'n blaze_scope::resolve::CrateNames<'n> = self.krate(Names::crate_of(self, module)?);
         c.path_of(module)
+    }
+
+    fn failed_call<'b>(self, call: ItemKey, _alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    where
+        'n: 'b,
+    {
+        use blaze_scope::resolve::{ExpandNote, NamesNote};
+        // Every crate's notes in order, the first failure of the call (blaze-scope
+        // failed_call.rs `FailedCall::of`, the same join).
+        (0..self.crates().len()).find_map(|krate| {
+            self.notes(krate).iter().find_map(|note| match *note {
+                NamesNote::Expand { call: c, note: ExpandNote::Failed { path, implicit, failed }, .. } if c == call => {
+                    Some(blaze_scope::names_record::FailedRow { call, path, implicit, failed })
+                }
+                _ => None,
+            })
+        })
     }
 
     fn each_item(self, krate: usize, each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool {
@@ -1544,6 +1570,23 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         let krate = self.items.crate_of(module)?;
         self.items_of(krate)?;
         self.read(krate, self.items.module(module))??.path
+    }
+
+    /// From the failed-calls section of the names record of the call's crate, by its key's
+    /// prefix (blaze-scope names_record.rs `NamesRecord::failed`): no other crate's record is
+    /// opened for it.
+    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    where
+        'n: 'b,
+    {
+        let names = self.names_of(self.items.crate_of(call)?)?;
+        match names.failed(call, alloc) {
+            Ok(row) => row,
+            Err(_) => {
+                self.gap("failed_call: a names record's failed-call row did not decode", Some(call));
+                None
+            }
+        }
     }
 
     fn each_item(self, krate: usize, each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool {

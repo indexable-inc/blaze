@@ -190,9 +190,12 @@ pub struct Script {
     pub deps: Arc<DepViews>,
 }
 
-/// `env`'s variables owned, for [`Script::env`].
-pub fn owned_env(env: &blaze_build_script::Env<'_>) -> Vec<(String, String)> {
-    env.vars.iter().map(|(name, value)| (name.as_str().to_owned(), value.as_str().to_owned())).collect()
+/// The environment a wasm run is given, owned, for [`Script::env`]: `env`'s variables and
+/// `NUM_JOBS` `1` (`Jobs::One`: a wasm run has no threads, and no jobserver), made in `alloc`
+/// and copied out. The job count is never in the key: the key takes `env` ([`crate::script`]).
+pub fn owned_env(env: &blaze_build_script::Env<'_>, alloc: blaze_own::Alloc<'_>) -> Vec<(String, String)> {
+    let run = env.for_run(blaze_build_script::Jobs::One, alloc);
+    run.vars.iter().map(|(name, value)| (name.as_str().to_owned(), value.as_str().to_owned())).collect()
 }
 
 impl Script {
@@ -751,7 +754,7 @@ impl ScriptSandbox {
                     let answered = probe_ask::answer(&compile, &self.script.host, &bytes, &Table { rows: &self.script.table });
                     match answered.verdict {
                         Verdict::Accepted(_) => (0, Vec::new(), Vec::new()),
-                        Verdict::Rejected(rejection) => (1, Vec::new(), rejection.stderr(&compile, Alloc::global()).as_bytes().to_vec()),
+                        Verdict::Rejected(rejection) => (1, Vec::new(), rejection.stderr(&compile, &bytes, Alloc::global()).as_bytes().to_vec()),
                         Verdict::Unanswered(_) => {
                             let snippet = String::from_utf8_lossy(&bytes).into_owned();
                             let (key, target) = (answered.key, answered.target.to_owned());
@@ -760,6 +763,7 @@ impl ScriptSandbox {
                     }
                 }
             },
+            crate::spawn_route::Route::CargoVersion => (0, probe::cargo_version(Alloc::global()).as_bytes().to_vec(), Vec::new()),
             crate::spawn_route::Route::Git => {
                 let Some(owned_words) = git_words(name, &args_text) else {
                     // A shell's `-c "git ..."` with quoting, a format or a glob (`log -1

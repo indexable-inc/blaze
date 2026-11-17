@@ -506,7 +506,21 @@ pub fn select_impl<W: World>(
 ) -> Result<Option<(ItemKey, List)>, ResolveError> {
     let mut reads = Reads::new_in(world, alloc);
     let mut cx = InferCtx::new_in(alloc);
-    select_in(&mut cx, &mut reads, trait_, args, ground)
+    let out = select_in(&mut cx, &mut reads, trait_, args, ground);
+    unholed(&reads, out)
+}
+
+/// `out`, the answer of a one-shot question asked through `reads` (this module's entry points),
+/// unless the run met a hole. A hole's stand-in (no impls in a bucket, no header) decided
+/// nothing: `IsWhitespace: MultiCharEq` read through an unmade bucket of `MultiCharEq` at
+/// `IsWhitespace` was "no impl", so a projection over it was a mismatch. So the answer is
+/// [`ResolveError::Missing`] naming the first hole, as a body's run with a hole makes no result
+/// (lib.rs `check`, world.rs `Hole`); the module's rule, never a guess.
+fn unholed<W: World, T>(reads: &Reads<'_, '_, W>, out: Result<T, ResolveError>) -> Result<T, ResolveError> {
+    match reads.first_hole() {
+        Some(q) => Err(ResolveError::Missing(q)),
+        None => out,
+    }
 }
 
 pub(crate) fn select_in<W: World>(
@@ -594,6 +608,55 @@ pub fn normalize_projection<W: World>(
     ground: &mut PortableTys<'_>,
     alloc: Alloc<'_>,
 ) -> Result<Option<PTy>, ResolveError> {
+    let mut reads = Reads::new_in(world, alloc);
+    let out = normalize_in(&mut reads, trait_, name, args, ground, alloc);
+    unholed(&reads, out)
+}
+
+fn normalize_in<W: World>(
+    reads: &mut Reads<'_, '_, W>,
+    trait_: ItemKey,
+    name: crate::ids::Name,
+    args: &[PTy],
+    ground: &mut PortableTys<'_>,
+    alloc: Alloc<'_>,
+) -> Result<Option<PTy>, ResolveError> {
+    if args.is_empty() {
+        return Err(ResolveError::NotGround { item: trait_ });
+    }
+    let mut cx = InferCtx::new_in(alloc);
+    let mut tys: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len(), alloc);
+    for &p in args {
+        let mut src = Asked { reads: &mut *reads, need: None };
+        match import(&mut cx, &mut src, ground.view(), p, &[], 0) {
+            Ok(t) => tys.push(t),
+            Err(e) => {
+                return Err(match src.need {
+                    Some(q) => ResolveError::Missing(q),
+                    None => ResolveError::Check(e),
+                });
+            }
+        }
+    }
+    let goal_args = cx.mk_list(&tys)?;
+    let term = cx.fresh(crate::ty::VarKind::Ty)?;
+    cx.register(Obligation { goal: Goal::Projection { trait_, args: goal_args, name, term }, cause: Cause::Body })?;
+    cx.select_all(reads)?;
+    if cx.next_error().is_some() {
+        return Ok(None);
+    }
+    let t = cx.resolve(term)?;
+    Ok(export(&mut cx, t, ground, 0)?)
+}
+
+/// Whether the trait goal `args[0]: trait_<args[1..]>` holds at the ground `args` (self first,
+/// in `ground`): the solver's own answer, the one a body's check gets, so the impls the
+/// LANGUAGE gives count as the written ones do (the Reference, "Special types and traits":
+/// `Copy` and `Clone` of a tuple, a closure, a fn item or a fn pointer; the auto traits;
+/// `Sized`), where [`select_impl`] finds only written impls. The code builder's question at an
+/// instance (blaze-ladder `FrontEnd::holds`: a `Copy` tuple's builtin `clone` copies its bytes).
+/// A goal still ambiguous at ground arguments is no answer: `NotGround`, never a guessed `false`.
+pub fn holds<W: World>(world: &W, trait_: ItemKey, args: &[PTy], ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<bool, ResolveError> {
     if args.is_empty() {
         return Err(ResolveError::NotGround { item: trait_ });
     }
@@ -613,14 +676,24 @@ pub fn normalize_projection<W: World>(
         }
     }
     let goal_args = cx.mk_list(&tys)?;
-    let term = cx.fresh(crate::ty::VarKind::Ty)?;
-    cx.register(Obligation { goal: Goal::Projection { trait_, args: goal_args, name, term }, cause: Cause::Body })?;
-    cx.select_all(&mut reads)?;
-    if cx.next_error().is_some() {
-        return Ok(None);
+    cx.register(Obligation { goal: Goal::Trait { trait_, args: goal_args }, cause: Cause::Body })?;
+    let solved = cx.select_all(&mut reads);
+    // A record the world had no answer to yet is a hole (`Reads::record_with`): the run read a
+    // stand-in, so neither its answer nor its error (a trait's record read as none) is one. The
+    // first hole is the need the caller fills before it asks again.
+    if reads.holed() {
+        let needs = reads.finish_need(None, alloc);
+        return Err(match needs.first {
+            Some(q) => ResolveError::Missing(q),
+            None => ResolveError::NotGround { item: trait_ },
+        });
     }
-    let t = cx.resolve(term)?;
-    Ok(export(&mut cx, t, ground, 0)?)
+    solved?;
+    match cx.next_error() {
+        None => Ok(true),
+        Some(e) if e.kind == crate::ty::FulfillErrorKind::Ambiguous => Err(ResolveError::NotGround { item: trait_ }),
+        Some(_) => Ok(false),
+    }
 }
 
 /// The body a call of `item` at the ground `args` runs: for a trait's method, the selected
@@ -634,6 +707,17 @@ pub fn resolve_instance<W: World>(
     alloc: Alloc<'_>,
 ) -> Result<Resolved, ResolveError> {
     let mut reads = Reads::new_in(world, alloc);
+    let out = resolve_in(&mut reads, item, args, ground, alloc);
+    unholed(&reads, out)
+}
+
+fn resolve_in<W: World>(
+    reads: &mut Reads<'_, '_, W>,
+    item: ItemKey,
+    args: List,
+    ground: &mut PortableTys<'_>,
+    alloc: Alloc<'_>,
+) -> Result<Resolved, ResolveError> {
     let Some(parent) = reads.assoc_parent(item)? else { return Ok(Resolved { item, args }) };
     let Some(t) = reads.trait_def(parent.container)? else { return Ok(Resolved { item, args }) };
     let trait_ = parent.container;
@@ -648,7 +732,7 @@ pub fn resolve_instance<W: World>(
         return Err(ResolveError::NotGround { item });
     }
     let mut cx = InferCtx::new_in(alloc);
-    let Some((imp, impl_args)) = select_in(&mut cx, &mut reads, trait_, &all[..n], ground)? else {
+    let Some((imp, impl_args)) = select_in(&mut cx, reads, trait_, &all[..n], ground)? else {
         return Err(ResolveError::NoImpl { trait_, item });
     };
     match reads.assoc_item(imp, parent.name)? {

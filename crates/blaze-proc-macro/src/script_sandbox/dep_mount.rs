@@ -53,6 +53,10 @@ pub struct DepProducer {
     pub out_dir: String,
     /// The files it left in `OUT_DIR`, by path from it, sorted (its outputs record's files).
     pub out: Arc<Vec<(String, Vec<u8>)>>,
+    /// The names of the files its outputs record names and does not hold (a native script's,
+    /// in the home's file area), sorted: its `OUT_DIR` is not served while any is
+    /// ([`DepViewError::StoredOut`]); they are never read into `out`.
+    pub stored: Arc<Vec<String>>,
     /// The scripts upstream of it (its transitive `links_inputs` closure), each with its
     /// `links`, once, sorted by `links` (brief S1b): its metadata may forward their paths
     /// (aws-lc-rs re-emits aws-lc-sys's `include`), which its readers are then served too.
@@ -66,7 +70,8 @@ impl DepProducer {
         let mut out: Vec<(String, Vec<u8>)> = outputs.files.iter().map(|file| (file.name.as_str().to_owned(), file.bytes.to_vec())).collect();
         // `Outputs::add_file` keeps them sorted; sorted here too, so `Tree::Mem`'s search holds.
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        DepProducer { tree, root, out_dir: outputs.out_dir.as_str().to_owned(), out: Arc::new(out), upstream: Arc::new(Vec::new()) }
+        let stored = outputs.stored.iter().map(|file| file.name.as_str().to_owned()).collect();
+        DepProducer { tree, root, out_dir: outputs.out_dir.as_str().to_owned(), out: Arc::new(out), stored: Arc::new(stored), upstream: Arc::new(Vec::new()) }
     }
 
     /// This producer with `upstream`, its closure ([`DepProducer::closure`] of its inputs).
@@ -187,6 +192,10 @@ pub enum DepViewError {
     Climbs { links: String, key: String, path: String },
     /// A member producer's workspace, for a reader not served that same workspace folder.
     OtherWorkspace { links: String },
+    /// A path under the producer's `OUT_DIR`, whose files include one its record names and does
+    /// not hold (a native script's, in the home's file area): serving that folder from the
+    /// file area is not built, and it is never served without the file (rule 3).
+    StoredOut { links: String, file: String },
 }
 
 impl From<DepPathError<'_>> for DepViewError {
@@ -211,6 +220,10 @@ impl fmt::Display for DepViewError {
             DepViewError::OtherWorkspace { links } => write!(
                 f,
                 "the `links = \"{links}\"` package is a workspace member whose paths name its workspace, and this script is not served that workspace (decision D96 (5))"
+            ),
+            DepViewError::StoredOut { links, file } => write!(
+                f,
+                "a `links = \"{links}\"` path names that package's OUT_DIR, whose file `{file}` is a stored file of its record (in the home's file area, not held in the record): serving a stored file to a dependent's build script is not built, so it is refused (rule 3)"
             ),
         }
     }
@@ -295,7 +308,12 @@ pub(crate) fn resolve<'p, 'a>(sight: Sight<'_>, producers: &[(&'p str, &'p DepPr
 /// The mount `mount` of a plan made against `producer`, as `reader`'s sandbox serves it.
 fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree) -> Result<Mounted, DepViewError> {
     let (links, at, served) = match mount {
-        DepMount::Out { links, at } => (links, at.to_owned(), Served::Keyed(Arc::clone(&producer.out))),
+        DepMount::Out { links, at } => {
+            if let Some(file) = producer.stored.first() {
+                return Err(DepViewError::StoredOut { links: links.to_owned(), file: file.clone() });
+            }
+            (links, at.to_owned(), Served::Keyed(Arc::clone(&producer.out)))
+        }
         DepMount::Tree { links } => {
             let served = match (&producer.tree, reader) {
                 (Tree::Mem { files, .. }, _) => Served::Keyed(Arc::clone(files)),
@@ -454,6 +472,7 @@ mod tests {
             root: ScriptRoot::package(),
             out_dir: SYS_OUT.to_owned(),
             out: files(&[("include/a.h", header)]),
+            stored: Arc::new(Vec::new()),
             upstream: Arc::new(Vec::new()),
         }
     }
@@ -589,10 +608,11 @@ mod tests {
             root: ScriptRoot::package(),
             out_dir: A_OUT.to_owned(),
             out: files(&[("include/x.h", header)]),
+            stored: Arc::new(Vec::new()),
             upstream: Arc::new(Vec::new()),
         };
         let b_over = |a: &DepProducer| {
-            DepProducer { tree: Tree::Mem { files: files(&[]), git: None }, root: ScriptRoot::package(), out_dir: B_OUT.to_owned(), out: files(&[]), upstream: Arc::new(Vec::new()) }
+            DepProducer { tree: Tree::Mem { files: files(&[]), git: None }, root: ScriptRoot::package(), out_dir: B_OUT.to_owned(), out: files(&[]), stored: Arc::new(Vec::new()), upstream: Arc::new(Vec::new()) }
                 .with_upstream(DepProducer::closure(&[("a", a)]))
         };
         let a_made = a(b"#define X 1\n");

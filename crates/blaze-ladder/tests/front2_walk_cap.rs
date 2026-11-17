@@ -116,7 +116,7 @@ fn a_walk_over_a_low_cap_stops_and_says_what_it_met() {
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
         let mut left_out = Vec::new_in(Global);
         let low = Within { crates: None, most_fns: Some(2) };
-        let stopped = Front2Program::survey_within(names, &frame, files, &roots, low, &mut left_out, blaze_own::Alloc::global());
+        let stopped = Front2Program::survey_within(names, &frame, files, &roots, low, &mut left_out, None, blaze_own::Alloc::global());
         let Err(e) = stopped else { panic!("a walk of five fns stops at a cap of 2") };
         let said = e.to_string();
         println!("CAPPED: {said}");
@@ -131,7 +131,7 @@ fn a_walk_over_a_low_cap_stops_and_says_what_it_met() {
         assert!(said.lines().count() <= 3 + 15 + 1 + 10 + 1 + 20, "the message is bounded: {said}");
         // CONTROL: the cap by need lets the same walk end.
         let mut left_out = Vec::new_in(Global);
-        let program = Front2Program::survey_within(names, &frame, files, &roots, Within::ALL, &mut left_out, blaze_own::Alloc::global())
+        let program = Front2Program::survey_within(names, &frame, files, &roots, Within::ALL, &mut left_out, None, blaze_own::Alloc::global())
             .unwrap_or_else(|e| panic!("control: the walk under the cap by need ends: {e}"));
         let tabled: usize = program.reached_by_crate().iter().map(|(_, n)| n).sum();
         let need = reach::cap_of(reach::items_held(names));
@@ -157,7 +157,7 @@ fn a_root_that_does_not_lower_is_left_out_under_within() {
         let mut left_out = Vec::new_in(Global);
         let crates = [0usize];
         let within = Within { crates: Some(&crates), most_fns: None };
-        let program = Front2Program::survey_within(names, &frame, files, &roots, within, &mut left_out, blaze_own::Alloc::global())
+        let program = Front2Program::survey_within(names, &frame, files, &roots, within, &mut left_out, None, blaze_own::Alloc::global())
             .unwrap_or_else(|e| panic!("a root that does not lower does not stop the survey: {e}"));
         for (f, row) in left_out.iter() {
             println!("ROOT LEFT OUT: {f}: {}", row.class);
@@ -173,7 +173,7 @@ fn a_root_that_does_not_lower_is_left_out_under_within() {
         assert_eq!(fns, 1, "the table holds `good` alone: {fns} rows");
         // CONTROL: without `Within`, the root's refusal stops the survey (a suite's rows).
         let mut left_out = Vec::new_in(Global);
-        let control = Front2Program::survey_from(names, &frame, files, &roots, &mut left_out, blaze_own::Alloc::global());
+        let control = Front2Program::survey_from(names, &frame, files, &roots, &mut left_out, None, blaze_own::Alloc::global());
         match control {
             Err(Front2Refusal::Lower(_)) => println!("CONTROL: survey_from stops at `bad`"),
             Err(e) => panic!("control: survey_from stops at `bad`'s lowering, not: {e}"),

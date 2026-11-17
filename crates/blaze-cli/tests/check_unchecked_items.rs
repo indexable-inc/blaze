@@ -5,8 +5,11 @@
 //! named under its cause (blaze-cli not_checked/items.rs); an error found keeps status 1 and
 //! wins when both are there; never "0 errors" or "no errors in" beside items not checked.
 //!
-//! The item not checked: `const C: u8 = 1;`, whose body front2 does not check yet (body_types.rs:
-//! "a `const` or `static` body: front2 checks fn bodies only"). The user's error: the Reference,
+//! The item not checked: `#[cfg(blaze_unknown(form))] fn g() {}`, whose `cfg` predicate is no
+//! form the Reference's "Conditional compilation" grammar has (a `ConfigurationPredicate` is an
+//! option, `all`, `any` or `not`), so whether the crate holds `g` is not known (body_types.rs
+//! `CFG_UNREAD`). (Until 2026-11-17 it was `const C: u8 = 1;`, whose initializer front2 did not
+//! check then; it is checked now.) The user's error: the Reference,
 //! "Literal expressions": a string literal is `&'static str`, so `let m: u8 = "x";` is E0308.
 //!
 //! Three packages: only the user's error (status 1, no incomplete line); only the item not
@@ -40,10 +43,10 @@ const REAP: Duration = Duration::from_secs(10);
 
 const ERROR: &str = "fn main(cx: &Cx, out: Out) -> Result<(), Error> {\n    let m: u8 = \"x\";\n    out.line(cx, \"x\")?;\n    Ok(())\n}\n";
 const CLEAN: &str = "fn main(cx: &Cx, out: Out) -> Result<(), Error> {\n    out.line(cx, \"x\")?;\n    Ok(())\n}\n";
-const UNCHECKED: &str = "const C: u8 = 1;\n";
+const UNCHECKED: &str = "#[cfg(blaze_unknown(form))]\nfn g() {}\n";
 
 const SUMMARY: &str = "the check is incomplete: blaze could not check";
-const CAUSE: &str = "not checked because a `const` or `static` body: front2 checks fn bodies only: `C` (";
+const CAUSE: &str = "not checked because a `cfg` predicate on it or on an item it is written in does not read: `g` (";
 const E0308: &str = "type error E0308";
 
 /// `blaze check` of a package whose `src/main.rs` is `main`: its status and everything it said.

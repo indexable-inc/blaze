@@ -2430,14 +2430,28 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         }
     };
     part(ExpandPart::Render, mac.name, expansion.tokens.len());
-    let mut places: AVec<'_, (usize, usize, usize, Option<CrateItemKey>)> = AVec::new_in(alloc);
+    // Each placed piece as the nested input keeps it, `(start, end, token)`, made once at its
+    // final size (at most one a token), and the `crate` written for another crate's `$crate`
+    // beside it, sparse, by its place's index: no wide row per token is held or grown (the
+    // frame's largest stretch in tempo's core, `scope frame by stretch`).
+    let mut placed: AVec<'a, (u32, u32, u32)> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
+    let mut roots: AVec<'_, (u32, CrateItemKey)> = AVec::new_in(alloc);
+    let mut too_large = false;
     let mut words: AVec<'a, Option<u32>> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
         |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
         def_crate,
-        &mut |token, start, end, root| places.push((token, start, end, root)),
+        &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
+            (Ok(token), Ok(start), Ok(end), Ok(place)) => {
+                if let Some(root) = root {
+                    roots.push((place, root));
+                }
+                placed.push((start, end, token));
+            }
+            _ => too_large = true,
+        },
         Some(&mut words),
         alloc,
     );
@@ -2448,28 +2462,14 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             return None;
         }
     };
+    if too_large {
+        note(ExpandNote::NestedInput { macro_name: mac.name, error: crate::nested_input::NestedInputError::TooLarge });
+        return None;
+    }
     // How many `crate`s the text writes for another crate's `$crate`: such a text is read only
     // with its marks (crate::crate_roots).
-    let roots = places.iter().filter(|p| p.3.is_some_and(|k| k != here)).count();
+    let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
     let text: &'a str = Box::leak(rendered.into_boxed_str());
-    // What a call written in this text takes its input from (crate::nested_input): the
-    // expansion's tokens sealed with its key, each placed piece's bytes, each token's word.
-    let expansion_tokens = {
-        let mut sealed = expansion.tokens.clone();
-        sealed.seal(own_key.0);
-        let sealed: &'a TokenStream<'a> = Box::leak(Box::new_in(sealed, alloc));
-        let mut placed: AVec<'a, (u32, u32, u32)> = AVec::with_capacity_in(places.len(), alloc);
-        for &(token, start, end, _) in places.iter() {
-            let (Ok(token), Ok(start), Ok(end)) = (u32::try_from(token), u32::try_from(start), u32::try_from(end)) else {
-                note(ExpandNote::NestedInput { macro_name: mac.name, error: crate::nested_input::NestedInputError::TooLarge });
-                return None;
-            };
-            placed.push((start, end, token));
-        }
-        let placed: &'a [(u32, u32, u32)] = placed.leak();
-        let words: &'a [Option<u32>] = words.leak();
-        crate::nested_input::ExpansionTokens { stream: sealed, text, places: placed, words }
-    };
     let input_index = match written_input.as_deref() {
         Some(map) => blaze_expand::origin_column::InputIndex::Aligned(map),
         None => blaze_expand::origin_column::InputIndex::AsWritten,
@@ -2479,15 +2479,26 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
     let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
-    let origins = crate::expansion_origins::column_of(call, &places, &expansion.origins, input_index, &mark_of, alloc)
+    let origins = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc)
         .and_then(|column| crate::expansion_origins::write(call, src.place, shape, src.name, src.implicit, &column, alloc));
+    // What a call written in this text takes its input from (crate::nested_input): the
+    // expansion's tokens sealed with its key, each placed piece's bytes, each token's word. The
+    // stream is moved, never copied: nothing reads the expansion's tokens after this.
+    let expansion_tokens = {
+        let mut sealed = expansion.tokens;
+        sealed.seal(own_key.0);
+        let sealed: &'a TokenStream<'a> = Box::leak(Box::new_in(sealed, alloc));
+        let placed: &'a [(u32, u32, u32)] = placed.leak();
+        let words: &'a [Option<u32>] = words.leak();
+        crate::nested_input::ExpansionTokens { stream: sealed, text, places: placed, words }
+    };
     part(ExpandPart::Outline, mac.name, text.len());
     let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, edition, alloc), origins }, alloc));
     part(ExpandPart::Lower, mac.name, text.len());
     // The marks a lowered path's first segment resolves by (token-mark-2): the text's column.
     let column = match crate::crate_roots::column_in(&made.origins) {
         Ok(column) => Some(column),
-        Err(lost) if roots > 0 => {
+        Err(lost) if roots_written > 0 => {
             note(ExpandNote::RootsLost { macro_name: mac.name, lost });
             return None;
         }
@@ -2523,7 +2534,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                         // The column moved with the slices the items text copied.
                         let column = match column.map(|c| crate::crate_roots::remapped(c, &copies, alloc)).transpose() {
                             Ok(column) => column,
-                            Err(lost) if roots > 0 => {
+                            Err(lost) if roots_written > 0 => {
                                 note(ExpandNote::RootsLost { macro_name: mac.name, lost });
                                 return None;
                             }
@@ -2641,14 +2652,10 @@ fn keep_item<'a, S: SourceTexts<'a>>(
             return None;
         }
     };
-    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(
-        ExpansionText {
-            text,
-            outline: outline(text, base.edition, alloc),
-            origins: Err(crate::expansion_origins::OriginsError::Rewritten { what: "a kept item's text" }),
-        },
-        alloc,
-    ));
+    // Its origins: the identity column and the entry the call is at, the item itself
+    // (expansion_origins.rs `kept`), so a head it declares is covered by that entry's check.
+    let origins = crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, alloc);
+    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, base.edition, alloc), origins }, alloc));
     if let Some(error) = made.outline.errors().first() {
         run.note(NamesNote::Expand { call, at: Some(src.loc), note: ExpandNote::NotItems { macro_name: KEPT_ITEM_NAME, message: made.outline.message(error) } });
         return None;
@@ -2665,7 +2672,8 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         members_of: src.owner,
         written: src.written,
         kept: true,
-        // A kept item's text: the item as the derive's walk wrote it, no expansion's column.
+        // A kept item's text: the item as written at the call; its column (expansion_origins.rs
+        // `kept`) holds no marks, and its tokens are read at the module, as this says.
         marks: None,
         // A slice of the calling text: written in an expansion, its calls take their inputs
         // from that expansion's tokens, placed in the same text.

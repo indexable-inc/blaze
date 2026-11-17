@@ -136,6 +136,15 @@ impl States {
         s.args.extend_from_slice(args);
         s.made.push((owner, ordinal, start, len, shape));
     }
+
+    /// Forgets the state recorded for that instance: the lay that recorded it stopped before
+    /// building it into its state (run/lay_states.rs), so the next lay lays and builds it again
+    /// instead of taking it as made with no functions built.
+    pub(crate) fn forget(&self, owner: ItemKey, ordinal: u32, args: &[PTy]) {
+        let mut s = self.inner.borrow_mut();
+        let StatesInner { made, args: all } = &mut *s;
+        made.retain(|m| !(m.0 == owner && m.1 == ordinal && all.get(m.2 as usize..(m.2 + m.3) as usize) == Some(args)));
+    }
 }
 
 /// What one build holds of the program's coroutines: the facts, the states made so far, and

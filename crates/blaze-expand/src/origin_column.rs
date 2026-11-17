@@ -213,8 +213,11 @@ pub struct OriginRow {
 /// Why a column could not be made or read (rule: blaze-expand origin_column.rs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColumnError {
-    /// A row starts before the previous one ends, or ends before it starts: the renderer's bug.
-    Unsorted { row: u32, start: u32, end: u32, previous_end: u32 },
+    /// Row `row` (`start..end`) starts before row `row - 1` (`previous_start..previous_end`)
+    /// ends, or ends before it starts: the writer's bug, named at the write (and at
+    /// [`OriginsRef::open`] for bytes no builder made). Tokens that share one place of a text
+    /// as written are one row ([`OriginColumn::input_identity`]).
+    Unsorted { row: u32, start: u32, end: u32, previous_start: u32, previous_end: u32 },
     /// A place past what a u32 holds.
     TooLarge { at: usize },
     /// The bytes are shorter than the count says.
@@ -231,9 +234,10 @@ pub enum ColumnError {
 impl core::fmt::Display for ColumnError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ColumnError::Unsorted { row, start, end, previous_end } => write!(
+            ColumnError::Unsorted { row, start, end, previous_start, previous_end } => write!(
                 f,
-                "an expansion's origin row {row} ({start}..{end}) is out of order after one ending at {previous_end} (rule: blaze-expand origin_column.rs)"
+                "an expansion's origin row {row} ({start}..{end}) is out of order after row {} ({previous_start}..{previous_end}): rows are sorted, apart and each place once (rule: blaze-expand origin_column.rs)",
+                row.saturating_sub(1)
             ),
             ColumnError::TooLarge { at } => write!(f, "an expansion's text place {at} does not fit a u32 (rule: blaze-expand origin_column.rs)"),
             ColumnError::Short { len, want } => {
@@ -261,15 +265,39 @@ impl<'a> OriginColumn<'a> {
         OriginColumn { rows: AVec::new_in(alloc) }
     }
 
-    /// Adds the next token's row: `start..end` in the text, at or after the last row's end.
+    /// Adds the next token's row: `start..end` in the text, at or after the last row's end (so
+    /// a nonempty place is never kept twice).
     pub fn push(&mut self, start: usize, end: usize, origin: TextOrigin, mark: Option<TextMark>) -> Result<(), ColumnError> {
         let (start, end) = (place32(start)?, place32(end)?);
-        let previous_end = self.rows.last().map_or(0, |r| r.end);
+        let (previous_start, previous_end) = self.rows.last().map_or((0, 0), |r| (r.start, r.end));
         if start < previous_end || end < start {
-            return Err(ColumnError::Unsorted { row: place32(self.rows.len())?, start, end, previous_end });
+            return Err(ColumnError::Unsorted { row: place32(self.rows.len())?, start, end, previous_start, previous_end });
         }
         self.rows.push(OriginRow { start, end, origin, mark });
         Ok(())
+    }
+
+    /// The identity column of a text that IS a call's input as written: `places` are its tokens'
+    /// bytes ([`input_places`], token `i` at entry `i`), every row `TextOrigin::Input` of its
+    /// token with no mark. The lexer gives several tokens ONE place (blaze-expand tokens.rs
+    /// `place_new`): a doc comment's `# [ doc = ".." ]` stand at the comment's bytes, a
+    /// lifetime's `'` and name at the lifetime's, the groups one closer closes at that closer,
+    /// the groups a text leaves open at its end. Such a run is one row, the run's FIRST token's
+    /// (a range mapped through it, [`map_range`], names that token, whose place is the run's:
+    /// the same bytes). So the column is sorted and each place once by construction, for any
+    /// text the lexer reads (tempo census g051231: 70 rows "row 1 (0..39) is out of order after
+    /// one ending at 39", a kept item `/// doc` + `#[derive(..)] #[serde(..)] enum CallKind`).
+    pub fn input_identity(places: &[(u32, u32)], alloc: Alloc<'a>) -> Result<OriginColumn<'a>, ColumnError> {
+        let mut column = OriginColumn::new_in(alloc);
+        let mut previous: Option<(u32, u32)> = None;
+        for (i, &(start, end)) in places.iter().enumerate() {
+            if previous == Some((start, end)) {
+                continue;
+            }
+            previous = Some((start, end));
+            column.push(start as usize, end as usize, TextOrigin::Input(place32(i)?), None)?;
+        }
+        Ok(column)
     }
 
     pub fn rows(&self) -> &[OriginRow] {
@@ -339,8 +367,16 @@ impl<'s> OriginsRef<'s> {
                 return Err(ColumnError::Mark { mark: place32(m)? });
             }
         }
-        // Every tag and mark index read once here, so `row` never meets a bad one.
+        // Every tag and mark index read once here, so `row` never meets a bad one; and the rows
+        // sorted and apart, as [`OriginColumn::push`] made them ([`map_range`] and
+        // `crate_roots::remap` search them by place).
+        let (mut previous_start, mut previous_end) = (0u32, 0u32);
         for i in 0..column.len() {
+            let (start, end) = (u32_at(column.rows, i * ROW), u32_at(column.rows, i * ROW + 4));
+            if start < previous_end || end < start {
+                return Err(ColumnError::Unsorted { row: place32(i)?, start, end, previous_start, previous_end });
+            }
+            (previous_start, previous_end) = (start, end);
             let tag = u32_at(column.rows, i * ROW + 8);
             if TextOrigin::of_tag(tag, 0).is_none() {
                 return Err(ColumnError::Tag { row: place32(i)?, tag });

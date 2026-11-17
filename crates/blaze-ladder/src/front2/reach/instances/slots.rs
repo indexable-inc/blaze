@@ -153,7 +153,7 @@ fn slots_of(r: &mut Records<'_, '_>, principal: ItemKey) -> Vec<Slot, Global> {
         // (program.rs `object_tables`): "no library key", "its head", "its members", "made, but
         // no head filed", "a member the front end could not read", "a method with no fn filed
         // under its name".
-        let Some(lib) = r.keys.library(t) else { continue };
+        let Some(lib) = r.keys.library_in(r.names, t) else { continue };
         if r.store.ensure(r.names, r.keys, Want::Head(lib)).is_err() || r.store.ensure(r.names, r.keys, Want::Members(lib)).is_err() {
             continue;
         }

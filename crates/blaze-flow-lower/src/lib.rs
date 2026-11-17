@@ -791,6 +791,36 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         Ok(n)
     }
 
+    /// Whether every origin position of `t` ([`Lower::npos`]'s count) is an opaque type's: no
+    /// reference, no ADT lifetime parameter, no projection, trait object, closure or async block
+    /// position among them (each of those may stand for an elided lifetime of a written
+    /// output). A bounded work list, as `npos`.
+    fn positions_all_opaque(&self, t: PTy, e: ExprId) -> Result<bool, Refusal> {
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        stack.push(t);
+        let mut steps = 0u32;
+        while let Some(t) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Opaque(_, _) => {}
+                PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
+                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Adt(k, l) => {
+                    if self.adt_facts(k, e)?.lifetimes > 0 {
+                        return Ok(false);
+                    }
+                    stack.extend_from_slice(self.list(l, e)?);
+                }
+                PNode::Ref(..) | PNode::Alias { .. } | PNode::Dynamic(_) | PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(true)
+    }
+
     /// A closure expression: an `Aggregate` of its captures, each a borrow or a move of the
     /// captured local at this point, as the type checker decided (the Reference, "Closure
     /// types", "Capture modes": "The compiler prefers to capture a closed-over variable by
@@ -2787,6 +2817,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                             {
                                 let fi = self.info(p);
                                 for j in fi.start + 1..fi.start + fi.len {
+                                    let y = self.origs[j as usize];
+                                    for k in out.start..out.start + out.len {
+                                        let x = self.origs[k as usize];
+                                        self.b.subset(y, x);
+                                    }
+                                }
+                            }
+                        }
+                        // An output whose every position is an opaque type's (an `async fn`'s
+                        // future, an `-> impl Trait`): no elided lifetime is written there, and
+                        // the opaque captures the inputs' lifetimes (the Reference, "Async
+                        // functions": `async fn f(x: A) -> T` is `fn f(x: A) -> impl Future<..>`
+                        // whose future "holds its arguments"; "Impl trait", "Capturing": an
+                        // `impl Trait` in return position captures all in-scope generic
+                        // parameters, lifetimes among them, in edition 2024). So every input
+                        // origin flows into each output position: exact for a capture of all,
+                        // a superset (more demanded, never less) for one that captures fewer.
+                        // With no input origin (`add_slowly(seed, 10)`), nothing is related: the
+                        // future holds no lifetime of the call's.
+                        None if ty.wrap.is_none() && self.positions_all_opaque(ty.ty, e)? => {
+                            for &p in ins.iter() {
+                                let fi = self.info(p);
+                                for j in fi.start..fi.start + fi.len {
                                     let y = self.origs[j as usize];
                                     for k in out.start..out.start + out.len {
                                         let x = self.origs[k as usize];

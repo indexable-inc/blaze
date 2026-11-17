@@ -1,14 +1,14 @@
 //! `memcpy`, `memmove` and `memset` (lib.rs, "Bulk memory"): inline for a constant length up
 //! to the bound, else a call of the system routine; and the copies of `byval` arguments.
 
-use std::alloc::Allocator;
+use std::alloc::{Allocator, Global};
 
 use blaze_lir::{Op, Value};
 
 use super::{EmitError, Pass, mask, unsupported};
 use crate::{
     MOVE_INLINE_MOST, Routine,
-    enc::{self, Reg, Size, X0, X1, X2, X9, X10, X11, X13},
+    enc::{self, Cond, Reg, Size, X0, X1, X2, X9, X10, X11, X13},
 };
 
 /// The registers a `memmove` holds its pieces in: none that `mem` takes for an address.
@@ -110,6 +110,60 @@ impl<A: Allocator> Pass<'_, '_, A> {
             self.mem(true, size, X13, src, off as i32);
             self.mem(false, size, X13, dst, off as i32);
         }
+    }
+
+    /// `memcmp a, b, len` (an `i32` below, equal to or above 0: C's `memcmp`, the first
+    /// differing byte pair compared as unsigned, 0 when `len` is 0). As the copies: inline for a
+    /// constant length up to the bound, else a call of the system's `memcmp`.
+    ///
+    /// Inline, piece by piece ([`pieces`]: 8-byte words, then a 4, 2 and 1-byte tail), each
+    /// pair loaded into `x0`, `x1` (zero-extended) and compared; the first unequal pair branches
+    /// to the end, where both are byte-reversed (`rev`: little-endian memory, so the lowest
+    /// address becomes the most significant byte, and an unsigned compare of the reversed words
+    /// is the byte order) and compared once more: `hi` gives 1, `lo` -1. With every pair equal
+    /// the loop falls into the same end with the last pair equal, which gives 0. No load is
+    /// made of a byte past `len`, and none needs an alignment (`ldr`/`ldur` of any address).
+    pub(super) fn memcmp(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
+        let mut o = self.view.operands(inst);
+        let (a, b, len) = (o.value(), o.value(), o.value());
+        self.width_of(inst, op, len)?;
+        match self.constant_of(len) {
+            Some(0) => self.st(enc::ZR, inst),
+            Some(n) if n <= self.inline_most => {
+                self.ld(X9, a);
+                self.ld(X10, b);
+                let mut to_end: Vec<u32, Global> = Vec::new_in(Global);
+                for (off, size) in pieces(n) {
+                    // (`mem` takes `x11` for an offset past its immediates, never `x0`, `x1`.)
+                    self.mem(true, size, X0, X9, off as i32);
+                    self.mem(true, size, X1, X10, off as i32);
+                    self.put(enc::cmp(X0, X1));
+                    to_end.push(self.here());
+                    self.put(enc::b_cond(Cond::Ne, 0));
+                }
+                for at in to_end {
+                    self.land(at)?;
+                }
+                self.put(enc::rev(X0, X0));
+                self.put(enc::rev(X1, X1));
+                self.put(enc::cmp(X0, X1));
+                self.put(enc::cset(X0, Cond::Hi));
+                self.put(enc::cset(X1, Cond::Lo));
+                self.put(enc::sub(X0, X0, X1));
+                self.narrow(X0, 32);
+                self.st(X0, inst);
+            }
+            _ => {
+                self.ld(X0, a);
+                self.ld(X1, b);
+                self.ld(X2, len);
+                self.call_routine(Routine::Memcmp);
+                // A C `int` in `w0`: the bits above it are unspecified.
+                self.narrow(X0, 32);
+                self.st(X0, inst);
+            }
+        }
+        Ok(())
     }
 
     /// The value of `value` when an `iconst` defines it: the cell invariant's bits.

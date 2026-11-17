@@ -1,0 +1,14 @@
+{
+ "id": "ctor-fn-seam-world-panic",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CB",
+ "where": "crates/blaze-ladder/src/front2/program.rs `in_world` (and program/lazy/front_end.rs's twin)",
+ "what": "After ctor fns were built at their bodiless rows (a2b1388119), every tempo census panicked before INSTANCES: Walk::repr -> layout -> Adts::drop_impl -> Front2Program::adt_drop_impl -> in_world `expect`ed a body. The ctor tests passed because their no_core prelude declared no `Drop` lang item, so drop_impl never reached the seam.",
+ "cost": "every census after the admission, until this fix",
+ "cause": "the seam's world for a question (Drop impl, selection, projection, instance) was always the asking row's BODY world, and an `expect` asserted every built row has a body",
+ "whys": "the back half was assumed to build only bodies; ctor fns and their Fn shims are built at a row with no body; the questions asked are at ground arguments and need no body's scope, but the world type was made only from a body; the test fixtures omitted the lang item that routes to the seam",
+ "class": "a seam answer that needs a body world, asked for a row that has none",
+ "prevention": "done: world_items.rs `ctor_world` (the ADT's own scope) answers for a ctor row, eager and lazy; `in_world` returns a typed `ResolveError::Missing(FnSig(fn))` for any other bodiless row and for a body with no spelling, never panics; test front2_ctor_fn.rs `a_ctor_with_a_drop_field_*` declares `Drop` so the seam is reached",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

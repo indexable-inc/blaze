@@ -56,13 +56,38 @@ pub struct Shown<'f> {
     /// The command's lint step (lints.rs `lints_of`): a lint finding's level is its levels' at
     /// print time (rule 81), never stored. `Step::Rust` until the command sets it.
     pub lints: blaze_lint::Step,
+    /// `--each`: every finding that is only a consequence (a task waiting on a failed one, an
+    /// item or a body not checked) drawn one by one, as well as counted under its cause. Off,
+    /// they are counted and grouped only, and never placed in their files.
+    pub each: bool,
+    /// The items not checked because a task failed (not_checked/waited.rs), as the lines under
+    /// the failures counted them, and how many failures' lines counted any: the summary line
+    /// counts them beside the items not checked for their own causes (main.rs `close`), so it
+    /// never reads better than the truth.
+    pub behind: crate::not_checked::Behind,
 }
 
 impl<'f> Shown<'f> {
     /// The plain views are lines whatever the terminal draws: their bytes are the same anywhere.
     pub fn new(caps: Caps, view: View, root: &'f str, frame: &'f Frame) -> Shown<'f> {
         let caps = if view == View::Person { caps } else { Caps::LINES };
-        Shown { caps, counts: Counts::default(), view, quiet: false, listed: Vec::new_in(frame), fixes: Vec::new_in(frame), root, files: Vec::new_in(frame), types_unchecked: 0, unchecked: Vec::new_in(frame), borrows_unchecked: 0, not_run: Vec::new_in(frame), lints: blaze_lint::Step::Rust }
+        Shown {
+            caps,
+            counts: Counts::default(),
+            view,
+            quiet: false,
+            listed: Vec::new_in(frame),
+            fixes: Vec::new_in(frame),
+            root,
+            files: Vec::new_in(frame),
+            types_unchecked: 0,
+            unchecked: Vec::new_in(frame),
+            borrows_unchecked: 0,
+            not_run: Vec::new_in(frame),
+            lints: blaze_lint::Step::Rust,
+            each: false,
+            behind: crate::not_checked::Behind::default(),
+        }
     }
 
     fn file(&mut self, path: &str) {
@@ -126,12 +151,20 @@ fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar:
 
 /// A finding of no file (or whose item is no longer in its file), listed at its name: its id
 /// is of the name. `one` holds the name's text while the id is made.
-fn unplaced<'f>(message: &'f [u8], finding: &Print<'_>, one: &Frame) -> Listed<'f> {
+/// `no_text` is the digest of no bytes, made once by the caller.
+fn unplaced<'f>(message: &'f [u8], finding: &Print<'_>, no_text: blaze_ids::ContentId, one: &Frame) -> Listed<'f> {
     let area = area_of(finding);
     let code = code_of(area, finding.rule);
     let about = format_in!(one, "{}", finding.name);
     let id = Id::of(about.as_bytes(), 0, &[], code, (finding.start, finding.end));
-    Listed { path: None, about: finding.name, read: crate::fix::text_id(&[]), area, rule: finding.rule, words: message, item: 0, start: finding.start, end: finding.end, id, fix: None }
+    Listed { path: None, about: finding.name, read: no_text, area, rule: finding.rule, words: message, item: 0, start: finding.start, end: finding.end, id, fix: None }
+}
+
+/// A finding only counted under its cause ([`Place::Counted`]): listed with its file's path and
+/// its words, and nothing made for it (no id, no name's text, no file read). Tempo's no-op
+/// check has 31,000 such findings beside 626 drawn.
+fn counted<'f>(wanted: &Wanted<'f>, finding: &Print<'_>, no_text: blaze_ids::ContentId) -> Listed<'f> {
+    Listed { path: wanted.path, about: finding.name, read: no_text, area: area_of(finding), rule: finding.rule, words: wanted.words, item: 0, start: finding.start, end: finding.end, id: Id::UNSHOWN, fix: None }
 }
 
 /// The memory a command's findings are placed and drawn in. One file's text and its outlines
@@ -231,6 +264,15 @@ pub enum Place {
     At(u32),
     /// The item's chain, in the outline of this edition (a crate's unresolved path).
     Chain(u64, blaze_surface::Edition),
+    /// Not placed: a finding only counted under its cause (not drawn without `--each`), listed
+    /// with its file's path and its task's name, its file never read for it.
+    Counted,
+}
+
+/// Whether a finding of `rule` is only counted under its cause unless `--each` is given: a body
+/// or a borrow check not done, or a task not run. Their files are not read to place them.
+pub fn counted_only(rule: u16) -> bool {
+    rule == crate::body_types::TYPES_NOT_CHECKED || rule == crate::body_types::BORROWS_NOT_CHECKED || rule == crate::work::NOT_RUN
 }
 
 /// Every finding of the request placed in today's text ([`Listed`]), pushed on `into` in the
@@ -242,9 +284,16 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
     const NO_ROOM: CliError = CliError::Text { what: "the command's frame has no room to list its findings: a finding takes a `Listed`, its words and (once a file) its path there" };
     let first = into.len();
     into.try_reserve(prints.len()).map_err(|_| NO_ROOM)?;
-    // By file (stable: a file's findings stay in the order they came), the fileless first.
+    let no_text = crate::fix::text_id(&[]);
+    // Each finding at its own index, first as counted ([`counted`]: nothing made); the placed
+    // ones are overwritten below. The counted-only findings ([`Place::Counted`]) stay so: no
+    // file is read, nothing hashed or sorted for them.
+    let is_counted = |i: usize| matches!(wanted[i].place, Place::Counted);
+    into.extend(wanted.iter().zip(prints.iter()).map(|(wanted, finding)| counted(wanted, finding, no_text)));
+    // The placed, by file (stable: a file's findings stay in the order they came), the
+    // fileless first.
     let mut order: Vec<usize, &Frame> = Vec::try_with_capacity_in(prints.len(), frame).map_err(|_| NO_ROOM)?;
-    order.extend(0..prints.len());
+    order.extend((0..prints.len()).filter(|&i| !is_counted(i)));
     order.sort_by_key(|&i| wanted[i].path);
     let mut at = 0;
     while at < order.len() {
@@ -253,8 +302,7 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
         at += run.len();
         let Some(path) = path else {
             for &i in run {
-                let listed = unplaced(wanted[i].words, &prints[i], scratch.one());
-                into.push(listed);
+                into[first + i] = unplaced(wanted[i].words, &prints[i], no_text, scratch.one());
             }
             continue;
         };
@@ -268,7 +316,7 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
             let Ok(text) = core::str::from_utf8(bytes.as_slice()) else {
                 for &i in run {
                     one.reset();
-                    into.push(unplaced(wanted[i].words, &prints[i], one));
+                    into[first + i] = unplaced(wanted[i].words, &prints[i], no_text, one);
                 }
                 return Ok(());
             };
@@ -284,6 +332,8 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
                 one.reset();
                 let place = match wanted[i].place {
                     Place::At(place) => Some(place),
+                    // Listed above, with no file read.
+                    Place::Counted => None,
                     Place::Chain(chain, edition) => match &grammar {
                         Some(outline) if edition == crate::fix::ITEM_GRAMMAR => crate::work::item_by_chain(outline, text, chain),
                         _ => {
@@ -294,24 +344,16 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
                         }
                     },
                 };
-                into.push(match place {
+                into[first + i] = match place {
                     Some(place) => placed_in(path, text, read, grammar.as_ref(), place, wanted[i].words, &prints[i])?,
-                    None => unplaced(wanted[i].words, &prints[i], one),
-                });
+                    None => unplaced(wanted[i].words, &prints[i], no_text, one),
+                };
             }
             Ok(())
         });
         match placed {
             Ok(done) => done?,
             Err(crate::work::Panicked) => return Err(scratch.stopped("placing", path)),
-        }
-    }
-    // `into[first + k]` is the finding `order[k]`: each swapped to its own place.
-    for k in 0..order.len() {
-        while order[k] != k {
-            let to = order[k];
-            into.swap(first + k, first + to);
-            order.swap(k, to);
         }
     }
     Ok(())
@@ -392,7 +434,12 @@ pub fn finding<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], shown: &mut Shown<'f>, 
     if lint == Some(blaze_lint::Level::Off) {
         return Ok(());
     }
-    let severity = if unchecked || borrows_note {
+    // A task that failed only because one it needs failed (work.rs `WAITED`): drawn only under
+    // `--each` (main.rs `draw` counts it under its root), and then a note.
+    let waited = l.area == Area::Cli && l.rule == crate::work::WAITED;
+    // A task that failed on its own: a failure, counted apart from the code's errors.
+    let root = l.area == Area::Cli && l.rule == crate::work::TASK_FAILED;
+    let severity = if unchecked || borrows_note || waited {
         Severity::Note
     } else if lint == Some(blaze_lint::Level::Error) {
         Severity::Error
@@ -414,26 +461,28 @@ pub fn finding<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], shown: &mut Shown<'f>, 
     if borrows_note && shown.view == View::Person {
         return Ok(());
     }
-    // A person sees the count in the closing line ("NOT checked: types"), not a note a body:
-    // on a workspace they are thousands. The agent's and JSON views list each with its why.
-    if shown.quiet || (unchecked && shown.view == View::Person) {
-        shown.counts.add(severity, l.fix.is_some());
+    // Every view sees an item or a body not checked as its cause's line (main.rs `draw`), not a
+    // note an item: on a workspace they are thousands (tempo: 4,958). `--each` lists each.
+    if shown.quiet || ((unchecked || borrows_unchecked) && !shown.each) {
+        count(shown, severity, root, l.fix.is_some());
         return Ok(());
     }
     let message = core::str::from_utf8(l.words).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
     let Some(path) = l.path else {
         // A text-less crate's finding: no source to draw, its name is its place.
-        shown.counts.add(Severity::Error, false);
+        count(shown, if waited { Severity::Note } else { Severity::Error }, root, false);
         let erased = blaze_own::Erased::new(frame);
         let about = format_in!(frame, "{}", l.about);
         let mut line = AString::new_in(erased.handle());
         match shown.view {
             View::Person => {
-                out.line(cx, format_args!("{}: error[{}]: {message}", l.about, l.code()))?;
+                let label = if waited { "note" } else { "error" };
+                out.line(cx, format_args!("{}: {label}[{}]: {message}", l.about, l.code()))?;
                 return Ok(());
             }
             View::Agent | View::Json => {
-                let plain = Plain { id: l.id.as_str(), severity: Severity::Error, code: l.code(), path: about.as_str(), text: None, start: 0, end: 0, message, fix: None };
+                let severity = if waited { Severity::Note } else { Severity::Error };
+                let plain = Plain { id: l.id.as_str(), severity, code: l.code(), path: about.as_str(), text: None, start: 0, end: 0, message, fix: None };
                 written(&mut line, &plain, shown.view)?;
             }
         }
@@ -442,7 +491,23 @@ pub fn finding<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], shown: &mut Shown<'f>, 
     };
     shown.file(path);
     let fix = l.fix.map(|change| (Edit { start: change.start, end: change.end, insert: change.insert }, change));
-    draw(cx, shown, severity, l.area, l.rule, message, path, text, Some(l.item), (l.start, l.end), None, fix, l.id.as_str(), frame, out)
+    draw(cx, shown, severity, l.area, l.rule, message, path, text, Some(l.item), (l.start, l.end), None, fix, l.id.as_str(), frame, out)?;
+    // `draw` counted it as an error: a task that failed on its own is a failure instead.
+    if root && shown.counts.errors > 0 {
+        shown.counts.errors -= 1;
+        shown.counts.failures += 1;
+    }
+    Ok(())
+}
+
+/// One finding of `severity` counted, not drawn; a task that failed on its own (`root`) as a
+/// failure, apart from the code's errors.
+fn count(shown: &mut Shown<'_>, severity: Severity, root: bool, fixable: bool) {
+    if root {
+        shown.counts.failures += 1;
+    } else {
+        shown.counts.add(severity, fixable);
+    }
 }
 
 /// One plain finding into `line` in `view`.
@@ -551,7 +616,7 @@ fn draw(
     let input = Input { findings: core::slice::from_ref(&finding), sources: &sources, link: LINK_FILE, fixes: Fixes::Command, ids: &ids };
     let mut drawn = AString::new_in(alloc);
     // A blank line between frames.
-    if shown.caps.form == Form::Frames && shown.counts.errors + shown.counts.warnings + shown.counts.notes > 0 {
+    if shown.caps.form == Form::Frames && shown.counts.failures + shown.counts.errors + shown.counts.warnings + shown.counts.notes > 0 {
         drawn.push_str("\n");
     }
     render(&mut drawn, &input, shown.caps, alloc)
@@ -640,7 +705,7 @@ pub fn closing(
         out.write_all(cx, line.as_bytes())?;
         return Ok(());
     }
-    if shown.caps.form == Form::Frames && shown.counts.errors + shown.counts.warnings + shown.counts.notes > 0 {
+    if shown.caps.form == Form::Frames && shown.counts.failures + shown.counts.errors + shown.counts.warnings + shown.counts.notes > 0 {
         line.push_str("\n");
     }
     closing_line(&mut line, &Closing { counts: shown.counts, checked, nanos, changed, fixes: Fixes::Command, coverage, fix_with }, shown.caps);

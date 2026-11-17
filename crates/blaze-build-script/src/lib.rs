@@ -63,7 +63,7 @@ mod probe_ask_tests;
 #[cfg(test)]
 mod tests;
 
-pub use env::{Env, Given, env};
+pub use env::{Env, Given, Jobs, RunEnv, env};
 pub use instr::{Instr, Line, parse};
 pub use key::{CMode, KeyInputs, base};
 pub use outputs::{Outputs, OutputsRef};

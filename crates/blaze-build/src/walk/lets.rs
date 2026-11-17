@@ -61,19 +61,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// the `else` block; then the consequent and the `else` as walk.rs `Task::IfThen` builds
     /// them.
     pub(super) fn if_let(&mut self, e: ExprId, cond: ExprId, then: ExprId, else_: Option<ExprId>) -> Result<(), BuildError> {
-        // `a && b && c` is `(a && b) && c`: the links left to right.
-        let mut links: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
-        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
-        todo.push(cond);
-        while let Some(x) = todo.pop() {
-            match self.expr(x)? {
-                Expr::Binary { op: BinOp::And, lhs, rhs } => {
-                    todo.push(rhs);
-                    todo.push(lhs);
-                }
-                _ => links.push(x),
-            }
-        }
+        let links = self.links_of(cond)?;
         let else_block = self.create();
         let join = self.create();
         // The condition's region (lets/scope.rs): its bindings and, in edition 2024, its
@@ -86,19 +74,63 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         self.work.push(Task::ScopeEnd(then));
         self.work.push(Task::Eval(then));
+        self.push_links(&links, else_block)
+    }
+
+    /// The links of condition `cond` left to right: `a && b && c` is `(a && b) && c`.
+    fn links_of(&self, cond: ExprId) -> Result<Vec<ExprId, A>, BuildError> {
+        let mut links: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        todo.push(cond);
+        while let Some(x) = todo.pop() {
+            match self.expr(x)? {
+                Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                    todo.push(rhs);
+                    todo.push(lhs);
+                }
+                _ => links.push(x),
+            }
+        }
+        Ok(links)
+    }
+
+    /// The tasks of `links` (a condition's, from `links_of`), each failure to `fail`: a
+    /// `let`'s scrutinee, then its tests and bindings; a `bool`, then its branch.
+    fn push_links(&mut self, links: &[ExprId], fail: Block) -> Result<(), BuildError> {
         for &x in links.iter().rev() {
             match self.expr(x)? {
                 Expr::Let { init, .. } => {
-                    self.work.push(Task::LetLink { expr: x, fail: else_block });
+                    self.work.push(Task::LetLink { expr: x, fail });
                     self.push_scrutinee(init)?;
                 }
                 _ => {
-                    self.work.push(Task::CondLink(else_block));
+                    self.work.push(Task::CondLink(fail));
                     self.work.push(Task::Eval(x));
                 }
             }
         }
         Ok(())
+    }
+
+    /// Match arm guard `g` holding a `let` (an `if let` guard, core's `dec2flt`: `None if let
+    /// Some(value) = parse_inf_nan(s, negative) => return Ok(value),`; or a chain with `&&`),
+    /// then the arm's `body`; every failed link to `next`, the next arm's block. The Reference,
+    /// "Match guards": the guard "may be ... a chain of conditions" whose `let` bindings are in
+    /// scope in the arm's body, and when it is false (a `let` fails) "control moves on to the
+    /// next arm". Built as an `if let` condition's links (`push_links`) in a region of its own
+    /// (lets/scope.rs) opened inside the arm's drop scope: a failed link drops what the region
+    /// holds then (`link_fail`), the matched path drops it after the body (a `Task::ScopeEnd`
+    /// of the body, which settles the body's value), before the arm's own bindings. A scrutinee temporary that needs drop is refused by name
+    /// (lets/scope.rs `let_anchor`: its temporary scope is not built for a guard).
+    pub(super) fn let_guard(&mut self, g: ExprId, body: ExprId, next: Block) -> Result<(), BuildError> {
+        let links = self.links_of(g)?;
+        if links.len() > 1 && !self.if_let_2024() {
+            return Err(unsupported(g, "a `let` chain before edition 2024 (chains are an edition-2024 form)"));
+        }
+        self.scope_marks.push(self.scope_pats.len() as u32);
+        self.work.push(Task::ScopeEnd(body));
+        self.work.push(Task::Eval(body));
+        self.push_links(&links, next)
     }
 
     /// A `let`'s scrutinee as walk.rs's `match` pushes one: a local that needs drop is a
@@ -142,7 +174,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // A failed test drops what the region holds at this link, then goes to the `else`.
         let (to, undo) = self.link_fail(fail)?;
         let pass = self.create();
-        self.test_pat(pat, at, pass, to)?;
+        // Set before the tests: an or-alternative binds (and moves) on its own pass.
+        self.move_arm(m, pat, false);
+        if let Err(error) = self.test_pat(pat, at, pass, to) {
+            self.move_arm_end();
+            return Err(error);
+        }
+        self.move_arm_end();
         if undo {
             self.link_fail_end(to, fail)?;
         }
@@ -196,7 +234,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let at = self.owned_place(m, init, init, v, srepr)?;
         let pass = self.create();
         let fail = self.create();
-        self.test_pat(pat, at, pass, fail)?;
+        // Set before the tests: an or-alternative binds (and moves) on its own pass.
+        self.move_arm(m, pat, false);
+        if let Err(error) = self.test_pat(pat, at, pass, fail) {
+            self.move_arm_end();
+            return Err(error);
+        }
+        self.move_arm_end();
         self.begin(pass);
         self.move_arm(m, pat, false);
         let bound = self.bind_tested(pat, at);

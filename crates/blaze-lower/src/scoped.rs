@@ -118,17 +118,20 @@ impl<'d, 'p: 'd> MacroNames<'d> for Scoped<'d, 'p> {
             Err(MacroDefError::NoSource { def, krate }) => {
                 // A procedural macro: its crate's runner, by the name it is defined under. The
                 // last segment is that name unless a `use .. as` renamed it, which the names do
-                // not record for a proc macro yet.
+                // not record for a proc macro yet. The definition names the crate by its
+                // RUNNER's key, as blaze-scope's `definition_of` does (the runner knows a crate
+                // by no other key); a crate no runner holds has no definition.
                 let name = segments.last().copied().unwrap_or(first);
                 let owner = names.krate(krate);
+                let Some(runner) = owner.proc_key else { return Err(NoMacro::Names(MacroDefError::NoSource { def, krate })) };
                 let at = DefAt {
-                    site: DefSite { krate: owner.key, module: None },
+                    site: DefSite { krate: runner, module: None },
                     edition: owner.edition,
                     export: Export::Exported,
                     local_inner: LocalInner::No,
                     transparency: None,
                 };
-                MacroDefinition::proc_macro(owner.key, kind, name, &[], at, alloc)
+                MacroDefinition::proc_macro(runner, kind, name, &[], at, alloc)
                     .map(Resolved::Def)
                     .map_err(|_| NoMacro::Names(MacroDefError::NoSource { def, krate }))
             }

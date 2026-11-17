@@ -39,7 +39,7 @@ use blaze_manifest::layout::{Entry, Layout, Need, Pass as LayoutPass, Units};
 use blaze_manifest::lock::{Checksum, Lock, LockId, LockSource};
 use blaze_own::{Alloc, Vec as AVec};
 use blaze_script::input::{self, Fields, Input, InputError};
-use blaze_toolchain::implied::{ImplicitSysroot, SysrootUnits, first_in_cycle, implied_edges, root_facts};
+use blaze_toolchain::implied::{ImplicitSysroot, SysrootUnits, crate_facts, first_in_cycle, implied_edges};
 use blaze_toolchain::record::{self, CrateIn, Role, TargetIn, UnitIn, UnitKind};
 use blaze_toolchain::side::{SideTriple, TargetSide, cut_triples};
 use blaze_toolchain::{Hex, ToolchainView, parse_hex};
@@ -721,13 +721,12 @@ fn main() {
                 PackView::open_verified(pack).unwrap_or_else(|e| fail(&format!("{name} {version}: {}", blaze_text::Shown(&e))))
             });
             let path = if dir.is_empty() || u.root.starts_with(dir.as_str()) { u.root.clone() } else { format!("{dir}/{}", u.root) };
-            let text = view
-                .find(&path)
-                .and_then(|f| std::str::from_utf8(f.bytes).ok())
-                .unwrap_or_else(|| fail(&format!("{name} {version}: its root {path} is not a UTF-8 file of its pack")));
             let mut cfg: Vec<(&str, Option<&str>)> = target_cfgs[t].iter().map(|(n, v)| (n.as_str(), v.as_deref())).collect();
             cfg.extend(u.features.iter().map(|f| ("feature", Some(f.as_str()))));
-            let read = root_facts(text, &cfg).unwrap_or_else(|e| fail(&format!("{triple}: {name} {version} ({path}): {e}")));
+            // Every module file of the crate, from its root (an `extern crate` asks for its
+            // crate in any module: bstd's `extern crate std;` is in `mod rt`).
+            let file = |p: &str| view.find(p).and_then(|f| std::str::from_utf8(f.bytes).ok());
+            let read = crate_facts(&path, file, &cfg, alloc).unwrap_or_else(|e| fail(&format!("{triple}: {name} {version} (root {path}): {e}")));
             u.sysroot = Some(read.sysroot);
             if u.kind == UnitKind::Lib && !u.for_host {
                 let explicit: Vec<String> = u.deps.iter().map(|(n, _)| n.clone()).collect();

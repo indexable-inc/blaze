@@ -12,15 +12,25 @@
 //! - `CARGO_CFG_<NAME>` for each cfg of the target the crate is built for: a flag as an empty
 //!   value, a name with values as the values joined by `,` (in the target description's
 //!   sorted order); `test` and `proc_macro`, which no `--print cfg` gives, left out;
-//! - `OUT_DIR`, `TARGET`, `HOST`, `NUM_JOBS` `1`, `OPT_LEVEL` `0`, `DEBUG` `true`, `PROFILE`
-//!   `debug`;
+//! - `OUT_DIR`, `TARGET`, `HOST`, `OPT_LEVEL` `0`, `DEBUG` `true`, `PROFILE` `debug`;
 //! - `RUSTC` `rustc` and `RUSTDOC` `rustdoc` (names the sandbox's process host answers, not
 //!   paths), `CARGO` `cargo`, `CARGO_ENCODED_RUSTFLAGS` empty;
 //! - `CARGO_PKG_*` from the manifest, absent values as `""`;
 //! - `DEP_<LINKS>_<KEY>` from each direct dependency's `links` metadata.
 //!
-//! Not set: `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_LINKER`, `CARGO_MAKEFLAGS`, `PATH`,
-//! `HOME`, and every variable of the user's: a switch such as `LIBC_CI` is unset.
+//! Not set: `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_LINKER`, `PATH`, `HOME`, and every
+//! variable of the user's: a switch such as `LIBC_CI` is unset.
+//!
+//! The parallelism a script's children get is NOT in [`Env`]: a job count is a hint about the
+//! machine, never an input of the run's result, so it is in no key and no record (rules 21, 25).
+//! A run is given [`Env::for_run`], a [`RunEnv`] (another type, so no key can take it): the keyed
+//! variables and its [`Jobs`]:
+//!
+//! - a wasm run ([`Jobs::One`], it has no threads): `NUM_JOBS` `1`, no jobserver;
+//! - a native run ([`Jobs::Shared`]): `NUM_JOBS` the command's worker count and
+//!   `CARGO_MAKEFLAGS` naming the command's jobserver fifo exactly as cargo writes it
+//!   ([`makeflags`]), which the `jobserver` crate (`cc`'s `parallel`), cmake and make read
+//!   (`CARGO_MAKEFLAGS`, then `MAKEFLAGS`, then `MFLAGS`; `NUM_JOBS` only when none is set).
 
 #![blaze::sans_io]
 
@@ -93,6 +103,79 @@ impl Env<'_> {
             out.extend_from_slice(value.as_bytes());
         }
     }
+
+    /// The environment a run is given: these variables and the job variables of `jobs`
+    /// ([`job_vars`]), sorted by name, each once. Never keyed: [`crate::key::KeyInputs`] takes an
+    /// [`Env`], and this is a [`RunEnv`].
+    pub fn for_run<'a>(&self, jobs: Jobs<'_>, alloc: Alloc<'a>) -> RunEnv<'a> {
+        let mut vars: AVec<'a, (AString<'a>, AString<'a>)> = Vec::with_capacity_in(self.vars.len() + 2, alloc);
+        for (name, value) in self.vars.iter() {
+            vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
+        }
+        for (name, value) in job_vars(jobs, alloc) {
+            match vars.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+                // The keyed environment never holds a job variable (`env` sets none); a caller's
+                // own `Env` that did is overridden, as the last `export` would.
+                Ok(at) => vars[at].1 = value,
+                Err(at) => vars.insert(at, (String::from_str_in(name, alloc), value)),
+            }
+        }
+        RunEnv { vars }
+    }
+}
+
+/// The environment a run is given ([`Env::for_run`]): the keyed variables and the job
+/// variables, sorted by name, each once. A separate type so no key can hold it (rule 25).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunEnv<'a> {
+    pub vars: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+impl RunEnv<'_> {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let at = self.vars.binary_search_by(|(n, _)| n.as_str().cmp(name)).ok()?;
+        Some(self.vars[at].1.as_str())
+    }
+}
+
+/// How many jobs a run's children may run at once: a hint about the machine, never an input of
+/// the run's result (no key or record holds it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jobs<'s> {
+    /// One: a wasm run (it has no threads), or a native run given no jobserver (an example's).
+    One,
+    /// A native run: the command's `workers` and its jobserver's fifo (an absolute path), which
+    /// holds the tokens the command lends its scripts' children.
+    Shared { workers: core::num::NonZeroU32, fifo: &'s str },
+}
+
+/// `CARGO_MAKEFLAGS`' value for the jobserver fifo `fifo`, as cargo writes it (the `jobserver`
+/// crate's `Client::configure`: both spellings, for old and new make):
+/// `-j --jobserver-fds=fifo:<fifo> --jobserver-auth=fifo:<fifo>`.
+pub fn makeflags<'a>(fifo: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::with_capacity_in(2 * fifo.len() + 48, alloc);
+    out.push_str("-j --jobserver-fds=fifo:");
+    out.push_str(fifo);
+    out.push_str(" --jobserver-auth=fifo:");
+    out.push_str(fifo);
+    out
+}
+
+/// The job variables of `jobs`, sorted by name: `NUM_JOBS` (`1`, or the worker count) and, for a
+/// shared jobserver, `CARGO_MAKEFLAGS` ([`makeflags`]).
+pub fn job_vars<'a>(jobs: Jobs<'_>, alloc: Alloc<'a>) -> AVec<'a, (&'static str, AString<'a>)> {
+    let mut out: AVec<'a, (&'static str, AString<'a>)> = Vec::with_capacity_in(2, alloc);
+    match jobs {
+        Jobs::One => out.push(("NUM_JOBS", String::from_str_in("1", alloc))),
+        Jobs::Shared { workers, fifo } => {
+            out.push(("CARGO_MAKEFLAGS", makeflags(fifo, alloc)));
+            let mut count = String::with_capacity_in(10, alloc);
+            // Writing into a string cannot fail (`String`'s `fmt::Write` never errs).
+            _ = core::fmt::Write::write_fmt(&mut count, format_args!("{workers}"));
+            out.push(("NUM_JOBS", count));
+        }
+    }
+    out
 }
 
 /// `-` as `_`, uppercased: how Cargo spells a feature or cfg name in a variable's name.
@@ -188,7 +271,7 @@ pub fn env<'a>(given: &Given<'_, '_>, alloc: Alloc<'a>) -> Env<'a> {
     set(named("OUT_DIR"), out_dir.as_str());
     set(named("TARGET"), given.target);
     set(named("HOST"), given.host);
-    set(named("NUM_JOBS"), "1");
+    // No `NUM_JOBS` here: a job count is the machine's, never keyed (`Env::for_run` adds it).
     set(named("OPT_LEVEL"), "0");
     set(named("DEBUG"), "true");
     set(named("PROFILE"), "debug");

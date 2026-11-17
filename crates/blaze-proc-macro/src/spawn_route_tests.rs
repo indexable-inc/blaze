@@ -73,6 +73,7 @@ pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sy
 fn kind(routed: &Route<'_>) -> &'static str {
     match routed {
         Route::Rustc => "rustc",
+        Route::CargoVersion => "cargo version",
         Route::Git => "git",
         Route::Fact(Fact::PkgConfig { .. }) => "fact pkg-config",
         Route::Fact(Fact::SwVers { .. }) => "fact sw_vers",
@@ -90,6 +91,13 @@ fn kind(routed: &Route<'_>) -> &'static str {
 fn route_order_is_fixed() {
     let cases: &[(&str, &[&str], CMode, bool, &str)] = &[
         ("rustc", &["-vV"], CMode::Built, true, "rustc"),
+        // codspeed's `cargo --version` (tempo's check, check-g051344): the pin's fact, with no
+        // sandbox; any other cargo command is a program like the rest.
+        ("cargo", &["--version"], CMode::Built, false, "cargo version"),
+        ("/toolchain/bin/cargo", &["-V"], CMode::Deferred, false, "cargo version"),
+        ("cargo", &["version"], CMode::Built, true, "cargo version"),
+        ("cargo", &["-vV"], CMode::Built, false, "refused"),
+        ("cargo", &["metadata"], CMode::Built, false, "refused"),
         ("git", &["rev-parse", "HEAD"], CMode::Built, true, "git"),
         ("sh", &["-c", "git rev-parse HEAD"], CMode::Built, true, "git"),
         ("pkg-config", &["--libs", "--cflags", "libusb-1.0"], CMode::Deferred, false, "fact pkg-config"),

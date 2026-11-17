@@ -109,7 +109,7 @@ fn a_promoted_borrow_evaluates_to_its_operand() {
     let mut lines = Vec::new();
     for &borrow in &promoted {
         let key = promoted_key(owner, borrow, PROGRAM);
-        let line = match consts.body_value(&mut records, prepared, owner, BodyRoot::Promoted(borrow), key, blaze_typeck::PTys::EMPTY, &[], heap.alloc()) {
+        let line = match consts.body_value(&mut records, prepared, owner, BodyRoot::Promoted(borrow), key, blaze_typeck::PTys::EMPTY, &[], None, heap.alloc()) {
             Ok(rec) => match rec.data.allocs.first() {
                 Some(root) if root.relocs.is_empty() && rec.data.allocs.len() == 1 => {
                     let bytes: Vec<String> = root.bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -126,7 +126,7 @@ fn a_promoted_borrow_evaluates_to_its_operand() {
     assert_eq!(lines, ["promoted value: 04 00 00 00 05 00 00 00", "promoted value: 07 00 00 00"]);
     // An expression id no body holds: never a promoted borrow, refused by name.
     let nowhere = blaze_typeck::ExprId(u32::MAX);
-    let refused = match consts.body_value(&mut records, prepared, owner, BodyRoot::Promoted(nowhere), promoted_key(owner, nowhere, PROGRAM), blaze_typeck::PTys::EMPTY, &[], heap.alloc()) {
+    let refused = match consts.body_value(&mut records, prepared, owner, BodyRoot::Promoted(nowhere), promoted_key(owner, nowhere, PROGRAM), blaze_typeck::PTys::EMPTY, &[], None, heap.alloc()) {
         Err(ConstFail::NotPromoted { .. }) => "not promoted: refused (NotPromoted)".to_string(),
         Err(e) => format!("not promoted: refused otherwise: {e}"),
         Ok(rec) => format!("not promoted: evaluated: {rec:?}"),

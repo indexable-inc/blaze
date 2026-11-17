@@ -41,7 +41,7 @@
 use blaze_id::ItemKey as LibKey;
 use blaze_own::{AVec, Alloc};
 use blaze_scope::names::{Why as PathWhy, Written};
-use blaze_scope::task::to_path;
+use blaze_scope::task::to_path_marked;
 use blaze_surface::{DefKind, Edition, Namespace, PathKind};
 use blaze_typeck::ItemKey;
 
@@ -192,6 +192,9 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
         }
         // The path, its first segment taken through the block imports around the row.
         let mut abs = row.abs;
+        // The mark of the path's first segment: the row's, or, once that segment is taken
+        // through a block import, that import's (its path's first segment is first then).
+        let mut first_mark = row.first_mark;
         let mut path: AVec<'_, &str> = AVec::new_in(alloc.clone());
         path.extend_from_slice(row.path);
         // Where the path is walked: the body's module, or the block module of the block `mod`
@@ -219,6 +222,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
                     through.extend_from_slice(&path[1..]);
                     path = through;
                     abs = local.abs;
+                    first_mark = local.first_mark;
                 }
                 // A block's type: only its variants are under it, never a trait. A block's
                 // trait: `use Tr as _;` names it, and it is in scope here already (its block
@@ -239,7 +243,9 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
         }
         let krate = self.names.crate_of(self.module).ok_or(Self::gap(row, UNRESOLVED))?;
         let krate_key = self.names.crate_key(krate).ok_or(Self::gap(row, UNRESOLVED))?;
-        let written = to_path(abs, &path, krate_key, alloc.clone());
+        // A `$crate` (or an opaque `crate`) a macro wrote names the macro's crate, by its mark
+        // (`Row::first_mark`): read as the names library reads a module's `use`.
+        let written = to_path_marked(abs, &path, first_mark, krate_key, alloc.clone());
         let w = Written { kind: written.kind, segments: &written.segments };
         if row.name == GLOB {
             return self.glob(row, w, krate, at, out, alloc);

@@ -27,7 +27,7 @@ use bstd::{
 
 use crate::{
     native_facts,
-    native_script::{NativeScript, NativeScriptError, files_under, remove, run_script},
+    native_script::{NativeScript, NativeScriptError, listed_under, remove, run_script},
     record::native_world,
     script::ScriptRun,
     script_sandbox::{
@@ -68,6 +68,9 @@ pub struct NativeSetting<'s> {
     pub work: &'s str,
     /// The deadline of one run (rule 18).
     pub deadline: Duration,
+    /// The command's jobserver ([`crate::jobserver`]): each run's children share the command's
+    /// workers through it. Never in a key (`blaze_build_script::env::Jobs`).
+    pub jobs: &'s crate::jobserver::Jobserver,
 }
 
 /// The native part of a run key, known before the run.
@@ -174,11 +177,10 @@ fn hex32(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// The `Version` of an `SDKSettings.json`'s text: the first `"Version"` key's string.
+/// The `Version` of an `SDKSettings.json`'s text as written: its top-level key's string, read
+/// by the SDK's one home (blaze-apple-sdk), so the run key and the linker hold one identity.
 pub fn sdk_version(settings: &str) -> Option<&str> {
-    let at = settings.find("\"Version\"")? + "\"Version\"".len();
-    let rest = settings[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
-    rest.split('"').next().filter(|v| !v.is_empty())
+    blaze_apple_sdk::settings_version(settings).map(|(written, _)| written)
 }
 
 /// A file's bytes through the effect layer.
@@ -198,8 +200,9 @@ fn fresh_folder(work: &str, rel: &str, files: &[(String, std::vec::Vec<u8>)], pa
     let folder = format!("{work}/{rel}");
     let failed = |why: String| NativeUnitError::Files { package: package.to_owned(), folder: folder.clone(), why };
     if Path::new(&folder).exists() {
-        for (name, _) in files_under(&folder).map_err(|e| failed(e.to_string()))? {
-            remove(&folder, &name).map_err(|e| failed(e.to_string()))?;
+        // Listed, never read: an earlier run's `OUT_DIR` may hold a C library's archive.
+        for left in listed_under(&folder).map_err(|e| failed(e.to_string()))? {
+            remove(&folder, &left.name).map_err(|e| failed(e.to_string()))?;
         }
     }
     let (io, root) = native_world(Path::new(work)).map_err(|e| failed(e.to_string()))?;
@@ -333,8 +336,8 @@ pub fn native_outputs<'a>(
         Tree::Dir(dir) => {
             let real = std::fs::canonicalize(dir).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: dir.display().to_string(), why: e.to_string() })?;
             let real = real.to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: dir.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
-            let names = files_under(&real).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: real.clone(), why: e.to_string() })?;
-            let names = names.into_iter().map(|(n, _)| n).collect();
+            let names = listed_under(&real).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: real.clone(), why: e.to_string() })?;
+            let names = names.into_iter().map(|listed| listed.name).collect();
             (real, names)
         }
         Tree::Mem { files, .. } => {
@@ -368,7 +371,15 @@ pub fn native_outputs<'a>(
     for (real, shown) in laid.shown.iter() {
         dep_shown.push((real.as_str(), shown.as_str()));
     }
+    // The home's file area: each file the script leaves goes there by digest, renamed, never
+    // read whole (librocksdb-sys's 810 MB archive); made once, canonical as Seatbelt's paths.
+    let area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
+    let area_failed = |why: String| NativeUnitError::Files { package: package.clone(), folder: area.display().to_string(), why };
+    std::fs::create_dir_all(&area).map_err(|e| area_failed(e.to_string()))?;
+    let area = std::fs::canonicalize(&area).map_err(|e| area_failed(e.to_string()))?;
+    let area = area.to_str().ok_or_else(|| area_failed("not UTF-8".to_owned()))?.to_owned();
     let run = NativeScript {
+        files: &area,
         program: &program,
         c,
         env: &run_env,
@@ -376,6 +387,7 @@ pub fn native_outputs<'a>(
         shown: &dep_shown,
         host_tools: &tools,
         facts: Some(&facts),
+        jobs: Some(native.jobs),
         limits: RunLimits::STANDARD,
         deadline: native.deadline,
     };

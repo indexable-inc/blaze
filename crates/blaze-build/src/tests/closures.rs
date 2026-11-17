@@ -380,6 +380,39 @@ fn a_closure_that_captures_nothing_is_called_directly() {
     assert_eq!(run(&w, &b, root, &lits), (3, 1));
 }
 
+/// A capture names the variable, whatever its pattern: chrono's
+/// `Parsed::to_naive_date::resolve_year` captures `Some(r @ 0..=99)`'s `r` in
+/// `|v| v.checked_add(r)` (tempo's census of 2026-11-17 04:35: refused with "a `ref` binding or a
+/// binding with a subpattern"). The Reference, "Identifier patterns": `r @ sub` binds `r` to
+/// the value `sub` matched; "Capture modes": the closure captures the variable `r`.
+/// `fn main() -> u64 { let a: u64 = 2; match a { r @ _ => { let f = |x| x + r; f(5) } } }` is 7.
+/// Fails without walk.rs `bind_capture_at` (the closure's `Fn::call` refused).
+#[test]
+fn a_closure_captures_a_binding_with_a_subpattern() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, a) = let_u64(&mut b, &mut lits, "a", 2);
+    let any = b.wild();
+    let r = b.bind_sub("r", any);
+    let x = b.bind("x");
+    let (sv, xe) = param_u64(&mut b, x);
+    let re = b.local(r);
+    let sum = bin(&mut b, BinOp::Add, xe, re);
+    let body = b.block(&[sv], Some(sum));
+    let clo = b.closure(&[x], body);
+    let f = b.bind("f");
+    let s1 = b.let_(f, None, clo);
+    let fe = b.local(f);
+    let five = lit(&mut b, &mut lits, 5);
+    let call = b.call(fe, &[five]);
+    let arm = b.block(&[s1], Some(call));
+    let ae = b.local(a);
+    let m = b.match_(ae, &[(r, arm)]);
+    let root = b.block(&[s0], Some(m));
+    assert_eq!(run(&w, &b, root, &lits), (7, 1));
+}
+
 /// `fn apply<F: <tr>(u64) -> u64>(f: F, x: u64) -> u64 { f(x); ..; f(x) }`, `f` called `calls`
 /// times, added to `w` (still open): `tr` is 0 `Fn`, 1 `FnMut`, 2 `FnOnce`. Returns its item,
 /// builder and root.

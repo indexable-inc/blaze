@@ -13,7 +13,7 @@ use blaze_typeck::{Def, Fetch, MissWhy, PathAnswer, PathMiss, PathPrefix};
 
 use super::keys::checker_of;
 use super::world_items::{BodyWorld, Gap};
-use crate::resolve::{Kind, Ns};
+use crate::resolve::{Kind, Ns, ResolveError};
 
 impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// The miss for the library's refusal `e` of `rest` (read at `module`, from the crate's
@@ -26,9 +26,22 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             Why::Ambiguous => MissWhy::Ambiguous,
             Why::NotAModule => MissWhy::NotAModule,
             Why::SuperPastRoot => MissWhy::SuperPastRoot,
-            Why::NotRead { .. } => MissWhy::NotRead,
-            Why::Unbounded => MissWhy::Unbounded,
-            Why::Refused { .. } => MissWhy::Refused,
+            // A macro call of the module was refused (its expansion may bind the name): a miss
+            // whose words blaze-cli body_types.rs files as the body not checked under that call,
+            // which the words name with why it was refused (path_miss_shown.rs).
+            Why::Refused { call, why, .. } => MissWhy::Refused {
+                call,
+                why: match why {
+                    blaze_surface::RefusedWhy::Expansion => blaze_typeck::Refusal::Expansion,
+                    blaze_surface::RefusedWhy::UnknownEnv => blaze_typeck::Refusal::UnknownEnv,
+                    blaze_surface::RefusedWhy::BuildScriptOutputs => blaze_typeck::Refusal::BuildScriptOutputs,
+                },
+            },
+            // Not known: a scope the path could resolve in was not read whole (a crate not
+            // read, a glob into one, the prelude), or a lookup through globs passed its bound.
+            // "Not found" is a fact only when every such scope was read (rule 3: never an E0425
+            // for a name that may exist); the body is not checked, and the note names the cause.
+            Why::NotRead { .. } | Why::Unbounded => return self.gap(Gap::Resolve(ResolveError::Path(e))),
             // The library was given no segment: the path has none to name.
             Why::Empty => return Ok(Err(PathMiss::Whole)),
         };

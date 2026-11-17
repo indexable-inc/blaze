@@ -121,7 +121,7 @@ fn a_closure_in_a_constant_is_a_pointer_to_its_call_once() {
     let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
     let mut consts = Consts::default();
     let key = block_key(owner, block, PROGRAM);
-    let line = match consts.body_value(&mut records, prepared, owner, BodyRoot::Block(block), key, blaze_typeck::PTys::EMPTY, &[], heap.alloc()) {
+    let line = match consts.body_value(&mut records, prepared, owner, BodyRoot::Block(block), key, blaze_typeck::PTys::EMPTY, &[], None, heap.alloc()) {
         Ok(rec) => match (rec.data.allocs.len(), rec.data.allocs.first()) {
             (1, Some(root)) if root.bytes.len() == 8 && root.relocs.len() == 1 && matches!(root.relocs[0].target, DataTarget::Fn(_)) => {
                 "closure fn pointer: one word, one fn relocation".to_string()

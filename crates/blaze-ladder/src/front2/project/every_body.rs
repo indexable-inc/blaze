@@ -42,7 +42,7 @@
 use blaze_own::{AVec, Alloc};
 use blaze_typeck::ItemKey;
 
-use super::super::keys::{MemberKind, checker_of};
+use super::super::keys::checker_of;
 use super::super::locals::LocalKind;
 use super::super::project_records::{BodySource, Listed, list_bodies};
 use super::{BodyAt, BodyRef, ProjectWorld};
@@ -128,7 +128,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     fn owner_of(&self, body: BodyRef<'n>) -> Option<ItemKey> {
         match body {
             BodyRef::Free(lib) => Some(checker_of(lib)),
-            BodyRef::Member { container, name, .. } => self.front.keys.filed_member(checker_of(container), MemberKind::Fn, name),
+            BodyRef::Member { container, kind, name, .. } => self.front.keys.filed_member(checker_of(container), kind, name),
         }
     }
 }

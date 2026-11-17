@@ -24,9 +24,9 @@
 //! [`World::body_sources`]; `prepared` is the declarative macros' prepared definitions a
 //! lowering asks for ([`Prepares`]).
 //!
-//! The builds survey's program ([`Front2Program::make_from`]) is made with no body sources
-//! yet (program.rs is not this file's): in a real world a body with a proc-macro call does not
-//! lower there; the `BUILDS:` line (or `BUILDS: no survey: ..`) says what that cost.
+//! The builds survey's program ([`Front2Program::make_from`]) is made with the same body
+//! sources as the walk ([`World::body_sources`]), so a body's proc-macro call, `env!` or
+//! include is answered there as in the walk.
 //!
 //! The lines are the test's own format strings, moved: one phrase of `REACHABLE:`, the test's
 //! `his main`, is the caller's [`Ask::label`], and the test passes exactly `his main`.
@@ -372,7 +372,7 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
                 Some(x) => x.1 += 1,
                 None => {
                     let mut first = AString::new_in(alloc);
-                    match records.keys.library(*k) {
+                    match records.keys.library_in(records.names, *k) {
                         Some(l) => write!(first, "{}: {detail}", shown(l))?,
                         None => write!(first, "{k:?}: {detail}")?,
                     }
@@ -398,13 +398,13 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
     // The survey's two lists are the global allocator's vectors of its API (program.rs, run.rs).
     let mut left_out = Default::default();
     let program = match ask.build_from {
-        BuildFrom::Main => Front2Program::survey(names, world.survey_frame, world.sources, &mut left_out, alloc),
+        BuildFrom::Main => Front2Program::make_from(names, world.survey_frame, world.sources, Some(&mut left_out), Starts::Main, world.body_sources, alloc).map(|made| made.program),
         BuildFrom::Roots => {
             let mut from: AVec<'_, LibKey> = AVec::with_capacity_in(walked.len(), alloc);
             for &i in walked.iter() {
                 from.push(mains[i].item);
             }
-            Front2Program::make_from(names, world.survey_frame, world.sources, Some(&mut left_out), Starts::Tests(&from), alloc).map(|made| made.program)
+            Front2Program::make_from(names, world.survey_frame, world.sources, Some(&mut left_out), Starts::Tests(&from), world.body_sources, alloc).map(|made| made.program)
         }
     };
     match program {

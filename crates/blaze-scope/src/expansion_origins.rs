@@ -17,10 +17,10 @@
 //! column (blaze-expand `OriginColumn::write`). A function of the call's text and its expansion's
 //! tokens only: equal for any builder (rule 25).
 
-use blaze_expand::origin_column::{ColumnError, InputShape, OriginColumn, OriginsRef};
+use blaze_expand::origin_column::{ColumnError, InputShape, OriginColumn, OriginsRef, input_places};
 use blaze_id::{ContentId, ItemKey};
 use blaze_own::{AVec, Alloc, Box};
-use blaze_surface::ItemIndex;
+use blaze_surface::{Edition, ItemIndex};
 
 use crate::resolve::At;
 
@@ -54,7 +54,8 @@ pub enum OriginsError {
     /// `Tables::add`).
     Unplaced { call: ItemKey },
     /// The text is not the call's rendering as the column places it: `what` names the text
-    /// (a call's statements read as items, a block's module text). A finding in it is filed at
+    /// (a call's statements read as items, a block's module text; a kept item's text has its
+    /// origins, [`kept`]). A finding in it is filed at
     /// its own place with this reason, never mapped by a guess.
     Rewritten { what: &'static str },
     /// The call's input is not a slice of the text it was lowered from.
@@ -67,6 +68,8 @@ pub enum OriginsError {
     Short { len: usize, want: usize },
     /// A tag or word of the head is no value it may hold.
     Head { what: &'static str, word: u32 },
+    /// A kept item's text ([`kept`]) does not lex, so its tokens have no places.
+    KeptLex { call: ItemKey },
 }
 
 impl core::fmt::Display for OriginsError {
@@ -87,6 +90,9 @@ impl core::fmt::Display for OriginsError {
                 write!(f, "an expansion's origins of {len} bytes are shorter than the {want} their head says (rule: blaze-scope expansion_origins.rs)")
             }
             OriginsError::Head { what, word } => write!(f, "an expansion's origins hold {word} as its {what} (rule: blaze-scope expansion_origins.rs)"),
+            OriginsError::KeptLex { call } => {
+                write!(f, "the kept item's text of call {call:?} does not lex, so its tokens have no places (rule: blaze-scope expansion_origins.rs `kept`)")
+            }
         }
     }
 }
@@ -129,13 +135,32 @@ pub fn write<'a>(
     Ok(Box::leak(out.into_boxed_slice()))
 }
 
-/// The column of `call`'s expansion from the renderer's places (`(token, start, end, root)` in
-/// token order: blaze-scope resolve.rs `render_with`; `root`: the `crate` written for that
-/// crate's `$crate`, whose row carries [`crate::crate_roots::root_mark`]) and the expansion's
-/// origins, input indexes carried into the call's text as written by `input`.
+/// The origins of keep call `call`'s text (resolve.rs `keep_item`: the item its derives' helper
+/// attributes keep, `#[derive(..)] #[helper(..)] struct S { .. }`), in `alloc`. The text IS the
+/// call's input as written (a slice of the calling text), so its column is the identity: token
+/// `i`, lexed as every reader lexes a call's input (blaze-expand `input_places`, the whole
+/// item), is input token `i` (tokens sharing one place: one row, the first's), with no mark (the lowering reads the kept text with none:
+/// resolve.rs `keep_item`, `Fragment::marks`). Its call part names the entry the call is at,
+/// the item itself: a reader of a head the kept item declares walks to that file entry and its
+/// `Signature` (blaze-cli body_types/covered.rs `callers`), and a finding in the text maps to
+/// the user's own tokens. A function of the text alone (rules 25, 71).
+pub fn kept<'a>(call: ItemKey, place: Option<CallInText>, text: &str, macro_name: &str, edition: Edition, alloc: Alloc<'a>) -> Result<&'a [u8], OriginsError> {
+    let places = input_places(text, InputShape::Whole, edition, alloc).map_err(|_| OriginsError::KeptLex { call })?;
+    // One row a PLACE, not a token: a doc comment's tokens, a lifetime's two and the groups one
+    // closer closes share one (blaze-expand `OriginColumn::input_identity`).
+    let column = OriginColumn::input_identity(&places, alloc).map_err(|error| OriginsError::Column { call: Some(call), error })?;
+    write(call, place, InputShape::Whole, macro_name, false, &column, alloc)
+}
+
+/// The column of `call`'s expansion from the renderer's places (`(start, end, token)` in token
+/// order: blaze-scope resolve.rs `render_with`) and its `roots` (`(place, crate)`, sorted by
+/// place: the `crate` written for that crate's `$crate`, whose row carries
+/// [`crate::crate_roots::root_mark`]) and the expansion's origins, input indexes carried into
+/// the call's text as written by `input`.
 pub fn column_of<'a>(
     call: ItemKey,
-    places: &[(usize, usize, usize, Option<blaze_id::CrateItemKey>)],
+    places: &[(u32, u32, u32)],
+    roots: &[(u32, blaze_id::CrateItemKey)],
     origins: &[blaze_expand::TokenOrigin],
     input: blaze_expand::origin_column::InputIndex<'_>,
     // Each token's innermost mark (drive.md, "A token keeps its mark": the same column):
@@ -145,7 +170,10 @@ pub fn column_of<'a>(
 ) -> Result<OriginColumn<'a>, OriginsError> {
     let mut column = OriginColumn::new_in(alloc);
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-    for &(token, start, end, root) in places {
+    let mut roots = roots.iter().peekable();
+    for (place, &(start, end, token)) in places.iter().enumerate() {
+        let (token, start, end) = (token as usize, start as usize, end as usize);
+        let root = roots.next_if(|(at, _)| *at as usize == place).map(|(_, krate)| *krate);
         let origin = origins.get(token).copied().ok_or(OriginsError::Places { call, tokens: count(origins.len()), places: count(places.len()) })?;
         // A root row is only placed for a marked `$crate` (the renderer's `dollar` is that mark's
         // crate): its edition is that mark's.

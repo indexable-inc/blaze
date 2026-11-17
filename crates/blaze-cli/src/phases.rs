@@ -89,7 +89,26 @@ pub struct Effects {
     pub runs: u64,
     pub publish: u64,
     pub prints: u64,
+    /// `prints` by part (main.rs `draw`): what the drawing does with each finding is named,
+    /// not guessed (rule 17).
+    pub print_parts: PrintParts,
     pub write_last: u64,
+}
+
+/// The parts of the drawing, in the order it does them (ns).
+#[derive(Clone, Copy, Default)]
+pub struct PrintParts {
+    /// Each finding's words and file said, then each placed in its file with its id
+    /// (print.rs `list`, fix.rs `lengths`).
+    pub listing: u64,
+    /// The findings sorted by cause: the waited grouped by root, the counted kept.
+    pub grouping: u64,
+    /// The note lines: failures, causes, items and tasks not checked.
+    pub notes: u64,
+    /// The code's findings drawn, each file read again.
+    pub findings: u64,
+    /// The failures drawn last, with the count under each.
+    pub roots: u64,
 }
 
 impl Phases {
@@ -230,6 +249,8 @@ impl fmt::Display for Phases {
             "request      steps {} gets {} puts {} runs {} publish {} prints {} write last {} (ns)",
             r.steps, r.gets, r.puts, r.runs, r.publish, r.prints, r.write_last
         )?;
+        let p = r.print_parts;
+        writeln!(f, "prints       listing {} grouping {} notes {} findings {} roots {} (ns)", p.listing, p.grouping, p.notes, p.findings, p.roots)?;
         if let Some(h) = self.frames {
             writeln!(
                 f,
@@ -237,6 +258,7 @@ impl fmt::Display for Phases {
                 h.request, h.scratch, h.batch, h.scope, h.bodies
             )?;
             write!(f, "{}", h.tasks)?;
+            write!(f, "{}", h.scope_bytes)?;
         }
         write!(f, "{}", self.records)?;
         if let Some(tally) = self.code_records {
@@ -257,6 +279,33 @@ impl fmt::Display for Phases {
         if let Some(calls) = &self.first_chunk {
             memory_line(f, "by the first chunk", calls)?;
         }
-        memory_line(f, "by the profile", &blaze_mem::syscalls::snapshot())
+        memory_line(f, "by the profile", &blaze_mem::syscalls::snapshot())?;
+        held_line(f, &blaze_mem::tag::snapshot())
     }
+}
+
+/// The `memory held` line: where the command's peak footprint can sit, each number blaze-mem's
+/// own counter (rule 17: a peak the task frames do not explain is named by its holder). The
+/// regions' committed bytes at most and now, what of them is purged (out of the footprint), each
+/// tag's most held in regions and in the global heap, the global heap outside any tag now, and
+/// what the global allocator says it committed. High waters are each their own counter's, not
+/// one instant's: a tag whose high water nears the command's peak footprint holds it.
+fn held_line(f: &mut fmt::Formatter<'_>, s: &blaze_mem::tag::Snapshot) -> fmt::Result {
+    write!(
+        f,
+        "memory       held (bytes): regions committed most {} now {} purged {} · global heap outside tags now {} · global allocator committed {}",
+        s.committed_high_water,
+        s.committed,
+        s.purged,
+        s.heap_outside,
+        s.heap_committed.map_or(-1, i128::from),
+    )?;
+    write!(f, " · by tag (most in regions, most in the heap):")?;
+    for tag in blaze_mem::Tag::ALL {
+        let c = s.get(tag);
+        if c.high_water > 0 || c.heap_high_water > 0 {
+            write!(f, " · {tag} {} {}", c.high_water, c.heap_high_water)?;
+        }
+    }
+    writeln!(f)
 }

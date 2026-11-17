@@ -361,21 +361,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 "#;
 
-/// [`SIDES`]' units as blaze-unit-graph makes them with tests asked (`blaze check`): 0 `reg`
-/// for the target, 1 `reg` for the host, 2 `helper` for the target, 3 `helper` for the host,
-/// 4 `pm` (proc macro, on the host's `helper` and `reg`), 5 `pm`'s library test harness (a
-/// target unit on the target's `helper` and `reg`: resolve.rs `Kind::TestLib`), 6 `app` (on
-/// the target's `helper` and on `pm`, its build script unit 7), 7 `app`'s build script (on
-/// the host's `bdep`), 8 `bdep` for the host.
+/// [`SIDES`]' units as blaze-unit-graph makes them with tests asked (`blaze check`), resolver
+/// 2: 0 `reg` for the target with feature `f` (which `app` turns on), 1 `reg` for the host
+/// without it, 2 `helper` for the target, 3 `helper` for the host, 4 `pm` (proc macro, on the
+/// host's `helper` and `reg`, its build script unit 9), 5 `pm`'s library test harness (a HOST
+/// unit on the host's `helper` and `reg`, as the proc macro: resolve.rs `Kind::TestLib`), 6
+/// `app` (on the target's `helper` and on `pm`, its build script unit 7), 7 `app`'s build
+/// script (on the host's `bdep`), 8 `bdep` for the host, 9 `pm`'s build script.
 fn sides_world() -> World<'static> {
     let lock: &'static Lock<'static> = StdBox::leak(StdBox::new(Lock::read(SIDES.as_bytes(), a()).expect("the lock reads")));
     let mut units = AVec::new_in(a());
-    units.push(unit(lock, "reg", UnitKind::Lib, false, &[]));
+    let mut reg = unit(lock, "reg", UnitKind::Lib, false, &[]);
+    reg.features.push(t("f"));
+    reg.cfg.push(CfgAtom::pair("feature", "f", a()));
+    units.push(reg);
     units.push(unit(lock, "reg", UnitKind::Lib, true, &[]));
     units.push(unit(lock, "helper", UnitKind::Lib, false, &[("reg", 0)]));
     units.push(unit(lock, "helper", UnitKind::Lib, true, &[("reg", 1)]));
-    units.push(unit(lock, "pm", UnitKind::ProcMacro, true, &[("helper", 3), ("reg", 1)]));
-    units.push(unit(lock, "pm", UnitKind::Test { bin: None }, false, &[("helper", 2), ("reg", 0)]));
+    let mut pm = unit(lock, "pm", UnitKind::ProcMacro, true, &[("helper", 3), ("reg", 1)]);
+    pm.build_script = Some(UnitId(9));
+    units.push(pm);
+    let mut harness = unit(lock, "pm", UnitKind::Test { bin: None }, true, &[("helper", 3), ("reg", 1)]);
+    harness.cfg.push(CfgAtom::flag("test", a()));
+    harness.build_script = Some(UnitId(9));
+    units.push(harness);
     let mut app = unit(lock, "app", UnitKind::Lib, false, &[("helper", 2), ("pm", 4)]);
     app.build_script = Some(UnitId(7));
     units.push(app);
@@ -383,6 +392,9 @@ fn sides_world() -> World<'static> {
     script.root = t("build.rs");
     units.push(script);
     units.push(unit(lock, "bdep", UnitKind::Lib, true, &[]));
+    let mut pm_script = unit(lock, "pm", UnitKind::BuildScript, true, &[]);
+    pm_script.root = t("build.rs");
+    units.push(pm_script);
     let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2 }));
     let reg = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
     let mut places = Places { lock, dep: StdBox::leak(reg.into_boxed_slice()) };
@@ -392,13 +404,20 @@ fn sides_world() -> World<'static> {
     world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
 }
 
+/// The crate `helper` of `side` in `w`.
+fn helpers_of(w: &World<'static>, side: Side) -> usize {
+    (0..w.crates.len()).find(|c| w.crates[*c].input.name == "helper" && w.crates[*c].side == side).unwrap_or_else(|| panic!("no helper on {side:?}"))
+}
+
 /// check_scope.rs `check_side`: every owner of [`SIDES`] has a scope on the side it is built
 /// for, and every crate of it is that side's (a proc macro aside, seen for its macros):
 /// - `pm` (a member proc macro) on the macro side, over the macro side's `helper` and `reg`;
-/// - `pm`'s library test harness on the macro side too: the list points its edges at the macro
-///   side's copies while the world files it among the target's crates (side Target), so a
-///   side read from its row, the rule before, refuses its first edge; tempo's 208
-///   `task-failed` rows of `crates/precompiles-macros/src/*.rs` (2026-11-17 03:49);
+/// - `pm`'s library test harness on the macro side too, a host unit of the graph as the proc
+///   macro is (cargo builds it for the host with host features); its row says Macro, its cfg
+///   is the side's (no host `target_os`, with `test`), and its build-script run is the macro
+///   side's (`pm`'s subject on Macro), as the proc macro's;
+/// - feature `f` of `reg`, which `app` turns on, is on the target side's `reg` only: the macro
+///   side's one copy of `reg` (shared by `pm`, the harness and `helper`) has no `f`;
 /// - `helper`, built for both sides: two crates under two keys, each an owner checked on its
 ///   side over its side's `reg`;
 /// - `app` on the target side, `pm` seen for its macros only; its build script and the
@@ -433,8 +452,30 @@ fn every_owner_is_checked_on_the_side_it_is_built_for() {
     let side_of = |owner: usize| check_side(&w, owner).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(side_of(pm), Side::Macro, "a member proc macro is checked on the macro side");
     assert_eq!(side_of(harness), Side::Macro, "its library test harness is the same code, built for the macro side");
-    assert_eq!(w.crates[harness].side, Side::Target, "the harness's row says Target: the rule before read the side from it");
+    assert_eq!(w.crates[harness].side, Side::Macro, "the harness's row says Macro");
+    assert_eq!(w.crates[pm].side, Side::Macro, "the proc macro's row says Macro");
     assert!(w.crates[harness].input.deps.iter().all(|(_, d)| w.crates[*d].side == Side::Macro), "the list points the harness's edges at the macro side");
+    // The member proc macro and its harness: the side's cfg, and the side's build-script run.
+    for (code, test) in [(pm, false), (harness, true)] {
+        let c = &w.crates[code];
+        assert!(!c.input.cfg.contains(&("target_os", Some("macos"))), "`{}` has the macro side's cfg, not the host unit's: {:?}", c.input.name, c.input.cfg);
+        assert_eq!(c.input.cfg.contains(&("test", None)), test, "`test` is the harness's only: {:?}", c.input.cfg);
+        assert!(c.input.cfg.contains(&("proc_macro", None)) != test, "`proc_macro` is the proc macro's: {:?}", c.input.cfg);
+        let subject = crate::script_subject("pm", "0.1.0", Side::Macro, &[], a());
+        assert_eq!(c.script, crate::Script::Read { subject }, "`{}` reads pm's build script run on the macro side", c.input.name);
+    }
+    // Resolver 2: `app`'s feature `f` of `reg` is the target side's only; the macro side has
+    // one `reg`, shared by every crate of it, without `f`.
+    let regs: StdVec<usize> = (0..w.crates.len()).filter(|c| w.crates[*c].input.name == "reg").collect();
+    assert_eq!(regs.len(), 2, "one `reg` per side: {regs:?}");
+    for &r in regs.iter() {
+        let has_f = w.crates[r].input.features.contains(&"f") && w.crates[r].input.cfg.contains(&("feature", Some("f")));
+        assert_eq!(has_f, w.crates[r].side == Side::Target, "`reg` on {:?}: feature `f` iff the target's", w.crates[r].side);
+    }
+    let side_reg = regs.iter().copied().find(|r| w.crates[*r].side == Side::Macro).expect("the macro side's reg");
+    for asker in [pm, harness, helpers_of(&w, Side::Macro)] {
+        assert!(w.crates[asker].input.deps.iter().any(|(n, d)| *n == "reg" && *d == side_reg), "`{}` on the macro side asks the one macro-side `reg`", w.crates[asker].input.name);
+    }
     assert_eq!(side_of(helper), Side::Target);
     assert_eq!(side_of(app), Side::Target);
     let app_scope = check_scope(&w, app, false, a()).unwrap_or_else(|e| panic!("{e}"));

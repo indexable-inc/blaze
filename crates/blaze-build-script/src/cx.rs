@@ -8,7 +8,7 @@
 //! invalidates exactly the items that read it; no machine path enters a key (rule 25).
 
 use crate::outputs::OutputsRef;
-use blaze_expand::{ExpandCx, HostError, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced, TokenStream};
+use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced, TokenStream};
 use blaze_own::Alloc;
 
 /// `inner` with the outputs of the crate's build script `out` laid over it, read in place from
@@ -38,8 +38,10 @@ impl<C: ExpandCx> ExpandCx for ScriptCx<'_, C> {
         let Some(file) = self.out.file_at(path) else {
             return self.inner.include(path, how);
         };
+        // A stored file (a native script's `OUT_DIR` file) is read from the record's file area,
+        // this one file only; one it cannot read is an unreadable include, never no file.
         Ok(match file {
-            Some(bytes) => Included::Bytes(bytes),
+            Some(file) => Included::Bytes(self.out.bytes_of(file).map_err(|_| HostError { ask: HostAsk::Include, why: HostWhy::Unreadable })?),
             None => Included::Missing,
         })
     }

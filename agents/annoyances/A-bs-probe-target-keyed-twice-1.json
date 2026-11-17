@@ -1,0 +1,12 @@
+{
+ "id": "A-bs-probe-target-keyed-twice-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane BS",
+ "where": "crates/blaze-build-script probe.rs (before probe_ask.rs)",
+ "what": "Every pinned try-compile row was keyed with `--target aarch64-apple-darwin` in its arguments and the target again from the host, so a macro-side probe for wasm32-wasip1 (thiserror, rustix, proc-macro2) never found its row and tempo's check stopped on CannotAnswerYet.",
+ "cost": "three CannotAnswerYet stops on tempo's check, each read as a missing row",
+ "cause": "the key held the target twice, once as written in the row's arguments and once as the side's triple",
+ "workaround": "none",
+ "fix": "probe_ask::Compile::key keys the target once (its --target, else the host); rows name no --target and are made per side",
+ "state": "fixed"
+}

@@ -19,7 +19,7 @@ use crate::condition::{Condition, ConditionError, MOST_ATOMS, MOST_CONDITIONS, O
 use crate::key::{self, ABSENT, Key, Kind, Name, Tool};
 use crate::owners::{self, Root as OwnerRoot};
 use crate::profile::Profile;
-use crate::record::{self, Finding, Locate, Part, PathOf, Stored, Whole, WholeView};
+use crate::record::{self, Finding, Locate, Part, PathOf, ShapeView, Stored, Whole, WholeView};
 use crate::run_scope::Closure;
 use crate::table::{Hashed, Set, Table, spread};
 use crate::wire::{NAME_BYTES, Reader, WireError, Writer};
@@ -413,6 +413,10 @@ pub struct Task<'a> {
 pub struct Print<'a> {
     /// The item (a base name, never a fork's).
     pub name: Name,
+    /// The other names whose records held this same finding, printed once under `name` (a
+    /// crate's finding that a library and its test unit both hold), by name: a task that waited
+    /// on one of them waited on this failure.
+    pub also: Vec<Name, Alloc<'a>>,
     /// The configurations it holds in: every one that implies this (bottom.md 11: a finding
     /// carries the reduced condition it was found under).
     pub condition: Condition,
@@ -569,6 +573,10 @@ pub enum DriveError {
     /// The record of `name` refused the lookup of a cell its reader read: its payload is not
     /// of the form its kind's [`crate::CellOf`] reads.
     CellRefused { name: Name, cell: Cell, what: &'static str },
+    /// The lookup of `name` (task key `key`) followed more than [`key::MOST_SHAPE_STEPS`]
+    /// shapes, each naming the next value key (`Walk`): a chain that long, or one that names
+    /// itself, is the drive's bug (rule 18).
+    ShapeSteps { name: Name, key: Key },
 }
 
 impl fmt::Display for DriveError {
@@ -655,6 +663,11 @@ impl fmt::Display for DriveError {
             DriveError::CellRefused { name, cell, what } => {
                 write!(f, "the record of {name} refused the lookup of cell {:02x}{:02x}{:02x}{:02x}: {what}", cell.0[0], cell.0[1], cell.0[2], cell.0[3])
             }
+            DriveError::ShapeSteps { name, key } => write!(
+                f,
+                "the lookup of {name} (key {key}) followed more than {} shapes, each naming the next value key (rule 18; blaze-drive's bug)",
+                key::MOST_SHAPE_STEPS
+            ),
         }
     }
 }
@@ -718,6 +731,11 @@ struct Job<'a> {
     /// lists hold at most one entry per advance (no `contains` scan) and a job is woken by the
     /// first of its waits to settle, then waits again on the next.
     parked: bool,
+    /// The answer-table pages it waits for ([`Request::page_wait`]), not under `parked`: a page
+    /// wait is counted, and the job is woken once the last of them is in. Under `parked`, a job
+    /// whose ~750 reads sat on ~750 pages (one tempo body edit) was woken per page and walked
+    /// its whole shape again each time: 828 steps, 172.6 ms (check-g051344-body).
+    pages_due: u32,
     /// The names its next run is handed, sorted.
     needs: Vec<Name, Alloc<'a>>,
     /// The read names its value key is made of.
@@ -727,6 +745,46 @@ struct Job<'a> {
     /// Jobs waiting on this one.
     waiters: Vec<Name, Alloc<'a>>,
     members: Vec<Name, Alloc<'a>>,
+    /// Where its lookup by shapes went this decide ([`Walk`]).
+    walk: Walk,
+}
+
+/// A job's lookup by shapes since it was last decided (drive.md, "Records and validity").
+///
+/// What a task reads is a function of its key AND of the answers to its earlier reads: a body
+/// resolves a name, and what it reads next follows from what the name resolved to (`f` removed:
+/// it reads its file's surface and no `Signature` of `f`). So one task key can rightly hold
+/// records of different read NAMES, each valid for its own answers. The store is written once a
+/// key, so the shapes form a chain from the task key: the shape there names the first record's
+/// reads; their digests today make a value key, which holds that record (valid today), or the
+/// shape of a record made when those digests were these (follow it), or nothing (a hole: the
+/// task runs, and its record's shape goes there unless the record is at the hole itself). The
+/// record itself is always at the value key of its own reads, so the row's shortcut finds it.
+///
+/// Two VALUES under one key stay refused (rule 21) exactly where the principle says: a record
+/// whose every read was answered as a held record's (or as a held shape's names were) and which
+/// still differs is a put of other bytes at one key (the store's `TwoValues`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Walk {
+    /// Shapes followed past the task key's (the task key's own is step 1; 0: the value key came
+    /// from the job's row, not from a shape).
+    step: u32,
+    /// The key the walk found nothing at: a record made now that reads names puts its shape
+    /// there. `None`: the job runs without having walked (a `Given` read not yet answered).
+    hole: Option<Key>,
+    /// The hole is a value key reached by a shape (not the task key): a record of that shape's
+    /// own read names puts no shape there, which would name itself.
+    hole_by_shape: bool,
+    /// The task key holds a shape: a record that reads nothing is then at the value key of no
+    /// reads, never at the task key.
+    shaped: bool,
+    /// The value key the row's read names missed at: the walk from the task key does not ask it
+    /// again.
+    row_miss: Option<Key>,
+}
+
+impl Walk {
+    const NONE: Walk = Walk { step: 0, hole: None, hole_by_shape: false, shaped: false, row_miss: None };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1181,6 +1239,13 @@ impl<'a> Request<'a> {
     /// The tasks that failed this run, in the order they came.
     pub fn failures(&self) -> &[TaskFailure] {
         &self.failures
+    }
+
+    /// The item `name` is about: a fork's base, any other name itself. A [`Print`]'s name is a
+    /// base; a task's inputs may be forks, so a caller naming what a task waited on gives its
+    /// base, the name the failure is printed under.
+    pub fn base_of(&self, name: Name) -> Name {
+        self.cond_of(name).0
     }
 
     fn failed(&self) -> u32 {
@@ -1769,8 +1834,26 @@ impl<'a> Request<'a> {
                     };
                     self.pages.insert(index, PageState::Loaded(page));
                     if let Some(waiters) = self.page_waiters.remove(&index) {
+                        // The planted bug wakes a job once a page, as `Job::parked` did: a job's
+                        // entries on one page lie together (one advance put them).
+                        let mut woke: Option<Name> = None;
                         for name in waiters.iter() {
-                            self.wake.push_back(*name);
+                            if self.plant == Plant::WakePerPage && woke == Some(*name) {
+                                continue;
+                            }
+                            let last = match self.jobs.get_mut(name) {
+                                // Saturating: a name dropped and made a job again while on a
+                                // list counts from zero, and is at most woken once early.
+                                Some(job) => {
+                                    job.pages_due = job.pages_due.saturating_sub(1);
+                                    job.pages_due == 0 || self.plant == Plant::WakePerPage
+                                }
+                                None => true,
+                            };
+                            if last {
+                                woke = Some(*name);
+                                self.wake.push_back(*name);
+                            }
                         }
                     }
                 }
@@ -1924,11 +2007,13 @@ impl<'a> Request<'a> {
                 stood: false,
                 queue_gen: 0,
                 parked: false,
+            pages_due: 0,
                 needs: Vec::new_in(a.clone()),
                 shape: Vec::new_in(a.clone()),
                 shape_cells: Vec::new_in(a.clone()),
                 waiters: Vec::new_in(a.clone()),
                 members: Vec::new_in(a),
+                walk: Walk::NONE,
             },
         );
         if name.kind == Kind::Units {
@@ -2205,23 +2290,25 @@ impl<'a> Request<'a> {
             }
             None => {
                 let key = root.pages[index as usize];
+                // An empty page is in hand at once: no wait is counted for it.
+                if key == Key::default() {
+                    self.pages.insert(index, PageState::Loaded(HeldPage::empty()));
+                    return true;
+                }
                 self.pages.insert(index, PageState::Loading);
                 self.page_wait(index, waiter);
-                match key == Key::default() {
-                    true => {
-                        self.pages.insert(index, PageState::Loaded(HeldPage::empty()));
-                        self.wake.push_back(waiter);
-                    }
-                    false => self.get(key, Purpose::Page(index), out),
-                }
+                self.get(key, Purpose::Page(index), out);
                 false
             }
         }
     }
 
+    /// `waiter` waits for page `index`: a job counts it ([`Job::pages_due`]) and is woken with
+    /// the last of its pages, so one advance asks every page its reads sit on and the next sees
+    /// them all. A name with no job (the cli's own) is woken by each.
     fn page_wait(&mut self, index: u32, waiter: Name) {
-        if !self.park(waiter) {
-            return;
+        if let Some(job) = self.jobs.get_mut(&waiter) {
+            job.pages_due += 1;
         }
         match self.page_waiters.get_mut(&index) {
             Some(list) => list.push(waiter),
@@ -2894,7 +2981,9 @@ impl<'a> Request<'a> {
     }
 
     fn decide(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
-        let job = self.jobs.get(&name).expect("a job");
+        let job = self.jobs.get_mut(&name).expect("a job");
+        // Each decide walks afresh: today's digests may have moved since the last.
+        job.walk = Walk::NONE;
         let (key, recheck) = (job.key, job.recheck);
         if name.kind == Kind::Group {
             self.set_state(name, State::Queued);
@@ -3028,6 +3117,10 @@ impl<'a> Request<'a> {
         if let Ok(released) = self.walked.binary_search(&name) {
             self.walked.remove(released);
         }
+        // The task key's shape names the row's reads: the store was asked this key already.
+        if job.walk.step > 0 && job.walk.row_miss == Some(at) {
+            return self.valued(name, at, None, out);
+        }
         self.get(at, Purpose::Value(name), out);
         Ok(())
     }
@@ -3036,24 +3129,39 @@ impl<'a> Request<'a> {
         if self.state(name) != Some(State::Looking) {
             return Ok(());
         }
-        let Some(bytes) = bytes else { return self.to_run(name, out) };
+        let Some(bytes) = bytes else {
+            let job = self.jobs.get_mut(&name).expect("a job");
+            job.walk.hole = Some(key);
+            job.walk.hole_by_shape = false;
+            return self.to_run(name, out);
+        };
         match record::open(bytes).map_err(|error| DriveError::Wire { key, error })? {
             Stored::Whole(view) => self.found(name, key, view, out),
             Stored::Shape(shape) => {
-                if shape.name != name {
-                    return Err(DriveError::WrongRecord { key, asked: name, held: shape.name });
-                }
-                let mut names = Vec::with_capacity_in(shape.names().len(), self.alloc);
-                names.extend(shape.names());
-                let mut cells = Vec::with_capacity_in(shape.cells().len(), self.alloc);
-                cells.extend(shape.cells());
-                let job = self.jobs.get_mut(&name).expect("a job");
-                job.shape = names;
-                job.shape_cells = cells;
-                job.state = State::Value;
-                self.value(name, out)
+                self.jobs.get_mut(&name).expect("a job").walk.shaped = true;
+                self.follow(name, key, shape, out)
             }
         }
+    }
+
+    /// The shape `shape` was found at `key` on `name`'s walk: its read names, with today's
+    /// digests, are the next value key ([`Walk`]). At most [`key::MOST_SHAPE_STEPS`] a decide
+    /// (rule 18).
+    fn follow(&mut self, name: Name, key: Key, shape: ShapeView<'_>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        if shape.name != name {
+            return Err(DriveError::WrongRecord { key, asked: name, held: shape.name });
+        }
+        let job = self.jobs.get_mut(&name).expect("a job");
+        if job.walk.step >= key::MOST_SHAPE_STEPS {
+            return Err(DriveError::ShapeSteps { name, key: job.key });
+        }
+        job.walk.step += 1;
+        job.shape.clear();
+        job.shape.extend(shape.names());
+        job.shape_cells.clear();
+        job.shape_cells.extend(shape.cells());
+        job.state = State::Value;
+        self.value(name, out)
     }
 
     fn valued(&mut self, name: Name, key: Key, bytes: Option<&[u8]>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
@@ -3066,10 +3174,27 @@ impl<'a> Request<'a> {
             self.set_state(name, State::Gather);
             return self.owners(name, out);
         }
-        let Some(bytes) = bytes else { return self.to_run(name, out) };
+        let Some(bytes) = bytes else {
+            let job = self.jobs.get_mut(&name).expect("a job");
+            if job.walk.step == 0 {
+                // The row's read names, with today's digests, name no record: the reads that moved
+                // may lead to other names (a callee removed). The walk from the task key finds a
+                // record of other names made under these answers, or the hole it goes in.
+                job.walk.row_miss = Some(key);
+                let task = job.key;
+                self.set_state(name, State::Looking);
+                self.get(task, Purpose::Look(name), out);
+                return Ok(());
+            }
+            job.walk.hole = Some(key);
+            job.walk.hole_by_shape = true;
+            return self.to_run(name, out);
+        };
         match record::open(bytes).map_err(|error| DriveError::Wire { key, error })? {
             Stored::Whole(view) => self.found(name, key, view, out),
-            Stored::Shape(shape) => Err(DriveError::WrongRecord { key, asked: name, held: shape.name }),
+            // An `Owners` record is never found by a shape (`made_split`).
+            Stored::Shape(shape) if name.kind == Kind::Owners => Err(DriveError::WrongRecord { key, asked: name, held: shape.name }),
+            Stored::Shape(shape) => self.follow(name, key, shape, out),
         }
     }
 
@@ -3171,7 +3296,7 @@ impl<'a> Request<'a> {
     /// [`Request::made`], for a split's record too (`split` its variable).
     fn made_split(&mut self, output: &Output<'_>, split: Option<Var>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let job = self.jobs.get(&output.name).expect("checked by the caller");
-        let (key, source) = (job.key, job.source);
+        let (key, source, walk) = (job.key, job.source, job.walk);
         // A worker names its reads by base name; the record holds the names its condition
         // implies (stored under the condition it read), so a fork's change dirties exactly the
         // readers of that fork.
@@ -3234,15 +3359,38 @@ impl<'a> Request<'a> {
         };
         let bytes = record::write_whole(&whole, self.alloc);
         let at = match reads.is_empty() && cells.is_empty() {
-            true => key,
+            // Valid by its key alone, unless the task key holds a shape (records of this key
+            // read names before): then it is at the value key of no reads, found by a shape.
+            true if !walk.shaped => key,
             // An `Owners` key holds no text its parents follow from, so its read names move
             // under one key: no shape there (it is never looked up by one, `decide`), only the
             // record at its value key, which its reads make unique.
-            false if output.name.kind == Kind::Owners => key::value_key_with_cells(key, &reads, &cells),
-            false => {
-                let shape = record::write_shape(output.name, &reads, &cells, self.alloc);
-                self.put(key, shape, out);
-                key::value_key_with_cells(key, &reads, &cells)
+            _ if output.name.kind == Kind::Owners => key::value_key_with_cells(key, &reads, &cells),
+            _ => {
+                // The record is at the value key of its own reads; its shape goes in the hole
+                // its walk found ([`Walk`]): the task key on a first make, else the value key
+                // whose answers it was made under. No shape when the record is the hole itself,
+                // when the hole was reached by a shape of these very names (it would name
+                // itself), when a read is not today's (valid for its own reads only, decided
+                // again), or when the job ran without walking.
+                let at = key::value_key_with_cells(key, &reads, &cells);
+                let walk = match self.plant {
+                    Plant::ShapeAtTaskKey => Walk { hole: Some(key), hole_by_shape: false, ..walk },
+                    _ => walk,
+                };
+                let same_names = || {
+                    reads.iter().map(|(read, _)| *read).eq(self.jobs.get(&output.name).expect("a job").shape.iter().copied())
+                        && cells.iter().map(|read| (read.name, read.cell)).eq(self.jobs.get(&output.name).expect("a job").shape_cells.iter().copied())
+                };
+                if let Some(hole) = walk.hole
+                    && hole != at
+                    && !stale
+                    && !(walk.hole_by_shape && same_names())
+                {
+                    let shape = record::write_shape(output.name, &reads, &cells, self.alloc);
+                    self.put(hole, shape, out);
+                }
+                at
             }
         };
         // The view is of the bytes written: the same path as a found record (one home).
@@ -4229,8 +4377,14 @@ impl<'a> Request<'a> {
         }
         let removed = self.dropped.iter().filter(|name| self.old(**name).is_some()).count() as u64;
         let rows = (old_rows + added).saturating_sub(removed);
-        let bits = answers::bits_for(rows);
+        // The table's size, which its paging is sized by (`answers::PAGE_BYTES`): the last root's
+        // mean row over today's rows; with no root, this run's rows and reader entries.
+        let bytes = match &self.root {
+            Some(root) if root.rows > 0 => rows.saturating_mul(root.bytes / root.rows),
+            _ => self.new.iter().map(|(_, row)| answers::row_bytes(row)).sum::<u64>() + answers::reader_bytes(updates.len(), cell_updates.len()),
+        };
         let old_bits = self.root.as_ref().map(|root| root.bits);
+        let bits = answers::bits_kept(bytes, old_bits);
         // Page indices collected, then sorted once (an insert into a sorted set per name would
         // shift: O(names x pages)).
         let mut wanted = Vec::new_in(a.clone());
@@ -4393,10 +4547,26 @@ impl<'a> Request<'a> {
             self.new.remove(target);
             self.dropped.insert(*target);
         }
+        // The pages' bytes in all: the last root's less the pages rewritten (each loaded above),
+        // plus what replaces them; every page when the paging changed.
+        let mut total = match (&self.root, old_bits) {
+            (Some(root), Some(old_bits)) if old_bits == bits => {
+                let replaced: u64 = touched
+                    .iter()
+                    .map(|index| match self.pages.get(index) {
+                        Some(PageState::Loaded(page)) => page.byte_len() as u64,
+                        _ => 0,
+                    })
+                    .sum();
+                root.bytes.saturating_sub(replaced)
+            }
+            _ => 0,
+        };
         for (index, bytes) in written {
             let key = match bytes {
                 None => Key::default(),
                 Some(bytes) => {
+                    total += bytes.len() as u64;
                     let key = key::content_key(&bytes);
                     self.profile.pages_written += 1;
                     self.put(key, bytes, out);
@@ -4405,7 +4575,7 @@ impl<'a> Request<'a> {
             };
             page_keys[index as usize] = key;
         }
-        let root = Root { bits, rows, pages: page_keys };
+        let root = Root { bits, rows, bytes: total, pages: page_keys };
         let root_bytes = answers::write_root(&root, a.clone());
         let root_key = key::content_key(&root_bytes);
         self.put(root_key, root_bytes, out);
@@ -4553,14 +4723,23 @@ impl<'a> Request<'a> {
             again.push(false);
         }
         by_what.sort_unstable_by(|x, y| what(*x).cmp(&what(*y)).then(x.cmp(y)));
+        // (the row kept, a name whose copy was dropped): each copy's name, given with the one
+        // printed (`Print::also`).
+        let mut also_of: Vec<(u32, Name), Alloc<'a>> = Vec::new_in(self.alloc);
         // The planted bug: each name's copy is a finding of its own.
         if self.plant != Plant::PrintEachName {
+            let mut kept = 0usize;
             for at in 1..by_what.len() {
                 if what(by_what[at - 1]) == what(by_what[at]) {
                     again[by_what[at] as usize] = true;
+                    also_of.push((by_what[kept], order[by_what[at] as usize].5.base));
+                } else {
+                    kept = at;
                 }
             }
         }
+        also_of.sort_unstable();
+        also_of.dedup();
         let is_error = self.config.is_error;
         let is_unchecked = self.is_unchecked;
         let (mut count, mut errors, mut unchecked) = (0, 0, 0);
@@ -4571,8 +4750,14 @@ impl<'a> Request<'a> {
             let finding = &entry.findings[*nth];
             let mut message = Vec::with_capacity_in(finding.message.len(), self.alloc);
             message.extend_from_slice(&finding.message);
+            let row = u32::try_from(at).expect("an answer's findings fit 32 bits");
+            let from = also_of.partition_point(|(kept, _)| *kept < row);
+            let to = also_of.partition_point(|(kept, _)| *kept <= row);
+            let mut also = Vec::with_capacity_in(to - from, self.alloc);
+            also.extend(also_of[from..to].iter().map(|(_, name)| *name).filter(|name| *name != entry.base));
             out.push(Effect::Print(Print {
                 name: entry.base,
+                also,
                 condition: entry.condition,
                 file: *file,
                 place: *place,

@@ -17,7 +17,7 @@
 //! check, for calls the check has not yet named; (3) a separate record is placed by its own
 //! name (store.rs `ToolchainCrates::place`), apart from the crate's.
 //!
-//! Form ([`FORMAT`] 2), little-endian, 16-aligned as a section: count u32, the FORMAT u32, 8 zero
+//! Form ([`FORMAT`] 3), little-endian, 16-aligned as a section: count u32, the FORMAT u32, 8 zero
 //! bytes, then `count` rows of 48 bytes sorted by call key (call key 32; the text's start u32 from
 //! the blob's start and its length u32; its origins' start u32 and length u32, length 0 when the
 //! text keeps none), then the blob: the texts in row order, then the origins in row order (the
@@ -34,8 +34,10 @@ use blaze_scope::resolve::CrateNames;
 const HEAD: usize = 16;
 /// One row: the call key, the text's start and length, the origins' start and length.
 const ROW: usize = 48;
-/// The section's form: 2 since the origins (0, the head's zero word, before).
-const FORMAT: u32 = 2;
+/// The section's form: 2 since the origins (0, the head's zero word, before); 3 since a kept
+/// item's text keeps its origins (blaze-scope expansion_origins.rs `kept`; before, none): a
+/// form-2 section is refused by name and its crate's record rebuilt (rule 26), never migrated.
+const FORMAT: u32 = 3;
 
 /// Why the section could not be written or read (rule: names/expansion_texts.rs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,7 +77,7 @@ impl core::fmt::Display for ExpansionTextsError {
 pub(crate) fn write(names: &CrateNames<'_>) -> Result<blaze_own::Vec<u8, Global>, ExpansionTextsError> {
     let mut calls: blaze_own::Vec<(ItemKey, &str, &[u8]), Global> = blaze_own::Vec::new_in(Global);
     // A text whose origins are `Err` (a call's statements read as items, a block's module text,
-    // a column that could not be made) keeps none: its reader answers "no origins kept", typed.
+    // a column that could not be made; a kept item's text keeps its own) keeps none: its reader answers "no origins kept", typed.
     calls.extend(names.expansions.iter().filter_map(|(k, e)| e.made.map(|m| (*k, m.text, m.origins.unwrap_or(&[])))));
     calls.sort_unstable_by_key(|c| c.0);
     let texts: usize = calls.iter().map(|c| c.1.len()).sum();

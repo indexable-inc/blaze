@@ -149,7 +149,8 @@ impl<'n> Front2Program<'n> {
                 roots.push(row.key);
             }
         }
-        let made = Self::make_from(names, frame, user, left_out, Starts::Tests(&roots), alloc).map_err(SuiteError::Program)?;
+        // A suite of given files: no package and no proc-macro runner, so no body sources.
+        let made = Self::make_from(names, frame, user, left_out, Starts::Tests(&roots), None, alloc).map_err(SuiteError::Program)?;
         let program = made.program;
         let mut rows: AVec<'a, SuiteRow<'r>> = AVec::with_capacity_in(listed.len(), alloc);
         let mut root = 0usize;

@@ -61,6 +61,7 @@ mod fn_traits;
 mod gat;
 mod holes;
 mod impl_const_params;
+mod instance_holes;
 mod infer_const_arg;
 mod legacy_const;
 mod lower_forms;

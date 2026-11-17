@@ -70,6 +70,8 @@ pub mod graph;
 mod group;
 pub mod include_place;
 pub mod left_reads;
+// The library features a toolchain crate declares for one cfg (the build-script probe's E0635).
+pub mod lib_features;
 pub mod included;
 pub mod items_record;
 // D116: names at module grain (tables of links, `Imports`, their part reads and the hop walk).

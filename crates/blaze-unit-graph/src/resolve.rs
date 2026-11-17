@@ -523,7 +523,19 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 };
                 add(key, &mut keys, &mut index, &mut tmp);
                 if self.ask.tests {
-                    add(Key::new(root, Kind::TestLib, 0, Side::Target, Side::Target), &mut keys, &mut index, &mut tmp);
+                    // A proc-macro library's test harness is that library's target compiled as a
+                    // test, so it is built for the host and resolves its dependencies' features
+                    // on the host's side, as the proc macro does (cargo: a target that is for the
+                    // host, a proc macro's, is compiled for the host whatever `--target` says, and
+                    // its features are the host dependency's). On the target side it took the
+                    // target's unified features: tempo's `tempo-precompiles-macros` harness then
+                    // reached `alloy-primitives` with the node's `asm-keccak`, and the macro side
+                    // was asked to run sha3-asm's native build script (check-g044908).
+                    let test = match lib.proc_macro {
+                        true => Key::new(root, Kind::TestLib, 0, Side::Host, self.fside(Side::Host)),
+                        false => Key::new(root, Kind::TestLib, 0, Side::Target, Side::Target),
+                    };
+                    add(test, &mut keys, &mut index, &mut tmp);
                 }
             }
             for i in 0..package.bins.len() as u32 {

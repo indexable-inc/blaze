@@ -18,7 +18,7 @@ use blaze_lower::typeck::TypeckBody;
 use blaze_own::Alloc;
 use blaze_typeck::{
     Adt, Checked, ExprId, FnSig, InferCtx, ItemKey, LangItem, List, Needs, Outcome, PTy, PTys, PatId, PortableTys, ResolveError,
-    resolve_instance, select_impl,
+    resolve_instance,
 };
 
 use crate::front::{At, FnKind, FnLang, Front, LitTexts};
@@ -162,12 +162,25 @@ pub trait FrontEnd {
     /// A call in fn `i`'s body of `item` at ground `args`, as the instance that runs: a trait's
     /// fn as the selected impl's (`blaze_typeck::resolve_instance` in `i`'s world).
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError>;
-    /// Whether trait `trait_` has an impl for `ty`, selected in fn `i`'s world.
-    fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError>;
+    /// Whether `ty: trait_` holds in fn `i`'s world, by the checker's own solver
+    /// (`blaze_typeck::holds`): an impl the language gives counts as a written one does (a
+    /// tuple's, a closure's, a fn item's or a fn pointer's `Copy`; clone_shim.rs asks it).
+    fn holds(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError>;
     /// ADT `adt`'s `Drop` impl, by the ADT's item alone in fn `i`'s world (blaze-typeck
     /// `adt_drop_impl`): a `Drop` impl covers every instance of its ADT (E0366/E0367), so no
     /// argument is imported and nothing is selected. Its scratch lives in `alloc`, the caller's.
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError>;
+    /// Makes what the instance questions (`resolve`, `selects`, `adt_drop_impl`, `normalize`)
+    /// asked and found unmade since the last call, as the body check makes its world's fills
+    /// (front2 check.rs `make_all`): an instance's arguments meet shapes no check asked (a
+    /// generic body's `F: FnMut(char) -> bool` read at `IsWhitespace` asks `MultiCharEq`'s
+    /// impls at `IsWhitespace`, the blanket among them). `Ok(false)` when nothing was asked:
+    /// the question's `Missing` is then its refusal. Fn `i` names a refusal. The default
+    /// makes nothing.
+    fn make_asked(&mut self, i: usize) -> Result<bool, crate::run::RunError> {
+        let _ = i;
+        Ok(false)
+    }
     fn sig(&self, i: usize) -> FnSig<'_>;
     fn fn_index(&self, key: ItemKey) -> Option<usize>;
     /// Each soft-float routine's fn in the program's compiler_builtins, found by its exported
@@ -200,6 +213,14 @@ pub trait FrontEnd {
     /// a front end that checks only the whole program has no one-body form.
     fn check_one(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
         Err(RunError::OneBody { key, why: "this front end checks only the whole program (`FrontEnd::check_all`); the record walk asks one body at a time (`FrontEnd::check_one`)" })
+    }
+    /// D106: the row of the ctor `key` (a tuple struct's or tuple variant's, [`FrontEnd::ctor_of`]
+    /// answers it), made once: its index. A ctor has no body to check (`check_one` lowers a
+    /// body), and the record walk builds its instance as a fn (blaze-build `build_ctor_fn`).
+    /// `Ok(None)`: no row for it. A front end that tables every row up front answers by
+    /// [`FrontEnd::fn_index`].
+    fn ctor_row(&mut self, key: ItemKey) -> Result<Option<usize>, RunError> {
+        Ok(self.fn_index(key))
     }
     /// D106: the instance of fn `i` the walk asked for is made; a lazy program may drop that
     /// body's lowering and literals. Nothing by default.
@@ -308,9 +329,11 @@ pub trait FrontEnd {
     /// build's instance loop pulls each need of an instance before it walks it
     /// (front2/const_at.rs). The front end may check a body or make an impl row it has not
     /// made yet. The default evaluates none: each need is refused by name. Asked only of a
-    /// front end whose [`FrontEnd::evaluates_at_args`] is true.
-    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: blaze_typeck::PTys<'_>, args: &[blaze_typeck::PTy]) -> Result<blaze_build::data::DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
-        let _ = (need, from, args);
+    /// front end whose [`FrontEnd::evaluates_at_args`] is true. `closures` is the build's
+    /// table of its checked fn bodies' closures: a closure type among `args` (`Box::new` at a
+    /// closure reads `<{closure} as SizedTypeProperties>::LAYOUT`) is laid out from it.
+    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: blaze_typeck::PTys<'_>, args: &[blaze_typeck::PTy], closures: &crate::run::ClosureTable) -> Result<blaze_build::data::DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+        let _ = (need, from, args, closures);
         Err(crate::front2::const_at::ConstAtWhy::NoEvaluator)
     }
     /// Whether the build pulls each instance's constants at its ground arguments from
@@ -357,8 +380,8 @@ pub trait FrontEnd {
         let _ = (owner, p);
         None
     }
-    /// String literal pattern `p` of `owner`'s body, unescaped.
-    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&str> {
+    /// String or byte string literal pattern `p` of `owner`'s body: its bytes, unescaped.
+    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&[u8]> {
         let _ = (owner, p);
         None
     }
@@ -419,8 +442,8 @@ impl FrontEnd for Front<'_> {
         Ok((r.item, r.args))
     }
 
-    fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
-        Ok(select_impl(&Front::world(self, i), trait_, &[ty], ground, self.alloc)?.is_some())
+    fn holds(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
+        blaze_typeck::holds(&Front::world(self, i), trait_, &[ty], ground, self.alloc)
     }
 
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {

@@ -117,6 +117,12 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
             written.kind = blaze_surface::PathKind::DollarCrate(k);
         }
         let w = Written { kind: written.kind, segments: &written.segments };
+        // The segments `to_path` read as the path's head (`crate`, `self`, `super`): counted in
+        // the path as WRITTEN, in a refusal's segment as in `consumed` below, so `at` indexes
+        // `segments`. (The library's `at` indexes what follows the head: `crate::a::f` with no
+        // `f` is its segment 1, the written path's 2; read as the written one, the prefix before
+        // it was `crate` alone, a path of no segments, and an E0425 became a refusal `Empty`.)
+        let head = (segments.len() - w.segments.len()) as u32;
         let first = match ns {
             Ns::Type => Namespace::Types,
             Ns::Value => Namespace::Values,
@@ -141,10 +147,7 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
             }
             r => r,
         }
-        .map_err(ResolveError::Path)?;
-        // The segments `to_path` read as the path's head (`crate`, `self`, `super`) count as
-        // consumed in the path as written.
-        let head = (segments.len() - w.segments.len()) as u32;
+        .map_err(|e| ResolveError::Path(PathError { at: e.at + head as usize, ..e }))?;
         let consumed = found.consumed as u32 + head;
         // A variant is no item of a module: its enum is the prefix one segment shorter.
         if !self.names.has_text(found.def.key) && found.def.kind != DefKind::Module && found.consumed >= 2 {

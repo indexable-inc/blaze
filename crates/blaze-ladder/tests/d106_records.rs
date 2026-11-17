@@ -482,9 +482,9 @@ fn a_tracked_callers_location_is_answered_over_names_records() {
 /// The async rung (crates/blaze-cli/tests/ladder/front2/x0-async-01: `async fn add_slowly`
 /// awaiting a hand-written future twice, an executor written there) as the crate's files under
 /// [`DIR`], its `main` driving `add_slowly(13, 10)` (23) where the rung drives `compute(13)`
-/// (37): `compute` stays in the file, unreached. Why not `compute`: today every front end
-/// refuses its body's flow (`ElisionAmbiguous` at its call `add_slowly(seed, 10)`; the whole
-/// program from solved names, `Front2Program::new`, answers the same refusal for its recipe).
+/// (37): `compute` stays in the file, unreached (the control below). `compute` itself, an
+/// `async fn` awaiting another, is walked by
+/// [`an_async_fn_awaiting_another_is_walked_over_names_records`].
 fn async_rung() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-cli/tests/ladder/front2/x0-async-01/src");
     ["main.rs", "future.rs", "prelude.rs"]
@@ -530,6 +530,260 @@ fn an_async_program_is_walked_over_names_records() {
     assert!(program.coroutine_recipe(entry, 0).is_none(), "control: `main` has no async block");
     assert!(program.coroutine_recipe(fn_named(&f, "compute"), 0).is_none(), "control: `compute` is not reached, so never checked");
     println!("d106 async over names records: {counts}, check_one {}; recipes: add_slowly yes, main none, compute (unreached) none", maker.checks().check_one);
+}
+
+/// The async rung's library (its future.rs and prelude.rs, unchanged) under a `main.rs` of
+/// [`ASYNC_HEAD`] (the rung's `Twice` and `block_on`, verbatim) followed by `items`, which hold
+/// the program's `main`: the shapes a real async program has that `add_slowly` alone does not.
+fn async_program(items: &str) -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-cli/tests/ladder/front2/x0-async-01/src");
+    let mut files: Vec<(String, String)> = ["future.rs", "prelude.rs"]
+        .iter()
+        .map(|f| (format!("{DIR}src/{f}"), std::fs::read_to_string(dir.join(f)).unwrap_or_else(|e| panic!("the async rung's {f}: {e}"))))
+        .collect();
+    files.push((String::from(ROOT), format!("{ASYNC_HEAD}{items}")));
+    files
+}
+
+/// The head of [`async_program`]'s `main.rs`: the rung's crate attributes, `Twice` (pending
+/// `left` times, a wake counted each time, then ready with `value`) and its executor `block_on`
+/// (polls until ready, counting polls), as x0-async-01's main.rs writes them.
+const ASYNC_HEAD: &str = "#![feature(no_core, lang_items, intrinsics, rustc_attrs, unboxed_closures, arbitrary_self_types)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+mod future;
+mod prelude;
+use future::*;
+use prelude::*;
+
+struct Twice {
+    left: u32,
+    value: u32,
+}
+
+impl Future for Twice {
+    type Output = u32;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+        let this = self.pointer;
+        if this.left == 0 {
+            Poll::Ready(this.value)
+        } else {
+            this.left = this.left - 1;
+            *cx.wakes = *cx.wakes + 1;
+            Poll::Pending
+        }
+    }
+}
+
+fn block_on<F: Future<Output = u32>>(fut: F, polls: &mut u32, wakes: &mut u32) -> u32 {
+    let mut fut = fut;
+    let mut cx = Context { wakes };
+    loop {
+        if *polls == 64 {
+            return 1000;
+        }
+        *polls = *polls + 1;
+        let pinned = Pin { pointer: &mut fut };
+        match <F as Future>::poll(pinned, &mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {}
+        }
+    }
+}
+";
+
+/// An `async fn` awaiting ANOTHER `async fn` (the rung's own `compute`, its future holding
+/// `add_slowly`'s by value across its `.await`, `kept` live across it).
+const AWAITS_ANOTHER: &str = "
+async fn add_slowly(a: u32, b: u32) -> u32 {
+    let x = Twice { left: 2, value: a }.await;
+    let y = Twice { left: 2, value: b }.await;
+    x + y
+}
+
+async fn compute(seed: u32) -> u32 {
+    let kept = seed + 1;
+    let sum = add_slowly(seed, 10).await;
+    sum + kept
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut polls = 0u32;
+    let mut wakes = 0u32;
+    if block_on(compute(13), &mut polls, &mut wakes) == 37 { 42 } else { 1 }
+}
+";
+
+/// An `async move` block capturing by move: a future (`Twice`, not `Copy`) and a `u32`, both
+/// moved into the block's state, the future awaited there.
+const BY_MOVE: &str = "
+fn by_move(k: u32, polls: &mut u32, wakes: &mut u32) -> u32 {
+    let pending = Twice { left: 2, value: k };
+    let base = k + 1;
+    block_on(async move { pending.await + base }, polls, wakes)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut polls = 0u32;
+    let mut wakes = 0u32;
+    if by_move(13, &mut polls, &mut wakes) == 27 { 42 } else { 1 }
+}
+";
+
+/// A `Poll::Pending` path woken ONCE: one pending poll (one wake), then ready.
+const PENDING_ONCE: &str = "
+async fn once(v: u32) -> u32 {
+    Twice { left: 1, value: v }.await
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut polls = 0u32;
+    let mut wakes = 0u32;
+    let got = block_on(once(5), &mut polls, &mut wakes);
+    if got == 5 && polls == 2 && wakes == 1 { 42 } else { 1 }
+}
+";
+
+/// [`async_program`] of `items` walked by the record walk over names records (as
+/// [`an_async_program_is_walked_over_names_records`]: `panic = abort`, every instance reached
+/// made, none found); each of `async_owners` (by fn name, `main` among them for a block in
+/// `main`) answers its first async body's recipe after the walk; a second walk over the same
+/// store finds every instance and makes none. Control: `block_on`, reached and no async body,
+/// has no recipe. Returns both walks' counts.
+fn walk_async(items: &str, async_owners: &[&str]) -> (Counts, Counts) {
+    let f = fixture_of(&async_program(items), blaze_build::Panic::Abort);
+    let entry = fn_named(&f, "main");
+    let b = builder_with(blaze_build::Panic::Abort);
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, maker) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert!(first.reached > 0 && first.made == first.reached && first.found == 0, "every instance reached is made: {first}");
+    let program = maker.program().expect("a first run constructs the program");
+    for &owner in async_owners {
+        match program.coroutine_recipe(fn_named(&f, owner), 0) {
+            Some(Ok(_)) => {}
+            Some(Err(refusal)) => panic!("`{owner}`'s async body: its recipe was refused: {refusal:?}"),
+            None => panic!("`{owner}`'s async body: no recipe made with its check"),
+        }
+    }
+    assert!(program.coroutine_recipe(fn_named(&f, "block_on"), 0).is_none(), "control: `block_on` has no async body");
+    let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!((again.reached, again.found, again.make_calls()), (first.reached, first.reached, 0), "a second walk finds every instance: {again}");
+    (first, again)
+}
+
+/// An `async fn` awaiting another ([`AWAITS_ANOTHER`]): `compute`'s state holds `add_slowly`'s
+/// future; both coroutines' instances are made over records.
+///
+/// Prints: `d106 async awaiting another over names records: first <counts>; again <counts>`
+#[test]
+fn an_async_fn_awaiting_another_is_walked_over_names_records() {
+    let (first, again) = walk_async(AWAITS_ANOTHER, &["compute", "add_slowly"]);
+    println!("d106 async awaiting another over names records: first {first}; again {again}");
+}
+
+/// An `async move` block capturing a future and a value by move ([`BY_MOVE`]): the block is
+/// `by_move`'s async body 0, its state made over records.
+///
+/// Prints: `d106 async move block over names records: first <counts>; again <counts>`
+#[test]
+fn an_async_move_block_is_walked_over_names_records() {
+    let (first, again) = walk_async(BY_MOVE, &["by_move"]);
+    println!("d106 async move block over names records: first {first}; again {again}");
+}
+
+/// A future pending once, woken once ([`PENDING_ONCE`]): `once`'s state made over records.
+///
+/// Prints: `d106 async pending once over names records: first <counts>; again <counts>`
+#[test]
+fn an_async_fn_pending_once_is_walked_over_names_records() {
+    let (first, again) = walk_async(PENDING_ONCE, &["once"]);
+    println!("d106 async pending once over names records: first {first}; again {again}");
+}
+
+/// The ladder rung x0-dyn-01 (no_core: provided and required methods called through `&dyn Tr`,
+/// `&mut dyn Tr` and `&dyn Sub`, whose supertrait is `Base`), its files unchanged.
+fn dyn_rung() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-cli/tests/ladder/front2/x0-dyn-01-provided-override/src");
+    ["main.rs", "prelude.rs"]
+        .iter()
+        .map(|f| (format!("{DIR}src/{f}"), std::fs::read_to_string(dir.join(f)).unwrap_or_else(|e| panic!("the dyn rung's {f}: {e}"))))
+        .collect()
+}
+
+/// The checker key of crate 0's item of `kind` named `name`.
+fn item_named(f: &Fixture, kind: ItemKind, name: &str) -> ItemKey {
+    let records = reader(f).records;
+    let mut found = None;
+    assert!(records.each_item(0, &mut |key, _| if found.is_none() && records.kind_of_item(key) == Some(kind) && records.name_of(key) == Some(name) {
+        found = Some(checker_of(key));
+    }), "the program's items record lists its items");
+    found.unwrap_or_else(|| panic!("no {kind:?} named `{name}`: {:?}", logged(records)))
+}
+
+/// Trait objects' tables over names records: a body naming `dyn Tr` or `dyn Sub` asks the lazy
+/// program for the trait's object table (fill.rs `body_objects`, program.rs `object_tables`),
+/// and over records the key map files no item, so the trait's library key must come from the
+/// names source (`Keys::library_in`, now the only form). Before the fix every such trait was
+/// refused "as a trait object sees it: no library key" (hello world's `core::error::Error`,
+/// 2026-11-17 g053512). After `m_of` and `b_of` are checked, alone, the program answers each
+/// table, the supertrait `Base`'s too (asked under `Sub`, never named as a principal).
+/// Control: before any check no table is made; `One`, a struct, never has one.
+///
+/// Prints: `d106 dyn tables over names records: Tr, Sub, Base`
+#[test]
+fn trait_object_tables_are_made_over_names_records() {
+    let f = fixture_of(&dyn_rung(), blaze_build::Panic::Abort);
+    let names = reader(&f);
+    let main = fn_named(&f, "main");
+    let mut program = RecordsProgram::from_records(names.records, names.frame, names.lang_crates, Some(main), alloc()).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
+    let traits = ["Tr", "Sub", "Base"].map(|t| (t, item_named(&f, ItemKind::Trait, t)));
+    for (t, k) in traits {
+        assert!(program.object_trait(k).is_none(), "control: `{t}`'s table before any body named it");
+    }
+    for owner in ["m_of", "b_of"] {
+        program.check_one(fn_named(&f, owner)).unwrap_or_else(|e| panic!("`{owner}`'s check: {e}")).expect("a fn of the program");
+    }
+    for (t, k) in traits {
+        assert!(program.object_trait(k).is_some(), "the trait `{t}`'s object table was made over records");
+    }
+    assert!(program.object_trait(item_named(&f, ItemKind::Struct, "One")).is_none(), "control: a struct has no object table");
+    assert!(logged(names.records).is_empty(), "the records filed {:?}", logged(names.records));
+    println!("d106 dyn tables over names records: Tr, Sub, Base");
+}
+
+/// The x0-dyn-01 rung WALKED over names records: its vtables' words are tabled on demand
+/// (make_one.rs `vtable_rows` files a word no row tables, `drop_in_place` first, as an untabled
+/// callee: checked, then the instance made again). The walk's next stop (2026-11-17, open): a
+/// word's impl no check selected (`impl Base for Two`, under `dyn Sub`'s table) reads as "no
+/// impl of trait holds": instance-time selection (blaze-typeck instance.rs `select_impl`,
+/// `resolve_instance`, `normalize_projection`, drop_impl.rs) reads a hole (a bucket not
+/// answered yet) as an empty impl list, where it must answer `Missing` and the lazy program
+/// fill it (lane UZ's instance-time fill); `holds` alone checks its holes today.
+///
+/// Prints: `d106 dyn walk over names records: <the stop, or every instance made>`
+#[test]
+fn a_dyn_walks_vtable_words_are_tabled() {
+    let f = fixture_of(&dyn_rung(), blaze_build::Panic::Abort);
+    let entry = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let b = builder_with(blaze_build::Panic::Abort);
+    let mut maker = Maker::new(reader(&f), Some(entry), &b, alloc());
+    let stop = match walk_records(entry, &EveryItem, &mut store, &b, &producer(), &mut maker, alloc()) {
+        Ok((_, counts)) => {
+            println!("d106 dyn walk over names records: every instance made: {counts}");
+            return;
+        }
+        Err(e) => e.to_string(),
+    };
+    println!("d106 dyn walk over names records: {stop}");
+    assert!(!stop.contains("a vtable's method word with no tabled body"), "a vtable word is tabled on demand: {stop}");
+    assert!(!stop.contains("as a trait object sees it"), "every object table is made: {stop}");
 }
 
 /// The entry WRITTEN BY A MACRO at module level (as bstd's `main!` writes `fn main`), calling a
@@ -608,6 +862,118 @@ macro_rules! hosted {
 
 hosted!();
 ";
+
+/// [`NESTED_ENTRY`]'s shape as bstd's `main!` writes `bstd_hosted_start`: the exported entry,
+/// declared in a body, hands a fn declared in ITS body to another fn as a VALUE
+/// (`guest::start(table, hosted)`), never calling it by name. Four instances: `main`, `apply`,
+/// `hosted` and `from_file`.
+const LOCAL_FN_VALUE: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+fn from_file() -> i32 {
+    4
+}
+
+fn apply(f: fn() -> i32) -> i32 {
+    f()
+}
+
+macro_rules! hosted {
+    () => {
+        fn outer() -> i32 {
+            #[unsafe(no_mangle)]
+            pub extern \"C-unwind\" fn main() -> i32 {
+                fn hosted() -> i32 {
+                    from_file()
+                }
+                apply(hosted)
+            }
+            0
+        }
+    };
+}
+
+hosted!();
+";
+
+/// The program's personality routine, declared by its crate as a `#![no_core]` program's own
+/// (std's `rust_eh_personality` is the same lang item in std's crate).
+const PERSONALITY_ROUTINE: &str = "
+#[lang = \"eh_personality\"]
+fn rust_eh_personality() {}
+";
+
+/// The run's roots over names records for a program built to unwind (run/special.rs
+/// `run_roots`; UNWIND.md 3.3, piece P3): a program whose lang crates declare
+/// `#[lang = \"eh_personality\"]` names that fn in its head, as the last root row at no
+/// arguments (so the walk makes it at its first call); built to abort, the same program names
+/// none. Control: the program without the routine is refused, built to unwind, by
+/// `PersonalityError::Missing` naming the crates searched, and names none built to abort.
+///
+/// Prints: `d106 personality over names records: named <hex>; refused: <error>`
+#[test]
+fn the_personality_routine_is_a_root_over_names_records() {
+    use blaze_ladder::code_records::PanicStrategy;
+    use blaze_ladder::personality::PersonalityError;
+    use blaze_ladder::run::special::{RootsError, run_roots};
+    let with = fixture(&std::format!("{PROGRAM}{PERSONALITY_ROUTINE}"));
+    let names = reader(&with);
+    let routine = fn_named(&with, "rust_eh_personality");
+    let got = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots: {e}"));
+    let last = got.root(got.len() - 1);
+    assert_eq!(last.tabled, routine, "the last root row is not the routine");
+    assert_eq!(got.head().personality, Some(last.symbol), "the head does not name the routine's row");
+    assert_ne!(Some(got.head().line.symbol), got.head().personality, "the routine was named as the entry");
+    let abort = run_roots(names.records, names.lang_crates, PanicStrategy::Abort, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, abort: {e}"));
+    assert_eq!(abort.head().personality, None, "a program built to abort named a routine");
+    assert_eq!(abort.len() + 1, got.len(), "built to abort, the routine is still a root");
+
+    let without = fixture(PROGRAM);
+    let names = reader(&without);
+    let refused = match run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, names.frame, alloc(), alloc()) {
+        Err(RootsError::Personality(why @ PersonalityError::Missing { .. })) => why,
+        Err(other) => panic!("a program with no routine was refused for another cause: {other}"),
+        Ok(roots) => panic!("a program with no routine named {:?}", roots.head().personality),
+    };
+    let abort = run_roots(names.records, names.lang_crates, PanicStrategy::Abort, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, abort, no routine: {e}"));
+    assert_eq!(abort.head().personality, None);
+    println!("d106 personality over names records: named {:x}; refused: {refused}", routine.0);
+}
+
+/// A local fn passed as a value from a macro-written entry ([`LOCAL_FN_VALUE`]) is tabled and
+/// made on demand: before the fix the build refused it, "`main` reaches item .. which no fn row
+/// tables" (a body's check tables the fns it CALLS; one named as a value was owed no row).
+/// Hello world's stop of 2026-11-17 g080047 (`bstd_hosted_start` handing `hosted` to
+/// `guest::start`). A second walk finds every instance.
+///
+/// Prints: `d106 local fn value over names records: first <counts>; again <counts>`
+#[test]
+fn a_local_fn_passed_as_a_value_is_made_over_names_records() {
+    use blaze_ladder::front2::program::{StartOf, start_of};
+    use blaze_ladder::front2::start::Entry2;
+    let f = fixture(LOCAL_FN_VALUE);
+    let entry = {
+        let records = reader(&f).records;
+        match start_of(records, alloc()).unwrap_or_else(|e| panic!("the start rule over records: {e}")) {
+            StartOf::Exported(Entry2::CMain(lib)) => checker_of(lib),
+            other => panic!("the start is `main` exported from `outer`'s body, not {other:?}"),
+        }
+    };
+    let b = builder();
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!((first.reached, first.found, first.made), (4, 0, 4), "`main`, `apply`, the local `hosted` and `from_file` are made: {first}");
+    let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!((again.reached, again.found, again.make_calls()), (4, 4, 0), "a second walk makes none: {again}");
+    println!("d106 local fn value over names records: first {first}; again {again}");
+}
 
 /// Whether checker key `k` is of an item declared in a body (`LibKey::INNER`, kept in a
 /// checker key's byte 8).

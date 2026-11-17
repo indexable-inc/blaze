@@ -14,16 +14,27 @@
 //! extern prelude"; its crate is found in the sysroot when no `--extern` of that name is given
 //! (so an explicit dependency of the same name wins, here and in [`implied_edges`]).
 //!
-//! What is read, from the ROOT FILE's text only (sans-IO: the caller hands the text in):
-//! - its inner attributes `#![no_std]`, `#![no_core]`, and `#![cfg_attr(pred, ..)]` holding
-//!   them (nested `cfg_attr` too), the predicate evaluated under the unit's cfg: the target's
-//!   atoms as the toolchain records them and `feature = ".."` per feature on. `test` is not
-//!   among them (a library unit is no test). A predicate naming `debug_assertions` is refused
-//!   by name: the cut is the same for every profile, so its value is not known here.
-//! - its root module's `extern crate core|alloc|std` items (not `extern crate self as std`),
-//!   each under its outer `#[cfg(..)]` (and `#[cfg_attr(.., cfg(..))]`) attributes. One in a
-//!   nested module or another file is not seen: the names run then reports that crate's
-//!   `std` by name if it is reached; it never resolves silently.
+//! What is read ([`crate_facts`]; sans-IO: the caller hands each file's text in by its path in
+//! the crate's pack, which the crate's pack digest covers whole, so the row moves with every
+//! file read here: rule 21):
+//! - the ROOT file's inner attributes `#![no_std]`, `#![no_core]`, and `#![cfg_attr(pred, ..)]`
+//!   holding them (nested `cfg_attr` too), the predicate evaluated under the unit's cfg: the
+//!   target's atoms as the toolchain records them and `feature = ".."` per feature on. `test`
+//!   is not among them (a library unit is no test). A predicate naming `debug_assertions` is
+//!   refused by name: the cut is the same for every profile, so its value is not known here.
+//! - EVERY module's `extern crate core|alloc|std` items (the Reference, "Extern crate
+//!   declarations": the item asks for its crate wherever it is written, binding the name in
+//!   that scope; bstd writes `extern crate std;` in `mod rt`), in the root file, in inline
+//!   `mod m { .. }` bodies, inside blocks, and in every module file a live `mod m;` loads (the
+//!   Reference, "Modules", "Module source filenames" and "The `path` attribute"). `extern
+//!   crate x as y` asks for `x`; `extern crate self` for no crate. An item, a module or a
+//!   module file counts only while every `#[cfg(..)]` (and `#[cfg_attr(.., cfg(..))]`) on it
+//!   and on what holds it, and every `#![cfg(..)]` of a module, holds: one rule for all of them.
+//! - Out of reach: an `extern crate` written by a macro call's expansion (the tokens of every
+//!   macro call and `macro_rules!` body are passed unread, as the item is not written there).
+//!   Taking it needs the expansion, which the cutter does not run; the names run then refuses
+//!   the crate's `extern crate` by name (blaze-scope `ScopeError::ExternCrate`): it never
+//!   resolves silently.
 //!
 //! Only attributes that can change the answer have their predicates evaluated: a
 //! `#![cfg_attr(debug_assertions, allow(dead_code))]` is not refused.
@@ -58,17 +69,38 @@ impl ImplicitSysroot {
     }
 }
 
-/// What a root's text says of the sysroot ([`root_facts`]).
+/// What a crate's files say of the sysroot ([`crate_facts`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RootFacts {
+    /// From the root's inner attributes.
     pub sysroot: ImplicitSysroot,
-    /// A live `extern crate core;` in the root module.
+    /// A live `extern crate core` in any module of the crate.
     pub extern_core: bool,
-    /// A live `extern crate alloc;` in the root module.
+    /// A live `extern crate alloc` in any module of the crate.
     pub extern_alloc: bool,
-    /// A live `extern crate std;` in the root module.
+    /// A live `extern crate std` in any module of the crate.
     pub extern_std: bool,
 }
+
+/// How many files one crate's modules may span.
+pub const MAX_FILES: usize = 4096;
+
+/// Why a crate's files could not be read for its sysroot: the file (its path in the pack) the
+/// refusal is in, and why (its `line` is in that file).
+#[derive(Debug)]
+pub struct CrateRefused<'t, 'a> {
+    pub file: AVec<'a, u8>,
+    pub why: ImpliedRefused<'t>,
+}
+
+impl core::fmt::Display for CrateRefused<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Every path here is joined from the pack's and the text's `str`s.
+        write!(f, "{}: {}", core::str::from_utf8(&self.file).unwrap_or("<a path that is not UTF-8>"), self.why)
+    }
+}
+
+impl core::error::Error for CrateRefused<'_, '_> {}
 
 /// Why a root's text could not be read for its sysroot. `line` is 1-based in the root file.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,6 +117,17 @@ pub enum ImpliedRefused<'t> {
     ValueForm { line: u32 },
     /// Predicates or `cfg_attr`s nested past [`MAX_DEPTH`].
     TooDeep { line: u32 },
+    /// The crate's root is no UTF-8 file of its pack.
+    NoRoot,
+    /// A live `mod name;` whose file is not in the pack (`name.rs`, `name/mod.rs`, or its
+    /// `#[path]`).
+    ModuleFile { name: &'t str, line: u32 },
+    /// A live `mod name;` with both `name.rs` and `name/mod.rs` (the Reference: an error, E0761).
+    TwoModuleFiles { name: &'t str, line: u32 },
+    /// A `#[path]` that is no plain string, or one that leaves the pack (`..` past its top).
+    ModulePath { line: u32 },
+    /// More than [`MAX_FILES`] module files.
+    TooManyFiles,
 }
 
 impl core::fmt::Display for ImpliedRefused<'_> {
@@ -98,6 +141,13 @@ impl core::fmt::Display for ImpliedRefused<'_> {
             }
             ImpliedRefused::ValueForm { line } => write!(f, "line {line}: a cfg value that is not a plain string"),
             ImpliedRefused::TooDeep { line } => write!(f, "line {line}: cfg predicates or `cfg_attr`s nested past {MAX_DEPTH}"),
+            ImpliedRefused::NoRoot => write!(f, "the crate's root is no UTF-8 file of its pack"),
+            ImpliedRefused::ModuleFile { name, line } => {
+                write!(f, "line {line}: `mod {name};` names no file of the crate's pack (`{name}.rs` or `{name}/mod.rs` beside it, or its `#[path]`)")
+            }
+            ImpliedRefused::TwoModuleFiles { name, line } => write!(f, "line {line}: `mod {name};` has both `{name}.rs` and `{name}/mod.rs` (E0761)"),
+            ImpliedRefused::ModulePath { line } => write!(f, "line {line}: a `#[path]` that is no plain string or leaves the crate's pack"),
+            ImpliedRefused::TooManyFiles => write!(f, "the crate's modules span more than {MAX_FILES} files"),
         }
     }
 }
@@ -358,11 +408,61 @@ impl<'t> Lexer<'t> {
 /// A unit's cfg: (name, value) atoms.
 pub type Cfg<'c> = &'c [(&'c str, Option<&'c str>)];
 
-fn atom<'t>(name: &'t str, value: Option<&str>, cfg: Cfg<'_>, line: u32) -> Result<bool, ImpliedRefused<'t>> {
-    if name == "debug_assertions" {
-        return Err(ImpliedRefused::ProfileAtom { name, line });
+/// Whether a cfg predicate holds: or not known here, with the refusal it takes where the
+/// answer depends on it (a profile's atom, a predicate this reader does not take).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Holds<'t> {
+    Yes,
+    No,
+    Unknown(ImpliedRefused<'t>),
+}
+
+impl<'t> Holds<'t> {
+    fn of(yes: bool) -> Holds<'t> {
+        if yes { Holds::Yes } else { Holds::No }
     }
-    Ok(cfg.iter().any(|(n, v)| *n == name && *v == value))
+
+    /// Both: `No` wins over an unknown, which wins over `Yes`.
+    fn and(self, other: Holds<'t>) -> Holds<'t> {
+        match (self, other) {
+            (Holds::No, _) | (_, Holds::No) => Holds::No,
+            (Holds::Unknown(e), _) | (_, Holds::Unknown(e)) => Holds::Unknown(e),
+            _ => Holds::Yes,
+        }
+    }
+
+    /// Either: `Yes` wins over an unknown, which wins over `No`.
+    fn or(self, other: Holds<'t>) -> Holds<'t> {
+        match (self, other) {
+            (Holds::Yes, _) | (_, Holds::Yes) => Holds::Yes,
+            (Holds::Unknown(e), _) | (_, Holds::Unknown(e)) => Holds::Unknown(e),
+            _ => Holds::No,
+        }
+    }
+
+    fn not(self) -> Holds<'t> {
+        match self {
+            Holds::Yes => Holds::No,
+            Holds::No => Holds::Yes,
+            unknown => unknown,
+        }
+    }
+
+    /// As a yes or no, where the answer depends on it: an unknown is its refusal.
+    fn known(self) -> Result<bool, ImpliedRefused<'t>> {
+        match self {
+            Holds::Yes => Ok(true),
+            Holds::No => Ok(false),
+            Holds::Unknown(e) => Err(e),
+        }
+    }
+}
+
+fn atom<'t>(name: &'t str, value: Option<&str>, cfg: Cfg<'_>, line: u32) -> Holds<'t> {
+    if name == "debug_assertions" {
+        return Holds::Unknown(ImpliedRefused::ProfileAtom { name, line });
+    }
+    Holds::of(cfg.iter().any(|(n, v)| *n == name && *v == value))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -372,10 +472,17 @@ enum Combine {
     Not,
 }
 
-/// One cfg predicate read from `lx` and evaluated under `cfg` (an explicit stack, no
-/// recursion); `lx` is left just past it.
+/// One cfg predicate read from `lx` and evaluated under `cfg`, where the answer depends on it:
+/// one not known here is its refusal.
 fn predicate<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<bool, ImpliedRefused<'t>> {
-    let mut stack = [(Combine::All, false, 0u32); MAX_DEPTH];
+    holds(lx, cfg)?.known()
+}
+
+/// One cfg predicate read from `lx` and evaluated under `cfg` (an explicit stack, no
+/// recursion); `lx` is left just past it. A predicate this reader does not take, or a
+/// profile's atom, is `Unknown` (its refusal kept); a token no predicate holds is refused.
+fn holds<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<Holds<'t>, ImpliedRefused<'t>> {
+    let mut stack = [(Combine::All, Holds::No, 0u32); MAX_DEPTH];
     let mut depth = 0usize;
     loop {
         let line = lx.line(lx.at);
@@ -385,27 +492,35 @@ fn predicate<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<bool, ImpliedRefuse
             Tok::Ident(name) => {
                 let save = lx.at;
                 match lx.next()? {
-                    Some((Tok::Open(b'('), _)) => {
+                    Some((Tok::Open(b'('), open)) => {
                         let kind = match name {
                             "all" => Combine::All,
                             "any" => Combine::Any,
                             "not" => Combine::Not,
-                            _ => return Err(ImpliedRefused::UnknownPredicate { name, line }),
+                            // `version(..)`, `target(..)`: not known here; passed whole.
+                            _ => {
+                                lx.group(open)?;
+                                Combine::All
+                            }
                         };
-                        if depth == MAX_DEPTH {
-                            return Err(ImpliedRefused::TooDeep { line });
+                        if !matches!(name, "all" | "any" | "not") {
+                            Holds::Unknown(ImpliedRefused::UnknownPredicate { name, line })
+                        } else {
+                            if depth == MAX_DEPTH {
+                                return Err(ImpliedRefused::TooDeep { line });
+                            }
+                            stack[depth] = (kind, Holds::of(kind == Combine::All), 0);
+                            depth += 1;
+                            continue;
                         }
-                        stack[depth] = (kind, kind == Combine::All, 0);
-                        depth += 1;
-                        continue;
                     }
                     Some((Tok::Punct(b'='), _)) => match lx.next()? {
-                        Some((Tok::Str(value), _)) => atom(name, Some(value), cfg, line)?,
+                        Some((Tok::Str(value), _)) => atom(name, Some(value), cfg, line),
                         _ => return Err(ImpliedRefused::ValueForm { line }),
                     },
                     _ => {
                         lx.at = save;
-                        atom(name, None, cfg, line)?
+                        atom(name, None, cfg, line)
                     }
                 }
             }
@@ -425,11 +540,11 @@ fn predicate<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<bool, ImpliedRefuse
         }
         let top = &mut stack[depth - 1];
         top.2 += 1;
-        match top.0 {
-            Combine::All => top.1 &= value,
-            Combine::Any => top.1 |= value,
-            Combine::Not => top.1 = !value,
-        }
+        top.1 = match top.0 {
+            Combine::All => top.1.and(value),
+            Combine::Any => top.1.or(value),
+            Combine::Not => value.not(),
+        };
     }
 }
 
@@ -548,9 +663,364 @@ fn expand<'t>(
     Ok(())
 }
 
-/// The sysroot facts of a crate root whose text is `text`, under the unit's `cfg` (the target's
-/// atoms and `feature = ".."` per feature on).
-pub fn root_facts<'t>(text: &'t str, cfg: Cfg<'_>) -> Result<RootFacts, ImpliedRefused<'t>> {
+/// The sysroot facts of a crate whose root file is `root` (its path in the crate's pack), every
+/// module file read by its pack path through `read` (`None`: no UTF-8 file there), under the
+/// unit's `cfg` (the target's atoms and `feature = ".."` per feature on). A work list of
+/// files, each read once; no recursion.
+pub fn crate_facts<'t, 'a>(root: &str, read: impl Fn(&str) -> Option<&'t str>, cfg: Cfg<'_>, alloc: Alloc<'a>) -> Result<RootFacts, CrateRefused<'t, 'a>> {
+    let refused = |file: &[u8], why: ImpliedRefused<'t>| {
+        let mut path = AVec::new_in(alloc);
+        path.extend_from_slice(file);
+        CrateRefused { file: path, why }
+    };
+    // Each file: its pack path, whether its own module's children sit beside it (a root, a
+    // `mod.rs`, or a file a `#[path]` loads: rustc's owned directory) or under its stem, and
+    // whether the `mod` that loads it is live (`Unknown` under a profile's atom).
+    let mut files: AVec<'a, Found<'t, 'a>> = AVec::new_in(alloc);
+    let mut first = AVec::new_in(alloc);
+    first.extend_from_slice(root.as_bytes());
+    files.push(Found { path: first, owned: true, live: Holds::Yes });
+    let mut facts = RootFacts { sysroot: ImplicitSysroot::Std, extern_core: false, extern_alloc: false, extern_std: false };
+    let mut dir: AVec<'a, u8> = AVec::new_in(alloc);
+    let mut parent: AVec<'a, u8> = AVec::new_in(alloc);
+    let mut next = 0;
+    while next < files.len() {
+        let at = next;
+        next += 1;
+        let path = &files[at].path;
+        // Joined from `str`s only.
+        let shown = core::str::from_utf8(path).unwrap_or("");
+        let Some(text) = read(shown) else {
+            // A module file was found by `read` before it was listed: only the root can be absent.
+            return Err(refused(path, ImpliedRefused::NoRoot));
+        };
+        let start = if at == 0 {
+            let (sysroot, start) = root_inner(text, cfg).map_err(|why| refused(path, why))?;
+            facts.sysroot = sysroot;
+            start
+        } else if text.starts_with('\u{feff}') {
+            3
+        } else {
+            0
+        };
+        let cut = path.iter().rposition(|b| *b == b'/');
+        parent.clear();
+        parent.extend_from_slice(&path[..cut.unwrap_or(0)]);
+        dir.clear();
+        dir.extend_from_slice(&parent);
+        let name = &path[cut.map_or(0, |c| c + 1)..];
+        if !files[at].owned && name != b"mod.rs".as_slice() {
+            push_segment(&mut dir, name.strip_suffix(b".rs".as_slice()).unwrap_or(name));
+        }
+        let mut found: AVec<'a, Found<'t, 'a>> = AVec::new_in(alloc);
+        let (path, live) = (&files[at].path, files[at].live);
+        scan_file(text, start, cfg, live, &parent, &mut dir, &read, &mut facts, &mut found).map_err(|why| refused(path, why))?;
+        for file in found {
+            if files.iter().any(|f| f.path == file.path) {
+                continue;
+            }
+            if files.len() == MAX_FILES {
+                return Err(refused(&files[at].path, ImpliedRefused::TooManyFiles));
+            }
+            files.push(file);
+        }
+    }
+    Ok(facts)
+}
+
+/// `segment` appended to the path `dir` with a `/` between.
+fn push_segment(dir: &mut AVec<'_, u8>, segment: &[u8]) {
+    if !dir.is_empty() {
+        dir.push(b'/');
+    }
+    dir.extend_from_slice(segment);
+}
+
+/// `path` with its `.` and `..` segments taken out, into `out`; `None` when a `..` leaves the top.
+fn normalized(path: &[u8], out: &mut AVec<'_, u8>) -> Option<()> {
+    out.clear();
+    for segment in path.split(|b| *b == b'/') {
+        match segment {
+            b"" | b"." => {}
+            b".." => {
+                let cut = out.iter().rposition(|b| *b == b'/').unwrap_or(0);
+                if out.is_empty() {
+                    return None;
+                }
+                out.truncate(cut);
+            }
+            _ => push_segment(out, segment),
+        }
+    }
+    Some(())
+}
+
+/// One brace a file's scan is inside: whether what it holds is live, the length of the
+/// children's directory before it, the bracket depth around it, and whether it is an inline
+/// module's body.
+#[derive(Clone, Copy)]
+struct Brace<'t> {
+    live: Holds<'t>,
+    dir_len: usize,
+    group: u32,
+    module: bool,
+}
+
+/// A module file to read: its pack path, whether it owns its directory, and whether the `mod`
+/// that loads it is live.
+struct Found<'t, 'a> {
+    path: AVec<'a, u8>,
+    owned: bool,
+    live: Holds<'t>,
+}
+
+/// One file's items from `start`: each live `extern crate core|alloc|std` set in `facts`, and
+/// each live `mod name;`'s file pushed onto `found`. `loaded` is whether the `mod` that loads
+/// this file is live; `parent` is the file's directory, `dir` its own children's. An
+/// `extern crate` of the sysroot whose liveness is not known here (a profile's atom) is
+/// refused by name: the answer depends on it.
+#[expect(clippy::too_many_arguments, reason = "one file's scan: its text, the unit's cfg, its liveness, its directories, the reader and the two outputs")]
+fn scan_file<'t, 'a>(
+    text: &'t str,
+    start: usize,
+    cfg: Cfg<'_>,
+    loaded: Holds<'t>,
+    parent: &[u8],
+    dir: &mut AVec<'a, u8>,
+    read: &impl Fn(&str) -> Option<&'t str>,
+    facts: &mut RootFacts,
+    found: &mut AVec<'a, Found<'t, 'a>>,
+) -> Result<(), ImpliedRefused<'t>> {
+    let alloc = *dir.allocator();
+    let mut lx = Lexer { text, at: start, end: text.len() };
+    let mut braces: AVec<'a, Brace<'t>> = AVec::new_in(alloc);
+    // The file's own module: `No` under a `#![cfg]` that does not hold.
+    let mut file_live = loaded;
+    // The outer attributes read since the last item or statement ended: whether their `cfg`s
+    // hold, and the `#[path]` among them.
+    let mut pending_live = Holds::Yes;
+    let mut pending_path: Option<&'t str> = None;
+    // `(` and `[` open inside the innermost brace.
+    let mut group = 0u32;
+    let mut inline = 0u32;
+    let mut candidate: AVec<'a, u8> = AVec::new_in(alloc);
+    while let Some((tok, at)) = lx.next()? {
+        // Counted only where a refusal or a module file needs it (a count per token is quadratic).
+        let line = || line_of(text, at);
+        let live = braces.last().map_or(file_live, |b| b.live).and(pending_live);
+        match tok {
+            Tok::Punct(b'#') => {
+                let save = lx.at;
+                let mut probe = lx;
+                let inner = matches!(probe.next()?, Some((Tok::Punct(b'!'), _)));
+                if inner {
+                    lx = probe;
+                }
+                let Some((Tok::Open(b'['), open)) = lx.next()? else {
+                    lx.at = save;
+                    continue;
+                };
+                let range = lx.group(open)?;
+                let (mut holds, mut path) = (Holds::Yes, None);
+                expand(text, range, cfg, |w| matches!(w, "cfg" | "path"), |word, mut rest| {
+                    let line = rest.line(rest.at);
+                    if word == "path" {
+                        match (rest.next()?, rest.next()?) {
+                            (Some((Tok::Punct(b'='), _)), Some((Tok::Str(p), _))) => path = Some(p),
+                            _ => return Err(ImpliedRefused::ModulePath { line }),
+                        }
+                        return Ok(());
+                    }
+                    let Some((Tok::Open(b'('), _)) = rest.next()? else {
+                        return Err(ImpliedRefused::Predicate { why: "a `cfg` with no predicate", line });
+                    };
+                    holds = holds.and(self::holds(&mut rest, cfg)?);
+                    Ok(())
+                })?;
+                if inner {
+                    match braces.last_mut() {
+                        Some(b) => b.live = b.live.and(holds),
+                        None => file_live = file_live.and(holds),
+                    }
+                } else {
+                    pending_live = pending_live.and(holds);
+                    if path.is_some() {
+                        pending_path = path;
+                    }
+                }
+            }
+            Tok::Ident("mod") if group == 0 => {
+                let save = lx.at;
+                let (Some((Tok::Ident(name), _)), Some((after, _))) = (lx.next()?, lx.next()?) else {
+                    lx.at = save;
+                    continue;
+                };
+                match after {
+                    Tok::Punct(b';') => {
+                        if live != Holds::No {
+                            let base: &[u8] = if inline == 0 { parent } else { &dir[..] };
+                            let (path, owned) = module_file(name, pending_path, base, &dir[..], read, &mut candidate, line())?;
+                            found.push(Found { path, owned, live });
+                        }
+                        pending_live = Holds::Yes;
+                        pending_path = None;
+                    }
+                    Tok::Open(b'{') => {
+                        braces.push(Brace { live, dir_len: dir.len(), group, module: true });
+                        push_segment(dir, pending_path.unwrap_or(name).as_bytes());
+                        inline += 1;
+                        group = 0;
+                        pending_live = Holds::Yes;
+                        pending_path = None;
+                    }
+                    _ => lx.at = save,
+                }
+            }
+            Tok::Ident("extern") => {
+                let save = lx.at;
+                match (lx.next()?, lx.next()?) {
+                    (Some((Tok::Ident("crate"), _)), Some((Tok::Ident(name), _))) => {
+                        let slot = match name {
+                            "core" => Some(&mut facts.extern_core),
+                            "alloc" => Some(&mut facts.extern_alloc),
+                            "std" => Some(&mut facts.extern_std),
+                            _ => None,
+                        };
+                        if let Some(slot) = slot {
+                            *slot |= live.known()?;
+                        }
+                    }
+                    _ => lx.at = save,
+                }
+            }
+            // A `macro` item (decl_macro): its rules are no items.
+            Tok::Ident("macro") if group == 0 => {
+                let save = lx.at;
+                let mut probe = lx;
+                if let Some((Tok::Ident(_), _)) = probe.next()? {
+                    let mut skipped = false;
+                    for _ in 0..2 {
+                        let mut more = probe;
+                        match more.next()? {
+                            Some((Tok::Open(_), open)) => {
+                                more.group(open)?;
+                                probe = more;
+                                skipped = true;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if skipped {
+                        lx = probe;
+                        continue;
+                    }
+                }
+                lx.at = save;
+            }
+            // A macro call or `macro_rules!` body: its tokens are no items (see the module's
+            // documentation for what an expansion writes).
+            Tok::Ident(_) => {
+                let save = lx.at;
+                let mut probe = lx;
+                if matches!(probe.next()?, Some((Tok::Punct(b'!'), _))) {
+                    let mut body = probe;
+                    let mut opened = body.next()?;
+                    if let Some((Tok::Ident(_), _)) = opened {
+                        opened = body.next()?;
+                    }
+                    if let Some((Tok::Open(_), open)) = opened {
+                        body.group(open)?;
+                        lx = body;
+                        continue;
+                    }
+                }
+                lx.at = save;
+            }
+            Tok::Open(b'{') => {
+                braces.push(Brace { live, dir_len: dir.len(), group, module: false });
+                group = 0;
+                pending_live = Holds::Yes;
+                pending_path = None;
+            }
+            Tok::Close(b'}') => {
+                let Some(b) = braces.pop() else {
+                    return Err(ImpliedRefused::Unclosed { what: "bracket closed before it opened", line: line() });
+                };
+                dir.truncate(b.dir_len);
+                group = b.group;
+                if b.module {
+                    inline -= 1;
+                }
+                if group == 0 {
+                    pending_live = Holds::Yes;
+                    pending_path = None;
+                }
+            }
+            Tok::Open(_) => group += 1,
+            Tok::Close(_) => group = group.checked_sub(1).ok_or_else(|| ImpliedRefused::Unclosed { what: "bracket closed before it opened", line: line() })?,
+            Tok::Punct(b';' | b',') if group == 0 => {
+                pending_live = Holds::Yes;
+                pending_path = None;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The file of a live `mod name;`: by its `#[path]` (`path`, relative to `base`: the file's
+/// directory outside inline modules, the children's inside them), else `name.rs` or
+/// `name/mod.rs` in `dir`; with whether it owns its directory.
+fn module_file<'t, 'a>(
+    name: &'t str,
+    path: Option<&'t str>,
+    base: &[u8],
+    dir: &[u8],
+    read: &impl Fn(&str) -> Option<&'t str>,
+    scratch: &mut AVec<'a, u8>,
+    line: u32,
+) -> Result<(AVec<'a, u8>, bool), ImpliedRefused<'t>> {
+    let alloc = *scratch.allocator();
+    let exists = |p: &[u8]| core::str::from_utf8(p).ok().and_then(read).is_some();
+    let mut out = AVec::new_in(alloc);
+    if let Some(path) = path {
+        scratch.clear();
+        scratch.extend_from_slice(base);
+        push_segment(scratch, path.as_bytes());
+        normalized(scratch, &mut out).ok_or(ImpliedRefused::ModulePath { line })?;
+        if !exists(&out) {
+            return Err(ImpliedRefused::ModuleFile { name, line });
+        }
+        return Ok((out, true));
+    }
+    scratch.clear();
+    scratch.extend_from_slice(dir);
+    push_segment(scratch, name.as_bytes());
+    let stem = scratch.len();
+    scratch.extend_from_slice(b".rs");
+    let flat = exists(scratch);
+    scratch.truncate(stem);
+    scratch.extend_from_slice(b"/mod.rs");
+    let nested = exists(scratch);
+    match (flat, nested) {
+        (true, true) => Err(ImpliedRefused::TwoModuleFiles { name, line }),
+        (false, false) => Err(ImpliedRefused::ModuleFile { name, line }),
+        (true, false) => {
+            scratch.truncate(stem);
+            scratch.extend_from_slice(b".rs");
+            out.extend_from_slice(scratch);
+            Ok((out, false))
+        }
+        (false, true) => {
+            out.extend_from_slice(scratch);
+            Ok((out, true))
+        }
+    }
+}
+
+/// A crate root's inner attributes, before its first item: its sysroot, and where its items
+/// start.
+fn root_inner<'t>(text: &'t str, cfg: Cfg<'_>) -> Result<(ImplicitSysroot, usize), ImpliedRefused<'t>> {
     let mut at = 0;
     if text.starts_with('\u{feff}') {
         at = 3;
@@ -588,68 +1058,14 @@ pub fn root_facts<'t>(text: &'t str, cfg: Cfg<'_>) -> Result<RootFacts, ImpliedR
             Ok(())
         })?;
     }
-    let mut facts = RootFacts {
-        sysroot: if no_core {
-            ImplicitSysroot::None
-        } else if no_std {
-            ImplicitSysroot::Core
-        } else {
-            ImplicitSysroot::Std
-        },
-        extern_core: false,
-        extern_alloc: false,
-        extern_std: false,
+    let sysroot = if no_core {
+        ImplicitSysroot::None
+    } else if no_std {
+        ImplicitSysroot::Core
+    } else {
+        ImplicitSysroot::Std
     };
-    // The root module's items: `extern crate` under its outer `#[cfg]`s.
-    let mut depth = 0u32;
-    let mut live = true;
-    while let Some((tok, at)) = lx.next()? {
-        match tok {
-            Tok::Punct(b'#') if depth == 0 => {
-                let save = lx.at;
-                match lx.next()? {
-                    Some((Tok::Open(b'['), open)) => {
-                        let range = lx.group(open)?;
-                        expand(text, range, cfg, |w| w == "cfg", |_, mut rest| {
-                            let line = rest.line(rest.at);
-                            let Some((Tok::Open(b'('), _)) = rest.next()? else {
-                                return Err(ImpliedRefused::Predicate { why: "a `cfg` with no predicate", line });
-                            };
-                            live &= predicate(&mut rest, cfg)?;
-                            Ok(())
-                        })?;
-                    }
-                    _ => lx.at = save,
-                }
-            }
-            Tok::Open(_) => depth += 1,
-            Tok::Close(c) => {
-                depth = depth.checked_sub(1).ok_or(ImpliedRefused::Unclosed { what: "bracket closed before it opened", line: line_of(text, at) })?;
-                if depth == 0 && c == b'}' {
-                    live = true;
-                }
-            }
-            Tok::Punct(b';') if depth == 0 => live = true,
-            Tok::Ident("extern") if depth == 0 => {
-                let save = lx.at;
-                match (lx.next()?, lx.next()?) {
-                    (Some((Tok::Ident("crate"), _)), Some((Tok::Ident(name), _))) => {
-                        if live {
-                            match name {
-                                "core" => facts.extern_core = true,
-                                "alloc" => facts.extern_alloc = true,
-                                "std" => facts.extern_std = true,
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => lx.at = save,
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(facts)
+    Ok((sysroot, lx.at))
 }
 
 /// The toolchain's sysroot units of one target and side, by index in its unit list.
@@ -702,8 +1118,69 @@ mod tests {
 
     const MAC: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];
 
+    /// A crate of one file, `lib.rs`.
+    fn root_facts<'t>(text: &'t str, cfg: Cfg<'_>) -> Result<RootFacts, ImpliedRefused<'t>> {
+        crate_facts("lib.rs", |p| (p == "lib.rs").then_some(text), cfg, blaze_own::testing::heap().alloc()).map_err(|e| e.why)
+    }
+
     fn of(text: &str) -> RootFacts {
         root_facts(text, MAC).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// A crate of `files` (pack path, text), its root the first.
+    fn files_of<'t>(files: &[(&str, &'t str)], cfg: Cfg<'_>) -> Result<RootFacts, std::string::String> {
+        let read = |p: &str| files.iter().find(|(path, _)| *path == p).map(|(_, text)| *text);
+        crate_facts(files[0].0, read, cfg, blaze_own::testing::heap().alloc()).map_err(|e| std::format!("{e}"))
+    }
+
+    /// The Reference, "Extern crate declarations": the item asks for its crate wherever it is
+    /// written. bstd's shape (crates/blaze-std: `#![no_std]`, `mod rt;`, and in rt.rs
+    /// `extern crate std;`): the row gets `std`. Under a `#[cfg]` that does not hold on the
+    /// `mod` (or a `#![cfg]` in the file) it does not; the same file through an inline module,
+    /// a `#[path]`, a `name/mod.rs`, a nested `name.rs` beside a non-root file, a block, and
+    /// `extern crate std as s` gets it; one in a `macro_rules!` body is no item. Prints
+    /// `crate facts: nested std=true, cfg'd off std=false`.
+    #[test]
+    fn an_extern_crate_in_any_module_file_is_an_edge() {
+        let root = "#![no_std]\nextern crate alloc;\nmod rt;\n";
+        let rt = "pub(crate) type Mark = u8;\nextern crate std;\n";
+        let nested = files_of(&[("src/lib.rs", root), ("src/rt.rs", rt)], MAC).expect("reads");
+        assert!(nested.extern_std && nested.extern_alloc && nested.sysroot == ImplicitSysroot::Core, "{nested:?}");
+        let off = files_of(&[("src/lib.rs", "#![no_std]\n#[cfg(windows)]\nmod rt;\n"), ("src/rt.rs", rt)], MAC).expect("reads");
+        assert!(!off.extern_std, "CONTROL: under a cfg that does not hold the module is not read: {off:?}");
+        let inner_off = files_of(&[("src/lib.rs", root), ("src/rt.rs", "#![cfg(windows)]\nextern crate std;\n")], MAC).expect("reads");
+        assert!(!inner_off.extern_std, "a `#![cfg]` that does not hold takes its file's items");
+        let on = files_of(&[("src/lib.rs", "#![no_std]\n#[cfg(unix)]\nmod rt;\n"), ("src/rt.rs", rt)], MAC).expect("reads");
+        assert!(on.extern_std, "a cfg that holds");
+        // Deeper: an inline module's `mod`, a `name/mod.rs`, a non-root file's child under its
+        // stem, a `#[path]`, a block and a rename.
+        let deep = [
+            ("src/lib.rs", "#![no_std]\nmod a { mod b; }\n#[path = \"other/p.rs\"]\nmod p;\n"),
+            ("src/a/b/mod.rs", "mod c;\n"),
+            ("src/a/b/c.rs", "mod d;\n"),
+            ("src/a/b/c/d.rs", "fn f() { extern crate std as s; }\n"),
+            ("src/other/p.rs", "extern crate core;\n"),
+        ];
+        let deep = files_of(&deep, MAC).expect("reads");
+        assert!(deep.extern_std && deep.extern_core, "{deep:?}");
+        let in_macro = of("#![no_std]\nmacro_rules! m { () => { extern crate std; } }\nm! { extern crate std; }\nmacro m2($x:tt) { extern crate std; }\n");
+        assert!(!in_macro.extern_std, "a macro's tokens are no items: {in_macro:?}");
+        // A profile's atom (core's `#[cfg(debug_assertions)]` items) refuses only where it
+        // decides an edge; a predicate this reader does not take, likewise.
+        let profiled = of("#![no_std]\n#[cfg(debug_assertions)]\nfn check() {}\n#[cfg(version(\"1.0\"))]\nfn later() {}\n");
+        assert!(!profiled.extern_std, "{profiled:?}");
+        let decided = root_facts("#![no_std]\n#[cfg(debug_assertions)]\nmod d { extern crate std; }\n", MAC);
+        assert!(matches!(decided, Err(ImpliedRefused::ProfileAtom { name: "debug_assertions", line: 2 })), "{decided:?}");
+        let ruled_out = of("#![no_std]\n#[cfg(all(debug_assertions, windows))]\nextern crate std;\n");
+        assert!(!ruled_out.extern_std, "`all(.., false)` is false whatever the profile");
+        let fn_args = of("#![no_std]\n#[cfg(windows)]\nfn f(a: u8, b: u8) { extern crate std; }\nfn g() {}\n");
+        assert!(!fn_args.extern_std, "a `,` inside the head keeps the item's cfg to its body");
+        // A live `mod` with no file, or with two, is refused by name.
+        let missing = files_of(&[("src/lib.rs", "mod gone;\n")], MAC).expect_err("no file");
+        assert!(missing.contains("`mod gone;`"), "{missing}");
+        let two = files_of(&[("src/lib.rs", "mod x;\n"), ("src/x.rs", ""), ("src/x/mod.rs", "")], MAC).expect_err("two files");
+        assert!(two.contains("E0761"), "{two}");
+        std::println!("crate facts: nested std={}, cfg'd off std={}", nested.extern_std, off.extern_std);
     }
 
     /// The Reference, "The `no_std` attribute" and "The `no_core` attribute": the root's inner
@@ -756,13 +1233,14 @@ mod tests {
     /// `std` from the sysroot; under a false `#[cfg]` it is not there. blaze-own's form
     /// (lib.rs:98-100) under no feature names nothing; with `std` it names `std`.
     /// `extern crate self as std` and `extern "C"` are not sysroot crates; one in a nested
-    /// module is not the root's. Prints `implied externs: own std=false, own+std std=true`.
+    /// module asks for its crate too (`an_extern_crate_in_any_module_file_is_an_edge`). Prints
+    /// `implied externs: own std=false, own+std std=true`.
     #[test]
     fn the_cutter_reads_the_roots_extern_crates() {
         let own = "#![no_std]\n#[cfg(any(test, feature = \"std\"))]\nextern crate std;\nextern crate alloc;\nextern \"C\" { fn f(); }\nmod m { extern crate core; }\nextern crate self as me;";
         let plain = of(own);
         assert_eq!(plain.sysroot, ImplicitSysroot::Core);
-        assert!(!plain.extern_std && plain.extern_alloc && !plain.extern_core);
+        assert!(!plain.extern_std && plain.extern_alloc && plain.extern_core);
         let with_std = root_facts(own, &[("feature", Some("std"))]).expect("reads");
         assert!(with_std.extern_std, "CONTROL: under `std` it is live");
         let stacked = of("#![no_std]\n#[cfg(test)]\n#[macro_use]\nextern crate std;\nfn g<'a>(x: &'a u8) -> char { let _ = *x; '}' }\nextern crate core;");

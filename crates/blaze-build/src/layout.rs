@@ -482,6 +482,28 @@ pub struct DynPrefix {
     pub align: u8,
 }
 
+/// The most structs a trait object may be nested in, each the last field of the one before
+/// (`ArcInner<Mutex<UnsafeCell<dyn Tr>>>` is three): the levels a [`DynChain`] holds. A deeper
+/// nesting is refused by name where it is laid out (`univariant`).
+pub const DYN_DEPTH: usize = 8;
+
+/// A layout ending in a trait object through nested structs ([`Layouts::dyn_chain`]): each
+/// level's [`DynPrefix`], outermost first; the innermost ends in the `dyn` itself. Level `i`'s
+/// tail (level `i + 1`, or the `dyn`) is at `round_up(levels[i].tail_at, align_of_val(tail))`,
+/// two or more run-time roundings in all (crate::dyn_tail).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DynChain {
+    levels: [DynPrefix; DYN_DEPTH],
+    depth: u8,
+}
+
+impl DynChain {
+    /// The levels, outermost first (at least one).
+    pub fn levels(&self) -> &[DynPrefix] {
+        &self.levels[..self.depth as usize]
+    }
+}
+
 /// A type's layout.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Layout {
@@ -614,6 +636,9 @@ pub struct Layouts<A: Allocator + Clone> {
     offsets: Vec<u64, A>,
     variant_rows: Vec<LayoutId, A>,
     discrs: Vec<i128, A>,
+    /// (a struct row's `Fields::Struct::first`, the row of its last field): every struct or
+    /// tuple whose last field is itself a struct ending in a trait object, read by `dyn_chain`.
+    dyn_inner: Vec<(u32, LayoutId), A>,
     alloc: A,
 }
 
@@ -694,6 +719,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             offsets: Vec::new_in(alloc.clone()),
             variant_rows: Vec::new_in(alloc.clone()),
             discrs: Vec::new_in(alloc.clone()),
+            dyn_inner: Vec::new_in(alloc.clone()),
             alloc,
         }
     }
@@ -814,6 +840,31 @@ impl<A: Allocator + Clone> Layouts<A> {
             Fields::Primitive | Fields::Union { .. } | Fields::Array { .. } => return None,
         };
         Some(DynPrefix { tail_at, align: l.align })
+    }
+
+    /// Every level of a layout ending in a trait object ([`DynChain`]): this row's
+    /// [`Self::dyn_prefix`], then its last field's when that is itself a struct ending in one
+    /// (`dyn_inner`), and so on. `None` for a row that does not end in a trait object.
+    pub fn dyn_chain(&self, id: LayoutId) -> Option<DynChain> {
+        let first = self.dyn_prefix(id)?;
+        let mut chain = DynChain { levels: [first; DYN_DEPTH], depth: 1 };
+        let mut at = id;
+        while let Fields::Struct { first, len } = self.rows.get(at.0 as usize)?.fields
+            && len > 0
+            && let Some(&(_, inner)) = self.dyn_inner.iter().rev().find(|(f, _)| *f == first)
+        {
+            let level = chain.levels.get_mut(chain.depth as usize)?;
+            *level = self.dyn_prefix(inner)?;
+            chain.depth += 1;
+            at = inner;
+        }
+        Some(chain)
+    }
+
+    /// How many levels `dyn_chain` gives for row `id` (0 when it does not end in `dyn`), for
+    /// `univariant`'s depth check before a new level is recorded.
+    fn dyn_depth(&self, id: LayoutId) -> usize {
+        self.dyn_chain(id).map_or(0, |c| c.depth as usize)
     }
 
     fn slot(&mut self, t: PTy) -> &mut u32 {
@@ -1282,11 +1333,13 @@ impl<A: Allocator + Clone> Layouts<A> {
                 // and its size 0, so the plain placement below puts it there.
                 if !matches!(l.fields, Fields::Struct { len: 0, .. }) {
                     // `struct Outer { a: u8, inner: S<dyn Tr> }`: `inner`'s own offset depends
-                    // on the vtable's alignment too, so a single rounding of a static offset
-                    // is not its place.
-                    return Err(Refusal::Unsupported(
-                        "a struct whose last field is itself a struct ending in a trait object (`dyn`): the nested tail's offset needs two run-time roundings",
-                    ));
+                    // on the vtable's alignment too (`align_of_val(inner)`, the larger of `S`'s
+                    // and the vtable's): its row here is placed at `S`'s static alignment, and
+                    // the run-time rounding of each level is `dyn_chain`'s (crate::dyn_tail).
+                    if self.dyn_depth(ids[i as usize]) + 1 > DYN_DEPTH {
+                        return Err(Refusal::Unsupported("a trait object (`dyn`) at the end of more than eight nested structs"));
+                    }
+                    self.dyn_inner.push((first, ids[i as usize]));
                 }
                 if attrs.packed.is_some() {
                     // The Reference, `[layout.repr.alignment.packed-fields]`: the vtable's
@@ -1434,6 +1487,21 @@ impl<A: Allocator + Clone> Layouts<A> {
         }
         let first = self.offsets.len() as u32;
         self.offsets.resize(self.offsets.len() + fields.len(), 0);
+        // A wrapper of a struct ending in a trait object is one more level of it (`dyn_chain`).
+        if let Some(l) = inner
+            && l.tail == Tail::Dyn
+            && !matches!(l.fields, Fields::Struct { len: 0, .. })
+            && let Some(&last) = fields.last()
+        {
+            let id = self.done(last).ok_or(Refusal::Malformed("a field not laid out"))?;
+            if self.get(id).tail != Tail::Dyn {
+                return Err(Refusal::Malformed("an unsized field that is not the last"));
+            }
+            if self.dyn_depth(id) + 1 > DYN_DEPTH {
+                return Err(Refusal::Unsupported("a trait object (`dyn`) at the end of more than eight nested structs"));
+            }
+            self.dyn_inner.push((first, id));
+        }
         Ok(match inner {
             Some(l) => Uni {
                 first,

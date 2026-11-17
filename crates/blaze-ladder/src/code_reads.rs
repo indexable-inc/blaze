@@ -684,7 +684,7 @@ impl Adts for Recorded<'_> {
         self.world.float_pat(owner, pat)
     }
 
-    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&str> {
+    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&[u8]> {
         self.world.str_pat(owner, pat)
     }
 

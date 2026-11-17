@@ -57,14 +57,23 @@ def pins():
         sys.exit(f"the manifest of {RELEASE} is dated {date}")
     rustc = channel["pkg"]["rustc"]["version"]
     commit = channel["pkg"]["rust"]["git_commit_hash"]
+    # `cargo -V` prints rustc's release (cargo is built with the tree's CFG_RELEASE) and its own
+    # commit and date, which the manifest gives after its crate version: `0.N.0-nightly (<hash>
+    # <date>)`. Build scripts ask it (codspeed); blaze answers it from this line.
+    cargo = channel["pkg"]["cargo"]["version"]
+    if "(" not in cargo:
+        sys.exit(f"the manifest's cargo version `{cargo}` names no commit")
+    cargo = f"{rustc.split()[0]} {cargo[cargo.index('('):]}"
     lines = [
         f"# The Rust nightly blaze downloads as its own toolchain: written by",
         f"# harness/toolchain_pins.py '{{\"write\": true}}' from {DIST}/{DATE}/channel-rust-{CHANNEL}.toml.",
         f"# release <toolchain> <date> <channel>; rustc <what `rustc -V` says after `rustc `>;",
+        f"# cargo <what `cargo -V` says after `cargo `>;",
         f"# commit <rust-lang/rust commit>; manifest <sha256> <bytes>; then per host",
         f"# <host> <package> <target> <sha256 of the .tar.xz> <bytes>.",
         f"release {RELEASE} {date} {CHANNEL}",
         f"rustc {rustc}",
+        f"cargo {cargo}",
         f"commit {commit}",
         f"manifest {digest} {len(manifest)}",
     ]

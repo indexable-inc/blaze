@@ -351,14 +351,20 @@ fn a_dependency_s_reach_is_asked_for_by_key() {
     assert!(b.reaches.contains(&c_key), "b re-exports c's items but its record does not reach c: {:?}", b.reaches);
     // `d` names only `b`; `b::far` is c's, through two globs.
     let d = CrateInput { key: CrateItemKey(ContentId::of("blaze-scope test crate", b"d")), ..input("d", "/d/lib.rs", &[("b", 0)]) };
+    // The records' heads, read in place, ask for what the solve's `Need` asks for, before it.
+    let unmet = crate::crate_scope::unmet_reaches(&[b_record], g).unwrap_or_else(|e| panic!("b's head: {e:?}"));
     match resolve_crate(&d, &[b_record], Sysroot::default(), &TEXTS, 4, &Serial, prepares, g) {
-        Err(CrateScopeError::Need(keys)) => assert!(keys.contains(&c_key), "d's Need lacks c: {keys:?}"),
+        Err(CrateScopeError::Need(keys)) => {
+            assert!(keys.contains(&c_key), "d's Need lacks c: {keys:?}");
+            assert_eq!(&unmet[..], &keys[..], "the heads' unmet reaches are the solve's Need");
+        }
         other => panic!("d without c's record: {other:?}"),
     }
     let mut deps = vec![b_record, aligned(&all[2].record, g)];
     if b.reaches.contains(&crates[3].key) {
         deps.push(aligned(&all[3].record, g));
     }
+    assert!(crate::crate_scope::unmet_reaches(&deps, g).expect("the heads").is_empty(), "every reach handed: nothing unmet");
     let done = resolve_crate(&d, &deps, Sysroot::default(), &TEXTS, 4, &Serial, prepares, g).unwrap_or_else(|e| panic!("d with c's record: {e:?}"));
     let text = scopes_of(done.names).join("\n");
     assert!(text.contains("name: \"far\"") && !text.contains("Unresolved"), "d's `use b::far` through records:\n{text}");

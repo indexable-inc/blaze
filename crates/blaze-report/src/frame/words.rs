@@ -227,6 +227,27 @@ pub const WORDINGS: &[Wording] = &[
         label: "not run: an input it reads could not be made",
         args: 1,
     },
+    // A task that failed only because a task it needs failed (blaze-cli work.rs `WAITED`): no
+    // error of its own. Drawn only under `--each`; else counted under its cause's line
+    // (not_checked/waited.rs). `{0}` the cause's name in hex, `{1}` the waiting crate (or empty).
+    Wording {
+        area: Area::Cli,
+        number: 24,
+        name: "waited",
+        headline: "not checked: it needs {code:0}, which failed (its crate: `{1}`)",
+        label: "not checked: a task it needs failed",
+        args: 2,
+    },
+    // A file whose text this build refuses (blaze-cli work.rs `FILE_NOT_TEXT`): the user's error
+    // at that file, never a task failure.
+    Wording {
+        area: Area::Cli,
+        number: 25,
+        name: "file-not-text",
+        headline: "{0}",
+        label: "this file is not text blaze reads (UTF-8, under 4 GiB): fix the file",
+        args: 1,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,

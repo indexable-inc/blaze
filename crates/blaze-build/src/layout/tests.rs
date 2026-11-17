@@ -316,8 +316,9 @@ fn trait_object_pointers_are_two_words_with_the_niche_in_the_data_word() {
 /// alignment, a run-time value (crate::dyn_tail). Its row keeps the end unrounded and the
 /// prefix's alignment: `S<dyn Tr> { a: u8, t: dyn Tr }` ends at 1 aligned to 1; `ArcInner<dyn
 /// Tr> { strong: u64, weak: u8, data: dyn Tr }` ends at 9 aligned to 8 (not 16: the rounding is
-/// the vtable's). A struct whose last field is itself such a struct, and a packed one, are
-/// refused by name. A wrong version that rounded the prefix's end to its own alignment would
+/// the vtable's). A struct whose last field is itself such a struct is a chain of two levels
+/// (`dyn_chain`; its run-time size is crate::dyn_tail's, run in
+/// tests/objects/nested_dyn_tail.rs); a packed one is refused by name. A wrong version that rounded the prefix's end to its own alignment would
 /// give 16 for the second; one that kept the old refusal fails the first `unwrap`.
 fn dyn_tails_keep_the_prefix_end_unrounded(w: &mut World, g: &mut G, ls: &mut Layouts<Global>, tail: ItemKey, dyn_tr: PTy) {
     let ends_in_dyn = g.adt(tail, &[dyn_tr]);
@@ -333,8 +334,13 @@ fn dyn_tails_keep_the_prefix_end_unrounded(w: &mut World, g: &mut G, ls: &mut La
     assert_eq!(ls.dyn_prefix(id), Some(DynPrefix { tail_at: 9, align: 3 }), "ArcInner<dyn Tr>: ends at 9, aligned to 8");
     let outer = w.strukt(1, &[F::Leaf(U8), F::AdtP(tail, 0)], ReprAttrs::RUST);
     let t = g.adt(outer, &[dyn_tr]);
-    let refused = lay(w, g, ls, t).unwrap_err();
-    assert!(matches!(refused.why, Refusal::Unsupported(what) if what.contains("itself a struct ending in a trait object")), "{refused:?}");
+    let id = lay(w, g, ls, t).unwrap();
+    let chain = ls.dyn_chain(id).expect("Outer<dyn Tr> ends in a trait object");
+    assert_eq!(
+        chain.levels(),
+        [DynPrefix { tail_at: 1, align: 0 }, DynPrefix { tail_at: 1, align: 0 }],
+        "Outer<dyn Tr>: its S at 1 (S's static alignment 1), then S's own level"
+    );
     let packed = w.strukt(1, &[F::Leaf(U8), F::P(0)], ReprAttrs { packed: Some(0), ..ReprAttrs::RUST });
     let t = g.adt(packed, &[dyn_tr]);
     let refused = lay(w, g, ls, t).unwrap_err();

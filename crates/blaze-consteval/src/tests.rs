@@ -16,6 +16,7 @@ use crate::{ConstError, Intrinsic, Layouts, Limits, Op, PanicPart, Refusal, eval
 
 mod byte_intrinsics;
 mod closure_fn_ptr;
+mod dst_tail;
 mod fn_fact;
 mod needs_drop;
 mod transmute_unchecked;

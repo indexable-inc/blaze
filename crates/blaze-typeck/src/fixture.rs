@@ -1227,6 +1227,38 @@ impl Bb {
         self.e(Expr::Path(PathIdx(at)))
     }
 
+    /// `name @ sub`: a binding with a subpattern (chrono's `Some(r @ 0..=99)`).
+    pub fn bind_sub(&mut self, name: &str, sub: PatId) -> PatId {
+        let at = self.pats.len() as u32;
+        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: Some(sub) });
+        self.pat_ranges.push(Range { start: 1000 + at, end: 1001 + at });
+        PatId(at)
+    }
+
+    /// The wildcard pattern `_`.
+    pub fn wild(&mut self) -> PatId {
+        let at = self.pats.len() as u32;
+        self.pats.push(Pat::Wild);
+        self.pat_ranges.push(Range { start: 1000 + at, end: 1001 + at });
+        PatId(at)
+    }
+
+    /// A qualified path pattern `<ty>::segments[0]..` (no trait): a constant compared by value
+    /// (`U256::ZERO =>`) or a unit variant.
+    pub fn qpath_pat(&mut self, ty: PTy, segments: &[&str]) -> PatId {
+        let start = self.segments.len() as u32;
+        for s in segments {
+            self.segments.push(Segment { name: Name::of(s), generic_args: List::EMPTY, has_args: false });
+        }
+        let path = self.paths.len() as u32;
+        let anchor = Some(crate::body::Anchor { ty, trait_: None, ty_range: Range::default() });
+        self.paths.push(BodyPath { scope: ScopeId(0), segments: List { start, len: segments.len() as u32 }, lang: None, anchor });
+        let at = self.pats.len() as u32;
+        self.pats.push(Pat::Path(PathIdx(path)));
+        self.pat_ranges.push(Range { start: 1000 + at, end: 1001 + at });
+        PatId(at)
+    }
+
     /// A qualified value path `<ty as tr>::segments[0]..`, `tr` a trait's name in scope.
     pub fn qpath_as(&mut self, ty: PTy, tr: &str, segments: &[&str]) -> ExprId {
         let tstart = self.segments.len() as u32;

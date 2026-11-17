@@ -188,6 +188,34 @@ fn control_without_the_column_all_three_are_at_the_call() {
     assert_eq!(at_call, 3);
 }
 
+/// The identity column of a text the lexer gives tokens SHARING a place (tempo census g051231:
+/// "origin row 1 (0..39) is out of order after one ending at 39", a kept `/// doc` +
+/// `#[derive(..)]` item): a doc comment's `# [ doc = ".." ]`, a lifetime's `'` and name. One row a
+/// place, its first token's; it opens and maps each shape back to its bytes. Control: one row a
+/// token, as `kept` wrote it, is refused AT THE WRITE naming both rows.
+#[test]
+fn shared_places_are_one_row_each() {
+    use crate::origin_column::ColumnError;
+    let alloc = blaze_own::testing::heap().alloc();
+    let text = "/// Doc.\n#[derive(Show)]\npub struct N<'a> { n: &'a u8 }";
+    let places = input_places(text, InputShape::Whole, Edition::E2021, alloc).expect("the text lexes");
+    let column = OriginColumn::input_identity(&places, alloc).expect("one row a place is sorted");
+    let mut bytes: AVec<'_, u8> = AVec::new_in(alloc);
+    column.write(&mut bytes).expect("a small column");
+    let (read, _) = OriginsRef::open(&bytes).expect("the column reads back");
+    assert!(read.len() < places.len(), "tokens share places: {} rows for {} tokens", read.len(), places.len());
+    for (needle, from) in [("/// Doc.", 0), ("'a", text.find("n:").expect("the field")), ("#[derive(Show)]", 0)] {
+        let at = from + text[from..].find(needle).expect("the needle");
+        let (s, e) = input_bytes(text, InputShape::Whole, map_range(read, at as u32, (at + needle.len()) as u32), alloc);
+        assert_eq!(&text[s..e], needle, "`{needle}` maps to its own bytes");
+    }
+    // Control: a row a token.
+    let mut per_token = OriginColumn::new_in(alloc);
+    let refused = places.iter().enumerate().try_for_each(|(i, &(s, e))| per_token.push(s as usize, e as usize, TextOrigin::Input(i as u32), None));
+    assert_eq!(refused, Err(ColumnError::Unsorted { row: 1, start: 0, end: 8, previous_start: 0, previous_end: 8 }));
+    std::println!("origin shared: {} rows for {} tokens; a row a token refused", read.len(), places.len());
+}
+
 /// The same column keeps each token's mark (drive.md, "A token keeps its mark", ruled 21:27): two
 /// definition tokens of one `macro` share one table entry, a written token has none, and the
 /// table's bytes do not depend on the order the marks were met in. Prints

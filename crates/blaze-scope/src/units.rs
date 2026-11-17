@@ -162,10 +162,21 @@ pub struct UnitCrates<'a> {
     /// crates); [`Self::crates`]'s length when there are none. A loader gives such a crate
     /// only facts of that side (never the host's build-script record).
     pub macro_from: usize,
+    /// The crates before [`Self::macro_from`] built for the macro side all the same: each member
+    /// proc macro and its library test harness (`macro_side`), whose dependencies are that
+    /// side's copies and whose cfg is that side's. Sorted, each once.
+    pub built_for_macro: AVec<'a, usize>,
     alloc: Alloc<'a>,
 }
 
 impl<'a> UnitCrates<'a> {
+    /// Whether the crate at `krate` is built for the macro side: one past
+    /// [`Self::macro_from`], or a member's proc macro or its harness
+    /// ([`Self::built_for_macro`]). The one answer of a crate's side (rule 30).
+    pub fn macro_side(&self, krate: usize) -> bool {
+        krate >= self.macro_from || self.built_for_macro.binary_search(&krate).is_ok()
+    }
+
     /// Why the crate at `krate` cannot be made, when it cannot: its names are refused with
     /// this error, naming it, instead of resolved.
     pub fn refusal(&self, krate: usize) -> Option<&UnitsError<'a>> {
@@ -316,10 +327,17 @@ pub fn unit_crates<'a>(
     let mut reached: AVec<'a, bool> = AVec::new_in(alloc);
     reached.resize(units.len(), false);
     let mut todo: AVec<'a, usize> = AVec::new_in(alloc);
+    // A proc macro's code (the proc macro and its library test harness, both built for the
+    // host by the unit graph: units/macro_crate.rs) is a crate of this list whose dependencies
+    // are not: a member's are the macro side's (`macro_side`), a dependency's come from the
+    // module store.
+    let macro_code = |at: usize| macro_crate::is_macro_crate(units, at);
+    let target_kind = |u: &Unit<'_>| matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_));
     for (at, u) in units.iter().enumerate() {
         // A member's test unit is a root too (the graph makes one only when tests are asked:
-        // `Ask::tests`): left out, `--tests` solved no unit with `test` in its cfg.
-        if members.iter().any(|m| m.id == u.package) && !u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_)) {
+        // `Ask::tests`): left out, `--tests` solved no unit with `test` in its cfg. A member
+        // proc macro's harness is one though it is a host unit.
+        if members.iter().any(|m| m.id == u.package) && ((!u.for_host && target_kind(u)) || (u.kind != UnitKind::ProcMacro && macro_code(at))) {
             todo.push(at);
         }
     }
@@ -328,23 +346,21 @@ pub fn unit_crates<'a>(
             continue;
         }
         reached[at] = true;
-        if units[at].kind != UnitKind::ProcMacro {
+        if !macro_code(at) {
             todo.extend(units[at].deps.iter().map(|d| d.unit.index()));
         }
     }
-    let kept = |u: &Unit<'_>| {
-        u.kind == UnitKind::ProcMacro || (!u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_)))
+    let kept = |at: usize| {
+        let u = &units[at];
+        u.kind == UnitKind::ProcMacro || macro_code(at) || (!u.for_host && target_kind(u))
     };
-    let blaze = units
-        .iter()
-        .enumerate()
-        .any(|(at, u)| reached[at] && kept(u) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Bstd(_)));
+    let blaze = units.iter().enumerate().any(|(at, _)| reached[at] && kept(at) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Bstd(_)));
     // The program's own need of Rust's std is its own edge; a toolchain crate's is its row's
     // (blaze_toolchain::implied): std is listed iff a crate of the closure names it.
     let rust_std = units
         .iter()
         .enumerate()
-        .any(|(at, u)| reached[at] && kept(u) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Rust));
+        .any(|(at, _)| reached[at] && kept(at) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Rust));
 
     let mut crates: AVec<'a, UnitCrate<'a>> = AVec::new_in(alloc);
     let sysroot = toolchain_crates(toolchain, triple, rust_std, blaze, &mut crates, alloc)?;
@@ -353,8 +369,8 @@ pub fn unit_crates<'a>(
     let mut at_of: AVec<'a, usize> = AVec::new_in(alloc);
     at_of.resize(units.len(), usize::MAX);
     let mut next = first;
-    for (at, u) in units.iter().enumerate() {
-        if reached[at] && kept(u) {
+    for at in 0..units.len() {
+        if reached[at] && kept(at) {
             at_of[at] = next;
             next += 1;
         }
@@ -368,8 +384,9 @@ pub fn unit_crates<'a>(
         let base = numbered("/package/", u.package.0, alloc);
         let root = joined_root(&base, u.root.as_str(), alloc).ok_or(UnitsError::RootLeavesPackage { krate: name, root: u.root.as_str() })?;
         let mut deps = AVec::new_in(alloc);
-        // A proc macro's dependencies are the host's, not in this list.
-        if u.kind != UnitKind::ProcMacro {
+        // A proc macro's code's dependencies are the host's, not in this list (a member's are
+        // pointed at the macro side's copies by `macro_side`).
+        if !macro_code(at) {
             for d in u.deps.iter() {
                 let to = at_of[d.unit.index()];
                 if to == usize::MAX {
@@ -411,8 +428,11 @@ pub fn unit_crates<'a>(
     // A member's proc macro is built from the macro side's crates (D89 (a)), or refused alone.
     let mut refused = AVec::new_in(alloc);
     let macro_from = crates.len();
-    macro_side::add_macro_side(graph, lock, members, toolchain, &at_of, &mut crates, &mut build_scripts, &mut refused, alloc)?;
-    Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, refused, macro_from, alloc })
+    let mut built_for_macro = AVec::new_in(alloc);
+    macro_side::add_macro_side(graph, lock, members, toolchain, &at_of, &mut crates, &mut build_scripts, &mut refused, &mut built_for_macro, alloc)?;
+    built_for_macro.sort_unstable();
+    built_for_macro.dedup();
+    Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, refused, macro_from, built_for_macro, alloc })
 }
 
 /// The toolchain units reachable from core and alloc (and Rust's std when `rust_std`, bstd

@@ -279,8 +279,9 @@ pub trait Adts {
         None
     }
 
-    /// The text of string literal pattern `pat` (`Pat::Lit(Lit::Str)`) of the body of `owner`.
-    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&str> {
+    /// The bytes of string or byte string literal pattern `pat` (`Pat::Lit(Lit::Str)`, `Pat::Lit(
+    /// Lit::ByteStr(_))`) of the body of `owner`, unescaped.
+    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&[u8]> {
         let _ = (owner, pat);
         None
     }
@@ -1101,6 +1102,22 @@ pub fn build_ctor_fn<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     walk::build_ctor_fn(ctor, variant, sig, subst, adts, alloc)
+}
+
+/// Builds the `Clone::clone` the LANGUAGE gives `Self` (`subst.args`, one type: a tuple, a
+/// closure, a fn item or a fn pointer; the Reference, "Special types and traits", `Clone`), at
+/// the trait's method `clone`, which no impl's text holds (clone_fn.rs). `copy` is the
+/// checker's answer to `Self: Copy` (the seam's `holds`): when it holds, the bytes are copied
+/// and no field's `clone` runs; else each field (a closure's captures in order) is cloned by
+/// its own `clone`, in order, the clones made dropped if a later one unwinds.
+pub fn build_builtin_clone<A: Allocator + Clone>(
+    clone: ItemKey,
+    copy: bool,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_builtin_clone(clone, copy, subst, adts, alloc)
 }
 
 /// What the instance `subst` names of `body` reads of trait shapes, before it is built: its

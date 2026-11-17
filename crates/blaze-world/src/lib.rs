@@ -155,8 +155,8 @@ pub struct Crate<'w> {
     /// The package's name and version, as the lock writes them (the toolchain's crate's for its).
     pub package: &'w str,
     pub version: &'w str,
-    /// Which side it is built for: a member proc macro's dependencies (and that side's
-    /// toolchain crates) are [`Side::Macro`]'s.
+    /// Which side it is built for: a member proc macro, its library test harness, their
+    /// dependencies (and that side's toolchain crates) are [`Side::Macro`]'s.
     pub side: Side,
 }
 

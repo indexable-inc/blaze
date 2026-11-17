@@ -44,8 +44,11 @@ fn back(lent: Lent<Sim, Global>) -> Sim {
 const TODAY: Certificate = Certificate([0x7a; 32]);
 const OTHER: Certificate = Certificate([0x7b; 32]);
 
-/// The model run's entry line: a Rust start's shim.
-const ENTRY: EntryLine = EntryLine { form: EntryForm::CMain, symbol: blaze_code::record::Symbol([0x5e; 32]) };
+/// The model run's head: a Rust start's shim, and a personality routine.
+const ENTRY: StartHead = StartHead {
+    line: EntryLine { form: EntryForm::CMain, symbol: blaze_code::record::Symbol([0x5e; 32]) },
+    personality: Some(blaze_code::record::Symbol([0x9e; 32])),
+};
 
 /// Asserts: encode then read gives the certificate and every row in order; encoding the read
 /// rows again gives equal bytes (deterministic); under today's certificate the rows come back
@@ -68,7 +71,7 @@ fn rows_round_trip_and_another_certificate_yields_symbols_only() {
     let entry = match view.under(TODAY) {
         Held::Today(today) => {
             assert_eq!(today.iter().collect::<std::vec::Vec<_>>(), model);
-            today.entry()
+            today.head()
         }
         Held::Other(_) => panic!("today's certificate read as another"),
     };
@@ -150,6 +153,19 @@ fn truncated_or_oversized_input_is_a_typed_error() {
     let mut form = std::vec::Vec::from(whole);
     form[48..52].copy_from_slice(&3u32.to_le_bytes());
     assert_eq!(read(&form, alloc).map(|_| ()), Err(ReadError::Form { found: 3 }), "an entry form no launcher has was read");
+    let mut word = std::vec::Vec::from(whole);
+    word[84..88].copy_from_slice(&2u32.to_le_bytes());
+    assert_eq!(read(&word, alloc).map(|_| ()), Err(ReadError::Personality { found: 2 }), "a personality word past 1 was read");
+    let mut stray = std::vec::Vec::from(whole);
+    stray[84..88].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(read(&stray, alloc).map(|_| ()), Err(ReadError::Personality { found: 0 }), "no routine with a symbol that is not zero was read");
+    let none = StartHead { personality: None, ..ENTRY };
+    let mut unnamed: AVec<'_, u8> = Vec::new_in(alloc);
+    encode(TODAY, none, &rows(1), &mut unnamed).expect("1 row");
+    match read(unnamed.as_slice(), alloc).expect("a list naming no routine").under(TODAY) {
+        Held::Today(today) => assert_eq!(today.head(), none, "a head naming no routine read back as another"),
+        Held::Other(_) => panic!("today's certificate read as another"),
+    }
     let mut twice: AVec<'_, u8> = Vec::new_in(alloc);
     encode(TODAY, ENTRY, &[row(1), row(2), row(1)], &mut twice).expect("the encoder does not dedup");
     assert_eq!(read(twice.as_slice(), alloc).map(|_| ()), Err(ReadError::Twice { symbol: row(1).symbol }));

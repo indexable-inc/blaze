@@ -856,6 +856,27 @@ impl<'a> Responses<'a> {
         self.row(r).identity
     }
 
+    /// No inference constraints, nested goals aside (`has_only_region_constraints`: regions
+    /// are erased here): value `i` is canonical variable `i`, for every `i`.
+    pub fn vars_identity(&self, r: RespId) -> bool {
+        if self.is_identity(r) {
+            return true;
+        }
+        let w = self.words_of(r);
+        let Some(&n) = w.first() else { return false };
+        let mut at = 1usize;
+        for i in 0..n {
+            let Some(&len) = w.get(at) else { return false };
+            let len = len as usize;
+            let Some(v) = w.get(at + 1..at + 1 + len) else { return false };
+            if !(len == 3 && v[0] == header(T_CANON, 0) && v[1] == i) {
+                return false;
+            }
+            at += 1 + len;
+        }
+        true
+    }
+
     /// Equal certainty and words (`via` aside).
     pub fn equal(&self, a: RespId, b: RespId) -> bool {
         self.certainty(a) == self.certainty(b) && self.words_of(a) == self.words_of(b)

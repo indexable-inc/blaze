@@ -512,11 +512,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         let V::Scalar(ptr) = self.load(Repr::Ptr, at) else {
                             return Err(malformed("a capture's pointer not a scalar"));
                         };
-                        self.bind_at(p, (ptr, 0))?;
+                        self.bind_capture_at(p, (ptr, 0))?;
                     }
                     CaptureKind::ByValue => {
-                        self.bind_at(p, at)?;
-                        self.own_pat(p)?;
+                        // The variable alone (not its subpattern's bindings: each is its own
+                        // capture).
+                        self.bind_capture_at(p, at)?;
+                        self.own(p, true)?;
                     }
                 }
             }
@@ -657,8 +659,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let into = self.method_callee(e)?;
         self.rust_abi(e, into.item)?;
         self.rust_abi(e, poll_item)?;
-        let adts = self.adts;
-        let held = adts.facts().normalize(items.into_future, Name::of("IntoFuture"), &[gt], self.ground)?;
+        // `tmp`'s type, `<T as IntoFuture>::IntoFuture`, is the check's own answer (its
+        // `awaited` row, as the flow lowering reads it: rule 74), grounded at this instance: an
+        // opaque future (an `async fn`'s) is then its hidden coroutine, which no solver is asked
+        // to prove a `Future` (a ground coroutine is a body's type, not one a record imports).
+        let held_record = self.checked.awaited_of(e).ok_or_else(|| unsupported(e, "`.await` whose held future the check did not record (`Checked::awaited`)"))?;
+        let held = self.ground_ty(held_record).map_err(err)?;
         let hrepr = self.repr(held).map_err(err)?;
         let tpass = Self::rust_pass(trepr)?;
         let hpass = Self::rust_pass(hrepr)?;

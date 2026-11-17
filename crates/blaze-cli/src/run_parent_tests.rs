@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use blaze_ladder::body_ids::{BodyId, Read};
 use blaze_ladder::code_records::MemoryStore;
 use blaze_ladder::run::special::EntryForm as LineForm;
+use blaze_ladder::run::special::EntryLine;
 use bstd::io::{Io, Limits, SimWorld};
 use bstd::mem::TASK_FRAME;
 use bstd::test::BUDGET;
@@ -175,14 +176,19 @@ fn symbol_of(item: u128) -> Symbol {
     Symbol(blaze_ladder::symbols::fn_symbol_of_name(&name_of(item)).0)
 }
 
-/// The run's roots: `main` alone, called directly.
+/// The model's personality routine: named before anything is published, never called (the
+/// model never throws), so no fn of [`CALLS`].
+const PERSONALITY: u128 = 0xA00F;
+
+/// The run's roots: `main` alone, called directly; the model is built to unwind, so its head
+/// names [`PERSONALITY`].
 struct ToyStart {
     main: [u8; 20],
 }
 
 impl Start for ToyStart {
-    fn entry_line(&self) -> EntryLine {
-        EntryLine { form: LineForm::Unit, symbol: CodeSymbol(symbol_of(MAIN).0) }
+    fn head(&self) -> StartHead {
+        StartHead { line: EntryLine { form: LineForm::Unit, symbol: CodeSymbol(symbol_of(MAIN).0) }, personality: Some(CodeSymbol(symbol_of(PERSONALITY).0)) }
     }
 
     fn root_count(&self) -> usize {
@@ -422,6 +428,40 @@ fn an_absent_workspace_body_is_refused_and_an_unknown_symbol_is_unknown() {
     std::println!("lazy parent: an unchecked body refused by name, an unknown symbol Unknown");
 }
 
+/// Asserts (UNWIND.md 3.3, piece P3): with no start list the head comes from the roots, and the
+/// personality routine is named before anything else is written: its slot's `Declare`, then
+/// `Personality` naming that slot, then `main`'s answer under the next slot. Control: a head
+/// naming no routine (built `panic = "abort"`) writes nothing.
+/// Prints "lazy parent: the personality named before the first publish; none for abort".
+#[test]
+fn the_personality_is_named_before_the_first_publish() {
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut store = MemoryStore::new_in(alloc);
+    let mut folder = ToyFolder::default();
+    let (calls, starts) = (Cell::new(0), Cell::new(0));
+    let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true }, &mut folder, &mut store, builder(), alloc);
+    let mut needs = Needs::new(alloc);
+    let mut kept: AVec<'_, Row> = Vec::new_in(alloc);
+    let mut out = std::vec::Vec::new();
+    let head = ahead_of(None, &mut lazy, &mut needs, &mut kept, &mut out).expect("the roots");
+    assert_eq!(head.personality, Some(CodeSymbol(symbol_of(PERSONALITY).0)), "the roots' head names no routine");
+    needs.serve(&mut lazy, &need(Needed::Symbol(symbol_of(MAIN))), &mut out).expect("served");
+    let said = frames(&out);
+    assert_eq!(said[..2], [std::format!("Declare [({}, 0)]", symbol_of(PERSONALITY).0[0]), std::string::String::from("Personality 0")], "the personality was not named first: {said:?}");
+    let published = said.iter().position(|frame| frame.starts_with("Publish")).expect("main was published");
+    assert!(published > 1, "a record was published before the personality was named: {said:?}");
+    assert!(said[published].starts_with("Publish 1 "), "main was not published under the slot after the routine's: {said:?}");
+    let mut abort = Needs::new(alloc);
+    let mut nothing = std::vec::Vec::new();
+    abort.name_personality(None, &mut nothing).expect("nothing to name");
+    assert!(nothing.is_empty(), "a program built to abort was told a personality: {:?}", frames(&nothing));
+    std::println!("lazy parent: the personality named before the first publish; none for abort");
+}
+
 /// Asserts: (1) a start list under today's certificate gives the entry line and places its
 /// rows with NO front end made (the roots never asked for, the `Option` still `None`), and a
 /// need of a placed row asks nothing; (2) a row whose record's file is gone is not placed, and
@@ -441,7 +481,7 @@ fn a_list_under_todays_certificate_starts_cold() {
     let (calls, starts) = (Cell::new(0), Cell::new(0));
     // A first run: main resolved, its row the list's.
     let mut first = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true }, &mut folder, &mut store, builder(), alloc);
-    let line = first.line().expect("the roots");
+    let line = first.head().expect("the roots");
     let mut needs = Needs::new(alloc);
     let mut out = std::vec::Vec::new();
     needs.serve(&mut first, &need(Needed::Symbol(symbol_of(MAIN))), &mut out).expect("served");
@@ -462,8 +502,13 @@ fn a_list_under_todays_certificate_starts_cold() {
     let mut kept: AVec<'_, Row> = Vec::new_in(alloc);
     let mut out = std::vec::Vec::new();
     let entry = ahead_of(Some(placed), &mut lazy, &mut needs, &mut kept, &mut out).expect("placed");
-    assert_eq!(entry, line, "the list's entry line is not the one written");
+    assert_eq!(entry, line, "the list's head is not the one written");
     assert_eq!(kept.as_slice(), &rows[..1], "a row whose record's file is gone was placed");
+    // The routine named from the list's head, first: its slot declared, then `Personality`,
+    // before the placed row's `Publish`.
+    let said = frames(&out);
+    assert_eq!(said[..2], [std::format!("Declare [({}, 0)]", symbol_of(PERSONALITY).0[0]), std::string::String::from("Personality 0")], "the personality was not named first: {said:?}");
+    assert!(said[2..].iter().any(|frame| frame.starts_with("Publish")), "the placed row was not published: {said:?}");
     needs.serve(&mut lazy, &need(Needed::Symbol(symbol_of(MAIN))), &mut out).expect("served");
     assert!(lazy.is_cold(), "a list under today's certificate made the front end");
     assert_eq!(starts.get(), 0);

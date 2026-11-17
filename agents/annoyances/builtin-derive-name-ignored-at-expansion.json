@@ -1,0 +1,14 @@
+{
+ "id": "builtin-derive-name-ignored-at-expansion",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane KI",
+ "where": "crates/blaze-scope/src/task/lower.rs (`rustc_builtin_macro` arm, `builtin_name`) and crates/blaze-scope/src/resolve.rs (the `MacroBody::BuiltinDerive` arm that picks `BuiltinDerive` by `mac.name`)",
+ "what": "Writing a blaze-cli check test of a derive with a helper (the fixture shelf runs no proc macro and its core has no derive), I declared `#[rustc_builtin_macro(Copy, attributes(show))] pub macro Shown(..)`. The lowering reads the first argument into `builtin_name` and uses it to choose the shape, but `MacroBody::BuiltinDerive` keeps only the helpers, and the expansion picks the builtin by the macro's own name, so `Shown` would be `BuiltinUnknown`. The macro had to be named `Copy`.",
+ "cost": "about ten minutes of reading before writing the test",
+ "cause": "the builtin's name is read at lowering and not carried in the record's macro body",
+ "whys": "`MacroBody::BuiltinDerive { helpers }` has no name field; the pinned library always names the macro as its builtin, so the gap never showed",
+ "class": "a fact the lowering reads that the record drops, so two readers answer by different facts",
+ "prevention": "carry the builtin's name in `MacroBody::BuiltinDerive` (and its record row) and pick by it, or refuse a `rustc_builtin_macro(Name, ..)` whose Name is not the macro's name, by name",
+ "workaround": "name the macro as its builtin",
+ "state": "open"
+}

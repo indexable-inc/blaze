@@ -39,7 +39,7 @@ fn a_native_grant_says_only_what_it_names_and_refuses_what_it_cannot_say() {
         assert_eq!(native::seatbelt(&Grant { read: &reads, ..grant }, alloc).err(), Some(want), "{bad}");
     }
 }
-use crate::outputs::{FileError, FileLimits, NoteKind, Outputs, OutputsRef, RecordError};
+use crate::outputs::{FileError, FileLimits, FileMode, NoteKind, OutFileRef, Outputs, OutputsRef, RecordError, StoredBytes, StoredError, StoredRef, StoredWhy};
 use crate::probe::{self, Table};
 use crate::probe_ask::Ask;
 
@@ -249,6 +249,14 @@ fn the_record_round_trips_byte_for_byte() {
             tape.fill(&mut bytes, "bytes");
             let _ = out.add_file(&name, &bytes[..tape.index(10, "len")], FileLimits::DEFAULT, alloc);
         }
+        while tape.more(3, "stored file") {
+            let name = format!("f{}/lib.a", tape.below(5, "name"));
+            let mut sha256 = [0u8; 32];
+            tape.fill(&mut sha256, "digest");
+            let mode = if tape.coin("executable") { FileMode::Executable } else { FileMode::Plain };
+            let len = tape.below(1 << 20, "len") << 12;
+            let _ = out.add_stored(&name, len, mode, sha256, FileLimits::DEFAULT, alloc);
+        }
         round_trip(&out);
     });
 }
@@ -332,6 +340,70 @@ fn a_path_the_script_printed_into_out_dir_names_the_records_file() {
     assert!(matches!(cx.include("/out/mime_types_generated.rs", IncludeAs::Str), Ok(Included::Missing)));
 }
 
+/// A test's file area: one file, by its digest.
+struct OneFile {
+    sha256: [u8; 32],
+    bytes: &'static [u8],
+}
+
+impl StoredBytes for OneFile {
+    fn bytes(&self, file: &StoredRef<'_>) -> Result<&[u8], StoredError> {
+        if *file.sha256 == self.sha256 { Ok(self.bytes) } else { Err(StoredError { sha256: *file.sha256, why: StoredWhy::NotThere }) }
+    }
+}
+
+/// A stored file (a native script's `OUT_DIR` file, its bytes in the home's file area) is
+/// named by the record and read through the area only when asked: `include!` of it is its
+/// bytes; with no area it is an unreadable include, never missing and never another's bytes; a
+/// file of the wrong length is refused; one name is never in both sections; the crate's
+/// digest covers the stored entry.
+/// Expected: `test tests::a_stored_file_is_read_through_the_area_only_when_asked ... ok`.
+#[test]
+fn a_stored_file_is_read_through_the_area_only_when_asked() {
+    use blaze_expand::{ExpandCx, HostWhy, IncludeAs, Included};
+    let alloc = Alloc::global();
+    let text: &'static [u8] = b"pub const BINDINGS: u8 = 7;";
+    let sha256 = [7u8; 32];
+    let mut out = Outputs::new_in(OUT, alloc);
+    out.add_stored("bindings.rs", text.len() as u64, FileMode::Plain, sha256, FileLimits::DEFAULT, alloc).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(out.add_file("bindings.rs", b"", FileLimits::DEFAULT, alloc), Err(FileError::Twice));
+    assert_eq!(out.add_stored("bindings.rs", 1, FileMode::Plain, sha256, FileLimits::DEFAULT, alloc), Err(FileError::Twice));
+    // Only the count of files is limited: a stored file of any length is taken.
+    out.add_stored("lib/librocksdb.a", 810_375_632 << 4, FileMode::Plain, [9u8; 32], FileLimits { bytes: 10, files: 3 }, alloc).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(out.add_stored("x.a", 1, FileMode::Plain, [1u8; 32], FileLimits { bytes: 10, files: 2 }, alloc), Err(FileError::TooMany { limit: 2 }));
+    round_trip(&out);
+    let mut bytes = Vec::new_in(alloc);
+    out.encode(&mut bytes);
+    let read = OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
+    let bindings = read.file("bindings.rs").unwrap_or_else(|| panic!("the record names bindings.rs"));
+    assert!(matches!(bindings, OutFileRef::Stored(StoredRef { len: 27, mode: FileMode::Plain, .. })), "{bindings:?}");
+    assert_eq!(read.bytes_of(bindings).err().map(|e| e.why), Some(StoredWhy::NoArea));
+    let path = format!("{OUT}/bindings.rs");
+    let bare = crate::cx::ScriptCx { inner: Nothing, out: read };
+    assert!(matches!(bare.include(&path, IncludeAs::Str), Err(blaze_expand::HostError { why: HostWhy::Unreadable, .. })));
+    let area = OneFile { sha256, bytes: text };
+    let cx = crate::cx::ScriptCx { inner: Nothing, out: read.with_area(&area) };
+    assert!(matches!(cx.include(&path, IncludeAs::Str), Ok(Included::Bytes(b"pub const BINDINGS: u8 = 7;"))));
+    // The area's file of another length than the record's is refused.
+    let short = OneFile { sha256, bytes: b"pub" };
+    assert_eq!(read.with_area(&short).bytes_of(bindings).err().map(|e| e.why), Some(StoredWhy::Length { found: 3 }));
+    // A file the area lacks is named by its digest.
+    let archive = read.file("lib/librocksdb.a").unwrap_or_else(|| panic!("the record names the archive"));
+    assert_eq!(read.with_area(&area).bytes_of(archive).err().map(|e| e.why), Some(StoredWhy::NotThere));
+    // The crate's digest covers the stored entry (control: one byte of its digest moved).
+    let mut other = Outputs::new_in(OUT, alloc);
+    other.add_stored("bindings.rs", text.len() as u64, FileMode::Plain, [8u8; 32], FileLimits::DEFAULT, alloc).unwrap_or_else(|e| panic!("{e:?}"));
+    let mut same = Outputs::new_in(OUT, alloc);
+    same.add_stored("bindings.rs", text.len() as u64, FileMode::Plain, sha256, FileLimits::DEFAULT, alloc).unwrap_or_else(|e| panic!("{e:?}"));
+    let digest = |o: &Outputs<'_>| {
+        let mut b = Vec::new_in(alloc);
+        o.encode(&mut b);
+        OutputsRef::open(&b).map(|r| r.crate_digest()).unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    assert_ne!(digest(&same), digest(&other));
+    assert_eq!(digest(&same), digest(&same));
+}
+
 fn given_env<'a>(features: &'a [blaze_unit_graph::Text<'a>], cfg: &'a [CfgAtom<'a>], deps: &'a [DepMetadata<'a>]) -> Given<'a, 'a> {
     Given {
         package: PackageFacts { name: "zstd-sys", version: "2.1.2+zstd.1.5.7", authors: "a:b", links: Some("zstd"), ..PackageFacts::default() },
@@ -395,6 +467,53 @@ fn the_environment_of_a_unit() {
     let fewer = [String::from_str_in("legacy", alloc)];
     let other = crate::env::env(&given_env(&fewer, &cfg, &deps), alloc);
     assert_ne!(other.get("OUT_DIR"), Some(out_dir));
+}
+
+/// The job variables are the run's, never the key's: the keyed environment has no `NUM_JOBS`;
+/// a wasm run is told `NUM_JOBS=1` and no makeflags; a native run the worker count and
+/// `CARGO_MAKEFLAGS` in cargo's exact text. Two job counts give two run environments and ONE key
+/// (the key takes `Env`, which `for_run` leaves as it was). Control: a key over the run
+/// environment's variables (the old `NUM_JOBS` in `env`) would differ by the count.
+#[test]
+fn script_jobs_are_told_to_the_run_and_never_keyed() {
+    use crate::env::{Env, Jobs, job_vars, makeflags};
+    let alloc = Alloc::global();
+    let cfg = [CfgAtom::flag("unix", alloc)];
+    let keyed = env(&given_env(&[], &cfg, &[]), alloc);
+    assert_eq!(keyed.get("NUM_JOBS"), None);
+    assert_eq!(keyed.get("CARGO_MAKEFLAGS"), None);
+
+    let wasm = keyed.for_run(Jobs::One, alloc);
+    assert_eq!(wasm.get("NUM_JOBS"), Some("1"));
+    assert_eq!(wasm.get("CARGO_MAKEFLAGS"), None);
+    assert_eq!(wasm.vars.len(), keyed.vars.len() + 1);
+
+    let fifo = "/h/.blaze/v2/native-work/blaze/jobs/4242";
+    assert_eq!(makeflags(fifo, alloc).as_str(), "-j --jobserver-fds=fifo:/h/.blaze/v2/native-work/blaze/jobs/4242 --jobserver-auth=fifo:/h/.blaze/v2/native-work/blaze/jobs/4242");
+    let shared = |n: u32| Jobs::Shared { workers: core::num::NonZeroU32::new(n).expect("a count"), fifo };
+    let native = keyed.for_run(shared(12), alloc);
+    assert_eq!(native.get("NUM_JOBS"), Some("12"));
+    assert_eq!(native.get("CARGO_MAKEFLAGS"), Some(makeflags(fifo, alloc).as_str()));
+    assert_eq!(native.vars.len(), keyed.vars.len() + 2);
+    assert!(native.vars.windows(2).all(|w| w[0].0.as_str() < w[1].0.as_str()), "sorted, each once");
+    // Every keyed variable reaches the run as it was.
+    for (name, value) in keyed.vars.iter() {
+        assert_eq!(native.get(name), Some(value.as_str()));
+    }
+    let names: std::vec::Vec<&str> = job_vars(shared(128), alloc).iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["CARGO_MAKEFLAGS", "NUM_JOBS"]);
+
+    // One key for two job counts: the key is made of `keyed`, which no count touches.
+    let key = |e: &Env<'_>| base(&KeyInputs { module: [1; 32], env: e, answers: Table::EMPTY.id(), c_mode: CMode::Deferred, limits: LIMITS, runner: RunnerKey::Wasm }, &mut Vec::new_in(alloc));
+    let (two, many) = (keyed.for_run(shared(2), alloc), keyed.for_run(shared(64), alloc));
+    assert_ne!(two, many, "the runs are told different counts");
+    assert_eq!(key(&keyed), key(&keyed.clone()));
+    // Control: had the count been keyed (an `Env` holding the run's variables), the keys differ.
+    fn as_keyed<'a>(run: &crate::env::RunEnv<'a>) -> Env<'a> {
+        Env { vars: run.vars.clone() }
+    }
+    assert_ne!(key(&as_keyed(&two)), key(&as_keyed(&many)));
+    println!("jobs: wasm NUM_JOBS=1; native NUM_JOBS=12 and CARGO_MAKEFLAGS={}; one key for 2 and 64", makeflags(fifo, alloc).as_str());
 }
 
 const LIMITS: RunLimits = RunLimits { fuel: 1 << 30, memory: 1 << 28, out_dir_bytes: 64 << 20, out_dir_files: 4096, output: 16 << 20, line: 256 << 10 };
@@ -548,4 +667,9 @@ fn the_version_is_the_pinned_nightly() {
     assert_eq!(format!("rustc {rustc}"), probe::VERSION);
     let commit = pins.lines().find_map(|l| l.strip_prefix("commit ")).unwrap_or("");
     assert_eq!(commit, probe::COMMIT_HASH);
+    // `cargo -V`'s line: pins.txt's, written by harness/toolchain_pins.py from the manifest.
+    let cargo = pins.lines().find_map(|l| l.strip_prefix("cargo ")).expect("pins.txt has the cargo line");
+    assert_eq!(format!("cargo {cargo}"), probe::CARGO_VERSION);
+    assert!(cargo.starts_with(probe::RELEASE), "cargo -V says rustc's release");
+    assert_eq!(probe::cargo_version(blaze_own::Alloc::global()).as_str(), "cargo 1.101.0-nightly (cad07cf8e 2026-10-23)\n");
 }

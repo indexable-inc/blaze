@@ -32,7 +32,6 @@ use blaze_scope::crate_scope::{CrateScopeError, resolve_crate};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::prepares::Prepares;
 use blaze_scope::resolve::{CrateInput, SourceTexts};
-use blaze_scope::task::Serial;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Frame, Tag};
@@ -273,8 +272,14 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
             let read = crate::work::payload(&cx, store, handed, round.frame)?;
             let bytes: &'j [u8] = blaze_own::Vec::from_slice_in(read.payload(), round.frame).leak();
             // A `Script` payload: how it ran, then the outputs record (scripts.rs `payload_parts`).
+            // Its stored files (a native script's `OUT_DIR` files, in the home's file area) are
+            // read from there by an `include!` that names one, each mapped on its first ask:
+            // nothing of them is read here.
             let opened = match crate::scripts::payload_parts(bytes) {
-                Some((_, record)) => OutputsRef::open(record),
+                Some((_, record)) => OutputsRef::open(record).map(|outputs| {
+                    let area: &'j crate::scripts::FileArea = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::FileArea::of(env.home, &outputs), round.frame));
+                    outputs.with_area(area)
+                }),
                 None => Err(blaze_build_script::outputs::RecordError::Layout),
             };
             match opened {
@@ -307,6 +312,18 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
         let bytes = blaze_scope::resolve::aligned(record, round.alloc);
         round.exports.push((handed.at, place, bytes));
         deps.push(bytes);
+    }
+    // Every crate the dependencies' records reach and none of them is, read from the records'
+    // heads in place: asked for here, all at once, so the pooled resolve never decodes every
+    // dependency only to answer `Need` (rule 77; tempo's cold check made 2,668 pooled
+    // resolutions for 1,550 records, the rest such answers).
+    match blaze_scope::crate_scope::unmet_reaches(&deps, round.alloc) {
+        Ok(unmet) if unmet.is_empty() => {}
+        Ok(unmet) => return Ok(Prepared::Answer(need_crates(names, name, &unmet, held))),
+        Err(error) => {
+            let words = bstd::mem::format_in!(held, "crate `{}`: a dependency's record: {error:?}", input.name);
+            return Ok(Prepared::Answer(Did::FailedSaying(refused("a dependency's record"), held_str(words.as_str(), held))));
+        }
     }
     let me = local.len();
     let own = |s: Option<CrateId>| s.filter(|s| s.index() == at).map(|_| CrateId(me as u32));
@@ -341,8 +358,16 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
 }
 
 /// The crate resolved, on whichever thread runs it, in `frame` (a pool task's own): its record
-/// and read lists, owned. Reads nothing but `job` and the checkout files the crate names.
-pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame) -> Resolution {
+/// and read lists, owned, and what its frame held by the stretch of the solve that took it
+/// ([`super::metered`]). Reads nothing but `job` and the checkout files the crate names.
+pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame) -> (Resolution, super::metered::ScopeBytes) {
+    let metered = super::metered::Metered::new(frame);
+    let resolution = resolve_metered(cx, root, job, frame, &metered);
+    let of = crate::phases::byte_rows::Label::of(format_args!("{}", job.input.name));
+    (resolution, metered.finish(of))
+}
+
+fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame, metered: &super::metered::Metered<'_>) -> Resolution {
     let cx = cx.span("crate scope: resolve one crate's names");
     let erased = Erased::new(frame);
     let alloc = erased.handle();
@@ -387,8 +412,9 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
     let prepares = Prepares::new_in(alloc);
     let done = {
         let _cx = cx.span("crate scope: resolve_crate");
-        resolve_crate(&job.input, job.deps, job.sysroot, &texts, job.at, &Serial, prepares, alloc)
+        resolve_crate(&job.input, job.deps, job.sysroot, &texts, job.at, metered, prepares, alloc)
     };
+    metered.outside(super::metered::Outside::Record);
     // Each include that left its package inside the workspace (D111): a warning finding at
     // its call, placed in the crate's own files (none when the crate failed).
     let left_package = match &done {
@@ -406,8 +432,14 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
     let (out, payload, findings, failed, ok, unresolved) = match done {
         Ok(done) => match scope_record(&done, crate_name, alloc) {
             Ok(record) => {
+                // Both records (rule 21): a dependent reads the exports, but the crate's own
+                // bodies read its inner names (front_load.rs), so an out over the exports alone
+                // left a private item's removal moving no reader: its body was handed the record
+                // that still resolved the item gone (`SourceError::ItemStale`, lane UN
+                // 2026-11-17; signature_grain_tests `a_name_that_does_not_exist_is_an_error`).
                 let mut out = blaze_ids::Hasher::new(OUT_DOMAIN);
                 out.update(&(done.record.len() as u64).to_le_bytes()).update(&done.record);
+                out.update(&(done.inner.len() as u64).to_le_bytes()).update(&done.inner);
                 (Some(out), record.payload, record.findings, record.tests_refused, true, record.unresolved)
             }
             Err(unwritten) => (None, sections::write(0, [&[][..]; sections::SECTIONS]), blaze_own::Vec::new_in(Global), Some(std::format!("{unwritten}")), true, 0),
@@ -470,20 +502,23 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
 
 /// A resolution filed on the main thread: a need is the task's answer; a made crate is kept
 /// for [`answer`] (the first kept stands: two equal jobs make equal bytes).
+/// The records of the crates `keys` asked for, each by its `CrateScope` name.
+fn need_crates<'b>(names: &Names<'_>, name: Name, keys: &[CrateItemKey], held: &'b Frame) -> Did<'b> {
+    let mut wants = blaze_own::Vec::with_capacity_in(keys.len(), held);
+    for key in keys.iter() {
+        let Ok(i) = names.by_key.binary_search_by_key(key, |(k, _)| *k) else {
+            let failure = TaskFailure { name, why: Why::Refused { what: "a needed crate the world does not hold", rule: RULE } };
+            return Did::FailedSaying(failure, "the resolution needs a crate's record this command's world does not hold");
+        };
+        wants.push(Want { name: name_of(names.world.crates[names.by_key[i].1].input.key), home: Name::unit_graph() });
+    }
+    Did::Need(wants)
+}
+
 pub(crate) fn settle<'b>(names: &mut Names<'_>, task: &Task<'_>, resolution: Resolution, held: &'b Frame) -> Option<Did<'b>> {
     let name = task.name;
     match resolution {
-        Resolution::Need(keys) => {
-            let mut wants = blaze_own::Vec::with_capacity_in(keys.len(), held);
-            for key in keys.iter() {
-                let Ok(i) = names.by_key.binary_search_by_key(key, |(k, _)| *k) else {
-                    let failure = TaskFailure { name, why: Why::Refused { what: "a needed crate the world does not hold", rule: RULE } };
-                    return Some(Did::FailedSaying(failure, "the resolution needs a crate's record this command's world does not hold"));
-                };
-                wants.push(Want { name: name_of(names.world.crates[names.by_key[i].1].input.key), home: Name::unit_graph() });
-            }
-            Some(Did::Need(wants))
-        }
+        Resolution::Need(keys) => Some(need_crates(names, name, &keys, held)),
         Resolution::Made { resolved, ok, unresolved } => {
             if ok {
                 names.resolved += 1;
@@ -634,7 +669,7 @@ pub(crate) fn run<'f, 'b>(
             Prepared::Made => None,
             Prepared::Resolve(job) => {
                 let scratch = Frame::with_reserve(SCOPE_FRAME, Tag::Other).map_err(|_| CliError::Text { what: "a crate scope's frame could not be reserved" })?;
-                Some(resolve(cx, root, job, &scratch))
+                Some(resolve(cx, root, job, &scratch).0)
             }
         }
     };
@@ -651,17 +686,20 @@ pub(crate) fn run<'f, 'b>(
 mod tests {
     use super::sysroot_given;
 
-    /// The real shelf's rows as the cutter writes them (blaze_toolchain::implied): `core`
-    /// (`#![no_core]`) names nothing; `alloc` (`#![no_std]`) core; `std` (itself `#![no_std]`)
-    /// alloc and core; bstd (`cfg_attr(not(test), no_std)`, `extern crate alloc`) core and
-    /// alloc, and its crate `blaze_ids` (std's prelude: `Vec<u64>`) core and std, edges
+    /// The real shelf's rows as the cutter writes them (blaze_toolchain::implied
+    /// `crate_facts`): `core` (`#![no_core]`) names nothing; `alloc` (`#![no_std]`) core; `std`
+    /// (itself `#![no_std]`) alloc and core; bstd (`cfg_attr(not(test), no_std)`, `extern
+    /// crate alloc` in its root, `extern crate std;` in `mod rt`: blaze-std rt.rs) core, alloc
+    /// and std, and its crate `blaze_ids` (std's prelude: `Vec<u64>`) core and std, edges
     /// written in its row though its manifest lists neither. A toolchain crate is given what
-    /// its row names: blaze_ids std, bstd not (the Rust Reference, "Extern prelude": `std` is
-    /// added "as long as the `no_std` attribute is not specified in the crate root"); a
-    /// program crate (`app`) every sysroot crate. CONTROL: runner 5's closure walk gave bstd
-    /// `std` too (it comes "after" std) and gave a toolchain crate the target sysroot whatever
-    /// its row said. Prints
-    /// `sysroot given: bstd [true, true, false, false], blaze_ids [true, false, true, false], app [true, true, true, true]`.
+    /// its row names: blaze_ids std, and bstd std too (the Rust Reference, "Extern crate
+    /// declarations": the item asks for its crate in whatever module it is written, binding
+    /// the name there; `#![no_std]` only keeps `std` out of the extern prelude); a program
+    /// crate (`app`) every sysroot crate. Before the cutter read every module file, bstd's row
+    /// named no std, its `extern crate std;` bound nothing, and hello world's `blaze run`
+    /// refused `std::thread::ThreadId` in `rt` NotFound (2026-11-17). CONTROL: runner 5's
+    /// closure walk gave a toolchain crate the target sysroot whatever its row said. Prints
+    /// `sysroot given: bstd [true, true, true, false], blaze_ids [true, false, true, false], app [true, true, true, true]`.
     #[test]
     fn a_toolchain_crate_is_given_what_its_row_names() {
         // World indexes: 0 core, 1 alloc, 2 std, 3 bstd, 4 blaze_ids, 5 app (a program crate).
@@ -669,7 +707,7 @@ mod tests {
             &[],
             &[("core", 0)],
             &[("alloc", 1), ("core", 0)],
-            &[("alloc", 1), ("blaze_ids", 4), ("core", 0)],
+            &[("alloc", 1), ("blaze_ids", 4), ("core", 0), ("std", 2)],
             &[("core", 0), ("std", 2)],
             &[],
         ];
@@ -678,7 +716,7 @@ mod tests {
         assert_eq!(given(0), [false, false, false, false], "core");
         assert_eq!(given(1), [true, false, false, false], "alloc");
         assert_eq!(given(2), [true, true, false, false], "std: never itself");
-        assert_eq!(given(3), [true, true, false, false], "bstd: no_std, its row names no std");
+        assert_eq!(given(3), [true, true, true, false], "bstd: its row names std, for `extern crate std;` in `mod rt`");
         assert_eq!(given(4), [true, false, true, false], "blaze_ids: its row names std");
         assert_eq!(given(5), [true, true, true, true], "a program crate: every sysroot crate");
         println!("sysroot given: bstd {:?}, blaze_ids {:?}, app {:?}", given(3), given(4), given(5));

@@ -1869,7 +1869,11 @@ impl<'n> Store<'n> {
         // function qualifier is present" (the Reference, "External blocks").
         let header = match self.locals.foreign(key) {
             Some(f) if f.kind == super::foreign_locals::ForeignKind::Fn => tc::FnPtrHeader { abi: super::types::fn_ptr_abi(f.abi, whole)?, safety: if f.safe { tc::Safety::Safe } else { tc::Safety::Unsafe }, c_variadic: false },
-            _ => header,
+            // A fn a MODULE-LEVEL `extern` block declares: its block's ABI, and `unsafe` unless
+            // written `safe` (super::foreign_head). Read as its own head before, it was a safe
+            // Rust fn: aws-lc-rs's `EVP_aead_chacha20_poly1305` was no `unsafe extern "C" fn`
+            // pointer (E0308) and libc's variadic `open` was refused as a `...` on a Rust fn.
+            _ => super::foreign_head::module_foreign_header(names, lib, container.is_some(), flags, header, whole)?,
         };
         if c_variadic && !matches!(header.abi, tc::Abi::C | tc::Abi::CUnwind | tc::Abi::System | tc::Abi::SystemUnwind) {
             return Err(Why::Unsupported("`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])", whole));

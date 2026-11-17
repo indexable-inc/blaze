@@ -20,6 +20,7 @@ pub mod code_records;
 pub mod declared_names;
 mod emit_class;
 mod callee_shown;
+mod clone_shim;
 mod fn_item_resolve;
 pub mod crates;
 mod fn_shim;

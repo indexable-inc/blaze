@@ -247,8 +247,14 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         }
         let needs = match out {
             // A finished check with a diagnostic is not a checked body: each is a finding.
-            Outcome::Done(done) if !round_gaps && !done.diags.is_empty() => {
-                let mut diags = Vec::with_capacity_in(done.diags.len(), Global);
+            // A written type that named nothing (E0412, front2 type_miss.rs) is a finding too,
+            // before the checker's: the body was checked with the error type in its place.
+            Outcome::Done(done) if !round_gaps && (!done.diags.is_empty() || !body.type_misses.is_empty()) => {
+                let mut diags = Vec::with_capacity_in(body.type_misses.len() + done.diags.len(), Global);
+                diags.extend(body.type_misses.iter().map(|m| {
+                    let words = super::path_miss_shown::path_miss_words(r, &format!("type `{}`", m.name), m.miss);
+                    (tc::DiagCode::UnresolvedType, m.range(), words.into_boxed_str())
+                }));
                 let tys = done.types.view();
                 diags.extend(done.diags.iter().map(|d| (d.code, d.at, diag_about(r, scope.spell, tys, d))));
                 if let Some(asked) = asked.as_deref_mut() {
@@ -691,12 +697,48 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     if holds_param(ground.view(), args).map_err(|error| CheckFail::Check { owner, error })? {
         return Ok(Target::AtInstance(item));
     }
+    // A self type whose `Clone` (and `Copy`) the LANGUAGE may give (below): the build asks
+    // `Self: Copy` of its clone (a `Copy` self's clone is its bytes: clone_shim.rs
+    // `Clones::note`) in a world that makes no records, so it is asked here first and the
+    // records its answer reads are made by this loop's fills. `Copy`'s key is filed in the key
+    // map (no body need name the trait for the world to find its record).
+    let builtin = match self_ty {
+        Some(t) => matches!(
+            ground.view().node(t).map_err(|error| CheckFail::Check { owner, error })?,
+            tc::PNode::Tuple(_) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
+        ),
+        None => false,
+    };
+    let copy = match builtin {
+        false => None,
+        true => copy_trait(r, owner)?,
+    };
     let alloc = r.store.tys.alloc();
     for _ in 0..MOST_ROUNDS {
         // A callee resolved at ground types after its body has checked is post-analysis: it
         // sees every opaque's hidden type, not only the body's leak list.
         let world = BodyWorld { reveal: super::opaque_auto::Reveal::All, ..world_at(r, scope) };
-        let out = tc::resolve_instance(&world, item, args, ground, alloc);
+        let mut out = tc::resolve_instance(&world, item, args, ground, alloc);
+        // A trait the LANGUAGE implements at this self type (the Reference, "Special types and
+        // traits": `Clone` of a tuple, a closure, a fn item, a fn pointer): no impl's text holds
+        // it, the solver's builtin rule does. Its fn is built at the instance (blaze-ladder
+        // clone_shim.rs), and the impls its fields' calls take are reached at their shapes as
+        // for a call at an instance (reach/instances.rs).
+        if let Err(tc::ResolveError::NoImpl { trait_, .. }) = out
+            && builtin
+        {
+            let mut asked: Vec<tc::PTy, Global> = Vec::new_in(Global);
+            asked.extend_from_slice(ground.view().list(args).map_err(|error| CheckFail::Check { owner, error })?);
+            let given = tc::holds(&world, trait_, &asked, ground, alloc).and_then(|given| match (given, copy) {
+                (true, Some(copy)) => tc::holds(&world, copy, &asked[..1], ground, alloc).map(|_| true),
+                (given, _) => Ok(given),
+            });
+            match given {
+                Ok(true) if world.gaps.borrow().is_empty() => return Ok(Target::AtInstance(item)),
+                Ok(_) => {}
+                Err(e) => out = Err(e),
+            }
+        }
         let mut fills = world.fills.into_inner();
         if r.order == BuildOrder::Reversed {
             fills.reverse();
@@ -711,6 +753,77 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
         }
     }
     Err(CheckFail::Rounds { owner, last: Vec::new_in(Global) })
+}
+
+/// The program's `Copy` trait, its key filed in the key map (no body need name the trait for
+/// the world to find its record); `None` in a program that declares none (`no_core`).
+fn copy_trait<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owner: ItemKey) -> Result<Option<ItemKey>, CheckFail> {
+    match super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::Copy) {
+        Ok(Some(lib)) => Ok(Some(r.keys.item(lib).map_err(|clash| CheckFail::Head { owner, error: HeadError::Key(clash) })?)),
+        Ok(None) => Ok(None),
+        Err(why) => {
+            let mut gaps = Vec::new_in(Global);
+            gaps.push(Gap::Lang(tc::LangItem::Copy, why));
+            Err(CheckFail::Gap { owner, gaps })
+        }
+    }
+}
+
+/// For a builtin `clone` at a closure of body `owner` (checked as `c`) called at `args`
+/// ([`callee_target`]'s `AtInstance`): asks `Copy` of each capture held by value, so the
+/// records the build's question reads are made here (clone_shim.rs `Clones::note` asks a
+/// closure's `Copy` capture by capture, in a world that makes none: the solver's closure type
+/// has no upvars yet). A capture by `&` is `Copy` and by `&mut` is not, with nothing to read.
+/// A closure of another body, or one whose types hold a parameter, is asked at its instance,
+/// where no record is made: the build refuses it by the record it missed.
+pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, scope: &BodyScope<'_>, owner: ItemKey, c: &mut tc::Checked<'_>, args: tc::List) -> Result<(), CheckFail> {
+    let shown = |e| CheckFail::Check { owner, error: e };
+    let Some(&me) = c.types.view().list(args).map_err(shown)?.first() else { return Ok(()) };
+    let tc::PNode::Closure { owner: of, ordinal, .. } = c.types.view().node(me).map_err(shown)? else { return Ok(()) };
+    if of != owner || holds_param(c.types.view(), args).map_err(shown)? {
+        return Ok(());
+    }
+    let Some(&e) = c.closures.column::<0>().get(ordinal as usize) else { return Ok(()) };
+    let mut held: Vec<tc::PTy, Global> = Vec::new_in(Global);
+    for (p, by) in blaze_build::layout::captures(c, e) {
+        if matches!(by, tc::CaptureKind::ByValue)
+            && let Some(&t) = c.local_ty.get(p.ix())
+        {
+            held.push(t);
+        }
+    }
+    if held.is_empty() {
+        return Ok(());
+    }
+    let Some(copy) = copy_trait(r, owner)? else { return Ok(()) };
+    let alloc = r.store.tys.alloc();
+    for &t in held.iter() {
+        let mut done = false;
+        for _ in 0..MOST_ROUNDS {
+            let world = BodyWorld { reveal: super::opaque_auto::Reveal::All, ..world_at(r, scope) };
+            let out = tc::holds(&world, copy, &[t], &mut c.types, alloc);
+            let mut fills = world.fills.into_inner();
+            if r.order == BuildOrder::Reversed {
+                fills.reverse();
+            }
+            let gaps = world.gaps.into_inner();
+            match out {
+                Ok(_) if gaps.is_empty() => {
+                    done = true;
+                    break;
+                }
+                Ok(_) => return Err(CheckFail::Gap { owner, gaps }),
+                Err(tc::ResolveError::Missing(_)) if !fills.is_empty() => make_all(r, fills, owner)?,
+                Err(_) if !gaps.is_empty() => return Err(CheckFail::Gap { owner, gaps }),
+                // Shown at the closure's arguments: the capture is one of its environment's.
+                Err(error) => return Err(CheckFail::Resolve { owner, item: copy, error, args: shown_args(c.types.view(), args) }),
+            }
+        }
+        if !done {
+            return Err(CheckFail::Rounds { owner, last: Vec::new_in(Global) });
+        }
+    }
+    Ok(())
 }
 
 /// Whether any type of `args` holds a type or const parameter (or a projection or opaque type,

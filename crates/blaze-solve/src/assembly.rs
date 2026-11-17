@@ -482,6 +482,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         self.ask.impl_header(self.reads, i)
     }
 
+    /// Whether impl `a` specializes impl `b` (`Facts::specializes`).
+    pub fn specializes(&mut self, a: Def, b: Def) -> Result<bool, Stop> {
+        self.ask.specializes(self.reads, a, b)
+    }
+
     pub fn adt(&mut self, d: Def) -> Result<AdtDef<'c>, Stop> {
         self.ask.adt(self.reads, d)
     }
@@ -539,6 +544,51 @@ pub struct Done {
     pub resp: crate::canon::RespId,
 }
 
+/// Whether a specializing candidate may constrain inference variables and still drop the
+/// candidate it specializes (`AllowInferenceConstraints`): trait goals no, the others yes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceConstraints {
+    Allowed,
+    NotAllowed,
+}
+
+/// `filter_specialized_impls` (assembly/mod.rs): outside coherence, an impl candidate is
+/// dropped when another impl candidate's impl specializes its impl (RFC 1210: of the impls
+/// that apply, the most specific is used). Under `NotAllowed` only a specializing candidate
+/// whose response binds no variable drops one, so an undecided goal does not pick the
+/// specializing impl by guessing. The question is asked only of two impl candidates of one
+/// goal, so a goal with one impl candidate asks nothing.
+pub fn filter_specialized_impls(
+    m: &Merger<'_, '_>,
+    mode: TypingMode,
+    allow: InferenceConstraints,
+    cands: &mut Vec<Done, Alloc<'_>>,
+    specializes: &mut dyn FnMut(Def, Def) -> Result<bool, Stop>,
+) -> Result<(), Stop> {
+    if mode == TypingMode::Coherence {
+        return Ok(());
+    }
+    let mut i = 0;
+    'outer: while i < cands.len() {
+        let Source::Impl(victim) = cands[i].cand.source else {
+            i += 1;
+            continue;
+        };
+        for j in 0..cands.len() {
+            if i == j {
+                continue;
+            }
+            let Source::Impl(other) = cands[j].cand.source else { continue };
+            if (allow == InferenceConstraints::Allowed || m.vars_identity(cands[j].resp)) && specializes(other, victim)? {
+                cands.remove(i);
+                continue 'outer;
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Merges candidates' responses (the reference's `try_merge_candidates`, `bail_with_ambiguity`,
 /// `flounder`): over the frame's response table.
 pub struct Merger<'m, 'a> {
@@ -562,6 +612,11 @@ impl Merger<'_, '_> {
     /// No inference constraints and no nested goals (`has_no_inference_or_external_constraints`).
     pub fn no_constraints(&self, r: crate::canon::RespId) -> bool {
         self.resps.is_identity(r)
+    }
+
+    /// No inference constraints, nested goals aside (`has_only_region_constraints`).
+    pub fn vars_identity(&self, r: crate::canon::RespId) -> bool {
+        self.resps.vars_identity(r)
     }
 
     /// The same response, modulo how it was proven (`equal_response_modulo_region_constraints`).

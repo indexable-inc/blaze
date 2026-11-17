@@ -25,7 +25,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::{build_ctor_fn, build_fn_shim, closures_in};
+pub(crate) use closure::{build_builtin_clone, build_ctor_fn, build_fn_shim, closures_in};
 #[path = "coroutine.rs"]
 pub(crate) mod coroutine;
 
@@ -381,6 +381,9 @@ enum Task {
     /// The guard of an arm whose pattern holds or-patterns (walk/matches/alts.rs): a false
     /// guard goes on at the alternative after the one that matched, numbered in `word`.
     GuardAlts { word: SlotId, chains: u32, n: u32 },
+    /// A guarded arm's guard passed: the moves its bindings held from `from` on are made
+    /// (walk/moves.rs `Pending`).
+    ArmMoves { from: u32 },
     ArmEnd { m: u32 },
     MatchEnd,
     Call(ExprId),
@@ -1784,6 +1787,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Binding pattern `p` lives at `at`, memory it owns (a caller's copy, a temporary).
     fn bind_at(&mut self, p: PatId, at: (Value, i32)) -> Result<(), BuildError> {
         self.plain_binding(p)?;
+        if self.slots[p.ix()].is_some() {
+            return Err(malformed("a binding bound twice"));
+        }
+        let repr = self.local_repr(p)?;
+        self.slots[p.ix()] = Some((Home::At(at.0, at.1), repr));
+        Ok(())
+    }
+
+    /// Captured variable `p` (a closure's or an async block's upvar) lives at `at`. Any
+    /// binding: a capture names the variable, whatever its pattern was in the enclosing body
+    /// (`ref x`, `r @ 0..=99`: chrono's `Parsed::to_naive_date::resolve_year` captures
+    /// `Some(r @ 0..=99)`'s `r` in `|v| v.checked_add(r)`); its subpattern was tested there.
+    fn bind_capture_at(&mut self, p: PatId, at: (Value, i32)) -> Result<(), BuildError> {
+        if !matches!(self.pat(p)?, Pat::Bind { .. }) {
+            return Err(malformed("a capture of other than a binding"));
+        }
         if self.slots[p.ix()].is_some() {
             return Err(malformed("a binding bound twice"));
         }
@@ -3384,6 +3403,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.begin(body);
             }
             Task::GuardAlts { word, chains, n } => self.guard_alts(word, chains, n)?,
+            Task::ArmMoves { from } => self.arm_moves(from)?,
             Task::ArmEnd { m } => {
                 let v = self.pop()?;
                 let st = self.matches[m as usize];
@@ -4743,8 +4763,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::If { expr: e, then, else_ });
                 self.work.push(Task::Eval(cond));
             }
-            // A `let` is built as a link of its `if` condition (walk/lets.rs); elsewhere (a
-            // match guard's `if let`) it is not.
+            // A `let` is built as a link of its `if` condition or its match guard (walk/lets.rs
+            // `if_let`, `let_guard`), never evaluated alone; reaching one here (a `let` under
+            // `||`, `!` or parentheses, which Rust refuses) is refused by name.
             Expr::Let { .. } => return Err(unsupported(e, "`let` outside an `if` or `while` condition")),
             // walk/fmt.rs: the arguments, then `Task::FormatArgs`.
             Expr::FormatArgs { args, uses } => self.format_args(e, args, uses)?,
@@ -5681,7 +5702,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// `l` at `at`, each by copy. Its subpatterns must be irrefutable (`bind_value` refuses the
     /// rest by name). A field that needs drop is moved out by a binding (its `field_bit` in
     /// the result) and left in place by `_`; nothing deeper is built.
-    fn bind_variant(&mut self, p: PatId, at: (Value, i32), l: u32, by_ref: bool) -> Result<u64, BuildError> {
+    /// `own`: each by-value binding joins the drop scope here; else the caller owns them
+    /// (a guarded arm, once its guard passed: walk/moves.rs `Pending`).
+    fn bind_variant(&mut self, p: PatId, at: (Value, i32), l: u32, by_ref: bool, own: bool) -> Result<u64, BuildError> {
         let variant = Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?;
         let (first, len, _) = self.variant_rows(l, variant)?;
         let n = len as usize;
@@ -5761,7 +5784,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // (`Some(Foo { a })` over `Option<&Foo>`) is recorded at the peeled one.
             let g = self.layout_field_tys[row];
             self.bind_value_of(sub, v, g)?;
-            self.own_pat(sub)?;
+            if own {
+                self.own_pat(sub)?;
+            }
         }
         Ok(moved)
     }
@@ -5791,6 +5816,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // A reference to an enum, matched by variant patterns: the default binding mode (the
         // reference, "Binding modes"): the references are followed to the enum's place.
         let mut by_ref = false;
+        // The enum's ground type when the references were followed to it.
+        let mut pointee: Option<PTy> = None;
         let mut owner = Owner::None;
         if srepr == Repr::Ptr {
             let t = self.adjusted_ty(scrutinee)?;
@@ -5821,15 +5848,21 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 srepr = self.repr(g).map_err(|error| Self::ty_err(scrutinee, error))?;
                 s = V::Place(p, 0);
                 by_ref = true;
+                pointee = Some(g);
             }
         }
-        // An enum's walk row, a zero-sized one's too (no place, a constant discriminant).
+        // An enum's walk row, a zero-sized one's too (no place, a constant discriminant): by
+        // value, or through references (`match self` in a derived `Debug` of `enum E { A }`).
         let enum_row = match srepr {
             Repr::Agg(l) => Some(l),
-            // (Through a reference, a zero-sized enum is never laid out as one: `is_agg` is false.)
-            Repr::None if !by_ref => {
-                let t = self.adjusted_ty(scrutinee)?;
-                let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
+            Repr::None => {
+                let g = match pointee {
+                    Some(g) => g,
+                    None => {
+                        let t = self.adjusted_ty(scrutinee)?;
+                        self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?
+                    }
+                };
                 match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
                     PNode::Adt(..) => Some(self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?),
                     _ => None,
@@ -5950,17 +5983,25 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.scope_marks.push(self.scope_pats.len() as u32);
         let mut moved = 0u64;
         let mut whole = false;
+        // A guarded arm's bindings are stored before its guard, which reads them, but own
+        // their parts and take them from the scrutinee only once it passed (walk/moves.rs
+        // `Pending`, applied by `Task::ArmMoves`): a false guard leaves the scrutinee whole.
+        let hold = arm.guard.is_some();
+        let from = self.pending_mark();
         match (self.pat(arm.pat)?, st.of_enum) {
             (Pat::Bind { .. }, None) => self.bind_value(arm.pat, V::Scalar(st.scrutinee))?,
             (Pat::Bind { .. }, Some((at, _, _))) => {
                 self.bind_value(arm.pat, V::Place(at.0, at.1))?;
                 if st.owner != Owner::None {
-                    self.own_pat(arm.pat)?;
+                    self.arm_effect(moves::Pending::OwnPat(arm.pat), hold)?;
                     whole = true;
                 }
             }
             (Pat::TupleStruct { .. } | Pat::Struct { .. }, Some((at, l, _))) => {
-                moved = self.bind_variant(arm.pat, at, l, st.by_ref)?;
+                moved = self.bind_variant(arm.pat, at, l, st.by_ref, !hold)?;
+                if hold && !st.by_ref {
+                    self.arm_effect(moves::Pending::OwnPat(arm.pat), true)?;
+                }
                 if moved != 0 {
                     let variant = Self::def_variant(self.pat_def(arm.pat)).ok_or(malformed("a variant pattern the check did not resolve"))?;
                     if self.layouts[l as usize].drop_fn.is_some() {
@@ -5974,11 +6015,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             let slot = self.owned[x.ix()]
                                 .and_then(|o| o.rest)
                                 .ok_or(malformed("a match moving fields out of a local without field flags"))?;
-                            let fa = self.b.slot_addr(slot);
-                            let mask = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
-                            let keep = self.b.iconst(Ty::I64, u128::from(!moved));
-                            let left = self.b.binary(Op::And, Flags::NONE, mask, keep);
-                            self.b.store(Flags::NONE, left, fa, 0, MemAttrs::aligned(3));
+                            self.arm_effect(moves::Pending::Clear { mask: slot, bits: moved }, hold)?;
                         }
                         Owner::Temp | Owner::None => return Err(malformed("a field that needs drop moved out of a scrutinee the switch does not own")),
                     }
@@ -6001,23 +6038,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         if whole {
             match st.owner {
-                Owner::Local(x) => self.moved(st.expr, x)?,
+                Owner::Local(x) => self.arm_effect(moves::Pending::Moved { expr: st.expr, x }, hold)?,
                 Owner::Temp => return Err(malformed("a switch owning a temporary scrutinee (the match by tests owns those)")),
                 Owner::None => {}
             }
         }
-        if (moved != 0 || whole)
-            && arm.guard.is_some()
-        {
-            return Err(BuildError::UnsupportedPat {
-                pat: arm.pat,
-                what: "a guard on an arm that moves out of its scrutinee (Rust moves only after the guard passes)",
-            });
-        }
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));
+        // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to `next`.
+        if let Some(g) = arm.guard
+            && self.cond_has_let(g)?
+        {
+            return self.let_guard(g, arm.body, next);
+        }
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {
+            self.work.push(Task::ArmMoves { from });
             self.work.push(Task::Guard { m, i });
             self.work.push(Task::Eval(g));
         }

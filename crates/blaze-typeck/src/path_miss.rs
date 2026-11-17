@@ -51,11 +51,16 @@ pub enum PathPrefix {
     Bstd { module: ItemKey, edition: &'static str },
 }
 
-/// Why the segment named nothing. The names library's own reasons, without their payloads
-/// (the payloads are the library's keys, not the program's), plus the checker's.
+/// Why the segment named nothing: each a FACT about the program, so each is an error. The
+/// names library's own reasons, without their payloads (the payloads are the library's keys,
+/// not the program's), plus the checker's. A miss the world does not KNOW (a scope it could not
+/// read whole: a crate not read, a refused macro call that may have bound the name, a glob
+/// lookup past its bound) is no answer at all: the world's gap, and the body is not checked
+/// (blaze-ladder front2 world_path_miss.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MissWhy {
-    /// No item, value or variant of that name where the segment was looked up.
+    /// No item, value or variant of that name where the segment was looked up, every scope it
+    /// could be in read whole.
     NotFound,
     /// An item of that name exists there but is not visible from the body.
     Private,
@@ -65,18 +70,31 @@ pub enum MissWhy {
     NotAModule,
     /// `super` past the crate's root.
     SuperPastRoot,
-    /// The crate the prefix leads into was not read (a dependency source missing).
-    NotRead,
-    /// A lookup through glob imports passed its bound.
-    Unbounded,
-    /// The names library refused the module (a macro call it could not expand).
-    Refused,
     /// The whole path names an item that is no value (a module, a macro, a trait alias): the
     /// item named.
     NotAValue(ItemKey),
     /// The segment is a `use` binding, or reached through a glob, whose own path resolves
     /// only part way: the binding names no item.
     ThroughUse,
+    /// Not found in a module one of whose macro calls was refused: the name may be one the
+    /// call would have made. Not the program's error but the refusal's consequence: blaze-cli
+    /// body_types.rs files the body as not checked under the refused call (`MACRO_REFUSED`).
+    /// `call` is the library's key of that call, which the world's words join to the call's
+    /// path and reason; `why` is why it was refused.
+    Refused { call: blaze_id::ItemKey, why: Refusal },
+}
+
+/// Why a macro call was refused (the names library's `RefusedWhy`, mirrored: this crate does
+/// not read the library's types).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Refusal {
+    /// Its expansion failed (no rule matched, `compile_error!`, a proc macro's error): the
+    /// crate's names record holds the call's path and the reason.
+    Expansion,
+    /// An `env!` of a variable this build could not answer.
+    UnknownEnv,
+    /// `env!("OUT_DIR")` of a package whose build script's outputs are missing.
+    BuildScriptOutputs,
 }
 
 impl ContentHash for PathMiss {
@@ -122,9 +140,17 @@ impl ContentHash for MissWhy {
             MissWhy::Ambiguous => h.tag(2),
             MissWhy::NotAModule => h.tag(3),
             MissWhy::SuperPastRoot => h.tag(4),
-            MissWhy::NotRead => h.tag(5),
-            MissWhy::Unbounded => h.tag(6),
-            MissWhy::Refused => h.tag(7),
+            // Tags 5 and 6 were `NotRead` and `Unbounded`: no miss now (the world's gap),
+            // never reused.
+            MissWhy::Refused { call, why } => {
+                h.tag(7);
+                *h = h.bytes(&call.0.0);
+                h.tag(match why {
+                    Refusal::Expansion => 0,
+                    Refusal::UnknownEnv => 1,
+                    Refusal::BuildScriptOutputs => 2,
+                });
+            }
             MissWhy::NotAValue(k) => {
                 h.tag(8);
                 k.hash_into(h);

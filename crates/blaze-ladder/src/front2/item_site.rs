@@ -71,8 +71,9 @@ impl MarksLost {
 
 /// The marks of the expansion `call` of crate `krate` wrote, read from `made` (one home for
 /// both sources: [`NamesSource::text_marks`]). `Ok(None)`: the text keeps no origin column by
-/// design (blaze-scope `OriginsError::Rewritten`: a call's statements read as items, a kept
-/// item's text, a block's module text; `Unplaced`: a call the tables did not place). Such a
+/// design (blaze-scope `OriginsError::Rewritten`: a call's statements read as items, a block's
+/// module text; a kept item's text keeps an identity column with no marks, `kept`, so it reads
+/// as before); `Unplaced`: a call the tables did not place). Such a
 /// text's heads resolve at their module, as before this piece, which is right for every token
 /// the text copies from the call as written; a token of such a text that a def-site macro wrote
 /// is the open case (token-mark-2 carries the column into rewritten texts).

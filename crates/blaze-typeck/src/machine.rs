@@ -318,8 +318,9 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub defs: Vec<(At, Def), Alloc<'a>>,
     /// The generic arguments of each constant a value path names whose arguments are not empty
     /// (`<T as Tr>::C`: `[Self, trait args..]`; an inherent impl's constant: the impl's), at its
-    /// expression: written back as `Checked::const_args` (rules/lit_path.rs `record_const_args`).
-    pub const_args: Vec<(ExprId, TyList), Alloc<'a>>,
+    /// expression or pattern: written back as `Checked::const_args` and `Checked::pat_const_args`
+    /// (rules/lit_path.rs `record_const_args`).
+    pub const_args: Vec<(At, TyList), Alloc<'a>>,
     pub fields: Vec<(ExprId, u32, u32), Alloc<'a>>,
     pub captures: Vec<(ExprId, PatId, CaptureKind), Alloc<'a>>,
     pub diags: Vec<PendingDiag, Alloc<'a>>,
@@ -1755,7 +1756,21 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         if !self.ty.may_hold(Goal::Trait { trait_: deref, args }, &mut self.reads)? {
             return Ok(None);
         }
-        self.ty.normalize(deref, args, Name::of("Target"), &mut self.reads)
+        let target = Name::of("Target");
+        match self.ty.normalize(deref, args, target, &mut self.reads)? {
+            Some(crate::ty::Normalized::Certain(t)) => Ok(Some(t)),
+            // The impl is selected and gives the target; a where-clause of it is undecided now
+            // (a closure's kind settles at the end of the body): the target is the step, and
+            // the projection stays an obligation at the node being checked, proved or refused
+            // with the rest (the Reference, "Type coercions", "Coercion types": `&T` to `&U`
+            // when `T: Deref<Target = U>`; the bound must hold).
+            Some(crate::ty::Normalized::Ambiguous(t)) => {
+                let cause = self.place;
+                self.ty.register(Obligation { goal: Goal::Projection { trait_: deref, args, name: target, term: t }, cause })?;
+                Ok(Some(t))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Records the adjustments of an autoderef to step `n` of `steps` on `e`.

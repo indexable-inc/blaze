@@ -27,10 +27,15 @@ default = ["runtime"]
 [dependencies]
 # The expansion records' files through the effect layer (`record::OnDir`).
 blaze-std.workspace = true
+# `jobserver.rs`: its named lock (`blaze_core::lock`, taken with a bound where no `Cx` is
+# held: a native run's lease, its drop). Already below blaze-std; no new crate is built.
+blaze-core.workspace = true
 # `spawn_route.rs`, `spawn_records.rs`: the spawn seam's records and the `Executor` trait (W1).
 blaze-spawn.workspace = true
 # A build script's environment, outputs, key and compiler answers (`script.rs`).
 blaze-build-script = { workspace = true, optional = true }
+# The macOS SDK's version from its `SDKSettings.json`: the native runs' key holds it (native_unit.rs).
+blaze-apple-sdk.workspace = true
 # `TokenStream`, `Produced`, `ProcDiagnostic`, `TokenOrigin`, `lex`: the hook's types.
 blaze-expand.workspace = true
 # `Alloc`, `AVec`: the output is made in the caller's allocator.
@@ -95,6 +100,13 @@ required-features = ["runtime"]
 # the test binary is also the script, so it has its own main.
 [[test]]
 name = "native_dep_tree"
+harness = false
+required-features = ["runtime"]
+
+# A native script is told `NUM_JOBS` and `CARGO_MAKEFLAGS` naming the command's jobserver and
+# takes a token from it inside its sandbox (jobserver.rs); the test binary is also the script.
+[[test]]
+name = "native_jobs"
 harness = false
 required-features = ["runtime"]
 

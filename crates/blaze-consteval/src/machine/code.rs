@@ -113,8 +113,11 @@ pub(super) enum Op {
     /// The discriminant of the enum (a place or a value of code type `ty`) whose facts are
     /// `Code::enums[e]`, masked to `bits`: `as` on a fieldless enum and `discriminant_value`.
     Discr { dst: Reg, src: Reg, e: u32, ty: u32, bits: u32 },
-    /// A field's place: the base place moved by `off`.
-    Field { dst: Reg, src: Reg, off: u64 },
+    /// A field's place: the base place moved by `off`. `tail`: the field is the unsized tail
+    /// of a dynamically sized struct (crypto-bigint's `UintRef(pub [Limb])`), whose place keeps
+    /// the base place's length (the Reference, "Dynamically sized types": the struct's
+    /// metadata is its last field's); every other field's place has none.
+    Field { dst: Reg, src: Reg, off: u64, tail: bool },
     /// An element's place; `len` the array's, or `None`: the slice place's own.
     Index { dst: Reg, base: Reg, index: Reg, size: u64, len: Option<u64> },
     /// A struct, variant, tuple or array value made of parts (`Code::builds[k]`).
@@ -1247,8 +1250,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 };
                 let bt = self.final_ty_c(cc, base)?;
                 let off = self.field_offset(bt, variant, field)?;
+                let ft = self.field_ty(bt, variant, field)?;
+                let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
                 let dst = self.reg(cc, Kind::P);
-                self.emit(code, cc, Op::Field { dst, src, off });
+                self.emit(code, cc, Op::Field { dst, src, off, tail });
                 cc.rs.push(dst);
             }
             C::Index(e) => {
@@ -2095,8 +2100,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 for k in 0..parts.len {
                     let ft = self.field_ty(tt, 0, k)?;
                     let off = self.field_offset(tt, 0, k)?;
+                    let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
                     let fp = self.reg(cc, Kind::P);
-                    self.emit(code, cc, Op::Field { dst: fp, src: place, off });
+                    self.emit(code, cc, Op::Field { dst: fp, src: place, off, tail });
                     inner.push((fp, ft));
                 }
                 let (k, l) = self.resolve(k, l)?;
@@ -2286,8 +2292,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         let idx = names.iter().position(|f| f.name == fp.name).ok_or(malformed("a field name its variant lacks"))? as u32;
                         let ft = self.field_ty(t, variant, idx)?;
                         let off = self.field_offset(t, variant, idx)?;
+                        let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
                         let fpl = self.reg(cc, Kind::P);
-                        self.emit(code, cc, Op::Field { dst: fpl, src: pl, off });
+                        self.emit(code, cc, Op::Field { dst: fpl, src: pl, off, tail });
                         work.push(P::Pat { p: fp.pat, place: fpl, ty: ft, fail });
                     }
                 }
@@ -2329,7 +2336,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                             Some(r) if k == r => {
                                 let back = count - 1 - r;
                                 match len {
-                                    Some(_) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k }),
+                                    Some(_) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k, tail: false }),
                                     None => self.emit(code, cc, Op::Subslice { dst: q, src: pl, size, from: k, back }),
                                 };
                                 self.cg(cc, *typed.pat_ty.get(sp.ix()).ok_or(malformed("a pattern with no type"))?)?
@@ -2337,13 +2344,13 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                             Some(r) if k > r => {
                                 let back = count - k;
                                 match len {
-                                    Some(n) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * (n - back) }),
+                                    Some(n) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * (n - back), tail: false }),
                                     None => self.emit(code, cc, Op::FromEnd { dst: q, src: pl, size, back }),
                                 };
                                 el
                             }
                             _ => {
-                                self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k });
+                                self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k, tail: false });
                                 el
                             }
                         };
@@ -2456,8 +2463,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             };
             let ft = self.field_ty(t, variant, field)?;
             let off = self.field_offset(t, variant, field)?;
+            let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
             let q = self.reg(cc, Kind::P);
-            self.emit(code, cc, Op::Field { dst: q, src: pl, off });
+            self.emit(code, cc, Op::Field { dst: q, src: pl, off, tail });
             work.push(P::Pat { p: sp, place: q, ty: ft, fail });
         }
         Ok(())

@@ -434,7 +434,7 @@ impl<'c, 'n> Reader<'c, 'n> {
 
     /// How many positions the ADT `k` itself has.
     fn adt_positions(&mut self, k: ItemKey) -> Result<u32, LifeRefusal> {
-        let lib = self.keys.library(k).ok_or(LifeRefusal::UnknownAdt)?;
+        let lib = self.keys.library_in(self.names, k).ok_or(LifeRefusal::UnknownAdt)?;
         let n = self.lifetimes_of(lib)?;
         Ok(match GRAIN {
             Grain::OnePerAdt => u32::from(n > 0),

@@ -69,9 +69,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if !self.has_unsized_tail(l) {
             return Err(unsupported(base, "a field of an unsized place that is not a struct or tuple ending in a slice, `str` or `dyn`"));
         }
-        // A `dyn` tail's offset is rounded up to the vtable's alignment (crate::dyn_tail).
+        // A `dyn` tail's offset is rounded up to its run-time alignment, the vtable's or a
+        // nested struct's (crate::dyn_tail).
         let ls_id = self.ls_of(g).map_err(|error| Self::ty_err(base, error))?;
-        let dyn_prefix = self.ls.dyn_prefix(ls_id);
+        let dyn_prefix = self.ls.dyn_chain(ls_id);
         let Shape::Fields { first, len } = self.layouts[l as usize].shape else {
             return Err(malformed("an unsized aggregate that is not a struct or a tuple"));
         };

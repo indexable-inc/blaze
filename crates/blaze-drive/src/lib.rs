@@ -99,6 +99,9 @@ pub const FORMATS: [(&str, &[u8; 4]); 6] = [
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Plant {
     None,
+    /// A job waiting on answer-table pages is woken by each page as it comes, not by the last
+    /// of them (request.rs `Job::pages_due`): it walks its whole shape again per page.
+    WakePerPage,
     /// A settled record whose out digest changed does not dirty its readers: the validity check
     /// skips a changed read.
     SkipChangedRead,
@@ -170,4 +173,8 @@ pub enum Plant {
     /// A name its home dropped this run is entered again when a read of it moves: its job,
     /// settled with no record, is decided and run as a part no home lists (request.rs `dirty`).
     DirtyDropped,
+    /// A made record's shape is put at its task key, never in the hole its walk found
+    /// (request.rs `Walk`): a task whose read NAMES moved with an answer (a callee removed) puts a
+    /// second shape under one key, refused as two values.
+    ShapeAtTaskKey,
 }

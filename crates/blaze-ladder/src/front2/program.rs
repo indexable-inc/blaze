@@ -22,7 +22,7 @@ use blaze_scope::resolve::Names;
 use blaze_surface::{Namespace, PathKind};
 use blaze_typeck as tc;
 use blaze_typeck::{
-    Adt, Checked, ExprId, FnSig, ItemKey, LangItem, List, PTy, PTys, PatId, PortableTys, ResolveError, resolve_instance, select_impl,
+    Adt, Checked, ExprId, FnSig, ItemKey, LangItem, List, PTy, PTys, PatId, PortableTys, ResolveError, resolve_instance,
 };
 
 use super::Front2;
@@ -81,6 +81,9 @@ pub enum Front2Refusal {
     Spell(Why),
     /// `main` did not check clean: diagnostics, gaps or a typed failure.
     Check(CheckFail),
+    /// What an instance of `function` asked of its world (the seam's `make_asked`) could not
+    /// be made.
+    Asked { function: Box<str>, error: CheckFail },
     /// A fn `main` reaches did not lower or check clean: never tabled, never built. `class`
     /// groups the cause; `first` is its first finding.
     Unchecked { function: Box<str>, class: Box<str>, first: Box<str> },
@@ -180,6 +183,7 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::Lower(e) => write!(f, "front2: `main` did not lower: {e:?}"),
             Front2Refusal::Spell(e) => write!(f, "front2: `main`'s names: {e:?}"),
             Front2Refusal::Check(e) => write!(f, "front2: `main` did not check: {e:?}"),
+            Front2Refusal::Asked { function, error } => write!(f, "front2: an answer an instance of `{function}` asked was not made: {error:?}"),
             Front2Refusal::Unchecked { function, class, first } => {
                 write!(f, "front2: `{function}`, reached from `main`, is not checked ({class}): {first}")
             }
@@ -263,8 +267,8 @@ struct Literals {
     floats: Vec<(ExprId, (u64, u32)), Global>,
     /// Each float literal pattern's magnitude (the `-` of a `NegLit` dropped), as `floats`.
     float_pats: Vec<(PatId, (u64, u32)), Global>,
-    /// Each string literal pattern's text, unescaped.
-    str_pats: Vec<(PatId, Box<str, Global>), Global>,
+    /// Each string or byte string literal pattern's bytes, unescaped.
+    str_pats: Vec<(PatId, Box<[u8], Global>), Global>,
     /// Each `format_args!` template the builder reads (fmt_template.rs), by expression, sorted.
     templates: Vec<(ExprId, super::fmt_template::Template), Global>,
 }
@@ -312,6 +316,8 @@ pub struct Front2Program<'n> {
     statics: super::statics::Statics,
     /// The cause of the last `normalize` with no answer (the seam's `last_projection`).
     projection_why: core::cell::RefCell<Option<Box<str>>>,
+    /// What the instance questions' worlds asked and found unmade (the seam's `make_asked`).
+    asked: RefCell<Vec<super::world_items::Fill, Global>>,
     /// The walk's steps ([`super::reach::Census::edges`]), sorted, once each: a root's static
     /// reach is read from them (program/suite.rs `Suite::reach_of`).
     edges: Vec<(ItemKey, ItemKey), Global>,
@@ -354,8 +360,10 @@ struct Made<'n> {
 
 /// The lang traits the seam's own `Option` answers name (`drop_trait`, `lang_trait_fn`):
 /// each looked up once in [`Front2Program::make`], a refusal stopping the program by the item's
-/// name there, so those answers never meet a lookup that fails.
-const SEAM_LANGS: [LangItem; 8] = [LangItem::Drop, LangItem::Deref, LangItem::DerefMut, LangItem::Fn, LangItem::FnMut, LangItem::FnOnce, LangItem::Index, LangItem::IndexMut];
+/// name there, so those answers never meet a lookup that fails. `Clone`: its `clone`, the
+/// builtin clone's (blaze-ladder clone_shim.rs).
+const SEAM_LANGS: [LangItem; 9] =
+    [LangItem::Drop, LangItem::Deref, LangItem::DerefMut, LangItem::Fn, LangItem::FnMut, LangItem::FnOnce, LangItem::Index, LangItem::IndexMut, LangItem::Clone];
 
 fn lang_of(front: &Front2<'_>, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
     match super::langs::find(&front.index, front.resolver, item) {
@@ -437,9 +445,9 @@ fn made_statics<'c>(
 /// (`Checked::const_args`: a trait's constant, an inherent impl's over its generics) is not
 /// asked here: it has a value only at an instance's ground arguments, pulled by the build
 /// before it walks that instance (const_at.rs, the seam's `const_at`). Its body is checked
-/// then, by this same evaluator, which the program keeps. A pattern's constant has no such
-/// row (blaze-typeck rules/lit_path.rs `record_const_args` records expressions only; a
-/// constant pattern may not depend on a generic parameter, E0158), so each one is asked here.
+/// then, by this same evaluator, which the program keeps. A pattern's constant alike: one
+/// with recorded arguments (`Checked::pat_const_args`: an inherent impl's, `U256::ZERO`) is
+/// pulled at them by const_at.rs; one without is asked here.
 fn const_values<'c, 'n, S: super::source::NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bodies: impl Iterator<Item = &'c Checked<'static>>) -> (Vec<(ItemKey, DataRecord<Global>), Global>, Vec<(ItemKey, Box<str>), Global>) {
     let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
     for c in bodies {
@@ -448,8 +456,9 @@ fn const_values<'c, 'n, S: super::source::NamesSource<'n>>(r: &mut Records<'_, '
             tc::Def::Const(k) if at_args.binary_search(e).is_err() => Some(*k),
             _ => None,
         }));
-        asked.extend(c.pat_defs.column::<1>().iter().filter_map(|d| match d {
-            tc::Def::Const(k) => Some(*k),
+        let pat_at_args = c.pat_const_args.column::<0>();
+        asked.extend(c.pat_defs.column::<0>().iter().zip(c.pat_defs.column::<1>().iter()).filter_map(|(p, d)| match d {
+            tc::Def::Const(k) if pat_at_args.binary_search(p).is_err() => Some(*k),
             _ => None,
         }));
     }
@@ -519,7 +528,7 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
             if steps > 4 * MOST_OBJECT_TRAITS {
                 return Err(String::from("more traits under its objects than the most one program's objects reach"));
             }
-            let lib = r.keys.library(k).ok_or_else(|| String::from("no library key"))?;
+            let lib = r.keys.library_in(r.names, k).ok_or_else(|| String::from("no library key"))?;
             r.store.ensure(r.names, r.keys, super::heads::Want::Head(lib)).map_err(|e| format!("its head: {e:?}"))?;
             r.store.ensure(r.names, r.keys, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e:?}"))?;
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
@@ -638,16 +647,38 @@ impl<'n> Front2Program<'n> {
     /// 0's (blaze-real's `tempo_build` example: a workspace's binary). Never run: the program has
     /// no entry, so [`crate::run::build_survey`] builds every clean non-generic fn and each
     /// generic one at the instances the built bodies call it at.
-    pub fn survey_from(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], roots: &[LibKey], left_out: &mut Vec<(Box<str>, LeftOut), Global>, alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make_from(names, frame, user, Some(left_out), Starts::Tests(roots), alloc).map(|made| made.program)
+    /// `body_sources` is what a body's macro calls expand with (the crates' environment, texts
+    /// and proc-macro runner: [`super::body_host::BodySources`], the item-level expansion's), as
+    /// the command's program has it (`set_body_sources`); `None` refuses each body `env!`,
+    /// include and proc macro by name.
+    pub fn survey_from(
+        names: &'n Names<'n>,
+        frame: &'n blaze_mem::Frame,
+        user: &[SourceFile<'_>],
+        roots: &[LibKey],
+        left_out: &mut Vec<(Box<str>, LeftOut), Global>,
+        body_sources: Option<&'n dyn super::body_host::BodySources>,
+        alloc: Alloc<'static>,
+    ) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make_from(names, frame, user, Some(left_out), Starts::Tests(roots), body_sources, alloc).map(|made| made.program)
     }
 
     /// [`Front2Program::survey_from`] limited by `within` (reach.rs [`super::reach::Within`]):
     /// only fns of its crates are lowered, checked and walked (another crate's fn is a left-out
     /// row of class [`super::reach::OUTSIDE`], so the builds survey builds none of it), and a
     /// root that does not lower is a left-out row (`lower: root`), not the survey's stop.
-    pub fn survey_within(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], roots: &[LibKey], within: super::reach::Within<'_>, left_out: &mut Vec<(Box<str>, LeftOut), Global>, alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make_from(names, frame, user, Some(left_out), Starts::Within { roots, within }, alloc).map(|made| made.program)
+    #[expect(clippy::too_many_arguments, reason = "survey_from's inputs and the limit, each read once")]
+    pub fn survey_within(
+        names: &'n Names<'n>,
+        frame: &'n blaze_mem::Frame,
+        user: &[SourceFile<'_>],
+        roots: &[LibKey],
+        within: super::reach::Within<'_>,
+        left_out: &mut Vec<(Box<str>, LeftOut), Global>,
+        body_sources: Option<&'n dyn super::body_host::BodySources>,
+        alloc: Alloc<'static>,
+    ) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make_from(names, frame, user, Some(left_out), Starts::Within { roots, within }, body_sources, alloc).map(|made| made.program)
     }
 
     /// The walk's fns by crate: (crate index, fns tabled), most first, then by crate
@@ -697,13 +728,25 @@ impl<'n> Front2Program<'n> {
     }
 
     fn make(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>, alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make_from(names, frame, user, left_out, Starts::Main, alloc).map(|made| made.program)
+        // A program of given files (a hello world, a fixture): no package, no proc-macro
+        // runner, so no body sources.
+        Self::make_from(names, frame, user, left_out, Starts::Main, None, alloc).map(|made| made.program)
     }
 
     /// The program from its ROOTS ([`Starts`]): `main` (the process's entry), or every test fn
     /// of a test unit (program/suite.rs). One walk from all roots ([`super::reach::reach_all`]),
     /// so a fn two roots reach is checked and tabled once; each root keeps its row.
-    fn make_from(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>, starts: Starts<'_>, alloc: Alloc<'static>) -> Result<Made<'n>, Front2Refusal> {
+    /// `body_sources` is the store's `sources` (what a body's `env!`, includes and proc macros
+    /// are answered from), set before any body is lowered.
+    fn make_from(
+        names: &'n Names<'n>,
+        frame: &'n blaze_mem::Frame,
+        user: &[SourceFile<'_>],
+        mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+        starts: Starts<'_>,
+        body_sources: Option<&'n dyn super::body_host::BodySources>,
+        alloc: Alloc<'static>,
+    ) -> Result<Made<'n>, Front2Refusal> {
         // The program's lang rows are its link closure's (linked.rs): `main`'s program is
         // crate 0's; given roots (a workspace's binary in `survey_from`, a test unit's tests,
         // a walk's roots) are the program of their crates.
@@ -717,6 +760,7 @@ impl<'n> Front2Program<'n> {
         // Made before the roots: a Rust program's start reads `main`'s head (start.rs).
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
+        store.sources = body_sources;
         let mut start2: Option<super::start::Entry2> = None;
         let tests = match starts {
             Starts::Main => {
@@ -875,6 +919,20 @@ impl<'n> Front2Program<'n> {
             })?;
             also.push(k);
         }
+        // The program's compiler_builtins soft-float routines (builtins_shim.rs): an `f128`
+        // operation is a call of one, made by the emitter's legalize, so no body names them;
+        // each found one is reached beside the roots, so its row and body are the build's
+        // (run.rs `build_from` binds them as the record walk does, run/make_one.rs).
+        let builtins = super::builtins_shim::find(names, alloc);
+        for r in blaze_lir::legalize::SoftFloat::ALL {
+            let Some(lib) = builtins.lib(r) else { continue };
+            let k = records.keys.item(lib).map_err(|clash| Front2Refusal::Unchecked {
+                function: Box::from(r.symbol()),
+                class: Box::from("key clash"),
+                first: format!("{clash}").into_boxed_str(),
+            })?;
+            also.push(k);
+        }
         let mut walk_from = Vec::with_capacity_in(mains.len(), Global);
         for ((m, c), scope) in mains.iter().zip(checked.iter_mut()).zip(scopes.iter()) {
             let first = match c {
@@ -980,7 +1038,7 @@ impl<'n> Front2Program<'n> {
                 return Err(refuse(&records, first, String::from("rows still missing after the most rounds")));
             }
             for k in missing {
-                let why = match records.keys.library(k) {
+                let why = match records.keys.library_in(names, k) {
                     None => Some(String::from("no library key")),
                     // A constant a head names (a pattern type's range end, `UsizeNoHighBit`'s
                     // `HALF_USIZE`) is evaluated as met and the head made again, at most
@@ -1143,7 +1201,7 @@ impl<'n> Front2Program<'n> {
                 continue;
             }
             by_key.insert(key, fns.len());
-            let at = head_abi::placed_ctor(names, front.keys.library(key));
+            let at = head_abi::placed_ctor(names, front.keys.library_in(names, key));
             let none = Box::<str>::from("");
             fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path: path.into_text(), at, abi: Abi::Rust, nounwind: false, track_caller: false, symbol: none, export: None, lits: Literals::default(), intrinsic: None });
         }
@@ -1156,17 +1214,24 @@ impl<'n> Front2Program<'n> {
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
         // The evaluator is kept, not dropped: the build pulls constants at instances' ground
         // arguments from it (`FrontEnd::const_at`, const_at.rs).
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), edges, consts, prepared, start: start2, recipes, reached_by_crate };
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), edges, consts, prepared, start: start2, recipes, reached_by_crate };
         Ok(Made { program, roots: rows, shapes })
     }
 
-    /// `f` over the checker's world of fn `i`'s body.
-    fn in_world<T>(&self, i: usize, f: impl FnOnce(&BodyWorld<'_, 'n>) -> T) -> T {
-        // The back half resolves and selects only in a body it builds: a foreign fn has none.
-        let body = self.fns[i].body.as_ref().expect("the back half asks only in a fn it builds, and every one has its body");
+    /// `f` over the checker's world of fn `i`: its body's, or for a ctor (a fn row with no body,
+    /// built as a fn by blaze-build's `build_ctor_fn`) its ADT's (`ctor_world`). Any other row
+    /// with no body, or a body whose spelling cannot be made, has no world: the question is the
+    /// world's own refusal naming the fn, and only the instance that asked it is refused.
+    fn in_world<T>(&self, i: usize, f: impl FnOnce(&BodyWorld<'_, 'n>) -> T) -> Result<T, ResolveError> {
+        let key = self.fns[i].key;
+        let Some(body) = self.fns[i].body.as_ref() else {
+            return super::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, f);
+        };
         let view = body.lowered.view();
         // A function of the lowering alone, made once when the body was checked.
-        let spell = Spelling::of(&view).expect("a tabled body's spelling was made when it was checked");
+        let Ok(spell) = Spelling::of(&view) else {
+            return Err(ResolveError::Missing(tc::Question::FnSig(key)));
+        };
         let scope = body.scope(&spell);
         let world = BodyWorld {
             names: self.front.names,
@@ -1189,7 +1254,10 @@ impl<'n> Front2Program<'n> {
             // on a `FlatMap` whose fn returns `impl Iterator` finds the impl.
             reveal: super::opaque_auto::Reveal::All,
         };
-        f(&world)
+        let out = f(&world);
+        // What the question found unmade, for the build's `make_asked`.
+        self.asked.borrow_mut().extend(world.fills.into_inner());
+        Ok(out)
     }
 }
 
@@ -1371,6 +1439,38 @@ pub(super) fn placed<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKe
     Ok((item_at(names, lib), abi))
 }
 
+/// Why `normalize` of `trait_`'s associated type `name` at `args` gave no type (`out`), for the
+/// seam's `last_projection`, the one printer of the eager and the lazy program: the trait,
+/// `Self`'s form (an ADT by its path, else the node's kind: `FnDef`, `Opaque`, `Coroutine`..),
+/// and the solver's whole error (at most 300 bytes), or that its step gave none.
+pub(super) fn projection_why<P: crate::seam::FrontEnd>(program: &P, trait_: ItemKey, name: tc::Name, args: &[PTy], ground: &PortableTys<'_>, out: &Result<Option<PTy>, ResolveError>) -> Box<str> {
+    let trait_shown = program.item_named(trait_).unwrap_or_else(|| format!("{:#x}", trait_.0).into_boxed_str());
+    let self_shown = match args.first().map(|&a| ground.view().node(a)) {
+        Some(Ok(tc::PNode::Adt(k, _))) => program.item_named(k).map_or_else(|| format!("ADT {:#x}", k.0), |p| format!("`{p}`")),
+        Some(Ok(n)) => {
+            let d = format!("{n:?}");
+            String::from(&d[..d.find(['(', ' ', '{']).unwrap_or(d.len())])
+        }
+        Some(Err(_)) | None => String::from("(no Self)"),
+    };
+    let why = match out {
+        Err(e) => {
+            let mut d = format!("{e:?}");
+            if d.len() > 300 {
+                let mut end = 300;
+                while !d.is_char_boundary(end) {
+                    end -= 1;
+                }
+                d.truncate(end);
+                d.push_str("..");
+            }
+            d
+        }
+        Ok(_) => String::from("the solver's step gave no type"),
+    };
+    format!("`{trait_shown}`'s associated type {:#x} at Self = {self_shown}: {why}", name.0).into_boxed_str()
+}
+
 /// The names source did not answer whether an `extern` block declares the item `key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unplaced {
@@ -1438,13 +1538,13 @@ fn literals(body: &Body<'_>, path: &str) -> Result<Literals, Front2Refusal> {
                     float_text::FloatText::Unread => return Err(refuse("this float literal pattern")),
                 }
             }
-            tc::Lit::Str => {
+            // `".."` and `b".."` alike (`string_bytes` reads both forms, as for expressions).
+            tc::Lit::Str | tc::Lit::ByteStr(_) => {
                 let bytes = string_bytes(text).ok_or_else(|| refuse("this escape in a string literal pattern"))?;
-                let text = core::str::from_utf8(&bytes).map_err(|_| refuse("a string literal pattern that is not UTF-8"))?;
-                out.str_pats.push((id, Box::from(text)));
+                out.str_pats.push((id, bytes.into_boxed_slice()));
             }
-            // The builder asks no other literal pattern's value (a byte string's, a `bool`'s).
-            tc::Lit::ByteStr(_) | tc::Lit::CStr | tc::Lit::Bool(_) => {}
+            // The builder asks no other literal pattern's value (a C string's, a `bool`'s).
+            tc::Lit::CStr | tc::Lit::Bool(_) => {}
         }
     }
     Ok(out)
@@ -1525,17 +1625,44 @@ impl FrontEnd for Front2Program<'_> {
         {
             return Ok((def, List::EMPTY));
         }
-        let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, alloc))?;
+        let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, alloc))??;
         Ok((r.item, r.args))
     }
 
-    fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
+    fn holds(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
         let alloc = self.store.tys.alloc();
-        Ok(self.in_world(i, |w| select_impl(w, trait_, &[ty], ground, alloc))?.is_some())
+        self.in_world(i, |w| blaze_typeck::holds(w, trait_, &[ty], ground, alloc))?
+    }
+
+    /// As the lazy program's: the graph's compiler_builtins exports (their rows were reached
+    /// beside the roots, `make_from`).
+    fn soft_float_routines(&self, alloc: Alloc<'_>) -> super::builtins_shim::Builtins {
+        super::builtins_shim::find(self.front.names, alloc)
     }
 
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
-        self.in_world(i, |w| blaze_typeck::adt_drop_impl(w, drop_trait, adt, alloc))
+        self.in_world(i, |w| blaze_typeck::adt_drop_impl(w, drop_trait, adt, alloc))?
+    }
+
+    /// The fills the instance questions' worlds noted, made as the body check makes its own
+    /// (check.rs `make_all`).
+    fn make_asked(&mut self, i: usize) -> Result<bool, crate::run::RunError> {
+        let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));        if fills.is_empty() {
+            return Ok(false);
+        }
+        let owner = self.fns[i].key;
+        let mut records = Records {
+            names: self.front.names,
+            keys: &mut self.front.keys,
+            index: &self.front.index,
+            store: &mut self.store,
+            buckets: &mut self.buckets,
+            order: BuildOrder::AsAsked,
+            consts: None,
+        };
+        super::check::make_all(&mut records, fills, owner)
+            .map_err(|error| crate::run::RunError::Front2(Front2Refusal::Asked { function: self.fns[i].path.clone(), error }))?;
+        Ok(true)
     }
 
     /// Every tabled fn's head is in the store (`new` refuses one without).
@@ -1654,7 +1781,12 @@ impl FrontEnd for Front2Program<'_> {
 
     /// The item's path in the names library (`crate::module::Name`).
     fn item_named(&self, key: ItemKey) -> Option<Box<str>> {
-        let (names, lib) = (self.front.names, self.front.keys.library(key)?);
+        // A member (a trait's fn: what a resolve refusal names) by its container's path.
+        if let Some(super::keys::Origin::Member { container, name, .. }) = self.front.keys.origin(key) {
+            let container = self.item_named(*container)?;
+            return Some(format!("{container}::{name}").into_boxed_str());
+        }
+        let (names, lib) = (self.front.names, self.front.keys.library_in(self.front.names, key)?);
         let name = names.item_text(lib)?.name?;
         let module = names.krate(names.crate_of(lib)?).path_of(names.module_of(lib)?)?;
         Some(format!("{module}::{name}").into_boxed_str())
@@ -1714,7 +1846,7 @@ impl FrontEnd for Front2Program<'_> {
         s.binary_search_by_key(&p.0, |(x, _)| x.0).ok().map(|i| s[i].1)
     }
 
-    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&str> {
+    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&[u8]> {
         let s = &self.fns[self.fn_index(owner)?].lits.str_pats;
         s.binary_search_by_key(&p.0, |(x, _)| x.0).ok().map(|i| &*s[i].1)
     }
@@ -1727,27 +1859,9 @@ impl FrontEnd for Front2Program<'_> {
             return Ok(None);
         };
         let alloc = self.store.tys.alloc();
-        let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, alloc));
+        let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, alloc)).and_then(|o| o);
         if !matches!(out, Ok(Some(_))) {
-            // Named for the refusal: the trait, `Self`'s form (an ADT by its path, else the
-            // node's kind: `FnDef`, `Closure`, `Slice`..), and the solver's error or none.
-            let trait_shown = self.item_named(trait_).unwrap_or_else(|| format!("{:#x}", trait_.0).into_boxed_str());
-            let self_shown = match args.first().map(|&a| ground.view().node(a)) {
-                Some(Ok(tc::PNode::Adt(k, _))) => self.item_named(k).map_or_else(|| format!("ADT {:#x}", k.0), |p| format!("`{p}`")),
-                Some(Ok(n)) => {
-                    let d = format!("{n:?}");
-                    String::from(&d[..d.find(['(', ' ', '{']).unwrap_or(d.len())])
-                }
-                Some(Err(_)) | None => String::from("(no Self)"),
-            };
-            let why = match &out {
-                Err(e) => {
-                    let d = format!("{e:?}");
-                    String::from(&d[..d.find(['(', ' ', '{']).unwrap_or(d.len())])
-                }
-                Ok(_) => String::from("the solver's step gave no type"),
-            };
-            *self.projection_why.borrow_mut() = Some(format!("`{trait_shown}`'s associated type {:#x} at Self = {self_shown}: {why}", name.0).into_boxed_str());
+            *self.projection_why.borrow_mut() = Some(projection_why(self, trait_, name, args, ground, &out));
         }
         out
     }
@@ -1762,7 +1876,7 @@ impl FrontEnd for Front2Program<'_> {
     /// a const block or a promoted borrow of a body (`Consts::body_value`, under its key over
     /// the owner's text: `ConstNeed::in_body`). The evaluator checks any body and makes any
     /// impl row the value needs.
-    fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy]) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
+    fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], closures: &crate::run::ClosureTable) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
         let alloc = self.store.tys.alloc();
         let mut records = Records {
             names: self.front.names,
@@ -1776,14 +1890,14 @@ impl FrontEnd for Front2Program<'_> {
             consts: None,
         };
         let made = match need {
-            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, alloc),
+            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, Some(closures), alloc),
             super::const_at::ConstNeed::Block { .. } | super::const_at::ConstNeed::Promoted { .. } => {
                 let owner = need.item();
                 let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
                 let Some((owner, root, key)) = in_body else {
                     return Err(super::const_at::ConstAtWhy::Eval(super::consts::ConstFail::Body { item: owner, error: super::body::BodyError::NoHead(owner) }));
                 };
-                self.consts.body_value(&mut records, self.prepared, owner, root, key, from, args, alloc)
+                self.consts.body_value(&mut records, self.prepared, owner, root, key, from, args, Some(closures), alloc)
             }
         };
         made.map(super::const_at::data_record).map_err(super::const_at::ConstAtWhy::Eval)

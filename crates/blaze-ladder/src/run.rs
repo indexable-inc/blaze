@@ -117,9 +117,10 @@ pub enum RunError {
     Projection { function: Named, why: Box<str> },
     /// A call of a trait's fn found no impl to run. `path` is the callee's name where the front
     /// end gives it (the seam's `item_named`). `at` is the FORM of the call's `Self`
-    /// (callee_shown.rs `self_form`): "a tuple", "a closure", "an ADT", .., so a gap of the
-    /// language's builtin impls is told from an impl the program lacks.
-    Resolve { function: Named, callee: ItemKey, path: Option<Box<str>>, at: &'static str, error: ResolveError },
+    /// (callee_shown.rs `self_shown`): "a tuple", "a closure", "an ADT `path`", .., so a gap of
+    /// the language's builtin impls is told from an impl the program lacks, and that one by
+    /// its type.
+    Resolve { function: Named, callee: ItemKey, path: Option<Box<str>>, at: Box<str>, error: ResolveError },
     /// A vtable the function takes the address of could not be made.
     Vtable { function: Named, principal: ItemKey, why: VtableFail },
     Place(PlaceError),
@@ -435,38 +436,56 @@ struct BuiltParts {
 /// `Step::Check` loop; rule 18): past it the build is refused by name, never waited on.
 const MOST_HELD_COROUTINES: usize = 4096;
 
-/// Every closure's facts ([`LayoutFacts::closure`]), made once before the build from its
-/// owner's check record by `blaze_build::layout::closure_facts`, sorted by (owner, ordinal).
+/// Every closure's facts ([`LayoutFacts::closure`]), made from the check record of the body
+/// that holds it by `blaze_build::layout::closure_facts` ([`ClosureTable::add`]), sorted by
+/// (owner, ordinal). THE ONE RULE for every kind of body (rule 30): a fn's checked body (the
+/// build's table, [`ClosureTable::of`]) and a constant's or a const block's body the constant
+/// evaluator checked (front2/consts.rs `Consts::closures`) each add their closures here, keyed
+/// by the owner the checker wrote into the closure's type (`BodyView::owner`, writeback.rs).
 /// A closure whose owner did not check has no row: the builder refuses it, naming it.
-struct ClosureTable {
+pub struct ClosureTable {
     tys: PortableTys<'static>,
     rows: Vec<(ItemKey, u32, Result<(blaze_build::FnTrait, PTy, PTy), BuildError>), Global>,
 }
 
 impl ClosureTable {
+    /// An empty table; `alloc` holds its types for the build or evaluator that keeps it.
+    pub fn new(alloc: Alloc<'static>) -> ClosureTable {
+        ClosureTable { tys: PortableTys::new_in(alloc), rows: Vec::new_in(Global) }
+    }
+
     /// `alloc` holds the table's types for the build that keeps it, and each closure's scratch.
     fn of<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], alloc: Alloc<'static>) -> ClosureTable {
-        let mut tys = PortableTys::new_in(alloc);
-        let mut rows = Vec::new_in(Global);
+        let mut table = ClosureTable::new(alloc);
         let types = program.types();
         for (i, done) in checked.iter().enumerate() {
             let Some(done) = done else { continue };
             let sig = program.sig(i);
             let generics = sig.parent_count + sig.own_count;
-            let function = program.function(i);
-            let owner = function.key;
-            let Some((body, _)) = function.body else { continue };
-            let view = body.view(types);
-            for ordinal in 0..done.closures.len() as u32 {
-                let facts = blaze_build::layout::closure_facts(&view, done, ordinal, generics, &mut tys, alloc);
-                rows.push((owner, ordinal, facts));
-            }
+            let Some((body, _)) = program.function(i).body else { continue };
+            table.add(&body.view(types), done, generics, alloc);
         }
-        rows.sort_unstable_by_key(|r| (r.0, r.1));
-        ClosureTable { tys, rows }
+        table
     }
 
-    fn get(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+    /// The facts of every closure of `body` (checked as `checked`; `generics` its owner's
+    /// parameter count, parents first), under the body's owner. A body whose owner already
+    /// has rows (one fn body checked again for each of its const blocks) adds none: one body
+    /// is one check, so its facts are the same.
+    pub fn add(&mut self, body: &blaze_typeck::BodyView<'_>, checked: &Checked<'_>, generics: u32, scratch: Alloc<'_>) {
+        let owner = body.owner;
+        let count = checked.closures.len() as u32;
+        if count == 0 || self.rows.binary_search_by_key(&(owner, 0), |r| (r.0, r.1)).is_ok() {
+            return;
+        }
+        let at = self.rows.partition_point(|r| r.0 < owner);
+        for ordinal in 0..count {
+            let facts = blaze_build::layout::closure_facts(body, checked, ordinal, generics, &mut self.tys, scratch);
+            self.rows.insert(at + ordinal as usize, (owner, ordinal, facts));
+        }
+    }
+
+    pub fn get(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
         let at = self.rows.binary_search_by_key(&(owner, ordinal), |r| (r.0, r.1)).ok()?;
         let (kind, sig, env) = *self.rows[at].2.as_ref().ok()?;
         Some(blaze_build::layout::ClosureFacts { types: self.tys.view(), kind, sig, env })
@@ -475,10 +494,22 @@ impl ClosureTable {
 
 /// The front end's normalization as the builder asks it: an answer not given is the builder's
 /// own refusal naming the projection.
+/// Whether `e` is an instance question's `Missing`: an answer no check made, which the
+/// front end can make (`FrontEnd::make_asked`) before the step is taken again.
+fn asks_again(e: &RunError) -> bool {    matches!(
+        e,
+        RunError::Build { error: BuildError::Select(blaze_typeck::ResolveError::Missing(_)), .. }
+            | RunError::Resolve { error: blaze_typeck::ResolveError::Missing(_), .. }
+    )
+}
+
 fn normalized<P: FrontEnd>(program: &P, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
     match program.normalize(trait_, name, args, ground) {
         Ok(Some(t)) => Ok(t),
-        Ok(None) | Err(_) => Err(BuildError::Projection { trait_, name }),
+        Ok(None) => Err(BuildError::Projection { trait_, name }),
+        // The solver's own refusal (an unmade answer is `Missing`, which the instance loop
+        // makes and asks again), never "not normalized".
+        Err(e) => Err(BuildError::Select(e)),
     }
 }
 
@@ -897,7 +928,7 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         }
     }
 
-    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&str> {
+    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&[u8]> {
         self.0.str_pat(owner, pat)
     }
 
@@ -1727,6 +1758,9 @@ fn filed(sink: &mut Sink<'_>, e: RunError) -> Result<(), RunError> {
             (function, format!("NoAdt: no row for the ADT {shown}").into_boxed_str())
         }
         RunError::Emit { function, error } => (function, crate::emit_class::emit_class(&error)),
+        // A soft-float routine not bound is the emitter's (legalize's) refusal: filed at the
+        // tier with the routine and why (builtins_shim.rs `BuiltinsRefused`).
+        RunError::CodeRecord { function, error: crate::code_records::CodeRecordError::Routine(refused) } => (function, format!("emit: {refused}").into_boxed_str()),
         RunError::CodeRecord { function, error } => (function, format!("code record: {}", class_chain(&format!("{error:?}"), 2)).into_boxed_str()),
         // By the callee's key, so each fn the walk never reached is its own class.
         RunError::Callee { function, callee, path, gap, .. } => {
@@ -1994,10 +2028,24 @@ fn build_from<P: FrontEnd>(
     let program = &*program_mut;
     let consts = eval_consts(program, &checked, alloc)?;
     let langs = BackLangs::of(program)?;
+    // `Clone::clone` at a tuple, closure, fn item or fn pointer: built (clone_shim.rs).
+    let clones = crate::clone_shim::Clones::of(program).map_err(RunError::Lang)?;
     let (image, mut tls_vars) = static_image(program, &consts, survey.survey.as_deref_mut())?;
     // The rows the descriptor holds: a thread-local first numbered past them has none.
     let tls_rows = tls_vars.as_ref().map_or(0, TlsVars::len);
     let mut ground = PortableTys::new_in(alloc);
+    // The program's compiler_builtins soft-float routines (front2/builtins_shim.rs), found once
+    // a build and bound in every instance as the record walk's maker binds them
+    // (run/make_one.rs `Work::routines`): one rule for both paths. A front end that does not
+    // look them up answers `NotLookedUp`, and an `f128` operation is refused naming that.
+    let builtins = program.soft_float_routines(alloc);
+    let bound = crate::front2::builtins_shim::Bound::new(builtins, &ground, alloc).map_err(|_| RunError::OneBody {
+        // `Bound::new` fails only naming a found routine's instance, so one is found.
+        key: blaze_lir::legalize::SoftFloat::ALL.into_iter().find_map(|r| builtins.lib(r).map(crate::front2::keys::checker_of)).unwrap_or(ItemKey(0)),
+        why: "a compiler_builtins soft-float routine's instance name did not encode (front2/builtins_shim.rs `Bound::new`)",
+    })?;
+    // Each found routine's slot, made the first time an instance that legalizes is emitted.
+    let mut routine_slots: [Option<u32>; blaze_lir::legalize::SoftFloat::ALL.len()] = [None; blaze_lir::legalize::SoftFloat::ALL.len()];
     // An item's code identity, until the item layer's records give one (shortcuts 2 and 12): its
     // key and its item's text. Never stale; coarse only in that a signature edit changes it too.
     // The key covers what each projection of the fn's checked types normalizes to at the
@@ -2026,7 +2074,10 @@ fn build_from<P: FrontEnd>(
             error => RunError::Build { function: program.function(c).named(), error, range: None },
         };
         let from = checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
-        let args = if instance.item == program.function(c).key {
+        let args = if let Some(shim) = clones.shim_of(instance, ground) {
+            // A builtin clone, keyed by `Self` and whether it is `Copy` (clone_shim.rs).
+            clones.key_args(shim, ground).map_err(fail)?
+        } else if instance.item == program.function(c).key {
             instance.args
         } else if crate::front2::coroutines::self_is_coroutine(instance, ground) {
             // One of a coroutine's three functions, tabled as its owner (front2/coroutines.rs).
@@ -2053,9 +2104,28 @@ fn build_from<P: FrontEnd>(
     if let Some(main) = entry {
         reached.instances.push(Instance { item: program.function(main).key, args: List::EMPTY });
         reached.tabled.push(main);
-        let key = key_of(program, main, Instance { item: program.function(main).key, args: List::EMPTY }, &mut ground, &keyer)?;
+        // The entry's key reads its body's types' facts (a `Drop` impl at each): an answer no
+        // check made is made (`FrontEnd::make_asked`) and the key asked again, as an
+        // instance's step is (at most `MOST_ROUNDS`).
+        let mut rounds = 0;
+        let key = loop {
+            let program = &*program_mut;
+            let keyer = FrontAdts(program, main, &consts, &langs, &checked_bodies);
+            match key_of(program, main, Instance { item: program.function(main).key, args: List::EMPTY }, &mut ground, &keyer) {
+                Err(e) if asks_again(&e) && rounds < crate::front2::check::MOST_ROUNDS => {
+                    if !program_mut.make_asked(main)? {
+                        return Err(e);
+                    }
+                    rounds += 1;
+                }
+                made => break made?,
+            }
+        };
         reached.keys.push(Some(key));
     }
+    // The program's borrows again, after the entry's makes.
+    let program = &*program_mut;
+    let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
     // A survey seeds every non-generic fn with a checked body, by key (the program's order,
     // never the asking's); a generic one is met at the instances built bodies call it at.
     let generic = |program: &P, c: usize| {
@@ -2125,6 +2195,9 @@ fn build_from<P: FrontEnd>(
     // The constants each instance reads at its ground arguments (front2/const_at.rs), refilled
     // per instance.
     let mut const_needs = crate::front2::const_at::Needs::new_in(Global);
+    // The slot built again after `FrontEnd::make_asked` made what its world asked, and how
+    // many times (bounded by `MOST_ROUNDS`, rule 18).
+    let mut asked_rounds: (usize, u32) = (usize::MAX, 0);
     while let Some(&instance) = reached.instances.get(at) {
         // Shared borrows of the program for this step only: the step takes `program_mut` to
         // pull its instance's constants before the walk.
@@ -2150,6 +2223,31 @@ fn build_from<P: FrontEnd>(
         }
         // Each instance is pushed with its fn's index (`tabled`), so none is looked up again.
         let i = reached.tabled[at - 1];
+        // This step's refusal `e`, filed, and the loop goes on; but an instance question's
+        // `Missing` (an answer no check made: a bucket at a shape only this instance's
+        // arguments hold) has the front end make what its worlds asked
+        // (`FrontEnd::make_asked`) and the step is taken again, at most `MOST_ROUNDS` times, as
+        // the body check retries its world (front2 check.rs). Nothing made: `e` is filed.
+        macro_rules! step_refused {
+            ($e:expr) => {{
+                let e = $e;
+                let rounds = if asked_rounds.0 == at { asked_rounds.1 } else { 0 };
+                if asks_again(&e) && rounds < crate::front2::check::MOST_ROUNDS {
+                    match program_mut.make_asked(i) {
+                        Ok(true) => {
+                            asked_rounds = (at, rounds + 1);
+                            at -= 1;
+                            continue;
+                        }
+                        Ok(false) => filed(&mut survey, e)?,
+                        Err(made) => filed(&mut survey, made)?,
+                    }
+                } else {
+                    filed(&mut survey, e)?;
+                }
+                continue;
+            }};
+        }
         let function = program.function(i);
         let name = || function.named();
         // A tuple struct's or variant's ctor, tabled with no body: the function the language
@@ -2159,9 +2257,15 @@ fn build_from<P: FrontEnd>(
             (FnKind::Ctor, None) => program.ctor_of(function.key).map(|(_, variant)| variant),
             _ => None,
         };
+        // `Clone::clone` at a `Self` the language gives it (clone_shim.rs), tabled at the
+        // trait's bodiless row: its `Self` and whether it is `Copy`, asked where it was called.
+        let clone_row = match function.body {
+            None => clones.shim_of(instance, &ground).map(|s| (s, clones.copy_of(s))),
+            Some(_) => None,
+        };
         let (body, done) = match (function.body, checked[i].as_ref()) {
             (Some((body, _)), Some(done)) => (Some(body), Some(done)),
-            _ if ctor_row.is_some() => (None, None),
+            _ if ctor_row.is_some() || clone_row.is_some() => (None, None),
             _ => {
             let refusal = callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view());
             // A survey files it (by the fn and the callee) and goes on, as its doc promises; a
@@ -2215,7 +2319,7 @@ fn build_from<P: FrontEnd>(
         }
         let named = function.named();
         if !const_needs.is_empty()
-            && let Err(refusal) = crate::front2::const_at::pull(&mut *program_mut, &const_needs, ground.view(), &mut checked_bodies.const_at)
+            && let Err(refusal) = crate::front2::const_at::pull(&mut *program_mut, &const_needs, ground.view(), &mut checked_bodies.const_at, &checked_bodies.closures)
         {
             let item = refusal.need.item();
             let path = program_mut.item_named(item);
@@ -2228,7 +2332,7 @@ fn build_from<P: FrontEnd>(
         let function = program.function(i);
         let name = || function.named();
         let body = function.body.map(|(body, _)| body);
-        if body.is_none() && ctor_row.is_none() {
+        if body.is_none() && ctor_row.is_none() && clone_row.is_none() {
             return Err(callee_refusal(&*program, named, instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view()));
         }
         // The record walk: the entry its key's pointer names is used only when every row of its
@@ -2260,6 +2364,16 @@ fn build_from<P: FrontEnd>(
                             .map_err(fail)?;
                         for &(tabled, callee) in declared.iter() {
                             let c = program.fn_index(tabled).ok_or_else(|| fail(CodeRecordError::NoTabledFn { tabled }))?;
+                            // A builtin clone's key holds its `Self: Copy`, asked in this fn's world.
+                            if let Some(Err(e)) = clones.owner(program, &world, i, callee, &mut ground, alloc) {
+                                return Err(match e {
+                                    crate::clone_shim::NoteError::Resolve(error) => {
+                                        let at = crate::callee_shown::self_shown(program, ground.view(), callee.args);
+                                        RunError::Resolve { function: name(), callee: callee.item, path: program.item_named(callee.item), at, error }
+                                    }
+                                    crate::clone_shim::NoteError::Build(error) => RunError::Build { function: name(), error, range: None },
+                                });
+                            }
                             let k = key_of(program, c, callee, &mut ground, &world)?;
                             reached.slot(callee, c, k)?;
                         }
@@ -2324,10 +2438,7 @@ fn build_from<P: FrontEnd>(
                             filed(&mut survey, lay_states::unchecked_owner(&*program, i, owner))?;
                             continue;
                         }
-                        Err(e) => {
-                            filed(&mut survey, e)?;
-                            continue;
-                        }
+                        Err(e) => step_refused!(e),
                     }
                 }
                 let taken = match find(&coroutine_stash) {
@@ -2346,7 +2457,7 @@ fn build_from<P: FrontEnd>(
         // built into its state BEFORE this build (run/lay_states.rs): the build never meets a
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
-        if from_coroutine.is_none() && shim.is_none() {
+        if from_coroutine.is_none() && shim.is_none() && clone_row.is_none() {
             let adts = FrontAdts(&*program, i, &consts, &langs, &checked_bodies);
             let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
                 Ok(roots) if roots.is_empty() => Ok(lay_states::Lay::Done),
@@ -2359,10 +2470,7 @@ fn build_from<P: FrontEnd>(
                     filed(&mut survey, lay_states::unchecked_owner(&*program, i, owner))?;
                     continue;
                 }
-                Err(e) => {
-                    filed(&mut survey, e)?;
-                    continue;
-                }
+                Err(e) => step_refused!(e),
             }
         }
         let view = body.map(|body| body.view(types));
@@ -2385,6 +2493,12 @@ fn build_from<P: FrontEnd>(
             match s.item {
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
+            }
+        } else if let Some((s, copy)) = clone_row {
+            // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
+            match copy {
+                Some(copy) => blaze_build::build_builtin_clone(s.clone, copy, &mut subst, world, Global),
+                None => Err(BuildError::Malformed { what: "a builtin `clone` built before its `Self: Copy` was asked" }),
             }
         } else if let Some(variant) = ctor_row {
             // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
@@ -2437,22 +2551,26 @@ fn build_from<P: FrontEnd>(
         });
         let built = match built {
             Ok(b) => b,
-            Err(e) => {
-                filed(&mut survey, e)?;
-                continue;
-            }
+            Err(e) => step_refused!(e),
         };
         let mut via = Vec::with_capacity_in(built.refs.len(), Global);
         let mut targets = Vec::with_capacity_in(built.refs.len(), Global);
         // In a survey, a callee refused leaves this instance unemitted (its targets short).
         let mut broken = false;
+        // The world the calls resolve in: this fn's, or for a builtin clone (bodiless, no
+        // world of its own) its caller's, whose world asked its `Self: Copy` (clone_shim.rs).
+        let world_of = clone_row.and_then(|(s, _)| clones.caller_of(s)).unwrap_or(i);
+        // A callee's selection or key met an answer no check made: the step is taken again
+        // after `make_asked` (as the build's `Missing` above), never filed as the callee's.
+        let may_ask = asked_rounds.0 != at || asked_rounds.1 < crate::front2::check::MOST_ROUNDS;
+        let mut ask_again = false;
         for &called in built.refs.iter() {
             // A fn item of a trait's method as an `Fn*` value: its Self resolved to the body
             // that runs, as a call is, before the shim is tabled (fn_item_resolve.rs).
             let called = match crate::fn_item_resolve::resolved_shim_self(program, &adts, i, called, &mut ground) {
                 Ok(c) => c,
                 Err(error) => {
-                    let at = crate::callee_shown::self_form(ground.view(), called.args);
+                    let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
                     let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error };
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
@@ -2469,14 +2587,40 @@ fn build_from<P: FrontEnd>(
             // A fn item's or fn pointer's: the shim, tabled as fn_shim.rs says.
             // A coroutine's own function (its `Future::poll`, its resume fn, its drop): no impl
             // to select; tabled as the block's owner (front2/coroutines.rs).
-            let tabled_as = crate::front2::coroutines::owner_of(program, &adts, called, &ground)
-                .or_else(|| closure_owner(program, &adts, called, &ground))
-                .or_else(|| crate::fn_shim::fn_shim_owner(program, &adts, called, &ground, i));
+            // A builtin `Clone::clone` (a tuple's, a closure's, a fn item's or pointer's): built,
+            // tabled at the trait's `clone` row, its `Self: Copy` asked here (clone_shim.rs).
+            let tabled_as = match clones.owner(program, &adts, world_of, called, &mut ground, alloc) {
+                Some(Ok(c)) => Some(c),
+                Some(Err(e)) => {
+                    let refusal = match e {
+                        crate::clone_shim::NoteError::Resolve(error) => {
+                            let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
+                            RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error }
+                        }
+                        crate::clone_shim::NoteError::Build(error) => RunError::Build { function: name(), error, range: None },
+                    };
+                    match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                        Some(slot) => {
+                            via.push(Via::Slot);
+                            targets.push(Target::Slot(slot));
+                        }
+                        None => broken = true,
+                    }
+                    continue;
+                }
+                None => crate::front2::coroutines::owner_of(program, &adts, called, &ground)
+                    .or_else(|| closure_owner(program, &adts, called, &ground))
+                    .or_else(|| crate::fn_shim::fn_shim_owner(program, &adts, called, &ground, i)),
+            };
             if let Some(c) = tabled_as {
                 match key_of(program, c, called, &mut ground, &adts) {
                     Ok(key) => {
                         via.push(Via::Slot);
                         targets.push(Target::Slot(reached.slot(called, c, key)?));
+                    }
+                    Err(e) if may_ask && asks_again(&e) => {
+                        ask_again = true;
+                        break;
                     }
                     Err(e) => match unresolved(&mut survey, &mut reached, called, i, e)? {
                         Some(slot) => {
@@ -2494,12 +2638,16 @@ fn build_from<P: FrontEnd>(
             let is_ctor = program.fn_index(called.item).is_some_and(|c| program.function(c).kind == FnKind::Ctor);
             let selected = match is_ctor {
                 true => Ok((called.item, called.args)),
-                false => program.resolve(i, called.item, called.args, &mut ground),
+                false => program.resolve(world_of, called.item, called.args, &mut ground),
             };
             let (item, resolved) = match selected {
                 Ok(r) => r,
+                Err(blaze_typeck::ResolveError::Missing(_)) if may_ask => {
+                    ask_again = true;
+                    break;
+                }
                 Err(error) => {
-                    let at = crate::callee_shown::self_form(ground.view(), called.args);
+                    let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
                     let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error };
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
@@ -2529,6 +2677,10 @@ fn build_from<P: FrontEnd>(
                 // A key the callee cannot have (a projection not normalized) refuses this caller.
                 let key = match key_of(program, c, callee, &mut ground, &adts) {
                     Ok(k) => k,
+                    Err(e) if may_ask && asks_again(&e) => {
+                        ask_again = true;
+                        break;
+                    }
                     Err(e) => {
                         match unresolved(&mut survey, &mut reached, callee, i, e)? {
                             Some(slot) => {
@@ -2561,6 +2713,26 @@ fn build_from<P: FrontEnd>(
                     None => broken = true,
                 }
             }
+        }
+        if ask_again {
+            // A coroutine's function was taken from its stash: put back for the step again.
+            if let Some((of, part)) = coroutine
+                && let Some(n) = coroutine_stash.iter().position(|b| b.owner == of.owner && b.ordinal == of.ordinal && b.args[..] == args[..])
+            {
+                coroutine_stash[n].parts[part.index()] = Some(built);
+            }
+            let rounds = if asked_rounds.0 == at { asked_rounds.1 } else { 0 };
+            asked_rounds = match program_mut.make_asked(i) {
+                Ok(true) => (at, rounds + 1),
+                // Nothing to make: the step once more, its `Missing` then filed as it is.
+                Ok(false) => (at, crate::front2::check::MOST_ROUNDS),
+                Err(made) => {
+                    filed(&mut survey, made)?;
+                    continue;
+                }
+            };
+            at -= 1;
+            continue;
         }
         if broken {
             continue;
@@ -2623,7 +2795,7 @@ fn build_from<P: FrontEnd>(
                                     true => (f.item, f.args),
                                     false => program
                                         .resolve(i, f.item, f.args, &mut ground)
-                                        .map_err(|error| RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_form(ground.view(), f.args), error })?,
+                                        .map_err(|error| RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error })?,
                                 };
                                 let c = program.fn_index(item).filter(|&c| program.function(c).body.is_some());
                                 let Some(c) = c else {
@@ -2677,7 +2849,7 @@ fn build_from<P: FrontEnd>(
                 reaches.push((tabled, bytes));
                 Ok(symbol)
             };
-            let mut funcs: Vec<Callee<'_>, Global> = Vec::with_capacity_in(targets.len(), Global);
+            let mut funcs: blaze_own::AVec<'_, Callee<'_>> = blaze_own::Vec::with_capacity_in(targets.len(), alloc);
             for target in targets.iter() {
                 match target {
                     Target::Slot(n) => funcs.push(Callee::Symbol(name_of(*n, &mut reaches)?)),
@@ -2715,6 +2887,9 @@ fn build_from<P: FrontEnd>(
             for &table in built.vtables.iter() {
                 vtables.push(vtable_symbol(table, ground.view(), alloc).map_err(sym)?);
             }
+            // The soft-float routines after the instance's own references, as run/make_one.rs
+            // binds them: `make_entry` declares those the emitter says the record calls.
+            let routines = bound.bind(&mut funcs).map_err(fail)?;
             let names = InstanceNames { funcs: &funcs, statics: &statics, vtables: &vtables, tls: &tls_names };
             // A census walk (`RecordRun::census`): the instance's LIR and names go to the census,
             // which emits them itself; no record is made. The walk goes on to the slots it filled.
@@ -2728,9 +2903,6 @@ fn build_from<P: FrontEnd>(
             for (tabled, bytes) in reaches.iter() {
                 declared.push(Declared { tabled: *tabled, name: &bytes[..] });
             }
-            // The eager walk binds no soft-float routine (its reached set is fixed before the
-            // emitter answers which it calls): an `f128` operation is refused naming its
-            // routine. The record walk (run/make_one.rs) binds them.
             // The instance each call runs is part of what the entry read: a trait's fn selected
             // to an impl (the front end's `resolve`, asked again when the entry is found).
             for &called in built.refs.iter() {
@@ -2738,7 +2910,7 @@ fn build_from<P: FrontEnd>(
                 run.reads.ask_resolve(called, resolved, ground.view(), alloc);
             }
             let reads = run.reads.seal(&mut ground, alloc).map_err(|e| fail(CodeRecordError::Reads(e)))?;
-            let entry = crate::code_records::make_entry_reading(&built.func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, &reads, run.builder.isa, alloc)
+            let entry = crate::code_records::make_entry_reading(&built.func, &names, routines, &mut declared, &reads, run.builder.isa, alloc)
                 .map_err(fail)?;
             // Put under its content key, and its code key pointed at it: an entry built again
             // after a stale one replaces the pointer, never the bytes under a key.
@@ -2748,9 +2920,44 @@ fn build_from<P: FrontEnd>(
             run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: format!("{}", name()).into_boxed_str(), found: false });
             continue;
         }
+        // The soft-float routines, bound as the record walk binds them (run/make_one.rs,
+        // front2/builtins_shim.rs `Bound::bind`): a function that legalizes gets one reference
+        // place per found routine after its own, each the routine's instance's slot; legalize
+        // turns an `f128` operation into a call there. A routine whose fn no row tables (the
+        // program reaches its exports beside the roots, program.rs `make_from`, unless a
+        // survey's `Within` leaves its crate out) stays unbound, and its operation is refused
+        // naming why.
+        let mut places = blaze_emit::RoutinePlaces::NONE;
+        if !matches!(blaze_lir::legalize::needed(&built.func.view()), Ok(false)) {
+            for r in blaze_lir::legalize::SoftFloat::ALL {
+                let Some(k) = builtins.lib(r).map(crate::front2::keys::checker_of) else { continue };
+                let slot = match routine_slots[r as usize] {
+                    Some(s) => s,
+                    None => {
+                        let Some(c) = program.fn_index(k) else { continue };
+                        let routine = Instance { item: k, args: List::EMPTY };
+                        let key = key_of(program, c, routine, &mut ground, &adts)?;
+                        let s = reached.slot(routine, c, key)?;
+                        routine_slots[r as usize] = Some(s);
+                        s
+                    }
+                };
+                let place = u32::try_from(via.len()).map_err(|_| RunError::TooManyInstances)?;
+                places.bind(r, place);
+                via.push(Via::Slot);
+                targets.push(Target::Slot(slot));
+            }
+        }
         let mut code = Code::new_in(Global);
-        if let Err(error) = blaze_emit::emit(built.func.view(), &via, isa(), &mut code) {
-            filed(&mut survey, RunError::Emit { function: name(), error })?;
+        if let Err(error) = blaze_emit::emit_with_routines(built.func.view(), &via, &places, isa(), &mut code) {
+            let refusal = match error {
+                blaze_emit::EmitError::Legalize(blaze_lir::legalize::LegalizeError::NoRoutine(routine)) => RunError::CodeRecord {
+                    function: name(),
+                    error: crate::code_records::CodeRecordError::Routine(crate::front2::builtins_shim::BuiltinsRefused { routine, why: builtins.found(routine) }),
+                },
+                error => RunError::Emit { function: name(), error },
+            };
+            filed(&mut survey, refusal)?;
             continue;
         }
         let mut tls_at = Vec::with_capacity_in(built.thread_locals.len(), Global);

@@ -10,7 +10,6 @@ use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 use super::{
     Ask, Cache, CrateLibs, Located, RunsOn, Target, caseless, fhs, listing, loader,
     locate_any, locate_with, machine_facts, output_with, parse_version, reactor_with, rpaths,
-    top_level_string,
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
 
@@ -1363,17 +1362,15 @@ fn a_wasm_proc_macro_links_as_a_wasi_reactor() {
     assert!(error.what.contains("`main`") && error.what.contains("_initialize"), "{}", error.what);
 }
 
+/// The settings file's reading is blaze-apple-sdk's (its own tests); the deployment target's
+/// version is read by the same `Version`.
 #[test]
-fn versions_and_the_sdks_settings_are_read_as_rustc_reads_them() {
+fn versions_are_read_as_rustc_reads_them() {
     assert_eq!(parse_version("11"), Some(0x000b_0000));
     assert_eq!(parse_version("10.15.7"), Some(0x000a_0f07));
     for bad in ["", "11.", "11.0.0.0", "x", "11.256", "+11", "11 .0"] {
         assert_eq!(parse_version(bad), None, "{bad}");
     }
-    let json = r#"{ "Nested": {"Version": "1"}, "List": ["Version", {"Version": "2"}], "Name": "Version", "Version" : "15.2" }"#;
-    assert_eq!(top_level_string(json, "Version"), Some("15.2"));
-    assert_eq!(top_level_string(r#"{"Version": 15}"#, "Version"), None);
-    assert_eq!(top_level_string(r#"{"Other": "a\"Version\": \"9\""}"#, "Version"), None);
 }
 
 /// An AArch64 Mach-O object defining `_f` whose `LC_LINKER_OPTION`s are `options`.

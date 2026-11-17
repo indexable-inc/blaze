@@ -64,12 +64,12 @@ fn run_once(name: &str, pins: Option<&FactPins>) -> Run {
     let alloc = blaze_own::testing::heap().alloc();
     let root = std::env::temp_dir().join(format!("blaze-n7-{}-{name}", std::process::id()));
     _ = std::fs::remove_dir_all(&root);
-    for dir in ["package", "out", "shelf", "sdk", "work"] {
+    for dir in ["package", "out", "shelf", "sdk", "work", "files"] {
         std::fs::create_dir_all(root.join(dir)).expect("a test folder");
     }
     let root = root.canonicalize().expect("the folder's real path");
     let text = |dir: &str| root.join(dir).to_str().expect("a UTF-8 temp path").to_owned();
-    let (package, out, shelf, sdk, work) = (text("package"), text("out"), text("shelf"), text("sdk"), text("work"));
+    let (package, out, shelf, sdk, work, files) = (text("package"), text("out"), text("shelf"), text("sdk"), text("work"), text("files"));
     let exe = std::env::current_exe().expect("the test binary").canonicalize().expect("its real path");
     let exe = exe.to_str().expect("a UTF-8 path").to_owned();
 
@@ -102,11 +102,16 @@ fn run_once(name: &str, pins: Option<&FactPins>) -> Run {
         shown: &[],
         host_tools: &[],
         facts: Some(&facts),
+        jobs: None,
         limits: RunLimits::STANDARD,
         deadline: Duration::from_secs(60),
+        files: &files,
     };
     let ran = run_script(&script, alloc).unwrap_or_else(|e| panic!("{e}"));
-    let answer = ran.outputs.file("answer").map(|bytes| std::string::String::from_utf8_lossy(bytes).into_owned()).expect("the script's OUT_DIR/answer");
+    // A stored file of the record: its bytes in the file area under its digest.
+    let stored = ran.outputs.stored_file("answer").expect("the script's OUT_DIR/answer");
+    let name: std::string::String = stored.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
+    let answer = std::string::String::from_utf8_lossy(&std::fs::read(format!("{files}/{name}")).expect("the stored answer in the area")).into_owned();
     let asked = native_facts::reads(&facts, pins, alloc).unwrap_or_else(|e| panic!("{e}"));
     let reads = asked.reads.iter().map(|r| (r.subject.clone(), r.digest.is_some())).collect();
     _ = std::fs::remove_dir_all(&root);

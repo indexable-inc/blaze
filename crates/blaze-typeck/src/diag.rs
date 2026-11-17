@@ -51,6 +51,9 @@ pub enum DiagCode {
     Unsatisfied,
     /// E0425: cannot find value.
     UnresolvedPath,
+    /// E0412: cannot find type. Filed by the front end for a written type whose path names
+    /// nothing (the checker sees it as the error type): blaze-ladder front2 body.rs `TypeMiss`.
+    UnresolvedType,
     /// E0423 / E0533: expected value, found a type, trait or struct name.
     NotAValue,
     /// E0574: expected struct, found something else.
@@ -185,6 +188,7 @@ impl DiagCode {
             DiagCode::CannotSatisfy => "E0283",
             DiagCode::Unsatisfied => "E0277",
             DiagCode::UnresolvedPath => "E0425",
+            DiagCode::UnresolvedType => "E0412",
             DiagCode::NotAValue => "E0423",
             DiagCode::NotAStruct => "E0574",
             DiagCode::NoMethod | DiagCode::NotAMethod => "E0599",

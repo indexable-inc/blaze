@@ -5,11 +5,14 @@
 //! the order the parent first answered them inside the start window (this run's first
 //! [`MOST_ROWS`] first answers: the window is the cap).
 //!
-//! The head carries the run's ENTRY LINE too (its launcher form and symbol, blaze-ladder
-//! run/special.rs `EntryLine`), so a start under today's certificate spawns the child with no
-//! front-end read at all: the entry comes from the list ([`TodayRows::entry`]), and nothing else
-//! of the list is read under another certificate (an entry of another program text is never
-//! started).
+//! The head carries the run's START HEAD too (blaze-ladder run/special.rs `StartHead`: the
+//! entry's launcher form and symbol, and the personality routine's symbol, which the parent
+//! names before its first `Publish`), so a start under today's certificate spawns the child
+//! with no front-end read at all: both come from the list ([`TodayRows::head`]), and nothing
+//! else of the list is read under another certificate (an entry of another program text is
+//! never started). The personality's symbol is its instance name's hash, so it is a function
+//! of the routine's item key, and the certificate covers every text that decides which item
+//! that is.
 //!
 //! Next start, under the SAME certificate, the rows are placed as they are, before any need is
 //! read: nothing keyed or looked up ([`Held::Today`]). Under another (an edit, an undo, another
@@ -40,7 +43,9 @@
 //! | 16 | 32 | the certificate it was written under |
 //! | 48 | 4 | the entry's launcher form, little-endian: 0 `unit`, 1 `c-main`, 2 `hosted` |
 //! | 52 | 32 | the entry's symbol |
-//! | 84 | 96 a row | the symbol, the code record's key, the record's id |
+//! | 84 | 4 | whether a personality routine is named, little-endian: 0 none, 1 one |
+//! | 88 | 32 | its symbol; all zero when none is named |
+//! | 120 | 96 a row | the symbol, the code record's key, the record's id |
 
 use core::fmt;
 use std::alloc::Global;
@@ -51,7 +56,7 @@ use blaze_core::Driver;
 use blaze_hash::ByHashSet;
 use blaze_ids::ContentId;
 use blaze_ladder::code_records::CodeKey;
-use blaze_ladder::run::special::{EntryForm, EntryLine};
+use blaze_ladder::run::special::{EntryForm, EntryLine, StartHead};
 use blaze_launch::wire::RecordId;
 use blaze_launch::wire::run::Symbol;
 use blaze_own::{AVec, Alloc, Vec};
@@ -61,14 +66,15 @@ pub(crate) const MAGIC: [u8; 8] = *b"blzstart";
 
 /// The form's version. A list of another is refused by name ([`ReadError::Version`]): the
 /// run proceeds as with none, says so, and writes today's form at exit.
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
 /// The most rows a list holds (run.md stage 7: "a cap of 8,192 rows"); one more is refused by
 /// name ([`CapError::Full`]).
 pub(crate) const MOST_ROWS: usize = 8192;
 
-/// The head's bytes: magic, version, row count, certificate, the entry's form and symbol.
-pub(crate) const HEAD: usize = 8 + 4 + 4 + 32 + 4 + 32;
+/// The head's bytes: magic, version, row count, certificate, the entry's form and symbol, the
+/// personality's word and symbol.
+pub(crate) const HEAD: usize = 8 + 4 + 4 + 32 + 4 + 32 + 4 + 32;
 
 /// The entry's form as the head writes it: one number a form, never reused.
 const fn form_word(form: EntryForm) -> u32 {
@@ -191,10 +197,11 @@ impl<'a> Rows<'a> {
     }
 }
 
-/// The list of `rows` under `certificate` with the run's `entry`, its bytes onto the end of `out`
-/// (the module's table). Equal inputs, equal bytes. More than [`MOST_ROWS`] rows is refused,
-/// naming the first past it.
-pub(crate) fn encode(certificate: Certificate, entry: EntryLine, rows: &[Row], out: &mut AVec<'_, u8>) -> Result<(), CapError> {
+/// The list of `rows` under `certificate` with the run's `head`, its bytes onto the end of
+/// `out` (the module's table). Equal inputs, equal bytes. More than [`MOST_ROWS`] rows is
+/// refused, naming the first past it.
+pub(crate) fn encode(certificate: Certificate, head: StartHead, rows: &[Row], out: &mut AVec<'_, u8>) -> Result<(), CapError> {
+    let entry = head.line;
     if let Some(past) = rows.get(MOST_ROWS) {
         return Err(CapError::Full { symbol: past.symbol });
     }
@@ -205,6 +212,16 @@ pub(crate) fn encode(certificate: Certificate, entry: EntryLine, rows: &[Row], o
     out.extend_from_slice(&certificate.0);
     out.extend_from_slice(&form_word(entry.form).to_le_bytes());
     out.extend_from_slice(&entry.symbol.0);
+    match head.personality {
+        None => {
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&[0u8; 32]);
+        }
+        Some(symbol) => {
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&symbol.0);
+        }
+    }
     for row in rows {
         out.extend_from_slice(&row.symbol.0);
         out.extend_from_slice(&row.key.0.0);
@@ -230,6 +247,8 @@ pub(crate) enum ReadError {
     Length { len: usize, want: usize },
     /// The entry's form word names no launcher form.
     Form { found: u32 },
+    /// The personality's word is neither 0 nor 1, or is 0 with a symbol that is not all zero.
+    Personality { found: u32 },
     /// One symbol in two rows (the writer answers each symbol first once).
     Twice { symbol: Symbol },
 }
@@ -245,6 +264,9 @@ impl fmt::Display for ReadError {
             ReadError::TooMany { rows } => write!(f, "{what} says {rows} rows, past its cap of {MOST_ROWS}"),
             ReadError::Length { len, want } => write!(f, "{what} is {len} bytes where its head says {want}: truncated or overlong"),
             ReadError::Form { found } => write!(f, "{what}'s entry form is {found}, which names no launcher form (0 `unit`, 1 `c-main`, 2 `hosted`)"),
+            ReadError::Personality { found } => {
+                write!(f, "{what}'s personality word is {found}: 0 (none, its symbol all zero) or 1 (one) is read, nothing else")
+            }
             ReadError::Twice { symbol } => {
                 write!(f, "{what} holds the symbol ")?;
                 hex(f, &symbol.0)?;
@@ -256,12 +278,12 @@ impl fmt::Display for ReadError {
 
 impl core::error::Error for ReadError {}
 
-/// A list read in place: its certificate, its entry and its rows' bytes, every limit checked.
-/// The entry is handed out only under today's certificate ([`TodayRows::entry`]).
+/// A list read in place: its certificate, its head and its rows' bytes, every limit checked.
+/// The head is handed out only under today's certificate ([`TodayRows::head`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ListView<'b> {
     pub certificate: Certificate,
-    entry: EntryLine,
+    head: StartHead,
     rows: &'b [u8],
 }
 
@@ -297,7 +319,15 @@ pub(crate) fn read<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> Result<ListView<'b>
     certificate.copy_from_slice(&head[16..48]);
     let mut entry = [0u8; 32];
     entry.copy_from_slice(&head[52..84]);
-    let view = ListView { certificate: Certificate(certificate), entry: EntryLine { form, symbol: blaze_code::record::Symbol(entry) }, rows: &bytes[HEAD..] };
+    let mut routine = [0u8; 32];
+    routine.copy_from_slice(&head[88..120]);
+    let personality = match word(84) {
+        0 if routine == [0u8; 32] => None,
+        1 => Some(blaze_code::record::Symbol(routine)),
+        found => return Err(ReadError::Personality { found }),
+    };
+    let line = EntryLine { form, symbol: blaze_code::record::Symbol(entry) };
+    let view = ListView { certificate: Certificate(certificate), head: StartHead { line, personality }, rows: &bytes[HEAD..] };
     let mut seen: ByHashSet<[u8; 32], Alloc<'_>> = ByHashSet::with_capacity_in(count as usize, alloc);
     for row in view.iter() {
         if !seen.insert(row.symbol.0) {
@@ -356,10 +386,10 @@ impl<'b> TodayRows<'b> {
         self.view.iter()
     }
 
-    /// The run's entry line as the list was written with it: today's, since the certificate is
-    /// (every input of the program's start is under it).
-    pub(crate) fn entry(&self) -> EntryLine {
-        self.view.entry
+    /// The run's start head as the list was written with it: today's, since the certificate is
+    /// (every input of the program's start and of its personality routine is under it).
+    pub(crate) fn head(&self) -> StartHead {
+        self.view.head
     }
 }
 

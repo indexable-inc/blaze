@@ -15,7 +15,7 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, FruFields, PatDefs};
+use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
 use crate::ty::ClosureKind;
 
 /// `Checked::selected`'s rows (impl-per-call).
@@ -256,8 +256,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(before.iter().filter(|x| matches!(x, crate::body::Expr::Closure { .. })).count() as u32)
     }
 
-    /// `resolve_type_vars_in_body`: the record.
-    pub(crate) fn writeback(mut self) -> Result<Checked<'a>, CheckError> {
+    /// `resolve_type_vars_in_body`: the record, or the needs when writeback's own reads met a
+    /// hole (a run past a hole makes no record: world.rs `Hole`).
+    pub(crate) fn writeback(mut self) -> Result<crate::Outcome<'a>, CheckError> {
         let alloc = self.alloc;
         let mut ex = Export {
             out: PortableTys::new_in(alloc),
@@ -308,18 +309,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // A constant path's arguments, resolved like a callee's: an argument still unknown here
         // is the export's ordinary "type annotations needed" at the path, never an empty list.
         let mut const_args: ConstArgs<'a> = Soa::with_capacity_in(self.const_args.len(), alloc);
+        let mut pat_const_args: PatConstArgs<'a> = Soa::new_in(alloc);
         for i in 0..self.const_args.len() {
-            let (e, args) = self.const_args[i];
+            let (at, args) = self.const_args[i];
             for j in 0..self.ty.list_len(args) {
                 let t = self.ty.list_get(args, j);
                 let t = self.ty.resolve(t)?;
-                self.export(&mut ex, t, At::Expr(e))?;
+                self.export(&mut ex, t, at)?;
             }
             let args = self.ty_resolve_list(args)?;
             let l = self.export_list(&mut ex, args)?;
-            const_args.push((e, l));
+            match at {
+                At::Expr(e) => const_args.push((e, l)),
+                At::Pat(p) => pat_const_args.push((p, l)),
+                At::Body | At::Written(_) => {}
+            }
         }
         const_args.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        pat_const_args.sort_by_key(|rows, i| rows.column::<0>()[i]);
         let mut expr_defs: ExprDefs<'a> = Soa::new_in(alloc);
         let mut pat_defs: PatDefs<'a> = Soa::new_in(alloc);
         for &(at, d) in self.defs.iter() {
@@ -556,8 +563,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut index_mut: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::with_capacity_in(self.index_mut.len(), alloc);
         index_mut.extend_from_slice(&self.index_mut);
         index_mut.sort_unstable();
+        // Writeback reads the world too (the selections above, over the body's own reads): a
+        // hole met here is a hole of the run (world.rs `Hole`), so the record is not made and
+        // the run asks for the fill. Made from the stand-in, the record would hold a selection
+        // over an empty bucket and a read list without the question, so the same body checked
+        // over a store that holds the answer would file another list (rule 21; tempo's census,
+        // `<impl SpanYears>::MAX` read `ImplsOf(Bounds, Param)` only when an earlier constant's
+        // evaluation had filled that bucket).
+        if self.reads.holed() {
+            return Ok(crate::Outcome::Need(self.reads.finish_need(None, alloc)));
+        }
         let (reads, needs) = self.reads.finish(alloc);
-        Ok(Checked {
+        Ok(crate::Outcome::Done(Checked {
             findings,
             index_mut,
             suggests,
@@ -576,6 +593,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             callees,
             expr_defs,
             const_args,
+            pat_const_args,
             pat_defs,
             fields,
             captures,
@@ -583,7 +601,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             diags,
             reads,
             needs,
-        })
+        }))
     }
 
     /// The list with every element resolved, as a list of the context.

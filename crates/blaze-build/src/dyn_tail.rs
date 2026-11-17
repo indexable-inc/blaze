@@ -14,16 +14,19 @@
 //! the `dyn` field there, `dyn`'s own static alignment being 1). The value's alignment is the
 //! larger of the prefix's ([`DynPrefix::align`], `repr(align)` included) and the vtable's, and
 //! its size is `round_up(offset + vtable.size, align)`: `size_of_val` / `align_of_val`, which
-//! `Layout::for_value` (`Arc`'s and `Rc`'s deallocation) reads. These are rustc's
-//! `size_and_align_of_dst` for one level of tail; a struct whose last field is itself a struct
-//! ending in `dyn` is refused by name in `ls` (layout.rs `univariant`), as is a packed one.
+//! `Layout::for_value` (`Arc`'s and `Rc`'s deallocation) reads. A struct whose last field is
+//! itself a struct ending in `dyn` (`ArcInner<Mutex<dyn Tr>>`) is a chain of such levels
+//! ([`DynChain`]): each level's tail is at its prefix's end rounded up to the tail's own
+//! run-time alignment, and the size and alignment fold from the innermost level out, as
+//! rustc's `size_and_align_of_dst` recurses. A packed one is refused by name in `ls` (layout.rs
+//! `univariant`).
 
 use core::alloc::Allocator;
 
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::{Builder, Flags, Op, Sink, Ty, Value};
 
-use crate::layout::DynPrefix;
+use crate::layout::{DynChain, DynPrefix};
 
 /// The vtable's word holding the value's size.
 const SIZE_WORD: i32 = 8;
@@ -41,29 +44,46 @@ fn round_up<LA: Allocator + Clone, S: Sink>(b: &mut Builder<LA, S>, x: Value, al
     b.binary(Op::And, Flags::NONE, up, keep)
 }
 
-/// The trait object's offset in the value whose vtable is `vtable` (an `i64`).
-pub(crate) fn tail_offset<LA: Allocator + Clone, S: Sink>(b: &mut Builder<LA, S>, prefix: DynPrefix, vtable: Value) -> Value {
-    let va = b.load(Ty::I64, Flags::NONE, vtable, ALIGN_WORD, MemAttrs::aligned(3));
-    let at = b.iconst(Ty::I64, u128::from(prefix.tail_at));
-    round_up(b, at, va)
+/// `max(1 << level.align, a)`: the alignment of a value of `level` whose tail's is `a`.
+fn level_align<LA: Allocator + Clone, S: Sink>(b: &mut Builder<LA, S>, level: DynPrefix, a: Value) -> Value {
+    let sized = b.iconst(Ty::I64, 1u128 << level.align);
+    b.binary(Op::Umax, Flags::NONE, sized, a)
 }
 
-/// The value's size and alignment (both `i64`), by the vtable `vtable`.
-pub(crate) fn size_and_align<LA: Allocator + Clone, S: Sink>(b: &mut Builder<LA, S>, prefix: DynPrefix, vtable: Value) -> (Value, Value) {
-    let vs = b.load(Ty::I64, Flags::NONE, vtable, SIZE_WORD, MemAttrs::aligned(3));
-    let va = b.load(Ty::I64, Flags::NONE, vtable, ALIGN_WORD, MemAttrs::aligned(3));
-    // A bare `dyn Tr`: the empty prefix; the vtable's size is already a multiple of its
-    // alignment (the Reference, "Type layout": "the size of a value is always a multiple of
-    // its alignment").
-    if prefix.tail_at == 0 && prefix.align == 0 {
-        return (vs, va);
+/// The offset of the outermost level's tail (the next level, or the trait object itself) in
+/// the value whose vtable is `vtable` (an `i64`): `round_up(tail_at, align_of_val(tail))`,
+/// the tail's alignment the larger of its own level's static one and the vtable's.
+pub(crate) fn tail_offset<LA: Allocator + Clone, S: Sink>(b: &mut Builder<LA, S>, chain: DynChain, vtable: Value) -> Value {
+    let levels = chain.levels();
+    let mut a = b.load(Ty::I64, Flags::NONE, vtable, ALIGN_WORD, MemAttrs::aligned(3));
+    if let Some(&tail) = levels.get(1) {
+        a = level_align(b, tail, a);
     }
-    let at = b.iconst(Ty::I64, u128::from(prefix.tail_at));
-    let offset = round_up(b, at, va);
-    let end = b.binary(Op::Add, Flags::NONE, offset, vs);
-    let sized = b.iconst(Ty::I64, 1u128 << prefix.align);
-    let align = b.binary(Op::Umax, Flags::NONE, sized, va);
-    (round_up(b, end, align), align)
+    let at = b.iconst(Ty::I64, u128::from(levels[0].tail_at));
+    round_up(b, at, a)
+}
+
+/// The value's size and alignment (both `i64`), by the vtable `vtable`: rustc's
+/// `size_and_align_of_dst` level by level from the innermost, each `size = round_up(tail_at +
+/// tail_size, align)` (the tail's size a multiple of its alignment, so rounding its offset
+/// first gives the same) and `align = max(static, tail_align)`.
+pub(crate) fn size_and_align<LA: Allocator + Clone, S: Sink>(b: &mut Builder<LA, S>, chain: DynChain, vtable: Value) -> (Value, Value) {
+    let mut size = b.load(Ty::I64, Flags::NONE, vtable, SIZE_WORD, MemAttrs::aligned(3));
+    let mut align = b.load(Ty::I64, Flags::NONE, vtable, ALIGN_WORD, MemAttrs::aligned(3));
+    for &level in chain.levels().iter().rev() {
+        // A bare `dyn Tr`: the empty prefix; the vtable's size is already a multiple of its
+        // alignment (the Reference, "Type layout": "the size of a value is always a multiple
+        // of its alignment").
+        if level.tail_at == 0 && level.align == 0 {
+            continue;
+        }
+        let at = b.iconst(Ty::I64, u128::from(level.tail_at));
+        let offset = round_up(b, at, align);
+        let end = b.binary(Op::Add, Flags::NONE, offset, size);
+        align = level_align(b, level, align);
+        size = round_up(b, end, align);
+    }
+    (size, align)
 }
 
 /// The size (an `i64`) of a value ending in a slice or `str` of `len` (an `i64`) elements

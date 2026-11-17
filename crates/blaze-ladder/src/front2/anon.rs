@@ -24,7 +24,9 @@
 //!   `Self` (`size_of::<Self>()` in `impl u16`) IS taken, filed with that `Self` in scope
 //!   ([`Ask::of_self`]; front2/const_open.rs, where the three states are told apart);
 //! - a type that is not `bool`, `char` or an integer ([`prim_name`]): the item text spells its
-//!   type, and only those are spelled the same in every module.
+//!   type, and only those are spelled the same in every module. A type the caller does not
+//!   know is spelled `_` when the expression's type is its own ([`written_ty`]), and refused
+//!   otherwise (an unsuffixed number would take a type the context never gave it).
 //! A BODY's expression that names an item declared in the body (`[0; 2 + SEP_LEN]`) is filed
 //! under the body and the block it is written in ([`Ask::in_body`]), its names read there
 //! first; every other expression is the module's. OWED: a block's glob `use` and a block's
@@ -99,6 +101,59 @@ pub fn prim_name(ty: PNode) -> Option<&'static str> {
     PRIMS.iter().find(|(_, n)| *n == ty).map(|&(name, _)| name)
 }
 
+/// The type an anonymous constant of type `ty` with the expression `text` is written with:
+/// the name of `bool`, `char` or an integer type ([`prim_name`]), or `_` for a type the
+/// caller does not know (`PNode::Infer`: a const argument whose parameter is not known where
+/// a body is converted, alloy-sol-types' `<U96>::from_be_bytes::<{ U96::BYTES }>(..)`) when
+/// the expression's type is its own ([`self_typed`]): the checker infers it from the
+/// expression alone, as for `let n = U96::BYTES;`, and the value is in that type's width.
+/// `None` for every other type, and for an unknown type of an expression that is not
+/// self-typed (`1 << 3` would be an `i32` without the parameter's type: a wrong width).
+pub fn written_ty(ty: PNode, text: &str) -> Option<&'static str> {
+    match ty {
+        PNode::Infer if self_typed(text) => Some("_"),
+        _ => prim_name(ty),
+    }
+}
+
+/// The integer suffixes (the Reference, "Literal expressions", "Integer literal
+/// expressions").
+const INT_SUFFIXES: [&str; 12] = ["u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize"];
+
+/// Whether the constant expression `text` has a type that is a function of the expression
+/// alone: it holds no number without an integer suffix and no `_` as a word. The Reference,
+/// "Literal expressions", "Integer literal expressions": "If the token has no suffix, the
+/// expression's type is determined by type inference", from the type the context expects; an
+/// anonymous constant with no expected type would make it `i32`. A `_` (`as _`, `::<_>`) asks
+/// the same of the context. Every other part of an expression (a path to a constant, a call,
+/// a method call, an operator over such parts) has its type from what its names resolve to.
+/// Careful by construction: a tuple index (`x.0`) or a number inside a string literal is
+/// taken for an unsuffixed number, and the expression is not self-typed.
+pub fn self_typed(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && word(bytes[i]) {
+            i += 1;
+        }
+        // `word` splits only at ASCII bytes, so both ends are char boundaries.
+        let Some(w) = text.get(start..i) else { return false };
+        if w == "_" {
+            return false;
+        }
+        if bytes[start].is_ascii_digit() && !INT_SUFFIXES.iter().any(|s| w.len() > s.len() && w.ends_with(s)) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `text` names `Self` or one of `params` (the generic parameters in scope) as an
 /// identifier: such an expression has no value at the head. A number's suffix (`1usize`) and
 /// its digits are one token, never an identifier.
@@ -141,10 +196,10 @@ pub fn need_key(key: ItemKey) -> LibKey {
 
 impl Ask {
     /// The anonymous constant `text` of type `ty` written in `module`; `None` when `ty` has no
-    /// written name ([`prim_name`]) or the text is empty.
+    /// written name ([`written_ty`]) or the text is empty.
     pub fn of(module: LibKey, ty: PNode, text: &str) -> Option<Ask> {
         let text = text.trim();
-        let prim = prim_name(ty)?;
+        let prim = written_ty(ty, text)?;
         if text.is_empty() {
             return None;
         }
@@ -162,16 +217,26 @@ impl Ask {
     /// module ([`super::locals::Locals::find`], through `Locals::file_anon`). Its key is a
     /// function of (the module, the type, the text, the body, the block): the block's id is
     /// an ordinal of the body's lowering, a function of the body's text alone, as a local
-    /// item's key is. `None` as [`Ask::of`].
-    pub fn in_body(module: LibKey, ty: PNode, text: &str, owner: ItemKey, scope: u32) -> Option<Ask> {
+    /// item's key is. `self_` is `Self` where the expression names it and `Self` is ground
+    /// (front2/const_open.rs `ground_self`; der's `impl DecodeValue for u128`: "let mut buf =
+    /// [0u8; (Self::BITS as usize / 8) + UNSIGNED_HEADROOM];" beside a body's `const
+    /// UNSIGNED_HEADROOM`): the head is filed with both the block and that `Self` in scope,
+    /// and the key says what `Self` is as [`Ask::of_self`]'s does. `None` as [`Ask::of`], or
+    /// when `self_`'s node is neither a built-in type nor an ADT with no arguments.
+    pub fn in_body(module: LibKey, ty: PNode, text: &str, owner: ItemKey, scope: u32, self_: Option<(tc::PTy, PNode)>) -> Option<Ask> {
         let text = text.trim();
-        let prim = prim_name(ty)?;
+        let prim = written_ty(ty, text)?;
         if text.is_empty() {
             return None;
         }
-        let name = format!("{prim}: {text} in the body {:x} at block {scope}", owner.0).into_boxed_str();
+        let name = match self_ {
+            None => format!("{prim}: {text} in the body {:x} at block {scope}", owner.0),
+            Some((_, PNode::Adt(adt, args))) if args.len == 0 => format!("{prim}: {text} in the body {:x} at block {scope} where Self is the type {:x}", owner.0, adt.0),
+            Some((_, other)) => format!("{prim}: {text} in the body {:x} at block {scope} where Self is {}", owner.0, PRIMS.iter().find(|(_, n)| *n == other)?.0),
+        }
+        .into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: Some((owner, scope)) })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)) })
     }
 
     /// The anonymous constant `text` of type `ty` written in `module` where `Self` is the
@@ -186,7 +251,7 @@ impl Ask {
     /// places is one. `None` as [`Ask::of`], or when `self_node` is neither.
     pub fn of_self(module: LibKey, ty: PNode, text: &str, self_ty: tc::PTy, self_node: PNode) -> Option<Ask> {
         let text = text.trim();
-        let prim = prim_name(ty)?;
+        let prim = written_ty(ty, text)?;
         if text.is_empty() {
             return None;
         }
@@ -255,7 +320,7 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
         if store.fns.contains_key(&key) {
             continue;
         }
-        let prim = prim_name(a.ty).ok_or(FileFail::NoName(a.ty))?;
+        let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
         let text: &'n str = store.locals.keep_text(&format!("const _: {prim} = {};", a.text));
         let output = intern(&mut store.tys, a.ty).map_err(FileFail::Type)?;
         let header = tc::FnPtrHeader::RUST;

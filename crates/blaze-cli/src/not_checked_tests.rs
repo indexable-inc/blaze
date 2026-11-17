@@ -17,6 +17,25 @@ fn said(failures: &[TaskFailure], failed: &Failures<'_>) -> std::vec::Vec<std::s
     out
 }
 
+/// The summary line counts every item not checked: those behind failures beside those for the
+/// causes above, so it never reads better than the truth (tempo said "could not check 1061
+/// items" over 20,685 more under one failure). Prints "test ... ok". Control: count `own` alone
+/// in `summary` (`let all = own;`) and the first assertion fails showing "1061 items".
+#[test]
+fn the_summary_counts_the_items_behind_failures() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("a test frame");
+    let mut behind = super::Behind::default();
+    for items in [20_685, 0, 7_993] {
+        behind.add(items);
+    }
+    let said = |own: u32, behind: super::Behind| super::items::summary(own, behind, &frame).map(|words| std::string::String::from(words.as_str()));
+    assert_eq!(said(1_061, behind).as_deref(), Some("the check is incomplete: blaze could not check 29739 items: 28678 behind 2 failures, 1061 for the reasons above"));
+    // Only behind failures: no "for the reasons above"; only own causes: the line as it was.
+    assert_eq!(said(0, behind).as_deref(), Some("the check is incomplete: blaze could not check 28678 items: 28678 behind 2 failures"));
+    assert_eq!(said(1, super::Behind::default()).as_deref(), Some("the check is incomplete: blaze could not check 1 item"));
+    assert_eq!(said(0, super::Behind::default()), None);
+}
+
 /// A failed task with two tasks waiting on it (one through the other) and a task waiting on a
 /// need dropped this run: two lines, the chain under its end, the dropped need its own cause,
 /// and no "task(s) not run" count line. Prints "test ... ok". Control: in blaze-drive

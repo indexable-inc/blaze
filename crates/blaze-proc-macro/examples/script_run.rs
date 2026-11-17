@@ -56,7 +56,7 @@ fn main() {
         package: format!("{name} {version}"),
         tree: dir_tree(Path::new(folder)),
         root: blaze_proc_macro::script_sandbox::ScriptRoot::package(),
-        env: owned_env(&env),
+        env: owned_env(&env, alloc),
         target: TARGET.to_owned(),
         host: TARGET.to_owned(),
         c_mode: CMode::Deferred,

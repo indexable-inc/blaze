@@ -57,7 +57,7 @@
 //! | `float_lit` (Adts) / (FrontEnd) | owner, expr, bits at the type / `(f64, f32)` | FrontAdts, TestAdts / Front2Program, LazyProgram | feature test worlds / Front | [`Fact::Literal`] |
 //! | `str_lit`, `byte_str` (Adts), `string` (FrontEnd) | owner, expr, `&str` / `&[u8]` | FrontAdts, TestAdts; every front end | feature test worlds | [`Fact::Literal`] |
 //! | `int_pat` (Adts, FrontEnd) | owner, pat, `Option<u128>` | FrontAdts, TestAdts, objects; every front end | other test worlds | [`Fact::Literal`] (`LitAt::Pat`) |
-//! | `float_pat`, `str_pat` (Adts, FrontEnd) | owner, pat, bits / `&str` | FrontAdts, TestAdts; Front2Program, LazyProgram | feature test worlds; Front | [`Fact::Literal`] |
+//! | `float_pat`, `str_pat` (Adts, FrontEnd) | owner, pat, bits / bytes | FrontAdts, TestAdts; Front2Program, LazyProgram | feature test worlds; Front | [`Fact::Literal`] |
 //! | `lang_fn` (Adts) | `&str`, `Option<ItemKey>` | FrontAdts, every test world | none | [`Fact::Lang`] |
 //! | `lang_adt` (Adts) | `LangItem`, `Option<ItemKey>` | FrontAdts, TestAdts, objects | other test worlds | [`Fact::Lang`] |
 //! | `fn_lang`, `lang_item`, `lang_named`, `drop_trait` (FrontEnd) | lang, `Option<ItemKey>` | every front end; `lang_named`: Front2Program, LazyProgram | `lang_named`: Front | [`Fact::Lang`] |

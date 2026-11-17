@@ -540,7 +540,7 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                         Some(Arg::Place(at)) => s.b.load(Ty::PTR, Flags::NONE, *at, 8, MemAttrs::aligned(3)),
                         _ => return Err(shape()),
                     };
-                    let prefix = s.cx.layouts.dyn_prefix(id).ok_or(s.shape("a `dyn` tail whose row has no prefix"))?;
+                    let prefix = s.cx.layouts.dyn_chain(id).ok_or(s.shape("a `dyn` tail whose row has no prefix"))?;
                     let (size, align) = crate::dyn_tail::size_and_align(&mut *s.b, prefix, vt);
                     Out::Scalar(if c.which == W::SizeOfVal { size } else { align })
                 }

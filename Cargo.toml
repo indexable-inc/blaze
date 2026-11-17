@@ -433,6 +433,7 @@ blaze-sort = { path = "crates/blaze-sort" } # Sorting, searching and comparing, 
 blaze-cond = { path = "crates/blaze-cond" } # Presence conditions: hash-consed decision diagrams over a request's cfg variables.
 blaze-lex = { path = "crates/blaze-lex" } # The SIMD lexer: rustc_lexer's tokens, a body skipper, UTF-8 validation.
 blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
+blaze-apple-sdk = { path = "crates/blaze-apple-sdk" } # The macOS SDK's one home: its folder (SDKROOT, else xcrun), its version as the identity keys hold.
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
 # toml/toml_edit and semver (docs/v2/plan/third-party.md).
 blaze-base64 = { path = "crates/blaze-base64" }

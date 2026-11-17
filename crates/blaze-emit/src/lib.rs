@@ -111,7 +111,9 @@
 //! `memmove` loads every piece before it stores any, so it is inline only up to
 //! [`MOVE_INLINE_MOST`] bytes, what fits in its registers). Any other is a call of the
 //! system routine through a literal word placement fills ([`RelocTo::Routine`]). A
-//! `volatile` one is refused.
+//! `volatile` one is refused. `memcmp` follows the same bound: inline, each piece pair
+//! compared and the first unequal pair ordered by its byte-reversed words; else a call of
+//! `memcmp` (pass/bulk.rs).
 //!
 //! # Thread-locals
 //!
@@ -156,7 +158,7 @@
 //! (arguments past `x7`/`v7` go on the stack, both ways: pass/stack.rs), a C-variadic definition, a
 //! variable argument narrower than 32 bits, an `f32`, an `i128` or a compound, more than 510
 //! stacked or stacked under an `invoke`, more than two returns, a `volatile` bulk
-//! operation, `memcmp`, `uninit`, `invoke` and unwinding, tail calls, `asm!`, target
+//! operation, `uninit`, `invoke` and unwinding, tail calls, `asm!`, target
 //! intrinsics, and `frame_address`, `return_address`, `stack_pointer`. The provenance
 //! operations are their bits: `expose` is `ptr_addr`, `from_exposed` the address itself,
 //! `ptr_with_addr` the new address.
@@ -222,6 +224,10 @@ mod variadic_tests;
 /// Arguments past the registers, both sides (pass/stack.rs).
 #[cfg(test)]
 mod stack_tests;
+
+/// `memcmp`, inline and called (pass/bulk.rs).
+#[cfg(test)]
+mod memcmp_tests;
 
 #[cfg(test)]
 mod tls_tests;
@@ -297,6 +303,9 @@ pub enum Routine {
     Memmove,
     /// `memset(dst, byte, len)`.
     Memset,
+    /// `memcmp(a, b, len) -> int`: `memcmp` past the inline bound (pass/bulk.rs); C's contract
+    /// is the sign of the first differing byte pair compared as unsigned, 0 for `len == 0`.
+    Memcmp,
     /// `fmod(f64, f64) -> f64`: `frem` at `f64` (the remainder takes the dividend's sign).
     Fmod,
     /// `fmodf(f32, f32) -> f32`: `frem` at `f32`.
@@ -339,6 +348,7 @@ impl Routine {
             Routine::Memcpy => "memcpy",
             Routine::Memmove => "memmove",
             Routine::Memset => "memset",
+            Routine::Memcmp => "memcmp",
             Routine::Fmod => "fmod",
             Routine::Fmodf => "fmodf",
             Routine::Udivti3 => "__udivti3",
@@ -500,7 +510,17 @@ impl core::error::Error for EmitError {}
 /// core and system `isa` says. `via` has one entry per function reference place the function
 /// names.
 pub fn emit<A: Allocator>(func: View<'_>, via: &[Via], isa: Isa, out: &mut Code<A>) -> Result<(), EmitError> {
-    emit_inline_up_to(func, via, isa, BULK_INLINE_MOST, out)
+    emit_inline_up_to(func, via, &RoutinePlaces::NONE, isa, BULK_INLINE_MOST, out).map(|_| ())
+}
+
+/// [`emit`] with the soft-float routines `routines` binds (routines.rs): an `f128` (or `f16`)
+/// operation becomes a call of its routine at the place `routines` gives it, which `via` covers
+/// like every other reference place (the caller appends one place per bound routine to its
+/// references, as the record path does, front2/builtins_shim.rs `Bound::bind`). Answers the
+/// routines the code calls. The one rule of both paths: the in-process build and the record
+/// emitter legalize with the same table.
+pub fn emit_with_routines<A: Allocator>(func: View<'_>, via: &[Via], routines: &RoutinePlaces, isa: Isa, out: &mut Code<A>) -> Result<Called, EmitError> {
+    emit_inline_up_to(func, via, routines, isa, BULK_INLINE_MOST, out)
 }
 
 /// [`emit`], inlining a bulk operation of a constant length up to `inline_most` bytes (the
@@ -508,24 +528,26 @@ pub fn emit<A: Allocator>(func: View<'_>, via: &[Via], isa: Isa, out: &mut Code<
 pub(crate) fn emit_inline_up_to<A: Allocator>(
     func: View<'_>,
     via: &[Via],
+    bound: &RoutinePlaces,
     isa: Isa,
     inline_most: u64,
     out: &mut Code<A>,
-) -> Result<(), EmitError> {
+) -> Result<Called, EmitError> {
     out.bytes.clear();
     out.fixups.clear();
     out.relocs.clear();
     out.positions.clear();
     // The pass takes legalized LIR in both forms (record.rs `emit_record_up_to` does the same
     // with the caller's routines): a function holding a vector, `f16` or `f128` value is made
-    // scalar on a copy first, in `Global` (the scratch the pass names for its own rows). No
-    // routine is bound here, and legalize adds no reference row, so `via` (one entry per
-    // reference place) still covers every reference of the copy.
+    // scalar on a copy first, in `Global` (the scratch the pass names for its own rows). Each
+    // bound routine's reference row names a place the caller gave (`bound`), so `via` (one
+    // entry per reference place) still covers every reference of the copy.
     let heap = blaze_own::Erased::new(std::alloc::Global);
-    let (legal, _none) = routines::legalized(func, &RoutinePlaces::NONE, heap.handle()).map_err(EmitError::Legalize)?;
+    let (legal, called) = routines::legalized(func, bound, heap.handle()).map_err(EmitError::Legalize)?;
     let func = match &legal {
         None => func,
         Some(owned) => owned.view(),
     };
-    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, &mut out.positions, None)
+    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, &mut out.positions, None)?;
+    Ok(called)
 }

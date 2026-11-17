@@ -64,8 +64,7 @@ pub enum Found {
     /// The names source did not answer (a crate's kind, its items, cfg or edition): the error
     /// is in the source's log.
     Unanswered,
-    /// The front end does not look routines up (the old front, the eager front2 program): the
-    /// record walk over the lazy front2 program does.
+    /// The front end does not look routines up (the old front): both front2 programs do.
     NotLookedUp,
 }
 
@@ -73,20 +72,31 @@ pub enum Found {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Builtins {
     found: [Found; COUNT],
+    /// Each [`Found::Key`]'s library key: what the eager program reaches the routine from (its
+    /// row is made before the build, program.rs `make_from`).
+    libs: [Option<blaze_id::ItemKey>; COUNT],
 }
 
 impl Builtins {
     /// The answer of a front end that does not look routines up.
-    pub const NOT_LOOKED_UP: Builtins = Builtins { found: [Found::NotLookedUp; COUNT] };
+    pub const NOT_LOOKED_UP: Builtins = Builtins { found: [Found::NotLookedUp; COUNT], libs: [None; COUNT] };
 
     pub fn found(&self, r: SoftFloat) -> Found {
         self.found[r as usize]
     }
 
+    /// Routine `r`'s exported fn by its library key, when [`Self::found`] is a key.
+    pub fn lib(&self, r: SoftFloat) -> Option<blaze_id::ItemKey> {
+        match self.found[r as usize] {
+            Found::Key(_) => self.libs[r as usize],
+            _ => None,
+        }
+    }
+
     /// Each routine's exported fn given (a test's stand-in for [`find`]).
     #[cfg(test)]
     pub(crate) fn of_keys(keys: [ItemKey; COUNT]) -> Builtins {
-        Builtins { found: keys.map(Found::Key) }
+        Builtins { found: keys.map(Found::Key), libs: [None; COUNT] }
     }
 }
 
@@ -121,7 +131,7 @@ impl core::error::Error for BuiltinsRefused {}
 /// 24 symbols (two each in the pinned crate) to read their `no_mangle`. `alloc` holds the
 /// candidates and the lowerings, dropped on return.
 pub fn find<'n, S: NamesSource<'n>>(names: S, alloc: Alloc<'_>) -> Builtins {
-    let all = |found: Found| Builtins { found: [found; COUNT] };
+    let all = |found: Found| Builtins { found: [found; COUNT], libs: [None; COUNT] };
     let mut krate = None;
     for k in 0..names.crate_count() {
         match names.proc_macro(k) {
@@ -168,6 +178,7 @@ pub fn find<'n, S: NamesSource<'n>>(names: S, alloc: Alloc<'_>) -> Builtins {
             continue;
         }
         let k = checker_of(key);
+        out.libs[at] = Some(key);
         out.found[at] = match out.found[at] {
             Found::Missing => Found::Key(k),
             Found::Key(have) if have == k => Found::Key(k),
@@ -262,7 +273,7 @@ pub struct Routines<'r> {
 }
 
 impl<'r> Routines<'r> {
-    /// No routine bound (the thread-local getter and ender, the eager walk): an `f128`
+    /// No routine bound (the thread-local getter and ender): an `f128`
     /// operation is refused naming its routine.
     pub const NONE: Routines<'static> = Routines { places: RoutinePlaces::NONE, bound: None };
 

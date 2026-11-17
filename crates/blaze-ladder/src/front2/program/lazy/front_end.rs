@@ -4,7 +4,7 @@
 //!
 //! Groups: (1) rows and bodies: `fn_count`, `function`, `c_variadic`, `entry`, `types`, `sig`,
 //! `fn_index`, `code_of`, `intrinsic`, `body_reads`, `check_all`, `check_one`, `done`;
-//! (2) the body's world: `resolve`, `selects`, `normalize`, `last_projection`; (3) lang items:
+//! (2) the body's world: `resolve`, `holds`, `normalize`, `last_projection`; (3) lang items:
 //! `fn_lang`, `drop_trait`, `lang_item`, `lang_named`, `lang_trait_fn`, `fmt_argument_adt`,
 //! `fmt_argument_new`; (4) types and items: `adt`, `repr`, `discriminant`, `ctor_of`,
 //! `opaque_of`, `object_trait`, `item_named`, `left_out`; (5) literals: `int_lit`, `int_pat`,
@@ -16,12 +16,14 @@ use super::*;
 use crate::seam::FrontEnd;
 
 impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
-    /// `f` over the checker's world of row `i`'s live body: as `Front2Program::in_world`. A row
-    /// with no live body has no world: the question is the world's own refusal (`Missing`),
+    /// `f` over the checker's world of row `i`'s live body: as `Front2Program::in_world`. A ctor
+    /// (a row with no body, built as a fn) is asked in its ADT's world (`ctor_world`); any other
+    /// row with no live body has no world: the question is the world's own refusal (`Missing`),
     /// naming the fn (the back half asks only in the body it builds, made by `check_one`).
     fn in_world<T>(&self, i: usize, f: impl FnOnce(&BodyWorld<'_, 'n, S>) -> T) -> Result<T, ResolveError> {
         let Some(live) = self.live_of(i) else {
-            return Err(ResolveError::Missing(tc::Question::FnSig(self.rows.key[i])));
+            let key = self.rows.key[i];
+            return crate::front2::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, f);
         };
         let body = &live.again;
         let view = body.lowered.view();
@@ -50,7 +52,10 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             // body checked (rustc's post-analysis mode), so every opaque is its hidden type.
             reveal: crate::front2::opaque_auto::Reveal::All,
         };
-        Ok(f(&world))
+        let out = f(&world);
+        // What the question found unmade, for the build's `make_asked`.
+        self.asked.borrow_mut().extend(world.fills.into_inner());
+        Ok(out)
     }
 
     fn lits_of(&self, owner: ItemKey) -> Option<&Literals> {
@@ -114,13 +119,36 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         Ok((r.item, r.args))
     }
 
-    fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
+    fn holds(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
         let alloc = self.store.tys.alloc();
-        Ok(self.in_world(i, |w| select_impl(w, trait_, &[ty], ground, alloc))??.is_some())
+        self.in_world(i, |w| tc::holds(w, trait_, &[ty], ground, alloc))?
     }
 
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
         self.in_world(i, |w| blaze_typeck::adt_drop_impl(w, drop_trait, adt, alloc))?
+    }
+
+    /// As `Front2Program::make_asked`: the fills the instance questions' worlds noted, made
+    /// as the body check makes its own (check.rs `make_all`).
+    fn make_asked(&mut self, i: usize) -> Result<bool, crate::run::RunError> {
+        let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));
+        if fills.is_empty() {
+            return Ok(false);
+        }
+        let owner = self.rows.key[i];
+        let function: Box<str> = Box::from(self.rows.str(self.rows.path[i]));
+        let mut records = Records {
+            names: self.front.names,
+            keys: &mut self.front.keys,
+            index: &self.front.index,
+            store: &mut self.store,
+            buckets: &mut self.buckets,
+            order: BuildOrder::AsAsked,
+            consts: None,
+        };
+        crate::front2::check::make_all(&mut records, fills, owner)
+            .map_err(|error| crate::run::RunError::Front2(crate::front2::program::Front2Refusal::Asked { function, error }))?;
+        Ok(true)
     }
 
     /// Every row has its head in the store or is a ctor: `row` makes no row otherwise.
@@ -221,6 +249,10 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         self.check_one_key(key).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
     }
 
+    fn ctor_row(&mut self, key: ItemKey) -> Result<Option<usize>, crate::run::RunError> {
+        self.ctor_row_key(key).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
+    }
+
     fn done(&mut self, i: usize) {
         self.done_row(i);
     }
@@ -252,15 +284,7 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         let alloc = self.store.tys.alloc();
         let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, alloc))?;
         if !matches!(out, Ok(Some(_))) {
-            let trait_shown = self.item_named(trait_).unwrap_or_else(|| format!("{:#x}", trait_.0).into_boxed_str());
-            let why = match &out {
-                Err(e) => {
-                    let d = format!("{e:?}");
-                    String::from(&d[..d.find(['(', ' ', '{']).unwrap_or(d.len())])
-                }
-                Ok(_) => String::from("the solver's step gave no type"),
-            };
-            *self.projection_why.borrow_mut() = Some(format!("`{trait_shown}`'s associated type {:#x}: {why}", name.0).into_boxed_str());
+            *self.projection_why.borrow_mut() = Some(crate::front2::program::projection_why(self, trait_, name, args, ground, &out));
         }
         out
     }
@@ -356,6 +380,11 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     /// `crate::module::Name`, over the source's questions (module path, name).
     fn item_named(&self, key: ItemKey) -> Option<Box<str>> {
+        // A member (a trait's fn: what a resolve refusal names) by its container's path.
+        if let Some(crate::front2::keys::Origin::Member { container, name, .. }) = self.front.keys.origin(key) {
+            let container = self.item_named(*container)?;
+            return Some(format!("{container}::{name}").into_boxed_str());
+        }
         let names = self.front.names;
         let lib = self.front.keys.library_in(names, key)?;
         let name = names.name_of(lib)?;
@@ -395,7 +424,7 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         s.binary_search_by_key(&p.0, |(x, _)| x.0).ok().map(|i| s[i].1)
     }
 
-    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&str> {
+    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&[u8]> {
         let s = &self.lits_of(owner)?.str_pats;
         s.binary_search_by_key(&p.0, |(x, _)| x.0).ok().map(|i| &*s[i].1)
     }
@@ -414,7 +443,7 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     /// As `Front2Program::const_at`: the evaluator the program keeps checks any body and makes
     /// any impl row the value needs.
-    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy]) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], closures: &crate::run::ClosureTable) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
         let prepared = self.prepared;
         let alloc = self.store.tys.alloc();
         let mut records = Records {
@@ -427,14 +456,14 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
             consts: None,
         };
         let made = match need {
-            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, alloc),
+            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, Some(closures), alloc),
             crate::front2::const_at::ConstNeed::Block { .. } | crate::front2::const_at::ConstNeed::Promoted { .. } => {
                 let owner = need.item();
                 let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
                 let Some((owner, root, key)) = in_body else {
                     return Err(crate::front2::const_at::ConstAtWhy::Eval(crate::front2::consts::ConstFail::Body { item: owner, error: BodyError::NoHead(owner) }));
                 };
-                self.consts.body_value(&mut records, prepared, owner, root, key, from, args, alloc)
+                self.consts.body_value(&mut records, prepared, owner, root, key, from, args, Some(closures), alloc)
             }
         };
         made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)

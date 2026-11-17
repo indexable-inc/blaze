@@ -36,6 +36,7 @@ use super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::scoped::ScopedBy;
 use super::source::NamesSource;
 use super::spell::Spelling;
+use super::type_miss::TypeMiss;
 use super::types::{Bounds, Builder, Env, ParamBound, SelfTy, Why};
 use crate::resolve::Paths;
 
@@ -45,7 +46,8 @@ use crate::resolve::Paths;
 pub enum BodyFinding {
     /// A macro call whose path names no macro the expander could run. Its path and why are
     /// rendered: the expander's finding borrows its frame, which ends with the lowering.
-    Macro { at: Range, path: Box<str, Global>, why: Box<str, Global> },
+    /// `cause` is the typed why's variant chain (`Failed(Expand(Host`), what a census counts by.
+    Macro { at: Range, path: Box<str, Global>, why: Box<str, Global>, cause: Box<str, Global> },
     /// A construct blaze-lower does not lower yet.
     Unhandled { syntax: blaze_file_items::SyntaxKind, why: lf::Why, range: Range },
     /// An error the lowering found in the text.
@@ -254,6 +256,9 @@ pub struct Body<'n> {
     /// The traits in scope at each block whose list is not `traits`: the blocks' `use`s
     /// ([`super::block_traits`]).
     pub blocks: super::block_traits::BlockTraits,
+    /// Each written type that names nothing (E0412, [`TypeMiss`]): converted as the error type,
+    /// reported by the check beside its own findings (front2 check.rs `check_rounds_as`).
+    pub type_misses: Vec<TypeMiss, Global>,
 }
 
 impl<'n> Body<'n> {
@@ -309,6 +314,12 @@ struct BodyTypes<'b, S> {
     builder: Builder<'b, Maps, S>,
     env: Env<'b>,
     failed: Option<Why>,
+    /// The item's text, which a written type's range is relative to: a [`TypeMiss`] reads its
+    /// path there.
+    text: &'b str,
+    /// Each written type that names nothing (E0412), converted as the error type so the rest of
+    /// the body is checked.
+    misses: Vec<TypeMiss, Global>,
     /// The body's blocks that are modules of the names library holding a struct, enum, union
     /// or type alias ([`super::locals::BodyLocals::blocks`]); empty for most bodies.
     blocks: &'b [super::locals::BlockModule],
@@ -377,6 +388,14 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                     Why::Resolve(_, r) if super::glob_uses::any_glob(self.locals, self.owner) => Why::Unsupported(super::glob_uses::TYPE_THROUGH_GLOB, r),
                     why => why,
                 };
+                // A path the names library decided names nothing: the program's E0412, the type
+                // the error type, the body checked for everything else (type_miss.rs).
+                if let Why::Resolve(crate::resolve::ResolveError::Path(e), r) = &why
+                    && let Some(miss) = TypeMiss::of(self.builder.resolver.names, self.text, *e, *r)
+                {
+                    self.misses.push(miss);
+                    return tys.intern(blaze_typeck::PNode::Error).map_err(Refused::from);
+                }
                 self.failed = Some(why);
                 Err(Refused::Form { what: "a written type", range: view.site(view.type_range(t)?)? })
             }
@@ -629,15 +648,13 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                     Some(t) => tys.view().get(t).copied(),
                     None => None,
                 };
-                let local = match node {
-                    Some(node) => self.body_anon(text, scope, node, range, tys),
-                    // Of a type the checker finds: an expression naming an item of the body
-                    // still never reads at the module, where the name means another item.
-                    None => match scope {
-                        Some(s) if self.names_body_item(text, s.0) => Some(Err(Why::ConstPath(Box::from(text), range))),
-                        _ => None,
-                    },
-                };
+                // Of a type the checker finds (`Infer`): an expression naming an item of the
+                // body is still the body's constant, never read at the module, where the name
+                // means another item; it is filed with its type left to the checker when that
+                // type is its own (anon.rs `written_ty`: std's `Ipv4Addr` `Display`,
+                // `DisplayBuffer::<{ LONGEST_IPV4_ADDR.len() }>::new()`), else refused by its
+                // text.
+                let local = self.body_anon(text, scope, node.unwrap_or(blaze_typeck::PNode::Infer), range, tys);
                 match local {
                     Some(made) => made,
                     None => self.builder.const_term(tys, &self.env, text, range, &want_ty),
@@ -699,10 +716,14 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
         if !self.names_body_item(text, scope.0) {
             return None;
         }
-        if super::anon::mentions(text, self.env.params) {
+        // `Self` where it is a ground type (`Self::BITS` in `impl DecodeValue for u128`) is no
+        // parameter: the constant is filed with it in scope. A generic parameter, or a `Self`
+        // that is not ground, leaves the expression with no value here.
+        let self_ = super::const_open::ground_self(tys.view(), &self.env, text);
+        if self_.is_none() && super::anon::mentions(text, self.env.params) {
             return Some(Err(Why::Unsupported("a constant expression over a generic parameter", range)));
         }
-        let Some(ask) = super::anon::Ask::in_body(self.env.module, ty, text, self.owner, scope.0) else {
+        let Some(ask) = super::anon::Ask::in_body(self.env.module, ty, text, self.owner, scope.0, self_) else {
             // A type with no written name (not `bool`, `char` or an integer): no item text
             // can be made of it, refused by the expression's name.
             return Some(Err(Why::ConstPath(Box::from(text), range)));
@@ -1014,7 +1035,15 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let view = lowered.view();
     let mut findings = Vec::new_in(Global);
     for m in expand.findings() {
-        findings.push(BodyFinding::Macro { at: m.at, path: Box::from(m.path.as_str()), why: format!("{}", m.why).into_boxed_str() });
+        let debug = format!("{:?}", m.why);
+        // The chain, then the host's ask when a host refused (`HostError { ask: ProcMacro, .. }`).
+        let ask = debug.split_once("ask: ").map(|(_, rest)| crate::class_chain::class_chain(rest, 1));
+        let chain = crate::class_chain::class_chain(&debug, 4);
+        let cause = match ask {
+            Some(ask) => format!("{chain} {ask}").into_boxed_str(),
+            None => chain,
+        };
+        findings.push(BodyFinding::Macro { at: m.at, path: Box::from(m.path.as_str()), why: format!("{}", m.why).into_boxed_str(), cause });
     }
     let record = |why: Why| BodyError::Record { item, owner, why };
     for u in view.unhandled() {
@@ -1065,6 +1094,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None },
             env: Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts },
             failed: None,
+            text,
+            misses: Vec::new_in(Global),
             blocks,
             locals: &store.locals,
             owner,
@@ -1093,7 +1124,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                     Some(k) => k,
                     None => OwnTys::none(alloc),
                 };
-                typeck = Some((b, kept));
+                typeck = Some((b, kept, core::mem::take(&mut types.misses)));
                 break;
             }
             // A fn whose text has no body (an intrinsic's or a foreign fn's declaration, met
@@ -1116,7 +1147,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             },
         }
     }
-    let Some((typeck, tys)) = typeck else { return Err(BodyError::Rounds { item, last }) };
+    let Some((typeck, tys, type_misses)) = typeck else { return Err(BodyError::Rounds { item, last }) };
     defaults_gate(names, krate, &typeck).map_err(|why| BodyError::Record { item, owner, why })?;
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;
@@ -1128,5 +1159,5 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // $crate::__macro_support::Callsite as _;` in the block its macros expand to).
     let blocks = super::block_traits::of(names, &store.locals, owner, module, krate, &traits, alloc);
     drop(view);
-    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks })
+    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks, type_misses })
 }

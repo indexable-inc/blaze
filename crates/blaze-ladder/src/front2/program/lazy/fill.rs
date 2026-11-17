@@ -87,6 +87,17 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
+    /// The seam's `ctor_row`: the ctor `key`'s row, made once by [`Self::row`] (a ctor's arm:
+    /// no body, no `extern` block asked). `Ok(None)` for a key that is no ctor of a made ADT
+    /// head (the store's `ctors`): the head of the ADT a body names is made when that body is
+    /// checked (`adt_rows`), so a ctor the walk reaches is filed by then.
+    pub(super) fn ctor_row_key(&mut self, key: ItemKey) -> Result<Option<usize>, LazyRefusal> {
+        if !self.store.ctors.contains_key(&key) {
+            return Ok(None);
+        }
+        self.row(key, false).map(Some)
+    }
+
     /// The seam's `done`: row `i`'s body is dropped (its head facts stay).
     pub(super) fn done_row(&mut self, i: usize) {
         let Some(slot) = self.rows.live.get_mut(i).and_then(Option::take) else { return };

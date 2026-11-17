@@ -340,7 +340,23 @@ fn class_of(debug: &str) -> Box<str> {
 
 fn body_failed(e: &BodyError) -> Reached {
     let d = format!("{e:?}");
-    Reached::Failed { class: format!("lower: {}", class_of(&d)).into_boxed_str(), detail: format!("{e}").into_boxed_str(), refusal: None }
+    // `Lowered` and `Convert` are many causes under one variant: the class names the first
+    // finding's cause (a macro's host ask, a construct's syntax kind, a diagnostic's kind; the
+    // refusal's variant and the type builder's), so the census counts each cause apart.
+    let cause = match e {
+        BodyError::Lowered { findings, .. } => match findings.first() {
+            Some(super::body::BodyFinding::Macro { cause, .. }) => format!(": Macro {cause}"),
+            Some(super::body::BodyFinding::Unhandled { syntax, why, .. }) => format!(": Unhandled {syntax:?} {}", class_chain(&format!("{why:?}"), 3)),
+            Some(super::body::BodyFinding::Diag { kind, .. }) => format!(": Diag {}", class_of(&format!("{kind:?}"))),
+            Some(super::body::BodyFinding::CfgOut) => String::from(": CfgOut"),
+            None => String::new(),
+        },
+        BodyError::Convert { refused, why, .. } => {
+            format!(": {}{}", class_chain(&format!("{refused:?}"), 2), why.as_ref().map(|w| format!(" {}", class_chain(&format!("{w:?}"), 4))).unwrap_or_default())
+        }
+        _ => String::new(),
+    };
+    Reached::Failed { class: format!("lower: {}{cause}", class_of(&d)).into_boxed_str(), detail: format!("{e}").into_boxed_str(), refusal: None }
 }
 
 /// `out` (a [`Reached::Failed`] made from `refusal`'s text) carrying `refusal` itself.
@@ -432,7 +448,7 @@ fn diags_failed(r: &Records<'_, '_>, k: ItemKey, e: &CheckFail) -> Reached {
         _ => &[],
     };
     let name = fn_shown(r, k);
-    let text = match r.keys.library(k) {
+    let text = match r.keys.library_in(r.names, k) {
         Some(lib) => r.names.item_text(lib).map(|t| t.text),
         None => r.store.fns.get(&k).map(|h| h.text),
     };
@@ -454,7 +470,13 @@ fn queue_targets(r: &mut Records<'_, '_>, scope: &BodyScope<'_>, owner: ItemKey,
     for i in 0..c.callees.len() {
         let item = c.callees.column::<1>()[i];
         let args = c.callees.column::<2>()[i];
-        queue.push(match callee_target(r, scope, owner, item, args, &mut c.types) {
+        // A builtin `clone` at a closure of this body: its captures' `Copy` asked here, where
+        // records are made (check.rs `reach_capture_copy`).
+        let target = callee_target(r, scope, owner, item, args, &mut c.types).and_then(|t| match t {
+            Target::AtInstance(_) => super::check::reach_capture_copy(r, scope, owner, c, args).map(|()| t),
+            t => Ok(t),
+        });
+        queue.push(match target {
             Ok(Target::Body(k)) => (k, None),
             Ok(Target::Ctor(k)) => (k, Some(Reached::Ctor)),
             Ok(Target::AtInstance(k)) => (k, Some(Reached::AtInstance)),
@@ -609,7 +631,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
         }
         // A head or a constant the lowering needs is made and the body lowered again
         // (front2/lower_made.rs, the one home of that loop).
-        let target = match r.keys.library(k) {
+        let target = match r.keys.library_in(r.names, k) {
             Some(lib) => LowerTarget::Free(lib),
             None => LowerTarget::Member(k),
         };

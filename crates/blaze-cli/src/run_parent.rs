@@ -27,10 +27,12 @@
 //!   with `Unresolved`, naming the need, every time it is needed, and never resolved again.
 //!   [`Needs::place_ahead`] publishes a start list's rows (start_list.rs) before any need is
 //!   read, and [`Needs::first`] is this run's first-answer order, the next list.
-//! - [`ahead_of`]: today's start list placed ([`Needs::place_ahead`]), each row whose record's
-//!   file is not in the folder left out (rule 3: nothing is published that is not there; it is
-//!   resolved at its first call), and the entry line: the list's under today's certificate (no
-//!   front end built), else the roots'.
+//! - [`ahead_of`]: the program's personality routine named (its slot declared, then
+//!   `Down::Personality`, before any `Publish`: [`Needs::name_personality`]), today's start list
+//!   placed ([`Needs::place_ahead`]), each row whose record's file is not in the folder left out
+//!   (rule 3: nothing is published that is not there; it is resolved at its first call), and
+//!   the start's head (entry line and personality, run/special.rs `StartHead`): the list's
+//!   under today's certificate (no front end built), else the roots'.
 //! - [`status_of`]: how the child ended as `blaze run`'s status: an exit's status unchanged; an
 //!   end by signal `n` is 128 + n, the shell's form (a Rust program's own status is never
 //!   above 255, so it cannot be confused with an exit).
@@ -55,7 +57,7 @@ use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ladder::body_ids::{self, BodyIds, DeclaredList, Form, How, Make, Scratch, Unkeyed, Walk, WalkError};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeRecordError, CodeStore, EntryError, EntryView, NotEmitting, Settings, StoreError, TierName, content_key};
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords};
-use blaze_ladder::run::special::{self, EntryLine, Roots, RootsError, SpecialMade, make_special, special_of};
+use blaze_ladder::run::special::{self, Roots, RootsError, SpecialMade, StartHead, make_special, special_of};
 use blaze_ladder::run::{OverflowChecks, RunError};
 use blaze_launch::wire::run::{Declared, Down, Failure, Needed, Symbol, Up};
 use blaze_launch::wire::{List, RecordId, WireError, split};
@@ -323,8 +325,8 @@ impl Gate for RunIds<'_> {
 /// What the run starts from: the entry line and the root instances (run/special.rs [`Roots`]),
 /// and the special records (the shim, the getter, the ender).
 pub(crate) trait Start {
-    /// The launcher's line for the entry.
-    fn entry_line(&self) -> EntryLine;
+    /// The launcher's line for the entry and the personality routine's symbol.
+    fn head(&self) -> StartHead;
     /// How many root instances.
     fn root_count(&self) -> usize;
     /// Root instance `i`: `(tabled fn, instance name)`, as `Walk::root` takes it.
@@ -336,8 +338,8 @@ pub(crate) trait Start {
 }
 
 impl Start for Roots<'_> {
-    fn entry_line(&self) -> EntryLine {
-        self.line()
+    fn head(&self) -> StartHead {
+        Roots::head(self)
     }
 
     fn root_count(&self) -> usize {
@@ -421,7 +423,7 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         let names = self.names()?;
-        special::roots(names.records, names.frame, self.tables, self.alloc).map_err(ParentError::Roots)
+        special::run_roots(names.records, names.lang_crates, self.builder.settings.panic, names.frame, self.tables, self.alloc).map_err(ParentError::Roots)
     }
 
     fn ids(&mut self) -> Result<RunIds<'h>, ParentError> {
@@ -543,9 +545,9 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         Lazy { cx, front, folder, store, builder, alloc, started: None, placed: Vec::new_in(alloc), declares: Vec::new_in(alloc), ahead: Vec::new_in(alloc), tally: Tally::default() }
     }
 
-    /// The entry line from the roots (made now if they are not yet).
-    pub(crate) fn line(&mut self) -> Result<EntryLine, ParentError> {
-        Ok(ensure(&mut self.started, &mut self.front, self.alloc)?.start.entry_line())
+    /// The start's head from the roots (made now if they are not yet).
+    pub(crate) fn head(&mut self) -> Result<StartHead, ParentError> {
+        Ok(ensure(&mut self.started, &mut self.front, self.alloc)?.start.head())
     }
 
     /// Whether nothing of the front end has been made: no roots, no walk, no body ids, no maker.
@@ -586,7 +588,7 @@ fn ensure<'s, 'a, F: Front>(slot: &'s mut Option<Started<'a, F::Start, F::Ids, F
             let start = front.start()?;
             let mut walk = Walk::new_in(alloc);
             for i in 0..start.root_count() {
-                walk.root::<RunError>(start.root_row(i), MOST_WALKED).map_err(|why| ParentError::Walk { symbol: start.entry_line().symbol.0, why })?;
+                walk.root::<RunError>(start.root_row(i), MOST_WALKED).map_err(|why| ParentError::Walk { symbol: start.head().line.symbol.0, why })?;
             }
             Started { start, walk, scratch: Scratch::new_in(alloc), list: DeclaredList::new_in(alloc), heavy: None }
         }
@@ -736,18 +738,26 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
     }
 }
 
-/// Before the spawn: today's start list (`today`, the rows under today's certificate) placed
-/// onto `out`, each row whose record's file `lazy`'s folder does not hold left out (it is
-/// resolved at its first call like any other), and the entry line: the list's when there is
-/// one (nothing of the front end is made), else the roots'. `kept` holds the rows placed.
+/// Before the spawn, onto `out`: the personality routine named ([`Needs::name_personality`],
+/// first, so no `Publish` precedes it), then today's start list (`today`, the rows under
+/// today's certificate) placed, each row whose record's file `lazy`'s folder does not hold left
+/// out (it is resolved at its first call like any other). The start's head: the list's when
+/// there is one (nothing of the front end is made), else the roots'. `kept` holds the rows
+/// placed.
 pub(crate) fn ahead_of<F: Front, D: Folder, A: Allocator>(
     today: Option<TodayRows<'_>>,
     lazy: &mut Lazy<'_, '_, F, D>,
     needs: &mut Needs<'_>,
     kept: &mut AVec<'_, Row>,
     out: &mut std::vec::Vec<u8, A>,
-) -> Result<EntryLine, ParentError> {
-    let Some(today) = today else { return lazy.line() };
+) -> Result<StartHead, ParentError> {
+    let Some(today) = today else {
+        let head = lazy.head()?;
+        needs.name_personality(head.personality, out)?;
+        return Ok(head);
+    };
+    let head = today.head();
+    needs.name_personality(head.personality, out)?;
     for row in today.iter() {
         if lazy.folder().holds(&row.record)? {
             kept.push(row);
@@ -755,7 +765,7 @@ pub(crate) fn ahead_of<F: Front, D: Folder, A: Allocator>(
     }
     needs.place_ahead(kept.as_slice(), out)?;
     lazy.placed(kept.as_slice());
-    Ok(today.entry())
+    Ok(head)
 }
 
 /// What a symbol is to this run, once met.
@@ -862,6 +872,20 @@ impl<'a> Needs<'a> {
         let id = self.id();
         Down::Declare { pairs: List::of(self.pairs.as_slice()) }.encode(id, out)?;
         self.pairs.clear();
+        Ok(())
+    }
+
+    /// The program's personality routine named before anything is published (UNWIND.md 3.3,
+    /// piece P3; blaze-launch wire/personality.rs): its symbol's slot numbered and told in a
+    /// `Declare`, then `Down::Personality` naming that slot, once. The symbol is NOT resolved:
+    /// its record is made at the routine's first call (the first throw), like any fn's, through
+    /// the slot's thunk. `None` (built `panic = "abort"`) sends nothing.
+    pub(crate) fn name_personality<A: Allocator>(&mut self, personality: Option<CodeSymbol>, out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+        let Some(symbol) = personality else { return Ok(()) };
+        let slot = self.slot_of(Symbol(symbol.0))?;
+        self.declare(out)?;
+        let id = self.id();
+        Down::Personality { slot }.encode(id, out)?;
         Ok(())
     }
 

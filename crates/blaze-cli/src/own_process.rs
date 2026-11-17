@@ -225,7 +225,8 @@ pub(crate) fn run_own<F: Front>(
     let mut needs = Needs::new(alloc);
     let mut ahead = std::vec::Vec::new_in(alloc);
     let mut placed = Vec::new_in(alloc);
-    let line = run_parent::ahead_of(rows, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?;
+    let head = run_parent::ahead_of(rows, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?;
+    let line = head.line;
     let entry = bstd::mem::format_in!(frame, "{line}");
     // 3. The launcher.
     let exe = host.exe().map_err(OwnError::Missing)?;
@@ -261,7 +262,7 @@ pub(crate) fn run_own<F: Front>(
     }
     // This run's first answers, the next start's list, under today's certificate.
     let mut bytes = blaze_own::Vec::new_in(alloc);
-    let wrote = start_list::encode(today.certificate, line, needs.first(), &mut bytes)
+    let wrote = start_list::encode(today.certificate, head, needs.first(), &mut bytes)
         .map_err(start_list::ListError::Cap)
         .and_then(|()| start_list::write(lent, &today.name, held, bytes.as_slice()));
     if let Err(why) = wrote {

@@ -71,7 +71,7 @@ use blaze_own::Alloc;
 
 pub use infer::{InferCtx, InferSnapshot};
 pub use replay::{Replay, replay};
-pub use instance::{ResolveError, Resolved, normalize_projection, resolve_instance, select_impl};
+pub use instance::{ResolveError, Resolved, holds, normalize_projection, resolve_instance, select_impl};
 pub use drop_impl::adt_drop_impl;
 pub use rules::async_fn::INTERIOR_GAP;
 pub use rules::args_inline::{ArgsMisuse, TypedFinding};
@@ -81,11 +81,11 @@ pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
     IntSuffix, Lit, Pat, Segment, Stmt, StructBase, UnOp,
 };
-pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatDefs};
+pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
 pub use selected::{Projected, Selected};
 pub use diag::{Because, Diag, DiagCode, UnmetGoal};
 pub use asm::{ASM_NORETURN, AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg};
-pub use path_miss::{MissWhy, PathAnswer, PathMiss, PathPrefix};
+pub use path_miss::{MissWhy, PathAnswer, PathMiss, PathPrefix, Refusal};
 /// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.
 pub use rules::suggest;
 pub use error::{CheckError, Limit, Malformed, Recorded, Stop};
@@ -202,7 +202,7 @@ fn run<'a, 'w, W: World, C: TypeCtx>(
     // A run that met a hole makes no result: not its types, not its diagnostics, not an
     // error met past the hole (world.rs `Hole`). Only a run that met none answers.
     match walked {
-        Ok(()) if !m.reads.holed() => Ok((Outcome::Done(m.writeback()?), log)),
+        Ok(()) if !m.reads.holed() => Ok((m.writeback()?, log)),
         Ok(()) | Err(Stop::Error(_)) if m.reads.holed() => Ok((Outcome::Need(m.reads.finish_need(None, alloc)), log)),
         Err(Stop::Need(q)) => Ok((Outcome::Need(m.reads.finish_need(Some(q), alloc)), log)),
         Ok(()) => Err(CheckError::Malformed(Malformed::HoleInAnswer)),

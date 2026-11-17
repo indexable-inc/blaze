@@ -842,8 +842,8 @@ impl Adts for TestAdts<'_> {
         self.int_pat(owner, pat)
     }
 
-    fn str_pat(&self, _: ItemKey, pat: PatId) -> Option<&str> {
-        self.body.pat_strs.iter().find(|(p, _)| *p == pat).map(|&(_, s)| s)
+    fn str_pat(&self, _: ItemKey, pat: PatId) -> Option<&[u8]> {
+        self.body.pat_strs.iter().find(|(p, _)| *p == pat).map(|&(_, s)| s.as_bytes())
     }
 
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
@@ -3345,15 +3345,20 @@ enum Scrut {
 
 /// The arms: `Each` is `A(a, _) | B(b) | C | W(_, g)`, each `=> {}`; `Whole` is
 /// `A(_, b) | C | y`; `Wild` is `W(n, _) | _`; `Return` is `A(a, _) => return, _ => {}`;
-/// `Deep` is `W(P(s), _) | _`; `Guard` is `A(a, _) if 1 == 1 | _`.
+/// `Deep` is `W(P(s), _) | _`; `Guard(t)` is `A(a, _) if 1 == 1 | _` (`t`), else with
+/// `1 == 2`; `DeepGuard(t)` is `W(P(s), _)` guarded alike `| _`; `Or` is
+/// `A(_, s) | B(s) => {}, _ => {}`, `OrGuard` the same with `if 1 == 1` on the first arm.
 #[derive(Clone, Copy, Debug)]
 enum Arms {
+    Or,
+    OrGuard,
     Each,
     Whole,
     Wild,
     Return,
     Deep,
-    Guard,
+    Guard(bool),
+    DeepGuard(bool),
 }
 
 /// `name(subs..)` as a pattern.
@@ -3393,6 +3398,21 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
         list.push(Arm { pat, guard: None, body });
     };
     match arms {
+        Arms::Or | Arms::OrGuard => {
+            let (w0, s) = (b.pat(Pat::Wild), b.bind("s"));
+            let pa = variant_pat(b, "A", &[w0, s]);
+            let s2 = b.bind("s");
+            let pb = variant_pat(b, "B", &[s2]);
+            let alts = b.pats_list(&[pa, pb]);
+            let or = b.pat(Pat::Or { alts });
+            push(b, or, false);
+            let w1 = b.pat(Pat::Wild);
+            push(b, w1, false);
+            if let Arms::OrGuard = arms {
+                let (one, other) = (b.int(1, None), b.int(1, None));
+                list[0].guard = Some(b.bin(BinOp::Eq, one, other));
+            }
+        }
         Arms::Each => {
             let (a, w0) = (b.bind("a"), b.pat(Pat::Wild));
             let pa = variant_pat(b, "A", &[a, w0]);
@@ -3417,7 +3437,7 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
             let y = b.bind("y");
             push(b, y, false);
         }
-        Arms::Wild | Arms::Deep => {
+        Arms::Wild | Arms::Deep | Arms::DeepGuard(_) => {
             let (first, w0) = match arms {
                 Arms::Wild => (b.bind("n"), b.pat(Pat::Wild)),
                 _ => {
@@ -3430,7 +3450,7 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
             let w1 = b.pat(Pat::Wild);
             push(b, w1, false);
         }
-        Arms::Return | Arms::Guard => {
+        Arms::Return | Arms::Guard(_) => {
             let (a, w0) = (b.bind("a"), b.pat(Pat::Wild));
             let pa = variant_pat(b, "A", &[a, w0]);
             push(b, pa, matches!(arms, Arms::Return));
@@ -3438,8 +3458,8 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
             push(b, w1, false);
         }
     }
-    if let Arms::Guard = arms {
-        let (one, other) = (b.int(1, None), b.int(1, None));
+    if let Arms::Guard(passes) | Arms::DeepGuard(passes) = arms {
+        let (one, other) = (b.int(1, None), b.int(if passes { 1 } else { 2 }, None));
         list[0].guard = Some(b.bin(BinOp::Eq, one, other));
     }
     let start = b.arms.len() as u32;
@@ -3679,10 +3699,46 @@ fn a_match_by_value_refuses_what_it_does_not_build() {
         assert_eq!(deep_temp.as_slice(), &[5, 6, 9]);
     }
     let _ = (deep, deep_temp);
-    let guard = match_drops(Scrut::A, Arms::Guard, false).expect_err("a guard on a moving arm is refused");
-    assert!(guard.contains("a guard on an arm that moves out of its scrutinee"), "{guard}");
+    // CHANGED ON PURPOSE (walk/moves.rs `Pending`): a guard on a moving arm was refused here
+    // ("a guard on an arm that moves out of its scrutinee") and is now built:
+    // `guarded_arms_move_only_after_the_guard_passes` below.
     // CHANGED ON PURPOSE (2026-11-16): a temporary scrutinee inside a larger expression was
     // refused here ("inside a larger expression") and is now built: tests/temp_drops.rs.
+}
+
+/// The Reference, "Match guards": "Moreover, by holding a shared reference while evaluating
+/// the guard, mutation inside guards is also prevented"; a by-value binding of a guarded arm
+/// moves its part only once the guard is true. A guard that passes moves as an unguarded arm
+/// does; one that fails leaves the scrutinee whole for the next arm (`_`), and the binding's
+/// copy is dropped by no one. Each case: the scrutinee, the arms, local or temporary, the
+/// drops seen (`G`'s `x`; 9 is `k`). A move made before the guard (the bit cleared, the
+/// binding not owned when the guard fails) loses a drop: `A, Guard(false)` gives `[9, 2]`.
+#[test]
+fn guarded_arms_move_only_after_the_guard_passes() {
+    use Arms::*;
+    use Scrut::*;
+    let cases: &[(Scrut, Arms, bool, &[i32])] = &[
+        // The switch (a local enum): `A(a, _) if g`.
+        (A, Guard(true), false, &[1, 9, 2]),
+        (A, Guard(false), false, &[9, 1, 2]),
+        // The match by tests (a temporary): its rest at the statement's end.
+        (A, Guard(true), true, &[1, 2, 9]),
+        (A, Guard(false), true, &[1, 2, 9]),
+        // A move below a field (`W(P(s), _) if g`), by tests, local and temporary.
+        (W, DeepGuard(true), false, &[5, 9, 6]),
+        (W, DeepGuard(false), false, &[9, 5, 6]),
+        (W, DeepGuard(true), true, &[5, 6, 9]),
+        (W, DeepGuard(false), true, &[5, 6, 9]),
+    ];
+    let mut failed = String::new();
+    for &(s, arms, temp, want) in cases {
+        match match_drops(s, arms, temp) {
+            Ok(seen) if cfg!(not(target_arch = "aarch64")) || seen.as_slice() == want => {}
+            Ok(seen) => failed.push_str(&format!("{s:?} {arms:?} temp={temp}: dropped {seen:?}, want {want:?}\n")),
+            Err(e) => failed.push_str(&format!("{s:?} {arms:?} temp={temp}: {e}\n")),
+        }
+    }
+    assert!(failed.is_empty(), "{failed}");
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3699,6 +3755,7 @@ mod projections;
 mod places;
 mod casts;
 mod matches;
+mod match_shapes;
 mod guards;
 mod promote;
 mod const_paths;

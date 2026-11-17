@@ -268,6 +268,13 @@ fn main() {
     if let Some(owned) = &native_owned {
         println!("native: shelf {}, SDK {} (version {}), work {}", owned.shelf.as_str(), owned.sdk.as_str(), owned.sdk_version.as_str(), owned.work.as_str());
     }
+    // The command's jobserver, as `blaze` makes it: one token for each core but the script's own.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let jobs = native_owned.as_ref().map(|owned| {
+        let workers = u32::try_from(cores).ok().and_then(core::num::NonZeroU32::new).expect("a core count of 1 to 2^32 - 1");
+        let opts = blaze_proc_macro::jobserver::JobserverOpts { work: owned.work.as_str(), workers, id: std::process::id() };
+        blaze_proc_macro::jobserver::Jobserver::new(opts).unwrap_or_else(|e| panic!("{e}"))
+    });
     let setting = Setting {
         store: &store,
         target: TARGET,
@@ -275,7 +282,7 @@ fn main() {
         table: Arc::clone(&table),
         c_mode: CMode::Deferred,
         mode: blaze_build_script::toolchain::Mode::Check,
-        native: native_owned.as_ref().map(|owned| owned.setting()),
+        native: native_owned.as_ref().zip(jobs.as_ref()).map(|(owned, jobs)| owned.setting(jobs)),
         // The derived facts' pins (brief P): the host's userland read here, once.
         spawn_setting: Arc::new(blaze_proc_macro::fact_pins::command_spawn_setting(TARGET, alloc).unwrap_or_else(|e| panic!("{e}"))),
     };

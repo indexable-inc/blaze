@@ -150,6 +150,7 @@ fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::Arm { .. }
         | Task::Guard { .. }
         | Task::GuardAlts { .. }
+        | Task::ArmMoves { .. }
         | Task::ArmEnd { .. }
         | Task::MatchEnd
         | Task::ShortEnd(_)

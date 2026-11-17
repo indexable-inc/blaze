@@ -321,7 +321,7 @@ fn routine_library(routine: Routine) -> &'static str {
         return "libSystem.B.dylib";
     }
     match routine {
-        Routine::Memcpy | Routine::Memmove | Routine::Memset => "libc.so.6",
+        Routine::Memcpy | Routine::Memmove | Routine::Memset | Routine::Memcmp => "libc.so.6",
         Routine::Fmod | Routine::Fmodf => "libm.so.6",
         Routine::Udivti3
         | Routine::Umodti3

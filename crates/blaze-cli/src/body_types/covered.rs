@@ -136,8 +136,10 @@ fn placed_by(body: BodyRef<'_>) -> ItemKey {
 /// Walks the call `call` of a crate whose expansion texts are `texts` up to the file entry it
 /// is at: its own origins' calling text when that is a file, else its caller's. `each` is
 /// given each call's macro path as written, innermost first. Bounded by the crate's count of
-/// calls: a chain longer than it is a loop, refused by name. The same walk as heads.rs
-/// `top_of` (lane R8's), which keeps no names: one of them goes when the two lanes are joined.
+/// calls: a chain longer than it is a loop, refused by name. The one walk: a body's root
+/// ([`written_by`]) and a head a macro wrote (heads.rs `make_expanded`) both take it. A kept
+/// item's text (`#[derive(..)] #[helper(..)] struct S`) names its entry, the item itself
+/// (blaze-scope expansion_origins.rs `kept`).
 pub(super) fn callers<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut dyn FnMut(&'n str)) -> Result<(u32, ItemIndex), &'static str> {
     let mut at = call;
     for _ in 0..=texts.len() {
@@ -147,7 +149,11 @@ pub(super) fn callers<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut 
             Err(_) => return Err("a macro call's expansion origins run past their section (names/expansion_texts.rs)"),
         };
         if bytes.is_empty() {
-            return Err("the expansion that wrote it keeps no origins (blaze-scope expansion_origins.rs `Rewritten`), so the entry its call is at is not known");
+            // The texts blaze-scope writes as `Rewritten` (resolve.rs): a call's statements read
+            // as items and a block's module text, both inside a body; and a text whose column
+            // could not be made. The lowering knows the call's entry (`CallSrc::place`): the
+            // piece owed is blaze-scope writing the call's part for them too.
+            return Err("the expansion that wrote it keeps no origins: a call's statements read as items or a block's module text (blaze-scope expansion_origins.rs `Rewritten`), or a column that could not be made, and blaze-scope writes no calling entry without its column, so the entry its call is at is not known");
         }
         let view = OriginsView::open(bytes).map_err(|_| "a macro call's expansion origins do not open (blaze-scope expansion_origins.rs)")?;
         each(view.macro_name);

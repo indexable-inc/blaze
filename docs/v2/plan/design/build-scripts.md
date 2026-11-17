@@ -186,10 +186,15 @@ unpacked package for a dependency), read-only, and the working directory. `OUT_D
 in-memory folder granted writable, at `/target/debug/build/<name>-<config>/out` (the shape
 scripts parse). `CARGO_CFG_*` are the target unit's cfg atoms (multi-valued joined by `,`;
 `test` and `proc_macro` left out), `CARGO_FEATURE_*` its features, `TARGET`, `HOST`, `PROFILE`
-`debug`, `OPT_LEVEL` `0`, `DEBUG` `true`, `NUM_JOBS` `1`, `RUSTC` `rustc`, `RUSTDOC`
+`debug`, `OPT_LEVEL` `0`, `DEBUG` `true`, `RUSTC` `rustc`, `RUSTDOC`
 `rustdoc`, `CARGO` `cargo`, `CARGO_ENCODED_RUSTFLAGS` empty, the `CARGO_PKG_*` values from the
 manifest, `CARGO_MANIFEST_LINKS`, and `DEP_<links>_<key>` from the direct dependencies'
 records. No `PATH`, `HOME`, wrapper or user variable: a switch like `LIBC_CI` is unset.
+The job count is outside the key (a hint about the machine, `env::Env::for_run`): a wasm run is
+told `NUM_JOBS` `1`; a native run `NUM_JOBS` the command's workers and `CARGO_MAKEFLAGS` naming
+the command's jobserver fifo (`-j --jobserver-fds=fifo:P --jobserver-auth=fifo:P`, cargo's
+text), which holds workers minus one tokens: the script's own worker is its implicit token
+(blaze-proc-macro `jobserver.rs`).
 
 **What it may do.** Read files under `/workspace` (each read tracked: path and digest), write
 only under `OUT_DIR`, print to stdout (the instructions) and stderr (dropped). No network; the

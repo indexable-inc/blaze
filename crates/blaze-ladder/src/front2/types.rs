@@ -754,7 +754,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         // Any other constant: a constant item's value or an anonymous constant's, in `ty`'s
         // width (`ty`'s node says how the anonymous one is typed; an unknown type, a body's
-        // `_`, takes only a constant item's path).
+        // `_`, takes a constant item's path or an expression whose type is its own, filed
+        // with its type left to the checker: anon.rs `written_ty`).
         let node = tys.view().get(ty).copied();
         // An expression that names `Self` where `Self` is a ground type has a value here
         // (`[u8; size_of::<Self>()]` in `impl u16`: front2/const_open.rs, state one): its

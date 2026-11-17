@@ -130,10 +130,10 @@ fn round_trip() {
     for cut in [0, 7, 8, record.len() / 2, record.len() - 1] {
         assert!(Outputs4Ref::open(&record[..cut]).is_err(), "prefix {cut}");
     }
-    // The old home: the same outputs as `bzbsout3`.
+    // The old home: the same outputs in `outputs::LAYOUT`.
     let mut old = Vec::new_in(alloc);
     out.encode(&mut old);
-    let tag = u64::from_le_bytes(*b"bzbsout3");
+    let tag = blaze_build_script::outputs::LAYOUT;
     assert_eq!(Outputs4Ref::open(&old).err(), Some(RecordError::OldHome { tag }));
     // A blob the store does not have, and one of the wrong length.
     let id = ContentId::of("blaze v2 test outputs4 blob", &big);

@@ -626,14 +626,42 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// "Associated Items", "Associated Constants": "An associated constant definition defines a
     /// constant associated with a type": `<T as Tr>::C` at `T = u8` is `u8`'s impl's value, or the
     /// trait's default where that impl writes none). A constant with no generics (a free `const`
-    /// item) has no row. A pattern's constant has none either: the builder asks it with no
-    /// arguments and a generic one stays refused there by name (front2 `TraitConstNoSelf`).
+    /// item) has no row. A pattern's constant has its row too (`Checked::pat_const_args`):
+    /// an inherent impl's constant (`U256::ZERO` of `impl<const BITS: usize, const LIMBS:
+    /// usize> Uint<BITS, LIMBS>`) has a value only at the impl's arguments, which a constant
+    /// pattern never takes from a generic parameter (E0158), so they are known once checked.
     fn record_const_args(&mut self, at: At, args: TyList) {
-        if let At::Expr(e) = at {
-            if self.ty.list_len(args) != 0 {
-                self.const_args.push((e, args));
-            }
+        if matches!(at, At::Expr(_) | At::Pat(_)) && self.ty.list_len(args) != 0 {
+            self.const_args.push((at, args));
         }
+    }
+
+    /// The parent's arguments of `item` (its first `count` generics) reached by the whole path
+    /// `segs`: for an item of a trait named through the trait (`Tr::<A>::f`, `Tr::<A>::C`), the
+    /// arguments written on the trait's segment for the trait's parameters after `Self`, with
+    /// `Self` fresh (the Reference, "Paths", "Paths in expressions": generic arguments are
+    /// written on the segment of the item they belong to; "Traits": a trait's `Self` is its
+    /// implicit first parameter, inferred). alloy-sol-types 1.x: `impl EventTopic for Address
+    /// { fn encode_topic(rust: &Self::RustType) -> WordToken {
+    /// crate::private::SolTypeValue::<Self>::stv_to_tokens(rust) } }`, where `T = Self` is
+    /// what picks the impl: dropped, `T` was a fresh variable nothing fixes and the call
+    /// E0283 `Address: SolTypeValue<?>`. Every other parent (none written, an impl's item):
+    /// fresh, inferred.
+    fn parent_args(&mut self, at: At, item: ItemKey, segs: &[Segment], count: u32) -> Result<TyList, Stop> {
+        let written = match segs {
+            [.., tseg, _] if tseg.has_args && count > 0 => Some(*tseg),
+            _ => None,
+        };
+        let Some(tseg) = written else { return self.fresh_generic_args(item, 0, count) };
+        let Some(parent) = self.reads.assoc_parent(item)? else { return self.fresh_generic_args(item, 0, count) };
+        let Some(def) = self.reads.trait_def(parent.container)? else { return self.fresh_generic_args(item, 0, count) };
+        if def.generics != count {
+            let site = crate::error::ParamSite::ExplicitArgs { item };
+            return Err(CheckError::Malformed(Malformed::Param { index: def.generics, args: count, site }).into());
+        }
+        let self_ty = self.fresh_generic_args(item, 0, 1)?;
+        let rest = self.explicit_args(at, Some(tseg), parent.container, 1, count - 1)?;
+        self.concat(self_ty, rest)
     }
 
     fn value_def_ty(&mut self, at: At, cause: Cause, def: Def, segs: &[Segment]) -> Result<Ty, Stop> {
@@ -645,7 +673,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.diag(DiagCode::UnresolvedPath, at, About::path(name));
                     return Ok(self.common.err);
                 };
-                let parent = self.fresh_generic_args(k, 0, sig.parent_count)?;
+                let parent = self.parent_args(at, k, segs, sig.parent_count)?;
                 let own = self.explicit_fn_args(at, last, k, &sig)?;
                 let args = self.concat(parent, own)?;
                 self.register_predicates(k, args, cause)?;
@@ -656,7 +684,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.diag(DiagCode::UnresolvedPath, at, About::path(name));
                     return Ok(self.common.err);
                 };
-                let args = self.fresh_generic_args(k, 0, sig.parent_count + sig.own_count)?;
+                let parent = self.parent_args(at, k, segs, sig.parent_count)?;
+                let own = self.fresh_generic_args(k, sig.parent_count, sig.own_count)?;
+                let args = self.concat(parent, own)?;
                 self.register_predicates(k, args, cause)?;
                 if let Def::Const(_) = def {
                     self.record_const_args(at, args);

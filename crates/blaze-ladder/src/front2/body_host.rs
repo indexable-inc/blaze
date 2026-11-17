@@ -69,9 +69,10 @@ pub trait BodySources {
         None
     }
     /// The file at `path` when `path` is under the crate's build script's `OUT_DIR`: `Some` of
-    /// the record's bytes or `Some(None)` when the record has no such file; `None` when the
-    /// path is not under it (or the crate has no joined record).
-    fn script_file(&self, krate: usize, path: &str) -> Option<Option<&[u8]>>;
+    /// the record's bytes or `Some(Ok(None))` when the record has no such file, `Some(Err)`
+    /// when it names a stored file whose bytes could not be read; `None` when the path is not
+    /// under it (or the crate has no joined record).
+    fn script_file(&self, krate: usize, path: &str) -> Option<Result<Option<&[u8]>, HostError>>;
     /// Runs the proc macro `def` on `call`, written in the crate at `krate`.
     fn run_proc_macro<'b>(&self, krate: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError>;
     /// Decision D111: files, as findings at `call`, the reads of `reads` in `span` a member's
@@ -107,9 +108,12 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
         self.0.crate_env(krate)?.shown_file(path, alloc)
     }
 
-    fn script_file(&self, krate: usize, path: &str) -> Option<Option<&[u8]>> {
+    fn script_file(&self, krate: usize, path: &str) -> Option<Result<Option<&[u8]>, HostError>> {
         let script = self.0.crate_env(krate)?.script()?;
-        script.file_at(path)
+        // A stored file (a native script's `OUT_DIR` file) is read from the record's file
+        // area, this one file only; one it cannot read is an unreadable include, never no file.
+        let unreadable = |_| HostError { ask: HostAsk::Include, why: HostWhy::Unreadable };
+        script.file_at(path).map(|file| file.map(|file| script.bytes_of(file).map_err(unreadable)).transpose())
     }
 
     fn run_proc_macro<'b>(&self, krate: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
@@ -172,7 +176,7 @@ impl ExpandCx for BodyHost<'_> {
     fn include(&self, written: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
         let sources = self.sources.ok_or(refused(HostAsk::Include))?;
         if let Some(file) = sources.script_file(self.krate, written) {
-            return Ok(file.map_or(Included::Missing, Included::Bytes));
+            return Ok(file?.map_or(Included::Missing, Included::Bytes));
         }
         let file = self.file.ok_or(refused(HostAsk::Include))?;
         let package = sources.folder(self.krate).ok_or(refused(HostAsk::Include))?;
@@ -237,7 +241,7 @@ mod tests {
             core::fmt::Write::write_fmt(&mut out, format_args!("tempo-node-1.0.0/{path}")).ok()?;
             (krate == 0).then_some(out)
         }
-        fn script_file(&self, _: usize, _: &str) -> Option<Option<&[u8]>> {
+        fn script_file(&self, _: usize, _: &str) -> Option<Result<Option<&[u8]>, HostError>> {
             None
         }
         fn run_proc_macro<'b>(&self, _: usize, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'b>) -> Result<Produced<'b>, HostError> {

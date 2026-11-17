@@ -465,6 +465,52 @@ fn a_call_is_related_through_its_callees_signature() {
     }
 }
 
+/// A call whose output is an OPAQUE type and whose arguments carry no lifetime: `async fn
+/// add_slowly(a: u32, b: u32) -> u32` called as `let f = mk(1u8);` (its future the opaque `mk`
+/// returns). The Reference, "Async functions": the call "returns a future that holds its
+/// arguments", and "Impl trait": a return-position `impl Trait` captures the in-scope generic
+/// parameters (edition 2024); with no input lifetime there is none to capture, so the output's
+/// one origin position is related to nothing, and the body is lowered with no finding. Before
+/// this, the opaque's position took the elision path, which needs exactly one input lifetime:
+/// refused `ElisionAmbiguous` (the rung x0-async-01's `compute`). Control: the same call with an
+/// output of a REFERENCE (`fn mk_ref(a: u8) -> &S`, an elided output lifetime with no input
+/// lifetime, E0106) stays refused `ElisionAmbiguous`: the rule is the opaque's, not elision's.
+///
+/// Prints: `an opaque output with no input lifetime: lowered, findings []; a reference output: ElisionAmbiguous`
+#[test]
+fn an_opaque_output_with_no_input_lifetime_is_related_to_nothing() {
+    let (mut fx, _st, rs) = sig_base();
+    let (unit, u8_) = (fx.unit(), fx.u8());
+    let sized = fx.tr("Sized", 1, vec::Vec::new(), &[]);
+    fx.lang(blaze_typeck::LangItem::Sized, sized);
+    let opaque_key = fx.opaque_key("mk::{opaque#0}");
+    let none = fx.list(&[]);
+    let opaque = fx.ty(PNode::Opaque(opaque_key, none));
+    let opaque_sized = fx.bound(sized, &[opaque]);
+    fx.set_opaque_bounds(opaque_key, vec![opaque_sized]);
+    fx.func("mk", 0, &[u8_], opaque, vec![]);
+    fx.func("mk_ref", 0, &[u8_], rs, vec![]);
+    let owner = fx.func("owner", 0, &[], unit, vec![]);
+    fx.finish();
+    let body = |callee: &str| {
+        let mut b = Bb::new();
+        let e0 = b.path(&[callee]);
+        let e1 = b.int(Some(blaze_typeck::IntSuffix::Uint(blaze_typeck::UintTy::U8)));
+        let e2 = b.call(e0, &[e1]);
+        let f = b.bind("f");
+        let s0 = b.let_(f, None, e2);
+        let root = b.block(&[s0], None);
+        (b, root)
+    };
+    let (b, root) = body("mk");
+    let got = findings_with(&fx, &b, owner, root, &Plain, Plant::None).unwrap_or_else(|r| panic!("an opaque output with no input lifetime is lowered: {r:?}"));
+    assert!(got.is_empty(), "{got:?}");
+    let (b, root) = body("mk_ref");
+    let control = findings_with(&fx, &b, owner, root, &Plain, Plant::None);
+    assert!(matches!(control, Err(Refusal { form: Form::ElisionAmbiguous, .. })), "control: {control:?}");
+    std::println!("an opaque output with no input lifetime: lowered, findings {got:?}; a reference output: ElisionAmbiguous");
+}
+
 /// A call whose callee's head is not known: `fn two(a: &S, b: &S) { k(a, b); }` is right: each
 /// argument is a reference held by value, covariant in its own lifetime, so the call cannot
 /// relate `a`'s lifetime to `b`'s (RFC 2094, "Subtyping"; the design is the source). Control:

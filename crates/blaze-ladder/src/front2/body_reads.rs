@@ -81,8 +81,9 @@ fn question_print(bytes: &[u8]) -> u64 {
 /// The most rows of a list whose rows [`Digests`] keeps beside its digest, so a second check
 /// that reads other answers names the first row that differs (rule 19). A constant's body
 /// (the class this exists for: tempo's census, "checking .. again read other answers") reads
-/// a few questions; 16 bytes a row, so at most 512 bytes a body, and nothing for a longer list.
-pub const MOST_KEPT_ROWS: usize = 32;
+/// about 40 (tests/front2_const_reads_once.rs: 39 and 40); 16 bytes a row, so at most 1 KiB a
+/// body, and nothing for a longer list.
+pub const MOST_KEPT_ROWS: usize = 64;
 
 /// One row of a kept list: its question's fingerprint and its answer's hash.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,22 +118,56 @@ pub struct ReadsDiff {
     pub second_differ: u32,
     /// How many of the first check's questions the second did not ask.
     pub first_only: u32,
+    /// The checked body, by path, and each `second_only` row's item, by path (rule 19): filled
+    /// where the store is at hand ([`check_body_asked`]), else empty.
+    pub shown: Vec<Box<str, Global>, Global>,
 }
 
 /// The most differing rows a [`ReadsDiff`] names.
 pub const MOST_DIFF_ROWS: usize = 4;
 
+/// The item a question is about, if it names one.
+fn question_item(q: &tc::Question) -> Option<ItemKey> {
+    use tc::Question as Q;
+    match *q {
+        Q::FnSig(k) | Q::Predicates(k) | Q::Adt(k) | Q::ImplsOf(k, _) | Q::ImplHeader(k) | Q::AssocItem(k, _) | Q::Const(k) | Q::Opaque(k) | Q::Attrs(k) | Q::TraitDef(k) | Q::AssocParent(k) => Some(k),
+        Q::ConstHolds(k, _) | Q::ConstParams(k) | Q::Closure(k, _) | Q::Coroutine(k, _) | Q::AssocGenerics(k, _) | Q::TypeAlias(k) | Q::FieldDefaults(k) => Some(k),
+        Q::Inherent(tc::Shape::Adt(k), _) => Some(k),
+        Q::Inherent(..) | Q::TraitsInScope(_) | Q::Path(..) | Q::Lang(_) | Q::LangPath(_) => None,
+    }
+}
+
+impl ReadsDiff {
+    /// Names the body `owner` and each differing row's item by path, as [`super::check::key_shown`] does.
+    fn name<'n, S: NamesSource<'n>>(&mut self, r: &Records<'_, 'n, S>, owner: ItemKey) {
+        self.shown.clear();
+        self.shown.push(super::check::key_shown(r, owner));
+        for (q, _, _) in self.second_only.iter() {
+            self.shown.push(match question_item(q) {
+                Some(k) => super::check::key_shown(r, k),
+                None => Box::from("-"),
+            });
+        }
+    }
+}
+
 impl core::fmt::Display for ReadsDiff {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if let Some(body) = self.shown.first() {
+            write!(f, "the body of {body}: ")?;
+        }
         write!(f, "first check {} reads, second {}", self.first_rows, self.second_rows)?;
         if !self.first_kept {
             return write!(f, "; the first list was longer than {MOST_KEPT_ROWS} rows, not kept");
         }
         write!(f, "; {} second-check rows differ, {} first-check questions not asked again", self.second_differ, self.first_only)?;
-        for (q, now, then) in self.second_only.iter() {
+        for (at, (q, now, then)) in self.second_only.iter().enumerate() {
             match then {
                 Some(then) => write!(f, "; {q:?} answered {then:#018x} first, {now:#018x} second")?,
                 None => write!(f, "; {q:?} asked only by the second check (answer {now:#018x})")?,
+            }
+            if let Some(item) = self.shown.get(at + 1) {
+                write!(f, " [{item}]")?;
             }
         }
         Ok(())
@@ -184,7 +219,7 @@ impl Digests {
     /// How `list` differs from the first check's rows `had`.
     fn diff(&self, had: FiledReads, list: &ReadList<'_>, scratch: Alloc<'_>) -> ReadsDiff {
         let questions = list.questions();
-        let mut diff = ReadsDiff { first_rows: had.count, second_rows: questions.len() as u32, first_kept: had.kept.is_some(), second_only: Vec::new_in(Global), second_differ: 0, first_only: 0 };
+        let mut diff = ReadsDiff { first_rows: had.count, second_rows: questions.len() as u32, first_kept: had.kept.is_some(), second_only: Vec::new_in(Global), second_differ: 0, first_only: 0, shown: Vec::new_in(Global) };
         let Some((start, len)) = had.kept else { return diff };
         let first = &self.rows[start as usize..(start + len) as usize];
         let mut now: Vec<KeptRow, Global> = Vec::with_capacity_in(questions.len(), Global);
@@ -237,7 +272,15 @@ pub fn check_body_asked<'n, S: NamesSource<'n>>(
     super::opaque_auto::file(r, body, &done)?;
     let filed = done.file_out();
     let scratch = r.store.tys.alloc();
-    r.store.reads.file(body.typeck.owner, &filed.reads, scratch)?;
+    let owner = body.typeck.owner;
+    match r.store.reads.file(owner, &filed.reads, scratch) {
+        Ok(()) => {}
+        Err(CheckFail::ReadsDiffer { owner, mut diff }) => {
+            diff.name(r, owner);
+            return Err(CheckFail::ReadsDiffer { owner, diff });
+        }
+        Err(other) => return Err(other),
+    }
     drop(filed);
     // Its closures, for a body that names one outside its owner (front2 foreign_closures.rs).
     let store = &mut *r.store;

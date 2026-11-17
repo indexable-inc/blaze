@@ -4,7 +4,9 @@
 //! - a slice indexed through an explicit dereference (core's `SliceIndex<[T]> for usize`:
 //!   `&mut (*slice)[self]`),
 //! - an overloaded dereference whose `Self` is unsized (winnow's `struct Bytes([u8])` with
-//!   `impl Deref for Bytes { type Target = [u8]; }`).
+//!   `impl Deref for Bytes { type Target = [u8]; }`),
+//! - a volatile store and load of an aggregate (core's `ptr::write_volatile` at a struct),
+//! - a match guard with `let` links (core's `dec2flt`: `None if let Some(v) = .. =>`).
 
 use super::*;
 
@@ -244,4 +246,195 @@ fn an_overloaded_dereference_of_an_unsized_self_passes_the_wide_pointer() {
         assert_eq!(run_native_with(&host, &[(BYTES_DEREF, None, &deref_built), (MAIN, None, &built)]), 31);
     }
     let _ = (built, deref_built);
+}
+
+/// core's intrinsics (library/core/src/intrinsics/mod.rs): `volatile_store<T>(dst: *mut T,
+/// val: T)` "Performs a volatile store to the `dst` pointer" and `volatile_load<T>(src: *const
+/// T) -> T` "Performs a volatile load from the `src` pointer", for any `T`, an aggregate too
+/// (core's `ptr::write_volatile`, called with a struct by tempo's dependencies).
+/// ```text
+/// fn main() -> u32 {
+///     let a = [1u32, 2, 3];
+///     let v = [7u32, 8, 9];
+///     let p: *mut [u32; 3] = &mut a;
+///     volatile_store(p, v);
+///     let q: *const [u32; 3] = &a;
+///     let r = volatile_load(q);
+///     r[0] + r[1] * 10 + r[2] * 100 + a[0] * 1000      // 7987
+/// }
+/// ```
+/// The built function holds a `store volatile` per 4-byte piece of the array; a build that
+/// refuses the aggregate (the census's "`volatile_store` of an aggregate") fails it, and one
+/// that stored only the first word reads 2 and 3 back.
+#[test]
+fn a_volatile_store_and_load_of_an_aggregate_move_every_byte() {
+    const VOLATILE_STORE: u128 = 7;
+    const VOLATILE_LOAD: u128 = 8;
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], PNode::Uint(UintTy::U32));
+    w.bounds_fn();
+    let t = w.ty(PNode::Param(0));
+    let unit = PNode::Tuple(List::EMPTY);
+    w.generic_func(VOLATILE_STORE, "volatile_store", 1, &[PNode::Ptr(Mutbl::Mut, t), PNode::Param(0)], unit);
+    w.generic_func(VOLATILE_LOAD, "volatile_load", 1, &[PNode::Ptr(Mutbl::Not, t)], PNode::Param(0));
+    w.intrinsics.push((ItemKey(VOLATILE_STORE), Intrinsic::Table(crate::intrinsics::Which::VolatileStore)));
+    w.intrinsics.push((ItemKey(VOLATILE_LOAD), Intrinsic::Table(crate::intrinsics::Which::VolatileLoad)));
+    let mut b = BodyBuf::new();
+    let u32_ty = b.types.intern(PNode::Uint(UintTy::U32)).expect("a type interns");
+    let three = b.types.usize_value(3).expect("a length interns");
+    let arr_ty = b.types.intern(PNode::Array(u32_ty, three)).expect("a type interns");
+    let mut_p = b.types.intern(PNode::Ptr(Mutbl::Mut, arr_ty)).expect("a type interns");
+    let const_p = b.types.intern(PNode::Ptr(Mutbl::Not, arr_ty)).expect("a type interns");
+    let su32 = Some(IntSuffix::Uint(UintTy::U32));
+    let (a, v, p, q, r) = (b.bind("a"), b.bind("v"), b.bind("p"), b.bind("q"), b.bind("r"));
+    let a_elems = [b.int(1, su32), b.int(2, su32), b.int(3, su32)];
+    let a_init = b.array(&a_elems);
+    let v_elems = [b.int(7, su32), b.int(8, su32), b.int(9, su32)];
+    let v_init = b.array(&v_elems);
+    let a_e = b.local(a);
+    let p_init = b.e(Expr::Ref { mutbl: Mutbl::Mut, operand: a_e });
+    let (p_e, v_e) = (b.local(p), b.local(v));
+    let store = b.call("volatile_store", &[p_e, v_e]);
+    let a_e = b.local(a);
+    let q_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: a_e });
+    let q_e = b.local(q);
+    let r_init = b.call("volatile_load", &[q_e]);
+    let term = |b: &mut BodyBuf, of: PatId, i: u128, scale: u128| {
+        let base = b.local(of);
+        let ix = b.int(i, None);
+        let at = b.index(base, ix);
+        let k = b.int(scale, None);
+        b.bin(BinOp::Mul, at, k)
+    };
+    let terms = [term(&mut b, r, 0, 1), term(&mut b, r, 1, 10), term(&mut b, r, 2, 100), term(&mut b, a, 0, 1000)];
+    let mut sum = terms[0];
+    for &t in &terms[1..] {
+        sum = b.bin(BinOp::Add, sum, t);
+    }
+    let root = b.block(
+        &[
+            Stmt::Let { pat: a, ty: None, init: Some(a_init), else_: None },
+            Stmt::Let { pat: v, ty: None, init: Some(v_init), else_: None },
+            Stmt::Let { pat: p, ty: Some(mut_p), init: Some(p_init), else_: None },
+            Stmt::Expr { expr: store, semi: true },
+            Stmt::Let { pat: q, ty: Some(const_p), init: Some(q_init), else_: None },
+            Stmt::Let { pat: r, ty: None, init: Some(r_init), else_: None },
+        ],
+        Some(sum),
+    );
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(built.func.view());
+    assert!(text.matches("volatile").count() >= 6, "three volatile stores and three volatile loads:\n{text}");
+    #[cfg(target_arch = "aarch64")]
+    {
+        let host = [(ItemKey(5), host_bounds as usize as u64)];
+        assert_eq!(run_native_with(&host, &[(MAIN, None, &built)]), 7987, "{text}");
+    }
+    let _ = built;
+}
+
+/// A binding with no annotation, immutable: the default binding mode applies.
+fn plain(b: &mut BodyBuf, name: &str) -> PatId {
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None })
+}
+
+fn tuple_pat(b: &mut BodyBuf, elems: &[PatId]) -> PatId {
+    let elems = b.pats_list(elems);
+    b.pat(Pat::Tuple { elems, rest: None })
+}
+
+/// `match 0u32 { 0 if let (a, 7) = (y, y + 4) => a * 10, 0 => 1, n => n }`: a scalar
+/// scrutinee, its arms by a switch.
+fn switch_guarded(b: &mut BodyBuf, y: u128) -> ExprId {
+    let a = plain(b, "a");
+    let seven = b.pat_int(7);
+    let pat = tuple_pat(b, &[a, seven]);
+    let (y1, y2, four) = (b.int(y, SU32), b.int(y, SU32), b.int(4, None));
+    let y4 = b.bin(BinOp::Add, y2, four);
+    let init = b.tuple(&[y1, y4]);
+    let guard = b.e(Expr::Let { pat, init });
+    let (a_e, ten) = (b.local(a), b.int(10, None));
+    let taken = b.bin(BinOp::Mul, a_e, ten);
+    let (zero1, zero2, n) = (b.pat_int(0), b.pat_int(0), plain(b, "n"));
+    let (one_, n_e) = (b.int(1, None), b.local(n));
+    let start = b.arms.len() as u32;
+    b.arms.push(Arm { pat: zero1, guard: Some(guard), body: taken });
+    b.arms.push(Arm { pat: zero2, guard: None, body: one_ });
+    b.arms.push(Arm { pat: n, guard: None, body: n_e });
+    let scrutinee = b.int(0, SU32);
+    b.e(Expr::Match { scrutinee, arms: List { start, len: 3 } })
+}
+
+/// `match (0u32, y) { (0, c) if let (d, _) = (c, 0u32) && d > 2 && let 9 = d + 6 => 100 + d,
+/// _ => 2 }`: a tuple scrutinee, its arms by tests; the guard a chain of two `let`s and a
+/// `bool`, `d` bound by the first link for the later ones and the body.
+fn tested_chain(b: &mut BodyBuf, y: u128) -> ExprId {
+    let (zero, c) = (b.pat_int(0), plain(b, "c"));
+    let pat = tuple_pat(b, &[zero, c]);
+    let (d, w) = (plain(b, "d"), b.pat(Pat::Wild));
+    let first_pat = tuple_pat(b, &[d, w]);
+    let (c_e, z) = (b.local(c), b.int(0, SU32));
+    let first_init = b.tuple(&[c_e, z]);
+    let first = b.e(Expr::Let { pat: first_pat, init: first_init });
+    let (d_e, two) = (b.local(d), b.int(2, None));
+    let big = b.bin(BinOp::Gt, d_e, two);
+    let nine = b.pat_int(9);
+    let (d_e, six) = (b.local(d), b.int(6, None));
+    let d6 = b.bin(BinOp::Add, d_e, six);
+    let third = b.e(Expr::Let { pat: nine, init: d6 });
+    let chain = b.bin(BinOp::And, first, big);
+    let chain = b.bin(BinOp::And, chain, third);
+    let (hundred, d_e) = (b.int(100, None), b.local(d));
+    let taken = b.bin(BinOp::Add, hundred, d_e);
+    let (wild, two_) = (b.pat(Pat::Wild), b.int(2, None));
+    let start = b.arms.len() as u32;
+    b.arms.push(Arm { pat, guard: Some(chain), body: taken });
+    b.arms.push(Arm { pat: wild, guard: None, body: two_ });
+    let (x, y_e) = (b.int(0, SU32), b.int(y, SU32));
+    let scrutinee = b.tuple(&[x, y_e]);
+    b.e(Expr::Match { scrutinee, arms: List { start, len: 2 } })
+}
+
+/// The Reference, "Match expressions", "Match guards" ([expr.match.guard.behavior]): "If all
+/// of the guard condition operands evaluate to true and all of the `let` patterns successfully
+/// match their scrutinees, the match arm is successfully matched against and the arm body is
+/// executed"; otherwise "the next pattern ... is tested"; and [expr.match.guard.chains]: a
+/// guard "may contain ... `let` patterns", whose bindings are in scope in the arm's body. core
+/// writes one in `dec2flt`: `None if let Some(value) = parse_inf_nan(s, negative) => return
+/// Ok(value),`.
+/// ```text
+/// fn main() -> u32 {
+///     switch_guarded(3)              // (3, 7) matches: 30
+///     + switch_guarded(4) * 100      // (4, 8) fails: the next arm `0`, 1
+///     + tested_chain(3) * 1000       // d = 3, 3 > 2, 9 = 9: 103
+///     + tested_chain(1) * 1_000_000  // d = 1, 1 > 2 fails: the next arm, 2
+/// }                                  // 2_103_130
+/// ```
+/// A build that refuses the `let` (the census's "`let` outside an `if` or `while` condition")
+/// fails it; one whose failed link went anywhere but the next arm gives other numbers.
+#[test]
+fn a_match_guard_with_let_links_binds_for_the_body_and_falls_to_the_next_arm() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U32);
+    let mut b = BodyBuf::new();
+    let parts = [
+        (switch_guarded(&mut b, 3), 1u128),
+        (switch_guarded(&mut b, 4), 100),
+        (tested_chain(&mut b, 3), 1000),
+        (tested_chain(&mut b, 1), 1_000_000),
+    ];
+    let mut acc = None;
+    for (part, scale) in parts {
+        let k = b.int(scale, None);
+        let scaled = b.bin(BinOp::Mul, part, k);
+        acc = Some(match acc {
+            Some(prev) => b.bin(BinOp::Add, prev, scaled),
+            None => scaled,
+        });
+    }
+    let root = b.block(&[], acc);
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(one(&built, &[]), 2_103_130);
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(run_native(&[(MAIN, &built)]), 2_103_130);
 }

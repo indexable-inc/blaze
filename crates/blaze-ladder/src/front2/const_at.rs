@@ -177,7 +177,8 @@ impl<A: Allocator + Clone> Needs<A> {
 /// The needs of the instance of `view`'s body at ground `args` (types of `ground`; the
 /// owner's generics in order), filed into `out` (cleared first): every constant path the check
 /// recorded arguments for (`Checked::const_args`, each grounded at `args` exactly as the
-/// builder's walk grounds it: blaze-build walk.rs `const_path_args`), and every const block,
+/// builder's walk grounds it: blaze-build walk.rs `const_path_args`), every constant pattern
+/// alike (`Checked::pat_const_args`), and every const block,
 /// at `args`, and every promoted borrow (`Checked::promoted`), at `args`. A constant with no
 /// generics has no row: its one value is the program's own (`FrontEnd::const_record`), made
 /// when the program was.
@@ -204,6 +205,22 @@ pub fn needs_of<A: Allocator + Clone>(
         };
         grounded.clear();
         for &t in types.list(list).map_err(|_| malformed("a constant path's arguments past the record's types"))? {
+            grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
+        }
+        out.push(ConstNeed::Item(item), &grounded)?;
+    }
+    // A constant pattern's (`Checked::pat_const_args`: `U256::ZERO =>`), as blaze-build
+    // walk/matches/forms.rs `const_record` grounds it. Its arguments name no generic parameter
+    // (E0158), so grounding only resolves them.
+    let pat_defs = done.pat_defs.column::<0>();
+    let pdefs = done.pat_defs.column::<1>();
+    for (&p, &list) in done.pat_const_args.column::<0>().iter().zip(done.pat_const_args.column::<1>().iter()) {
+        let at = pat_defs.binary_search(&p).map_err(|_| malformed("a constant pattern's arguments with no definition for the pattern"))?;
+        let &Def::Const(item) = &pdefs[at] else {
+            return Err(malformed("a constant pattern's arguments whose path names no constant"));
+        };
+        grounded.clear();
+        for &t in types.list(list).map_err(|_| malformed("a constant pattern's arguments past the record's types"))? {
             grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
         }
         out.push(ConstNeed::Item(item), &grounded)?;
@@ -267,12 +284,14 @@ impl<A: Allocator + Clone> ConstTable<A> {
 
 /// Asks the front end for each of `needs` (arguments of `from`, the build's ground table) not
 /// in `table` yet, and files each answer. The first need refused is the instance's refusal.
-pub fn pull<P: FrontEnd, A: Allocator + Clone>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>) -> Result<(), ConstAtRefusal> {
+/// `closures`: the build's closure facts, which a closure type among the arguments is laid
+/// out from ([`FrontEnd::const_at`]).
+pub fn pull<P: FrontEnd, A: Allocator + Clone>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, closures: &crate::run::ClosureTable) -> Result<(), ConstAtRefusal> {
     for (need, args) in needs.iter() {
         if table.get(need, args).is_some() {
             continue;
         }
-        let record = program.const_at(need, from, args).map_err(|why| ConstAtRefusal { need, why })?;
+        let record = program.const_at(need, from, args, closures).map_err(|why| ConstAtRefusal { need, why })?;
         table.insert(need, args, record);
     }
     Ok(())

@@ -274,13 +274,22 @@ const RUSTIX: &[&str] = &["--crate-type=rlib", "--emit=metadata"];
 /// The crates most rows rest on.
 const STD: &[&str] = &["core", "std"];
 const CORE: &[&str] = &["core"];
-const ALLOC: &[&str] = &["alloc", "core", "std"];
 const PROC_MACRO: &[&str] = &["alloc", "core", "proc_macro", "std"];
 
 /// The rows for tempo, made for each side's target (`probe::pinned_rows`): no row's reason
 /// rests on a target-gated item (none of the items named is under a `#[cfg(target_..)]`), so
 /// each holds for every target whose toolchain ships its [`Known::needs`]: the host
 /// (`aarch64-apple-darwin`) and the macro side's `wasm32-wasip1`.
+///
+/// Only what blaze cannot decide yet stays: every row here is a snippet with items
+/// (`probe_ask::Open::Items`; anyhow's opens with an inner `cfg_attr` over them,
+/// `Open::Attribute`), and each is removed by the same piece, the item probe (a probe
+/// task that checks the snippet in a world of no dependencies but the side's sysroot crates,
+/// by blaze's own front end with the library's stability gates; the lane-BS report's spec). A
+/// snippet of inner attributes only (the empty crate, `#![no_std]`, rustix's
+/// `#![feature(..)]` probes) is decided by `probe_ask::decide` from the language list and the
+/// library listings, so it has no row (`probe_ask_tests::pinned_rows_read_as_try_compiles`
+/// fails on one).
 pub const TEMPO: &[Known] = &[
     Known {
         probe: "anyhow 1.0.104: error_generic_member_access with std::backtrace (src/nightly.rs)",
@@ -315,22 +324,6 @@ pub const TEMPO: &[Known] = &[
         needs: PROC_MACRO,
     },
     Known {
-        probe: "autocfg 1.5.1 (eyre, memoffset, num-traits): the empty crate, autocfg's sanity check that std links",
-        args: AUTOCFG,
-        snippet: "",
-        accepted: true,
-        why: "an empty library crate with the std prelude compiles on every Rust whose toolchain ships std for the target (blaze also decides it itself: probe_ask::decide)",
-        needs: STD,
-    },
-    Known {
-        probe: "autocfg 1.5.1 (eyre, memoffset, num-traits): `#![no_std]`",
-        args: AUTOCFG,
-        snippet: "#![no_std]",
-        accepted: true,
-        why: "`#![no_std]` is a stable crate attribute (since 1.6) and the empty no_std crate needs only core (blaze also decides it itself: probe_ask::decide)",
-        needs: CORE,
-    },
-    Known {
         probe: "eyre 0.6.14 (autocfg): `std::panic::Location::caller` (track_caller)",
         args: AUTOCFG,
         snippet: "pub fn probe() { let _ = std::panic::Location::caller; }",
@@ -352,46 +345,6 @@ pub const TEMPO: &[Known] = &[
         snippet: EYRE_PROBE,
         accepted: true,
         why: ERROR_GENERIC_MEMBER_ACCESS,
-        needs: STD,
-    },
-    Known {
-        probe: "rustix 1.1.5: #![feature(core_c_str)]",
-        args: RUSTIX,
-        snippet: "#![allow(stable_features)]\n#![feature(core_c_str)]\n",
-        accepted: true,
-        why: "core/src/ffi/c_str.rs:94 #[stable(feature = \"core_c_str\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
-        needs: STD,
-    },
-    Known {
-        probe: "rustix 1.1.5: #![feature(core_ffi_c)]",
-        args: RUSTIX,
-        snippet: "#![allow(stable_features)]\n#![feature(core_ffi_c)]\n",
-        accepted: true,
-        why: "core/src/ffi/primitives.rs:13 #[stable(feature = \"core_ffi_c\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
-        needs: STD,
-    },
-    Known {
-        probe: "rustix 1.1.5: #![feature(alloc_c_string)]",
-        args: RUSTIX,
-        snippet: "#![allow(stable_features)]\n#![feature(alloc_c_string)]\n",
-        accepted: true,
-        why: "alloc/src/ffi/mod.rs:84 #[stable(feature = \"alloc_c_string\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
-        needs: ALLOC,
-    },
-    Known {
-        probe: "rustix 1.1.5: #![feature(alloc_ffi)]",
-        args: RUSTIX,
-        snippet: "#![allow(stable_features)]\n#![feature(alloc_ffi)]\n",
-        accepted: true,
-        why: "alloc/src/ffi/mod.rs:81 #![stable(feature = \"alloc_ffi\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
-        needs: ALLOC,
-    },
-    Known {
-        probe: "rustix 1.1.5: #![feature(error_in_core)]",
-        args: RUSTIX,
-        snippet: "#![allow(stable_features)]\n#![feature(error_in_core)]\n",
-        accepted: true,
-        why: "core/src/error.rs:2 #![stable(feature = \"error_in_core\", since = \"1.81.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
         needs: STD,
     },
     Known {

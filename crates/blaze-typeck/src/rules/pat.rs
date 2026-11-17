@@ -7,8 +7,8 @@
 //! typeck/pat.rs.
 //!
 //! A pattern is checked against an expected type with a default binding mode (move, `ref`,
-//! `ref mut`). Non-reference patterns (tuples, structs, tuple structs, slices, paths, literals
-//! other than string literals) first peel references off the expected type, each `&` making the
+//! `ref mut`). Non-reference patterns (tuples, structs, tuple structs, slices, paths other than
+//! constants of a reference type, literals other than string literals) first peel references off the expected type, each `&` making the
 //! mode `ref` and each `&mut` making a move mode `ref mut`. Wildcards, bindings, `&` patterns
 //! and or-patterns pass the type through. A binding's type is the expected type, behind a
 //! reference when its mode is by-reference; an explicit `mut` resets the mode to move, and from
@@ -46,13 +46,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let pat = self.body.pat(p)?;
         let mut expected = f.expect.to_option().unwrap_or(self.common.err);
         let mut mode = f.a;
+        // A path pattern's type is known before it meets the expected type, and a constant of
+        // a reference type is no non-reference pattern (the Reference, "Binding modes":
+        // "Non-reference patterns include all patterns except bindings, wildcard patterns
+        // (`_`), const patterns of reference types, and reference patterns"): it does not
+        // peel. jsonwebtoken's `match s.as_str() { ENC_A128GCM => .. }` with `const
+        // ENC_A128GCM: &str` (census: `found &str, expected str`).
+        let path_ty = match pat {
+            Pat::Path(path) => Some(self.value_path(At::Pat(p), Cause::Pat(p), path)?),
+            _ => None,
+        };
         let peel = match pat {
-            Pat::Tuple { .. }
-            | Pat::TupleStruct { .. }
-            | Pat::Struct { .. }
-            | Pat::Slice { .. }
-            | Pat::Path(_)
-            | Pat::Range { .. } => true,
+            Pat::Path(_) => match path_ty {
+                Some(t) => {
+                    let t = self.try_structurally_resolve(t)?;
+                    !matches!(self.view(t), TyView::Ref(..))
+                }
+                None => true,
+            },
+            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Range { .. } => true,
             Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
             Pat::Missing | Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Or { .. } => false,
         };
@@ -72,12 +84,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
         }
-        let ty = self.pat_rule(p, pat, expected, mode)?;
+        let ty = self.pat_rule(p, pat, expected, mode, path_ty)?;
         self.pat_ty[p.ix()] = ty;
         Ok(())
     }
 
-    fn pat_rule(&mut self, p: PatId, pat: Pat, expected: Ty, mode: u32) -> Result<Ty, Stop> {
+    /// `path_ty`: a path pattern's type, found before the peeling (`step_pat`).
+    fn pat_rule(&mut self, p: PatId, pat: Pat, expected: Ty, mode: u32, path_ty: Option<Ty>) -> Result<Ty, Stop> {
         let at = At::Pat(p);
         match pat {
             Pat::Missing => Ok(self.common.err),
@@ -157,8 +170,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.demand_eq(at, expected, lt)?;
                 Ok(expected)
             }
-            Pat::Path(path) => {
-                let t = self.value_path(at, Cause::Pat(p), path)?;
+            Pat::Path(_) => {
+                let Some(t) = path_ty else { return Err(crate::error::CheckError::Malformed(crate::error::Malformed::Pat(p)).into()) };
                 if !self.is_err(t) {
                     self.demand_eq(at, expected, t)?;
                 }

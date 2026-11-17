@@ -230,6 +230,10 @@ name = "blaze-alloc-count"
 version = "0.0.0"
 
 [[package]]
+name = "blaze-apple-sdk"
+version = "0.0.0"
+
+[[package]]
 name = "blaze-arrow-ipc"
 version = "0.0.0"
 dependencies = [
@@ -381,6 +385,7 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
  "blaze-spawn",
+ "blaze-surface",
  "blaze-unit-graph",
 ]
 
@@ -451,6 +456,7 @@ dependencies = [
 name = "blaze-cli"
 version = "0.0.0"
 dependencies = [
+ "blaze-apple-sdk",
  "blaze-blake3",
  "blaze-build-script",
  "blaze-cas",
@@ -1402,6 +1408,7 @@ dependencies = [
 name = "blaze-proc-macro"
 version = "0.0.0"
 dependencies = [
+ "blaze-apple-sdk",
  "blaze-build-script",
  "blaze-expand",
  "blaze-fetch",

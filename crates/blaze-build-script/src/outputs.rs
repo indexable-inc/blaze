@@ -23,7 +23,22 @@
 //!   notes       u32 line, u8 what (0 an unknown `cargo::` key, else 1 + `Malformed`), key
 //!   files       name, u64 length, bytes
 //!   c-requests  argv (the program first), joined by NUL
+//! then the stored files, a u32 count and its entries:
+//!   stored      name, u64 length, u32 mode (`0o100644` or `0o100755`), 32 bytes SHA-256
 //! ```
+//!
+//! A stored file is one the record names and does not hold: a native script's `OUT_DIR` file
+//! (a C library's `.a` is hundreds of MB: librocksdb-sys's is 810 MB), whose bytes went from
+//! the script's folder to the home's file area ([`FILE_AREA`], one file per digest) by a copy
+//! in fixed chunks, never through the command's memory, its digest streamed the same way. A
+//! reader that needs one stored file's bytes (`include!` of a generated `bindings.rs`, a link
+//! of the `.a`) asks for that one file ([`OutputsRef::bytes_of`]), mapped read-only by the
+//! command that opened the record ([`StoredBytes`]); nothing reads a stored file it does not
+//! name, so `check` never touches a `.a`. No limit is on a stored file's size: the count of
+//! files is the limit ([`FileLimits::files`]). Names are sorted and the mode is whether an
+//! execute bit is set, alone (the rest of a mode is the machine's umask), so two runs of one key give
+//! the same bytes (rule 25). A wasm script's files are in its sandbox's memory and stay inline
+//! (`files`); one name is never in both sections.
 //!
 //! The `OUT_DIR` is kept because a script may print a path into it (mime_guess's
 //! `rustc-env=MIME_TYPES_GENERATED_PATH=<OUT_DIR>/mime_types_generated.rs`, read by
@@ -45,8 +60,115 @@ use blaze_own::{AString, AVec, Alloc, String, Vec};
 
 use crate::instr::{self, Instr, Line, LinkTo, Malformed, OutputError, OutputLimits, SearchKind};
 
-/// The record's layout word: `bzbsout` and the layout's number.
-pub const LAYOUT: u64 = u64::from_le_bytes(*b"bzbsout3");
+/// The record's layout word: `bzbsout` and the layout's number. `bzbsout5` added the stored
+/// files; a `bzbsout3` record is another layout ([`RecordError::Layout`]) and the run key
+/// holds this word (`key.rs`), so an old home's records are never found and are made again
+/// (rule 26).
+pub const LAYOUT: u64 = u64::from_le_bytes(*b"bzbsout5");
+
+/// The home's file area, under `<home>/.blaze/v2`: each stored file at `<this>/<sha256 hex>`,
+/// placed once by whoever ran the script and read by every command that opens its record.
+pub const FILE_AREA: &str = "build-script/files";
+
+/// A stored file's mode as the record keeps it: whether an execute bit is set, nothing of
+/// the machine's umask (rule 25).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FileMode {
+    /// `0o100644`.
+    Plain,
+    /// `0o100755`.
+    Executable,
+}
+
+impl FileMode {
+    /// The mode word the record holds.
+    pub const fn word(self) -> u32 {
+        match self {
+            FileMode::Plain => 0o100644,
+            FileMode::Executable => 0o100755,
+        }
+    }
+
+    /// Of a mode word the record holds; any other word is none.
+    pub const fn of_word(word: u32) -> Option<FileMode> {
+        match word {
+            0o100644 => Some(FileMode::Plain),
+            0o100755 => Some(FileMode::Executable),
+            _ => None,
+        }
+    }
+}
+
+/// One file the record names and does not hold: its bytes are in the [`FILE_AREA`] under
+/// `sha256`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredFile<'a> {
+    /// Relative to `OUT_DIR`, `/`-separated.
+    pub name: AString<'a>,
+    pub len: u64,
+    pub mode: FileMode,
+    pub sha256: [u8; 32],
+}
+
+/// A stored file as a record read in place names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredRef<'b> {
+    pub name: &'b str,
+    pub len: u64,
+    pub mode: FileMode,
+    pub sha256: &'b [u8; 32],
+}
+
+/// One file of a record read in place: its bytes held in the record, or named by digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutFileRef<'b> {
+    Inline(&'b [u8]),
+    Stored(StoredRef<'b>),
+}
+
+/// Where the command that opened a record reads its stored files' bytes: the home's
+/// [`FILE_AREA`], each file mapped read-only on its first ask (blaze-cli `scripts::FileArea`),
+/// or a test's files.
+pub trait StoredBytes: Sync {
+    /// The bytes of `file`, held as long as `self` is: exactly `file.len` of them, or why not.
+    fn bytes(&self, file: &StoredRef<'_>) -> Result<&[u8], StoredError>;
+}
+
+/// Why a stored file's bytes were not read; the caller names the file
+/// ([`StoredRef::name`]), this its digest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StoredError {
+    pub sha256: [u8; 32],
+    pub why: StoredWhy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoredWhy {
+    /// The record was opened with no file area ([`OutputsRef::with_area`]): the reader asked
+    /// a stored file it cannot read; nothing is answered in its place (rule 3).
+    NoArea,
+    /// The file area has no file of this digest.
+    NotThere,
+    /// The file area's file of this digest has `found` bytes, not the record's length.
+    Length { found: u64 },
+    /// The file area's file could not be mapped.
+    Unreadable,
+}
+
+impl core::fmt::Display for StoredError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the stored file ")?;
+        for byte in self.sha256 {
+            write!(f, "{byte:02x}")?;
+        }
+        match self.why {
+            StoredWhy::NoArea => write!(f, " was asked of a record opened with no file area ({FILE_AREA}); it is not read in place of one (rule 3)"),
+            StoredWhy::NotThere => write!(f, " is not in the file area ({FILE_AREA}): the record that names it was made by a home that kept it"),
+            StoredWhy::Length { found } => write!(f, " has {found} bytes in the file area ({FILE_AREA}), not the record's length"),
+            StoredWhy::Unreadable => write!(f, " could not be mapped from the file area ({FILE_AREA})"),
+        }
+    }
+}
 
 /// A link argument as kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,13 +243,17 @@ pub struct Outputs<'a> {
     /// The native tool spawns a `check` run deferred (the C toolchain, `perl`, `make`, a
     /// `configure`: `probe::is_deferred_tool`): each argv joined by NUL, in spawn order.
     pub c_requests: AVec<'a, AString<'a>>,
+    /// Sorted by name; no name of `files` among them.
+    pub stored: AVec<'a, StoredFile<'a>>,
 }
 
 /// How much a script may write into `OUT_DIR`.
 #[derive(Clone, Copy, Debug)]
 pub struct FileLimits {
-    /// All files' bytes together.
+    /// All inline files' bytes together (a wasm script's, held in its sandbox's memory); a
+    /// stored file's length is under no limit.
     pub bytes: u64,
+    /// Inline and stored files together.
     pub files: usize,
 }
 
@@ -172,6 +298,7 @@ impl<'a> Outputs<'a> {
             notes: Vec::new_in(alloc),
             files: Vec::new_in(alloc),
             c_requests: Vec::new_in(alloc),
+            stored: Vec::new_in(alloc),
         }
     }
 
@@ -221,13 +348,7 @@ impl<'a> Outputs<'a> {
 
     /// Takes a file the script left in `OUT_DIR`, kept sorted by name, within `limits`.
     pub fn add_file(&mut self, name: &str, bytes: &[u8], limits: FileLimits, alloc: Alloc<'a>) -> Result<(), FileError> {
-        let bad = name.is_empty() || name.starts_with('/') || name.split('/').any(|part| matches!(part, "" | "." | ".."));
-        if bad {
-            return Err(FileError::BadName);
-        }
-        if self.files.len() >= limits.files {
-            return Err(FileError::TooMany { limit: limits.files });
-        }
+        self.room_for(name, limits)?;
         let total = self.files.iter().map(|f| f.bytes.len() as u64).sum::<u64>() + bytes.len() as u64;
         if total > limits.bytes {
             return Err(FileError::TooLarge { bytes: total, limit: limits.bytes });
@@ -242,10 +363,46 @@ impl<'a> Outputs<'a> {
         Ok(())
     }
 
-    /// The file `name` (relative to `OUT_DIR`), as the crate's `include!` reads it.
+    /// Takes a file the script left in `OUT_DIR` whose bytes are in the [`FILE_AREA`] under
+    /// `sha256`, kept sorted by name; only the count of files is limited, never its length.
+    pub fn add_stored(&mut self, name: &str, len: u64, mode: FileMode, sha256: [u8; 32], limits: FileLimits, alloc: Alloc<'a>) -> Result<(), FileError> {
+        self.room_for(name, limits)?;
+        let at = match self.stored.binary_search_by(|f| f.name.as_str().cmp(name)) {
+            Ok(_) => return Err(FileError::Twice),
+            Err(at) => at,
+        };
+        self.stored.insert(at, StoredFile { name: own(name, alloc), len, mode, sha256 });
+        Ok(())
+    }
+
+    /// That `name` is a name a record may hold, held by neither section yet, with room for
+    /// one more file.
+    fn room_for(&self, name: &str, limits: FileLimits) -> Result<(), FileError> {
+        let bad = name.is_empty() || name.starts_with('/') || name.split('/').any(|part| matches!(part, "" | "." | ".."));
+        if bad {
+            return Err(FileError::BadName);
+        }
+        if self.files.len() + self.stored.len() >= limits.files {
+            return Err(FileError::TooMany { limit: limits.files });
+        }
+        let inline = self.files.binary_search_by(|f| f.name.as_str().cmp(name)).is_ok();
+        let stored = self.stored.binary_search_by(|f| f.name.as_str().cmp(name)).is_ok();
+        if inline || stored {
+            return Err(FileError::Twice);
+        }
+        Ok(())
+    }
+
+    /// The inline file `name` (relative to `OUT_DIR`); a stored one is [`Outputs::stored_file`].
     pub fn file(&self, name: &str) -> Option<&[u8]> {
         let at = self.files.binary_search_by(|f| f.name.as_str().cmp(name)).ok()?;
         Some(&self.files[at].bytes)
+    }
+
+    /// The stored file `name` (relative to `OUT_DIR`).
+    pub fn stored_file(&self, name: &str) -> Option<&StoredFile<'a>> {
+        let at = self.stored.binary_search_by(|f| f.name.as_str().cmp(name)).ok()?;
+        Some(&self.stored[at])
     }
 
     /// Appends the record's bytes to `out`.
@@ -258,6 +415,13 @@ impl<'a> Outputs<'a> {
             out.extend_from_slice(&file.bytes);
         }
         self.encode_tail(out);
+        count(out, self.stored.len());
+        for file in self.stored.iter() {
+            text(out, &file.name);
+            out.extend_from_slice(&file.len.to_le_bytes());
+            out.extend_from_slice(&file.mode.word().to_le_bytes());
+            out.extend_from_slice(&file.sha256);
+        }
     }
 
     /// The layout word `layout`, the `OUT_DIR` and the ten sections before the files: one
@@ -401,7 +565,7 @@ impl<'b> Cursor<'b> {
 pub(crate) const SECTIONS: usize = 12;
 
 /// The domain of [`OutputsRef::crate_digest`]; a change to what it covers takes the next number.
-pub const CRATE_VIEW: &str = "blaze v2 build-script crate view 1";
+pub const CRATE_VIEW: &str = "blaze v2 build-script crate view 2";
 
 /// An outputs record, read in place.
 #[derive(Clone, Copy)]
@@ -409,6 +573,20 @@ pub struct OutputsRef<'b> {
     bytes: &'b [u8],
     out_dir: &'b str,
     starts: [(usize, u32); SECTIONS],
+    /// The stored files' section: its start (after its count) and count.
+    stored_at: (usize, u32),
+    /// Where its stored files' bytes are read; `None` until [`OutputsRef::with_area`].
+    area: Option<&'b dyn StoredBytes>,
+}
+
+/// One stored file's entry, checked.
+fn stored_entry<'b>(cur: &mut Cursor<'b>) -> Result<StoredRef<'b>, RecordError> {
+    let name = cur.text()?;
+    let len = cur.u64()?;
+    let at = cur.at;
+    let mode = FileMode::of_word(cur.u32()?).ok_or(RecordError::Kind { at })?;
+    let sha256 = <&[u8; 32]>::try_from(cur.take(32)?).map_err(|_| RecordError::Short { at: cur.at })?;
+    Ok(StoredRef { name, len, mode, sha256 })
 }
 
 /// One entry of any section, borrowed.
@@ -478,10 +656,26 @@ impl<'b> OutputsRef<'b> {
                 entry(section, &mut cur)?;
             }
         }
+        let n = cur.u32()?;
+        let stored_at = (cur.at, n);
+        for _ in 0..n {
+            stored_entry(&mut cur)?;
+        }
         if cur.at != bytes.len() {
             return Err(RecordError::Trailing { at: cur.at });
         }
-        Ok(OutputsRef { bytes, out_dir, starts })
+        Ok(OutputsRef { bytes, out_dir, starts, stored_at, area: None })
+    }
+
+    /// This record with its stored files read from `area`.
+    pub fn with_area(self, area: &'b dyn StoredBytes) -> OutputsRef<'b> {
+        OutputsRef { area: Some(area), ..self }
+    }
+
+    /// Where its stored files are read from, if one was attached ([`OutputsRef::with_area`]): a
+    /// reader that copies the record's bytes and opens them again attaches it again.
+    pub fn area(&self) -> Option<&'b dyn StoredBytes> {
+        self.area
     }
 
     /// The `OUT_DIR` the script ran with.
@@ -496,9 +690,10 @@ impl<'b> OutputsRef<'b> {
     }
 
     /// The digest of everything of the record the served crate's text can read: its `OUT_DIR`,
-    /// its cfgs, its env pairs and its files (names and bytes). A crate's key covers this, so
-    /// two records that differ in any of these are two keys; what the crate cannot read (link
-    /// requests, metadata, warnings, C requests) is left out.
+    /// its cfgs, its env pairs and its files (names and bytes; a stored file's name, length,
+    /// mode and digest). A crate's key covers this, so two records that differ in any of these
+    /// are two keys; what the crate cannot read (link requests, metadata, warnings, C
+    /// requests) is left out.
     pub fn crate_digest(&self) -> blaze_ids::ContentId {
         let mut hasher = blaze_ids::Hasher::new(CRATE_VIEW);
         hasher.part(self.out_dir.as_bytes());
@@ -508,15 +703,47 @@ impl<'b> OutputsRef<'b> {
             let end = self.starts[section + 1].0 - 4;
             hasher.update(&n.to_le_bytes()).part(&self.bytes[start..end]);
         }
+        // The stored files' section runs to the record's end.
+        let (start, n) = self.stored_at;
+        hasher.update(&n.to_le_bytes()).part(&self.bytes[start..]);
         hasher.finish()
     }
 
     /// The file a crate names by `path` when it is under the script's `OUT_DIR`: `Some` of the
-    /// record's bytes, or `Some(None)` when the record has no such file; `None` when `path` is
+    /// record's file, or `Some(None)` when the record has no such file; `None` when `path` is
     /// not under `OUT_DIR` at all.
-    pub fn file_at(&self, path: &str) -> Option<Option<&'b [u8]>> {
+    pub fn file_at(&self, path: &str) -> Option<Option<OutFileRef<'b>>> {
         let name = path.strip_prefix(self.out_dir)?.strip_prefix('/')?;
         Some(self.file(name))
+    }
+
+    /// The bytes of one of the record's files: an inline file's in place, a stored file's
+    /// from the area the record was opened with (exactly its length), else why not.
+    pub fn bytes_of(&self, file: OutFileRef<'b>) -> Result<&'b [u8], StoredError> {
+        match file {
+            OutFileRef::Inline(bytes) => Ok(bytes),
+            OutFileRef::Stored(stored) => {
+                let area = self.area.ok_or(StoredError { sha256: *stored.sha256, why: StoredWhy::NoArea })?;
+                let bytes = area.bytes(&stored)?;
+                if bytes.len() as u64 != stored.len {
+                    return Err(StoredError { sha256: *stored.sha256, why: StoredWhy::Length { found: bytes.len() as u64 } });
+                }
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// The stored files, sorted by name.
+    pub fn stored(&self) -> impl Iterator<Item = StoredRef<'b>> + use<'b> {
+        let (at, n) = self.stored_at;
+        let mut cur = Cursor { bytes: self.bytes, at };
+        (0..n).map_while(move |_| stored_entry(&mut cur).ok())
+    }
+
+    /// Every file, inline then stored (each section sorted by name; no name in both).
+    pub fn all_files(&self) -> impl Iterator<Item = (&'b str, OutFileRef<'b>)> + use<'b> {
+        let inline = self.files().map(|(name, bytes)| (name, OutFileRef::Inline(bytes)));
+        inline.chain(self.stored().map(|stored| (stored.name, OutFileRef::Stored(stored))))
     }
 
     /// The entries of `section`, which `open` checked.
@@ -575,14 +802,14 @@ impl<'b> OutputsRef<'b> {
         self.entries(9).filter_map(|e| if let Entry::Note(l, k, t) = e { Some((l, k, t)) } else { None })
     }
 
-    /// (name, bytes), sorted by name.
+    /// The inline files, (name, bytes), sorted by name; the stored ones are [`Self::stored`].
     pub fn files(&self) -> impl Iterator<Item = (&'b str, &'b [u8])> + use<'b> {
         self.entries(10).filter_map(|e| if let Entry::File(n, b) = e { Some((n, b)) } else { None })
     }
 
-    /// The file `name`, by a scan of the sorted names.
-    pub fn file(&self, name: &str) -> Option<&'b [u8]> {
-        self.files().find(|(n, _)| *n == name).map(|(_, b)| b)
+    /// The file `name`, inline or stored, by a scan of the sorted names.
+    pub fn file(&self, name: &str) -> Option<OutFileRef<'b>> {
+        self.all_files().find(|(n, _)| *n == name).map(|(_, file)| file)
     }
 
     /// The deferred C requests, each argv joined by NUL.
@@ -611,6 +838,9 @@ impl<'b> OutputsRef<'b> {
             out.files.push(OutFile { name: own(name, alloc), bytes: owned });
         }
         self.c_requests().for_each(|it| out.c_requests.push(own(it, alloc)));
+        for stored in self.stored() {
+            out.stored.push(StoredFile { name: own(stored.name, alloc), len: stored.len, mode: stored.mode, sha256: *stored.sha256 });
+        }
         out
     }
 }

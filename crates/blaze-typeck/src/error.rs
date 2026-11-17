@@ -26,6 +26,9 @@ pub enum Limit {
     ObjectPreds,
     /// A trait object's principal with more than `dyn_compat::MAX_SUPERTRAITS` traits above it.
     Supertraits,
+    /// Whether one impl specializes another asked while answering that question for more than
+    /// `infer::MAX_SPEC_DEPTH` pairs at once.
+    Specialization,
 }
 
 /// Input the driver cannot have been given by a correct lowering or world.

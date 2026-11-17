@@ -860,74 +860,10 @@ fn minimum<A: Ask>(ask: &A) -> Result<u32, LinkError> {
     Ok(version.max(MACOS_MINIMUM))
 }
 
-/// `major[.minor[.patch]]` as `xxxx.yy.zz` nibbles.
+/// `major[.minor[.patch]]` as `xxxx.yy.zz` nibbles: Apple's version, read by its one home
+/// (blaze-apple-sdk `Version`), which the SDK's identity is too.
 fn parse_version(text: &str) -> Option<u32> {
-    let mut parts = text.trim().split('.');
-    let part = |it: Option<&str>, max: u32| -> Option<u32> {
-        match it {
-            None => Some(0),
-            Some(it) if it.bytes().all(|b| b.is_ascii_digit()) => {
-                it.parse().ok().filter(|it| *it <= max)
-            }
-            Some(_) => None,
-        }
-    };
-    let major = part(Some(parts.next()?), 0xffff)?;
-    let minor = part(parts.next(), 0xff)?;
-    let patch = part(parts.next(), 0xff)?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(major << 16 | minor << 8 | patch)
-}
-
-/// The string value of `key` in the outermost object of the JSON `text`, unescaped as it is
-/// written; `None` when it has none or is not well formed there.
-fn top_level_string<'t>(text: &'t str, key: &str) -> Option<&'t str> {
-    let bytes = text.as_bytes();
-    let mut depth = 0u32;
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'{' | b'[' => {
-                depth += 1;
-                at += 1;
-            }
-            b'}' | b']' => {
-                depth = depth.checked_sub(1)?;
-                at += 1;
-            }
-            b'"' => {
-                let (string, end) = string_at(text, at)?;
-                at = end;
-                if depth != 1 || string != key {
-                    continue;
-                }
-                let Some(value) = text[at..].trim_start().strip_prefix(':') else { continue };
-                let value = value.trim_start();
-                if !value.starts_with('"') {
-                    return None;
-                }
-                return string_at(text, text.len() - value.len()).map(|it| it.0);
-            }
-            _ => at += 1,
-        }
-    }
-    None
-}
-
-/// The JSON string whose `"` is at `at`, and where it ends.
-fn string_at(text: &str, at: usize) -> Option<(&str, usize)> {
-    let bytes = text.as_bytes();
-    let mut i = at + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some((&text[at + 1..i], i + 1)),
-            _ => i += 1,
-        }
-    }
-    None
+    blaze_apple_sdk::Version::parse(text).map(blaze_apple_sdk::Version::nibbles)
 }
 
 /// What the toolchain is found from: the environment, and the answers of the commands that
@@ -1568,35 +1504,51 @@ fn a_linker_job_splits_into_the_same_words_quoted_or_bare() {
     assert_eq!(quoted_words(r#" "open"#), None, "an unclosed quote is refused");
 }
 
-/// The macOS SDK: its library and framework directories and its version.
+/// The macOS SDK: its library and framework directories and its version. Where it is and what
+/// it is are decided by the SDK's one home (blaze-apple-sdk `resolve`): `SDKROOT` (the key's
+/// first variable), else what xcrun prints, its `SDKSettings.json` read from the folder chosen;
+/// this machine reads what that asks.
 fn apple<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
-    let sdk = match key.var(0) {
-        Some(root) => PathBuf::from(root),
-        None => {
-            // alloc: once per toolchain asked, its command
-            let run = ["--sdk", "macosx", "--show-sdk-path"].map(str::to_owned).to_vec();
-            let printed = ask
-                .run(Path::new("xcrun"), std::slice::from_ref(&run))
-                .pop()
-                // alloc: error path
-                .unwrap_or_else(|| Err("no answer".to_owned()))
-                .map_err(|why| {
+    use std::cell::OnceCell;
+
+    use blaze_apple_sdk::{SETTINGS, Unread, XCRUN, XCRUN_ARGS, XcrunFailed};
+
+    // What xcrun said and what the settings file holds, kept for the resolution's borrows.
+    let printed: OnceCell<Result<String, String>> = OnceCell::new();
+    let read: OnceCell<Result<String, String>> = OnceCell::new();
+    let resolved = blaze_apple_sdk::resolve(
+        key.var(0),
+        || {
+            let said = printed.get_or_init(|| {
+                // alloc: once per toolchain asked, its command
+                let run = XCRUN_ARGS.map(str::to_owned).to_vec();
+                ask.run(Path::new(XCRUN), std::slice::from_ref(&run))
+                    .pop()
                     // alloc: error path
-                    fail(format!("the macOS SDK: SDKROOT is not set, and `xcrun --sdk macosx --show-sdk-path`: {why}"))
-                })?;
-            PathBuf::from(printed.trim())
-        }
-    };
-    let settings = sdk.join("SDKSettings.json");
-    let text = std::fs::read_to_string(&settings)
-        // alloc: error path
-        .map_err(|error| {
-            fail(format!("the macOS SDK's version: {}: {error}", settings.display()))
-        })?;
-    let version = top_level_string(&text, "Version").and_then(parse_version).ok_or_else(|| {
-        // alloc: error path
-        fail(format!("{}: no `Version` that is `major[.minor[.patch]]`", settings.display()))
-    })?;
+                    .unwrap_or_else(|| Err("no answer".to_owned()))
+            });
+            match said {
+                Ok(text) => Ok(text.as_str()),
+                Err(why) => Err(XcrunFailed::Failed { why: why.as_str() }),
+            }
+        },
+        |folder| {
+            // alloc: once per toolchain asked, the settings' text
+            let text = read.get_or_init(|| {
+                std::fs::read_to_string(Path::new(folder).join(SETTINGS))
+                    // alloc: error path
+                    .map_err(|error| error.to_string())
+            });
+            match text {
+                Ok(text) => Ok(text.as_str()),
+                Err(why) => Err(Unread { why: why.as_str() }),
+            }
+        },
+    );
+    // alloc: error path
+    let resolved = resolved.map_err(|refused| fail(format!("{refused}")))?;
+    let version = resolved.identity().nibbles();
+    let sdk = PathBuf::from(resolved.folder());
     let (linker, linker_frameworks) = linker_dirs(ask, &c_driver(key, 3)?, key.target.triple())?;
     let unpassed = unpassed(key.named("NIX_LDFLAGS"), &linker);
     Ok(Found {

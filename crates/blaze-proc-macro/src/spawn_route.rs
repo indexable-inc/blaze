@@ -128,6 +128,9 @@ pub(crate) fn child_env(script_env: &[(String, String)], d: &Decoded) -> Vec<(St
 pub(crate) enum Route<'s> {
     /// `rustc`: the probe table.
     Rustc,
+    /// `cargo -V` (`--version`, `version`): the pinned cargo's line, `probe::CARGO_VERSION`,
+    /// held in the base key with rustc's version text (`probe::answers_id`), so no read.
+    CargoVersion,
     /// `git ...`, or a shell's `-c "git ..."`: a derived fact (D54), or a refusal naming the
     /// git command when it has quoting no row reads.
     Git,
@@ -147,6 +150,9 @@ pub(crate) enum Route<'s> {
 pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, has_executor: bool) -> Route<'s> {
     if name == "rustc" {
         return Route::Rustc;
+    }
+    if probe::is_cargo_version(name, args) {
+        return Route::CargoVersion;
     }
     let shell_git = matches!(name, "sh" | "bash") && matches!(args, ["-c", command] if command.starts_with("git "));
     if shell_git || git_words(name, args).is_some() {

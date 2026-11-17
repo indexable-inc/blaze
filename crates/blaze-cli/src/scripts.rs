@@ -34,19 +34,22 @@
 //!   naming the path: the scripts that need it fail by name (a native one), or every script
 //!   does (the runtime, the spawn setting); none is run without it, none is skipped.
 //!
-//! Owed (said in the closing note's words of each refusal): the setting's machine facts (the
-//! OS pins, the SDK's version) become a fact the record reads when the drive takes command
+//! A native run's source holds the macOS SDK's identity (its version, blaze-apple-sdk; never
+//! its folder), resolved once at the command's edge (sdk.rs): [`parts`].
+//!
+//! Owed (said in the closing note's words of each refusal): the setting's other machine facts
+//! (the OS pins) become a fact the record reads when the drive takes command
 //! facts (`Ask::facts`, DRIVER runner 17); a checkout file read becomes a read when
 //! `key::content_of` exists; `cargo:warning` lines are not printed yet.
 
 use std::alloc::Global;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blaze_build_script::env::DepMetadata;
 use blaze_build_script::key::CMode;
 use blaze_build_script::native::Runner;
-use blaze_build_script::outputs::OutputsRef;
+use blaze_build_script::outputs::{OutputsRef, StoredBytes, StoredError, StoredRef, StoredWhy};
 use blaze_build_script::probe::Row;
 use blaze_build_script::toolchain::Mode;
 use blaze_drive::{Input, Kind, Name, Task, Want};
@@ -131,6 +134,50 @@ pub(crate) fn payload_parts(payload: &[u8]) -> Option<(RanAs, &[u8])> {
     Some((ran_as, record))
 }
 
+/// A record's stored files as this command reads them (`blaze_build_script::outputs`'s
+/// `StoredBytes`): each mapped read-only from the home's file area
+/// (`<home>/.blaze/v2/build-script/files/<sha256 hex>`) the first time a reader asks it, and
+/// never before. Opening a record maps nothing, so `check` of a crate that includes a native
+/// script's `bindings.rs` maps that one file and never the 810 MB archive beside it; a link
+/// maps the archive. A mapping reads no page until its bytes are read.
+pub(crate) struct FileArea {
+    /// `None`: the command has no home, so no stored file can be read (each ask is refused).
+    folder: Option<PathBuf>,
+    /// One slot per stored file of the record, by digest, sorted and each once.
+    #[expect(clippy::disallowed_types, reason = "a slot of one record's file, mapped on its first ask and read by every reader of the record after: per value, not global state")]
+    files: std::vec::Vec<([u8; 32], std::sync::OnceLock<Result<blaze_core::Mapping, StoredWhy>>), Global>,
+}
+
+impl FileArea {
+    /// The area of `outputs`' stored files under `home` (`HOME`, read at the edge): nothing
+    /// mapped yet.
+    pub(crate) fn of(home: Option<&str>, outputs: &OutputsRef<'_>) -> FileArea {
+        let folder = home.map(|home| Path::new(home).join(STORE_UNDER_HOME).join(blaze_build_script::outputs::FILE_AREA));
+        #[expect(clippy::disallowed_types, reason = "see the field")]
+        let mut files: std::vec::Vec<([u8; 32], std::sync::OnceLock<Result<blaze_core::Mapping, StoredWhy>>), Global> = outputs.stored().map(|file| (*file.sha256, std::sync::OnceLock::new())).collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files.dedup_by(|a, b| a.0 == b.0);
+        FileArea { folder, files }
+    }
+}
+
+impl StoredBytes for FileArea {
+    fn bytes(&self, file: &StoredRef<'_>) -> Result<&[u8], StoredError> {
+        let refused = |why: StoredWhy| StoredError { sha256: *file.sha256, why };
+        let folder = self.folder.as_ref().ok_or(refused(StoredWhy::NoArea))?;
+        let at = self.files.binary_search_by(|(digest, _)| digest.cmp(file.sha256)).map_err(|_| refused(StoredWhy::NotThere))?;
+        let mapped = self.files[at].1.get_or_init(|| {
+            let name: std::string::String = file.sha256.iter().map(|byte| std::format!("{byte:02x}")).collect();
+            match blaze_core::Mapping::map_file(&folder.join(name)) {
+                Ok(mapping) => Ok(mapping),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(StoredWhy::NotThere),
+                Err(_) => Err(StoredWhy::Unreadable),
+            }
+        });
+        mapped.as_ref().map(blaze_core::Mapping::bytes).map_err(|why| refused(*why))
+    }
+}
+
 /// The build-script module store's folder under blaze's folder in the home (`<home>/.blaze`):
 /// `build-script/modules/<key>/{identity,module.wasm,wasm-sha256}`, filled by the bootstrap
 /// builder (`toolrun.sh proc_macro_modules`, build-script mode). Its listing is a
@@ -180,19 +227,43 @@ pub(crate) fn name_of(graph: &UnitGraph<'_>, script: UnitId, side: Side, alloc: 
     subject(graph, script, side, alloc).map(|subject| Name::new(Kind::Script, subject))
 }
 
+/// The identity of the command's macOS SDK (blaze-apple-sdk `Sdk::identity`: its version, never
+/// its folder), which a native run's key holds; `None` when the command has none, and then a
+/// native run fails naming why ([`run`]).
+pub(crate) fn sdk_identity(env: &FetchEnv<'_>) -> Option<blaze_apple_sdk::Version> {
+    env.sdk.ok().map(|sdk| sdk.identity())
+}
+
+/// What a run's key holds of the macOS SDK (rule 21): a native run's compiles and links are
+/// made against it, so its identity ([`sdk_identity`]; a marker for none); a wasm run reads no
+/// SDK, so nothing, and its key moves with no SDK change.
+fn sdk_bytes(ran_as: RanAs, sdk: Option<blaze_apple_sdk::Version>) -> ([u8; 5], usize) {
+    match (ran_as, sdk) {
+        (RanAs::Wasm, _) => ([0; 5], 0),
+        (RanAs::Native, None) => ([0; 5], 1),
+        (RanAs::Native, Some(version)) => {
+            let [a, b, c, d] = version.key();
+            ([1, a, b, c, d], 5)
+        }
+    }
+}
+
 /// The `Script` parts of a world whose crates read the runs `keys` (`Names::script_keys`: each
-/// run's subject and its reading crate's world key, named with the crates' `CrateScope` parts):
-/// one a subject, sorted and without repeats (two crates of one subject read one run, and have
-/// one crate key: ruling D115 (3)).
-pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>) -> std::vec::Vec<(Name, ContentId), Global> {
+/// run's subject and its reading crate's world key, named with the crates' `CrateScope` parts),
+/// for a command whose macOS SDK is `sdk` ([`sdk_identity`]): one a subject, sorted and without
+/// repeats (two crates of one subject read one run, and have one crate key: ruling D115 (3)).
+pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>, sdk: Option<blaze_apple_sdk::Version>) -> std::vec::Vec<(Name, ContentId), Global> {
     let mut parts = std::vec::Vec::new_in(Global);
     // Piece 2c (ruling D115 (5), (c)): no module listing in a run's source. Its module is a
     // read (script_modules.rs); its crate's world key holds the package's identity and its
     // dependencies' (which `links` inputs it has). Its placement is in it too (ruling D115
-    // sharing (ii), rule 21): a native run and a wasm run are never one record.
+    // sharing (ii), rule 21): a native run and a wasm run are never one record. A native run's
+    // holds the SDK's identity, never its folder (rules 21, 25).
     for (subject, crate_key, ran_as) in keys {
         let mut h = blaze_ids::Hasher::new(SOURCE_DOMAIN);
         h.id(&subject).id(&crate_key).update(&[mode_byte(MODE), C_MODE as u8, ran_as as u8]);
+        let (bytes, len) = sdk_bytes(ran_as, sdk);
+        h.update(&bytes[..len]);
         parts.push((Name::new(Kind::Script, subject), h.finish()));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
@@ -211,10 +282,7 @@ pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>) -
 /// A question neither answers is the runtime's refusal naming the triple
 /// (`SpawnRefusal::CannotAnswerYet`).
 pub(crate) fn pinned_table<'s>(side: Side, shipped: impl Iterator<Item = &'s str> + Clone, alloc: Alloc<'_>) -> std::vec::Vec<Row> {
-    let triple = match side {
-        Side::Target => crate::graph::TRIPLE,
-        Side::Macro => MACRO_TARGET,
-    };
+    let triple = side_triple(side);
     let mut known = std::vec::Vec::new_in(Global);
     for row in blaze_build_script::pinned::TEMPO {
         if row.needs.iter().all(|needed| shipped.clone().any(|name| name == *needed)) {
@@ -225,6 +293,61 @@ pub(crate) fn pinned_table<'s>(side: Side, shipped: impl Iterator<Item = &'s str
     rows.extend_from_slice(&blaze_build_script::probe_ask::ships_rows(triple, shipped, alloc));
     rows.sort_by(|a, b| a.key.cmp(&b.key));
     rows
+}
+
+/// The triple a side's scripts are run for: what its probes are keyed by.
+fn side_triple(side: Side) -> &'static str {
+    match side {
+        Side::Target => crate::graph::TRIPLE,
+        Side::Macro => MACRO_TARGET,
+    }
+}
+
+/// The library-feature listings of `side` (`probe_ask::feature_rows`), unsorted: for each crate
+/// a probe of no items loads (`core` under `#![no_std]`, else `std`), every toolchain crate of
+/// the side it reaches by its dependencies (the crates rustc's `lib_features` reads), each read
+/// under its own cfg and features by blaze-scope's `lib_features`. `core`'s closure is read
+/// first and `std`'s listing goes on from it (std's closure holds core's). Read when a command
+/// first runs a script, from the world's texts in place; the record it is to become is the
+/// lane report's spec (keyed by the toolchain and the side's cfg, rule 77).
+pub(crate) fn feature_table(world: &blaze_world::World<'_>, side: Side, alloc: Alloc<'_>) -> Result<std::vec::Vec<Row>, SetupError> {
+    use blaze_build_script::probe_ask::{Needs, feature_rows};
+    use blaze_scope::lib_features::{LibFeatures, LibFeaturesOpts};
+    let triple = side_triple(side);
+    let mut rows = std::vec::Vec::new_in(Global);
+    let mut features = LibFeatures::new(LibFeaturesOpts { alloc: alloc.clone() });
+    let mut read = std::vec::Vec::new_in(Global);
+    read.resize(world.crates.len(), false);
+    for needs in [Needs::Core, Needs::Std] {
+        let toolchain = |krate: &blaze_world::Crate<'_>| matches!(krate.origin, blaze_world::Origin::Toolchain(_)) && krate.side == side;
+        let Some(root) = world.crates.iter().position(|krate| toolchain(krate) && krate.input.name == needs.krate()) else { continue };
+        let mut stack = std::vec::Vec::new_in(Global);
+        stack.push(root);
+        while let Some(at) = stack.pop() {
+            if core::mem::replace(&mut read[at], true) {
+                continue;
+            }
+            let krate = &world.crates[at];
+            stack.extend(krate.input.deps.iter().map(|(_, dep)| *dep));
+            // Only a crate of `#![feature(staged_api)]` may carry a stability attribute (rustc
+            // refuses one elsewhere, E0734): the registry crates beneath std (libc, cfg-if,
+            // hashbrown, ...) declare no feature and are not read.
+            let staged = blaze_scope::resolve::SourceTexts::read(&world.texts, at, krate.input.root).is_some_and(|text| text.contains("staged_api"));
+            if !staged {
+                continue;
+            }
+            let mut atoms = std::vec::Vec::new_in(Global);
+            atoms.extend_from_slice(krate.input.cfg);
+            atoms.extend(krate.input.features.iter().map(|feature| ("feature", Some(*feature))));
+            let cfg = blaze_scope::task::Cfg::from_atoms(&atoms, alloc.clone());
+            if let Err(error) = features.scan(&world.texts, at, krate.input.root, &cfg) {
+                return Err(SetupError::LibFeatures { triple, krate: krate.input.name.to_owned(), why: std::format!("{error}") });
+            }
+        }
+        let listed = features.listed(alloc.clone());
+        rows.extend_from_slice(&feature_rows(triple, needs, &listed.declared, &listed.mentioned, alloc.clone()));
+    }
+    Ok(rows)
 }
 
 /// The toolchain crates the world holds for `side` (its sysroot's), by library name.
@@ -267,6 +390,11 @@ pub(crate) struct Shared<'f> {
     spawn: Arc<SpawnSetting>,
     /// The native setting, or why the command has none (its words, naming the path).
     native: Result<NativeSetting<'f>, &'f str>,
+    /// The command resolved no macOS SDK (sdk.rs). A native run's key then holds "no SDK"
+    /// ([`sdk_bytes`]), so its refusal is a function of its key: filed as its record, standing
+    /// until an SDK resolves, which moves the key. Never a hole, which left tempo's answer
+    /// uncertified and every dependent walked again each command (check-g043851: 37 s a no-op).
+    no_sdk: bool,
     /// The graph record's bytes, decoded again on each worker (its `Alloc` is a task's).
     graph_record: &'f [u8],
 }
@@ -300,6 +428,9 @@ pub(crate) enum SetupError {
     Runtime(std::string::String),
     SpawnSetting(std::string::String),
     Sources(std::string::String),
+    /// A toolchain crate's library features could not be listed (blaze-scope `lib_features`'s
+    /// `ScanError`, rendered): the crate, and the triple whose cfg it was read under.
+    LibFeatures { triple: &'static str, krate: std::string::String, why: std::string::String },
 }
 
 impl core::fmt::Display for SetupError {
@@ -312,6 +443,7 @@ impl core::fmt::Display for SetupError {
             SetupError::Runtime(words) => write!(f, "the build-script runtime: {words}"),
             SetupError::SpawnSetting(words) => write!(f, "the command's spawn setting (the derived facts' pins): {words}"),
             SetupError::Sources(words) => write!(f, "the fetched sources: {words}"),
+            SetupError::LibFeatures { triple, krate, why } => write!(f, "the toolchain crate `{krate}` for {triple}: {why}"),
         }
     }
 }
@@ -373,10 +505,13 @@ fn said<'f>(frame: &'f Frame, words: core::fmt::Arguments<'_>) -> &'f str {
 impl<'f> Scripts<'f> {
     /// The command's scripts, made once: the graph record `graph_record` (held in `frame`),
     /// the lock, the members' folders and what `main` read at the edge (`env`: the home, the
-    /// SDK folder, the checkout). `world` names each side's sysroot ([`shipped`]).
+    /// SDK folder, the checkout). `world` names each side's sysroot ([`shipped`]). `workers` is
+    /// the command's worker count, which its native scripts' children share (the jobserver).
+    #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
     pub(crate) fn open(
         cx: &Cx,
         env: &FetchEnv<'_>,
+        workers: u32,
         world: &blaze_world::World<'_>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
@@ -416,14 +551,29 @@ impl<'f> Scripts<'f> {
         store.push(STORE_UNDER_HOME);
         let runtime = ScriptRuntime::new(&store).map_err(|error| SetupError::Runtime(std::format!("{error}")))?;
         let host = crate::graph::TRIPLE;
-        let table = Arc::new(pinned_table(Side::Target, shipped(world, Side::Target), alloc.clone()));
-        let macro_table = Arc::new(pinned_table(Side::Macro, shipped(world, Side::Macro), alloc.clone()));
+        let table = {
+            let _cx = cx.span("scripts: the target side's probe answers (library features listed)");
+            let mut rows = pinned_table(Side::Target, shipped(world, Side::Target), alloc.clone());
+            rows.extend_from_slice(&feature_table(world, Side::Target, alloc.clone())?);
+            rows.sort_by(|a, b| a.key.cmp(&b.key));
+            Arc::new(rows)
+        };
+        let macro_table = {
+            let _cx = cx.span("scripts: the macro side's probe answers (library features listed)");
+            let mut rows = pinned_table(Side::Macro, shipped(world, Side::Macro), alloc.clone());
+            rows.extend_from_slice(&feature_table(world, Side::Macro, alloc.clone())?);
+            rows.sort_by(|a, b| a.key.cmp(&b.key));
+            Arc::new(rows)
+        };
         let spawn = blaze_proc_macro::fact_pins::command_spawn_setting(host, alloc).map_err(|error| SetupError::SpawnSetting(std::format!("{error}")))?;
         // The native setting: only a script `placed` native needs it; without it that script
         // fails naming why ([`pooled`]), never run as wasm (D112).
+        // The SDK was resolved once at the command's edge (sdk.rs); its refusal names what was
+        // tried (`SDKROOT`'s value, or xcrun's answer) and how to set `SDKROOT`.
+        let workers = core::num::NonZeroU32::new(workers);
         let native = match env.sdk {
-            None => Err(said(frame, format_args!("SDKROOT is not set: the native runner (D112) needs the macOS SDK folder, read once at the command's start"))),
-            Some(sdk) => match blaze_proc_macro::native_setting::command_native_setting(home, sdk, NATIVE_WORK, host, alloc) {
+            Err(refused) => Err(said(frame, format_args!("{refused}"))),
+            Ok(sdk) => match blaze_proc_macro::native_setting::command_native_setting(home, sdk.folder(), NATIVE_WORK, host, alloc) {
                 Ok(owned) => {
                     // D112 (N7): the fact shim, beside the running blaze (its folder read once
                     // at the edge, main.rs), copied into the work folder once here, where each
@@ -435,19 +585,35 @@ impl<'f> Scripts<'f> {
                             blaze_proc_macro::native_facts::place_shim(owned.work.as_str(), &from).map_err(FactShimError::Place)
                         }
                     };
-                    match placed {
-                        Ok(_) => {
+                    // The command's jobserver (jobserver.rs): its fifo under the work folder,
+                    // `workers - 1` tokens; the native runs' children share the command's
+                    // workers through it. Ended, its fifo removed, when `Scripts` drops.
+                    let jobs = match workers {
+                        None => Err(said(frame, format_args!("the command's worker count is 0: the native runner's jobserver needs at least one (scripts.rs)"))),
+                        Some(workers) => blaze_proc_macro::jobserver::Jobserver::new(blaze_proc_macro::jobserver::JobserverOpts { work: owned.work.as_str(), workers, id: std::process::id() })
+                            .map_err(|error| said(frame, format_args!("the native runner's jobserver (D112): {error}"))),
+                    };
+                    match (placed, jobs) {
+                        (Ok(_), Ok(jobs)) => {
                             let held = |text: &str| crate::work::held_str(text, frame);
-                            Ok(NativeSetting { shelf: held(owned.shelf.as_str()), sdk: held(owned.sdk.as_str()), work: held(owned.work.as_str()), deadline: owned.deadline })
+                            let jobs: &'f blaze_proc_macro::jobserver::Jobserver = blaze_own::Box::leak(blaze_own::Box::new_in(jobs, frame));
+                            Ok(NativeSetting { shelf: held(owned.shelf.as_str()), sdk: held(owned.sdk.as_str()), work: held(owned.work.as_str()), deadline: owned.deadline, jobs })
                         }
-                        Err(error) => Err(said(frame, format_args!("the native runner's fact shim (D112, N7): {error}"))),
+                        (Err(error), jobs) => {
+                            if let Ok(jobs) = jobs {
+                                end_jobs(&jobs);
+                            }
+                            Err(said(frame, format_args!("the native runner's fact shim (D112, N7): {error}")))
+                        }
+                        (Ok(_), Err(why)) => Err(why),
                     }
                 }
                 Err(error) => Err(said(frame, format_args!("the native runner's setting (D112): {error}"))),
             },
         };
         let checkout = PathBuf::from(if env.checkout.is_empty() { "." } else { env.checkout });
-        let shared: &'f Shared<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(Shared { runtime, store, checkout, table, macro_table, spawn: Arc::new(spawn), native, graph_record }, frame));
+        let no_sdk = env.sdk.is_err();
+        let shared: &'f Shared<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(Shared { runtime, store, checkout, table, macro_table, spawn: Arc::new(spawn), native, no_sdk, graph_record }, frame));
 
         let _cx = cx.span("scripts: the fetched sources");
         let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
@@ -458,6 +624,23 @@ impl<'f> Scripts<'f> {
 
     fn unit_of(&self, name: Name) -> Option<(UnitId, Side)> {
         self.by_subject.binary_search_by_key(&name.subject, |(subject, _, _)| *subject).ok().map(|at| (self.by_subject[at].1, self.by_subject[at].2))
+    }
+}
+
+impl Drop for Scripts<'_> {
+    /// The command is over (its scripts' runs all ended): the jobserver's fifo is removed.
+    fn drop(&mut self) {
+        if let Ok(native) = &self.shared.native {
+            end_jobs(native.jobs);
+        }
+    }
+}
+
+/// The command's jobserver ended: its descriptor closed, its fifo removed. A drop cannot return
+/// the failure, so it is said on standard error naming the fifo (rule 3: never quiet).
+fn end_jobs(jobs: &blaze_proc_macro::jobserver::Jobserver) {
+    if let Err(error) = jobs.end() {
+        _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("blaze: {error}\n"));
     }
 }
 
@@ -597,9 +780,10 @@ pub(crate) fn job<'f: 'j, 'j>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     store: &mut dyn Store<'_>,
-    scripts: &mut Option<Scripts<'f>>,
+    scripts: &mut Option<Result<Scripts<'f>, &'f str>>,
     names: &mut Option<crate::names::Names<'f>>,
     env: &FetchEnv<'_>,
+    workers: u32,
     lock: Option<&'f Lock<'static>>,
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
     task: &Task<'_>,
@@ -609,6 +793,10 @@ pub(crate) fn job<'f: 'j, 'j>(
     let cx = cx.span("script: make the job");
     if let Some(failed) = task.failed.first() {
         return Ok(Prepared::Waited(*failed));
+    }
+    const NOT_SET_UP: &str = "the command's build scripts could not be set up";
+    if let Some(Err(words)) = scripts {
+        return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true });
     }
     if scripts.is_none() || names.is_none() {
         let Some(graph) = task.inputs.iter().find(|input: &&Input| input.name == Name::unit_graph()) else {
@@ -632,13 +820,18 @@ pub(crate) fn job<'f: 'j, 'j>(
         if scripts.is_none() {
             let bytes: &'f [u8] = held_bytes(read.unit_graph(graph.name)?.graph, frame);
             let world = names.as_ref().expect("made above").world();
-            match Scripts::open(&cx, env, world, bytes, lock, members, frame) {
-                Ok(opened) => *scripts = Some(opened),
-                Err(error) => return Ok(Prepared::Said { what: "the command's build scripts could not be set up", words: said(jobs, format_args!("{error}")), hole: true }),
+            match Scripts::open(&cx, env, workers, world, bytes, lock, members, frame) {
+                Ok(opened) => *scripts = Some(Ok(opened)),
+                Err(error) => {
+                    // Kept for the command: the next `Script` task says it, never opens again.
+                    let words = said(frame, format_args!("{error}"));
+                    *scripts = Some(Err(words));
+                    return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true });
+                }
             }
         }
     }
-    let scripts = scripts.as_mut().expect("opened above");
+    let Some(Ok(scripts)) = scripts.as_mut() else { return Err(CliError::Text { what: "the command's scripts, opened above, are not there" }) };
     let Some((script, side)) = scripts.unit_of(task.name) else {
         return Ok(Prepared::Said { what: "a `Script` part names no build script of this command's graph", words: "a `Script` part names no build-script unit of this command's graph", hole: false });
     };
@@ -787,7 +980,10 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame) -> Ran {
         let upstream = DepProducer::closure(&inputs);
         let mut out: std::vec::Vec<(std::string::String, std::vec::Vec<u8>)> = outputs.files().map(|(path, bytes)| (path.to_owned(), bytes.to_vec())).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        let made = DepProducer { tree, root, out_dir: outputs.out_dir().to_owned(), out: Arc::new(out), upstream: Arc::new(std::vec::Vec::new()) }.with_upstream(upstream);
+        // Its stored files (a native script's, in the file area) are named, never read into
+        // `out`: a dependent served that `OUT_DIR` is refused by name (`DepViewError::StoredOut`).
+        let stored: std::vec::Vec<std::string::String> = outputs.stored().map(|file| file.name.to_owned()).collect();
+        let made = DepProducer { tree, root, out_dir: outputs.out_dir().to_owned(), out: Arc::new(out), stored: Arc::new(stored), upstream: Arc::new(std::vec::Vec::new()) }.with_upstream(upstream);
         served.push((producer.script, made));
     }
     let given: std::vec::Vec<(&str, &DepProducer), Global> = job
@@ -805,8 +1001,11 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame) -> Ran {
     let runner = placed(graph, job.script, MODE, alloc);
     let ran_as = RanAs::of(&runner);
     let native = match (runner, &shared.native) {
-        (Runner::Native { .. }, Err(why)) => return failed("a native build script with no native setting", format_args!("the build script of {package} runs native (D112): {why}"), true),
-        (_, Ok(native)) => Some(NativeSetting { shelf: native.shelf, sdk: native.sdk, work: native.work, deadline: native.deadline }),
+        // No SDK: a function of the run's key, which holds "no SDK" ([`Shared::no_sdk`]), so
+        // filed. An SDK and the setting still refused (its shelf, its fact shim): a fact of the
+        // machine no key holds yet, so a hole, asked again next command.
+        (Runner::Native { .. }, Err(why)) => return failed("a native build script with no native setting", format_args!("the build script of {package} runs native (D112): {why}"), !shared.no_sdk),
+        (_, Ok(native)) => Some(*native),
         (Runner::Wasm, Err(_)) => None,
     };
     let setting = Setting {

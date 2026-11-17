@@ -86,6 +86,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             let errs = self.err_list(arg_ids.len())?;
                             return self.start_args(f, e, arg_ids, errs, self.common.err, 2, false);
                         };
+                        // The call's expected type decides what it can of the formal inputs
+                        // before an argument is typed, as for a call (rules/expect_inputs.rs;
+                        // rustc's `check_method_argument_types` passes its expectation to the
+                        // same `check_argument_types`). mime_guess 2.0.5's `MimeGuess::iter`:
+                        // `Iter(self.iter_raw().map(expect_mime))`, the field
+                        // `Map<IterRaw, fn(&'static str) -> Mime>`: the expected output makes
+                        // `F` the fn pointer, and the fn item `expect_mime` then coerces to it
+                        // ("Coercion types": a fn item to a fn pointer) instead of making `F`
+                        // the fn item's own type, which the field refuses (E0308).
+                        self.expected_inputs(f.expect, inputs, output, arg_ids)?;
                         self.start_args(f, e, arg_ids, inputs, output, 2, true)
                     }
                     Err(code) => {

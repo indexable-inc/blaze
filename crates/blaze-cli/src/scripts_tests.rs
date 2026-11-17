@@ -146,3 +146,44 @@ fn scripts_a_side_cfg_atom_list_keeps_the_rows_order_and_values() {
         assert_eq!(atom.value.as_ref().map(|v| v.as_str()), *value, "a valued atom lost its value");
     }
 }
+
+/// A native run's key holds the macOS SDK's identity (its version) and never its folder: two
+/// SDKs of one version in two folders key one run, two versions key two, and a wasm run's key
+/// moves with neither. Prints "sdk keyed by version". Control: drop `sdk_bytes` from `parts` and
+/// the second assertion fails with "two SDK versions keyed one native run"; hash the folder in
+/// and the first fails.
+#[test]
+fn scripts_a_native_runs_key_holds_the_sdks_version_not_its_folder() {
+    use blaze_apple_sdk::{Sdk, Unread, XcrunFailed, resolve};
+    use blaze_ids::ContentId;
+
+    use super::{RanAs, parts};
+
+    let sdk = |folder: &'static str, settings: &'static str| -> Sdk<'static> {
+        resolve(Some(folder), || -> Result<&'static str, XcrunFailed<'static>> { panic!("SDKROOT is set") }, |_| -> Result<&'static str, Unread<'static>> { Ok(settings) }).expect("an SDK")
+    };
+    let xcode = sdk("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#);
+    let tools = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#);
+    let older = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk", r#"{"Version":"26.5"}"#);
+    let key = |ran_as: RanAs, sdk: Option<&Sdk<'_>>| parts([(ContentId([1; 32]), ContentId([2; 32]), ran_as)].into_iter(), sdk.map(|sdk| sdk.identity()))[0].1;
+
+    assert_eq!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&tools)), "one SDK version in two folders keyed two native runs");
+    assert_ne!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&older)), "two SDK versions keyed one native run");
+    assert_ne!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, None), "a native run with no SDK keyed as one with an SDK");
+    assert_eq!(key(RanAs::Wasm, Some(&xcode)), key(RanAs::Wasm, Some(&older)), "a wasm run's key moved with the SDK");
+    assert_eq!(key(RanAs::Wasm, Some(&xcode)), key(RanAs::Wasm, None), "a wasm run's key moved with the SDK's presence");
+    println!("sdk keyed by version");
+}
+
+/// The refusal a native script fails with when the command has no SDK is the resolution's own
+/// words: what was tried and how to set `SDKROOT`, never "SDKROOT is not set" alone (the old
+/// refusal, which stopped tempo's check on a plain shell). Prints "refusal names both".
+#[test]
+fn scripts_no_sdk_refusal_names_both_attempts() {
+    use blaze_apple_sdk::{SdkRefused, XcrunFailed};
+    let refused = SdkRefused::Neither { xcrun: XcrunFailed::Exited { status: 1, said: "xcrun: error: invalid active developer path" } };
+    let words = format!("{refused}");
+    assert!(words.contains("SDKROOT is not set, and `xcrun --sdk macosx --show-sdk-path` exited with status 1"), "{words}");
+    assert!(words.contains("export SDKROOT="), "{words}");
+    println!("refusal names both");
+}

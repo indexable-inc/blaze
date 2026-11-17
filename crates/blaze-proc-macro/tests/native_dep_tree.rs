@@ -49,6 +49,9 @@ fn main() {
         child();
         return;
     }
+    // A harness-less test's panic is not a libtest block: it is said on one `error:` line, so a
+    // runner that keeps error lines shows why.
+    std::panic::set_hook(std::boxed::Box::new(|info| eprintln!("error: native_dep_tree: {}", info.to_string().replace('\n', " | "))));
     a_native_script_reads_a_wasm_producers_header();
 }
 
@@ -72,12 +75,18 @@ fn child() {
     println!("cargo::metadata=include={}", std::env::var("DEP_LZ4_INCLUDE").unwrap_or_default());
 }
 
+/// A digest's lowercase hex: a stored file's name in the file area.
+fn hex(digest: &[u8; 32]) -> std::string::String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn producer() -> DepProducer {
     DepProducer {
         tree: Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), git: None },
         root: ScriptRoot::package(),
         out_dir: LZ4_OUT.to_owned(),
         out: Arc::new(vec![("include/lz4.h".to_owned(), HEADER.to_vec())]),
+        stored: Arc::new(std::vec::Vec::new()),
         upstream: Arc::new(std::vec::Vec::new()),
     }
 }
@@ -88,12 +97,12 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
     let alloc = blaze_own::testing::heap().alloc();
     let root = std::env::temp_dir().join(format!("blaze-n8-{}-{name}", std::process::id()));
     _ = std::fs::remove_dir_all(&root);
-    for dir in ["package", "out", "shelf", "sdk", "work"] {
+    for dir in ["package", "out", "shelf", "sdk", "work", "files"] {
         std::fs::create_dir_all(root.join(dir)).expect("a test folder");
     }
     let root = root.canonicalize().expect("the folder's real path");
     let text = |dir: &str| root.join(dir).to_str().expect("a UTF-8 temp path").to_owned();
-    let (package, out, shelf, sdk, work) = (text("package"), text("out"), text("shelf"), text("sdk"), text("work"));
+    let (package, out, shelf, sdk, work, files) = (text("package"), text("out"), text("shelf"), text("sdk"), text("work"), text("files"));
     let exe = std::env::current_exe().expect("the test binary").canonicalize().expect("its real path");
     let exe = exe.to_str().expect("a UTF-8 path").to_owned();
 
@@ -130,6 +139,8 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
     vars.push(pair("DEP_LZ4_INCLUDE", &values[0]));
     vars.push(pair("DEP_LZ4_ROOT", &values[1]));
     vars.push(pair(CHILD, "1"));
+    // `Env` is sorted by name (its `get` searches it).
+    vars.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     let env = Env { vars };
     let c = CInputs {
         shelf: Shelf { dir: &shelf, clang_major: "23" },
@@ -149,16 +160,23 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
         shown: &shown_refs,
         host_tools: &[],
         facts: None,
+        jobs: None,
         limits: RunLimits::STANDARD,
         deadline: Duration::from_secs(60),
+        files: &files,
     };
     let ran = run_script(&script, alloc);
+    // The file the script left is a stored file of the record: its bytes are in the file area
+    // under its digest, read here (before the folder goes) as a reader of the record would.
+    let file = match &ran {
+        Ok(ran) => ran.outputs.stored_file("lz4.h.seen").map(|stored| std::fs::read(format!("{files}/{}", hex(&stored.sha256))).expect("the stored file in the area")).unwrap_or_default(),
+        Err(_) => std::vec::Vec::new(),
+    };
     _ = std::fs::remove_dir_all(&root);
     let ran = ran?;
     let mut seen = std::vec::Vec::new();
     for (key, value) in ran.outputs.metadata.iter() {
-        let file = ran.outputs.file("lz4.h.seen").map(<[u8]>::to_vec).unwrap_or_default();
-        seen.push((key.as_str().to_owned(), value.as_str().to_owned(), file));
+        seen.push((key.as_str().to_owned(), value.as_str().to_owned(), file.clone()));
     }
     Ok(seen)
 }
