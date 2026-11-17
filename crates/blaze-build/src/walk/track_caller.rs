@@ -139,7 +139,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let needs_drop = |_: PTy| false;
         let built = {
             let mut lcx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
-            let mut icx = IntrinsicCx { layouts: &mut self.ls, cx: &mut lcx, needs_drop: &needs_drop };
+            let mut icx = IntrinsicCx { layouts: &mut self.ls, cx: &mut lcx, needs_drop: &needs_drop, ub_checks: adts.ub_checks(), overflow_checks: adts.overflow_checks() };
             intrinsics::build(&mut self.b, &call, &mut icx)
         };
         match built {

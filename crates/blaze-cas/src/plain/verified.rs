@@ -52,6 +52,11 @@ impl Proof {
     pub(crate) fn own(generation: Generation) -> Proof {
         Proof { segment: SegmentId(blaze_ids::ContentId([0; 32])), generation }
     }
+
+    /// Whether this is [`Proof::own`]'s: a record this process put and has not committed.
+    pub(crate) fn is_own(&self) -> bool {
+        self.segment.0.0 == [0; 32]
+    }
 }
 
 impl SegmentProof for Proof {

@@ -98,6 +98,16 @@ impl AssocWhere {
         self.len == 0
     }
 
+    /// The clauses `kept` (at most [`MOST_OUTLIVES`], which the caller checked), as read back
+    /// from a head record (head_record.rs, form 9).
+    pub fn of(kept: &[Outlives]) -> AssocWhere {
+        let mut w = AssocWhere::default();
+        let n = kept.len().min(MOST_OUTLIVES);
+        w.clauses[..n].copy_from_slice(&kept[..n]);
+        w.len = n as u8;
+        w
+    }
+
     fn push(&mut self, o: Outlives, at: Range) -> Result<(), Why> {
         let Some(slot) = self.clauses.get_mut(self.len as usize) else {
             return Err(Why::Unsupported("more than 8 outlives where clauses on one associated type", at));

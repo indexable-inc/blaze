@@ -84,6 +84,12 @@ mod test_run;
 mod toolchain;
 mod units;
 mod work;
+mod engine_check;
+mod engine_names;
+mod engine_pool;
+mod engine_store;
+mod engine_tasks;
+mod engine_units;
 
 use core::fmt;
 
@@ -167,6 +173,8 @@ pub enum CliError {
     /// The pool could not run or join a batch's tasks (its frame not made, or a wait that
     /// stopped); a task's own panic or refusal is a failed task, never this.
     Pool(bstd::task::TaskError),
+    /// `blaze engine-check` stopped (engine_check.rs).
+    EngineCheck(engine_check::EngineCheckError),
     /// A settled input a task needed could not be read (work.rs, `payload`).
     Input { name: blaze_drive::Name, why: work::InputWhy },
     /// [`CliError::Input`] while the job of `task` was made (work.rs): the task and its input.
@@ -222,6 +230,7 @@ impl fmt::Display for CliError {
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
             CliError::Producers(error) => write!(f, "{error}"),
             CliError::Pool(error) => write!(f, "{error}"),
+            CliError::EngineCheck(error) => write!(f, "engine-check: {error}"),
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
             CliError::TaskInput { task, name, why } => write!(f, "the input {name} of the task {task} could not be read while its job was made: {why}"),
             CliError::Shelf(error) => write!(f, "{error}"),
@@ -449,6 +458,9 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
     let args = io.need_args()?;
     let (command, word) = match args.get(1) {
         Some("check") => (Command::Check, "check"),
+        // `check` through the execution engine (engine_check.rs), `check`'s arguments; deleted
+        // at the switch, when `check` itself is this path.
+        Some("engine-check") => return engine_check::run(cx, io, out, phases, heap),
         Some("run") => (Command::Run, "run"),
         Some("test") => (Command::Test, "test"),
         // The commands are `check`, `run`, `test` and, later, `export`: there is no `build`.
@@ -1829,6 +1841,7 @@ mod tests {
     mod fix_tests;
     mod members_tests;
     mod names_records_tests;
+    mod engine_check_tests;
     mod native_image_tests;
     mod include_data_tests;
     mod include_outside_tests;

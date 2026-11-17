@@ -41,6 +41,7 @@ fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
                 let data: std::vec::Vec<_> = data.iter().map(|it| (it.symbol.0[0], it.record.0[0])).collect();
                 std::format!("Data {data:?}")
             }
+            Down::ThreadLocals { descriptor, ender } => std::format!("ThreadLocals {} {}", descriptor.0[0], ender.0[0]),
         });
         at += len;
     }
@@ -176,9 +177,16 @@ const T: u128 = 0xA0E2;
 const HUB: u128 = 0xA008;
 /// Made on demand (`hub`'s callee), the FIRST record of its run to name `S`.
 const ECHO: u128 = 0xA007;
-/// A fn touching a thread-local: its record names the thread-local descriptor, which no
-/// `static` item backs and its entry's statics block does not list ([`toy_named`]).
+/// A fn touching thread-local [`V`]: its entry declares `V` (its template is a row), and its
+/// record names `V`'s template and the thread-local descriptor ([`toy_named`]).
 const THREADY: u128 = 0xA006;
+/// The thread-local `THREADY` touches.
+const V: u128 = 0xA0E3;
+/// The length that marks a thread-local row in a toy entry (a static's is `u32::MAX`).
+const TLS_ROW: u32 = u32::MAX - 1;
+
+/// The thread-locals each item's entry declares.
+const THREAD_LOCALS: [(u128, &[u128]); 1] = [(THREADY, &[V])];
 
 /// Each fn's callees.
 const CALLS: [(u128, &[u128]); 8] = [(MAIN, &[A, B]), (A, &[LEAF]), (B, &[]), (LEAF, &[]), (SHOUT, &[LEAF]), (HUB, &[ECHO, SHOUT]), (ECHO, &[LEAF]), (THREADY, &[])];
@@ -186,9 +194,10 @@ const CALLS: [(u128, &[u128]); 8] = [(MAIN, &[A, B]), (A, &[LEAF]), (B, &[]), (L
 /// The statics each item's entry declares (a fn's code names them; a static's value does).
 const NAMES: [(u128, &[u128]); 4] = [(SHOUT, &[S]), (S, &[T]), (T, &[S]), (ECHO, &[S])];
 
-/// What a toy record names, the model's stand-in for a code record's `Space::Static` targets
-/// (code_records.rs `statics::each_static_named`): its static rows' statics, and for
-/// [`THREADY`] (told by its mark, the last 16 bytes) the thread-local descriptor too.
+/// What a toy record names, the model's stand-in for a code record's `Space::Static` and
+/// `Space::Tls` targets (code_records.rs `statics::each_static_named`): its static rows'
+/// statics, and for a thread-local row its template and the thread-local descriptor (the
+/// emitter's access sequence loads both).
 fn toy_named(entry: &[u8]) -> std::vec::Vec<Symbol> {
     let mut named = std::vec::Vec::new();
     let mut at = 0;
@@ -201,17 +210,19 @@ fn toy_named(entry: &[u8]) -> std::vec::Vec<Symbol> {
             at += 20;
             continue;
         }
+        if len == TLS_ROW {
+            named.push(tls_of(u128::from_le_bytes(wide)));
+            named.push(Symbol(blaze_ladder::symbols::tls_desc_symbol().0));
+            at += 20;
+            continue;
+        }
         at += 20 + len as usize;
-    }
-    let mut mark = [0u8; 16];
-    mark.copy_from_slice(&entry[entry.len() - 16..]);
-    if u128::from_le_bytes(mark) == THREADY {
-        named.push(Symbol(blaze_ladder::symbols::tls_desc_symbol().0));
     }
     named
 }
 
-/// Item `item`'s static rows onto `entry`: each the static's key and the length `u32::MAX`.
+/// Item `item`'s static rows onto `entry`: each the static's key and the length `u32::MAX`;
+/// then its thread-local rows, each the key and [`TLS_ROW`].
 fn static_rows(item: u128, entry: &mut AVec<'_, u8>) {
     for &(_, statics) in NAMES.iter().filter(|(k, _)| *k == item) {
         for s in statics.iter() {
@@ -219,6 +230,16 @@ fn static_rows(item: u128, entry: &mut AVec<'_, u8>) {
             entry.extend_from_slice(&u32::MAX.to_le_bytes());
         }
     }
+    for &(_, locals) in THREAD_LOCALS.iter().filter(|(k, _)| *k == item) {
+        for v in locals.iter() {
+            entry.extend_from_slice(&v.to_le_bytes());
+            entry.extend_from_slice(&TLS_ROW.to_le_bytes());
+        }
+    }
+}
+
+fn tls_of(item: u128) -> Symbol {
+    Symbol(blaze_ladder::symbols::tls_symbol(ItemKey(item)).0)
 }
 
 fn static_of(item: u128) -> Symbol {
@@ -281,7 +302,7 @@ const DIGEST: [u8; 32] = [0xd1; 32];
 
 impl BodyIds for ToyIds {
     fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
-        (CALLS.iter().any(|(f, _)| *f == item.0) || NAMES.iter().any(|(k, _)| *k == item.0)).then(|| BodyId { key: blaze_ids::ContentId::of("run parent test body", &item.0.to_le_bytes()), reads: &self.reads })
+        (CALLS.iter().any(|(f, _)| *f == item.0) || NAMES.iter().any(|(k, _)| *k == item.0) || item.0 == V).then(|| BodyId { key: blaze_ids::ContentId::of("run parent test body", &item.0.to_le_bytes()), reads: &self.reads })
     }
 
     fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
@@ -337,6 +358,13 @@ impl Make for ToyMaker<'_> {
         entry.extend_from_slice(&item.0.to_le_bytes());
         Ok(())
     }
+
+    /// A thread-local's template entry: its mark alone (counted with the others).
+    fn make_thread_local(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        self.calls.set(self.calls.get() + 1);
+        entry.extend_from_slice(&item.0.to_le_bytes());
+        Ok(())
+    }
 }
 
 struct ToyForm;
@@ -352,6 +380,11 @@ impl Form for ToyForm {
             // A static row: its key, the length `u32::MAX`, no name.
             if len == u32::MAX {
                 out.push_static(ItemKey(u128::from_le_bytes(wide)));
+                at += 20;
+                continue;
+            }
+            if len == TLS_ROW {
+                out.push_thread_local(ItemKey(u128::from_le_bytes(wide)));
                 at += 20;
                 continue;
             }
@@ -756,7 +789,7 @@ fn a_record_naming_a_static_told_before_is_no_start_list_row() {
 
     let mut rogue = std::vec::Vec::new();
     let refused = needs.serve(&mut namers, &need(Needed::Symbol(Symbol([4; 32]))), &mut rogue);
-    assert!(matches!(refused, Err(ParentError::StaticUnsent { record, symbol }) if record == [40; 32] && symbol == [0x77; 32]), "{refused:?}");
+    assert!(matches!(refused, Err(ParentError::StaticUnsent { record, symbol, touches_tls: false, .. }) if record == [40; 32] && symbol == [0x77; 32]), "{refused:?}");
     assert!(!frames(&rogue).iter().any(|frame| frame.starts_with("Publish")), "a record naming an unsent static was published: {:?}", frames(&rogue));
     std::println!("run_parent: a record naming a static sent before is no start-list row; one never sent is refused");
 }
@@ -777,6 +810,12 @@ fn statics_before_publish(bytes: &[u8], folder: &ToyFolder) -> Result<usize, std
                     if !sent.insert(datum.symbol.0) {
                         return Err(std::format!("static {:02x?} sent twice", &datum.symbol.0[..6]));
                     }
+                }
+            }
+            // The thread-local descriptor: the child makes it when told (wire/thread_locals.rs).
+            Down::ThreadLocals { descriptor, .. } => {
+                if !sent.insert(descriptor.0) {
+                    return Err(std::format!("the thread-local descriptor {:02x?} told twice", &descriptor.0[..6]));
                 }
             }
             Down::Publish { record, .. } => {
@@ -832,12 +871,13 @@ fn the_wire_checker_catches_a_publish_before_its_data() {
 /// - a second record naming `S` (`shout`), with no `Data`, and the same record published AGAIN;
 /// - the next run's start-list rows placed ahead (`Needs::place_ahead`), then a callee of a
 ///   placed row made on demand: the list holds `hub` and `leaf` alone, never a namer;
-/// - a record touching a thread-local (`thready`): its record names the thread-local
-///   descriptor, which no `Data` sends, so the parent refuses it by name, before any `Publish`.
-///   This is the hello world's stop "record 39483f916dea names static 511cfb82853a, which the
-///   parent did not send before it", moved from the child to the parent.
-/// CONTROL: the planted bug in `the_wire_checker_catches_a_publish_before_its_data`.
-/// Prints "wire: every Publish stands on its statics; 5 + 5 publishes checked; thread-local refused".
+/// - a record touching a thread-local (`thready`, the hello world's old stop): the template of
+///   `V` goes in a `Data` and the descriptor in one `ThreadLocals`, both before its `Publish`;
+///   a second record touching `V` (the same record again) sends neither again.
+/// CONTROLS: the planted bug in `the_wire_checker_catches_a_publish_before_its_data`; and run
+/// 3's messages with the `ThreadLocals` cut out (a parent that never told the descriptor) fail
+/// the checker, naming the descriptor.
+/// Prints "wire: every Publish stands on its statics; 5 + 5 + 1 publishes checked; the descriptor told once, before its first namer".
 #[test]
 fn every_publish_stands_on_its_statics_on_the_wire() {
     let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
@@ -882,16 +922,26 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
     assert_eq!(statics_before_publish(&again, &folder), Ok(5), "run 2: {:?}", frames(&again));
 
     let mut thready = std::vec::Vec::new();
-    let refused = {
+    {
         let mut needs = Needs::new(alloc);
         let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: THREADY }, &mut folder, &mut store, builder(), alloc);
-        needs.serve(&mut lazy, &need(Needed::Symbol(symbol_of(THREADY))), &mut thready)
-    };
+        needs.serve(&mut lazy, &need(Needed::Symbol(symbol_of(THREADY))), &mut thready).expect("a record touching a thread-local served");
+    }
+    let said = frames(&thready);
+    let kinds: std::vec::Vec<&str> = said.iter().map(|frame| frame.split(' ').next().unwrap_or("")).collect();
+    assert_eq!(kinds, ["Declare", "Data", "ThreadLocals", "Publish"], "run 3: {said:?}");
+    assert_eq!(statics_before_publish(&thready, &folder), Ok(1), "run 3: {said:?}");
+    // The control: the same messages with the `ThreadLocals` cut out.
     let tls = blaze_ladder::symbols::tls_desc_symbol().0;
-    let why = refused.expect_err("a record touching a thread-local was published");
-    assert!(matches!(why, ParentError::StaticUnsent { symbol, .. } if symbol == tls), "not refused by the descriptor's name: {why:?}");
-    let shown = std::format!("{why}");
-    assert!(shown.contains("thread-local"), "the refusal does not say thread-local: {shown}");
-    assert_eq!(statics_before_publish(&thready, &folder), Ok(0), "run 3: {:?}", frames(&thready));
-    std::println!("wire: every Publish stands on its statics; 5 + 5 publishes checked; thread-local refused");
+    let mut untold = std::vec::Vec::new();
+    let mut at = 0;
+    while let Some((item, len)) = split(&thready[at..]).expect("run 3's frames") {
+        if !matches!(Down::decode(item), Ok((_, Down::ThreadLocals { .. }))) {
+            untold.extend_from_slice(&thready[at..at + len]);
+        }
+        at += len;
+    }
+    let breach = statics_before_publish(&untold, &folder).expect_err("a Publish naming the descriptor, never told, passed the checker");
+    assert!(breach.contains(&std::format!("{:02x?}", &tls[..6])), "the breach does not name the descriptor: {breach}");
+    std::println!("wire: every Publish stands on its statics; 5 + 5 + 1 publishes checked; the descriptor told once, before its first namer");
 }

@@ -67,7 +67,7 @@ use blaze_typeck::ItemKey;
 
 use crate::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView};
 use crate::code_records::{Builder, CodeKey, CodeStore, ENTRY_FORM, EntryError, EntryView, PanicStrategy, StoreError, triple};
-use crate::symbols::{fn_symbol_of_name, static_symbol};
+use crate::symbols::{fn_symbol_of_name, static_symbol, tls_symbol};
 
 const KEY_DOMAIN: &str = "blaze-ladder code record key 2";
 
@@ -189,22 +189,34 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
 }
 
 /// The instances one entry declares, copied out of its bytes: (tabled fn, name) rows over one
-/// text; and the statics it declares, by item key.
+/// text; and the statics and thread-locals it declares, by item key.
 pub struct DeclaredList<'a> {
     rows: AVec<'a, (ItemKey, u32, u32)>,
     text: AVec<'a, u8>,
     statics: AVec<'a, ItemKey>,
+    thread_locals: AVec<'a, ItemKey>,
 }
 
 impl<'a> DeclaredList<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> DeclaredList<'a> {
-        DeclaredList { rows: Vec::new_in(alloc), text: Vec::new_in(alloc), statics: Vec::new_in(alloc) }
+        DeclaredList { rows: Vec::new_in(alloc), text: Vec::new_in(alloc), statics: Vec::new_in(alloc), thread_locals: Vec::new_in(alloc) }
     }
 
     pub fn clear(&mut self) {
         self.rows.clear();
         self.text.clear();
         self.statics.clear();
+        self.thread_locals.clear();
+    }
+
+    /// A thread-local the entry declares (its record names it): its template is a row.
+    pub fn push_thread_local(&mut self, item: ItemKey) {
+        self.thread_locals.push(item);
+    }
+
+    /// The declared thread-locals, in the entry's order.
+    pub fn thread_locals(&self) -> &[ItemKey] {
+        &self.thread_locals
     }
 
     pub fn push(&mut self, tabled: ItemKey, name: &[u8]) {
@@ -228,9 +240,9 @@ impl<'a> DeclaredList<'a> {
         self.rows.len()
     }
 
-    /// Whether it declares no instance and no static.
+    /// Whether it declares no instance, no static and no thread-local.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.statics.is_empty()
+        self.rows.is_empty() && self.statics.is_empty() && self.thread_locals.is_empty()
     }
 
     /// Row `i`: its tabled fn and its instance name.
@@ -274,6 +286,7 @@ impl Form for EntryForm {
             |e| e,
         )?;
         view.each_static(|item| out.push_static(item));
+        view.each_thread_local(|item| out.push_thread_local(item));
         Ok(())
     }
 }
@@ -288,13 +301,18 @@ pub trait Make {
     /// Appends to `entry` the entry of static `item` (code_records.rs `statics`): its
     /// initializer evaluated, its value made a datum.
     fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
+    /// Appends to `entry` the TEMPLATE entry of thread-local `item` (code_records.rs
+    /// `statics::make_template_entry`): its initial value made a read-only datum.
+    fn make_thread_local(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
 }
 
-/// What a walk row is: a fn instance (its code record) or a static (its datum).
+/// What a walk row is: a fn instance (its code record), a static (its datum) or a thread-local
+/// (its template's datum, under symbols.rs `tls_symbol`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RowKind {
     Instance,
     Static,
+    ThreadLocal,
 }
 
 /// A static's row name: its item's key and no arguments (an instance name's form, so
@@ -605,6 +623,7 @@ impl<'a> Walk<'a> {
         let symbol = match kind {
             RowKind::Instance => fn_symbol_of_name(name),
             RowKind::Static => static_symbol(tabled),
+            RowKind::ThreadLocal => tls_symbol(tabled),
         };
         match self.find(&symbol) {
             Ok(row) if self.tabled[row] == tabled => Ok(row),
@@ -714,6 +733,7 @@ impl<'a> Walk<'a> {
             match self.kinds[row] {
                 RowKind::Instance => make.make(tabled, name.as_slice(), made),
                 RowKind::Static => make.make_static(tabled, made),
+                RowKind::ThreadLocal => make.make_thread_local(tabled, made),
             }
             .map_err(|why| WalkError::Make { tabled, why })?;
             form.declared(made.as_slice(), declared).map_err(|why| WalkError::Entry { tabled, found: false, why })?;
@@ -724,16 +744,17 @@ impl<'a> Walk<'a> {
         // The declared rows, reached in the entry's order; on a refusal the row's edges so far
         // are dropped and the row stays waiting.
         let start = self.edges.len();
-        for i in 0..declared.len() + declared.statics().len() {
-            let reached = match i.checked_sub(declared.len()) {
-                None => {
-                    let (callee, callee_name) = declared.row(i);
-                    self.reach(callee, callee_name, RowKind::Instance, most)
-                }
-                Some(s) => {
-                    let item = declared.statics()[s];
-                    self.reach(item, &static_name(item), RowKind::Static, most)
-                }
+        let (instances, statics) = (declared.len(), declared.statics().len());
+        for i in 0..instances + statics + declared.thread_locals().len() {
+            let reached = if i < instances {
+                let (callee, callee_name) = declared.row(i);
+                self.reach(callee, callee_name, RowKind::Instance, most)
+            } else if i < instances + statics {
+                let item = declared.statics()[i - instances];
+                self.reach(item, &static_name(item), RowKind::Static, most)
+            } else {
+                let item = declared.thread_locals()[i - instances - statics];
+                self.reach(item, &static_name(item), RowKind::ThreadLocal, most)
             };
             match reached {
                 Ok(callee_row) => self.edges.push(callee_row as u32),
@@ -841,6 +862,10 @@ mod tests {
         fn make_static(&mut self, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             panic!("the five-instance model declares no static");
         }
+
+        fn make_thread_local(&mut self, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            panic!("the five-instance model declares no thread-local");
+        }
     }
 
     /// The statics model: `main` (crate `app`) names static `S` (crate `app`), whose value
@@ -870,6 +895,10 @@ mod tests {
                 entry.extend_from_slice(&u32::MAX.to_le_bytes());
             }
             Ok(())
+        }
+
+        fn make_thread_local(&mut self, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            panic!("the statics model declares no thread-local");
         }
     }
 

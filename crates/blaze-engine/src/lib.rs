@@ -29,6 +29,6 @@ pub mod engine;
 mod sim;
 
 pub use crate::engine::{
-    Answer, Buffer, CellId, Done, Edit, Engine, EngineError, Everything, Finished, Gen, Made, Phase, Plant, Planned, Pool,
-    Report, Row, SMap, SSet, SVec, Scope, Stage, Task, View, drive,
+    Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Entered, Everything, Finished, Gen, Made, Phase, Plant,
+    Planned, Pool, Report, Row, SMap, SSet, STAGES, SVec, Scope, Stage, StageCount, Task, Tools, View, drive,
 };

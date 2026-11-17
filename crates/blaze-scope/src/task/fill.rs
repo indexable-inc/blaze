@@ -60,6 +60,13 @@ pub trait Par {
     fn decided(&self, krate: &str, check: &crate::DecideCheck<'_, &str>) {
         let _ = (krate, check);
     }
+
+    /// E4: each crate's names written per group too ([`crate::CrateNames::groups`],
+    /// cells/groups.rs). Off by default: only a caller that reads the groups asks (its tests,
+    /// and the engine once it plans names by group); the command's `CrateScope` does not.
+    fn names_groups(&self) -> bool {
+        false
+    }
 }
 
 /// The stretches of one crate's solve, in the order a solve passes them ([`Par::stage`]).

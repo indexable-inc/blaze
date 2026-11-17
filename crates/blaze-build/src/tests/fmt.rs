@@ -164,6 +164,10 @@ impl Adts for FmtAdts<'_> {
         self.inner.overflow_checks()
     }
 
+    fn ub_checks(&self) -> crate::UbChecks {
+        self.inner.ub_checks()
+    }
+
     fn facts(&self) -> &dyn LayoutFacts {
         self.inner.facts()
     }

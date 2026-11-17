@@ -61,14 +61,36 @@ pub type SSet<'a, T> = BTreeSet<T, SharedAlloc<'a>>;
 /// What a phase does, in the order a request runs them.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Stage {
+    /// The manifests, the lock, the unit graph and the fetched sources: the records the rest of
+    /// the plan is made from (the crates and their dependency depths). Its own stage, first,
+    /// because every later task's plan and key come from it, and nothing of it reads code.
+    Units = 0,
     /// One file's outline: its items and the cells of their text.
-    Outlines = 0,
+    Outlines = 1,
     /// Names: crates in dependency waves, modules inside.
-    Names = 1,
+    Names = 2,
     /// Frozen heads and impl tables.
-    Heads = 2,
+    Heads = 3,
     /// Bodies, at body grain.
-    Bodies = 3,
+    Bodies = 4,
+}
+
+/// Each kind's tool, by `Kind::index` (decision D105): a task's key is its kind's tool's, so an
+/// edit of one producer moves only its kinds' keys (rule 52: a change of the type checker never
+/// moves an outline's key).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tools(pub [Tool; key::KINDS]);
+
+impl Tools {
+    /// The tool `name`'s kind is made by.
+    pub fn of(&self, name: Name) -> Tool {
+        self.0[name.kind.index()]
+    }
+
+    /// The key of the task `name` over `source`.
+    pub fn key(&self, name: Name, source: &ContentId) -> Key {
+        key::task_key(self.of(name), name, source)
+    }
 }
 
 /// One phase: a stage and a wave in it (a crate's names after its dependencies').
@@ -82,6 +104,68 @@ impl Phase {
     pub const fn new(stage: Stage, wave: u16) -> Phase {
         Phase { stage, wave }
     }
+}
+
+impl Stage {
+    /// Every stage, in phase order: `Stage::ALL[stage.index()] == stage`.
+    pub const ALL: [Stage; STAGES] = [Stage::Units, Stage::Outlines, Stage::Names, Stage::Heads, Stage::Bodies];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// How many stages there are.
+pub const STAGES: usize = 5;
+
+/// Why a task was entered: the first reason the engine found, in this order. Kept for every
+/// entered task and nothing for a task that stood, so a profile says why each was redone and
+/// `blaze why` can walk the chain back to the edit (engine.md, E6 telemetry).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Cause {
+    /// No row of it: never made, or removed.
+    New,
+    /// Its key moved: its own text (its source), or its tool.
+    KeyMoved,
+    /// Its key stands and a cell it read moved: the first such in its sorted read list, the
+    /// digest its row saw and the digest today. The cell's defining task is `read.of`.
+    ReadMoved { read: CellId, was: ContentId, now: ContentId },
+    /// Owed from an earlier request whose scope did not run it, its key and reads standing.
+    Owed,
+    /// Made inline by another task of its phase (no file's plan lists it).
+    Inline,
+}
+
+impl Cause {
+    /// The cause's kind, for counting causes in a table.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Cause::New => "new",
+            Cause::KeyMoved => "key moved",
+            Cause::ReadMoved { .. } => "read moved",
+            Cause::Owed => "owed",
+            Cause::Inline => "inline",
+        }
+    }
+}
+
+/// One entered task's row: its name, its phase, why it was entered, and whether its result came
+/// out the same bytes as its last row's (`out` equal): a wasted entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Entered {
+    pub name: Name,
+    pub phase: Phase,
+    pub cause: Cause,
+    pub identical: bool,
+}
+
+/// One stage's entries in a request: how many were entered, and of those how many came out the
+/// same bytes as their last row (early cutoff: such a task moves no cell, so no reader of it is
+/// entered for it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StageCount {
+    pub entered: u32,
+    pub identical: u32,
 }
 
 /// A request's number: each answer is one more than the last.
@@ -225,7 +309,12 @@ impl<'a> Answer<'a> {
 
     /// Whether `name`'s row saw today's digest of every cell it read.
     fn today(&self, row: &Row<'_>) -> bool {
-        row.reads.iter().all(|(id, seen)| self.cell(id) == *seen)
+        self.first_moved(row).is_none()
+    }
+
+    /// The first read of `row`, in its sorted order, whose cell moved since the row saw it.
+    fn first_moved(&self, row: &Row<'_>) -> Option<Cause> {
+        row.reads.iter().find(|(id, seen)| self.cell(id) != *seen).map(|(id, seen)| Cause::ReadMoved { read: *id, was: *seen, now: self.cell(id) })
     }
 }
 
@@ -264,6 +353,8 @@ pub enum Plant {
     /// A failed task writes no row and is owed, so every later request enters it again (tempo,
     /// tag g090627: 744 bodies with no record made nothing-changed 25 s instead of 0.09 s).
     FailureNotKept,
+    /// A task entered for a moved read is said to be entered for its key.
+    WrongCause,
 }
 
 /// What one request did.
@@ -279,6 +370,8 @@ pub struct Report {
     pub phases: u32,
     /// Nothing entered and nothing moved: the answer is the last one.
     pub certified: bool,
+    /// Each stage's entries, by [`Stage::index`].
+    pub stages: [StageCount; STAGES],
 }
 
 /// Why a request stopped. Each names the thing (rule 19).
@@ -322,6 +415,8 @@ pub struct Finished<'a> {
     pub report: Report,
     /// The names entered, in phase order and name order within a phase.
     pub entered: SVec<'a, Name>,
+    /// Why each was entered, in the same order as `entered`.
+    pub causes: SVec<'a, Entered>,
 }
 
 /// The read-only view a task reads the tables through (E2 grows it): `Copy + Sync`, one per
@@ -360,7 +455,7 @@ pub trait Pool<'a> {
 /// One request's engine.
 pub struct Engine<'a, S: Scope> {
     alloc: SharedAlloc<'a>,
-    tool: Tool,
+    tools: Tools,
     plant: Plant,
     scope: S,
     answer: Answer<'a>,
@@ -372,9 +467,12 @@ pub struct Engine<'a, S: Scope> {
     /// The open phase and its tasks, sorted by name.
     open: Option<Phase>,
     tasks: SVec<'a, Task>,
+    /// Why each of the open phase's tasks was entered, in `tasks`' order.
+    opened: SVec<'a, Cause>,
     /// Cells moved this request.
     moved: SSet<'a, CellId>,
     entered: SVec<'a, Name>,
+    causes: SVec<'a, Entered>,
     report: Report,
 }
 
@@ -382,11 +480,11 @@ impl<'a, S: Scope> Engine<'a, S> {
     /// Plans a request from the last answer and the edit (invariant 1): each changed file's
     /// tasks whose key moved, its tasks gone (their cells move to absent), the owed tasks, and
     /// the readers of the owed cells.
-    pub fn new_in(tool: Tool, answer: Answer<'a>, edit: &Edit<'_>, scope: S, plant: Plant, alloc: SharedAlloc<'a>) -> Result<Engine<'a, S>, EngineError> {
+    pub fn new_in(tools: Tools, answer: Answer<'a>, edit: &Edit<'_>, scope: S, plant: Plant, alloc: SharedAlloc<'a>) -> Result<Engine<'a, S>, EngineError> {
         let serial = Gen(answer.serial.0 + 1);
         let mut engine = Engine {
             alloc,
-            tool,
+            tools,
             plant,
             scope,
             answer,
@@ -395,8 +493,10 @@ impl<'a, S: Scope> Engine<'a, S> {
             planned: BTreeMap::new_in(alloc),
             open: None,
             tasks: Vec::new_in(alloc),
+            opened: Vec::new_in(alloc),
             moved: BTreeSet::new_in(alloc),
             entered: Vec::new_in(alloc),
+            causes: Vec::new_in(alloc),
             report: Report::default(),
         };
         for (file, plan) in edit.files.iter() {
@@ -414,7 +514,7 @@ impl<'a, S: Scope> Engine<'a, S> {
                 }
             }
             for planned in plan.iter() {
-                let key = key::task_key(tool, planned.name, &planned.source);
+                let key = tools.key(planned.name, &planned.source);
                 if engine.answer.rows.get(&planned.name).is_none_or(|row| row.key != key) {
                     engine.candidate(*planned, None)?;
                 }
@@ -453,23 +553,35 @@ impl<'a, S: Scope> Engine<'a, S> {
         }
         while let Some((phase, names)) = self.pending.pop_first() {
             self.tasks.clear();
+            self.opened.clear();
             for name in names.iter() {
                 let Some(planned) = self.planned_of(*name) else { continue };
                 if !self.scope.runs(&planned) {
                     self.report.not_run += 1;
-                    let key = key::task_key(self.tool, planned.name, &planned.source);
+                    let key = self.tools.key(planned.name, &planned.source);
                     if self.answer.rows.get(name).is_none_or(|row| row.key != key) {
                         self.answer.owed_tasks.insert(*name, planned);
                     }
                     continue;
                 }
-                let key = key::task_key(self.tool, planned.name, &planned.source);
+                let key = self.tools.key(planned.name, &planned.source);
                 let stands = self.answer.rows.get(name).is_some_and(|row| {
                     row.key == key && !self.answer.owed_tasks.contains_key(name) && (self.plant == Plant::ReadsNotCompared || self.answer.today(row))
                 });
                 if stands {
                     continue;
                 }
+                // Why, in the order the test above reads it: no row, its key, a read, owed.
+                let cause = match self.answer.rows.get(name) {
+                    None => Cause::New,
+                    Some(row) if row.key != key => Cause::KeyMoved,
+                    Some(row) => match self.answer.first_moved(row) {
+                        Some(_) if self.plant == Plant::WrongCause => Cause::KeyMoved,
+                        Some(moved) => moved,
+                        None => Cause::Owed,
+                    },
+                };
+                self.opened.push(cause);
                 self.tasks.push(Task { planned, key });
             }
             if !self.tasks.is_empty() {
@@ -508,6 +620,7 @@ impl<'a, S: Scope> Engine<'a, S> {
         done.sort_unstable_by_key(|d| d.name);
         made.sort_unstable_by_key(|m| m.planned.name);
         let tasks = core::mem::replace(&mut self.tasks, Vec::new_in(self.alloc));
+        let opened = core::mem::replace(&mut self.opened, Vec::new_in(self.alloc));
         // Both sorted by name: matched one to one, or the first mismatch named.
         for at in 0..tasks.len().max(done.len()) {
             match (tasks.get(at), done.get(at)) {
@@ -528,15 +641,16 @@ impl<'a, S: Scope> Engine<'a, S> {
         // Results are in task order now: both are sorted by name and matched one to one.
         self.report.results += done.len() as u32;
         let mut done_iter = done.into_iter();
-        for task in tasks.iter() {
+        for (task, cause) in tasks.iter().zip(opened.iter()) {
             let result = done_iter.next().ok_or(EngineError::NoResult { name: task.planned.name })?;
-            self.apply(task.planned, result, phase, false)?;
+            let identical = self.apply(task.planned, result, phase, false)?;
+            self.count(task.planned, *cause, identical);
         }
         if self.plant != Plant::MadeDropped {
             let mut last: Option<Name> = None;
             let mut kept: SVec<'a,Made<'a>> = Vec::new_in(self.alloc);
             for one in made.into_iter() {
-                let key = key::task_key(self.tool, one.planned.name, &one.planned.source);
+                let key = self.tools.key(one.planned.name, &one.planned.source);
                 if one.done.key != key {
                     return Err(EngineError::KeyMoved { name: one.planned.name, planned: key, got: one.done.key });
                 }
@@ -558,7 +672,8 @@ impl<'a, S: Scope> Engine<'a, S> {
                 self.report.entered += 1;
                 self.report.results += 1;
                 self.entered.push(one.planned.name);
-                self.apply(one.planned, one.done, phase, true)?;
+                let identical = self.apply(one.planned, one.done, phase, true)?;
+                self.count(one.planned, Cause::Inline, identical);
             }
         }
         Ok(())
@@ -594,7 +709,15 @@ impl<'a, S: Scope> Engine<'a, S> {
         }
         self.answer.serial = self.serial;
         self.report.certified = self.report.entered == 0 && self.moved.is_empty();
-        Ok(Finished { answer: self.answer, report: self.report, entered: self.entered })
+        Ok(Finished { answer: self.answer, report: self.report, entered: self.entered, causes: self.causes })
+    }
+
+    /// One entered task's cause row, and its stage's counts.
+    fn count(&mut self, planned: Planned, cause: Cause, identical: bool) {
+        self.causes.push(Entered { name: planned.name, phase: planned.phase, cause, identical });
+        let stage = &mut self.report.stages[planned.phase.stage.index()];
+        stage.entered += 1;
+        stage.identical += u32::from(identical);
     }
 
     fn planned_of(&self, name: Name) -> Option<Planned> {
@@ -676,13 +799,16 @@ impl<'a, S: Scope> Engine<'a, S> {
         }
     }
 
-    fn apply(&mut self, planned: Planned, done: Done<'a>, phase: Phase, inline: bool) -> Result<(), EngineError> {
+    /// Applies one result; true when it came out the same bytes as the task's last row (`out`
+    /// equal), a wasted entry.
+    fn apply(&mut self, planned: Planned, done: Done<'a>, phase: Phase, inline: bool) -> Result<bool, EngineError> {
         let name = planned.name;
+        let identical = self.answer.rows.get(&name).is_some_and(|old| old.out == done.out);
         if done.failed {
             self.report.failed += 1;
             if self.plant == Plant::FailureNotKept {
                 self.answer.owed_tasks.insert(name, planned);
-                return self.remove_row(name, Some(phase));
+                return self.remove_row(name, Some(phase)).map(|()| identical);
             }
         }
         self.answer.owed_tasks.remove(&name);
@@ -770,7 +896,7 @@ impl<'a, S: Scope> Engine<'a, S> {
                 }
             }
         }
-        Ok(())
+        Ok(identical)
     }
 
     /// The readers of an inline record's moved cell: those of later phases are candidates; one

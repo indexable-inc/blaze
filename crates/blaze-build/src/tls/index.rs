@@ -33,41 +33,17 @@ use blaze_lir::{BuildError, Builder, Flags, Full, IntCond, Op, Ty};
 
 use super::NO_MEMORY_TRAP;
 
-/// The descriptor's fields: byte offsets, and its size.
-pub const DESC_KEY: i32 = 0;
-pub const DESC_ROOT: i32 = 8;
-pub const DESC_COUNT: i32 = 16;
-pub const DESC_CAP: i32 = 24;
-pub const DESC_VARS: i32 = 32;
-pub const DESC_BYTES: usize = 40;
-
-/// Bit 63 of the descriptor's `root`: the Linux form, where the root is the launcher's own
-/// thread-local and the getter stores the table's address there itself.
-pub const ROOT_OWN: u64 = 1 << 63;
-
-/// A `VarRow`'s fields: byte offsets, and its size.
-pub const ROW_SIZE: i32 = 0;
-pub const ROW_ALIGN: i32 = 8;
-pub const ROW_INIT: i32 = 16;
-pub const ROW_INIT_LEN: i32 = 24;
-pub const ROW_BYTES: usize = 32;
-
-/// A thread's table header: byte offsets; the slots start at [`TABLE_SLOTS`].
-pub const TABLE_LEN: i32 = 0;
-pub const TABLE_ROUNDS: i32 = 8;
-pub const TABLE_DESC: i32 = 16;
-pub const TABLE_ROOT_AT: i32 = 24;
-pub const TABLE_SLOTS: i32 = 32;
+// The forms' one home is blaze-code's `tls` (the launcher's run mode writes them too).
+pub use blaze_code::tls::{
+    CAP, DESC_BYTES, DESC_CAP, DESC_COUNT, DESC_KEY, DESC_ROOT, DESC_VARS, ROOT_OWN, ROW_ALIGN, ROW_BYTES, ROW_INIT,
+    ROW_INIT_LEN, ROW_SIZE, TABLE_DESC, TABLE_LEN, TABLE_ROOT_AT, TABLE_ROUNDS, TABLE_SLOTS, var_row,
+};
 
 /// The destructor round the ender frees in: PTHREAD_DESTRUCTOR_ITERATIONS is 4 on macOS and
 /// glibc (the test asserts `sysconf(_SC_THREAD_DESTRUCTOR_ITERATIONS) >= 4`). The program's own
 /// thread-local destructors (std's `run_dtors`, through `_tlv_atexit` on macOS) run in the
 /// rounds before.
 pub const ROUNDS: u64 = 4;
-
-/// The rows reserved at start: a thread-local past it is a typed refusal naming it (the run
-/// path's numbering, blaze-ladder `tls_index.rs`).
-pub const CAP: u64 = 65_536;
 
 /// The getter's references, by place: each an outside function called directly.
 pub const GETTER_IMPORTS: [&str; 6] =
@@ -91,17 +67,6 @@ const LEAST_ALIGN: u64 = 16;
 
 /// The least slots a fresh table has.
 const LEAST_SLOTS: u64 = 16;
-
-/// One `VarRow`, little-endian: `size`, `align`, `init`, `init_len`.
-pub fn var_row(size: u64, align: u64, init: u64, init_len: u64) -> [u8; 32] {
-    let mut row = [0u8; ROW_BYTES];
-    let fields = [(ROW_SIZE, size), (ROW_ALIGN, align), (ROW_INIT, init), (ROW_INIT_LEN, init_len)];
-    for (at, value) in fields {
-        let at = at as usize;
-        row[at..at + 8].copy_from_slice(&value.to_le_bytes());
-    }
-    row
-}
 
 /// The getter: `fn(desc: *const Desc, index: u64, root_at: *mut *mut u8) -> *mut u8` (C
 /// convention), the calling thread's copy of thread-local `index`, made on its first touch.

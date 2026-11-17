@@ -124,12 +124,14 @@ pub trait SourceTexts<'a> {
         Err(REFUSED)
     }
 
-    /// Why the proc macro `def`, called in the crate at `krate`, cannot run, when a run of it
-    /// was refused ([`SourceTexts::run_proc_macro`]'s bare `HostError`): the runner's words
+    /// Why the proc macro `def`, called in the crate at `krate`, was refused, asked just after a
+    /// run of it was ([`SourceTexts::run_proc_macro`]'s bare `HostError`): the runner's words
     /// naming the macro's crate and why its module cannot run the macro (not in the store under
-    /// the key asked, does not load, exports no such macro). `None`: nothing about the module
-    /// stops it (the run itself failed), or no runner here (a test's table).
-    fn proc_macro_unusable(&self, krate: usize, def: &MacroDefinition<'_>) -> Option<&'a str> {
+    /// the key asked, does not load, exports no such macro: [`ProcUnusable::Module`]), or, its
+    /// module able to, why that run stopped ([`ProcUnusable::Run`]: a sandbox limit naming the
+    /// path as the macro named it, a variable, a failure). `None`: the runner kept no words, or
+    /// no runner here (a test's table).
+    fn proc_macro_unusable(&self, krate: usize, def: &MacroDefinition<'_>) -> Option<ProcUnusable<'a>> {
         let _ = (krate, def);
         None
     }
@@ -402,12 +404,13 @@ pub enum ExpandNote<'a> {
     /// A call written in an expansion whose input is no range of that expansion's tokens
     /// ([`crate::nested_input`]): refused, never lexed from the rendered text.
     NestedInput { macro_name: &'a str, error: crate::nested_input::NestedInputError },
-    /// A proc macro whose crate's module cannot run it, and why ([`SourceTexts::proc_macro_unusable`]):
-    /// the runner's own words in place of the expander's bare `HostError`.
+    /// A proc macro the host refused to run, and why ([`SourceTexts::proc_macro_unusable`]): its
+    /// crate's module cannot run it, or its run stopped; the runner's own words in place of the
+    /// expander's bare `HostError`.
     ProcModule { macro_name: &'a str, why: ProcUnusable<'a> },
 }
 
-/// Why a proc macro's crate cannot run it ([`ExpandNote::ProcModule`]).
+/// Why the host refused a proc macro's run ([`ExpandNote::ProcModule`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProcUnusable<'a> {
     /// No runner knows the crate: it has no runner key ([`SourceTexts::proc_macro_key`]), so
@@ -416,6 +419,10 @@ pub enum ProcUnusable<'a> {
     /// The runner's words: which crate, and why its module cannot run the macro (not in the
     /// store under the key asked, does not load, exports no such macro).
     Module(&'a str),
+    /// The module ran the macro and the run stopped: the runner's words naming what stopped it
+    /// as the macro saw it (its sandbox refusing a path, by the path from the tree it is
+    /// served; a limit; a variable this build does not know; a failure). Rule 19.
+    Run(&'a str),
 }
 
 /// Why a call nested in an eager builtin's input is not expanded.
@@ -546,6 +553,10 @@ pub struct CrateNames<'a> {
     pub expansions: HashMap<ItemKey, Expansion<'a>, Alloc<'a>>,
     /// Each module's finished scope and the read list it is valid by.
     pub done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>>,
+    /// The written modules by group (E4, cells/groups.rs): one record per strongly connected
+    /// component of their reads, sorted by first member. Empty unless the caller asked
+    /// ([`crate::task::Par::names_groups`]).
+    pub groups: AVec<'a, crate::NameGroup<'a>>,
     /// The modules whose task failed, and why.
     pub failed: HashMap<ItemKey, TaskError, Alloc<'a>>,
     pub report: FillReport,
@@ -1254,6 +1265,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let mut fill: Fill<'a, &'a str> = Fill::new_in(alloc);
     fill.first = first;
     let added_externs: AVec<'a, (&'a str, ItemKey)>;
+    let shapes: AVec<'a, crate::GroupShape<'a>>;
     {
         let base = Base {
             index,
@@ -1286,13 +1298,14 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
         };
         let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
-        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, par.decide_check(), alloc)
+        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, par.decide_check(), par.names_groups(), alloc)
             .map_err(|error| NamesError::Cells { krate: input.name, error })?;
         if let Some(check) = &solved.decide {
             par.decided(input.name, check);
         }
         fill.done = solved.done;
         added_externs = solved.added_externs;
+        shapes = solved.groups;
     }
     // The extern prelude of the record is the whole one: the root's macro-written `extern crate`
     // items' names too (libc's `cfg_if! { extern crate rustc_std_workspace_core as core; }`
@@ -1315,6 +1328,9 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     // Each refused call into its module's scope: what a dependent's lookup behind it reads.
     let expansions_now = held(run.expansions.lock(), "expansions");
     crate::refused::write_refused(&mut done, &expansions_now, alloc);
+    // E4: each group's record, over the final scopes and its members' expansions.
+    let made_text = |call: ItemKey| expansions_now.get(&call).and_then(|x| x.made).map(|m| m.text);
+    let groups = crate::write_groups(&shapes, &done, &made_text, alloc).map_err(|error| NamesError::Cells { krate: input.name, error: crate::cells::Unwritten::Groups(error) })?;
     drop(expansions_now);
     let failed = core::mem::replace(&mut fill.failed, HashMap::new_in(alloc));
     let report = fill.report;
@@ -1346,6 +1362,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         made,
         expansions: held(expansions.into_inner(), "expansions"),
         done,
+        groups,
         failed,
         report,
         notes,
@@ -2402,14 +2419,15 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let expansion = match expanded {
         Ok(expansion) => expansion,
         // A proc macro's run the host refused: the runner says why its module cannot run it
-        // (the crate, and the module key asked or the load's error), when the module is why.
+        // (the crate, and the module key asked or the load's error), or why its run stopped
+        // (the path its sandbox refused, as the macro named it).
         Err(why) => {
             let module = match why {
                 ExpandNote::Expand { error: ExpandError::Host(HostError { ask: HostAsk::ProcMacro, .. }), .. } => base.sources.proc_macro_unusable(base.index, def.def()),
                 _ => None,
             };
             match module {
-                Some(words) => note(ExpandNote::ProcModule { macro_name: mac.name, why: ProcUnusable::Module(words) }),
+                Some(why) => note(ExpandNote::ProcModule { macro_name: mac.name, why }),
                 None => note(why),
             }
             return None;

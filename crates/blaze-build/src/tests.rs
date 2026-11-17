@@ -266,6 +266,8 @@ struct TestWorld {
     panic: crate::Panic,
     /// What [`Adts::overflow_checks`] answers.
     overflow: crate::OverflowChecks,
+    /// What [`Adts::ub_checks`] answers.
+    ub: crate::UbChecks,
     fns: Vec<Fun, Global>,
     structs: Vec<Struct, Global>,
     /// The fns declared `extern "C"`; every other is of the Rust ABI.
@@ -361,6 +363,9 @@ impl TestWorld {
             panic: crate::Panic::Abort,
             // The fixture's bodies were written for wrapping arithmetic (the release setting).
             overflow: crate::OverflowChecks::Off,
+            // As the record path's baseline settings (blaze-ladder code_records.rs), no debug
+            // assertions.
+            ub: crate::UbChecks::Off,
             fns: Vec::new_in(Global),
             structs: Vec::new_in(Global),
             c_abi: Vec::new_in(Global),
@@ -811,6 +816,10 @@ impl Adts for TestAdts<'_> {
 
     fn overflow_checks(&self) -> crate::OverflowChecks {
         self.world.overflow
+    }
+
+    fn ub_checks(&self) -> crate::UbChecks {
+        self.world.ub
     }
 
     fn static_item(&self, item: ItemKey) -> Option<StaticItem> {
@@ -2161,6 +2170,64 @@ fn transmute_keeps_the_bytes() {
     let root = b.block(&[Stmt::Let { pat: a, ty: Some(arr_ty), init: Some(call), else_: None }], Some(sum));
     let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(one(&built, &[]), 42);
+}
+
+/// core's `ub_checks()` reached through the intrinsic table (core ub_checks.rs
+/// `check_language_ub`'s shape, `.. && intrinsics::ub_checks()` guarding a precondition):
+/// ```text
+/// fn main(x: u32) -> u32 { if ub_checks() { if x < 10 { 1 } else { 2 } } else { 3 } }
+/// ```
+/// The answer is the building profile's (`Adts::ub_checks`): with the checks on the
+/// precondition is checked (1 for 5, 2 for 12), with them off it is not (3). And
+/// `overflow_checks()` answers the overflow setting the same way. A builder that ignored the
+/// setting answers one of the two settings wrongly.
+/// Prints "ub_checks: on 1 2, off 3 3; overflow_checks: on 1, off 0".
+#[test]
+fn ub_checks_is_the_building_profiles_answer() {
+    let body = |b: &mut BodyBuf| {
+        let x = b.bind("x");
+        b.params.push(x);
+        let asked = b.call("ub_checks", &[]);
+        let x_e = b.local(x);
+        let ten = b.int(10, SU32);
+        let cond = b.bin(BinOp::Lt, x_e, ten);
+        let one_ = b.int(1, SU32);
+        let then_in = b.block(&[], Some(one_));
+        let two = b.int(2, SU32);
+        let else_in = b.block(&[], Some(two));
+        let inner = b.e(Expr::If { cond, then: then_in, else_: Some(else_in) });
+        let then = b.block(&[], Some(inner));
+        let three = b.int(3, SU32);
+        let else_ = b.block(&[], Some(three));
+        b.e(Expr::If { cond: asked, then, else_: Some(else_) })
+    };
+    let mut seen = std::vec::Vec::new();
+    for ub in [crate::UbChecks::On, crate::UbChecks::Off] {
+        let mut w = TestWorld::new();
+        w.ub = ub;
+        w.func(1, "main", &[U32], U32);
+        w.func(6, "ub_checks", &[], PNode::Bool);
+        w.intrinsics.push((ItemKey(6), Intrinsic::Table(crate::intrinsics::Which::UbChecks)));
+        let mut b = BodyBuf::new();
+        let root = body(&mut b);
+        let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+        seen.push((one(&built, &[Val::Int(5)]), one(&built, &[Val::Int(12)])));
+    }
+    assert_eq!(seen, [(1, 2), (3, 3)], "ub_checks() under On, then Off");
+    let mut flows = std::vec::Vec::new();
+    for overflow in [crate::OverflowChecks::On, crate::OverflowChecks::Off] {
+        let mut w = TestWorld::new();
+        w.overflow = overflow;
+        w.func(1, "main", &[], PNode::Bool);
+        w.func(6, "overflow_checks", &[], PNode::Bool);
+        w.intrinsics.push((ItemKey(6), Intrinsic::Table(crate::intrinsics::Which::OverflowChecks)));
+        let mut b = BodyBuf::new();
+        let root = b.call("overflow_checks", &[]);
+        let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+        flows.push(one(&built, &[]));
+    }
+    assert_eq!(flows, [1, 0], "overflow_checks() under On, then Off");
+    std::println!("ub_checks: on {} {}, off {} {}; overflow_checks: on {}, off {}", seen[0].0, seen[0].1, seen[1].0, seen[1].1, flows[0], flows[1]);
 }
 
 /// `panic_bounds_check` on the host: an index out of bounds stops the test.

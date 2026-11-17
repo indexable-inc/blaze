@@ -72,9 +72,9 @@ fn goals_per_sec(label: &str, w: &World, tys: &mut TestTys, env_clauses: &[Claus
         "{label:<40} {:>12.0} goals/s  ({n} goals, {:.1} ms; frames {}, cache hits {}, fast path {})",
         n as f64 / dt,
         dt * 1e3,
-        solver.stats.frames,
-        solver.stats.cache_hits,
-        solver.stats.fast_path
+        solver.stats().frames,
+        solver.stats().cache_hits,
+        solver.stats().fast_path
     );
 }
 

@@ -15,7 +15,7 @@ use blaze_own::{SharedAlloc, Vec};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::engine::{
-    Answer, Buffer, CellId, Done, Edit, Engine, EngineError, Finished, Made, Phase, Plant, Planned, Pool, SVec, Scope, Stage, Task, View, drive,
+    Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Finished, Made, Phase, Plant, Planned, Pool, SVec, Scope, Stage, Task, View, drive,
 };
 
 const TOOL: Tool = Tool(ContentId([7; 32]));
@@ -294,7 +294,7 @@ fn request(
     pool: Pools,
 ) -> Result<Finished<'static>, EngineError> {
     let files: StdVec<(Name, &[Planned])> = changed.iter().map(|(name, plan)| (*name, plan.as_slice())).collect();
-    let mut engine = Engine::new_in(TOOL, answer, &Edit { files: &files }, scope, plant, alloc())?;
+    let mut engine = Engine::new_in(crate::engine::Tools([TOOL; key::KINDS]), answer, &Edit { files: &files }, scope, plant, alloc())?;
     let mut buffers: StdVec<Buffer<'static>> = (0..4).map(|_| Buffer::new_in(alloc())).collect();
     drive(&mut engine, &mut pool.clone(), &mut buffers, &|_, view, task, buffer| work(world, view, task, buffer))?;
     engine.finish()
@@ -429,6 +429,7 @@ struct History {
 /// What one request of a history did, for a fixture to look at further.
 struct Step {
     entered: StdVec<Name>,
+    causes: StdVec<crate::engine::Entered>,
     prints: StdVec<(Name, u32)>,
     report: crate::engine::Report,
 }
@@ -496,12 +497,37 @@ impl History {
             }
             oracle(!owes(name, now) || entered.contains(name), || format!("request {serial}: {name:?} owed and not entered"))?;
         }
+        // The cause of every entered task, derived here from the last answer and a fresh build
+        // alone: no row was new; else a moved key; else the first read, in sorted order, whose
+        // cell a fresh build holds otherwise; else owed. Identical: its out is its last row's.
+        oracle(ours.causes.len() == ours.entered.len(), || format!("request {serial}: {} causes for {} entered", ours.causes.len(), ours.entered.len()))?;
+        let counted: u32 = ours.report.stages.iter().map(|stage| stage.entered).sum();
+        oracle(counted == ours.report.entered, || format!("request {serial}: stages count {counted}, entered {}", ours.report.entered))?;
+        for (at, one) in ours.causes.iter().enumerate() {
+            oracle(ours.entered[at] == one.name, || format!("request {serial}: cause {at} is {:?}'s, entered {:?}", one.name, ours.entered[at]))?;
+            if one.name.kind == Kind::Code {
+                oracle(one.cause == Cause::Inline, || format!("request {serial}: inline {:?} entered for {:?}", one.name, one.cause))?;
+                continue;
+            }
+            let Some(now) = there.get(&one.name) else { continue };
+            let expected = match before.get(&one.name) {
+                None => Cause::New,
+                Some(old) if old.0 != now.0 => Cause::KeyMoved,
+                Some(old) => match old.6.iter().find(|(id, saw)| fresh.answer.cell(id) != *saw) {
+                    Some((id, saw)) => Cause::ReadMoved { read: *id, was: *saw, now: fresh.answer.cell(id) },
+                    None => Cause::Owed,
+                },
+            };
+            oracle(one.cause == expected, || format!("request {serial}: {:?} entered for {:?}, the model says {expected:?}", one.name, one.cause))?;
+            let identical = before.get(&one.name).is_some_and(|old| old.4 == now.4);
+            oracle(one.identical == identical, || format!("request {serial}: {:?} identical {} , the model says {identical}", one.name, one.identical))?;
+        }
         // Nothing changed and nothing owed: the certificate.
         // A failed row stands like any: the request after a failure is the certificate too.
         if changed.is_empty() && !owed_before {
             oracle(ours.report.entered == 0, || format!("request {serial}: nothing changed and {} entered", ours.report.entered))?;
         }
-        let step = Step { entered: ours.entered.iter().copied().collect(), prints: here_prints, report: ours.report };
+        let step = Step { entered: ours.entered.iter().copied().collect(), causes: ours.causes.iter().copied().collect(), prints: here_prints, report: ours.report };
         self.answer = Some(ours.answer);
         Ok(step)
     }
@@ -569,6 +595,36 @@ fn finding_1_a_changed_file_out_of_scope_is_planned() {
         let reached = history.request(crates(&[0]), Pools::One)?;
         oracle(reached.entered == StdVec::from([body(0)]), || format!("the held body: {:?}", reached.entered))
     });
+}
+
+/// The cause of each entered task (E6 telemetry): an edited body is entered for its key; the
+/// reader of an edited signature for that signature's cell, with the digests it saw and sees;
+/// a fresh history's tasks are new.
+#[test]
+fn each_entered_task_says_why() {
+    fixture(|| {
+        let mut history = History::new(two_crates(1), Plant::None);
+        let first = history.request(crates(&[0, 1]), Pools::One)?;
+        oracle(first.causes.iter().all(|one| one.cause == Cause::New), || format!("a fresh history: {:?}", first.causes))?;
+        let cause_of = |step: &Step, name: Name| step.causes.iter().find(|one| one.name == name).map(|one| one.cause);
+        history.world.files[0].1[0].body = 4;
+        let edited = history.request(crates(&[0, 1]), Pools::One)?;
+        oracle(cause_of(&edited, body(0)) == Some(Cause::KeyMoved), || format!("the edited body: {:?}", edited.causes))?;
+        oracle(cause_of(&edited, body(1)).is_none(), || format!("a body that reads no moved cell: {:?}", edited.causes))?;
+        history.world.files[0].1[0].sig = 3;
+        let signed = history.request(crates(&[0, 1]), Pools::One)?;
+        oracle(cause_of(&signed, head(0)) == Some(Cause::KeyMoved), || format!("the edited signature: {:?}", signed.causes))?;
+        let moved = CellId { of: head(0), cell: cell(HEAD, 0) };
+        oracle(
+            matches!(cause_of(&signed, body(1)), Some(Cause::ReadMoved { read, was, now }) if read == moved && was != now),
+            || format!("the edited signature's reader: {:?}", signed.causes),
+        )
+    });
+}
+
+#[test]
+fn control_a_wrong_cause_is_caught() {
+    control(SimConfig::cases(300), Plant::None, Plant::WrongCause, "", |tape, plant| histories(tape, plant, EVERY));
 }
 
 /// Finding 2: a part is never entered before its file's outline is made again in the request.

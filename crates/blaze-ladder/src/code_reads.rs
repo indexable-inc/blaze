@@ -718,6 +718,10 @@ impl Adts for Recorded<'_> {
         self.world.overflow_checks()
     }
 
+    fn ub_checks(&self) -> blaze_build::UbChecks {
+        self.world.ub_checks()
+    }
+
     fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
         self.world.fn_trait_method(which)
     }

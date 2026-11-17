@@ -8,7 +8,6 @@ use blaze_own::{Alloc, Vec};
 
 use crate::canon::RespId;
 use crate::error::SolveError;
-use crate::facts::Read;
 
 /// The kind of a path from a cycle head to a goal (`PathKind`), ordered so that `extend` is
 /// the maximum: any coinductive step makes the path coinductive, any forced-ambiguity step
@@ -143,7 +142,8 @@ pub struct Inputs<'a> {
     /// Per input: its stack index, or `u32::MAX`.
     pub on_stack: Vec<u32, Alloc<'a>>,
     pub nested_pool: Vec<u32, Alloc<'a>>,
-    pub reads_pool: Vec<Read, Alloc<'a>>,
+    /// The entries' read lists, as the solver's read ids (`readlog::ReadLog`).
+    pub reads_pool: Vec<u32, Alloc<'a>>,
     pub prov: Vec<Prov, Alloc<'a>>,
 }
 
@@ -229,8 +229,8 @@ impl<'a> Inputs<'a> {
         self.overflow.iter().find(|o| o.input == input && o.depth == depth && applicable(&o.entry)).map(|o| o.entry)
     }
 
-    /// Stores a finished goal's answer: `nested` its nested goals (sorted, deduplicated),
-    /// `reads` its reads (sorted, deduplicated).
+    /// Stores a finished goal's answer: `nested` its nested goals and `reads` its read ids,
+    /// each a set in first-seen order (`readlog::SegLog`).
     pub fn insert(
         &mut self,
         input: u32,
@@ -240,7 +240,7 @@ impl<'a> Inputs<'a> {
         required_depth: u32,
         nested: &[u32],
         big: bool,
-        reads: &[Read],
+        reads: &[u32],
     ) -> Result<Entry, SolveError> {
         let nested_range = if big || nested.len() > MAX_NESTED {
             (0, u32::MAX)
@@ -260,7 +260,7 @@ impl<'a> Inputs<'a> {
         Ok(entry)
     }
 
-    pub fn reads_of(&self, e: &Entry) -> &[Read] {
+    pub fn reads_of(&self, e: &Entry) -> &[u32] {
         &self.reads_pool[e.reads.0 as usize..(e.reads.0 + e.reads.1) as usize]
     }
 

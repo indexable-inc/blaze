@@ -34,7 +34,7 @@ use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHe
 use crate::resolve::Paths;
 
 mod member_fn;
-pub use member_fn::{member_fn_want, member_head_want};
+pub use member_fn::{MemberFrame, member_fn_want, member_head_want};
 
 /// The most steps one [`Store::ensure`] takes: past it the needs are a cycle.
 const MOST_STEPS: usize = 1 << 16;
@@ -617,6 +617,23 @@ pub struct Store<'n> {
     /// against the rest of it; the fn's `Signature` task says the error (blaze-cli
     /// body_types/heads.rs). Replaced whenever the head is made again.
     pub type_misses: HashMap<ItemKey, Vec<TypeMiss, Global>, Global>,
+    /// The body task's meter (front2 tables/cost.rs), when one measures: a measurement only.
+    pub cost: Option<&'n super::tables::cost::Cost<'n>>,
+    /// The needs a step met beside the one it stopped at (`trait_members`), taken by the
+    /// next step of [`Store::ensure_noting`].
+    more_needs: Vec<LibKey, Global>,
+    /// How a trait's members' needs are met: the seam the cost test proves equal.
+    pub needs: NeedsMet,
+}
+
+/// How [`Store::ensure`] meets the needs of a trait's members (front2_tables_cost.rs runs
+/// every body both ways and asserts equal bytes and read lists).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NeedsMet {
+    /// Every member's need met before the trait is made again (the default).
+    All,
+    /// The trait made again after each need (the form before 2026-11-17: quadratic).
+    First,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -908,7 +925,16 @@ impl<'n> Store<'n> {
             reads: super::body_reads::Digests::new(),
             closures: super::foreign_closures::ClosureRows::new_in(Global),
             type_misses: HashMap::new_in(Global),
+            cost: None,
+            more_needs: Vec::new_in(Global),
+            needs: NeedsMet::All,
         }
+    }
+
+    /// The frame impl `ck`'s member fns are made in, kept when its head was made (head
+    /// records carry it, form 9).
+    pub fn member_frame(&self, ck: ItemKey) -> Option<&MemberFrame> {
+        self.member_frames.get(&ck)
     }
 
     /// What a [`Why::Need`] of `k` asks for: its head, or, for a trait whose head is made,
@@ -931,6 +957,14 @@ impl<'n> Store<'n> {
 
     /// Makes `want` and every head it needs, by a work list.
     pub fn ensure<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want) -> Result<(), HeadError> {
+        self.ensure_noting(names, keys, want, &mut |_| {})
+    }
+
+    /// [`Store::ensure`], handing `noted` every other want it is made to make on the way (each
+    /// need, at the moment it is met, before it is made). Over a store that held nothing, that
+    /// is every head `want`'s making read beside its own (front2/tables/head.rs `freeze`).
+    pub fn ensure_noting<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want, noted: &mut dyn FnMut(Want)) -> Result<(), HeadError> {
+        let _cost = super::tables::cost::Cost::enter_want(self.cost, want);
         let mut stack = Vec::new_in(Global);
         stack.push(want);
         // The want made by the step before: asked again at once, it was made and its lookup
@@ -938,7 +972,12 @@ impl<'n> Store<'n> {
         let mut just_made = None;
         for _ in 0..MOST_STEPS {
             let Some(&top) = stack.last() else { return Ok(()) };
-            let need = match self.step(names, keys, top)? {
+            let stepped = super::tables::cost::Cost::step_start(self.cost);
+            self.more_needs.clear();
+            let step = self.step(names, keys, top)?;
+            super::tables::cost::Cost::step_end(self.cost, stepped, matches!(step, Step::Need(_)));
+            let more = core::mem::replace(&mut self.more_needs, Vec::new_in(Global));
+            let need = match step {
                 Step::Done => {
                     just_made = stack.pop();
                     continue;
@@ -953,6 +992,19 @@ impl<'n> Store<'n> {
                 return Err(HeadError::Cycle(cycle(&stack)));
             }
             just_made = None;
+            // The step's other needs, made after `need` and before `top` steps again; one
+            // already made, or on the stack (a cycle: met by name when `top` steps again and
+            // stops at it alone), is left to that step.
+            if matches!(step, Step::Need(_)) {
+                for k in more.iter().rev() {
+                    let w = self.need(*k);
+                    if w != need && !self.made(w) && !stack.iter().any(|s| *s == w) {
+                        noted(w);
+                        stack.push(w);
+                    }
+                }
+            }
+            noted(need);
             stack.push(need);
         }
         Err(HeadError::Cycle(cycle(&stack)))
@@ -1299,6 +1351,7 @@ impl<'n> Store<'n> {
         // Each associated type's own const parameters (own position, type): filed after the
         // loop into `Maps::assoc_consts`.
         let mut assoc_consts: Vec<(Name, Vec<(u32, PTy), Global>), Global> = Vec::new_in(Global);
+        let mut needs: Vec<LibKey, Global> = Vec::new_in(Global);
         for m in &members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))? {
             let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let mv = low.view();
@@ -1309,7 +1362,15 @@ impl<'n> Store<'n> {
                 ItemDetail::Fn { .. } => {
                     let mk = keys.member(ck, MemberKind::Fn, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
                     let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                    self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m.text, marks)?;
+                    // A need of one member's signature does not stop the others: every need
+                    // of the trait's members is met before the trait is made again, so a trait
+                    // of n members is made at most a few times, not once per need (Iterator's
+                    // members: 62 restarts and 126 ms of 149 a body, front2_tables_cost.rs).
+                    match self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m.text, marks) {
+                        Ok(()) => {}
+                        Err(Why::Need(k)) if self.needs == NeedsMet::All => needs.push(k),
+                        Err(why) => return Err(why),
+                    }
                 }
                 ItemDetail::TypeAlias => {
                     let item = keys.member(ck, MemberKind::Type, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
@@ -1410,6 +1471,12 @@ impl<'n> Store<'n> {
                 }
                 _ => {}
             }
+        }
+        // The members' needs: the first as a step's need, the rest made before it (`ensure_noting`).
+        if let Some((&first, rest)) = needs.split_first() {
+            self.more_needs.clear();
+            self.more_needs.extend_from_slice(rest);
+            return Err(Why::Need(first));
         }
         for (name, mine) in assoc_consts {
             self.maps.assoc_consts.insert((key, name), mine);

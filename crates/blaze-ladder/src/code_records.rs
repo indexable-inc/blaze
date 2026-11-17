@@ -66,7 +66,7 @@ use blaze_typeck::ItemKey;
 use crate::front2::body_reads::ReadsDigest;
 use parser::{Edition, LexedStr};
 
-use crate::symbols::{SymbolError, static_symbol, tls_desc_symbol, tls_getter_symbol};
+use crate::symbols::{SymbolError, static_symbol, tls_desc_symbol, tls_getter_symbol, tls_symbol};
 
 #[path = "code_reads.rs"]
 pub mod reads;
@@ -80,8 +80,9 @@ pub mod statics;
 /// The version of the entry form and of what a key means: stepped when either changes, so an
 /// old store's entries are never found (and never misread) by a new blaze. 4: an entry declares
 /// the statics its record names (by item key), and a static has an entry of its own
-/// ([`statics`]).
-pub const ENTRY_FORM: u32 = 4;
+/// ([`statics`]). 5: an entry also declares the thread-locals its record names (by item key),
+/// and a thread-local's template has an entry of its own (`statics::make_template_entry`).
+pub const ENTRY_FORM: u32 = 5;
 
 /// The first eight bytes of every entry.
 pub const ENTRY_MAGIC: [u8; 8] = *b"bzcent01";
@@ -121,8 +122,9 @@ impl Settings {
     /// What the baseline tier builds at `overflow_checks` with the program's panic strategy
     /// `panic` (UNWIND.md 3.1; no default: the caller names it), no debug assertions. On the
     /// record path this IS where the program's strategy lives: the walk and the program's
-    /// inputs are made from it (run.rs `build_records_new`). Debug assertions are keyed but
-    /// not built differently today: over-keyed, never stale.
+    /// inputs are made from it (run.rs `build_records_new`). Debug assertions decide what
+    /// core's `intrinsics::ub_checks()` is in the code built (blaze-build `UbChecks`), so they
+    /// are in the key for that.
     pub const fn baseline(overflow_checks: blaze_build::OverflowChecks, panic: blaze_build::Panic) -> Settings {
         Settings { overflow_checks, debug_assertions: false, panic: crate::panic_strategy::strategy(panic) }
     }
@@ -342,7 +344,9 @@ pub struct InstanceNames<'n> {
     /// declared by the entry, so the run's parent can send it before the record.
     pub statics: &'n [ItemKey],
     pub vtables: &'n [Symbol],
-    pub tls: &'n [Symbol],
+    /// The thread-locals, by item key: each is named by its symbol (symbols.rs `tls_symbol`)
+    /// and declared by the entry, so the run's parent can send its template before the record.
+    pub tls: &'n [ItemKey],
 }
 
 impl Names for InstanceNames<'_> {
@@ -355,7 +359,7 @@ impl Names for InstanceNames<'_> {
             }),
             Outside::Static(place) => self.statics.get(at(place)).map(|&s| Named::Symbol(static_symbol(s))),
             Outside::Vtable(place) => self.vtables.get(at(place)).map(|&s| Named::Symbol(s)),
-            Outside::Tls(place) => self.tls.get(at(place)).map(|&s| Named::Symbol(s)),
+            Outside::Tls(place) => self.tls.get(at(place)).map(|&s| Named::Symbol(tls_symbol(s))),
             Outside::TlsDesc => Some(Named::Symbol(tls_desc_symbol())),
             Outside::TlsGetter => Some(Named::Symbol(tls_getter_symbol())),
         }
@@ -435,7 +439,9 @@ impl core::error::Error for CodeRecordError {}
 /// count of declared instances (4), and each: its tabled fn's key (16), its name's length (4)
 /// and bytes, sorted by (tabled, name) and each once; the count of declared statics (4) and
 /// each one's item key (16), ascending and each once: every static `names` holds (form 4: the
-/// parent sends each before the record, run.md "Statics in the run"); then the count of read-list rows (4) and
+/// parent sends each before the record, run.md "Statics in the run"); the declared
+/// thread-locals in the same form (form 5: every thread-local `names` holds, whose template the
+/// parent sends before the record); then the count of read-list rows (4) and
 /// each: its question's length (4) and bytes, and its answer's digest (32), sorted by question
 /// and each once ([`reads`]). An entry made here reads nothing beyond its key: no row.
 pub fn make_entry<'a, 'd>(
@@ -486,6 +492,9 @@ pub fn make_entry_reading<'a, 'd>(
         out.extend_from_slice(d.name);
     }
     put_statics(names.statics, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
+    // Form 5: the thread-locals, in the same keys form (each one's template is sent before the
+    // record, as a static is).
+    put_statics(names.tls, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
     out.extend_from_slice(&len(reads.len(), "entry's read list")?.to_le_bytes());
     for (question, answer) in reads.rows() {
         out.extend_from_slice(&len(question.len(), "read-list question")?.to_le_bytes());
@@ -594,6 +603,8 @@ pub struct EntryView<'b> {
     count: u32,
     /// The declared statics' item keys, 16 bytes each (checked ascending by [`EntryView::read`]).
     statics: &'b [u8],
+    /// The declared thread-locals' item keys, in the statics' form.
+    thread_locals: &'b [u8],
     /// The read list's rows' bytes (checked whole and in order by [`EntryView::read`]).
     reads: &'b [u8],
     reads_count: u32,
@@ -688,6 +699,7 @@ impl<'b> EntryView<'b> {
         }
         let (declared, count) = c.declared_block()?;
         let statics = c.statics_block()?;
+        let thread_locals = c.statics_block()?;
         let reads_count = c.u32("count of read-list rows")?;
         let reads_start = c.at;
         let mut last: Option<&[u8]> = None;
@@ -701,12 +713,17 @@ impl<'b> EntryView<'b> {
         if c.at != bytes.len() {
             return Err(EntryError::Trailing);
         }
-        Ok(EntryView { insts, record, declared, count, statics, reads: &bytes[reads_start..], reads_count })
+        Ok(EntryView { insts, record, declared, count, statics, thread_locals, reads: &bytes[reads_start..], reads_count })
     }
 
     /// Each static the record names, by item key, ascending.
     pub fn each_static(&self, each: impl FnMut(ItemKey)) {
         each_key(self.statics, each);
+    }
+
+    /// Each thread-local the record names, by item key, ascending.
+    pub fn each_thread_local(&self, each: impl FnMut(ItemKey)) {
+        each_key(self.thread_locals, each);
     }
 
     /// The count of read-list rows.

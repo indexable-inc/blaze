@@ -27,6 +27,7 @@ pub mod fold;
 pub mod fulfill;
 pub mod object_shape;
 pub mod prefilter;
+pub mod readlog;
 pub mod search;
 pub mod term;
 pub mod trait_goals;
@@ -35,6 +36,7 @@ pub mod tys;
 // The helpers' modules (solve.md, "Candidates and merging").
 pub mod alias;
 pub mod async_fn;
+pub mod auto_summary;
 pub mod builtin;
 pub mod coherence;
 pub mod structural;

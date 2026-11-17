@@ -264,6 +264,9 @@ impl Sim {
             Down::Data { data } => {
                 return Err(Broke::Oracle(format!("the parent sent `Data` with {} statics: this simulation's manifest has no static", data.len())));
             }
+            Down::ThreadLocals { .. } => {
+                return Err(Broke::Oracle(String::from("the parent sent `ThreadLocals`: this simulation's manifest has no thread-local")));
+            }
         };
         drop(self.down.drain(..took));
         match got {

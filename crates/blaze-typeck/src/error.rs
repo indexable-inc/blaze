@@ -89,6 +89,42 @@ pub enum Malformed {
     /// overlay, or its kept types (`OwnTys::view`) read over a base with fewer than the `base`
     /// nodes or list entries it was made over (`have`): its ids would name other types.
     Overlay { base: u32, have: u32 },
+    /// The context met a handle it cannot read as asked (infer/mod.rs, its `TypeCtx` reads,
+    /// which cannot return an error): `node` is the handle, `what` says how it failed. The
+    /// read gave the error type in its place and the body's check fails with this (rule 20:
+    /// a malformed input fails its own body, never the process).
+    Unreadable { node: u32, what: Unreadable },
+    /// A closure kind settled for closure expression `.0`, which this context never made.
+    ClosureNotMade(ExprId),
+}
+
+/// How a handle could not be read (`Malformed::Unreadable`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreadable {
+    /// Not in this context's arena.
+    NotInArena,
+    /// Not a type where one is needed (a const term or a list).
+    NotAType,
+    /// Not a list where one is needed.
+    NotAList,
+    /// An element index past the list's end (`index`).
+    PastEnd { index: u32 },
+    /// A closure's signature that is not a fn pointer.
+    ClosureSig,
+    /// A closure term with fewer than its three closure arguments.
+    ClosureArgs,
+    /// A closure term this context neither made nor read from an opaque's hidden body.
+    ClosureUnmade,
+    /// A future term this body did not make.
+    FutureUnmade,
+    /// A future term without its output and interior, or one of them not a type.
+    FutureArgs,
+    /// An alias or an object binding whose trait and name this context never saw.
+    AliasUnnamed,
+    /// A row that is neither a type nor a predicate.
+    NeitherTypeNorPred,
+    /// A const, type or predicate kind typeck has no view of.
+    NoView,
 }
 
 /// The driver's own failure.

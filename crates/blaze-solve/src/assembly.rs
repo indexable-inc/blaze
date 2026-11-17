@@ -182,7 +182,8 @@ impl Default for Langs {
 pub struct Cx<'c, 'a, T: Tys, F: Facts> {
     pub tys: &'c mut T,
     pub(crate) ask: Ask<'c, F>,
-    pub(crate) reads: &'c mut Vec<Read, Alloc<'a>>,
+    /// The solver's read log, its open segment the frame's.
+    pub(crate) reads: &'c mut crate::readlog::ReadLog<'a>,
     pub(crate) added: &'c mut Vec<Added, Alloc<'a>>,
     pub(crate) deferred: &'c mut Vec<(Ty, Ty), Alloc<'a>>,
     pub(crate) scratch: &'c mut Scratch<'a>,
@@ -517,15 +518,13 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         let i = l as usize;
         match self.langs.state[i] {
             Some(d) => {
-                self.reads.push(Read { question: crate::facts::Question::Lang(l), digest: self.langs.digests[i] });
+                crate::facts::Log::note(self.reads, Read { question: crate::facts::Question::Lang(l), digest: self.langs.digests[i] })?;
                 Ok(d)
             }
             None => {
                 let d = self.ask.lang(self.reads, l)?;
                 self.langs.state[i] = Some(d);
-                if let Some(r) = self.reads.last() {
-                    self.langs.digests[i] = r.digest;
-                }
+                self.langs.digests[i] = crate::facts::lang_digest(d);
                 Ok(d)
             }
         }

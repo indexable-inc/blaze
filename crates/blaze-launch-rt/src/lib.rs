@@ -43,6 +43,8 @@
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
 ))]
 #![feature(allocator_api)]
+// The launcher's own root word on Linux (run_mode/thread_locals.rs `ROOT`).
+#![cfg_attr(target_os = "linux", feature(thread_local))]
 // `#![blaze::trust]` below names blaze's tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]

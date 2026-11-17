@@ -34,7 +34,7 @@ use blaze_own::{Alloc, Vec};
 use crate::assembly::{Cand, Cx, Goal, Source, Step};
 use crate::error::{Limit, Malformed, SolveError, Stop};
 use crate::eval::{Answer, Solver};
-use crate::facts::{AdtFlags, Ask, Facts, ImplHeader, ImplPolarity, Portable, Read, TraitFlags};
+use crate::facts::{AdtFlags, Ask, Facts, ImplHeader, ImplPolarity, Log, Portable, Read, TraitFlags};
 use crate::fold::{self, Inst, Scratch};
 use crate::term::{AliasKind, Certainty, Def, GoalSource, List, Polarity, Pred, Ty, TyKind, TypingMode, Var, VarKind};
 use crate::trait_goals::TraitGoal;
@@ -136,10 +136,10 @@ fn has_ty_var<T: Tys>(tys: &T, work: &mut Vec<(Ty, u32), Alloc<'_>>, t: Ty) -> R
 /// Walks the trait ref `self_ty: trait<args[1..]>` in generic order, preorder, the way
 /// coherence.rs `OrphanChecker` (`visit_ty`, `visit_region`, `visit_const`) visits it, with an
 /// explicit stack. `stack` is left as it was found.
-fn orphan_walk<T: Tys, F: Facts>(
+fn orphan_walk<T: Tys, F: Facts, L: Log + ?Sized>(
     tys: &T,
     ask: &Ask<'_, F>,
-    reads: &mut Vec<Read, Alloc<'_>>,
+    reads: &mut L,
     stack: &mut Vec<Ty, Alloc<'_>>,
     work: &mut Vec<(Ty, u32), Alloc<'_>>,
     self_ty: Ty,
@@ -152,10 +152,10 @@ fn orphan_walk<T: Tys, F: Facts>(
     r
 }
 
-fn orphan_walk_inner<T: Tys, F: Facts>(
+fn orphan_walk_inner<T: Tys, F: Facts, L: Log + ?Sized>(
     tys: &T,
     ask: &Ask<'_, F>,
-    reads: &mut Vec<Read, Alloc<'_>>,
+    reads: &mut L,
     stack: &mut Vec<Ty, Alloc<'_>>,
     work: &mut Vec<(Ty, u32), Alloc<'_>>,
     base: usize,
@@ -176,7 +176,7 @@ fn orphan_walk_inner<T: Tys, F: Facts>(
         }
         let t = tys.shallow_resolve(t);
         let k = tys.kind(t);
-        let local = |reads: &mut Vec<Read, Alloc<'_>>, d: Def| -> Result<bool, Stop> {
+        let local = |reads: &mut L, d: Def| -> Result<bool, Stop> {
             match in_crate {
                 // `def_id_is_local`: remotely nothing is local.
                 InCrate::Local => ask.is_local(reads, d),
@@ -274,10 +274,10 @@ fn orphan_walk_inner<T: Tys, F: Facts>(
 /// Whether every impl that could apply to `self_ty: trait_<args[1..]>` is known to this crate
 /// (coherence.rs `trait_ref_is_knowable`, with blaze's sealed-trait rule; `true` is
 /// `Ok(())`, `false` either `Conflict`).
-fn trait_ref_is_knowable<T: Tys, F: Facts>(
+fn trait_ref_is_knowable<T: Tys, F: Facts, L: Log + ?Sized>(
     tys: &T,
     ask: &Ask<'_, F>,
-    reads: &mut Vec<Read, Alloc<'_>>,
+    reads: &mut L,
     alloc: Alloc<'_>,
     trait_: Def,
     self_ty: Ty,

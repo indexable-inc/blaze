@@ -55,6 +55,11 @@ per-job state; whole reads of `CrateScope` and `Surface`; the items record's buc
 4. **Bodies at body grain.** A body is one task on the work-stealing pool, batched by predicted cost,
    its frame reset per body. Its world is a read-only view over the tables plus a recorder of the cells
    it read. Results go to a per-worker buffer.
+   YOUR CODE FIRST (the owner, 2026-11-17): bodies are independent, so their order is a choice: the files
+   changed most recently first, then the member the command stands in, then the rest; findings print as
+   they land, sorted within what has landed. A dependency owes a check only its names and the heads a
+   body of yours reads: a dependency's head is made when first read (point 3), its names once a machine
+   per version and features, and its bodies never.
 5. **The coordinator is off the hot path.** It makes the plan, starts each phase, and merges each
    phase's buffers in bulk, sorted by key (rule 25): puts to the store, rows to the answer table. Its
    cost is a constant per phase plus a sort, never a step per task.
@@ -63,14 +68,29 @@ per-job state; whole reads of `CrateScope` and `Surface`; the items record's buc
    cells did not move is not entered. Nothing changed is the certificate and nothing else.
 7. **One front end.** `check` plans every body asked; `run` plans the entry and makes the rest on first
    call through the same inline rule; the census is `run` with every instance asked.
-8. **A live process** is allowed and not needed: everything above is records, so a process that exits
+8. **Lints and tests are stages too.** A lint is a task after Bodies: one per (lint, body), reading that
+   body's typed result record and the cells the lint asks, its findings a record keyed like the check
+   (rule 81); an edited body reruns its own lints, a changed lint reruns that lint alone. Errors print
+   with the answer; advice and whole-program analyses are later phases that never hold the answer back.
+   A test is a task whose reads are the code records its run reached (the run's reach list), so a
+   request reruns exactly the tests whose reached code moved, and the rest are reused by key.
+9. **A live process** is allowed and not needed: everything above is records, so a process that exits
    loses nothing and a restart re-indexes nothing. One may be added later to save process start.
 
 ## Floors (rule 67)
 
-Cold: the semantic work divided by the cores, plus a merge per phase (tempo's first 17,000 bodies were
-about 290 s of CPU: about 20 s on 18 cores). One body edit: one outline, one body, their cells' readers,
-the certificate. Nothing changed: the pointer read and one get.
+Cold, tempo on an 18-core Mac: UNDER 10 SECONDS (the owner, 2026-11-17, on hearing "about 3 minutes from
+parallelism alone": "that seems.... wrong like it should be way faster"). The count: about 1 ms of CPU a
+body, so tempo's 15,793 bodies are about 16 s of CPU and 1 to 2 s on 18 cores; the names of its 1,208 crates
+are 39 s of CPU today, a few seconds in parallel, and the dependencies' share is paid once a machine; a
+merge per phase. The old engine on the same input (tag g090627): 1,445 s, 3,369 s of CPU, about 200 ms a
+body: each body entered 4 times, 1,704 GB allocated in the run, a private world per file job (58.5 impl
+lookups a question against 1.1 from shared tables), and a solver that sorts its read list and copies its
+terms per goal. None of that is the cost of checking Rust. Every real run is reported as a ratio to 10 s,
+and a stage whose CPU a body passes 1 ms names where it goes before anything else is built on it.
+
+One body edit: one outline, one body, their cells' readers, the certificate. Nothing changed: the pointer
+read and one get (0.09 s measured on tempo with no process alive).
 
 ## Pieces (each a lane; new code in new files; the old path stays until the switch)
 
@@ -83,5 +103,14 @@ the certificate. Nothing changed: the pointer read and one get.
 | E5 tasks | names, heads, impls and body as functions over `Tables` with inline needs through claims | entries per result is 1.0 for planned kinds |
 | E6 the switch | `blaze check` on the engine beside the old path, equal answers on fixtures and tempo; then the old path deleted | tempo cold seconds, GB and the edit loop quoted before and after; the deletion list above gone |
 | E7 run and census | the lazy program and the eager program replaced by point 7 | hello world prints; the census equals the last one on the old path |
+| E8 lints | `Stage::Lints`: a task per (lint, body) over the typed result; advice after the answer | a body edit reruns its lints only; a lint's edit reruns that lint only; tempo's lint time beside its check time |
+| E9 tests | `Stage::Tests`: a test's reads are the code records its run reached | one body edit reruns only the tests that reach it; the rest reused |
+| E10 the toolchain's records fetched | std, core, alloc (names with expansions, heads, impl tables, later code) made by CI per toolchain and platform, fetched from R2 on a local miss, verified by digest (D132, remote-read.md) | a fresh home's first check of a small crate spends no time on the shelf's names (4.1 s of 4.4 s today) |
+| E11 why | the cause of every entered task (new, its key moved, or the first read that moved: cell, old and new digest), a count of tasks redone to the same bytes, an "entered because" table in the profile, and `blaze why <file or item>` printing the chain from the edit (the owner, 10:29: "could u add better telm", on a private fn added costing 113 s with no row saying why) | on tempo, one private fn added: the table names each cause; redone-identical is 0 |
+| E12 `blaze clean` | removes the checkout's `.blaze/v2`; `--store` the home's store; and a two-values refusal names the record's kind and name and says what to run (the owner hit one on 2026-11-17 with no way out) | the refusal's text; the command on a scratch home |
 
-Order: E1 to E4 at once; E5 on E2; E6 when E1 and E5 pass their checks; E7 after E6.
+Order: E1 to E4 at once; E5 on E2; E6 when E1 and E5 pass their checks; E7 after E6; E8 and E9 on E6.
+
+State, 2026-11-17 10:00: E1 admitted (crates/blaze-engine, simulated; a failed task is a row). E3's writer,
+reader and equality proof admitted on one fixture. E4's cell table and recorder seam admitted. E2 in two
+lanes (frozen heads; the view and the body task). E6's driver (`blaze engine-check`) started.

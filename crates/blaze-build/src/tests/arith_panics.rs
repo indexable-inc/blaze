@@ -123,6 +123,10 @@ impl Adts for ArithAdts<'_> {
         if self.checks { crate::OverflowChecks::On } else { crate::OverflowChecks::Off }
     }
 
+    fn ub_checks(&self) -> crate::UbChecks {
+        crate::UbChecks::Off
+    }
+
     fn planted(&self) -> Planted {
         self.planted
     }

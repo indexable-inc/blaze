@@ -152,10 +152,12 @@ pub enum ParentError {
     /// `Lazy::resolve`'s statics.
     StaticServed { symbol: [u8; 32] },
     /// Record `record` names static `symbol` (a `Space::Static` target of its own, or of a
-    /// datum sent with it), and no `Data` of this run sent it: refused before its `Publish`
-    /// ([`Needs::publish`]). The thread-local descriptor is one such: no `static` item backs
-    /// it, and the run does not place thread-locals yet (run.md, "Statics in the run", step 4).
-    StaticUnsent { record: [u8; 32], symbol: [u8; 32] },
+    /// datum sent with it; or a thread-local, whose template is its datum), and no `Data` of
+    /// this run sent it: refused before its `Publish` ([`Needs::publish`]). `instance`: the fn
+    /// symbol of the slot the record was to fill; `touches_tls`: the record also names the
+    /// thread-local descriptor, so `symbol` may be a thread-local's template (symbols.rs
+    /// `tls_symbol`) that the walk's declared list did not hold.
+    StaticUnsent { record: [u8; 32], symbol: [u8; 32], instance: Option<[u8; 32]>, touches_tls: bool },
     /// Record `record` was published again as one published before, and never was (a bug of
     /// `Needs`'s answers).
     NotCleared { record: [u8; 32] },
@@ -213,18 +215,17 @@ impl fmt::Display for ParentError {
             ParentError::ResolvedTwice { symbol } => write!(f, "{rule}: the symbol {} was resolved twice (run_parent.rs `Needs` asks once a symbol)", Hex(symbol)),
             ParentError::SpecialStatic { symbol } => write!(f, "{rule}: the run's special record {} names a static, and the specials are made over no program (run.md, \"Statics in the run\")", Hex(symbol)),
             ParentError::StaticServed { symbol } => write!(f, "{rule}: the static {} was served once and is not among the statics told (run_parent.rs `Lazy::resolve`)", Hex(symbol)),
-            ParentError::StaticUnsent { record, symbol } if *symbol == blaze_ladder::symbols::tls_desc_symbol().0 => write!(
-                f,
-                "{rule}: record {} touches a thread-local (it names the thread-local descriptor {}), and the run does not place thread-locals yet (run.md, \"Statics in the run\", step 4)",
-                Hex(record),
-                Hex(symbol)
-            ),
-            ParentError::StaticUnsent { record, symbol } => write!(
-                f,
-                "{rule}: record {} names static {}, which no `Data` of this run sent; refused before its `Publish` (run_parent.rs `Needs::publish`; run.md, \"Statics in the run\")",
-                Hex(record),
-                Hex(symbol)
-            ),
+            ParentError::StaticUnsent { record, symbol, instance, touches_tls } => {
+                write!(f, "{rule}: record {}", Hex(record))?;
+                if let Some(instance) = instance {
+                    write!(f, " (fn symbol {})", Hex(instance))?;
+                }
+                match touches_tls {
+                    true => write!(f, " touches a thread-local and names {}, a static or a thread-local's template", Hex(symbol))?,
+                    false => write!(f, " names static {}", Hex(symbol))?,
+                }
+                write!(f, ", which no `Data` of this run sent: the walk's declared list for this record does not hold it; refused before its `Publish` (run_parent.rs `Needs::publish`; run.md, \"Statics in the run\")")
+            }
             ParentError::NotCleared { record } => write!(f, "{rule}: record {} was published again and never published first (run_parent.rs `Needs::publish`)", Hex(record)),
             ParentError::Store { symbol, why } => write!(f, "{rule}: the code entry of symbol {}: {why}", Hex(symbol)),
             ParentError::NotStored { symbol } => write!(f, "{rule}: the record walk found symbol {} and the store holds no entry under its key", Hex(symbol)),
@@ -734,7 +735,8 @@ fn callees(walk: &Walk<'_>, row: usize, declares: &mut AVec<'_, Symbol>, told: &
         let symbol = walk.symbol(callee).0;
         match walk.kind(callee) {
             RowKind::Instance => declares.push(Symbol(symbol)),
-            RowKind::Static => {
+            // A thread-local's row is its template's datum, sent as a static's is.
+            RowKind::Static | RowKind::ThreadLocal => {
                 if let Err(at) = told.binary_search(&symbol) {
                     told.insert(at, symbol);
                     statics.push(callee);
@@ -786,7 +788,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             let id = folder.file(record)?;
             started.list.clear();
             front.form().declared(entry, &mut started.list).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
-            if !started.list.statics().is_empty() {
+            if !started.list.statics().is_empty() || !started.list.thread_locals().is_empty() {
                 return Err(ParentError::SpecialStatic { symbol: symbol.0 });
             }
             front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
@@ -830,8 +832,9 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             at += 1;
         }
         let Some(row) = row else { return Ok(Resolved::Unknown) };
-        // A static is no call target: its symbol is never a need (the child binds its word).
-        if started.walk.kind(row) == RowKind::Static {
+        // A static or a thread-local is no call target: its symbol is never a need (the child
+        // binds its word).
+        if matches!(started.walk.kind(row), RowKind::Static | RowKind::ThreadLocal) {
             return Ok(Resolved::Unknown);
         }
         // A row stepped ahead is served once, from what its step answered; any other row that is
@@ -1003,9 +1006,23 @@ impl<'a> Needs<'a> {
                     let id = self.id();
                     Down::Data { data: List::of(self.batch.as_slice()) }.encode(id, out)?;
                 }
+                // The thread-local descriptor is the child's own (its key and root are facts of
+                // that process): named once, with the key's destructor, before the first record
+                // naming it (wire/thread_locals.rs). Each thread-local's template went in `data`.
+                let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
+                if named.iter().any(|it| it.0 == descriptor)
+                    && let Err(at) = self.sent.binary_search(&descriptor)
+                {
+                    self.sent.insert(at, descriptor);
+                    let id = self.id();
+                    let ender = Symbol(blaze_ladder::tls_index::tls_ender_symbol().0);
+                    Down::ThreadLocals { descriptor: Symbol(descriptor), ender }.encode(id, out)?;
+                }
                 for static_ in named {
                     if self.sent.binary_search(&static_.0).is_err() {
-                        return Err(ParentError::StaticUnsent { record: record.0, symbol: static_.0 });
+                        let instance = self.slots.get(slot.0 as usize).map(|s| s.0);
+                        let touches_tls = named.iter().any(|it| it.0 == descriptor);
+                        return Err(ParentError::StaticUnsent { record: record.0, symbol: static_.0, instance, touches_tls });
                     }
                 }
                 if let Err(at) = self.cleared.binary_search(&record.0) {

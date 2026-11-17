@@ -342,6 +342,12 @@ pub trait Adts {
     /// `dev` and `test`, off in `release`, the manifest's `[profile.<name>]` overriding).
     fn overflow_checks(&self) -> OverflowChecks;
 
+    /// What core's `intrinsics::ub_checks()` is at run time in the code built here ([`UbChecks`]):
+    /// decided where the instance is built, as the pinned core's doc says ("evaluation is
+    /// delayed until monomorphization"), from the caller's profile. Part of every code record's
+    /// key (code_records.rs `Settings::debug_assertions`). No default, as `overflow_checks`.
+    fn ub_checks(&self) -> UbChecks;
+
     /// The trait method `which` names (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once`): a
     /// closure's body is the instance of its kind's at `[closure, (args..)]`, and a direct call
     /// of a closure calls it (codegen.md, "Closures and the Fn traits"). With no answer the
@@ -747,6 +753,32 @@ impl OverflowChecks {
     /// Whether overflow is checked.
     pub const fn on(self) -> bool {
         matches!(self, OverflowChecks::On)
+    }
+}
+
+/// What core's `intrinsics::ub_checks()` answers at run time ([`Adts::ub_checks`]). The pinned
+/// core: "Returns whether we should perform some UB-checking at runtime. This eventually
+/// evaluates to `cfg!(ub_checks)`, but behaves different from `cfg!` when mixing crates built
+/// with different flags": the answer is the building profile's, never the library crate's
+/// own cfg. rustc's `ub_checks` follows `-C debug-assertions`. In a constant it is `true`
+/// whatever this says (blaze-consteval machine.rs `intrinsic`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum UbChecks {
+    /// `ub_checks()` is `true`: `assert_unsafe_precondition!`'s checks run.
+    On,
+    /// `ub_checks()` is `false`: the checks are branches never taken.
+    Off,
+}
+
+impl UbChecks {
+    /// The setting of a profile whose `debug-assertions` is `debug_assertions`.
+    pub const fn of_debug_assertions(debug_assertions: bool) -> UbChecks {
+        if debug_assertions { UbChecks::On } else { UbChecks::Off }
+    }
+
+    /// Whether the checks run.
+    pub const fn on(self) -> bool {
+        matches!(self, UbChecks::On)
     }
 }
 

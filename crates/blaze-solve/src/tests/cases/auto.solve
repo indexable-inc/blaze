@@ -133,6 +133,63 @@ goal Node: Send => yes
 case auto_cycle_mutual_yes = trait_goals.rs::consider_auto_trait_candidate
 goal A: Sync => yes
 
+# ---- nested ADTs, answered through the auto-trait summaries (auto_summary.rs) ----
+# Each step a summary takes is one the rule takes; where an impl may apply it stops.
+
+case auto_summary_nested_yes = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+struct S2<T>(S1<T>, Box<S1<T>>, &'static S1<T>)
+goal S2<u8>: Send => yes
+
+case auto_summary_nested_rc_no = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+struct S2<T>(S1<T>, Box<S1<T>>, &'static S1<T>)
+goal S2<Rc<u8>>: Send => no
+
+case auto_summary_inner_explicit_impl_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+# Cell's own impls decide its auto traits: its `!Sync` two levels down.
+struct C1<T>(Cell<T>, u8)
+struct C2<T>(Option<C1<T>>)
+goal C2<u8>: Sync => no
+
+case auto_summary_inner_explicit_impl_where_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+struct C1<T>(Cell<T>, u8)
+struct C2<T>(Option<C1<T>>)
+goal C2<Rc<u8>>: Send => no
+
+case auto_summary_inner_explicit_impl_yes = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+struct C1<T>(Cell<T>, u8)
+struct C2<T>(Option<C1<T>>)
+goal C2<u8>: Send => yes
+
+case auto_summary_local_negative_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+auto trait Mark
+struct In(u8)
+impl !Mark for In
+struct O1<T>(T, In)
+struct O2<T>(Option<O1<T>>, T)
+goal O2<u8>: Mark => no
+
+case auto_summary_recursive_yes = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+goal S1<List<u8>>: Send => yes
+
+case auto_summary_recursive_rc_no = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+goal S1<List<Rc<u8>>>: Send => no
+
+case auto_summary_param_env_yes = trait_goals.rs::consider_auto_trait_candidate
+# A where-clause of the trait: the summary is not used (a param-env candidate competes).
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+params T
+env T: Send
+goal S1<T>: Send => yes
+
+case auto_summary_param_no = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+params T
+goal S1<T>: Send => no
+
 # ---- no structural impl ----
 
 case auto_dyn_with_auto_bound_yes = assembly/mod.rs::assemble_object_bound_candidates

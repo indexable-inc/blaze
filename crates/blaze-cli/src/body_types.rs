@@ -1040,7 +1040,32 @@ impl<'n> FileTypes<'n> {
                         }
                         None => bstd::mem::format_in!(frame, "body `{shown}`: {}: {refused:?}", refused.text()),
                     };
-                    crate::not_checked::items::file(made, (0, 0), item_path, refused.text(), words.as_str());
+                    // Rule 19: a lowering's refusal groups by WHAT it refused (the construct and
+                    // why, the macro call and its host ask), never by "lowering refused" alone,
+                    // which named nothing (port27/mini/clap-root, tempo's clap derives).
+                    let cause = match refused {
+                        // A head the body needs: which head (its item by path) and why, as the
+                        // impl candidates' refusals name it (header_written.rs `head_failed`);
+                        // `Head` alone named neither (port27/mini/clap-root, 2026-11-17).
+                        // One line per head and reason: the head's item by its path, no key and
+                        // no range (two keys of one impl at two ranges were eight lines); the
+                        // key and the range stay in the finding's words.
+                        blaze_ladder::front2::project::Refused::Lower(error @ blaze_ladder::front2::body::BodyError::Head { item, error: head }) => {
+                            let at = match head {
+                                blaze_ladder::front2::heads::HeadError::Item(k, _) => *k,
+                                _ => *item,
+                            };
+                            let shown = blaze_ladder::front2::item_shown::ItemShown::of_lib(checker.records, at);
+                            let path = shown.path().unwrap_or("an item the names source holds no path for").replace('\x1f', " ");
+                            let class = blaze_ladder::front2::reach::lower_class(error).replace('\x1f', " ");
+                            bstd::mem::format_in!(frame, "{} ({class}, in the head of `{path}`)", refused.text())
+                        }
+                        blaze_ladder::front2::project::Refused::Lower(error) => {
+                            bstd::mem::format_in!(frame, "{} ({})", refused.text(), blaze_ladder::front2::reach::lower_refusal(error).replace('\x1f', " "))
+                        }
+                        _ => bstd::mem::format_in!(frame, "{}", refused.text()),
+                    };
+                    crate::not_checked::items::file(made, (0, 0), item_path, cause.as_str(), words.as_str());
                 } else if let Some(gap) = verdict.gaps.first() {
                     let words = bstd::mem::format_in!(frame, "body `{shown}`: {} questions the front end cannot answer yet, the first {gap:?}", verdict.gaps.len());
                     crate::not_checked::items::file(made, (0, 0), item_path, "a question the front end cannot answer yet", words.as_str());

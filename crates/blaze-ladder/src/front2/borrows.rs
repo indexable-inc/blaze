@@ -18,7 +18,7 @@
 
 use blaze_flow::loans::{Access, conflicts, for_each_access};
 use blaze_flow::{BorrowFinding, BorrowKind, Flow, Loan, MoveFindingKind, MoveOut, Point, StmtKind, Value};
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Refusal, SigBuf, SigLife, SigRefusal, read_impl_signature, read_signature};
+use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Refusal, SigBuf, SigLife, SigRefusal, read_async_signature, read_impl_signature, read_signature};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use core::alloc::Allocator;
@@ -163,6 +163,9 @@ pub struct BorrowFacts<'a> {
     /// Per (ADT, variant): where its field names start in `fields`, and how many.
     variants: AVec<'a, (u128, u32, u32, u32)>,
     fields: AVec<'a, tc::Name>,
+    /// Beside `fields`: the type parameter each field is declared as, when its declared type
+    /// is a bare one (blaze-flow-lower `Facts::field_param`).
+    field_params: AVec<'a, Option<u32>>,
     callees: AVec<'a, (u128, CalleeFacts)>,
     /// The lifetime part of each fn whose text `read_signature` could line up with its head
     /// (the stand-in for question H1: read from the fn's own text, never guessed).
@@ -201,6 +204,7 @@ impl<'a> BorrowFacts<'a> {
             adts: AVec::new_in(alloc),
             variants: AVec::new_in(alloc),
             fields: AVec::new_in(alloc),
+            field_params: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             sigs: AVec::new_in(alloc),
             sig_refused: AVec::new_in(alloc),
@@ -275,6 +279,13 @@ impl Facts for BorrowFacts<'_> {
     }
     fn field_count(&self, adt: tc::ItemKey, variant: u32) -> Option<u32> {
         self.variant(adt, variant).map(|(_, count)| count)
+    }
+    fn field_param(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<u32> {
+        let (first, count) = self.variant(adt, variant)?;
+        if field >= count {
+            return None;
+        }
+        self.field_params.get((first + field) as usize).copied().flatten()
     }
     fn param_copy(&self, _: u32) -> bool {
         false
@@ -547,6 +558,10 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
             let first = g.fields.len() as u32;
             for f in row.fields.get(v.fields.range()).unwrap_or(&[]) {
                 g.fields.push(f.name);
+                g.field_params.push(match r.store.tys.view().node(f.ty) {
+                    Ok(tc::PNode::Param(p)) => Some(p),
+                    _ => None,
+                });
             }
             g.variants.push((k, vi as u32, first, g.fields.len() as u32 - first));
         }
@@ -583,7 +598,17 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         for &(_, _, _, count) in g.variants[variants_from..].iter() {
             variant_lens.push(count);
         }
-        let read = adt_read(k, AdtAnswer::Made { copy, drop_impl, facts, variant_lens: &variant_lens, fields: &g.fields[fields_from..] });
+        let read = adt_read(
+            k,
+            AdtAnswer::Made {
+                copy,
+                drop_impl,
+                facts,
+                variant_lens: &variant_lens,
+                fields: &g.fields[fields_from..],
+                field_params: &g.field_params[fields_from..],
+            },
+        );
         g.reads.push(read);
     }
     let mut items: AVec<'a, u128> = AVec::new_in(alloc);
@@ -639,9 +664,12 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         // took of the impl's text is a row of its own (sig_impl.rs, rule 21).
         let imp = super::sig_impl::impl_of(names, keys, key, f, alloc);
         g.reads.push(super::sig_impl::impl_read(k, &imp, alloc));
-        let read = match imp.text() {
-            Some(it) => read_impl_signature(f.text, it, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc),
-            None => read_signature(f.text, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc),
+        // An `async fn`'s body's value is its future's `Output` as written (blaze-flow-lower
+        // `BodyOut`): read with that type (async_output.rs, the head's one home of it).
+        let read = match (super::async_output::of(&*r.store, key), imp.text()) {
+            (Some(written), it) => read_async_signature(f.text, it, tys, &f.inputs[..], f.output, written, &adt_lifetimes, &mut buf, alloc),
+            (None, Some(it)) => read_impl_signature(f.text, it, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc),
+            (None, None) => read_signature(f.text, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc),
         };
         let adts = asked.take_sorted();
         match read {
@@ -730,8 +758,10 @@ fn move_words(kind: MoveFindingKind) -> (&'static str, &'static str) {
 /// An invalidated loan's code and words, from the statement at `at` and the access of it that
 /// conflicts with `loan` (blaze-flow's `conflicts`, the rule tier two applied): the
 /// Reference, "References and borrowing" (a `&mut` borrow is unique; a shared one forbids
-/// mutation while it is live).
-fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan) -> (&'static str, &'static str) {
+/// mutation while it is live). `returned`: the return place holds the loan there (blaze-flow
+/// `BorrowFinding::Invalidated`), so a local's or temporary's end is the returned value
+/// outliving what it borrows: E0515, never E0597 or E0505.
+fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan, returned: bool) -> (&'static str, &'static str) {
     let s = at.stmt();
     let held_mut = matches!(flow.loan(loan).kind, BorrowKind::Mut | BorrowKind::TwoPhase);
     let mut found: Option<Access> = None;
@@ -744,6 +774,9 @@ fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan) -> (&'
         return ("E0502", "a live borrow is invalidated here");
     };
     match flow.stmt(s).kind {
+        StmtKind::StorageDead(_) | StmtKind::Drop(_) if returned => {
+            ("E0515", "a reference to a local or temporary value is returned: the value ends with the fn")
+        }
         StmtKind::StorageDead(_) => ("E0597", "a borrowed value goes out of scope while the borrow is live"),
         StmtKind::Drop(_) => ("E0505", "a borrowed value is dropped while the borrow is live"),
         // A two-phase borrow is a mutable one (RFC 2025): under a live mutable loan its
@@ -874,9 +907,9 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         }
         for b in record.borrows.iter() {
             let (span, (code, text)) = match *b {
-                BorrowFinding::Invalidated { at, loan, span } => (span, invalidated_words(&flow, at, loan)),
+                BorrowFinding::Invalidated { at, loan, span, returned } => (span, invalidated_words(&flow, at, loan, returned)),
                 // A nested body's outlives result is its owner's to prove: refused, never a finding.
-                BorrowFinding::UnprovenOutlives { span, .. } if of.is_nested() => {
+                BorrowFinding::UnprovenOutlives { span, .. } if of.is_nested(&view) => {
                     if verdict.refused.is_none() {
                         verdict.refused = Some(BorrowRefused::NestedOutlives { start: span.lo, end: span.hi });
                     }
@@ -960,7 +993,7 @@ fn show_facts(facts: &BorrowFacts<'_>, out: &mut dyn core::fmt::Write) -> core::
         let key = tc::ItemKey(k);
         writeln!(out, "head {k:x}: {:?}", Facts::callee(facts, key))?;
         if let Some(life) = Facts::sig(facts, key) {
-            writeln!(out, "  sig {:?} ends {:?} bounds {:?}", life.regions, life.ends, life.bounds)?;
+            writeln!(out, "  sig {:?} ends {:?} bounds {:?} body {:?}", life.regions, life.ends, life.bounds, life.body)?;
         }
         if let Some(&(_, why)) = facts.sig_refused().iter().find(|(x, _)| *x == k) {
             writeln!(out, "  sig refused {why:?}")?;
@@ -1005,6 +1038,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // interior as a stalled row; the borrow check lowers each async body once, and the
         // rows are decided on the exact interiors of those lowerings (stalled_goals.rs).
         let mut verdict = self.check_then(body, Stalls::Decide, alloc, |r, lowered, done| {
+            let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Borrows);
             let mut interiors = AsyncInteriors::new_in(done, alloc);
             borrows = Some(borrows_of(r, lowered, done, &mut reads, &mut interiors, show, alloc));
             decision = Some(decide_stalled_goals(r, lowered, done, &interiors, &mut reads, alloc));

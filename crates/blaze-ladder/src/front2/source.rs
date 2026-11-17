@@ -278,6 +278,18 @@ pub trait NamesSource<'n>: Copy {
         None
     }
 
+    /// The impl tables (front2 buckets/records.rs, E3) the check files a question's impls
+    /// from, when this source holds them: then no crate is filed whole and the items records'
+    /// bucket section is not read. `None`: today's index.
+    fn impl_tables(self) -> Option<&'n super::buckets::TableSet<'n>> {
+        None
+    }
+
+    /// One cell of a crate's impl tables a lookup in [`NamesSource::impl_tables`] read
+    /// (buckets/records.rs `cells_of`): a source that records its reads (front2 tables/view.rs)
+    /// lists it; one that does not has nothing to list.
+    fn impls_read(self, _read: super::tables::recorder::TableRead) {}
+
     /// The impl `key` of crate `krate`, written in `module`, with its header's text: for the
     /// one impl a row does not file ([`NamesSource::each_impl_row`]'s reader). `None`: the
     /// text did not read (filed in the log).

@@ -25,6 +25,7 @@ use crate::canon::{self, Canon, Decode, RespGoal, RespId, Responses};
 use crate::error::{Limit, Malformed, SolveError, Stop};
 use crate::facts::{Ask, Facts, Read, TraitFlags};
 use crate::fold::{self, Inst, Scratch};
+use crate::readlog::{ReadLog, SegLog};
 use crate::search::{Ans, FIXPOINT_STEP_LIMIT, Heads, Inputs, MAX_DEPTH, PathKind, Prov};
 use crate::term::{Certainty, Def, Flags, GoalSource, Lang, MarkerTrait, Polarity, Pred, Ty, TyKind, TypingMode, VarKind};
 use crate::trait_goals;
@@ -190,8 +191,10 @@ pub struct Solver<'a> {
     dones: Vec<Done, Alloc<'a>>,
     goals: Vec<Pending, Alloc<'a>>,
     origs: Vec<Ty, Alloc<'a>>,
-    reads: Vec<Read, Alloc<'a>>,
-    nested_ids: Vec<u32, Alloc<'a>>,
+    /// Every frame's read list, a set per frame (readlog.rs).
+    reads: ReadLog<'a>,
+    /// Every frame's nested goals (input ids), a set per frame.
+    nested_ids: SegLog<'a>,
     added: Vec<Added, Alloc<'a>>,
     deferred: Vec<(Ty, Ty), Alloc<'a>>,
     resp_goals: Vec<RespGoal, Alloc<'a>>,
@@ -200,15 +203,27 @@ pub struct Solver<'a> {
     limit: u32,
     /// The ground fast path's reads, by (term, marker trait) (solve.md (c)).
     marker_reads: Map<(u32, u8), (u32, u32), FixedState, Alloc<'a>>,
-    marker_pool: Vec<Read, Alloc<'a>>,
-    /// Counters for the cost example and the tests.
-    pub stats: Stats,
+    marker_pool: Vec<u32, Alloc<'a>>,
+    /// A measurement, off unless asked for ([`Solver::keep_root_keys`]): a 64-bit digest of
+    /// each ground root goal's canonical input with its environment's canonical words in place
+    /// of the env id, so goals of different bodies (different solvers) compare.
+    root_keys: Option<Vec<u64, Alloc<'a>>>,
 }
 
-/// What the solver did, counted.
-#[derive(Clone, Copy, Debug, Default)]
+/// What the solver did, counted: plain integers, bumped on the paths they name and read by the
+/// caller after a body ([`Solver::stats`]). They live in the scratch (`fold::Scratch::stats`),
+/// the one table every rule and walk is handed, so a walk deep in a rule counts without a
+/// second channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// Root goals asked ([`Solver::evaluate`] calls).
+    pub evaluations: u64,
+    /// Distinct canonical goals the solver has interned (frames pushed for each, cache hits
+    /// after): filled by [`Solver::stats`].
+    pub distinct_goals: u64,
+    /// Goals proven by a frame (each a stack entry that assembled and ran candidates).
     pub frames: u64,
+    /// Goals answered from the task cache.
     pub cache_hits: u64,
     pub fast_path: u64,
     pub candidates: u64,
@@ -216,6 +231,99 @@ pub struct Stats {
     /// Impl candidates assembled, after the fingerprint prefilter (prefilter.rs): each is one
     /// impl header imported with fresh arguments (`trait_goals::step_impl`).
     pub impl_candidates: u64,
+    /// Term nodes made in the arena by importing a portable answer (`fold::import_at`).
+    pub terms_imported: u64,
+    /// ADT fields instantiated for a structural goal (`builtin::adt_fields`).
+    pub adt_fields: u64,
+    /// Read lists sorted, and the reads those sorts held (none since the read log, readlog.rs:
+    /// kept so the fixtures say so).
+    pub read_sorts: u64,
+    pub reads_sorted: u64,
+    /// Read ids a finished frame's list folded into its parent's (`SegLog::close`): the read
+    /// log's work per frame, where the sort was.
+    pub reads_folded: u64,
+    /// Auto-trait summaries made, one per (ADT, trait) (auto_summary.rs), and the fields their
+    /// walks read.
+    pub auto_summaries: u64,
+    pub summary_fields: u64,
+    /// Impl headers imported whose arguments then failed to relate with the goal's
+    /// (`trait_goals::step_impl`): the imports a deeper reject would have saved.
+    pub impl_header_mismatch: u64,
+    /// Impl candidates refused by the header pre-match before any import
+    /// (prefilter.rs `header_may_match`).
+    pub impl_prematch_rejected: u64,
+    /// Goals written in canonical form (`canon::goal_input`: each root and each nested goal
+    /// started), and the words written.
+    pub canonicalized: u64,
+    pub canon_words: u64,
+    /// Canonical inputs decoded into the arena (`canon::instantiate_input`, one per frame).
+    pub decoded: u64,
+    /// Root goals that reached the search with no inference variable, no parameter and no
+    /// placeholder (counted only while root keys are kept: [`Solver::keep_root_keys`]).
+    pub ground_roots: u64,
+    /// Root evaluations stopped by a fact not yet filled (`Stop::Need`: the caller fills it and
+    /// asks the root again), and the frames on the stack each such stop (or any other) threw
+    /// away unfinished.
+    pub need_stops: u64,
+    pub frames_abandoned: u64,
+    /// Frames finished with a provisional answer (inside a cycle, not in the global cache).
+    pub provisional: u64,
+}
+
+/// `add` and `since` over every field of [`Stats`], named once: a field left out of the list
+/// fails `since`'s struct literal.
+macro_rules! stats_fields {
+    ($($f:ident),* $(,)?) => {
+        impl Stats {
+            /// Adds `o` into `self`.
+            pub fn add(&mut self, o: &Stats) {
+                $(self.$f += o.$f;)*
+            }
+
+            /// `self - earlier`: what happened between two readings.
+            pub fn since(&self, earlier: &Stats) -> Stats {
+                Stats { $($f: self.$f - earlier.$f,)* }
+            }
+        }
+    };
+}
+
+stats_fields!(
+    evaluations,
+    distinct_goals,
+    frames,
+    cache_hits,
+    fast_path,
+    candidates,
+    reruns,
+    impl_candidates,
+    terms_imported,
+    adt_fields,
+    read_sorts,
+    reads_sorted,
+    reads_folded,
+    auto_summaries,
+    summary_fields,
+    impl_header_mismatch,
+    impl_prematch_rejected,
+    canonicalized,
+    canon_words,
+    decoded,
+    ground_roots,
+    need_stops,
+    frames_abandoned,
+    provisional,
+);
+
+/// Which of the solver's shortcuts are off. Each answers as the steps it shortcuts do; the
+/// tests run with each off and compare (tests/cost.rs, rule 78).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Off {
+    /// The auto-trait summaries (auto_summary.rs): every structural step a goal of its own.
+    pub summaries: bool,
+    /// The impl header pre-match (prefilter.rs `header_may_match`): every surviving header
+    /// imported and related.
+    pub prematch: bool,
 }
 
 fn env_slice<'e>(clauses: &'e [Clause], rows: &[(u32, u32)], env: EnvId) -> &'e [Clause] {
@@ -260,8 +368,8 @@ impl<'a> Solver<'a> {
             dones: Vec::new_in(alloc),
             goals: Vec::new_in(alloc),
             origs: Vec::new_in(alloc),
-            reads: Vec::new_in(alloc),
-            nested_ids: Vec::new_in(alloc),
+            reads: ReadLog::new_in(alloc),
+            nested_ids: SegLog::new_in(alloc),
             added: Vec::new_in(alloc),
             deferred: Vec::new_in(alloc),
             resp_goals: Vec::new_in(alloc),
@@ -270,12 +378,37 @@ impl<'a> Solver<'a> {
             limit: RECURSION_LIMIT,
             marker_reads: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             marker_pool: Vec::new_in(alloc),
-            stats: Stats::default(),
+            root_keys: None,
         }
     }
 
     pub fn alloc(&self) -> Alloc<'a> {
         self.alloc
+    }
+
+    /// Turns shortcuts off: the tests' other strategy.
+    #[cfg(test)]
+    pub(crate) fn turn_off(&mut self, off: Off) {
+        self.scratch.off = off;
+    }
+
+    /// Keeps a digest of each ground root goal from now on (a measurement: how many goals
+    /// of one body another body asks too). Off by default: it hashes every root goal's words.
+    pub fn keep_root_keys(&mut self) {
+        if self.root_keys.is_none() {
+            self.root_keys = Some(Vec::new_in(self.alloc));
+        }
+    }
+
+    /// The digests kept since [`Solver::keep_root_keys`], one per ground root goal that
+    /// reached the search, in order.
+    pub fn root_keys(&self) -> &[u64] {
+        self.root_keys.as_deref().unwrap_or(&[])
+    }
+
+    /// What this solver did so far, counted ([`Stats`]).
+    pub fn stats(&self) -> Stats {
+        Stats { distinct_goals: self.inputs.len() as u64, ..self.scratch.stats }
     }
 
     /// Sets the recursion limit (clamped to the stack's bound, `MAX_DEPTH`).
@@ -380,11 +513,13 @@ impl<'a> Solver<'a> {
         goal: Goal,
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<Answer, Stop> {
+        self.scratch.stats.evaluations += 1;
         if let Some(a) = self.fast_path(tys, mode, goal, reads) {
-            self.stats.fast_path += 1;
+            self.scratch.stats.fast_path += 1;
             return Ok(a);
         }
-        let reads_lo = self.reads.len();
+        let reads_lo = self.reads.seg.len();
+        self.reads.lo = reads_lo as u32;
         let r = self.evaluate_root(tys, facts, mode, goal);
         match r {
             Ok((ans, orig_lo)) => {
@@ -392,13 +527,13 @@ impl<'a> Solver<'a> {
                 self.origs.truncate(orig_lo as usize);
                 let answer = answer?;
                 self.remember_marker(tys, mode, goal, answer, reads_lo);
-                reads.extend_from_slice(&self.reads[reads_lo..]);
-                self.reads.truncate(reads_lo);
+                self.reads.export(reads_lo, reads);
+                self.reads.seg.truncate(reads_lo);
                 self.resps.truncate_scratch((0, 0));
                 Ok(answer)
             }
             Err(e) => {
-                self.reads.truncate(reads_lo);
+                self.reads.seg.truncate(reads_lo);
                 self.origs.clear();
                 self.resps.truncate_scratch((0, 0));
                 Err(e)
@@ -444,7 +579,9 @@ impl<'a> Solver<'a> {
         let (t, m) = self.marker_of(tys, mode, goal)?;
         let holds = tys.markers(t).get(m)?;
         let &(s, l) = self.marker_reads.get(&(t.0, m as u8))?;
-        reads.extend_from_slice(&self.marker_pool[s as usize..(s + l) as usize]);
+        for &id in &self.marker_pool[s as usize..(s + l) as usize] {
+            reads.push(self.reads.read(id));
+        }
         Some(if holds { Answer::Yes } else { Answer::No })
     }
 
@@ -456,7 +593,7 @@ impl<'a> Solver<'a> {
         };
         let Some((t, m)) = self.marker_of(tys, mode, goal) else { return };
         let s = self.marker_pool.len() as u32;
-        let rs = &self.reads[reads_lo..];
+        let rs = self.reads.seg.from(reads_lo);
         self.marker_pool.extend_from_slice(rs);
         self.marker_reads.insert((t.0, m as u8), (s, rs.len() as u32));
         let k = tys.markers(t).with(m, holds);
@@ -484,13 +621,33 @@ impl<'a> Solver<'a> {
     /// the returned index.
     fn evaluate_root<T: Tys, F: Facts>(&mut self, tys: &mut T, facts: &F, mode: TypingMode, goal: Goal) -> Result<(Ans, u32), Stop> {
         canon::goal_input(&*tys, &mut self.canon, &mut self.words, mode, goal)?;
+        self.scratch.stats.canonicalized += 1;
+        self.scratch.stats.canon_words += self.words.len() as u64;
+        if self.root_keys.is_some() && self.canon.orig.is_empty() {
+            let mut ground = true;
+            pred_terms(&*tys, goal.pred, &mut |t| {
+                ground &= tys.flags(t).is_global_ground();
+                Ok(())
+            })?;
+            if ground {
+                self.scratch.stats.ground_roots += 1;
+                let env = match self.env_word_rows.get(goal.env.0 as usize) {
+                    Some(&(s, l)) => crate::search::hash_words(&self.env_words[s as usize..(s + l) as usize]),
+                    None => 0,
+                };
+                let key = crate::search::hash_words(&self.words[2..]) ^ env.rotate_left(17) ^ u64::from(self.words[0]);
+                if let Some(keys) = self.root_keys.as_mut() {
+                    keys.push(key);
+                }
+            }
+        }
         let orig_lo = self.origs.len() as u32;
         self.origs.extend_from_slice(&self.canon.orig);
         let input = self.inputs.intern(&self.words)?;
         if let Some(e) = self.inputs.lookup(input, self.limit, true) {
-            self.stats.cache_hits += 1;
-            let rs = self.inputs.reads_of(&e);
-            self.reads.extend_from_slice(rs);
+            self.scratch.stats.cache_hits += 1;
+            let lo = self.reads.lo;
+            self.reads.seg.extend(lo, self.inputs.reads_of(&e))?;
             return Ok((e.ans, orig_lo));
         }
         let mut snaps: Vec<T::Snapshot, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -504,6 +661,10 @@ impl<'a> Solver<'a> {
                 if let Some(&s) = snaps.first() {
                     tys.rollback_to(s);
                 }
+                if matches!(e, Stop::Need(_)) {
+                    self.scratch.stats.need_stops += 1;
+                }
+                self.scratch.stats.frames_abandoned += self.frames.len() as u64;
                 for f in self.frames.iter() {
                     self.inputs.on_stack[f.input as usize] = u32::MAX;
                 }
@@ -511,7 +672,7 @@ impl<'a> Solver<'a> {
                 self.cands.clear();
                 self.dones.clear();
                 self.goals.clear();
-                self.nested_ids.clear();
+                self.nested_ids.truncate(0);
                 self.added.clear();
                 self.deferred.clear();
                 self.inputs.prov.clear();
@@ -530,7 +691,7 @@ impl<'a> Solver<'a> {
         depth: u32,
         from_parent: PathKind,
     ) {
-        self.stats.frames += 1;
+        self.scratch.stats.frames += 1;
         let at = self.frames.len() as u32;
         self.inputs.on_stack[input as usize] = at;
         snaps.push(tys.snapshot());
@@ -568,10 +729,11 @@ impl<'a> Solver<'a> {
             iterations: 0,
             overflow: false,
             big: false,
-            reads_lo: self.reads.len() as u32,
+            reads_lo: self.reads.seg.len() as u32,
             nested_lo: self.nested_ids.len() as u32,
             scratch_mark: self.resps.scratch_mark(),
         });
+        self.reads.lo = self.reads.seg.len() as u32;
     }
 
     /// The main loop: runs the top frame until the root frame finishes.
@@ -636,6 +798,7 @@ impl<'a> Solver<'a> {
 
     fn cx<'c, T: Tys, F: Facts>(&'c mut self, tys: &'c mut T, facts: &'c F, top: usize) -> Cx<'c, 'a, T, F> {
         let f = self.frames[top];
+        self.reads.lo = f.reads_lo;
         Cx {
             tys,
             ask: Ask::new(facts),
@@ -661,6 +824,7 @@ impl<'a> Solver<'a> {
             let w = self.inputs.words_of(input);
             canon::instantiate_input(tys, &mut self.decode, w)?
         };
+        self.scratch.stats.decoded += 1;
         let vars_lo = self.origs.len() as u32;
         for &s in self.decode.slots.iter() {
             if s == Ty::NONE {
@@ -785,7 +949,7 @@ impl<'a> Solver<'a> {
     ) -> Result<(), Stop> {
         let f = self.frames[top];
         if (f.cand_at as usize) < self.cands.len() {
-            self.stats.candidates += 1;
+            self.scratch.stats.candidates += 1;
             probes[top] = Some(tys.snapshot());
             let lo = self.goals.len() as u32;
             for i in f.goals_lo..f.fgoals_hi {
@@ -811,7 +975,7 @@ impl<'a> Solver<'a> {
                     let mut cx = self.cx(tys, facts, top);
                     trait_goals::assemble_impls(&mut cx, &st, &mut out)?;
                 }
-                self.stats.impl_candidates += out.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
+                self.scratch.stats.impl_candidates += out.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
                 self.added.clear();
                 self.cands.extend_from_slice(&out);
                 return Ok(());
@@ -1064,6 +1228,8 @@ impl<'a> Solver<'a> {
         let f = self.frames[top];
         let goal = Goal { env: f.goal.env, pred: g.pred, bound: g.bound };
         canon::goal_input(&*tys, &mut self.canon, &mut self.words, f.mode, goal)?;
+        self.scratch.stats.canonicalized += 1;
+        self.scratch.stats.canon_words += self.words.len() as u64;
         let orig_lo = self.origs.len() as u32;
         self.origs.extend_from_slice(&self.canon.orig);
         self.frames[top].call_orig_lo = orig_lo;
@@ -1101,18 +1267,16 @@ impl<'a> Solver<'a> {
         // The global cache.
         let avail = f.depth.saturating_sub(1);
         if let Some(e) = self.inputs.lookup(input, avail, false) {
-            self.stats.cache_hits += 1;
-            let rs = self.inputs.reads_of(&e);
-            self.reads.extend_from_slice(rs);
+            self.scratch.stats.cache_hits += 1;
+            self.reads.seg.extend(f.reads_lo, self.inputs.reads_of(&e))?;
             let big = match self.inputs.nested_of(&e) {
                 Some(n) => {
-                    let n: &[u32] = n;
-                    self.nested_ids.extend_from_slice(n);
+                    self.nested_ids.extend(f.nested_lo, n)?;
                     false
                 }
                 None => true,
             };
-            self.nested_ids.push(input);
+            self.nested_ids.push(f.nested_lo, input)?;
             let fr = &mut self.frames[top];
             fr.big |= big;
             fr.required_depth = fr.required_depth.max(e.required_depth + 1);
@@ -1135,6 +1299,7 @@ impl<'a> Solver<'a> {
         // Specialization between two impl candidates, a fact of the impls read like any other
         // (the frame's read list keeps it).
         let ask = Ask::new(facts);
+        self.reads.lo = f.reads_lo;
         let reads = &mut self.reads;
         let mut specializes = |a: Def, b: Def| ask.specializes(reads, a, b);
         Ok(match f.kind {
@@ -1193,7 +1358,7 @@ impl<'a> Solver<'a> {
             }
             if !reached {
                 if f.iterations + 1 < FIXPOINT_STEP_LIMIT {
-                    self.stats.reruns += 1;
+                    self.scratch.stats.reruns += 1;
                     self.inputs.drop_provisional(top as u32);
                     self.rerun(tys, snaps, probes, top, ans);
                     return Ok(None);
@@ -1220,16 +1385,17 @@ impl<'a> Solver<'a> {
         self.goals.truncate(f.goals_lo as usize);
         self.origs.truncate(f.vars_lo as usize);
         self.resps.truncate_scratch(f.scratch_mark);
+        // The frame's reads and nested goals are sets already (readlog.rs): the entry takes them
+        // as they are, and they fold into the parent's below.
         let rl = f.reads_lo as usize;
-        sort_dedup(&mut self.reads, rl);
         let nl = f.nested_lo as usize;
-        sort_dedup(&mut self.nested_ids, nl);
         let mut heads = f.heads;
         heads.remove(top as u32);
         if heads.is_empty() {
-            let (inputs, nested, reads) = (&mut self.inputs, &self.nested_ids[nl..], &self.reads[rl..]);
+            let (inputs, nested, reads) = (&mut self.inputs, self.nested_ids.from(nl), self.reads.seg.from(rl));
             inputs.insert(f.input, f.depth, f.overflow, ans, f.required_depth, nested, f.big, reads)?;
         } else if let Some(highest) = heads.highest() {
+            self.scratch.stats.provisional += 1;
             let path = {
                 let mut p = f.from_parent;
                 for g in self.frames[highest as usize + 1..].iter() {
@@ -1240,10 +1406,17 @@ impl<'a> Solver<'a> {
             self.inputs.prov.push(Prov { input: f.input, heads, highest, path, ans });
         }
         if top == 0 {
+            // The root's reads stay for `evaluate` to hand out; its nested goals are done with.
+            self.nested_ids.truncate(nl);
             return Ok(Some(ans));
         }
         let p = top - 1;
-        self.nested_ids.push(f.input);
+        let pf = self.frames[p];
+        self.scratch.stats.reads_folded += (self.reads.seg.len() - rl) as u64;
+        self.reads.seg.close(pf.reads_lo, f.reads_lo);
+        self.reads.lo = pf.reads_lo;
+        self.nested_ids.close(pf.nested_lo, f.nested_lo);
+        self.nested_ids.push(pf.nested_lo, f.input)?;
         {
             let pf = &mut self.frames[p];
             pf.required_depth = pf.required_depth.max(f.required_depth + 1);
@@ -1280,7 +1453,8 @@ impl<'a> Solver<'a> {
         self.dones.truncate(f.dones_lo as usize);
         self.goals.truncate(f.goals_lo as usize);
         self.origs.truncate(f.vars_lo as usize);
-        self.reads.truncate(f.reads_lo as usize);
+        self.reads.seg.truncate(f.reads_lo as usize);
+        self.reads.lo = f.reads_lo;
         self.nested_ids.truncate(f.nested_lo as usize);
         let fr = &mut self.frames[top];
         fr.provisional = Some(ans);
@@ -1295,18 +1469,6 @@ impl<'a> Solver<'a> {
         fr.fgoals_hi = fr.goals_lo;
         fr.phase = Phase::Start;
     }
-}
-
-fn sort_dedup<X: Ord + Copy>(v: &mut Vec<X, Alloc<'_>>, lo: usize) {
-    v[lo..].sort_unstable();
-    let mut w = lo;
-    for r in lo..v.len() {
-        if w == lo || v[w - 1] != v[r] {
-            v[w] = v[r];
-            w += 1;
-        }
-    }
-    v.truncate(w);
 }
 
 /// Calls `f` on every term of `p`.

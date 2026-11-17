@@ -187,7 +187,17 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             _ => (false, &written[..]),
         };
         let lead = (written.len() - rest.len()) as u32;
-        let target = match self.resolver().path_with(at_module, site.dollar_crate, abs, rest, Ns::Value) {
+        // The crate a first segment `$crate` names: once the path stands for a block import's,
+        // that import's (its first segment is first now, with the mark it was written with:
+        // `use $crate::builder::impl_prelude::*;` of clap_builder's `value_parser!`), else the
+        // written path's own.
+        let dollar = match (&via_glob, via_use) {
+            (Some(hit), _) => hit.dollar,
+            (None, Some(row)) if !row.abs => super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark),
+            (None, Some(_)) => None,
+            (None, None) => site.dollar_crate,
+        };
+        let target = match self.resolver().path_with(at_module, dollar, abs, rest, Ns::Value) {
             Ok(t) => t,
             // A block's item the body's lowering listed, which the name solver does not find
             // under its block's module (a later segment it cannot read): never "the program
@@ -196,7 +206,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 Some(row) if written.len() == 1 => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
                 // The program names nothing: the checker's own diagnostic, naming the segment
                 // the library stopped at (world_path_miss.rs).
-                _ => return self.path_miss(at_module, site.dollar_crate, abs, rest, lead, shift, e),
+                _ => return self.path_miss(at_module, dollar, abs, rest, lead, shift, e),
             },
             Err(e @ ResolveError::NoText { .. }) => return self.gap(Gap::Resolve(e)),
         };

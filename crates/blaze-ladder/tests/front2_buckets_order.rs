@@ -41,7 +41,8 @@ use std::collections::HashMap;
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_impls::{ImplRead, Probe};
-use blaze_ladder::front2::buckets::{Ask, BucketRead, BucketSource, Buckets, ItemsIndex, TableSet, cell_read, inherent_home, trait_cell, trait_home, write_impl_tables};
+use blaze_ladder::front2::buckets::{Ask, BucketRead, BucketSource, Buckets, ItemsIndex, TableSet, cell_read, cells_of, inherent_home, trait_cell, trait_home, write_impl_tables};
+use blaze_ladder::front2::tables::recorder::TableRead;
 use blaze_surface::BucketKey;
 use blaze_ladder::front2::heads::Store;
 use blaze_ladder::front2::keys::{Keys, checker_of};
@@ -443,6 +444,10 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
                 ImplRead::Filter { krate, .. } | ImplRead::Directory { krate, .. } | ImplRead::Bucket { krate, .. } => *krate,
             };
             let Some(cell) = cell_read(read) else { continue };
+            // The one map a body's recorder calls gives the same cell, of the same crate.
+            let mut k16 = [0u8; 16];
+            k16.copy_from_slice(&krate.0.0[..16]);
+            assert_eq!(cells_of(read), Some(TableRead::Impls { krate: k16, bucket: cell }), "`{what}: Tr`: `cells_of` disagrees with `cell_read`");
             let saw = defined(krate, cell);
             match read {
                 ImplRead::Directory { found, .. } => assert_eq!(saw, *found, "`{what}: Tr`: a directory read of {krate:x} is not its cell"),

@@ -25,6 +25,7 @@ pub mod datum;
 pub mod image;
 pub mod place;
 pub mod record;
+pub mod tls;
 pub mod unwind;
 pub mod eh;
 

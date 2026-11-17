@@ -29,6 +29,13 @@ blaze-surface.workspace = true
 # The impl tables' lookups (front2/buckets/records.rs, engine.md E3): `candidates_in` over the
 # records blaze-surface writes.
 blaze-impls.workspace = true
+# The engine's task and result (engine.md, D131): the body task (front2/tables/task.rs) is
+# entered as a `Task` and answers a `Done`.
+blaze-engine = { path = "../blaze-engine" }
+# The engine's names, kinds, keys and cells (blaze-drive key.rs, cells.rs): the impl tables
+# task's result in the engine's form (front2/buckets/records.rs `impl_tables_task`), and the
+# body task's reads as `Name`/`Cell` ids.
+blaze-drive.workspace = true
 parser.workspace = true
 # The body form, the checker and its type context (`InferCtx`).
 blaze-typeck = { workspace = true }
@@ -92,6 +99,8 @@ blaze-sim.workspace = true
 blaze-std.workspace = true
 # tests/front2_borrows.rs: `blaze_own::testing::heap()`, the test's root allocator.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# tests/front2_solver_cost.rs: the solver's question kinds, to name its counters.
+blaze-solve.workspace = true
 
 [lints]
 workspace = true

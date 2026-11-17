@@ -60,6 +60,10 @@ impl Adts for World {
         OverflowChecks::On
     }
 
+    fn ub_checks(&self) -> blaze_build::UbChecks {
+        blaze_build::UbChecks::Off
+    }
+
     fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
         Ok(None)
     }

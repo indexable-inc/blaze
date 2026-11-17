@@ -43,14 +43,13 @@ use crate::{
     enc_tls,
 };
 
-/// The descriptor's `root`, in 8-byte units for `ldr`'s scaled offset: blaze-build
-/// `tls::index::DESC_ROOT` (8). This crate cannot depend on blaze-build; blaze-build's
-/// `tls::index_tests` runs this sequence against its getter and descriptor, which pins them equal.
-const DESC_ROOT_WORDS: u32 = 1;
-/// The table's `len`, in 8-byte units: blaze-build `tls::index::TABLE_LEN` (0).
-const TABLE_LEN_WORDS: u32 = 0;
-/// The table's first slot, in bytes: blaze-build `tls::index::TABLE_SLOTS` (32).
-const TABLE_SLOTS: u32 = 32;
+/// The descriptor's `root`, in 8-byte units for `ldr`'s scaled offset (the forms' one home is
+/// blaze-code's `tls`; blaze-build's `tls::index_tests` runs this sequence against its getter).
+const DESC_ROOT_WORDS: u32 = blaze_code::tls::DESC_ROOT as u32 / 8;
+/// The table's `len`, in 8-byte units.
+const TABLE_LEN_WORDS: u32 = blaze_code::tls::TABLE_LEN as u32 / 8;
+/// The table's first slot, in bytes.
+const TABLE_SLOTS: u32 = blaze_code::tls::TABLE_SLOTS as u32;
 
 impl<A: Allocator> Pass<'_, '_, A> {
     pub(super) fn tls_addr_indexed(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {

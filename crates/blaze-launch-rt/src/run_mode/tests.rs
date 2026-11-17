@@ -10,7 +10,7 @@ use blaze_launch::{Slot, Thread, Tier};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::{Nanos, SlotId};
 
-use super::{Act, Event, Memory, Outside, Placing, Plant, RecordSource, RunMode, RunModeError};
+use super::{Act, Event, Memory, Outside, Placing, Plant, RecordSource, RunMode, RunModeError, ThreadKey};
 use crate::code_unwind::Step;
 
 const ADRP_X16: u32 = 0x9000_0010;
@@ -151,6 +151,14 @@ impl Memory for Sim {
     fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
         Err(RunModeError::NotBuilt { what: "this scenario places no static" })
     }
+
+    fn thread_key(&mut self, _ender: u64) -> Result<ThreadKey, RunModeError> {
+        Err(RunModeError::NotBuilt { what: "this scenario makes no thread-local key" })
+    }
+
+    fn write(&mut self, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
+        Err(RunModeError::NotBuilt { what: "this scenario writes no thread-local row" })
+    }
 }
 
 /// What one run of the scenario shows.
@@ -184,6 +192,7 @@ fn carry(
             Act::Stop(stop) => panic!("the run stopped: {stop:?}"),
             Act::Native { record } => panic!("this simulation's parent sends no native library: {record:?}"),
             Act::Statics => panic!("this simulation's parent sends no static"),
+            Act::ThreadLocals => panic!("this simulation's parent sends no thread-local"),
         }
     }
     acts.clear();

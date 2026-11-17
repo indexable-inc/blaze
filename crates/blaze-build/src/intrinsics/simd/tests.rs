@@ -54,7 +54,7 @@ impl Env {
     fn call(&mut self, b: &mut Builder<Global, Full>, c: &Call<'_>) -> Result<Out, IntrinsicError> {
         let mut cx = LayoutCx { ground: &mut self.g.t, facts: &self.w, scratch: Alloc::global() };
         let needs_drop = |_: PTy| false;
-        let mut icx = IntrinsicCx { layouts: &mut self.ls, cx: &mut cx, needs_drop: &needs_drop };
+        let mut icx = IntrinsicCx { layouts: &mut self.ls, cx: &mut cx, needs_drop: &needs_drop, ub_checks: crate::UbChecks::Off, overflow_checks: crate::OverflowChecks::Off };
         build(b, c, &mut icx)
     }
 }

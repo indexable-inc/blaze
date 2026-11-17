@@ -30,9 +30,10 @@
 //! closure type and an async block's future in a head's terms (body types, never a head's); an
 //! alias whose head was refused (its why is a `Why`, not a record). Not in this form: an impl's
 //! or a trait's lifetime part (`lifetimes::ContainerLife`: its declared names are private to
-//! lifetimes.rs, so it cannot be written from here), an impl's const parameters (filed by a
-//! library key the impl's checker key does not give back), the store's gaps (`fn_gaps`,
-//! `alias_gaps`: refusals, not heads).
+//! lifetimes.rs, so it cannot be written from here; no body reads it from the store: the
+//! borrow check reads lifetimes from the text, as `FactKind::BorrowHead` rows), the store's gaps
+//! (`fn_gaps`, `alias_gaps`: refusals, not heads). An impl's const parameters are its frame's
+//! (form 9), filed under the impl's library key by whoever holds it (the want).
 
 use blaze_build::layout::{IntRepr, ReprAttrs};
 use blaze_hash::HashMap;
@@ -44,7 +45,8 @@ use blaze_typeck as tc;
 use blaze_typeck::dyn_compat::{FnFacts, MemberFacts, MemberShape, Receiver, Unread};
 use blaze_typeck::{FloatTy, IntTy, ItemKey, List, Name, PClause, PNode, PTy, PTys, PortableTys, UintTy};
 
-use super::heads::{AdtRow, CtorSig, FnHead, ImplHead, Store, TraitExtra, TraitHead};
+use super::gat::{AssocWhere, Outlived, Outlives};
+use super::heads::{AdtRow, CtorSig, FnHead, ImplHead, Maps, MemberFrame, Store, TraitExtra, TraitHead};
 use super::keys::checker_of;
 use super::lifetimes::{AdtLife, FnLife, LifeVariance, Region, Variance};
 use super::preds::Preds;
@@ -66,7 +68,12 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// (`AdtRow::args`, rule 83).
 /// 8: an ADT's record holds its field defaults (RFC 3681) after that mark: one optional key
 /// per field (`Store::field_defaults`), each the key of an anonymous constant's fn head.
-pub const VERSION: u32 = 8;
+/// 9: the store's side tables a body or a later head reads (engine E2a, front2/tables/head.rs):
+/// an ADT's record holds its fieldless-enum variant count (`Maps::fieldless_enums`); a trait's,
+/// per associated type in `TraitHead::assoc` order, its own parameter count, outlives clauses
+/// and own const parameters (`Maps::assoc_generics`, `assoc_where`, `assoc_consts`); an impl's,
+/// its members' frame (`Store::member_frame`), whose const parameters are the impl's own.
+pub const VERSION: u32 = 9;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -206,6 +213,8 @@ pub enum HeadRef<'h, 'n> {
         field_defaults: &'h [Option<ItemKey>],
         preds: Option<&'h Preds>,
         life: Option<&'h AdtLife>,
+        /// Its variant count when it is a fieldless enum (`Maps::fieldless_enums`, form 9).
+        fieldless: Option<u32>,
     },
     /// A tuple struct's or variant's constructor fn.
     Ctor { key: ItemKey, sig: &'h CtorSig },
@@ -218,13 +227,52 @@ pub enum HeadRef<'h, 'n> {
         supers: &'h [(LibKey, List)],
         const_params: &'h [(u32, PTy)],
         preds: Option<&'h Preds>,
+        /// Its associated types' side rows (form 9), one per `head.assoc` name.
+        assoc_side: AssocSides<'h>,
     },
-    Impl { key: ItemKey, head: &'h ImplHead, preds: Option<&'h Preds> },
+    /// An impl: its header, its where-clauses and its members' frame (form 9).
+    Impl { key: ItemKey, head: &'h ImplHead, preds: Option<&'h Preds>, frame: Option<&'h MemberFrame> },
     /// A type alias whose head was made.
     Alias { key: LibKey, generics: u32, ty: PTy, defaults: &'h [Option<PTy>], const_params: &'h [(u32, PTy)] },
     TraitAlias { key: LibKey, head: &'h TraitAliasHead },
     /// An `impl Trait` a fn's head made: its fn and index, its bounds (`Self` the opaque).
     Opaque { key: ItemKey, fn_: ItemKey, index: u32, preds: Option<&'h Preds> },
+}
+
+/// One associated type's side rows of a trait (form 9): what the store files beside the trait's
+/// members, by the trait and the name.
+pub struct AssocSide {
+    pub name: Name,
+    /// Its own type and const parameter count (`Maps::assoc_generics`).
+    pub generics: Option<u32>,
+    /// Its outlives where clauses (`Maps::assoc_where`).
+    pub where_: Option<AssocWhere>,
+    /// Its own const parameters (`Maps::assoc_consts`).
+    pub consts: Option<Vec<(u32, PTy), Mem>>,
+}
+
+/// Where a trait's [`AssocSide`] rows are read from: the store's maps, or a decoded head's own.
+#[derive(Clone, Copy)]
+pub enum AssocSides<'h> {
+    Store { maps: &'h Maps, trait_: LibKey },
+    Rows(&'h [AssocSide]),
+}
+
+impl AssocSides<'_> {
+    /// `name`'s rows: its parameter count, outlives clauses and own const parameters.
+    pub fn of(&self, name: Name) -> (Option<u32>, Option<AssocWhere>, Option<&[(u32, PTy)]>) {
+        match *self {
+            AssocSides::Store { maps, trait_ } => (
+                maps.assoc_generics.get(&(trait_, name)).copied(),
+                maps.assoc_where.get(&(trait_, name)).copied(),
+                maps.assoc_consts.get(&(trait_, name)).map(|c| &c[..]),
+            ),
+            AssocSides::Rows(rows) => match rows.iter().find(|r| r.name == name) {
+                Some(r) => (r.generics, r.where_, r.consts.as_deref()),
+                None => (None, None, None),
+            },
+        }
+    }
 }
 
 impl<'n> HeadRef<'_, 'n> {
@@ -248,6 +296,7 @@ pub enum Head<'n> {
         field_defaults: Vec<Option<ItemKey>, Mem>,
         preds: Option<Preds>,
         life: Option<AdtLife>,
+        fieldless: Option<u32>,
     },
     Ctor { key: ItemKey, sig: CtorSig },
     Trait {
@@ -257,8 +306,9 @@ pub enum Head<'n> {
         supers: Vec<(LibKey, List), Mem>,
         const_params: Vec<(u32, PTy), Mem>,
         preds: Option<Preds>,
+        assoc_side: Vec<AssocSide, Mem>,
     },
-    Impl { key: ItemKey, head: ImplHead, preds: Option<Preds> },
+    Impl { key: ItemKey, head: ImplHead, preds: Option<Preds>, frame: Option<MemberFrame> },
     Alias { key: LibKey, generics: u32, ty: PTy, defaults: Vec<Option<PTy>, Mem>, const_params: Vec<(u32, PTy), Mem> },
     TraitAlias { key: LibKey, head: TraitAliasHead },
     Opaque { key: ItemKey, fn_: ItemKey, index: u32, preds: Option<Preds> },
@@ -271,7 +321,7 @@ impl<'n> Head<'n> {
             Head::Fn { key, head, preds, static_, life } => {
                 HeadRef::Fn { key: *key, head, preds: preds.as_ref(), static_: *static_, life: life.as_ref() }
             }
-            Head::Adt { key, row, defaults, const_params, field_defaults, preds, life } => HeadRef::Adt {
+            Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless } => HeadRef::Adt {
                 key: *key,
                 row,
                 defaults: &defaults[..],
@@ -279,17 +329,19 @@ impl<'n> Head<'n> {
                 field_defaults: &field_defaults[..],
                 preds: preds.as_ref(),
                 life: life.as_ref(),
+                fieldless: *fieldless,
             },
             Head::Ctor { key, sig } => HeadRef::Ctor { key: *key, sig },
-            Head::Trait { key, head, extra, supers, const_params, preds } => HeadRef::Trait {
+            Head::Trait { key, head, extra, supers, const_params, preds, assoc_side } => HeadRef::Trait {
                 key: *key,
                 head,
                 extra: extra.as_ref(),
                 supers: &supers[..],
                 const_params: &const_params[..],
                 preds: preds.as_ref(),
+                assoc_side: AssocSides::Rows(&assoc_side[..]),
             },
-            Head::Impl { key, head, preds } => HeadRef::Impl { key: *key, head, preds: preds.as_ref() },
+            Head::Impl { key, head, preds, frame } => HeadRef::Impl { key: *key, head, preds: preds.as_ref(), frame: frame.as_ref() },
             Head::Alias { key, generics, ty, defaults, const_params } => HeadRef::Alias {
                 key: *key,
                 generics: *generics,
@@ -358,7 +410,8 @@ pub fn from_store<'h, 'n>(
             let const_params = store.maps.const_params.get(&lib).map_or(&[][..], |c| &c[..]);
             // Made with the row (`Store::adt`): a row without it is not this store's own.
             let field_defaults = store.field_defaults.get(&ck).ok_or(E::NotMade { at })?;
-            HeadRef::Adt { key: lib, row, defaults, const_params, field_defaults: &field_defaults[..], preds: store.preds.get(&ck), life: adt_life }
+            let fieldless = store.maps.fieldless_enums.get(&ck).copied();
+            HeadRef::Adt { key: lib, row, defaults, const_params, field_defaults: &field_defaults[..], preds: store.preds.get(&ck), life: adt_life, fieldless }
         }
         HeadAt::Ctor(k) => HeadRef::Ctor { key: k, sig: store.ctors.get(&k).ok_or(none)? },
         HeadAt::Trait(lib) => {
@@ -366,9 +419,12 @@ pub fn from_store<'h, 'n>(
             let head = store.maps.traits.get(&lib).ok_or(none)?;
             let supers = store.maps.supers.get(&lib).map_or(&[][..], |s| &s[..]);
             let const_params = store.maps.const_params.get(&lib).map_or(&[][..], |c| &c[..]);
-            HeadRef::Trait { key: lib, head, extra: store.trait_defs.get(&ck), supers, const_params, preds: store.preds.get(&ck) }
+            let assoc_side = AssocSides::Store { maps: &store.maps, trait_: lib };
+            HeadRef::Trait { key: lib, head, extra: store.trait_defs.get(&ck), supers, const_params, preds: store.preds.get(&ck), assoc_side }
         }
-        HeadAt::Impl(k) => HeadRef::Impl { key: k, head: store.impls.get(&k).ok_or(none)?, preds: store.preds.get(&k) },
+        HeadAt::Impl(k) => {
+            HeadRef::Impl { key: k, head: store.impls.get(&k).ok_or(none)?, preds: store.preds.get(&k), frame: store.member_frame(k) }
+        }
         HeadAt::Alias(lib) => {
             let Some((generics, ty)) = *store.maps.aliases.get(&lib).ok_or(none)? else {
                 return Err(E::Unencoded { what: "a type alias whose head was refused (its why is a `Why`, not a record)" });
@@ -415,6 +471,17 @@ fn copy<T: Copy>(from: &[T], alloc: Mem) -> Vec<T, Mem> {
 
 // ---------------------------------------------------------------------------------------------
 // Writing.
+
+/// Whether two `Self`s are one, their lists compared by `l` ([`same`]).
+fn self_same(a: SelfTy, b: SelfTy, l: &impl Fn(List, List) -> bool) -> bool {
+    match (a, b) {
+        (SelfTy::None, SelfTy::None) => true,
+        (SelfTy::Trait(x), SelfTy::Trait(y)) => x == y,
+        (SelfTy::Ty(x, None), SelfTy::Ty(y, None)) => x == y,
+        (SelfTy::Ty(x, Some((t1, a1))), SelfTy::Ty(y, Some((t2, a2)))) => x == y && t1 == t2 && l(a1, a2),
+        _ => false,
+    }
+}
 
 /// `head` as a record. Its terms are read from `tys`, the table they are in.
 pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, HeadRecordError> {
@@ -485,33 +552,7 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                 o.u32(k);
             }
             o.lib(head.module);
-            o.count(head.params.len(), "a fn's parameters in scope")?;
-            for &(n, i) in &head.params {
-                o.name(n);
-                o.u32(i);
-            }
-            o.const_params(&head.consts)?;
-            o.count(head.bounds.len(), "a fn's parameter bounds")?;
-            for b in &head.bounds {
-                o.u32(b.param);
-                o.lib(b.trait_);
-                o.list(b.args, "a parameter bound's arguments")?;
-            }
-            match head.self_ {
-                SelfTy::None => o.byte(0),
-                SelfTy::Trait(t) => {
-                    o.byte(1);
-                    o.lib(t);
-                }
-                SelfTy::Ty(t, tr) => {
-                    o.byte(2);
-                    o.ty(t)?;
-                    o.opt(tr, |o, (k, l)| {
-                        o.lib(k);
-                        o.list(l, "`Self`'s trait arguments")
-                    })?;
-                }
-            }
+            o.scope(&head.params, &head.consts, &head.bounds, head.self_)?;
             o.named_tys(&head.self_assoc, "a fn's `Self` associated types")?;
             o.opt(preds, |o, p| o.preds(p))?;
             o.opt(static_, |o, m| {
@@ -528,7 +569,7 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
             })?;
             K_FN
         }
-        HeadRef::Adt { key, row, defaults, const_params, field_defaults, preds, life } => {
+        HeadRef::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless } => {
             o.lib(key);
             o.byte(match row.kind {
                 tc::AdtKind::Struct => 0,
@@ -586,6 +627,10 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                 o.regions(&l.fields, "an ADT's field regions")?;
                 o.u32s(&l.field_ends, "an ADT's field region ends")
             })?;
+            o.opt(fieldless, |o, n| {
+                o.u32(n);
+                Ok(())
+            })?;
             K_ADT
         }
         HeadRef::Ctor { key, sig } => {
@@ -596,7 +641,7 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
             o.ty(sig.output)?;
             K_CTOR
         }
-        HeadRef::Trait { key, head, extra, supers, const_params, preds } => {
+        HeadRef::Trait { key, head, extra, supers, const_params, preds, assoc_side } => {
             o.lib(key);
             o.u32(head.generics);
             o.defaults(&head.defaults)?;
@@ -623,9 +668,36 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
             o.lib_lists(supers, "a trait's supertraits")?;
             o.const_params(const_params)?;
             o.opt(preds, |o, p| o.preds(p))?;
+            // Form 9: each associated type's side rows, in `head.assoc` order (written order).
+            for &n in &head.assoc {
+                let (generics, where_, consts) = assoc_side.of(n);
+                o.opt(generics, |o, g| {
+                    o.u32(g);
+                    Ok(())
+                })?;
+                o.opt(where_, |o, w| {
+                    o.count(w.outlives().len(), "an associated type's outlives clauses")?;
+                    for c in w.outlives() {
+                        match c.subject {
+                            Outlived::SelfTy => o.byte(0),
+                            Outlived::Type(t) => {
+                                o.byte(1);
+                                o.name(t);
+                            }
+                            Outlived::Lifetime(l) => {
+                                o.byte(2);
+                                o.name(l);
+                            }
+                        }
+                        o.name(c.lifetime);
+                    }
+                    Ok(())
+                })?;
+                o.opt(consts, |o, c| o.const_params(c))?;
+            }
             K_TRAIT
         }
-        HeadRef::Impl { key, head, preds } => {
+        HeadRef::Impl { key, head, preds, frame } => {
             o.key(key);
             o.u32(head.generics);
             o.ty(head.self_ty)?;
@@ -647,6 +719,12 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                 tc::ImplPolarity::Reservation => 2,
             });
             o.opt(preds, |o, p| o.preds(p))?;
+            // Form 9: the frame its fns' signatures are made in.
+            o.opt(frame, |o, f| {
+                o.lib(f.module);
+                o.u32(f.generics);
+                o.scope(&f.params, &f.consts, &f.bounds, f.self_)
+            })?;
             K_IMPL
         }
         HeadRef::Alias { key, generics, ty, defaults, const_params } => {
@@ -784,6 +862,38 @@ impl Out<'_, '_> {
         for &(i, t) in v {
             self.u32(i);
             self.ty(t)?;
+        }
+        Ok(())
+    }
+    /// The scope a fn's signature is read in (a fn's own, an impl's members' frame): the
+    /// parameters by name, the const parameters, the bounds and `Self`.
+    fn scope(&mut self, params: &[(Name, u32)], consts: &[(u32, PTy)], bounds: &[ParamBound], self_: SelfTy) -> Result<(), E> {
+        self.count(params.len(), "a fn's parameters in scope")?;
+        for &(n, i) in params {
+            self.name(n);
+            self.u32(i);
+        }
+        self.const_params(consts)?;
+        self.count(bounds.len(), "a fn's parameter bounds")?;
+        for b in bounds {
+            self.u32(b.param);
+            self.lib(b.trait_);
+            self.list(b.args, "a parameter bound's arguments")?;
+        }
+        match self_ {
+            SelfTy::None => self.byte(0),
+            SelfTy::Trait(t) => {
+                self.byte(1);
+                self.lib(t);
+            }
+            SelfTy::Ty(t, tr) => {
+                self.byte(2);
+                self.ty(t)?;
+                self.opt(tr, |o, (k, l)| {
+                    o.lib(k);
+                    o.list(l, "`Self`'s trait arguments")
+                })?;
+            }
         }
         Ok(())
     }
@@ -1456,6 +1566,32 @@ impl<'r> In<'r, '_, '_> {
     fn const_params_own(&mut self) -> Result<Vec<(u32, PTy), Mem>, E> {
         self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))
     }
+    /// `Out::scope`'s fields, into the store's own lists.
+    fn scope<P, C, B>(&mut self) -> Result<(P, C, B, SelfTy), E>
+    where
+        P: Default + Extend<(Name, u32)>,
+        C: Default + Extend<(u32, PTy)>,
+        B: Default + Extend<ParamBound>,
+    {
+        let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
+        let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
+        let bounds = self.many("a fn's parameter bounds", |r| {
+            let param = r.u32("a bound's parameter")?;
+            let trait_ = r.lib("a bound's trait")?;
+            Ok(ParamBound { param, trait_, args: r.list("a parameter bound's arguments")? })
+        })?;
+        let self_ = match self.u8("a fn's `Self`")? {
+            0 => SelfTy::None,
+            1 => SelfTy::Trait(self.lib("a fn's `Self` trait")?),
+            2 => {
+                let t = self.ty("a fn's `Self` type")?;
+                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
+                SelfTy::Ty(t, tr)
+            }
+            byte => return Err(E::Byte { what: "a fn's `Self`", byte }),
+        };
+        Ok((params, consts, bounds, self_))
+    }
     fn clause(&mut self) -> Result<PClause, E> {
         Ok(match self.u8("a clause's tag")? {
             0 => {
@@ -1513,23 +1649,7 @@ impl<'r> In<'r, '_, '_> {
         let c_variadic = self.flag("a fn's C-variadic flag")?;
         let legacy_const_generics = self.many("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
         let module = self.lib("a fn's module")?;
-        let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
-        let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
-        let bounds = self.many("a fn's parameter bounds", |r| {
-            let param = r.u32("a bound's parameter")?;
-            let trait_ = r.lib("a bound's trait")?;
-            Ok(ParamBound { param, trait_, args: r.list("a parameter bound's arguments")? })
-        })?;
-        let self_ = match self.u8("a fn's `Self`")? {
-            0 => SelfTy::None,
-            1 => SelfTy::Trait(self.lib("a fn's `Self` trait")?),
-            2 => {
-                let t = self.ty("a fn's `Self` type")?;
-                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
-                SelfTy::Ty(t, tr)
-            }
-            byte => return Err(E::Byte { what: "a fn's `Self`", byte }),
-        };
+        let (params, consts, bounds, self_) = self.scope()?;
         let self_assoc = self.named_tys("a fn's `Self` associated types")?;
         let head = FnHead {
             lib,
@@ -1613,6 +1733,7 @@ impl<'r> In<'r, '_, '_> {
             let field_ends = r.own("an ADT's field region ends", |r| r.u32("a field region end"))?;
             Ok(AdtLife { lifetimes, variances, bounds, fields, field_ends })
         })?;
+        let fieldless = self.opt("a fieldless enum's variant count", |r| r.u32("a fieldless enum's variant count"))?;
         let row = AdtRow { kind, generics, variants, fields, repr, narrowed, discrs, args };
         for v in &row.variants {
             let end = v.fields.start.checked_add(v.fields.len);
@@ -1623,7 +1744,7 @@ impl<'r> In<'r, '_, '_> {
         if !field_defaults.is_empty() && field_defaults.len() != row.fields.len() {
             return Err(E::Shape { what: "an ADT's field defaults are not one per field" });
         }
-        Ok(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life })
+        Ok(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless })
     }
 
     fn repr(&mut self) -> Result<ReprAttrs, E> {
@@ -1715,7 +1836,28 @@ impl<'r> In<'r, '_, '_> {
         let supers = self.own("a trait's supertraits", |r| Ok((r.lib("a supertrait")?, r.list("a supertrait's arguments")?)))?;
         let const_params = self.const_params_own()?;
         let preds = self.opt("a trait's where-clauses", |r| r.preds())?;
-        Ok(Head::Trait { key, head, extra, supers, const_params, preds })
+        let mut assoc_side = Vec::with_capacity_in(head.assoc.len(), self.alloc);
+        for &name in &head.assoc {
+            let generics = self.opt("an associated type's parameter count", |r| r.u32("an associated type's parameter count"))?;
+            let where_ = self.opt("an associated type's outlives clauses", |r| {
+                let n = r.count("an associated type's outlives clauses")?;
+                let mut clauses = [Outlives { subject: Outlived::SelfTy, lifetime: Name(0) }; super::gat::MOST_OUTLIVES];
+                let Some(kept) = clauses.get_mut(..n) else { return Err(E::Shape { what: "more outlives clauses than an associated type keeps" }) };
+                for c in kept.iter_mut() {
+                    let subject = match r.u8("an outlives clause's subject")? {
+                        0 => Outlived::SelfTy,
+                        1 => Outlived::Type(r.name("an outlives clause's type")?),
+                        2 => Outlived::Lifetime(r.name("an outlives clause's lifetime")?),
+                        byte => return Err(E::Byte { what: "an outlives clause's subject", byte }),
+                    };
+                    *c = Outlives { subject, lifetime: r.name("an outlives clause's bound")? };
+                }
+                Ok(AssocWhere::of(&clauses[..n]))
+            })?;
+            let consts = self.opt("an associated type's const parameters", |r| r.const_params_own())?;
+            assoc_side.push(AssocSide { name, generics, where_, consts });
+        }
+        Ok(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side })
     }
 
     fn impl_<'n>(&mut self) -> Result<Head<'n>, E> {
@@ -1755,11 +1897,17 @@ impl<'r> In<'r, '_, '_> {
             byte => return Err(E::Byte { what: "an impl's polarity", byte }),
         };
         let preds = self.opt("an impl's where-clauses", |r| r.preds())?;
+        let frame = self.opt("an impl's members' frame", |r| {
+            let module = r.lib("a frame's module")?;
+            let generics = r.u32("a frame's generics")?;
+            let (params, consts, bounds, self_) = r.scope()?;
+            Ok(MemberFrame { module, generics, params, consts, bounds, self_ })
+        })?;
         let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, consts, polarity };
         if head.fn_self.len() != head.fns.len() {
             return Err(E::Shape { what: "an impl's fn `self` flags are not one per fn" });
         }
-        Ok(Head::Impl { key, head, preds })
+        Ok(Head::Impl { key, head, preds, frame })
     }
 }
 
@@ -1857,16 +2005,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
                     && h1.bounds.iter().zip(&h2.bounds).all(|(x, y)| x.param == y.param && x.trait_ == y.trait_ && l(x.args, y.args)),
                 "a fn's parameter bounds"
             );
-            need!(
-                match (h1.self_, h2.self_) {
-                    (SelfTy::None, SelfTy::None) => true,
-                    (SelfTy::Trait(x), SelfTy::Trait(y)) => x == y,
-                    (SelfTy::Ty(x, None), SelfTy::Ty(y, None)) => x == y,
-                    (SelfTy::Ty(x, Some((t1, a1))), SelfTy::Ty(y, Some((t2, a2)))) => x == y && t1 == t2 && l(a1, a2),
-                    _ => false,
-                },
-                "a fn's `Self`"
-            );
+            need!(self_same(h1.self_, h2.self_, &l), "a fn's `Self`");
             need!(h1.self_assoc[..] == h2.self_assoc[..], "a fn's `Self` associated types");
             need!(preds(p1, p2), "a fn's where-clauses");
             need!(s1 == s2, "a static's mutability");
@@ -1886,9 +2025,10 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             None
         }
         (
-            HeadRef::Adt { key: k1, row: r1, defaults: d1, const_params: c1, field_defaults: f1, preds: p1, life: l1 },
-            HeadRef::Adt { key: k2, row: r2, defaults: d2, const_params: c2, field_defaults: f2, preds: p2, life: l2 },
+            HeadRef::Adt { key: k1, row: r1, defaults: d1, const_params: c1, field_defaults: f1, preds: p1, life: l1, fieldless: e1 },
+            HeadRef::Adt { key: k2, row: r2, defaults: d2, const_params: c2, field_defaults: f2, preds: p2, life: l2, fieldless: e2 },
         ) => {
+            need!(e1 == e2, "a fieldless enum's variant count");
             need!(f1 == f2, "an ADT's field defaults");
             need!(k1 == k2, "an ADT's key");
             need!(r1.kind == r2.kind && r1.generics == r2.generics, "an ADT's kind or generics");
@@ -1922,9 +2062,10 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             None
         }
         (
-            HeadRef::Trait { key: k1, head: h1, extra: x1, supers: u1, const_params: c1, preds: p1 },
-            HeadRef::Trait { key: k2, head: h2, extra: x2, supers: u2, const_params: c2, preds: p2 },
+            HeadRef::Trait { key: k1, head: h1, extra: x1, supers: u1, const_params: c1, preds: p1, assoc_side: s1 },
+            HeadRef::Trait { key: k2, head: h2, extra: x2, supers: u2, const_params: c2, preds: p2, assoc_side: s2 },
         ) => {
+            need!(h1.assoc.iter().all(|&n| s1.of(n) == s2.of(n)), "a trait's associated types' side rows");
             need!(k1 == k2 && h1.generics == h2.generics, "a trait's key or generics");
             need!(h1.defaults[..] == h2.defaults[..], "a trait's parameter defaults");
             need!(h1.assoc[..] == h2.assoc[..], "a trait's associated types");
@@ -1944,7 +2085,23 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(preds(p1, p2), "a trait's where-clauses");
             None
         }
-        (HeadRef::Impl { key: k1, head: h1, preds: p1 }, HeadRef::Impl { key: k2, head: h2, preds: p2 }) => {
+        (HeadRef::Impl { key: k1, head: h1, preds: p1, frame: m1 }, HeadRef::Impl { key: k2, head: h2, preds: p2, frame: m2 }) => {
+            need!(
+                match (m1, m2) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        x.module == y.module
+                            && x.generics == y.generics
+                            && x.params[..] == y.params[..]
+                            && x.consts[..] == y.consts[..]
+                            && x.bounds.len() == y.bounds.len()
+                            && x.bounds.iter().zip(&y.bounds).all(|(a, b)| a.param == b.param && a.trait_ == b.trait_ && l(a.args, b.args))
+                            && self_same(x.self_, y.self_, &l)
+                    }
+                    _ => false,
+                },
+                "an impl's members' frame"
+            );
             need!(k1 == k2 && h1.generics == h2.generics, "an impl's key or generics");
             need!(h1.self_ty == h2.self_ty, "an impl's self type");
             need!(h1.trait_ == h2.trait_ && l(h1.trait_args.list(), h2.trait_args.list()), "an impl's trait");

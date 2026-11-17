@@ -46,6 +46,10 @@ pub(crate) struct JobTexts<'n> {
     /// its index in the NAMES world (the runner's key: one per unit, so a package's lib and
     /// bin are two, macro-env-per-unit) and its edition.
     pub(crate) callers: &'n [(usize, usize, blaze_expand::Edition)],
+    /// The words of this job's last proc-macro run that stopped (its `CallError`), held in
+    /// the frame: [`SourceTexts::proc_macro_unusable`] gives them for the call the solve asks
+    /// about just after the run (one job, one thread: the run and the ask are in order).
+    pub(crate) run_stopped: core::cell::Cell<Option<&'n str>>,
 }
 
 impl<'n> JobTexts<'n> {
@@ -140,23 +144,36 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         alloc: blaze_own::Alloc<'b>,
     ) -> Result<blaze_expand::Produced<'b>, blaze_expand::HostError> {
         let refused = blaze_expand::HostError { ask: blaze_expand::HostAsk::ProcMacro, why: blaze_expand::HostWhy::Refused };
+        // Each run starts with no stopped run kept: what `proc_macro_unusable` names is this one's.
+        self.run_stopped.set(None);
         let Some(procs) = self.procs else { return Err(refused) };
         let Some(&(_, world_at, edition)) = self.callers.iter().find(|(at, _, _)| *at == krate) else { return Err(refused) };
-        procs.run(world_at, edition, def, call, alloc)
+        procs.run(world_at, edition, def, call, alloc).map_err(|stopped| {
+            if let Some(error) = &stopped.call {
+                self.run_stopped.set(Some(held_str(&std::format!("{error}"), self.frame)));
+            }
+            stopped.host
+        })
     }
 
     /// Why a refused run of `def` was refused, by the same steps [`Self::run_proc_macro`]
-    /// takes: no runner in this job, a crate this job was not given as a caller, or the
-    /// runner's reason (proc_runner.rs `unusable`: the macro's crate and its module). Kept in
-    /// the job's frame: the names record's failed-call row holds these words.
-    fn proc_macro_unusable(&self, krate: usize, def: &blaze_expand::MacroDefinition<'_>) -> Option<&'n str> {
+    /// takes: no runner in this job, a crate this job was not given as a caller, the runner's
+    /// reason (proc_runner.rs `unusable`: the macro's crate and its module), or, the module able
+    /// to run it, the words of the run that stopped (a sandbox limit naming the path as the
+    /// macro named it, a variable, a failure: blaze-proc-macro `CallError`). Kept in the job's
+    /// frame: the names record's failed-call row holds these words.
+    fn proc_macro_unusable(&self, krate: usize, def: &blaze_expand::MacroDefinition<'_>) -> Option<blaze_scope::resolve::ProcUnusable<'n>> {
+        use blaze_scope::resolve::ProcUnusable;
         let words = match self.procs {
             None => std::string::String::from("this names job has no proc-macro runner (the command made none: proc_runner.rs `make`)"),
             Some(procs) => match self.callers.iter().find(|(at, _, _)| *at == krate) {
                 None => std::format!("the calling crate (index {krate} of this job) is not one this job was given as a proc-macro caller"),
-                Some(&(_, world_at, _)) => procs.unusable(world_at, def)?,
+                Some(&(_, world_at, _)) => match procs.unusable(world_at, def) {
+                    Some(words) => words,
+                    None => return self.run_stopped.take().map(ProcUnusable::Run),
+                },
             },
         };
-        Some(held_str(&words, self.frame))
+        Some(ProcUnusable::Module(held_str(&words, self.frame)))
     }
 }

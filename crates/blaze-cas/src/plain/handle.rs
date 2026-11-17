@@ -28,7 +28,7 @@ use std::{
 use blaze_core::{Driver, Mapping, Native, SharedMap, lock::Lock};
 use blaze_keyed::{
     kind::{Key as KeyOf, Kind, Namespace, Tag},
-    store::{Compacted, ENTRY, Generation, Put, Read, RootRef, Store, StoreError},
+    store::{Compacted, ENTRY, Generation, Holder, Put, Read, RootRef, Store, StoreError, TwoValues},
 };
 
 use super::{
@@ -38,7 +38,8 @@ use super::{
     settings::Settings,
     verified::Proof,
 };
-use crate::{Key, Mismatch, content_of};
+use super::lent::two_values;
+use crate::Key;
 
 /// At most this many lanes (worker threads that put) in one process: a cap, not a guess at
 /// the machine (128 cores with room for a pool's spares).
@@ -262,14 +263,14 @@ impl<D: Driver> PlainStore<D> {
             if entry.tag == tag && kept == value {
                 return Ok(Put::Same);
             }
-            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
+            return Err(PutError::Mismatch(two_values(&key, Holder::Committed, entry.tag, kept, tag, value)));
         }
         let mut state = self.lane_at(lane).lock();
         if let Some((kept_tag, kept)) = state.flushing.iter().flat_map(|it| it.iter()).filter(|it| it.batch().namespace() == namespace).find_map(|it| it.get(&key)) {
             if kept_tag == tag && kept == value {
                 return Ok(Put::Same);
             }
-            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
+            return Err(PutError::Mismatch(two_values(&key, Holder::ThisProcess, kept_tag, kept, tag, value)));
         }
         let held = state.open.iter_mut().find(|it| it.batch().namespace() == namespace).expect("a lane holds a batch for each namespace written");
         held.put(key, tag, value)
@@ -367,6 +368,12 @@ fn own_proof(generation: u64) -> Proof {
     Proof::own(Generation(generation))
 }
 
+/// A read of kind `asked` at `key`, which holds `held_len` bytes of kind `held_tag` (rule 21):
+/// no value of the read's to compare, so no length and no differing byte.
+fn read_of_another_kind(key: blaze_ids::ContentId, asked: Tag, held: Holder, held_tag: Tag, held_len: usize) -> TwoValues {
+    TwoValues { key, tag: asked, len: None, held_tag, held_len: held_len as u64, held, differs_at: None }
+}
+
 /// `entry`'s payload in `mapped`, copied into `frame`, with its tag and proof.
 fn copied<A: Allocator>(mapped: &Mapped, entry: &Entry, frame: A) -> (Tag, Vec<u8, A>, Proof) {
     let payload = mapped.payload(entry);
@@ -385,7 +392,10 @@ impl<D: Driver> Store for PlainStore<D> {
     fn read<K: Kind, A: Allocator>(&self, key: &KeyOf<K>, frame: A) -> Result<Option<Read<Proof, Vec<u8, A>>>, StoreError> {
         match self.get(self.own_lane(),&Key(key.id()), frame) {
             None => Ok(None),
-            Some((tag, _, _)) if tag != K::TAG => Err(StoreError::TwoValues { tag: K::TAG, key: key.id() }),
+            Some((tag, bytes, from)) if tag != K::TAG => {
+                let held = if from.is_own() { Holder::ThisProcess } else { Holder::Committed };
+                Err(StoreError::TwoValues(read_of_another_kind(key.id(), K::TAG, held, tag, bytes.len())))
+            }
             Some((_, bytes, from)) => Ok(Some(Read { bytes, from })),
         }
     }
@@ -396,7 +406,7 @@ impl<D: Driver> Store for PlainStore<D> {
         let released = self.released.load(Ordering::Acquire);
         if let Some((mapped, entry)) = self.find(&self.reads, &key.id()) {
             if entry.tag != K::TAG {
-                return Err(StoreError::TwoValues { tag: K::TAG, key: key.id() });
+                return Err(StoreError::TwoValues(read_of_another_kind(key.id(), K::TAG, Holder::Committed, entry.tag, entry.len as usize)));
             }
             return Ok(Some(Read { bytes: mapped.payload(&entry), from: mapped.proof }));
         }
@@ -409,7 +419,7 @@ impl<D: Driver> Store for PlainStore<D> {
             && let Some((mapped, entry)) = self.find(&self.reads, &key.id())
         {
             if entry.tag != K::TAG {
-                return Err(StoreError::TwoValues { tag: K::TAG, key: key.id() });
+                return Err(StoreError::TwoValues(read_of_another_kind(key.id(), K::TAG, Holder::Committed, entry.tag, entry.len as usize)));
             }
             return Ok(Some(Read { bytes: mapped.payload(&entry), from: mapped.proof }));
         }

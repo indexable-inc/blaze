@@ -1,0 +1,15 @@
+{
+ "id": "engine-names-no-runner-logs",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane EP",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/runner.py ask (test output); crates/blaze-cli/src/tests/engine_check_tests.rs",
+ "what": "The build queue prints a test's stdout only when it fails, and keeps no log of a passing run (runner/ans holds the verdict alone, no `--nocapture` output). To report the phases a fixture ran (tasks and entries per phase) I had to turn a println into a panic, ask again with --no-admit, and put the line back: one extra queue turn.",
+ "cost": "one queue turn (58 s) and two edits for numbers the passing run had already printed",
+ "cause": "the runner reduces cargo test output to its summary and failure blocks, and drops the rest",
+ "whys": ["the summary keeps lanes' context small", "nothing keeps the full output elsewhere"],
+ "class": "evidence a passing run produced is thrown away",
+ "prevention": "keep each request's full test output at runner/out/<request>.log and print its path in the answer",
+ "annoyance": "a lane cannot quote a passing test's own measurements",
+ "workaround": "a temporary panic carrying the numbers, run with --no-admit",
+ "state": "open"
+}

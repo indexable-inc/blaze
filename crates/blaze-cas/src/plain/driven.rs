@@ -16,7 +16,7 @@ use blaze_ids::ContentId;
 use blaze_keyed::{
     exec::RecordRef,
     kind::{Namespace, Tag},
-    store::{FOOTER, HEADER, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, StoreFile, Verifier},
+    store::{FOOTER, HEADER, Holder, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, StoreFile, TwoValues, Verifier},
 };
 
 use super::{
@@ -137,7 +137,8 @@ impl Source for LocalDir {
                 let hit = format::find_ranged(segment, described.count, &key.key, |at, out| self.read_at(&digest, index_at + at, out))?;
                 if let Some((_, entry)) = hit {
                     if entry.tag != key.tag {
-                        return Err(StoreError::TwoValues { tag: key.tag, key: key.key });
+                        // A read of kind `key.tag` met another kind's record (rule 21).
+                        return Err(StoreError::TwoValues(TwoValues { key: key.key, tag: key.tag, len: None, held_tag: entry.tag, held_len: u64::from(entry.len), held: Holder::Committed, differs_at: None }));
                     }
                     *slot = Some(Located { segment: reference, at: entry.at, len: entry.len });
                 }

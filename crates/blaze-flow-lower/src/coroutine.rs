@@ -68,7 +68,7 @@ use blaze_flow::{BorrowKind, Flow, Local, Operand, Place, Proj, StmtKind};
 use blaze_typeck::{BodyView, CaptureKind, Checked, Expr, ExprId, Mutbl, PNode, PTy, PatId, PortableTys, Range};
 
 use crate::identity::{Identity, Role};
-use crate::{At, Facts, Form, Lower, MOST_POSITIONS, Refusal, Task, TyD, range_of};
+use crate::{At, BodyOut, Facts, Form, Lower, MOST_POSITIONS, Refusal, Region, Task, TyD, range_of};
 
 /// An async block's body lowered as its own flow.
 pub struct LoweredAsync<A: Allocator + Clone> {
@@ -379,9 +379,15 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         if (all - upvar_origins) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
             return self.refuse(Form::Bound, block);
         }
-        for u in 0..upvar_origins {
-            for o in upvar_origins..all {
-                self.b.known(self.origs[u], self.origs[o]);
+        if block == self.body.root && self.body.coroutine.is_some() {
+            // An `async fn`'s root block: its captures are the fn's parameters and its value
+            // the written return type, both the signature's (`async_fn_root`).
+            self.async_fn_root(&rows, block)?;
+        } else {
+            for u in 0..upvar_origins {
+                for o in upvar_origins..all {
+                    self.b.known(self.origs[u], self.origs[o]);
+                }
             }
         }
         self.tasks.push(Task::RootEnd(inner));
@@ -477,6 +483,91 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         self.drop_local(fut, e)?;
         self.temps.push(r);
         self.push_place(rp, out);
+        Ok(())
+    }
+}
+
+impl<'b, F: Facts, A: Allocator + Clone> Lower<'b, '_, F, A> {
+    /// The root block of an `async fn`, its captures (`rows`, arguments `1..`) and return place
+    /// (its value) laid: the Reference, "Async functions": `async fn f(x: &u8) -> T` is "roughly
+    /// equivalent to" `fn f<'a>(x: &'a u8) -> impl Future<Output = T> + 'a`, its body an `async
+    /// move` block that captures the parameters and whose value is the future's `Output`. So the
+    /// body's value must be a `T` as written, its regions the signature's (RFC 2394), exactly as
+    /// a fn body's returned value is (`Lower::signature`): each capture's positions are made
+    /// equal to its parameter's regions, the value's to the written return type's
+    /// (`BodyOut::Async`), and what is known among them is the signature's (its declared bounds,
+    /// `'static`, the implied bounds of its types). An async block's own rule, every capture
+    /// outliving the output, is not this: it let `async fn f(x: &u8) -> &'static u8 { x }`
+    /// through. A capture that is not a whole parameter by value, or a signature not read, is
+    /// refused by name; with no lifetime part, a value with no position needs nothing.
+    fn async_fn_root(&mut self, rows: &[(PatId, CaptureKind)], block: ExprId) -> Result<(), Refusal> {
+        let body = self.body;
+        let facts: &'b F = self.facts;
+        let (out_start, out_n) = self.local_origs[0];
+        let Some(sig) = facts.sig(body.owner) else {
+            if out_n == 0 {
+                return Ok(());
+            }
+            return self.refuse(Form::AsyncOutputUnread, block);
+        };
+        let written: &[Region] = match sig.body {
+            BodyOut::Async(r) => r,
+            BodyOut::AsyncUnread(_) => return self.refuse(Form::AsyncOutputUnread, block),
+            BodyOut::Output => return self.refuse(Form::SigUnaligned, block),
+        };
+        if sig.ends.len() != body.params.len() || written.len() != out_n as usize {
+            return self.refuse(Form::SigUnaligned, block);
+        }
+        // Each capture: its parameter's regions, position by position.
+        for (k, &(p, kind)) in rows.iter().enumerate() {
+            let Some(i) = body.params.iter().position(|&q| q == p) else {
+                return self.refuse_pat(Form::AsyncFnCapture, p);
+            };
+            if kind != CaptureKind::ByValue {
+                return self.refuse_pat(Form::AsyncFnCapture, p);
+            }
+            let lo = if i == 0 { 0 } else { sig.ends[i - 1] as usize };
+            let hi = sig.ends[i] as usize;
+            let (start, n) = self.local_origs[1 + k];
+            if hi < lo || hi > sig.regions.len() || hi - lo != n as usize {
+                return self.refuse(Form::SigUnaligned, block);
+            }
+            for j in 0..n as usize {
+                let u = self.universal(sig.regions[lo + j]);
+                let o = self.origs[start as usize + j];
+                self.b.known(o, u);
+                self.b.known(u, o);
+            }
+        }
+        // The value: the written return type's regions.
+        for (j, &r) in written.iter().enumerate() {
+            let u = self.universal(r);
+            let o = self.origs[out_start as usize + j];
+            self.b.known(o, u);
+            self.b.known(u, o);
+        }
+        // The implied bounds of the captures' and the value's types (`&'a T`: `T: 'a`).
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        for l in 0..=rows.len() {
+            let (start, _) = self.local_origs[l];
+            let t = self.local_ty[l];
+            self.ref_ranges(t, block, &mut ranges)?;
+            for j in 0..ranges.len() {
+                let (at, inner) = ranges[j];
+                let outer = self.origs[(start + at) as usize];
+                for k in 1..=inner {
+                    let o = self.origs[(start + at + k) as usize];
+                    if o != outer {
+                        self.b.known(o, outer);
+                    }
+                }
+            }
+        }
+        // The declared bounds.
+        for &(a, b) in sig.bounds {
+            let (oa, ob) = (self.universal(a), self.universal(b));
+            self.b.known(oa, ob);
+        }
         Ok(())
     }
 }

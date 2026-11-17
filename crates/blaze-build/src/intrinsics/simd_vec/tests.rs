@@ -70,7 +70,7 @@ fn reduce_and_saturate() {
     let max = {
         let mut cx = LayoutCx { ground: &mut g.t, facts: &w, scratch: heap.alloc() };
         let needs_drop = |_: PTy| false;
-        let mut icx = IntrinsicCx { layouts: &mut ls, cx: &mut cx, needs_drop: &needs_drop };
+        let mut icx = IntrinsicCx { layouts: &mut ls, cx: &mut cx, needs_drop: &needs_drop, ub_checks: crate::UbChecks::Off, overflow_checks: crate::OverflowChecks::Off };
         // `vqsubq_u8(x, y)`
         let generics = [GenericArg::Ty(u8x16)];
         let args = [Arg::Place(addrs[0]), Arg::Place(addrs[1])];

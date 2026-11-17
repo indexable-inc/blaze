@@ -245,6 +245,10 @@ impl Adts for OpAdts<'_> {
         crate::OverflowChecks::Off
     }
 
+    fn ub_checks(&self) -> crate::UbChecks {
+        crate::UbChecks::Off
+    }
+
     fn facts(&self) -> &dyn LayoutFacts {
         self
     }

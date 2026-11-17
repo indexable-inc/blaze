@@ -16,7 +16,7 @@ pub const BUILTIN_TYPES: [&str; 19] = [
 
 /// The first eight bytes of a builtin type's key, where an item's key holds its crate's
 /// prefix (a hash, never these bytes but by a 2^-64 chance).
-const PREFIX: [u8; 8] = *b"builtin\0";
+pub const PREFIX: [u8; 8] = *b"builtin\0";
 
 /// The definition `name` is as a builtin type: a key of its own, the same in every crate and
 /// on every machine, so a record that names `u8` names one thing.

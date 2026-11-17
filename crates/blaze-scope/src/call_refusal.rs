@@ -174,16 +174,25 @@ pub fn words_of<'b>(note: &ExpandNote<'_>, env: Option<&str>, alloc: Alloc<'b>) 
             let _ = write!(out, "the {} macro `{name}` has no definition this crate's solve reads", shape.name());
             RefusalKind::NoDefinition
         }
-        ExpandNote::ProcModule { macro_name, why } => {
-            let _ = match why {
-                ProcUnusable::NoRunner => write!(
+        ExpandNote::ProcModule { macro_name, why } => match why {
+            ProcUnusable::NoRunner => {
+                let _ = write!(
                     out,
                     "`{macro_name}`'s crate is known to no proc-macro runner of this command (it has no module identity, or no runner was made; the crate's `MacroModule` lookup names why)"
-                ),
-                ProcUnusable::Module(words) => write!(out, "`{macro_name}`: {words}"),
-            };
-            RefusalKind::ProcModule
-        }
+                );
+                RefusalKind::ProcModule
+            }
+            ProcUnusable::Module(words) => {
+                let _ = write!(out, "`{macro_name}`: {words}");
+                RefusalKind::ProcModule
+            }
+            // The module ran it: the run's own words (the path its sandbox refused, as the
+            // macro named it), in place of the bare `ProcMacro read (Limit(Paths))`.
+            ProcUnusable::Run(words) => {
+                let _ = write!(out, "`{macro_name}` {words}");
+                RefusalKind::HostRead
+            }
+        },
         ExpandNote::ItemAttrs { macro_name, error } => {
             let _ = write!(out, "`{macro_name}`: {error}");
             RefusalKind::ItemAttrs

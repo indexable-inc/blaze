@@ -68,6 +68,10 @@ impl Adts for UnwindAdts<'_, '_> {
         Adts::overflow_checks(self.inner)
     }
 
+    fn ub_checks(&self) -> crate::UbChecks {
+        Adts::ub_checks(self.inner)
+    }
+
     fn facts(&self) -> &dyn LayoutFacts {
         Adts::facts(self.inner)
     }

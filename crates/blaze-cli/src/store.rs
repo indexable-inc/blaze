@@ -350,6 +350,15 @@ impl Clash {
 
 impl fmt::Display for Clash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write_subject(f)?;
+        f.write_str(": ")?;
+        self.write_detail(f)
+    }
+}
+
+impl Clash {
+    /// The record's name as the drive prints it, the crate it is of and its own file.
+    fn write_subject(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.name {
             Some(name) => write!(f, "{name}")?,
             None => f.write_str("a record of no drive name")?,
@@ -360,7 +369,12 @@ impl fmt::Display for Clash {
         if let Some(path) = &self.path {
             write!(f, " ({path})")?;
         }
-        write!(f, ": held {}, put {}", self.held.word(), self.put.word())?;
+        Ok(())
+    }
+
+    /// Each side's form, the first field they differ in, and where.
+    fn write_detail(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "held {}, put {}", self.held.word(), self.put.word())?;
         match self.field {
             "none" => f.write_str(", equal fields")?,
             field => write!(f, ", first differing in {field}")?,
@@ -394,7 +408,43 @@ impl fmt::Display for StoreFailure {
             StoreFailure::Place(error) => write!(f, "{error}"),
             StoreFailure::Copy(stopped) => write!(f, "a record read from the store: {stopped}"),
             StoreFailure::Look { folder, error } => write!(f, "looking for the old store folder {folder}: {error}"),
-            StoreFailure::TwoValues { key, lent, clash } => write!(f, "{clash}; the store under the home's .blaze/v2/store refused its put at {key}: {lent}"),
+            StoreFailure::TwoValues { key, lent, clash } => {
+                write!(f, "the store under the home's .blaze/v2/store: two values under one key {key}: the record of ")?;
+                clash.write_subject(f)?;
+                // Whether `blaze clean --store` lets the user go on: only when the held value is
+                // a committed one (an earlier command's); two values made by this one command
+                // come back after a clean.
+                use blaze_keyed::store::Holder;
+                let committed = match lent {
+                    blaze_cas::plain::LentError::TwoValues { two, .. } => {
+                        let held = match two.held {
+                            Holder::ThisProcess => "put earlier by this command",
+                            Holder::Committed => "committed",
+                        };
+                        match two.len {
+                            Some(len) => write!(f, " made now ({len} bytes)")?,
+                            None => f.write_str(" asked now")?,
+                        }
+                        write!(f, " differs from the one the store holds ({} bytes, {held})", two.held_len)?;
+                        match two.differs_at {
+                            Some(at) => write!(f, ", first at byte {at}")?,
+                            None => f.write_str(", with equal bytes under another kind or namespace")?,
+                        }
+                        two.held == Holder::Committed
+                    }
+                    other => {
+                        write!(f, " was refused: {other}")?;
+                        true
+                    }
+                };
+                f.write_str(" (")?;
+                clash.write_detail(f)?;
+                f.write_str(") (rule 21: its key misses an input of its value). This is a bug in blaze: please report this line.")?;
+                match committed {
+                    true => f.write_str(" To go on: `blaze clean --store`, then run the command again."),
+                    false => f.write_str(" Both values were made by this command, so `blaze clean --store` does not get past it."),
+                }
+            }
         }
     }
 }

@@ -208,6 +208,7 @@ pub(crate) fn adt_fields<T: Tys, F: Facts>(
     out: &mut Vec<Ty, Alloc<'_>>,
 ) -> Result<(), Stop> {
     let adt = cx.adt(d)?;
+    cx.scratch.stats.adt_fields += adt.fields.len() as u64;
     for &f in adt.fields {
         let t = cx.import(adt.portable, f, args)?;
         out.push(t);

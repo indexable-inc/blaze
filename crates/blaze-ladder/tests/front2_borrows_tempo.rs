@@ -341,6 +341,76 @@ fn control_autoref_of_temporary() -> &'static [u8] {
 fn control_dyn_lengthened<'a>(x: &'a mut (dyn Buf + 'a)) -> &'a mut (dyn Buf + 'static) {
     &mut *x
 }
+
+fn control_sync_static_from_input(x: &u8) -> &'static u8 {
+    x
+}
+
+async fn control_async_static_from_input(x: &u8) -> &'static u8 {
+    x
+}
+
+async fn async_elided_from_input(x: &u8) -> &u8 {
+    x
+}
+
+async fn control_async_other_named<'a, 'b>(x: &'a u8, y: &'b u8) -> &'a u8 {
+    let _ = x;
+    y
+}
+
+async fn async_named_from_input<'a, 'b>(x: &'a u8, y: &'b u8) -> &'a u8 {
+    let _ = y;
+    x
+}
+
+async fn async_block_borrows_awaited_local() -> u8 {
+    let v = 1u8;
+    let r = async { &v }.await;
+    *r
+}
+
+fn control_return_ref_to_local() -> &'static u8 {
+    let v = 1u8;
+    &v
+}
+
+fn return_ref_to_promoted() -> &'static u8 {
+    &1
+}
+
+pub trait AsDynError<'a> {
+    fn as_dyn_error(&self) -> &(dyn std::error::Error + 'a) {
+        loop {}
+    }
+}
+
+impl<'a, T: std::error::Error + 'a> AsDynError<'a> for T {
+    fn as_dyn_error(&self) -> &(dyn std::error::Error + 'a) {
+        self
+    }
+}
+
+pub struct IoFault {
+    source: std::io::Error,
+}
+
+fn error_source(f: &IoFault) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(f.source.as_dyn_error())
+}
+
+fn some_of_input(x: &u8) -> Option<&u8> {
+    Some(x)
+}
+
+fn control_some_of_local() -> Option<&'static u8> {
+    let v = 1u8;
+    Some(&v)
+}
+
+fn control_some_static_from_input<'x>(x: &'x u8) -> Option<&'static u8> {
+    Some(x)
+}
 ";
 
 /// Each body's expected finding codes: empty for a body Rust accepts (each a tempo class
@@ -417,12 +487,38 @@ const EXPECTED: &[(&str, &[&str])] = &[
     // CONTROLS for F (blaze-flow loans.rs: a drop is a use where it may run) and D (lib.rs:
     // a shared autoref of a constant is promoted): a writer dropped on one path only still
     // holds `out` at the scope's end (E0505); an autoref of a call's result is not promoted
-    // (refused; rustc names it E0515, a reference to a temporary returned, where blaze's words
-    // name the temporary's end, E0597: the code mapping does not yet tell a loan that reaches
-    // the return place).
+    // (refused E0515, a reference to a temporary returned: blaze-flow's finding says the return
+    // place holds the loan, `returned`).
     ("make", &[]),
     ("control_drop_after_maybe_move", &["E0505"]),
-    ("control_autoref_of_temporary", &["E0597"]),
+    ("control_autoref_of_temporary", &["E0515"]),
+    // BX case 4: a reference to a local returned is E0515 too (the stored-local controls above
+    // stay E0597: their loan is held by a local, not the return place); a promoted constant's
+    // reference is `'static`.
+    ("control_return_ref_to_local", &["E0515"]),
+    ("return_ref_to_promoted", &[]),
+    // A tuple-like constructor whose field is a bare type parameter (`Some(T)`): its operand
+    // goes into the argument's own positions (lib.rs `ctor_fields`), not through one hub.
+    // thiserror's derived `source` (`Some(source.as_dyn_error())`, its src/aserror.rs
+    // `AsDynError<'a>`) printed a false "outlives"; the trait's `'a` per call is right as it is
+    // (`f.source.as_dyn_error()` returned bare was already clean). CONTROLS: a local's borrow
+    // in `Some` returned (E0515), an input's lifetime made `'static` through `Some`
+    // ("outlives"). The trait's fn has a body (`loop {}`) only because a bodiless trait fn is
+    // listed as a body and refused `TypesNotChecked` (bx_probe2, reported).
+    ("as_dyn_error", &[]),
+    ("error_source", &[]),
+    ("some_of_input", &[]),
+    ("control_some_of_local", &["E0515"]),
+    ("control_some_static_from_input", &["outlives"]),
+    // BX case 1 (RFC 2394; blaze-flow-lower sig.rs `BodyOut`): an `async fn`'s body's value is
+    // checked against the WRITTEN return type's regions, as a sync fn's is ("outlives", the
+    // code a sync fn gets for the same error: its twin first), never the future's.
+    ("control_sync_static_from_input", &["outlives"]),
+    ("control_async_static_from_input", &["outlives"]),
+    ("async_elided_from_input", &[]),
+    ("control_async_other_named", &["outlives"]),
+    ("async_named_from_input", &[]),
+    ("async_block_borrows_awaited_local", &[]),
     // CONTROLS: two live reborrows of one `&mut dyn` (E0499); a reborrow kept for `'a` while
     // the object is used (E0499); the object lifetime lengthened to `'static` ("outlives").
     ("control_dyn_two_reborrows", &["E0499"]),

@@ -1,0 +1,15 @@
+{
+ "id": "member-macro-empty-checkout",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane MX",
+ "where": "crates/blaze-proc-macro/src/sandbox.rs Files::real; crates/blaze-cli/src/proc_callers.rs shown (workspace = FetchEnv::checkout)",
+ "what": "every proc-macro call written in a workspace member at a non-empty dir (crates/app) was refused Limit(Paths); the same crate as a root package expanded. tempo: 321 call groups, 1,313 unresolved names, 9,867 items not checked behind them. The note printed only 'its ProcMacro read (Limit(Paths))': HostError is Copy and carries no words, so the sandbox's sentence was dropped at CallError::host_error.",
+ "cost": "about an hour of reading; the cause was found by reading, not by a run, because the refusal named no path",
+ "cause": "the checkout is \"\" when blaze runs in the workspace root, so a member's Files::Member workspace was PathBuf(\"\"); the shim's chdir into /workspace/<dir> stats that folder through Files::real, and canonicalize(\"\") is ENOENT: refused. A dir of \"\" stats the tree's root without asking Files::real, so root packages worked.",
+ "whys": "'' means 'here' in the checkout's convention but not to the OS; Files::real took a path from the process's working folder with no rule for the empty one; and the refusal's words never reached the row, so the 4-second run could not show the path",
+ "class": "a relative-folder convention ('' = here) handed to an OS call that does not share it; and a typed error (HostError) too small to carry the words of the refusal it stands for",
+ "prevention": "done: Files::real reads '' as '.', its errors name the mount, not a machine path; the run's CallError words reach the names record's row through SourceTexts::proc_macro_unusable's ProcUnusable::Run; tests sandbox::seen_tests::a_member_of_a_checkout_named_here_is_entered_and_read, proc_callers::tests::a_member_of_a_checkout_started_in_is_entered, refused_rows::a_run_the_sandbox_stopped_is_refused_by_the_path_it_named. Open: blaze still reads files relative to its working folder (rule 75 would pass the root folder as a capability).",
+ "annoyance": "the build queue's wait cannot be polled and editing is forbidden while it waits; a lane has little to do in that time but read",
+ "workaround": "read ahead for the next piece while the ask waits",
+ "state": "fixed"
+}

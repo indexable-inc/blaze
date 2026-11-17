@@ -420,6 +420,9 @@ struct Bodies<'a> {
     coroutines: crate::front2::coroutines::Coroutines,
     /// What [`FrontAdts`]'s `overflow_checks` answers: the build's caller's setting (D101).
     overflow: OverflowChecks,
+    /// What [`FrontAdts`]'s `ub_checks` answers: on the record path the key's
+    /// `Settings::debug_assertions` (code_records.rs), so the key covers it (rule 21).
+    ub: blaze_build::UbChecks,
     /// What [`FrontAdts`]'s `panic` answers: on the record path the program's strategy (the
     /// key's, from which its inputs were made); Abort on the in-process paths (D91).
     panic: blaze_build::Panic,
@@ -884,6 +887,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
 
     fn overflow_checks(&self) -> OverflowChecks {
         self.4.overflow
+    }
+
+    fn ub_checks(&self) -> blaze_build::UbChecks {
+        self.4.ub
     }
 
     fn panic(&self) -> blaze_build::Panic {
@@ -1666,7 +1673,7 @@ pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFil
     }
     // Placed in this process as literal-word code (place.rs), which carries no landing pads:
     // built Abort, with D91's stop at a raise, until run.md piece 13 deletes this path.
-    let built = build_from(&mut program, None, None, true, texts.overflow, blaze_build::Panic::Abort, alloc)?;
+    let built = build_from(&mut program, None, None, true, texts.overflow, IN_PROCESS_UB, blaze_build::Panic::Abort, alloc)?;
     built.ok_or(RunError::NoMain)
 }
 
@@ -1687,8 +1694,14 @@ fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs, ov
 pub fn build_with<P: FrontEnd>(program: &mut P, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<Built, RunError> {
     // Only a survey goes on with no entry: a run's `None` is no `main`. Placed in this process
     // (place.rs): built Abort with D91's stop, until run.md piece 13 deletes this path.
-    build_from(program, None, None, false, overflow, blaze_build::Panic::Abort, alloc)?.ok_or(RunError::NoMain)
+    build_from(program, None, None, false, overflow, IN_PROCESS_UB, blaze_build::Panic::Abort, alloc)?.ok_or(RunError::NoMain)
 }
+
+/// What `ub_checks()` is on the in-process paths ([`build_with`], [`build_survey`], the
+/// strict front's build), which make no records and keep no key: off, as the record path's
+/// baseline settings (code_records.rs `Settings::baseline`: no debug assertions), until run.md
+/// piece 13 deletes these paths.
+const IN_PROCESS_UB: blaze_build::UbChecks = blaze_build::UbChecks::Off;
 
 /// The run path's code records (code_records.rs; run.md pieces 3 and 7): every instance the
 /// entry reaches, each as one entry in `records.store` under its full key, computed before the
@@ -1703,7 +1716,8 @@ pub fn build_with<P: FrontEnd>(program: &mut P, overflow: OverflowChecks, alloc:
 pub fn build_records<P: FrontEnd>(program: &mut P, records: &mut crate::code_records::RecordRun<'_>, alloc: Alloc<'static>) -> Result<(), RunError> {
     let overflow = records.builder.settings.overflow_checks;
     let panic = crate::panic_strategy::of_strategy(records.builder.settings.panic);
-    build_from(program, None, Some(records), false, overflow, panic, alloc)?;
+    let ub = blaze_build::UbChecks::of_debug_assertions(records.builder.settings.debug_assertions);
+    build_from(program, None, Some(records), false, overflow, ub, panic, alloc)?;
     Ok(())
 }
 
@@ -1745,7 +1759,7 @@ pub struct SurveyCounts {
 pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, Box<str>), Global>, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<SurveyCounts, RunError> {
     let mut counts = SurveyCounts { built: 0, tried: 0, no_instance: Vec::new_in(Global) };
     // As the in-process run builds (D91): Abort, until run.md piece 13.
-    build_from(program, Some((refused, &mut counts)), None, false, overflow, blaze_build::Panic::Abort, alloc)?;
+    build_from(program, Some((refused, &mut counts)), None, false, overflow, IN_PROCESS_UB, blaze_build::Panic::Abort, alloc)?;
     Ok(counts)
 }
 
@@ -2014,6 +2028,7 @@ fn build_from<P: FrontEnd>(
     mut records: Option<&mut crate::code_records::RecordRun<'_>>,
     stub_refusals: bool,
     overflow: OverflowChecks,
+    ub: blaze_build::UbChecks,
     panic: blaze_build::Panic,
     // The caller's, for the build's tables (ground types, layouts, closures, coroutines) and
     // each instance's scratch: none outlives the build.
@@ -2081,6 +2096,7 @@ fn build_from<P: FrontEnd>(
         coroutines: crate::front2::coroutines::Coroutines::of(program, &checked, alloc),
         const_at: crate::front2::const_at::ConstTable::new_in(Global),
         overflow,
+        ub,
         panic,
         alloc,
     };
@@ -2873,7 +2889,7 @@ fn build_from<P: FrontEnd>(
         // `via`), put under its key with the instances it reaches declared.
         if let (Some(run), Some((parts, key))) = (records.as_deref_mut(), record_key) {
             use crate::code_records::{Callee, CodeRecordError, Declared, InstanceNames};
-            use crate::symbols::{encode_instance, fn_symbol_of_name, tls_symbol, vtable_symbol};
+            use crate::symbols::{encode_instance, fn_symbol_of_name, vtable_symbol};
             let fail = |error| RunError::CodeRecord { function: name(), error };
             let sym = |e| fail(CodeRecordError::Symbol(e));
             // Each instance the record reaches by slot: its tabled fn and its name.
@@ -2917,8 +2933,6 @@ fn build_from<P: FrontEnd>(
                     }
                 }
             }
-            let mut tls_names = Vec::with_capacity_in(built.thread_locals.len(), Global);
-            tls_names.extend(built.thread_locals.iter().map(|&k| tls_symbol(k)));
             let mut vtables = Vec::with_capacity_in(built.vtables.len(), Global);
             for &table in built.vtables.iter() {
                 vtables.push(vtable_symbol(table, ground.view(), alloc).map_err(sym)?);
@@ -2926,7 +2940,7 @@ fn build_from<P: FrontEnd>(
             // The soft-float routines after the instance's own references, as run/make_one.rs
             // binds them: `make_entry` declares those the emitter says the record calls.
             let routines = bound.bind(&mut funcs).map_err(fail)?;
-            let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &tls_names };
+            let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &built.thread_locals };
             // A census walk (`RecordRun::census`): the instance's LIR and names go to the census,
             // which emits them itself; no record is made. The walk goes on to the slots it filled.
             if let Some(seen) = run.seen.as_deref_mut() {

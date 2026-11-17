@@ -388,6 +388,12 @@ impl<'t> Inputs<'t> {
     /// Every crate's names, resolved together, held in `alloc` (the caller's, alive as long as
     /// the names).
     pub fn resolve(&'t self, crates: &[CrateInput<'t>], alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
-        resolve_crates(crates, self.sysroot, &self.texts, &Serial, alloc)
+        self.resolve_with(crates, &Serial, alloc)
+    }
+
+    /// [`Inputs::resolve`] under the caller's `par` (one that asks for each crate's names
+    /// groups, `Par::names_groups`).
+    pub fn resolve_with<P: blaze_scope::task::Par>(&'t self, crates: &[CrateInput<'t>], par: &P, alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
+        resolve_crates(crates, self.sysroot, &self.texts, par, alloc)
     }
 }

@@ -35,7 +35,9 @@ use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::lower_fn;
-use blaze_ladder::front2::buckets::{Ask, BucketSource, Buckets, ItemsIndex, TableSet, inherent_home, row_answers, trait_home, write_impl_tables};
+use blaze_ladder::front2::buckets::{Ask, BucketSource, Buckets, ItemsIndex, TableSet, impl_tables_name, impl_tables_task, inherent_home, row_answers, rows_key, trait_home, write_impl_tables};
+use blaze_ladder::front2::tables::recorder::TableRead;
+use blaze_scope::names_cells::NameCell;
 use blaze_ladder::front2::check::{self, BuildOrder, check_body};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::Store;
@@ -191,6 +193,17 @@ fn alone<B: BucketSource>(source: &B, records: &'static Records<'static>, keys: 
 
 #[test]
 fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
+    // Each line printed is kept too, and written to `front2_tables_core.out` in the temp
+    // directory: the build queue shows a passing test's output to no one.
+    let mut said = String::new();
+    macro_rules! say {
+        ($($t:tt)*) => {{
+            let line = format!($($t)*);
+            println!("{line}");
+            said.push_str(&line);
+            said.push('\n');
+        }};
+    }
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
@@ -221,7 +234,7 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
         fns.sort_unstable();
         (kept, fns)
     };
-    println!("SOLVED {} crates {crate_names:?}, {} fns of the root, records written in {:?}", crate_names.len(), fns.len(), start.elapsed());
+    say!("SOLVED {} crates {crate_names:?}, {} fns of the root, records written in {:?}", crate_names.len(), fns.len(), start.elapsed());
     assert!(fns.len() >= 10, "the root has its fns: {}", fns.len());
 
     // Over the records alone.
@@ -242,7 +255,7 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
         let body = match lower_fn(records, prepared, &mut front.keys, &mut store, *key) {
             Ok(body) => body,
             Err(e) => {
-                println!("NOT LOWERED {key:x}: {e}");
+                say!("NOT LOWERED {key:x}: {e}");
                 continue;
             }
         };
@@ -252,17 +265,18 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
         let mut r = check::Records { names: records, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
         match check_body(&mut r, &body, &scope) {
             Ok(_) => clean += 1,
-            Err(e) => println!("NOT CLEAN {key:x}: {}", format!("{e:?}").chars().take(300).collect::<String>()),
+            Err(e) => say!("NOT CLEAN {key:x}: {}", format!("{e:?}").chars().take(300).collect::<String>()),
         }
     }
     let asked = buckets.as_ref().map(|b| b.asked()).unwrap_or_default();
-    println!("CHECKED {} bodies ({clean} clean) in {} ms; {} questions asked", fns.len(), start.elapsed().as_millis(), asked.len());
+    say!("CHECKED {} bodies ({clean} clean) in {} ms; {} questions asked", fns.len(), start.elapsed().as_millis(), asked.len());
     assert!(asked.len() >= 20, "the check asked {} impl questions", asked.len());
     let keys_map = &front.keys;
 
     // 2. Every crate's impl tables.
     let mut tables = TableSet::new(g);
     let mut crate_keys: Vec<CrateItemKey> = Vec::new();
+    let (mut task_reads, mut task_wholes) = (0usize, 0usize);
     for krate in 0..crate_names.len() {
         let start = Instant::now();
         let mut rows = Vec::new();
@@ -272,7 +286,7 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
         let took = start.elapsed();
         let bytes: usize = written.records.buckets.iter().map(|b| b.bytes.len()).sum::<usize>() + written.records.directory.len() + written.records.no_impls_of.len();
         let largest = written.records.buckets.iter().max_by_key(|b| b.bytes.len());
-        println!(
+        say!(
             "TABLES {}: {} rows, {} buckets, {bytes} bytes (directory {}, NoImplsOf {}; largest bucket {} bytes: {:?}), {} cells, {} from rows, {} from text, {} us",
             crate_names[krate],
             rows.len(),
@@ -286,9 +300,41 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
             written.counts.from_text,
             took.as_micros()
         );
+        // THE TASK: the same tables through the read-only view, with what the filing read.
+        let done = impl_tables_task(records, krate, &rows, g);
+        assert_eq!(done.failed, None, "`{}`'s impl tables task failed", crate_names[krate]);
+        let task_records = done.records.as_ref().expect("a task that did not fail has its records");
+        assert_eq!(task_records.directory, written.records.directory, "`{}`: the task's directory differs from the writer's", crate_names[krate]);
+        assert_eq!(task_records.no_impls_of, written.records.no_impls_of, "`{}`: the task's NoImplsOf differs from the writer's", crate_names[krate]);
+        assert_eq!(done.key.0, written.key, "`{}`: the task's key is not the tables' key", crate_names[krate]);
+        assert_eq!(done.key.0, rows_key(written.krate, &rows), "`{}`: `rows_key` is not the tables' key", crate_names[krate]);
+        assert_eq!(done.name, impl_tables_name(written.krate));
+        assert!(done.defines.windows(2).all(|w| w[0].0 < w[1].0), "`{}`: the task's cells are not sorted and once", crate_names[krate]);
+        assert!(done.reads.windows(2).all(|w| w[0] < w[1]), "`{}`: the task's reads are not sorted and once", crate_names[krate]);
+        let (mut items, mut wholes, mut other_crates, mut other) = (0usize, 0usize, 0usize, 0usize);
+        let own = {
+            let mut p = [0u8; 8];
+            p.copy_from_slice(&written.krate.0.0[..8]);
+            p
+        };
+        for read in done.reads.iter() {
+            match read {
+                TableRead::Names(NameCell::Whole { .. }) => wholes += 1,
+                TableRead::Names(cell) if cell.crate_prefix() != own => other_crates += 1,
+                TableRead::Names(NameCell::Item { .. }) => items += 1,
+                _ => other += 1,
+            }
+        }
+        if krate == 0 || crate_names[krate] == "core" || wholes > 0 {
+            let shown: Vec<String> = done.reads.iter().filter(|r| matches!(r, TableRead::Names(NameCell::Whole { .. }))).take(4).map(|r| format!("{r:?}")).collect();
+            say!("TASK {}: {} reads (own items rows {items}, other crates' cells {other_crates}, whole sections {wholes}, other {other}) {shown:?}", crate_names[krate], done.reads.len());
+        }
+        task_reads += done.reads.len();
+        task_wholes += wholes;
         crate_keys.push(written.krate);
         tables.put(written);
     }
+    say!("TASKS: {} crates, {task_reads} reads in all, {task_wholes} of a whole section", crate_names.len());
 
     // A table row of `impl_`, for the negatives' shapes.
     let row_of = |impl_: ItemKey| -> Option<blaze_surface::ImplRow> {
@@ -324,12 +370,14 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
         most_index = most_index.max(index_reads);
     }
     let n = asked.len().max(1) as u64;
-    println!("EQUAL: {} questions, {candidates} candidates in all, equal over both sources", asked.len());
-    println!(
+    say!("EQUAL: {} questions, {candidates} candidates in all, equal over both sources", asked.len());
+    say!(
         "PROBES tables: {over_tables} bucket reads, {most} at most for one question, {:.1} per question; index: {over_index} bucket lookups, {most_index} at most, {:.1} per question",
         over_tables as f64 / n as f64,
         over_index as f64 / n as f64
     );
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
-    println!("RECORD ERRORS: {errors:?}");
+    say!("RECORD ERRORS: {errors:?}");
+    let out = std::env::temp_dir().join("front2_tables_core.out");
+    std::fs::write(&out, said).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
 }

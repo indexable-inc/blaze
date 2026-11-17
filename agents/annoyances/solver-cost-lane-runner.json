@@ -1,0 +1,11 @@
+{
+ "id": "solver-cost-lane-runner",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane SV",
+ "where": "the build queue (runner.py ask) while working on crates/blaze-solve",
+ "what": "`--test \"-p blaze-solve\"` is refused (a target is required: --lib, --test X); blaze-ladder front2_dyn `typed_receivers_through_front2` fails on green (DynIncompatible on Recv), and front2_borrows_tempo failed on green from a834625362 for a while (libc names groups), so admits had to drop them; an ask past ~180 s is moved to the background",
+ "cost": "three extra asks",
+ "annoyance": "no way to see a test's counters without making it fail; known-red tests on green are not listed anywhere a lane can read before asking",
+ "workaround": "panic with the counters in a --no-admit trial, then set ceilings; ask without the test that is red on green and say so",
+ "state": "open"
+}

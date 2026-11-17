@@ -128,6 +128,7 @@ pub(crate) fn names_records<'n>(
             procs,
             own: None,
             callers,
+            run_stopped: core::cell::Cell::new(None),
         },
         frame,
     ));

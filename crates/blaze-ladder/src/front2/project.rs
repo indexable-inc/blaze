@@ -16,6 +16,7 @@ use blaze_scope::resolve::Names;
 
 use super::Front2;
 use super::FrontError;
+use super::tables::cost::{Cost, Part};
 use super::body::{Body, BodyError};
 use super::lower_made::{LowerTarget, lower_made};
 use super::buckets::Buckets;
@@ -214,6 +215,16 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None }
     }
 
+    /// The meter the checks file their parts in (front2 tables/cost.rs): a measurement only.
+    pub fn set_cost(&mut self, cost: Option<&'n super::tables::cost::Cost<'n>>) {
+        self.store.cost = cost;
+    }
+
+    /// How the head store meets a trait's members' needs (heads.rs `NeedsMet`).
+    pub fn set_needs(&mut self, needs: super::heads::NeedsMet) {
+        self.store.needs = needs;
+    }
+
     /// Every body of the program's own crate, in key order (free fns, then each container's
     /// fn members), each with where it is written.
     pub fn bodies<'a>(&self, alloc: Alloc<'a>) -> AVec<'a, (BodyRef<'n>, Option<BodyAt>)> {
@@ -291,6 +302,8 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             order: BuildOrder::AsAsked,
             consts: Some((&mut self.consts, prepared)),
         };
+        let cost = r.store.cost;
+        let lowering = Cost::enter(cost, Part::Lower);
         let lowered = match lower(&mut r, prepared, body) {
             Ok(b) => b,
             Err(why) => {
@@ -298,6 +311,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 return verdict;
             }
         };
+        drop(lowering);
         let view = lowered.lowered.view();
         let spell = match Spelling::of(&view) {
             Ok(s) => s,
@@ -314,7 +328,10 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // no view of it is held here); a type read through this view is refused, never wrong.
         let written = lowered.typeck.view(blaze_typeck::PTys::EMPTY);
         let mut asked = Asked::new_in(alloc);
+        let rounds = Cost::enter(cost, Part::Rounds);
         let checked = super::body_reads::check_body_filed_as(&mut r, &lowered, &scope, None, Some(&mut asked), stalls);
+        drop(rounds);
+        let _reads = Cost::enter(cost, Part::Reads);
         // The buckets as the check left them: what each impl question read, per crate.
         let buckets = r.buckets.as_ref();
         let whole = |list: &blaze_typeck::ReadList<'_>| -> Result<BodyReads<'a>, ReadsError> {

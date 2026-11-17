@@ -198,13 +198,13 @@ fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
         ms(s.ns),
         s.ns as f64 / 1000.0 / s.calls.max(1) as f64,
         s.refills,
-        s.frames,
-        s.frames as f64 / s.calls.max(1) as f64,
-        s.cache_hits,
-        s.fast_path,
-        s.candidates,
-        s.candidates as f64 / s.frames.max(1) as f64,
-        s.reruns
+        s.stats.frames,
+        s.stats.frames as f64 / s.calls.max(1) as f64,
+        s.stats.cache_hits,
+        s.stats.fast_path,
+        s.stats.candidates,
+        s.stats.candidates as f64 / s.stats.frames.max(1) as f64,
+        s.stats.reruns
     ));
     out.push_str(&format!(
         "{label} checker phases: walk and rules (all less world answers, hashing, solver calls and fact fills; a fill's asks are taken off twice, so a lower bound) {}\n",

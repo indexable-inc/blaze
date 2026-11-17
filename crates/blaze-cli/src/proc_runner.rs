@@ -111,7 +111,7 @@ mod with_sandbox {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use blaze_proc_macro::hook::{ProcMacros, crate_key};
+    use blaze_proc_macro::hook::{ProcMacros, RunRefused, crate_key};
     use blaze_proc_macro::module::{LockedPackages, ModuleError, module_key, read_module};
     use blaze_scope::resolve::SourceTexts;
     use blaze_world::procs::files::{PackageAt, sandbox_files};
@@ -138,7 +138,8 @@ mod with_sandbox {
         /// Runs the proc macro `def` on `call`, written in the crate at index `krate` of the
         /// names world, at `edition`: through `ProcMacros::run` alone, shown that crate's own
         /// package and variables (a lib's and a bin's of one package are two). A caller with no
-        /// package here is refused (the macro is never shown another crate's).
+        /// package here is refused (the macro is never shown another crate's). A run that
+        /// stopped holds its error, naming what stopped it ([`RunRefused`]).
         pub(crate) fn run<'a>(
             &self,
             krate: usize,
@@ -146,11 +147,11 @@ mod with_sandbox {
             def: &MacroDefinition<'_>,
             call: ProcCall<'_>,
             alloc: Alloc<'a>,
-        ) -> Result<Produced<'a>, HostError> {
+        ) -> Result<Produced<'a>, RunRefused> {
             let Some(package) = self.callers.of(krate) else {
-                return Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused });
+                return Err(RunRefused { host: HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused }, call: None });
             };
-            self.procs.run(def, &call, edition, package, alloc)
+            self.procs.run_why(def, &call, edition, package, alloc)
         }
 
         /// Why `def` cannot run, called in the crate at index `krate`, in words naming the
@@ -250,7 +251,7 @@ mod without_sandbox {
             }
         }
 
-        pub(crate) fn run<'a>(&self, _: usize, _: Edition, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+        pub(crate) fn run<'a>(&self, _: usize, _: Edition, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'a>) -> Result<Produced<'a>, blaze_proc_macro::hook::RunRefused> {
             match self {
                 ProcRunner::Never(never, _) => match *never {},
             }

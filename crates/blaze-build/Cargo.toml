@@ -24,6 +24,9 @@ blaze-own.workspace = true
 blaze-flow-lower.workspace = true
 # `ContentId` and `Hasher`: an instance's key. By path: the workspace entry turns on serde adapters.
 blaze-ids = { path = "../blaze-ids" }
+# `tls`: the thread-local descriptor, row and table forms (one home with the emitter and the
+# launcher's run mode).
+blaze-code = { path = "../blaze-code" }
 # `testing`: `read_back`, a value's record read through emitted code (blaze-consteval's
 # layout-drift test).
 blaze-emit = { workspace = true, optional = true }

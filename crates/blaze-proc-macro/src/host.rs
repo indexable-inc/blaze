@@ -715,8 +715,10 @@ fn imports(l: &mut Linker<Host>) -> wasmtime::Result<()> {
     Ok(())
 }
 
-/// Why one call gave no expansion.
-#[derive(Debug)]
+/// Why one call gave no expansion. Its words ([`std::fmt::Display`]) name what stopped it as
+/// the macro saw it (a path from the tree it is served, `/workspace/..` or `/package/..`, a
+/// variable's name): never a path on this machine, so they may stand in a record (rule 25).
+#[derive(Clone, Debug)]
 pub enum CallError {
     /// A limit it ran past.
     Limit { limit: ProcLimit, why: String },
@@ -741,6 +743,19 @@ impl CallError {
     }
 }
 
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The sandbox's own refusal (rule 9): its words name the path as the macro named it.
+            CallError::Limit { limit: ProcLimit::Paths, why } => write!(f, "was refused a path by its sandbox: {why}"),
+            CallError::Limit { limit, why } => write!(f, "ran past its {limit:?} limit: {why}"),
+            CallError::Refused(why) => write!(f, "asked what blaze does not answer: {why}"),
+            CallError::EnvUnknown(refused) => write!(f, "{refused}"),
+            CallError::Failed(why) => write!(f, "failed: {why}"),
+        }
+    }
+}
+
 /// A [`CallError`] with the macro and the call it is about.
 #[derive(Debug)]
 pub struct ExpandError {
@@ -753,13 +768,7 @@ pub struct ExpandError {
 
 impl std::fmt::Display for ExpandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (what, why) = match &self.error {
-            CallError::Limit { limit, why } => (format!("ran past its {limit:?} limit"), why),
-            CallError::Refused(why) => ("asked what blaze does not answer".to_owned(), why),
-            CallError::EnvUnknown(refused) => return write!(f, "the proc macro `{}` of {} {refused}", self.name, self.krate),
-            CallError::Failed(why) => ("failed".to_owned(), why),
-        };
-        write!(f, "the proc macro `{}` of {} {what}: {why}", self.name, self.krate)
+        write!(f, "the proc macro `{}` of {} {}", self.name, self.krate, self.error)
     }
 }
 

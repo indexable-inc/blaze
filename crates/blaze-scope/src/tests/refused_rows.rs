@@ -27,7 +27,7 @@ use crate::CallShape;
 use crate::call_refusal::{CallRefusal, RefusalKind};
 use crate::graph::Sysroot;
 use crate::names_record::{FailedRow, NamesRecord, NamesRecordError, Verified, encode, refused_row};
-use crate::resolve::{CrateInput, SourceTexts, aligned, resolve_crates};
+use crate::resolve::{CrateInput, ProcUnusable, SourceTexts, aligned, resolve_crates};
 use crate::task::Serial;
 
 const USER: &str = "#![no_core]
@@ -83,12 +83,72 @@ impl SourceTexts<'static> for Files {
         Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused })
     }
 
-    fn proc_macro_unusable(&self, _: usize, _: &MacroDefinition<'_>) -> Option<&'static str> {
-        Some(MISSING)
+    fn proc_macro_unusable(&self, _: usize, _: &MacroDefinition<'_>) -> Option<ProcUnusable<'static>> {
+        Some(ProcUnusable::Module(MISSING))
     }
 }
 
 static FILES: Files = Files(&[&[("/user/lib.rs", USER)], &[("/procs/lib.rs", PROCS)], &[("/bare/lib.rs", BARE)]]);
+
+/// What blaze-proc-macro's `CallError` says of a member's run its sandbox stopped on a path
+/// (`Limit { limit: Paths, .. }`'s words): the path as the macro named it, in its mount.
+const PATH_REFUSED: &str = "was refused a path by its sandbox: named /workspace/../x, outside /workspace, the tree the macro is served, the only one it may read";
+
+/// The same crates, the module of `procs` able to run `Show` and its run stopped by the
+/// sandbox (`HostWhy::Limit(Paths)`), the runner keeping the run's words.
+struct Stopped;
+
+impl SourceTexts<'static> for Stopped {
+    fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+        FILES.read(krate, path)
+    }
+
+    fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+        FILES.proc_macro_key(krate)
+    }
+
+    fn run_proc_macro<'b>(&self, _: usize, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'b>) -> Result<Produced<'b>, HostError> {
+        Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Limit(blaze_expand::ProcLimit::Paths) })
+    }
+
+    fn proc_macro_unusable(&self, _: usize, _: &MacroDefinition<'_>) -> Option<ProcUnusable<'static>> {
+        Some(ProcUnusable::Run(PATH_REFUSED))
+    }
+}
+
+/// MX (2026-11-17), rule 19: a proc macro whose RUN its sandbox stopped is refused by the path
+/// it named, read back from the names record's row as the note prints it ("not checked because
+/// the call of `procs::Show` (derive) .. failed: <row>"): tempo's check printed only "its
+/// ProcMacro read (Limit(Paths))" for 321 call groups, naming no path. The row's kind is the
+/// host read's; its words are the run's, the path as the macro saw it (rule 25: no path of
+/// this machine). CONTROL: with `Stopped::proc_macro_unusable` giving `None` (no runner words)
+/// the row reads "its ProcMacro read (Limit(Paths))" and the path assertion fails.
+/// Passing prints "test tests::refused_rows::a_run_the_sandbox_stopped_is_refused_by_the_path_it_named ... ok".
+#[test]
+fn a_run_the_sandbox_stopped_is_refused_by_the_path_it_named() {
+    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let crates: [CrateInput<'static>; 3] = [
+        input("user", "/user/lib.rs", &[("procs", 1), ("bare", 2)]),
+        CrateInput { implicit: PROC, ..input("procs", "/procs/lib.rs", &[]) },
+        CrateInput { implicit: PROC, ..input("bare", "/bare/lib.rs", &[]) },
+    ];
+    let names = resolve_crates(&crates, Sysroot::default(), &Stopped, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let user = names.krate(0);
+    let written = encode(user, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
+    let record = NamesRecord::open(Verified::check(aligned(&written, alloc)).unwrap_or_else(|e| panic!("check: {e:?}")));
+    let show = user
+        .expansions
+        .iter()
+        .filter(|(_, e)| e.refused.is_some())
+        .filter_map(|(call, _)| record.failed(*call, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")))
+        .find(|row| row.path == "procs::Show")
+        .unwrap_or_else(|| panic!("the derive `procs::Show` has a row"));
+    let note = std::format!("not checked because the call of `{}` ({}) in {} failed: {}", show.path, show.shape.name(), show.file, show.why);
+    assert_eq!(show.why.kind(), RefusalKind::HostRead, "{note}");
+    assert!(note.contains("named /workspace/../x, outside /workspace"), "the note names the path the macro named: {note}");
+    assert!(!note.contains("Limit(Paths)"), "the bare limit stands in for the words: {note}");
+    std::println!("{note}");
+}
 
 const PROC: Implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
 

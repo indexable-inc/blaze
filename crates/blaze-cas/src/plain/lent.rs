@@ -24,7 +24,7 @@ use blaze_core::Driver;
 use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
-use blaze_keyed::store::{Put, StoreError};
+use blaze_keyed::store::{Holder, Put, StoreError, TwoValues};
 
 use super::core::{Batch, Committed, POINTER_LEN, POINTER_TAG, Probes, Report, Sliced};
 use super::driven::Driven;
@@ -38,12 +38,11 @@ const CHUNK_BLOCKS: usize = 1 << 16;
 pub enum LentError {
     /// The plain store stopped while `doing`: its own typed error.
     Store { doing: &'static str, why: StoreError },
-    /// Two values under one key (rule 21): the key misses an input of its value. The held
-    /// record (`held_own`: this command's own put, else a committed one) and the refused put,
-    /// each by namespace, tag and length, and the offset of their first differing byte (`None`
-    /// when the bytes are equal and the tag or namespace is not; the shorter's length when one
-    /// is a prefix of the other).
-    TwoValues { key: Key, namespace: Namespace, tag: Tag, len: usize, held_namespace: Namespace, held_tag: Tag, held_len: usize, held_own: bool, differs_at: Option<usize> },
+    /// Two values under one key (rule 21): the key misses an input of its value. The store's one
+    /// shape ([`TwoValues`]: the held record, this command's own put or a committed one, and the
+    /// refused put, each by kind and length, and their first differing byte: `None` when the
+    /// bytes are equal and the kind or namespace is not), and each side's namespace.
+    TwoValues { two: TwoValues, namespace: Namespace, held_namespace: Namespace },
     /// The arena's allocator refused a record of this many bytes.
     Arena { bytes: usize },
     /// A namespace this store does not write (a trusted builder's).
@@ -66,15 +65,10 @@ impl fmt::Display for LentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LentError::Store { doing, why } => write!(f, "the plain store stopped while {doing}: {why}"),
-            LentError::TwoValues { key, namespace, tag, len, held_namespace, held_tag, held_len, held_own, differs_at } => {
-                let held = if *held_own { "this command's" } else { "committed" };
-                write!(
-                    f,
-                    "two values under one key {:?} (rule 21: the key misses an input of its value): {held} record of {held_len} bytes (namespace {}, tag {}), put of {len} bytes (namespace {}, tag {})",
-                    key.0, held_namespace.0, held_tag.0, namespace.0, tag.0
-                )?;
-                match differs_at {
-                    Some(at) => write!(f, ", first differing byte at {at}"),
+            LentError::TwoValues { two, namespace, held_namespace } => {
+                write!(f, "{two} (held in namespace {}, put in namespace {})", held_namespace.0, namespace.0)?;
+                match two.differs_at {
+                    Some(_) => Ok(()),
                     None => f.write_str(", bytes equal"),
                 }
             }
@@ -104,17 +98,23 @@ struct Held<'b> {
 impl Held<'_> {
     /// The refusal of a put of `bytes` (in `namespace`, of `tag`) under `key`, which holds this.
     fn against(&self, key: &Key, namespace: Namespace, tag: Tag, bytes: &[u8]) -> LentError {
-        LentError::TwoValues {
-            key: *key,
-            namespace,
-            tag,
-            len: bytes.len(),
-            held_namespace: self.namespace,
-            held_tag: self.tag,
-            held_len: self.bytes.len(),
-            held_own: self.own,
-            differs_at: first_difference(self.bytes, bytes),
-        }
+        let holder = if self.own { Holder::ThisProcess } else { Holder::Committed };
+        LentError::TwoValues { two: two_values(key, holder, self.tag, self.bytes, tag, bytes), namespace, held_namespace: self.namespace }
+    }
+}
+
+/// The store's two-values refusal of `bytes` (kind `tag`) under `key`, which holds `held_bytes`
+/// (kind `held_tag`, put by `held`): both lengths and their first differing byte (rule 19). The
+/// one place a raise site with both values at hand makes it.
+pub(crate) fn two_values(key: &Key, held: Holder, held_tag: Tag, held_bytes: &[u8], tag: Tag, bytes: &[u8]) -> TwoValues {
+    TwoValues {
+        key: key.0,
+        tag,
+        len: Some(bytes.len() as u64),
+        held_tag,
+        held_len: held_bytes.len() as u64,
+        held,
+        differs_at: first_difference(held_bytes, bytes).map(|at| at as u64),
     }
 }
 

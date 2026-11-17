@@ -216,7 +216,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let mut regions: Vec<Region, A> = Vec::new_in(self.alloc.clone());
         let mut ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
         expand(life, &unders, &mut regions, &mut ends);
-        let wide = SigLife { regions: &regions, ends: &ends, bounds: life.bounds };
+        let wide = SigLife { regions: &regions, ends: &ends, bounds: life.bounds, body: life.body };
         if !self.call_by_signature(wide, vs, dest, dest_ty, e)? {
             // The expansion lines up by construction; a destination that does not is named.
             return self.refuse(Form::CallHiddenInput { callee: item, input: u32::MAX }, e);

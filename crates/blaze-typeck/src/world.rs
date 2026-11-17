@@ -1666,8 +1666,14 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
 
     /// The read list and the needs of the run, sorted and deduplicated (rule 25).
     pub(crate) fn finish(mut self, alloc: Alloc<'a>) -> (ReadList<'a>, Needs<'a>) {
+        let recorded = self.entries.len() as u64;
         self.entries.sort_unstable();
         self.entries.dedup();
+        let kept = self.entries.len() as u64;
+        if let Some(t) = self.tally() {
+            t.solve.entries_recorded += recorded;
+            t.solve.entries_kept += kept;
+        }
         let mut rows = Soa::with_capacity_in(self.entries.len(), alloc);
         let mut needs = Vec::with_capacity_in(self.entries.len(), alloc);
         for &(q, h) in self.entries.iter() {

@@ -1,0 +1,686 @@
+//! THE COST OF ONE BODY ON THE NEW PATH (rule 16; engine.md "Floors": about 1 ms of CPU a
+//! body). The real 78-crate fixture (std, alloc, core, bstd, serde, ..: `Inputs` over the
+//! toolchain) is solved and written as records; every crate's impl tables are written (lane
+//! BK); then every body of the program's crate is checked, single-threaded:
+//!
+//! 1. TODAY'S PATH: one `ProjectWorld::from_records` for all bodies (`check_borrows`), its
+//!    store, index and impl buckets shared from body to body;
+//! 2. THE TASK: `tables::task::check_body` over the read-only view with the impl tables, a
+//!    fresh world per body (engine.md E5), measured by part with the meter (tables/cost.rs).
+//!
+//! It prints, per body and in sum, the microseconds and heap bytes of each part, the heads and
+//! impl questions counted, the solver's frames, and how many of the task's bodies read a whole
+//! section (`NameCell::Whole`: every edit to that section dirties the body). `ANSWERS` is a
+//! digest of every task's bytes and read list: a change that removes cost must leave it equal.
+//! Lines are also written to `front2_tables_cost.out` in the temp directory.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use blaze_drive::key::{ABSENT, Key, Kind, Name};
+use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
+use blaze_id::{ContentId, CrateItemKey, ItemKey};
+use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+use blaze_ladder::front2::buckets::{TableSet, write_impl_tables};
+use blaze_ladder::front2::heads::NeedsMet;
+use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
+use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::tables::cost::{Cost, Gauge, PARTS, Spent};
+use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
+use blaze_ladder::front2::tables::task::{BodyFrame, Make, MakeRefused, check_body};
+use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
+use blaze_own::Alloc;
+use blaze_scope::names_cells::NameCell;
+use blaze_scope::resolve::aligned;
+use blaze_scope::{items_record, names_record};
+
+/// The heap's bytes allocated so far: the meter's byte counter.
+static BYTES: AtomicU64 = AtomicU64::new(0);
+
+struct Counting;
+
+// SAFETY: every call is forwarded to `System` unchanged; only a counter is added.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        BYTES.fetch_add(new_size.saturating_sub(layout.size()) as u64, Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static HEAP: Counting = Counting;
+
+struct Clock(Instant);
+
+impl Gauge for Clock {
+    fn now_ns(&self) -> u64 {
+        self.0.elapsed().as_nanos() as u64
+    }
+
+    fn bytes(&self) -> u64 {
+        BYTES.load(Ordering::Relaxed)
+    }
+}
+
+const MAIN: &str = "#![no_std]
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt;
+use core::ops::Add;
+
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub struct P {
+    x: i32,
+    y: i32,
+}
+
+impl Add for P {
+    type Output = P;
+    fn add(self, o: P) -> P {
+        P { x: self.x + o.x, y: self.y + o.y }
+    }
+}
+
+impl fmt::Display for P {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, \"({}, {})\", self.x, self.y)
+    }
+}
+
+pub trait Shape {
+    fn area(&self) -> f64;
+    fn name(&self) -> &'static str {
+        \"shape\"
+    }
+}
+
+pub struct Sq(pub f64);
+pub struct Circle {
+    pub r: f64,
+}
+
+impl Shape for Sq {
+    fn area(&self) -> f64 {
+        self.0 * self.0
+    }
+}
+
+impl Shape for Circle {
+    fn area(&self) -> f64 {
+        3.14 * self.r * self.r
+    }
+    fn name(&self) -> &'static str {
+        \"circle\"
+    }
+}
+
+#[derive(Debug)]
+pub enum E {
+    Empty,
+    Bad(u32),
+}
+
+pub struct Stack<T> {
+    items: Vec<T>,
+}
+
+impl<T: Clone> Stack<T> {
+    pub fn new() -> Self {
+        Stack { items: Vec::new() }
+    }
+    pub fn push(&mut self, t: T) {
+        self.items.push(t);
+    }
+    pub fn pop(&mut self) -> Option<T> {
+        self.items.pop()
+    }
+    pub fn peek(&self) -> Option<&T> {
+        self.items.last()
+    }
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+pub fn sum(xs: &[u32]) -> u32 {
+    let mut t = 0;
+    for x in xs {
+        t += *x;
+    }
+    t
+}
+
+pub fn iters(xs: &[u32]) -> usize {
+    xs.iter().map(|x| x * 2).filter(|x| *x > 3).count()
+}
+
+pub fn opts(a: Option<u8>) -> u8 {
+    a.map(|v| v + 1).unwrap_or(0)
+}
+
+pub fn strs(a: &str, b: &str) -> bool {
+    a == b && a.len() < 10
+}
+
+pub fn points(a: P, b: P) -> P {
+    let c = a + b;
+    if c == P::default() { a.clone() } else { c }
+}
+
+pub fn res(r: Result<u32, ()>) -> u32 {
+    match r {
+        Ok(v) => v.wrapping_add(1),
+        Err(()) => 0,
+    }
+}
+
+pub fn chars(s: &str) -> usize {
+    s.chars().rev().take(3).count()
+}
+
+pub fn floats(a: f64) -> f64 {
+    (a * 2.0).max(1.0)
+}
+
+pub fn ranges(n: usize) -> usize {
+    (0..n).map(|i| i % 3).sum()
+}
+
+pub fn slices(xs: &mut [i64]) -> Option<i64> {
+    xs.sort_unstable();
+    xs.first().copied()
+}
+
+pub fn vecs(n: u32) -> Vec<u32> {
+    let mut v = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        v.push(i * i);
+    }
+    v.retain(|x| x % 2 == 0);
+    v
+}
+
+pub fn collect_sorted(xs: &[i32]) -> Vec<i32> {
+    let mut v: Vec<i32> = xs.iter().copied().filter(|x| *x >= 0).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+pub fn words(s: &str) -> Vec<String> {
+    s.split(' ').filter(|w| !w.is_empty()).map(|w| w.to_string()).collect()
+}
+
+pub fn joined(xs: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, x) in xs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(x);
+    }
+    out
+}
+
+pub fn counts(xs: &[u8]) -> BTreeMap<u8, usize> {
+    let mut m = BTreeMap::new();
+    for x in xs {
+        *m.entry(*x).or_insert(0) += 1;
+    }
+    m
+}
+
+pub fn lookup(m: &BTreeMap<String, u32>, k: &str) -> u32 {
+    m.get(k).copied().unwrap_or_default()
+}
+
+pub fn uniq(xs: &[u32]) -> usize {
+    let s: BTreeSet<u32> = xs.iter().copied().collect();
+    s.len()
+}
+
+pub fn queue(n: usize) -> Option<usize> {
+    let mut q = VecDeque::new();
+    for i in 0..n {
+        q.push_back(i);
+    }
+    q.pop_front();
+    q.back().copied()
+}
+
+pub fn parse_all(xs: &[&str]) -> Result<Vec<u32>, core::num::ParseIntError> {
+    let mut out = Vec::new();
+    for x in xs {
+        out.push(x.parse::<u32>()?);
+    }
+    Ok(out)
+}
+
+pub fn first_bad(xs: &[u32]) -> Result<u32, E> {
+    let first = xs.first().ok_or(E::Empty)?;
+    if *first > 10 {
+        return Err(E::Bad(*first));
+    }
+    Ok(*first)
+}
+
+pub fn chain(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    let x = a?;
+    let y = b?;
+    x.checked_add(y)
+}
+
+pub fn shapes() -> Vec<Box<dyn Shape>> {
+    let mut v: Vec<Box<dyn Shape>> = Vec::new();
+    v.push(Box::new(Sq(2.0)));
+    v.push(Box::new(Circle { r: 1.0 }));
+    v
+}
+
+pub fn total_area(v: &[Box<dyn Shape>]) -> f64 {
+    v.iter().map(|s| s.area()).sum()
+}
+
+pub fn names(v: &[Box<dyn Shape>]) -> Vec<&'static str> {
+    v.iter().map(|s| s.name()).collect()
+}
+
+pub fn largest<T: PartialOrd + Copy>(xs: &[T]) -> Option<T> {
+    let mut it = xs.iter();
+    let mut best = *it.next()?;
+    for x in it {
+        if *x > best {
+            best = *x;
+        }
+    }
+    Some(best)
+}
+
+pub fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 {
+    f(f(x))
+}
+
+pub fn adder(n: u32) -> impl Fn(u32) -> u32 {
+    move |x| x + n
+}
+
+pub fn boxed_fn(n: i32) -> Box<dyn Fn(i32) -> i32> {
+    Box::new(move |x| x * n)
+}
+
+pub fn counter() -> u32 {
+    let mut c = 0;
+    let mut inc = || c += 1;
+    inc();
+    inc();
+    c
+}
+
+pub fn zipped(a: &[u32], b: &[u32]) -> u32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+pub fn windows(xs: &[i32]) -> usize {
+    xs.windows(2).filter(|w| w[0] < w[1]).count()
+}
+
+pub fn folded(xs: &[u64]) -> u64 {
+    xs.iter().fold(0, |acc, x| acc ^ x)
+}
+
+pub fn positions(s: &str) -> Option<usize> {
+    s.bytes().position(|b| b == b'=')
+}
+
+pub fn shown(p: P) -> String {
+    alloc::format!(\"{} {:?}\", p, p)
+}
+
+pub fn stacked() -> Option<u32> {
+    let mut s = Stack::new();
+    s.push(1u32);
+    s.push(2);
+    let top = s.pop()?;
+    Some(top + *s.peek()? + s.len() as u32)
+}
+
+pub fn matched(e: &E) -> u32 {
+    match e {
+        E::Empty => 0,
+        E::Bad(n) if *n > 3 => *n,
+        E::Bad(_) => 1,
+    }
+}
+
+pub fn nested(v: &Vec<Vec<u8>>) -> usize {
+    v.iter().flat_map(|row| row.iter()).filter(|b| **b != 0).count()
+}
+
+pub fn maxed(xs: &[(u32, &str)]) -> Option<&str> {
+    xs.iter().max_by_key(|(n, _)| *n).map(|(_, s)| *s)
+}
+
+pub fn split_sum(s: &str) -> u32 {
+    s.split(',').filter_map(|p| p.trim().parse::<u32>().ok()).sum()
+}
+
+pub fn rev_string(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+fn main() {}
+";
+
+fn leak(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
+}
+
+/// The records and texts as kept after the solve (tests/front2_tables_core.rs `Kept`).
+struct Kept {
+    names: Vec<&'static [u8]>,
+    items: Vec<&'static [u8]>,
+    files: Vec<HashMap<String, &'static str>>,
+    expansions: Vec<HashMap<ItemKey, &'static str>>,
+    origins: Vec<HashMap<ItemKey, &'static [u8]>>,
+}
+
+fn made_origins(call: ItemKey, origins: &Result<&[u8], blaze_scope::expansion_origins::OriginsError>) -> &'static [u8] {
+    use blaze_scope::expansion_origins::OriginsError;
+    match origins {
+        Ok(bytes) => Box::leak(bytes.to_vec().into_boxed_slice()),
+        Err(OriginsError::Rewritten { .. } | OriginsError::Unplaced { .. }) => &[],
+        Err(e) => panic!("the origins of expansion {call:x}: {e:?}"),
+    }
+}
+
+impl Load<'static> for Kept {
+    fn names(&self, krate: usize) -> Option<&'static [u8]> {
+        self.names.get(krate).copied()
+    }
+
+    fn items(&self, krate: usize) -> Option<&'static [u8]> {
+        self.items.get(krate).copied()
+    }
+
+    fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'static str> {
+        self.files.get(krate)?.get(path.as_str()).copied()
+    }
+
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
+        self.expansions.get(krate)?.get(&call).copied()
+    }
+
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'static [u8]> {
+        self.origins.get(krate)?.get(&call).copied()
+    }
+}
+
+fn task_of(key: ItemKey) -> Task {
+    let planned = Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) };
+    Task { planned, key: Key(ABSENT) }
+}
+
+/// Every cell's digest from its name (tests/front2_tables_task.rs `MapMake`).
+struct NameMake;
+
+impl<'a> Make<'a> for NameMake {
+    fn make(&self, want: &CellId, _made: &mut SVec<'a, Made<'a>>) -> Result<ContentId, MakeRefused> {
+        Ok(ContentId::of("blaze-ladder tables cost test cell", format!("{want:?}").as_bytes()))
+    }
+}
+
+fn frame() -> &'static blaze_mem::Frame {
+    Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame")))
+}
+
+/// One line of parts: µs and KB each, heads and impl questions counted.
+fn parts(s: &Spent, n: u64) -> String {
+    let n = n.max(1);
+    let mut out = String::new();
+    for p in PARTS {
+        let i = p as usize;
+        out.push_str(&format!(" {} {}us/{}KB", p.name(), s.ns[i] / 1000 / n, s.bytes[i] / 1024 / n));
+        if matches!(p, blaze_ladder::front2::tables::cost::Part::Heads | blaze_ladder::front2::tables::cost::Part::Impls) {
+            out.push_str(&format!("(x{})", s.entries[i] / n));
+        }
+    }
+    out.push_str(&format!(" | head steps {} stopped at a need {} ({} us)", s.steps / n, s.stopped / n, s.stopped_ns / 1000 / n));
+    out.push_str(&format!(" | rounds {} solver frames {} candidates {} cache hits {}", s.rounds / n, s.solve.stats.frames / n, s.solve.stats.candidates / n, s.solve.stats.cache_hits / n));
+    out
+}
+
+#[test]
+fn the_cost_of_one_body_by_part() {
+    let mut said = String::new();
+    macro_rules! say {
+        ($($t:tt)*) => {{
+            let line = format!($($t)*);
+            println!("{line}");
+            said.push_str(&line);
+            said.push('\n');
+        }};
+    }
+    // A line for the file only (the queue cuts a long output before a failure's text).
+    macro_rules! note {
+        ($($t:tt)*) => {{
+            said.push_str(&format!($($t)*));
+            said.push('\n');
+        }};
+    }
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/cost/src/main.rs".to_string(), MAIN.to_string())];
+    let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+    let user = UserCrate { name: "cost", dir: "/cost/", root: "/cost/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let core = crate_names.iter().position(|n| *n == "core").expect("a crate named core");
+    let lang: &'static [usize] = Vec::leak(vec![0, core]);
+    let g = Alloc::global();
+
+    let start = Instant::now();
+    let kept = {
+        let names = inputs.resolve(&crates, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), origins: Vec::new() };
+        for c in names.crates().iter() {
+            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
+            kept.items.push(aligned(&items_record::encode_with(c, &names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+            kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
+            kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
+            kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
+        }
+        kept
+    };
+    let load: &'static Kept = Box::leak(Box::new(kept));
+    let reader = || -> &'static Records<'static> {
+        let log: &'static Log<'static> = Box::leak(Box::new(Log::new(crate_names, g)));
+        Box::leak(Box::new(Records::new(keys, load, log, frame(), g)))
+    };
+    say!("SOLVED {} crates in {} ms", crate_names.len(), start.elapsed().as_millis());
+
+    // Every crate's impl tables.
+    let start = Instant::now();
+    let records = reader();
+    let mut tables = TableSet::new(g);
+    for krate in 0..crate_names.len() {
+        let mut rows = Vec::new();
+        NamesSource::each_impl_row(records, krate, &mut |r| rows.push(r));
+        tables.put(write_impl_tables(records, krate, &rows, g).unwrap_or_else(|e| panic!("`{}`'s impl tables: {e}", crate_names[krate])));
+    }
+    let tables: &'static TableSet<'static> = Box::leak(Box::new(tables));
+    say!("IMPL TABLES of {} crates in {} ms", crate_names.len(), start.elapsed().as_millis());
+
+    // The program's bodies by item key (a member by its own key), in key order.
+    let listing = ProjectWorld::from_records(records, frame(), lang, g).unwrap_or_else(|e| panic!("the world did not start: {e}"));
+    let mut bodies: Vec<(ItemKey, BodyRef<'static>)> = Vec::new();
+    for (body, _) in listing.bodies(g).iter() {
+        let key = match *body {
+            BodyRef::Free(k) => k,
+            BodyRef::Member { container, name, .. } => {
+                let mut found = None;
+                NamesSource::each_member(records, container, &mut |m| {
+                    if m.name == Some(name) {
+                        found = Some(m.key);
+                    }
+                });
+                found.unwrap_or_else(|| panic!("the member `{name}` of {container:x} has no key"))
+            }
+        };
+        bodies.push((key, *body));
+    }
+    drop(listing);
+    bodies.sort_by_key(|(k, _)| *k);
+    assert!(bodies.len() >= 40, "the program's bodies: {}", bodies.len());
+
+    let clock = Clock(Instant::now());
+    let cost: &'static Cost<'static> = Box::leak(Box::new(Cost::new(Box::leak(Box::new(Clock(clock.0))))));
+
+    // 1. TODAY'S PATH: one world for every body.
+    let today_records = reader();
+    let mut today = ProjectWorld::from_records(today_records, frame(), lang, g).unwrap_or_else(|e| panic!("the world did not start: {e}"));
+    today.set_cost(Some(cost));
+    let mut today_us: HashMap<ItemKey, u64> = HashMap::new();
+    let (mut today_clean, mut today_sum) = (0usize, Spent::default());
+    let start = Instant::now();
+    for (key, body) in bodies.iter() {
+        let (before, t0) = (cost.spent(), Instant::now());
+        let (verdict, borrows) = today.check_borrows(*body, g);
+        today_us.insert(*key, t0.elapsed().as_micros() as u64);
+        today_sum.add(&cost.spent().since(&before));
+        if verdict.is_clean() && borrows.refused.is_none() && borrows.findings.is_empty() {
+            today_clean += 1;
+        }
+    }
+    let today_total = start.elapsed();
+    let n = bodies.len() as u64;
+    say!("TODAY {} bodies ({today_clean} clean) in {} ms: {} us a body;{}", bodies.len(), today_total.as_millis(), today_total.as_micros() as u64 / n, parts(&today_sum, n));
+
+    // 2. THE TASK: a fresh world per body over the view with the impl tables.
+    let task_records = reader();
+    let unused = Recorder::new(RecorderOpts { alloc: g });
+    let view = Tables::new(TablesOpts { records: task_records, impls: Some(tables), lang_crates: lang, reads: &unused });
+    let shared = blaze_own::testing::heap().shared();
+    let (mut clean, mut with_whole, mut sum, mut answers) = (0usize, 0usize, Spent::default(), ContentId::of("cost answers", b""));
+    let mut whole_sections: HashMap<String, usize> = HashMap::new();
+    // The costliest heads (inclusive), each body's four: (bodies, ns in all).
+    let mut slow: HashMap<String, (u64, u64)> = HashMap::new();
+    cost.take_slowest();
+    // Each body's bytes and read list, for the strategies' equality below.
+    let mut kept_outs: Vec<(ItemKey, Vec<u8>, String)> = Vec::new();
+    let mut all_reads: HashMap<ItemKey, Vec<String>> = HashMap::new();
+    let start = Instant::now();
+    for (key, _) in bodies.iter() {
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All };
+        let (before, b0, t0) = (cost.spent(), BYTES.load(Ordering::Relaxed), Instant::now());
+        let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
+        let us = t0.elapsed().as_micros() as u64;
+        let bytes = BYTES.load(Ordering::Relaxed) - b0;
+        let spent = cost.spent().since(&before);
+        sum.add(&spent);
+        if !out.done.failed && out.done.findings == 0 {
+            clean += 1;
+        }
+        let wholes: Vec<String> = out.reads.iter().filter_map(|r| match r {
+            TableRead::Names(NameCell::Whole { section, .. }) => Some(format!("{section:?}")),
+            _ => None,
+        }).collect();
+        if !wholes.is_empty() {
+            with_whole += 1;
+        }
+        for w in wholes.iter() {
+            *whole_sections.entry(w.clone()).or_default() += 1;
+        }
+        let mut digest = Vec::new();
+        digest.extend_from_slice(&answers.0);
+        digest.extend_from_slice(&out.bytes);
+        digest.extend_from_slice(format!("{:?}", out.done.reads).as_bytes());
+        answers = ContentId::of("cost answers", &digest);
+        kept_outs.push((*key, out.bytes.to_vec(), format!("{:?}", out.done.reads)));
+        all_reads.insert(*key, out.reads.iter().map(|r| format!("{r:?}")).collect());
+        let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
+        for (ns, want) in cost.take_slowest().into_iter().flatten() {
+            let entry = slow.entry(format!("{want:?} `{}`", NamesSource::name_of(task_records, want.key()).unwrap_or("?"))).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += ns;
+        }
+        note!(
+            "BODY {label}: task {us} us ({} KB), today {} us; {} reads, {} whole; failed {} findings {};{}",
+            bytes / 1024,
+            today_us.get(key).copied().unwrap_or(0),
+            out.done.reads.len(),
+            wholes.len(),
+            out.done.failed,
+            out.done.findings,
+            parts(&spent, 1)
+        );
+    }
+    let total = start.elapsed();
+    say!("TASK {} bodies ({clean} clean) in {} ms: {} us a body;{}", bodies.len(), total.as_millis(), total.as_micros() as u64 / n, parts(&sum, n));
+    let named: u64 = sum.ns.iter().sum();
+    say!("TASK named parts {} us a body of {} us; unnamed {} us a body", named / 1000 / n, total.as_micros() as u64 / n, (total.as_nanos() as u64).saturating_sub(named) / 1000 / n);
+    let mut slow: Vec<(String, (u64, u64))> = slow.into_iter().collect();
+    slow.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(&b.0)));
+    for (want, (bodies_in, ns)) in slow.iter().take(12) {
+        say!("SLOW HEAD {want}: among the 4 costliest of {bodies_in} bodies, {} ms in all (inclusive)", ns / 1_000_000);
+    }
+    let mut sections: Vec<(String, usize)> = whole_sections.into_iter().collect();
+    sections.sort();
+    say!("WHOLE READS: {with_whole} of {} bodies read a whole section; by section {sections:?}", bodies.len());
+    say!("ANSWERS {answers:?}");
+
+    // 3. THE SAME TASKS with a trait made again after each need (heads.rs `NeedsMet::First`,
+    //    the form before): equal bytes and read lists, body by body.
+    let start = Instant::now();
+    let mut differ: Vec<String> = Vec::new();
+    let mut reads_differ: Vec<String> = Vec::new();
+    for (key, bytes, reads) in kept_outs.iter() {
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First };
+        let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
+        let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
+        if out.bytes.as_slice() != bytes.as_slice() {
+            differ.push(format!("`{label}` answer"));
+            note!("DIFFER `{label}` all:\n{}\nfirst:\n{}", String::from_utf8_lossy(bytes), String::from_utf8_lossy(&out.bytes));
+        }
+        if &format!("{:?}", out.done.reads) != reads {
+            let first: Vec<String> = out.reads.iter().map(|r| format!("{r:?}")).collect();
+            let all: Vec<String> = all_reads.get(key).cloned().unwrap_or_default();
+            let only_all: Vec<&String> = all.iter().filter(|r| !first.contains(r)).collect();
+            let only_first: Vec<&String> = first.iter().filter(|r| !all.contains(r)).collect();
+            // OPEN (reported): the interim read list holds the reads of the heads the body
+            // made in its own store, so it moves with which heads were made on the way; the
+            // answers do not. Counted, not asserted, until frozen heads replace the store.
+            reads_differ.push(format!("`{label}` +{} -{}", only_all.len(), only_first.len()));
+            note!("READS DIFFER `{label}`: only when all needs are met {only_all:?}; only one at a time {only_first:?}");
+        }
+    }
+    say!("NEEDS ONE AT A TIME: {} bodies in {} ms; answers differ: {differ:?}; read lists differ (reads only with all needs met +, only one at a time -): {reads_differ:?}", kept_outs.len(), start.elapsed().as_millis());
+    let out = std::env::temp_dir().join("front2_tables_cost.out");
+    std::fs::write(&out, &said).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
+    assert!(differ.is_empty(), "answers differ with needs met one at a time: {differ:?}");
+    let errors: Vec<String> = task_records.errors().iter().map(|e| e.to_string()).collect();
+    say!("RECORD ERRORS: {errors:?}");
+    let out = std::env::temp_dir().join("front2_tables_cost.out");
+    std::fs::write(&out, said).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
+}

@@ -721,7 +721,7 @@ pub fn closing(
     Ok(())
 }
 
-const PROFILE: &str = ".blaze/v2/profile.txt";
+pub(crate) const PROFILE: &str = ".blaze/v2/profile.txt";
 
 /// The profile and the command's phases, written in place and never synced: a crash, or a
 /// reader during the write, sees a part of it; it is a report, read by a person, made again by

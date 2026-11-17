@@ -267,7 +267,20 @@ pub fn check_body_asked<'n, S: NamesSource<'n>>(
     count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
     asked: Option<&mut super::reads::Asked<'_>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
-    let mut done = check_rounds(r, body, scope, count, asked)?;
+    check_body_keyed(r, body, scope, count, asked, None)
+}
+
+/// [`check_body_asked`] that also leaves the last round's ground root goal digests in
+/// `root_keys` (check.rs `check_body_metered`).
+pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+    count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
+    asked: Option<&mut super::reads::Asked<'_>>,
+    root_keys: Option<&mut std::vec::Vec<u64, Global>>,
+) -> Result<tc::Checked<'static>, CheckFail> {
+    let mut done = check_rounds(r, body, scope, count, asked, root_keys)?;
     // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
     super::opaque_auto::file(r, body, &done)?;
     let filed = done.file_out();
@@ -312,7 +325,7 @@ pub fn check_body_filed_as<'n, S: NamesSource<'n>>(
     asked: Option<&mut super::reads::Asked<'_>>,
     stalls: super::stalled_goals::Stalls,
 ) -> Result<(tc::Checked<'static>, tc::Filed<'static>), CheckFail> {
-    let mut done = super::check::check_rounds_as(r, body, scope, count, asked, stalls)?;
+    let mut done = super::check::check_rounds_as(r, body, scope, count, asked, stalls, None)?;
     // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
     super::opaque_auto::file(r, body, &done)?;
     let filed = done.file_out();

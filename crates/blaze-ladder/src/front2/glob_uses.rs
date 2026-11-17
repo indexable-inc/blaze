@@ -40,6 +40,7 @@
 //! block's glob imports ([`TYPE_THROUGH_GLOB`]: the type builder reads at one module).
 
 use blaze_file_items::nested::{Nested, NestedEnd};
+use blaze_id::CrateItemKey;
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::Range;
 use blaze_lower::block_uses::BlockUse;
@@ -67,6 +68,9 @@ pub const THROUGH_LOCAL: &str = "a use in a block whose path starts with a block
 pub const NAMED_TARGET: &str = "a use in a block whose path does not resolve (asked by a pattern)";
 /// The `use` item's tree does not read.
 pub const UNREAD: &str = "a use tree in a block that does not read";
+/// The marks of a block `use`'s words do not read from the body's record, or its path's first
+/// segment is not in its text: a `$crate` a macro wrote could not be placed.
+pub const MARKS_UNREAD: &str = "a use in a block whose words' marks do not read";
 /// The blocks around a name nest deeper than [`MAX_STEPS`].
 pub const TOO_DEEP: &str = "a use in a block under more blocks than the lookup walks";
 /// A written type in a body some block of which holds a glob import, whose path does not
@@ -88,16 +92,40 @@ fn copy<'a>(segments: &[&'a str], alloc: Alloc<'a>) -> AVec<'a, &'a str> {
     path
 }
 
-/// Where a `use`'s path is read: the module, whether from the global root, and the path.
+/// Where a `use`'s path is read: the module, whether from the global root, the path, and the
+/// crate a first segment `$crate` (or an opaque `crate`) names.
 pub struct Start<'a> {
     pub abs: bool,
     pub at: LibKey,
     pub path: AVec<'a, &'a str>,
+    /// The crate of the macro that wrote the path's first segment when that segment is a
+    /// `$crate` (or an opaque `crate`): its token's mark's, by the one resolver-by-mark
+    /// (blaze-scope `crate_roots::root_by_mark`, [`Row::first_mark`]). `None`: the body's
+    /// crate. The Reference, "Macros By Example", "Hygiene": "`$crate` [..] refers to the crate
+    /// that defines the macro". clap_builder 4.6.7's `value_parser!` writes `use
+    /// $crate::builder::impl_prelude::*;` in the block it expands to; read as the calling
+    /// crate's `crate::builder`, every clap derive's method body was refused [`TARGET`]
+    /// (port27/mini/clap-root, MX 2026-11-17).
+    pub dollar: Option<CrateItemKey>,
 }
 
 impl<'a> Start<'a> {
     fn again(&self, alloc: Alloc<'a>) -> Start<'a> {
-        Start { abs: self.abs, at: self.at, path: copy(&self.path, alloc) }
+        Start { abs: self.abs, at: self.at, path: copy(&self.path, alloc), dollar: self.dollar }
+    }
+
+    /// [`Paths::path_with`] of `path` from this start.
+    fn walk<'n, S: NamesSource<'n>>(&self, paths: &Paths<S>, path: &[&str], ns: Ns) -> Result<Target, ResolveError> {
+        paths.path_with(self.at, self.dollar, self.abs, path, ns)
+    }
+}
+
+/// The crate a path whose first segment is `first`, of mark `mark`, names by `$crate` (or an
+/// opaque `crate`) when it is another crate's ([`Start::dollar`]).
+pub fn dollar_of(first: Option<&str>, mark: Option<blaze_expand::origin_column::TextMark>) -> Option<CrateItemKey> {
+    match blaze_scope::crate_roots::root_by_mark(first?, mark) {
+        blaze_scope::crate_roots::Root::Crate(k) => Some(k),
+        blaze_scope::crate_roots::Root::Here | blaze_scope::crate_roots::Root::NotARoot => None,
     }
 }
 
@@ -125,6 +153,8 @@ pub struct Hit<'a> {
     /// The import's path with the name as its last segment (a named import's: its path).
     pub path: AVec<'a, &'a str>,
     pub target: Target,
+    /// The crate [`Self::path`]'s first segment `$crate` names ([`Start::dollar`]).
+    pub dollar: Option<CrateItemKey>,
 }
 
 /// Whether `t`, the answer to a path asked in `ns` (which [`Paths::path`] also looks up in the
@@ -146,7 +176,7 @@ fn through<'n, 'a, S: NamesSource<'n>>(paths: &Paths<S>, globs: &[(&UseAt<'a>, S
         // The entity whose names are imported: a module or an enum. A path of heads alone
         // (`super::*`, `crate::*`) names a module.
         if !start.path.iter().all(|s| is_head(s)) {
-            match paths.path(start.at, start.abs, &start.path, Ns::Type) {
+            match start.walk(paths, &start.path, Ns::Type) {
                 Ok(t) if t.consumed as usize == start.path.len() && matches!(t.kind, Kind::Module | Kind::Enum) => {}
                 Ok(t) if t.consumed as usize == start.path.len() => return Err(gap(NOT_A_MODULE)),
                 Ok(_) | Err(_) => return Err(gap(TARGET)),
@@ -155,7 +185,7 @@ fn through<'n, 'a, S: NamesSource<'n>>(paths: &Paths<S>, globs: &[(&UseAt<'a>, S
         let mut path: AVec<'a, &'a str> = AVec::new_in(alloc);
         path.extend_from_slice(&start.path);
         path.push(name);
-        let target = match paths.path(start.at, start.abs, &path, ns) {
+        let target = match start.walk(paths, &path, ns) {
             Ok(t) if t.consumed as usize == path.len() => t,
             // The walk stopped before the name (an enum's associated item is no import), or
             // the name is not there or not visible from here: this glob does not import it.
@@ -172,7 +202,7 @@ fn through<'n, 'a, S: NamesSource<'n>>(paths: &Paths<S>, globs: &[(&UseAt<'a>, S
             _ => true,
         };
         if takes {
-            hit = Some((Hit { abs: start.abs, at: start.at, path, target }, own));
+            hit = Some((Hit { abs: start.abs, at: start.at, path, target, dollar: start.dollar }, own));
         }
     }
     Ok(hit.map(|(h, _)| h))
@@ -184,7 +214,7 @@ fn start_of<'n, 'a, S: NamesSource<'n>>(paths: &Paths<S>, module: LibKey, uses: 
     if let Some(s) = &u.start {
         return Ok(s.again(alloc));
     }
-    let as_written = |alloc: Alloc<'a>| Start { abs: false, at: module, path: copy(&u.written, alloc) };
+    let as_written = |alloc: Alloc<'a>| Start { abs: false, at: module, path: copy(&u.written, alloc), dollar: None };
     let Some(&first) = u.written.first() else { return Ok(as_written(alloc)) };
     let mut depth = u.depth;
     let mut at = 0usize;
@@ -205,7 +235,7 @@ fn start_of<'n, 'a, S: NamesSource<'n>>(paths: &Paths<S>, module: LibKey, uses: 
         if let Some(hit) = through(paths, &group, first, Ns::Type, alloc)? {
             let mut path = hit.path;
             path.extend_from_slice(&u.written[1..]);
-            return Ok(Start { abs: hit.abs, at: hit.at, path });
+            return Ok(Start { abs: hit.abs, at: hit.at, path, dollar: hit.dollar });
         }
     }
     Ok(as_written(alloc))
@@ -229,10 +259,10 @@ pub fn lookup<'n, 'a, S: NamesSource<'n>>(paths: &Paths<S>, module: LibKey, uses
         // A named import of the block shadows its globs.
         for u in block.iter().filter(|u| u.bound == Some(name)) {
             let start = start_of(paths, module, uses, u, alloc)?;
-            match paths.path(start.at, start.abs, &start.path, ns) {
+            match start.walk(paths, &start.path, ns) {
                 Ok(target) if target.consumed as usize == start.path.len() => {
                     if of_namespace(paths, &target, ns) {
-                        return Ok(Some(Hit { abs: start.abs, at: start.at, path: start.path, target }));
+                        return Ok(Some(Hit { abs: start.abs, at: start.at, dollar: start.dollar, path: start.path, target }));
                     }
                 }
                 Ok(_) | Err(_) => return Err(LocalGap { item: u.item, form: NAMED_TARGET, range: u.range }),
@@ -276,10 +306,12 @@ where
     'n: 'a,
 {
     let mut path: AVec<'a, &'a str> = AVec::new_in(alloc);
-    let Some(&first) = row.path.first() else { return Ok(Some(Start { abs: row.abs, at: module, path })) };
+    let Some(&first) = row.path.first() else { return Ok(Some(Start { abs: row.abs, at: module, path, dollar: None })) };
     if row.abs || is_head(first) {
         path.extend_from_slice(row.path);
-        return Ok(Some(Start { abs: row.abs, at: module, path }));
+        // A `$crate` a macro wrote: the macro's crate, by the row's first segment's mark.
+        let dollar = if row.abs { None } else { dollar_of(Some(first), row.first_mark) };
+        return Ok(Some(Start { abs: row.abs, at: module, path, dollar }));
     }
     let gap = LocalGap { item: row.key, form: THROUGH_LOCAL, range: row.range };
     match locals.find(body, Some(row.scope), first, LocalNs::Type) {
@@ -288,15 +320,16 @@ where
         Some(local) if local.kind.in_block_module() => match local.module {
             Some(m) => {
                 path.extend_from_slice(row.path);
-                Ok(Some(Start { abs: false, at: m, path }))
+                Ok(Some(Start { abs: false, at: m, path, dollar: None }))
             }
             None => Err(gap),
         },
-        // A named import: its path stands for the name.
+        // A named import: its path stands for the name (its first segment's mark with it).
         Some(local) if local.kind == LocalKind::Use => {
             path.extend_from_slice(local.path);
             path.extend_from_slice(&row.path[1..]);
-            Ok(Some(Start { abs: local.abs, at: module, path }))
+            let dollar = if local.abs { None } else { dollar_of(local.path.first().copied(), local.first_mark) };
+            Ok(Some(Start { abs: local.abs, at: module, path, dollar }))
         }
         Some(_) => Err(gap),
     }
@@ -430,15 +463,32 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
     let mut uses: AVec<'a, UseAt<'a>> = AVec::new_in(alloc);
     // (the name a named import binds, its path, whether from the root): what a later `use`
     // path may start with.
-    let mut named: AVec<'a, (&'a str, AVec<'a, &'a str>, bool)> = AVec::new_in(alloc);
-    let mut leaves_of: AVec<'a, (usize, Range)> = AVec::new_in(alloc);
+    // (.., and the crate its first segment `$crate` names: [`Start::dollar`]).
+    let mut named: AVec<'a, (&'a str, AVec<'a, &'a str>, bool, Option<CrateItemKey>)> = AVec::new_in(alloc);
+    // Each import's (its `use`'s index, where shown, its first segment's `$crate`).
+    let mut leaves_of: AVec<'a, (usize, Range, Option<CrateItemKey>)> = AVec::new_in(alloc);
     for (i, u) in block_uses.iter().enumerate() {
         // Where the `use` is shown in the body's item, for a refusal's words.
         let range: Range = u.shown;
         let Some(leaves) = blaze_scope::task::use_leaves(super::locals::use_tree(u.text), alloc) else {
             return Err(LocalGap { item, form: UNREAD, range });
         };
+        // The marks of the `use`'s words, each at its start in `u.text`: a `$crate` (or opaque
+        // `crate`) a macro wrote names that macro's crate (blaze-scope `root_by_mark`, as a
+        // module's `use` and a block's kept row are read, locals.rs `Row::first_mark`).
+        let marks = view.marks_in(u.range, alloc).map_err(|_| LocalGap { item, form: MARKS_UNREAD, range })?;
         for leaf in leaves.iter() {
+            let first = leaf.segments.first().copied();
+            let mark = match first {
+                Some(first) if !leaf.abs => {
+                    let Some(at) = blaze_scope::expansion_origins::offset_in(u.text, first) else {
+                        return Err(LocalGap { item, form: MARKS_UNREAD, range });
+                    };
+                    marks.iter().find(|(start, _)| *start == at).map(|(_, m)| *m)
+                }
+                _ => None,
+            };
+            let dollar = if leaf.abs { None } else { dollar_of(first, mark) };
             let bound = match leaf.form {
                 UseForm::Named { rename: Rename::Same, .. } => Some(leaf.segments.last().copied().unwrap_or("")),
                 UseForm::Named { rename: Rename::To(n), .. } => Some(n),
@@ -447,12 +497,12 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
                 UseForm::Glob => None,
             };
             if let Some(b) = bound {
-                named.push((b, copy(&leaf.segments, alloc), leaf.abs));
+                named.push((b, copy(&leaf.segments, alloc), leaf.abs, dollar));
             }
             // `::a::*` is read from the global root, whatever the blocks declare.
-            let start = leaf.abs.then(|| Start { abs: true, at: module, path: copy(&leaf.segments, alloc) });
+            let start = leaf.abs.then(|| Start { abs: true, at: module, path: copy(&leaf.segments, alloc), dollar: None });
             uses.push(UseAt { depth: u.depth, bound, start, written: copy(&leaf.segments, alloc), item, range });
-            leaves_of.push((i, range));
+            leaves_of.push((i, range, dollar));
         }
     }
     // Each import's start, where its own path says it (the module doc).
@@ -461,17 +511,17 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
             continue;
         }
         let Some(&first) = uses[n].written.first() else {
-            uses[n].start = Some(Start { abs: false, at: module, path: AVec::new_in(alloc) });
+            uses[n].start = Some(Start { abs: false, at: module, path: AVec::new_in(alloc), dollar: None });
             continue;
         };
         if is_head(first) {
             let path = copy(&uses[n].written, alloc);
-            uses[n].start = Some(Start { abs: false, at: module, path });
+            uses[n].start = Some(Start { abs: false, at: module, path, dollar: leaves_of[n].2 });
         } else if local_names.contains(&first) {
             // An item of a block: read at the module of the block the `use` is written in, the
             // scope table's for the `use`'s scope (super::scope_table, where the order is
             // stated): a hand block's or an expansion's, by the block, never by a site.
-            let (i, range) = leaves_of[n];
+            let (i, range, _) = leaves_of[n];
             if table.is_none() {
                 let Some(crate_key) = paths.names.crate_of(module).and_then(|k| paths.names.crate_key(k)) else {
                     return Err(LocalGap { item, form: THROUGH_LOCAL, range });
@@ -486,16 +536,16 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
                 Some(super::scope_table::ScopeAt::Unfiled(_)) | None => return Err(LocalGap { item, form: THROUGH_LOCAL, range }),
             };
             let path = copy(&uses[n].written, alloc);
-            uses[n].start = Some(Start { abs: false, at: m, path });
+            uses[n].start = Some(Start { abs: false, at: m, path, dollar: None });
         } else if uses[n].bound != Some(first)
-            && let Some((_, through, abs)) = named.iter().find(|(b, _, _)| *b == first)
+            && let Some((_, through, abs, dollar)) = named.iter().find(|(b, _, _, _)| *b == first)
         {
             // A named import of a block: its path stands for the name (one step: an import
             // through another block import is read as written there; `use x::x;` names the
-            // `x` outside).
+            // `x` outside), its first segment's `$crate` with it.
             let mut path = copy(through, alloc);
             path.extend_from_slice(&uses[n].written[1..]);
-            uses[n].start = Some(Start { abs: *abs, at: module, path });
+            uses[n].start = Some(Start { abs: *abs, at: module, path, dollar: *dollar });
         }
     }
     Ok(lookup(paths, module, &uses, name, Ns::Value, alloc)?.map(|hit| hit.target))

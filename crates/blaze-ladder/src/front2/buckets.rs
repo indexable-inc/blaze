@@ -44,7 +44,10 @@ mod by_trait;
 mod records;
 
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
-pub use records::{BucketSource, ImplTables, ItemsIndex, NoTables, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, row_answers, row_digest, trait_cell, write_impl_tables};
+pub use records::{
+    BucketSource, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, cells_of, impl_tables_name, impl_tables_task, row_answers, row_digest,
+    rows_key, trait_cell, write_impl_tables,
+};
 
 /// A candidate impl whose header the store does not hold when the answer is made, or an
 /// inherent impl's fn whose signature it does not.

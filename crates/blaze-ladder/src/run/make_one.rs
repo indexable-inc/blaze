@@ -54,7 +54,7 @@ use crate::front2::const_at::{ConstTable, Needs};
 use crate::front2::coroutines::{CoroutineTable, Coroutines};
 use crate::front2::program::lazy::LazyRefusal;
 use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
-use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, tls_symbol, vtable_symbol};
+use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
 
 /// How many bodies were checked for a walk's makes: the claim "a run that finds every record
 /// checks no body" is read here. A plain counter, owned by the maker and read by the test.
@@ -89,6 +89,8 @@ struct Work {
     alloc: Alloc<'static>,
     isa: Isa,
     overflow: OverflowChecks,
+    /// What `ub_checks()` is: the records' key's debug assertions (`Maker::new`).
+    ub: blaze_build::UbChecks,
     /// The program's panic strategy: the records' key's (`Maker::new`).
     panic: blaze_build::Panic,
     langs: BackLangs,
@@ -134,7 +136,7 @@ fn tables_gone(key: ItemKey) -> RunError {
 impl MakerState {
     /// The state for `program`, before its first instance. Refuses a front end that evaluates
     /// constants for the whole program only (`evaluates_at_args` false), naming `first`.
-    pub fn new<P: FrontEnd>(program: &P, first: ItemKey, isa: Isa, overflow: OverflowChecks, panic: blaze_build::Panic, alloc: Alloc<'static>) -> Result<MakerState, RunError> {
+    pub fn new<P: FrontEnd>(program: &P, first: ItemKey, isa: Isa, overflow: OverflowChecks, ub: blaze_build::UbChecks, panic: blaze_build::Panic, alloc: Alloc<'static>) -> Result<MakerState, RunError> {
         if !program.evaluates_at_args() {
             return Err(RunError::OneBody {
                 key: first,
@@ -157,6 +159,7 @@ impl MakerState {
             alloc,
             isa,
             overflow,
+            ub,
             panic,
             langs,
             ground,
@@ -308,8 +311,8 @@ pub fn make_instance<P: FrontEnd>(
     loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
-        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, panic: work.panic, alloc: work.alloc };
-        let step = build_one(&*program, &bodies, work, i, instance, entry);
+        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+let step = build_one(&*program, &bodies, work, i, instance, entry);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         let step = match step {
             Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
@@ -368,7 +371,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
     args.extend_from_slice(work.ground.view().list(instance.args).map_err(malformed)?);
     let t = tables.take().ok_or_else(|| tables_gone(function.key))?;
-    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, panic: work.panic, alloc: work.alloc };
+    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
     let view = body.view(program.types());
     let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
     let found = crate::front2::const_at::needs_of(&view, done, &args, &mut work.ground, &facts, work.alloc, &mut work.needs);
@@ -522,8 +525,6 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         return Ok(Step::Table(untabled));
     }
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
-    let mut tls_names: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), work.alloc);
-    tls_names.extend(built.thread_locals.iter().map(|&k| tls_symbol(k)));
     let mut vtables: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.vtables.len(), work.alloc);
     for &table in built.vtables.iter() {
         vtables.push(vtable_symbol(table, work.ground.view(), work.alloc).map_err(sym)?);
@@ -531,7 +532,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     // The soft-float routines after the instance's own references: the emitter's one table
     // (front2/builtins_shim.rs); `make_entry` declares those it says the record calls.
     let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
-    let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &tls_names };
+    let names = InstanceNames { funcs: &funcs, statics: &built.statics, vtables: &vtables, tls: &built.thread_locals };
     let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
     for n in 0..reach.rows.len() {
         let (tabled, name_bytes) = reach.row(n);
@@ -836,6 +837,7 @@ pub struct Maker<'n> {
     made: Option<(RecordsProgram<'n>, MakerState)>,
     isa: Isa,
     overflow: OverflowChecks,
+    ub: blaze_build::UbChecks,
     panic: blaze_build::Panic,
     alloc: Alloc<'static>,
     checks: CheckCount,
@@ -854,6 +856,9 @@ impl<'n> Maker<'n> {
             made: None,
             isa: builder.isa,
             overflow: builder.settings.overflow_checks,
+            // `ub_checks()` follows the key's debug assertions, as rustc's `ub_checks` cfg
+            // follows `-C debug-assertions`: in the key, so never stale (rule 21).
+            ub: blaze_build::UbChecks::of_debug_assertions(builder.settings.debug_assertions),
             panic: crate::panic_strategy::of_strategy(builder.settings.panic),
             alloc,
             checks: CheckCount::default(),
@@ -896,15 +901,19 @@ impl<'n> Maker<'n> {
     }
 
     /// The program made on the first call, then static `item`'s value made its entry
-    /// (code_records.rs `statics`).
-    fn static_over(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    /// (code_records.rs `statics`): a static's datum, or (`template`) a thread-local's template.
+    fn static_over(&mut self, item: ItemKey, template: bool, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.construct(item)?;
         let alloc = self.alloc;
         let Some((program, _)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: item, why: "the maker's program was not made (make_one.rs `Maker::make_static`)" });
         };
         let (value, kind) = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-        let made = match crate::code_records::statics::make_static_entry(value, kind, alloc) {
+        let made = match template {
+            false => crate::code_records::statics::make_static_entry(value, kind, alloc),
+            true => crate::code_records::statics::make_template_entry(value, kind, alloc),
+        };
+        let made = match made {
             Ok(made) => made,
             Err(error) => return Err(RunError::StaticRecord { static_: program.static_shown(item), error }),
         };
@@ -927,7 +936,7 @@ impl<'n> Maker<'n> {
             self.checks.constructed += 1;
             // A lazy program holds no checked body when made: 0, counted as the claim reads it.
             self.checks.by_construction += (0..program.fn_count()).filter(|&c| program.function(c).body.is_some()).count();
-            let state = MakerState::new(&program, tabled, self.isa, self.overflow, self.panic, self.alloc)?;
+            let state = MakerState::new(&program, tabled, self.isa, self.overflow, self.ub, self.panic, self.alloc)?;
             self.made = Some((program, state));
         }
         Ok(())
@@ -954,7 +963,19 @@ impl Make for Maker<'_> {
         if let Some(void) = self.void(item) {
             return Err(void);
         }
-        let made = self.static_over(item, entry);
+        let made = self.static_over(item, false, entry);
+        // As `make`: an entry made over an unanswered question is void.
+        if let Some(void) = self.void(item) {
+            return Err(void);
+        }
+        made
+    }
+
+    fn make_thread_local(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        if let Some(void) = self.void(item) {
+            return Err(void);
+        }
+        let made = self.static_over(item, true, entry);
         // As `make`: an entry made over an unanswered question is void.
         if let Some(void) = self.void(item) {
             return Err(void);

@@ -195,8 +195,13 @@ pub trait TypeCtx {
     /// The interned type of `v`.
     fn mk(&mut self, v: TyView) -> Result<Ty, CheckError>;
     /// One level of `t`, unresolved: a variable is `Infer` even when bound (see
-    /// `shallow_resolve`).
+    /// `shallow_resolve`). A handle the context cannot view is `Error`, noted for
+    /// [`TypeCtx::take_malformed`].
     fn view(&self, t: Ty) -> TyView;
+    /// The first handle a read that returns no error (`view`, `list_get`, `list_len`,
+    /// `shallow_resolve`) could not read since the last call, taken: the check of a body fails
+    /// with it when it ends (lib.rs `run`; rule 20: a malformed input fails its own body).
+    fn take_malformed(&mut self) -> Option<crate::error::Malformed>;
     /// The interned list of `tys`.
     fn mk_list(&mut self, tys: &[Ty]) -> Result<TyList, CheckError>;
     /// The length of `l`.

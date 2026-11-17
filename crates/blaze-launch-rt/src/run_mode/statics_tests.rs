@@ -19,7 +19,7 @@ use blaze_launch::{Slot, Thread, Tier};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::{Nanos, SlotId};
 
-use super::{Act, Event, Memory, Outside, Placing, Plant, RecordSource, RunMode, RunModeError};
+use super::{Act, Event, Memory, Outside, Placing, Plant, RecordSource, RunMode, RunModeError, ThreadKey};
 use crate::code_unwind::Step;
 
 const ADRP_X0: u32 = 0x9000_0000;
@@ -100,8 +100,13 @@ struct Sim {
     next: u64,
     published: AVec<'static, (u32, u64, AVec<'static, u8>)>,
     copied: AVec<'static, (u64, AVec<'static, u8>)>,
-    /// "static" or "store", in order: no record's word is stored before the statics it names.
+    /// "static", "store", "key" or "write", in order: no record's word is stored before the
+    /// statics and rows it names.
     order: AVec<'static, &'static str>,
+    /// Each [`Memory::write`]: its address and bytes.
+    written: AVec<'static, (u64, AVec<'static, u8>)>,
+    /// The destructor the key was made with.
+    ender: Option<u64>,
     alloc: Alloc<'static>,
 }
 
@@ -160,7 +165,24 @@ impl Memory for Sim {
         self.order.push("static");
         Ok(())
     }
+
+    fn thread_key(&mut self, ender: u64) -> Result<ThreadKey, RunModeError> {
+        self.ender = Some(ender);
+        self.order.push("key");
+        Ok(ThreadKey { key: KEY, root: KEY * 8 })
+    }
+
+    fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), RunModeError> {
+        let mut kept = Vec::new_in(self.alloc);
+        kept.extend_from_slice(bytes);
+        self.written.push((at, kept));
+        self.order.push("write");
+        Ok(())
+    }
 }
+
+/// The simulated key.
+const KEY: u64 = 0x2a;
 
 /// What one run showed: the placement's result (or the frame's refusal), and the memory.
 struct Seen {
@@ -171,16 +193,30 @@ struct Seen {
 /// The entry's stub fired; then the parent's `Data` (when `told` holds any), `Declare` and
 /// `Publish` of `f`'s record, the acts carried as the native driver does, to the first error.
 fn run(statics: &[(Symbol, AVec<'static, u8>)], twice: bool) -> Seen {
+    run_with(code(Alloc::global()), statics, twice, 0)
+}
+
+/// [`run`] of the record `code`, with `thread_locals` `ThreadLocals` messages (naming [`DESC`]
+/// and [`ENDER`]) after the `Data`.
+fn run_with(code: AVec<'static, u8>, statics: &[(Symbol, AVec<'static, u8>)], twice: bool, thread_locals: usize) -> Seen {
     let alloc = Alloc::global();
     let mut store = Store { records: Vec::new_in(alloc) };
-    let f = store.put(code(alloc));
+    let f = store.put(code);
     let mut told: AVec<'static, Told> = Vec::new_in(alloc);
     for (symbol, bytes) in statics {
         let mut copy = Vec::new_in(alloc);
         copy.extend_from_slice(bytes);
         told.push(Told { symbol: WireSymbol(symbol.0), record: store.put(copy) });
     }
-    let mut memory = Sim { next: AREA, published: Vec::new_in(alloc), copied: Vec::new_in(alloc), order: Vec::new_in(alloc), alloc };
+    let mut memory = Sim {
+        next: AREA,
+        published: Vec::new_in(alloc),
+        copied: Vec::new_in(alloc),
+        order: Vec::new_in(alloc),
+        written: Vec::new_in(alloc),
+        ender: None,
+        alloc,
+    };
     let mut mode = RunMode::new(alloc);
     let mut acts: AVec<'static, Act> = Vec::new_in(alloc);
     let entry = mode.start(F, &mut acts).expect("the entry is numbered");
@@ -196,6 +232,11 @@ fn run(statics: &[(Symbol, AVec<'static, u8>)], twice: bool) -> Seen {
             Down::Data { data: List::of(&told[..1]) }.encode(2, &mut down).expect("Data encodes");
         }
     }
+    for n in 0..thread_locals {
+        Down::ThreadLocals { descriptor: WireSymbol(DESC.0), ender: WireSymbol(ENDER.0) }
+            .encode(10 + n as u64, &mut down)
+            .expect("ThreadLocals encodes");
+    }
     let pairs = [Declared { symbol: WireSymbol(F.0), slot: F_WIRE }];
     Down::Declare { pairs: List::of(&pairs) }.encode(3, &mut down).expect("Declare encodes");
     Down::Publish { slot: F_WIRE, tier: Tier::Zero, record: f }.encode(4, &mut down).expect("Publish encodes");
@@ -210,6 +251,7 @@ fn run(statics: &[(Symbol, AVec<'static, u8>)], twice: bool) -> Seen {
         result = match act {
             Act::Stub { slot } => memory.stub(slot),
             Act::Statics => mode.place_statics(&store, &mut memory),
+            Act::ThreadLocals => mode.make_thread_locals(&mut memory),
             Act::Place { slot, record } => mode.place(slot, record, &store, &mut memory, Plant::None, &mut acts),
             Act::Wake { .. } => Ok(()),
             Act::Promote { .. } => panic!("this simulation publishes no optimized record"),
@@ -274,4 +316,82 @@ fn a_static_is_placed_before_the_record_that_names_it() {
     let writable = run(&[(S, datum(Place::Writable, HELLO, &[], alloc))], false);
     assert!(matches!(writable.result, Err(RunModeError::NotBuilt { .. })), "a writable static: {:?}", writable.result);
     println!("run mode: 2 statics placed before the record naming them; its load reads S's word; T holds S, itself and f; 3 controls refused");
+}
+
+/// The thread-local descriptor's symbol, the ender's, and thread-local `N` (its template is the
+/// datum under the same symbol).
+const DESC: Symbol = Symbol([0xd5; 32]);
+const ENDER: Symbol = Symbol([0xe7; 32]);
+const N: Symbol = Symbol([0x77; 32]);
+const ADRP_X1: u32 = 0x9000_0001;
+const LDR_X1: u32 = 0xF940_0021;
+
+/// `g`: the access sequence's two loads, `adrp x0, DESC; ldr x0, [x0, DESC]` (the descriptor's
+/// address) and `adrp x1, N; ldr x1, [x1, N]` (`N`'s index), then `ret`.
+fn tls_code(alloc: Alloc<'static>) -> AVec<'static, u8> {
+    let mut r = CodeRecord::new_in(alloc);
+    for inst in [ADRP_X0, LDR_X0, ADRP_X1, LDR_X1, RET] {
+        r.code.extend_from_slice(&inst.to_le_bytes());
+    }
+    let desc = r.target(Target { space: Space::Static, symbol: DESC });
+    let n = r.target(Target { space: Space::Tls, symbol: N });
+    r.sites.push(Site { at: 0, kind: SiteKind::Load, target: desc, addend: 0 });
+    r.sites.push(Site { at: 8, kind: SiteKind::Load, target: n, addend: 0 });
+    let sealed = r.seal().expect("the record seals");
+    let mut out = Vec::new_in(alloc);
+    sealed.encode(&mut out);
+    out
+}
+
+/// Step 4: the parent's `ThreadLocals` makes the descriptor (the key with the ender's thunk as
+/// its destructor, then the header published as the static under DESC), and `g`'s load of `N`
+/// numbers it: row 0 is `N`'s template (size, align, address, size), `count` is 1, and the
+/// index word holds 0, all written before `g`'s word is stored; `g`'s loads read the
+/// descriptor's word and the index word. Controls: no `ThreadLocals` is refused naming `N`; two
+/// are refused; `N` with no template sent is refused naming it.
+/// Prints "run mode: thread-local descriptor made, N numbered 0 from its template before g; 3
+/// controls refused".
+#[test]
+fn a_thread_local_is_numbered_from_its_template_before_the_record_naming_it() {
+    use blaze_code::tls::{CAP, DESC_BYTES, DESC_COUNT, descriptor, var_row};
+    let alloc = Alloc::global();
+    let template = || datum(Place::ReadOnly, &7u32.to_le_bytes(), &[], alloc);
+    let seen = run_with(tls_code(alloc), &[(N, template())], false, 1);
+    assert_eq!(seen.result, Ok(()), "the run made the descriptor and placed g");
+    let m = &seen.memory;
+    assert_eq!(m.ender, Some(m.thunk(SlotId(1))), "the key's destructor is the ender's entry thunk (slot 1, after g)");
+    assert_eq!(m.published.len(), 2, "the template and the descriptor: {:?}", m.order);
+    let (n_index, n_at, n_bytes) = &m.published[0];
+    assert_eq!(&n_bytes[..], &7u32.to_le_bytes()[..], "N's template holds its initial value");
+    let (desc_index, desc_at, header) = &m.published[1];
+    assert_eq!(&header[..], &descriptor(KEY, KEY * 8, 0, CAP, desc_at + DESC_BYTES as u64)[..], "the header");
+    let row_at = desc_at + DESC_BYTES as u64;
+    let row = m.written.iter().find(|(at, _)| *at == row_at).expect("row 0 written");
+    assert_eq!(&row.1[..], &var_row(4, 8, *n_at, 4)[..], "row 0 is N's template");
+    let count = m.written.iter().find(|(at, _)| *at == desc_at + DESC_COUNT as u64).expect("count written");
+    assert_eq!(&count.1[..], &1u64.to_le_bytes()[..], "one row");
+    let index_word = m.written.last().expect("the index word written");
+    assert_eq!(&index_word.1[..], &0u64.to_le_bytes()[..], "N's index is 0");
+    assert_eq!(m.order.last().copied(), Some("store"), "g's word after every row and word: {:?}", m.order);
+    let (code_at, code) = &m.copied[0];
+    let inst = |i: usize| u32::from_le_bytes(code[4 * i..4 * i + 4].try_into().expect("4 bytes"));
+    assert_eq!(adrp_ldr_target(inst(0), inst(1), *code_at), Some(m.static_word(*desc_index)), "g's first load reads the descriptor's word");
+    assert_eq!(adrp_ldr_target(inst(2), inst(3), code_at + 8), Some(index_word.0), "g's second load reads N's index word");
+    assert_ne!(n_index, desc_index);
+
+    let untold = run_with(tls_code(alloc), &[(N, template())], false, 0);
+    assert!(
+        matches!(untold.result, Err(RunModeError::StaticNotTold { symbol, .. }) if symbol == DESC),
+        "a record naming the descriptor before ThreadLocals: {:?}",
+        untold.result
+    );
+    let twice = run_with(tls_code(alloc), &[(N, template())], false, 2);
+    assert!(matches!(twice.result, Err(RunModeError::ThreadLocalsTwice)), "two ThreadLocals: {:?}", twice.result);
+    let bare = run_with(tls_code(alloc), &[], false, 1);
+    assert!(
+        matches!(bare.result, Err(RunModeError::StaticNotTold { symbol, .. }) if symbol == N),
+        "N with no template sent: {:?}",
+        bare.result
+    );
+    println!("run mode: thread-local descriptor made, N numbered 0 from its template before g; 3 controls refused");
 }

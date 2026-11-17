@@ -24,11 +24,26 @@ pub struct Scratch<'a> {
     /// header's digest (coherence.rs `fresh_for_impl`): found once per solver, not once per
     /// candidate.
     masks: Map<(crate::term::Def, u64), u64, FixedState, Alloc<'a>>,
+    /// The solver's counters (`eval::Stats`), kept here because every walk and rule is handed
+    /// this table.
+    pub(crate) stats: crate::eval::Stats,
+    /// The auto-trait summaries per (ADT, trait) of this solver (auto_summary.rs).
+    pub(crate) auto: crate::auto_summary::Summaries<'a>,
+    /// The shortcuts turned off (none but in tests).
+    pub(crate) off: crate::eval::Off,
 }
 
 impl<'a> Scratch<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
-        Scratch { work: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }), masks: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }) }
+        Scratch {
+            work: Vec::new_in(alloc),
+            out: Vec::new_in(alloc),
+            memo: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            masks: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            stats: crate::eval::Stats::default(),
+            auto: crate::auto_summary::Summaries::new_in(alloc),
+            off: crate::eval::Off { summaries: false, prematch: false },
+        }
     }
 
     /// The const-parameter mask kept for `impl_` with the header digest `digest`.
@@ -290,6 +305,7 @@ fn import_walk<T: Tys>(
                 }
             }
         };
+        s.stats.terms_imported += 1;
         s.memo.insert(t.0, made);
     }
     Ok(s.memo[&root.0])

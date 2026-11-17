@@ -29,6 +29,8 @@ mod agree;
 mod decide;
 mod deps;
 mod early;
+// E4: what the cold solve writes, one record per group of modules (engine.md "Tables").
+mod groups;
 // D116: a module's tables of links and its `Imports`, from what the core loaded and decided.
 mod made;
 mod switch;
@@ -49,6 +51,8 @@ pub(crate) use made::Tables;
 pub use made::TablesError;
 pub(crate) use switch::solve_and_write;
 pub use decide::{DecideCheck, DecideError};
+pub use groups::{ABSENT as GROUP_ABSENT, GroupRead, GroupSeen, GroupShape, GroupsError, NameGroup, NodeAt, OwnError as GroupOwnError, write_groups};
+use groups::OwnError;
 pub use switch::{MOST_ROUNDS, Unwritten};
 
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames, EnumNames};
@@ -747,6 +751,8 @@ pub(crate) struct Cells<'a, N> {
     walked: ModId,
     /// D116's read log (decide.rs): while a decision runs, every cell it reads, in order.
     decide_log: Option<AVec<'a, CellId>>,
+    /// The groups' textual log (groups.rs): while armed, every fragment a textual walk reads.
+    textual_log: Option<AVec<'a, FragId>>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -856,6 +862,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             weak_error: None,
             walked: 0,
             decide_log: None,
+            textual_log: None,
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
@@ -2896,6 +2903,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         loop {
             let below = self.frags[f as usize].slots.partition_point(|s| s.0 < end);
             stack.push((f, below));
+            // Every fragment the walk reads, its slots before the cut or all of them (one it
+            // finds empty there is read too): groups.rs's textual cells.
+            if let Some(log) = self.textual_log.as_mut() {
+                log.push(f);
+            }
             while let Some(top) = stack.last_mut() {
                 if top.1 == 0 {
                     stack.pop();
@@ -2911,12 +2923,18 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     Slot::Mod(child, true) => {
                         let t = self.modules[child as usize].text;
                         stack.push((t, self.frags[t as usize].slots.len()));
+                        if let Some(log) = self.textual_log.as_mut() {
+                            log.push(t);
+                        }
                     }
                     Slot::Call(j) => {
                         let it = &self.items[j as usize];
                         if it.grown {
                             if let Some(x) = it.expansion {
                                 stack.push((x, self.frags[x as usize].slots.len()));
+                                if let Some(log) = self.textual_log.as_mut() {
+                                    log.push(x);
+                                }
                             }
                         } else if !guess.is_some_and(|g| g.items.contains_key(&j)) {
                             return Step::Wait(Node::Item(j));

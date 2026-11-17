@@ -24,6 +24,7 @@ pub mod data;
 mod native;
 mod personality;
 pub mod run;
+mod thread_locals;
 
 use alloc::vec::Vec;
 use core::alloc::Allocator;

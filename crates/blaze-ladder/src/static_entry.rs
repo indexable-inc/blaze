@@ -21,9 +21,11 @@
 //! THE PLACE: read-only for a static that is neither `static mut` nor holds an allocation the
 //! evaluator marked mutable (interior mutability: data.rs `DataAlloc::mutable`); writable
 //! otherwise (the child refuses writable statics by name until step 3). A `#[thread_local]`
-//! static is no datum (it is the thread's template, a `Tls` target): refused here by name.
+//! static is no static's datum: reached as a static it is refused by name; its initial value is
+//! a TEMPLATE in the same form ([`make_template_entry`]), always read-only, under its `Tls`
+//! symbol, from which each thread's copy is made.
 //!
-//! THE FORM, little-endian: [`STATIC_ENTRY_MAGIC`], [`super::ENTRY_FORM`] (4), the datum's
+//! THE FORM, little-endian: [`STATIC_ENTRY_MAGIC`], [`super::ENTRY_FORM`] (5), the datum's
 //! length (4) and bytes, the declared instances' block as a code entry's (count 4, then rows:
 //! none until step 2), and the declared statics' block (count 4, then item keys 16 each,
 //! ascending, each once). The KEY is a walk row's (body_ids.rs `record_key`: the static's
@@ -64,6 +66,13 @@ pub enum StaticRecordError {
     TooLarge { what: &'static str },
     /// The datum did not seal (blaze-code datum.rs names the rule).
     Datum(DatumError),
+    /// A template asked of a static that is not `#[thread_local]`.
+    NotThreadLocal,
+    /// A thread-local's value holds, at byte `at` of allocation `alloc`, its own address.
+    SelfPointer { alloc: u32, at: u32 },
+    /// A thread-local's value points into allocation `alloc`, which the evaluator marked
+    /// mutable: every thread's copy would share it.
+    SharedMutable { alloc: u32 },
 }
 
 impl fmt::Display for StaticRecordError {
@@ -77,6 +86,9 @@ impl fmt::Display for StaticRecordError {
             StaticRecordError::Reloc { alloc, reloc } => write!(f, "relocation {reloc} of its value's allocation {alloc} is past its bytes or names no allocation of the record (blaze-build data.rs, \"The form\")"),
             StaticRecordError::TooLarge { what } => write!(f, "its {what} is larger than a static's entry counts"),
             StaticRecordError::Datum(why) => write!(f, "its datum: {why}"),
+            StaticRecordError::NotThreadLocal => write!(f, "a thread-local's template was asked of a static that is not `#[thread_local]` ({spec}, step 4)"),
+            StaticRecordError::SelfPointer { alloc, at } => write!(f, "its initial value's allocation {alloc} holds the thread-local's own address at byte {at}: each thread's copy would point at the template, not at itself ({spec}, step 4)"),
+            StaticRecordError::SharedMutable { alloc } => write!(f, "its initial value points into allocation {alloc}, which holds interior mutability: every thread's copy would share it; per-thread copies of inner allocations are not made until a program needs them ({spec}, step 4)"),
         }
     }
 }
@@ -89,6 +101,34 @@ pub fn make_static_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc
     if kind.thread_local {
         return Err(StaticRecordError::ThreadLocal);
     }
+    let place = match kind.mutable || value.allocs.iter().any(|a| a.mutable) {
+        true => Place::Writable,
+        false => Place::ReadOnly,
+    };
+    datum_entry(value, place, false, alloc)
+}
+
+/// A `#[thread_local]` static's TEMPLATE entry (run.md, "Statics in the run", step 4): its
+/// initial value as a read-only datum in a static's entry form, placed once by the run's child
+/// under the thread-local's symbol (symbols.rs `tls_symbol`); each thread's copy is made from it
+/// on the thread's first touch (blaze-build `tls::index::getter`). The copy is the whole datum,
+/// so a word of the value naming one of its other allocations (a `&str`'s bytes) names the
+/// template's, shared by every thread, which is right only while that allocation is immutable:
+/// a mutable one is refused, and so is a word naming the value's own bytes (each copy would
+/// point at the template, not at itself).
+pub fn make_template_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
+    if !kind.thread_local {
+        return Err(StaticRecordError::NotThreadLocal);
+    }
+    if let Some(n) = value.allocs.iter().skip(1).position(|a| a.mutable) {
+        return Err(StaticRecordError::SharedMutable { alloc: n as u32 + 1 });
+    }
+    datum_entry(value, Place::ReadOnly, true, alloc)
+}
+
+/// The entry of `value` as a datum at `place`; `template`: a word naming allocation 0 is refused
+/// ([`StaticRecordError::SelfPointer`]).
+fn datum_entry<'a>(value: &DataRecord<Global>, place: Place, template: bool, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
     let first = value.allocs.first().ok_or(StaticRecordError::Empty)?;
     // Each allocation's offset in the datum, in order, each at its own alignment.
     let mut starts: AVec<'_, u64> = Vec::with_capacity_in(value.allocs.len(), alloc);
@@ -101,10 +141,6 @@ pub fn make_static_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc
         align = align.max(a.align);
     }
     let len = usize::try_from(end).ok().filter(|&n| u32::try_from(n).is_ok()).ok_or(StaticRecordError::TooLarge { what: "value" })?;
-    let place = match kind.mutable || value.allocs.iter().any(|a| a.mutable) {
-        true => Place::Writable,
-        false => Place::ReadOnly,
-    };
     let mut d = Datum::new_in(place, align, alloc);
     d.bytes.resize(len, 0);
     for (n, a) in value.allocs.iter().enumerate() {
@@ -127,6 +163,9 @@ pub fn make_static_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc
             // `at` is under the datum's length, which fits a u32.
             let at = at as u32;
             let (target, addend) = match reloc.target {
+                DataTarget::Local(0) if template => {
+                    return Err(StaticRecordError::SelfPointer { alloc: n as u32, at: reloc.offset });
+                }
                 DataTarget::Local(m) => {
                     let start = *starts.get(m as usize).ok_or(refused)?;
                     (OWN_DATUM, addend.checked_add(start as i64).ok_or(refused)?)
@@ -207,15 +246,18 @@ impl<'b> StaticEntryView<'b> {
 /// `Binder::static_at`). It reads the record itself, not the entry's declared statics block, so
 /// a static target the block does not list is named too: the thread-local descriptor
 /// (blaze-emit `RelocTo::TlsDesc`, a `Space::Static` target of every record touching a
-/// thread-local, which no `static` item backs). The run's parent sends nothing it has not
-/// checked against this (blaze-cli run_parent.rs `Needs::publish`).
+/// thread-local, which no `static` item backs). A `Space::Tls` target is named too: the child
+/// numbers a thread-local from its template, the datum the parent sends under the same symbol.
+/// The run's parent publishes no record before checking each of these was sent (blaze-cli
+/// run_parent.rs `Needs::publish`).
 pub fn each_static_named(entry: &[u8], mut each: impl FnMut(Symbol)) -> Result<(), EntryError> {
+    let sent = |space| matches!(space, Space::Static | Space::Tls);
     match entry.get(..8) {
         Some(magic) if magic == STATIC_ENTRY_MAGIC => {
             let datum = StaticEntryView::read(entry)?.datum;
             for i in 0..datum.targets() {
                 let target = datum.target(i);
-                if target.space == Space::Static {
+                if sent(target.space) {
                     each(target.symbol);
                 }
             }
@@ -224,7 +266,7 @@ pub fn each_static_named(entry: &[u8], mut each: impl FnMut(Symbol)) -> Result<(
             let record = super::EntryView::read(entry)?.record;
             for i in 0..record.targets() {
                 let target = record.target(i);
-                if target.space == Space::Static {
+                if sent(target.space) {
                     each(target.symbol);
                 }
             }
@@ -238,5 +280,69 @@ pub fn entry_record(entry: &[u8]) -> Result<&[u8], EntryError> {
     match entry.get(..8) {
         Some(magic) if magic == STATIC_ENTRY_MAGIC => Ok(StaticEntryView::read(entry)?.datum.encoded()),
         _ => Ok(super::EntryView::read(entry)?.record.bytes()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::Global;
+
+    use blaze_build::StaticItem;
+    use blaze_build::data::{DataAlloc, DataRecord, DataReloc, DataTarget};
+    use blaze_code::datum::{OWN_DATUM, Place};
+
+    use super::{StaticEntryView, StaticRecordError, make_static_entry, make_template_entry};
+
+    /// `#[thread_local] static V: (&str, u32) = ("hi", 7)`'s evaluated value: allocation 0 the
+    /// value (a pointer word to allocation 1, its length, the u32), allocation 1 the bytes "hi";
+    /// `inner_mutable` marks allocation 1 mutable, `target` is the pointer's target.
+    fn value(inner_mutable: bool, target: DataTarget) -> DataRecord<Global> {
+        let mut own = std::vec::Vec::new_in(Global);
+        own.extend_from_slice(&0u64.to_le_bytes());
+        own.extend_from_slice(&2u64.to_le_bytes());
+        own.extend_from_slice(&7u64.to_le_bytes());
+        let mut relocs = std::vec::Vec::new_in(Global);
+        relocs.push(DataReloc { offset: 0, target });
+        let mut hi = std::vec::Vec::new_in(Global);
+        hi.extend_from_slice(b"hi");
+        let mut allocs = std::vec::Vec::new_in(Global);
+        allocs.push(DataAlloc { bytes: own, align: 3, mutable: false, relocs });
+        allocs.push(DataAlloc { bytes: hi, align: 0, mutable: inner_mutable, relocs: std::vec::Vec::new_in(Global) });
+        DataRecord { allocs }
+    }
+
+    /// Asserts a thread-local's template (run.md, "Statics in the run", step 4): its value laid
+    /// out as one read-only datum, the pointer to its string an own word at the string's offset
+    /// (24), the same form a static's datum has. A thread-local asked as a STATIC stays refused
+    /// by name (`ThreadLocal`, whose text says the thread-locals make it). CONTROLS: a mutable
+    /// inner allocation (every thread's copy would share it) is `SharedMutable { alloc: 1 }`; a
+    /// word naming the value's own bytes (each copy would point at the template) is
+    /// `SelfPointer`; a template asked of a plain static is `NotThreadLocal`.
+    /// Prints "template: read-only, 26 bytes, one own word at +24; a thread-local as a static, a shared mutable, a self pointer and a plain static refused".
+    #[test]
+    fn a_thread_local_is_a_read_only_template_and_never_a_static() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let tls = StaticItem { thread_local: true, mutable: false };
+        let made = make_template_entry(&value(false, DataTarget::Local(1)), tls, alloc).expect("the template");
+        let view = StaticEntryView::read(&made).expect("the template's entry reads as a static's");
+        assert_eq!((view.datum.place(), view.datum.bytes().len(), view.datum.words()), (Place::ReadOnly, 26, 1));
+        let word = view.datum.word(0);
+        assert_eq!((word.at, word.target, word.addend), (0, OWN_DATUM, 24), "the pointer names the string inside the datum");
+        assert_eq!(&view.datum.bytes()[24..], b"hi");
+
+        let as_static = make_static_entry(&value(false, DataTarget::Local(1)), tls, alloc).map(|_| ());
+        assert_eq!(as_static, Err(StaticRecordError::ThreadLocal));
+        let shown = std::format!("{}", StaticRecordError::ThreadLocal);
+        assert!(shown.contains("thread_local") && shown.contains("template"), "{shown}");
+
+        let shared = make_template_entry(&value(true, DataTarget::Local(1)), tls, alloc).map(|_| ());
+        assert_eq!(shared, Err(StaticRecordError::SharedMutable { alloc: 1 }));
+        let selfish = make_template_entry(&value(false, DataTarget::Local(0)), tls, alloc).map(|_| ());
+        assert_eq!(selfish, Err(StaticRecordError::SelfPointer { alloc: 0, at: 0 }));
+        let plain = make_template_entry(&value(false, DataTarget::Local(1)), StaticItem { thread_local: false, mutable: false }, alloc).map(|_| ());
+        assert_eq!(plain, Err(StaticRecordError::NotThreadLocal));
+        std::println!("template: read-only, 26 bytes, one own word at +24; a thread-local as a static, a shared mutable, a self pointer and a plain static refused");
     }
 }

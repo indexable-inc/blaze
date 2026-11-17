@@ -408,6 +408,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         procs: job.procs,
         own: Some(job.at),
         callers,
+        run_stopped: core::cell::Cell::new(None),
     };
     let prepares = Prepares::new_in(alloc);
     let done = {

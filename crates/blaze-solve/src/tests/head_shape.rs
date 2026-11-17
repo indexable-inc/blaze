@@ -489,7 +489,7 @@ fn impl_candidates(world: &World, case: &CaseA, goal: usize) -> Result<(Answer, 
     let a = solver
         .evaluate(&mut tys, world, TypingMode::Analysis, Goal { env, pred: c.pred, bound: c.bound }, &mut reads)
         .map_err(|s| format!("the solver stopped: {s:?}"))?;
-    Ok((a, solver.stats.impl_candidates))
+    Ok((a, solver.stats().impl_candidates))
 }
 
 /// (b) Prints `head shape: u32: Plus<S7> assembles 2 of 40 impls (34 by self shape); u32:

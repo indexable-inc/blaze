@@ -49,6 +49,29 @@ pub enum Question {
     Specializes(Def, Def),
 }
 
+/// The names of [`Question`]'s kinds, in [`Question::kind`]'s order.
+pub const QUESTION_KIND_NAMES: [&str; 11] =
+    ["trait_def", "impls", "impl_header", "adt", "fn_sig", "assoc", "opaque", "lang", "is_local", "const_holds", "specializes"];
+
+impl Question {
+    /// The question's kind, an index into [`QUESTION_KIND_NAMES`] (a measurement's bucket).
+    pub fn kind(self) -> usize {
+        match self {
+            Question::TraitDef(_) => 0,
+            Question::Impls(..) => 1,
+            Question::ImplHeader(_) => 2,
+            Question::Adt(_) => 3,
+            Question::FnSig(_) => 4,
+            Question::Assoc(_) => 5,
+            Question::Opaque(_) => 6,
+            Question::Lang(_) => 7,
+            Question::IsLocal(_) => 8,
+            Question::ConstHolds(..) => 9,
+            Question::Specializes(..) => 10,
+        }
+    }
+}
+
 /// The value of a `where const` condition at ground arguments (`Facts::const_holds`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConstHolds {
@@ -330,8 +353,21 @@ pub trait Facts {
     fn specializes(&self, seal: Seal, a: Def, b: Def) -> Fetch<bool>;
 }
 
+/// Where the recorder notes a read: a caller's plain list, or the solver's own log
+/// (`readlog::ReadLog`, a set per frame).
+pub trait Log {
+    fn note(&mut self, r: Read) -> Result<(), crate::error::SolveError>;
+}
+
+impl Log for blaze_own::Vec<Read, blaze_own::Alloc<'_>> {
+    fn note(&mut self, r: Read) -> Result<(), crate::error::SolveError> {
+        self.push(r);
+        Ok(())
+    }
+}
+
 /// The digest of a lang item's answer (its def, or none).
-fn lang_digest(d: Option<Def>) -> u64 {
+pub(crate) fn lang_digest(d: Option<Def>) -> u64 {
     match d {
         // FNV-1a over the key's bytes: a digest only has to tell answers apart.
         Some(Def(k)) => {
@@ -360,80 +396,70 @@ impl<'f, F: Facts> Ask<'f, F> {
         Seal { _private: () }
     }
 
-    fn note<T>(
-        log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>,
-        q: Question,
-        got: Fetch<T>,
-        digest: impl FnOnce(&T) -> u64,
-    ) -> Result<T, Stop> {
+    fn note<T, L: Log + ?Sized>(log: &mut L, q: Question, got: Fetch<T>, digest: impl FnOnce(&T) -> u64) -> Result<T, Stop> {
         match got {
             Ok(v) => {
-                log.push(Read { question: q, digest: digest(&v) });
+                log.note(Read { question: q, digest: digest(&v) })?;
                 Ok(v)
             }
             Err(Missing) => Err(Stop::Need(q)),
         }
     }
 
-    pub fn trait_def(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, t: Def) -> Result<TraitDef<'f>, Stop> {
+    pub fn trait_def<L: Log + ?Sized>(&self, log: &mut L, t: Def) -> Result<TraitDef<'f>, Stop> {
         let got = self.facts.trait_def(Self::seal(), t);
         Self::note(log, Question::TraitDef(t), got, |a| a.digest)
     }
 
-    pub fn impls(
-        &self,
-        log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>,
-        t: Def,
-        shape: Shape,
-    ) -> Result<ImplSet<'f>, Stop> {
+    pub fn impls<L: Log + ?Sized>(&self, log: &mut L, t: Def, shape: Shape) -> Result<ImplSet<'f>, Stop> {
         let got = self.facts.impls(Self::seal(), t, shape);
         Self::note(log, Question::Impls(t, shape), got, |a| a.digest)
     }
 
-    pub fn impl_header(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, i: Def) -> Result<ImplHeader<'f>, Stop> {
+    pub fn impl_header<L: Log + ?Sized>(&self, log: &mut L, i: Def) -> Result<ImplHeader<'f>, Stop> {
         let got = self.facts.impl_header(Self::seal(), i);
         Self::note(log, Question::ImplHeader(i), got, |a| a.digest)
     }
 
-    pub fn adt(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, d: Def) -> Result<AdtDef<'f>, Stop> {
+    pub fn adt<L: Log + ?Sized>(&self, log: &mut L, d: Def) -> Result<AdtDef<'f>, Stop> {
         let got = self.facts.adt(Self::seal(), d);
         Self::note(log, Question::Adt(d), got, |a| a.digest)
     }
 
-    pub fn fn_sig(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, d: Def) -> Result<FnSigDef<'f>, Stop> {
+    pub fn fn_sig<L: Log + ?Sized>(&self, log: &mut L, d: Def) -> Result<FnSigDef<'f>, Stop> {
         let got = self.facts.fn_sig(Self::seal(), d);
         Self::note(log, Question::FnSig(d), got, |a| a.digest)
     }
 
-    pub fn assoc(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, d: Def) -> Result<AssocDef, Stop> {
+    pub fn assoc<L: Log + ?Sized>(&self, log: &mut L, d: Def) -> Result<AssocDef, Stop> {
         let got = self.facts.assoc(Self::seal(), d);
         Self::note(log, Question::Assoc(d), got, |a| a.digest)
     }
 
-    pub fn opaque(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, d: Def) -> Result<OpaqueDef<'f>, Stop> {
+    pub fn opaque<L: Log + ?Sized>(&self, log: &mut L, d: Def) -> Result<OpaqueDef<'f>, Stop> {
         let got = self.facts.opaque(Self::seal(), d);
         Self::note(log, Question::Opaque(d), got, |a| a.digest)
     }
 
-    pub fn lang(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, l: Lang) -> Result<Option<Def>, Stop> {
+    pub fn lang<L: Log + ?Sized>(&self, log: &mut L, l: Lang) -> Result<Option<Def>, Stop> {
         let got = self.facts.lang(Self::seal(), l);
         Self::note(log, Question::Lang(l), got, |a| lang_digest(*a))
     }
 
-    pub fn is_local(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, d: Def) -> Result<bool, Stop> {
+    pub fn is_local<L: Log + ?Sized>(&self, log: &mut L, d: Def) -> Result<bool, Stop> {
         let got = self.facts.is_local(Self::seal(), d);
         Self::note(log, Question::IsLocal(d), got, |a| u64::from(*a))
     }
 
-    pub fn specializes(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, a: Def, b: Def) -> Result<bool, Stop> {
+    pub fn specializes<L: Log + ?Sized>(&self, log: &mut L, a: Def, b: Def) -> Result<bool, Stop> {
         let got = self.facts.specializes(Self::seal(), a, b);
         Self::note(log, Question::Specializes(a, b), got, |s| u64::from(*s))
     }
 
     /// `cond` at the ground `args`, which `list` holds (the question a `Need` names).
-    pub fn const_holds(
+    pub fn const_holds<L: Log + ?Sized>(
         &self,
-        log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>,
+        log: &mut L,
         cond: Def,
         list: List,
         args: &[Ty],

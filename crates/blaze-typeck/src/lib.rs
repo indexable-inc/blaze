@@ -195,14 +195,31 @@ fn run<'a, 'w, W: World, C: TypeCtx>(
     } else {
         reads.prefetch(&hints.questions);
     }
+    // A note left by an earlier run on this context was that run's failure, already returned.
+    let _ = ty.take_malformed();
     let mut m = Machine::new_in(*body, reads, ty, plant, alloc)?;
     m.interior = interior;
     let walked = walk(&mut m);
     let log = m.reads.take_log();
+    // A handle the context could not read fails the body by name (rule 20), unless the run met
+    // a hole: then it makes no result at all and the next run reads again.
+    let unreadable = m.ty.take_malformed();
+    if let Some(bad) = unreadable
+        && !m.reads.holed()
+    {
+        return Err(CheckError::Malformed(bad));
+    }
     // A run that met a hole makes no result: not its types, not its diagnostics, not an
     // error met past the hole (world.rs `Hole`). Only a run that met none answers.
     match walked {
-        Ok(()) if !m.reads.holed() => Ok((m.writeback()?, log)),
+        Ok(()) if !m.reads.holed() => {
+            let done = m.writeback()?;
+            // The writeback reads too: a handle it could not read fails the body as above.
+            match ty.take_malformed() {
+                Some(bad) => Err(CheckError::Malformed(bad)),
+                None => Ok((done, log)),
+            }
+        }
         Ok(()) | Err(Stop::Error(_)) if m.reads.holed() => Ok((Outcome::Need(m.reads.finish_need(None, alloc)), log)),
         Err(Stop::Need(q)) => Ok((Outcome::Need(m.reads.finish_need(Some(q), alloc)), log)),
         Ok(()) => Err(CheckError::Malformed(Malformed::HoleInAnswer)),

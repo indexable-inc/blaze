@@ -68,15 +68,25 @@ impl Files {
         }
     }
 
-    /// The folder on disk of `rel` (a path from the package's folder), when it is in it.
-    /// `Err`: a link out of the package's folder, named.
-    fn real(root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
+    /// The folder on disk of `rel` (a path from the served tree's root `root`), when it is in
+    /// it. `Err`: a link out of the tree, named by the path as the macro saw it (rule 25: no
+    /// path of this machine in the words, which a names record's row may hold).
+    ///
+    /// `root` may be relative to the folder blaze was started in, and `""` IS that folder: the
+    /// checkout's form (`FetchEnv::checkout`, "" when blaze runs in the workspace's root), which
+    /// a member's `Files::Member { workspace, .. }` is (blaze-cli proc_callers.rs `shown`). The OS names it `.`: `canonicalize("")` is
+    /// `ENOENT`, which refused every file of every member of a checkout so started, `chdir` into
+    /// `/workspace/<dir>` first (the shim's, at each call; MX 2026-11-17).
+    fn real(&self, root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
+        let root = if root.as_os_str().is_empty() { Path::new(".") } else { root };
+        let seen = self.seen();
+        let shown = || if rel.is_empty() { seen.mount().to_owned() } else { format!("{}/{rel}", seen.mount()) };
         let Ok(real) = std::fs::canonicalize(root.join(rel)) else { return Ok(None) };
         let Ok(top) = std::fs::canonicalize(root) else {
-            return Err(format!("opened {PACKAGE}/{rel}, but the package's own folder {} cannot be resolved", root.display()));
+            return Err(format!("opened {}, but the folder {} is served from cannot be resolved", shown(), seen.mount()));
         };
         if !real.starts_with(&top) {
-            return Err(format!("opened {PACKAGE}/{rel}, a link out of the package's folder"));
+            return Err(format!("opened {}, a link out of {}, the tree the macro is served", shown(), seen.mount()));
         }
         Ok(Some(real))
     }
@@ -92,7 +102,7 @@ impl Files {
     fn find(&self, rel: &str) -> Result<Option<Found>, String> {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => {
-                Ok(Files::real(root, rel)?.and_then(|real| stat_of(&real)).map(|(filetype, size)| if filetype == Filetype::Directory { Found::Folder } else { Found::File(size) }))
+                Ok(self.real(root, rel)?.and_then(|real| stat_of(&real)).map(|(filetype, size)| if filetype == Filetype::Directory { Found::Folder } else { Found::File(size) }))
             }
             Files::Listed(files) => {
                 if let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) {
@@ -106,7 +116,7 @@ impl Files {
     /// The bytes of the file `rel`; `None` when absent.
     fn bytes(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(Files::real(root, rel)?.and_then(|real| std::fs::read(real).ok())),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.and_then(|real| std::fs::read(real).ok())),
             Files::Listed(files) => Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| files[at].1.to_vec())),
         }
     }
@@ -114,7 +124,7 @@ impl Files {
     /// The entries of the folder `rel`, sorted by name.
     fn listing(&self, rel: &str) -> Result<Vec<(Vec<u8>, Filetype)>, String> {
         match self {
-            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(Files::real(root, rel)?.map(|real| listing(&real)).unwrap_or_default()),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.map(|real| listing(&real)).unwrap_or_default()),
             Files::Listed(files) => {
                 let mut entries: Vec<(Vec<u8>, Filetype)> = Vec::new();
                 for rest in Files::under(files, rel) {
@@ -337,7 +347,12 @@ impl Sandbox {
         let rel = seen.in_tree(&full).map(str::to_owned);
         match rel {
             Some(rel) => Ok(rel),
-            None => Err(self.refuse(format!("named /{text}, outside {mount}, the tree the macro is served, the only one it may read"))),
+            // From the root `/`: a relative path the module asked (wasi-libc's, from its cwd) is
+            // shown absolute, one written absolute as it was.
+            None => {
+                let slash = if text.starts_with('/') { "" } else { "/" };
+                Err(self.refuse(format!("named {slash}{text}, outside {mount}, the tree the macro is served, the only one it may read")))
+            }
         }
     }
 
@@ -554,5 +569,54 @@ mod seen_tests {
         let mut dep = Sandbox::new(Arc::new(dependency));
         assert_eq!(dep.resolve(b"/package/src/lib.rs").ok().as_deref(), Some("src/lib.rs"));
         assert!(dep.resolve(b"/workspace/x").is_err());
+    }
+
+    /// MX (2026-11-17): every proc-macro call written in a workspace member at a non-empty dir
+    /// was refused, `Limit(Paths)` (port27/mini/serde: `crates/app` deriving `Serialize`; tempo:
+    /// 321 call groups), while the same crate as a root package expanded. The command serves a
+    /// member's workspace from the checkout as `FetchEnv::checkout` names it, `""` when blaze
+    /// runs in the workspace's root (blaze-cli proc_callers.rs `shown`), and the shim, at each
+    /// call, enters `CARGO_MANIFEST_DIR` (`std::env::set_current_dir("/workspace/<dir>")`, which
+    /// wasi-libc's `chdir` asks as `path_filestat_get(root fd, "workspace/<dir>")`). For dir `""`
+    /// that stat is the tree's root and asks no file; for `crates/app` it asked `Files::real`,
+    /// whose `canonicalize("")` is `ENOENT`: refused. The Reference, "Procedural Macros": a proc
+    /// macro is run on the crate that invokes it; cargo's `CARGO_MANIFEST_DIR` is "the directory
+    /// containing the manifest of your package", wherever the package is in its workspace.
+    ///
+    /// Here the workspace is `""` as the command gives it: cargo runs a test in its package's
+    /// folder (crates/blaze-proc-macro), so the member is its `src`. The shim's calls, in order:
+    /// the stat of the member's folder, an open of a file the macro names relative to it (as
+    /// wasi-libc joins it to its cwd), a stat of the member's folder by its absolute path.
+    /// CONTROLS: a path above the workspace is still refused by name, as the macro wrote it;
+    /// with `Files::real`'s `""` arm taken out the first assertion fails with "cannot be
+    /// resolved". Expected line:
+    /// `test sandbox::seen_tests::a_member_of_a_checkout_named_here_is_entered_and_read ... ok`.
+    #[test]
+    fn a_member_of_a_checkout_named_here_is_entered_and_read() {
+        use blaze_wasi::{Filetype, Open, ROOT_FD, System};
+        let root = ScriptRoot::member("src").unwrap_or_else(|e| panic!("{e}"));
+        let member = Package::new(Files::Member { workspace: PathBuf::new(), root }, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(member.cwd(), "/workspace/src");
+        let mut sandbox = Sandbox::new(Arc::new(member));
+        let entered = sandbox.path_stat(ROOT_FD, b"workspace/src", true);
+        assert!(
+            matches!(&entered, Ok(Ok(stat)) if stat.filetype == Filetype::Directory),
+            "the shim's chdir into the member's folder: {:?}, refused {:?}",
+            entered.as_ref().map_err(|stop| &stop.0).map(|it| it.as_ref().map(|s| s.filetype)),
+            sandbox.refused
+        );
+        let how = Open { dirflags: 1, oflags: 0, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
+        let fd = sandbox.open(ROOT_FD, b"workspace/src/sandbox.rs", how);
+        let Ok(Ok(fd)) = fd else { panic!("the member's file: {:?}, refused {:?}", fd.map_err(|stop| stop.0), sandbox.refused) };
+        let mut head = [0u8; 3];
+        assert!(matches!(sandbox.read(fd, &mut head), Ok(Ok(3))));
+        assert_eq!(&head, b"//!", "the member's own file is read");
+        assert!(matches!(sandbox.path_stat(ROOT_FD, b"/workspace/src", true), Ok(Ok(_))));
+        assert!(sandbox.refused.is_none(), "{:?}", sandbox.refused);
+        // The controls: climbing out of the workspace is refused, naming the path as written.
+        let above = sandbox.path_stat(ROOT_FD, b"/workspace/../etc/passwd", true);
+        let Err(stop) = above else { panic!("a path above the workspace was answered") };
+        assert!(stop.0.contains("/workspace/../etc/passwd") && stop.0.contains("outside /workspace"), "{}", stop.0);
+        assert!(!stop.0.contains(env!("CARGO_MANIFEST_DIR")), "the words hold no path of this machine: {}", stop.0);
     }
 }

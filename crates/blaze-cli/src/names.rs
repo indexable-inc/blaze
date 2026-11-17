@@ -530,6 +530,14 @@ impl Names<'_> {
         None
     }
 
+    /// The checkout files the crate `subject`'s resolution read this command (checkout-relative),
+    /// and each file it read as data with its home's slot: what its answer asks for as its
+    /// surfaces and data records (scope.rs `answer`). `None` before it was resolved.
+    pub(crate) fn read_files(&self, subject: ContentId) -> Option<(&[String], &[(String, String)])> {
+        let at = self.made.binary_search_by_key(&subject, |(subject, _)| *subject).ok()?;
+        Some((&self.made[at].1.files, &self.made[at].1.data))
+    }
+
     /// The `Script` name the crate at world index `at` reads, if its package has a build script.
     pub(crate) fn script_of(&self, at: usize) -> Option<Name> {
         self.scripts.binary_search_by_key(&at, |(krate, _)| *krate).ok().map(|i| self.scripts[i].1)

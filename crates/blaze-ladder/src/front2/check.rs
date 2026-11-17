@@ -19,7 +19,7 @@ use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::{BodyView, InferCtx, ItemKey, Name, Needs, Outcome, Question};
 
-use super::buckets::{Buckets, Unfilled, inherent_home, trait_home};
+use super::buckets::{Ask, BucketSource, Buckets, TablesReadError, Unfilled, inherent_home, trait_home};
 use super::heads::{HeadError, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -63,6 +63,8 @@ pub enum CheckFail {
     /// The store could not make a record.
     Head { owner: ItemKey, error: HeadError },
     Buckets { owner: ItemKey, error: Unfilled },
+    /// The impl tables ([`NamesSource::impl_tables`]) could not file a question's impls.
+    Tables { owner: ItemKey, error: TablesReadError },
     /// The body is malformed or a bound of the checker passed.
     Check { owner: ItemKey, error: tc::CheckError },
     /// The check finished with diagnostics: the program's errors in the body, each by its
@@ -100,6 +102,7 @@ impl core::fmt::Display for CheckFail {
             CheckFail::NothingToFill { owner, questions } => write!(f, "checking {owner:?}: the checker needs {questions:?} and the world noted nothing to make"),
             CheckFail::Head { owner, error } => write!(f, "checking {owner:?}: {error}"),
             CheckFail::Buckets { owner, error } => write!(f, "checking {owner:?}: {error}"),
+            CheckFail::Tables { owner, error } => write!(f, "checking {owner:?}: {error}"),
             CheckFail::Check { owner, error } => write!(f, "checking {owner:?}: {error:?}"),
             CheckFail::Diags { owner, diags, filed } => {
                 write!(f, "checking {owner:?}: {} diagnostics", diags.len())?;
@@ -161,6 +164,20 @@ pub fn check_body_counted<'n, S: NamesSource<'n>>(
     check_body_asked(r, body, scope, count, None)
 }
 
+/// `check_body_counted` that also leaves in `root_keys` a digest of each ground root goal the
+/// solver searched in the body's last round (blaze-solve `Solver::keep_root_keys`): a
+/// measurement of how many goals bodies share, never an input to the outcome.
+pub fn check_body_metered<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+    tally: &mut tc::Tally,
+    clock: &dyn tc::Clock,
+    root_keys: &mut Vec<u64, Global>,
+) -> Result<tc::Checked<'static>, CheckFail> {
+    super::body_reads::check_body_keyed(r, body, scope, Some((tally, clock)), None, Some(root_keys))
+}
+
 /// The check loop itself: `body` checked round by round, leaving in `asked` what a check that
 /// did NOT end in a clean `Checked` asked of the world (front2 reads.rs: every body has a read
 /// list): the read list of a run that finished but is returned as a failure (diagnostics, or a
@@ -173,8 +190,9 @@ pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
     scope: &BodyScope<'_>,
     count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
     asked: Option<&mut super::reads::Asked<'_>>,
+    root_keys: Option<&mut Vec<u64, Global>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
-    check_rounds_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap)
+    check_rounds_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap, root_keys)
 }
 
 /// The body `owner` finished with the findings `diags`: each filed where its tokens came from,
@@ -196,6 +214,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     mut count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
     mut asked: Option<&mut super::reads::Asked<'_>>,
     stalls: super::stalled_goals::Stalls,
+    mut root_keys: Option<&mut Vec<u64, Global>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
     let owner = body.typeck.owner;
     // The store's allocator: the checked body outlives the round (`Checked<'static>`).
@@ -205,12 +224,17 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     // The opaques whose hidden types this check reads, grown only by its own gaps
     // (front2/opaque_auto.rs): its answers never depend on what was checked before it.
     let mut leaks = r.store.hidden.new_leaks();
+    // The body task's meter (front2 tables/cost.rs): a measurement only.
+    let meter = r.store.cost;
     for round in 0..MOST_ROUNDS {
         r.store.hidden.set_leaking(&leaks);
         let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
         let view: BodyView<'_> = body.typeck.view(tys);
         let world = world_at(r, scope);
         let mut cx = InferCtx::new_in(alloc);
+        if root_keys.is_some() {
+            cx.keep_root_keys();
+        }
         let out = match &mut count {
             Some((tally, clock)) => tc::check_counted(&view, &world, &mut cx, &hints, tally, *clock, alloc),
             // Stalled goals decided after the async bodies' flows (front2 stalled_goals.rs).
@@ -241,6 +265,16 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         };
         if let Some((tally, _)) = &mut count {
             cx.add_solver_counts(&mut tally.solve);
+        }
+        if let Some(cost) = meter {
+            let mut solve = tc::Solve::default();
+            cx.add_solver_counts(&mut solve);
+            cost.round(&solve);
+        }
+        // The last round's keys: an earlier round's goals are asked again in the next.
+        if let Some(keys) = root_keys.as_deref_mut() {
+            keys.clear();
+            keys.extend_from_slice(cx.root_keys());
         }
         let mut fills = world.fills.into_inner();
         if r.order == BuildOrder::Reversed {
@@ -911,6 +945,7 @@ fn shown_args(v: tc::PTys<'_>, args: tc::List) -> Box<str> {
 enum MakeFail {
     Head(HeadError),
     Buckets(Unfilled),
+    Tables(TablesReadError),
     Const(LibKey, ConstFail),
 }
 
@@ -919,6 +954,7 @@ impl MakeFail {
         match self {
             MakeFail::Head(error) => CheckFail::Head { owner, error },
             MakeFail::Buckets(error) => CheckFail::Buckets { owner, error },
+            MakeFail::Tables(error) => CheckFail::Tables { owner, error },
             MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: key_shown(r, checker_of(key)), error: Box::new_in(error, Global) },
         }
     }
@@ -1099,11 +1135,12 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
                     Err(_refused_by_its_text) => {}
                 }
             }
+            let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Impls);
             // Only impls written where the orphan rules allow (`trait_home`) are candidates.
             let home = trait_home(r.names, r.keys, r.store, trait_, shape);
             let b = buckets_for(r.buckets, r.names, r.index, home);
             // Over a bucket index: this question's buckets of the crates `home` admits.
-            b.admit_asked(r.names, r.keys, home, super::buckets::Ask::Trait(trait_, shape));
+            admit_one(b, r.names, r.keys, home, Ask::Trait(trait_, shape))?;
             let mut candidates = b.trait_candidates(trait_, shape, home);
             // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
             // decides an auto trait's structural rule, and the solver matches it to no positive
@@ -1115,11 +1152,12 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
             b.answer(r.store, trait_, shape, home).map_err(MakeFail::Buckets)
         }
         Fill::Inherent(shape, name) => {
+            let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Impls);
             // Only impls written in the type's own crate (`inherent_home`) are candidates.
             let home = inherent_home(r.names, r.keys, shape);
             let names = r.names;
             let b = buckets_for(r.buckets, names, r.index, home);
-            b.admit_asked(names, r.keys, home, super::buckets::Ask::Inherent(shape));
+            admit_one(b, names, r.keys, home, Ask::Inherent(shape))?;
             // The name filters first, from the impls' member rows (no header made): an impl
             // that declares no member of the name is never the answer, so its header is not
             // lowered for it. rustc finds an inherent item by name before it unifies self
@@ -1143,8 +1181,24 @@ fn buckets_for<'b, 'n, S: NamesSource<'n>>(buckets: &'b mut Option<Buckets>, nam
         Some(solved) => Buckets::new(solved, index),
         None => Buckets::lazy(names),
     });
-    b.admit(names, home);
+    // Over the impl tables a question files only its own buckets (`admit_one`): no crate is
+    // filed whole.
+    if names.impl_tables().is_none() {
+        b.admit(names, home);
+    }
     b
+}
+
+/// Files what `ask` at `home` is answered from: from the impl tables when the names source
+/// holds them (front2 buckets/records.rs, E3), else from the items records' bucket section.
+fn admit_one<'n, S: NamesSource<'n>>(b: &mut Buckets, names: S, keys: &Keys, home: super::buckets::Homes, ask: Ask) -> Result<(), MakeFail> {
+    match names.impl_tables() {
+        Some(tables) => tables.admit(b, names, keys, home, ask).map(|_| ()).map_err(MakeFail::Tables),
+        None => {
+            b.admit_asked(names, keys, home, ask);
+            Ok(())
+        }
+    }
 }
 
 /// Lowers the headers of `candidates` the store does not hold yet, counting them.

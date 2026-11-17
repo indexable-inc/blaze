@@ -549,7 +549,13 @@ impl<'a> FactCache<'a> {
 
     /// Reads `q` through `reads` and keeps its answer (see the module).
     pub fn fill<W: World>(&mut self, q: SQ, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
-        if self.has(q) {
+        let kept = self.has(q);
+        if let Some(t) = reads.tally() {
+            t.solve.fills += 1;
+            t.solve.fill_misses += u64::from(!kept);
+            t.solve.misses_by_kind[q.kind()] += u64::from(!kept);
+        }
+        if kept {
             return Ok(());
         }
         let at = reads.stamp();

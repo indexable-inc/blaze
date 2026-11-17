@@ -66,13 +66,18 @@ pub struct InferCtx<'a> {
     futures: HashMap<u128, ExprId, Alloc<'a>>,
     /// Each future of another body this context made (`TyView::CoroutineOf`).
     foreign_coroutines: Vec<ForeignCoroutine, Alloc<'a>>,
-    /// Solver reads (the solver's own log; the body's read list is `Reads`).
+    /// Solver reads (the solver's own log; the body's read list is `Reads`): emptied after each
+    /// call, as nothing here reads it (it grew for the whole body before).
     solver_reads: Vec<blaze_solve::Read, Alloc<'a>>,
     /// Solver calls repeated after a fact was filled: the Need rounds inside the context.
     pub need_rounds: u64,
     /// How many `Specializes` questions this context is answering for the contexts above it
     /// (each is answered in a context of its own, one deeper): bounded by `MAX_SPEC_DEPTH`.
     spec_depth: u8,
+    /// The first handle a read could not read (`Malformed::Unreadable`): the `TypeCtx` reads
+    /// return no error, so they give the error type and leave this, and the check of the body
+    /// fails with it when it ends (lib.rs `run`, `TypeCtx::take_malformed`; rule 20).
+    malformed: core::cell::Cell<Option<crate::error::Malformed>>,
     /// A planted bug of the body suite; `InferPlant::None` in every other test.
     #[cfg(test)]
     pub(crate) plant: InferPlant,
@@ -148,13 +153,6 @@ pub struct InferSnapshot {
     env: Option<EnvId>,
 }
 
-fn ty_of(n: Node) -> blaze_ty::Ty {
-    match n.as_ty() {
-        Some(t) => t,
-        None => panic!("blaze-typeck: node {} is not a type", n.bits()),
-    }
-}
-
 fn solve_err(e: blaze_solve::Stop) -> Result<(), CheckError> {
     match e {
         blaze_solve::Stop::Error(e) => Err(CheckError::Solve(e)),
@@ -189,9 +187,19 @@ impl<'a> InferCtx<'a> {
             solver_reads: Vec::new_in(alloc),
             need_rounds: 0,
             spec_depth: 0,
+            malformed: core::cell::Cell::new(None),
             #[cfg(test)]
             plant: InferPlant::None,
         }
+    }
+
+    /// Notes that handle `node` could not be read (`what`), keeping the first such note, and
+    /// gives `stand_in` (the error type, an empty list) for the read to go on with: the body's
+    /// check fails with the note when it ends (`TypeCtx::take_malformed`).
+    fn unreadable<T>(&self, node: u32, what: crate::error::Unreadable, stand_in: T) -> T {
+        let first = self.malformed.take();
+        self.malformed.set(Some(first.unwrap_or(crate::error::Malformed::Unreadable { node, what })));
+        stand_in
     }
 
     /// The `AmbiguityByOrder` plant: each pending trait obligation whose self type has a shape
@@ -229,24 +237,33 @@ impl<'a> InferCtx<'a> {
 
     /// Adds what this context's solver did into `s` (a measurement: asks.rs `Solve`).
     pub fn add_solver_counts(&self, s: &mut crate::asks::Solve) {
-        let st = self.solver.stats;
         s.refills += self.need_rounds;
-        s.frames += st.frames;
-        s.cache_hits += st.cache_hits;
-        s.fast_path += st.fast_path;
-        s.candidates += st.candidates;
-        s.reruns += st.reruns;
+        s.stats.add(&self.solver.stats());
+    }
+
+    /// Keeps a digest of each ground root goal the solver searches from now on (blaze-solve
+    /// `Solver::keep_root_keys`: a measurement of goals shared across bodies).
+    pub fn keep_root_keys(&mut self) {
+        self.solver.keep_root_keys();
+    }
+
+    /// The digests kept since [`InferCtx::keep_root_keys`].
+    pub fn root_keys(&self) -> &[u64] {
+        self.solver.root_keys()
     }
 
     fn node(&self, bits: u32) -> Node {
         match self.terms.cx.tys.node_at(bits) {
             Some(n) => n,
-            None => panic!("blaze-typeck: handle {bits} is not in this context's arena"),
+            None => self.unreadable(bits, crate::error::Unreadable::NotInArena, blaze_ty::Ty::ERROR.node()),
         }
     }
 
     fn bty(&self, t: Ty) -> blaze_ty::Ty {
-        ty_of(self.node(t.0))
+        match self.node(t.0).as_ty() {
+            Some(t) => t,
+            None => self.unreadable(t.0, crate::error::Unreadable::NotAType, blaze_ty::Ty::ERROR),
+        }
     }
 
     /// The closure of another body this context made whose owner's arguments, with the
@@ -362,7 +379,7 @@ impl<'a> InferCtx<'a> {
     /// its one input the tuple of the closure's inputs (blaze-solve builtin.rs `callable`).
     fn rust_call_sig(&mut self, sig: Ty) -> Result<blaze_ty::Ty, CheckError> {
         let TyView::FnPtr(io, _) = self.view(sig) else {
-            panic!("blaze-typeck: a closure's signature {sig:?} is not a fn pointer")
+            return Err(CheckError::Malformed(crate::error::Malformed::Unreadable { node: sig.0, what: crate::error::Unreadable::ClosureSig }));
         };
         let n = self.list_len(io);
         let mut ins: Vec<blaze_ty::Ty, Alloc<'a>> = Vec::with_capacity_in(n.saturating_sub(1) as usize, self.alloc);
@@ -379,7 +396,7 @@ impl<'a> InferCtx<'a> {
     fn blist(&self, l: TyList) -> blaze_ty::List {
         match self.node(l.0).as_list() {
             Some(l) => l,
-            None => panic!("blaze-typeck: handle {} is not a list", l.0),
+            None => self.unreadable(l.0, crate::error::Unreadable::NotAList, blaze_ty::List::EMPTY),
         }
     }
 
@@ -533,6 +550,7 @@ impl<'a> InferCtx<'a> {
             let at = reads.stamp();
             let r = self.solver.env(&mut self.terms, &self.facts, clauses, &mut self.solver_reads);
             reads.count_solve(at);
+            self.solver_reads.clear();
             match r {
                 Ok(e) => {
                     self.env = Some(e);
@@ -556,6 +574,7 @@ impl<'a> InferCtx<'a> {
             let at = reads.stamp();
             let r = self.solver.evaluate(&mut self.terms, &self.facts, TypingMode::Analysis, g, &mut self.solver_reads);
             reads.count_solve(at);
+            self.solver_reads.clear();
             match r {
                 Ok(a) => return Ok(a),
                 Err(blaze_solve::Stop::Need(q)) => {
@@ -585,6 +604,7 @@ impl<'a> InferCtx<'a> {
             let at = reads.stamp();
             let r = f.select(&mut self.solver, &mut self.terms, &self.facts, TypingMode::Analysis, &mut self.solver_reads);
             reads.count_solve(at);
+            self.solver_reads.clear();
             for (j, &i) in ids.iter().enumerate() {
                 let s = f.state[j];
                 if s == State::Fails && self.state[i] == State::Pending {
@@ -712,7 +732,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 let mut all: Vec<blaze_ty::Arg, Alloc<'a>> = Vec::with_capacity_in(n as usize + 3, self.alloc);
                 for i in 0..n {
                     let Some(a) = self.terms.cx.tys.list_get(bl, i) else {
-                        panic!("blaze-typeck: argument {i} of a list of {n}")
+                        return Err(CheckError::Malformed(crate::error::Malformed::Unreadable { node: args.0, what: crate::error::Unreadable::PastEnd { index: i } }));
                     };
                     all.push(a);
                 }
@@ -813,18 +833,26 @@ impl<'a> TypeCtx for InferCtx<'a> {
         Ok(Ty(t.node().bits()))
     }
 
+    fn take_malformed(&mut self) -> Option<crate::error::Malformed> {
+        self.malformed.take()
+    }
+
+    /// One level of `t`. A handle it cannot view is noted (`unreadable`) and viewed as the error
+    /// type: the body's check then fails with it by name (rule 20), never the process.
     fn view(&self, t: Ty) -> TyView {
+        use crate::error::Unreadable as U;
         let tys = &self.terms.cx.tys;
         let ty = |x: blaze_ty::Ty| Ty(x.node().bits());
         let list = |l: blaze_ty::List| TyList(l.node().bits());
         let key = |d: blaze_ty::Def| ItemKey(def_of(tys.item_key(d)));
+        let bad = |what: U| self.unreadable(t.0, what, TyView::Error);
         if let Some(c) = self.node(t.0).as_const() {
             return match tys.const_kind(c) {
                 ConstKind::Value(vt, bits) => TyView::ConstValue { ty: ty(vt), bits },
                 ConstKind::Param(i) => TyView::ConstParam(i),
                 ConstKind::Var(v) => TyView::ConstInfer(Var { kind: VarKind::Const, index: v }),
                 ConstKind::Error => TyView::Error,
-                k => panic!("blaze-typeck: a const typeck has no view of yet: {k:?}"),
+                _ => bad(U::NoView),
             };
         }
         match tys.ty_kind(self.bty(t)) {
@@ -849,7 +877,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 // Typeck's view keeps the signature untupled, as the closure was made; the
                 // solver's tupled form (`mk`) shares its variables.
                 if tys.list_len(l) < 3 {
-                    panic!("blaze-typeck: a closure without its signature")
+                    return bad(U::ClosureArgs);
                 }
                 if let Some(r) = self.closures.get(&k) {
                     return TyView::Closure(r.expr, r.sig);
@@ -857,7 +885,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 let made = self.bty(t);
                 let exact = self.foreign.iter().find(|f| f.made == made);
                 let Some(f) = exact.or_else(|| self.foreign_resolved(d, l)) else {
-                    panic!("blaze-typeck: a closure this context did not make")
+                    return bad(U::ClosureUnmade);
                 };
                 TyView::ClosureOf { owner: f.owner, ordinal: f.ordinal, args: f.args, sig: f.sig, kind: f.kind }
             }
@@ -867,15 +895,12 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 if let Some(f) = self.foreign_coroutines.iter().find(|f| f.made == made) {
                     return TyView::CoroutineOf { owner: f.owner, ordinal: f.ordinal, args: f.args, output: f.output, interior: f.interior };
                 }
-                let Some(&e) = self.futures.get(&k) else { panic!("blaze-typeck: a future this body did not make") };
-                if tys.list_len(l) != 2 {
-                    panic!("blaze-typeck: a future without its output and interior")
+                let Some(&e) = self.futures.get(&k) else { return bad(U::FutureUnmade) };
+                let at = |i: u32| tys.list_get(l, i).and_then(blaze_ty::Arg::ty).map(ty);
+                match (tys.list_len(l), at(0), at(1)) {
+                    (2, Some(o), Some(i)) => TyView::Future(e, o, i),
+                    _ => bad(U::FutureArgs),
                 }
-                let at = |i: u32| match tys.list_get(l, i).and_then(blaze_ty::Arg::ty) {
-                    Some(t) => ty(t),
-                    None => panic!("blaze-typeck: a future's argument is not a type"),
-                };
-                TyView::Future(e, at(0), at(1))
             }
             TyKind::Param(i) => TyView::Param(i),
             TyKind::Alias { kind: AliasKind::Opaque, def, args, .. } => TyView::Opaque(key(def), list(args)),
@@ -883,7 +908,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 let d = def_of(tys.item_key(def));
                 match self.facts.names.get(&d) {
                     Some(&(trait_, name)) => TyView::Alias { trait_, name, args: list(args) },
-                    None => panic!("blaze-typeck: an alias whose trait and name this context never saw"),
+                    None => bad(U::AliasUnnamed),
                 }
             }
             TyKind::TyVar(v) => TyView::Infer(Var { kind: VarKind::Ty, index: v }),
@@ -892,20 +917,20 @@ impl<'a> TypeCtx for InferCtx<'a> {
             TyKind::Error => TyView::Error,
             TyKind::Dynamic(preds, _) => TyView::Dynamic(list(preds)),
             TyKind::NotAType => {
-                let Some(p) = tys.as_pred(self.bty(t)) else { panic!("blaze-typeck: a row neither type nor predicate") };
+                let Some(p) = tys.as_pred(self.bty(t)) else { return bad(U::NeitherTypeNorPred) };
                 match tys.pred_kind(p) {
                     blaze_ty::PredKind::ExTrait(d, l) => TyView::ExTrait(key(d), list(l)),
                     blaze_ty::PredKind::ExAuto(d) => TyView::ExAuto(key(d)),
                     blaze_ty::PredKind::ExProjection(d, l) => {
                         let Some(&(trait_, name)) = self.facts.names.get(&def_of(tys.item_key(d))) else {
-                            panic!("blaze-typeck: an object binding whose trait and name this context never saw")
+                            return bad(U::AliasUnnamed);
                         };
                         TyView::ExProj { trait_, name, args_term: list(l) }
                     }
-                    k => panic!("blaze-typeck: a predicate typeck has no view of: {k:?}"),
+                    _ => bad(U::NoView),
                 }
             }
-            k => panic!("blaze-typeck: a type typeck has no view of yet: {k:?}"),
+            _ => bad(U::NoView),
         }
     }
 
@@ -928,7 +953,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
     fn list_get(&self, l: TyList, i: u32) -> Ty {
         match self.terms.cx.tys.list_get(self.blist(l), i) {
             Some(a) => Ty(a.bits()),
-            None => panic!("blaze-typeck: element {i} past a list's end"),
+            None => self.unreadable(l.0, crate::error::Unreadable::PastEnd { index: i }, Ty(blaze_ty::Ty::ERROR.node().bits())),
         }
     }
 
@@ -1165,7 +1190,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
     fn settle_closure_kind(&mut self, closure: ExprId, kind: crate::ty::ClosureKind) -> Result<bool, CheckError> {
         use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
         let Some(row) = self.closures.values().find(|r| r.expr == closure).copied() else {
-            panic!("blaze-typeck: closure {closure:?} was never made")
+            return Err(CheckError::Malformed(crate::error::Malformed::ClosureNotMade(closure)));
         };
         let v = match kind {
             crate::ty::ClosureKind::Fn => CLOSURE_FN,

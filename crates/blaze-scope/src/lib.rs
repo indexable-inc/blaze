@@ -97,11 +97,14 @@ mod work;
 mod tests;
 
 pub use again::{Again, Touched};
-pub use builtin::{BUILTIN_TYPES, Builtin, builtin_of, builtin_type, builtin_type_in, is_builtin_type};
+pub use builtin::{BUILTIN_TYPES, Builtin, PREFIX as BUILTIN_PREFIX, builtin_of, builtin_type, builtin_type_in, is_builtin_type};
 pub use error::{GlobBug, ResolveError};
 pub use facts::{Name, RecordFacts, ScopeFacts};
 
-pub use cells::{DecideCheck, DecideError, ItemResult as CellResult, Outcome as CellOutcome};
+pub use cells::{
+    DecideCheck, DecideError, GROUP_ABSENT, GroupOwnError, GroupRead, GroupSeen, GroupShape, GroupsError, ItemResult as CellResult, NameGroup, NodeAt as GroupNodeAt, Outcome as CellOutcome,
+    write_groups,
+};
 
 /// The cell core (bottom.md section 6) on one crate's module tree under `root`, for measuring
 /// it on real trees: `expand(call, def)` makes the call's expansion, which `facts.expansion`

@@ -58,8 +58,8 @@ mod super_let;
 mod tests;
 
 pub use sig::{
-    AssocWhy, CallableRefusal, ImplText, Region, SigBuf, SigLife, SigRefusal, impl_header_end, read_callable_param, read_impl_signature,
-    read_signature,
+    AssocWhy, BodyOut, BodyState, CallableRefusal, ImplText, Region, SigBuf, SigLife, SigRefusal, impl_header_end, read_async_signature,
+    read_callable_param, read_impl_signature, read_signature,
 };
 /// `Self::Name` read through the impl's own text (piece sig-assoc-projection).
 #[cfg(test)]
@@ -179,6 +179,13 @@ pub trait Facts {
     }
     /// The index of field `name` of `variant`.
     fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32>;
+    /// The type parameter field `field` of `variant` is declared as, when its declared type is
+    /// a bare one (`Some(T)`'s field is `T`): its index among the ADT's type arguments. `None`:
+    /// not known or another type, and a constructor call filling it keeps `unify_call`'s one
+    /// origin.
+    fn field_param(&self, _adt: ItemKey, _variant: u32, _field: u32) -> Option<u32> {
+        None
+    }
     /// The number of fields of `variant`.
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32>;
     /// Whether the body's generic parameter `index` is bounded by `Copy`.
@@ -253,6 +260,12 @@ pub enum Form {
     /// The signature's lifetime part does not have one region per origin position of the
     /// body's parameters and return type.
     SigUnaligned,
+    /// The body of an `async fn` whose written return type's regions were not read
+    /// (`BodyOut::AsyncUnread`): its value cannot be checked against them, so it is not checked.
+    AsyncOutputUnread,
+    /// A capture of an `async fn`'s root block that is not one of the fn's parameters by value
+    /// (coroutine.rs `async_fn_root`): its regions are not the signature's to lay.
+    AsyncFnCapture,
     ///The output has elided lifetimes but no single input lifetime.
     ElisionAmbiguous,
     /// The body's own signature writes lifetimes the record cannot read.
@@ -452,6 +465,15 @@ struct PInfo {
     deref: u8,
     parent: u32,
     local: u32,
+}
+
+/// Which aggregate `Lower::aggregate` builds: a constructor call (`Some(x)`, `S(a, b)`), a
+/// literal (a tuple, a struct, an array), or `format_args!`'s arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Agg {
+    Ctor,
+    Other,
+    Fmt,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1557,12 +1579,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.set_local(l, t, self.origs.len() as u32, 0);
                 break;
             }
-            if hi < lo || hi > sig.regions.len() || hi - lo != n {
+            if hi < lo || hi > sig.regions.len() {
+                return self.refuse(Form::SigUnaligned, root);
+            }
+            // An `async fn`'s body returns its future, the root async block's value (the
+            // Reference, "Async functions"; `BodyOut`): an opaque type of ONE region, which
+            // every position of the block's captures stands at (`impl Future + 'a` outlives
+            // `'a` when each capture does). What the future yields is checked in the root
+            // block's own flow, against the written return type (coroutine.rs
+            // `async_fn_root`).
+            let regions: &[Region] = &sig.regions[lo..hi];
+            let future = i == nparams as usize && sig.body != BodyOut::Output;
+            if (future && regions.len() != 1) || (!future && regions.len() != n) {
                 return self.refuse(Form::SigUnaligned, root);
             }
             let start = self.origs.len() as u32;
-            for k in lo..hi {
-                let o = self.universal(sig.regions[k]);
+            for k in 0..n {
+                let region = if future { regions[0] } else { regions[k] };
+                let o = self.universal(region);
                 self.b.mentions(l.0, o);
                 self.origs.push(o);
             }
@@ -1850,8 +1884,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 Ok(())
             }
             Task::CallDone(e, n, value_callee, mark) => self.call_done(e, n, value_callee, mark),
-            Task::CtorDone(e, n) | Task::AggDone(e, n) | Task::FmtDone(e, n) => self.aggregate(e, n, matches!(t, Task::FmtDone(..))),
-            Task::OpDone(e) => self.aggregate(e, 1, false),
+            Task::CtorDone(e, n) => self.aggregate(e, n, Agg::Ctor),
+            Task::AggDone(e, n) => self.aggregate(e, n, Agg::Other),
+            Task::FmtDone(e, n) => self.aggregate(e, n, Agg::Fmt),
+            Task::OpDone(e) => self.aggregate(e, 1, Agg::Other),
             Task::BinDone(e, op) => self.bin_done(e, op),
             Task::AssignDone(e) => {
                 let lhs = self.pop(e)?;
@@ -2645,7 +2681,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
 
     /// An aggregate (a constructor, tuple, array, struct, cast, unary op or `format_args!`): its
     /// operands in order into a new temporary, every origin made equal.
-    fn aggregate(&mut self, e: ExprId, n: u32, fmt: bool) -> Result<(), Refusal> {
+    fn aggregate(&mut self, e: ExprId, n: u32, agg: Agg) -> Result<(), Refusal> {
+        let fmt = agg == Agg::Fmt;
         let ty = TyD::of(self.expr_ty(e)?);
         let at = match self.vals.len().checked_sub(n as usize) {
             Some(a) => a,
@@ -2697,6 +2734,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             (None, PNode::Tuple(l)) => Some(self.list(l, e)?),
             _ => None,
         };
+        // A tuple-like constructor whose every field holding positions is declared as a bare
+        // type parameter (`Some(T)`, `Ok(T)`, `Err(E)`; `Facts::field_param`): that field's
+        // value is a value of the type argument, so it goes into the argument's own positions
+        // of the ADT's (the lifetimes first, then each argument's, `npos`), as a tuple's
+        // element goes into its field. thiserror's `Some(source.as_dyn_error())` went through
+        // one hub, which made the `&self` loan in `&'s (dyn Error + 'static)`'s first position
+        // reach its `'static` (a false "outlives" in every derived `Error::source`).
+        if agg == Agg::Ctor && elems.is_none() && !fmt && d.exact && self.plant != Plant::TupleUnified {
+            if let Some(spots) = self.ctor_fields(e, ty, d.len, &vs)? {
+                for (j, &(off, n, at)) in spots.iter().enumerate() {
+                    if let At::Place(p) = vs[j].at {
+                        self.relate_at(p, d.start + off, n, TyD::of(at), e)?;
+                    }
+                }
+                self.push_place(tp, ty);
+                return Ok(());
+            }
+        }
         match elems {
             Some(tys) if !fmt && d.exact && tys.len() == vs.len() && self.plant != Plant::TupleUnified => {
                 let mut off = d.start;
@@ -2719,6 +2774,50 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         self.push_place(tp, ty);
         Ok(())
+    }
+
+    /// Where each operand of the constructor call `e` (of type `ty`) goes among the value's
+    /// positions: `(offset, count, type)` per operand, when the callee is a variant or struct
+    /// constructor of `ty`'s ADT, the operands are its fields in order, and every field an
+    /// operand with positions fills is declared as a bare type parameter. `None` otherwise (the
+    /// aggregate keeps `unify_call`'s one origin).
+    fn ctor_fields(&self, e: ExprId, ty: TyD, len: u32, vs: &[Val]) -> Result<Option<Vec<(u32, u32, PTy), A>>, Refusal> {
+        let Expr::Call { callee, .. } = self.expr(e)? else { return Ok(None) };
+        let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee) else { return Ok(None) };
+        let (None, PNode::Adt(k, l)) = (ty.wrap, self.node(ty.ty, e)?) else { return Ok(None) };
+        let (Some(facts), Some(count)) = (self.facts.adt(k), self.facts.field_count(adt, variant)) else { return Ok(None) };
+        if k != adt || count as usize != vs.len() {
+            return Ok(None);
+        }
+        let args = self.list(l, e)?;
+        // The value's positions are the ADT's lifetimes, then each argument's, in order.
+        let mut total = facts.lifetimes;
+        for &a in args {
+            total += self.npos(a, e)?;
+        }
+        if total != len {
+            return Ok(None);
+        }
+        let mut spots: Vec<(u32, u32, PTy), A> = Vec::new_in(self.alloc.clone());
+        for (j, v) in vs.iter().enumerate() {
+            let held = match v.at {
+                At::Place(p) => self.info(p).len > 0,
+                At::Const => false,
+            };
+            let Some(p) = self.facts.field_param(adt, variant, j as u32).filter(|&p| (p as usize) < args.len()) else {
+                if held {
+                    return Ok(None);
+                }
+                spots.push((0, 0, v.ty.ty));
+                continue;
+            };
+            let mut off = facts.lifetimes;
+            for &a in &args[..p as usize] {
+                off += self.npos(a, e)?;
+            }
+            spots.push((off, self.npos(args[p as usize], e)?, args[p as usize]));
+        }
+        Ok(Some(spots))
     }
 
     /// `src` goes into the positions `start..start + n` of some place, whose type there is

@@ -18,7 +18,7 @@ use blaze_ids::{ContentId, crc32c};
 use blaze_keyed::{
     exec::RecordRef,
     kind::{Namespace, Tag},
-    store::{ALIGN, ENTRY, FOOTER, HEADER, SEGMENT_MOST, SegmentId, StoreError},
+    store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, SEGMENT_MOST, SegmentId, StoreError, TwoValues},
 };
 
 /// The format of a plain store's own files: its head slots and its manifests. Formats 1 and 2
@@ -989,7 +989,18 @@ pub(crate) fn sorted_run(mut entries: Vec<Entry>) -> Result<Vec<u8>, StoreError>
         match last {
             Some(kept) if kept.key == entry.key => {
                 if !kept.same_record(&entry) {
-                    return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
+                    // Only the two index entries are at hand: lengths and kinds, no bytes. Both
+                    // are committed records (compaction's input; a commit's layout refused
+                    // its own two values before it runs this).
+                    return Err(StoreError::TwoValues(TwoValues {
+                        key: entry.key,
+                        tag: entry.tag,
+                        len: Some(u64::from(entry.len)),
+                        held_tag: kept.tag,
+                        held_len: u64::from(kept.len),
+                        held: Holder::Committed,
+                        differs_at: None,
+                    }));
                 }
             }
             _ => {

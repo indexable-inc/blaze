@@ -18,7 +18,7 @@ use blaze_launch_rt::native_lib::{
     self, DESCRIPTOR_LEN, Descriptor, Loaded, MAGIC, MAGIC_BNL1, NativeError, Natives, PATH_MOST, POINTER_ROW_LEN,
     PointerRow,
 };
-use blaze_launch_rt::run_mode::{Act, Event, Memory, Outside, Placing, RunMode, RunModeError};
+use blaze_launch_rt::run_mode::{Act, Event, Memory, Outside, Placing, RunMode, RunModeError, ThreadKey};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::SlotId;
 
@@ -72,6 +72,12 @@ impl Memory for FakeMemory {
     }
     fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
         Err(RunModeError::NotBuilt { what: "these tests place no static" })
+    }
+    fn thread_key(&mut self, _ender: u64) -> Result<ThreadKey, RunModeError> {
+        Err(RunModeError::NotBuilt { what: "these tests make no thread-local key" })
+    }
+    fn write(&mut self, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
+        Err(RunModeError::NotBuilt { what: "these tests write no thread-local row" })
     }
 }
 

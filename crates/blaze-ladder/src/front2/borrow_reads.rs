@@ -24,7 +24,7 @@
 
 use core::cell::RefCell;
 
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Region, SigLife, SigRefusal};
+use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, Region, SigLife, SigRefusal};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use blaze_typeck::StableHasher;
@@ -51,6 +51,8 @@ pub enum AdtAnswer<'f> {
         /// `fields`, variant after variant.
         variant_lens: &'f [u32],
         fields: &'f [tc::Name],
+        /// Beside `fields`: the type parameter each is declared as, when a bare one.
+        field_params: &'f [Option<u32>],
     },
 }
 
@@ -103,6 +105,7 @@ fn refusal(h: &mut StableHasher, why: SigRefusal) {
         SigRefusal::TypeNode => (8, 0, 0),
         SigRefusal::Bound => (9, 0, 0),
         SigRefusal::Assoc { at, why } => (10, at, why as u32),
+        SigRefusal::AsyncOutputNotGiven => (11, 0, 0),
     };
     h.tag(tag);
     h.u32(a);
@@ -114,7 +117,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
     let mut h = StableHasher::new(ADT_DOMAIN);
     match answer {
         AdtAnswer::NotMade => h.tag(0),
-        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields } => {
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params } => {
             h.tag(1);
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
@@ -130,6 +133,16 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
             h.u32(fields.len() as u32);
             for name in fields {
                 h.u64(name.0);
+            }
+            h.u32(field_params.len() as u32);
+            for &p in field_params {
+                match p {
+                    None => h.tag(0),
+                    Some(p) => {
+                        h.tag(1);
+                        h.u32(p);
+                    }
+                }
             }
         }
     }
@@ -161,6 +174,21 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
                     for &(a, b) in life.bounds {
                         region(&mut h, a);
                         region(&mut h, b);
+                    }
+                    // The body's value's regions (an `async fn`'s written return type).
+                    match life.body {
+                        BodyOut::Output => h.tag(0),
+                        BodyOut::Async(body) => {
+                            h.tag(1);
+                            h.u32(body.len() as u32);
+                            for &r in body {
+                                region(&mut h, r);
+                            }
+                        }
+                        BodyOut::AsyncUnread(why) => {
+                            h.tag(2);
+                            refusal(&mut h, why);
+                        }
                     }
                 }
                 Err(why) => {

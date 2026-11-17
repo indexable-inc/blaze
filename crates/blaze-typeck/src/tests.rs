@@ -685,3 +685,22 @@ fn a_hole_never_makes_a_diagnostic() {
         Err(e) => panic!("the control failed: {e}"),
     }
 }
+
+/// Rule 20 (infer/mod.rs `unreadable`): a handle the context cannot read is viewed as the error
+/// type and noted, taken once by `take_malformed`, where it was a panic of the process ("node 6
+/// is not a type", tempo g090627: 744 bodies lost with it). The control: a handle the context
+/// made reads clean and notes nothing.
+#[test]
+fn an_unreadable_handle_fails_its_body_not_the_process() {
+    use crate::error::{Malformed, Unreadable};
+    use crate::ty::{Ty, TyView, TypeCtx};
+    let mut cx = InferCtx::new_in(Alloc::global());
+    let empty = cx.mk_list(&[]).expect("the empty list");
+    let unit = cx.mk(TyView::Tuple(empty)).expect("the unit type");
+    assert_ne!(cx.view(unit), TyView::Error);
+    assert_eq!(cx.take_malformed(), None, "a handle the context made noted a failure");
+    let past = Ty(u32::MAX >> 3);
+    assert_eq!(cx.view(past), TyView::Error);
+    assert_eq!(cx.take_malformed(), Some(Malformed::Unreadable { node: past.0, what: Unreadable::NotInArena }));
+    assert_eq!(cx.take_malformed(), None, "the note is taken once");
+}

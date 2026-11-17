@@ -98,7 +98,7 @@ struct Body {
     funcs: Vec<Owned, Global>,
     statics: Vec<blaze_typeck::ItemKey, Global>,
     vtables: Vec<Symbol, Global>,
-    tls: Vec<Symbol, Global>,
+    tls: Vec<blaze_typeck::ItemKey, Global>,
 }
 
 impl Body {
@@ -141,7 +141,11 @@ impl LirSeen for Collect {
                 v
             },
             vtables: copy(names.vtables),
-            tls: copy(names.tls),
+            tls: {
+                let mut v = Vec::with_capacity_in(names.tls.len(), Global);
+                v.extend_from_slice(names.tls);
+                v
+            },
         });
     }
 }

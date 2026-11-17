@@ -34,6 +34,8 @@ pub enum Unwritten {
     Rounds,
     /// D116's equality check (asked by the driver's [`crate::task::Par::decide_check`]) stopped.
     Decide(super::DecideError),
+    /// The crate's groups were not found (groups.rs).
+    Groups(super::GroupsError),
 }
 
 impl core::fmt::Display for Unwritten {
@@ -46,6 +48,7 @@ impl core::fmt::Display for Unwritten {
             }
             Unwritten::Rounds => write!(f, "made modules kept appearing past {MOST_ROUNDS} rounds of the cell core"),
             Unwritten::Decide(e) => write!(f, "{e}"),
+            Unwritten::Groups(e) => write!(f, "{e}"),
         }
     }
 }
@@ -59,6 +62,9 @@ pub(crate) struct Solved<'a> {
     pub added_externs: AVec<'a, (&'a str, ItemKey)>,
     /// D116's equality check of this crate, when the driver asked for it.
     pub decide: Option<super::DecideCheck<'a, &'a str>>,
+    /// The crate's groups as the solve found them (groups.rs), written into records from the
+    /// final scopes by the caller.
+    pub groups: AVec<'a, super::GroupShape<'a>>,
 }
 
 /// Solves the crate under `root` with the cell core and writes each of its modules' scopes.
@@ -75,6 +81,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     expand: &dyn Fn(ItemKey, Def),
     made: &dyn Fn(&mut AVec<'a, ItemKey>),
     check: Option<&dyn Fn() -> u64>,
+    groups: bool,
     alloc: Alloc<'a>,
 ) -> Result<Solved<'a>, Unwritten> {
     let deps = BuiltDeps { built, alloc, asks: true, through: core::cell::Cell::new(None) };
@@ -127,5 +134,16 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
         }
         None => None,
     };
-    Ok(Solved { done, added_externs, decide })
+    // E4: the groups, over the decided values (after D116's check, which re-decides `c`;
+    // `groups` leaves every value as it found it), when the caller asked.
+    // A member's own text: its own fragment's `ModuleDecls` record, as the facts hold it.
+    let own = |k: ItemKey| -> Result<blaze_id::ContentId, super::GroupsError> {
+        let fail = |error| super::GroupsError::Own { module: k, error };
+        let info = facts.module(k).map_err(|e| fail(super::OwnError::Facts(e)))?;
+        let decls = facts.decls(k).map_err(|e| fail(super::OwnError::Facts(e)))?;
+        let bytes = decls.write(k, &info, alloc).map_err(|e| fail(super::OwnError::Write(e)))?;
+        Ok(super::groups::own_digest(&bytes))
+    };
+    let groups = if groups { c.groups(&|k| done.contains_key(&k), &own, alloc).map_err(Unwritten::Groups)? } else { AVec::new_in(alloc) };
+    Ok(Solved { done, added_externs, decide, groups })
 }

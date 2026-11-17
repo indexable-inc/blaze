@@ -89,6 +89,7 @@ fn records_are_read_in_place_and_reach_the_next_process_by_the_commit_after_the_
 fn a_refused_put_names_its_record_and_where_the_two_differ() {
     use crate::store::{Clash, Form};
     use blaze_drive::record::write_plain;
+    use blaze_keyed::store::{Holder, TwoValues};
     use blaze_drive::{Kind, Name};
     let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
     let erased = blaze_own::Erased::new(&frame);
@@ -101,15 +102,58 @@ fn a_refused_put_names_its_record_and_where_the_two_differ() {
     let mut place = PlainPlace::new(&lent, false);
     place.put(key(1), false, &held).expect("the first put");
     place.put(key(1), false, &held).expect("equal bytes under a held key are left as they are");
-    match place.put(key(1), false, &other) {
-        Err(PlaceError::Lent(LentError::TwoValues { held_own: true, differs_at: Some(_), .. })) => {}
+    let refused = match place.put(key(1), false, &other) {
+        Err(PlaceError::Lent(refused @ LentError::TwoValues { two: TwoValues { held: Holder::ThisProcess, differs_at: Some(_), .. }, .. })) => refused,
         put => panic!("other bytes under an own key were not refused with both sides: {put:?}"),
-    }
+    };
     let kept = place.get(key(1)).expect("a get").map(|held| held.bytes);
     let clash = Clash::of(kept, &other);
     assert_eq!((clash.name, clash.held, clash.put, clash.field, clash.payload_at), (Some(name), Form::Whole, Form::Whole, "payload", Some(2)), "{clash}");
     let shown = clash.to_string();
     assert!(shown.starts_with(&std::format!("{name}")) && shown.contains("first differing in payload at payload byte 2"), "{shown}");
+    // The command's printed line: the record by kind, subject and crate, both sizes, which side
+    // is held, the first differing byte of the whole record, the rule and what to run.
+    let mut labelled = Clash::of(kept, &other);
+    labelled.label = Some({
+        let mut label = blaze_own::String::new_in(Global);
+        label.push_str("crate hello_world");
+        label
+    });
+    let labelled = |clash: &mut Clash| {
+        let mut label = blaze_own::String::new_in(Global);
+        label.push_str("crate hello_world");
+        clash.label = Some(label);
+    };
+    let at = blaze_cas::plain::first_difference(&held, &other).expect("the two records differ");
+    let says = |refused: LentError, kept: Option<&[u8]>, side: &str, go_on: &str| {
+        let mut clash = Clash::of(kept, &other);
+        labelled(&mut clash);
+        let line = crate::store::StoreFailure::TwoValues { key: key(1), lent: refused, clash }.to_string();
+        for words in [
+            std::format!("two values under one key {}: the record of {name} (crate hello_world) made now ({} bytes)", key(1), other.len()),
+            std::format!("differs from the one the store holds ({} bytes, {side}), first at byte {at}", held.len()),
+            "first differing in payload at payload byte 2".into(),
+            "(rule 21: its key misses an input of its value). This is a bug in blaze: please report this line.".into(),
+            go_on.into(),
+        ] {
+            assert!(line.contains(words.as_str()), "the refusal does not say {words:?}:\n{line}");
+        }
+        line
+    };
+    let own = says(refused, kept, "put earlier by this command", "so `blaze clean --store` does not get past it");
+    println!("plain place: {own}");
+    // Against a committed record (an earlier command's) the line says what to run.
+    drop(place);
+    after_answer(&lent, 0).expect("the commit after the answer");
+    let lent = process(back(lent), 2, u64::MAX);
+    let mut place = PlainPlace::new(&lent, false);
+    let refused = match place.put(key(1), false, &other) {
+        Err(PlaceError::Lent(refused @ LentError::TwoValues { two: TwoValues { held: Holder::Committed, differs_at: Some(_), .. }, .. })) => refused,
+        put => panic!("other bytes under a committed key were not refused with both sides: {put:?}"),
+    };
+    let kept = place.get(key(1)).expect("a get").map(|held| held.bytes);
+    let committed = says(refused, kept, "committed", "To go on: `blaze clean --store`, then run the command again.");
+    println!("plain place: {committed}");
     // Two reads lists under one key: the first read apart is named.
     let a = write_plain(name, ContentId([6; 32]), ContentId([7; 32]), &[(graph, ContentId([8; 32]))], &[], alloc);
     let b = write_plain(name, ContentId([6; 32]), ContentId([7; 32]), &[], &[], alloc);

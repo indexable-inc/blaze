@@ -38,7 +38,10 @@ const REFUSED_BODY: &str = "fn helper() {\n    nowhere::missing!();\n}\n";
 
 const INVARIANT: &str = "a types-not-checked finding without its item and cause";
 const NOT_CHECKED: &str = "not checked because";
-const HELPER: &str = "not checked because lowering refused: `helper` (";
+/// The line's cause names what the lowering refused (rule 19; MX 2026-11-17: "lowering
+/// refused" alone named nothing on tempo's clap derives): the class, then the macro's call.
+const HELPER: &str = "not checked because lowering refused (Lowered: Macro ";
+const HELPER_CALL: &str = ", the call of `nowhere::missing!`): `helper` (";
 
 /// `blaze check` of a package whose `src/main.rs` is `main`: its status and everything it said.
 fn check(base: &Path, name: &str, main: &str) -> (Option<i32>, String) {
@@ -100,7 +103,7 @@ fn a_body_refused_at_lowering_is_named_with_its_macro_path() {
     let (status, said) = &refused;
     assert!(!said.contains(INVARIANT), "refused body: the printer's invariant was hit:\n{said}");
     assert!(status.is_some() && *status != Some(0), "refused body: status {status:?}:\n{said}");
-    assert_eq!(said.matches(HELPER).count(), 1, "refused body: one line naming `helper` under the lowering's refusal:\n{said}");
+    assert_eq!(said.lines().filter(|line| line.contains(HELPER) && line.contains(HELPER_CALL)).count(), 1, "refused body: one line naming `helper` under the lowering's refusal and the macro it could not take:\n{said}");
     assert!(said.contains("nowhere") && said.contains("missing"), "refused body: the macro path in the lowering's words:\n{said}");
 
     let (status, said) = &control;

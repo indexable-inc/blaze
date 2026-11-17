@@ -153,11 +153,13 @@ pub enum Which {
     TypeId,
     /// `float_to_int_unchecked::<F, I>(value)`: `fptosi`/`fptoui` by `I`'s signedness.
     FloatToIntUnchecked,
-    /// core's `ub_checks()`: `true` in a constant (blaze-consteval machine.rs `intrinsic`);
-    /// built from its body `cfg!(ub_checks)` (front2 tables an intrinsic with a body by its body).
+    /// core's `ub_checks()`: `true` in a constant (blaze-consteval machine.rs `intrinsic`); at
+    /// run time the building profile's answer ([`IntrinsicCx::ub_checks`]), never its body's
+    /// `cfg!(ub_checks)`, which is the library crate's.
     UbChecks,
     /// core's `overflow_checks()`: `true` in a constant (blaze-consteval machine.rs
-    /// `intrinsic`), as `ub_checks`; built from its body `cfg!(debug_assertions)`.
+    /// `intrinsic`), as `ub_checks`; at run time the building profile's overflow setting
+    /// ([`IntrinsicCx::overflow_checks`]).
     OverflowChecks,
     /// `ptr_mask::<T>(ptr, mask)`: the address `and` the mask, the provenance kept.
     PtrMask,
@@ -243,7 +245,7 @@ pub const TABLE: &[Entry] = &[
     e("mul_with_overflow", Which::MulWithOverflow, "Performs checked integer multiplication", "`umul_overflow`/`smul_overflow`"),
     e("needs_drop", Which::NeedsDrop, "Returns `true` if the actual type given as `T` requires drop glue; returns `false` if the actual type provided for `T` implements `Copy`.", "a constant from the drop facts"),
     e("offset", Which::Offset, "Calculates the offset from a pointer.", "`ptr_add inbounds` of `delta * size`").stepping(ElementArg::PointeeOf(0)),
-    e("overflow_checks", Which::OverflowChecks, "Returns whether we should perform some overflow-checking at runtime.", "its body, `cfg!(debug_assertions)`; `true` in a constant"),
+    e("overflow_checks", Which::OverflowChecks, "Returns whether we should perform some overflow-checking at runtime.", "the building profile's `overflow-checks`, a constant; `true` in a constant"),
     e("ptr_guaranteed_cmp", Which::PtrGuaranteedCmp, "See documentation of `<*const T>::guaranteed_eq` for details.", "`icmp eq` zero-extended to `u8` (never 2 at run time); wide pointers refused by name; the constant evaluator answers 2 (unknown) unless certain"),
     e("ptr_mask", Which::PtrMask, "Masks out bits of the pointer according to a mask.", "`ptr_addr`, `and` the mask, `ptr_with_addr` (the provenance kept)"),
     e("ptr_metadata", Which::PtrMetadata, "Lowers in MIR to `Rvalue::UnaryOp` with `UnOp::PtrMetadata`.", "a wide pointer's word at 8, read as `M`; `()` for a thin pointer"),
@@ -264,7 +266,7 @@ pub const TABLE: &[Entry] = &[
     e("transmute_unchecked", Which::TransmuteUnchecked, "Like [`transmute`], but even less checked at compile-time: rather than giving an error for `size_of::<Src>() != size_of::<Dst>()`, it's **Undefined Behavior** at runtime.", "as `transmute`; sizes must still agree here"),
     e("type_id", Which::TypeId, "Gets an identifier which is globally unique to the specified type. This function will return the same value for a type regardless of whichever crate it is invoked in.", "the 128 bits of `instance::type_id_hash` (the type's ground tree, lifetimes erased) as `TypeId`'s two words, little-endian; blaze-consteval makes the same bytes from the same function"),
     e("type_name", Which::TypeName, "Gets a static string slice containing the name of a type.", "nothing at run time (\"can only be called at compile-time\"): blaze-consteval evaluates it to the text of type_name.rs"),
-    e("ub_checks", Which::UbChecks, "Returns whether we should perform some UB-checking at runtime.", "its body, `cfg!(ub_checks)`; `true` in a constant"),
+    e("ub_checks", Which::UbChecks, "Returns whether we should perform some UB-checking at runtime.", "the building profile's `debug-assertions`, a constant; `true` in a constant"),
     e("unaligned_volatile_load", Which::UnalignedVolatileLoad, "Performs a volatile load from the `src` pointer The pointer is not required to be aligned.", "`load volatile`, alignment 1"),
     e("unaligned_volatile_store", Which::UnalignedVolatileStore, "Performs a volatile store to the `dst` pointer. The pointer is not required to be aligned.", "`store volatile`, alignment 1"),
     e("unchecked_add", Which::UncheckedAdd, "Returns the result of an unchecked addition, resulting in undefined behavior when `x + y > T::MAX` or `x + y < T::MIN`.", "`add nsw`/`add nuw`"),
@@ -378,6 +380,10 @@ pub struct IntrinsicCx<'c, 'g, 't, A: Allocator + Clone> {
     pub cx: &'c mut LayoutCx<'g, 't>,
     /// Whether a ground type needs drop glue (the drop elaboration's answer).
     pub needs_drop: &'c dyn Fn(PTy) -> bool,
+    /// What `ub_checks()` is in the code built ([`crate::Adts::ub_checks`]).
+    pub ub_checks: crate::UbChecks,
+    /// What `overflow_checks()` is in the code built ([`crate::Adts::overflow_checks`]).
+    pub overflow_checks: crate::OverflowChecks,
 }
 
 /// Why an intrinsic call was not built.
@@ -985,15 +991,12 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         W::AssertInhabited | W::AssertZeroValid | W::AssertMemUninitializedValid => {
             return Err(s.shape("a validity assertion reached the intrinsic builder: the walk builds it (walk/validity.rs)"));
         }
-        // core's `ub_checks` has a body (`cfg!(ub_checks)`), which front2 builds as the fn
-        // (front2/program/tabled.rs: an intrinsic is tabled only without a body). A table call
-        // would need the build's own `ub_checks` setting, which no builder context carries yet.
-        W::UbChecks => return Err(IntrinsicError::Unsupported { which: c.which, why: "`ub_checks` as a table call (front2 builds its `cfg!(ub_checks)` body)" }),
-        // core's `overflow_checks` has a body too (`cfg!(debug_assertions)`), built as the fn
-        // for the same reason.
-        W::OverflowChecks => {
-            return Err(IntrinsicError::Unsupported { which: c.which, why: "`overflow_checks` as a table call (front2 builds its `cfg!(debug_assertions)` body)" });
-        }
+        // core's `ub_checks()` and `overflow_checks()`: the building profile's answer, a
+        // constant `bool` (the pinned core: "evaluation is delayed until monomorphization", so
+        // never the body's `cfg!`, which is the LIBRARY crate's). Both settings are in every
+        // code record's key (rule 21: blaze-ladder code_records.rs `Settings`).
+        W::UbChecks => Out::Scalar(s.b.iconst(Ty::I8, u128::from(s.cx.ub_checks.on()))),
+        W::OverflowChecks => Out::Scalar(s.b.iconst(Ty::I8, u128::from(s.cx.overflow_checks.on()))),
         // core/src/intrinsics/mod.rs: "this can only be called at compile-time as backends do
         // not have an implementation for it"; core's `type_name` wraps it in a `const` block.
         W::TypeName => return Err(s.shape("`type_name` reached the intrinsic builder: it is evaluated in its `const` block (blaze-consteval)")),

@@ -26,25 +26,28 @@ the before and after from those spans.
 
 What blaze is for is the time between an edit and its result, so that is what is measured, profiled
 and fixed first. When two things trade, the order is the owner's (said again 2026-11-17, and revised
-the same day at 09:14: records shared between machines are no longer a goal, so the remote cache
-left the order; a live process is allowed if it is wanted, ideally not, because a restart must never
-cost a re-index): incremental compile time, on enormous crates and files too and after a restart
-with nothing running, with lints as fast as it; then memory use; then cold compile time; then disk
-cleanup that never blocks a build; then disk use. Caches are shared across worktrees with no
-setting, tests are incremental (only the changed ones rerun), and the data is laid out for it
-(columns, structure of arrays). The edit loop is these operations, each on real large workspaces
-(`verify-on-real-projects`: paradigmxyz/reth, tempoxyz/tempo and blaze itself), on a typical Mac and
-on the 128-core build VM, each reported against its floor (`within-ten-percent-of-the-floor`): a
-no-op; a comment edit; a private body edit; a signature edit with N dependents; adding an item;
-adding a derive; the first edit after a cold build; an edit in a fresh process (the normal case,
-since a command answers and exits: `no-state-between-requests`); and the memory held between edits
-(none outside a build's helper process). When incremental work and cold-build work compete for time,
-incremental wins, and a cold-build cost is accepted where it buys a faster edit (work done once at
-build end so an edit need not redo it, records written so a restart can read them). Cold builds are
-not ignored: every design keeps the door open to a fast cold build (nothing that makes cold time
-worse than linear in the work, no structure that only an edit can use), a cold build that fails or
-regresses badly is still a bug, and its numbers are still recorded; but tuning cold time is not
-picked ahead of an open incremental item until the owner says the priority has changed. Say which of
-the two a speed change is for, and quote the edit-loop numbers with it.
+the same day at 09:14: a PROJECT's records shared between machines are not a goal; a live process is
+allowed if it is wanted, ideally not, because a restart must never cost a re-index): incremental
+compile time, on enormous crates and files too and after a restart with nothing running, with lints
+as fast as it; then fetching the records blaze publishes (std, core and alloc precomputed per
+platform, from R2: the owner at 10:18 the same day, "when ppl do blaze they get a pre
+compiled/cached versino of std core alloc ... BY platform ... it would dl from r2"); then memory
+use; then cold compile time; then disk cleanup that never blocks a build; then disk use. Caches are
+shared across worktrees with no setting, tests are incremental (only the changed ones rerun), and
+the data is laid out for it (columns, structure of arrays). The edit loop is these operations, each
+on real large workspaces (`verify-on-real-projects`: paradigmxyz/reth, tempoxyz/tempo and blaze
+itself), on a typical Mac and on the 128-core build VM, each reported against its floor
+(`within-ten-percent-of-the-floor`): a no-op; a comment edit; a private body edit; a signature edit
+with N dependents; adding an item; adding a derive; the first edit after a cold build; an edit in a
+fresh process (the normal case, since a command answers and exits: `no-state-between-requests`); and
+the memory held between edits (none outside a build's helper process). When incremental work and
+cold-build work compete for time, incremental wins, and a cold-build cost is accepted where it buys
+a faster edit (work done once at build end so an edit need not redo it, records written so a restart
+can read them). Cold builds are not ignored: every design keeps the door open to a fast cold build
+(nothing that makes cold time worse than linear in the work, no structure that only an edit can
+use), a cold build that fails or regresses badly is still a bug, and its numbers are still recorded;
+but tuning cold time is not picked ahead of an open incremental item until the owner says the
+priority has changed. Say which of the two a speed change is for, and quote the edit-loop numbers
+with it.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

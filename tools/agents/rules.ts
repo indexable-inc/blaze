@@ -138,7 +138,7 @@ Build only what you are proud of, on the first iteration too. Aim every design a
 
 ## The goal
 
-Fast incremental compiles, lints and tests of real Rust in monorepos of millions of lines, enormous crates and files included: an edit redoes only what changed. When two trade, the order is: incremental time (after a restart too) with lints as fast; memory; cold time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical Mac, one code path.
+Fast incremental compiles, lints and tests of real Rust in monorepos of millions of lines, enormous crates and files included: an edit redoes only what changed. When two trade, the order is: incremental time (after a restart too) with lints as fast; fetching published records; memory; cold time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical Mac, one code path.
 
 ## The design ([in full](docs/v2/plan/design/bottom.md))
 
@@ -150,7 +150,7 @@ Fast incremental compiles, lints and tests of real Rust in monorepos of millions
 - A program runs from code records in its own process: compiled on first call, no link step.
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
-- Records are shared by content across one machine's checkouts; none are made to leave the machine.
+- Records are shared by content: across a machine's checkouts, and std's arrive precomputed from R2.
 - Decide at run time: a hook, check or optimization is a version swapped into a slot.
 - A lint finding is a record too: errors before the answer, advice after, analyses in the background.
 
@@ -162,14 +162,14 @@ In scope:
 - A build runs when asked, and may leave a helper with an expiry that never builds on its own.
 - \`run\`, \`test\`, \`check\`; later \`export\` (a native file). No \`build\`. A run compiles what is called.
 - Dependencies and cached records are fully optimized; workspace code is built fast, then tiered up in the background, the top tier optimizing across functions at function grain.
-- One machine: std and dependencies are compiled there once per toolchain and kept as records.
+- std's records (names, heads, code) are fetched per platform from R2, CI-written; yours stay local.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
 - blaze's own code is on bstd and our collections: no \`std\`, \`alloc\` or third-party crate.
 - A plain Rust project adopts blaze's checks by steps: \`rust\`, \`suggest\`, \`edition\`, \`strict\`.
 
 Not now:
 - \`blaze watch\` or building on save; live patching that keeps a program's state (wanted later).
-- Windows; Buck or Bazel workspaces; records shared between machines (a remote cache, remote runs).
+- Windows; Buck or Bazel workspaces; a project's records shared between machines; remote runs.
 
 ## How work is done
 
@@ -628,8 +628,8 @@ export const rules = [
 	{
 		id: "incremental-first",
 		skill: "perf-and-tracing",
-		line: "Judge by the edit loop first; trade: incremental and lints, memory, cold, cleanup, disk.",
-		info: "What blaze is for is the time between an edit and its result, so that is what is measured, profiled and fixed first. When two things trade, the order is the owner's (said again 2026-11-17, and revised the same day at 09:14: records shared between machines are no longer a goal, so the remote cache left the order; a live process is allowed if it is wanted, ideally not, because a restart must never cost a re-index): incremental compile time, on enormous crates and files too and after a restart with nothing running, with lints as fast as it; then memory use; then cold compile time; then disk cleanup that never blocks a build; then disk use. Caches are shared across worktrees with no setting, tests are incremental (only the changed ones rerun), and the data is laid out for it (columns, structure of arrays). The edit loop is these operations, each on real large workspaces (`verify-on-real-projects`: paradigmxyz/reth, tempoxyz/tempo and blaze itself), on a typical Mac and on the 128-core build VM, each reported against its floor (`within-ten-percent-of-the-floor`): a no-op; a comment edit; a private body edit; a signature edit with N dependents; adding an item; adding a derive; the first edit after a cold build; an edit in a fresh process (the normal case, since a command answers and exits: `no-state-between-requests`); and the memory held between edits (none outside a build's helper process). When incremental work and cold-build work compete for time, incremental wins, and a cold-build cost is accepted where it buys a faster edit (work done once at build end so an edit need not redo it, records written so a restart can read them). Cold builds are not ignored: every design keeps the door open to a fast cold build (nothing that makes cold time worse than linear in the work, no structure that only an edit can use), a cold build that fails or regresses badly is still a bug, and its numbers are still recorded; but tuning cold time is not picked ahead of an open incremental item until the owner says the priority has changed. Say which of the two a speed change is for, and quote the edit-loop numbers with it.",
+		line: "Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.",
+		info: "What blaze is for is the time between an edit and its result, so that is what is measured, profiled and fixed first. When two things trade, the order is the owner's (said again 2026-11-17, and revised the same day at 09:14: a PROJECT's records shared between machines are not a goal; a live process is allowed if it is wanted, ideally not, because a restart must never cost a re-index): incremental compile time, on enormous crates and files too and after a restart with nothing running, with lints as fast as it; then fetching the records blaze publishes (std, core and alloc precomputed per platform, from R2: the owner at 10:18 the same day, \"when ppl do blaze they get a pre compiled/cached versino of std core alloc ... BY platform ... it would dl from r2\"); then memory use; then cold compile time; then disk cleanup that never blocks a build; then disk use. Caches are shared across worktrees with no setting, tests are incremental (only the changed ones rerun), and the data is laid out for it (columns, structure of arrays). The edit loop is these operations, each on real large workspaces (`verify-on-real-projects`: paradigmxyz/reth, tempoxyz/tempo and blaze itself), on a typical Mac and on the 128-core build VM, each reported against its floor (`within-ten-percent-of-the-floor`): a no-op; a comment edit; a private body edit; a signature edit with N dependents; adding an item; adding a derive; the first edit after a cold build; an edit in a fresh process (the normal case, since a command answers and exits: `no-state-between-requests`); and the memory held between edits (none outside a build's helper process). When incremental work and cold-build work compete for time, incremental wins, and a cold-build cost is accepted where it buys a faster edit (work done once at build end so an edit need not redo it, records written so a restart can read them). Cold builds are not ignored: every design keeps the door open to a fast cold build (nothing that makes cold time worse than linear in the work, no structure that only an edit can use), a cold build that fails or regresses badly is still a bug, and its numbers are still recorded; but tuning cold time is not picked ahead of an open incremental item until the owner says the priority has changed. Say which of the two a speed change is for, and quote the edit-loop numbers with it.",
 		reason: "Andrew, 2026-11-11: \"we don't care that much about cold builds, just incremental (for now); although we should design for fast cold, we care most about incremental\". The owner, 2026-11-13: \"incremental comp being short > memory usage > cold comp > disk gc being good/not locking > disk usage\"; the operations are the measurement matrix of that day's target decisions.",
 	},
 	{

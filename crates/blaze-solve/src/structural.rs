@@ -36,7 +36,7 @@ use crate::builtin::{
 use crate::error::Stop;
 use crate::facts::{AdtFlags, Facts, TraitDef};
 use crate::term::{
-    AliasKind, Certainty, Children, Flags, GoalSource, Lang, Polarity, Pred, Shape, Ty, TyKind, UintTy, Var, VarKind,
+    AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, Polarity, Pred, Shape, Ty, TyKind, TypingMode, UintTy, Var, VarKind,
     children, is_region,
 };
 use crate::trait_goals::TraitGoal;
@@ -125,7 +125,20 @@ pub fn assemble_auto<T: Tys, F: Facts>(
         }
         _ => None,
     };
-    let set = cx.impls(g.trait_, shape)?;
+    if possible_impl(cx, g.trait_, shape, goal_base)? {
+        return Ok(());
+    }
+    out.push(row());
+    Ok(())
+}
+
+/// Whether an impl of `trait_` filed under `shape` or as a blanket impl may apply to a type of
+/// that shape (`for_each_relevant_impl`), which disqualifies the structural auto-trait
+/// candidate. `goal_base`: a pattern type's base shape. The one test of it: assembly's, and
+/// the auto-trait summaries' (auto_summary.rs), which take a structural step only where this
+/// says the structural candidate is the type's.
+pub(crate) fn possible_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, trait_: Def, shape: Shape, goal_base: Option<Shape>) -> Result<bool, Stop> {
+    let set = cx.impls(trait_, shape)?;
     for &i in set.impls {
         let h = cx.impl_header(i)?;
         if h.args.len == 0 {
@@ -137,26 +150,25 @@ pub fn assemble_auto<T: Tys, F: Facts>(
         // its list's first entry.
         let first = |l: crate::term::List| if l.len > 0 { h.portable.lists.get(l.start as usize).and_then(|p| h.portable.nodes.get(p.0 as usize)).copied() } else { None };
         match crate::object_shape::shape_with_principal(sk, first) {
-            Some(Shape::Blanket) => return Ok(()),
+            Some(Shape::Blanket) => return Ok(true),
             Some(Shape::Pat) if shape == Shape::Pat => {
                 // Both pattern types: relevant when the bases simplify alike (a parameter
                 // base, or one not read, is relevant to every base: it may be any).
-                let Some(goal_base) = goal_base else { return Ok(()) };
+                let Some(goal_base) = goal_base else { return Ok(true) };
                 let TyKind::Pat(hb, _) = sk else { return Err(malformed()) };
                 let Some(&hbk) = h.portable.nodes.get(hb.0 as usize) else { return Err(malformed()) };
                 let first = |l: crate::term::List| if l.len > 0 { h.portable.lists.get(l.start as usize).and_then(|p| h.portable.nodes.get(p.0 as usize)).copied() } else { None };
                 match crate::object_shape::shape_with_principal(hbk, first) {
-                    Some(Shape::Blanket) | None => return Ok(()),
-                    Some(x) if x == goal_base => return Ok(()),
+                    Some(Shape::Blanket) | None => return Ok(true),
+                    Some(x) if x == goal_base => return Ok(true),
                     _ => {}
                 }
             }
-            Some(x) if x == shape => return Ok(()),
+            Some(x) if x == shape => return Ok(true),
             _ => {}
         }
     }
-    out.push(row());
-    Ok(())
+    Ok(false)
 }
 
 /// `compute_well_formed_goal` (eval_ctxt/mod.rs): one candidate whose step adds the term's
@@ -219,11 +231,33 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
             tys.push(cx.arg(args, 1));
         }
         TyKind::Adt(d, args) => {
-            if cx.adt(d)?.flags.has(AdtFlags::PHANTOM_DATA) {
+            let adt = cx.adt(d)?;
+            if adt.flags.has(AdtFlags::PHANTOM_DATA) {
                 if args.len == 0 {
                     return Err(malformed());
                 }
                 tys.push(cx.arg(args, 0));
+            } else if let Some(row) = adt_summary(cx, d, cand.d)? {
+                // The fields by the ADT's summary (auto_summary.rs): its parameters' goals,
+                // and the goals of the fields it does not see through.
+                let mut params: Vec<u32, Alloc<'_>> = Vec::new_in(cx.alloc);
+                let mut opaque: Vec<u32, Alloc<'_>> = Vec::new_in(cx.alloc);
+                {
+                    let s = cx.scratch.auto.get(row);
+                    params.extend_from_slice(s.params);
+                    opaque.extend_from_slice(s.opaque);
+                }
+                for &i in params.iter() {
+                    if i >= args.len {
+                        return Err(malformed());
+                    }
+                    tys.push(cx.arg(args, i));
+                }
+                cx.scratch.stats.adt_fields += opaque.len() as u64;
+                for &j in opaque.iter() {
+                    let Some(&f) = adt.fields.get(j as usize) else { return Err(malformed()) };
+                    tys.push(cx.import(adt.portable, f, args)?);
+                }
             } else {
                 adt_fields(cx, d, args, &mut tys)?;
             }
@@ -240,6 +274,20 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
     }
     add_constituent_goals(cx, cand.d, &tys)?;
     Ok(Step::Done(Certainty::Yes))
+}
+
+/// The summary of `d: trait_` (auto_summary.rs) where it gives the rule's answer: in analysis
+/// (coherence adds the unknowable candidate to the goals it skips) and with no where-clause of
+/// the trait in the environment (a param-env candidate would compete there), as the ground
+/// fast path's condition (eval.rs `marker_of`).
+fn adt_summary<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, d: Def, trait_: Def) -> Result<Option<u32>, Stop> {
+    if cx.mode != TypingMode::Analysis || cx.scratch.off.summaries {
+        return Ok(None);
+    }
+    if cx.env.iter().any(|c| matches!(c.pred, Pred::Trait { trait_: t, .. } if t == trait_)) {
+        return Ok(None);
+    }
+    crate::auto_summary::summary(cx, d, trait_)
 }
 
 /// A term whose well-formedness holds with no obligation and no child to check (wf.rs: "Bool |

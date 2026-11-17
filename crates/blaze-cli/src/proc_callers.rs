@@ -218,4 +218,45 @@ mod tests {
         assert_ne!(old.seen().to_string(), seen.to_string(), "the planted old arm mounted the member where D96 does");
         println!("member macro sees {seen}");
     }
+
+    /// MX (2026-11-17): a member at a non-empty dir of a checkout the command names `""` (blaze
+    /// started in the workspace's root, `FetchEnv::checkout`) is entered and read by its macro,
+    /// as the shim does at each call (`chdir` into `CARGO_MANIFEST_DIR`, asked as
+    /// `path_filestat_get(root fd, "workspace/<dir>")`): before the fix every call was refused
+    /// `Limit(Paths)` (port27/mini/serde, `crates/app`; tempo's 321 call groups). The member here
+    /// is `src`: cargo runs this test in crates/blaze-cli, so `""` is that folder. CONTROLS: the
+    /// member's macro naming `/workspace/../x` is refused by that name; a fetched package's
+    /// macro cannot climb out of `/package`.
+    ///
+    /// Expected (`runner.py ask MX --test "-p blaze-cli --lib -- proc_callers"`):
+    /// `test proc_callers::tests::a_member_of_a_checkout_started_in_is_entered ... ok`.
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn a_member_of_a_checkout_started_in_is_entered() {
+        use std::sync::Arc;
+
+        use blaze_proc_macro::package_env::PackageEnv;
+        use blaze_proc_macro::sandbox::{Package, Sandbox};
+        use blaze_wasi::{Filetype, ROOT_FD, System};
+
+        let files = super::shown(Place::Checkout { dir: "src" }, "").expect("a plain member dir");
+        let package = Package::new(files, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
+        let mut sandbox = Sandbox::new(Arc::new(package));
+        let cwd = sandbox.package().cwd();
+        assert_eq!(cwd, "/workspace/src");
+        let entered = sandbox.path_stat(ROOT_FD, cwd.trim_start_matches('/').as_bytes(), true);
+        assert!(matches!(&entered, Ok(Ok(stat)) if stat.filetype == Filetype::Directory), "the shim's chdir: {:?}", entered.map_err(|stop| stop.0).map(|it| it.map(|s| s.filetype)));
+        assert!(matches!(sandbox.path_stat(ROOT_FD, b"workspace/src/proc_callers.rs", true), Ok(Ok(_))), "the member's own file is answered");
+        let above = sandbox.path_stat(ROOT_FD, b"/workspace/../x", true);
+        let Err(stop) = above else { panic!("a path above the workspace was answered") };
+        assert!(stop.0.contains("named /workspace/../x, outside /workspace"), "{}", stop.0);
+        // A fetched package's macro: its record at `/package`, nothing above it.
+        let fetched: Arc<[(std::string::String, &'static [u8])]> = Arc::from(std::vec![(std::string::String::from("Cargo.toml"), &b"[package]"[..])]);
+        let dependency = Package::new(Files::Listed(fetched), PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
+        let mut dep = Sandbox::new(Arc::new(dependency));
+        assert!(matches!(dep.path_stat(ROOT_FD, b"/package/Cargo.toml", true), Ok(Ok(_))));
+        let Err(stop) = dep.path_stat(ROOT_FD, b"/package/../workspace/Cargo.toml", true) else { panic!("a fetched package's macro climbed out of /package") };
+        assert!(stop.0.contains("outside /package"), "{}", stop.0);
+        println!("member entered at {cwd}");
+    }
 }

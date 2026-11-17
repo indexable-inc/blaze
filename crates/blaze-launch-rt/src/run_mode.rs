@@ -150,6 +150,9 @@ pub enum Act {
     /// Place the statics the parent's last `Data` told, together ([`RunMode::place_statics`]):
     /// before the acts after it, so before any record that names them.
     Statics,
+    /// Make the run's thread-local descriptor and key, as the parent's `ThreadLocals` said
+    /// ([`RunMode::make_thread_locals`]): before any record naming a thread-local.
+    ThreadLocals,
 }
 
 /// Where a record's code is placed: the area in first-call order, or the hot region in the order
@@ -215,6 +218,12 @@ pub trait Memory {
     /// Copies static number `index`'s filled `bytes` to `at` (room [`Memory::reserve`] gave),
     /// then stores `at` in its word: nothing names the static before both hold.
     fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8]) -> Result<(), RunModeError>;
+    /// Makes the run's one pthread key with the function at `ender` (the ender's entry thunk)
+    /// as its destructor: the key and the descriptor's `root` word (run_mode/thread_locals.rs).
+    fn thread_key(&mut self, ender: u64) -> Result<ThreadKey, RunModeError>;
+    /// Copies `bytes` to `at`, inside room [`Memory::reserve`] gave, before any record naming
+    /// them is published: a thread-local's row, the descriptor's count, an index word.
+    fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), RunModeError>;
 }
 
 /// Why the run mode stopped, naming the thing.
@@ -286,6 +295,16 @@ pub enum RunModeError {
     NoNativeLibrary { symbol: CodeSymbol },
     /// The program's native library could not be loaded (native_lib.rs).
     Native(NativeError),
+    /// The parent sent a second `ThreadLocals`: a run has one descriptor and one key.
+    ThreadLocalsTwice,
+    /// Record `record` names thread-local `symbol` before the parent's `ThreadLocals`.
+    ThreadLocalsUntold { record: RecordId, symbol: CodeSymbol },
+    /// More thread-locals than the descriptor's rows (`blaze_code::tls::CAP`).
+    ThreadLocalsFull,
+    /// `pthread_key_create` failed with `errno`.
+    ThreadKey { errno: i32 },
+    /// The thread-local root's offset uses bit 63, which the access sequence clears.
+    TlsRoot { offset: u64 },
 }
 
 impl From<WireError> for RunModeError {
@@ -332,7 +351,7 @@ impl fmt::Display for RunModeError {
             RunModeError::NotBuilt { what } => write!(f, "the launcher's run mode does not do this yet: {what}"),
             RunModeError::Target { record, space, symbol } => write!(
                 f,
-                "record {} names {space:?} {symbol} where the run mode binds no such target: functions, C names and statics are bound; a call of a static, a vtable and a thread-local are not yet (run.md, \"Statics in the run\")",
+                "record {} names {space:?} {symbol} where the run mode binds no such target: functions, C names, statics and a load of a thread-local's index are bound; a call of a static or a thread-local, a vtable, and a thread-local's address in a static's value are not (run.md, \"Statics in the run\")",
                 Short(&record.0)
             ),
             RunModeError::StaticNotTold { record, symbol } => write!(
@@ -379,6 +398,22 @@ impl fmt::Display for RunModeError {
                 "the C name of symbol {symbol} is asked before the program's native library was loaded (NATIVE.md 3.7: the parent's `Native` comes first)"
             ),
             RunModeError::Native(why) => write!(f, "{why}"),
+            RunModeError::ThreadLocalsTwice => write!(
+                f,
+                "the parent named the thread-local descriptor a second time: a run has one descriptor and one key (run wire, `ThreadLocals`)"
+            ),
+            RunModeError::ThreadLocalsUntold { record, symbol } => write!(
+                f,
+                "record {} names thread-local {symbol} before the parent named the run's thread-local descriptor (run wire `ThreadLocals` comes before the record: run.md, \"Statics in the run\", step 4)",
+                Short(&record.0)
+            ),
+            RunModeError::ThreadLocalsFull => {
+                write!(f, "the program touches more than {} thread-locals (the descriptor's rows, blaze-code tls.rs)", blaze_code::tls::CAP)
+            }
+            RunModeError::ThreadKey { errno } => write!(f, "the run's thread-local key: pthread_key_create failed with errno {errno}"),
+            RunModeError::TlsRoot { offset } => {
+                write!(f, "the run's thread-local root is at offset {offset:#x}, which bit 63 of the descriptor's root cannot say")
+            }
         }
     }
 }
@@ -457,14 +492,19 @@ pub struct RunMode<'a> {
     statics: AVec<'a, (CodeSymbol, StaticAt)>,
     /// The statics the parent told and [`Act::Statics`] has not placed yet, in its order.
     told: AVec<'a, (CodeSymbol, RecordId)>,
+    /// The run's thread-local descriptor and indexes (run_mode/thread_locals.rs).
+    thread_locals: thread_locals::ThreadLocals<'a>,
     alloc: Alloc<'a>,
 }
 
-/// A static of the run: its word's number ([`Memory::static_word`]) and its first byte.
+/// A static of the run: its word's number ([`Memory::static_word`]), its first byte, its
+/// length and alignment (a thread-local's row is made from its template's).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct StaticAt {
     index: u32,
     at: u64,
+    len: u64,
+    align: u64,
 }
 
 impl<'a> RunMode<'a> {
@@ -489,6 +529,7 @@ impl<'a> RunMode<'a> {
             native: native::NativeState::Waiting,
             statics: Vec::new_in(alloc),
             told: Vec::new_in(alloc),
+            thread_locals: thread_locals::ThreadLocals::new(),
             alloc,
         }
     }
@@ -626,6 +667,7 @@ impl<'a> RunMode<'a> {
                 }
                 Ok(())
             }
+            Down::ThreadLocals { descriptor, ender } => self.tell_thread_locals(descriptor, ender, out),
             Down::Failed { need, why } => {
                 let local = match need {
                     Needed::Slot(slot) => self.slots.local(slot)?,
@@ -776,7 +818,7 @@ impl<'a> RunMode<'a> {
             let index = u32::try_from(self.statics.len()).ok().filter(|&n| n < MOST_STATICS).ok_or(RunModeError::StaticsFull)?;
             // `DatumView::read` checked the length fits a u32, and the alignment a page.
             let at = memory.reserve(view.len() as usize, view.align() as usize)?;
-            let row = StaticAt { index, at };
+            let row = StaticAt { index, at, len: view.len(), align: view.align() };
             match self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
                 Ok(_) => return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) }),
                 Err(pos) => self.statics.insert_shift(pos, (symbol, row)),
@@ -787,7 +829,15 @@ impl<'a> RunMode<'a> {
         for &(symbol, record, view, row) in rows.iter() {
             let mut bytes: AVec<'_, u8> = Vec::from_elem_in(0, view.bytes().len(), self.alloc);
             {
-                let mut binder = Binder { slots: &mut self.slots, statics: &self.statics, memory: &mut *memory, names: None, record, refused: None };
+                let mut binder = Binder {
+                    slots: &mut self.slots,
+                    statics: &self.statics,
+                    thread_locals: &mut self.thread_locals,
+                    memory: &mut *memory,
+                    names: None,
+                    record,
+                    refused: None,
+                };
                 let filled = datum::fill(&view, symbol, row.at, &mut binder, &mut bytes[..]);
                 if let Some(why) = binder.refused {
                     return Err(why);
@@ -821,7 +871,15 @@ impl<'a> RunMode<'a> {
         let mut relro: AVec<'_, u8> = Vec::from_elem_in(0, view.relro().len(), self.alloc);
         let symbol = self.slots.symbol(slot);
         {
-            let mut binder = Binder { slots: &mut self.slots, statics: &self.statics, memory: &mut *memory, names: Some(view), record, refused: None };
+            let mut binder = Binder {
+                slots: &mut self.slots,
+                statics: &self.statics,
+                thread_locals: &mut self.thread_locals,
+                memory: &mut *memory,
+                names: Some(view),
+                record,
+                refused: None,
+            };
             let placed = blaze_code::place::place(&view, symbol, At { code: code_at, relro: relro_at }, &mut binder, &mut code, &mut relro);
             if let Some(why) = binder.refused {
                 return Err(why);
@@ -871,6 +929,8 @@ struct Binder<'s, 'a, M: Memory> {
     slots: &'s mut Numbering<'a>,
     /// The statics placed (or given their room in this batch), sorted by symbol.
     statics: &'s [(CodeSymbol, StaticAt)],
+    /// The run's thread-local indexes: a load of a thread-local's index numbers it.
+    thread_locals: &'s mut thread_locals::ThreadLocals<'a>,
     memory: &'s mut M,
     /// The code record's C names; `None` for a datum, which names none.
     names: Option<CodeView<'s>>,
@@ -921,6 +981,12 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
             Space::Outside => self.outside(target.symbol).map(|it| it.word),
             // A load of the static's address reads its word; nothing calls a static.
             Space::Static if !call => self.static_at(target.symbol).map(|it| self.memory.static_word(it.index)),
+            // A load of a thread-local's index reads a word holding it (run_mode/thread_locals.rs).
+            Space::Tls if !call => {
+                let template = self.static_at(target.symbol);
+                thread_locals::made(self.thread_locals, self.record, target.symbol)
+                    .and_then(|made| made.index_word(target.symbol, template, &mut *self.memory))
+            }
             Space::Static | Space::Vtable | Space::Tls => {
                 Err(RunModeError::Target { record: self.record, space: target.space, symbol: target.symbol })
             }
@@ -1330,6 +1396,15 @@ impl Memory for NativeMemory<'_> {
         self.code.store(self.layout.statics + index as usize * 8, at).map_err(RunModeError::Sys)?;
         Ok(())
     }
+
+    fn thread_key(&mut self, ender: u64) -> Result<ThreadKey, RunModeError> {
+        thread_locals::native_thread_key(ender)
+    }
+
+    fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), RunModeError> {
+        // Through the write view: the area is read-only in the run view.
+        self.code.copy(self.offset(at), bytes).map_err(RunModeError::Sys)
+    }
 }
 
 /// The driver's clock: `CLOCK_MONOTONIC`, read at its edge.
@@ -1635,6 +1710,7 @@ fn control<S: RecordSource>(
                 Act::Place { slot, record } => mode.place(slot, record, source, &mut memory, Plant::None, &mut acts),
                 Act::Promote { slot, record } => mode.promote(slot, record, source, &mut memory, Plant::None),
                 Act::Statics => mode.place_statics(source, &mut memory),
+                Act::ThreadLocals => mode.make_thread_locals(&mut memory),
                 Act::Wake { thread, slot } => {
                     match waiting.iter().position(|(at, who, _)| *at == slot && *who == thread) {
                         Some(index) => {
@@ -1702,6 +1778,9 @@ impl fmt::Display for WhyText {
 
 mod native;
 mod personality;
+mod thread_locals;
+
+pub use thread_locals::ThreadKey;
 
 #[cfg(test)]
 mod entry_tests;

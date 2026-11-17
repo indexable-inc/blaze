@@ -37,9 +37,16 @@ pub enum FlowOf {
 }
 
 impl FlowOf {
-    /// Whether an outlives result of this flow is the owner's to prove (a nested body's).
-    pub fn is_nested(self) -> bool {
-        self != FlowOf::Owner
+    /// Whether an outlives result of this flow is the owner's to prove (a nested body's). The
+    /// root block of an `async fn` (`view.root` of a body with a coroutine) is not: its
+    /// placeholders are the fn's signature's (blaze-flow-lower coroutine.rs `async_fn_root`),
+    /// so its outlives result is the fn's own finding, as a fn body's is.
+    pub fn is_nested(self, view: &tc::BodyView<'_>) -> bool {
+        match self {
+            FlowOf::Owner => false,
+            FlowOf::AsyncBlock(e) if view.coroutine.is_some() && e == view.root => false,
+            FlowOf::Closure(_) | FlowOf::AsyncBlock(_) => true,
+        }
     }
 }
 
@@ -82,6 +89,9 @@ impl Facts for NestedFacts<'_, '_> {
     }
     fn field_count(&self, adt: tc::ItemKey, variant: u32) -> Option<u32> {
         self.facts.field_count(adt, variant)
+    }
+    fn field_param(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<u32> {
+        self.facts.field_param(adt, variant, field)
     }
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy(index)

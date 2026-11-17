@@ -187,6 +187,66 @@ pub fn fingerprint_impl(p: Portable<'_>, args: List) -> Fingerprint {
     fp
 }
 
+/// Whether the goal's trait arguments `goal` (in the arena) may unify with the impl header's
+/// `header` (portable, its parameters wildcards), compared head by head at every depth
+/// (fast_reject.rs `types_may_unify_inner`, the deep form of the fingerprint): `false` only
+/// where two rigid heads differ, so the header need not be imported and related. A head is
+/// [`head`]'s 64-bit hash, a function of the head alone: unequal hashes are unequal heads, and
+/// an equal hash of two heads that differ only lets the header through to the relation (no
+/// byte folding as in the fingerprint). A wildcard on either side (an inference variable, a
+/// non-rigid alias, a region, an impl parameter) matches any subtree, and a repeated impl
+/// parameter is not checked for agreement (the relation does that). `work` is scratch.
+pub fn header_may_match<T: Tys>(
+    tys: &T,
+    goal: List,
+    p: Portable<'_>,
+    header: List,
+    work: &mut Vec<(Ty, Ty), Alloc<'_>>,
+) -> Result<bool, crate::error::SolveError> {
+    if goal.len != header.len {
+        return Ok(false);
+    }
+    let pget = |l: List, i: u32| -> Ty { p.lists.get((l.start + i) as usize).copied().unwrap_or(Ty::NONE) };
+    work.clear();
+    for i in 0..goal.len {
+        work.push((tys.list_get(goal, i), pget(header, i)));
+    }
+    let mut visited = 0usize;
+    while let Some((g, h)) = work.pop() {
+        visited += 1;
+        if visited > crate::fold::MAX_WALK {
+            return Err(crate::error::SolveError::Limit(crate::error::Limit::Walk));
+        }
+        let Some(&hk) = p.nodes.get(h.0 as usize) else { continue };
+        let Some(hh) = head(hk, true) else { continue };
+        let gk = tys.kind(tys.shallow_resolve(g));
+        let Some(gh) = head(gk, false) else { continue };
+        if gh != hh {
+            return Ok(false);
+        }
+        match (children(gk), children(hk)) {
+            (Children::One(a), Children::One(b)) => work.push((a, b)),
+            (Children::Two(a, x), Children::Two(b, y)) => {
+                work.push((a, b));
+                work.push((x, y));
+            }
+            (Children::List(a), Children::List(b)) => {
+                for i in 0..a.len.min(b.len) {
+                    work.push((tys.list_get(a, i), pget(b, i)));
+                }
+            }
+            (Children::ListThen(a, x), Children::ListThen(b, y)) => {
+                for i in 0..a.len.min(b.len) {
+                    work.push((tys.list_get(a, i), pget(b, i)));
+                }
+                work.push((x, y));
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
 /// The planted bug of the prefilter's control: a wildcard impl byte is treated as a mismatch.
 #[cfg(test)]
 fn drops_wildcard() -> bool {

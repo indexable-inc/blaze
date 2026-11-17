@@ -391,8 +391,15 @@ impl<'r> ProcMacros<'r> {
     /// Runs the proc macro `def` on `call`, expanded in `package` at `edition`: from its record,
     /// or run and kept. Its error is what blaze-expand takes; the finding it made is kept.
     pub fn run<'a>(&self, def: &MacroDefinition<'_>, call: &ProcCall<'_>, edition: Edition, package: &Arc<Package>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
-        let refused = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
-        let failed = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Failed };
+        self.run_why(def, call, edition, package, alloc).map_err(|refused| refused.host)
+    }
+
+    /// [`ProcMacros::run`], whose error also holds, when the run itself stopped, why
+    /// ([`RunRefused::call`]): what a caller that keeps a refused call's reason (blaze-cli's
+    /// names jobs, into the names record's row) names it by (rule 19).
+    pub fn run_why<'a>(&self, def: &MacroDefinition<'_>, call: &ProcCall<'_>, edition: Edition, package: &Arc<Package>, alloc: Alloc<'a>) -> Result<Produced<'a>, RunRefused> {
+        let refused = RunRefused::bare(HostWhy::Refused);
+        let failed = RunRefused::bare(HostWhy::Failed);
         let MacroKind::ProcMacro { krate, kind } = def.kind() else { return Err(refused) };
         let Some(macro_crate) = self.crates.iter().find(|it| it.key == krate) else {
             self.report(Finding::UnknownCrate { krate });
@@ -449,11 +456,29 @@ impl<'r> ProcMacros<'r> {
                 Ok(ran.produced)
             }
             Err(error) => {
-                let host = error.error.host_error();
+                let refused = RunRefused { host: error.error.host_error(), call: Some(error.error.clone()) };
                 self.report(Finding::Call { base, error });
-                Err(host)
+                Err(refused)
             }
         }
+    }
+}
+
+/// A call [`ProcMacros::run_why`] gave no expansion: the error blaze-expand takes, and, when the
+/// module ran and its run stopped (a limit, the sandbox refusing a path, a variable this build
+/// does not know, a failure), that run's error, whose words name what stopped it as the macro
+/// saw it. `None`: the run never started (the crate unregistered, its module missing or not
+/// loading, no such export, its record unreadable): the finding kept, and the module's
+/// refusal ([`ProcMacros::refusal_of`]), name why.
+#[derive(Clone, Debug)]
+pub struct RunRefused {
+    pub host: HostError,
+    pub call: Option<CallError>,
+}
+
+impl RunRefused {
+    fn bare(why: HostWhy) -> RunRefused {
+        RunRefused { host: HostError { ask: HostAsk::ProcMacro, why }, call: None }
     }
 }
 

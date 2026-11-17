@@ -235,9 +235,19 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<
         (ImplPolarity::Positive, Polarity::Positive) | (ImplPolarity::Negative, Polarity::Negative) => Certainty::Yes,
         _ => return Ok(Step::No),
     };
+    // The header against the goal in place, before importing it: a rigid head that differs at
+    // any depth fails the relation below anyway.
+    if !cx.scratch.off.prematch {
+        let mut work: Vec<(Ty, Ty), Alloc<'_>> = Vec::new_in(cx.alloc);
+        if !crate::prefilter::header_may_match(&*cx.tys, gargs, h.portable, h.args, &mut work)? {
+            cx.scratch.stats.impl_prematch_rejected += 1;
+            return Ok(Step::No);
+        }
+    }
     let args = cx.fresh_impl_args_of(impl_, &h)?;
     let header = cx.import_list(h.portable, h.args, args)?;
     if !cx.eq_lists(gargs, header)? {
+        cx.scratch.stats.impl_header_mismatch += 1;
         return Ok(Step::No);
     }
     for &w in h.where_clauses {

@@ -149,16 +149,28 @@ pub fn read_impl_signature<'t, A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
-    let life = match impl_life(imp, tys, adt_lifetimes, alloc.clone()) {
-        Ok(life) => life,
+    let life = impl_life_or_unread(text, imp, tys, adt_lifetimes, alloc.clone())?;
+    read_signature_in(text, Some(life), tys, inputs, output, None, adt_lifetimes, out, alloc)
+}
+
+/// The impl's header as a member `text`'s reading takes it ([`read_impl_signature`]'s doc): read,
+/// or unread when the member writes none of its lifetimes, or refused by name.
+pub(super) fn impl_life_or_unread<'t, A: Allocator + Clone>(
+    text: &'t str,
+    imp: ImplText<'t>,
+    tys: PTys<'_>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
+    alloc: A,
+) -> Result<ImplLife<'t, A>, SigRefusal> {
+    match impl_life(imp, tys, adt_lifetimes, alloc.clone()) {
+        Ok(life) => Ok(life),
         Err(why) => {
             if writes_outer_lifetime(text, alloc.clone())? {
                 return Err(SigRefusal::Assoc { at: 0, why });
             }
-            ImplLife::unread(alloc.clone())
+            Ok(ImplLife::unread(alloc))
         }
-    };
-    read_signature_in(text, Some(life), tys, inputs, output, adt_lifetimes, out, alloc)
+    }
 }
 
 /// The byte offset where the impl's header ends (its first `{` outside brackets), as

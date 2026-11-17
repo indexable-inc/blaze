@@ -51,6 +51,10 @@ pub struct BlockUse<'a> {
     /// Where it is shown in the enclosing item ([`View::site`]), for a refusal's words only:
     /// never a key, never a lookup.
     pub shown: blaze_surface::Range,
+    /// Its range in the view: the marks of its words ([`View::marks_in`], a start in
+    /// [`Self::text`] each), so a `$crate` a macro wrote in it is read as the MACRO's crate
+    /// (clap_builder's `value_parser!` writes `use $crate::builder::impl_prelude::*;`).
+    pub range: crate::columns::BodyRange,
 }
 
 /// What the `use`s around a pattern make of its name.
@@ -88,7 +92,7 @@ pub fn in_scope<'a, 'b>(v: &View<'b>, scope: ScopeId, name: u64, own_item: bool,
         for i in block.items.start..block.items.start + block.items.len {
             let item = v.local_item(v.row(RowIdx(i))?)?;
             if item.syntax == USE as u16 {
-                found.uses.push(BlockUse { depth, text: v.text_at(item.range)?, scope: s, shown: v.site(item.range)? });
+                found.uses.push(BlockUse { depth, text: v.text_at(item.range)?, scope: s, shown: v.site(item.range)?, range: item.range });
             } else if let Some(n) = item.name {
                 declares |= v.name(n)? == name;
                 found.locals.push(v.name_text(n)?);

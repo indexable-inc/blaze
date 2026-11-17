@@ -26,6 +26,7 @@ use blaze_scope::resolve::{Names, Place};
 use blaze_scope::task::{ItemText, MacroBody, Variant};
 use blaze_surface::{Edition, ItemDetail, ItemKind, Namespace};
 
+use super::super::buckets::TableSet;
 use super::super::index::ImplAt;
 use super::super::project_records::BodySource;
 use super::super::source::{self, MacroAt, MemberOf, NamesSource};
@@ -35,6 +36,13 @@ use super::recorder::{INCOHERENT, NamesInto, ReadSink, TableRead, UNFILED, bucke
 pub struct TablesOpts<'t, 'n> {
     /// Every crate's two records, read in place (this worker's reader over the shared bytes).
     pub records: &'n source::Records<'n>,
+    /// Every crate's impl tables (lane BK's E3, buckets/records.rs), which the check files a
+    /// question's impls from; `None`: today's per-job filing from the items records' bucket
+    /// section (only to hold the two equal while both exist).
+    pub impls: Option<&'n TableSet<'n>>,
+    /// The crates whose lang rows name the lang items (the crate graph's: `core` and the
+    /// program's own crate, as `ProjectWorld::from_records` takes them).
+    pub lang_crates: &'n [usize],
     /// Where each read goes: the task's recorder.
     pub reads: &'t dyn ReadSink,
 }
@@ -43,17 +51,34 @@ pub struct TablesOpts<'t, 'n> {
 #[derive(Clone, Copy)]
 pub struct Tables<'t, 'n> {
     records: &'n source::Records<'n>,
+    impls: Option<&'n TableSet<'n>>,
+    lang_crates: &'n [usize],
     reads: &'t dyn ReadSink,
 }
 
 impl<'t, 'n> Tables<'t, 'n> {
     pub fn new(opts: TablesOpts<'t, 'n>) -> Tables<'t, 'n> {
-        Tables { records: opts.records, reads: opts.reads }
+        Tables { records: opts.records, impls: opts.impls, lang_crates: opts.lang_crates, reads: opts.reads }
     }
 
     /// The records the view answers from.
     pub fn records(self) -> &'n source::Records<'n> {
         self.records
+    }
+
+    /// The crates whose lang rows name the lang items.
+    pub fn lang_crates(self) -> &'n [usize] {
+        self.lang_crates
+    }
+
+    /// The same view putting its reads in `reads` (a task's own recorder).
+    pub fn reading_into<'u>(self, reads: &'u dyn ReadSink) -> Tables<'u, 'n> {
+        Tables { records: self.records, impls: self.impls, lang_crates: self.lang_crates, reads }
+    }
+
+    /// Where the view puts its reads.
+    pub fn reads(self) -> &'t dyn ReadSink {
+        self.reads
     }
 
     fn cell(self, cell: NameCell) {
@@ -322,6 +347,16 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
 
     fn has_buckets(self) -> bool {
         self.records.has_buckets()
+    }
+
+    /// The impl tables; each cell a lookup in them read comes back through
+    /// [`NamesSource::impls_read`].
+    fn impl_tables(self) -> Option<&'n TableSet<'n>> {
+        self.impls
+    }
+
+    fn impls_read(self, read: TableRead) {
+        self.reads.read(read);
     }
 
     fn bucket(self, krate: usize, key: &blaze_scope::items_record::buckets::BucketKey, each: &mut dyn FnMut(blaze_scope::items_record::buckets::BucketImpl)) -> Option<blaze_id::ContentId> {

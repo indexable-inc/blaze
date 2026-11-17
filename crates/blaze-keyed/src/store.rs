@@ -427,6 +427,54 @@ impl fmt::Display for StoreFile {
     }
 }
 
+/// Who put the value a key holds when another value meets it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Holder {
+    /// A record a committed generation names: an earlier process's, or this one's after its
+    /// commit.
+    Committed,
+    /// This process's own put, not yet committed (its batch, a lane, a segment being laid out).
+    ThisProcess,
+}
+
+/// Two values under one key (rule 21), the one shape every raise site fills (rule 19): the key,
+/// the held record and the refused one, each by kind and length, and where their bytes first
+/// differ. What a site cannot know is `None`, never a guess: `len` for a read that asked kind
+/// `tag` of a key holding another kind, `differs_at` where only the two index entries are at
+/// hand (equal lengths whose checksums differ) or the bytes are equal and the kind is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TwoValues {
+    pub key: ContentId,
+    /// The refused value's kind: a put's, or the kind a read asked for.
+    pub tag: Tag,
+    /// The refused value's length; `None` for a read.
+    pub len: Option<u64>,
+    pub held_tag: Tag,
+    pub held_len: u64,
+    pub held: Holder,
+    /// The offset of the first differing byte (the shorter's length when one is a prefix).
+    pub differs_at: Option<u64>,
+}
+
+impl fmt::Display for TwoValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let held = match self.held {
+            Holder::Committed => "a committed",
+            Holder::ThisProcess => "this process's",
+        };
+        write!(f, "two values under one key {:?} (rule 21: the key misses an input of its value): {held} record of kind {} and {} bytes", self.key, self.held_tag.0, self.held_len)?;
+        match self.len {
+            Some(len) => write!(f, ", and a put of kind {} and {len} bytes", self.tag.0)?,
+            None => write!(f, ", where a read asked kind {}", self.tag.0)?,
+        }
+        match (self.differs_at, self.len) {
+            (Some(at), _) => write!(f, ", first differing at byte {at}"),
+            (None, Some(len)) if len == self.held_len && self.tag == self.held_tag => f.write_str(", their bytes not at hand (their checksums differ)"),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// A failure of the store, by name and class: never a formatted string.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StoreError {
@@ -449,9 +497,9 @@ pub enum StoreError {
     Format { what: &'static str, found: u32, wanted: u32 },
     /// Generation `generation`'s manifest: `what` is wrong at byte `at`.
     Manifest { generation: u64, what: &'static str, at: u64 },
-    /// Two values under one key within one segment being sealed: the key misses an input
-    /// (rule 21).
-    TwoValues { tag: Tag, key: ContentId },
+    /// Two values under one key (rule 21: the key misses an input), each side as the raise
+    /// site knows it (rule 19).
+    TwoValues(TwoValues),
     /// A namespace other than the one asked: a key is never answered from a namespace the
     /// caller did not ask for.
     Namespace { found: Namespace, wanted: Namespace },
@@ -524,9 +572,7 @@ impl fmt::Display for StoreError {
             StoreError::Manifest { generation, what, at } => {
                 write!(f, "generation {generation}'s manifest: {what} at byte {at}")
             }
-            StoreError::TwoValues { tag, key } => {
-                write!(f, "two values of kind {} under key {key:?}: the key misses an input", tag.0)
-            }
+            StoreError::TwoValues(two) => write!(f, "{two}"),
             StoreError::Namespace { found, wanted } => write!(
                 f,
                 "namespace {:016x} where {:016x} was asked: a key is never answered from a namespace the caller did not ask for",

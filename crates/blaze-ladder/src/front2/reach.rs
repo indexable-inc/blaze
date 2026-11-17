@@ -339,6 +339,15 @@ fn class_of(debug: &str) -> Box<str> {
 }
 
 fn body_failed(e: &BodyError) -> Reached {
+    Reached::Failed { class: format!("lower: {}", lower_class(e)).into_boxed_str(), detail: format!("{e}").into_boxed_str(), refusal: None }
+}
+
+/// What refused a body's lowering, as a class that groups (rule 19): the error's variant and,
+/// for `Lowered` and `Convert`, its first finding's cause (a macro's host ask, a construct's
+/// syntax kind and why, a diagnostic's kind; the refusal's variant and the type builder's). The
+/// census counts by it; `blaze check`'s "not checked because lowering refused (..)" line names
+/// it, with the macro's path for a macro call ([`lower_refusal`]).
+pub fn lower_class(e: &BodyError) -> String {
     let d = format!("{e:?}");
     // `Lowered` and `Convert` are many causes under one variant: the class names the first
     // finding's cause (a macro's host ask, a construct's syntax kind, a diagnostic's kind; the
@@ -354,9 +363,29 @@ fn body_failed(e: &BodyError) -> Reached {
         BodyError::Convert { refused, why, .. } => {
             format!(": {}{}", class_chain(&format!("{refused:?}"), 2), why.as_ref().map(|w| format!(" {}", class_chain(&format!("{w:?}"), 4))).unwrap_or_default())
         }
+        // A head the body needs: the head error's variant and, for an item's types, why
+        // (`Head: Item Unsupported("..")`), never `Head` alone (port27/mini/clap-root).
+        BodyError::Head { error, .. } => match error {
+            HeadError::Item(_, why) => format!(": Item {}", class_chain(&format!("{why:?}"), 3)),
+            other => format!(": {}", class_of(&format!("{other:?}"))),
+        },
         _ => String::new(),
     };
-    Reached::Failed { class: format!("lower: {}{cause}", class_of(&d)).into_boxed_str(), detail: format!("{e}").into_boxed_str(), refusal: None }
+    format!("{}{cause}", class_of(&d))
+}
+
+/// [`lower_class`], with the path of the macro whose call the lowering could not take when
+/// that is the first finding: what a reader of `blaze check`'s note acts on (`Lowered: Macro
+/// Failed(Expand(Host ProcMacro` alone names no macro).
+pub fn lower_refusal(e: &BodyError) -> String {
+    let class = lower_class(e);
+    match e {
+        BodyError::Lowered { findings, .. } => match findings.first() {
+            Some(super::body::BodyFinding::Macro { path, .. }) => format!("{class}, the call of `{path}!`"),
+            _ => class,
+        },
+        _ => class,
+    }
 }
 
 /// `out` (a [`Reached::Failed`] made from `refusal`'s text) carrying `refusal` itself.

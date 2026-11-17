@@ -41,6 +41,7 @@
 use core::cell::RefCell;
 use core::fmt;
 
+use blaze_drive as drive;
 use blaze_ids::Hasher;
 use blaze_impls::{ImplLookupError, ImplRead, ImplRecords, Probe, RecordKind, candidates_in, inherent_candidates_in};
 use blaze_own::{AVec, Alloc};
@@ -49,6 +50,9 @@ use blaze_surface::{self as surface, ContentId, CrateImpls, CrateItemKey, FloatW
 use blaze_typeck::{FloatTy, IntTy, UintTy};
 
 use super::*;
+use crate::front2::source::Records;
+use crate::front2::tables::recorder::{ReadsFull, Recorder, RecorderOpts, TableRead};
+use crate::front2::tables::view::{Tables, TablesOpts};
 
 /// The domain of [`row_digest`].
 const ROW_DOMAIN: &str = "blaze-ladder impl table row 1";
@@ -56,6 +60,8 @@ const ROW_DOMAIN: &str = "blaze-ladder impl table row 1";
 const TABLES_DOMAIN: &str = "blaze-ladder impl tables 1";
 /// The domain of a [`Probe::Trait`]'s name in a [`BucketRead`].
 const PROBE_DOMAIN: &str = "blaze-ladder impl table probe 1";
+/// The domain of a [`Probe::Bucket`]'s name in a [`BucketRead`].
+const PROBE_BUCKET_DOMAIN: &str = "blaze-ladder impl table bucket probe 1";
 
 /// One crate's impl tables as [`write_impl_tables`] made them.
 pub struct ImplTables<'a> {
@@ -105,13 +111,103 @@ pub fn bucket_cell(hash: surface::BucketHash) -> [u8; 16] {
     hash.0
 }
 
-/// The cell one lookup read maps to (module docs): `None` for a bucket record's read, which
-/// its directory cell covers.
+/// The cell of its crate's tables one lookup read maps to (module docs): `None` for a bucket
+/// record's read, which its directory cell covers.
 pub fn cell_read(read: &ImplRead) -> Option<[u8; 16]> {
     match read {
         ImplRead::Filter { probe: Probe::Trait(t), .. } => Some(trait_cell(*t)),
         ImplRead::Filter { probe: Probe::Bucket(hash), .. } | ImplRead::Directory { bucket: hash, .. } => Some(bucket_cell(*hash)),
         ImplRead::Bucket { .. } => None,
+    }
+}
+
+/// THE ONE MAP from a lookup's read to the task read a body's recorder lists (front2
+/// tables/recorder.rs [`TableRead::Impls`]): the crate's impl tables (its key's first 16 bytes:
+/// [`ReadOf::Impls`](crate::front2::tables::recorder::ReadOf::Impls), whose record is the crate's
+/// [`impl_tables_name`]) at the cell [`cell_read`] gives. A body that found NO impl reads a cell
+/// too: the trait's cell where `NoImplsOf` said none, the bucket's where the directory has none;
+/// both are absent today, and an impl added there makes them present, which dirties the body
+/// (rule 21).
+pub fn cells_of(read: &ImplRead) -> Option<TableRead> {
+    let krate = match read {
+        ImplRead::Filter { krate, .. } | ImplRead::Directory { krate, .. } | ImplRead::Bucket { krate, .. } => *krate,
+    };
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&krate.0.0[..16]);
+    cell_read(read).map(|bucket| TableRead::Impls { krate: k, bucket })
+}
+
+/// The domain of [`impl_tables_name`]'s subject.
+const SUBJECT_DOMAIN: &str = "blaze-ladder impl tables subject 1";
+/// The domain of [`ImplTablesDone::out`].
+const OUT_DOMAIN: &str = "blaze-ladder impl tables out 1";
+
+/// The engine's name of crate `krate`'s impl tables task (`Kind::ImplBucket`, one per crate):
+/// the record a body's [`TableRead::Impls`] of that crate is a read of.
+pub fn impl_tables_name(krate: CrateItemKey) -> drive::Name {
+    drive::Name::new(drive::Kind::ImplBucket, ContentId::of(SUBJECT_DOMAIN, &krate.0.0))
+}
+
+/// Why the impl tables task failed: its row is the failure, its `defines` empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImplTablesFailed {
+    Tables(TablesError),
+    Reads(ReadsFull),
+}
+
+/// The impl tables task's result in the engine's form (blaze-engine engine.rs `Done`): what
+/// the driver turns into its `Done` by allocator and by naming each read's record.
+pub struct ImplTablesDone<'a> {
+    /// [`impl_tables_name`].
+    pub name: drive::Name,
+    /// [`ImplTables::key`]: from the rows' text, before the work.
+    pub key: drive::Key,
+    /// The digest of the three records (the directory names every bucket's content id).
+    pub out: ContentId,
+    /// The records; `None` when the task failed.
+    pub records: Option<CrateImpls<'a>>,
+    /// [`ImplTables::defines`] as drive cells, sorted; empty when failed.
+    pub defines: AVec<'a, (drive::Cell, ContentId)>,
+    /// What the filing read, sorted and each once: the names cells its walks and rows consulted
+    /// and each header text it lowered (front2 tables/view.rs records them). A read's record is
+    /// [`TableRead::of`] and its cell [`TableRead::cell`]; its digest is decided by the merge
+    /// from the same tables a later run checks it against (names_cells.rs `seen_in`).
+    pub reads: AVec<'a, TableRead>,
+    pub counts: FileCounts,
+    pub failed: Option<ImplTablesFailed>,
+}
+
+/// THE TASK: crate `krate`'s impl tables from its impl rows `rows` (the task's input, which its
+/// key covers), each name the filing asks answered through the read-only view over `records`
+/// with its cells recorded, its buffers in `alloc`. Pure in (rows, records, alloc).
+pub fn impl_tables_task<'n, 'a>(records: &'n Records<'n>, krate: usize, rows: &[ImplRow<'n>], alloc: Alloc<'a>) -> ImplTablesDone<'a> {
+    let recorder = Recorder::new(RecorderOpts { alloc });
+    // The writer asks no impl question and names no lang item: no tables, no lang crates.
+    let view = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &recorder });
+    let written = write_impl_tables(view, krate, rows, alloc);
+    let reads = recorder.finish();
+    let failed = match (written, reads) {
+        (Ok(t), Ok(reads)) => {
+            let mut out = Hasher::new(OUT_DOMAIN);
+            out.part(&t.records.directory).part(&t.records.no_impls_of);
+            let mut defines: AVec<'a, (drive::Cell, ContentId)> = AVec::with_capacity_in(t.defines.len(), alloc);
+            defines.extend(t.defines.iter().map(|(cell, digest)| (drive::Cell(*cell), *digest)));
+            return ImplTablesDone { name: impl_tables_name(t.krate), key: drive::Key(t.key), out: out.finish(), records: Some(t.records), defines, reads, counts: t.counts, failed: None };
+        }
+        (Err(e), _) => ImplTablesFailed::Tables(e),
+        (Ok(_), Err(e)) => ImplTablesFailed::Reads(e),
+    };
+    // A crate with no key fails as `NoCrateKey`; its row is named by the all-zero key.
+    let crate_key = NamesSource::crate_key(records, krate).unwrap_or(CrateItemKey(ContentId([0; 32])));
+    ImplTablesDone {
+        name: impl_tables_name(crate_key),
+        key: drive::Key(rows_key(crate_key, rows)),
+        out: ContentId::of(OUT_DOMAIN, b"failed"),
+        records: None,
+        defines: AVec::new_in(alloc),
+        reads: AVec::new_in(alloc),
+        counts: FileCounts::default(),
+        failed: Some(failed),
     }
 }
 
@@ -178,6 +274,24 @@ pub fn row_digest(row: &ImplRow<'_>) -> ContentId {
     h.finish()
 }
 
+/// [`ImplTables::key`]: the crate's key, then its rows' digests in impl key order.
+fn key_of(crate_key: CrateItemKey, digests: impl Iterator<Item = ContentId>) -> ContentId {
+    let mut key = Hasher::new(TABLES_DOMAIN);
+    key.update(&crate_key.0.0);
+    for digest in digests {
+        key.id(&digest);
+    }
+    key.finish()
+}
+
+/// [`key_of`] of `rows` in any order.
+pub fn rows_key(crate_key: CrateItemKey, rows: &[ImplRow<'_>]) -> ContentId {
+    let mut by_key: Vec<(LibKey, ContentId), Global> = Vec::with_capacity_in(rows.len(), Global);
+    by_key.extend(rows.iter().map(|row| (row.key, row_digest(row))));
+    by_key.sort_unstable_by_key(|it| it.0);
+    key_of(crate_key, by_key.iter().map(|it| it.1))
+}
+
 /// Crate `krate`'s impl tables from its impl rows `rows` (its items record's, in any order)
 /// and the names `names` resolves them by: a pure function of the two, its buffers in
 /// `alloc`. Every row is filed once ([`file_rows`]); a row blaze-surface refuses is in
@@ -188,11 +302,7 @@ pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, row
     let mut by_key: AVec<'a, (LibKey, ContentId, surface::ImplFlags)> = AVec::with_capacity_in(rows.len(), alloc);
     by_key.extend(rows.iter().map(|row| (row.key, row_digest(row), row.flags.intersect(surface::ImplFlags::HEADER))));
     by_key.sort_unstable_by_key(|it| it.0);
-    let mut key = Hasher::new(TABLES_DOMAIN);
-    key.update(&crate_key.0.0);
-    for (_, digest, _) in by_key.iter() {
-        key.id(digest);
-    }
+    let key = key_of(crate_key, by_key.iter().map(|it| it.1));
     let mut out: AVec<'a, surface::ImplRow> = AVec::with_capacity_in(rows.len(), alloc);
     let mut named: AVec<'a, CrateItemKey> = AVec::new_in(alloc);
     let mut no_checker_type = 0u32;
@@ -230,7 +340,7 @@ pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, row
     defines.extend(out.iter().filter_map(|row| row.trait_).map(|t| (trait_cell(t), TRAIT_HELD)));
     defines.sort_unstable();
     defines.dedup();
-    Ok(ImplTables { krate: crate_key, key: key.finish(), records, named, counts, no_checker_type, defines })
+    Ok(ImplTables { krate: crate_key, key, records, named, counts, no_checker_type, defines })
 }
 
 /// The table row of one filing (module docs' table); `None` for an impl filed nowhere.
@@ -552,7 +662,10 @@ fn bucket_read(read: ImplRead) -> BucketRead {
         ImplRead::Filter { krate, probe, may_hold } => {
             let bucket = match probe {
                 Probe::Trait(t) => first8(&ContentId::of(PROBE_DOMAIN, &t.0.0).0),
-                Probe::Bucket(hash) => hash.mark(),
+                // Not `hash.mark()`: that is the bucket's directory read, whose answer is the
+                // bucket's digest; a probe's answer is "may hold", so the two are two facts
+                // (one fact with two answers is refused, rule 21).
+                Probe::Bucket(hash) => first8(&ContentId::of(PROBE_BUCKET_DOMAIN, &hash.0).0),
             };
             BucketRead { krate: first16(krate.0), bucket, answer: u64::from(may_hold) }
         }
@@ -668,6 +781,10 @@ impl Buckets {
                 self.indexed.lookups += 1;
             }
             reads.push(bucket_read(*read));
+            // The task's recorder (front2 tables/view.rs), as a cell of the crate's tables.
+            if let Some(cell) = cells_of(read) {
+                names.impls_read(cell);
+            }
         }
         self.indexed.asks += 1;
         self.indexed.from_index += filed as u32;

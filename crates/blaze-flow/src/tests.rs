@@ -588,7 +588,7 @@ fn live_mutable_loan_then_shared_borrow_is_refused() {
     let flow = finish(b);
     assert_eq!(
         tiers(&flow),
-        (TierOne::Refused, std::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(2)), loan: l, span: S }])
+        (TierOne::Refused, std::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(2)), loan: l, span: S, returned: false }])
     );
     match check_body(&flow, Global) {
         Ok(r) => assert!(r.proof.is_none() && r.borrows.len() == 1),
@@ -746,7 +746,8 @@ fn signature_method_returns_a_borrow_of_self() {
 
 /// `fn f<'a>() -> &'a u8 { let v = 0; &v }` is wrong, the classic (rustc's E0515, "cannot return
 /// reference to local variable"): the loan of `v` is in `'a`, a placeholder, live at every point,
-/// when `v`'s storage dies. Both tiers refuse; the finding names the loan at the `StorageDead`.
+/// when `v`'s storage dies. Both tiers refuse; the finding names the loan at the `StorageDead`,
+/// held by the return place's origin (`returned`: E0515's case, not E0597's).
 #[test]
 fn signature_refuses_a_reference_to_a_local() {
     // _0 the returned &'a u8, _1 v, _2 the borrow.
@@ -767,7 +768,7 @@ fn signature_refuses_a_reference_to_a_local() {
     let flow = finish(b);
     assert_eq!(
         tiers(&flow),
-        (TierOne::Refused, std::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(4)), loan: l, span: S }])
+        (TierOne::Refused, std::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(4)), loan: l, span: S, returned: true }])
     );
 }
 

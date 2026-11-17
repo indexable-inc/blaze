@@ -160,37 +160,49 @@ pub struct Solve {
     pub ns: u64,
     /// Solver calls repeated after a fact was filled (`InferCtx::need_rounds`).
     pub refills: u64,
-    /// Goal frames the solver entered, cache hits, ground fast-path answers, impl candidates
-    /// assembled, and cycle reruns (blaze-solve `Stats`).
-    pub frames: u64,
-    pub cache_hits: u64,
-    pub fast_path: u64,
-    pub candidates: u64,
-    pub reruns: u64,
+    /// The solver's own counters (blaze-solve `Stats`: goals, frames, cache hits, imports,
+    /// canonical forms, ...), summed over the contexts counted.
+    pub stats: blaze_solve::eval::Stats,
+    /// Calls into the fact cache (`FactCache::fill`), and those that read the world because
+    /// the fact was not kept yet.
+    pub fills: u64,
+    pub fill_misses: u64,
+    /// The misses by the solver's question kind (blaze-solve `Question::kind`).
+    pub misses_by_kind: [u64; blaze_solve::facts::QUESTION_KIND_NAMES.len()],
+    /// The read list's entries recorded (one per answer asked, repeats included) and kept
+    /// after its sort and dedup (`Reads::finish`).
+    pub entries_recorded: u64,
+    pub entries_kept: u64,
 }
 
 impl Solve {
-    fn add(&mut self, o: &Solve) {
+    /// Adds `o` into `self`.
+    pub fn add(&mut self, o: &Solve) {
         self.calls += o.calls;
         self.ns += o.ns;
         self.refills += o.refills;
-        self.frames += o.frames;
-        self.cache_hits += o.cache_hits;
-        self.fast_path += o.fast_path;
-        self.candidates += o.candidates;
-        self.reruns += o.reruns;
+        self.stats.add(&o.stats);
+        self.fills += o.fills;
+        self.fill_misses += o.fill_misses;
+        for (a, b) in self.misses_by_kind.iter_mut().zip(o.misses_by_kind.iter()) {
+            *a += *b;
+        }
+        self.entries_recorded += o.entries_recorded;
+        self.entries_kept += o.entries_kept;
     }
 
-    fn since(&self, e: &Solve) -> Solve {
+    /// `self - e`: what happened between two readings.
+    pub fn since(&self, e: &Solve) -> Solve {
         Solve {
             calls: self.calls - e.calls,
             ns: self.ns - e.ns,
             refills: self.refills - e.refills,
-            frames: self.frames - e.frames,
-            cache_hits: self.cache_hits - e.cache_hits,
-            fast_path: self.fast_path - e.fast_path,
-            candidates: self.candidates - e.candidates,
-            reruns: self.reruns - e.reruns,
+            stats: self.stats.since(&e.stats),
+            fills: self.fills - e.fills,
+            fill_misses: self.fill_misses - e.fill_misses,
+            misses_by_kind: core::array::from_fn(|i| self.misses_by_kind[i] - e.misses_by_kind[i]),
+            entries_recorded: self.entries_recorded - e.entries_recorded,
+            entries_kept: self.entries_kept - e.entries_kept,
         }
     }
 }

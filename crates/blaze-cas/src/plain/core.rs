@@ -20,7 +20,7 @@ use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as Ef
 use blaze_ids::{ContentId, crc32c};
 use blaze_keyed::{
     kind::{Namespace, Tag},
-    store::{ALIGN, ENTRY, FOOTER, HEADER, Put, SegmentId, StoreError, StoreFile},
+    store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, Put, SegmentId, StoreError, StoreFile, TwoValues},
 };
 
 use super::format::{
@@ -28,7 +28,8 @@ use super::format::{
     SLOT_AT, Segment, Slot, aligned, record_crc,
 };
 use super::verified::{Boot, Checks, Unverified, Verified};
-use crate::{Corrupt, Key, Mismatch, content_of};
+use super::lent::two_values;
+use crate::{Corrupt, Key};
 
 /// The lazy open's reads: [`Plain::find`], [`Plain::map_all`], the probe order.
 mod probe;
@@ -161,8 +162,8 @@ pub struct Placed {
 /// because a mismatch is an answer there ([`Put::Other`]), not a failure.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PutError {
-    /// The key holds other bytes.
-    Mismatch(Mismatch),
+    /// The key holds other bytes: both sides and where they first differ.
+    Mismatch(TwoValues),
     /// A value of 4 GiB or more, or a batch past what an entry's offset holds.
     TooLong { key: Key, len: u64 },
     /// A put names a namespace this store does not write ([`PlainConfig::writes`]): a machine
@@ -195,7 +196,7 @@ impl PutError {
     /// laying out two batches, a root) is two values under one key (rule 21).
     pub fn into_store(self, tag: Tag) -> StoreError {
         match self {
-            PutError::Mismatch(it) => StoreError::TwoValues { tag, key: it.key.0 },
+            PutError::Mismatch(two) => StoreError::TwoValues(two),
             PutError::TooLong { key, len } => StoreError::TooLong { tag, key: key.0, len },
             PutError::NotWritable { namespace } => StoreError::NotWritable { namespace },
             // blaze-keyed's vocabulary has no row for it yet (store-next.md lists it): the
@@ -209,7 +210,7 @@ impl std::fmt::Display for PutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PutError::NotWritable { namespace } => write!(f, "a put names namespace {:x}, which this store does not write: a machine that is not a trusted writer writes only the local namespace", namespace.0),
-            PutError::Mismatch(it) => write!(f, "{:x} holds other bytes ({:x}) than the put's ({:x}): a key covers every input its value depends on", it.key.0, it.kept, it.given),
+            PutError::Mismatch(two) => write!(f, "{two}"),
             PutError::TooLong { key, len } => write!(f, "the value of {:x} is {len} bytes: a plain store's record is shorter than 4 GiB and a segment shorter than 16 TiB", key.0),
             PutError::Machine { key, namespace, at, needle } => write!(
                 f,
@@ -691,7 +692,7 @@ impl Held {
                 return Ok(Put::Same);
             }
             let kept = self.batch.payload(entry);
-            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
+            return Err(PutError::Mismatch(two_values(&key, Holder::ThisProcess, entry.tag, kept, tag, value)));
         }
         self.batch.put(key, tag, value)?;
         self.at.insert(key, self.batch.entries.len() - 1);
@@ -1124,14 +1125,14 @@ impl Plain {
                 return Ok(Put::Same);
             }
             let kept = held.batch.payload(&entry);
-            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
+            return Err(PutError::Mismatch(two_values(&key, Holder::ThisProcess, entry.tag, kept, tag, value)));
         }
         if let Some((mapped, entry)) = self.find_in(std::slice::from_ref(&namespace), &key) {
             if same(&entry) {
                 return Ok(Put::Same);
             }
             let kept = self.maps[mapped].payload(&entry);
-            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
+            return Err(PutError::Mismatch(two_values(&key, Holder::Committed, entry.tag, kept, tag, value)));
         }
         let held = &mut self.held[at];
         held.batch.put(key, tag, value)?;
@@ -1244,36 +1245,38 @@ impl Plain {
             let mut entries: Vec<Entry> = Vec::with_capacity_in(all.len(), Global);
             // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment.
             let mut bytes: Vec<u8> = Vec::new_in(Global);
-            let mut last: Option<Entry> = None;
+            let mut last: Option<(Entry, &[u8])> = None;
             for (entry, payload) in all {
-                if let Some(kept) = last
+                if let Some((kept, kept_payload)) = last
                     && kept.key == entry.key
                 {
                     if !kept.same_record(&entry) {
                         // Two workers put other bytes under one key: two values (rule 21).
-                        return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
+                        return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::ThisProcess, kept.tag, kept_payload, entry.tag, payload)));
                     }
                     continue;
                 }
-                last = Some(entry);
+                last = Some((entry, payload));
                 if entry.tag == POINTER_TAG {
                     // A pointer replaces, so it is always laid out, even when this process's view
                     // holds its value: that view may be older than another process's commit of
                     // another value, and this commit's row, after every row the generation it
                     // flips on names, must make this value the newest. A key held under another
                     // tag is two values (rule 21).
-                    if let Some((_, kept)) = self.newest_mapped(namespace, &Key(entry.key))
+                    if let Some((mapped, kept)) = self.newest_mapped(namespace, &Key(entry.key))
                         && kept.tag != POINTER_TAG
                     {
-                        return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
+                        let kept_payload = self.maps[mapped].payload(&kept);
+                        return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept.tag, kept_payload, entry.tag, payload)));
                     }
-                } else if let Some((_, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
+                } else if let Some((mapped, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
                     if kept.same_record(&entry) {
                         // Committed already: not laid again.
                         continue;
                     }
                     // A record committed under the key with other bytes (rule 21).
-                    return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
+                    let kept_payload = self.maps[mapped].payload(&kept);
+                    return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept.tag, kept_payload, entry.tag, payload)));
                 }
                 let at = HEADER as u64 + bytes.len() as u64;
                 let end = at + u64::from(entry.len);

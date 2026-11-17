@@ -192,64 +192,121 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         if !self.store.made(want) {
             self.store.ensure(self.front.names, &mut self.front.keys, want).map_err(|error| HeadDigestError::Ensure { want, error })?;
         }
-        let heads = self.heads_of(want, alloc);
-        let mut h = Hasher::new(WANT_DOMAIN);
-        h.update(&(heads.len() as u64).to_le_bytes());
-        for at in heads.iter().copied() {
-            let head = head_record::from_store(&self.store, at, None, None).map_err(|error| HeadDigestError::Record { want, at, error })?;
-            // What the head means, not how it is spelled: a reformat moves no reader.
-            let digest = head_record::reader_digest(head, self.store.tys.view(), alloc).map_err(|error| HeadDigestError::Record { want, at, error })?;
-            h.update(&digest.0);
-        }
-        Ok(h.finish())
+        want_digest_in(self.front.names, &self.front.keys, &self.store, want, alloc)
     }
 
-    /// The heads `want` makes, in a fixed order: the item's own first, then its members' or
-    /// constructors' by key.
-    fn heads_of<'a>(&self, want: Want, alloc: Alloc<'a>) -> AVec<'a, HeadAt> {
-        let mut out: AVec<'a, HeadAt> = AVec::new_in(alloc);
-        match want {
-            Want::Fn(lib) => out.push(HeadAt::Fn(checker_of(lib))),
-            Want::MemberFn(_, f) => out.push(HeadAt::Fn(f)),
-            Want::Impl(lib) => out.push(HeadAt::Impl(checker_of(lib))),
-            Want::Adt(lib) => {
-                out.push(HeadAt::Adt(lib));
-                let adt = checker_of(lib);
-                let mut ctors: AVec<'a, ItemKey> = AVec::new_in(alloc);
-                for &k in self.store.ctors.keys() {
-                    let Some(Origin::Member { container, .. }) = self.front.keys.origin(k) else { continue };
-                    let of_this = *container == adt
-                        || matches!(by_origin::kind_of_key(self.front.names, &self.front.keys, *container), Ok(KeyKind::Item(by_origin::ItemKind::Variant { enum_, .. })) if enum_ == lib);
-                    if of_this {
-                        ctors.push(k);
-                    }
-                }
-                ctors.sort_unstable();
-                out.extend(ctors.iter().map(|k| HeadAt::Ctor(*k)));
-            }
-            Want::Members(lib) => {
-                out.push(HeadAt::Trait(lib));
-                if let Some(head) = self.store.maps.traits.get(&lib) {
-                    let mut fns: AVec<'a, ItemKey> = AVec::new_in(alloc);
-                    fns.extend(head.fns.iter().map(|(_, k)| *k).filter(|k| self.store.fns.contains_key(k)));
-                    fns.sort_unstable();
-                    out.extend(fns.iter().map(|k| HeadAt::Fn(*k)));
-                }
-            }
-            Want::Head(lib) => {
-                if self.store.maps.aliases.contains_key(&lib) {
-                    out.push(HeadAt::Alias(lib));
-                } else if self.store.maps.trait_aliases.contains_key(&lib) {
-                    out.push(HeadAt::TraitAlias(lib));
-                } else if self.store.maps.traits.contains_key(&lib) {
-                    out.push(HeadAt::Trait(lib));
-                } else {
-                    out.push(HeadAt::Adt(lib));
-                }
+}
+
+/// The digest of every head `want` made in `store` ([`want_heads`]; see the module docs): the
+/// count, then each head's [`head_record::reader_digest`] in that order. `want` must be made.
+pub fn want_digest_in<'n, N: crate::front2::source::NamesSource<'n>>(names: N, keys: &crate::front2::keys::Keys, store: &crate::front2::heads::Store<'_>, want: Want, alloc: Alloc<'_>) -> Result<ContentId, HeadDigestError> {
+    let heads = want_heads(names, keys, store, want, alloc);
+    let mut digests: AVec<'_, ContentId> = AVec::new_in(alloc);
+    for at in heads.iter().copied() {
+        let head = head_record::from_store(store, at, None, None).map_err(|error| HeadDigestError::Record { want, at, error })?;
+        // What the head means, not how it is spelled: a reformat moves no reader.
+        digests.push(head_record::reader_digest(head, store.tys.view(), alloc).map_err(|error| HeadDigestError::Record { want, at, error })?);
+    }
+    Ok(digest_of_heads(digests.len(), digests.iter().copied()))
+}
+
+/// A want's digest from its `count` heads' reader digests, in [`want_heads`]'s order: the one
+/// formula a `Signature`'s out and a frozen head's meaning (front2/tables/head.rs) share.
+pub fn digest_of_heads(count: usize, digests: impl IntoIterator<Item = ContentId>) -> ContentId {
+    let mut h = Hasher::new(WANT_DOMAIN);
+    h.update(&(count as u64).to_le_bytes());
+    for d in digests {
+        h.update(&d.0);
+    }
+    h.finish()
+}
+
+/// The heads `want` makes in `store` (the one list: a `Signature`'s digest above and a frozen
+/// head, front2/tables/head.rs), in a fixed order with no map order in it: the item's own first,
+/// then the heads made with it, each group sorted by key:
+/// - a fn (free or of an impl): its `impl Trait` return types' opaques;
+/// - an ADT: its constructors, then its field defaults' anonymous constants (RFC 3681);
+/// - a trait's members: its fns and associated constants that have a head (a refused one is a
+///   gap, `Store::fn_gaps`), then those fns' opaques;
+/// - an impl: its associated constants.
+///
+/// A trait's associated types' item bounds (filed in `Store::preds` under each type's key) are
+/// no head of their own kind yet (`HeadAt`), so not listed.
+pub fn want_heads<'n, 'a, N: crate::front2::source::NamesSource<'n>>(names: N, keys: &crate::front2::keys::Keys, store: &crate::front2::heads::Store<'_>, want: Want, alloc: Alloc<'a>) -> AVec<'a, HeadAt> {
+    let mut out: AVec<'a, HeadAt> = AVec::new_in(alloc);
+    // Each opaque made by one of `fns`, sorted.
+    let opaques_of = |fns: &[ItemKey], out: &mut AVec<'a, HeadAt>| {
+        let mut found: AVec<'a, ItemKey> = AVec::new_in(alloc);
+        found.extend(store.opaques.iter().filter(|(_, (f, _))| fns.contains(f)).map(|(k, _)| *k));
+        found.sort_unstable();
+        out.extend(found.iter().map(|k| HeadAt::Opaque(*k)));
+    };
+    match want {
+        Want::Fn(lib) => {
+            out.push(HeadAt::Fn(checker_of(lib)));
+            opaques_of(&[checker_of(lib)], &mut out);
+        }
+        Want::MemberFn(_, f) => {
+            out.push(HeadAt::Fn(f));
+            opaques_of(&[f], &mut out);
+        }
+        Want::Impl(lib) => {
+            let ck = checker_of(lib);
+            out.push(HeadAt::Impl(ck));
+            if let Some(head) = store.impls.get(&ck) {
+                let mut consts: AVec<'a, ItemKey> = AVec::new_in(alloc);
+                consts.extend(head.consts.iter().map(|(_, k)| *k).filter(|k| store.fns.contains_key(k)));
+                consts.sort_unstable();
+                out.extend(consts.iter().map(|k| HeadAt::Fn(*k)));
             }
         }
-        out
+        Want::Adt(lib) => {
+            out.push(HeadAt::Adt(lib));
+            let adt = checker_of(lib);
+            let mut ctors: AVec<'a, ItemKey> = AVec::new_in(alloc);
+            for &k in store.ctors.keys() {
+                let Some(Origin::Member { container, .. }) = keys.origin(k) else { continue };
+                let of_this = *container == adt || matches!(by_origin::kind_of_key(names, keys, *container), Ok(KeyKind::Item(by_origin::ItemKind::Variant { enum_, .. })) if enum_ == lib);
+                if of_this {
+                    ctors.push(k);
+                }
+            }
+            ctors.sort_unstable();
+            out.extend(ctors.iter().map(|k| HeadAt::Ctor(*k)));
+            let mut defaults: AVec<'a, ItemKey> = AVec::new_in(alloc);
+            if let Some(d) = store.field_defaults.get(&adt) {
+                defaults.extend(d.iter().flatten().copied().filter(|k| store.fns.contains_key(k)));
+            }
+            defaults.sort_unstable();
+            out.extend(defaults.iter().map(|k| HeadAt::Fn(*k)));
+        }
+        Want::Members(lib) => {
+            out.push(HeadAt::Trait(lib));
+            if let Some(head) = store.maps.traits.get(&lib) {
+                let mut fns: AVec<'a, ItemKey> = AVec::new_in(alloc);
+                fns.extend(head.fns.iter().map(|(_, k)| *k).filter(|k| store.fns.contains_key(k)));
+                if let Some(extra) = store.trait_defs.get(&checker_of(lib)) {
+                    fns.extend(extra.consts.iter().map(|(_, k)| *k).filter(|k| store.fns.contains_key(k)));
+                }
+                fns.sort_unstable();
+                fns.dedup();
+                out.extend(fns.iter().map(|k| HeadAt::Fn(*k)));
+                opaques_of(&fns, &mut out);
+            }
+        }
+        Want::Head(lib) => {
+            if store.maps.aliases.contains_key(&lib) {
+                out.push(HeadAt::Alias(lib));
+            } else if store.maps.trait_aliases.contains_key(&lib) {
+                out.push(HeadAt::TraitAlias(lib));
+            } else if store.maps.traits.contains_key(&lib) {
+                out.push(HeadAt::Trait(lib));
+            } else {
+                out.push(HeadAt::Adt(lib));
+            }
+        }
     }
+    out
 }
 
 /// A want's library key: the item it is of (an impl fn's: its impl's).

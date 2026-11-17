@@ -59,6 +59,34 @@ pub struct SigLife<'s> {
     /// `(a, b)`: the signature declares `a: b`, or its form implies it (an `async fn`'s inputs
     /// outlive its future, `read_signature_in`).
     pub bounds: &'s [(Region, Region)],
+    /// The regions of the fn's BODY's value, its own return place: the output's for a fn, the
+    /// written return type's for an `async fn` (whose output, what a caller gets, is the future).
+    pub body: BodyOut<'s>,
+}
+
+/// The regions of a body's value ([`SigLife::body`]). The Reference, "Async functions": `async
+/// fn f(x: &u8) -> T` is "roughly equivalent to" `fn f<'a>(x: &'a u8) -> impl Future<Output = T>
+/// + 'a`, the body an `async move` block whose value is the future's `Output`: so the body's value
+/// must be a `T` as written, its regions the signature's (RFC 2394), exactly as a fn's returned
+/// value is checked against its declared output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyOut<'s> {
+    /// A fn's body: its value is the output, `regions[ends.last()..]`.
+    Output,
+    /// An `async fn`'s body: its value is the written return type, one region per position.
+    Async(&'s [Region]),
+    /// An `async fn` whose written return type was not lined up, and why: its body is not
+    /// checked against it (the lowering refuses it by name), its callers still are.
+    AsyncUnread(SigRefusal),
+}
+
+/// The body part of a [`SigBuf`]: [`BodyOut`] owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyState {
+    Output,
+    /// The regions are [`SigBuf::body_regions`].
+    Async,
+    AsyncUnread(SigRefusal),
 }
 
 /// The owned form [`read_signature`] fills.
@@ -71,6 +99,10 @@ pub struct SigBuf<A: Allocator + Clone> {
     pub type_outlives: Vec<(blaze_typeck::Name, Region), A>,
     /// A type-outlives bound whose left side is not one bare name (`Self: 'a`, `&'b T: 'a`).
     pub type_outlives_unread: bool,
+    /// What the body's value's regions are ([`BodyOut`]).
+    pub body: BodyState,
+    /// With [`BodyState::Async`]: the written return type's regions.
+    pub body_regions: Vec<Region, A>,
 }
 
 impl<A: Allocator + Clone> SigBuf<A> {
@@ -79,13 +111,20 @@ impl<A: Allocator + Clone> SigBuf<A> {
             regions: Vec::new_in(alloc.clone()),
             ends: Vec::new_in(alloc.clone()),
             bounds: Vec::new_in(alloc.clone()),
-            type_outlives: Vec::new_in(alloc),
+            type_outlives: Vec::new_in(alloc.clone()),
             type_outlives_unread: false,
+            body: BodyState::Output,
+            body_regions: Vec::new_in(alloc),
         }
     }
 
     pub fn life(&self) -> SigLife<'_> {
-        SigLife { regions: &self.regions, ends: &self.ends, bounds: &self.bounds }
+        let body = match self.body {
+            BodyState::Output => BodyOut::Output,
+            BodyState::Async => BodyOut::Async(&self.body_regions),
+            BodyState::AsyncUnread(why) => BodyOut::AsyncUnread(why),
+        };
+        SigLife { regions: &self.regions, ends: &self.ends, bounds: &self.bounds, body }
     }
 }
 
@@ -115,6 +154,9 @@ pub enum SigRefusal {
     /// that was not read, and why (impl_life.rs); `at`: the path's offset in the fn's text, 0
     /// for the header.
     Assoc { at: u32, why: AssocWhy },
+    /// An `async fn` read without its written return type's erased form (the `Output` of its
+    /// future: [`read_async_signature`] takes it): its body's value cannot be lined up.
+    AsyncOutputNotGiven,
 }
 
 /// The reader's bound on any one walk (tokens, types): a signature past it is refused.
@@ -703,6 +745,24 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
         Ok(())
     }
 
+    /// An `async fn`'s written return type `written` (its tokens `out_ty`, none for `()`) lined
+    /// up into `body` by the output's elision `decided`: the body's value's regions
+    /// ([`BodyOut::Async`]).
+    fn async_body(&mut self, written: PTy, out_ty: Option<(u32, u32)>, decided: Option<Region>, body: &mut Vec<Region, A>) -> Result<(), SigRefusal> {
+        body.clear();
+        let n = self.count(written)?;
+        body.resize(n as usize, Region::Hidden(u32::MAX));
+        match out_ty {
+            Some((lo, hi)) => self.line_up(Pair { ty: written, lo, hi, base: 0, ctx: Ctx::Other, whole_self: false }, Mode::Output(decided), body)?,
+            None if n == 0 => {}
+            None => return Err(SigRefusal::Unaligned { at: self.text.len() as u32 }),
+        }
+        if body.iter().any(|x| *x == Region::Hidden(u32::MAX)) {
+            return Err(SigRefusal::Unaligned { at: out_ty.map_or(self.text.len() as u32, |(lo, _)| self.at(lo)) });
+        }
+        Ok(())
+    }
+
     /// The declared bounds of one generics list or where clause: `'a: 'b + 'c`.
     fn bounds(&mut self, lo: u32, hi: u32, out: &mut Vec<(Region, Region), A>) {
         let mut parts: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
@@ -746,18 +806,43 @@ pub fn read_signature<A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
-    read_signature_in(text, None, tys, inputs, output, adt_lifetimes, out, alloc)
+    read_signature_in(text, None, tys, inputs, output, None, adt_lifetimes, out, alloc)
+}
+
+/// [`read_signature`] (of a member of the impl `imp` when given: [`read_impl_signature`]) of an
+/// `async fn`: `future` is its output, the opaque future a caller gets, and `written` that
+/// future's `Output`, the return type as written, which the body's value is lined up with
+/// ([`SigLife::body`]). A text that is not an `async fn`'s reads as [`read_signature`] does.
+#[expect(clippy::too_many_arguments, reason = "read_signature's inputs, the impl, and the async fn's written output")]
+pub fn read_async_signature<'t, A: Allocator + Clone>(
+    text: &'t str,
+    imp: Option<ImplText<'t>>,
+    tys: PTys<'_>,
+    inputs: &[PTy],
+    future: PTy,
+    written: PTy,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
+    out: &mut SigBuf<A>,
+    alloc: A,
+) -> Result<(), SigRefusal> {
+    let life = match imp {
+        Some(it) => Some(impl_life::impl_life_or_unread(text, it, tys, adt_lifetimes, alloc.clone())?),
+        None => None,
+    };
+    read_signature_in(text, life, tys, inputs, future, Some(written), adt_lifetimes, out, alloc)
 }
 
 /// [`read_signature`], of a member of the impl `imp` when given (impl_life.rs
-/// [`read_impl_signature`]): its lifetimes by name, its `Self::Name`, its header's bounds.
-#[expect(clippy::too_many_arguments, reason = "read_signature's inputs and the impl's reading")]
+/// [`read_impl_signature`]): its lifetimes by name, its `Self::Name`, its header's bounds; of an
+/// `async fn` with its written output when given ([`read_async_signature`]).
+#[expect(clippy::too_many_arguments, reason = "read_signature's inputs, the impl's reading and the async fn's written output")]
 fn read_signature_in<'t, A: Allocator + Clone>(
     text: &'t str,
     imp: Option<impl_life::ImplLife<'t, A>>,
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
+    async_written: Option<PTy>,
     adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
     out: &mut SigBuf<A>,
     alloc: A,
@@ -767,6 +852,8 @@ fn read_signature_in<'t, A: Allocator + Clone>(
     out.bounds.clear();
     out.type_outlives.clear();
     out.type_outlives_unread = false;
+    out.body = BodyState::Output;
+    out.body_regions.clear();
     let mut r = Reader {
         text,
         tys,
@@ -915,6 +1002,18 @@ fn read_signature_in<'t, A: Allocator + Clone>(
                 }
             }
         }
+        // The body's value is the written return type (`BodyOut`): its regions by the same
+        // elision as a fn's output, the fn's names, and hidden regions after the future's.
+        out.body = match async_written {
+            None => BodyState::AsyncUnread(SigRefusal::AsyncOutputNotGiven),
+            Some(written) => match r.async_body(written, out_ty, decided, &mut out.body_regions) {
+                Ok(()) => BodyState::Async,
+                Err(why) => {
+                    out.body_regions.clear();
+                    BodyState::AsyncUnread(why)
+                }
+            },
+        };
     }
     let wheres = if where_at < end { Some((where_at + 1, end)) } else { None };
     r.type_outlives(generics, wheres, &mut out.type_outlives, &mut out.type_outlives_unread)?;

@@ -293,8 +293,11 @@ pub fn invalidated<A: Allocator>(flow: &Flow<A>, facts: &Facts<A>, s: Stmt, l: L
 /// A borrow finding: what, where, and the statement's item-relative range.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum BorrowFinding {
-    /// `errors(L, P)`: a live loan is invalidated.
-    Invalidated { at: Point, loan: Loan, span: Span },
+    /// `errors(L, P)`: a live loan is invalidated. `returned`: an origin of the return place
+    /// (local 0) holds the loan at some point, so the value returned borrows what ends (a
+    /// returned reference must outlive the call; rustc words it E0515, "cannot return
+    /// reference to local variable").
+    Invalidated { at: Point, loan: Loan, span: Span, returned: bool },
     /// `subset_errors`: two placeholders related without the signature saying so.
     UnprovenOutlives { at: Point, from: Origin, into: Origin, span: Span },
 }
@@ -539,10 +542,17 @@ pub fn tier_two<A: Allocator + Clone>(
                 contains.get(p.index(), x * nl + l) && live(p.index(), x)
             });
             if live_at && invalidated(flow, facts, stmt, Loan(l as u32)) {
+                // The loan reaches the return place: at some point an origin of local 0 holds
+                // it (the value returned borrows it, wherever the loan's end falls; a block's
+                // value is often moved into local 0 after its locals' storage ended).
+                let returned = flow.local_origins.iter().any(|&(local, x)| {
+                    local == Local(0) && (0..points).any(|q| contains.get(q, x.index() * nl + l))
+                });
                 out.push(BorrowFinding::Invalidated {
                     at: p,
                     loan: Loan(l as u32),
                     span: flow.stmts[s].span,
+                    returned,
                 });
             }
         }
