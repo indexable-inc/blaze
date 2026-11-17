@@ -1155,14 +1155,18 @@ fn watches_hear_a_file_written_under_them() {
             std::fs::write(root.join("src/keep"), b"edited").unwrap();
         }
         let mut done = Vec::new();
+        // The write's own completion too: a watch may hear the file, and end, before the
+        // driver reaps it (the uring driver does), and then it is still in flight.
+        let mut written = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !ended && std::time::Instant::now() < deadline {
+        while !(ended && written) && std::time::Instant::now() < deadline {
             driver.submit(&mut effects);
             driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
             for it in done.drain(..) {
                 match it.done {
                     Done::Changed { files, .. } => heard.extend(files),
                     Done::Unwatched => ended = true,
+                    Done::Written if it.tag == Tag(2) => written = true,
                     Done::Failed(why) => panic!("{why}"),
                     _ => {}
                 }
@@ -1173,6 +1177,7 @@ fn watches_hear_a_file_written_under_them() {
             }
         }
         assert!(ended, "the watch never ended; heard {heard:?}");
+        assert!(written, "the write never completed; heard {heard:?}");
         assert_eq!(driver.in_flight(), 0);
         heard
     }
