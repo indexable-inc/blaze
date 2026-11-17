@@ -58,7 +58,7 @@ use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 
-const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+const MAIN: &str = "fn main(cx: &Cx) -> Result<(), Error> {
     Ok(())
 }
 mod far {

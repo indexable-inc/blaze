@@ -170,24 +170,10 @@ pub fn rust_start<'n>(names: &'n Names<'n>, lang_start: LibKey, main: LibKey, st
     Ok(RustStart { lang_start, main, returns: head.output })
 }
 
-/// `lib` as `module::name` for a message (as program.rs `item_named`), or its key.
+/// `lib` for a message: front2 item_shown.rs `ItemShown`, the one printer of an item in a
+/// refusal (its whole path and its key).
 fn shown(names: &Names<'_>, lib: LibKey) -> String {
-    let mut out = String::new();
-    let name = names.item_text(lib).and_then(|t| t.name);
-    let module = names.crate_of(lib).and_then(|k| names.module_of(lib).and_then(|m| names.krate(k).path_of(m)));
-    match (module, name) {
-        (Some(m), Some(n)) => {
-            out.push_str(m);
-            out.push_str("::");
-            out.push_str(n);
-        }
-        (None, Some(n)) => out.push_str(n),
-        _ => {
-            use core::fmt::Write;
-            write!(out, "{lib:x}").expect("writing into a `String` cannot fail");
-        }
-    }
-    out
+    super::item_shown::ItemShown::of_lib(names, lib).to_string()
 }
 
 /// The crates looked in for `#[lang = "start"]`: each one's name and root file, in the names

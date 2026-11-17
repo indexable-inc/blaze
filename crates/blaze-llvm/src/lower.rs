@@ -121,12 +121,44 @@ impl From<fmt::Error> for LowerError {
     }
 }
 
+/// The linkage of the lowered function itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Root {
+    /// A definition the object exports: every tier's function.
+    External,
+    /// A definition only this module sees: a body inlined into another of the module and then
+    /// dropped (T2's one-instruction function inside its wrapper, table_gen.rs).
+    Internal,
+}
+
+impl Root {
+    const fn linkage(self) -> &'static str {
+        match self {
+            Root::External => "",
+            Root::Internal => "internal ",
+        }
+    }
+}
+
 /// Lowers `func` (named `symbol`, its outside references named by `names`) with its offered
 /// callees and the facts of every callee into one module.
 pub fn lower<'a, 'v>(
     func: View<'_>,
     names: &dyn Names,
     symbol: Symbol,
+    offered: &[Offered<'v>],
+    facts: &[CalleeFacts],
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 'v>, LowerError> {
+    lower_as(func, names, symbol, Root::External, offered, facts, alloc)
+}
+
+/// [`lower`] with the function's own linkage `root`.
+pub fn lower_as<'a, 'v>(
+    func: View<'_>,
+    names: &dyn Names,
+    symbol: Symbol,
+    root: Root,
     offered: &[Offered<'v>],
     facts: &[CalleeFacts],
     alloc: Alloc<'a>,
@@ -166,7 +198,7 @@ pub fn lower<'a, 'v>(
     let mut ir = String::new_in(alloc);
     let mut decls: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     let cx = Cx { defined: &defined, facts: &facts_sorted, alloc };
-    Emit::new(func, names, symbol, 0, "", &cx, &mut ir, &mut decls).body()?;
+    Emit::new(func, names, symbol, 0, root.linkage(), &cx, &mut ir, &mut decls).body()?;
     for (index, &(sym, at)) in lir.iter().enumerate() {
         let Offered::Lir { view, names, .. } = &offered[at] else { continue };
         Emit::new(*view, *names, sym, index as u32 + 1, "available_externally ", &cx, &mut ir, &mut decls).body()?;

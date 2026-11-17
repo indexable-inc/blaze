@@ -86,6 +86,10 @@ pub use unwind::{Panics, split_with};
 #[path = "coroutine_overlap.rs"]
 mod overlap;
 
+#[path = "coroutine_region.rs"]
+mod region;
+pub use region::{Region, SlotName, split_in};
+
 /// The tag of a state never polled.
 pub const UNRESUMED: u32 = 0;
 /// The tag of a state whose body returned.
@@ -215,6 +219,27 @@ pub enum CoroutineError {
     NotCarried { value: u32, function: Which },
     /// The state, or an output, is past what a 32-bit offset or row names.
     TooLarge,
+    /// In a state laid out from types ([`Region`]): the kept slots end at `needed`, past the
+    /// region's `end`.
+    PastRegion { needed: u32, end: u32 },
+    /// In a state laid out from types: a value live across a suspend (or into a cleanup path)
+    /// that is not made again after it. Only flow-level locals cross a suspension; the builder
+    /// writes each into its slot (main's ruling, 2026-11-16; coroutine_region.rs).
+    ValueAcrossSuspend { value: u32 },
+    /// In a state laid out from types: its tag is not the width `points` suspend points need.
+    RegionTag { points: u32 },
+    /// In a state laid out from types: a kept slot asks alignment `2^needed`, past its `2^align`.
+    RegionAlign { needed: u8, align: u8 },
+    /// In a state laid out from types: slot `slot` is kept across a suspend by the pass's rule,
+    /// code after a suspension reaches it, and the builder named it as no flow local
+    /// ([`SlotName`]). The builder maps the slot to the expression that made it.
+    UnnamedAcrossSuspend { slot: u32 },
+    /// A [`SlotName`] of no slot of the body, or a slot named twice.
+    SlotName { slot: u32 },
+    /// A [`SlotName`] outside the region, or at an offset misaligned for its slot.
+    NameOutside { slot: u32, offset: u32 },
+    /// Two named slots sharing bytes.
+    NamesOverlap { a: u32, b: u32 },
     /// A block of [`Panics`] that is no block, the entry, or a landing block.
     Panics { block: u32 },
 }
@@ -252,6 +277,30 @@ impl fmt::Display for CoroutineError {
                 write!(f, "v{value} is used in {function:?}, where nothing makes it and no suspend carries it")
             }
             CoroutineError::TooLarge => f.write_str("the coroutine's state or an output is past 32-bit offsets"),
+            CoroutineError::PastRegion { needed, end } => write!(
+                f,
+                "the kept slots end at byte {needed}, past the {end} the state laid from types gives them"
+            ),
+            CoroutineError::ValueAcrossSuspend { value } => write!(
+                f,
+                "v{value} is live across a suspend and is no saved local's slot: only flow-level locals cross a suspension (the builder writes each into its slot)"
+            ),
+            CoroutineError::RegionTag { points } => {
+                write!(f, "the state laid from types has a tag of another width than {points} suspend points need")
+            }
+            CoroutineError::RegionAlign { needed, align } => {
+                write!(f, "a kept slot asks alignment 2^{needed}, past the 2^{align} of the state laid from types")
+            }
+            CoroutineError::UnnamedAcrossSuspend { slot } => write!(
+                f,
+                "slot {slot} is read after a suspension and names no saved flow local: only flow locals cross a suspension"
+            ),
+            CoroutineError::SlotName { slot } => write!(f, "a state name of slot {slot}, which the body has not, or names twice"),
+            CoroutineError::NameOutside { slot, offset } => write!(
+                f,
+                "slot {slot} named at state byte {offset}: outside the saved region, or misaligned for the slot"
+            ),
+            CoroutineError::NamesOverlap { a, b } => write!(f, "named slots {a} and {b} share bytes of the state"),
             CoroutineError::Panics { block } => write!(
                 f,
                 "block{block} cannot be where `poll` goes on a finished state: no such block, the entry, or a landing block"
@@ -286,13 +335,36 @@ pub fn split_planted_with<A: Allocator + Clone>(
     plant: Plant,
     alloc: A,
 ) -> Result<Split<A>, CoroutineError> {
+    split_inner(view, shape, panics, plant, None, alloc)
+}
+
+/// The one split: [`split_planted_with`] (the pass lays the state), and with `region`
+/// [`split_in`] (the caller laid it from types and named the slots that are saved locals;
+/// coroutine_region.rs).
+fn split_inner<A: Allocator + Clone>(
+    view: View<'_>,
+    shape: Shape,
+    panics: Panics,
+    plant: Plant,
+    region: Option<(Region, &[SlotName])>,
+    alloc: A,
+) -> Result<Split<A>, CoroutineError> {
     verify(view).map_err(CoroutineError::Verify)?;
     let body = read(view, shape, panics, &alloc)?;
     let live = overlap::addressed(&body, &alloc);
-    let kept = kept_slots(&body, &live, plant, &alloc);
+    let lir_kept = kept_slots(&body, &live, plant, &alloc);
+    // In a laid state the names decide what is kept, and an unnamed slot the pass would keep
+    // that code after a suspension reaches is refused (coroutine_region.rs `kept_by_name`).
+    let (kept, at) = match region {
+        Some((r, names)) => {
+            let (kept, at) = region::kept_by_name(&body, &lir_kept, r, names, &alloc)?;
+            (kept, Some((r, at)))
+        }
+        None => (lir_kept, None),
+    };
     let conflicts = overlap::conflicts(&body, &live, &kept, plant, &alloc);
     let crossing = crossing_values(&body, &alloc);
-    let plan = plan(&body, &kept, &conflicts, &crossing, &alloc)?;
+    let plan = plan(&body, &kept, &conflicts, &crossing, at.as_ref().map(|(r, at)| (*r, &at[..])), &alloc)?;
     let poll = emit(&body, &plan, Which::Poll, plant, &alloc)?;
     let drop = emit(&body, &plan, Which::Drop, plant, &alloc)?;
     Ok(Split { poll, drop, layout: plan.layout })
@@ -644,6 +716,7 @@ fn plan<A: Allocator + Clone>(
     kept: &[bool],
     conflicts: &[u64],
     crossing: &[bool],
+    region: Option<(Region, &[u32])>,
     alloc: &A,
 ) -> Result<Plan<A>, CoroutineError> {
     let view = &body.view;
@@ -669,7 +742,11 @@ fn plan<A: Allocator + Clone>(
     }
     // The kept slots, in slot order as `conflicts` numbers them: two share bytes when no
     // point has both storage-live (coroutine_overlap.rs; the design's D8).
-    let placed = overlap::offsets(&sizes, conflicts, body.shape.prefix_size, alloc)?;
+    // In a laid state each kept slot is at its name's offset (coroutine_region.rs).
+    let placed = match region {
+        Some((_, at)) => region::placed(kept, at, alloc),
+        None => overlap::offsets(&sizes, conflicts, body.shape.prefix_size, alloc)?,
+    };
     let mut at = u64::from(body.shape.prefix_size);
     let mut align = body.shape.prefix_align;
     for (field, &offset) in fields.iter_mut().zip(placed.iter()) {
@@ -681,6 +758,15 @@ fn plan<A: Allocator + Clone>(
         }
     }
     let slots = fields.len();
+    // In a state laid from types the kept slots end inside its region.
+    if let Some((r, _)) = region {
+        if at > u64::from(r.end) {
+            return Err(CoroutineError::PastRegion { needed: u32::try_from(at).unwrap_or(u32::MAX), end: r.end });
+        }
+        if align > r.align {
+            return Err(CoroutineError::RegionAlign { needed: align, align: r.align });
+        }
+    }
     for (value, _) in crossing.iter().enumerate().filter(|it| *it.1) {
         let remade = match view.op(value) {
             Op::SlotAddr => kept[view.data[value] as usize],
@@ -690,6 +776,11 @@ fn plan<A: Allocator + Clone>(
         if remade {
             home[value] = REMADE;
             continue;
+        }
+        // Only flow-level locals cross a suspension (main's ruling): in a laid state a value
+        // crossing that is not made again has no field.
+        if region.is_some() {
+            return Err(CoroutineError::ValueAcrossSuspend { value: value as u32 });
         }
         let ty = Ty(view.tys[value]);
         let Some(size) = spill_bytes(ty, ptr_bits) else {
@@ -737,9 +828,20 @@ fn plan<A: Allocator + Clone>(
     } else {
         (Ty::I32, 2)
     };
-    let tag_offset = align_up(at, tag_align);
-    align = align.max(tag_align);
-    let size = align_up(tag_offset + (1u64 << tag_align), align);
+    let (size, align, tag_offset) = match region {
+        // The caller's layout: the tag where it says, of the width these points need.
+        Some((r, _)) => {
+            if r.tag_ty != tag_ty {
+                return Err(CoroutineError::RegionTag { points });
+            }
+            (u64::from(r.size), r.align, u64::from(r.tag_offset))
+        }
+        None => {
+            let tag_offset = align_up(at, tag_align);
+            let align = align.max(tag_align);
+            (align_up(tag_offset + (1u64 << tag_align), align), align, tag_offset)
+        }
+    };
     // Every offset is an `i32` of a load or store.
     if size > i32::MAX as u64 {
         return Err(CoroutineError::TooLarge);

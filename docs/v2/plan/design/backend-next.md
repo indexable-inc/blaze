@@ -641,3 +641,24 @@ listed where the code contradicts it. Each is decided here; where this differs f
 14. Proofs do not gate a template (critic 12): a template is admitted by evaluator equality over the edge
    tables; the bit-vector proofs are added where they are generated for free. The target CPU is named in the
    key and given to LLVM explicitly, never `native` (critic 11).
+
+## One lowering (the coordinator's ruling, 2026-11-16 21:07; the end state is not built)
+
+Found on the coroutine state's layout (ASYNC P8): flow-lower (about 29 local and temporary sites) and the
+builder's walk (about 56 slot sites) lower the same checked body independently, and neither gives a
+temporary a name the other knows. So the state's layout, made from the flow body's saved locals, had no
+stated tie to the slots the builder keeps across a suspension.
+
+END STATE: one lowering. The checked body is lowered once, to the flow body (the form the borrow check,
+liveness and the Lean semantics of rule 57 are about), and the builder builds code FROM the flow body, for
+every body, coroutine or not. Then a local is one thing by construction and there is no table to keep in
+step. This is a rebuild of the builder's front and is started after tempo runs, as its own design.
+
+UNTIL THEN, one owner of identities, never two conventions that must agree: the FLOW layer names every
+local and temporary and EMITS the table (a binding's pattern to its local; an expression and its role
+(value, borrow, awaitee, pin, result) to its local). The builder never invents a slot that lives across a
+suspension: at each such site it LOOKS UP the local in that table and writes the value to that local's place
+in the state; a value it wants to keep across a suspension that the table does not name is refused, naming
+the expression: that is a gap in the flow body (and so in what the check knows is held across the await),
+fixed there. The builder's own values (addresses, derived pointers) are recomputed after a resume. Test, a
+rung each: every slot kept across a suspension names a flow local; plant: a builder-made slot is caught.

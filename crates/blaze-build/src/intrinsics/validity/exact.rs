@@ -226,7 +226,7 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
                 Fields::Array { count: 0, .. } => Form::Yes,
                 _ => Form::All,
             },
-            PNode::Tuple(_) | PNode::Closure { .. } | PNode::Future(..) | PNode::Pat(..) => Form::All,
+            PNode::Tuple(_) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
             PNode::Bool
             | PNode::Char
             | PNode::Int(_)
@@ -239,7 +239,6 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
             | PNode::Slice(_)
             | PNode::FnDef(..)
             | PNode::FnPtr(..)
-            | PNode::Coroutine { .. }
             | PNode::Dynamic(_) => Form::Record,
             _ => return Err(LayoutError { ty: t, why: Refusal::Malformed("a validity assertion's type the layout lays out but no rule names") }),
         };

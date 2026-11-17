@@ -16,7 +16,7 @@ use blaze_file_items::Outline;
 use blaze_id::ItemKey;
 use blaze_lower::{AttrMeta, Lowered, head};
 use blaze_own::{AVec, Alloc};
-use blaze_scope::resolve::{ExpansionText, Names};
+use blaze_scope::resolve::{At, ExpansionText, Names};
 use blaze_surface::{Edition, Item, ItemDetail, ItemIndex, Range};
 
 use super::heads::CrateCfg;
@@ -43,8 +43,19 @@ pub struct CrateLinks<'a> {
     pub decls: AVec<'a, LinkDecl<'a>>,
     /// `link_name` or identifier of every foreign fn/static, sorted, unique.
     pub foreign: AVec<'a, &'a str>,
-    /// `no_mangle` (identifier) and `export_name` values, sorted, unique.
-    pub exports: AVec<'a, &'a str>,
+    /// Every export of the crate with the item it names, sorted by name; one export a name
+    /// (a second is [`LinksError::TwoExports`], never merged).
+    pub exports: AVec<'a, CrateExport<'a>>,
+}
+
+/// One export of a crate: its symbol name (`export_name`'s value, else the identifier: the
+/// Reference, [abi.no_mangle], [abi.export_name]), the item that exports it (its key, as
+/// nested_exports.rs's `NestedExport::key`), and that item's identifier (for the message).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CrateExport<'a> {
+    pub name: &'a str,
+    pub item: ItemKey,
+    pub ident: &'a str,
 }
 
 /// Why a crate's link facts could not be read: each names the crate, and the item where one
@@ -60,6 +71,14 @@ pub enum LinksError<'a> {
     UnknownModifier { krate: &'a str, text: &'a str },
     /// An item's `cfg` (or a `#[link(cfg(..))]`) the crate's cfg set does not answer.
     Cfg { krate: &'a str, at: ItemIndex },
+    /// Two items of the crate export one symbol name (Reference, [abi.no_mangle] and
+    /// [abi.export_name]: the symbol is the identifier or the given name, and
+    /// [abi.no_mangle.unsafe]: an unmangled symbol "may collide with another symbol with the same
+    /// name"; one crate exporting one name twice is an error). `first` and `second` in key order.
+    TwoExports { krate: &'a str, first: CrateExport<'a>, second: CrateExport<'a> },
+    /// An exported entry at `at` the names source gives no item key: its export cannot say
+    /// which item it is, so it is refused, never passed over.
+    Unkeyed { krate: &'a str, at: ItemIndex },
     Alloc,
 }
 
@@ -68,8 +87,9 @@ pub enum LinksError<'a> {
 pub(crate) fn crate_links<'a>(names: &Names<'a>, krate: usize, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
     let c = names.krate(krate);
     let mut gather = Gather::new(c.name, names.edition(krate), c.cfg.atoms(), alloc);
-    for file in c.files.iter() {
-        gather.text(file.text, &file.outline)?;
+    for (n, file) in c.files.iter().enumerate() {
+        let at = At::File(n as u32);
+        gather.text(file.text, &file.outline, &|item| names.key_at(krate, at, item))?;
     }
     // An extern block written by an item macro (ring's `prefixed_extern!`) declares roots too.
     let mut made: AVec<'a, (ItemKey, &'a ExpansionText<'a>)> = AVec::new_in(alloc);
@@ -79,10 +99,26 @@ pub(crate) fn crate_links<'a>(names: &Names<'a>, krate: usize, alloc: Alloc<'a>)
         }
     }
     made.sort_unstable_by_key(|it| it.0);
-    for &(_, m) in made.iter() {
-        gather.text(m.text, &m.outline)?;
+    for &(call, m) in made.iter() {
+        let at = At::Expansion(call);
+        gather.text(m.text, &m.outline, &|item| names.key_at(krate, at, item))?;
     }
-    Ok(gather.finish())
+    gather.finish()
+}
+
+/// The facts of one text `text` as the only text of crate `krate`, under cfg `atoms` (natives.rs's
+/// tests, which have no `Names`).
+#[cfg(test)]
+pub(crate) fn text_links<'a>(
+    krate: &'a str,
+    text: &'a str,
+    atoms: &[(&str, Option<&str>)],
+    alloc: Alloc<'a>,
+) -> Result<CrateLinks<'a>, LinksError<'a>> {
+    let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
+    let mut gather = Gather::new(krate, Edition::E2021, atoms, alloc);
+    gather.text(text, &outline, &|at| Some(exports_tests::index_key(at)))?;
+    gather.finish()
 }
 
 /// One attribute row as written: its path, its arguments (the token tree with its delimiters,
@@ -132,8 +168,9 @@ impl<'a, 'c> Gather<'a, 'c> {
 
     /// The walk over one text's outline: extern blocks give their `#[link]`s and their entries'
     /// symbols; free fns, statics and members give their exports; an entry whose own `cfg` is
-    /// off is passed over with everything written inside it.
-    fn text(&mut self, text: &'a str, outline: &Outline<'_>) -> Result<(), LinksError<'a>> {
+    /// off is passed over with everything written inside it. `key_of` gives the item key of an
+    /// entry of this text (`Names::key_at` of its `At`).
+    fn text(&mut self, text: &'a str, outline: &Outline<'_>, key_of: &dyn Fn(ItemIndex) -> Option<ItemKey>) -> Result<(), LinksError<'a>> {
         let items = outline.items();
         let mut at = 0usize;
         while at < items.len() {
@@ -144,7 +181,7 @@ impl<'a, 'c> Gather<'a, 'c> {
             let off = match item.detail {
                 ItemDetail::ExternBlock { .. } => self.extern_block(item_text, index)?,
                 _ if in_block => self.foreign_entry(&item, item_text, index)?,
-                ItemDetail::Fn { .. } | ItemDetail::Static { .. } => self.exported(&item, item_text, index)?,
+                ItemDetail::Fn { .. } | ItemDetail::Static { .. } => self.exported(&item, item_text, index, key_of)?,
                 ItemDetail::Mod { .. } | ItemDetail::Impl | ItemDetail::Trait => {
                     // A container is lowered only when its attributes can turn it off.
                     let sig = cut(item_text, item.signature).ok_or(self.attr_err(index, "a signature outside its entry"))?;
@@ -157,14 +194,17 @@ impl<'a, 'c> Gather<'a, 'c> {
         Ok(())
     }
 
-    /// Sorts and dedups the symbol lists (deterministic output: the same crate gives the same
-    /// lists in any walk order).
-    fn finish(mut self) -> CrateLinks<'a> {
+    /// Sorts the symbol lists (deterministic output: the same crate gives the same lists in any
+    /// walk order). Foreign names are deduplicated (two declarations of one foreign symbol are
+    /// one import); exports are not: two of one name are refused, naming both items.
+    fn finish(mut self) -> Result<CrateLinks<'a>, LinksError<'a>> {
         self.out.foreign.sort_unstable();
         self.out.foreign.dedup();
-        self.out.exports.sort_unstable();
-        self.out.exports.dedup();
-        self.out
+        self.out.exports.sort_unstable_by(|a, b| a.name.cmp(b.name).then(a.item.cmp(&b.item)));
+        if let Some(pair) = self.out.exports.windows(2).find(|pair| pair[0].name == pair[1].name) {
+            return Err(LinksError::TwoExports { krate: self.krate, first: pair[0], second: pair[1] });
+        }
+        Ok(self.out)
     }
 
     fn lower(&self, item_text: &'a str, at: ItemIndex) -> Result<Lowered<'a, 'a>, LinksError<'a>> {
@@ -410,7 +450,7 @@ impl<'a, 'c> Gather<'a, 'c> {
     /// "When the no_mangle and export_name attributes are both applied to the same item, the
     /// symbol name from export_name is used"). Lowered only when its attributes can name one or
     /// turn it off. Gives whether it is off.
-    fn exported(&mut self, item: &Item, item_text: &'a str, at: ItemIndex) -> Result<bool, LinksError<'a>> {
+    fn exported(&mut self, item: &Item, item_text: &'a str, at: ItemIndex, key_of: &dyn Fn(ItemIndex) -> Option<ItemKey>) -> Result<bool, LinksError<'a>> {
         let sig = cut(item_text, item.signature).ok_or(self.attr_err(at, "a signature outside its entry"))?;
         if !(sig.contains("no_mangle") || sig.contains("export_name") || sig.contains("cfg")) {
             return Ok(false);
@@ -443,7 +483,9 @@ impl<'a, 'c> Gather<'a, 'c> {
             (None, true) => self.identifier(item, item_text, at)?,
             (None, false) => return Ok(false),
         };
-        self.out.exports.try_push(symbol).map_err(|_| LinksError::Alloc)?;
+        let key = key_of(at).ok_or(LinksError::Unkeyed { krate: self.krate, at })?;
+        let ident = self.identifier(item, item_text, at)?;
+        self.out.exports.try_push(CrateExport { name: symbol, item: key, ident }).map_err(|_| LinksError::Alloc)?;
         Ok(false)
     }
 
@@ -455,15 +497,20 @@ impl<'a, 'c> Gather<'a, 'c> {
 }
 
 #[cfg(test)]
+#[path = "links_exports_tests.rs"]
+mod exports_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use super::exports_tests::index_key;
 
     /// The facts of one file `text` as the only text of crate `t`, under `atoms`.
     fn links_of<'a>(text: &'a str, atoms: &[(&str, Option<&str>)], alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
         let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
         let mut gather = Gather::new("t", Edition::E2021, atoms, alloc);
-        gather.text(text, &outline)?;
-        Ok(gather.finish())
+        gather.text(text, &outline, &|at| Some(index_key(at)))?;
+        gather.finish()
     }
 
     const MAC: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];
@@ -497,7 +544,7 @@ mod tests {
             ]
         );
         assert_eq!(links.foreign.as_slice(), ["f", "g2"]);
-        assert_eq!(links.exports.as_slice(), ["cb"]);
+        assert_eq!(links.exports.iter().map(|e| e.name).collect::<std::vec::Vec<_>>(), ["cb"]);
         // Off macOS the framework's `cfg_attr` does not hold: no decl from it.
         let linux = links_of(text, &[("target_os", Some("linux")), ("unix", None)], Alloc::global())
             .unwrap_or_else(|e| panic!("refused: {e:?}"));

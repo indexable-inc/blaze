@@ -319,7 +319,11 @@ struct Host {
 
 impl ExpandCx for Host {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
-        Ok(self.package.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()))
+        match self.package.env.get(name) {
+            blaze_proc_macro::package_env::EnvAnswer::Set(value) => Ok(Some(value)),
+            blaze_proc_macro::package_env::EnvAnswer::Unset => Ok(None),
+            blaze_proc_macro::package_env::EnvAnswer::Unknown => Err(HostError { ask: HostAsk::Env, why: HostWhy::Refused }),
+        }
     }
 
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
@@ -710,10 +714,14 @@ fn main() {
                         let Some(path) = files.get(at) else { break };
                         let Ok(text) = std::fs::read_to_string(path) else { continue };
                         let package = Arc::new(package_of(checkout, path));
-                        let blaze_proc_macro::sandbox::Files::Folder(dir) = &package.files else { unreachable!("package_of gives a folder") };
+                        let blaze_proc_macro::sandbox::Files::Member { workspace, root } = &package.files else { unreachable!("package_of gives a member") };
+                        let dir = workspace.join(root.seen().folder());
                         let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
                         let edition = edition_of(&manifest, &root_manifest);
-                        let pkg_name = package.env.iter().find(|(k, _)| k == "CARGO_PKG_NAME").map(|(_, v)| v.clone()).unwrap_or_default();
+                        let pkg_name = match package.env.get("CARGO_PKG_NAME") {
+                            blaze_proc_macro::package_env::EnvAnswer::Set(name) => name.to_owned(),
+                            blaze_proc_macro::package_env::EnvAnswer::Unset | blaze_proc_macro::package_env::EnvAnswer::Unknown => String::new(),
+                        };
                         let Some(member) = (0..names.lock.len()).find(|i| names.lock[*i].path && names.lock[*i].name == pkg_name) else {
                             continue;
                         };

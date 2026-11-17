@@ -57,6 +57,9 @@ pub(crate) enum Wait {
     /// A field's type holds a projection no impl answered yet ([`Refusal::FieldGround`] with
     /// `projection: Some`).
     FieldProjection { adt: ItemKey, field: u32, name: Name, projection: (ItemKey, Name) },
+    /// A callee's kind needs a fact the world does not hold yet ([`Refusal::FnFact`]): the
+    /// front end makes it (an impl's fn's signature, a trait's members) and asks again.
+    FnFact { item: ItemKey, fact: crate::Fact },
 }
 
 impl Wait {
@@ -73,6 +76,7 @@ impl Wait {
             Refusal::FieldGround { projection: None, .. } => None,
             // A part `needs_drop` cannot judge: final, no later answer changes the type.
             Refusal::NeedsDrop { .. } => None,
+            Refusal::FnFact { item, fact } => Some(Wait::FnFact { item: *item, fact: *fact }),
             Refusal::Overflow { .. }
             | Refusal::DivByZero
             | Refusal::RemByZero
@@ -116,6 +120,7 @@ impl Wait {
             Wait::FieldProjection { adt, field, name, projection } => {
                 Stop::Refused(Refusal::FieldGround { adt, field, name, projection: Some(projection) })
             }
+            Wait::FnFact { item, fact } => Stop::Refused(Refusal::FnFact { item, fact }),
         }
     }
 }

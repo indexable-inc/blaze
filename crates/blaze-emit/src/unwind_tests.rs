@@ -60,7 +60,7 @@ fn inst(code: &[u8], at: u32) -> u32 {
 #[test]
 fn an_invoke_gets_a_cleanup_row_and_a_call_in_the_cleanup_none() {
     let func = with_cleanup();
-    let record = emit_record(func.view(), &ByPlace, ISA, Alloc::global()).expect("emits");
+    let (record, _) = emit_record(func.view(), &ByPlace, &crate::RoutinePlaces::NONE, ISA, Alloc::global()).expect("emits");
     let sealed = record.seal().expect("seals");
     let mut bytes = Vec::new_in(Alloc::global());
     sealed.encode(&mut bytes);

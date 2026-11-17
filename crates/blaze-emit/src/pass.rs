@@ -18,6 +18,7 @@ use crate::{
 mod atomic;
 mod bulk;
 mod float;
+mod float_width;
 mod int;
 pub(crate) mod probe;
 mod runtime;
@@ -27,6 +28,8 @@ mod tls_index;
 pub(crate) mod unwind;
 pub(crate) mod variadic;
 mod wide;
+
+pub(crate) use float_width::FloatWidth;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
 /// immediate, so codes from here up are refused.
@@ -203,8 +206,8 @@ pub(crate) fn run<A: Allocator>(
                     pass.st2(r, r + 1, inst);
                     continue;
                 }
-                Some(Loc::V(v)) => {
-                    pass.float_in(v, inst, ty == Ty::F64);
+                Some(Loc::V(v, w)) => {
+                    pass.v_in(v, inst, w);
                     continue;
                 }
                 None => return Err(EmitError::Signature { why: "an entry parameter past the registers" }),
@@ -260,7 +263,7 @@ fn check_sig(view: View<'_>, isa: Isa, rec: SigRec, params: &[ParamRec], rets: &
         match regs.next(Ty(ret.ty)) {
             Some(Loc::X(r)) if r < 2 => {}
             Some(Loc::Pair(0)) => {}
-            Some(Loc::V(v)) if v < 4 => {}
+            Some(Loc::V(v, _)) if v < 4 => {}
             _ => return Err("returns past `x0:x1` and `v0..v3` (a composite past 16 bytes returns through `sret`)"),
         }
     }
@@ -280,20 +283,13 @@ fn check_sig(view: View<'_>, isa: Isa, rec: SigRec, params: &[ParamRec], rets: &
     for param in params.iter().chain(rets) {
         let ty = Ty(param.ty);
         let fits = ty.is_scalar()
-            && matches!(
-                ty.elem(),
-                Scalar::I1
-                    | Scalar::I8
-                    | Scalar::I16
-                    | Scalar::I32
-                    | Scalar::I64
-                    | Scalar::I128
-                    | Scalar::Ptr
-                    | Scalar::F32
-                    | Scalar::F64
-            );
+            && (FloatWidth::of(ty).is_some()
+                || matches!(
+                    ty.elem(),
+                    Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 | Scalar::I64 | Scalar::I128 | Scalar::Ptr
+                ));
         if !fits {
-            return Err("a parameter or return that is not an integer, a pointer, an `f32` or an `f64`");
+            return Err("a parameter or return that is not an integer, a pointer or a scalar float");
         }
     }
     Ok(())
@@ -301,12 +297,12 @@ fn check_sig(view: View<'_>, isa: Isa, rec: SigRec, params: &[ParamRec], rets: &
 
 /// Where one parameter or return goes (AAPCS64 C.1..C.16): the next `x` register, an `i128`'s
 /// even-numbered pair of `x` registers (C.8: "rounded up to the next even number"), or the
-/// next vector register for a float (C.1).
+/// next vector register for a float of any width (C.1: `h`, `s`, `d` or `q`), with that width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Loc {
     X(Reg),
     Pair(Reg),
-    V(u32),
+    V(u32, FloatWidth),
 }
 
 /// The next general and vector registers of one signature walk.
@@ -327,10 +323,10 @@ impl Regs {
 
     /// The place of the next value of `ty`, or `None` past `x7` or `v7` (the stack).
     pub(crate) fn next(&mut self, ty: Ty) -> Option<Loc> {
-        if ty.is_scalar() && matches!(ty.elem(), Scalar::F32 | Scalar::F64) {
+        if let Some(w) = FloatWidth::of(ty) {
             let v = self.v;
             self.v += 1;
-            return (v < 8).then_some(Loc::V(v));
+            return (v < 8).then_some(Loc::V(v, w));
         }
         if ty == Ty::I128 {
             let x = if self.even { self.x.next_multiple_of(2) } else { self.x };
@@ -650,7 +646,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         match ty.compound_row() {
             Some(_) => 2,
             None if Self::is_wide(ty) => 2,
-            None => 1,
+            None => FloatWidth::of(ty).map_or(1, FloatWidth::words),
         }
     }
 
@@ -725,6 +721,10 @@ impl<A: Allocator> Pass<'_, '_, A> {
         };
         if op.info().flags.meanings_only(flags).0 & !honoured != 0 {
             return Err(unsupported(inst, op, "a flag that is a meaning it does not honour (`volatile` on a bulk operation)"));
+        }
+        // `f16` and `f128` values, only moved after legalize (pass/float_width.rs).
+        if let Some(w) = float_width::moved_of(view, inst, op) {
+            return self.moved(inst, op, w);
         }
         // Floats (pass/float.rs) and `i128` (pass/wide.rs), by the type they compute in.
         let result = view.ty(Value(inst as u32));
@@ -1143,8 +1143,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
                             self.ld2(reg, reg + 1, value);
                             continue;
                         }
-                        Some(Loc::V(v)) => {
-                            self.float_out(v, value, Ty(ret.ty) == Ty::F64);
+                        Some(Loc::V(v, w)) => {
+                            self.v_out(v, value, w);
                             continue;
                         }
                         None => return Err(unsupported(inst, op, "a return past the registers")),
@@ -1328,7 +1328,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     }
                 }
                 (_, Loc::Pair(gpr)) => self.ld2(gpr, gpr + 1, arg),
-                (_, Loc::V(v)) => self.float_out(v, arg, Ty(param.ty) == Ty::F64),
+                (_, Loc::V(v, w)) => self.v_out(v, arg, w),
             }
         }
         // The `...` values (pass/variadic.rs): on Linux into the registers after the named
@@ -1368,7 +1368,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     self.st_sp(reg, inst as u32 * 16 + 8 * k as u32);
                 }
                 Loc::Pair(reg) if sig.rets.len() == 1 => self.st2(reg, reg + 1, inst),
-                Loc::V(v) if sig.rets.len() == 1 => self.float_in(v, inst, ty == Ty::F64),
+                Loc::V(v, w) if sig.rets.len() == 1 => self.v_in(v, inst, w),
                 _ => return Err(unsupported(inst, op, "an `i128` or float return beside another return")),
             }
         }

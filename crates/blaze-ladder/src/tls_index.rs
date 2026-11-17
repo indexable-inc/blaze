@@ -296,7 +296,7 @@ pub fn make_ender_entry<'a>(isa: blaze_emit::Isa, alloc: Alloc<'a>) -> Result<AV
     let funcs = index::ENDER_IMPORTS.map(Callee::C);
     let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
-    make_entry(&func, &names, &mut declared, isa, alloc)
+    make_entry(&func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
 }
 
 impl RecordRun<'_> {

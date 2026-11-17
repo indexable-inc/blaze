@@ -18,7 +18,7 @@
 
 use blaze_flow::loans::{Access, conflicts, for_each_access};
 use blaze_flow::{BorrowFinding, BorrowKind, Flow, Loan, MoveFindingKind, MoveOut, Point, StmtKind, Value};
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Refusal, SigBuf, SigLife, SigRefusal, read_signature};
+use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Refusal, SigBuf, SigLife, SigRefusal, read_impl_signature, read_signature};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use core::alloc::Allocator;
@@ -29,6 +29,7 @@ use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
 use super::borrows_nested::{FlowOf, NestedFacts, next_nested};
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
+use super::borrows_unmade::{AdtUnmade, HeadClass};
 use super::heads::{HeadError, Want, member_fn_want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -78,6 +79,11 @@ pub enum BorrowRefused {
     /// parameters and result that its owner would have to prove (the closure's region
     /// requirements, not built: borrows_nested.rs): at the item-relative range of the first.
     NestedOutlives { start: u32, end: u32 },
+    /// The lowering refused an ADT it has no facts for (`Form::UnknownAdt`, at the
+    /// item-relative `start..end`) because the store could not make the ADT's row: the first
+    /// such ADT of the body by checker key, why its row was not made, and how many others of
+    /// the body were not made either (borrows_unmade.rs).
+    AdtNotMade { adt: tc::ItemKey, why: AdtUnmade, others: u32, start: u32, end: u32 },
 }
 
 impl BorrowRefused {
@@ -91,6 +97,7 @@ impl BorrowRefused {
             BorrowRefused::Lower(_) => "the flow lowering refused a form",
             BorrowRefused::Bound(_) => "the check went past its bound",
             BorrowRefused::NestedOutlives { .. } => "a closure or async block needs a lifetime relation its owner must prove (not built)",
+            BorrowRefused::AdtNotMade { .. } => "an ADT the body moves or drops could not be made from the records",
         }
     }
 
@@ -99,6 +106,7 @@ impl BorrowRefused {
         match self {
             BorrowRefused::Lower(r) => Some((r.range.start, r.range.end)),
             BorrowRefused::NestedOutlives { start, end } => Some((*start, *end)),
+            BorrowRefused::AdtNotMade { start, end, .. } => Some((*start, *end)),
             _ => None,
         }
     }
@@ -165,6 +173,9 @@ pub struct BorrowFacts<'a> {
     /// Each ADT whose `Copy` or `Drop` answer was not known (the census takes it as `false`;
     /// the command refuses the body: [`BorrowRefused::FactUnknown`]).
     unknown: AVec<'a, (u128, &'static str)>,
+    /// Each ADT of the body's types whose row the store could not make, and why, sorted by
+    /// checker key (borrows_unmade.rs; the lowering refuses such an ADT as `UnknownAdt`).
+    unmade: AVec<'a, (u128, AdtUnmade)>,
     /// One read row per ADT and per head the facts were taken of (front2 borrow_reads.rs),
     /// for the body's read list (rule 21).
     reads: AVec<'a, Read>,
@@ -183,6 +194,7 @@ impl<'a> BorrowFacts<'a> {
             shapes: AVec::new_in(alloc),
             items: AVec::new_in(alloc),
             unknown: AVec::new_in(alloc),
+            unmade: AVec::new_in(alloc),
             reads: AVec::new_in(alloc),
         }
     }
@@ -206,6 +218,11 @@ impl<'a> BorrowFacts<'a> {
     /// Each ADT whose `Copy` or `Drop` answer was not known, and which.
     pub fn unknown(&self) -> &[(u128, &'static str)] {
         &self.unknown
+    }
+
+    /// Each ADT whose row was not made, and why, by checker key.
+    pub fn unmade(&self) -> &[(u128, AdtUnmade)] {
+        &self.unmade
     }
 
     fn variant(&self, adt: tc::ItemKey, variant: u32) -> Option<(u32, u32)> {
@@ -257,24 +274,38 @@ fn writes_lifetime(text: &str) -> bool {
 
 /// Whether an ADT's head declares lifetimes: a `'` in its head's text before its body.
 fn adt_head_lifetimes<'n, S: NamesSource<'n>>(keys: &Keys, names: S, adt: tc::ItemKey) -> bool {
-    keys.library_in(names, adt).and_then(|lib| names.text_of(lib)).is_some_and(|t| t.text.split(['{', '(', ';']).next().unwrap_or("").contains('\''))
+    // The head after its docs and attributes (head_text.rs): `Rc`'s docs say "'Rc' stands for ..".
+    keys.library_in(names, adt)
+        .and_then(|lib| names.text_of(lib))
+        .is_some_and(|t| super::head_text::after_outer_trivia(t.text).split(['{', '(', ';']).next().unwrap_or("").contains('\''))
 }
 
 /// Asks the store for one head, evaluating the array lengths it names, at most [`MOST_LENS`];
 /// `false` when it cannot be made (the fact then stays unknown, and the lowering says so by
-/// name where it matters).
+/// name where it matters). A caller that files why asks [`ensure_why`].
 fn ensure_one<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, w: Want) -> bool {
+    ensure_why(r, w).is_ok()
+}
+
+/// [`ensure_one`] with the store's refusal kept, by its class: the last `HeadError` met (an
+/// array length that did not evaluate is the `NeedConst` that asked for it).
+fn ensure_why<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, w: Want) -> Result<(), HeadClass> {
     let mut lens = 0;
     loop {
         match r.store.ensure(r.names, r.keys, w) {
-            Ok(()) => return true,
-            Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_LENS => {
-                lens += 1;
-                if eval_len(r, c).is_err() {
-                    return false;
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let class = HeadClass::of(&e);
+                match e {
+                    HeadError::Item(_, Why::NeedConst(c, _)) if lens < MOST_LENS => {
+                        lens += 1;
+                        if eval_len(r, c).is_err() {
+                            return Err(class);
+                        }
+                    }
+                    _ => return Err(class),
                 }
             }
-            Err(_) => return false,
         }
     }
 }
@@ -312,12 +343,21 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         let key = tc::ItemKey(k);
         // The store holds only the ADTs something asked for: ask. One that cannot be made stays
         // unknown here, and the lowering refuses its body by name (`UnknownAdt`).
-        if !r.store.adts.contains_key(&key)
-            && let Some(lib) = r.keys.library_in(r.names, key)
-        {
-            ensure_one(r, Want::Adt(lib));
+        // Why a row is missing is kept (rule 3): the key begins no library item, or the
+        // store's refusal by class, or (no error and no row) a want that made nothing.
+        let mut unmade = AdtUnmade::NoRow;
+        if !r.store.adts.contains_key(&key) {
+            match r.keys.library_in(r.names, key) {
+                Some(lib) => {
+                    if let Err(class) = ensure_why(r, Want::Adt(lib)) {
+                        unmade = AdtUnmade::Head(class);
+                    }
+                }
+                None => unmade = AdtUnmade::NoLibraryKey,
+            }
         }
         let Some(row) = r.store.adts.get(&key) else {
+            g.unmade.push((k, unmade));
             g.reads.push(adt_read(k, AdtAnswer::NotMade));
             continue;
         };
@@ -394,7 +434,7 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         };
         let tys = r.store.tys.view();
         let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-        let callee = CalleeFacts { writes_lifetimes: writes_lifetime(f.text), self_ref };
+        let callee = CalleeFacts { writes_lifetimes: writes_lifetime(super::head_text::after_outer_trivia(f.text)), self_ref };
         g.callees.push((k, callee));
         let (keys, names) = (&*r.keys, r.names);
         // Each ADT the reading asks about is part of what this head's row says (rule 21).
@@ -405,7 +445,15 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
             Some(lifetimes)
         };
         let mut buf = SigBuf::new_in(alloc);
-        let read = read_signature(f.text, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc);
+        // An impl's member reads `Self::Name` through the impl's own `type Name` text and the
+        // impl's lifetimes through its self type (blaze-flow-lower sig/impl_life.rs); what it
+        // took of the impl's text is a row of its own (sig_impl.rs, rule 21).
+        let imp = super::sig_impl::impl_of(names, keys, key, f, alloc);
+        g.reads.push(super::sig_impl::impl_read(k, &imp, alloc));
+        let read = match imp.text() {
+            Some(it) => read_impl_signature(f.text, it, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc),
+            None => read_signature(f.text, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc),
+        };
         let adts = asked.take_sorted();
         match read {
             Ok(()) => {
@@ -538,7 +586,18 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         let (flow, params) = match interiors.flow_of(of, &view, done, &nested, alloc) {
             Ok(f) => f,
             Err(refusal) => {
-                verdict.refused = Some(BorrowRefused::Lower(refusal));
+                // The lowering asks `Facts::adt` only of the body's ADTs, and every ADT made is
+                // in the facts: an `UnknownAdt` is one of `unmade`, named with why.
+                verdict.refused = Some(match facts.unmade().first() {
+                    Some(&(adt, why)) if refusal.form == blaze_flow_lower::Form::UnknownAdt => BorrowRefused::AdtNotMade {
+                        adt: tc::ItemKey(adt),
+                        why,
+                        others: facts.unmade().len() as u32 - 1,
+                        start: refusal.range.start,
+                        end: refusal.range.end,
+                    },
+                    _ => BorrowRefused::Lower(refusal),
+                });
                 break;
             }
         };

@@ -159,6 +159,52 @@ pub enum FnKind {
     /// `panic_const_*` of the overflow checks): the constant fails with the arguments as the
     /// message's parts.
     Panic,
+    /// The world does not hold `Fact`, which the call's kind needs: refused as
+    /// `Refusal::FnFact`, a pending refusal (code holding it is compiled again once the world
+    /// answers). Never `NotConst`: "not const" is said only of a head read without `const`.
+    Missing(Fact),
+}
+
+/// A fact about a called fn that the world does not hold (yet): [`FnKind::Missing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fact {
+    /// The callee's written text: the world holds none for it, so its head was not read.
+    Text,
+    /// The crate the callee is in, or that crate's edition or cfg.
+    Crate,
+    /// The callee's head is written and did not lower.
+    Head,
+    /// A `#[rustc_intrinsic]` callee's name.
+    IntrinsicName,
+    /// An impl's fn's signature, made on use: not made yet.
+    Signature,
+    /// A trait's fn: its trait's members, not made yet.
+    TraitMembers,
+    /// The callee's signature was refused by the front end (a gap of its own there).
+    SignatureRefused,
+    /// The callee's container: neither an impl nor a trait the world keys.
+    Container,
+    /// The callee is a member that is not a fn (a constant, a type) called as one.
+    NotAFn,
+    /// The callee has no origin the world knows: no item, no member, no row.
+    Origin,
+}
+
+impl core::fmt::Display for Fact {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Fact::Text => "its head was not read: no text is held for it",
+            Fact::Crate => "its head was not read: its crate, or the crate's edition or cfg, is not known",
+            Fact::Head => "its head is written and did not lower",
+            Fact::IntrinsicName => "it is a `#[rustc_intrinsic]` and no name is held for it",
+            Fact::Signature => "it is an impl's fn whose signature is not made",
+            Fact::TraitMembers => "it is a trait's fn whose trait's members are not made",
+            Fact::SignatureRefused => "its signature was refused",
+            Fact::Container => "it is a member of neither an impl nor a trait",
+            Fact::NotAFn => "it is a member that is not a fn",
+            Fact::Origin => "it has no library item, no member origin and no signature row",
+        })
+    }
 }
 
 /// The intrinsics, by blaze's one table (`blaze_build::intrinsics`, rule 30): a world answers

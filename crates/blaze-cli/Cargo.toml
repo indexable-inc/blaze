@@ -22,6 +22,15 @@ name = "blaze"
 path = "src/main.rs"
 doctest = false
 
+# D112 interim (N7): the multi-call fact shim a native build script finds first on its PATH
+# as sw_vers / pkg-config; a separate tiny binary, installed beside `blaze` (built by the same
+# `cargo build -p blaze-cli --bins`).
+[[bin]]
+name = "blaze-fact-shim"
+path = "src/bin/blaze-fact-shim.rs"
+doctest = false
+required-features = ["sandbox"]
+
 [dependencies]
 # The request machine, its records and keys, the line table and the profile.
 blaze-drive.workspace = true
@@ -73,8 +82,11 @@ blaze-manifest = { workspace = true, default-features = false }
 # What each crate is given with nothing in its manifest (`implicit`), the one rule.
 blaze-unit-graph.workspace = true
 # The `MacroModule` task (macros.rs): a module's identity, its key and the module store's lookup;
-# the runtime only with `sandbox`.
-blaze-proc-macro.workspace = true
+# and the `Script` task (scripts.rs, D115): a build script's run, so `runtime` always.
+blaze-proc-macro = { workspace = true, features = ["runtime"] }
+# A build script's outputs record, its environment's `links` metadata and the probe table
+# (scripts.rs).
+blaze-build-script.workspace = true
 # `procs`: a macro crate's module identity from the lock and the graph (one home, procs.rs).
 blaze-world = { workspace = true, features = ["procs"] }
 # The toolchain this binary opens (`PINNED`), its manifest and packs read from the shelf.
@@ -84,6 +96,7 @@ blaze-scope.workspace = true
 # `blaze test`'s plan, head, postings, results and report (test_args.rs, test_loop.rs).
 blaze-run.workspace = true
 blaze-id.workspace = true
+blaze-expand.workspace = true
 # The lock's units (`plan`) and the machine that fetches them (fetch.rs). The plan is needed
 # without `fetch` too: a unit the store lacks is then a finding naming it. blaze-drive's
 # `fetch_task` already brings this crate into the graph either way.

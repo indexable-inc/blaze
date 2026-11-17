@@ -254,7 +254,7 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
         let tys = done.types.view();
         let mut diagnostics: AVec<'a, BodyDiagnostic<'a>> = AVec::new_in(alloc);
         for d in found.iter() {
-            let about = diag_about(r, tys, d);
+            let about = diag_about(r, scope.spell, tys, d);
             diagnostics.push(BodyDiagnostic { code: d.code.code(), text: AString::from_str_in(&about, alloc), start: d.at.start, end: d.at.end });
         }
         return Decision::Findings(diagnostics);

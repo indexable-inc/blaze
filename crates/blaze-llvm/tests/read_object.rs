@@ -215,15 +215,17 @@ fn the_elf_object_reads_to_the_same_shape() {
     assert_eq!((at.code + call_at).wrapping_add_signed(delta), thunk, "the bl reaches d3_outside's thunk");
 }
 
-/// LLVM's callee-saved layout is not blaze's frame form (read.rs's doc): refused by name on both
-/// hosts, never a record whose unwind would restore x19 from x20's slot.
-/// Passes: "test a_frame_blaze_cannot_say_is_refused_by_name ... ok".
+/// On Mach-O, LLVM saves `%a`'s callee-saved register in the platform's pair order (x19 at
+/// CFA - 24, x20 at CFA - 32), which is blaze's one frame form (unwind-P8a-4): it reads to a frame
+/// with the pair x19:x20. On ELF, LLVM puts the frame record below the saved registers, which the
+/// form cannot say: refused by name, never converted.
+/// Passes: "test llvms_saved_pair_is_the_one_frame_form ... ok".
 #[test]
-fn a_frame_blaze_cannot_say_is_refused_by_name() {
-    for (machine, cpu) in [(&MAC, MAC_CPU), (&LINUX, LINUX_CPU)] {
-        let error = record(G_IR, machine, cpu, "d3_g").err().expect("the frame is refused");
-        assert!(matches!(error, ReadError::FrameLayout { .. }), "{error}");
-    }
+fn llvms_saved_pair_is_the_one_frame_form() {
+    let e = record(G_IR, &MAC, MAC_CPU, "d3_g").unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(e.unwind_frame, Some(Frame { x_pairs: 1, d_pairs: 0 }), "the frame record and the pair x19:x20");
+    let error = record(G_IR, &LINUX, LINUX_CPU, "d3_g").err().expect("the ELF frame is refused");
+    assert!(matches!(error, ReadError::FrameLayout { .. }), "{error}");
 }
 
 /// D100 point 10 ("A code record carries its unwind rows and landing pads"): a frame LLVM

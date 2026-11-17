@@ -578,7 +578,11 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
         Rule::Metadata => {
             let (alias, term) = nt_goal(cx)?;
             let Some((_, kind, item, args)) = alias_parts(cx, alias) else { return Err(malformed()) };
-            let d = match crate::builtin::metadata_ty(cx, cand.a)? {
+            // Stage 0 walks from the self type; each later stage from the tail the stage before
+            // normalized (`cand.b`), as the reference's nested `<tail as Pointee>::Metadata`
+            // normalizes its self type before its rule runs.
+            let from = if stage == 0 { cand.a } else { cand.b };
+            let d = match crate::builtin::metadata_ty(cx, from)? {
                 crate::builtin::Metadata::Is(d) => d,
                 // `<tail as Pointee>::Metadata`, rigid: the tail's sizedness is not known here.
                 crate::builtin::Metadata::Rigid(tail) => {
@@ -586,6 +590,15 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
                     cx.mk(TyKind::Alias(Rigid::Yes, kind, item, l))?
                 }
                 crate::builtin::Metadata::Ambiguous => return Ok(Step::Done(Certainty::Ambiguous)),
+                crate::builtin::Metadata::Normalize(tail) => {
+                    let Some(next) = stage.checked_add(1) else {
+                        return Err(Stop::Error(SolveError::Limit(Limit::Walk)));
+                    };
+                    let v = cx.fresh_ty()?;
+                    cand.b = v;
+                    cx.add(GoalSource::NormalizeGoal, Pred::Projection { alias: tail, term: v });
+                    return Ok(Step::Then(next));
+                }
             };
             if cx.eq(term, d)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
         }

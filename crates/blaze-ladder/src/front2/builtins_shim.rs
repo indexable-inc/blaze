@@ -325,6 +325,7 @@ mod tests {
     /// emitter's list of routines called would declare none (the control: this test fails).
     ///
     /// Prints: `test front2::builtins_shim::tests::one_f128_add_declares_addtf3_only ... ok`
+    /// (once un-ignored).
     #[test]
     fn one_f128_add_declares_addtf3_only() {
         let heap = blaze_own::testing::heap();

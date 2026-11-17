@@ -12,9 +12,10 @@ use core::fmt;
 
 use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, Space, Target, Word};
 use blaze_lir::View;
-use blaze_lir::func::RefId;
-use blaze_lir::legalize::{self, LegalizeError, QuadRoutines, SoftFloat};
+use blaze_lir::legalize::LegalizeError;
 use blaze_own::Alloc;
+
+use crate::routines::{Called, RoutinePlaces};
 
 use crate::{
     BULK_INLINE_MOST, Code, EmitError, Isa, RelocTo,
@@ -47,17 +48,6 @@ pub enum RecordEmitError {
     Legalize(LegalizeError),
 }
 
-/// No `f128` routine is bound to the record emitter yet: the program's compiler_builtins
-/// routines are bound by INTRINSICS.md P5b. An `f128` operation is refused by name
-/// ([`LegalizeError::NoRoutine`]).
-struct Unbound;
-
-impl QuadRoutines for Unbound {
-    fn routine(&self, _: SoftFloat) -> Option<RefId> {
-        None
-    }
-}
-
 impl fmt::Display for RecordEmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -78,8 +68,19 @@ impl core::error::Error for RecordEmitError {}
 /// every call goes through its callee's import word.
 ///
 /// The code is written by the pass into its own vector and copied once into the record's.
-pub fn emit_record<'a>(func: View<'_>, names: &dyn Names, isa: Isa, alloc: Alloc<'a>) -> Result<CodeRecord<'a>, RecordEmitError> {
-    emit_record_up_to(func, names, isa, BULK_INLINE_MOST, alloc).map(|(record, _)| record)
+///
+/// `routines` says where each compiler_builtins soft-float routine is among `names`' function
+/// references (crate::routines); the answer's [`Called`] is the routines the record calls,
+/// which the caller declares as its callees. [`RoutinePlaces::NONE`]: an `f128` operation is
+/// refused naming its routine.
+pub fn emit_record<'a>(
+    func: View<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    isa: Isa,
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, Called), RecordEmitError> {
+    emit_record_up_to(func, names, routines, isa, BULK_INLINE_MOST, alloc).map(|(record, _, called)| (record, called))
 }
 
 /// [`emit_record`], inlining a bulk operation of a constant length up to `inline_most` bytes;
@@ -88,22 +89,19 @@ pub fn emit_record<'a>(func: View<'_>, names: &dyn Names, isa: Isa, alloc: Alloc
 pub(crate) fn emit_record_up_to<'a>(
     func: View<'_>,
     names: &dyn Names,
+    routines: &RoutinePlaces,
     isa: Isa,
     inline_most: u64,
     alloc: Alloc<'a>,
-) -> Result<(CodeRecord<'a>, u32), RecordEmitError> {
+) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
     // The Reference tier takes no vector, `f16` or `f128` arithmetic (INTRINSICS.md 3.2): a
-    // function holding any is made scalar first, on a copy in `alloc`; one holding none is
-    // emitted as it is.
-    let legal;
-    let func = match legalize::needed(&func).map_err(RecordEmitError::Legalize)? {
-        false => func,
-        true => {
-            let mut owned = func.to_func_in(alloc);
-            legalize::legalize(&mut owned, &Unbound, alloc).map_err(RecordEmitError::Legalize)?;
-            legal = owned;
-            legal.view()
-        }
+    // function holding any is made scalar first, on a copy in `alloc`, with a reference row for
+    // each routine `routines` binds (the rows legalize's calls name); one holding none is
+    // emitted as it is. Which routines it calls is legalize's answer, returned to the caller.
+    let (legal, called) = crate::routines::legalized(func, routines, alloc).map_err(RecordEmitError::Legalize)?;
+    let func = match &legal {
+        None => func,
+        Some(owned) => owned.view(),
     };
     let mut out = Code::new_in(alloc);
     let mut form = Form::new_in(alloc);
@@ -141,7 +139,7 @@ pub(crate) fn emit_record_up_to<'a>(
         record.words.push(Word { at: row.at, target, addend: row.addend });
     }
     pass::unwind::into_record(&form.unwind, &mut record).map_err(RecordEmitError::Emit)?;
-    Ok((record, form.insts))
+    Ok((record, form.insts, called))
 }
 
 /// The index of `to` among `record`'s targets (added again each time: `seal` merges equal

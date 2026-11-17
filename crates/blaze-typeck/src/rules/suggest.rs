@@ -301,6 +301,12 @@ fn children(body: &BodyView<'_>, e: Expr, out: &mut Vec<ExprId, Alloc<'_>>) -> R
         Expr::Tuple { elems } | Expr::Array { elems } | Expr::FormatArgs { args: elems, .. } => {
             out.extend_from_slice(body.expr_list(elems)?);
         }
+        Expr::Asm { operands, .. } => {
+            for o in body.asm_operand_list(operands)? {
+                out.push(o.expr);
+                out.extend(o.out_expr);
+            }
+        }
         Expr::Repeat { elem, count, .. } => out.extend([elem].into_iter().chain(count)),
         Expr::Struct { fields, base, .. } => {
             for f in body.field_init_list(fields)? {

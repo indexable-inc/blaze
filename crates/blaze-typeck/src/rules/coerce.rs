@@ -62,7 +62,10 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         Ok(if self.unify(a, b)? { Some(()) } else { None })
     }
 
-    fn try_coerce(&mut self, a: Ty, b: Ty, two_phase: bool, cause: Cause) -> Result<Option<()>, Stop> {
+    /// `Coerce::coerce` past its first cases: the adjustments are left in `adj_scratch` for the
+    /// caller to record (on one source here; on every earlier source of a site in
+    /// rules/coerce_lub.rs `lub_earlier_to_new`). Run inside `commit_if`.
+    pub(crate) fn try_coerce(&mut self, a: Ty, b: Ty, two_phase: bool, cause: Cause) -> Result<Option<()>, Stop> {
         self.adj_scratch.clear();
         if self.commit_if(|m| m.coerce_unsized(a, b, cause))?.is_some() {
             return Ok(Some(()));
@@ -77,15 +80,27 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             // `coerce_from_fn_item`: the fn's own header (`extern "C" fn` reifies to
             // `extern "C" fn(..)`), then, to an `unsafe` target, `UnsafeFnPointer` after it.
             (TyView::FnDef(k, args), TyView::FnPtr(_, hb)) => {
-                let Some(sig) = self.reads.fn_sig(k)? else { return Ok(None) };
-                let ha = sig.header;
-                let Some((inputs, output)) = self.fn_def_sig(k, args, cause)? else {
-                    return Ok(None);
+                // The one rule for reifying a fn item (rules/reify.rs): an intrinsic is refused
+                // by name there, and the coercion taken, so no second error follows as a
+                // mismatch (as a missing lang item in `coerce_unsized`).
+                let (reified, list, ha) = match self.reify_fn_item(a, k, args, cause)? {
+                    crate::rules::reify::Reify::Ptr { ty, list, header, gated } => {
+                        // A safe `#[target_feature]` fn to a SAFE pointer outside its features
+                        // (rules/target_feature.rs): Rust's refusal by name, and the coercion
+                        // taken, so no second error follows as a mismatch.
+                        if gated && hb.safety == Safety::Safe {
+                            self.diag(
+                                crate::diag::DiagCode::TargetFeatureToSafeFnPointer,
+                                crate::diag::At::of(cause),
+                                crate::diag::About::types(b, a),
+                            );
+                            return Ok(Some(()));
+                        }
+                        (ty, list, header)
+                    }
+                    crate::rules::reify::Reify::NoSig => return Ok(None),
+                    crate::rules::reify::Reify::Refused => return Ok(Some(())),
                 };
-                let mut all = self.list(inputs);
-                all.push(output);
-                let list = self.mk_list(&all)?;
-                let reified = self.mk(TyView::FnPtr(list, ha))?;
                 if ha.safety == Safety::Safe && hb.safety == Safety::Unsafe {
                     let unsafe_ = self.mk(TyView::FnPtr(list, FnPtrHeader { safety: Safety::Unsafe, ..ha }))?;
                     if !self.unify(unsafe_, b)? {
@@ -212,7 +227,12 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if self.plant == crate::machine::Plant::UnsizeUnasked {
             return Ok(true);
         }
-        if !self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
+        // A `No` that may rest only on a future's superset interior is not the answer: the
+        // coercion is taken and the goal registered; its failure is the interior gap
+        // (rules/coerce_interior.rs).
+        if !self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)?
+            && !self.unsize_no_may_rest_on_interior(tr, args)?
+        {
             return Ok(false);
         }
         self.register_trait(tr, args, cause)?;

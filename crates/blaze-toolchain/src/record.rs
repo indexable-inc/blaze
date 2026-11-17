@@ -2,15 +2,18 @@
 //! Little-endian; a text is `(offset u32, length u32)` into the strings:
 //!
 //! ```text
-//! 0..8     b"BLZTCH02"
+//! 0..8     b"BLZTCH03" (BLZTCH02, before the unit's sysroot byte, is refused by name)
 //! 8..36    counts u32: crates, targets, units, deps, features, cfgs, bytes of strings
 //! then     crates   96 each: name, version, edition, lib, root, dir (texts); role u8; pack
 //!                   kind u8 (blaze-fetch's: 1 a registry crate, 3 a tree); 6 zero; pack
 //!                   length u64; pack digest [32] (the pack's footer)
 //! then     targets  24 each: triple (text), first unit u32, units u32, first cfg u32, cfgs u32
 //! then     units    32 each: crate u32, kind u8 (1 lib, 2 proc macro, 3 build script), for the
-//!                   host u8, 2 zero, root (text), first feature u32, features u32, first dep
-//!                   u32, deps u32
+//!                   host u8, implicit sysroot u8 (1 none, 2 core, 3 std: a fact of the unit's
+//!                   root text, crate::implied), 1 zero, root (text), first feature u32,
+//!                   features u32, first dep u32, deps u32. A target-side library unit's deps
+//!                   include the sysroot crates its root names (`core`, `std`, `alloc`) as
+//!                   edges like any other, so a reader's closure walk opens them by itself.
 //! then     deps     12 each: extern name (text), unit u32 (within its target)
 //! then     features  8 each: a text
 //! then     cfgs     16 each: name (text), value (text; offset u32::MAX and length 0: none).
@@ -30,8 +33,9 @@ use blaze_fetch::Blake3;
 use blaze_own::{AVec, Alloc, AllocFailure};
 
 use crate::ToolchainId;
+use crate::implied::ImplicitSysroot;
 
-pub const MAGIC: &[u8; 8] = b"BLZTCH02";
+pub const MAGIC: &[u8; 8] = b"BLZTCH03";
 const HEADER: usize = 36;
 const CRATE: usize = 96;
 const TARGET: usize = 24;
@@ -114,8 +118,10 @@ pub struct UnitIn<'s> {
     /// Its root file, relative to its crate's `dir`.
     pub root: &'s str,
     pub features: &'s [&'s str],
-    /// (extern name, unit index within the same target).
+    /// (extern name, unit index within the same target), the implied sysroot edges included.
     pub deps: &'s [(&'s str, u32)],
+    /// What its root's text gives it from the sysroot (crate::implied::root_facts).
+    pub sysroot: ImplicitSysroot,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +139,8 @@ pub enum RecordRefused {
     Form { why: &'static str },
     /// Its BLAKE3 is not the id it was opened as.
     NotTheId { expected: ToolchainId, found: ToolchainId },
+    /// A manifest of an earlier form (`found` its first eight bytes): cut again.
+    OldForm { found: [u8; 8] },
     Alloc(AllocFailure),
     /// More than `u32` of something.
     TooLarge,
@@ -143,6 +151,12 @@ impl core::fmt::Display for RecordRefused {
         match self {
             RecordRefused::Form { why } => write!(f, "not a toolchain manifest: {why}"),
             RecordRefused::NotTheId { expected, found } => write!(f, "its BLAKE3 is {found}, not the toolchain id {expected}"),
+            RecordRefused::OldForm { found } => write!(
+                f,
+                "a toolchain manifest of form {}, cut by an earlier toolchain_cut (before each unit's implicit sysroot was recorded); this blaze reads {}: cut the toolchain again",
+                core::str::from_utf8(found).unwrap_or("(not text)"),
+                core::str::from_utf8(MAGIC).unwrap_or("(not text)")
+            ),
             RecordRefused::Alloc(failure) => write!(f, "{failure}"),
             RecordRefused::TooLarge => f.write_str("a toolchain manifest past 4 GiB of a part"),
         }
@@ -215,7 +229,7 @@ pub fn write<'a>(crates: &[CrateIn<'_>], targets: &[TargetIn<'_>], alloc: Alloc<
             return Err(RecordRefused::Form { why: "a unit of no crate" });
         }
         body.extend_from_slice(&u.krate.to_le_bytes());
-        body.extend_from_slice(&[u.kind as u8, u8::from(u.for_host), 0, 0]);
+        body.extend_from_slice(&[u.kind as u8, u8::from(u.for_host), u.sysroot as u8, 0]);
         body.extend_from_slice(&strings.text(u.root)?);
         for n in [first_feature, u.features.len(), first_dep, u.deps.len()] {
             body.extend_from_slice(&u32_of(n)?.to_le_bytes());
@@ -285,6 +299,8 @@ pub struct UnitRow<'b> {
     pub krate: u32,
     pub kind: UnitKind,
     pub for_host: bool,
+    /// What its root's text gives it from the sysroot (its edges are among [`UnitRow::deps`]).
+    pub sysroot: ImplicitSysroot,
     pub root: &'b str,
     features: (usize, usize),
     deps: (usize, usize),
@@ -313,7 +329,13 @@ impl<'b> ToolchainView<'b> {
     /// text, crate, unit and dependency range checked, once.
     pub fn open(bytes: &'b [u8], id: ToolchainId) -> Result<ToolchainView<'b>, RecordRefused> {
         let form = |why| RecordRefused::Form { why };
-        if bytes.len() < HEADER + FOOTER || &bytes[..8] != MAGIC {
+        if bytes.len() < HEADER + FOOTER {
+            return Err(form("no header"));
+        }
+        if &bytes[..8] != MAGIC {
+            if bytes[..6] == MAGIC[..6] {
+                return Err(RecordRefused::OldForm { found: bytes[..8].try_into().expect("8 bytes") });
+            }
             return Err(form("no header"));
         }
         let body = bytes.len() - FOOTER;
@@ -375,7 +397,7 @@ impl<'b> ToolchainView<'b> {
                 if le32(bytes, unit) >= counts[CRATES] {
                     return Err(form("a unit of no crate"));
                 }
-                if UnitKind::of(bytes[unit + 4]).is_none() || bytes[unit + 5] > 1 || bytes[unit + 6..unit + 8] != [0; 2] {
+                if UnitKind::of(bytes[unit + 4]).is_none() || bytes[unit + 5] > 1 || ImplicitSysroot::of(bytes[unit + 6]).is_none() || bytes[unit + 7] != 0 {
                     return Err(form("an unknown unit kind"));
                 }
                 view.text(unit + 8).ok_or(form("a unit's root outside the strings"))?;
@@ -490,6 +512,7 @@ impl<'b> ToolchainView<'b> {
                 krate: le32(b, unit) as u32,
                 kind: UnitKind::of(b[unit + 4]).expect("checked at open"),
                 for_host: b[unit + 5] == 1,
+                sysroot: ImplicitSysroot::of(b[unit + 6]).expect("checked at open"),
                 root: view.text_checked(unit + 8),
                 features: (le32(b, unit + 16), le32(b, unit + 20)),
                 deps: (le32(b, unit + 24), le32(b, unit + 28)),

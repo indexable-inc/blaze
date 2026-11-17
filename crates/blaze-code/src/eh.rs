@@ -163,7 +163,8 @@ fn offset(out: &mut AVec<'_, u8>, reg: u16, words: u64) {
 
 /// The FDE's instructions for `frame` (unwind.rs, "The frame word"): after instruction 0 the
 /// frame address is `sp + 16` with `x29`, `x30` saved below it; after instruction 1 it is
-/// `x29 + 16`; after the `k`th pair's `stp`, its registers are saved at `CFA - 16 - 16(k+1)`.
+/// `x29 + 16`; after the `k`th pair's `stp`, its registers are saved at `CFA - 32 - 16k` (the
+/// first [`Frame::pairs`] names) and `CFA - 24 - 16k` (the second): x20 below x19.
 pub fn frame_program(frame: Frame, out: &mut AVec<'_, u8>) {
     out.push(CFA_ADVANCE_LOC | 1);
     out.push(CFA_DEF_CFA_OFFSET);
@@ -173,11 +174,11 @@ pub fn frame_program(frame: Frame, out: &mut AVec<'_, u8>) {
     out.push(CFA_ADVANCE_LOC | 1);
     out.push(CFA_DEF_CFA_REGISTER);
     uleb(out, u64::from(reg::FP));
-    for (k, (low, high)) in frame.pairs().enumerate() {
+    for (k, (at_lower, at_higher)) in frame.pairs().enumerate() {
         let below = 16 + 16 * (k as u64 + 1);
         out.push(CFA_ADVANCE_LOC | 1);
-        offset(out, low, below / 8);
-        offset(out, high, (below - 8) / 8);
+        offset(out, at_lower, below / 8);
+        offset(out, at_higher, (below - 8) / 8);
     }
 }
 

@@ -292,17 +292,13 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
     /// The traits a glob row `use <w>::*;` brings into scope.
     fn glob(&self, row: &Row<'n>, w: Written<'_, &str>, krate: usize, out: &mut AVec<'_, ItemKey>, alloc: Alloc<'_>) -> Result<(), LocalGap> {
         let target = if w.segments.is_empty() {
-            // `self::*`, `super::*`, `crate::*`: the module the head names.
+            // `self::*`, `super::*`, `crate::*`: the module the head names. `self` and `super`
+            // as the names library reads a path's head: a block's module is passed over (the
+            // Reference, `paths.qualifiers.mod-self`, `paths.qualifiers.super`).
             match w.kind {
-                PathKind::SelfMod => self.module,
+                PathKind::SelfMod => self.names.written_module(self.module, 0).map_err(|_| Self::gap(row, UNRESOLVED))?,
                 PathKind::Crate => self.names.root_module(krate).ok_or(Self::gap(row, UNRESOLVED))?,
-                PathKind::Super(n) => {
-                    let mut m = self.module;
-                    for _ in 0..n {
-                        m = self.names.home_of(m).ok_or(Self::gap(row, UNRESOLVED))?;
-                    }
-                    m
-                }
+                PathKind::Super(n) => self.names.written_module(self.module, n).map_err(|_| Self::gap(row, UNRESOLVED))?,
                 _ => return Err(Self::gap(row, UNRESOLVED)),
             }
         } else {

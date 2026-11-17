@@ -16,7 +16,7 @@
 //! name a parameter that is not there, so the count is checked where the type is lowered,
 //! and a wrong one is E0107 (`Because::ArgCount`), the type the error type.
 
-use crate::diag::{At, Because, DiagCode};
+use crate::diag::{About, At, Because, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ItemKey, Name};
 use crate::infer::assoc_def;
@@ -38,16 +38,12 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if written == declared {
             return Ok(true);
         }
-        let at = match cause {
-            Cause::Expr(e) => At::Expr(e),
-            Cause::Pat(p) => At::Pat(p),
-            Cause::Body => At::Body,
-        };
+        let at = At::of(cause);
         let (expected, got) = match written.checked_sub(g.parent) {
             Some(own) => (g.own, own),
             None => (declared, written),
         };
-        self.diag(DiagCode::GenericArgCount, at, None, None, Some(name));
+        self.diag(DiagCode::GenericArgCount, at, About::name(name));
         if let Some(d) = self.diags.last_mut() {
             d.because = Some(Because::ArgCount { item: ItemKey(assoc_def(trait_, name)), expected, got });
         }

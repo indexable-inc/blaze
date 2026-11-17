@@ -73,7 +73,7 @@ Prints one line per crate: its key, the module's SHA-256 and size, its macros, o
 Exits 1 when any crate failed."#;
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     io::Read as _,
     path::{Path, PathBuf},
@@ -251,12 +251,21 @@ struct Ran {
     output: Vec<u8>,
 }
 
+/// The one place this builder starts the toolchain (cargo, rustc, and the sandbox wrapping
+/// cargo): `run` and both of `wrap`'s rustc calls take their `Command` from here.
+///
+/// RULE 1 BUG, counted here and only here: the interim bootstrap builder starts the pinned cargo
+/// and rustc (D52; D110 point 2). Deleted when blaze compiles proc-macro crates itself.
+#[allow(clippy::disallowed_methods, reason = "RULE 1 BUG, counted here and only here: the interim bootstrap builder starts the pinned cargo and rustc (D52; D110 point 2)")]
+fn toolchain_command(program: &OsStr) -> Command {
+    Command::new(program)
+}
+
 /// Runs `argv` in `cwd` with exactly `env` (nothing inherited), its output and error captured
 /// together, killed at `limit`.
 fn run(argv: &[OsString], cwd: &Path, env: &[(String, OsString)], limit: Duration, what: &str) -> Result<Ran, Failure> {
     let (program, args) = argv.split_first().expect("a command names its program");
-    #[allow(clippy::disallowed_methods, reason = "the builder starts cargo and the sandbox; `cwd` and the whole environment are given")]
-    let mut command = Command::new(program);
+    let mut command = toolchain_command(program);
     command.args(args).current_dir(cwd).env_clear().stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (name, value) in env {
         command.env(name, value);
@@ -1250,8 +1259,7 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
     let named = text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == macro_crate);
     let lib = text.windows(2).any(|pair| pair[0] == "--crate-type" && pair[1] == "cdylib");
     let target = text.iter().any(|it| it == "--target" || it.starts_with("--target="));
-    #[allow(clippy::disallowed_methods, reason = "the wrapper starts the rustc cargo named")]
-    let mut command = Command::new(rustc);
+    let mut command = toolchain_command(rustc);
     let shim = text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "blaze_pm_shim");
     if shim && target {
         // The shim as one object as well as its library: the macro crate links the object,
@@ -1333,8 +1341,7 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
         expand.push(arg.clone());
     }
     expand.push("-Zunpretty=expanded".into());
-    #[allow(clippy::disallowed_methods, reason = "the wrapper asks the same rustc for the expanded crate")]
-    let mut expand_command = Command::new(rustc);
+    let mut expand_command = toolchain_command(rustc);
     if let Some(dir) = std::env::var_os("BLAZE_PM_MANIFEST_DIR") {
         expand_command.env("CARGO_MANIFEST_DIR", dir);
     }

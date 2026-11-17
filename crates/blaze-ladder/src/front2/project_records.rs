@@ -16,7 +16,10 @@
 //! the fix is then the chain, never the lookup), as is an entry that is not the fn the names
 //! source said it is. A body a macro wrote has no entry in a file's outline: it is listed with
 //! no place and is not in the index (the command names such a body by its call's expansion,
-//! which this identity does not cover yet: [`ByChain::unplaced`] counts them).
+//! which this identity does not cover yet: [`ByChain::unplaced`] counts them). It IS checked:
+//! the whole-project check asks `ProjectWorld::each_body` (project/every_body.rs), which
+//! reaches every listed body and, through each body's lowering, the fns declared in it (D104's
+//! written `main` is one: a local fn of std::main's launcher).
 //!
 //! The chain function is a parameter of [`index_by_chain`] (rule 78): the world passes
 //! `blaze_file_items::item_chain`; tests/front2_project_records.rs passes a chain without the
@@ -107,8 +110,7 @@ pub fn list_bodies<'n, 'a, S: BodySource<'n>>(names: S, alloc: Alloc<'a>) -> AVe
                 base
             }
         }?;
-        let (b, t) = (base.as_ptr() as usize, text.as_ptr() as usize);
-        if t >= b && t <= b + base.len() { u32::try_from(t - b).ok() } else { None }
+        super::project::every_body::offset_in(base, text)
     };
     let mut out: AVec<'a, Listed<'n>> = AVec::new_in(alloc);
     let mut members: AVec<'a, LibKey> = AVec::new_in(alloc);

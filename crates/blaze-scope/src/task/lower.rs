@@ -24,7 +24,7 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::Hasher;
 use blaze_own::{AString, AVec, Alloc};
 use blaze_surface::{
-    AttrKind, BuiltinAttr, BuiltinDerive, CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem,
+    AttrKind, BuiltinAttr, BuiltinDerive, CallRole, CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem,
     DeclsBuilder, Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, Item, ItemDetail, ItemIndex, ItemKind,
     MacroCallDecl, MacroRulesDecl, MacroShapes, Namespace, Path, PathKind, ProcKind, Range, Rename, UseDecl, UseForm,
     WrittenVis,
@@ -528,6 +528,7 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     }
                     if !is_builtin_attr(name) {
                         attrs.others.push(name);
+                        attrs.derives_before.push(attrs.derives.len());
                     }
                 }
             }
@@ -713,6 +714,9 @@ pub struct Attrs<'t, 'a> {
     /// (the item's taker) or, after a derive, a derive's helper, which `Lower::helper_checks`
     /// sends to the cells (names-attr-4).
     pub others: AVec<'a, &'t str>,
+    /// For each of `others`, how many of `derives` were written before it: a derive written
+    /// after an attribute macro that takes the item is refused (attr-bang-kind-2).
+    pub derives_before: AVec<'a, usize>,
     /// The attributes the cells answer ([`cells_answer`]), as written, in order: sent by
     /// `Lower::attr_checks` when the item is kept.
     pub checks: AVec<'a, &'t str>,
@@ -813,6 +817,7 @@ impl<'a> Attrs<'_, 'a> {
             arbitrary_ints: false,
             tools: AVec::new_in(alloc),
             others: AVec::new_in(alloc),
+            derives_before: AVec::new_in(alloc),
             checks: AVec::new_in(alloc),
             attr_macro: None,
             takers: AVec::new_in(alloc),
@@ -1565,10 +1570,17 @@ pub struct CallSrc<'t> {
     pub input: &'t str,
     pub kind: CallShape,
     pub loc: Loc,
+    /// The file (absolute, the reader's path space) the call's text is written in: its `Loc`'s
+    /// file, or the file an `include!` read on the way ([`Fragment::written`]). Where an
+    /// `include!` call reads from (core `macros/mod.rs`: "relative to the current file").
+    pub written: &'t str,
     pub depth: u16,
     /// An attribute call no attribute in the text names ([`IMPLICIT_MAIN`], D104): it stands
     /// outermost, and its item is the whole input (blaze-expand `ItemAttrs::implicit_call`).
     pub implicit: bool,
+    /// Where the call stands in its text: what a finding in its expansion maps back through
+    /// (crate::expansion_origins). `None` for a check call, which is never expanded.
+    pub place: Option<crate::expansion_origins::CallInText>,
 }
 
 /// The attribute macro a blaze-edition binary's root `fn main` is the input of when none is
@@ -1630,6 +1642,8 @@ pub struct BodySrc<'t> {
     /// Its whole text.
     pub text: &'t str,
     pub loc: Loc,
+    /// The file its text is written in ([`CallSrc::written`]): what its block modules' calls read from.
+    pub written: &'t str,
     /// How many expansions (and bodies) deep its text is.
     pub depth: u16,
     /// Where it is written: the fragment (its owner's key: the module's own text, or a call's
@@ -1642,7 +1656,7 @@ pub struct BodySrc<'t> {
 
 impl<'t> BodySrc<'t> {
     /// The entry for an item of `detail` and `text`, if its body may write an impl.
-    fn of(detail: ItemDetail, key: ItemKey, module: ItemKey, text: &'t str, loc: Loc, depth: u16, place: (ItemKey, u32)) -> Option<BodySrc<'t>> {
+    fn of(detail: ItemDetail, key: ItemKey, module: ItemKey, text: &'t str, loc: Loc, written: &'t str, depth: u16, place: (ItemKey, u32)) -> Option<BodySrc<'t>> {
         let holds = matches!(
             detail,
             ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
@@ -1655,7 +1669,7 @@ impl<'t> BodySrc<'t> {
         const WORDS: [&str; 8] = ["impl", "struct", "enum", "union", "type", "trait", "mod", "extern"];
         // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
         // decides whether one is in statement position.
-        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, depth, place })
+        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, written, depth, place })
     }
 }
 
@@ -1851,6 +1865,14 @@ pub struct Fragment<'c, 't> {
     /// An expansion of a call in this trait's or impl's body: its entries are the owner's
     /// members ([`Lower::assoc`]), not a module's items.
     pub members_of: Option<ItemKey>,
+    /// The file its text is written in: a file's own path; for an expansion, the file an
+    /// `include!` read, else the calling call's [`CallSrc::written`]. Copied into every call
+    /// and body it lowers.
+    pub written: &'t str,
+    /// A derived item's keep call's expansion (attr-bang-kind-2): its one item is kept after the
+    /// attributes written after its derives, whose calls, with its derives and its helper
+    /// checks, the calling fragment sent (`Lower::after_derive_takers`); none is sent again.
+    pub kept: bool,
 }
 
 /// Lowers `fragment`'s items under `cx`.
@@ -1872,8 +1894,10 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
         text: fragment.text,
         outline: fragment.outline,
         at: fragment.at,
+        written: fragment.written,
         depth: fragment.depth,
         made: fragment.made,
+        kept: fragment.kept,
         pos: 0,
         procs: cx.procs,
         alloc,
@@ -1952,8 +1976,12 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     text: &'t str,
     outline: &'c Outline<'c>,
     at: Where,
+    /// [`Fragment::written`].
+    written: &'t str,
     depth: u16,
     made: bool,
+    /// [`Fragment::kept`].
+    kept: bool,
     pos: u32,
     procs: ProcDecls<'t>,
     alloc: Alloc<'a>,
@@ -2017,10 +2045,10 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             };
             let call = self.key(self.owner, "attr check", path);
             let pos = self.next_pos();
-            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0) });
+            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             // No input: a check is never `Called`, so never expanded; only its place is read
             // (an error's location, blaze-cli names.rs).
-            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), depth: self.depth, implicit: false };
+            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place: None };
             self.out.calls.push((call, src));
             self.checks_sent += 1;
         }
@@ -2133,9 +2161,24 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 return false;
             };
             let pos = self.next_pos();
-            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0) });
-            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), depth: self.depth, implicit };
+            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
+            let place = self.call_in_text(idx, item, whole);
+            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit, place };
             self.out.calls.push((call, src));
+            return false;
+        }
+        // A one-segment attribute written after a derive on the item itself is that derive's
+        // helper (inert) or an attribute macro that takes the item: rustc takes the derive, then
+        // each later attribute with the derive's helpers innermost (`take_first_attr`). Which
+        // one is the cells' answer, so the item is sent as calls and kept by its keep call when
+        // none took it (`Lower::after_derive_takers`, attr-bang-kind-2). In the keep call's own
+        // fragment (`kept`) the item is lowered here, its calls already sent.
+        if !self.kept
+            && !attrs.derives.is_empty()
+            && !attrs.others.is_empty()
+            && matches!(item.detail, ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union)
+        {
+            self.after_derive_takers(idx, item, &attrs, whole);
             return false;
         }
         // The item's own text, only now: an item an attribute macro takes is replaced by the
@@ -2145,23 +2188,15 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         let impl_header = matches!(item.detail, ItemDetail::Impl).then(|| self.impl_header(item));
         self.out.texts.push(ItemText { key, module: self.module, item: idx, name, impl_header, text: whole });
         self.attr_checks(idx, at, &attrs.checks);
-        for &path in attrs.derives.iter() {
-            let call = self.key(self.owner, "derive", path);
-            let Some(parsed) = parse_path(path, self.krate, self.alloc) else {
-                self.note(LowerNoteKind::DerivePathNotRead, at, path);
-                continue;
-            };
-            let pos = self.next_pos();
-            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Derive, pos, item: Some(idx.0) });
-            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Derive, loc: self.loc(at), depth: self.depth, implicit: false };
-            self.out.calls.push((call, src));
+        if !self.kept {
+            self.derive_calls(idx, item, at, &attrs.derives, whole);
+            self.helper_checks(idx, item, &attrs);
         }
-        self.helper_checks(idx, item, &attrs);
         if let Some(lang) = attrs.lang {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
         }
-        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.depth, (self.owner, self.pos)) {
+        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos)) {
             self.out.bodies.push(body);
         }
         match item.detail {
@@ -2348,7 +2383,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false };
                 self.out.macros.push((key, src));
             }
-            ItemDetail::MacroCall { .. } => self.fn_like_call(item, key, None),
+            ItemDetail::MacroCall { .. } => self.fn_like_call(idx, item, key, None),
             ItemDetail::Variant { .. } | ItemDetail::Field { .. } => {}
             ItemDetail::Error => {
                 let line = first_line(item.text(text, Range::new(0, item.range.end - item.range.start)));
@@ -2361,10 +2396,24 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         false
     }
 
+    /// Where a call whose input is `input` (a slice of this fragment's text) stands: its outline
+    /// entry and its input's bytes from the entry's first byte (item-relative, rule 71). The
+    /// calling text is set when the tables take the call (`Tables::add`). `None`: `input` is no
+    /// slice of the text, which `expansion_origins::write` refuses by name.
+    fn call_in_text(&self, idx: ItemIndex, item: &Item, input: &str) -> Option<crate::expansion_origins::CallInText> {
+        let at = crate::expansion_origins::offset_in(self.text, input)?;
+        Some(crate::expansion_origins::CallInText {
+            text: None,
+            item: idx,
+            input_start: at.checked_sub(item.range.start)?,
+            input_len: u32::try_from(input.len()).ok()?,
+        })
+    }
+
     /// A function-like macro call `item` keyed `call`: its path declared for the solver at this
     /// position and its source kept for the fill. `owner`: the trait or impl whose body it
     /// stands in (its expansion's items are that owner's members), `None` in a module.
-    fn fn_like_call(&mut self, item: &Item, call: ItemKey, owner: Option<ItemKey>) {
+    fn fn_like_call(&mut self, idx: ItemIndex, item: &Item, call: ItemKey, owner: Option<ItemKey>) {
         let text = self.text;
         let at = item.range.start;
         let ItemDetail::MacroCall { path: Some(path), input: Some(input) } = item.detail else {
@@ -2377,16 +2426,18 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             return;
         };
         let pos = self.next_pos();
-        self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::FnLike, pos, item: None });
+        self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::FnLike, pos, item: None, role: CallRole::Call });
         let src = CallSrc {
             module: self.module,
             owner,
             name: path_text,
             input: inside(item.text(text, input)),
+            place: self.call_in_text(idx, item, inside(item.text(text, input))),
             kind: CallShape::FnLike,
             // The call's place is its path's start, not the item's (an attribute before the
             // call is no part of it): where `line!()`/`column!()` in its eager input count from.
             loc: self.loc(item.in_file(path).start),
+            written: self.written,
             depth: self.depth,
             implicit: false,
         };
@@ -2424,11 +2475,11 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
             self.attr_checks(idx, item.range.start, &attrs.checks);
-            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.depth, (self.owner, self.pos)) {
+            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos)) {
                 self.out.bodies.push(body);
             }
             if is_call {
-                self.fn_like_call(item, key, Some(parent_key));
+                self.fn_like_call(idx, item, key, Some(parent_key));
             }
             if let Some(lang) = attrs.lang {
                 let loc = self.loc(item.range.start);

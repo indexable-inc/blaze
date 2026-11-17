@@ -32,6 +32,9 @@ pub struct Phases {
     at_main: Syscalls,
     /// The most each frame held over the request, once it answered.
     pub frames: Option<crate::work::HighWater>,
+    /// How many names worlds the request made (names.rs `world`: 0 or 1): an edit's check reads
+    /// the crate list in place and makes none (D114 rule 1, graph_payload.rs).
+    pub worlds: u32,
     /// The command's own frame, by what took its bytes ([`Phases::mark_in`], [`Phases::took`]).
     held: Held,
 }
@@ -97,6 +100,7 @@ impl Phases {
             first_chunk: None,
             at_main: blaze_mem::syscalls::snapshot(),
             frames: None,
+            worlds: 0,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
         }
     }
@@ -209,6 +213,7 @@ impl fmt::Display for Phases {
             write!(f, " · {name} {ns}")?;
         }
         writeln!(f, " · in main {} (ns; the profile's own write and exit are after this line)", self.in_main())?;
+        writeln!(f, "names        worlds made {}", self.worlds)?;
         let r = self.request;
         writeln!(
             f,

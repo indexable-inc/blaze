@@ -43,7 +43,7 @@ use blaze_build::vtable::VtableRef;
 use blaze_code::record::Symbol;
 use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_typeck::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, List, Mutbl, Name, PNode, PTy, PTys, PortableTys, UintTy};
+use blaze_typeck::{FloatTy, FnPtrHeader, IntTy, ItemKey, List, Mutbl, Name, PNode, PTy, PTys, PortableTys, UintTy};
 
 const FN_DOMAIN: &str = "blaze-ladder fn instance symbol 1";
 const STATIC_DOMAIN: &str = "blaze-ladder static symbol 1";
@@ -169,10 +169,7 @@ fn encode_trees(top: &[PTy], ground: PTys<'_>, scratch: Alloc<'_>, out: &mut AVe
                 out.extend_from_slice(&ordinal.to_le_bytes());
             }
             PNode::FnPtr(_, header) => out.extend_from_slice(&[21, header.bits()]),
-            PNode::Future(ordinal, ..) => {
-                out.push(22);
-                out.extend_from_slice(&ordinal.0.to_le_bytes());
-            }
+            PNode::Future(..) => return Err(SymbolError::NotGround { what: "an async block's future named by its expression" }),
             // A future of another body by identity (`PNode::Coroutine`): its own tag, its
             // owner and ordinal, as a closure's; its children the owner's arguments.
             PNode::Coroutine { owner, ordinal, .. } => {
@@ -281,11 +278,10 @@ pub fn decode_instance(name: &[u8], ground: &mut PortableTys<'_>, scratch: Alloc
                 wide = r.u128()?;
                 name_part = r.u64()?;
             }
-            20 => {
+            20 | 23 => {
                 wide = r.u128()?;
                 ordinal = r.u32()?;
             }
-            22 => ordinal = r.u32()?,
             _ => return Err(SymbolError::UnknownTag { tag, at }),
         }
         let want = r.count()?;
@@ -363,10 +359,7 @@ fn intern_node(o: Open, kids: &[PTy], ground: &mut PortableTys<'_>) -> Result<PT
             let header = u8::try_from(o.wide).ok().and_then(FnPtrHeader::from_bits).ok_or(byte("fn pointer header"))?;
             PNode::FnPtr(list(ground, kids)?, header)
         }
-        22 => {
-            exactly(2)?;
-            PNode::Future(ExprId(o.ordinal), kids[0], kids[1])
-        }
+        23 => PNode::Coroutine { owner: ItemKey(o.wide), ordinal: o.ordinal, args: list(ground, kids)? },
         tag => return Err(SymbolError::UnknownTag { tag, at: 0 }),
     };
     ground.intern(node).map_err(|_| SymbolError::TableFull)

@@ -27,7 +27,10 @@ impl Tier for Reference {
         // Feature bits other than LSE permit code this tier never emits: base code runs on any
         // machine that has them.
         let isa = Isa { lse: machine.features & Machine::LSE != 0, os };
-        let record = emit_record(func, names, isa, alloc).map_err(refused)?;
+        // The seam's `Tier::emit` hands no routine table yet (its `Names` has no routine
+        // places): an `f128` operation is refused naming its routine. The run path binds the
+        // routines through `emit_record_measured` (blaze-ladder code_records.rs `make_entry`).
+        let (record, _none_called) = emit_record(func, names, &crate::RoutinePlaces::NONE, isa, alloc).map_err(refused)?;
         blaze_tier::record::from_v1(record, alloc).map_err(|error| TierError::Record { tier: Self::NAME, error })
     }
 }

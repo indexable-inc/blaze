@@ -53,7 +53,7 @@ mod macro_crate;
 mod macro_side;
 mod names_refusal;
 
-pub use macro_side::RefusedCrate;
+pub use macro_side::{MACRO_TARGET, RefusedCrate};
 
 #[cfg(test)]
 #[path = "tests/units.rs"]
@@ -339,9 +339,15 @@ pub fn unit_crates<'a>(
         .iter()
         .enumerate()
         .any(|(at, u)| reached[at] && kept(u) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Bstd(_)));
+    // The program's own need of Rust's std is its own edge; a toolchain crate's is its row's
+    // (blaze_toolchain::implied): std is listed iff a crate of the closure names it.
+    let rust_std = units
+        .iter()
+        .enumerate()
+        .any(|(at, u)| reached[at] && kept(u) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Rust));
 
     let mut crates: AVec<'a, UnitCrate<'a>> = AVec::new_in(alloc);
-    let sysroot = toolchain_crates(toolchain, triple, blaze, &mut crates, alloc)?;
+    let sysroot = toolchain_crates(toolchain, triple, rust_std, blaze, &mut crates, alloc)?;
     let first = crates.len();
 
     let mut at_of: AVec<'a, usize> = AVec::new_in(alloc);
@@ -409,11 +415,14 @@ pub fn unit_crates<'a>(
     Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, refused, macro_from, alloc })
 }
 
-/// The toolchain units reachable from std, core and alloc (and bstd when `blaze`) for
-/// `triple`'s target side, pushed onto `out`; the sysroot's indices among them.
+/// The toolchain units reachable from core and alloc (and Rust's std when `rust_std`, bstd
+/// when `blaze`) for `triple`'s target side, by the rows' edges (a crate's implied sysroot
+/// edges among them, so std comes in when a crate of the closure names it), pushed onto
+/// `out`; the sysroot's indices among them.
 fn toolchain_crates<'a>(
     view: ToolchainView<'a>,
     triple: &'a str,
+    rust_std: bool,
     blaze: bool,
     out: &mut AVec<'a, UnitCrate<'a>>,
     alloc: Alloc<'a>,
@@ -425,7 +434,10 @@ fn toolchain_crates<'a>(
     let mut keep: AVec<'a, bool> = AVec::new_in(alloc);
     keep.resize(all.len(), false);
     let mut todo: AVec<'a, usize> = AVec::new_in(alloc);
-    todo.extend([sys.std.0 as usize, sys.core.0 as usize, sys.alloc.0 as usize]);
+    todo.extend([sys.core.0 as usize, sys.alloc.0 as usize]);
+    if rust_std {
+        todo.push(sys.std.0 as usize);
+    }
     if blaze {
         todo.push(sys.bstd.0 as usize);
     }
@@ -449,7 +461,6 @@ fn toolchain_crates<'a>(
             n += 1;
         }
     }
-    let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
     let target_cfg = view.cfg(triple).ok_or(no_target)?;
     let mut cfg_base: AVec<'a, (&'a str, Option<&'a str>)> = AVec::new_in(alloc);
     cfg_base.extend(target_cfg);
@@ -461,6 +472,9 @@ fn toolchain_crates<'a>(
         }
         let krate = view.krate(row.krate);
         let edition = edition_text(krate.edition).ok_or(UnitsError::ToolchainEdition { krate: krate.lib, written: krate.edition })?;
+        // Its implicit is its own: its crate's edition (the prelude's `rust_20xx`), not one
+        // uniform Rust 2024; what it is given from the sysroot is its row's edges.
+        let own = PackageEdition::of_manifest(krate.edition).map_err(|_| UnitsError::ToolchainEdition { krate: krate.lib, written: krate.edition })?;
         let proc_macro = row.kind == ToolchainKind::ProcMacro;
         let base = numbered("/toolchain/", u as u32, alloc);
         // A tree crate's pack paths start with its directory; a registry crate's do not.
@@ -511,7 +525,7 @@ fn toolchain_crates<'a>(
             origin: Origin::Toolchain { unit: u as u32, krate: row.krate },
             key: CrateItemKey(ContentId::of("blaze toolchain unit", &key)),
             edition,
-            implicit: implicit(rust, if proc_macro { &UnitKind::ProcMacro } else { &UnitKind::Lib }),
+            implicit: implicit(own, if proc_macro { &UnitKind::ProcMacro } else { &UnitKind::Lib }),
             root,
             shown_from: base,
             seen: SeenRoot::Package,

@@ -20,7 +20,7 @@
 use blaze_own::Alloc;
 
 use crate::body::Segment;
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Stop};
 use crate::ids::{ExprId, ItemKey, List, Name, PathIdx};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
@@ -171,7 +171,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Def::Adt(k) => (k, None, r.def),
                 Def::Ctor { adt, variant, .. } => (adt, Some(variant), r.def),
                 _ => {
-                    self.diag(DiagCode::NotAStruct, at, None, None, last);
+                    self.diag(DiagCode::NotAStruct, at, About::path(last));
                     return Ok(None);
                 }
             },
@@ -183,23 +183,23 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             Ok(_) => {
-                self.diag(DiagCode::NotAStruct, at, None, None, last);
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
                 return Ok(None);
             }
             Err(why) => {
-                self.unresolved(why, at, last);
+                self.unresolved(why, at, &names);
                 return Ok(None);
             }
         };
         let Some(adt) = self.reads.adt(k)? else {
-            self.diag(DiagCode::NotAStruct, at, None, None, last);
+            self.diag(DiagCode::NotAStruct, at, About::path(last));
             return Ok(None);
         };
         let variant = match (variant, adt.kind) {
             (Some(v), _) => v,
             (None, AdtKind::Struct | AdtKind::Union) => 0,
             (None, AdtKind::Enum) => {
-                self.diag(DiagCode::NotAStruct, at, None, None, last);
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
                 return Ok(None);
             }
         };
@@ -231,7 +231,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// arguments are not allowed on this type"), and the checker has no code for it.
     fn struct_variant(&mut self, at: At, k: ItemKey, seg: Segment) -> Result<Option<(u32, Def)>, Stop> {
         let Some(adt) = self.reads.adt(k)? else {
-            self.diag(DiagCode::NotAStruct, at, None, None, Some(seg.name));
+            self.diag(DiagCode::NotAStruct, at, About::name(seg.name));
             return Ok(None);
         };
         let found = match adt.kind {
@@ -239,7 +239,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             AdtKind::Struct | AdtKind::Union => None,
         };
         let Some((i, ctor)) = found else {
-            self.diag(DiagCode::NotAStruct, at, None, None, Some(seg.name));
+            self.diag(DiagCode::NotAStruct, at, About::name(seg.name));
             return Ok(None);
         };
         if seg.has_args {
@@ -259,7 +259,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             None => None,
         };
         let Some(h) = header else {
-            self.diag(DiagCode::NotAStruct, at, None, None, Some(SELF_NAME));
+            self.diag(DiagCode::NotAStruct, at, About::name(SELF_NAME));
             return Ok(None);
         };
         let self_ty = self.lower(h.types, h.self_ty, Lower::Body, at.cause())?;
@@ -267,7 +267,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         match self.view(self_ty) {
             TyView::Adt(k, args) if k == adt => Ok(Some(args)),
             _ => {
-                self.diag(DiagCode::NotAStruct, at, None, Some(self_ty), Some(SELF_NAME));
+                self.diag(DiagCode::NotAStruct, at, About::found_named(self_ty, SELF_NAME));
                 Ok(None)
             }
         }
@@ -308,7 +308,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Some(t) => self.push_coercible(init.expr, t)?,
                     None => {
                         if f.b == 0 {
-                            self.diag(DiagCode::NoSuchFieldInit, At::Expr(init.expr), None, Some(f.t), Some(init.name));
+                            self.diag(DiagCode::NoSuchFieldInit, At::Expr(init.expr), About::found_named(f.t, init.name));
                         }
                         self.push_expr(init.expr, Expectation::None, Then::Nothing)?;
                     }
@@ -355,7 +355,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let missing = declared.iter().find(|d| !inits.iter().any(|i| i.name == d.name));
         if adt.kind != AdtKind::Union {
             if let Some(d) = missing {
-                self.diag(DiagCode::MissingFields, At::Expr(e), None, Some(adt_ty), Some(d.name));
+                self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(adt_ty, d.name));
             }
         }
         Ok(())

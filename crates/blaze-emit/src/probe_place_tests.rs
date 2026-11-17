@@ -154,7 +154,7 @@ fn the_probe_tail_is_inside_the_record_instructions() {
             let at = b.data_addr(row);
             b.load(Ty::I8, Flags::NONE, at, 1, MemAttrs::default())
         });
-        let (record, insts) = emit_record_up_to(func.view(), &Nameless, ISA, BULK_INLINE_MOST, Alloc::global())
+        let (record, insts, _) = emit_record_up_to(func.view(), &Nameless, &crate::RoutinePlaces::NONE, ISA, BULK_INLINE_MOST, Alloc::global())
             .unwrap_or_else(|why| panic!("a {slot}-byte slot's function emits as a record: {why}"));
         let code = &record.code[..];
         let insts = u64::from(insts);

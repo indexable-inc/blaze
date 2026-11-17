@@ -17,20 +17,22 @@
 //!    proof it was checked over the new text and not skipped), `second` is checked at its new
 //!    place with the same outcome as in (1) (positions in a check are item-relative, rule 71),
 //!    the log is empty, and its count of whole-file stale refusals (`Log::stale_files`) is 0;
-//! 3. `second`'s SIGNATURE edited (`SIG_EDIT`: it returns `u64`): its head moved, so its text is
-//!    refused at item grain, BY NAME (`SourceError::ItemStale` naming `second`'s key), while
-//!    `first`, whose head did not move, still reads; again no whole-file refusal.
+//! 3. `second`'s SIGNATURE edited (`SIG_EDIT`: it returns `u64`, a type-only edit its crate's
+//!    `Surface` leaves out): its row is FRESH, so its text is read as it is today (`-> u64`),
+//!    no item is refused and `first` still reads; again no whole-file refusal. (Until the D114
+//!    ruling the row held a head and `second` was refused as `ItemStale` while the scope stood
+//!    valid by its reads, which nothing then remade: the class this step guards.)
 //!
 //! WITHOUT THE FIX (source.rs's `text_of` reading through `ItemsRecord::whole`): reader 2's
 //! `first` is "not lowered" with the log holding "the items record of crate `hello_world`
 //! (crate 0): Stale { .. }", so `BODY: edited body reported` panics with "the records filed
 //! [..Stale..]" (and `stale_files` would be 2 or more); reader 3 files a whole-file `Stale`,
-//! never `ItemStale`.
+//! never reads `second` as edited.
 //!
 //! It should print:
 //! `ITEM GRAIN: before: first clean, second clean`
 //! `ITEM GRAIN: body edit: first reported with <n> diagnostics, second clean and equal at its new place; whole-file stale refusals 0`
-//! `ITEM GRAIN: signature edit: second refused at item grain (ItemStale), first still read; whole-file stale refusals 0`
+//! `ITEM GRAIN: signature edit: second fresh at item grain, read as edited, first still read; item refusals 0, whole-file stale refusals 0`
 //! It needs the installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_main.rs.
 
 #![feature(allocator_api)]
@@ -87,7 +89,7 @@ fn second() -> u32 {
 }
 ";
 
-/// `second`'s signature edited: its head moved.
+/// `second`'s signature edited, in type only: its row is fresh.
 const SIG_EDIT: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     io.need_out()?.line(cx, \"Hello, world!\")?;
     Ok(())
@@ -129,6 +131,11 @@ impl Load<'static> for Kept {
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
         self.expansions.get(krate)?.get(&call).copied()
+    }
+
+    /// This loader keeps texts, not their origins: a finding in one is filed `NotServed`.
+    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'static [u8]> {
+        None
     }
 }
 
@@ -258,14 +265,19 @@ fn an_edited_body_is_checked_over_the_old_records() {
     assert_eq!(now[1].text, base[1].text, "body edit: `second` checks as before at its new place");
     println!("ITEM GRAIN: body edit: first reported with {reported} diagnostics, second clean and equal at its new place; whole-file stale refusals {}", edited.log().stale_files());
 
-    // 3. `second`'s signature edited: refused at item grain, by name.
+    // 3. `second`'s signature edited in type only: fresh, read as it is today.
     let (sig, _) = reader(keys, crate_names, kept.with_main(leak(SIG_EDIT)));
-    assert!(sig.text_of(second).is_none(), "signature edit: `second`'s text is refused");
-    let named = sig.errors().iter().any(|e| matches!(e, SourceError::ItemStale { key, .. } if *key == second));
-    assert!(named, "signature edit: an ItemStale naming `second` ({second:x}) is filed: {:?}", errors(sig));
-    assert_eq!(sig.log().stale_items(), 1, "signature edit: one item refused: {:?}", errors(sig));
-    let first_text = sig.text_of(first).expect("signature edit: `first`, its head unmoved, still reads");
+    let second_text = sig.text_of(second).unwrap_or_else(|| panic!("signature edit: `second` is fresh and reads: {:?}", errors(sig)));
+    assert!(second_text.text.starts_with("fn second() -> u64"), "signature edit: `second` is read from TODAY's text: {:?}", second_text.text);
+    let named = sig.errors().iter().any(|e| matches!(e, SourceError::ItemStale { .. }));
+    assert!(!named, "signature edit: no item is refused as stale: {:?}", errors(sig));
+    assert_eq!(sig.log().stale_items(), 0, "signature edit: no item refused: {:?}", errors(sig));
+    let first_text = sig.text_of(first).expect("signature edit: `first` still reads");
     assert!(first_text.text.starts_with("fn first() -> u32"), "signature edit: `first` read: {:?}", first_text.text);
     assert_eq!(sig.log().stale_files(), 0, "signature edit: no whole-file stale refusal");
-    println!("ITEM GRAIN: signature edit: second refused at item grain (ItemStale), first still read; whole-file stale refusals {}", sig.log().stale_files());
+    println!(
+        "ITEM GRAIN: signature edit: second fresh at item grain, read as edited, first still read; item refusals {}, whole-file stale refusals {}",
+        sig.log().stale_items(),
+        sig.log().stale_files()
+    );
 }

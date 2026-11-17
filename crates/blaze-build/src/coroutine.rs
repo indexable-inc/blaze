@@ -10,14 +10,15 @@
 //!
 //! IDENTITY, as a closure's (typeck.md, "A closure's identity"): the owner item whose body
 //! holds the `async` block, the block's ORDINAL among that body's async blocks in expression
-//! order ([`coroutines_in`]), and the owner's generic arguments. The checker's type is still
-//! `PNode::Future(expression, output, interior)`, by an expression id local to one body, which
-//! no key and no ground type may hold. Until blaze-typeck spells the identity itself (wanted:
-//! `PNode::Coroutine { owner, ordinal, args }`, made where `open_future` makes `Future`), the
-//! GROUND form is the same node read as `Future(ExprId(ordinal), output, FnDef(owner,
-//! owner_args))`: [`identity`] is the one place that makes it, [`coroutine_of`] the one that
-//! reads it. A future still named by its expression is refused by name wherever it is grounded
-//! (instance.rs `ground` through [`ground_node`]), never guessed.
+//! order ([`coroutines_in`]), and the owner's generic arguments. The checker spells it
+//! `PNode::Coroutine { owner, ordinal, args }` (blaze-typeck coroutine_id.rs) for a future of
+//! another body, and that node is the ONE ground form (coroutine-identity-1): [`identity`] is
+//! the one place the builder makes it, [`coroutine_of`] the one that reads it, and `ground`
+//! maps its arguments as a closure's. Its output, upvars and state are facts of the identity
+//! (`LayoutFacts::coroutine`, `coroutine_state`), never parts of the type. In its OWN body the
+//! checker still names a block by its expression, `PNode::Future(expression, output,
+//! interior)`, which no key and no ground type may hold: the walk turns it into the identity
+//! ([`own_block`]), and anywhere else it is refused by name (instance.rs `ground`), never guessed.
 //!
 //! FACTS of that identity, as a closure's: [`CoroutineFacts`] (the upvars' tuple and the
 //! output, in the owner's generic parameters: `LayoutFacts::coroutine`), and one fact a closure
@@ -30,6 +31,7 @@
 use blaze_lir::Ty;
 use blaze_lir::coroutine::StateLayout;
 use blaze_own::Alloc;
+use blaze_flow_lower::identity::{Identity, Role};
 use blaze_typeck::{BodyView, CaptureKind, Checked, Expr, ExprId, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys};
 
 use crate::BuildError;
@@ -59,42 +61,22 @@ pub struct CoroutineOf {
     pub owner_args: List,
     /// Its position among the owner body's async blocks ([`coroutines_in`]).
     pub ordinal: u32,
-    /// Its output (`Future::Output`), ground.
-    pub output: PTy,
 }
 
-/// The ground type of coroutine `ordinal` of `owner` at `owner_args`, with `output`, interned
-/// in `out` (the module doc's ground form). The one constructor: the walk makes its own
-/// body's blocks with it, and a seam that answers a hidden type (an `async fn`'s) makes that
-/// with it over the owner's parameters.
-pub fn identity(out: &mut PortableTys<'_>, owner: ItemKey, ordinal: u32, owner_args: List, output: PTy) -> Result<PTy, BuildError> {
-    let full = |_| BuildError::Malformed { what: "the ground table is full" };
-    let named = out.intern(PNode::FnDef(owner, owner_args)).map_err(full)?;
-    out.intern(PNode::Future(ExprId(ordinal), output, named)).map_err(full)
+/// The ground type of coroutine `ordinal` of `owner` at `owner_args`, interned in `out`:
+/// `PNode::Coroutine`, the checker's own identity node (the module doc). The one constructor:
+/// the walk makes its own body's blocks with it. Its output is a fact of the identity
+/// (`LayoutFacts::coroutine`), not a part of the type.
+pub fn identity(out: &mut PortableTys<'_>, owner: ItemKey, ordinal: u32, owner_args: List) -> Result<PTy, BuildError> {
+    out.intern(PNode::Coroutine { owner, ordinal, args: owner_args }).map_err(|_| BuildError::Malformed { what: "the ground table is full" })
 }
 
-/// Ground type `ty` as a coroutine, or `None`: another type, or a future still named by its
-/// expression (the checker's own form, which has no identity outside its body).
+/// Ground type `ty` as a coroutine, or `None`: another type. (A future still named by its
+/// expression never reaches a ground table: `ground` refuses it.)
 pub fn coroutine_of(ground: PTys<'_>, ty: PTy) -> Option<CoroutineOf> {
-    let PNode::Future(ordinal, output, named) = ground.node(ty).ok()? else {
-        return None;
-    };
-    match ground.node(named).ok()? {
-        PNode::FnDef(owner, owner_args) => Some(CoroutineOf { owner, owner_args, ordinal: ordinal.0, output }),
+    match ground.node(ty).ok()? {
+        PNode::Coroutine { owner, ordinal, args } => Some(CoroutineOf { owner, owner_args: args, ordinal }),
         _ => None,
-    }
-}
-
-/// instance.rs `ground`'s arm for a `Future` node of table `from` whose children are already
-/// mapped (`output` and `named`): the identity form goes on as it is, its owner's arguments
-/// substituted with the rest; the checker's by-expression form is refused by name.
-pub(crate) fn ground_node(from: PTys<'_>, ordinal: ExprId, interior: PTy, output: PTy, named: PTy) -> Result<PNode, BuildError> {
-    match from.node(interior) {
-        Ok(PNode::FnDef(..)) => Ok(PNode::Future(ordinal, output, named)),
-        Ok(_) => Err(BuildError::UnsupportedSig {
-            what: "an async block's future named by its expression (only its identity form, coroutine.rs, crosses a body)",
-        }),
-        Err(_) => Err(BuildError::Malformed { what: "a future's third part past its table" }),
     }
 }
 
@@ -221,19 +203,18 @@ pub(super) struct Co {
 pub(super) struct CoParts {
     pub(super) of: CoroutineOf,
     pub(super) env: PTy,
+    /// Its output (`Future::Output`), ground: the world's fact grounded at the owner's arguments.
+    pub(super) output: PTy,
 }
 
-/// Record type `t` as an `async` block still in the checker's own form (`Future(expression,
-/// output, interior)`): the block's expression and its output. `None` for every other type,
-/// the identity form included. `Walk::ground_ty` asks it: a block's type in its OWN body is
+/// Record type `t` as an `async` block in the checker's own form (`Future(expression, output,
+/// interior)`): the block's expression. `None` for every other type, the identity
+/// (`PNode::Coroutine`) included. `Walk::ground_ty` asks it: a block's type in its OWN body is
 /// the one place the by-expression form is read, and there it has an ordinal.
-pub(super) fn own_block(types: PTys<'_>, t: PTy) -> Option<(ExprId, PTy)> {
-    let PNode::Future(e, output, third) = types.node(t).ok()? else {
-        return None;
-    };
-    match types.node(third) {
-        Ok(PNode::FnDef(..)) => None,
-        _ => Some((e, output)),
+pub(super) fn own_block(types: PTys<'_>, t: PTy) -> Option<ExprId> {
+    match types.node(t).ok()? {
+        PNode::Future(e, ..) => Some(e),
+        _ => None,
     }
 }
 
@@ -247,23 +228,21 @@ fn co_err(error: TyErr) -> BuildError {
 }
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
-    /// The ground type of `async` block `e` of this body, whose output is record type
-    /// `output`: its identity at this instance's arguments ([`identity`]). An output that
-    /// itself holds a block of the body in the checker's form is refused by `ground`, by name.
-    pub(super) fn own_coroutine_ty(&mut self, e: ExprId, output: PTy) -> Result<PTy, TyErr> {
+    /// The ground type of `async` block `e` of this body: its identity at this instance's
+    /// arguments ([`identity`]). Its output is the world's fact of that identity
+    /// ([`Self::coroutine_parts`]).
+    pub(super) fn own_coroutine_ty(&mut self, e: ExprId) -> Result<PTy, TyErr> {
         let ordinal = coroutines_in(self.body)
             .find(|c| c.1 == e)
             .map(|c| c.0)
             .ok_or(TyErr::Malformed("a future's expression that is not an async block of its body"))?;
-        let types = self.types;
-        let out = self.ground_in(types, output)?;
         let own = self.args;
         let args = self.ground.intern_list(own).map_err(|_| TyErr::Malformed("the ground table is full"))?;
-        identity(self.ground, self.body.owner, ordinal, args, out).map_err(TyErr::Other)
+        identity(self.ground, self.body.owner, ordinal, args).map_err(TyErr::Other)
     }
 
-    /// Ground coroutine type `g` read: its identity from the type, its upvars from the seam,
-    /// grounded at the owner's arguments (closure.rs `closure_parts` is its sibling).
+    /// Ground coroutine type `g` read: its identity from the type, its upvars and output from
+    /// the seam, grounded at the owner's arguments (closure.rs `closure_parts` is its sibling).
     pub(super) fn coroutine_parts(&mut self, g: PTy) -> Result<CoParts, TyErr> {
         let of = coroutine_of(self.ground.view(), g).ok_or(TyErr::Malformed("a coroutine's parts asked of another type"))?;
         let facts = self.adts.facts();
@@ -273,7 +252,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut a: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
         a.extend_from_slice(self.ground.view().list(of.owner_args).map_err(|_| TyErr::Malformed("a list past the ground table"))?);
         let env = crate::instance::ground(c.types, c.env, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
-        Ok(CoParts { of, env })
+        let output = crate::instance::ground(c.types, c.output, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
+        Ok(CoParts { of, env, output })
     }
 
     /// `Walk::copy`'s step for walk row `l` when it is a coroutine's: the state's bytes moved
@@ -488,7 +468,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let g = self.ground_ty(t).map_err(co_err)?;
         let parts = self.coroutine_parts(g).map_err(co_err)?;
         let items = self.async_items(Some(block))?;
-        let polled = self.poll_ty(items, parts.of.output)?;
+        let polled = self.poll_ty(items, parts.output)?;
         self.ret = self.repr(polled).map_err(co_err)?;
         let (row, id) = self.poll_row(self.ret).map_err(co_err)?;
         self.ret_pass = Self::rust_pass(self.ret)?;
@@ -672,13 +652,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let gt = self.ground_ty(t).map_err(err)?;
         let trepr = self.repr(gt).map_err(err)?;
         let v = self.pop()?;
-        let v = match (v, trepr) {
+        // `moved`: the operand's own slot when the operand is a whole one (a copy, or a fresh
+        // temporary): `into_future` takes it by value, so its storage ends after the call and
+        // the slot, whose address the call took, is not kept across the suspend.
+        let (v, moved) = match (v, trepr) {
             (V::Place(..), Repr::Agg(_)) if !self.is_fresh(operand)? => {
                 let at = self.temp(trepr);
                 self.store(v, trepr, at)?;
-                V::Place(at.0, at.1)
+                (V::Place(at.0, at.1), self.whole_slot(at))
             }
-            _ => v,
+            (V::Place(p, off), Repr::Agg(_)) => (v, self.whole_slot((p, off))),
+            _ => (v, None),
         };
         if !self.checked.callees.column::<0>().iter().any(|&x| x == e) {
             return Err(unsupported(e, "`.await` with no `IntoFuture::into_future` callee in the record"));
@@ -696,6 +680,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let reference = self.b.reference(RefKind::Func, place);
         self.emit_call(Callee::Direct(reference), &[trepr], &[tpass], hrepr, hpass)?;
         let hv = self.pop()?;
+        if let Some(slot) = moved {
+            self.b.slot_dead(slot);
+        }
 
         // Step 2: `tmp`.
         let at = match (hv, hrepr) {
@@ -710,6 +697,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // `tmp`'s storage ends on the Ready edge (ASYNC.md D-A6), so the state's bytes for it
         // are free for what a later await keeps.
         let fut_slot = self.await_slot(e, at, "`.await` of a future not in a slot of its own: its storage cannot end on the Ready edge")?;
+        self.name_slot(fut_slot, Identity::Temp(e, Role::Awaitee));
 
         // Step 3's type: `Pin<&mut Held>`; the loop's result type: `Poll<Output>`.
         let fut_ref = self.ground.intern(PNode::Ref(Mutbl::Mut, held)).map_err(full)?;
@@ -738,6 +726,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let poll = Instance { item: poll_item, args };
         let held_drops = self.needs_drop(held).map_err(err)?;
 
+        // Every value waiting on the stack (an operand evaluated before this `.await`) is
+        // written into the slot of the flow local it is, before the loop, and read back on the
+        // Ready edge: the walk invents no slot across a suspend (walk/await_spill.rs).
+        let spilled = self.spill_waiting(e)?;
+        let planted = self.plant_before();
+
         // Steps 3 and 4, the loop's head: where a poll after a suspend goes on.
         let head = self.create();
         self.jump(head, &[]);
@@ -751,6 +745,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let reference = self.b.reference(RefKind::Func, place);
         self.emit_call(Callee::Direct(reference), &[prepr, Repr::Ptr], &[ppass, cpass], rrepr, rpass)?;
         let r = self.pop()?;
+        self.b.slot_dead(pin_slot);
         let rat = self.place(r, rrepr)?;
         let poll_slot = self.await_slot(e, rat, "`.await` whose `Poll` is not in a slot of its own: its storage cannot end on the Ready edge")?;
         let d = self.read_discriminant(id, rat)?;
@@ -761,6 +756,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
         // Step 5: this poll returns `Poll::Pending`; the next goes on at the head.
         self.begin(pending);
+        self.b.slot_dead(poll_slot);
         let to = self.sret.ok_or(malformed("a coroutine's `Poll` returned without its pointer"))?;
         self.write_tag(Some(co.poll_id), items.pending, (to, 0));
         let cancel = self.create();
@@ -782,6 +778,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
         // Step 6: the value, then `tmp` is dropped.
         self.begin(ready);
+        self.reload_waiting(&spilled);
+        self.plant_after(planted);
         let (ff, fl, _) = self.variant_rows(row, items.ready)?;
         let value = match (fl, orepr) {
             (_, Repr::None) => V::None,
@@ -800,6 +798,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let value = match value {
             V::Place(..) => {
                 let to = self.temp(orepr);
+                self.name_at(to, Identity::Temp(e, Role::Result));
                 self.store(value, orepr, to)?;
                 V::Place(to.0, to.1)
             }
@@ -819,27 +818,33 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `slot_dead` the Ready edge writes. Refused by name when it is not one: a `slot_dead`
     /// of a slot that also holds something else would end that too.
     fn await_slot(&self, e: ExprId, at: (Value, i32), refused: &'static str) -> Result<SlotId, BuildError> {
+        self.whole_slot(at).ok_or_else(|| unsupported(e, refused))
+    }
+
+    /// The slot whose whole storage the place `at` is, if it is one (its `slot_addr`, offset 0).
+    fn whole_slot(&self, at: (Value, i32)) -> Option<SlotId> {
         let view = self.b.func().view();
         let ix = at.0.index();
-        if at.1 == 0 && ix < view.len() && view.op(ix) == Op::SlotAddr {
-            return Ok(SlotId(view.data[ix]));
-        }
-        Err(unsupported(e, refused))
+        (at.1 == 0 && ix < view.len() && view.op(ix) == Op::SlotAddr).then(|| SlotId(view.data[ix]))
     }
 }
 
 /// Builds coroutine `ordinal` of `body` (the owner's, checked once as `checked`) at the
-/// owner's instance `subst` names: its body walked and split by the pass
-/// (`blaze_lir::coroutine::split`) into RESUME and DROP, its ENTRY, and the state's shape,
-/// which the caller keeps as the record `LayoutFacts::coroutine_state` answers from. The
-/// split functions name their callees by the body's reference places, so each carries the
-/// body's tables.
+/// owner's instance `subst` names: its body walked and split by the pass into RESUME and DROP,
+/// its ENTRY, and the state's shape. With `plan` (the run path, always: coroutine_state.rs
+/// `lay_state` from the flow's saved locals' types, ASYNC.md P8) the walk names each slot that
+/// is a saved flow local (walk/state_names.rs), the split places those at their offsets and
+/// refuses any other it keeps across a suspend (`blaze_lir::coroutine::split_in`), and the
+/// shape and niche are the laid ones; with `None` (this crate's unit tests, which have no
+/// recipe) the split lays the state itself. The split functions name their callees by the
+/// body's reference places, so each carries the body's tables.
 pub(crate) fn build<A: Allocator + Clone>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     ordinal: u32,
     subst: &mut Subst<'_, '_>,
     adts: &dyn Adts,
+    plan: Option<crate::coroutine_state::StatePlan<'_>>,
     alloc: A,
 ) -> Result<crate::BuiltCoroutine<A>, BuildError> {
     let block = coroutines_in(body).find(|c| c.0 == ordinal).map(|c| c.1).ok_or(malformed("a coroutine ordinal past its owner body's async blocks"))?;
@@ -853,19 +858,38 @@ pub(crate) fn build<A: Allocator + Clone>(
         blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
         other => BuildError::Lir(other),
     };
-    let (func, shape, refs, statics, thread_locals, vtables) = {
+    let (func, shape, refs, statics, thread_locals, vtables, names) = {
         let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc.clone());
+        w.names = plan.map(|p| super::state_names::Names::new(p.names, p.plant, root, alloc.clone()));
         w.scan_flags()?;
         let shape = w.run_coroutine(block)?;
         // `poll` on a finished state: the library's two panics, when it declares them.
         let panics = w.coroutine_panics()?;
-        let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
-        (b.finish().map_err(lir)?, (shape, panics), refs, statics, thread_locals, vtables)
+        let Walk { b, refs, statics, thread_locals, vtables, names, .. } = w;
+        (b.finish().map_err(lir)?, (shape, panics), refs, statics, thread_locals, vtables, names)
     };
     let (shape, panics) = shape;
-    let split = blaze_lir::coroutine::split_with(func.view(), shape, panics, alloc.clone()).map_err(BuildError::Coroutine)?;
-    let state = StateShape::of(&split.layout);
-    let niche = crate::niche_of(&split.layout);
+    let split = match (plan, &names) {
+        (Some(p), Some(n)) => {
+            let l = p.laid;
+            let region = blaze_lir::coroutine::Region {
+                start: l.region.start,
+                end: l.region.end,
+                tag_offset: l.shape.tag_offset,
+                tag_ty: l.shape.tag_ty,
+                size: l.shape.size,
+                align: l.shape.align,
+            };
+            let slot_names = n.slot_names(alloc.clone());
+            blaze_lir::coroutine::split_in(func.view(), shape, panics, region, &slot_names, alloc.clone()).map_err(|error| n.split_err(error))?
+        }
+        (None, None) => blaze_lir::coroutine::split_with(func.view(), shape, panics, alloc.clone()).map_err(BuildError::Coroutine)?,
+        _ => return Err(malformed("a coroutine's state plan and its walk's names out of step")),
+    };
+    let (state, niche) = match plan {
+        Some(p) => (p.laid.shape, p.laid.niche),
+        None => (StateShape::of(&split.layout), crate::niche_of(&split.layout)),
+    };
     let poll = {
         let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc);
         w.run_poll_entry(block)?;

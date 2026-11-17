@@ -228,6 +228,10 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         if let Some(last) = segs.last() {
             let shown = v.text_at(v.path_range(p)?)?;
             self.gat_bindings(tys, env, v, last, key, args, pr, shown, &mut |c| out.push(c))?;
+            // `Name<T>: Bounds` (an associated type bound on a generic associated type with
+            // type or const arguments): each bound on `<self_ty as Owner>::Name<T>`, into the
+            // same work list as `Name: Bounds` below (gat_bounds.rs).
+            self.gat_bounds(tys, env, v, last, key, args, pr, shown, &mut |b, on| todo.push((b, on)))?;
         }
         // `Name: Bounds`: each bound on `<self_ty as Owner>::Name`, the owner found as for
         // `Name = T`.

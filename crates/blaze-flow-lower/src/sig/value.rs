@@ -178,6 +178,8 @@ pub fn read_callable_param<A: Allocator + Clone>(
         anon: 0,
         hidden: 0,
         alloc: alloc.clone(),
+        imp: None,
+        unwritten: Vec::new_in(alloc.clone()),
     };
     lex(text, &mut r.toks)?;
     r.pair_brackets()?;

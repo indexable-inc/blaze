@@ -95,4 +95,8 @@ fn the_mode_decides_the_runner() {
     assert_eq!(placement(native, Mode::Check, "zstd-sys"), Runner::Wasm);
     assert_eq!(placement(native, Mode::Build, "zstd-sys"), native);
     assert_eq!(placement(native, Mode::Run, "zstd-sys"), native);
+    // N7: libusb1-sys checks as wasm (no sw_vers there; pkg-config from the pins) and builds
+    // native (its C compile).
+    assert_eq!(placement(native, Mode::Check, "libusb1-sys"), Runner::Wasm);
+    assert_eq!(placement(native, Mode::Build, "libusb1-sys"), native);
 }

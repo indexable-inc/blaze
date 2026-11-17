@@ -69,6 +69,7 @@ pub mod inline;
 /// Legalize (INTRINSICS.md 3.2, 3.5): vectors to scalars, `f16` widened, `f128` to
 /// compiler_builtins calls, in front of the Reference and Fast tiers only.
 pub mod legalize;
+pub mod loop_entry;
 pub mod op;
 pub mod parse;
 pub mod persist;
@@ -97,6 +98,8 @@ pub const VERSION: u64 = 2;
 mod coroutine_tests;
 #[cfg(test)]
 mod inline_tests;
+#[cfg(test)]
+mod loop_entry_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

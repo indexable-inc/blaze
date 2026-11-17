@@ -405,6 +405,7 @@ name = "blaze-cli"
 version = "0.0.0"
 dependencies = [
  "blaze-blake3",
+ "blaze-build-script",
  "blaze-cas",
  "blaze-core",
  "blaze-deflate",
@@ -612,7 +613,9 @@ dependencies = [
 name = "blaze-export"
 version = "0.0.0"
 dependencies = [
+ "blaze-build-script",
  "blaze-code",
+ "blaze-hash",
  "blaze-ids",
  "blaze-native",
  "blaze-own",
@@ -1150,6 +1153,8 @@ version = "0.0.0"
 dependencies = [
  "blaze-code",
  "blaze-core",
+ "blaze-emit",
+ "blaze-inproc",
  "blaze-lir",
  "blaze-own",
  "blaze-tier",

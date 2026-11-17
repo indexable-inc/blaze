@@ -70,8 +70,7 @@ impl LayoutFacts for World {
 /// The ground type of the world's coroutine in `ground`.
 fn coroutine_ty(ground: &mut PortableTys<'_>) -> PTy {
     let none = ground.intern_list(&[]).unwrap();
-    let output = ground.intern(PNode::Uint(UintTy::U64)).unwrap();
-    coroutine_identity(ground, OWNER, 0, none, output).unwrap()
+    coroutine_identity(ground, OWNER, 0, none).unwrap()
 }
 
 /// A coroutine's state is its upvars, then what the pass keeps, then the tag
@@ -138,8 +137,8 @@ fn a_coroutine_is_named_by_owner_ordinal_and_arguments() {
     let t = coroutine_ty(&mut from);
     let none = from.intern_list(&[]).unwrap();
     let output = from.intern(PNode::Uint(UintTy::U64)).unwrap();
-    assert_eq!(coroutine_of(from.view(), t), Some(CoroutineOf { owner: OWNER, owner_args: none, ordinal: 0, output }));
-    let second = coroutine_identity(&mut from, OWNER, 1, none, output).unwrap();
+    assert_eq!(coroutine_of(from.view(), t), Some(CoroutineOf { owner: OWNER, owner_args: none, ordinal: 0 }));
+    let second = coroutine_identity(&mut from, OWNER, 1, none).unwrap();
     assert_ne!(t, second, "two async blocks of one body share a type");
 
     let mut out = PortableTys::new_in(Alloc::global());

@@ -216,6 +216,14 @@ pub trait Heads {
         let _ = (trait_, name);
         None
     }
+    /// The const parameters of the trait's associated type `name` among its OWN type and
+    /// const parameters (position counted from 0 after the trait's, lifetimes not counted;
+    /// declared type), filed with the trait's members: `None` when not on record (the
+    /// default: a source of heads that keeps none; or the members not made yet).
+    fn assoc_const_params(&self, trait_: LibKey, name: Name) -> Option<&[(u32, PTy)]> {
+        let _ = (trait_, name);
+        None
+    }
     /// The trait's supertraits written on its header (`: FnMut<Args>`), each with its
     /// arguments (`Self` first) over the trait's own parameters (`Self` = `Param(0)`).
     fn trait_supers(&self, trait_: LibKey) -> Option<&[(LibKey, List)]>;
@@ -1383,6 +1391,9 @@ pub(super) fn fn_ptr_abi(written: &str, r: Range) -> Result<tc::Abi, Why> {
         "system-unwind" => Ok(tc::Abi::SystemUnwind),
         "Rust" => Ok(tc::Abi::Rust),
         "rust-call" => Ok(tc::Abi::RustCall),
+        // A body's `extern "llvm-intrinsic"` block: its declarations' headers (heads.rs, a
+        // local foreign fn); the builder calls them by their `link_name` (front2/llvm_intrinsic.rs).
+        "llvm-intrinsic" => Ok(tc::Abi::LlvmIntrinsic),
         _ => Err(Why::Unsupported("an ABI other than \"C\", \"C-unwind\", \"system\" and \"Rust\"", r)),
     }
 }

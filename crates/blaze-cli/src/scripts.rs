@@ -60,9 +60,10 @@ use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree};
 use blaze_proc_macro::script_unit::{self, Setting};
 use blaze_proc_macro::spawn_route::SpawnSetting;
 use blaze_unit_graph::record::Decoded;
-use blaze_unit_graph::{Records, StoreSources, Unit, UnitGraph, UnitId, UnitKind};
+use blaze_unit_graph::{CfgAtom, Records, StoreSources, Unit, UnitGraph, UnitId, UnitKind};
+use blaze_world::Side;
 use bstd::cx::Cx;
-use bstd::fs::{Dir, ReadOnly};
+use bstd::fs::{Dir, ReadOnly, ReadWrite};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
@@ -72,6 +73,10 @@ use crate::store::Store;
 use crate::work::Record;
 
 const SUBJECT_DOMAIN: &str = "blaze-cli script unit 1";
+
+#[cfg(test)]
+#[path = "scripts_tests.rs"]
+mod tests;
 const SOURCE_DOMAIN: &str = "blaze-cli script unit source 1";
 /// The out: the outputs record's bytes ("1": `bzbsout4`, blaze-build-script's form).
 const OUT_DOMAIN: &str = "blaze-cli script outputs out 1";
@@ -88,6 +93,30 @@ pub(crate) enum RanAs {
     Wasm = 1,
     /// Through the D112 native runner: the machine's tools ran it.
     Native = 2,
+}
+
+impl RanAs {
+    /// How a script placed on `runner` runs: the one map from D112's choice point.
+    pub(crate) fn of(runner: &Runner) -> RanAs {
+        match runner {
+            Runner::Native { .. } => RanAs::Native,
+            Runner::Wasm => RanAs::Wasm,
+        }
+    }
+}
+
+/// Whether the run of a crate's build script may be shared (ruling D115 sharing (i)): its crate
+/// is public (the toolchain's, a checksummed registry archive's) AND it is placed on the wasm
+/// path. A native run never is: its record, and by the store's public-reads rule every record
+/// reading it, stays this machine's (D112's "local records only").
+pub(crate) fn run_is_public(crate_public: bool, ran_as: RanAs) -> bool {
+    crate_public && ran_as == RanAs::Wasm
+}
+
+/// How the run of build-script unit `script` is placed: D112's one choice point, made before
+/// anything runs; the same function the job asks (`job`), so the key and the run agree.
+pub(crate) fn placement(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> RanAs {
+    RanAs::of(&placed(graph, script, MODE, alloc))
 }
 
 /// A `Script` record's payload split into how it ran and its outputs record (`bzbsout`, read
@@ -128,47 +157,73 @@ pub(crate) const SCRIPT_FRAME: usize = 4 << 30;
 /// The native work folder's command name (`<home>/.blaze/v2/native-work/<this>`).
 const NATIVE_WORK: &str = "blaze";
 
-/// A script unit's subject: its package's name and version, the side of the unit it serves
-/// (`h` host, `t` target) and its features, sorted as the graph holds them. Stable across
-/// edits of anything else; two units of one package (a host and a target copy, two feature
-/// sets) are two names.
-pub(crate) fn subject(graph: &UnitGraph<'_>, script: UnitId) -> Option<ContentId> {
+/// The macro side's target (D89 (a), rule 10): a macro-side crate's script runs for it.
+/// (blaze-scope's `macro_side::MACRO_TARGET` is the same text, private to it.)
+const MACRO_TARGET: &str = "wasm32-wasip1";
+
+/// The subject of the run of build-script unit `script` for `side`: the one function,
+/// `blaze_world::script_subject`, over the unit it serves (package, version, features) and the
+/// world's side, never `for_host` (ruling D115 (2)). `None`: no build-script unit, or one that
+/// serves no unit.
+pub(crate) fn subject(graph: &UnitGraph<'_>, script: UnitId, side: Side, alloc: Alloc<'_>) -> Option<ContentId> {
     let unit = graph.units.get(script.index())?;
     if unit.kind != UnitKind::BuildScript {
         return None;
     }
-    let serves = script_unit::served(graph, script)?;
-    let mut h = blaze_ids::Hasher::new(SUBJECT_DOMAIN);
-    h.part(unit.name.as_str().as_bytes()).part(unit.version.as_str().as_bytes());
-    h.update(if graph.units[serves.index()].for_host { b"h" } else { b"t" });
-    for feature in unit.features.iter() {
-        h.part(feature.as_str().as_bytes());
-    }
-    Some(h.finish())
+    let serves = &graph.units[script_unit::served(graph, script)?.index()];
+    let mut features: AVec<'_, &str> = AVec::with_capacity_in(serves.features.len(), alloc.clone());
+    features.extend(serves.features.iter().map(|f| f.as_str()));
+    Some(blaze_world::script_subject(serves.name.as_str(), serves.version.as_str(), side, &features, alloc))
 }
 
-/// The `Script` name of the build-script unit `script`.
-pub(crate) fn name_of(graph: &UnitGraph<'_>, script: UnitId) -> Option<Name> {
-    subject(graph, script).map(|subject| Name::new(Kind::Script, subject))
+/// The `Script` name of the run of build-script unit `script` for `side`.
+pub(crate) fn name_of(graph: &UnitGraph<'_>, script: UnitId, side: Side, alloc: Alloc<'_>) -> Option<Name> {
+    subject(graph, script, side, alloc).map(|subject| Name::new(Kind::Script, subject))
 }
 
-
-/// The `Script` parts of a graph record `graph_record` made over the graph source
-/// `graph_source`: one per build-script unit that serves a unit, by subject, sorted and
-/// without repeats (two scripts of one subject are one run: their inputs are one).
-pub(crate) fn parts(graph_source: ContentId, graph_record: &[u8], alloc: Alloc<'_>) -> Result<std::vec::Vec<(Name, ContentId), Global>, blaze_unit_graph::record::RecordRefused> {
-    let decoded = blaze_unit_graph::record::decode(graph_record, alloc)?;
-    let graph = &decoded.graph;
+/// The `Script` parts of a world whose crates read the runs `keys` (`Names::script_keys`: each
+/// run's subject and its reading crate's world key, named with the crates' `CrateScope` parts):
+/// one a subject, sorted and without repeats (two crates of one subject read one run, and have
+/// one crate key: ruling D115 (3)).
+pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>) -> std::vec::Vec<(Name, ContentId), Global> {
     let mut parts = std::vec::Vec::new_in(Global);
-    for at in 0..graph.units.len() {
-        let Some(subject) = subject(graph, UnitId(at as u32)) else { continue };
+    // Piece 2c (ruling D115 (5), (c)): no module listing in a run's source. Its module is a
+    // read (script_modules.rs); its crate's world key holds the package's identity and its
+    // dependencies' (which `links` inputs it has). Its placement is in it too (ruling D115
+    // sharing (ii), rule 21): a native run and a wasm run are never one record.
+    for (subject, crate_key, ran_as) in keys {
         let mut h = blaze_ids::Hasher::new(SOURCE_DOMAIN);
-        h.id(&graph_source).id(&subject).update(&[mode_byte(MODE), C_MODE as u8]);
+        h.id(&subject).id(&crate_key).update(&[mode_byte(MODE), C_MODE as u8, ran_as as u8]);
         parts.push((Name::new(Kind::Script, subject), h.finish()));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);
-    Ok(parts)
+    parts
+}
+
+/// The probe table of `side`: the pinned rows (`pinned::TEMPO`) keyed for that side's triple, so
+/// a try-compile asked for it is answered by a row made for it (`probe::compile_key` holds the
+/// target), never by another triple's row, and a question no row answers is the runtime's
+/// refusal naming the triple (`SpawnRefusal::CannotAnswerYet`).
+pub(crate) fn pinned_table(side: Side, alloc: Alloc<'_>) -> std::vec::Vec<Row> {
+    let triple = match side {
+        Side::Target => crate::graph::TRIPLE,
+        Side::Macro => MACRO_TARGET,
+    };
+    blaze_build_script::probe::pinned_rows(triple, blaze_build_script::pinned::TEMPO, alloc).to_vec()
+}
+
+/// The cfg `cfg` (a world row's, sorted, each once) as the atoms a script's environment is made
+/// from, in `alloc`, in the same order.
+pub(crate) fn side_atoms<'a>(cfg: &[(&str, Option<&str>)], alloc: Alloc<'a>) -> AVec<'a, CfgAtom<'a>> {
+    let mut atoms: AVec<'a, CfgAtom<'a>> = AVec::with_capacity_in(cfg.len(), alloc.clone());
+    for (name, value) in cfg.iter() {
+        atoms.push(match value {
+            Some(value) => CfgAtom::pair(name, value, alloc.clone()),
+            None => CfgAtom::flag(name, alloc.clone()),
+        });
+    }
+    atoms
 }
 
 const fn mode_byte(mode: Mode) -> u8 {
@@ -187,7 +242,9 @@ pub(crate) struct Shared<'f> {
     store: PathBuf,
     /// The checkout, as a member's folder is reached from where blaze was started.
     checkout: PathBuf,
+    /// The probe rows of each side, keyed for its triple ([`pinned_table`]).
     table: Arc<std::vec::Vec<Row>>,
+    macro_table: Arc<std::vec::Vec<Row>>,
     spawn: Arc<SpawnSetting>,
     /// The native setting, or why the command has none (its words, naming the path).
     native: Result<NativeSetting<'f>, &'f str>,
@@ -200,8 +257,9 @@ pub(crate) struct Shared<'f> {
 pub(crate) struct Scripts<'f> {
     shared: &'f Shared<'f>,
     decoded: &'f Decoded<'f>,
-    /// (subject, script unit), sorted.
-    by_subject: std::vec::Vec<(ContentId, UnitId), Global>,
+    /// (subject, script unit, side), sorted: each build-script unit's run on either side, so
+    /// any part the world named is found (a side nobody reaches is never asked).
+    by_subject: std::vec::Vec<(ContentId, UnitId, Side), Global>,
     sources: StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
     lock: &'f Lock<'f>,
     /// Each member's lock entry and folder, checkout-relative, copied into the request's frame.
@@ -261,6 +319,23 @@ fn held_bytes<'f>(bytes: &[u8], frame: &'f Frame) -> &'f [u8] {
 }
 
 /// Words held in `frame`.
+/// Why the fact shim is not in place for the command's native runs (D112, N7): each names the
+/// path it looked at, or why the running blaze's folder is not known.
+#[derive(Debug)]
+enum FactShimError {
+    ExeDir(crate::fetch::ExeDirWhy),
+    Place(blaze_proc_macro::native_facts::NativeFactsError),
+}
+
+impl core::fmt::Display for FactShimError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FactShimError::ExeDir(why) => write!(f, "{why}"),
+            FactShimError::Place(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 fn said<'f>(frame: &'f Frame, words: core::fmt::Arguments<'_>) -> &'f str {
     let text = bstd::mem::format_in!(frame, "{words}");
     crate::work::held_str(text.as_str(), frame)
@@ -294,18 +369,21 @@ impl<'f> Scripts<'f> {
         let mut by_subject = std::vec::Vec::new_in(Global);
         for at in 0..decoded.graph.units.len() {
             let script = UnitId(at as u32);
-            if let Some(subject) = subject(&decoded.graph, script) {
-                by_subject.push((subject, script));
+            for side in [Side::Target, Side::Macro] {
+                if let Some(subject) = subject(&decoded.graph, script, side, alloc.clone()) {
+                    by_subject.push((subject, script, side));
+                }
             }
         }
-        by_subject.sort_unstable();
-        by_subject.dedup_by_key(|(subject, _)| *subject);
+        by_subject.sort_unstable_by_key(|(subject, script, _)| (*subject, *script));
+        by_subject.dedup_by_key(|(subject, _, _)| *subject);
 
         let mut store = PathBuf::from(home);
         store.push(STORE_UNDER_HOME);
         let runtime = ScriptRuntime::new(&store).map_err(|error| SetupError::Runtime(std::format!("{error}")))?;
         let host = crate::graph::TRIPLE;
-        let table = Arc::new(blaze_build_script::probe::pinned_rows(host, blaze_build_script::pinned::TEMPO, alloc).to_vec());
+        let table = Arc::new(pinned_table(Side::Target, alloc.clone()));
+        let macro_table = Arc::new(pinned_table(Side::Macro, alloc.clone()));
         let spawn = blaze_proc_macro::fact_pins::command_spawn_setting(host, alloc).map_err(|error| SetupError::SpawnSetting(std::format!("{error}")))?;
         // The native setting: only a script `placed` native needs it; without it that script
         // fails naming why ([`pooled`]), never run as wasm (D112).
@@ -313,14 +391,29 @@ impl<'f> Scripts<'f> {
             None => Err(said(frame, format_args!("SDKROOT is not set: the native runner (D112) needs the macOS SDK folder, read once at the command's start"))),
             Some(sdk) => match blaze_proc_macro::native_setting::command_native_setting(home, sdk, NATIVE_WORK, host, alloc) {
                 Ok(owned) => {
-                    let held = |text: &str| crate::work::held_str(text, frame);
-                    Ok(NativeSetting { shelf: held(owned.shelf.as_str()), sdk: held(owned.sdk.as_str()), work: held(owned.work.as_str()), deadline: owned.deadline })
+                    // D112 (N7): the fact shim, beside the running blaze (its folder read once
+                    // at the edge, main.rs), copied into the work folder once here, where each
+                    // native run finds it. Either failure is typed and names the path.
+                    let placed = match env.exe_dir {
+                        Err(why) => Err(FactShimError::ExeDir(why)),
+                        Ok(dir) => {
+                            let from = std::format!("{dir}/{}", blaze_build_script::fact_shim::SHIM_NAME);
+                            blaze_proc_macro::native_facts::place_shim(owned.work.as_str(), &from).map_err(FactShimError::Place)
+                        }
+                    };
+                    match placed {
+                        Ok(_) => {
+                            let held = |text: &str| crate::work::held_str(text, frame);
+                            Ok(NativeSetting { shelf: held(owned.shelf.as_str()), sdk: held(owned.sdk.as_str()), work: held(owned.work.as_str()), deadline: owned.deadline })
+                        }
+                        Err(error) => Err(said(frame, format_args!("the native runner's fact shim (D112, N7): {error}"))),
+                    }
                 }
                 Err(error) => Err(said(frame, format_args!("the native runner's setting (D112): {error}"))),
             },
         };
         let checkout = PathBuf::from(if env.checkout.is_empty() { "." } else { env.checkout });
-        let shared: &'f Shared<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(Shared { runtime, store, checkout, table, spawn: Arc::new(spawn), native, graph_record }, frame));
+        let shared: &'f Shared<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(Shared { runtime, store, checkout, table, macro_table, spawn: Arc::new(spawn), native, graph_record }, frame));
 
         let cx: &'f Cx = blaze_own::Box::leak(blaze_own::Box::new_in(cx.until(cx.deadline()), frame));
         let sources = crate::fetch::sources_dir(cx, env).map_err(|error| SetupError::Sources(std::format!("{error}")))?;
@@ -329,8 +422,8 @@ impl<'f> Scripts<'f> {
         Ok(Scripts { shared, decoded, by_subject, sources, lock, members })
     }
 
-    fn unit_of(&self, name: Name) -> Option<UnitId> {
-        self.by_subject.binary_search_by_key(&name.subject, |(subject, _)| *subject).ok().map(|at| self.by_subject[at].1)
+    fn unit_of(&self, name: Name) -> Option<(UnitId, Side)> {
+        self.by_subject.binary_search_by_key(&name.subject, |(subject, _, _)| *subject).ok().map(|at| (self.by_subject[at].1, self.by_subject[at].2))
     }
 }
 
@@ -348,6 +441,11 @@ pub(crate) struct ScriptJob<'j> {
     name: Name,
     shared: &'j Shared<'j>,
     script: UnitId,
+    /// The side of the crates that read it: a macro-side run has TARGET [`MACRO_TARGET`].
+    side: Side,
+    /// The cfg of the crate of the list that reads this run (its world row's, sorted): a
+    /// macro-side run's `CARGO_CFG_*` (wasm32-wasip1's atoms, the profile's, its features).
+    cfg: &'j [(&'j str, Option<&'j str>)],
     files: Files<'j>,
     /// Each script of its `links` closure ([`links_closure`]), sorted by unit, each once.
     producers: &'j [Producer<'j>],
@@ -439,6 +537,9 @@ pub(crate) enum Prepared<'j> {
     Need(std::vec::Vec<Want, Global>),
     /// It fails with these words; `hole` when the cause is outside its key (asked again).
     Said { what: &'static str, words: &'j str, hole: bool },
+    /// A need of it failed this command (its module's lookup, a `links` producer): it fails
+    /// `Waited` on it, alone (rule 20); asking again would loop.
+    Waited(Name),
 }
 
 /// The `Script` job of `task`, made on the main thread from record bytes (as a crate scope's
@@ -447,8 +548,10 @@ pub(crate) enum Prepared<'j> {
 #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
 pub(crate) fn job<'f: 'j, 'j>(
     cx: &Cx,
+    root: &Dir<ReadWrite>,
     store: &mut dyn Store,
     scripts: &mut Option<Scripts<'f>>,
+    names: &mut Option<crate::names::Names<'f>>,
     env: &FetchEnv<'_>,
     lock: Option<&'f Lock<'static>>,
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
@@ -457,7 +560,10 @@ pub(crate) fn job<'f: 'j, 'j>(
     jobs: &'j Frame,
 ) -> Result<Prepared<'j>, CliError> {
     let cx = cx.span("script: make the job");
-    if scripts.is_none() {
+    if let Some(failed) = task.failed.first() {
+        return Ok(Prepared::Waited(*failed));
+    }
+    if scripts.is_none() || names.is_none() {
         let Some(graph) = task.inputs.iter().find(|input: &&Input| input.name == Name::unit_graph()) else {
             let mut wants = std::vec::Vec::new_in(Global);
             wants.push(Want { name: Name::unit_graph(), home: Name::unit_graph() });
@@ -465,16 +571,48 @@ pub(crate) fn job<'f: 'j, 'j>(
         };
         // Held in the request's frame: every job of the command decodes it again on its worker.
         let read = crate::work::payload(&cx, store, graph, frame)?;
-        let bytes: &'f [u8] = held_bytes(read.payload(), frame);
-        match Scripts::open(&cx, env, bytes, lock, members, frame) {
-            Ok(opened) => *scripts = Some(opened),
-            Err(error) => return Ok(Prepared::Said { what: "the command's build scripts could not be set up", words: said(jobs, format_args!("{error}")), hole: true }),
+        // The world (the crate list's rows, both sides): made once a command, here when no
+        // `CrateScope` task made it first, exactly as names/scope.rs `prepare` does.
+        if names.is_none() {
+            match crate::names::world(&cx, root, read.unit_graph(graph.name)?.graph, lock, members, env) {
+                Ok(made) => {
+                    crate::names::tell_public(store, &made);
+                    *names = Some(made);
+                }
+                Err(error) => return Ok(Prepared::Said { what: "the crates' inputs could not be made", words: said(jobs, format_args!("names not resolved: {error}")), hole: false }),
+            }
+        }
+        if scripts.is_none() {
+            let bytes: &'f [u8] = held_bytes(read.unit_graph(graph.name)?.graph, frame);
+            match Scripts::open(&cx, env, bytes, lock, members, frame) {
+                Ok(opened) => *scripts = Some(opened),
+                Err(error) => return Ok(Prepared::Said { what: "the command's build scripts could not be set up", words: said(jobs, format_args!("{error}")), hole: true }),
+            }
         }
     }
     let scripts = scripts.as_mut().expect("opened above");
-    let Some(script) = scripts.unit_of(task.name) else {
+    let Some((script, side)) = scripts.unit_of(task.name) else {
         return Ok(Prepared::Said { what: "a `Script` part names no build script of this command's graph", words: "a `Script` part names no build-script unit of this command's graph", hole: false });
     };
+    // The crate of the list that reads this run: the world row whose script is this subject,
+    // the row its part was named from (ruling D115 (2)). Its cfg is the run's side's.
+    let Some(world) = names.as_ref().map(|names| names.world()) else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
+    let wanted = blaze_world::Script::Read { subject: task.name.subject };
+    let Some(row) = world.crates.iter().find(|krate| krate.script == wanted) else {
+        return Ok(Prepared::Said { what: "a `Script` part that no crate of the world reads", words: "a `Script` part names a run that no crate of this command's world reads", hole: false });
+    };
+    if row.side != side {
+        return Ok(Prepared::Said {
+            what: "a `Script` part whose world row is of another side",
+            words: said(jobs, format_args!("the build script run read by crate `{}` is of the {:?} side in the world and of the {side:?} side in the graph's subjects: one subject function names both (blaze_world::script_subject)", row.input.name, row.side)),
+            hole: false,
+        });
+    }
+    let mut cfg: blaze_own::Vec<(&'j str, Option<&'j str>), &'j Frame> = blaze_own::Vec::with_capacity_in(row.input.cfg.len(), jobs);
+    for (name, value) in row.input.cfg.iter() {
+        cfg.push((crate::work::held_str(name, jobs), value.map(|value| crate::work::held_str(value, jobs))));
+    }
+    let cfg: &'j [(&'j str, Option<&'j str>)] = cfg.leak();
     // Copied out of `scripts`, which the sources' lookup below borrows mutably.
     let (decoded, shared, members, lock) = (scripts.decoded, scripts.shared, scripts.members, scripts.lock);
     let graph = &decoded.graph;
@@ -483,9 +621,22 @@ pub(crate) fn job<'f: 'j, 'j>(
     // handed, and where its package's files are (a path in its metadata may name them).
     let closure = links_closure(graph, script);
     let mut wants = std::vec::Vec::new_in(Global);
+    // Its module, looked up by its own task (script_modules.rs, ruling D115 (c)): read, so a
+    // rebuilt module reruns this run alone and an equal one moves nothing.
+    let at = world.crates.iter().position(|krate| krate.script == wanted).ok_or(CliError::Text { what: "the world row found above is gone" })?;
+    let Some(module) = names.as_ref().and_then(|names| names.script_module_of(at)) else {
+        return Ok(Prepared::Said { what: "a build script with no module lookup", words: "the build script read here has no unit in the graph to name its module by", hole: false });
+    };
+    let module = crate::script_modules::name(module.subject);
+    if !task.inputs.iter().any(|input: &Input| input.name == module) {
+        wants.push(Want { name: module, home: Name::unit_graph() });
+    }
     let mut producers: blaze_own::Vec<Producer<'j>, &'j Frame> = blaze_own::Vec::with_capacity_in(closure.len(), jobs);
     for (input, links, direct) in closure.iter() {
-        let Some(dep) = name_of(graph, *input) else {
+        // A producer of a reader on one side is that side's run (its `links` crate is a crate
+        // of the same side's list).
+        let erased = Erased::new(jobs);
+        let Some(dep) = name_of(graph, *input, side, erased.handle()) else {
             return Ok(Prepared::Said { what: "a `links` input that serves no unit", words: said(jobs, format_args!("the build script of {} {} reads the `links` metadata of a script that serves no unit", unit.name.as_str(), unit.version.as_str())), hole: false });
         };
         match task.inputs.iter().find(|handed: &&Input| handed.name == dep) {
@@ -507,7 +658,7 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(files) => files,
         Err(refused) => return Ok(refused),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, files, producers: producers.leak() }))
+    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.leak() }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -604,10 +755,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame) -> Ran {
     // The one choice point (D112), before anything runs: a script placed native needs the
     // command's native setting, or fails naming why it has none.
     let runner = placed(graph, job.script, MODE, alloc);
-    let ran_as = match runner {
-        Runner::Native { .. } => RanAs::Native,
-        Runner::Wasm => RanAs::Wasm,
-    };
+    let ran_as = RanAs::of(&runner);
     let native = match (runner, &shared.native) {
         (Runner::Native { .. }, Err(why)) => return failed("a native build script with no native setting", format_args!("the build script of {package} runs native (D112): {why}"), true),
         (_, Ok(native)) => Some(NativeSetting { shelf: native.shelf, sdk: native.sdk, work: native.work, deadline: native.deadline }),
@@ -615,15 +763,29 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame) -> Ran {
     };
     let setting = Setting {
         store: &shared.store,
-        target: crate::graph::TRIPLE,
+        // Its crates' side's target (ruling D115 (2)); HOST and every other machine fact from
+        // the pinned table, never the machine (rule 25).
+        target: match job.side {
+            Side::Target => crate::graph::TRIPLE,
+            Side::Macro => MACRO_TARGET,
+        },
         host: crate::graph::TRIPLE,
-        table: Arc::clone(&shared.table),
+        table: Arc::clone(match job.side {
+            Side::Target => &shared.table,
+            Side::Macro => &shared.macro_table,
+        }),
         c_mode: C_MODE,
         mode: MODE,
         native,
         spawn_setting: Arc::clone(&shared.spawn),
     };
-    let ran = match script_unit::outputs_viewing(&shared.runtime, &setting, graph, job.script, tree, root, &deps, &given, alloc) {
+    // A macro-side run is made with its row's cfg (wasm32-wasip1's atoms); a target-side run
+    // with the graph's, which its row copies (and a native target-side script may run).
+    let side_cfg = match job.side {
+        Side::Target => None,
+        Side::Macro => Some(side_atoms(job.cfg, alloc.clone())),
+    };
+    let ran = match script_unit::outputs_viewing_on(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &deps, &given, alloc) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), false),
     };

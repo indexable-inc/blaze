@@ -68,7 +68,7 @@ use blaze_surface::{Namespace, PathKind};
 
 const STRUCT_MAIN: &str = "#![feature(adt_const_params)]
 use core::marker::ConstParamTy;
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx) -> Result<(), Error> {
     Ok(())
 }
 #[derive(PartialEq, Eq, ConstParamTy)]
@@ -84,7 +84,7 @@ fn wv(w: W<{ A { x: true } }>) {}
 ";
 
 const STR_MAIN: &str = "#![feature(adt_const_params, unsized_const_params)]
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx) -> Result<(), Error> {
     Ok(())
 }
 pub struct R<const F: &'static str, T>(pub T);
@@ -100,7 +100,7 @@ fn rv(r: R<{ \"k\" }, u8>) {}
 ";
 
 const E0741_MAIN: &str = "#![feature(adt_const_params)]
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx) -> Result<(), Error> {
     Ok(())
 }
 struct S;

@@ -232,7 +232,9 @@ impl DirStore {
         DirStore::within(io, store, "proc-macro/records")
     }
 
-    /// The build scripts' records, `build-script/records` beneath the store's folder `store`.
+    /// The spawn answers' records (`spawn_records::Recorded`), `build-script/records` beneath the
+    /// store's folder `store`. A script run itself is kept by no store here: its only cache is
+    /// the command's `Script` task record (D115).
     pub fn build_scripts(io: &Io, store: &Dir<ReadWrite>) -> DirStore {
         DirStore::within(io, store, "build-script/records")
     }

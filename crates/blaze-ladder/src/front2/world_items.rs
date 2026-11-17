@@ -473,7 +473,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn resolve_path(&self, _: Seal, scope: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
+    fn resolve_path(&self, _: Seal, scope: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<tc::PathAnswer> {
         self.path(scope, segments)
     }
 
@@ -632,6 +632,9 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
             assoc_types: &extra.assoc,
             types: self.types(),
             members: blaze_typeck::TraitMembers::Known(&t.members),
+            // heads.rs `TraitHead::defaults`: lowered into `store.tys` (as buckets.rs
+            // `trait_home` reads them), one per parameter after `Self`.
+            defaults: blaze_typeck::TraitDefaults::Known(&t.defaults),
         }))
     }
 

@@ -94,7 +94,8 @@ pub trait Types {
     /// expression of type `usize` (e.g. a literal or a constant item)", and a const parameter
     /// is one, "Const generics": "Const parameters can be used anywhere a const item can be
     /// used"): a `usize` `ConstValue`, the enclosing item's `ConstParam`, or a gap. The
-    /// default is [`Types::repeat_len`]'s value.
+    /// default is [`Types::repeat_len`]'s value. Never asked for `_`: `to_typeck` makes that
+    /// inferred const a hole itself (`Conv::expr`, `Expr::Repeat`).
     fn repeat_term(&mut self, view: &View<'_>, len: ExprId, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
         let n = self.repeat_len(view, len)?;
         Ok(ConstTerm::Is(tys.usize_value(n).map_err(Refused::Check)?))
@@ -246,9 +247,20 @@ pub struct TypeckBody<'a> {
     pub field_pats: AVec<'a, tc::FieldPat>,
     pub paths: AVec<'a, tc::BodyPath>,
     pub segments: AVec<'a, tc::Segment>,
+    /// Where each of `segments` is written; short or empty = not known (`BodyView::segment_ranges`).
+    pub segment_ranges: AVec<'a, tc::Range>,
     pub type_lists: AVec<'a, PTy>,
+    /// Where each of `type_lists` is written; short or empty = not known.
+    pub type_list_ranges: AVec<'a, tc::Range>,
+    /// Where each method call's name is written, ascending by the call's id (expressions are
+    /// converted in ascending order).
+    pub method_name_ranges: AVec<'a, (ExprId, tc::Range)>,
     pub opt_types: AVec<'a, Option<PTy>>,
     pub fmt_uses: AVec<'a, tc::FmtUse>,
+    pub asm_pieces: AVec<'a, tc::AsmPiece>,
+    pub asm_operands: AVec<'a, tc::AsmOperand>,
+    pub asm_clobbers: AVec<'a, (u32, u32)>,
+    pub asm_text: blaze_own::AString<'a>,
     pub coroutine: Option<tc::CoroutineKind>,
     /// The `super let` statements, ascending (super_let.rs).
     pub super_lets: AVec<'a, StmtId>,
@@ -278,12 +290,19 @@ impl<'a> TypeckBody<'a> {
             field_pats: &self.field_pats,
             paths: &self.paths,
             segments: &self.segments,
+            segment_ranges: &self.segment_ranges,
             types,
             type_lists: &self.type_lists,
+            type_list_ranges: &self.type_list_ranges,
+            method_name_ranges: &self.method_name_ranges,
             opt_types: &self.opt_types,
             fmt_uses: &self.fmt_uses,
             coroutine: self.coroutine,
             super_lets: &self.super_lets,
+            asm_pieces: &self.asm_pieces,
+            asm_operands: &self.asm_operands,
+            asm_clobbers: &self.asm_clobbers,
+            asm_text: self.asm_text.as_str(),
         }
     }
 }
@@ -515,6 +534,11 @@ pub(crate) fn const_literal_bits(text: &str) -> Option<u128> {
     const_literal(text).map(|c| c.bits)
 }
 
+/// `asm!` converted (INTRINSICS.md P9b).
+mod asm;
+#[cfg(test)]
+mod asm_tests;
+
 fn len(n: usize) -> u32 {
     u32::try_from(n).expect("a body's column under 4G rows")
 }
@@ -575,25 +599,36 @@ impl Conv<'_, '_, '_, '_, '_> {
     fn type_args(&mut self, l: List, r: BodyRange) -> Result<(List, bool), Refused> {
         let rows = self.v.rows(l)?;
         let mut at: AVec<'_, PTy> = Vec::new_in(*self.out.type_lists.allocator());
+        // Where each argument in `at` is written (BodyView::type_list_ranges), index for index.
+        let mut ranges: AVec<'_, tc::Range> = Vec::new_in(*self.out.type_list_ranges.allocator());
         for &n in rows {
             match GenericArg::decode(n)? {
                 // One plain name (`foo::<N>()`, `W::<SIZE>`) parses as a type and is a type
                 // or a constant by what it resolves to: the caller's ([`Types::name_arg`]).
-                GenericArg::Type(t) => match bare_arg_name(self.v, t)? {
-                    Some(name) => {
-                        let term = self.types.name_arg(self.v, t, name, self.tys)?;
-                        let tr = self.v.type_range(t)?;
-                        at.push(self.term(term, ConstSite::Arg, tr)?);
+                GenericArg::Type(t) => {
+                    let tr = self.v.type_range(t)?;
+                    ranges.push(range(self.v.site(tr)?));
+                    match bare_arg_name(self.v, t)? {
+                        Some(name) => {
+                            let term = self.types.name_arg(self.v, t, name, self.tys)?;
+                            at.push(self.term(term, ConstSite::Arg, tr)?);
+                        }
+                        None => at.push(self.ty(t)?),
                     }
-                    None => at.push(self.ty(t)?),
-                },
+                }
                 GenericArg::Lifetime(_) => {}
-                GenericArg::Const(c) => at.push(self.const_arg(c)?),
+                GenericArg::Const(c) => {
+                    ranges.push(range(self.v.site(self.v.const_range(c)?)?));
+                    at.push(self.const_arg(c)?);
+                }
                 _ => return self.refuse("an associated item constraint", r),
             }
         }
         let start = len(self.out.type_lists.len());
         self.out.type_lists.extend_from_slice(&at);
+        // Pad over lists pushed with no ranges (a type alias's expansion), then align.
+        self.out.type_list_ranges.resize(start as usize, tc::Range::default());
+        self.out.type_list_ranges.extend_from_slice(&ranges);
         Ok((List { start, len: len(at.len()) }, !at.is_empty()))
     }
 
@@ -659,8 +694,11 @@ impl Conv<'_, '_, '_, '_, '_> {
         // `::x` (the Reference, "Paths": a global path) starts at the root rustc names
         // `{{root}}`: the crate root in edition 2015, the extern prelude from 2018. The world's
         // resolution reads it as its first segment, as it reads `crate` and `super`.
+        // Where each of `segs` is written (BodyView::segment_ranges); `{{root}}` is no text.
+        let mut seg_ranges: AVec<'_, tc::Range> = Vec::new_in(*self.out.segment_ranges.allocator());
         if path.absolute {
             segs.push(tc::Segment { name: Name::of("{{root}}"), generic_args: List::EMPTY, has_args: false });
+            seg_ranges.push(tc::Range::default());
         }
         let rows = self.v.segments(path)?;
         let mut anchor = None;
@@ -689,10 +727,11 @@ impl Conv<'_, '_, '_, '_, '_> {
                     _ => return self.refuse("a path anchor whose trait is not a path", r),
                 },
             };
-            anchor = Some(tc::Anchor { ty, trait_ });
+            let ty_range = range(self.v.site(self.v.type_range(t)?)?);
+            anchor = Some(tc::Anchor { ty, trait_, ty_range });
             rest = after;
         }
-        self.push_segments(rest, r, &mut segs)?;
+        self.push_segments(rest, r, &mut segs, &mut seg_ranges)?;
         // A segment naming a type alias whose aliased type fixes arguments takes the aliased
         // type's arguments ([`Types::alias_args`]: the alias expanded at the path).
         if anchor.is_none() {
@@ -717,6 +756,8 @@ impl Conv<'_, '_, '_, '_, '_> {
         }
         let start = len(self.out.segments.len());
         self.out.segments.extend_from_slice(&segs);
+        self.out.segment_ranges.resize(start as usize, tc::Range::default());
+        self.out.segment_ranges.extend_from_slice(&seg_ranges);
         let at = PathIdx(len(self.out.paths.len()));
         let segments = List { start, len: len(segs.len()) };
         self.out.paths.push(tc::BodyPath { scope, segments, lang: None, anchor });
@@ -731,23 +772,38 @@ impl Conv<'_, '_, '_, '_, '_> {
             return self.refuse("a lang item's path as an anchor's trait", r);
         }
         let mut segs: AVec<'_, tc::Segment> = Vec::new_in(*self.out.segments.allocator());
+        let mut seg_ranges: AVec<'_, tc::Range> = Vec::new_in(*self.out.segment_ranges.allocator());
         if path.absolute {
             segs.push(tc::Segment { name: Name::of("{{root}}"), generic_args: List::EMPTY, has_args: false });
+            seg_ranges.push(tc::Range::default());
         }
         let rows = self.v.segments(path)?;
-        self.push_segments(rows, r, &mut segs)?;
+        self.push_segments(rows, r, &mut segs, &mut seg_ranges)?;
         let start = len(self.out.segments.len());
         self.out.segments.extend_from_slice(&segs);
+        self.out.segment_ranges.resize(start as usize, tc::Range::default());
+        self.out.segment_ranges.extend_from_slice(&seg_ranges);
         let at = PathIdx(len(self.out.paths.len()));
         let segments = List { start, len: len(segs.len()) };
         self.out.paths.push(tc::BodyPath { scope: path.scope.unwrap_or(scope), segments, lang: None, anchor: None });
         Ok(at)
     }
 
-    /// Named segments (no anchor) onto `segs`.
-    fn push_segments(&mut self, rows: &[Node], r: BodyRange, segs: &mut AVec<'_, tc::Segment>) -> Result<(), Refused> {
+    /// Named segments (no anchor) onto `segs`, and where each is written onto `ranges` (empty
+    /// for a keyword segment: `self`, `super`, `crate`, `Self`, `$crate` have no name row).
+    fn push_segments(
+        &mut self,
+        rows: &[Node],
+        r: BodyRange,
+        segs: &mut AVec<'_, tc::Segment>,
+        ranges: &mut AVec<'_, tc::Range>,
+    ) -> Result<(), Refused> {
         for &n in rows {
             let s = Segment::decode(n)?;
+            let written = match (s.kind, s.name) {
+                (SegKind::Ident, Some(n)) => range(self.v.site(self.v.name_range(n)?)?),
+                _ => tc::Range::default(),
+            };
             let name = match (s.kind, s.name) {
                 (SegKind::Ident, Some(n)) => self.name(n)?,
                 (SegKind::SelfMod, _) => Name::of("self"),
@@ -763,6 +819,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             let (generic_args, has_args) = if s.has_args { self.type_args(s.args, r)? } else { (List::EMPTY, false) };
             segs.push(tc::Segment { name, generic_args, has_args });
+            ranges.push(written);
         }
         Ok(())
     }
@@ -823,6 +880,9 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::MethodCall { row, scope } => {
                 let m = MethodCall::decode(self.v.row(row)?)?;
                 let generic_args = if m.has_args { self.type_args(m.generic_args, r)?.0 } else { List::EMPTY };
+                // Ascending: expressions are converted in id order (`to_typeck`). An entry out of
+                // order is never misread: blaze-typeck's binary search returns only `e`'s own.
+                self.out.method_name_ranges.push((e, range(self.v.site(self.v.name_range(m.name)?)?)));
                 tc::Expr::MethodCall {
                     receiver: m.receiver,
                     name: self.name(m.name)?,
@@ -843,9 +903,20 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Tuple { elems } => tc::Expr::Tuple { elems: self.exprs(elems)? },
             Expr::Array { elems } => tc::Expr::Array { elems: self.exprs(elems)? },
             Expr::Repeat { elem, len } => {
-                let term = self.types.repeat_term(self.v, len, self.tys)?;
-                let lr = self.v.expr_range(len)?;
-                tc::Expr::Repeat { elem, len: self.term(term, ConstSite::RepeatLen, lr)?, count: Some(len) }
+                // `[x; _]`: the length is an INFERRED CONST (the Reference, "Array expressions":
+                // "the length operand must be either an inferred const or a constant expression
+                // of type `usize`"), never an expression: a hole the checker makes a const
+                // variable (blaze-typeck `lower_len`) and unification fixes, with no count to
+                // check as `usize` (`_` checked as an expression is E0000) and no gap (it is
+                // inferred, not unvalued). Decided here, before the caller is asked.
+                if matches!(self.v.expr(len)?, Expr::Underscore) {
+                    let hole = self.tys.intern(tc::PNode::Infer).map_err(Refused::Check)?;
+                    tc::Expr::Repeat { elem, len: hole, count: None }
+                } else {
+                    let term = self.types.repeat_term(self.v, len, self.tys)?;
+                    let lr = self.v.expr_range(len)?;
+                    tc::Expr::Repeat { elem, len: self.term(term, ConstSite::RepeatLen, lr)?, count: Some(len) }
+                }
             }
             Expr::Struct { path, fields, base } => {
                 let base = match base {
@@ -897,9 +968,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             Expr::FormatArgs { row } => self.format_args(row, r)?,
             Expr::MacroCall { .. } => return self.refuse("a macro call", r),
-            // blaze-typeck's body form has no `asm!` expression yet (INTRINSICS.md P9b adds it
-            // with the operand rules): refused by name until then.
-            Expr::Asm { .. } => return self.refuse("inline assembly (blaze-typeck has no `asm!` form yet)", r),
+            Expr::Asm { row } => self.asm(row, r)?,
             Expr::OffsetOf { ty, fields } => {
                 let ty = self.ty(ty)?;
                 let start = len(self.out.segments.len());
@@ -1071,9 +1140,16 @@ pub fn to_typeck<'a>(
         field_pats: Vec::new_in(alloc),
         paths: Vec::new_in(alloc),
         segments: Vec::new_in(alloc),
+        segment_ranges: Vec::new_in(alloc),
         type_lists: Vec::new_in(alloc),
+        type_list_ranges: Vec::new_in(alloc),
+        method_name_ranges: Vec::new_in(alloc),
         opt_types: Vec::new_in(alloc),
         fmt_uses: Vec::new_in(alloc),
+        asm_pieces: Vec::new_in(alloc),
+        asm_operands: Vec::new_in(alloc),
+        asm_clobbers: Vec::new_in(alloc),
+        asm_text: blaze_own::AString::new_in(alloc),
         coroutine: None,
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),

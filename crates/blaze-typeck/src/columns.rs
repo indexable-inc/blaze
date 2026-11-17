@@ -117,6 +117,12 @@ pub struct Checked<'a> {
     /// `tmp` (blaze-flow-lower coroutine.rs), so an async block's exact interior holds it. An
     /// `.await` whose future is not wholly known has no row.
     pub awaited: Vec<(ExprId, PTy), Alloc<'a>>,
+    /// Each projection a callee's signature names at each call, and the impl the check chose
+    /// for it (src/selected.rs), sorted by expression, each call's rows in the order its
+    /// signature was lowered; read with [`Checked::selected_at`]. The borrow check reads a
+    /// hidden input (`x: T::Out`) through the chosen impl's `type` text (blaze-flow-lower
+    /// impl_call.rs).
+    pub selected: Vec<crate::selected::Projected, Alloc<'a>>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -171,6 +177,14 @@ impl<'a> Checked<'a> {
         Some(self.awaited[at].1)
     }
 
+    /// The projections the callee's signature named at the call `e`, in lowering order (row
+    /// `i` has `at == i`); empty for an expression that is no call or whose callee names none.
+    pub fn selected_at(&self, e: ExprId) -> &[crate::selected::Projected] {
+        let lo = self.selected.partition_point(|r| r.expr < e);
+        let hi = self.selected.partition_point(|r| r.expr <= e);
+        &self.selected[lo..hi]
+    }
+
     /// Equal results ignoring the read list and needs: what the read-list property compares.
     pub fn same_result(&self, other: &Checked<'a>) -> bool {
         self.types == other.types
@@ -191,6 +205,7 @@ impl<'a> Checked<'a> {
             && self.promoted == other.promoted
             && self.stalled == other.stalled
             && self.awaited == other.awaited
+            && self.selected == other.selected
     }
 }
 
@@ -220,6 +235,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("promoted", &self.promoted)
             .field("stalled", &self.stalled)
             .field("awaited", &self.awaited)
+            .field("selected", &self.selected)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

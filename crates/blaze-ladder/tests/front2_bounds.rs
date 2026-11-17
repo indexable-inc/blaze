@@ -91,6 +91,27 @@ fn gat_bind<F: Fam<Out<u16> = (u16, u8)>>(x: <F as Fam>::Out<u16>) -> (u16, u8) 
 fn gat_impl(x: <Pairs as Fam>::Out<u16>) -> (u16, u8) { x }
 trait Lend { type Iter<'a> where Self: 'a; }
 fn gat_where<'a, L: Lend + 'a>(x: <L as Lend>::Iter<'a>) -> <L as Lend>::Iter<'a> { x }
+trait Sz { type Arr<T>; }
+struct Twin;
+impl Sz for Twin { type Arr<T> = (T, T); }
+struct NoCl;
+struct Lone;
+impl Sz for Lone { type Arr<T> = NoCl; }
+fn gat_args_bound<U: Sz<Arr<u8>: Clone>>(a: &U::Arr<u8>) -> U::Arr<u8> { need_clone(a) }
+fn gat_args_where<U: Sz>(a: &U::Arr<u8>) -> U::Arr<u8> where U::Arr<u8>: Clone { need_clone(a) }
+fn gat_args_qwhere<U: Sz>(a: &<U as Sz>::Arr<u8>) -> <U as Sz>::Arr<u8> where <U as Sz>::Arr<u8>: Clone { need_clone(a) }
+fn use_gat_args() -> (u8, u8) { gat_args_bound::<Twin>(&(1, 2)) }
+fn use_gat_args_bad() { let _n = gat_args_bound::<Lone>(&NoCl); }
+trait LendT { type It<'a, T> where Self: 'a; }
+fn gat_life_bound<'a, L: LendT<It<'a, u8>: Clone> + 'a>(x: &L::It<'a, u8>) -> L::It<'a, u8> { need_clone(x) }
+trait Cap { type Buf<const N: usize>; }
+struct Bytes3;
+impl Cap for Bytes3 { type Buf<const N: usize> = u8; }
+struct NoBuf;
+impl Cap for NoBuf { type Buf<const N: usize> = NoCl; }
+fn gat_const_lit<C: Cap<Buf<3>: Clone>>() {}
+fn use_gat_const_lit() { gat_const_lit::<Bytes3>() }
+fn use_gat_const_bad() { gat_const_lit::<NoBuf>() }
 struct Count(u8);
 impl Iterator for Count { type Item = u8; fn next(&mut self) -> Option<u8> { None } }
 impl DoubleEndedIterator for Count { fn next_back(&mut self) -> Option<Self::Item> { None } }
@@ -140,7 +161,7 @@ fn first_into(xs: impl IntoIterator<Item = impl Into<u64>>) -> u64 { match xs.in
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 53] = [
+const CLEAN: [(&str, &str); 60] = [
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -181,6 +202,18 @@ const CLEAN: [(&str, &str); 53] = [
     ("gat_bind", "`F: Fam<Out<u16> = (u16, u8)>`: the clause `<F as Fam>::Out<u16> == (u16, u8)`, so `x` is the pair"),
     ("gat_impl", "`<Pairs as Fam>::Out<u16>` through `impl Fam for Pairs { type Out<T> = (T, u8); }` is `(u16, u8)`"),
     ("gat_where", "`type Iter<'a> where Self: 'a;`: the outlives clause is read and kept (not checked); `Iter<'a>` has no own argument"),
+    // Associated type bounds on a GAT with arguments (the Reference, "Trait and lifetime
+    // bounds", associated item constraints: `T: Tr<Assoc: B>` is `T: Tr` and `<T as
+    // Tr>::Assoc: B`; ecdsa 0.17's `impl<C> From<Signature<C>> for Box<[u8]>` was out of
+    // tempo's census 5 on this form). front2/gat_bounds.rs. Without it the three `_bound`/`_lit`
+    // heads are refused "an associated type bound with type or const arguments".
+    ("gat_args_bound", "`U: Sz<Arr<u8>: Clone>`: the clause `<U as Sz>::Arr<u8>: Clone`, so `need_clone(a)` holds"),
+    ("gat_args_where", "`where U::Arr<u8>: Clone`: the where-clause form of the same clause"),
+    ("gat_args_qwhere", "`where <U as Sz>::Arr<u8>: Clone`: the qualified where-clause form"),
+    ("use_gat_args", "`gat_args_bound::<Twin>`: `<Twin as Sz>::Arr<u8>` is `(u8, u8)`, which is `Clone`"),
+    ("gat_life_bound", "`L: LendT<It<'a, u8>: Clone>`: the lifetime argument erased, `u8` the own argument"),
+    ("gat_const_lit", "`C: Cap<Buf<3>: Clone>`: `3` made as a `usize` constant, the GAT's declared const parameter type"),
+    ("use_gat_const_lit", "`gat_const_lit::<Bytes3>`: `<Bytes3 as Cap>::Buf<3>` is `u8`, which is `Clone`"),
     ("thin", "`T: Thin` (core: `pub trait Thin = Pointee<Metadata = ()> + PointeeSized;`): the trait clause and the projection, so `metadata(p)` is `()`"),
     ("thin_where", "`where P: Thin`"),
     ("conv", "`trait Conv<T> = Into<T> + Copy`: a generic alias, its parameter substituted"),
@@ -230,7 +263,11 @@ const CLEAN: [(&str, &str); 53] = [
 ];
 
 /// The bodies that must be refused, each with the diagnostic it must give.
-const REFUSED: [(&str, &str, &str); 5] = [
+const REFUSED: [(&str, &str, &str); 7] = [
+    // The controls of gat_bounds.rs: the bound is made AND required, so a type whose
+    // projection is not `Clone` is the language's E0277 at the caller, never a head refusal.
+    ("use_gat_args_bad", "Unsatisfied", "`gat_args_bound::<Lone>`: `<Lone as Sz>::Arr<u8>` is `NoCl`, not `Clone`: E0277"),
+    ("use_gat_const_bad", "Unsatisfied", "`gat_const_lit::<NoBuf>`: `<NoBuf as Cap>::Buf<3>` is `NoCl`, not `Clone`: E0277"),
     ("pointee_meta", "Unsatisfied", "`PointeeSized` states no size: `T: MetaSized` is E0277"),
     ("h", "Mismatch", "an async fn's body `\"a\"` against its written `u8`: E0308"),
     ("two_types", "Mismatch", "two return points of two types (`u8`, `&str`): \"one type\": E0308"),
@@ -356,7 +393,7 @@ fn bounds_through_front2() {
             }
         }
     }
-    assert_eq!(impls, 4, "the fixture's four impls (`impl Make for u8`: its method's own opaque; `impl Fam for Pairs`: its `type Out<T>`)");
+    assert_eq!(impls, 8, "the fixture's eight impls (`impl Make for u8`: its method's own opaque; `impl Fam for Pairs`: its `type Out<T>`; `Sz` for `Twin` and `Lone`, `Cap` for `Bytes3` and `NoBuf`: GAT values with a type and a const parameter)");
     // Two trait aliases that name each other stand for nothing: a typed cycle naming both.
     match store.ensure(&names, &mut front.keys, Want::Fn(lib("cyc"))) {
         Err(e @ blaze_ladder::front2::heads::HeadError::Cycle(_)) => println!("cyc: {e}"),

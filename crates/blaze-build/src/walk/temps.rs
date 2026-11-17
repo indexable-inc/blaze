@@ -62,6 +62,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// (`temp_anchor`); each is dropped at that scope's end.
     pub(super) fn hold_temp(&mut self, e: ExprId, at: (Value, i32), repr: Repr) -> Result<(), BuildError> {
         let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
+        // In a laid coroutine state: the temporary is the flow's local of `e` (walk/state_names.rs).
+        self.name_at(at, blaze_flow_lower::identity::Identity::Temp(e, blaze_flow_lower::identity::Role::Value));
         if let Some((borrow, init, branch)) = self.extended_by(e)? {
             // "The temporary scopes for expressions in `let` statements are sometimes extended
             // to the scope of the block containing the `let` statement": a hidden local

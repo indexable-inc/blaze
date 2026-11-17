@@ -29,6 +29,16 @@ pub(crate) struct JobTexts<'n> {
     /// Each checkout path asked (tree 0, after `/0/`), in the order first asked, with its text
     /// or `None` when there is no such file.
     pub(crate) read: RefCell<std::vec::Vec<(&'n str, Option<&'n str>), Global>>,
+    /// The command's proc-macro runner (proc_runner.rs), lent read-only. `None`: no runner, so
+    /// a proc-macro crate gets no key and a proc-macro call is refused by name where lowered.
+    pub(crate) procs: Option<&'n crate::proc_runner::ProcRunner<'static>>,
+    /// The names job's one crate, by its world index: the crate whose runner key is asked.
+    /// `None` for a body job (a body reads its dependencies' keys from their items records).
+    pub(crate) own: Option<usize>,
+    /// Each crate whose code this job may expand a proc-macro call in, by its `krate` index:
+    /// its index in the NAMES world (the runner's key: one per unit, so a package's lib and
+    /// bin are two, macro-env-per-unit) and its edition.
+    pub(crate) callers: &'n [(usize, usize, blaze_expand::Edition)],
 }
 
 impl<'n> JobTexts<'n> {
@@ -65,5 +75,32 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
 
     fn crate_env(&self, krate: usize) -> Option<&CrateEnv<'n>> {
         self.env.filter(|(at, _)| *at == krate).map(|(_, env)| env)
+    }
+
+    /// The runner key of the names job's crate when it is a proc-macro crate: its module
+    /// identity's key (proc_runner.rs). It does not depend on whether the store has the
+    /// module, so a missing module is refused at each call and named by the `MacroModule` task,
+    /// never `NoDefinition` (pm-call-expand).
+    fn proc_macro_key(&self, krate: usize) -> Option<blaze_id::CrateItemKey> {
+        if self.own != Some(krate) {
+            return None;
+        }
+        self.procs?.key_of(krate)
+    }
+
+    /// A proc-macro call written in the crate `krate`: through the runner's one path
+    /// (`ProcMacros::run`), shown the crate's own package at its edition. No runner, or a crate
+    /// this job was not given as a caller, is refused with the expander's typed `HostError`.
+    fn run_proc_macro<'b>(
+        &self,
+        krate: usize,
+        def: &blaze_expand::MacroDefinition<'_>,
+        call: blaze_expand::ProcCall<'_>,
+        alloc: blaze_own::Alloc<'b>,
+    ) -> Result<blaze_expand::Produced<'b>, blaze_expand::HostError> {
+        let refused = blaze_expand::HostError { ask: blaze_expand::HostAsk::ProcMacro, why: blaze_expand::HostWhy::Refused };
+        let Some(procs) = self.procs else { return Err(refused) };
+        let Some(&(_, world_at, edition)) = self.callers.iter().find(|(at, _, _)| *at == krate) else { return Err(refused) };
+        procs.run(world_at, edition, def, call, alloc)
     }
 }

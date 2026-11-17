@@ -1541,8 +1541,10 @@ impl ExpandCx for BodyHost<'_> {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
         let Some(procs) = self.procs else { return Err(BODY_REFUSED) };
         let package = &procs.packages[self.krate];
-        if let Some((_, value)) = package.env.iter().find(|(k, _)| k == name) {
-            return Ok(Some(value.as_str()));
+        match package.env.get(name) {
+            blaze_proc_macro::package_env::EnvAnswer::Set(value) => return Ok(Some(value)),
+            blaze_proc_macro::package_env::EnvAnswer::Unknown => return Err(BODY_REFUSED),
+            blaze_proc_macro::package_env::EnvAnswer::Unset => {}
         }
         if self.build_script || names_load::CARGO_SET.contains(&name) {
             return Err(BODY_REFUSED);

@@ -381,14 +381,9 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
             traits.push(principal);
             match verdict(&mut reads, principal)? {
                 Verdict::Compatible => {}
-                Verdict::Not { trait_, by, member, rule } => out.push(crate::diag::Diag {
-                    code: crate::diag::DiagCode::DynIncompatible,
-                    at: crate::ids::Range { start: 0, end: 0 },
-                    expected: None,
-                    found: None,
-                    name: member,
-                    because: Some(crate::diag::Because::Dyn { trait_, by, member, rule }),
-                }),
+                Verdict::Not { trait_, by, member, rule } => {
+                    out.push(crate::diag::Diag::dyn_incompatible(crate::diag::Because::Dyn { trait_, by, member, rule }, member));
+                }
                 Verdict::Gap { trait_, by, why } => return Err(CheckError::DynUndecided { trait_, by, why }.into()),
             }
         }

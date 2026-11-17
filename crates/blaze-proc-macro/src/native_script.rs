@@ -18,6 +18,7 @@ use std::{path::Path, time::Instant};
 
 use blaze_build_script::{
     Env,
+    fact_shim,
     instr::OutputLimits,
     key::RunLimits,
     host_tools::{self, HostTool},
@@ -44,12 +45,22 @@ pub struct NativeScript<'s> {
     pub c: CInputs<'s>,
     /// cargo's environment as the key holds it ([`blaze_build_script::env`]).
     pub env: &'s Env<'s>,
-    /// More folders it reads: its dependencies' outputs.
+    /// More folders it reads, read-only: its `links` dependencies' trees as laid for this run
+    /// ([`crate::script_sandbox::dep_mount::native::lay`], brief N8).
     pub reads: &'s [&'s str],
+    /// More real folders its output may name, each with the text its record keeps instead (the
+    /// laid trees, written as the wasm sight names them, brief N8): no path of this run is kept.
+    pub shown: &'s [(&'s str, &'s str)],
     /// The host tools it is granted (D71, [`blaze_build_script::host_tools::granted`]), each
     /// `path` the resolved real path: started by a `PATH` of exactly their folders, read and
     /// executed, their `reads` read-only. Empty for nearly every script.
     pub host_tools: &'s [HostTool<'s>],
+    /// D112 interim (brief N7): the run's fact shim folder ([`crate::native_facts::prepare`]):
+    /// its `bin/` first on `PATH` (so `sw_vers` and `pkg-config` are answered from the pins and
+    /// never reach the machine's tools), the shim granted execute, the folder read, its `log/`
+    /// the one part written. `None` only in an example whose script asks no fact; a spawned
+    /// probe then finds no program, as before.
+    pub facts: Option<&'s crate::native_facts::ShimRun>,
     pub limits: RunLimits,
     pub deadline: Duration,
 }
@@ -214,26 +225,34 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     for (name, value) in toolchain.iter() {
         vars.push((name.as_str(), value.as_str()));
     }
-    // `PATH`: empty, or exactly the folders of the granted host tools (D71: sha3-asm starts
-    // `Command::new("perl")` and reads no variable naming it, so the search must find the
-    // granted path; any other program the search finds there is not granted and the sandbox
-    // refuses its start).
-    let mut path: AString<'a> = String::new_in(alloc);
-    let mut folders: AVec<'a, &str> = Vec::new_in(alloc);
-    for tool in script.host_tools {
-        let (folder, _) = tool.path.rsplit_once('/').unwrap_or(("", tool.path));
-        folders.push(if folder.is_empty() { "/" } else { folder });
+    // nm-row: each granted tool the table names by a variable, at its real path (tikv-jemalloc-
+    // sys's configure: `NM=<shelf>/bin/llvm-nm`, never the machine's /usr/bin/nm shim).
+    let tool_env = host_tools::tool_env(script.host_tools, c.shelf.dir, alloc);
+    for (name, value) in tool_env.iter() {
+        vars.push((name.as_str(), value.as_str()));
     }
-    folders.sort_unstable();
-    folders.dedup();
-    for (at, folder) in folders.iter().enumerate() {
-        if at > 0 {
+    // `PATH`: empty, or exactly the folders of the granted host tools found by search (D71:
+    // sha3-asm starts `Command::new("perl")` and reads no variable naming it, so the search must
+    // find the granted path; any other program the search finds there is not granted and the
+    // sandbox refuses its start). A tool named by a variable adds no folder.
+    let mut path: AString<'a> = String::new_in(alloc);
+    let folders = host_tools::path_folders(script.host_tools, alloc);
+    // D112 (N7): the fact shim's links come first: a probe is answered from the pins, never
+    // by a granted folder's program of the same name.
+    if let Some(facts) = script.facts {
+        path.push_str(&facts.bin);
+    }
+    for folder in folders.iter() {
+        if !path.is_empty() {
             path.push(':');
         }
         path.push_str(folder);
     }
     vars.push(("PATH", path.as_str()));
     vars.push(("TMPDIR", c.out_dir));
+    if let Some(facts) = script.facts {
+        vars.push((fact_shim::FOLDER_VAR, facts.folder.as_str()));
+    }
 
     // D112: a script granted a tool that runs what the script built under OUT_DIR (sh running
     // configure's test programs) links those programs: the pinned linker too (the shelf's
@@ -248,14 +267,24 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         path.push_str(name);
         exec.push(path);
     }
+    // Each tool and the programs it starts itself (perl's piped `open`: /bin/sh, /bin/bash), at
+    // their real paths: a shelf row's (nm-row: nm, the shelf's llvm-nm) under the shelf.
+    for tool in script.host_tools {
+        for program in tool.programs_in(c.shelf.dir, alloc) {
+            exec.push(program);
+        }
+    }
     let exec: AVec<'a, &str> = {
         let mut out = Vec::new_in(alloc);
         for path in exec.iter() {
             out.push(path.as_str());
         }
-        // Each tool and the programs it starts itself (perl's piped `open`: /bin/sh, /bin/bash).
-        for tool in script.host_tools {
-            out.extend(tool.programs());
+        // The fact shim (N7), started through its links.
+        if let Some(facts) = script.facts {
+            out.push(facts.shim.as_str());
+            for link in facts.links.iter() {
+                out.push(link.as_str());
+            }
         }
         out
     };
@@ -267,7 +296,13 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
             reads.push(folder);
         }
     }
-    let writes = [c.out_dir];
+    // The fact shim's folder: its links and pins read; only its log written (N7).
+    let mut writes: AVec<'a, &str> = Vec::new_in(alloc);
+    writes.push(c.out_dir);
+    if let Some(facts) = script.facts {
+        reads.push(facts.folder.as_str());
+        writes.push(facts.log_dir.as_str());
+    }
     let out_only = [c.out_dir];
     let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
     let started = Instant::now();
@@ -296,7 +331,12 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         return Err(NativeScriptError::Failed { program: program(), code: ran.code, stderr: tail.join("\n") });
     }
 
-    let pairs = [(c.out_dir, shown_out), (c.package, shown_package)];
+    // The laid trees first (brief N8): they are the most specific folders; then `OUT_DIR`, then
+    // the package.
+    let mut pairs: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
+    pairs.extend_from_slice(script.shown);
+    pairs.push((c.out_dir, shown_out));
+    pairs.push((c.package, shown_package));
     let stdout = map_paths(&ran.stdout, &pairs, alloc);
     let output_limits = OutputLimits { line: script.limits.line as usize, output: script.limits.output as usize };
     let mut outputs = Outputs::read(&stdout, shown_out, output_limits, alloc).map_err(|e| NativeScriptError::Output { program: program(), why: format!("{e:?}") })?;

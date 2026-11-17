@@ -28,6 +28,7 @@ pub(crate) mod closure;
 pub(crate) mod coerce;
 pub(crate) mod coerce_lub;
 pub(crate) mod coerce_nested;
+pub(crate) mod coerce_interior;
 pub(crate) mod control;
 pub(crate) mod coroutine;
 pub(crate) mod expect_inputs;
@@ -35,12 +36,16 @@ pub(crate) mod fallback;
 pub(crate) mod field;
 pub(crate) mod lit_path;
 pub(crate) mod method;
+pub(crate) mod obligation_site;
 pub(crate) mod mut_places;
 pub(crate) mod op;
 pub(crate) mod opaque_def;
 pub(crate) mod pat;
 pub(crate) mod promote;
+pub(crate) mod qpath_defaults;
+pub(crate) mod reify;
 pub(crate) mod self_path;
+pub(crate) mod target_feature;
 pub mod suggest;
 pub(crate) mod writeback;
 
@@ -88,6 +93,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::OffsetOf { ty, fields } => self.expr_offset_of(e, ty, fields),
             Expr::RawRef { mutbl, operand } => self.expr_raw_ref(f, e, mutbl, operand),
             Expr::ConstBlock { stmts, tail, scope: _ } => self.expr_block(f, e, stmts, tail),
+            Expr::Asm { operands, options, arch, .. } => self.expr_asm(f, operands, arch, options),
         }
     }
 
@@ -173,7 +179,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         count_checked: bool,
     ) -> Result<Flow, Stop> {
         if count_checked && self.ty.list_len(inputs) as usize != args.len() {
-            self.diag(crate::diag::DiagCode::ArgCount, crate::diag::At::Expr(e), None, None, None);
+            let count = crate::diag::About::Count { expected: self.ty.list_len(inputs), got: args.len() as u32, found: None };
+            self.diag(crate::diag::DiagCode::ArgCount, crate::diag::At::Expr(e), count);
         }
         f.l = inputs;
         f.u = output;

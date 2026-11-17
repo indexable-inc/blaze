@@ -13,7 +13,7 @@ use core::mem::DropGuard;
 
 use crate::body::BodyView;
 use crate::columns::{AdjustKind, CaptureKind};
-use crate::diag::{At, DiagCode, PendingDiag, PendingGoal};
+use crate::diag::{About, At, Because, DiagCode, PendingDiag, PendingGoal};
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{
     ExprId, FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, PatId, StmtId, UintTy,
@@ -66,6 +66,19 @@ pub(crate) enum Plant {
     /// are E0308 (`suite::fn_item_lub::control_without_the_lub_the_second_arm_is_e0308`).
     #[cfg(test)]
     FnLubOff,
+    /// The lub's second direction is not tried: a fn item then a fn pointer at one coercion
+    /// site is E0308 (`suite::fn_lub_earlier::control_without_the_second_direction_the_else_is_e0308`).
+    #[cfg(test)]
+    LubEarlierOff,
+    /// A noop reborrow on an earlier source counts as an adjustment: three arms `a, b, d` with
+    /// `a, b: &mut [u8; 4]`, `d: &mut [u8]` are E0308 at `d`
+    /// (`suite::fn_lub_gates::control_without_the_reborrow_rule_the_last_arm_is_e0308`).
+    #[cfg(test)]
+    LubReborrowOff,
+    /// Every unmet where-clause filed at the whole expression the item was used at, as before
+    /// rules/obligation_site.rs (`suite::obligation_range::control_whole_expression_fails_all_four`).
+    #[cfg(test)]
+    ClauseAtWholeExpr,
 }
 
 /// What the context expects of an expression (rustc's `Expectation`).
@@ -210,9 +223,11 @@ pub(crate) struct MachineSnapshot<S> {
     fields: usize,
     captures: usize,
     casts: usize,
+    asms: usize,
     numeric: usize,
     diverging: usize,
     closures: usize,
+    projected: usize,
 }
 
 /// An autoderef step: the type, and whether it was reached by `Deref::deref`.
@@ -310,6 +325,8 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub errors: u32,
     // Queues, processed where rustc processes them.
     pub casts: Vec<CastCheck, Alloc<'a>>,
+    /// `asm!` operands to check after fallback (asm.rs).
+    pub asms: Vec<crate::asm::AsmCheck, Alloc<'a>>,
     pub numeric: Vec<Ty, Alloc<'a>>,
     pub diverging: Vec<Ty, Alloc<'a>>,
     pub closures: Vec<PendingClosure, Alloc<'a>>,
@@ -347,6 +364,10 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub opening: bool,
     /// The promoted borrows (rules/promote.rs `analyze_promotions`), sorted by expression.
     pub promoted: Vec<ExprId, Alloc<'a>>,
+    /// Each projection lowered while instantiating a callee's signature at a call: the call,
+    /// the trait, the name, `[Self, trait args..]` (src/selected.rs; written back as
+    /// `Checked::selected`). Rolled back with a probe.
+    pub projected: Vec<(ExprId, ItemKey, Name, TyList), Alloc<'a>>,
     /// What an auto-trait goal of a future that failed only on the superset interior becomes:
     /// the gap, or under `check_deferring` a stalled row (src/stalled.rs).
     pub interior: crate::stalled::Interior,
@@ -413,6 +434,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             dyn_seen: Vec::new_in(alloc),
             errors: 0,
             casts: Vec::new_in(alloc),
+            asms: Vec::new_in(alloc),
             numeric: Vec::new_in(alloc),
             diverging: Vec::new_in(alloc),
             closures: Vec::new_in(alloc),
@@ -431,6 +453,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             defining: Vec::new_in(alloc),
             opening: false,
             promoted: Vec::new_in(alloc),
+            projected: Vec::new_in(alloc),
             interior: crate::stalled::Interior::Gap,
             stalled: Vec::new_in(alloc),
             alloc,
@@ -472,6 +495,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             + core::mem::size_of_val(&self.fields[..])
             + core::mem::size_of_val(&self.captures[..])
             + core::mem::size_of_val(&self.casts[..])
+            + core::mem::size_of_val(&self.asms[..])
             + core::mem::size_of_val(&self.numeric[..])
             + core::mem::size_of_val(&self.closures[..]);
         b as u64
@@ -563,7 +587,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             Then::Nothing => ty,
             Then::Coerce { to, two_phase } => {
                 if !self.coerce(Some(e), ty, to, two_phase)? {
-                    self.diag(DiagCode::Mismatch, At::Expr(e), Some(to), Some(ty), None);
+                    self.diag(DiagCode::Mismatch, At::Expr(e), About::types(to, ty));
                 }
                 to
             }
@@ -590,7 +614,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             return Ok(());
         }
         if !self.unify(to, ty)? {
-            self.diag(DiagCode::Mismatch, At::Expr(e), Some(to), Some(ty), None);
+            self.diag(DiagCode::Mismatch, At::Expr(e), About::types(to, ty));
         }
         Ok(())
     }
@@ -644,7 +668,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             None => {
                 let code = if cm.pushed == 0 { DiagCode::Mismatch } else { DiagCode::IncompatibleArms };
-                self.diag(code, at, Some(merged), Some(ty), None);
+                self.diag(code, at, About::types(merged, ty));
                 self.coerce_many[site as usize].final_ty = Some(self.common.err);
             }
         }
@@ -653,8 +677,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
 
     /// `try_find_coercion_lub`: two fn items (or a fn item and a closure that captures nothing)
     /// meet at their fn pointer, every source reified (rules/coerce_lub.rs); else the new source
-    /// coerced to the merged type, else the two unified as their least upper bound (equal,
-    /// regions being erased).
+    /// coerced to the merged type; else every earlier source coerced to the new source's type
+    /// when none carries an adjustment (rules/coerce_lub.rs `lub_earlier_to_new`); else the two
+    /// unified as their least upper bound (equal, regions being erased).
     fn coercion_lub(&mut self, site: u32, e: ExprId, merged: Ty, ty: Ty) -> Result<Option<Ty>, Stop> {
         #[cfg(test)]
         let fn_lub_on = self.plant != Plant::FnLubOff;
@@ -669,6 +694,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         }
         if self.coerce(Some(e), ty, merged, false)? {
             return Ok(Some(merged));
+        }
+        #[cfg(test)]
+        let earlier_on = self.plant != Plant::LubEarlierOff;
+        #[cfg(not(test))]
+        let earlier_on = true;
+        if earlier_on && let Some(t) = self.lub_earlier_to_new(site, merged, ty)? {
+            return Ok(Some(t));
         }
         if self.unify(merged, ty)? {
             return Ok(Some(merged));
@@ -800,28 +832,24 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     pub(crate) fn demand_eq(&mut self, at: At, expected: Ty, found: Ty) -> Result<bool, Stop> {
         let ok = self.unify(expected, found)?;
         if !ok {
-            self.diag(DiagCode::Mismatch, at, Some(expected), Some(found), None);
+            self.diag(DiagCode::Mismatch, at, About::types(expected, found));
         }
         Ok(ok)
     }
 
-    /// Records a diagnostic. The body is tainted by errors from now on.
-    pub(crate) fn diag(
-        &mut self,
-        code: DiagCode,
-        at: At,
-        expected: Option<Ty>,
-        found: Option<Ty>,
-        name: Option<Name>,
-    ) {
+    /// Records a diagnostic about `about` (src/diag/about.rs: no finding says nothing). The body
+    /// is tainted by errors from now on.
+    pub(crate) fn diag(&mut self, code: DiagCode, at: At, about: About) {
         self.errors += 1;
-        let code = match (code, expected, found) {
-            (DiagCode::Mismatch, Some(e), Some(f)) if self.pattern_over(e, f) || self.pattern_over(f, e) => {
+        let code = match (code, about) {
+            (DiagCode::Mismatch, About::Types { expected: Some(e), found: f, .. })
+                if self.pattern_over(e, f) || self.pattern_over(f, e) =>
+            {
                 DiagCode::PatternNotBase
             }
             _ => code,
         };
-        self.diags.push(PendingDiag { code, at, expected, found, name, because: None, unmet: None });
+        self.diags.push(PendingDiag::new(code, at, about));
     }
 
     /// Whether `p` is a pattern type over `other` (typeck.md, "Pattern types"): its base is
@@ -854,7 +882,20 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     fn report_fulfill_errors(&mut self, ambiguity: bool) -> Result<(), Stop> {
         // Bounded by the context's error count; each `next_error` removes one.
         while let Some(err) = self.ty.next_error() {
-            let at = At::of(err.obligation.cause);
+            // An unmet (or mismatched) clause goes to the text that introduced it; an ambiguous
+            // one stays on the whole use: what it lacks is an annotation, not a bound.
+            let at = match (err.kind, err.obligation.cause) {
+                (crate::ty::FulfillErrorKind::Ambiguous, cause) => At::of(cause),
+                (_, Cause::Clause { expr, nth }) => self.clause_at(expr, nth)?,
+                (_, cause) => At::of(cause),
+            };
+            // An unsizing taken at its site whose goal failed only on a superset interior
+            // (rules/coerce_interior.rs): the interior gap in every mode.
+            if matches!(err.kind, crate::ty::FulfillErrorKind::Unsatisfied | crate::ty::FulfillErrorKind::Mismatch)
+                && let Some(gap) = self.unsize_interior_gap(err.obligation.goal)?
+            {
+                return Err(gap.into());
+            }
             // An auto trait of an async block's future that failed on the superset interior
             // and is not known to fail on the exact one: a typed gap, never E0277
             // (rules/async_fn.rs, 2).
@@ -868,11 +909,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     (crate::stalled::Interior::Defer, crate::ty::Goal::Trait { trait_, args }) => {
                         let ty = self.ty.list_get(args, 0);
                         let leaf = self.failed_leaf(trait_, args)?.map(|(trait_, args)| PendingGoal::Trait { trait_, args });
-                        let (because, unmet) = match err.because {
-                            Some(b) => (Some(b), None),
-                            None => (None, Some((PendingGoal::Trait { trait_, args }, leaf))),
+                        let diag = match err.because {
+                            Some(b) => PendingDiag::because(DiagCode::Unsatisfied, at, b, Some(ty), None),
+                            None => PendingDiag::unmet(DiagCode::Unsatisfied, at, Some(ty), PendingGoal::Trait { trait_, args }, leaf),
                         };
-                        let diag = PendingDiag { code: DiagCode::Unsatisfied, at, expected: None, found: Some(ty), name: None, because, unmet };
                         self.stalled.push(crate::stalled::PendingStalled { trait_, ty, diag });
                         continue;
                     }
@@ -894,21 +934,22 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         };
                         // The finding names the goal left undecided, entire, as an unmet one
                         // does: "cannot satisfy `T: Tr`" says which goal had two answers.
-                        let goal = match err.obligation.goal {
-                            crate::ty::Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
-                            crate::ty::Goal::Projection { trait_, args, name, term } => {
-                                Some(PendingGoal::Projection { trait_, args, name, term })
+                        match err.obligation.goal {
+                            crate::ty::Goal::Trait { trait_, args } => {
+                                self.push_goal_finding(code, at, PendingGoal::Trait { trait_, args }, false)?;
                             }
-                            _ => None,
-                        };
-                        match goal {
-                            Some(goal) => {
-                                let (PendingGoal::Trait { args, .. } | PendingGoal::Projection { args, .. }) = goal;
+                            crate::ty::Goal::Projection { trait_, args, name, term } => {
+                                self.push_goal_finding(code, at, PendingGoal::Projection { trait_, args, name, term }, false)?;
+                            }
+                            // `ty` well formed, undecided: the type is what the finding is about.
+                            crate::ty::Goal::WellFormed(t) => self.diag(code, at, About::found(t)),
+                            // A `where const` condition not decided at these types: the condition,
+                            // with the bound's self type.
+                            crate::ty::Goal::ConstHolds { cond, args } => {
                                 let found = if self.ty.list_len(args) > 0 { Some(self.ty.list_get(args, 0)) } else { None };
                                 self.errors += 1;
-                                self.diags.push(PendingDiag { code, at, expected: None, found, name: None, because: None, unmet: Some((goal, None)) });
+                                self.diags.push(PendingDiag::because(code, at, Because::Generic(cond), found, None));
                             }
-                            None => self.diag(code, at, None, None, None),
                         }
                     }
                 }
@@ -923,46 +964,28 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             _ => None,
                         };
                         self.errors += 1;
-                        self.diags.push(PendingDiag {
-                            code: DiagCode::Unsatisfied,
-                            at,
-                            expected: None,
-                            found,
-                            name: None,
-                            because: Some(because),
-                            unmet: None,
-                        });
+                        self.diags.push(PendingDiag::because(DiagCode::Unsatisfied, at, because, found, None));
                     }
                     // The finding carries the goal entire (trait or projection, every
                     // argument, the term) and the leaf where-clause that failed under it;
                     // `found` is the goal's self type.
-                    None => {
-                        let goal = match err.obligation.goal {
-                            crate::ty::Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
-                            crate::ty::Goal::Projection { trait_, args, name, term } => {
-                                Some(PendingGoal::Projection { trait_, args, name, term })
-                            }
-                            _ => None,
-                        };
-                        match goal {
-                            Some(goal) => {
-                                let (PendingGoal::Trait { trait_, args } | PendingGoal::Projection { trait_, args, .. }) = goal;
-                                let found = if self.ty.list_len(args) > 0 { Some(self.ty.list_get(args, 0)) } else { None };
-                                let leaf = self.failed_leaf(trait_, args)?.map(|(trait_, args)| PendingGoal::Trait { trait_, args });
-                                self.errors += 1;
-                                self.diags.push(PendingDiag {
-                                    code: DiagCode::Unsatisfied,
-                                    at,
-                                    expected: None,
-                                    found,
-                                    name: None,
-                                    because: None,
-                                    unmet: Some((goal, leaf)),
-                                });
-                            }
-                            None => self.diag(DiagCode::Unsatisfied, at, None, None, None),
+                    None => match err.obligation.goal {
+                        crate::ty::Goal::Trait { trait_, args } => {
+                            self.push_goal_finding(DiagCode::Unsatisfied, at, PendingGoal::Trait { trait_, args }, true)?;
                         }
-                    }
+                        crate::ty::Goal::Projection { trait_, args, name, term } => {
+                            self.push_goal_finding(DiagCode::Unsatisfied, at, PendingGoal::Projection { trait_, args, name, term }, true)?;
+                        }
+                        // `ty` is not well formed: the type is what the finding is about.
+                        crate::ty::Goal::WellFormed(t) => self.diag(DiagCode::Unsatisfied, at, About::found(t)),
+                        // A `where const` condition false at these types, with no reason given
+                        // by the solver: the condition, with the bound's self type.
+                        crate::ty::Goal::ConstHolds { cond, args } => {
+                            let found = if self.ty.list_len(args) > 0 { Some(self.ty.list_get(args, 0)) } else { None };
+                            self.errors += 1;
+                            self.diags.push(PendingDiag::because(DiagCode::Unsatisfied, at, Because::False(cond), found, None));
+                        }
+                    },
                 },
             }
         }
@@ -1066,7 +1089,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let t = self.try_structurally_resolve(t)?;
         if self.is_ty_var(t) {
             if self.errors == 0 {
-                self.diag(DiagCode::AnnotationsNeeded, at, None, None, None);
+                self.diag(DiagCode::AnnotationsNeeded, at, About::found(t));
             } else {
                 self.errors += 1;
             }
@@ -1098,9 +1121,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             fields: self.fields.len(),
             captures: self.captures.len(),
             casts: self.casts.len(),
+            asms: self.asms.len(),
             numeric: self.numeric.len(),
             diverging: self.diverging.len(),
             closures: self.closures.len(),
+            projected: self.projected.len(),
         }
     }
 
@@ -1118,9 +1143,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.fields.truncate(s.fields);
         self.captures.truncate(s.captures);
         self.casts.truncate(s.casts);
+        self.asms.truncate(s.asms);
         self.numeric.truncate(s.numeric);
         self.diverging.truncate(s.diverging);
         self.closures.truncate(s.closures);
+        self.projected.truncate(s.projected);
     }
 
     /// Runs `f` in a snapshot that is always rolled back (`probe`).
@@ -1409,6 +1436,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     goal: Goal::Projection { trait_, args, name, term },
                     cause,
                 })?;
+                // A callee's signature instantiated at a call: the impl chosen for this
+                // projection is written back per call (src/selected.rs).
+                if let (Lower::Args(_), Cause::Expr(e)) = (mode, cause) {
+                    self.projected.push((e, trait_, name, args));
+                }
                 return Ok(term);
             }
             PNode::Opaque(k, _) if self.opening => return self.defining_var(k),
@@ -1457,8 +1489,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             crate::dyn_compat::Verdict::Compatible => {}
             crate::dyn_compat::Verdict::Not { trait_, by, member, rule } => {
                 self.errors += 1;
-                let because = Some(crate::diag::Because::Dyn { trait_, by, member, rule });
-                self.diags.push(PendingDiag { code: DiagCode::DynIncompatible, at, expected: None, found: None, name: member, because, unmet: None });
+                let because = Because::Dyn { trait_, by, member, rule };
+                self.diags.push(PendingDiag::because(DiagCode::DynIncompatible, at, because, None, member));
             }
             crate::dyn_compat::Verdict::Gap { trait_, by, why } => {
                 return Err(CheckError::DynUndecided { trait_, by, why }.into());
@@ -1482,7 +1514,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// (`add_required_obligations_for_hir`).
     pub(crate) fn register_predicates(&mut self, item: ItemKey, args: TyList, cause: Cause) -> Result<(), Stop> {
         let preds = self.reads.predicates(item)?;
-        for clause in preds.clauses {
+        for (nth, clause) in preds.clauses.iter().enumerate() {
             let goal = match *clause {
                 PClause::Trait { trait_, args: l } => {
                     Goal::Trait { trait_, args: self.lower_list(preds.types, l, args, cause)? }
@@ -1497,7 +1529,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     Goal::ConstHolds { cond, args: self.lower_list(preds.types, l, args, cause)? }
                 }
             };
-            self.ty.register(Obligation { goal, cause })?;
+            // A use's clause is filed, if unmet, where its text is (rules/obligation_site.rs).
+            let ob_cause = match cause {
+                Cause::Expr(expr) => Cause::Clause { expr, nth: u32::try_from(nth).unwrap_or(u32::MAX) },
+                other => other,
+            };
+            self.ty.register(Obligation { goal, cause: ob_cause })?;
         }
         Ok(())
     }
@@ -1532,8 +1569,19 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// Records `DiagCode::MissingLangItem` naming `item` at `at`. The body is tainted.
     pub(crate) fn missing_lang(&mut self, item: LangItem, at: At) {
         self.errors += 1;
-        let because = Some(crate::diag::Because::NoLangItem(item));
-        self.diags.push(PendingDiag { code: DiagCode::MissingLangItem, at, expected: None, found: None, name: None, because, unmet: None });
+        self.diags.push(PendingDiag::because(DiagCode::MissingLangItem, at, Because::NoLangItem(item), None, None));
+    }
+
+    /// A finding of `code` about `goal` entire (undecided, or unmet when `unmet`), with the leaf
+    /// where-clause that failed under an unmet one where the checker names one; `found` is the
+    /// goal's self type.
+    fn push_goal_finding(&mut self, code: DiagCode, at: At, goal: PendingGoal, unmet: bool) -> Result<(), Stop> {
+        let (PendingGoal::Trait { trait_, args } | PendingGoal::Projection { trait_, args, .. }) = goal;
+        let found = if self.ty.list_len(args) > 0 { Some(self.ty.list_get(args, 0)) } else { None };
+        let leaf = if unmet { self.failed_leaf(trait_, args)?.map(|(trait_, args)| PendingGoal::Trait { trait_, args }) } else { None };
+        self.errors += 1;
+        self.diags.push(PendingDiag::unmet(code, at, found, goal, leaf));
+        Ok(())
     }
 
     /// The impl-lookup shape of `t`, or `None` for a variable or the error type.
@@ -1645,6 +1693,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             At::Expr(e) => self.body.expr_range(e),
             At::Pat(p) => self.body.pat_range(p),
             At::Body => crate::ids::Range::default(),
+            At::Written(r) => r,
         }
     }
 }

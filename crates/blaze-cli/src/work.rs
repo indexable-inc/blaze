@@ -185,6 +185,9 @@ pub struct Facts<'f, S> {
     pub names: Option<crate::names::Names<'f>>,
     /// The `CrateScope` records the `BodyCheck` tasks read this command (body_types.rs).
     pub bodies: crate::body_types::Kept,
+    /// The command's build scripts (scripts.rs): its setting and the graph, made by the first
+    /// `Script` task of the command.
+    pub scripts: Option<crate::scripts::Scripts<'f>>,
 }
 
 pub(crate) enum Did<'f> {
@@ -211,6 +214,12 @@ impl Read<'_> {
     /// The record's payload (blaze-surface's or the kind's own form).
     pub(crate) fn payload(&self) -> &[u8] {
         &self.bytes.as_slice()[self.payload.clone()]
+    }
+
+    /// A `UnitGraph` record's two sections (graph_payload.rs): its graph record, then its crate
+    /// list. `name` is the input's, for the error.
+    pub(crate) fn unit_graph(&self, name: Name) -> Result<crate::graph_payload::Sections<'_>, CliError> {
+        crate::graph_payload::sections(self.payload()).map_err(|error| CliError::Input { name, why: InputWhy::Graph(error) })
     }
 }
 
@@ -244,6 +253,8 @@ pub enum InputWhy {
     Malformed(blaze_drive::WireError),
     /// It is a shape record, which has no payload.
     Shape,
+    /// A `UnitGraph` payload not of its form, or a crate list its check refused.
+    Graph(crate::graph_payload::PayloadError),
 }
 
 impl core::fmt::Display for InputWhy {
@@ -252,6 +263,7 @@ impl core::fmt::Display for InputWhy {
             InputWhy::Absent => f.write_str("the store holds no record at its key"),
             InputWhy::Malformed(error) => write!(f, "its record is not one: {error}"),
             InputWhy::Shape => f.write_str("its record is a shape, with no payload"),
+            InputWhy::Graph(error) => write!(f, "{error}"),
         }
     }
 }
@@ -425,6 +437,28 @@ pub fn run_batches<'f, 'r>(
                         Ok(Err(CliError::Text { what })) => Spawned::Refused(what),
                         Ok(Err(error)) => return Err(error),
                     },
+                    // One build script's run on the pool (scripts.rs, D115): its job made here
+                    // from record bytes, its files located; the run in its worker's frame.
+                    Kind::Script => {
+                        if facts.laid.is_none() {
+                            facts.laid = Some(crate::units::lay(&cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
+                        }
+                        let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock);
+                        let members = crate::names::member_dirs(facts.laid.as_ref());
+                        match crate::scripts::job(&cx, root, store, &mut facts.scripts, &mut facts.names, &facts.fetch_env, lock, members, task, frame, jobs)? {
+                            crate::scripts::Prepared::Need(wants) => Spawned::Need(wants),
+                            crate::scripts::Prepared::Waited(on) => Spawned::Waited(on),
+                            crate::scripts::Prepared::Said { what, words, hole } => {
+                                let mut owned = std::vec::Vec::new_in(Global);
+                                owned.extend_from_slice(words.as_bytes());
+                                Spawned::Said { what, words: owned, hole }
+                            }
+                            crate::scripts::Prepared::Ready(job) => Spawned::Script(scope.may_overlap("build script", crate::scripts::SCRIPT_FRAME, {
+                                let clock = &clock;
+                                move |cx: &Cx| Ok::<_, core::convert::Infallible>(crate::scripts::pooled(cx, &job, clock))
+                            })),
+                        }
+                    }
                     Kind::BodyCheck => {
                         // The crates its types read come first (body_types.rs): a task that
                         // lacks them answers `Need`, and joins its file's job only with them.
@@ -441,23 +475,14 @@ pub fn run_batches<'f, 'r>(
                                 Ok(job) => {
                                     let real = crate::sweep::real_path(job.slot, job.flags, jobs);
                                     let real = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
-                                    // The names world, made once a command, timed apart from the
-                                    // reads of the crates' records that `prepare` does next.
-                                    let mut world = Ok(());
-                                    if facts.names.is_none()
-                                        && let Some(graph) = task.inputs.iter().find(|input| input.name == Name::unit_graph())
-                                    {
-                                        let world_at = phases.now();
-                                        world = crate::body_types::names_world(&cx, root, store, facts, graph, frame, alloc)?;
-                                        phases.worked(BODY_WORLD, phases.since(world_at));
-                                    }
-                                    match world.map(|()| crate::body_types::prepare(&cx, root, store, facts, task, real, frame, jobs, alloc)) {
-                                        Err(what) => Err(Spawned::Refused(what)),
-                                        Ok(Err(error)) => return Err(error),
-                                        Ok(Ok(crate::body_types::Prepared::Need(wants))) => Err(Spawned::Need(wants)),
-                                        Ok(Ok(crate::body_types::Prepared::Waited(on))) => Err(Spawned::Waited(on)),
-                                        Ok(Ok(crate::body_types::Prepared::Refused(what))) => Err(Spawned::Refused(what)),
-                                        Ok(Ok(crate::body_types::Prepared::Ready(types))) => {
+                                    // No names world: `prepare` reads the crate list in place
+                                    // (graph_payload.rs).
+                                    match crate::body_types::prepare(&cx, root, store, facts, task, real, frame, jobs, alloc) {
+                                        Err(error) => return Err(error),
+                                        Ok(crate::body_types::Prepared::Need(wants)) => Err(Spawned::Need(wants)),
+                                        Ok(crate::body_types::Prepared::Waited(on)) => Err(Spawned::Waited(on)),
+                                        Ok(crate::body_types::Prepared::Refused(what)) => Err(Spawned::Refused(what)),
+                                        Ok(crate::body_types::Prepared::Ready(types)) => {
                                             files.push((job, Vec::new_in(jobs), types));
                                             Ok(files.len() - 1)
                                         }
@@ -533,6 +558,11 @@ enum Spawned<'s> {
     Waited(Name),
     /// A `BodyCheck` task that lacks inputs (body_types.rs `prepare`): it answers `Need`.
     Need(std::vec::Vec<Want, Global>),
+    /// A `Script` task's run on the pool (scripts.rs).
+    Script(bstd::task::Task<'s, crate::scripts::PooledScript>),
+    /// A `Script` task whose job could not be made: it fails with these words (UTF-8), a hole
+    /// when the cause is outside its key.
+    Said { what: &'static str, words: std::vec::Vec<u8, Global>, hole: bool },
 }
 
 /// A batch's tasks as [`run_batches`] spawned them.
@@ -621,6 +651,33 @@ fn answer_batch<'f, 'r>(
                 };
                 phases.worked(row_of(task.name.kind), ns);
                 (done, ns)
+            }
+            (Spawned::Script(handle), _) => {
+                let joined = handle.join(&cx).map_err(CliError::Pool)?;
+                high.scratch = high.scratch.max(joined.used);
+                phases.worked(row_of(task.name.kind), joined.ns);
+                let done = match joined.did {
+                    Err(why) => Did::Failed(TaskFailure { name: task.name, why }),
+                    Ok(crate::scripts::Ran::Made(record)) => Did::Done(record.clone_in(held)),
+                    Ok(crate::scripts::Ran::Failed { what, words, hole }) => {
+                        let failure = TaskFailure { name: task.name, why: Why::Refused { what, rule: crate::scripts::RULE } };
+                        let words = core::str::from_utf8(&words).map_err(|_| CliError::Text { what: "a build script's failure words are not UTF-8" })?;
+                        match hole {
+                            true => Did::Hole(failure, held_str(words, held)),
+                            false => Did::FailedSaying(failure, held_str(words, held)),
+                        }
+                    }
+                };
+                (done, joined.ns)
+            }
+            (Spawned::Said { what, words, hole }, _) => {
+                let failure = TaskFailure { name: task.name, why: Why::Refused { what, rule: crate::scripts::RULE } };
+                let words = core::str::from_utf8(&words).map_err(|_| CliError::Text { what: "a build script's failure words are not UTF-8" })?;
+                let done = match hole {
+                    true => Did::Hole(failure, held_str(words, held)),
+                    false => Did::FailedSaying(failure, held_str(words, held)),
+                };
+                (done, 0)
             }
             (Spawned::Scope(handle), _) => {
                 let joined = handle.join(&cx).map_err(CliError::Pool)?;
@@ -760,9 +817,6 @@ pub(crate) const BODY_SETUP: &str = "of those, the setup: readers and the world 
 /// The profile's row of the pooled `CrateScope` resolutions.
 pub(crate) const SCOPES: &str = "pooled CrateScope (worker ns)";
 
-/// Of the `BodyCheck` jobs made on the main thread, the names world made once a command
-/// (body_types.rs `names_world`); the rest of that row is the reads of the crates' records.
-pub(crate) const BODY_WORLD: &str = "of BodyCheck jobs made, the names world (main ns)";
 /// The profile's row of the `BodyCheck` tasks.
 pub(crate) const BODIES: &str = "pooled BodyCheck (worker ns)";
 
@@ -774,6 +828,7 @@ fn made_row(kind: Kind) -> &'static str {
         Kind::FileItems => "jobs made: FileItems (main ns)",
         Kind::CrateScope => "jobs made: CrateScope (main ns)",
         Kind::BodyCheck => "jobs made: BodyCheck (main ns)",
+        Kind::Script => "jobs made: Script (main ns)",
         _ => "jobs made: answered here (main ns)",
     }
 }
@@ -788,6 +843,7 @@ fn row_of(kind: Kind) -> &'static str {
         Kind::CrateScope => "task CrateScope",
         Kind::FileItems => "pooled FileItems (worker ns)",
         Kind::BodyCheck => BODIES,
+        Kind::Script => "pooled Script (worker ns)",
         _ => "task of another kind",
     }
 }
@@ -857,8 +913,10 @@ pub const fn builds(kind: Kind) -> bool {
         | Kind::Surface
         | Kind::MacroModule
         | Kind::CrateScope
+        | Kind::Script
         | Kind::BodyCheck => true,
-        Kind::ModuleScope | Kind::Group | Kind::Expansion | Kind::Signature | Kind::ImplBucket | Kind::Code | Kind::Test => false,
+        // `Owners` is the request machine's own row (blaze-drive owners.rs), never a task.
+        Kind::ModuleScope | Kind::Group | Kind::Expansion | Kind::Signature | Kind::ImplBucket | Kind::Code | Kind::Test | Kind::Owners => false,
     }
 }
 
@@ -970,12 +1028,40 @@ fn run<'f, 'b>(
                     Ok(names) => {
                         let parts = crate::names::parts(&names);
                         record.parts.extend(parts.iter().map(|(name, source)| Part { name: *name, locate: Locate::Source(*source), place: 0 }));
+                        // Each crate's build-script run, named with its `CrateScope` part from the
+                        // same row (ruling D115 (2)): a side nobody reaches names none.
+                        let scripts = crate::scripts::parts(names.script_keys());
+                        record.parts.extend(scripts.iter().map(|(name, source)| Part { name: *name, locate: Locate::Source(*source), place: 0 }));
+                        // Each script's module lookup, once a module (script_modules.rs, ruling
+                        // D115 (c)): its source holds the graph's, so the module store's listing.
+                        let mut named: Option<ContentId> = None;
+                        for module in names.script_modules() {
+                            if named != Some(module.subject) {
+                                named = Some(module.subject);
+                                let source = crate::script_modules::part_source(graph.source, module.subject);
+                                record.parts.push(Part { name: crate::script_modules::name(module.subject), locate: Locate::Source(source), place: 0 });
+                            }
+                        }
+                        // The crate list, one row a crate (drive.md, "The crate list is a
+                        // record"): every other reader of the crates opens it in place, so an
+                        // edit makes no world (graph_payload.rs). Freed when sealed (`Global`,
+                        // named: copied into the record next).
+                        let list = match blaze_world::crate_list::encode(names.world(), &|at| names.script_name_of(at), blaze_own::Alloc::global()) {
+                            Ok(list) => list,
+                            Err(error) => {
+                                let words = bstd::mem::format_in!(held, "the crate list of the world could not be written: {error}");
+                                return Ok(Did::FailedSaying(TaskFailure { name: task.name, why: Why::Refused { what: "the crate list", rule: "crate_list.rs" } }, held_str(words.as_str(), held)));
+                            }
+                        };
+                        record.out = crate::graph_payload::seal(&mut record.payload, &list);
                         crate::names::tell_public(store, &names);
                         facts.names = Some(names);
                     }
                     Err(error) => {
                         let words = bstd::mem::format_in!(held, "names not resolved: {error}");
                         record.find(crate::fetch::SOURCE_REFUSED, (0, 0), &[words.as_str()]);
+                        // No world, no rows: the list is empty and its readers say so.
+                        record.out = crate::graph_payload::seal(&mut record.payload, &[]);
                     }
                 }
                 Ok(Did::Done(record))
@@ -989,7 +1075,7 @@ fn run<'f, 'b>(
             // read this command.
             None => Ok(Did::Failed(TaskFailure { name: task.name, why: Why::Refused { what: "a `Fetch` task with no lock read this command", rule: "fetch.rs" } })),
         },
-        Kind::FileItems | Kind::BodyCheck => unreachable!("{:?} tasks run on the pool, in `answer_batch`", task.name.kind),
+        Kind::FileItems | Kind::BodyCheck | Kind::Script => unreachable!("{:?} tasks run on the pool, in `answer_batch`", task.name.kind),
         // A file's surface: its out is its source, the digest its file's outline made; it holds
         // no bytes of its own. Its `CrateScope` readers compare that out.
         Kind::Surface => {
@@ -1002,6 +1088,22 @@ fn run<'f, 'b>(
             if facts.laid.is_none() {
                 facts.laid = Some(crate::units::lay(&cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
             }
+            // A build script's module or a proc-macro crate's: the names world says which
+            // (script_modules.rs, ruling D115 (c)); made here when no task made it first.
+            if facts.names.is_none() {
+                let Some(graph) = task.inputs.iter().find(|input| input.name == Name::unit_graph()) else {
+                    let mut wants = Vec::with_capacity_in(1, held);
+                    wants.push(Want { name: Name::unit_graph(), home: Name::unit_graph() });
+                    return Ok(Did::Need(wants));
+                };
+                if let Err(what) = crate::body_types::names_world(&cx, root, store, facts, graph, frame, alloc)? {
+                    return Ok(Did::Hole(TaskFailure { name: task.name, why: Why::Refused { what, rule: crate::script_modules::RULE } }, what));
+                }
+            }
+            if let Some(module) = facts.names.as_ref().and_then(|names| names.script_module(task.name.subject)) {
+                let wanted = crate::script_modules::Wanted { package: module.package, version: module.version, features: &module.features };
+                return crate::script_modules::run(&cx, facts.fetch_env.home, wanted, task, held);
+            }
             let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref());
             let members = crate::names::member_dirs(facts.laid.as_ref());
             let place = crate::macros::Place { home: facts.fetch_env.home, checkout: facts.fetch_env.checkout, members, rows: &facts.rows };
@@ -1013,7 +1115,11 @@ fn run<'f, 'b>(
             }
             let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock);
             let members = crate::names::member_dirs(facts.laid.as_ref());
-            crate::names::run(&cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, task, held)
+            let side = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| crate::proc_runner::MacroSide {
+                lock: lockfile,
+                place: crate::macros::Place { home: facts.fetch_env.home, checkout: facts.fetch_env.checkout, members, rows: &facts.rows },
+            });
+            crate::names::run(&cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, side.as_ref(), task, held)
         }
         _ => unreachable!("`builds` said yes to {:?} and `run` has no arm for it", task.name.kind),
     }
@@ -1538,7 +1644,11 @@ fn scope_job<'f: 'j, 'j>(
     // An answer without a resolution is dropped here and made again by the serial step: the
     // round's frame holds its few words until the round ends.
     let held = round.frame();
-    match crate::names::prepare(cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, task, round, held)? {
+    let side = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| crate::proc_runner::MacroSide {
+        lock: lockfile,
+        place: crate::macros::Place { home: facts.fetch_env.home, checkout: facts.fetch_env.checkout, members, rows: &facts.rows },
+    });
+    match crate::names::prepare(cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, side.as_ref(), task, round, held)? {
         crate::names::Prepared::Resolve(job) => Ok(Some(job)),
         crate::names::Prepared::Answer(_) | crate::names::Prepared::Made => Ok(None),
     }

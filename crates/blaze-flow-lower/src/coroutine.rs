@@ -67,6 +67,7 @@ use core::alloc::Allocator;
 use blaze_flow::{BorrowKind, Flow, Local, Operand, Place, Proj, StmtKind};
 use blaze_typeck::{BodyView, CaptureKind, Checked, Expr, ExprId, Mutbl, PNode, PTy, PatId, PortableTys, Range};
 
+use crate::identity::{Identity, Role};
 use crate::{At, Facts, Form, Lower, MOST_POSITIONS, Refusal, Task, TyD, range_of};
 
 /// An async block's body lowered as its own flow.
@@ -80,6 +81,9 @@ pub struct LoweredAsync<A: Allocator + Clone> {
     /// that the record does not name (a capture's reference argument, an `.await`'s pin, a
     /// guard's fake borrow, an overloaded deref's result); `None` when `local_ty` is its type.
     pub local_wrap: Vec<Option<Mutbl>, A>,
+    /// Per local of `flow`: what it stands for (identity.rs), the ONE table of identities the
+    /// builder looks the locals it keeps across a suspension up in (ASYNC.md P8, async-P8-4).
+    pub identity: Vec<crate::identity::Identity, A>,
     /// The block's item-relative range (what a refusal of [`interior`] names).
     pub range: Range,
 }
@@ -115,7 +119,10 @@ pub fn lower_async<A: Allocator + Clone, F: Facts>(
     if suspends != l.points.len() {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    Ok(LoweredAsync { flow, local_ty, point_of: l.points, local_wrap, range })
+    if l.identity.len() != flow.locals as usize {
+        return Err(Refusal { form: Form::Malformed, range });
+    }
+    Ok(LoweredAsync { flow, local_ty, point_of: l.points, local_wrap, identity: l.identity, range })
 }
 
 /// A planted bug for the tests' controls.
@@ -159,6 +166,80 @@ pub(crate) fn interior_planted<A: Allocator + Clone>(
     interior_with(lowered, ck, block, out, plant == InteriorPlant::EveryLocal, alloc)
 }
 
+/// One element of an exact interior ([`interior_parts`]): a type of the block's record
+/// (`Checked::types`), behind a reference `&m` when `wrap` is `Some(m)` (a capture by reference,
+/// or a local the record does not type as itself: [`LoweredAsync::local_wrap`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InteriorPart {
+    pub ty: PTy,
+    pub wrap: Option<Mutbl>,
+}
+
+/// The exact interior's elements, sorted by (record type, wrap) and deduplicated: the saved
+/// locals (`blaze_flow::suspend::saved`, the one rule of what a state stores) and the captures
+/// by kind. [`interior`] interns the same elements into a table extending the record's; a caller
+/// with a table of its own (front2 opaque_auto.rs) copies each `ty` and makes the wraps there.
+/// A local or capture whose type the record does not hold is refused by name
+/// ([`Form::Malformed`]).
+pub fn interior_parts<A: Allocator + Clone>(lowered: &LoweredAsync<A>, ck: &Checked<'_>, block: ExprId, alloc: A) -> Result<Vec<InteriorPart, A>, Refusal> {
+    parts_with(lowered, ck, block, false, alloc)
+}
+
+fn parts_with<A: Allocator + Clone>(
+    lowered: &LoweredAsync<A>,
+    ck: &Checked<'_>,
+    block: ExprId,
+    every_local: bool,
+    alloc: A,
+) -> Result<Vec<InteriorPart, A>, Refusal> {
+    let range = lowered.range;
+    let refuse = |form: Form| Refusal { form, range };
+    let flow = &lowered.flow;
+    if lowered.local_ty.len() != flow.locals as usize || lowered.local_wrap.len() != flow.locals as usize {
+        return Err(refuse(Form::Malformed));
+    }
+    let saved = blaze_flow::suspend::saved(flow, alloc.clone()).map_err(|_| refuse(Form::Bound))?;
+    let record = ck.types.view();
+    let mut parts: Vec<InteriorPart, A> = Vec::new_in(alloc.clone());
+    // The saved locals; the arguments are the captures, taken below by their kind.
+    for l in flow.args + 1..flow.locals {
+        if !every_local && !saved.is_saved(Local(l)) {
+            continue;
+        }
+        let ty = lowered.local_ty[l as usize];
+        record.get(ty).ok_or(refuse(Form::Malformed))?;
+        parts.push(InteriorPart { ty, wrap: lowered.local_wrap[l as usize] });
+    }
+    // The captures, in row order, by kind.
+    let firsts = ck.captures.column::<0>();
+    let pats = ck.captures.column::<1>();
+    let kinds = ck.captures.column::<2>();
+    for i in 0..firsts.len() {
+        if firsts[i] != block {
+            continue;
+        }
+        let ty = match ck.local_ty.get(pats[i].ix()) {
+            Some(&t) => t,
+            None => return Err(refuse(Form::Malformed)),
+        };
+        record.get(ty).ok_or(refuse(Form::Malformed))?;
+        let wrap = match kinds[i] {
+            CaptureKind::ByValue => None,
+            CaptureKind::ByRef => Some(Mutbl::Not),
+            CaptureKind::ByMutRef => Some(Mutbl::Mut),
+        };
+        parts.push(InteriorPart { ty, wrap });
+    }
+    parts.sort_unstable();
+    let mut unique: Vec<InteriorPart, A> = Vec::new_in(alloc);
+    for &p in parts.iter() {
+        if unique.last() != Some(&p) {
+            unique.push(p);
+        }
+    }
+    Ok(unique)
+}
+
 fn interior_with<A: Allocator + Clone>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
@@ -169,46 +250,17 @@ fn interior_with<A: Allocator + Clone>(
 ) -> Result<PTy, Refusal> {
     let range = lowered.range;
     let refuse = |form: Form| Refusal { form, range };
-    let flow = &lowered.flow;
-    if lowered.local_ty.len() != flow.locals as usize || lowered.local_wrap.len() != flow.locals as usize {
-        return Err(refuse(Form::Malformed));
-    }
-    let saved = blaze_flow::suspend::saved(flow, alloc.clone()).map_err(|_| refuse(Form::Bound))?;
+    let parts = parts_with(lowered, ck, block, every_local, alloc.clone())?;
     let record = ck.types.view();
     if out.view().len() < record.len() {
         return Err(refuse(Form::InteriorTable));
     }
     let mut tys: Vec<PTy, A> = Vec::new_in(alloc.clone());
-    // The saved locals; the arguments are the captures, taken below by their kind.
-    for l in flow.args + 1..flow.locals {
-        if !every_local && !saved.is_saved(Local(l)) {
-            continue;
-        }
-        let t = lowered.local_ty[l as usize];
-        same_in(record.get(t), out.view().get(t)).ok_or(refuse(Form::InteriorTable))?;
-        let t = match lowered.local_wrap[l as usize] {
-            Some(m) => out.intern(PNode::Ref(m, t)).map_err(|_| refuse(Form::Bound))?,
-            None => t,
-        };
-        tys.push(t);
-    }
-    // The captures, in row order, by kind.
-    let firsts = ck.captures.column::<0>();
-    let pats = ck.captures.column::<1>();
-    let kinds = ck.captures.column::<2>();
-    for i in 0..firsts.len() {
-        if firsts[i] != block {
-            continue;
-        }
-        let t = match ck.local_ty.get(pats[i].ix()) {
-            Some(&t) => t,
-            None => return Err(refuse(Form::Malformed)),
-        };
-        same_in(record.get(t), out.view().get(t)).ok_or(refuse(Form::InteriorTable))?;
-        let t = match kinds[i] {
-            CaptureKind::ByValue => t,
-            CaptureKind::ByRef => out.intern(PNode::Ref(Mutbl::Not, t)).map_err(|_| refuse(Form::Bound))?,
-            CaptureKind::ByMutRef => out.intern(PNode::Ref(Mutbl::Mut, t)).map_err(|_| refuse(Form::Bound))?,
+    for p in parts.iter() {
+        same_in(record.get(p.ty), out.view().get(p.ty)).ok_or(refuse(Form::InteriorTable))?;
+        let t = match p.wrap {
+            Some(m) => out.intern(PNode::Ref(m, p.ty)).map_err(|_| refuse(Form::Bound))?,
+            None => p.ty,
         };
         tys.push(t);
     }
@@ -374,6 +426,7 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         let ft = TyD::of(held);
         // Step 1: `fut = into_future(op)`.
         let fut = self.temp(ft, e)?;
+        self.name_local(fut, Identity::Temp(e, Role::Awaitee));
         let fp = self.place_of(fut);
         let a = self.operand(v, e)?;
         self.b.call(&[a], fp, span);
@@ -391,10 +444,12 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         // Steps 3 and 4: pin, poll.
         self.b.start(head);
         let pin = self.new_local_with(TyD { wrap: Some(Mutbl::Mut), ty: held }, false, None, e)?;
+        self.name_local(pin, Identity::Temp(e, Role::Pin));
         self.b.stmt(StmtKind::StorageLive(pin), span);
         self.borrow(fp, ft, BorrowKind::Mut, pin, e)?;
         let out = TyD::of(self.expr_ty(e)?);
         let r = self.new_local_with(out, false, None, e)?;
+        self.name_local(r, Identity::Temp(e, Role::Result));
         self.b.stmt(StmtKind::StorageLive(r), span);
         let rp = self.place_of(r);
         let pp = self.place_of(pin);

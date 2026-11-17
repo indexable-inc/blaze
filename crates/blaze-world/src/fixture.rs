@@ -33,7 +33,30 @@ pub fn shelf(
     cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    shelf_of(&[(triple, cfg)], std, false, alloc)
+    shelf_of(&[(triple, cfg)], std, Shape::Plain, alloc)
+}
+
+/// [`shelf_with_std_dep`] where bstd also depends on `blaze_ids` (`Role::Blaze`), a crate that
+/// uses std's prelude (`Vec<u64>`, as crates/blaze-ids does): its row's sysroot is `std` and
+/// it holds the edge `("std", 2)` the cutter writes for it.
+pub fn shelf_with_bstd_naming_std(
+    triple: &'static str,
+    std: &str,
+    cfg: &'static [(&'static str, Option<&'static str>)],
+    alloc: Alloc<'_>,
+) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    shelf_of(&[(triple, cfg)], std, Shape::BstdNamesStd, alloc)
+}
+
+/// Which units the fixture's shelf holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// core, alloc, std, proc_macro, bstd.
+    Plain,
+    /// And std on `cfg_if`.
+    StdDep,
+    /// And bstd on `blaze_ids`, which names std.
+    BstdNamesStd,
 }
 
 /// [`shelf`] whose std depends on a crate of library/ beneath it, `cfg_if` (`Role::Library`,
@@ -45,7 +68,7 @@ pub fn shelf_with_std_dep(
     cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    shelf_of(&[(triple, cfg)], std, true, alloc)
+    shelf_of(&[(triple, cfg)], std, Shape::StdDep, alloc)
 }
 
 /// [`shelf`] cut for `triple` and for `wasm32-wasip1` (`macro_cfg` its atoms), the macro side a
@@ -57,17 +80,19 @@ pub fn shelf_with_macro_side(
     macro_cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    shelf_of(&[(triple, cfg), ("wasm32-wasip1", macro_cfg)], std, false, alloc)
+    shelf_of(&[(triple, cfg), ("wasm32-wasip1", macro_cfg)], std, Shape::Plain, alloc)
 }
 
 /// The fixture's shelf cut for each of `targets` (its triple and atoms), every target with the
-/// same units; with `std_dep`, std depends on `cfg_if`, a sixth crate.
+/// same units, as `shape` says. Each unit's sysroot is its root text's (core `#![no_core]`:
+/// none; the `#![no_std]` ones: core; `blaze_ids`: std), with the edges the cutter writes.
 fn shelf_of(
     targets: &[(&'static str, &'static [(&'static str, Option<&'static str>)])],
     std: &str,
-    std_dep: bool,
+    shape: Shape,
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    use blaze_toolchain::ImplicitSysroot;
     let library = pack(
         &[
             ("core/src/lib.rs", "#![no_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }"),
@@ -78,7 +103,13 @@ fn shelf_of(
         ],
         alloc,
     );
-    let bstd = pack(&[("crates/blaze-std/src/lib.rs", "#![no_std]\npub mod prelude { pub mod blaze_2026_11 {} }")], alloc);
+    let bstd = pack(
+        &[
+            ("crates/blaze-ids/src/lib.rs", "pub struct Bits<S = Vec<u64>>(S);"),
+            ("crates/blaze-std/src/lib.rs", "#![no_std]\npub mod prelude { pub mod blaze_2026_11 {} }"),
+        ],
+        alloc,
+    );
     let digest = |p: &[u8]| blaze_toolchain::shelf::pack_digest(p).expect("a pack's footer");
     let row = |name: &'static str, lib: &'static str, dir: &'static str, role: Role, p: &[u8]| CrateIn {
         name,
@@ -99,9 +130,14 @@ fn shelf_of(
         row("proc_macro", "proc_macro", "proc_macro", Role::ProcMacro, &library),
         row("blaze-std", "bstd", "crates/blaze-std", Role::Bstd, &bstd),
         row("cfg_if", "cfg_if", "cfg_if", Role::Library, &library),
+        row("blaze-ids", "blaze_ids", "crates/blaze-ids", Role::Blaze, &bstd),
     ];
-    // Without `std_dep`, the shelf is the five crates it always was.
-    let crates = if std_dep { &crates[..] } else { &crates[..5] };
+    // Plain: the five crates it always was.
+    let crates = match shape {
+        Shape::Plain => &crates[..5],
+        Shape::StdDep => &crates[..6],
+        Shape::BstdNamesStd => &crates[..],
+    };
     let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn {
         krate,
         kind: blaze_toolchain::UnitKind::Lib,
@@ -109,6 +145,11 @@ fn shelf_of(
         root: "src/lib.rs",
         features: &[],
         deps,
+        sysroot: match krate {
+            0 => ImplicitSysroot::None,
+            6 => ImplicitSysroot::Std,
+            _ => ImplicitSysroot::Core,
+        },
     };
     let plain = [lib(0, &[]), lib(1, &[("core", 0)]), lib(2, &[("alloc", 1), ("core", 0)]), lib(3, &[("core", 0), ("std", 2)]), lib(4, &[("alloc", 1), ("core", 0)])];
     // With `std_dep`: std (unit 2) also on `cfg_if` (unit 5, on core).
@@ -120,7 +161,22 @@ fn shelf_of(
         lib(4, &[("alloc", 1), ("core", 0)]),
         lib(5, &[("core", 0)]),
     ];
-    let units: &[UnitIn<'_>] = if std_dep { &with_dep } else { &plain };
+    // With `BstdNamesStd`: bstd (unit 4) also on `blaze_ids` (unit 6), whose root uses std's
+    // prelude, so its row holds the edges the cutter writes: `core` and `std`.
+    let names_std = [
+        lib(0, &[]),
+        lib(1, &[("core", 0)]),
+        lib(2, &[("alloc", 1), ("cfg_if", 5), ("core", 0)]),
+        lib(3, &[("core", 0), ("std", 2)]),
+        lib(4, &[("alloc", 1), ("blaze_ids", 6), ("core", 0)]),
+        lib(5, &[("core", 0)]),
+        lib(6, &[("core", 0), ("std", 2)]),
+    ];
+    let units: &[UnitIn<'_>] = match shape {
+        Shape::Plain => &plain,
+        Shape::StdDep => &with_dep,
+        Shape::BstdNamesStd => &names_std,
+    };
     let cut: StdVec<TargetIn<'_>> = targets.iter().map(|(triple, cfg)| TargetIn { triple, units, cfg }).collect();
     let manifest = record::write(crates, &cut, alloc).expect("a record").to_vec();
     let id = ToolchainView::id_of_bytes(&manifest);

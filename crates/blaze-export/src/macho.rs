@@ -31,6 +31,8 @@ use crate::bytes;
 use crate::eh_out::EhSections;
 use crate::error::ExportError;
 use crate::layout::{FixTo, Fixup, Laid, Plan};
+use crate::native_dylib::{DYLIB_VERSION, dylib_command};
+use crate::native_merge::{Merged, NATIVE_DATA, NATIVE_TEXT, Sect, command_room};
 use crate::plant::{self, Plant};
 use crate::sign;
 
@@ -95,8 +97,8 @@ const N_UNDEF_EXT: u8 = 0x01;
 /// `SET_LIBRARY_ORDINAL(n_desc, 1)`: libSystem, the first `LC_LOAD_DYLIB`.
 const LIBSYSTEM_ORDINAL: u16 = 1 << 8;
 
-const SEGMENT: u64 = 72;
-const SECTION: u64 = 80;
+pub(crate) const SEGMENT: u64 = 72;
+pub(crate) const SECTION: u64 = 80;
 /// Every load command at its largest: the header's room is fixed, so the code's place does not
 /// depend on which optional segments a program has.
 const MAX_COMMANDS: u64 = SEGMENT // __PAGEZERO
@@ -122,7 +124,13 @@ const UUID_DOMAIN: &str = "blaze-export macho uuid 1";
 
 /// The layout plan a Mach-O file needs.
 pub fn plan() -> Plan {
-    Plan { page: PAGE, text_at: TEXT_AT, const_head: 0 }
+    plan_with(0)
+}
+
+/// [`plan`] with `extra` bytes of load commands in the header's room (a native image's,
+/// native_merge.rs `command_room`): the code's place depends on the image, never on the rest.
+pub fn plan_with(extra: u64) -> Plan {
+    Plan { page: PAGE, text_at: (TEXT_AT + extra + 15) & !15, const_head: 0 }
 }
 
 fn up(n: u64, to: u64) -> u64 {
@@ -327,22 +335,50 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
     Ok((blob, slots))
 }
 
-/// The chained fixups blob, and each fixup slot's encoded value by file offset: the
-/// executable's imports are libSystem's (ordinal 1), named with the platform's `_`.
-fn chained<'a>(laid: &Laid<'_, '_>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ExportError> {
+/// The chained fixups blob, and each fixup slot's encoded value by image offset: the
+/// program's imports are libSystem's (ordinal 1), named with the platform's `_`; a native
+/// image's (native_merge.rs) follow, by flat lookup, with their addends (`Addend64` rows then).
+fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ExportError> {
     let mut chain_segs: AVec<'a, ChainSeg> = Vec::with_capacity_in(segs.len(), alloc);
     for seg in segs {
         chain_segs.push(ChainSeg { vm: seg.vm, vm_size: seg.vm_size, fixups: seg.fixups });
     }
-    let slot = |f: &Fixup| {
+    // A program import the image defines is a rebase to it (`Merged::direct`); the rows left
+    // keep their order (`kept`, and each import's new row in `row_of`).
+    let direct = |import: u32| native.and_then(|m| m.direct.binary_search_by_key(&import, |&(row, _)| row).ok().map(|i| m.direct[i].1));
+    let mut kept: AVec<'a, u32> = Vec::with_capacity_in(laid.imports.len(), alloc);
+    let mut row_of: AVec<'a, u32> = Vec::with_capacity_in(laid.imports.len(), alloc);
+    for k in 0..laid.imports.len() as u32 {
+        row_of.push(kept.len() as u32);
+        if direct(k).is_none() {
+            kept.push(k);
+        }
+    }
+    // The program's slots (all before its end), then the image's (all after it): sorted.
+    let mut all: AVec<'a, (u64, Chain)> = Vec::with_capacity_in(laid.fixups.len() + native.map_or(0, |m| m.fixups.len()), alloc);
+    for f in laid.fixups.iter() {
         let to = match f.to {
             FixTo::Rebase { target } => Chain::Rebase { target },
-            FixTo::Bind { import } => Chain::Bind { import },
+            FixTo::Bind { import } => match direct(import) {
+                Some(target) => Chain::Rebase { target },
+                None => Chain::Bind { import: row_of[import as usize] },
+            },
         };
-        (f.at, to)
+        all.push((f.at, to));
+    }
+    if let Some(m) = native {
+        all.extend_from_slice(&m.fixups);
+    }
+    let program = kept.len();
+    let import = |i: usize| match (i.checked_sub(program), native) {
+        (Some(k), Some(m)) => m.imports[k],
+        _ => ChainImport { lead: b"_", name: laid.imports[kept[i] as usize].name.as_bytes(), ordinal: 1, weak: false, addend: 0 },
     };
-    let import = |i: usize| ChainImport { lead: b"_", name: laid.imports[i].name.as_bytes(), ordinal: 1, weak: false, addend: 0 };
-    chained_fixups(&laid.fixups, slot, &chain_segs, ImportRows::Plain, laid.imports.len(), import, alloc)
+    let (rows, count) = match native {
+        None => (ImportRows::Plain, program),
+        Some(m) => (ImportRows::Addend64, program + m.imports.len()),
+    };
+    chained_fixups(&all, |c: &(u64, Chain)| *c, &chain_segs, rows, count, import, alloc)
         .map_err(|e| ExportError::TooLarge { what: e.what, len: e.len })
 }
 
@@ -402,6 +438,23 @@ pub(crate) fn linkedit_data(out: &mut AVec<'_, u8>, cmd: u32, off: u64, size: u6
 /// signed. `identifier` is the signature's; `seed` joins the content in the file's `LC_UUID`
 /// (the profile's digest, or zeros). Returns the UUID.
 pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, seed: &[u8; 32], out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<[u8; 16], ExportError> {
+    write_native(laid, eh, None, identifier, seed, out, alloc)
+}
+
+/// [`write`] with the program's native image merged (native_merge.rs): its two segments after
+/// the program's, its libraries after libSystem, its fixups and import rows in the one chained
+/// blob, `MH_HAS_TLV_DESCRIPTORS` when it has thread-locals. The header's room must be
+/// `plan_with(command_room(..))`'s.
+#[allow(clippy::too_many_arguments)]
+pub fn write_native<'a>(
+    laid: &Laid<'_, '_>,
+    eh: &EhSections<'_>,
+    native: Option<&Merged<'_, '_>>,
+    identifier: &str,
+    seed: &[u8; 32],
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+) -> Result<[u8; 16], ExportError> {
     let has_const = !laid.konst.is_empty();
     let has_data = !laid.data.is_empty() || laid.zero_len > 0;
     // `__TEXT` holds the code and, after it, the unwind tables (eh_out.rs).
@@ -445,8 +498,39 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, see
             file_end = laid.data_at + data_file;
         }
     }
+    // The native image: its code segment, then its data segment, after every region of the
+    // program; in the file, on the page after the program's file bytes.
+    let mut vm_end = laid.end;
+    let mut native_file = 0u64;
+    if let Some(m) = native {
+        native_file = up(file_end, PAGE);
+        let code = m.data_at - m.text_at;
+        segs.push(Seg {
+            name: NATIVE_TEXT,
+            vm: m.text_at,
+            vm_size: code,
+            file: native_file,
+            file_size: code,
+            prot: VM_PROT_READ | VM_PROT_EXECUTE,
+            flags: 0,
+            fixups: false,
+        });
+        let data_file = up(m.file_end.max(m.data_at) - m.data_at, PAGE);
+        segs.push(Seg {
+            name: NATIVE_DATA,
+            vm: m.data_at,
+            vm_size: m.end - m.data_at,
+            file: native_file + code,
+            file_size: data_file,
+            prot: VM_PROT_READ | VM_PROT_WRITE,
+            flags: 0,
+            fixups: true,
+        });
+        file_end = native_file + code + data_file;
+        vm_end = m.end;
+    }
     // `__LINKEDIT`'s pieces, at offsets from its start.
-    let (fixups_blob, slots) = chained(laid, &segs_with_linkedit(&segs, laid.end, alloc), alloc)?;
+    let (fixups_blob, slots) = chained(laid, native, &segs_with_linkedit(&segs, vm_end, alloc), alloc)?;
     let mut link: AVec<'_, u8> = Vec::new_in(alloc);
     let link_off = file_end;
     let fixups_at = link.len() as u64;
@@ -498,7 +582,7 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, see
     let link_len = link.len() as u64 + sig_len;
     let link_seg = Seg {
         name: "__LINKEDIT",
-        vm: laid.end,
+        vm: vm_end,
         vm_size: up(link_len, PAGE),
         file: link_off,
         file_size: link_len,
@@ -546,6 +630,18 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, see
                 }
                 if laid.zero_len > 0 {
                     section(out, "__bss", "__DATA", laid.zero_at, laid.zero_len, 0, 4, S_ZEROFILL, 0);
+                }
+            }
+            NATIVE_TEXT | NATIVE_DATA => {
+                let sects: &[Sect] = match native {
+                    Some(m) if seg.name == NATIVE_TEXT => &m.code,
+                    Some(m) => &m.data,
+                    None => &[],
+                };
+                segment(out, seg, sects.len() as u32);
+                for s in sects {
+                    let offset = if s.zero { 0 } else { s.at - seg.vm + seg.file };
+                    section(out, s.name, seg.name, s.at, s.len, offset, s.align_log2, s.flags, 0);
                 }
             }
             _ => segment(out, seg, 0),
@@ -596,18 +692,25 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, see
     let at = out.len();
     out.extend_from_slice(LIB_SYSTEM.as_bytes());
     out.resize(at + 32, 0);
+    // The native image's libraries, after libSystem (flat lookup binds among all of them).
+    if let Some(m) = native {
+        for path in m.libraries.iter() {
+            dylib_command(out, LC_LOAD_DYLIB, path.as_str(), 2, DYLIB_VERSION, DYLIB_VERSION);
+            ncmds += 1;
+        }
+    }
     linkedit_data(out, LC_FUNCTION_STARTS, link_off + starts_at, starts_len);
     linkedit_data(out, LC_CODE_SIGNATURE, code_limit, sig_len);
     ncmds += 10;
     let sizeofcmds = out.len() as u64 - HEADER;
-    debug_assert!(sizeofcmds <= MAX_COMMANDS, "the load commands outgrew the header's room");
+    debug_assert!(sizeofcmds <= MAX_COMMANDS + native.map_or(0, |m| command_room(&m.libraries)), "the load commands outgrew the header's room");
     bytes::set32(out, 0, MH_MAGIC_64);
     bytes::set32(out, 4, CPU_TYPE_ARM64);
     bytes::set32(out, 8, 0); // CPU_SUBTYPE_ARM64_ALL
     bytes::set32(out, 12, MH_EXECUTE);
     bytes::set32(out, 16, ncmds);
     bytes::set32(out, 20, sizeofcmds as u32);
-    bytes::set32(out, 24, MH_FLAGS);
+    bytes::set32(out, 24, MH_FLAGS | native.map_or(0, |m| m.header_flags()));
 
     // The regions at their offsets, the fixups' slots in them.
     out.resize(laid.text_at as usize, 0);
@@ -628,11 +731,18 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, see
         out.extend_from_slice(&laid.data);
         out.resize((laid.data_at + data_file) as usize, 0);
     }
+    if let Some(m) = native {
+        out.resize(native_file as usize, 0);
+        out.extend_from_slice(m.bytes);
+        out.resize(file_end as usize, 0);
+    }
     debug_assert_eq!(out.len() as u64, link_off);
+    // A slot's file offset: its image offset, but for the native image's (moved in the file).
+    let file_of = |at: u64| native.map_or(at, |m| m.file_of(at, native_file));
     let late = plant::on(Plant::SignBeforeLastFixup) && !slots.is_empty();
     let written = if late { slots.len() - 1 } else { slots.len() };
     for &(at, value) in slots[..written].iter() {
-        bytes::set64(out, at as usize, value);
+        bytes::set64(out, file_of(at) as usize, value);
     }
     out.extend_from_slice(&link);
 
@@ -647,7 +757,7 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, see
     sign::sign(out, identifier, text_size, true);
     if late {
         let (at, value) = slots[slots.len() - 1];
-        bytes::set64(out, at as usize, value);
+        bytes::set64(out, file_of(at) as usize, value);
     }
     Ok(uuid)
 }

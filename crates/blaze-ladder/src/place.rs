@@ -177,6 +177,9 @@ pub enum PlaceError {
     VtableWord { table: u32, offset: u32 },
     /// The placed code is AArch64 and this process is not: its entry is never called.
     NotThisMachine,
+    /// The entry is a Rust program's C entry shim (`main(argc, argv)`), which runs only in the
+    /// program's own process: the in-process call passes one register, the shim reads two.
+    ShimInProcess,
     /// The run could not be watched for traps, or a trap could not be placed (crate::trap).
     Trap(crate::trap::TrapError),
 }
@@ -212,6 +215,7 @@ impl core::fmt::Display for PlaceError {
             PlaceError::NoVtable { table } => write!(f, "a vtable's word names table {table}, which the program does not have"),
             PlaceError::VtableWord { table, offset } => write!(f, "vtable {table}: the address word at byte {offset} is not an aligned word inside it"),
             PlaceError::NotThisMachine => write!(f, "the program's code is AArch64 and this machine is not: the skeleton runs a program only where it was emitted for"),
+            PlaceError::ShimInProcess => write!(f, "the C entry shim `main(argc, argv)` reads two registers and the in-process call sets one: a Rust-edition program runs only in its own process (run.md piece 6)"),
             PlaceError::Trap(error) => write!(f, "the trap watch: {error}"),
         }
     }
@@ -516,6 +520,10 @@ pub enum Entry {
     /// bstd's hosted entry, `extern "C" fn(*const HostTable) -> i32`: called with the host's
     /// table (crates/blaze-std/src/wire.rs); the status is its low 8 bits.
     Hosted(core::ptr::NonNull<core::ffi::c_void>),
+    /// A Rust program's C entry shim, `extern "C" fn(argc: i32, argv: *const *const c_char) ->
+    /// i32` calling `lang_start::<T>` (blaze-build start.rs `c_main_shim`): run only in the
+    /// program's own process (run.md piece 6); [`Placed::call`] refuses it.
+    CMainShim,
 }
 
 impl Placed {
@@ -528,6 +536,11 @@ impl Placed {
     /// Calls the function in `slot` on this thread: the process status it ends with, or the
     /// stub it called (a function that is not built: the program is left there, crate::stub).
     pub fn call(&self, slot: u32, entry: Entry) -> Result<Ended, PlaceError> {
+        // The shim reads `argc` in `w0` and `argv` in `x1`; `Stops::run` sets only `x0`, so a
+        // call here would hand `lang_start` whatever `x1` held. Refused before anything starts.
+        if let Entry::CMainShim = entry {
+            return Err(PlaceError::ShimInProcess);
+        }
         let at = match self.shared.target(Slot(slot)) {
             Some(at) if at != 0 => at,
             _ => return Err(PlaceError::NoEntry { slot }),
@@ -538,6 +551,8 @@ impl Placed {
         let argument = match entry {
             Entry::Unit | Entry::I32 => core::ptr::null(),
             Entry::Hosted(table) => table.as_ptr().cast_const(),
+            // Refused at the top of this function.
+            Entry::CMainShim => return Err(PlaceError::ShimInProcess),
         };
         // A trap in the placed code on this thread ends the run at stub.rs `leave` (crate::trap's
         // handler resumes there), caught by this watch, armed for the run only.
@@ -564,6 +579,8 @@ impl Placed {
             Entry::Unit => 0,
             // An `i32` in `w0`: its low 8 bits, as the C runtime's `exit` takes it.
             Entry::I32 | Entry::Hosted(_) => left.value as u8,
+            // Never called here (refused at the top); a C `main`'s `i32` would be read the same.
+            Entry::CMainShim => left.value as u8,
         }))
     }
 }

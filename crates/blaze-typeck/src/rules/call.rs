@@ -18,7 +18,7 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::columns::AdjustKind;
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, ItemKey, LangItem, List, Mutbl, Name};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
@@ -94,14 +94,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // The count is checked here, as E0057 (the caller passes no count check on).
                 TyView::Tuple(inputs) => {
                     if self.ty.list_len(inputs) as usize != n {
-                        self.diag(DiagCode::FnTraitArgCount, At::Expr(e), None, None, None);
+                        self.diag(DiagCode::FnTraitArgCount, At::Expr(e), About::Count { expected: self.ty.list_len(inputs), got: n as u32, found: Some(t) });
                         return Ok(Some((self.err_list(n)?, self.common.err)));
                     }
                     Ok(Some((inputs, output)))
                 }
                 TyView::Error => Ok(Some((self.err_list(n)?, self.common.err))),
                 _ => {
-                    self.diag(DiagCode::CallArgsNotTuple, At::Expr(callee), None, Some(tuple), None);
+                    self.diag(DiagCode::CallArgsNotTuple, At::Expr(callee), About::found(tuple));
                     Ok(Some((self.err_list(n)?, self.common.err)))
                 }
             };
@@ -142,7 +142,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                                 // wrong count is the Fn-trait call's E0057, not a fn item's E0061.
                                 if self.ty.list_len(inputs) as usize != arg_ids.len() {
                                     self.adjust_autoderef(callee, &steps, i);
-                                    self.diag(DiagCode::FnTraitArgCount, At::Expr(e), None, None, None);
+                                    let count = About::Count { expected: self.ty.list_len(inputs), got: arg_ids.len() as u32, found: Some(callee_ty) };
+                                    self.diag(DiagCode::FnTraitArgCount, At::Expr(e), count);
                                     return self.start_args(f, e, arg_ids, inputs, output, 2, false);
                                 }
                                 Some((inputs, output))
@@ -177,7 +178,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                 }
                 let code = if limit { DiagCode::RecursionLimit } else { DiagCode::NotCallable };
-                self.diag(code, At::Expr(callee), None, Some(callee_ty), None);
+                self.diag(code, At::Expr(callee), About::found(callee_ty));
                 let errs = self.err_list(arg_ids.len())?;
                 self.start_args(f, e, arg_ids, errs, self.common.err, 2, false)
             }

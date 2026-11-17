@@ -57,8 +57,9 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// row's path is its [`PackagePath`] (D96), never the caller's `/<tree>/...`; a version-4
 /// record is refused the same way. 6: a built-in derive is its own body kind
 /// ([`BODY_BUILTIN_DERIVE`], its helpers in the strings: names-attr-4); a version-5 record is
-/// refused the same way.
-const VERSION: u32 = 6;
+/// refused the same way. 7: the crate's `std` (header field [`F_STD`], [`ItemsRecord::std_is`]);
+/// a version-6 record is refused the same way.
+const VERSION: u32 = 7;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -85,6 +86,9 @@ const F_OFFSETS: usize = 12; // the same ten sections, then the strings
 const F_STRINGS_LEN: usize = 23;
 const F_NAME_AT: usize = 24;
 const F_NAME_LEN: usize = 25;
+/// Which `std` the crate's code names `std` ([`std_field`]): what an E0425 after a written
+/// `std` notes (blaze-ladder front2/std_is_bstd.rs).
+const F_STD: usize = 26;
 const TABLES: usize = 10;
 const WIDTHS: [usize; TABLES] = [FILE_ROW, EXPANSION_ROW, ITEM_ROW, OWNER_ROW, MEMBER_ROW, IMPL_ROW, LANG_ROW, MACRO_ROW, MODULE_ROW, ATOM_ROW];
 const WHAT: [&str; TABLES] = ["file rows", "expansion rows", "item rows", "owner rows", "member rows", "impl rows", "lang rows", "macro rows", "module rows", "cfg atom rows"];
@@ -193,6 +197,23 @@ pub enum ItemsRecordError {
     Range { krate: CrateItemKey, start: u32, len: u32 },
     /// File row `at`'s path is not a package-relative path (D96: a record holds no root).
     NotPackagePath { at: usize, why: NotPackagePath },
+}
+
+/// Header field [`F_STD`]: 0 for Rust's `std`, 1 + the edition's discriminant for bstd under a
+/// blaze edition.
+fn std_field(std: blaze_unit_graph::StdIs) -> u32 {
+    match std {
+        blaze_unit_graph::StdIs::Rust => 0,
+        blaze_unit_graph::StdIs::Bstd(edition) => 1 + edition as u32,
+    }
+}
+
+/// [`std_field`] read back; `None` for a value no edition of this blaze has.
+fn std_of(field: u32) -> Option<blaze_unit_graph::StdIs> {
+    match field {
+        0 => Some(blaze_unit_graph::StdIs::Rust),
+        n => edition::BlazeEdition::ALL.iter().copied().find(|e| *e as u32 + 1 == n).map(blaze_unit_graph::StdIs::Bstd),
+    }
 }
 
 fn u32_of(n: usize, what: &'static str) -> Result<u32, ItemsRecordError> {
@@ -819,6 +840,7 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
     put32(&mut out, u32_of(strings.bytes.len(), "items strings")?);
     put32(&mut out, crate_name.0);
     put32(&mut out, crate_name.1);
+    put32(&mut out, std_field(names.implicit.std));
     out.resize(KEYS_AT, 0);
     out.extend_from_slice(&names.key.0.0);
     out.extend_from_slice(&names.root.0.0);
@@ -1079,6 +1101,7 @@ impl<'a> ItemsRecord<'a> {
         }
         within("strings", offsets[TABLES], Some(strings_len))?;
         Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX)).ok_or(ItemsRecordError::Byte { what: "an edition", byte: bytes[8 + 4 * F_EDITION] })?;
+        std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: bytes[8 + 4 * F_STD] })?;
         fn cells<'a, T>(n: usize, alloc: Alloc<'a>) -> AVec<'a, OnceCell<T>> {
             let mut v = AVec::with_capacity_in(n, alloc);
             v.resize_with(n, OnceCell::new);
@@ -1131,6 +1154,12 @@ impl<'a> ItemsRecord<'a> {
     /// The key its proc-macro runner knows it by, for a proc-macro crate that has one.
     pub fn proc_key(&self) -> Option<CrateItemKey> {
         (self.field(F_FLAGS) & CRATE_PROC_KEY != 0).then(|| CrateItemKey(id_at(self.bytes, KEYS_AT + 64)))
+    }
+
+    /// Which `std` the crate's code names `std`: Rust's, or bstd under a blaze edition
+    /// (blaze-unit-graph's `implicit`, as the crate was solved with it).
+    pub fn std_is(&self) -> blaze_unit_graph::StdIs {
+        std_of(self.field(F_STD)).expect("`open` refused a header whose F_STD names no std")
     }
 
     /// The crate's library name.

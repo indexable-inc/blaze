@@ -161,6 +161,19 @@ pub struct TraitDef<'w> {
     pub types: PTys<'w>,
     /// Its members' facts for dyn compatibility (`crate::dyn_compat`, the rule's one home).
     pub members: TraitMembers<'w>,
+    /// Its parameters' defaults after `Self` (`trait PartialEq<Rhs = Self>`), in `types`,
+    /// `Self` as `Param(0)`: what a qualified path `<T as Tr>::x` that writes no arguments
+    /// takes (rules/qpath_defaults.rs).
+    pub defaults: TraitDefaults<'w>,
+}
+
+/// A trait's parameter defaults as the world read them: one entry per parameter after `Self`
+/// (`None`: no default), or a typed "not known": a qualified path that needs them is then a
+/// named refusal (`CheckError::TraitDefaultsNotKnown`), never inferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraitDefaults<'w> {
+    Known(&'w [Option<PTy>]),
+    NotKnown,
 }
 
 /// A trait's members as the world read them, or a typed "not known yet": a `dyn` of a trait
@@ -479,6 +492,15 @@ impl TypeAttrs {
     /// `#[rustc_promotable]` on a fn: a call of it with promotable arguments may be promoted
     /// to a `'static` slot (rules/promote.rs; core/src/task/wake.rs `RawWakerVTable::new`).
     pub const PROMOTABLE: u32 = 4;
+    /// `#[repr(simd)]` on a struct: a vector, its one field an array (an `asm!` operand's
+    /// vector types, asm.rs). The world sets it from the type's repr.
+    pub const SIMD: u32 = 8;
+    /// `#[rustc_intrinsic]` on a fn: a compiler intrinsic, never reified to a fn pointer
+    /// (rules/reify.rs; core/src/intrinsics/mod.rs). Bit 16: 8 is taken by `SIMD` (intr-P9b).
+    pub const INTRINSIC: u32 = 16;
+    /// `#[target_feature(..)]` on a fn (rules/target_feature.rs): a SAFE such fn is a safe fn
+    /// pointer only in a body that enables its features. Bit 32.
+    pub const TARGET_FEATURE: u32 = 32;
     /// Bits 8..12: an enum's discriminant type ([`DiscrRepr`]); 0 is `Unread`.
     const DISCR: u32 = 0xf << 8;
 
@@ -564,14 +586,16 @@ pub trait World {
     fn assoc_item(&self, seal: Seal, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>>;
     /// The traits in scope at a block of the body, sorted by key.
     fn traits_in_scope(&self, seal: Seal, scope: ScopeId) -> Fetch<&[ItemKey]>;
-    /// The resolution of a path written at `scope`, by its segments' names.
+    /// The resolution of a path written at `scope`, by its segments' names; when it names
+    /// nothing, the segment that failed, why, and what the segments before it named
+    /// ([`crate::PathMiss`]: E0425 names that segment).
     fn resolve_path(
         &self,
         seal: Seal,
         scope: ScopeId,
         path: PathIdx,
         segments: &[Name],
-    ) -> Fetch<Option<PathRes>>;
+    ) -> Fetch<crate::path_miss::PathAnswer>;
     fn lang_item(&self, seal: Seal, item: LangItem) -> Fetch<Option<ItemKey>>;
     /// The definition a desugaring's path to `item` names (`BodyPath::lang`): `Def::Fn` for a
     /// fn or a trait's fn (`Try::branch`), `Def::Ctor` for a variant (`ControlFlow::Continue`),
@@ -955,6 +979,9 @@ impl Tabled for TraitDef<'_> {
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         clause_roots(self.supertraits, roots);
         roots.extend(self.assoc_types.iter().filter_map(|a| a.default).map(Root::Ty));
+        if let TraitDefaults::Known(ds) = self.defaults {
+            roots.extend(ds.iter().filter_map(|d| *d).map(Root::Ty));
+        }
         Some(self.types)
     }
     fn hash_shape(&self, h: &mut StableHasher) {
@@ -975,6 +1002,16 @@ impl Tabled for TraitDef<'_> {
             h.tag(u8::from(a.default.is_some()));
         }
         self.members.hash_into(h);
+        match self.defaults {
+            TraitDefaults::NotKnown => h.tag(0),
+            TraitDefaults::Known(ds) => {
+                h.tag(1);
+                h.u64(ds.len() as u64);
+                for d in ds {
+                    h.tag(u8::from(d.is_some()));
+                }
+            }
+        }
     }
 }
 
@@ -1306,7 +1343,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
                     names.clear();
                     let Ok(segs) = body.segment_list(bp.segments) else { continue };
                     names.extend(segs.iter().map(|s| s.name));
-                    self.world.resolve_path(Self::seal(), bp.scope, PathIdx(i as u32), &names).map(|r| r.map(|r| r.def))
+                    self.world.resolve_path(Self::seal(), bp.scope, PathIdx(i as u32), &names).map(|r| r.ok().map(|r| r.def))
                 }
             };
             let Ok(Some(def)) = def else { continue };
@@ -1416,7 +1453,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         scope: ScopeId,
         path: PathIdx,
         segments: &[Name],
-    ) -> Result<Option<PathRes>, Stop> {
+    ) -> Result<crate::path_miss::PathAnswer, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.resolve_path(Self::seal(), scope, path, segments);
         self.record(Question::Path(scope, path), got, asked_at)
@@ -1774,6 +1811,22 @@ impl ContentHash for TraitDef<'_> {
         }
         self.types.hash_into(h);
         self.members.hash_into(h);
+        match self.defaults {
+            TraitDefaults::NotKnown => h.tag(0),
+            TraitDefaults::Known(ds) => {
+                h.tag(1);
+                h.u64(ds.len() as u64);
+                for d in ds {
+                    match d {
+                        Some(t) => {
+                            h.tag(1);
+                            h.u32(t.0);
+                        }
+                        None => h.tag(0),
+                    }
+                }
+            }
+        }
     }
 }
 

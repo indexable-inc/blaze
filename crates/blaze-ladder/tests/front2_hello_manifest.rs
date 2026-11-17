@@ -18,9 +18,11 @@
 //!
 //! What a right answer is, layout-free: `SELECTED`'s bytes are `OUT_KIND`'s (`Kind::Out`) and not
 //! `CLOCK_KIND`'s (`Kind::Clock`, `impl Grant for Clock`'s constant); `PARAM_SELECTED`'s bytes are
-//! `PARAM`'s; `MANIFEST` is a reference to a slice of one `Param`: one 16-byte root of two words,
-//! one a relocation to the array and the other the length 1, and the array's bytes are `PARAM`'s
-//! with its `name` pointing at the bytes `out`.
+//! `PARAM`'s; `MANIFEST` is a `Manifest { params, defaults }` (bstd grant.rs), two slice
+//! references: a 32-byte root of four words, in either field order (the Reference, "Type
+//! layout": the Rust representation does not fix it). The `params` half holds a relocation to
+//! an array of one `Param` and the length 1; the array's bytes are `PARAM`'s, and its `name`
+//! points at the bytes `out`. The `defaults` half is the empty slice `&[]`, whose length is 0.
 //!
 //! Lines (eprintln, and appended to the file `FRONT2_WORK_LIST` names): one per static,
 //! `<NAME>: <n> allocs, root <b> bytes, relocs [..]` or `<NAME>: refused: <the whole refusal>`;
@@ -162,13 +164,26 @@ fn manifest_statics_evaluate() {
     let offsets = |a: &Alloc1| a.relocs.iter().map(|(o, _)| *o).collect::<Vec<u32>>();
     assert_eq!(offsets(&param_selected[0]), offsets(&param[0]), "PARAM_SELECTED's name pointer is where PARAM's is");
 
-    // `&[Param; 1]` coerced to `&'static [Param]`: a pointer to the array and the length 1.
+    // `Manifest { params: &[Param; 1] as &'static [Param], defaults: &[] }`: two slice
+    // references of 16 bytes each, in an order the Rust representation does not fix.
     let root = &manifest[0];
-    assert_eq!(root.bytes.len(), 16, "MANIFEST is one `&'static [Param]`: two words");
-    assert_eq!(root.relocs.len(), 1, "MANIFEST's root points at its array, once: {:?}", offsets(root));
-    let (at, target) = root.relocs[0];
-    let len_at = if at == 0 { 8 } else { 0 };
-    assert_eq!(le8(&root.bytes, len_at as usize), 1, "MANIFEST's slice holds one `Param`");
+    assert_eq!(root.bytes.len(), 32, "MANIFEST is a `Manifest`: two `&'static [_]` fields (params, defaults), four words");
+    // The `params` half: the relocation whose target is the one-`Param` array (PARAM's bytes).
+    let params_reloc = root.relocs.iter().copied().find(|(_, t)| match t {
+        DataTarget::Local(n) => manifest.get(*n as usize).is_some_and(|a| a.bytes == param[0].bytes),
+        _ => false,
+    });
+    let (at, target) = params_reloc.unwrap_or_else(|| panic!("MANIFEST's root points at an array holding PARAM's bytes; relocs at {:?}", offsets(root)));
+    let half = at - at % 16;
+    let len_at = half + if at % 16 == 0 { 8 } else { 0 };
+    assert_eq!(le8(&root.bytes, len_at as usize), 1, "MANIFEST's `params` slice holds one `Param`");
+    // The `defaults` half: `&[]`, length 0 (whichever of its two words is the length).
+    let other = if half == 0 { 16usize } else { 0 };
+    assert!(
+        le8(&root.bytes, other) == 0 || le8(&root.bytes, other + 8) == 0,
+        "MANIFEST's `defaults` is the empty slice: one of its words, the length, is 0: {:?}",
+        &root.bytes[other..other + 16]
+    );
     let DataTarget::Local(array) = target else { panic!("MANIFEST's array is an allocation of its own record, not {target:?}") };
     let array = &manifest[array as usize];
     assert_eq!(array.bytes, param[0].bytes, "MANIFEST's one `Param` is PARAM");

@@ -1,5 +1,5 @@
-//! Runs one build script's module in the sandbox, twice: the first run's outputs, then the
-//! second answered from the record.
+//! Runs one build script's module in the sandbox, twice: each run's outputs and reads (the
+//! runner keeps nothing; equal lines twice show the run is a function of its inputs).
 //!
 //! `script_run <store> <module.wasm> <package folder> <name> <version>`: the package folder is
 //! served read-only at `/package` (a dependency, D96); the environment is `blaze_build_script::env`'s for a dev
@@ -14,15 +14,13 @@ use blaze_build_script::{
 };
 use blaze_own::Alloc;
 use blaze_proc_macro::{
-    record::{DirStore, native_world},
     script::ScriptRuntime,
     script_sandbox::{Script, dir_tree, owned_env},
 };
 
-/// The runtime over the folder `store`, its records through a world this program opens there.
+/// The runtime over the folder `store` (its compiled modules).
 fn script_runtime(store: &Path) -> ScriptRuntime {
-    let (io, root) = native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
-    ScriptRuntime::new(store, DirStore::build_scripts(&io, &root)).unwrap_or_else(|error| panic!("the script runtime: {error}"))
+    ScriptRuntime::new(store).unwrap_or_else(|error| panic!("the script runtime: {error}"))
 }
 
 const TARGET: &str = "aarch64-apple-darwin";
@@ -74,9 +72,8 @@ fn main() {
             Ok(ran) => {
                 let o = &ran.outputs;
                 println!(
-                    "{pass}: {:?}, from the record: {}, fuel {}, peak memory {}, spawns {}, base {:02x?}",
+                    "{pass}: {:?}, fuel {}, peak memory {}, spawns {}, base {:02x?}",
                     started.elapsed(),
-                    ran.from_record,
                     ran.fuel,
                     ran.peak_memory,
                     ran.spawns,

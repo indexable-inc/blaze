@@ -110,12 +110,13 @@ fn own_impl_holds_beside_a_failing_blanket() {
 }
 
 /// The control: without `impl Clone for B` the finding is the hello run's, E0277 naming the
-/// blanket impl's bound as the leaf. Prints "without B's own impl: [\"Unsatisfied at 0:
+/// blanket impl's bound as the leaf. Prints "without B's own impl: [\"Unsatisfied at 1:
 /// Clone / Marker\"]".
 #[test]
 fn control_own_impl_left_out_blames_the_blanket_bound() {
     let got = findings(false);
     std::println!("without B's own impl: {got:?}");
-    // The bound a callee's where-clauses owe is placed at the callee's path (`need`, 0).
-    assert_eq!(got, std::vec![String::from("Unsatisfied at 0: Clone / Marker")]);
+    // The bound a callee's where-clauses owe is filed at the argument passed for the input that
+    // names it (`x` of `need(x)`, 1: rules/obligation_site.rs).
+    assert_eq!(got, std::vec![String::from("Unsatisfied at 1: Clone / Marker")]);
 }

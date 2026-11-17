@@ -4,6 +4,7 @@
 //! store) and the export keeps nothing.
 
 use blaze_code::record::{CodeView, Symbol, Target};
+use blaze_native::image::Image;
 
 /// The tier a function's record was made at. The frame (bottom.md, section 11) says an export is
 /// "at the optimized tier"; until that tier makes records on the new layer the export takes the
@@ -121,6 +122,15 @@ impl Platform {
     }
 }
 
+/// A C name the program exports (`#[no_mangle]`: the identifier; `#[export_name = ".."]`: the
+/// string; Reference, abi), without a platform's prefix, and the function it names. The native
+/// image's words (C calling Rust) are found by it (native_merge.rs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CExport<'r> {
+    pub name: &'r [u8],
+    pub symbol: Symbol,
+}
+
 /// One export's whole input.
 #[derive(Clone, Copy)]
 pub struct ProgramIn<'r> {
@@ -138,4 +148,11 @@ pub struct ProgramIn<'r> {
     /// lands. `None` refuses any landing row by name (`ExportError::NoPersonality`).
     pub personality: Option<Symbol>,
     pub profile: Option<Profile<'r>>,
+    /// The program's native library image (blaze-native `layout::lay`: the archive members its
+    /// `#[link]` libraries and build scripts pull), merged into the file (native_merge.rs);
+    /// `None`: the program links no C.
+    pub natives: Option<&'r Image<'r>>,
+    /// Every C name the program exports, sorted by name, each once (two exporters of one name
+    /// are refused by name). The front end gives it; only `natives`' words read it.
+    pub exports: &'r [CExport<'r>],
 }

@@ -49,7 +49,7 @@ fn toolchain() -> Vec<u8> {
         krate("proc_macro", Role::ProcMacro, 4),
         krate("bstd", Role::Bstd, 5),
     ];
-    let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn { krate, kind: ToolchainKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps };
+    let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn { krate, kind: ToolchainKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps, sysroot: blaze_toolchain::ImplicitSysroot::Core };
     // proc_macro and bstd: the sysroot names every role; neither is reached here.
     let units = [lib(0, &[]), lib(1, &[("core", 0)]), lib(2, &[("alloc", 1), ("core", 0)]), lib(3, &[("core", 0), ("std", 2)]), lib(4, &[("core", 0)])];
     let cfg = [("target_os", Some("macos")), ("unix", None)];
@@ -235,7 +235,7 @@ fn a_member_proc_macro_resolves_its_dependencies_on_the_macro_side() {
             krate("proc_macro", Role::ProcMacro, 4),
             krate("bstd", Role::Bstd, 5),
         ];
-        let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn { krate, kind: ToolchainKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps };
+        let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn { krate, kind: ToolchainKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps, sysroot: blaze_toolchain::ImplicitSysroot::Core };
         let units = [lib(0, &[]), lib(1, &[("core", 0)]), lib(2, &[("alloc", 1), ("core", 0)]), lib(3, &[("core", 0), ("std", 2)]), lib(4, &[("core", 0)])];
         let host_cfg = [("target_os", Some("macos")), ("unix", None)];
         let wasm_cfg = [

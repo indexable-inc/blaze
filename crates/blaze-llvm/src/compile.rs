@@ -156,10 +156,14 @@ pub fn init() -> Result<(), LlvmError<'static>> {
         ffi::LLVMInitializeAArch64Target();
         ffi::LLVMInitializeAArch64TargetMC();
         ffi::LLVMInitializeAArch64AsmPrinter();
+        // The asm parser: an object holding inline assembly (T2's wrapper, `asm!` once lowered)
+        // is refused by LLVM's streamer without it ("we don't have an asm parser").
+        ffi::LLVMInitializeAArch64AsmParser();
         ffi::LLVMInitializeX86TargetInfo();
         ffi::LLVMInitializeX86Target();
         ffi::LLVMInitializeX86TargetMC();
         ffi::LLVMInitializeX86AsmPrinter();
+        ffi::LLVMInitializeX86AsmParser();
     }
     *registered = true;
     TARGETS.store(READY, Ordering::Release);

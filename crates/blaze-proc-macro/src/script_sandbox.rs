@@ -225,8 +225,9 @@ pub enum Refusal {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SpawnRefusal {
     /// A try-compile no row of the table answers: its key, arguments and snippet, so the row
-    /// can be written (with its reason) from this.
-    CannotAnswerYet { key: ContentId, args: Vec<String>, snippet: String },
+    /// can be written (with its reason) from this, and the target its key was made for (a
+    /// macro-side run asks for wasm32-wasip1: a row of another target never answers it).
+    CannotAnswerYet { key: ContentId, args: Vec<String>, snippet: String, target: String },
     /// `rustc` asked something that is neither a version nor a compile (`--print`).
     RustcArgs { args: Vec<String> },
     /// A program the sandbox does not run (a shell command, a tool in a build, ...).
@@ -275,9 +276,14 @@ impl std::fmt::Display for Malformed {
 impl std::fmt::Display for SpawnRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpawnRefusal::CannotAnswerYet { key, args, snippet } => {
+            SpawnRefusal::CannotAnswerYet { key, args, snippet, target } => {
                 let first = snippet.lines().next().unwrap_or("");
-                write!(f, "asked the compiler `rustc {}` about a snippet blaze cannot answer yet (probe {:02x?}, first line {first:?})", args.join(" "), &key.0[..8])
+                write!(
+                    f,
+                    "asked the compiler `rustc {}` about a snippet blaze cannot answer yet for the target `{target}` (probe {:02x?}, first line {first:?}): no row of the pinned table for `{target}` answers it",
+                    args.join(" "),
+                    &key.0[..8]
+                )
             }
             SpawnRefusal::RustcArgs { args } => write!(f, "asked the compiler `rustc {}`, which blaze does not answer", args.join(" ")),
             SpawnRefusal::Program { program, args } => write!(f, "spawned `{program} {}`, a program a build script may not run", args.join(" ")),
@@ -735,7 +741,7 @@ impl ScriptSandbox {
                         Some(false) => (1, Vec::new(), b"error: the pinned nightly rejects this probe (blaze's table of answers)\n".to_vec()),
                         None => {
                             let snippet = String::from_utf8_lossy(&bytes).into_owned();
-                            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::CannotAnswerYet { key, args: owned(), snippet })));
+                            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::CannotAnswerYet { key, args: owned(), snippet, target: self.script.target.clone() })));
                         }
                     }
                 }
@@ -1270,3 +1276,6 @@ pub fn mem_tree<'f>(files: impl IntoIterator<Item = (&'f str, &'f [u8])>, dir: &
 pub fn dir_tree(root: &Path) -> Tree {
     Tree::Dir(root.to_owned())
 }
+
+#[cfg(test)]
+mod side_refusal_tests;

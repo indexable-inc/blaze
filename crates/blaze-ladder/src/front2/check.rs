@@ -67,7 +67,9 @@ pub enum CheckFail {
     /// code and its range in the item's text. Never counted as checked.
     /// Each with what it is about, printed from the record's types: an unmet bound (E0277) as
     /// `Self: Trait<First>` from `Because::Bound`, else its `because`, `found` and `expected`.
-    Diags { owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global> },
+    /// `filed`, one per diagnostic: where it is filed (front2 expansion_origin.rs): in expanded
+    /// text, at the user's tokens or at the call; elsewhere [`Filed::Own`](super::expansion_origin::Filed::Own).
+    Diags { owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, filed: Vec<super::expansion_origin::Filed, Global> },
     /// Still `Need` after [`MOST_ROUNDS`].
     Rounds { owner: ItemKey, last: Vec<Question, Global> },
     /// The constant `key` an array length in a head names has no value: the evaluator's
@@ -96,10 +98,13 @@ impl core::fmt::Display for CheckFail {
             CheckFail::Head { owner, error } => write!(f, "checking {owner:?}: {error}"),
             CheckFail::Buckets { owner, error } => write!(f, "checking {owner:?}: {error}"),
             CheckFail::Check { owner, error } => write!(f, "checking {owner:?}: {error:?}"),
-            CheckFail::Diags { owner, diags } => {
+            CheckFail::Diags { owner, diags, filed } => {
                 write!(f, "checking {owner:?}: {} diagnostics", diags.len())?;
-                for (code, at, about) in diags {
+                for (i, (code, at, about)) in diags.iter().enumerate() {
                     write!(f, "\n  {} at {}..{}: {about}", code.code(), at.start, at.end)?;
+                    if let Some(place) = filed.get(i).filter(|p| !matches!(p, super::expansion_origin::Filed::Own)) {
+                        write!(f, "\n    {place}")?;
+                    }
                 }
                 Ok(())
             }
@@ -240,11 +245,17 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             Outcome::Done(done) if !round_gaps && !done.diags.is_empty() => {
                 let mut diags = Vec::with_capacity_in(done.diags.len(), Global);
                 let tys = done.types.view();
-                diags.extend(done.diags.iter().map(|d| (d.code, d.at, diag_about(r, tys, d))));
+                diags.extend(done.diags.iter().map(|d| (d.code, d.at, diag_about(r, scope.spell, tys, d))));
                 if let Some(asked) = asked.as_deref_mut() {
                     asked.finished = Some(done.reads.clone());
                 }
-                return Err(CheckFail::Diags { owner, diags });
+                // Each filed where its tokens came from, before it leaves the task that made it
+                // (drive.md, ruled 20:57). `Alloc::global()` as this loop's other three: to be
+                // handed down with them.
+                let lib = r.keys.library_in(r.names, owner);
+                let mut filed = Vec::with_capacity_in(diags.len(), Global);
+                filed.extend(diags.iter().map(|(_, at, _)| super::expansion_origin::file_range(r.names, lib, *at, Alloc::global())));
+                return Err(CheckFail::Diags { owner, diags, filed });
             }
             Outcome::Done(done) if !round_gaps => return Ok(done),
             // A gap answered `Missing`, so a finished check past one is no answer.
@@ -314,12 +325,11 @@ fn make_round<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills: Vec<Fill
     }
 }
 
-/// An item's name for a finding: its written name, else its key.
-pub(crate) fn item_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,k: ItemKey) -> String {
-    match r.keys.library_in(r.names, k).and_then(|lib| r.names.name_of(lib)) {
-        Some(n) => n.to_string(),
-        None => format!("{k:?}"),
-    }
+/// An item's name for a finding (a type's spelling, a path's segment): its declared identifier
+/// (front2 row_path.rs `shown_ident`: a body-local item's too), else its `ItemShown`; never
+/// a key's `Debug`.
+pub(crate) fn item_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> String {
+    super::row_path::shown_ident(r.names, &*r.keys, &*r.store, k)
 }
 
 /// What `k` names, for an error beside its key (rule 19: an error names the item; the key
@@ -347,11 +357,11 @@ pub(crate) fn key_shown_in<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store:
         },
         Some(Origin::Member { container, name, .. }) => match keys.library_in(names, *container).and_then(path_of) {
             Some(c) => format!("`{c}::{name}`"),
-            None => format!("`{name}` of {container:?}"),
+            None => format!("`{name}` of {}", super::item_shown::ItemShown::of(names, keys, *container)),
         },
         _ => match keys.library_in(names, k).and_then(path_of) {
             Some(p) => format!("`{p}`"),
-            None => String::from("no path in the store"),
+            None => super::item_shown::ItemShown::of(names, keys, k).to_string(),
         },
     };
     shown.into_boxed_str()
@@ -404,6 +414,25 @@ fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, t:
                 out.push('!');
                 continue;
             }
+            Ok(n @ (tc::PNode::Bool | tc::PNode::Char | tc::PNode::Str | tc::PNode::Int(_) | tc::PNode::Uint(_) | tc::PNode::Float(_))) => {
+                // types.rs `PRIMS` is the one table of built-in names; it covers all 19.
+                match super::types::PRIMS.iter().find(|(_, p)| *p == n) {
+                    Some(&(name, _)) => out.push_str(name),
+                    None => out.push_str(&format!("{n:?} (a built-in type missing from types.rs PRIMS)")),
+                }
+                continue;
+            }
+            Ok(tc::PNode::Slice(e)) => {
+                out.push('[');
+                todo.push(Step::Lit("]"));
+                todo.push(Step::Ty(e));
+                continue;
+            }
+            Ok(tc::PNode::Ptr(m, i)) => {
+                out.push_str(if m == tc::Mutbl::Mut { "*mut " } else { "*const " });
+                todo.push(Step::Ty(i));
+                continue;
+            }
             Ok(n) => {
                 out.push_str(&format!("{n:?}"));
                 continue;
@@ -428,7 +457,7 @@ fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, t:
 
 /// What a diagnostic is about, printed: an unmet goal entire, the leaf where-clause first when
 /// the checker names one (`Error: From<Other>` because `Result<u8, Error>: FromResidual<..>`).
-pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> {
+pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> {
     let ty = |t: Option<tc::PTy>| t.map(|t| ty_shown(r, tys, t));
     let s = match d.because {
         Some(tc::Because::Unmet { goal, leaf }) => {
@@ -439,7 +468,15 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc:
                 let tr = if rest.is_empty() { item_shown(r, trait_).to_string() } else { format!("{}<{}>", item_shown(r, trait_), rest.join(", ")) };
                 match g {
                     tc::UnmetGoal::Trait { .. } => format!("`{self_}: {tr}`"),
-                    tc::UnmetGoal::Projection { name, term, .. } => format!("`<{self_} as {tr}>::{name:?} == {}`", ty_shown(r, tys, term)),
+                    tc::UnmetGoal::Projection { trait_, name, term, .. } => {
+                        // Rule 19: the associated type by its name, from the trait's members
+                        // as filed; never its hash alone.
+                        let assoc = match r.store.trait_defs.get(&trait_).and_then(|t| t.assoc.iter().find(|a| a.name == name)) {
+                            Some(a) => item_shown(r, a.item),
+                            None => format!("{name:?} (an associated type of a trait whose members are not filed, so its name is not known here)"),
+                        };
+                        format!("`<{self_} as {tr}>::{assoc} == {}`", ty_shown(r, tys, term))
+                    }
                 }
             };
             let unmet = match leaf {
@@ -454,6 +491,8 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc:
             }
         }
         Some(tc::Because::NoLangItem(l)) => format!("no lang item {l:?}"),
+        // E0425: the segment that named nothing, by its spelling (rule 19).
+        Some(tc::Because::Path(miss)) => super::path_miss_shown::path_miss_shown(r, spell, d.name, miss),
         // Every goal's finding (E0277, E0283) carries `Unmet`; what is left is about a node, not a
         // goal: its types and the name it looked up.
         Some(other) => format!("because {other:?}, found {:?}, expected {:?}", ty(d.found), ty(d.expected)),
@@ -470,15 +509,25 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc:
 fn trait_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>, g: tc::UnmetGoal) -> Option<String> {
     use super::on_unimplemented::{Lit, Words, find, write_value};
     let tc::UnmetGoal::Trait { trait_, args } = g else { return None };
-    let text = r.keys.library_in(r.names, trait_).and_then(|lib| r.names.text_of(lib))?;
+    let lib = r.keys.library_in(r.names, trait_)?;
+    let text = r.names.text_of(lib)?;
     let this = item_shown(r, trait_);
-    let self_ = tys.list(args).ok().and_then(|l| l.first().map(|&t| ty_shown(r, tys, t)));
-    let fill = |name: &str| match name {
-        "Self" => self_.as_deref(),
-        "This" => Some(this.as_str()),
-        _ => None,
-    };
+    // The goal's arguments shown, `Self` first: `{Self}` is the first, a parameter's name
+    // (`{Rhs}`) its own, by the index the trait's header gives it (heads.rs `param_names`).
+    let shown: Vec<String, Global> = tys.list(args).map(|l| l.iter().map(|&t| ty_shown(r, tys, t)).collect()).unwrap_or_default();
+    let mut params: Vec<(Name, u32), Global> = Vec::new_in(Global);
+    let params_read = super::heads::lower(r.names, lib, text.text)
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|low| super::heads::param_names(&low.view(), 1, &mut params, super::heads::Consts::Keep).map_err(|e| format!("{e:?}")));
     let unread = |why: &dyn core::fmt::Display| Some(format!("the trait `{this}`'s `#[diagnostic::on_unimplemented]` does not read ({why})"));
+    if let Err(e) = params_read {
+        return unread(&format_args!("its generic parameters' names: {e}"));
+    }
+    let fill = |name: &str| match name {
+        "Self" => shown.first().map(|s| s.as_str()),
+        "This" => Some(this.as_str()),
+        _ => params.iter().find(|(n, _)| *n == Name::of(name)).and_then(|&(_, i)| shown.get(i as usize)).map(|s| s.as_str()),
+    };
     let words = match find(text.text).and_then(|found| found.map(Words::of).transpose()) {
         Ok(Some(words)) => words,
         Ok(None) => return None,

@@ -17,7 +17,7 @@ use blaze_typeck::{Checked, ItemKey};
 
 use super::body::{Body, BodyError};
 use super::lower_made::{LowerTarget, lower_made};
-use super::check::{BodyScope, CheckFail, Records, Target, callee_target, check_body, item_shown};
+use super::check::{BodyScope, CheckFail, Records, Target, callee_target, check_body};
 use super::check::{make_all, world_at, MOST_ROUNDS};
 use super::keys::checker_of;
 use super::langs::lang_name;
@@ -60,8 +60,11 @@ pub enum Reached {
     AtInstance,
     /// A trait method on `dyn Trait`: walked where the object is made.
     AtObject,
-    /// Stopped: the cause's class (for grouping) and the whole cause.
-    Failed { class: Box<str>, detail: Box<str> },
+    /// Stopped: the cause's class (for grouping), the whole cause, and the typed refusal
+    /// itself where the site has one (a check's `CheckFail`, a lowering's `BodyError`: a
+    /// survey's left-out row keeps it, program/left_out.rs); `None` at a site that names its
+    /// cause by text only (a key clash, a spelling, a lang fn the builder needs, ..).
+    Failed { class: Box<str>, detail: Box<str>, refusal: Option<Box<super::program::Front2Refusal>> },
 }
 
 /// The walk's outcome: every fn reached, in the order first reached.
@@ -70,6 +73,9 @@ pub struct Census<'n> {
     /// Each [`Reached::Checked`] fn's lowering and checked body, in the order checked: what a
     /// program's table is made of, so no body is lowered or checked twice (rule 77).
     pub bodies: Vec<(Body<'n>, Checked<'static>), Global>,
+    /// The state recipe of every async block of each checked body (coroutine_recipes.rs), made
+    /// with its check from the same lowering and record (rule 77).
+    pub recipes: Vec<super::coroutine_recipes::RecipeRow, Global>,
     /// Whether [`MOST_FNS`] stopped the walk.
     pub capped: bool,
     /// The fns still waiting in the work list when [`MOST_FNS`] stopped it (0 when it ended).
@@ -164,9 +170,9 @@ fn queue_by_name(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_>
                     let Some(segs) = view.segments.get(start..start + len) else { continue };
                     names.extend(segs.iter().map(|s| s.name));
                     match world.path(bp.scope, &names) {
-                        Ok(Some(p)) if p.consumed as usize == names.len() => Some(p.def),
+                        Ok(Ok(p)) if p.consumed as usize == names.len() => Some(p.def),
                         // `Type::f`: the fn is found on the type's impls, by its type.
-                        Ok(Some(_)) => {
+                        Ok(Ok(_)) => {
                             by_type += 1;
                             None
                         }
@@ -203,7 +209,15 @@ fn class_of(debug: &str) -> Box<str> {
 
 fn body_failed(e: &BodyError) -> Reached {
     let d = format!("{e:?}");
-    Reached::Failed { class: format!("lower: {}", class_of(&d)).into_boxed_str(), detail: format!("{e}").into_boxed_str() }
+    Reached::Failed { class: format!("lower: {}", class_of(&d)).into_boxed_str(), detail: format!("{e}").into_boxed_str(), refusal: None }
+}
+
+/// `out` (a [`Reached::Failed`] made from `refusal`'s text) carrying `refusal` itself.
+fn with_refusal(mut out: Reached, refusal: super::program::Front2Refusal) -> Reached {
+    if let Reached::Failed { refusal: slot, .. } = &mut out {
+        *slot = Some(Box::new(refusal));
+    }
+    out
 }
 
 fn check_failed(r: &Records<'_, '_>, e: &CheckFail) -> Reached {
@@ -219,12 +233,12 @@ fn check_failed(r: &Records<'_, '_>, e: &CheckFail) -> Reached {
         }
         CheckFail::Gap { gaps, .. } => {
             let first = gaps.first().map(|g| format!("{g:?}")).unwrap_or_default();
-            (format!("check gap: {}", class_of(&first)), format!("{} gaps; the first: {}", gaps.len(), gaps.first().map(|g| format!("{g}")).unwrap_or_default()))
+            (format!("check gap: {}", class_of(&first)), format!("{} gaps; the first: {}", gaps.len(), gaps.first().map(|g| super::row_path::gap_shown(r, g)).unwrap_or_default()))
         }
         // By the head error's variant chain and, for a path that did not resolve, the path as
         // written (from the item's text): head failures of unrelated causes are not one class
         // (walk-AH Brief 2's addendum: 117 "check: Head").
-        CheckFail::Head { error, .. } => {
+        CheckFail::Head { owner, error } => {
             let class = match error {
                 HeadError::Item(lib, why) => {
                     let chain = class_chain(&format!("{why:?}"), 3);
@@ -242,7 +256,7 @@ fn check_failed(r: &Records<'_, '_>, e: &CheckFail) -> Reached {
                 }
                 other => format!("check: Head: {}", class_chain(&format!("{other:?}"), 3)),
             };
-            (class, format!("{e}"))
+            (class, super::row_path::head_fail_shown(r, *owner, error))
         }
         CheckFail::Check { error, .. } => (format!("check: Check: {}", class_chain(&format!("{error:?}"), 3)), format!("{e}")),
         // By the first diagnostic's code and its message's first words (`E0277 Param(0):
@@ -269,15 +283,12 @@ fn check_failed(r: &Records<'_, '_>, e: &CheckFail) -> Reached {
             (format!("check: {}", class_of(&d)), format!("{other}"))
         }
     };
-    Reached::Failed { class: class.into_boxed_str(), detail: detail.into_boxed_str() }
+    Reached::Failed { class: class.into_boxed_str(), detail: detail.into_boxed_str(), refusal: None }
 }
 
 /// A fn's name for messages: a member's as `container::name`.
 pub(crate) fn fn_shown<'n, S: super::source::NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> String {
-    match r.keys.origin(k) {
-        Some(Origin::Member { container, name, .. }) => format!("{}::{name}", item_shown(r, *container)),
-        _ => item_shown(r, k),
-    }
+    super::row_path::shown_name(r.names, &*r.keys, &*r.store, k)
 }
 
 /// A body that finished with diagnostics, shown so a reader can judge each: the fn's name (a
@@ -317,7 +328,10 @@ fn queue_targets(r: &mut Records<'_, '_>, scope: &BodyScope<'_>, owner: ItemKey,
             Ok(Target::Ctor(k)) => (k, Some(Reached::Ctor)),
             Ok(Target::AtInstance(k)) => (k, Some(Reached::AtInstance)),
             Ok(Target::AtObject(k)) => (k, Some(Reached::AtObject)),
-            Err(e) => (item, Some(check_failed(r, &e))),
+            Err(e) => {
+                let out = check_failed(r, &e);
+                (item, Some(with_refusal(out, super::program::Front2Refusal::Check(e))))
+            }
         });
     }
 }
@@ -348,10 +362,10 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
         let Some(lib) = r.index.fn_lang(l) else { continue };
         queue.push(match r.keys.item(lib) {
             Ok(k) => (k, None),
-            Err(clash) => (clash.key, Some(Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str() })),
+            Err(clash) => (clash.key, Some(Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str(), refusal: None })),
         });
     }
-    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0, edges: Vec::new_in(Global), instance_pairs: Vec::new_in(Global) };
+    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), recipes: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0, edges: Vec::new_in(Global), instance_pairs: Vec::new_in(Global) };
     note_edges(&mut census.edges, AMBIENT, &queue, &[]);
     queue.extend(also.iter().map(|&k| (k, None)));
     // What the builder calls on its own for what the reached bodies write, queued as read.
@@ -422,9 +436,16 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             // `#[lang = "panic_impl"]` runs the program's `#[panic_handler]` fn
             // ([`super::panic_entry`]); each is queued here as its callee; every other fn with
             // no body is `NoBody`.
+            // Every other `extern "Rust"` `#[rustc_std_internal_symbol]` declaration runs its
+            // one definition, the panic runtime's by the strategy ([`super::internal_symbol`]).
+            // P1 replaces this with the program's strategy.
+            let panic = blaze_build::Panic::Unwind;
             let (outcome, callee) = match super::alloc_shim::reached(r, k, blaze_own::Alloc::global()) {
                 Some(bound) => bound,
-                None => super::panic_entry::reached(r, k, blaze_own::Alloc::global()),
+                None => match super::internal_symbol::reached(r, k, panic, blaze_own::Alloc::global()) {
+                    Some(bound) => bound,
+                    None => super::panic_entry::reached(r, k, blaze_own::Alloc::global()),
+                },
             };
             queue.extend(callee.map(|h| (h, None)));
             census.fns.push((k, outcome));
@@ -444,7 +465,8 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
                 continue;
             }
             Err(e) => {
-                census.fns.push((k, body_failed(&e)));
+                let out = body_failed(&e);
+                census.fns.push((k, with_refusal(out, super::program::Front2Refusal::Lower(e))));
                 continue;
             }
         };
@@ -453,7 +475,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             Ok(s) => s,
             Err(e) => {
                 let d = format!("{e:?}");
-                census.fns.push((k, Reached::Failed { class: Box::from("spelling"), detail: d.into_boxed_str() }));
+                census.fns.push((k, Reached::Failed { class: Box::from("spelling"), detail: d.into_boxed_str(), refusal: None }));
                 continue;
             }
         };
@@ -463,10 +485,12 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
                 queue_targets(r, &scope, body.owner, &mut c, &mut queue);
                 census.fns.push((k, Reached::Checked));
                 needs.read(r, body.owner, Some(&body), &c, &mut queue, &mut census.fns);
+                super::coroutine_recipes::recipes_of(r, body.owner, &view, &c, &mut census.recipes, blaze_own::Alloc::global());
                 Some(c)
             }
             Err(e) => {
-                census.fns.push((k, diags_failed(r, k, &e)));
+                let out = diags_failed(r, k, &e);
+                census.fns.push((k, with_refusal(out, super::program::Front2Refusal::Check(e))));
                 queue_by_name(r, &body, &scope, &mut queue, &mut census.not_followed);
                 None
             }

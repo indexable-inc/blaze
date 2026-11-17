@@ -120,6 +120,14 @@ pub enum ConstFail {
     /// impl (two impls hold, a question the world has no answer to, a trait declared in a
     /// body): front2/const_select.rs.
     SelectConst { refused: super::const_select::ConstSelectRefused },
+    /// A call of `callee` (`shown`: its path, item_shown.rs) whose head was read and has no
+    /// `const` (the Reference, "Constant evaluation": a call in a constant context is of a
+    /// const fn or a tuple constructor).
+    NotConstFn { callee: ItemKey, shown: Box<str> },
+    /// A call of `callee` (`shown`: its path) whose kind needs `fact`, which front2 does not
+    /// hold: `made` is the want made for it in this evaluation, if one was; `why` the store's or
+    /// the head maker's own words, if any.
+    FnFact { callee: ItemKey, shown: Box<str>, fact: blaze_consteval::Fact, made: Option<super::heads::Want>, why: Option<Box<str>> },
 }
 
 impl core::fmt::Display for ConstFail {
@@ -147,6 +155,17 @@ impl core::fmt::Display for ConstFail {
             ConstFail::NotConstBlock { owner, block } => write!(f, "fn {owner:?}: expression {} of its body as the evaluator lowered it is not a `const {{ .. }}` block", block.0),
             ConstFail::Projection { item, refused } => write!(f, "constant {item:?}: a type it lays out: {refused}"),
             ConstFail::SelectConst { refused } => write!(f, "{refused}"),
+            ConstFail::NotConstFn { shown, .. } => write!(f, "a call of {shown}, which is not a `const fn` (its head was read and has no `const`)"),
+            ConstFail::FnFact { shown, fact, made, why, .. } => {
+                write!(f, "a call of {shown}: its kind is not known: {fact}")?;
+                if let Some(w) = made {
+                    write!(f, "; made {w:?}")?;
+                }
+                match why {
+                    Some(why) => write!(f, ": {why}"),
+                    None => Ok(()),
+                }
+            }
         }
     }
 }
@@ -258,6 +277,9 @@ struct ConstsWorld<'w, 'n, S> {
     /// What the step's projections asked of the records ([`LayoutFacts::normalize`] below):
     /// [`Consts::value`] makes its fills and asks again, or refuses naming the projection.
     project: super::const_project::ProjectAsk<'w>,
+    /// What a callee's head is lowered in ([`ConstWorld::fn_kind`]): handed down from the
+    /// evaluation (D102), never named here.
+    alloc: Alloc<'w>,
 }
 
 /// An item's code identity from its key and its text: the ONE identity of a fn's code, which
@@ -280,7 +302,7 @@ fn hash_text(text: &str) -> ContentId {
 }
 
 /// The panic entries of core, by the names `#[lang]` gives them.
-fn is_panic_lang(name: &str) -> bool {
+pub(super) fn is_panic_lang(name: &str) -> bool {
     matches!(name, "panic" | "panic_fmt" | "const_panic_fmt" | "panic_display" | "panic_str_2015" | "panic_nounwind" | "panic_explicit" | "panic_bounds_check" | "panic_misaligned_pointer_dereference")
         || name.starts_with("panic_const_")
 }
@@ -289,35 +311,11 @@ fn is_panic_lang(name: &str) -> bool {
 /// program.rs `item_named` reads it). Not sliced from the outline's text by the entry's name
 /// range: that range was not the text's (`size_of` came out as "onst_ev", seven bytes of
 /// another item, and the intrinsic was refused as unknown).
-fn written_name<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<&'n str> {
+pub(super) fn written_name<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<&'n str> {
     names.name_of(lib)
 }
 
 impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
-    /// A free fn's kind from its signature: `const`, `#[rustc_intrinsic]`, or neither.
-    fn free_fn_kind(&self, lib: LibKey) -> FnKind {
-        if self.index.lang_name_of(lib).is_some_and(is_panic_lang) {
-            return FnKind::Panic;
-        }
-        let (Some(it), Some(krate)) = (self.names.text_of(lib), self.names.crate_of(lib)) else { return FnKind::NotConst };
-        let (Some(atoms), Some(edition)) = (self.names.cfg_atoms(krate), self.names.edition_of(krate)) else { return FnKind::NotConst };
-        let Ok(sig) = blaze_lower::lower_signature(it.text, edition, &mut CrateCfg(atoms), Alloc::global()) else { return FnKind::NotConst };
-        let v = sig.view();
-        let intrinsic = v.rows(v.list(head::ATTRS)).ok().is_some_and(|rows| {
-            rows.iter().any(|&n| v.attr(n).ok().and_then(|a| v.text_at(a.path).ok()).is_some_and(|p| p == "rustc_intrinsic"))
-        });
-        if intrinsic {
-            let Some(name) = written_name(self.names, lib) else { return FnKind::NotConst };
-            // An unknown name is its own kind: the evaluator refuses a call of it as
-            // `Refusal::UnknownIntrinsic`, which compiled code keeps like any final refusal.
-            return match Intrinsic::named(name) {
-                Ok(w) => FnKind::Intrinsic(w),
-                Err(_) => FnKind::UnknownIntrinsic,
-            };
-        }
-        if v.head[head::FLAGS] & blaze_lower::machine::sig::CONST != 0 { FnKind::Const } else { FnKind::NotConst }
-    }
-
     /// `item` as an associated constant DECLARED by a trait (`Specifier::BITS`): the trait and
     /// the constant's name; `None` for any other item (an impl's constant, a free one).
     fn trait_const(&self, item: ItemKey) -> Option<(ItemKey, tc::Name)> {
@@ -387,26 +385,12 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
         Ok(Some(Typed::new(view, &b.checked, b.text, b.lits.lend(), b.hash)))
     }
 
+    /// What a call of `item` does (front2/const_fn_fact.rs `fn_fact`). A fact it needs and
+    /// does not find is `FnKind::Missing(fact)`: the evaluator refuses the call as the pending
+    /// `Refusal::FnFact`, and [`Consts::value`] makes the fact or names it (const_fn_fact.rs
+    /// `answer`). `NotConst` only from a head read without `const`.
     fn fn_kind(&self, item: ItemKey) -> FnKind {
-        if let Some(c) = self.store.ctors.get(&item) {
-            let variant = self.keys.library_in(self.names, item).and_then(|lib| crate::resolve::Paths { names: self.names }.variant_of(lib)).map_or(0, |(_, i)| i);
-            return FnKind::Ctor { adt: c.adt, variant };
-        }
-        match self.keys.library_in(self.names, item) {
-            Some(lib) => self.free_fn_kind(lib),
-            None => match self.store.fns.get(&item) {
-                Some(f) if f.has_body => {
-                    let v = f.text;
-                    let atoms_ok = self.names.crate_of(f.lib).and_then(|k| Some((self.names.edition_of(k)?, self.names.cfg_atoms(k)?)));
-                    let Some((edition, atoms)) = atoms_ok else { return FnKind::NotConst };
-                    match blaze_lower::lower_signature(v, edition, &mut CrateCfg(atoms), Alloc::global()) {
-                        Ok(sig) if sig.view().head[head::FLAGS] & blaze_lower::machine::sig::CONST != 0 => FnKind::Const,
-                        _ => FnKind::NotConst,
-                    }
-                }
-                _ => FnKind::NotConst,
-            },
-        }
+        super::const_fn_fact::fn_fact(self.names, self.keys, self.index, self.store, item, self.alloc)
     }
 
     fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Option<(ItemKey, List)> {
@@ -456,6 +440,18 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
 
     fn explicit_discriminant(&self, _: ItemKey, _: u32) -> Option<ItemKey> {
         None
+    }
+
+    /// By the records (front2/const_drop.rs): the ADT's impl of the `Drop` lang trait in its
+    /// own bucket (blaze-typeck `adt_drop_impl`, as run.rs answers the builder); what is not
+    /// made yet is noted in `project` as fills, made by `value_key`, and the step asked again.
+    fn drop_impl(&self, ty: tc::PTy, ground: &mut PortableTys<'_>) -> Option<Result<Option<ItemKey>, blaze_build::BuildError>> {
+        super::const_drop::drop_impl(self.names, self.keys, self.index, self.store, &self.project, ty, ground)
+    }
+
+    /// core's `#[lang = "manually_drop"]` ADT (front2/const_drop.rs).
+    fn manually_drop(&self) -> Option<Option<ItemKey>> {
+        super::const_drop::manually_drop(self.names, self.index, &self.project)
     }
 }
 
@@ -526,7 +522,7 @@ impl<'n> Consts<'n> {
     /// fill loop (const_select.rs `select_made`): the impl's definition at the impl's
     /// arguments, or the trait's default at `args`. Any other constant is its own root.
     fn select_args<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, item: ItemKey, args: List, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let Some(trait_) = self.trait_of_const(&*r, item) else {
+        let Some(trait_) = self.trait_of_const(&*r, item, alloc) else {
             return Ok((item, args));
         };
         super::const_select::select_made(r, item, trait_, args, ground, alloc)
@@ -536,7 +532,7 @@ impl<'n> Consts<'n> {
     /// ground `self_ty`: `[self_ty]` as the arguments, selected as [`Consts::select_args`]
     /// selects them.
     fn select_root<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, declared: ItemKey, self_ty: tc::PNode, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let Some(trait_) = self.trait_of_const(&*r, declared) else {
+        let Some(trait_) = self.trait_of_const(&*r, declared, alloc) else {
             return Err(ConstFail::TraitConstNoSelf { item: declared, constant: declared });
         };
         let full = |_| ConstFail::Eval(Box::from("the constant evaluator's type table is full"));
@@ -547,8 +543,8 @@ impl<'n> Consts<'n> {
 
     /// The trait that declares `item`, when `item` is a trait's associated constant
     /// ([`ConstsWorld::trait_const`], over the records as they are now).
-    fn trait_of_const<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, item: ItemKey) -> Option<ItemKey> {
-        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
+    fn trait_of_const<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
+        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()), alloc };
         world.trait_const(item).map(|(trait_, _)| trait_)
     }
 
@@ -663,6 +659,9 @@ impl<'n> Consts<'n> {
         let mut last = None;
         let mut out = Ok(());
         let mut steps = 0u32;
+        // The callees whose missing record (an impl's fn's signature) this evaluation made
+        // (const_fn_fact.rs `answer`): each at most once.
+        let mut made: Vec<ItemKey, Global> = Vec::new_in(Global);
         while let Some(n) = settle.next() {
             steps += 1;
             if steps > MOST_STEPS {
@@ -689,9 +688,19 @@ impl<'n> Consts<'n> {
                 }
                 continue;
             }
-            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
+            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()), alloc };
             let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
             let selected = world.selected.take();
+            // A call refused by its callee's kind: the refusal carries what `fn_kind` said
+            // (`None`: a head read without `const`; `Some(fact)`: a fact front2 does not hold).
+            let called = match &answer {
+                Err(e) => match e.refusal {
+                    Refusal::NotConstFn { item: callee } => Some((callee, None)),
+                    Refusal::FnFact { item: callee, fact } => Some((callee, Some(fact))),
+                    _ => None,
+                },
+                Ok(_) => None,
+            };
             let asked = world.project.into_asked();
             let step = match answer {
                 Ok(Answer::Done(rec)) => {
@@ -733,23 +742,31 @@ impl<'n> Consts<'n> {
                         _ => None,
                     };
                     let text = format!("{e}").into_boxed_str();
-                    match (unknown, no_adt, no_impl) {
-                        (Some(item), _, _) => Err(match r.keys.library_in(r.names, item).and_then(|lib| written_name(r.names, lib)) {
+                    match (called, unknown, no_adt, no_impl) {
+                        (Some((callee, None)), _, _, _) => Err(ConstFail::NotConstFn { callee, shown: super::const_fn_fact::shown(r, callee) }),
+                        (Some((callee, Some(fact))), _, _, _) => match super::const_fn_fact::answer(r, &mut made, callee, fact) {
+                            // The fact was made: the code holding the refusal is pending
+                            // (blaze-consteval machine/late.rs `Wait::FnFact`), so the
+                            // evaluator compiles it again; the same need is evaluated again.
+                            Ok(()) => continue,
+                            Err(e) => Err(e),
+                        },
+                        (None, Some(item), _, _) => Err(match r.keys.library_in(r.names, item).and_then(|lib| written_name(r.names, lib)) {
                             Some(name) => ConstFail::UnknownIntrinsic { item, name: Box::from(name) },
                             // Not reached: `free_fn_kind` answers `UnknownIntrinsic` only after
                             // reading this name; the evaluator's own text names the item and why.
                             None => ConstFail::Eval(text),
                         }),
-                        (None, Some(adt), _) => match adt_row(r, n.item, adt) {
+                        (None, None, Some(adt), _) => match adt_row(r, n.item, adt) {
                             Ok(()) => continue,
                             Err(e) => Err(e),
                         },
-                        (None, None, Some(refused)) => Err(refused.into_fail()),
+                        (None, None, None, Some(refused)) => Err(refused.into_fail()),
                         // A projection a type of the step holds (a field's `T::Storage`): the
                         // records its normalization needs are made now and the same need is
                         // evaluated again; one the solver refuses is named
                         // (front2/const_project.rs `answer`).
-                        (None, None, None) => match super::const_project::answer(r, n.item, asked) {
+                        (None, None, None, None) => match super::const_project::answer(r, n.item, asked) {
                             // The fills change what a type grounds to: code that met the
                             // unanswered projection is not complete (blaze-consteval
                             // machine/late.rs), so the evaluator compiles that body again.

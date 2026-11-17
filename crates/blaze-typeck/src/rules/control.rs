@@ -19,7 +19,7 @@
 
 use blaze_own::Alloc;
 
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::body::CoroutineKind;
 use crate::error::{CheckError, Malformed, Stop};
 use crate::ids::{ExprId, LangItem, List, PatId};
@@ -268,7 +268,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             entry.final_ty = Some(unit);
             entry.pushed += 1;
         } else {
-            self.diag(DiagCode::IfWithoutElse, At::Expr(e), Some(merged), Some(unit), None);
+            self.diag(DiagCode::IfWithoutElse, At::Expr(e), About::types(merged, unit));
             self.coerce_many[site as usize].final_ty = Some(self.common.err);
         }
         Ok(())

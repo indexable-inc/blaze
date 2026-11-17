@@ -74,6 +74,11 @@ pub trait BodySources {
     fn script_file(&self, krate: usize, path: &str) -> Option<Option<&[u8]>>;
     /// Runs the proc macro `def` on `call`, written in the crate at `krate`.
     fn run_proc_macro<'b>(&self, krate: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError>;
+    /// Decision D111: files, as findings at `call`, the reads of `reads` in `span` a member's
+    /// proc macro made outside its own dir, through blaze-scope's one filing
+    /// (`blaze_scope::left_reads::file_left_reads`), the item host's own; returns how many.
+    /// Required, never defaulted: no body source can leave the finding out (super::body_left).
+    fn file_left_reads(&self, krate: usize, call: blaze_scope::left_reads::CallAt<'_>, reads: &blaze_expand::Reads<'_>, span: core::ops::Range<usize>, alloc: Alloc<'_>) -> u32;
 }
 
 /// A [`SourceTexts`] as a body's [`BodySources`]: the same texts, environment and runner
@@ -109,6 +114,10 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
 
     fn run_proc_macro<'b>(&self, krate: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
         self.0.run_proc_macro(krate, def, call, alloc)
+    }
+
+    fn file_left_reads(&self, krate: usize, call: blaze_scope::left_reads::CallAt<'_>, reads: &blaze_expand::Reads<'_>, span: core::ops::Range<usize>, alloc: Alloc<'_>) -> u32 {
+        blaze_scope::left_reads::file_left_reads(self.0, krate, call, reads, span, alloc)
     }
 }
 
@@ -233,6 +242,10 @@ mod tests {
         }
         fn run_proc_macro<'b>(&self, _: usize, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'b>) -> Result<Produced<'b>, HostError> {
             Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Failed })
+        }
+        // Its macros never run: nothing to file.
+        fn file_left_reads(&self, _: usize, _: blaze_scope::left_reads::CallAt<'_>, _: &blaze_expand::Reads<'_>, _: core::ops::Range<usize>, _: Alloc<'_>) -> u32 {
+            0
         }
     }
 

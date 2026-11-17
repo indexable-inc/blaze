@@ -42,15 +42,14 @@
 //!   formats, each resolving the pointer fields by its own relocations (`EhPointers`). The
 //!   frame is checked against blaze-code unwind.rs's ONE
 //!   frame form (CFA `x29 + 16`, `x29` at CFA - 16, `x30` at CFA - 8, the `k`th saved pair's
-//!   lower register at CFA - 32 - 16k and its higher at CFA - 24 - 16k); the rows from the LSDA
-//!   by crate::read_lsda (the one LSDA reader). A frame the form cannot say is REFUSED BY NAME
-//!   ([`ReadError::FrameLayout`]), never a record with a hole: the first panic through such a
-//!   frame would restore the caller's registers wrong. NOTE what this refuses today: LLVM's
-//!   arm64 prologue saves a callee-saved pair HIGH register first (`stp x20, x19, ..`, so
-//!   libunwind's compact frame mode reads x19 at `fp - 8`, x20 at `fp - 16`; on Linux the frame
-//!   record sits below the saved registers, CFA `x29 + 16 + 16n`), and blaze's form 1 says the
-//!   lower register first: every optimized function that keeps a value in x19..x28 or d8..d15
-//!   across a call is refused until blaze-code unwind.rs has a form for LLVM's layout.
+//!   lower register at CFA - 24 - 16k and its higher at CFA - 32 - 16k: the platform's order,
+//!   which LLVM's arm64 prologue writes, `stp x20, x19, ..`, and libunwind's compact frame mode
+//!   reads, x19 at `fp - 8`; unwind-P8a-4); the rows from the LSDA by crate::read_lsda (the one
+//!   LSDA reader). A frame the form cannot say is REFUSED BY NAME ([`ReadError::FrameLayout`]),
+//!   never a record with a hole and never converted: the first panic through such a frame would
+//!   restore the caller's registers wrong. What this still refuses: on Linux LLVM puts the frame
+//!   record BELOW the saved registers (CFA `x29 + 16 + 16n`), so an ELF function that keeps a
+//!   value in x19..x28 or d8..d15 across a call is refused by that name.
 //!   A function with no call is never between a throw and its catch: with no frame described
 //!   (a frameless compact entry, or no entry) its `unwind_frame` is `None` (blaze-code unwind.rs:
 //!   "the record cannot be unwound through", which no unwind asks of it); a frameless entry
@@ -480,8 +479,8 @@ fn page_off_scale(inst: u32, at: u64) -> Result<u8, ReadError> {
 const DWARF_REGS: usize = 96;
 const FP: u16 = 29;
 const LR: u16 = 30;
-/// The lower register of each saved pair, in blaze's order (unwind.rs `Frame::pairs`): x pairs,
-/// then d pairs.
+/// The lower register of each saved pair, in the frame word's bit order (unwind.rs
+/// `Frame::pairs`): x pairs, then d pairs. The lower register sits at the HIGHER address.
 const PAIRS: [u16; 9] = [19, 21, 23, 25, 27, 72, 74, 76, 78];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -536,7 +535,7 @@ fn frame_of(state: &CfiState, at: u64) -> Result<Frame, ReadError> {
         let (a, b) = (state.rules[usize::from(lo)], state.rules[usize::from(lo) + 1]);
         match (a, b) {
             (Rule::Same, Rule::Same) => {}
-            (Rule::At(p), Rule::At(q)) if p == -32 - 16 * k && q == -24 - 16 * k => {
+            (Rule::At(p), Rule::At(q)) if p == -24 - 16 * k && q == -32 - 16 * k => {
                 match bit < 5 {
                     true => x_pairs |= 1 << bit,
                     false => d_pairs |= 1 << (bit - 5),
@@ -546,7 +545,7 @@ fn frame_of(state: &CfiState, at: u64) -> Result<Frame, ReadError> {
             _ => {
                 return Err(ReadError::FrameLayout {
                     at,
-                    what: "a saved pair is not its lower register at CFA - 32 - 16k and its higher at CFA - 24 - 16k",
+                    what: "a saved pair is not its lower register at CFA - 24 - 16k and its higher at CFA - 32 - 16k",
                     reg: lo,
                     offset: rule_offset(a),
                 });

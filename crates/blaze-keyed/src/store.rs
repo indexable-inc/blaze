@@ -458,7 +458,11 @@ pub enum StoreError {
     /// A fetch of `segment` returned `len` bytes where its reference names `wanted`.
     Fetched { segment: SegmentId, len: u64, wanted: u64 },
     /// A segment generation `generation` names is gone or cannot be mapped (`what`): removed
-    /// outside blaze, or lost in a power cut; its records are dropped, and said.
+    /// outside blaze, or lost in a power cut; its records are dropped, and said. Also a lazy
+    /// map asked more than the grace after the open (blaze-cas plain probe.rs, "THE GRACE"):
+    /// refused, never retried. A short command cannot reach it; a long-lived holder (the
+    /// `blaze run` parent, any helper) maps every segment once its child has started, off the
+    /// path to `main`, and re-opens the head whenever it needs a record committed after its open.
     Lost { segment: u64, generation: u64, what: &'static str },
     /// The store's driver ended `what` (a commit, a compaction slice, an open) without the
     /// outcome it owes.

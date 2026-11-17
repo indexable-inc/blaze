@@ -12,12 +12,13 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::body::{BodyPath, IntSuffix, Lit, Segment};
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Malformed, Stop};
 use crate::ids::{ExprId, ItemKey, Mutbl, Name, PathIdx, ScopeId};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::portable::{PNode, PTy, PTys};
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx, VarKind};
+use crate::path_miss::{MissWhy, PathMiss, PathPrefix};
 use crate::world::{AssocKind, CtorKind, Def, FnSig, PathRes, Shape, World};
 
 /// The segment `Self` (`Name::of`, as the world spells every name).
@@ -26,8 +27,8 @@ const SELF_NAME: Name = Name::of("Self");
 /// Why a body path has no definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unresolved {
-    /// Not found by its name: E0425 naming it.
-    ByName,
+    /// Not found by its name: E0425 naming the segment the world's answer says failed.
+    ByName(PathMiss),
     /// A desugaring's lang path the world cannot answer: already reported as
     /// `DiagCode::MissingLangItem` naming the lang item.
     Reported,
@@ -170,7 +171,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let written = self.body.type_list(seg.generic_args)?;
         if written.len() != declared as usize {
-            self.diag(DiagCode::GenericArgCount, at, None, None, Some(seg.name));
+            self.diag(DiagCode::GenericArgCount, at, About::name(seg.name));
             let got = u32::try_from(written.len()).unwrap_or(u32::MAX);
             if let Some(d) = self.diags.last_mut() {
                 d.because = Some(crate::diag::Because::ArgCount { item, expected: declared, got });
@@ -196,8 +197,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     fn generic_arg(&mut self, at: At, t: PTy, declared: Option<(PTy, PTys<'_>)>) -> Result<Ty, Stop> {
         let node = self.body.types.node(t)?;
         let Some((d, dtypes)) = declared else {
-            if let PNode::ConstValue { .. } = node {
-                self.diag(DiagCode::GenericArgKind, at, None, None, None);
+            if let PNode::ConstValue { ty, .. } = node {
+                let const_ty = self.lower_body_ty(ty, at)?;
+                self.diag(DiagCode::GenericArgKind, at, About::found(const_ty));
                 return self.fresh();
             }
             return self.lower_body_ty(t, at);
@@ -216,7 +218,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             && let PNode::Infer = self.body.types.node(ty)?
         {
             if !matches!(self.view(d), TyView::Int(_) | TyView::Uint(_)) {
-                self.diag(DiagCode::Mismatch, at, Some(d), None, None);
+                self.diag(DiagCode::Mismatch, at, About::expected(d));
                 return self.ty.fresh(VarKind::Const).map_err(Stop::from);
             }
             return self.mk(TyView::ConstValue { ty: d, bits });
@@ -236,7 +238,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             TyView::ConstInfer(_) => return Ok(arg),
             _ => {
-                self.diag(DiagCode::GenericArgKind, at, None, Some(arg), None);
+                self.diag(DiagCode::GenericArgKind, at, About::found(arg));
                 return self.ty.fresh(VarKind::Const).map_err(Stop::from);
             }
         };
@@ -273,14 +275,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Ok(Err(Unresolved::Reported))
                 }
             },
-            None => Ok(self.reads.resolve_path(bp.scope, path, names)?.ok_or(Unresolved::ByName)),
+            None => Ok(self.reads.resolve_path(bp.scope, path, names)?.map_err(Unresolved::ByName)),
         }
     }
 
-    /// E0425 naming `name` for a path not found by name; nothing for one already reported.
-    pub(crate) fn unresolved(&mut self, why: Unresolved, at: At, name: Option<Name>) {
-        if why == Unresolved::ByName {
-            self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+    /// E0425 for a path written as `names` and not found by name, naming the segment that
+    /// failed; nothing for one already reported.
+    pub(crate) fn unresolved(&mut self, why: Unresolved, at: At, names: &[Name]) {
+        if let Unresolved::ByName(miss) = why {
+            self.path_miss(at, names, miss);
+        }
+    }
+
+    /// E0425 at `at` for `miss` of the path written as `names` (rule 19): `name` is the
+    /// failing segment's (the last one's only when the world does not say which,
+    /// [`PathMiss::Whole`]), `because` is `miss` itself.
+    pub(crate) fn path_miss(&mut self, at: At, names: &[Name], miss: PathMiss) {
+        let name = match miss.segment() {
+            Some(i) => names.get(i as usize).copied(),
+            None => names.last().copied(),
+        };
+        self.diag(DiagCode::UnresolvedPath, at, About::path(name));
+        if let Some(d) = self.diags.last_mut() {
+            d.because = Some(crate::diag::Because::Path(miss));
         }
     }
 
@@ -300,7 +317,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let res = match self.path_res(bp, path, &names, at)? {
             Ok(res) => res,
             Err(why) => {
-                self.unresolved(why, at, last_name);
+                self.unresolved(why, at, &names);
                 return Ok(self.common.err);
             }
         };
@@ -316,7 +333,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return self.value_def(at, cause, res.def, segs);
         }
         if consumed == 0 {
-            self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
+            self.diag(DiagCode::UnresolvedPath, at, About::path(last_name));
             return Ok(self.common.err);
         }
         // Type-relative: the consumed prefix names a type. One segment after it is an
@@ -347,13 +364,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Def::SelfTy => match self.impl_self_ty(cause)? {
                 Some(t) => t,
                 None => {
-                    self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
+                    // `Self` outside an impl: the first segment names nothing here.
+                    self.path_miss(at, &names, PathMiss::At { segment: 0, after: None, why: MissWhy::NotFound });
                     return Ok(self.common.err);
                 }
             },
             Def::Adt(k) => {
                 let Some(adt) = self.reads.adt(k)? else {
-                    self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
+                    self.diag(DiagCode::UnresolvedPath, at, About::path(last_name));
                     return Ok(self.common.err);
                 };
                 // `Self::X` in an impl: `Self` is the impl's self type at the impl's own
@@ -419,8 +437,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 crate::world::Prim::Uint(u) => TyView::Uint(u),
                 crate::world::Prim::Float(f) => TyView::Float(f),
             })?,
+            // A prefix with no associated values the checker looks in (a trait whose fn of
+            // that name the world did not find, a fn, a const, a constructor): the segment
+            // after it names nothing, on it.
             _ => {
-                self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
+                let miss = PathMiss::At { segment: res.consumed, after: Some(PathPrefix::Def(res.def)), why: MissWhy::NotFound };
+                self.path_miss(at, &names, miss);
                 return Ok(self.common.err);
             }
         };
@@ -469,36 +491,43 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let tr = match self.path_res(tbp, tpath, &names, at)? {
             Ok(PathRes { def: Def::Trait(tr), consumed }) if consumed as usize == tsegs.len() => tr,
             Ok(_) => {
-                self.diag(DiagCode::NotATrait, at, None, None, tlast.map(|s| s.name));
+                self.diag(DiagCode::NotATrait, at, About::path(tlast.map(|s| s.name)));
                 return Ok(self.common.err);
             }
             Err(why) => {
-                self.unresolved(why, at, tlast.map(|s| s.name));
+                self.unresolved(why, at, &names);
                 return Ok(self.common.err);
             }
         };
         let Some(def) = self.reads.trait_def(tr)? else {
-            self.diag(DiagCode::UnresolvedPath, at, None, None, tlast.map(|s| s.name));
+            self.diag(DiagCode::UnresolvedPath, at, About::path(tlast.map(|s| s.name)));
             return Ok(self.common.err);
         };
-        let rest = self.explicit_args(at, tlast, tr, 1, def.generics.saturating_sub(1))?;
-        let self_list = self.mk_list(&[self_ty])?;
-        let trait_args = self.concat(self_list, rest)?;
+        let trait_args = match tlast.filter(|s| s.has_args) {
+            // Written: exactly as written (`explicit_args`), `Self` first.
+            Some(_) => {
+                let rest = self.explicit_args(at, tlast, tr, 1, def.generics.saturating_sub(1))?;
+                let self_list = self.mk_list(&[self_ty])?;
+                self.concat(self_list, rest)?
+            }
+            // None written: the trait's defaults, as any type path's (rules/qpath_defaults.rs).
+            None => self.qpath_trait_args(tr, &def, self_ty, cause)?,
+        };
         if let Some(assoc) = assoc {
             if !def.assoc_types.iter().any(|a| a.name == assoc.name) {
-                self.diag(DiagCode::NoAssocItem, at, None, Some(self_ty), Some(assoc.name));
+                self.diag(DiagCode::NoAssocItem, at, About::found_named(self_ty, assoc.name));
                 return Ok(self.common.err);
             }
-            self.register_trait(tr, trait_args, cause)?;
+            self.register_trait(tr, trait_args, self.written_cause(anchor.ty_range, cause))?;
             let projected = self.project(tr, trait_args, assoc.name, cause)?;
             let projected = self.try_structurally_resolve(projected)?;
             return self.assoc_value(at, cause, projected, *seg, scope);
         }
         let Some(item) = self.reads.assoc_item(tr, seg.name)? else {
-            self.diag(DiagCode::NoAssocItem, at, None, Some(self_ty), Some(seg.name));
+            self.diag(DiagCode::NoAssocItem, at, About::found_named(self_ty, seg.name));
             return Ok(self.common.err);
         };
-        self.register_trait(tr, trait_args, cause)?;
+        self.register_trait(tr, trait_args, self.written_cause(anchor.ty_range, cause))?;
         self.assoc_item_ty(at, cause, item.item, item.kind, trait_args, Some(*seg))
     }
 
@@ -520,7 +549,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         // `Self` outside an impl (a trait's default body answers `Def::TyParam`, not here).
         let Some(h) = header else {
-            self.diag(DiagCode::NotAValue, at, None, None, name);
+            self.diag(DiagCode::NotAValue, at, About::path(name));
             return Ok(self.common.err);
         };
         let self_ty = self.lower(h.types, h.self_ty, Lower::Body, cause)?;
@@ -529,19 +558,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             TyView::Adt(k, args) if k == adt => args,
             // The world's `Self` and the impl's header name different types: no value to give.
             _ => {
-                self.diag(DiagCode::UnresolvedPath, at, None, Some(self_ty), name);
+                self.diag(DiagCode::UnresolvedPath, at, About::found_maybe_named(self_ty, name));
                 return Ok(self.common.err);
             }
         };
         let Some(info) = self.reads.adt(adt)? else {
-            self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+            self.diag(DiagCode::UnresolvedPath, at, About::path(name));
             return Ok(self.common.err);
         };
         let first = info.variants.first().map(|v| (v.key, v.ctor));
         let (vkey, ctor) = match (info.kind, first) {
             (crate::world::AdtKind::Struct, Some(v)) => v,
             _ => {
-                self.diag(DiagCode::NotAValue, at, None, Some(self_ty), name);
+                self.diag(DiagCode::NotAValue, at, About::found_maybe_named(self_ty, name));
                 return Ok(self.common.err);
             }
         };
@@ -583,7 +612,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         match def {
             Def::Fn(k) => {
                 let Some(sig) = self.reads.fn_sig(k)? else {
-                    self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+                    self.diag(DiagCode::UnresolvedPath, at, About::path(name));
                     return Ok(self.common.err);
                 };
                 let parent = self.fresh_generic_args(k, 0, sig.parent_count)?;
@@ -594,7 +623,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             Def::Const(k) | Def::Static(k, _) => {
                 let Some(sig) = self.reads.fn_sig(k)? else {
-                    self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+                    self.diag(DiagCode::UnresolvedPath, at, About::path(name));
                     return Ok(self.common.err);
                 };
                 let args = self.fresh_generic_args(k, 0, sig.parent_count + sig.own_count)?;
@@ -606,7 +635,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             Def::Ctor { adt, variant, kind } => {
                 let Some(info) = self.reads.adt(adt)? else {
-                    self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+                    self.diag(DiagCode::UnresolvedPath, at, About::path(name));
                     return Ok(self.common.err);
                 };
                 // The type's arguments may be written on any segment (`S::<T>`, `E::<T>::V`,
@@ -622,14 +651,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let owner = self.body.owner;
                 let own = self.reads.const_params(owner)?;
                 let Some(pt) = own.type_of(i) else {
-                    self.diag(DiagCode::NotAValue, at, None, None, name);
+                    self.diag(DiagCode::NotAValue, at, About::path(name));
                     return Ok(self.common.err);
                 };
                 let empty = self.mk_list(&[])?;
                 self.lower(own.types, pt, Lower::Args(empty), cause)
             }
             Def::Adt(_) | Def::Trait(_) | Def::Prim(_) | Def::SelfTy => {
-                self.diag(DiagCode::NotAValue, at, None, None, name);
+                self.diag(DiagCode::NotAValue, at, About::path(name));
                 Ok(self.common.err)
             }
         }
@@ -650,13 +679,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             CtorKind::Unit => self.mk(TyView::Adt(adt, args)),
             CtorKind::Tuple => {
                 let Some(v) = variant else {
-                    self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+                    self.diag(DiagCode::UnresolvedPath, at, About::path(name));
                     return Ok(self.common.err);
                 };
                 self.mk(TyView::FnDef(v, args))
             }
             CtorKind::Braces => {
-                self.diag(DiagCode::NotAValue, at, None, None, name);
+                self.diag(DiagCode::NotAValue, at, About::path(name));
                 Ok(self.common.err)
             }
         }
@@ -693,12 +722,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             if count > 1 {
-                self.diag(DiagCode::AmbiguousMethod, at, None, Some(self_ty), Some(seg.name));
+                self.diag(DiagCode::AmbiguousMethod, at, About::found_named(self_ty, seg.name));
                 return Ok(self.common.err);
             }
             if let Some((imp, item, kind)) = found {
                 let Some(impl_args) = self.impl_args(imp, self_ty, at.cause())? else {
-                    self.diag(DiagCode::NoMethod, at, None, Some(self_ty), Some(seg.name));
+                    self.diag(DiagCode::NoMethod, at, About::found_named(self_ty, seg.name));
                     return Ok(self.common.err);
                 };
                 return self.assoc_item_ty(at, cause, item, kind, impl_args, Some(seg));
@@ -741,7 +770,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             if count > 1 {
-                self.diag(DiagCode::AmbiguousMethod, at, None, Some(self_ty), Some(seg.name));
+                self.diag(DiagCode::AmbiguousMethod, at, About::found_named(self_ty, seg.name));
                 return Ok(self.common.err);
             }
             if let Some((tr, item, kind, trait_args)) = picked {
@@ -749,7 +778,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return self.assoc_item_ty(at, cause, item, kind, trait_args, Some(seg));
             }
         }
-        self.diag(DiagCode::NoMethod, at, None, Some(self_ty), Some(seg.name));
+        self.diag(DiagCode::NoMethod, at, About::found_named(self_ty, seg.name));
         Ok(self.common.err)
     }
 
@@ -825,7 +854,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         seg: Option<Segment>,
     ) -> Result<Ty, Stop> {
         let Some(sig) = self.reads.fn_sig(item)? else {
-            self.diag(DiagCode::UnresolvedPath, at, None, None, seg.map(|s| s.name));
+            self.diag(DiagCode::UnresolvedPath, at, About::path(seg.map(|s| s.name)));
             return Ok(self.common.err);
         };
         match kind {
@@ -843,7 +872,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.lower(sig.types, sig.output, Lower::Args(parent_args), cause)
             }
             AssocKind::Type => {
-                self.diag(DiagCode::NotAValue, at, None, None, seg.map(|s| s.name));
+                self.diag(DiagCode::NotAValue, at, About::path(seg.map(|s| s.name)));
                 Ok(self.common.err)
             }
         }

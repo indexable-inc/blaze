@@ -275,6 +275,37 @@ params T
 env T: ?Sized
 goal <T as Pointee>::Metadata == ?0 => yes ?0 = rigid <T as Pointee>::Metadata
 
+# std's `Node` (std/src/sys/sync/rwlock/queue.rs:178) ends in `Atomic<bool>`, whose one field is
+# `UnsafeCell<T::Storage>` (core/src/sync/atomic.rs:384) with `bool`'s `Storage = Align1<u8>`
+# (atomic.rs:334): the tail is an alias, normalized before it is walked (normalizes_to.rs
+# `consider_builtin_pointee_candidate` answers a struct by `<tail as Pointee>::Metadata`, a nested
+# projection whose self type is normalized first). `null_mut::<Node>()` needs exactly this goal
+# (`T: Thin`, `Thin = Pointee<Metadata = ()> + PointeeSized`, core/src/ptr/metadata.rs). Without
+# the fix the walk stops at the unnormalized alias and answers it rigid: the goal fails.
+case metadata_alias_tail_normalized_unit = normalizes_to.rs::consider_builtin_pointee_candidate
+trait PtPrim { type Storage; }
+struct PtAlign<X>(X)
+impl PtPrim for bool { type Storage = PtAlign<u8>; }
+struct PtCell<X>(X)
+struct PtAtom<X>(PtCell<<X as PtPrim>::Storage>)
+struct PtNode(u8, PtAtom<bool>)
+goal <PtNode as Pointee>::Metadata == () => yes
+
+# The same walk ends at a slice through the alias: the normalized tail decides, not a guess.
+case metadata_alias_tail_normalized_slice = normalizes_to.rs::consider_builtin_pointee_candidate
+trait PtPrim { type Storage: ?Sized; }
+impl PtPrim for bool { type Storage = [u8]; }
+struct PtTail<X>(u8, <X as PtPrim>::Storage)
+goal <PtTail<bool> as Pointee>::Metadata == ?0 => yes ?0 = usize
+
+# Control: a struct whose tail is a parameter not known `Sized` stays the rigid projection of
+# that parameter, by name (no guess of `()`).
+case metadata_unsized_param_tail_rigid = normalizes_to.rs::consider_builtin_pointee_candidate
+params T
+env T: ?Sized
+struct PtWrap<X: ?Sized>(u8, X)
+goal <PtWrap<T> as Pointee>::Metadata == ?0 => yes ?0 = rigid <T as Pointee>::Metadata
+
 case discriminant_kind_yes =trait_goals.rs::consider_builtin_discriminant_kind_candidate
 goal Option<u8>: DiscriminantKind => yes
 

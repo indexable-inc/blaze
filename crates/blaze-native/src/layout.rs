@@ -26,7 +26,7 @@ use blaze_own::{AVec, Alloc, Vec};
 
 use crate::Platform;
 use crate::descriptor::{Descriptor, MAGIC as DESCRIPTOR_MAGIC, NAME_ROW_LEN, POINTER_ROW_LEN};
-use crate::image::{DESCRIPTOR_LEN, FixTo, Fixup, Image, Import, Placed, Region, TlsReloc, descriptor_name};
+use crate::image::{DESCRIPTOR_LEN, EhPointer, FixTo, Fixup, Frame, Image, Import, Placed, Region, TlsReloc, descriptor_name};
 use crate::object::{Bind, Def, Reloc, RelocKind, RelocTo, SectionKind};
 use crate::resolve::{Input, Origin, Plan, Resolution};
 use crate::unwind::{self, Row, UnwindInfoError};
@@ -235,6 +235,8 @@ struct Lay<'p, 'a> {
     /// The kept (first-seen) CIEs, as indices of `pieces`.
     cies: AVec<'a, u32>,
     fdes: AVec<'a, Fde>,
+    /// The merged eh_frame's pc-relative fields as `apply` filled them (Image::eh_pointers).
+    eh_pointers: AVec<'a, EhPointer>,
     stubs: AVec<'a, Target>,
     cells: AVec<'a, Cell>,
     cell_at: AVec<'a, u64>,
@@ -957,12 +959,13 @@ impl<'p, 'a> Lay<'p, 'a> {
             // A 32-bit absolute address cannot hold a position-independent image's addresses.
             RelocKind::Abs32 => return Err(far),
             RelocKind::Rel32 | RelocKind::Rel64 | RelocKind::Delta32 { .. } | RelocKind::Delta64 { .. } => {
-                let v = match self.eh_delta(o, r)? {
+                let in_eh = matches!(sec.class, Class::EhFrame);
+                let (to, minus) = match self.eh_delta(o, r)? {
                     Some((t, name)) => {
                         if !self.laid(t) {
                             return Err(LayoutError::Unplaced { name, from });
                         }
-                        self.address(t, o, name)?.wrapping_sub(place)
+                        (self.address(t, o, name)?, place)
                     }
                     None => {
                         let (t, name) = self.target(o, r.to, r.addend)?;
@@ -977,15 +980,25 @@ impl<'p, 'a> Lay<'p, 'a> {
                             }
                             _ => place,
                         };
-                        to.wrapping_sub(minus)
+                        (to, minus)
                     }
                 };
-                match r.kind {
+                let v = to.wrapping_sub(minus);
+                let width: u8 = match r.kind {
                     RelocKind::Rel32 | RelocKind::Delta32 { .. } => {
                         let v = i32::try_from(v as i64).map_err(|_| far)?;
                         self.put32(place, v as u32);
+                        4
                     }
-                    _ => self.put64(place, v),
+                    _ => {
+                        self.put64(place, v);
+                        8
+                    }
+                };
+                // Kept as data (Image::eh_pointers): an executable writer that moves the
+                // eh_frame's bytes re-encodes the field from these two addresses (W9).
+                if in_eh {
+                    push(&mut self.eh_pointers, EhPointer { at: place, width, to, minus })?;
                 }
             }
             RelocKind::Branch26 | RelocKind::CondBranch19 | RelocKind::TestBranch14 => {
@@ -1121,6 +1134,7 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
         pieces: Vec::new_in(alloc),
         cies: Vec::new_in(alloc),
         fdes: Vec::new_in(alloc),
+        eh_pointers: Vec::new_in(alloc),
         stubs: Vec::new_in(alloc),
         cells: Vec::new_in(alloc),
         cell_at: Vec::new_in(alloc),
@@ -1303,7 +1317,9 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
         me.put32(row + 12, 0);
     }
 
-    // The unwind index, now that every address is known.
+    // The unwind index, now that every address is known; its rows are also kept as data
+    // (Image::unwind) for an executable writer's one `__unwind_info` (W9).
+    let mut unwind_rows: AVec<'a, Row> = Vec::new_in(alloc);
     let unwind_at = me.region_at(Region::UnwindInfo);
     if unwind_len > 0 {
         let mut out: AVec<'a, u8> = Vec::new_in(alloc);
@@ -1313,6 +1329,7 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
                 let rows = me.rows(true)?;
                 let list = Lay::row_list(&rows, alloc)?;
                 unwind::unwind_info(&list, &mut out).map_err(|e| me.unwind_error(&rows, e))?;
+                unwind_rows = list;
             }
             Platform::LinuxArm64 => {
                 let i = (eh_at - layout.header_reserve) as usize;
@@ -1371,6 +1388,21 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
         let (at, len, align_log2) = me.regions[ri(region)];
         push(&mut regions, Placed { region, at, len, align_log2 })?;
     }
+    // The FDEs as data (Image::frames): record range in the EhFrame region, code range.
+    let mut frames: AVec<'a, Frame> = Vec::new_in(alloc);
+    for k in 0..me.fdes.len() {
+        let fde = me.fdes[k];
+        let object = match fde.function {
+            Target::Place { object, .. } => object,
+            _ => return Err(LayoutError::Unwind { from: me.origin(0), why: "an FDE whose pc_begin names no place of the image" }),
+        };
+        let start = me.address(fde.function, object, b"")?;
+        let at = eh_at + u64::from(fde.out);
+        let len = me.get32(at) + 4;
+        push(&mut frames, Frame { at, len, start, range: fde.range })?;
+    }
+    frames.sort_unstable_by_key(|f| f.at);
+    me.eh_pointers.sort_unstable_by_key(|p| p.at);
     me.fixups.sort_unstable_by_key(|f| f.at);
     me.tls.sort_unstable_by_key(|t| match *t {
         TlsReloc::Desc { got_at, .. } | TlsReloc::TpRel { got_at, .. } => got_at,
@@ -1389,5 +1421,8 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
         inits: inits as u32,
         descriptor_at,
         libraries,
+        unwind: unwind_rows,
+        frames,
+        eh_pointers: me.eh_pointers,
     })
 }

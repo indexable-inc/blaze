@@ -200,6 +200,7 @@ pub mod instance;
 pub mod intrinsics;
 pub mod layout;
 pub mod coroutine_niche;
+pub mod coroutine_state;
 mod normalize;
 #[cfg(any(test, feature = "testing"))]
 pub mod read_back;
@@ -892,21 +893,24 @@ impl core::error::Error for BuildError {}
 /// state's shape. The caller finds the owner, its arguments and the ordinal from the
 /// coroutine's ground type ([`coroutine_of`]), for an instance of `Adts::future_poll`, of
 /// `AsyncItems::resume` or of `drop_in_place` whose first argument is a coroutine; one build
-/// gives all three. It is built BEFORE any body that holds the state by value (the state's
-/// layout is this build's answer): until then that body's build is refused with
-/// [`BuildError::MissingRecord`] naming the owner.
+/// gives all three. Its state is laid out from TYPES before it is built (`plan`:
+/// [`coroutine_state::lay_state`] and the flow's table of identities, ASYNC.md P8), and before
+/// any body that holds it by value is built; a body that asks a state not laid is refused with
+/// [`BuildError::MissingRecord`] naming the owner (never built late). `plan` is `None` only in
+/// this crate's unit tests.
 pub fn build_coroutine<A: Allocator + Clone>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     ordinal: u32,
     subst: &mut Subst<'_, '_>,
     adts: &dyn Adts,
+    plan: Option<coroutine_state::StatePlan<'_>>,
     alloc: A,
 ) -> Result<BuiltCoroutine<A>, BuildError> {
     if !checked.diags.is_empty() {
         return Err(BuildError::Diagnostics { count: u32::try_from(checked.diags.len()).unwrap_or(u32::MAX) });
     }
-    walk::coroutine::build(body, checked, ordinal, subst, adts, alloc)
+    walk::coroutine::build(body, checked, ordinal, subst, adts, plan, alloc)
 }
 
 /// Builds the instance `subst` names of `body`, checked once generically as `checked`, of a fn

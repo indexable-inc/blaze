@@ -41,7 +41,7 @@ use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 
 const MAIN: &str = "#![feature(sized_hierarchy)]
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx) -> Result<(), Error> {
     Ok(())
 }
 fn meta_need<T: core::marker::MetaSized>(p: *const T) -> *const T { p }

@@ -71,6 +71,27 @@ impl<'f, P: Packages<'static>> Packages<'f> for Placing<'_, '_, P> {
     }
 }
 
+/// What a proc macro called in a crate whose package the world placed at `place` is shown:
+/// a MEMBER's workspace (the checkout at `checkout`) mounted at `/workspace` with the member
+/// at its dir in it (decision D96, the same `ScriptRoot` build scripts get, scripts.rs
+/// `tree_of`), a fetched package's record at `/package` (blaze-world procs/files.rs). The
+/// files' `seen()` is the one value both the mount and `CARGO_MANIFEST_DIR` are read from.
+/// `Err`: a member dir no sandbox can mount, named (D96).
+#[cfg(feature = "sandbox")]
+pub(crate) fn shown(
+    place: Place<'static>,
+    checkout: &str,
+) -> Result<blaze_proc_macro::sandbox::Files, blaze_expand::seen::MemberDirError<'static>> {
+    use blaze_world::procs::files::{PackageAt, sandbox_files};
+    match place {
+        Place::Checkout { dir } => Ok(blaze_proc_macro::sandbox::Files::Member {
+            workspace: std::path::PathBuf::from(checkout),
+            root: blaze_proc_macro::script_sandbox::ScriptRoot::member(dir)?,
+        }),
+        Place::Pack { view, dir } => Ok(sandbox_files(PackageAt::Pack { view, dir })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! A crate of a fetched registry package is shown its own record's files, served at the
@@ -165,5 +186,36 @@ mod tests {
         // package's tree), so its calls were refused before the macro ran.
         assert!(!old_rule_has_package("/1/"), "the planted old rule showed a fetched crate a package");
         println!("fetched crate shown {} files of its own record", shown.len());
+    }
+
+    /// D96: a member's proc macro sees its workspace at `/workspace` with the member at its dir,
+    /// and `CARGO_MANIFEST_DIR` names that same folder (both read from one `seen()`); a fetched
+    /// package stays at `/package`. Cargo's "Environment variables Cargo sets for crates":
+    /// `CARGO_MANIFEST_DIR` is "the directory containing the manifest of your package".
+    /// Control: the old member arm (`PackageAt::Disk`, `Files::Folder`) mounts the member at
+    /// `/package`, which is not `/workspace/crates/app`.
+    ///
+    /// Expected (`lanecheck.sh blaze-cli test proc_callers`):
+    /// `test proc_callers::tests::a_member_s_macro_sees_its_workspace_mount ... ok`, printing
+    /// "member macro sees /workspace/crates/app".
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn a_member_s_macro_sees_its_workspace_mount() {
+        use std::string::ToString;
+
+        let member = super::shown(Place::Checkout { dir: "crates/app" }, "/ws").expect("a plain member dir");
+        let seen = member.seen();
+        assert_eq!(seen.mount(), "/workspace", "a member is mounted at the workspace's mount");
+        assert_eq!(seen.folder(), "crates/app", "the member's folder in the mount");
+        assert_eq!(seen.to_string(), "/workspace/crates/app", "CARGO_MANIFEST_DIR is the mounted folder");
+        let Files::Member { workspace, .. } = &member else { panic!("a member is not served as its workspace: {member:?}") };
+        assert_eq!(workspace.as_path(), std::path::Path::new("/ws"), "the workspace served is the checkout");
+        let root = super::shown(Place::Checkout { dir: "" }, "/ws").expect("the root package");
+        assert_eq!(root.seen().to_string(), "/workspace", "the root package is the workspace's folder");
+        assert!(super::shown(Place::Checkout { dir: "../out" }, "/ws").is_err(), "a dir above the workspace was mounted");
+        // The control: the old arm.
+        let old = sandbox_files(PackageAt::Disk(std::path::Path::new("/ws/crates/app")));
+        assert_ne!(old.seen().to_string(), seen.to_string(), "the planted old arm mounted the member where D96 does");
+        println!("member macro sees {seen}");
     }
 }

@@ -76,6 +76,9 @@ pub enum Refusal<'a> {
     NotConstFn { item: ItemKey },
     /// A call of a `#[rustc_intrinsic]` fn blaze's intrinsic table does not hold.
     UnknownIntrinsic { item: ItemKey },
+    /// A call of `item`, whose kind needs `fact`, which the world does not hold: pending
+    /// (machine/late.rs `Wait::FnFact`), never "not a `const fn`".
+    FnFact { item: ItemKey, fact: crate::Fact },
     /// A `bool` that is not 0 or 1, a `char` that is not a scalar value, an enum tag no
     /// variant has: invalid values ("Behavior considered undefined").
     InvalidBool { value: u128 },
@@ -157,6 +160,7 @@ impl fmt::Display for ConstError<'_> {
             Refusal::MutableStatic { item } => write!(f, "a constant reads mutable static {:#x}", item.0),
             Refusal::NotConstFn { item } => write!(f, "a call of {:#x}, which is not a `const fn`", item.0),
             Refusal::UnknownIntrinsic { item } => write!(f, "a call of {:#x}, an intrinsic blaze's intrinsics table does not hold", item.0),
+            Refusal::FnFact { item, fact } => write!(f, "a call of {:#x}: its kind is not known: {fact}", item.0),
             Refusal::InvalidBool { value } => write!(f, "{value} is not a valid `bool`"),
             Refusal::InvalidChar { value } => write!(f, "{value:#x} is not a valid `char`"),
             Refusal::InvalidTag { bits } => write!(f, "{bits:#x} is the tag of no variant"),

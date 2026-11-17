@@ -170,7 +170,7 @@ fn made(macro_side: bool) -> World<'static> {
     let (id, mut shelf) = shelf(macro_side);
     let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
     let listed = StdBox::leak(StdBox::new(listed));
-    world(graph, lock, listed, &mut places, &NoFiles, None, a()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// With the `wasm32-wasip1` cut: `pm`'s extern `dep` is a crate of the macro side, with that
@@ -223,6 +223,14 @@ version = "0.1.0"
 /// The world of `hello` alone, `edition` its edition, over the fixture's shelf whose std
 /// depends on `cfg_if`.
 fn hello(edition: PackageEdition) -> World<'static> {
+    hello_on(edition, crate::fixture::shelf_with_std_dep)
+}
+
+/// The fixture's shelf, as one of its makers gives it.
+type ShelfOf = fn(&'static str, &str, &'static [(&'static str, Option<&'static str>)], Alloc<'_>) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>);
+
+/// The world of `hello` alone, `edition` its edition, over the shelf `shelf_of` makes.
+fn hello_on(edition: PackageEdition, shelf_of: ShelfOf) -> World<'static> {
     let lock: &'static Lock<'static> = StdBox::leak(StdBox::new(Lock::read(HELLO.as_bytes(), a()).expect("the lock reads")));
     let mut member = unit(lock, "hello", UnitKind::Lib, false, &[]);
     member.edition = edition;
@@ -230,32 +238,44 @@ fn hello(edition: PackageEdition) -> World<'static> {
     units.push(member);
     let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2 }));
     let mut places = Places { lock, dep: &[] };
-    let (id, files) = crate::fixture::shelf_with_std_dep(TRIPLE, crate::fixture::STD, TARGET_CFG, a());
+    let (id, files) = shelf_of(TRIPLE, crate::fixture::STD, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
     let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
     let listed = StdBox::leak(StdBox::new(listed));
-    world(graph, lock, listed, &mut places, &NoFiles, None, a()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// Every toolchain crate's implicit is Rust's, bstd's included, so a blaze-edition program's
-/// world holds Rust's std and std's own dependency (`cfg_if`, from the fixture's shelf) beside
-/// bstd. The world is made only when the list's toolchain crates (std's closure always) are all
-/// opened: the strict match by unit. Prints
-/// `crate list one home: a blaze-edition world opens Rust std for its toolchain (<n> toolchain crates)`.
-/// Without -4 (std opened only for a Rust-edition unit): `hello(BLAZE)` is refused, "the
-/// toolchain crate `…` of the crate list was not opened from the shelf", and on the real run
-/// bstd's closure lost `std` (blaze_ids `Vec` NotFound, recpipe5/time5.sh).
+/// A crate's implicit sysroot dependency is a fact of its own text, an edge of its shelf row
+/// (blaze_toolchain::implied; the Rust Reference, "Extern prelude": `std` is added "as long as
+/// the `no_std` attribute is not specified in the crate root"). So std is opened iff a crate
+/// of the closure names it:
+/// - a blaze-edition program over a shelf whose bstd closure is all `#![no_std]` leaves std
+///   (and std's `cfg_if`) unopened;
+/// - the same program over a shelf where bstd depends on `blaze_ids`, whose root uses std's
+///   prelude (`Vec<u64>`; row `std`, edge `("std", 2)`), opens std and cfg_if, and blaze_ids's
+///   world crate holds the edge to the world's std (what its `Vec` resolves through);
+/// - a Rust 2021 program opens std by its own need.
+/// CONTROL: -4's rule (std always) fails the first assertion; the rule before -4 (std only
+/// for a Rust-edition unit, no edges) fails the second (blaze_ids `Vec` NotFound on the real
+/// run, recpipe5/time5.sh). Prints
+/// `sysroot edge: no_std closure leaves std unopened (<a> toolchain crates); blaze_ids opens std (<b>)`.
 #[test]
-fn a_blaze_edition_world_opens_rust_std_for_the_toolchain() {
+fn std_is_opened_iff_a_crate_of_the_closure_names_it() {
     let named = |w: &World<'static>, name: &str| w.crates.iter().any(|c| c.input.name == name);
+    let at = |w: &World<'static>, name: &str| w.crates.iter().position(|c| c.input.name == name);
     let toolchain = |w: &World<'static>| w.crates.iter().filter(|c| matches!(c.origin, crate::Origin::Toolchain(_))).count();
     let blaze = hello(BLAZE);
-    assert!(named(&blaze, "blaze-std") || named(&blaze, "bstd"), "a blaze-edition program opens bstd");
-    assert!(named(&blaze, "std"), "bstd's implicit is Rust's std: it is opened");
-    assert!(named(&blaze, "cfg_if"), "std's dependency is opened with it");
+    assert!(named(&blaze, "bstd"), "a blaze-edition program opens bstd");
+    assert!(!named(&blaze, "std"), "no crate of a no_std closure names std: it stays unopened");
+    assert!(!named(&blaze, "cfg_if"), "nor std's own dependency");
+    let ids = hello_on(BLAZE, crate::fixture::shelf_with_bstd_naming_std);
+    assert!(named(&ids, "std") && named(&ids, "cfg_if"), "blaze_ids names std: std and its closure are opened");
+    let std_at = at(&ids, "std").expect("std is opened");
+    let ids_at = at(&ids, "blaze_ids").expect("blaze_ids is opened");
+    assert!(ids.crates[ids_at].input.deps.iter().any(|(name, d)| *name == "std" && *d == std_at), "blaze_ids's `std` is the world's std");
     let rust = hello(RUST21);
-    assert!(named(&rust, "std") && named(&rust, "cfg_if"), "under Rust 2021 std and its cfg_if are opened");
-    std::println!("crate list one home: a blaze-edition world opens Rust std for its toolchain ({} toolchain crates)", toolchain(&blaze));
+    assert!(named(&rust, "std") && named(&rust, "cfg_if"), "a Rust 2021 program opens std by its own need");
+    std::println!("sysroot edge: no_std closure leaves std unopened ({} toolchain crates); blaze_ids opens std ({})", toolchain(&blaze), toolchain(&ids));
 }
 
 /// check_scope.rs: an owner's bodies are checked against ONE side. `app` sees the target's
@@ -303,4 +323,44 @@ fn an_owner_sees_one_side() {
     let old_cores = old.iter().filter(|at| w.crates[**at].input.name == "core").count();
     assert_eq!(old_cores, 2, "the old rule joined both sides' cores for pm");
     std::println!("check scope: app's core is crate {}, pm's crate {}; the old rule gave pm {old_cores} cores", app_cores[0], pm_cores[0]);
+}
+
+/// crate_list.rs: the crate list written from a world reads back EQUAL to it (every field of
+/// every crate found by its key, each dependency's name and key, the sysroot), and every
+/// owner's check scope over the list names the crates its scope over the world names, seen
+/// alike: for the hello program and for a workspace with a macro side. CONTROL: a list whose
+/// first row holds the second row's root (a row of another crate) differs. Prints
+/// `crate list: <what>: <n> crates, <b> bytes, 0 differences; control: <k> differences`.
+#[test]
+fn the_crate_list_reads_back_as_its_world() {
+    use crate::check_scope::{Seen, check_scope, check_scope_in};
+    use crate::crate_list::{CrateList, HEADER_LEN, ROW, differences, encode};
+    for (what, w) in [("hello", hello(BLAZE)), ("macro side", made(true))] {
+        let bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
+        let list = CrateList::open(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        let differ = differences(&w, &list);
+        assert_eq!(differ, 0, "{what}: the list differs from its world");
+        for owner in 0..w.crates.len() {
+            let row = list.find(w.crates[owner].input.key).expect("every crate has its row");
+            let by_world = check_scope(&w, owner, false, a()).ok().map(|s| {
+                let mut v: StdVec<([u8; 32], Seen)> = s.readers().iter().map(|(at, how)| (w.crates[*at].input.key.0.0, *how)).collect();
+                v.sort_unstable_by_key(|(k, _)| *k);
+                v
+            });
+            let by_list = check_scope_in(&list, row, false, a()).ok().map(|s| {
+                let mut v: StdVec<([u8; 32], Seen)> = s.readers().iter().map(|(r, how)| (list.key(*r).0.0, *how)).collect();
+                v.sort_unstable_by_key(|(k, _)| *k);
+                v
+            });
+            assert_eq!(by_world, by_list, "{what}: owner {} sees other crates over the list", w.crates[owner].input.name);
+        }
+        // CONTROL: row 0's root range replaced by row 1's.
+        let mut planted = bytes.to_vec();
+        let (r0, r1) = (HEADER_LEN + 40, HEADER_LEN + ROW + 40);
+        let other: [u8; 8] = planted[r1..r1 + 8].try_into().expect("8 bytes");
+        planted[r0..r0 + 8].copy_from_slice(&other);
+        let control = differences(&w, &CrateList::open(&planted).unwrap_or_else(|e| panic!("{e}")));
+        assert!(control > 0, "{what}: CONTROL: a row holding another crate's root must differ");
+        std::println!("crate list: {what}: {} crates, {} bytes, {differ} differences; control: {control} differences", w.crates.len(), bytes.len());
+    }
 }

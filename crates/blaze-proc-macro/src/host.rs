@@ -73,6 +73,7 @@ use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, Oper
 use crate::{
     module::{Exported, ModuleRecord, sha256_hex},
     parts::{Clock, Mark, Part, Parts},
+    package_env::EnvRefused,
     sandbox::{Package, Sandbox},
     server::{Outcome, ProduceError, Server, ServerError, ServerLimits, Tracked},
 };
@@ -698,8 +699,10 @@ fn imports(l: &mut Linker<Host>) -> wasmtime::Result<()> {
             };
             let name = name.to_owned();
             match host.sandbox.var(&name) {
-                Some(value) => give(mem, into, capacity, value.as_bytes()),
-                None => Ok(-1),
+                Ok(Some(value)) => give(mem, into, capacity, value.as_bytes()),
+                Ok(None) => Ok(-1),
+                // Kept in `sandbox.env_refused`: `stopped_by` gives it as the call's error.
+                Err(refused) => Err(Stop(refused.to_string())),
             }
         })
     })?;
@@ -719,6 +722,9 @@ pub enum CallError {
     Limit { limit: ProcLimit, why: String },
     /// A question the host refuses (a position in a file).
     Refused(String),
+    /// A variable read whose value this build does not know (package_env.rs): refused by name,
+    /// never answered unset.
+    EnvUnknown(EnvRefused),
     /// The module broke the protocol, trapped or stopped otherwise.
     Failed(String),
 }
@@ -728,7 +734,7 @@ impl CallError {
     pub fn host_error(&self) -> HostError {
         let why = match self {
             CallError::Limit { limit, .. } => HostWhy::Limit(*limit),
-            CallError::Refused(_) => HostWhy::Refused,
+            CallError::Refused(_) | CallError::EnvUnknown(_) => HostWhy::Refused,
             CallError::Failed(_) => HostWhy::Failed,
         };
         HostError { ask: HostAsk::ProcMacro, why }
@@ -750,6 +756,7 @@ impl std::fmt::Display for ExpandError {
         let (what, why) = match &self.error {
             CallError::Limit { limit, why } => (format!("ran past its {limit:?} limit"), why),
             CallError::Refused(why) => ("asked what blaze does not answer".to_owned(), why),
+            CallError::EnvUnknown(refused) => return write!(f, "the proc macro `{}` of {} {refused}", self.name, self.krate),
             CallError::Failed(why) => ("failed".to_owned(), why),
         };
         write!(f, "the proc macro `{}` of {} {what}: {why}", self.name, self.krate)
@@ -829,7 +836,9 @@ impl Runtime {
         for tracked in std::mem::take(&mut host.server.tracked) {
             match tracked {
                 Tracked::Env(name) => {
-                    host.sandbox.var(&name);
+                    if let Err(refused) = host.sandbox.var(&name) {
+                        return Err(named(CallError::EnvUnknown(refused)));
+                    }
                 }
                 Tracked::Path(path) => {
                     if host.sandbox.track_path(&path).is_err()
@@ -862,6 +871,9 @@ impl Runtime {
 /// What an instance that ended in `error` gave: the panic its hook gave before it aborted,
 /// or why it stopped.
 fn stopped_by(host: &mut Host, error: &wasmtime::Error, out_of_fuel: bool) -> Result<Outcome, CallError> {
+    if let Some(refused) = host.sandbox.env_refused.take() {
+        return Err(CallError::EnvUnknown(refused));
+    }
     if let Some((limit, why)) = host.sandbox.refused.take() {
         return Err(CallError::Limit { limit, why });
     }

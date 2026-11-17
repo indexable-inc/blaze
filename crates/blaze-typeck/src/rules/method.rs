@@ -28,7 +28,7 @@ use blaze_own::{Alloc, Vec};
 
 use crate::body::Segment;
 use crate::columns::AdjustKind;
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, ItemKey, List, Mutbl, Name, ScopeId};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Step, Then};
@@ -82,14 +82,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 match self.probe_method(recv, name, scope)? {
                     Ok(pick) => {
                         let Some((inputs, output)) = self.confirm(e, receiver, &pick, seg)? else {
-                            self.diag(DiagCode::NoMethod, At::Expr(e), None, Some(recv), Some(name));
+                            self.diag(DiagCode::NoMethod, At::Expr(e), About::found_named(recv, name));
                             let errs = self.err_list(arg_ids.len())?;
                             return self.start_args(f, e, arg_ids, errs, self.common.err, 2, false);
                         };
                         self.start_args(f, e, arg_ids, inputs, output, 2, true)
                     }
                     Err(code) => {
-                        self.diag(code, At::Expr(e), None, Some(recv), Some(name));
+                        self.diag(code, At::Expr(e), About::found_named(recv, name));
                         let errs = self.err_list(arg_ids.len())?;
                         self.start_args(f, e, arg_ids, errs, self.common.err, 2, false)
                     }

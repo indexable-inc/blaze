@@ -33,6 +33,8 @@
 
 use crate::Platform;
 
+mod so;
+
 /// "BNL2".
 pub const MAGIC: u32 = 0x424e_4c32;
 /// "BNL1", the form before the pointer rows and the names: refused by name.
@@ -112,9 +114,11 @@ impl Descriptor {
 pub enum DescriptorError {
     /// The bytes are not an arm64 Mach-O `MH_DYLIB` (W4's record form).
     NotDylib,
-    /// The record is for Linux: its ELF reader comes with W5's writer.
-    ElfNotBuilt,
-    /// The dylib has no `__DATA,__data` section, where the descriptor starts.
+    /// The Linux record's ELF field `field` holds `got`, which the reader refuses (ELF64
+    /// little-endian `ET_DYN` for `EM_AARCH64` or `EM_X86_64` only; descriptor/so.rs).
+    ElfField { field: &'static str, got: u64 },
+    /// The record has no `__DATA,__data` (Mach-O) or `.data` (ELF) section, where the descriptor
+    /// starts.
     NoData,
     /// `what` at file offset `at` runs past the record's bytes.
     Truncated { what: &'static str, at: u64 },
@@ -220,11 +224,13 @@ fn file_offset(file: &[u8], at: u64, what: &'static str) -> Result<usize, Descri
     found.map(|off| off as usize).ok_or(DescriptorError::Unmapped { what, at })
 }
 
-/// The descriptor and the names table of a native library record's bytes (W4's dylib), read in
-/// place, checked: BNL2, and every name inside the bytes.
+/// The descriptor and the names table of a native library record's bytes (W4's dylib on macOS,
+/// W5's shared object on Linux: descriptor/so.rs), read in place, checked: BNL2, and every name
+/// inside the bytes.
 pub fn read(file: &[u8], platform: Platform) -> Result<(Descriptor, Names<'_>), DescriptorError> {
-    if platform != Platform::MacosArm64 {
-        return Err(DescriptorError::ElfNotBuilt);
+    match platform {
+        Platform::MacosArm64 => {}
+        Platform::LinuxArm64 => return so::read(file),
     }
     // `__DATA,__data`'s address: the descriptor is its first 48 bytes (layout.rs).
     let data = each_command(file, |c, cmd| {
@@ -242,14 +248,26 @@ pub fn read(file: &[u8], platform: Platform) -> Result<(Descriptor, Names<'_>), 
     })?
     .ok_or(DescriptorError::NoData)?;
     let off = file_offset(file, data, "the descriptor")?;
-    let bytes: &[u8; LEN as usize] = file
-        .get(off..off + LEN as usize)
+    descriptor_at(file, off, |at, what| file_offset(file, at, what))
+}
+
+/// The tail both formats share: the descriptor at file offset `off`, its tag checked, and its
+/// names table found through `map` (image address to file offset, the format's segment map),
+/// every name checked inside the bytes.
+fn descriptor_at<'f>(
+    file: &'f [u8],
+    off: usize,
+    map: impl Fn(u64, &'static str) -> Result<usize, DescriptorError>,
+) -> Result<(Descriptor, Names<'f>), DescriptorError> {
+    let bytes: &[u8; LEN as usize] = off
+        .checked_add(LEN as usize)
+        .and_then(|end| file.get(off..end))
         .and_then(|b| b.try_into().ok())
         .ok_or(DescriptorError::Truncated { what: "the descriptor", at: off as u64 })?;
     let d = Descriptor::from_bytes(bytes);
     d.check()?;
-    let names_off = file_offset(file, d.name_at, "the names table")?;
-    let table = &file[names_off..];
+    let names_off = map(d.name_at, "the names table")?;
+    let table = file.get(names_off..).ok_or(DescriptorError::Truncated { what: "the names table", at: names_off as u64 })?;
     let names = Names { table, count: d.words };
     for i in 0..names.len() {
         if names.get(i).is_none() {
@@ -353,8 +371,9 @@ mod tests {
 
     /// The store-hit reader finds the descriptor at `__DATA,__data` through the load commands
     /// and the names through the segment's address-to-file map; BNL1 is refused by its tag; a
-    /// Linux record is refused by name. Prints "descriptor: read 2 names [_a, _bc] from a dylib's
-    /// bytes; BNL1 Old; Linux ElfNotBuilt".
+    /// dylib read as a Linux record is refused at its ELF magic, by name. Prints "descriptor:
+    /// read 2 names [_a, _bc] from a dylib's bytes; BNL1 Old; a dylib read as ELF refused at
+    /// e_ident".
     #[test]
     fn read_finds_names_in_a_dylib() {
         let file = dylib(MAGIC);
@@ -363,8 +382,11 @@ mod tests {
         assert_eq!((names.get(0), names.get(1)), (Some(&b"_a"[..]), Some(&b"_bc"[..])));
         let old = dylib(MAGIC_BNL1);
         assert_eq!(read(&old, Platform::MacosArm64).map(|(d, _)| d), Err(DescriptorError::Old { tag: MAGIC_BNL1 }));
-        assert_eq!(read(&file, Platform::LinuxArm64).map(|(d, _)| d), Err(DescriptorError::ElfNotBuilt));
+        assert_eq!(
+            read(&file, Platform::LinuxArm64).map(|(d, _)| d),
+            Err(DescriptorError::ElfField { field: "e_ident[EI_MAG0..=EI_MAG3]", got: 0xfeed_facf })
+        );
         assert_eq!(read(&file[..0x110], Platform::MacosArm64).map(|(d, _)| d), Err(DescriptorError::Truncated { what: "the descriptor", at: 0x100 }));
-        std::println!("descriptor: read 2 names [_a, _bc] from a dylib's bytes; BNL1 Old; Linux ElfNotBuilt");
+        std::println!("descriptor: read 2 names [_a, _bc] from a dylib's bytes; BNL1 Old; a dylib read as ELF refused at e_ident");
     }
 }

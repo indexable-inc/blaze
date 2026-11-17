@@ -118,7 +118,7 @@ pub(super) fn check_with(io: &Io, at: &'static str, keys: Keys, home: &'static s
     let said = words(command.0, &out, &err);
     let toolchain = shelf(io, home);
     let before = stdout(io).len();
-    let finished = request(&cx, &root, (at, None, None, Some(home), None, Some("/"), toolchain), origin, command, 1, &producers_for(at, keys), work::Sizes::USUAL, &launch, frame, said, &err, &mut ran, &mut shown, &mut phases)
+    let finished = request(&cx, &root, (at, None, None, Some(home), None, Some("/"), toolchain, None, Err(crate::fetch::ExeDirWhy::NotRead)), origin, command, 1, &producers_for(at, keys), work::Sizes::USUAL, &launch, frame, said, &err, &mut ran, &mut shown, &mut phases)
         .expect("the request answers");
     let status = close(&cx, command.0, &finished, &shown, ran, 0, frame, said).ok().map(|status| status.0);
     let printed = stdout(io);

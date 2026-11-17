@@ -1,5 +1,6 @@
 //! The plain store's state machine ([`super`] has the layout and the costs): opening (the
-//! head, the manifest, every segment mapped once, a segment of another boot checked whole),
+//! head and the manifest; a segment mapped at its first probe, an unsealed segment of another
+//! boot checked whole at its first hit: `probe.rs`),
 //! reads in place with no lock and no shared write, puts into per-worker [`Batch`]es, the
 //! commit (one segment written without a lock, then the flip under the one lock), and
 //! compaction in bounded slices. It owns no IO: it hands back [`Effect`]s and takes their
@@ -28,6 +29,10 @@ use super::format::{
 };
 use super::verified::{Boot, Checks, Unverified, Verified};
 use crate::{Corrupt, Key, Mismatch, content_of};
+
+/// The lazy open's reads: [`Plain::find`], [`Plain::map_all`], the probe order.
+mod probe;
+pub use probe::{Found, Probe, Probes};
 
 /// The tag of the store's own root records (a root's sorted keys), always under
 /// [`Namespace::LOCAL`]: reserved, no kind of blaze-keyed's takes it.
@@ -294,6 +299,11 @@ pub(crate) enum Plant {
     /// A flip after an open that found no generation's manifest appends to the log the newest
     /// slot names, which a power cut may have taken.
     AppendToLostLog,
+    /// A hit in an earlier boot's unsealed segment, parked by a probe, is served without its
+    /// full check: a torn record served.
+    TrustsUnchecked,
+    /// The lazy open maps (and checks) every segment its generation names, as the old open did.
+    MapsAllAtOpen,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -525,6 +535,10 @@ enum Then {
     Commit,
     Stamp,
     Compact(Sliced),
+    /// One row a probe asked ([`Plain::find`]).
+    Probe,
+    /// Every row ([`Plain::map_all`]): whole after it.
+    All,
 }
 
 /// The plain store's state machine: one per process (or per test actor).
@@ -554,8 +568,20 @@ pub struct Plain {
     /// crash re-walks only the segment it was in.
     scrubbing: Option<ScrubAt>,
     by_id: BTreeMap<u64, usize>,
-    /// What [`Plain::get`] searches: this generation's mapped segments, newest first.
+    /// This generation's local rows not lost, as indices into `manifest.segments`, in probe
+    /// order (largest first, ties newest first: [`Plain::order_view`]). A row may be unmapped.
     view: Vec<usize>,
+    /// Earlier-boot unsealed segments a probe mapped, length checked, not yet proved: each is
+    /// checked whole at its first hit, or by [`Plain::map_all`] (probe.rs).
+    unchecked: BTreeMap<u64, Unverified>,
+    /// Whole: every row is mapped (and none parked) from now on, every later generation mapped
+    /// as it is adopted: after [`Plain::map_all`] or [`Plain::open_whole`].
+    eager: bool,
+    /// The wall clock when the open read its generation: a map is asked within [`GRACE_NS`]
+    /// of it (probe.rs, "THE GRACE").
+    opened_ns: u64,
+    /// What this process's gets probed, for `--stats`.
+    probes: Probes,
     /// The store's own batches, one for each namespace of [`PlainConfig::writes`] in its order,
     /// behind [`Plain::put`]: read back by [`Plain::get`] until the commit that writes them
     /// completes.
@@ -756,6 +782,10 @@ impl Plain {
             maps: Vec::new_in(Global),
             by_id: BTreeMap::new(),
             view: Vec::new_in(Global),
+            unchecked: BTreeMap::new(),
+            eager: false,
+            opened_ns: 0,
+            probes: Probes::default(),
             roots_pending: Vec::new_in(Global),
             checked: BTreeSet::new(),
             dropped: BTreeSet::new(),
@@ -894,11 +924,18 @@ impl Plain {
     /// until one holds it. Each segment here is proved ([`Verified`]): the probe reads the entry
     /// it lands on and checks nothing (its layout was checked once, with every byte), so a
     /// lookup cannot fail.
+    ///
+    /// The MAPPED rows alone, in probe order: every row once the store is whole
+    /// ([`Plain::map_all`]); before that only [`Plain::find`] reaches the rest, and the `&self`
+    /// reads that call this assert a whole store. (A put asks it before whole: it sees what is
+    /// mapped, and the commit, which needs a whole store, refuses two values under one key.)
     fn find_in(&self, spaces: &[Namespace], key: &Key) -> Option<(usize, Entry)> {
         if self.plant() == Plant::IgnoresNamespace {
-            return self.view.iter().find_map(|&at| self.probe(at, key));
+            return self.view.iter().filter_map(|&row| self.mapped_row(row)).find_map(|at| self.probe(at, key));
         }
-        spaces.iter().find_map(|space| self.view.iter().filter(|&&at| self.maps[at].seg().namespace == *space).find_map(|&at| self.probe(at, key)))
+        spaces.iter().find_map(|space| {
+            self.view.iter().filter(|&&row| self.manifest.segments[row].namespace == *space).filter_map(|&row| self.mapped_row(row)).find_map(|at| self.probe(at, key))
+        })
     }
 
     fn probe(&self, at: usize, key: &Key) -> Option<(usize, Entry)> {
@@ -913,6 +950,7 @@ impl Plain {
     /// [`Plain::get`] in `spaces` alone, asked in their order (the caller's, never more): for
     /// each, what this process holds uncommitted under it, then its committed segments.
     pub fn get_in(&self, spaces: &[Namespace], key: &Key) -> Option<Got<'_>> {
+        assert!(self.eager, "Plain::get_in reads a whole store: Plain::map_all (or open_whole) first, or Plain::find, which maps at a first probe");
         for space in spaces {
             if let Some(got) = self.held_get(*space, key) {
                 return Some(got);
@@ -969,6 +1007,7 @@ impl Plain {
     /// on the disk after its segment was proved is found here, or by the consumer that fails on
     /// it; a read never looks.
     pub fn scrub(&self) -> Vec<Corrupt> {
+        assert!(self.eager, "Plain::scrub walks a whole store: Plain::map_all first");
         let mut out = Vec::new_in(Global);
         out.extend(self.maps.iter().flat_map(Verified::scrub));
         out
@@ -1018,6 +1057,7 @@ impl Plain {
     /// read into the caller's buffer (`pread`) of a proved segment. Records put and not
     /// committed are [`Plain::get`]'s.
     pub fn locate_in(&self, spaces: &[Namespace], key: &Key) -> Option<Placed> {
+        assert!(self.eager, "Plain::locate_in reads a whole store: Plain::map_all (or open_whole) first, or Plain::find and Plain::placed");
         self.find_in(spaces, key).map(|(at, entry)| {
             let mut checks = self.checks.get();
             checks.reads += 1;
@@ -1116,6 +1156,12 @@ impl Plain {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
+        // The layout refuses two values under one key against every committed row: a whole
+        // store (rule 21). A commit with nothing to lay out (stamps alone) needs none.
+        assert!(
+            self.eager || (!self.holds_uncommitted() && batches.iter().all(|it| it.is_empty())),
+            "Plain::commit lays out against a whole store: Plain::map_all first"
+        );
         if let Some(batch) = batches.iter().find(|it| !self.cfg.writes.contains(&it.namespace)) {
             return Err(StoreError::NotWritable { namespace: batch.namespace });
         }
@@ -1326,6 +1372,7 @@ impl Plain {
         if !self.ready() {
             return false;
         }
+        assert!(self.eager, "Plain::compact copies from a whole store: Plain::map_all first");
         self.phase = Phase::Listing;
         effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
         true
@@ -1823,6 +1870,12 @@ impl Plain {
 
     /// Maps each segment of this process's manifest it has not mapped; then what `then` says.
     fn map_new(&mut self, then: Then, effects: &mut Vec<Effect>) {
+        // Lazy until whole: no row is mapped before a probe reaches it (probe.rs). The plant
+        // maps every row at the open, as the open did before piece 3.
+        if !self.eager && !(then == Then::Open && self.plant() == Plant::MapsAllAtOpen) {
+            self.mapped(then, effects);
+            return;
+        }
         let mut left = 0;
         for (i, seg) in self.manifest.segments.iter().enumerate() {
             if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) {
@@ -1883,6 +1936,8 @@ impl Plain {
                     at: unverified.len(),
                 })),
             },
+            // A probe's map: length checked and parked; the full check waits for its first hit.
+            Err(unverified) if self.parks() => return self.park(unverified),
             Err(unverified) if self.plant() == Plant::TrustBoot => Ok(self.trust_for_a_plant(unverified)),
             Err(unverified) => {
                 let mut checks = self.checks.get();
@@ -2002,6 +2057,12 @@ impl Plain {
         let mut ids = Vec::new_in(Global);
         ids.extend(self.manifest.segments.iter().filter(|it| it.local && !it.sealed && it.boot == self.cfg.boot).map(|it| (it.id, it.generation)));
         if ids.is_empty() {
+            // Nothing to seal, but rows this process checked at a first hit (or lost) after
+            // its open: one flip records them for the boot, so no later process checks again.
+            if self.pending_stamps() {
+                self.start_flip(Change::Stamp, effects);
+                return true;
+            }
             return false;
         }
         if self.plant() == Plant::SealBeforeBarrier {
@@ -2068,10 +2129,9 @@ impl Plain {
             let why = format!("a sealed segment's record rotted on the disk after its seal ({}): found by this boot's background pass; its records are dropped", rot.what);
             let file = self.segment_file(at.id);
             self.lose(seg, file, LostKind::NotWhole, why);
-            // Out of the lookup's view now, before its flip lands: no lookup is served from
-            // it again. The mapping stays (mappings live as long as the process), so a reader
-            // holding its bytes keeps them.
-            self.view.retain(|it| *it != map);
+            // Out of every lookup now, before its flip lands (`lose` marks it dropped, which
+            // every probe skips): no lookup is served from it again. The mapping stays
+            // (mappings live as long as the process), so a reader holding its bytes keeps them.
             self.start_flip(Change::Stamp, effects);
             return Some(Scrubbed { segment: at.id, bytes, done: true, rot: Some(rot) });
         }
@@ -2090,14 +2150,7 @@ impl Plain {
     }
 
     fn mapped(&mut self, then: Then, effects: &mut Vec<Effect>) {
-        self.view.clear();
-        for seg in self.manifest.segments.iter().rev() {
-            if let Some(&at) = self.by_id.get(&seg.id)
-                && !self.dropped.contains(&seg.id)
-            {
-                self.view.push(at);
-            }
-        }
+        self.order_view();
         match then {
             Then::Commit => {
                 let segments = std::mem::replace(&mut self.committing, Vec::new_in(Global));
@@ -2109,7 +2162,8 @@ impl Plain {
                 stats.more = !next.is_empty();
                 self.sliced = Some(stats);
             }
-            Then::Open | Then::Stamp => {}
+            Then::Open | Then::Stamp | Then::Probe => {}
+            Then::All => self.all_mapped(),
         }
         if then == Then::Open && self.pending_stamps() {
             self.start_flip(Change::Stamp, effects);
@@ -2607,6 +2661,7 @@ impl Plain {
             Ctx::Open => {
                 self.slot = base.slot;
                 self.manifest = base.manifest;
+                self.opened_ns = now_ns;
                 // Rows retired as lost and not yet reported to a caller who got the report
                 // (whoever wrote them: this open's process before a crash, or another): this
                 // open reports them, and clears them only after its own report is handed.

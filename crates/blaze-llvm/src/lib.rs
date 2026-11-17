@@ -36,6 +36,10 @@ pub mod pipeline;
 pub mod read;
 pub mod read_lsda;
 pub mod remarks;
+pub mod table_gen;
+
+#[cfg(test)]
+mod table_gen_tests;
 
 pub use compile::{Linked, LlvmError, Severity, bitcode, compile, default_pipeline, init, triple};
 pub use lower::{CalleeFacts, LowerError, Lowered, Offered, lower};

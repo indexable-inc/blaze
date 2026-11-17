@@ -20,7 +20,7 @@ use blaze_toolchain::Shelf;
 use blaze_unit_graph::{CfgAtom, Resolver, StdIs, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 use edition::{BlazeEdition, Edition as Syntax, PackageEdition};
 
-use crate::{Listed, Packages, Place, Script, ScriptOutputs, Toolchain, Tree, World, WorldError, open_list, world};
+use crate::{Listed, Packages, Place, Script, Toolchain, Tree, World, WorldError, joined, open_list, world};
 
 fn g() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
@@ -257,18 +257,9 @@ fn store(lock: &'static Lock<'static>) -> Store {
     Store { lock, packs, asked: vec![], app_dir: "app" }
 }
 
-/// One record for every served library: cfg `has_atomics`, an env pair and one generated file.
-struct Scripts(OutputsRef<'static>);
-
-impl ScriptOutputs<'static> for Scripts {
-    fn served(&self, _lib: UnitId) -> Option<crate::Served<'static>> {
-        Some(crate::Served { outputs: self.0, cfg: &[("has_atomics", None)], digest: self.0.crate_digest() })
-    }
-}
-
-/// [`Scripts`] whose record's generated file `gen.rs` holds `file`, and whose env pair
-/// `VERSION` is `version`.
-fn scripts(file: &str, version: &str) -> &'static Scripts {
+/// A script's outputs record: cfg `has_atomics`, the env pair `VERSION` = `version` and one
+/// generated file `gen.rs` holding `file`.
+fn scripts(file: &str, version: &str) -> OutputsRef<'static> {
     let printed = format!("cargo:rustc-cfg=has_atomics\ncargo:rustc-env=VERSION={version}\n");
     let out_dir = "/target/debug/build/util-0123456789abcdef/out";
     let mut out = Outputs::read(printed.as_bytes(), out_dir, OutputLimits::DEFAULT, g()).unwrap_or_else(|e| panic!("{e:?}"));
@@ -276,19 +267,19 @@ fn scripts(file: &str, version: &str) -> &'static Scripts {
     let mut bytes = AVec::new_in(g());
     out.encode(&mut bytes);
     let bytes: &'static [u8] = bytes.leak();
-    StdBox::leak(StdBox::new(Scripts(OutputsRef::open(bytes).unwrap_or_else(|e| panic!("{e:?}")))))
+    OutputsRef::open(bytes).unwrap_or_else(|e| panic!("{e:?}"))
 }
 
 fn lock() -> &'static Lock<'static> {
     StdBox::leak(StdBox::new(Lock::read(LOCK.as_bytes(), g()).expect("the lock reads")))
 }
 
-fn made(order: &[u32; 9], scripts: Option<&dyn ScriptOutputs<'static>>) -> World<'static> {
+fn made(order: &[u32; 9]) -> World<'static> {
     let lock = lock();
     let graph = graph(lock, order);
     let mut store = store(lock);
     let listed = listed(graph, lock, &mut store);
-    world(graph, lock, listed, &mut store, checkout(), scripts, g()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut store, checkout(), g()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn by_name<'w>(w: &'w World<'static>, name: &str) -> StdVec<&'w crate::Crate<'static>> {
@@ -299,7 +290,7 @@ const IN_ORDER: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 #[test]
 fn the_inputs_hold_what_each_unit_is_given() {
-    let w = made(&IN_ORDER, None);
+    let w = made(&IN_ORDER);
     let names: StdVec<&str> = w.crates.iter().map(|c| c.input.name).collect();
     // The toolchain first (proc_macro for derive_it, bstd for blz), then the list's units: no
     // build script, no host-side helper (a dependency's proc macro is kept without its
@@ -337,30 +328,34 @@ fn the_inputs_hold_what_each_unit_is_given() {
     assert!(pm.input.cfg.contains(&("proc_macro", None)));
 
     let util = by_name(&w, "util")[0];
-    assert_eq!(util.script, Script::Missing, "its build script's outputs were not given");
+    assert!(matches!(util.script, Script::Read { .. }), "its build script's record is read by its tasks");
+    assert!(util.input.script.is_none(), "the world holds no script record (D115 (B))");
     assert!(util.input.cfg.contains(&("feature", Some("std"))));
     assert_eq!(util.input.features, ["std"]);
     assert!(util.input.root.ends_with("/src/lib.rs") && !util.input.root.starts_with("/0/"));
 }
 
+/// D115 (B): the crate's task joins its script's outputs: the `rustc-cfg` atom joins the unit's
+/// cfg and the record is the input's (`env!`, `include!`); the key is the world's, unmoved.
+/// Expected: `test tests::a_build_scripts_cfg_joins_its_library_at_task_time ... ok`.
+/// Control: drop `cfg.extend(outputs.cfgs())` in `joined`: "the joined input lacks the script's cfg".
 #[test]
-fn a_build_scripts_cfg_joins_its_library() {
-    let w = made(&IN_ORDER, Some(scripts("pub fn made() {}\n", "1")));
+fn a_build_scripts_cfg_joins_its_library_at_task_time() {
+    let w = made(&IN_ORDER);
     let util = by_name(&w, "util")[0];
-    assert_eq!(util.script, Script::Joined);
-    assert!(util.input.cfg.contains(&("has_atomics", None)));
-    // The record is the crate's input: its generated file and env pair are what expansion reads.
-    let record = util.input.script.unwrap_or_else(|| panic!("util's input has no script record"));
+    assert!(matches!(util.script, Script::Read { .. }));
+    assert!(!util.input.cfg.contains(&("has_atomics", None)), "the world's input holds no script atom");
+    let input = joined(&util.input, scripts("pub fn made() {}\n", "1"), g());
+    assert!(input.cfg.contains(&("has_atomics", None)), "the joined input lacks the script's cfg");
+    assert!(util.input.cfg.iter().all(|atom| input.cfg.contains(atom)), "the join dropped a unit atom");
+    assert!(input.cfg.windows(2).all(|pair| pair[0] < pair[1]), "the joined cfg is not sorted and each once");
+    // The record is the task's input: its generated file and env pair are what expansion reads.
+    let record = input.script.unwrap_or_else(|| panic!("the joined input has no script record"));
     assert_eq!(record.file("gen.rs"), Some(&b"pub fn made() {}\n"[..]));
     assert_eq!(record.env().collect::<StdVec<_>>(), [("VERSION", "1")]);
-    // Only a unit a script serves takes a record.
-    assert!(by_name(&w, "app")[0].input.script.is_none());
-    // Control: without the outputs the atom is not there, and the key differs (rule 21).
-    let bare = made(&IN_ORDER, None);
-    let bare_util = by_name(&bare, "util")[0];
-    assert!(!bare_util.input.cfg.contains(&("has_atomics", None)));
-    assert!(bare_util.input.script.is_none());
-    assert_ne!(util.input.key, bare_util.input.key);
+    assert_eq!(input.key, util.input.key, "the join moved the crate's key");
+    // Only a crate with a script reads one.
+    assert_eq!(by_name(&w, "app")[0].script, Script::None);
 }
 
 /// std's build script (library/std/build.rs:80) prints `cargo:rustc-cfg=backtrace_in_libstd` on
@@ -371,23 +366,62 @@ fn a_build_scripts_cfg_joins_its_library() {
 /// table gives std, and only std, the atom (toolchain.rs `STD_SCRIPT_CFG`).
 #[test]
 fn std_carries_its_build_script_cfg() {
-    let tc = toolchain(crate::Needs { bstd: false, proc_macro: false });
+    let tc = toolchain(crate::Needs { std: true, bstd: false, proc_macro: false });
     let std = &tc.crates()[tc.std().unwrap_or_else(|| panic!("no std"))];
     assert!(std.cfg.contains(&("backtrace_in_libstd", None)), "std's cfg: {:?}", std.cfg);
     let core = &tc.crates()[tc.core().unwrap_or_else(|| panic!("no core"))];
     assert!(!core.cfg.contains(&("backtrace_in_libstd", None)), "core's cfg: {:?}", core.cfg);
 }
 
-/// Two records equal in cfgs that differ only in one generated file's bytes, or only in one env
-/// value, give the crate two keys: a changed file under an unchanged key would be two values
-/// under one key (rule 21). The control: equal records give one key.
+/// D115 (B): a script's outputs are a READ of the crate's task (its `Script` record and out in
+/// the read list), never in the crate's key: two outputs that differ in a generated file or an
+/// env value join to two inputs under ONE key; what moves is the joined input the task reads.
+/// Expected: `test tests::a_crates_key_does_not_hold_its_scripts_outputs ... ok`.
 #[test]
-fn a_crates_key_covers_its_scripts_files_and_env() {
-    let key = |file: &str, version: &str| by_name(&made(&IN_ORDER, Some(scripts(file, version))), "util")[0].input.key;
-    let first = key("pub fn made() {}\n", "1");
-    assert_eq!(first, key("pub fn made() {}\n", "1"));
-    assert_ne!(first, key("pub fn made() { }\n", "1"), "a changed generated file left the key unchanged");
-    assert_ne!(first, key("pub fn made() {}\n", "2"), "a changed env value left the key unchanged");
+fn a_crates_key_does_not_hold_its_scripts_outputs() {
+    let w = made(&IN_ORDER);
+    let util = by_name(&w, "util")[0];
+    let first = joined(&util.input, scripts("pub fn made() {}\n", "1"), g());
+    let file = joined(&util.input, scripts("pub fn made() { }\n", "1"), g());
+    let env = joined(&util.input, scripts("pub fn made() {}\n", "2"), g());
+    assert_eq!(first.key, file.key);
+    assert_eq!(first.key, env.key);
+    assert_eq!(first.key, util.input.key);
+    // What the task reads does move (control: the record differs where the inputs differ).
+    assert_ne!(first.script.map(|r| r.file("gen.rs")), file.script.map(|r| r.file("gen.rs")));
+    assert_ne!(first.script.map(|r| r.env().collect::<StdVec<_>>()), env.script.map(|r| r.env().collect::<StdVec<_>>()));
+}
+
+/// Ruling D115 (2): one subject function from the list key's parts; the SIDE tells a target
+/// copy's run from a macro-side copy's, so a unit on both sides (a proc macro kept on the target
+/// side and reached on the macro side) names two runs, and each crate its own.
+/// Expected: `test tests::a_scripts_subject_is_its_crates_side ... ok`.
+#[test]
+fn a_scripts_subject_is_its_crates_side() {
+    let subject = |side, features: &[&str]| crate::script_subject("util", "0.1.0", side, features, g());
+    assert_eq!(subject(crate::Side::Target, &["std"]), subject(crate::Side::Target, &["std"]));
+    assert_ne!(subject(crate::Side::Target, &["std"]), subject(crate::Side::Macro, &["std"]), "the side left the subject unchanged");
+    assert_ne!(subject(crate::Side::Target, &["std"]), subject(crate::Side::Target, &[]), "the features left the subject unchanged");
+    // The world names util's run by that function, its side's.
+    let w = made(&IN_ORDER);
+    let util = by_name(&w, "util")[0];
+    assert_eq!(util.script, Script::Read { subject: crate::script_subject(util.package, util.version, util.side, util.input.features, g()) });
+}
+
+/// Two units under one crate key that name two runs are refused naming both (built by hand:
+/// unreachable through `world`, whose subject is made of the key's parts).
+/// Expected: `test tests::two_runs_under_one_crate_key_are_refused ... ok`.
+/// Control: `one_script` returning `Ok(())` always: "two runs under one key passed".
+#[test]
+fn two_runs_under_one_crate_key_are_refused() {
+    let target = Script::Read { subject: crate::script_subject("util", "0.1.0", crate::Side::Target, &[], g()) };
+    let other = Script::Read { subject: crate::script_subject("util", "0.1.0", crate::Side::Macro, &[], g()) };
+    assert!(crate::list::one_script(("util", target), ("util", target)).is_ok());
+    match crate::list::one_script(("util", target), ("util_copy", other)) {
+        Err(WorldError::ScriptClash { first, second }) => assert_eq!((first, second), ("util", "util_copy")),
+        Err(other) => panic!("another refusal: {other}"),
+        Ok(()) => panic!("two runs under one key passed"),
+    }
 }
 
 /// A toolchain crate's key is its identity: the same pack on another target's cfg is another
@@ -396,7 +430,7 @@ fn a_crates_key_covers_its_scripts_files_and_env() {
 /// pack: a toolchain bump moves them all). Control: the same inputs give equal keys.
 #[test]
 fn a_toolchain_crates_key_covers_its_target_and_dependencies() {
-    let needs = crate::Needs { bstd: false, proc_macro: true };
+    let needs = crate::Needs { std: false, bstd: false, proc_macro: true };
     let std = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";
     let mac: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];
     let linux: &[(&str, Option<&str>)] = &[("target_os", Some("linux")), ("unix", None)];
@@ -414,17 +448,20 @@ fn a_toolchain_crates_key_covers_its_target_and_dependencies() {
 #[test]
 fn the_same_graph_in_any_order_gives_equal_bytes() {
     let mut first = AVec::new_in(g());
-    made(&IN_ORDER, None).write(&mut first);
+    made(&IN_ORDER).write(&mut first);
     let orders: [[u32; 9]; 4] = [[8, 7, 6, 5, 4, 3, 2, 1, 0], [5, 0, 7, 3, 1, 8, 2, 6, 4], [4, 6, 2, 8, 0, 3, 7, 1, 5], [7, 5, 3, 1, 8, 6, 4, 2, 0]];
     for order in &orders {
         let mut other = AVec::new_in(g());
-        made(order, None).write(&mut other);
+        made(order).write(&mut other);
         assert!(first == other, "order {order:?} gives other inputs");
     }
     // Control: a changed input changes the bytes.
-    let mut joined = AVec::new_in(g());
-    made(&IN_ORDER, Some(scripts("pub fn made() {}\n", "1"))).write(&mut joined);
-    assert!(first != joined);
+    let mut changed = made(&IN_ORDER);
+    let at = changed.crates.iter().position(|c| c.input.name == "util").unwrap_or_else(|| panic!("no util"));
+    changed.crates[at].input.cfg = &[];
+    let mut other = AVec::new_in(g());
+    changed.write(&mut other);
+    assert!(first != other);
 }
 
 #[test]
@@ -451,7 +488,7 @@ fn an_absent_source_is_an_error_naming_the_package() {
     let mut store = store(lock);
     store.packs.remove("testkit");
     let listed = listed(graph, lock, &mut store);
-    match world(graph, lock, listed, &mut store, checkout(), None, g()) {
+    match world(graph, lock, listed, &mut store, checkout(), g()) {
         Err(e) => assert!(format!("{e}").contains("testkit"), "{e}"),
         Ok(_) => panic!("taken"),
     }
@@ -459,7 +496,7 @@ fn an_absent_source_is_an_error_naming_the_package() {
 
 #[test]
 fn the_world_resolves() {
-    let w = made(&IN_ORDER, None);
+    let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
     let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
     let app = by_name(&w, "app")[0];
@@ -480,7 +517,7 @@ fn the_world_resolves() {
 #[test]
 fn a_dependency_sees_the_one_package_root_and_a_member_its_workspace_dir() {
     use blaze_scope::resolve::SourceTexts;
-    let w = made(&IN_ORDER, None);
+    let w = made(&IN_ORDER);
     let dir = |name: &str| {
         let at = w.crates.iter().position(|c| c.input.name == name).unwrap_or_else(|| panic!("no crate `{name}`"));
         let env = w.texts.crate_env(at).unwrap_or_else(|| panic!("`{name}`: the command's texts give no crate environment"));
@@ -500,7 +537,7 @@ fn a_dependency_sees_the_one_package_root_and_a_member_its_workspace_dir() {
 /// according to the context." Prints `D96 P4: util read /package/src/more.rs`.
 #[test]
 fn an_include_under_the_crates_own_root_is_served() {
-    let w = made(&IN_ORDER, None);
+    let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
     let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
     let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
@@ -519,7 +556,7 @@ fn an_include_under_the_crates_own_root_is_served() {
 /// `D96 file!: util-1.0.0/src/lib.rs`.
 #[test]
 fn file_in_a_dependency_is_its_name_version_and_path() {
-    let w = made(&IN_ORDER, None);
+    let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
     let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
     let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
@@ -539,7 +576,7 @@ fn file_in_a_dependency_is_its_name_version_and_path() {
 /// `src/util-18-20.rs` (`pub fn placed`). Prints `D96 place: util-18-20.rs`.
 #[test]
 fn module_path_line_and_column_in_eager_input_are_the_call_s() {
-    let w = made(&IN_ORDER, None);
+    let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
     let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
     let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
@@ -561,8 +598,8 @@ fn a_members_directory_is_in_its_crate_key() {
     let mut moved = store(lock);
     moved.app_dir = "crates/app";
     let (listed_here, listed_moved) = (listed(graph, lock, &mut here), listed(graph, lock, &mut moved));
-    let a = world(graph, lock, listed_here, &mut here, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
-    let b = world(graph, lock, listed_moved, &mut moved, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    let a = world(graph, lock, listed_here, &mut here, checkout(), g()).unwrap_or_else(|e| panic!("{e}"));
+    let b = world(graph, lock, listed_moved, &mut moved, checkout(), g()).unwrap_or_else(|e| panic!("{e}"));
     let key = |w: &World<'static>, name: &str| by_name(w, name)[0].input.key;
     assert_ne!(key(&a, "app"), key(&b, "app"), "`app` moved to crates/app kept its key: its directory is not in it");
     assert_ne!(key(&a, "blz"), key(&b, "blz"), "`blz` depends on the moved `app`");
@@ -578,7 +615,7 @@ fn a_members_directory_is_in_its_crate_key() {
 /// Prints `D96 P1: <n> crates' records equal in two workspaces`.
 #[test]
 fn a_dependencys_records_are_equal_in_two_workspaces() {
-    let first = made(&IN_ORDER, None);
+    let first = made(&IN_ORDER);
     let lock = lock();
     let mut units = graph(lock, &IN_ORDER).units.clone();
     units[3].kind = UnitKind::Lib;
@@ -588,7 +625,7 @@ fn a_dependencys_records_are_equal_in_two_workspaces() {
     let other: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2 }));
     let mut store = store(lock);
     let listed = listed(other, lock, &mut store);
-    let second = world(other, lock, listed, &mut store, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    let second = world(other, lock, listed, &mut store, checkout(), g()).unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(first.toolchain_crates, second.toolchain_crates, "the two workspaces keep the same toolchain crates");
 
     let (a_inputs, b_inputs) = (first.inputs(g()), second.inputs(g()));

@@ -38,13 +38,11 @@
 //!   which this file does not have; libunwind reads the personality and the LSDA from the FDE
 //!   in DWARF mode (its `setInfoBasedOnIPRegister`: "Found info in table, done unless encoding
 //!   says to use dwarf"). The LSDA index is therefore empty.
-//! - [`compact`] gives `UNWIND_ARM64_MODE_FRAME` only for the plain frame record. Apple's frame
-//!   mode restores a saved pair from `fp - 8` downwards, its lower register first (libunwind
-//!   `stepWithCompactEncodingFrame`: `savedRegisterLoc = fp - 8`, x19 there, x20 at `fp - 16`);
-//!   blaze's prologue stores each pair with `stp low, high` so the lower register sits at the
-//!   lower address (blaze-code unwind.rs, "The frame word"): the opposite order. A frame with
-//!   saved pairs is described by its FDE (DWARF mode), never by a compact word that would
-//!   restore the pair swapped.
+//! - [`compact`] gives `UNWIND_ARM64_MODE_FRAME` with the frame's pair bits. Apple's frame mode
+//!   restores a saved pair from `fp - 8` downwards, its lower register first (libunwind
+//!   `stepWithCompactEncodingFrame`: `savedRegisterLoc = fp - 8`, x19 there, x20 at `fp - 16`),
+//!   which is blaze's one frame form (blaze-code unwind.rs, "The frame word"; unwind-P8a-4): the
+//!   frame word's pair bits ARE the encoding's `UNWIND_ARM64_FRAME_*_PAIR` bits.
 //! - A function whose rows never land carries no LSDA, as blaze-code eh.rs `entry` decides
 //!   (`Unwind::lands`): an unwind through any of its calls goes on to the caller.
 //!
@@ -57,9 +55,13 @@ use blaze_code::record::Symbol;
 use blaze_code::unwind::{self, Frame, Unwind, reg};
 use blaze_own::{AVec, Alloc, Vec};
 
+use blaze_native::image::{Image, Region as NativeRegion};
+use blaze_native::unwind::{self as native_unwind, Row};
+
 use crate::error::ExportError;
 use crate::input::Platform;
 use crate::layout::{Laid, Member};
+use crate::native_merge::MergeError;
 
 /// `DW_EH_PE_pcrel | DW_EH_PE_sdata4`.
 pub const PCREL_SDATA4: u8 = 0x1b;
@@ -73,18 +75,10 @@ pub const COMPACT_FRAME: u32 = 0x0400_0000;
 pub const COMPACT_DWARF: u32 = 0x0300_0000;
 /// `UNWIND_ARM64_DWARF_SECTION_OFFSET`.
 const DWARF_OFFSET: u32 = 0x00ff_ffff;
-/// `UNWIND_SECTION_VERSION`.
-const UNWIND_INFO_VERSION: u32 = 1;
-/// `UNWIND_SECOND_LEVEL_REGULAR`.
-const SECOND_LEVEL_REGULAR: u32 = 2;
-/// Entries in one regular page: ld64's 4096-byte page less its 8-byte header, 8 bytes each.
-const PAGE_ENTRIES: usize = 511;
-/// `unwind_info_section_header`: seven 32-bit fields.
-const UNWIND_INFO_HEADER: u32 = 28;
-/// `unwind_info_section_header_index_entry`: three 32-bit fields.
-const INDEX_ENTRY: u32 = 12;
-/// `unwind_info_regular_second_level_page_header`: kind, entry offset (16 bits), count (16).
-const PAGE_HEADER: u32 = 8;
+/// `UNWIND_ARM64_MODE_MASK`.
+const MODE_MASK: u32 = 0x0f00_0000;
+/// The page a native image's stand-in place is rounded to while the room is measured.
+const NATIVE_PAGE: u64 = 0x4000;
 /// What alignment can add between [`eh_room`]'s measure and the real sections: the start's
 /// 8-alignment after the code (up to 7) and two 4-alignments (up to 3 each), rounded up.
 const ROOM_SLACK: u64 = 16;
@@ -127,13 +121,35 @@ impl EhSections<'_> {
     }
 }
 
-/// The compact encoding of `frame`, where one restores it exactly: only the plain frame record
-/// (the module's doc says why a frame with saved pairs has none).
-pub fn compact(frame: Frame) -> Option<u32> {
-    match frame == Frame::PLAIN {
-        true => Some(COMPACT_FRAME),
-        false => None,
+/// The native image's unwind data the file carries (native_merge.rs, NATIVE.md W9; main's ruling
+/// (a)): its rows, FDEs and eh_frame pointers as data (blaze-native `Image::unwind`, `frames`,
+/// `eh_pointers`), the image placed at `shift` (image address + `shift` = image offset here).
+/// [`tables`] copies the image's eh_frame after the Rust FDEs (one `__eh_frame`), re-encodes each
+/// of its pc-relative fields, and writes one `__unwind_info` over both row lists with
+/// blaze-native's writer (one builder, rule 30); the image's personality is named by its GOT
+/// cell in the personality array.
+pub struct Outside<'o, 'n> {
+    pub image: &'o Image<'n>,
+    pub shift: u64,
+}
+
+impl Outside<'_, '_> {
+    /// The image's merged eh_frame: its image address and bytes.
+    fn eh_frame(&self) -> Result<(u64, &[u8]), ExportError> {
+        let missing = ExportError::Native(MergeError::NoRegion { region: NativeRegion::EhFrame });
+        let region = self.image.region(NativeRegion::EhFrame).ok_or(missing)?;
+        let from = region.at.checked_sub(self.image.file_start).ok_or(missing)? as usize;
+        let bytes = self.image.bytes.get(from..from + region.len as usize).ok_or(missing)?;
+        Ok((region.at, bytes))
     }
+}
+
+/// The compact encoding of `frame`: frame mode, with `UNWIND_ARM64_FRAME_X19_X20_PAIR`
+/// (0x001) .. `X27_X28_PAIR` (0x010) from the frame word's x bits and `D8_D9_PAIR` (0x100) ..
+/// `D14_D15_PAIR` (0x800) from its d bits (`<mach-o/compact_unwind_encoding.h>`:296-304). The
+/// layouts agree (the module's doc), so every frame has one.
+pub fn compact(frame: Frame) -> u32 {
+    COMPACT_FRAME | u32::from(frame.x_pairs) | (u32::from(frame.d_pairs) << 8)
 }
 
 /// One placed function the tables cover, at its image offset.
@@ -232,7 +248,17 @@ fn cie(f: &mut AVec<'_, u8>, personality: Option<u64>, patches: &mut AVec<'_, (u
 
 /// The tables for `covered` (sorted by address), the personality routine at `personality_at`,
 /// the first table at `at` (8-aligned).
-fn tables<'a>(covered: &[Covered<'_>], personality_at: Option<u64>, at: u64, platform: Platform, alloc: Alloc<'a>) -> Result<EhSections<'a>, ExportError> {
+fn tables<'a>(
+    covered: &[Covered<'_>],
+    personality_at: Option<u64>,
+    at: u64,
+    platform: Platform,
+    outside: Option<&Outside<'_, '_>>,
+    alloc: Alloc<'a>,
+) -> Result<EhSections<'a>, ExportError> {
+    if outside.is_some() && platform == Platform::LinuxArm64 {
+        return Err(ExportError::Native(MergeError::ElfNotBuilt));
+    }
     // The LSDAs first: their bytes do not depend on where anything is.
     let mut except: AVec<'a, u8> = Vec::new_in(alloc);
     let mut given: AVec<'_, Given> = Vec::with_capacity_in(covered.len(), alloc);
@@ -296,6 +322,13 @@ fn tables<'a>(covered: &[Covered<'_>], personality_at: Option<u64>, at: u64, pla
         given[k].fde = Some(u32_of(start as u64, "an FDE's offset in eh_frame")?);
         functions += 1;
     }
+    // The native image's CIEs and FDEs, after Rust's, before the one terminator.
+    let native_at = f.len();
+    if let Some(o) = outside {
+        let (_, bytes) = o.eh_frame()?;
+        f.extend_from_slice(bytes);
+        functions += o.image.frames.len() as u32;
+    }
     f.extend_from_slice(&[0; 4]);
 
     let eh_frame_at = at;
@@ -309,11 +342,31 @@ fn tables<'a>(covered: &[Covered<'_>], personality_at: Option<u64>, at: u64, pla
         let bytes = rel32(target, eh_frame_at + field as u64, "a pc-relative pointer in eh_frame")?;
         f[field..field + 4].copy_from_slice(&bytes);
     }
+    // The image's pc-relative fields: an address inside its eh_frame moved with the copy, any
+    // other with the image (`shift`); each field is the difference of the two, re-encoded.
+    if let Some(o) = outside {
+        let (was, bytes) = o.eh_frame()?;
+        let len = bytes.len() as u64;
+        let now = eh_frame_at + native_at as u64;
+        let map = |x: u64| if x >= was && x < was + len { now + (x - was) } else { x + o.shift };
+        for p in o.image.eh_pointers.iter() {
+            let field = native_at + (p.at - was) as usize;
+            let value = map(p.to).wrapping_sub(map(p.minus));
+            match p.width {
+                4 => {
+                    let v = i32::try_from(value as i64)
+                        .map_err(|_| ExportError::TooLarge { what: "a native eh_frame pointer past 32 bits once moved", len: value })?;
+                    f[field..field + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                _ => f[field..field + 8].copy_from_slice(&value.to_le_bytes()),
+            }
+        }
+    }
 
     let mut unwind_info: AVec<'a, u8> = Vec::new_in(alloc);
     let mut eh_frame_hdr: AVec<'a, u8> = Vec::new_in(alloc);
     match platform {
-        Platform::MacosArm64 => write_unwind_info(covered, &given, &mut unwind_info)?,
+        Platform::MacosArm64 => write_unwind_info(covered, &given, outside, native_at, alloc, &mut unwind_info)?,
         Platform::LinuxArm64 => write_eh_frame_hdr(covered, &given, eh_frame_at, index_at, functions, &mut eh_frame_hdr)?,
     }
     Ok(EhSections {
@@ -338,7 +391,7 @@ fn encoding(c: &Covered<'_>, given: Given) -> Result<u32, ExportError> {
     };
     let compact_word = match given.lsda {
         Some(_) => None,
-        None => c.unwind.frame().and_then(compact),
+        None => c.unwind.frame().map(compact),
     };
     match compact_word {
         Some(word) => Ok(word),
@@ -347,46 +400,52 @@ fn encoding(c: &Covered<'_>, given: Given) -> Result<u32, ExportError> {
     }
 }
 
-/// Mach-O's `__unwind_info`: header, first-level index with its end sentinel, the (empty) LSDA
-/// index, then the regular second-level pages.
-fn write_unwind_info(covered: &[Covered<'_>], given: &[Given], out: &mut AVec<'_, u8>) -> Result<(), ExportError> {
-    let n = covered.len();
-    let pages = n.div_ceil(PAGE_ENTRIES);
-    let index_count = u32_of(pages as u64 + 1, "__unwind_info's first-level index")?;
-    let lsda_at = UNWIND_INFO_HEADER + INDEX_ENTRY * index_count;
-    let pages_at = lsda_at;
-    let full_page = PAGE_HEADER + 8 * PAGE_ENTRIES as u32;
-    // The header: version, common encodings (none), personalities (none), the index.
-    for word in [UNWIND_INFO_VERSION, UNWIND_INFO_HEADER, 0, UNWIND_INFO_HEADER, 0, UNWIND_INFO_HEADER, index_count] {
-        out.extend_from_slice(&word.to_le_bytes());
+/// Mach-O's one `__unwind_info`, by blaze-native's writer (the one builder of the format, rule
+/// 30): a row per placed Rust function, reaching the next one's start (so the padding between
+/// two needs no entry of its own), then the native image's rows moved by its `shift`, their
+/// DWARF-mode offsets moved by where its FDEs sit in the one eh_frame (`native_at`), their
+/// personalities (GOT cells) and LSDAs by `shift`.
+fn write_unwind_info(
+    covered: &[Covered<'_>],
+    given: &[Given],
+    outside: Option<&Outside<'_, '_>>,
+    native_at: usize,
+    alloc: Alloc<'_>,
+    out: &mut AVec<'_, u8>,
+) -> Result<(), ExportError> {
+    let native_rows = outside.map_or(0, |o| o.image.unwind.len());
+    let mut rows: AVec<'_, Row> = Vec::with_capacity_in(covered.len() + native_rows, alloc);
+    for (k, c) in covered.iter().enumerate() {
+        let end = match covered.get(k + 1) {
+            Some(next) => next.at,
+            None => c.at + u64::from(c.unwind.code_len()),
+        };
+        let length = u32_of(end - c.at, "a function's length in __unwind_info")?;
+        rows.push(Row { start: c.at, length, encoding: encoding(c, given[k])?, personality: None, lsda: None });
     }
-    for p in 0..pages {
-        let first = u32_of(covered[p * PAGE_ENTRIES].at, "a function's offset in __unwind_info")?;
-        let page_at = pages_at + full_page * p as u32;
-        for word in [first, page_at, lsda_at] {
-            out.extend_from_slice(&word.to_le_bytes());
+    if let Some(o) = outside {
+        let moved = u32_of(native_at as u64, "the native FDEs' offset in eh_frame")?;
+        for r in o.image.unwind.iter() {
+            let mut encoding = r.encoding;
+            if encoding & MODE_MASK == COMPACT_DWARF {
+                let fde = (encoding & DWARF_OFFSET) + moved;
+                if fde & !DWARF_OFFSET != 0 {
+                    return Err(ExportError::TooLarge { what: "an FDE's offset in __unwind_info's DWARF mode (24 bits)", len: u64::from(fde) });
+                }
+                encoding = (encoding & !DWARF_OFFSET) | fde;
+            }
+            rows.push(Row {
+                start: r.start + o.shift,
+                length: r.length,
+                encoding,
+                personality: r.personality.map(|cell| cell + o.shift),
+                lsda: r.lsda.map(|lsda| lsda + o.shift),
+            });
         }
     }
-    let end = match covered.last() {
-        Some(last) => last.at + u64::from(last.unwind.code_len()),
-        None => 0,
-    };
-    for word in [u32_of(end, "the end of the code in __unwind_info")?, 0, lsda_at] {
-        out.extend_from_slice(&word.to_le_bytes());
-    }
-    for p in 0..pages {
-        let from = p * PAGE_ENTRIES;
-        let to = (from + PAGE_ENTRIES).min(n);
-        out.extend_from_slice(&SECOND_LEVEL_REGULAR.to_le_bytes());
-        out.extend_from_slice(&(PAGE_HEADER as u16).to_le_bytes());
-        out.extend_from_slice(&((to - from) as u16).to_le_bytes());
-        for k in from..to {
-            let at = u32_of(covered[k].at, "a function's offset in __unwind_info")?;
-            out.extend_from_slice(&at.to_le_bytes());
-            out.extend_from_slice(&encoding(&covered[k], given[k])?.to_le_bytes());
-        }
-    }
-    Ok(())
+    let len = native_unwind::unwind_info_len(&rows).map_err(|error| ExportError::NativeUnwind { error })?;
+    out.try_reserve_exact(len).map_err(|_| ExportError::TooLarge { what: "__unwind_info's bytes (allocation)", len: len as u64 })?;
+    native_unwind::unwind_info(&rows, out).map_err(|error| ExportError::NativeUnwind { error })
 }
 
 /// ELF's `.eh_frame_hdr` at image offset `hdr_at`, for the `functions` FDEs of `eh_frame` at
@@ -422,6 +481,13 @@ fn read_rows<'r>(functions: &[Member<'r>], by_symbol: &[u32], symbol: Symbol) ->
 /// tables written as if laid end to end, plus what alignment can add. `lay_out` keeps this many
 /// bytes after the code.
 pub fn eh_room<'a>(functions: &[Member<'_>], personality: Option<Symbol>, platform: Platform, alloc: Alloc<'a>) -> Result<u64, ExportError> {
+    eh_room_with(functions, personality, platform, None, alloc)
+}
+
+/// [`eh_room`] with the program's native image (native_merge.rs): its eh_frame bytes and rows
+/// join the measure, the image at a stand-in place after the code (the size depends on the
+/// rows' count, not their addresses).
+pub fn eh_room_with<'a>(functions: &[Member<'_>], personality: Option<Symbol>, platform: Platform, natives: Option<&Image<'_>>, alloc: Alloc<'a>) -> Result<u64, ExportError> {
     let mut covered: AVec<'_, Covered<'_>> = Vec::with_capacity_in(functions.len(), alloc);
     let mut at = 0u64;
     for f in functions {
@@ -432,7 +498,8 @@ pub fn eh_room<'a>(functions: &[Member<'_>], personality: Option<Symbol>, platfo
     }
     let base = up(at, 8);
     let personality_at = personality.map(|_| 0);
-    let measured = tables(&covered, personality_at, base, platform, alloc)?;
+    let standin = natives.map(|image| Outside { image, shift: up(base, NATIVE_PAGE) + NATIVE_PAGE });
+    let measured = tables(&covered, personality_at, base, platform, standin.as_ref(), alloc)?;
     Ok(measured.end() - base + ROOM_SLACK)
 }
 
@@ -441,6 +508,19 @@ pub fn eh_room<'a>(functions: &[Member<'_>], personality: Option<Symbol>, platfo
 /// at the next 8-aligned offset, in the room [`eh_room`] measured. `functions` are the members
 /// `laid` was made of; `personality` is the program's `eh_personality` routine, one of them.
 pub fn eh_sections<'a>(laid: &Laid<'_, '_>, functions: &[Member<'_>], personality: Option<Symbol>, platform: Platform, alloc: Alloc<'a>) -> Result<EhSections<'a>, ExportError> {
+    eh_sections_with(laid, functions, personality, platform, None, alloc)
+}
+
+/// [`eh_sections`] with the program's native image placed by native_merge.rs (`outside`): one
+/// `__eh_frame` and one `__unwind_info` over the Rust functions and the image (main's ruling (a)).
+pub fn eh_sections_with<'a>(
+    laid: &Laid<'_, '_>,
+    functions: &[Member<'_>],
+    personality: Option<Symbol>,
+    platform: Platform,
+    outside: Option<&Outside<'_, '_>>,
+    alloc: Alloc<'a>,
+) -> Result<EhSections<'a>, ExportError> {
     let personality_at = match personality {
         None => None,
         Some(routine) => {
@@ -472,7 +552,7 @@ pub fn eh_sections<'a>(laid: &Laid<'_, '_>, functions: &[Member<'_>], personalit
     }
     covered.sort_unstable_by_key(|c| c.at);
     let at = up(laid.text_end(), 8);
-    let tables = tables(&covered, personality_at, at, platform, alloc)?;
+    let tables = tables(&covered, personality_at, at, platform, outside, alloc)?;
     if tables.end() > laid.const_at {
         return Err(ExportError::EhRoom { need: tables.end() - laid.text_end(), room: laid.const_at - laid.text_end() });
     }
@@ -492,7 +572,7 @@ pub fn eh_room_rows<'a>(functions: &[(Symbol, Unwind<'_>)], personality: Option<
     }
     let base = up(at, 8);
     let personality_at = personality.map(|_| 0);
-    let measured = tables(&covered, personality_at, base, platform, alloc)?;
+    let measured = tables(&covered, personality_at, base, platform, None, alloc)?;
     Ok(measured.end() - base + ROOM_SLACK)
 }
 
@@ -529,7 +609,7 @@ pub fn eh_sections_rows<'a>(
     }
     covered.sort_unstable_by_key(|c| c.at);
     let at = up(laid.text_end(), 8);
-    let tables = tables(&covered, personality_at, at, platform, alloc)?;
+    let tables = tables(&covered, personality_at, at, platform, None, alloc)?;
     if tables.end() > laid.const_at {
         return Err(ExportError::EhRoom { need: tables.end() - laid.text_end(), room: laid.const_at - laid.text_end() });
     }

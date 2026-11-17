@@ -1,28 +1,63 @@
-//! The filler of [`ScriptOutputs`]: each build script's outputs record, read in place, by the
-//! unit it serves (the library or proc macro whose `build_script` it is: blaze-proc-macro's
-//! `script_unit::served`). Its `cargo::rustc-cfg` atoms are what [`world`](crate::world) joins
-//! to that unit's cfg; the record itself goes into the crate's input (`CrateInput::script`, for
-//! the expansion host `blaze_build_script::cx::ScriptCx`: `env!("OUT_DIR")`, `env!` pairs,
-//! `include!` of a generated file), and its crate digest into the crate's key.
+//! A build script's outputs joined to its crate's input at TASK time ([`joined`], decision D115
+//! (B)): its `cargo::rustc-cfg` atoms added to the unit's cfg, and the record as the crate's
+//! `CrateInput::script` (for the expansion host `blaze_build_script::cx::ScriptCx`:
+//! `env!("OUT_DIR")`, `env!` pairs, `include!` of a generated file). Never into the crate's
+//! key: a script's output is not known before it runs, so it is a read of the task.
 //!
-//! Records are checked once ([`OutputsRef::open`]); a unit given two is a refusal, never a
-//! choice between them (rule 21).
+//! [`ScriptRecords`]: a folder's records by the unit each serves, for the examples that take
+//! records from a folder (blaze-real's names_load, this crate's names example). Records are
+//! checked once ([`OutputsRef::open`]); a unit given two is a refusal, never a choice between
+//! them (rule 21).
 
 use core::fmt;
 
 use blaze_build_script::outputs::{OutputsRef, RecordError};
 use blaze_own::{AVec, Alloc};
+use blaze_scope::resolve::CrateInput;
 use blaze_unit_graph::UnitId;
 
-use crate::ScriptOutputs;
+/// `input` with its build script's outputs `outputs` joined, at the crate's task time
+/// (decision D115 (B)): the script's `cargo::rustc-cfg` atoms added to the unit's cfg, sorted and
+/// each once, and the record as [`CrateInput::script`]. The key stays the input's own: a
+/// script's output is a read of the task (its `Script` record and out in the read list),
+/// never part of a crate's key. The cfg lives in `alloc`.
+pub fn joined<'w>(input: &CrateInput<'w>, outputs: OutputsRef<'w>, alloc: Alloc<'w>) -> CrateInput<'w> {
+    let mut cfg: AVec<'w, (&'w str, Option<&'w str>)> = AVec::with_capacity_in(input.cfg.len(), alloc);
+    cfg.extend_from_slice(input.cfg);
+    cfg.extend(outputs.cfgs());
+    cfg.sort_unstable();
+    cfg.dedup();
+    CrateInput { cfg: cfg.leak(), script: Some(outputs), ..*input }
+}
 
-/// One served unit's record and its cfg atoms, sorted and each once.
+/// The subject of the `Script` run a crate of the list reads: its package, version, SIDE (the
+/// world's, never the graph's `for_host`) and features, the parts of its list key (ruling D115
+/// (2)). The one function: the world's [`Script::Read`], the `Script` task's lookup and the
+/// `CrateScope` job that reads its run all name a run by it, so two units with one crate key
+/// cannot name two runs. `features` as the list holds them (sorted, each once). The bytes
+/// hashed live in `alloc` for the call.
+pub fn script_subject(package: &str, version: &str, side: crate::Side, features: &[&str], alloc: Alloc<'_>) -> blaze_id::ContentId {
+    let mut bytes: AVec<'_, u8> = AVec::new_in(alloc);
+    let mut put = |part: &[u8]| {
+        bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(part);
+    };
+    put(package.as_bytes());
+    put(version.as_bytes());
+    put(match side {
+        crate::Side::Target => b"target",
+        crate::Side::Macro => b"macro",
+    });
+    for feature in features {
+        put(feature.as_bytes());
+    }
+    blaze_id::ContentId::of("blaze-world script subject 1", &bytes)
+}
+
+/// One served unit's record.
 struct Served<'w> {
     unit: UnitId,
     outputs: OutputsRef<'w>,
-    cfg: AVec<'w, (&'w str, Option<&'w str>)>,
-    /// [`OutputsRef::crate_digest`], once.
-    digest: blaze_id::ContentId,
 }
 
 /// Every build script's outputs of a graph, by the unit each serves, sorted by unit.
@@ -51,16 +86,12 @@ impl fmt::Display for ScriptRecordsError {
 }
 
 impl<'w> ScriptRecords<'w> {
-    /// Each `(served unit, record bytes)` opened and its cfg atoms gathered.
+    /// Each `(served unit, record bytes)` opened.
     pub fn new(records: impl IntoIterator<Item = (UnitId, &'w [u8])>, alloc: Alloc<'w>) -> Result<ScriptRecords<'w>, ScriptRecordsError> {
-        let mut served: AVec<'w, Served<'w>> = AVec::new_in(alloc.clone());
+        let mut served: AVec<'w, Served<'w>> = AVec::new_in(alloc);
         for (unit, bytes) in records {
             let outputs = OutputsRef::open(bytes).map_err(|why| ScriptRecordsError::NotARecord { unit, why })?;
-            let mut cfg = AVec::new_in(alloc.clone());
-            cfg.extend(outputs.cfgs());
-            cfg.sort_unstable();
-            cfg.dedup();
-            served.push(Served { unit, outputs, cfg, digest: outputs.crate_digest() });
+            served.push(Served { unit, outputs });
         }
         served.sort_unstable_by_key(|s| s.unit);
         if let Some(pair) = served.windows(2).find(|pair| pair[0].unit == pair[1].unit) {
@@ -85,13 +116,5 @@ impl<'w> ScriptRecords<'w> {
 
     pub fn is_empty(&self) -> bool {
         self.served.is_empty()
-    }
-}
-
-/// Given to [`world`](crate::world) as `Some(&&records)`: the atoms live as long as the records.
-impl<'w> ScriptOutputs<'w> for &'w ScriptRecords<'w> {
-    fn served(&self, lib: UnitId) -> Option<crate::Served<'w>> {
-        let records: &'w ScriptRecords<'w> = self;
-        records.find(lib).map(|s| crate::Served { outputs: s.outputs, cfg: s.cfg.as_slice(), digest: s.digest })
     }
 }

@@ -23,6 +23,7 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_flow::{Block, BorrowKind, Flow, FlowBuilder, Loan, Local, Operand, Origin, Place, Proj, Span, StmtKind};
+use crate::identity::{Identity, Role};
 use blaze_typeck::{
     AdjustKind, BinOp, BodyView, Checked, Def, Edition, Expr, ExprId, ItemKey, List, Mutbl, Name, PNode, PTy, PTys, Pat,
     PatId, Range, Stmt as TStmt, StmtId, UnOp,
@@ -36,7 +37,19 @@ pub mod sig;
 mod generic_call;
 /// Step 1 of an `.await` whose future is not its operand: `into_future` by its recorded head.
 mod await_call;
+/// A call of a head with a hidden input (`T::Out`), related per call (sig-assoc-per-call).
+mod hidden_call;
+#[cfg(test)]
+mod hidden_call_tests;
+/// A local's storage end invalidates its loans whatever its type (storage-end-loans).
+#[cfg(test)]
+mod storage_end_tests;
+/// A hidden input read through the impl the checker selected at the call (impl-per-call).
+mod impl_call;
+#[cfg(test)]
+mod impl_call_tests;
 pub use generic_call::{CallBounds, Mark, Shape, ShapeBuf, read_shape};
+pub use impl_call::ImplSource;
 /// A caller's own type parameters under a callee's `T: 'a` (static-param-gap-1).
 mod param_outlives;
 pub use param_outlives::ParamOrigin;
@@ -44,13 +57,21 @@ mod super_let;
 #[cfg(test)]
 mod tests;
 
-pub use sig::{CallableRefusal, Region, SigBuf, SigLife, SigRefusal, read_callable_param, read_signature};
+pub use sig::{
+    AssocWhy, CallableRefusal, ImplText, Region, SigBuf, SigLife, SigRefusal, impl_header_end, read_callable_param, read_impl_signature,
+    read_signature,
+};
+/// `Self::Name` read through the impl's own text (piece sig-assoc-projection).
+#[cfg(test)]
+mod sig_assoc_tests;
 
 pub mod coroutine;
+pub mod identity;
+pub mod state_recipe;
 #[cfg(test)]
 mod coroutine_tests;
 
-pub use coroutine::{LoweredAsync, interior, lower_async};
+pub use coroutine::{InteriorPart, LoweredAsync, interior, interior_parts, lower_async};
 
 pub mod closure;
 
@@ -91,6 +112,14 @@ pub trait Facts {
     /// instantiated at each call. `None`: not known, and the older stand-ins apply (elision from
     /// [`CalleeFacts`], a call that writes lifetimes refused).
     fn sig(&self, _item: ItemKey) -> Option<SigLife<'_>> {
+        None
+    }
+    /// The texts of impl `imp` (its item text and each associated type member's `(name,
+    /// text)`), for a call whose hidden projection the type check selected `imp` for
+    /// (`Checked::selected`; impl_call.rs). Whoever answers files the read of those texts in
+    /// the body's read list, keyed by the impl (rule 21). `None`: not given, and such a call is
+    /// refused by name (`Form::CallHiddenInput`).
+    fn impl_source(&self, _imp: ItemKey) -> Option<ImplSource<'_>> {
         None
     }
     /// The text of the body's own fn, from its attributes or `fn` keyword on (what
@@ -154,6 +183,8 @@ pub enum Form {
     AsyncBlock,
     Await,
     Coroutine,
+    /// `asm!`: its operands' places and borrows are not lowered yet.
+    InlineAsm,
     /// An `async` closure, or an `.await` inside a closure, within an async block
     /// (coroutine.rs): its body is no part of the block's flow.
     AsyncClosure,
@@ -196,6 +227,13 @@ pub enum Form {
     /// under a bound the reader did not resolve (the container's header declares one). Not
     /// checked rather than accepted (generic_call.rs `call_by_generic_signature`).
     CallOutlivesUnread { callee: ItemKey, param: u32 },
+    /// A call of `callee` whose head holds a hidden position at its input `input` (a
+    /// projection over its type parameter, `x: T::Out`; `u32::MAX`: the call as a whole) whose
+    /// argument carries a lifetime there, where the impl is not known at the call (a type
+    /// argument carries an origin or names the caller's own generics): the impl may demand
+    /// `'static` or a type argument's lifetime, so the body is not checked rather than
+    /// related coarsely (hidden_call.rs).
+    CallHiddenInput { callee: ItemKey, input: u32 },
     /// The body's type parameter `param` is required to outlive a lifetime its read bounds do
     /// not prove, and some bound on it was not read (a trait bound, its container's header, a
     /// type in its signature whose implied bounds are not read): not checked rather than
@@ -220,6 +258,9 @@ pub enum Form {
     Malformed,
     Bound,
     Builder,
+    /// Two locals saved across a suspension with one identity (identity.rs): the builder could
+    /// not tell which one a slot holds. The fix is a role of its own for one, in the lowering.
+    IdentityTwice,
     /// A `super let` form not placed: with an `else` block, or in a block no temporary scope
     /// holds (super_let.rs).
     SuperLet,
@@ -241,6 +282,15 @@ pub struct Stats {
     pub calls_unified: u32,
     /// Calls related by instantiating the callee's lifetime part ([`Facts::sig`]).
     pub calls_by_signature: u32,
+    /// Calls of a known head whose lifetime part holds a hidden position (`Region::Hidden`: an
+    /// opaque type, or a projection over the head's own type parameter, `<T as Tr>::X`, whose
+    /// impl is chosen per call), so not instantiated: related by elision or one origin
+    /// instead, a superset for the output (sig/impl_life.rs's doc says why, and what is left).
+    pub calls_hidden: u32,
+    /// Calls of a head with a hidden input whose impl the call fixes (no origin in its type
+    /// arguments): each hidden input's argument positions demanded `'static` (E0207;
+    /// hidden_call.rs).
+    pub calls_hidden_static: u32,
     /// The body's own placeholders and known relations came from its lifetime part.
     pub sig_read: bool,
     /// The body's signature writes lifetimes: its placeholders are taken as all related.
@@ -280,6 +330,13 @@ pub enum Plant {
     UnknownUnified,
     /// A closure's captures are not lowered: the closure value holds no loan and moves nothing.
     NoCaptures,
+    /// A call of a head with a hidden input takes the coarse path as before sig-assoc-per-call
+    /// (hidden_call.rs): `take::<Foo>(&local)` with `type Out = &'static S` is accepted.
+    HiddenCoarse,
+    /// A local's storage ends only where a drop runs (`needs_drop`): a parameter of a type with
+    /// no drop glue is never ended, and `fn f(s: S) { keep(&s) }` with `keep(&'static S)` is
+    /// accepted (the form before storage-end-loans).
+    StorageEndTiedToDrop,
 }
 
 /// Lowers one checked body.
@@ -461,6 +518,9 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone> {
     upvar_places: Vec<(PatId, Place, TyD), A>,
     /// Per suspension, in statement order, its `Expr::Await`.
     points: Vec<ExprId, A>,
+    /// Per local: what it stands for (identity.rs): the one table of identities, emitted in
+    /// `LoweredAsync::identity`.
+    identity: Vec<Identity, A>,
 }
 
 /// Every type walk visits each node at most once per position: bounded by the table's size.
@@ -518,6 +578,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             async_root: None,
             upvar_places: Vec::new_in(alloc.clone()),
             points: Vec::new_in(alloc.clone()),
+            identity: Vec::new_in(alloc.clone()),
         };
         Ok(l)
     }
@@ -874,7 +935,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             self.origs.push(o);
         }
         self.set_local(l, t, start, n);
+        // identity.rs: every local named; a site with a sharper key renames it (`name_local`).
+        let identity = match at {
+            Some(Local(0)) => Identity::Return,
+            Some(a) => Identity::Arg(a.0),
+            None => Identity::Temp(e, Role::Value),
+        };
+        self.name_local(l, identity);
         Ok(l)
+    }
+
+    /// Names local `l` in the table of identities (identity.rs; `LoweredAsync::identity`).
+    /// Rows not yet named hold `Return` until their `new_local_with` names them.
+    fn name_local(&mut self, l: Local, id: Identity) {
+        let i = l.0 as usize;
+        if self.identity.len() <= i {
+            self.identity.resize(i + 1, Identity::Return);
+        }
+        self.identity[i] = id;
     }
 
     fn set_local(&mut self, l: Local, t: TyD, start: u32, n: u32) {
@@ -1626,6 +1704,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     At::Const => return self.refuse(Form::Malformed, e),
                 };
                 let t = self.new_local_with(TyD { wrap: Some(Mutbl::Not), ty: pty.ty }, false, None, e)?;
+                self.name_local(t, Identity::Temp(e, Role::Borrow));
                 self.b.stmt(StmtKind::StorageLive(t), self.span(e));
                 self.vars.push(t);
                 self.borrow(p, pty, BorrowKind::Shallow, t, e)?;
@@ -2058,6 +2137,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.tasks.push(Task::Eval(op, false));
             }
             Expr::Underscore => return self.refuse(Form::Malformed, e),
+            Expr::Asm { .. } => return self.refuse(Form::InlineAsm, e),
             Expr::FormatArgs { args, .. } => {
                 let es = match body.expr_lists.get(args.range()) {
                     Some(a) => a,
@@ -2103,6 +2183,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 AdjustKind::Borrow { raw: true, .. } => {
                     let p = self.as_place(v, e)?;
                     let t = self.temp(out, e)?;
+                    self.name_local(t, Identity::Temp(e, Role::Borrow));
                     let tp = self.place_of(t);
                     self.b.aggregate(tp, &[Operand::Copy(p)], self.span(e));
                     Val { at: At::Place(tp), ty: out }
@@ -2110,6 +2191,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 AdjustKind::Borrow { mutbl, two_phase, raw: false } => {
                     let p = self.as_place(v, e)?;
                     let t = self.temp(out, e)?;
+                    self.name_local(t, Identity::Temp(e, Role::Borrow));
                     let kind = match (mutbl, two_phase) {
                         (Mutbl::Not, _) => BorrowKind::Shared,
                         (Mutbl::Mut, true) => BorrowKind::TwoPhase,
@@ -2158,9 +2240,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         let mutbl = if m { Mutbl::Mut } else { Mutbl::Not };
         let bt = self.temp(TyD { wrap: Some(mutbl), ty: v.ty.ty }, e)?;
+        self.name_local(bt, Identity::Temp(e, Role::Borrow));
         let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
         self.borrow(p, v.ty, kind, bt, e)?;
         let rt = self.temp(TyD { wrap: Some(mutbl), ty: out.ty }, e)?;
+        self.name_local(rt, Identity::Temp(e, Role::Result));
         let (bp, rp) = (self.place_of(bt), self.place_of(rt));
         let op = if m { Operand::Move(bp) } else { Operand::Copy(bp) };
         self.b.call(&[op], rp, self.span(e));
@@ -2252,10 +2336,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         // whose lifetime is the receiver's (elision, `&self`).
         let mutbl = if m { Mutbl::Mut } else { Mutbl::Not };
         let bt = self.temp(TyD { wrap: Some(mutbl), ty: base.ty.ty }, e)?;
+        self.name_local(bt, Identity::Temp(e, Role::Borrow));
         let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
         self.borrow(bp, base.ty, kind, bt, e)?;
         let iop = self.operand(idx, e)?;
         let rt = self.temp(TyD { wrap: Some(mutbl), ty: ty.ty }, e)?;
+        self.name_local(rt, Identity::Temp(e, Role::Result));
         let (btp, rp) = (self.place_of(bt), self.place_of(rt));
         let bop = if m { Operand::Move(btp) } else { Operand::Copy(btp) };
         self.b.call(&[bop, iop], rp, self.span(e));
@@ -2499,6 +2585,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             },
             _ => None,
         };
+        // A head with a hidden position (`x: T::Out`): related per call, never coarsely where
+        // an argument's demand could be missed (hidden_call.rs). A call that `owes` a declared
+        // `T: 'a` goes on to `call_by_generic_signature`, which refuses a hidden head.
+        if owes.is_none()
+            && let Some((item, g)) = callee
+            && let Some(life) = facts.sig(item)
+            && life.holds_hidden()
+            && self.call_through_hidden(item, life, sig, g, generic_origins, &vs, tp, ty, e)? == hidden_call::HiddenCall::BySignature
+        {
+            self.stats.calls_by_signature += 1;
+            self.push_place(tp, ty);
+            return Ok(());
+        }
         if !generic_origins
             && owes.is_none()
             && let Some((item, _)) = callee
@@ -2530,6 +2629,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             && let Some((item, _)) = callee
         {
             return self.refuse(Form::CallOutlivesUnread { callee: item, param }, e);
+        }
+        if let Some((item, _)) = callee
+            && facts.sig(item).is_some_and(|l| l.holds_hidden())
+        {
+            self.stats.calls_hidden += 1;
         }
         match sig {
             Some(s) if s.writes_lifetimes => return self.refuse(Form::CallWritesLifetimes, e),
@@ -2902,6 +3006,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         },
                     };
                     let l = self.new_local_with(lt, false, None, root)?;
+                    self.name_local(l, Identity::Binding(p));
                     self.pat_local[p.ix()] = l.0;
                     let lp = self.place_of(l);
                     self.b.stmt(StmtKind::StorageLive(l), self.pat_span(p));
@@ -3093,6 +3198,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                             None => return self.refuse_pat(Form::Malformed, p),
                         };
                         let l = self.new_local_with(lt, false, None, self.body.root)?;
+                        self.name_local(l, Identity::Binding(p));
                         self.pat_local[p.ix()] = l.0;
                         self.b.stmt(StmtKind::StorageLive(l), self.pat_span(p));
                         self.vars.push(l);

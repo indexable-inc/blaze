@@ -422,6 +422,7 @@ extern crate std;
 pub mod asm;
 pub mod block_uses;
 pub mod by_name;
+pub mod call_reads;
 mod columns;
 pub mod desugar;
 mod driver;
@@ -439,6 +440,8 @@ mod super_let;
 mod type_text;
 pub mod typeck;
 
+#[cfg(test)]
+mod call_reads_tests;
 #[cfg(test)]
 mod expand_tests;
 #[cfg(test)]

@@ -106,7 +106,7 @@ fn both(named: &[(&str, &[u8])], data: &[Data<'_>], platform: Platform) -> (AVec
     for &(name, bytes) in named {
         v1s.push(Function { symbol: sym(name), record: CodeView::read(bytes).unwrap(), tier: Tier::Fast });
     }
-    let program = ProgramIn { name: "tiny", functions: &v1s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile: None };
+    let program = ProgramIn { name: "tiny", functions: &v1s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile: None, natives: None, exports: &[] };
     let mut today = Vec::new_in(alloc);
     export(&program, platform, &mut today, alloc).unwrap();
     let mut converted: AVec<'_, AVec<'static, u8>> = Vec::new_in(alloc);

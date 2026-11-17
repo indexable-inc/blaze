@@ -31,7 +31,7 @@
 //!   no `IntoFuture` specialization in the library; coherence (E0119) refuses two such impls in
 //!   a crate, so this is a world that is already wrong, never a choice to make).
 
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ItemKey, LangItem, Name};
 use crate::machine::{Lower, Machine};
@@ -87,7 +87,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 }
                 (0, _) => {}
                 _ => {
-                    self.diag(DiagCode::CannotSatisfy, At::Expr(e), Some(t), None, Some(Name::of("into_future")));
+                    self.diag(DiagCode::CannotSatisfy, At::Expr(e), About::expected_named(t, Name::of("into_future")));
                 }
             }
         }

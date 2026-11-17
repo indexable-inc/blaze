@@ -82,5 +82,19 @@ blaze-surface.workspace = true
 # `tempo_pipeline`: each body checked as blaze-real's stage h does (`to_typeck`'s table).
 blaze-typeck.workspace = true
 
+# N7 (D112): a native script's `sw_vers` answered by the fact shim; the test binary is both the
+# script and the shim (argv[0]), so it has its own main.
+[[test]]
+name = "native_fact_shim"
+harness = false
+required-features = ["runtime"]
+
+# N8 (D112): a native script reads a wasm producer's header through its laid, read-only tree;
+# the test binary is also the script, so it has its own main.
+[[test]]
+name = "native_dep_tree"
+harness = false
+required-features = ["runtime"]
+
 [lints]
 workspace = true

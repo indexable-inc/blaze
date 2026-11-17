@@ -104,9 +104,15 @@ fn main() -> ExitCode {
     let tools = host_tools::granted(&table_tools, name, alloc);
     // Each tool under its name, then each program it starts under `<tool>+<path>`, as
     // native_unit keys them.
-    let names: std::vec::Vec<(std::string::String, &str, &host_tools::HostTool<'_>)> = tools
+    // nm-row: each at its real path, a shelf row's under the shelf.
+    let names: std::vec::Vec<(std::string::String, std::string::String, &host_tools::HostTool<'_>)> = tools
         .iter()
-        .flat_map(|tool| tool.programs().map(move |p| (if p == tool.path { tool.name.to_owned() } else { format!("{}+{p}", tool.name) }, p, tool)))
+        .flat_map(|tool| {
+            tool.programs_in(shelf, alloc).into_iter().enumerate().map(move |(at, p)| {
+                let p = p.as_str().to_owned();
+                (if at == 0 { tool.name.to_owned() } else { format!("{}+{p}", tool.name) }, p, tool)
+            })
+        })
         .collect();
     let tool_keys: std::vec::Vec<HostToolKey<'_>> = names
         .iter()
@@ -142,7 +148,8 @@ fn main() -> ExitCode {
             seen: blaze_expand::seen::SeenRoot::Package,
             macos_min: "11.0",
         };
-        let script = NativeScript { program: script, c, env: &env, reads: &[], host_tools: &tools, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600) };
+        // sha3-asm asks no fact (no sw_vers, no pkg-config): no fact shim (N7).
+        let script = NativeScript { program: script, c, env: &env, reads: &[], shown: &[], host_tools: &tools, facts: None, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600) };
         let ran = match run_script(&script, alloc) {
             Ok(ran) => ran,
             Err(error) => {

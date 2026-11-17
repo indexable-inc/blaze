@@ -14,11 +14,9 @@
 //!   from its owner's body and check record by `blaze_build::coroutine_facts` (the upvars are
 //!   the rows of `Checked::captures` whose first column is the block: blaze-typeck
 //!   rules/async_fn.rs writes them).
-//! - [`States`]: `LayoutFacts::coroutine_state`. A state's layout is the answer of one
-//!   instance's BUILD (`blaze_lir::coroutine::split`), so a state asked before it is made is
-//!   `Missing` and is remembered as WANTED: the driver builds that coroutine, records its
-//!   state, and builds the asking body again. A demand, not a second try: the first build
-//!   could not have answered.
+//! - [`States`]: `LayoutFacts::coroutine_state`. A state is laid out from TYPES before any
+//!   build (run/lay_states.rs, ASYNC.md P8) and recorded here; a state asked that was not laid
+//!   is `Missing` naming the owner, which the run refuses by name (never a second build).
 //! - [`opaque_hidden`]: `LayoutFacts::opaque_hidden`. An opaque type's hidden type is its
 //!   defining body's (`Checked::hidden`); an async block's future is given in its identity
 //!   form, at the block's own ordinal.
@@ -87,33 +85,10 @@ impl CoroutineTable {
     }
 }
 
-/// One coroutine instance by name: the owner, the block's ordinal, the owner's ground
-/// arguments (types of the build's one ground table, where equal types are one id).
-pub(crate) struct Wanted {
-    pub(crate) owner: ItemKey,
-    pub(crate) ordinal: u32,
-    pub(crate) args: Vec<PTy, Alloc<'static>>,
-}
-
-impl Wanted {
-    pub(crate) fn new(owner: ItemKey, ordinal: u32, args: &[PTy], alloc: Alloc<'static>) -> Wanted {
-        let mut own = Vec::with_capacity_in(args.len(), alloc);
-        own.extend_from_slice(args);
-        Wanted { owner, ordinal, args: own }
-    }
-
-    pub(crate) fn is(&self, owner: ItemKey, ordinal: u32, args: &[PTy]) -> bool {
-        self.owner == owner && self.ordinal == ordinal && self.args[..] == *args
-    }
-}
-
 struct StatesInner {
     /// Each state made: its instance (its arguments are `args[start..start + len]`) and shape.
     made: Vec<(ItemKey, u32, u32, u32, StateShape), Alloc<'static>>,
     args: Vec<PTy, Alloc<'static>>,
-    /// The last state asked for and not made, its arguments in `wanted_args`.
-    wanted: Option<(ItemKey, u32)>,
-    wanted_args: Vec<PTy, Alloc<'static>>,
 }
 
 impl StatesInner {
@@ -130,26 +105,19 @@ impl StatesInner {
 /// records. One thread, and no borrow is held across a call out of this file.
 pub(crate) struct States {
     inner: RefCell<StatesInner>,
-    alloc: Alloc<'static>,
 }
 
 impl States {
     pub(crate) fn new(alloc: Alloc<'static>) -> States {
-        let inner = StatesInner { made: Vec::new_in(alloc), args: Vec::new_in(alloc), wanted: None, wanted_args: Vec::new_in(alloc) };
-        States { inner: RefCell::new(inner), alloc }
+        let inner = StatesInner { made: Vec::new_in(alloc), args: Vec::new_in(alloc) };
+        States { inner: RefCell::new(inner) }
     }
 
-    /// The state of `owner`'s block `ordinal` at `args`, or `Missing` naming the owner, the
-    /// instance remembered as wanted ([`States::take_wanted`]).
+    /// The state of `owner`'s block `ordinal` at `args`. Every state a build reads was laid
+    /// before it (run/lay_states.rs): one not laid is `Missing` naming the owner, which the run
+    /// refuses by name (never a second build).
     pub(crate) fn get(&self, owner: ItemKey, ordinal: u32, args: &[PTy]) -> Result<StateShape, Missing> {
-        let mut s = self.inner.borrow_mut();
-        if let Some(shape) = s.find(owner, ordinal, args) {
-            return Ok(shape);
-        }
-        s.wanted_args.clear();
-        s.wanted_args.extend_from_slice(args);
-        s.wanted = Some((owner, ordinal));
-        Err(Missing { item: owner })
+        self.inner.borrow().find(owner, ordinal, args).ok_or(Missing { item: owner })
     }
 
     /// Whether the state of that instance is made.
@@ -157,18 +125,7 @@ impl States {
         self.inner.borrow().find(owner, ordinal, args).is_some()
     }
 
-    /// The instance the last `Missing` named, once: the cause of the `MissingRecord` the
-    /// build that asked just returned (a `Missing` ends its build at once, so the last asked
-    /// is the one that ended it).
-    pub(crate) fn take_wanted(&self) -> Option<Wanted> {
-        let mut s = self.inner.borrow_mut();
-        let (owner, ordinal) = s.wanted.take()?;
-        let mut args = Vec::with_capacity_in(s.wanted_args.len(), self.alloc);
-        args.extend_from_slice(&s.wanted_args);
-        Some(Wanted { owner, ordinal, args })
-    }
-
-    /// Records the state `shape` the build of that instance returned.
+    /// Records the state `shape` laid out for that instance (run/lay_states.rs).
     pub(crate) fn record(&self, owner: ItemKey, ordinal: u32, args: &[PTy], shape: StateShape) {
         let mut s = self.inner.borrow_mut();
         if s.find(owner, ordinal, args).is_some() {
@@ -232,7 +189,8 @@ pub(crate) fn async_items<P: FrontEnd>(program: &P) -> Option<AsyncItems> {
 /// arguments: its fn's generic parameters, parents first, as front2's heads make them), in
 /// `ground`. Read from the defining fn's check record (`Checked::hidden`). A hidden type that
 /// is an async block's future (an `async fn`'s root block; a fn returning `async { .. }`) is
-/// the block's coroutine in its identity form, at the block's ordinal in that body.
+/// written by the checker by identity, `PNode::Coroutine { owner, ordinal, Param(0..) }`
+/// (async P3), which is the builder's ground form too: `ground` maps its arguments.
 pub(crate) fn opaque_hidden<P: FrontEnd>(
     program: &P,
     checked: &[Option<Checked<'static>>],
@@ -250,7 +208,7 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
         return Err(refused("an `impl Trait` type whose defining fn is not in the program (not reached, or it did not check)"));
     };
     let function = program.function(i);
-    let (Some((body, _)), Some(done)) = (function.body, checked.get(i).and_then(Option::as_ref)) else {
+    let (Some(_), Some(done)) = (function.body, checked.get(i).and_then(Option::as_ref)) else {
         return Err(refused("an `impl Trait` type whose defining fn has no checked body"));
     };
     let Some(&(_, hidden)) = done.hidden.iter().find(|h| h.0 == opaque) else {
@@ -258,16 +216,9 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
     };
     let from = done.types.view();
     match from.node(hidden) {
-        Ok(PNode::Future(block, output, _)) => {
-            let view = body.view(program.types());
-            let ordinal = blaze_build::coroutines_in(&view)
-                .find(|c| c.1 == block)
-                .map(|c| c.0)
-                .ok_or(BuildError::Malformed { what: "a hidden type naming an async block its defining body does not hold" })?;
-            let output = blaze_build::ground(from, output, args, ground, scratch, facts)?;
-            let list = ground.intern_list(args).map_err(|_| BuildError::Malformed { what: "the ground table is full" })?;
-            blaze_build::coroutine_identity(ground, owner, ordinal, list, output)
-        }
+        Ok(PNode::Future(..)) => Err(BuildError::Malformed {
+            what: "a hidden type naming an async block by its expression (the checker writes it by identity, `PNode::Coroutine`, since async P3)",
+        }),
         Ok(_) => blaze_build::ground(from, hidden, args, ground, scratch, facts),
         Err(_) => Err(BuildError::Malformed { what: "a hidden type past its record's table" }),
     }

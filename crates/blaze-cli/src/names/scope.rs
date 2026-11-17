@@ -21,6 +21,7 @@ use core::cell::RefCell;
 use std::alloc::Global;
 use std::string::String;
 
+use blaze_build_script::outputs::OutputsRef;
 use blaze_drive::{Input, Key, Kind, Name, Task, TaskFailure, Want, Why};
 use blaze_fetch::pack::PackView;
 use blaze_id::CrateItemKey;
@@ -64,6 +65,8 @@ pub(crate) struct ScopeJob<'j> {
     packs: &'j [PackView<'j>],
     corrected: &'j [(u32, &'j str, &'j str)],
     env: Option<EnvLent<'j, 'j>>,
+    /// The command's proc-macro runner (`Names::procs`).
+    procs: Option<&'j crate::proc_runner::ProcRunner<'static>>,
 }
 
 /// What a round's jobs share, made once a round in its frame: the packs' views and the
@@ -121,32 +124,16 @@ struct Locals<'f> {
 }
 
 /// Which of the sysroot crates `all` (core, alloc, std, bstd, by world index) the crate at
-/// `at` is given, of a world of `count` crates whose dependencies `deps` lists: blaze-scope's
-/// rule (graph.rs `sysroot_before`) over `built_from`, whose bit `s` is set when the crate is
-/// sysroot crate `s` or in its dependency closure. Never the crate itself.
-fn sysroot_given<'d>(at: usize, all: [Option<usize>; 4], count: usize, deps: &dyn Fn(usize) -> &'d [(&'d str, usize)]) -> [bool; 4] {
-    let mut built_from: u8 = 0;
-    let mut seen: std::vec::Vec<bool, Global> = std::vec::Vec::new();
-    let mut stack: std::vec::Vec<usize, Global> = std::vec::Vec::new();
-    for (bit, s) in all.iter().enumerate() {
-        let Some(s) = s else { continue };
-        seen.clear();
-        seen.resize(count, false);
-        stack.clear();
-        stack.push(*s);
-        while let Some(g) = stack.pop() {
-            if g == at {
-                built_from |= 1 << bit;
-                break;
-            }
-            if !core::mem::replace(&mut seen[g], true) {
-                stack.extend(deps(g).iter().map(|(_, index)| *index));
-            }
-        }
-    }
+/// `at`, whose own dependencies are `own`, is given. A toolchain crate (`toolchain`): those its
+/// shelf row names, which are its edges (the cutter writes the sysroot crates a root names as
+/// real dependencies: blaze_toolchain::implied), read here and nowhere else. A crate of the
+/// program: every one the world holds (which `std` it names is its `Implicit`'s; what its
+/// root's `#![no_std]` drops is blaze-scope graph.rs `externs`'). Never the crate itself.
+fn sysroot_given(toolchain: bool, at: usize, all: [Option<usize>; 4], own: &[(&str, usize)]) -> [bool; 4] {
     let mut given = [false; 4];
-    for (bit, (slot, s)) in given.iter_mut().zip(all).enumerate() {
-        *slot = s.is_some_and(|s| s != at) && blaze_scope::graph::sysroot_before(built_from, bit);
+    for (slot, s) in given.iter_mut().zip(all) {
+        let Some(s) = s else { continue };
+        *slot = s != at && (!toolchain || own.iter().any(|(_, d)| *d == s));
     }
     given
 }
@@ -168,16 +155,13 @@ fn locals<'f>(names: &Names<'f>, at: usize, task: &Task<'_>) -> Locals<'f> {
     }
     let sysroot = names.world.sysroot;
     let all = [sysroot.core, sysroot.alloc, sysroot.std, sysroot.bstd];
-    // A crate is given the sysroot crates that come before the first one it is built into, by
-    // blaze-scope's one rule (graph.rs `sysroot_before`, as the whole-world solve gives them):
-    // bit `s` of `built_from` is set when the crate is sysroot crate `s` or in its dependency
-    // closure. So `core` and `alloc` never wait on each other, and a toolchain crate that
-    // reaches `core` by the implicit rule alone (bstd, the blaze crates under it, none of
-    // which lists `core`) is given it. Before: only the sysroot crates in the crate's own
-    // dependency closure, so bstd was resolved with no `core` and its prelude's
-    // `pub use core::prelude::rust_2024::*` named nothing: `Result` was NotFound at every
-    // blaze-edition program's head (test `bstd_is_given_the_core_it_reaches_by_the_implicit_rule`).
-    let given = sysroot_given(at, all.map(|s| s.map(|s| s.index())), crates.len(), &|g| crates[g].input.deps);
+    // A toolchain crate is given the sysroot crates its shelf row names (its edges: the
+    // cutter's implied `core`, `alloc`, `std`), so bstd and the blaze crates under it, none of
+    // which lists `core` in a manifest, are given it, and std's own closure is never given
+    // std; a program crate every one the world holds (test
+    // `a_toolchain_crate_is_given_what_its_row_names`).
+    let toolchain = matches!(crates[at].origin, blaze_world::Origin::Toolchain(_));
+    let given = sysroot_given(toolchain, at, all.map(|s| s.map(|s| s.index())), input.deps);
     let mut mapped = [None; 4];
     for ((slot, s), given) in mapped.iter_mut().zip(all).zip(given) {
         *slot = s.filter(|_| given).map(|s| place(s.index(), &mut local));
@@ -209,6 +193,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
     lock: Option<&'f Lock<'static>>,
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
     env: &FetchEnv<'_>,
+    macros: Option<&crate::proc_runner::MacroSide<'_, '_, '_>>,
     task: &Task<'_>,
     round: &mut ScopeRound<'j>,
     held: &'b Frame,
@@ -223,7 +208,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
             return Ok(Prepared::Answer(Did::Need(wants)));
         };
         let read = crate::work::payload(&cx, store, graph, round.frame)?;
-        match world(&cx, root, read.payload(), lock, members, env) {
+        match world(&cx, root, read.unit_graph(graph.name)?.graph, lock, members, env) {
             Ok(made) => {
                 tell_public(store, &made);
                 *names = Some(made);
@@ -231,6 +216,19 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
             Err(error) => {
                 let words = bstd::mem::format_in!(held, "names not resolved: {error}");
                 return Ok(Prepared::Answer(Did::FailedSaying(refused("the crates' inputs could not be made"), held_str(words.as_str(), held))));
+            }
+        }
+    }
+    // The proc-macro runner, once a command, right after the world: every crate's job carries
+    // it, so a proc-macro crate's record holds its key and every call reaches the one path.
+    if let (Some(made), Some(side)) = (names.as_mut(), macros)
+        && made.procs().is_none()
+    {
+        match crate::proc_runner::make(made, side) {
+            Ok(runner) => made.set_procs(runner),
+            Err(error) => {
+                let words = bstd::mem::format_in!(held, "names not resolved: the proc-macro runner: {error}");
+                return Ok(Prepared::Answer(Did::FailedSaying(refused("the proc-macro runner could not be made"), held_str(words.as_str(), held))));
             }
         }
     }
@@ -255,21 +253,43 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
     let crates = &names.world.crates;
     let Locals { local, own_deps, mapped, all } = locals(names, at, task);
     let missing: std::vec::Vec<usize, Global> = local.iter().copied().filter(|g| have(names, task, *g).is_none()).collect();
-    if !missing.is_empty() {
-        let mut wants = blaze_own::Vec::with_capacity_in(missing.len(), held);
+    // Its unit's build script's run (decision D115 (B)): read now, never in the crate's key.
+    let script = names.script_of(at);
+    let script_handed = script.and_then(|script| task.inputs.iter().find(|input| input.name == script));
+    if !missing.is_empty() || (script.is_some() && script_handed.is_none()) {
+        let mut wants = blaze_own::Vec::with_capacity_in(missing.len() + 1, held);
         wants.extend(missing.iter().map(|g| Want { name: name_of(crates[*g].input.key), home: Name::unit_graph() }));
+        wants.extend(script.filter(|_| script_handed.is_none()).map(|script| Want { name: script, home: Name::unit_graph() }));
         return Ok(Prepared::Answer(Did::Need(wants)));
     }
     if names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).is_ok() {
         return Ok(Prepared::Made);
     }
-    let input = crates[at].input;
+    // The crate's input with its script's outputs joined (`rustc-cfg` atoms, the record for
+    // `env!`/`include!`), in the round's frame.
+    let (input, outputs): (CrateInput<'j>, Option<OutputsRef<'j>>) = match script_handed {
+        None => (crates[at].input, None),
+        Some(handed) => {
+            let read = crate::work::payload(&cx, store, handed, round.frame)?;
+            let bytes: &'j [u8] = blaze_own::Vec::from_slice_in(read.payload(), round.frame).leak();
+            // A `Script` payload: how it ran, then the outputs record (scripts.rs `payload_parts`).
+            let opened = match crate::scripts::payload_parts(bytes) {
+                Some((_, record)) => OutputsRef::open(record),
+                None => Err(blaze_build_script::outputs::RecordError::Layout),
+            };
+            match opened {
+                Ok(outputs) => (blaze_world::joined(&crates[at].input, outputs, round.alloc), Some(outputs)),
+                Err(error) => {
+                    let words = bstd::mem::format_in!(held, "crate `{}`: its build script's record ({:?}) is not an outputs record: {error:?}", crates[at].input.name, handed.name);
+                    return Ok(Prepared::Answer(Did::FailedSaying(refused("a build script's record"), held_str(words.as_str(), held))));
+                }
+            }
+        }
+    };
     let mut deps: blaze_own::Vec<&'j [u8], &'j Frame> = blaze_own::Vec::with_capacity_in(local.len(), round.frame);
     for (place, g) in local.iter().enumerate() {
         let handed = have(names, task, *g).ok_or(CliError::Text { what: "a crate's input, checked above, is gone" })?;
         let by_place = round.by_place;
-        #[cfg(test)]
-        std::eprintln!("RECPIPE6-DIAG crate {} place {place} dep {} by_place {by_place} round has {}", input.name, crates[*g].input.name, round.exports.len());
         if let Some((_, _, bytes)) = round.exports.iter().find(|(key, at, _)| if by_place { *at == place } else { *key == handed.at }) {
             deps.push(bytes);
             continue;
@@ -303,10 +323,12 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
         }
     };
     // The environment is copied here into the round's frame, so the job outlives this borrow
-    // of the world; the worker copies it again into its own frame ([`EnvLent`]).
-    let env = match names.world.texts.crate_env(at) {
-        None => None,
-        Some(env) => match env.clone_in(round.alloc) {
+    // of the world; the worker copies it again into its own frame ([`EnvLent`]). With a script,
+    // its `OUT_DIR` and `rustc-env` pairs joined (`CrateEnv::joined`, a copy too).
+    let env = match (names.world.texts.crate_env(at), outputs) {
+        (None, _) => None,
+        (Some(env), Some(outputs)) => Some(EnvLent::new(&*blaze_own::Box::leak(blaze_own::Box::new_in(env.joined(outputs, round.alloc), round.alloc)))),
+        (Some(env), None) => match env.clone_in(round.alloc) {
             Ok(copy) => Some(EnvLent::new(&*blaze_own::Box::leak(blaze_own::Box::new_in(copy, round.alloc)))),
             Err(error) => {
                 let words = bstd::mem::format_in!(held, "crate `{}`: its environment's build-script record did not open again: {error:?}", input.name);
@@ -314,7 +336,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
             }
         },
     };
-    let job = ScopeJob { at, input: CrateInput { deps: own_deps, ..input }, deps: deps.leak(), sysroot, packs, corrected, env };
+    let job = ScopeJob { at, input: CrateInput { deps: own_deps, ..input }, deps: deps.leak(), sysroot, packs, corrected, env, procs: names.procs() };
     Ok(Prepared::Resolve(blaze_own::Box::leak(blaze_own::Box::new_in(job, round.frame))))
 }
 
@@ -344,7 +366,19 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
             Err(error) => return failed_with(std::format!("crate `{crate_name}`: its environment's build-script record did not open again: {error:?}")),
         },
     };
-    let texts = JobTexts { cx: &cx, root, frame, packs: job.packs, corrected: job.corrected, env: env.map(|env| (job.at, env)), read: RefCell::new(std::vec::Vec::new()) };
+    let callers: &[(usize, usize, blaze_expand::Edition)] = blaze_own::Box::leak(blaze_own::Box::new_in([(job.at, job.at, job.input.edition)], frame));
+    let texts = JobTexts {
+        cx: &cx,
+        root,
+        frame,
+        packs: job.packs,
+        corrected: job.corrected,
+        env: env.map(|env| (job.at, env)),
+        read: RefCell::new(std::vec::Vec::new()),
+        procs: job.procs,
+        own: Some(job.at),
+        callers,
+    };
     let prepares = Prepares::new_in(alloc);
     let done = {
         let _cx = cx.span("crate scope: resolve_crate");
@@ -455,10 +489,12 @@ pub(crate) fn answer<'b>(names: &Names<'_>, task: &Task<'_>, held: &'b Frame) ->
     let local = locals(names, at, task).local;
     let crates = &names.world.crates;
     let unread: std::vec::Vec<&String, Global> = resolved.files.iter().filter(|path| !task.inputs.iter().any(|input| input.name == surface(path))).collect();
+    let script = names.script_of(at);
     if !unread.is_empty() {
-        let mut wants = blaze_own::Vec::with_capacity_in(unread.len() + local.len(), held);
+        let mut wants = blaze_own::Vec::with_capacity_in(unread.len() + local.len() + 1, held);
         wants.extend(unread.iter().map(|path| Want { name: surface(path), home: blaze_drive::Name::file(path.as_bytes()) }));
         wants.extend(local.iter().map(|g| Want { name: name_of(crates[*g].input.key), home: Name::unit_graph() }));
+        wants.extend(script.map(|script| Want { name: script, home: Name::unit_graph() }));
         return Ok(Did::Need(wants));
     }
     let mut made = Made::new_in(name, held);
@@ -480,6 +516,11 @@ pub(crate) fn answer<'b>(names: &Names<'_>, task: &Task<'_>, held: &'b Frame) ->
     }
     for g in local.iter() {
         let input = have(names, task, *g).ok_or(CliError::Text { what: "a crate's input, checked above, is gone" })?;
+        made.reads.push((input.name, input.out));
+    }
+    // Its script's run, by its out: an equal record moves nothing; another runs this crate.
+    if let Some(script) = script {
+        let input = task.inputs.iter().find(|input| input.name == script).ok_or(CliError::Text { what: "a crate's build script's record, checked above, is gone" })?;
         made.reads.push((input.name, input.out));
     }
     #[cfg(test)]
@@ -511,13 +552,14 @@ pub(crate) fn run<'f, 'b>(
     lock: Option<&'f Lock<'static>>,
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
     env: &FetchEnv<'_>,
+    macros: Option<&crate::proc_runner::MacroSide<'_, '_, '_>>,
     task: &Task<'_>,
     held: &'b Frame,
 ) -> Result<Did<'b>, CliError> {
     let own = Frame::with_reserve(SCOPE_JOBS, Tag::Other).map_err(|_| CliError::Text { what: "a crate scope's frame could not be reserved" })?;
     let resolution = {
         let mut round = ScopeRound::new(&own, false);
-        match prepare(cx, root, store, names, lock, members, env, task, &mut round, held)? {
+        match prepare(cx, root, store, names, lock, members, env, macros, task, &mut round, held)? {
             Prepared::Answer(did) => return Ok(did),
             Prepared::Made => None,
             Prepared::Resolve(job) => {
@@ -539,27 +581,36 @@ pub(crate) fn run<'f, 'b>(
 mod tests {
     use super::sysroot_given;
 
-    /// The real toolchain's shape (its shelf's unit rows): `alloc` lists `core`, `std` lists
-    /// `alloc` and `core`, but bstd lists only its own crates (`blaze_core` here), which list
-    /// no `core`: a `#![no_std]` crate names `core` by the implicit rule (the Rust Reference,
-    /// "Preludes": `core` is in the extern prelude of every crate), never by a dependency line.
-    /// bstd, and `blaze_core` under it, are given `core`, `alloc` and `std`; `core` is given
-    /// none, `alloc` only `core` (no cycle). CONTROL (seen failing first): the rule before,
-    /// "only the sysroot crates in the crate's own dependency closure", gave bstd nothing, so
-    /// its prelude's `pub use core::prelude::rust_2024::*` named nothing and every
-    /// blaze-edition program's `Result` was NotFound.
-    /// Prints `sysroot given: bstd [true, true, true, false], blaze_core [true, true, true, false]`.
+    /// The real shelf's rows as the cutter writes them (blaze_toolchain::implied): `core`
+    /// (`#![no_core]`) names nothing; `alloc` (`#![no_std]`) core; `std` (itself `#![no_std]`)
+    /// alloc and core; bstd (`cfg_attr(not(test), no_std)`, `extern crate alloc`) core and
+    /// alloc, and its crate `blaze_ids` (std's prelude: `Vec<u64>`) core and std, edges
+    /// written in its row though its manifest lists neither. A toolchain crate is given what
+    /// its row names: blaze_ids std, bstd not (the Rust Reference, "Extern prelude": `std` is
+    /// added "as long as the `no_std` attribute is not specified in the crate root"); a
+    /// program crate (`app`) every sysroot crate. CONTROL: runner 5's closure walk gave bstd
+    /// `std` too (it comes "after" std) and gave a toolchain crate the target sysroot whatever
+    /// its row said. Prints
+    /// `sysroot given: bstd [true, true, false, false], blaze_ids [true, false, true, false], app [true, true, true, true]`.
     #[test]
-    fn bstd_is_given_the_core_it_reaches_by_the_implicit_rule() {
-        // World indexes: 0 core, 1 alloc, 2 std, 3 bstd, 4 blaze_core.
-        let deps: [&[(&str, usize)]; 5] = [&[], &[("core", 0)], &[("alloc", 1), ("core", 0)], &[("blaze_core", 4)], &[]];
+    fn a_toolchain_crate_is_given_what_its_row_names() {
+        // World indexes: 0 core, 1 alloc, 2 std, 3 bstd, 4 blaze_ids, 5 app (a program crate).
+        let deps: [&[(&str, usize)]; 6] = [
+            &[],
+            &[("core", 0)],
+            &[("alloc", 1), ("core", 0)],
+            &[("alloc", 1), ("blaze_ids", 4), ("core", 0)],
+            &[("core", 0), ("std", 2)],
+            &[],
+        ];
         let all = [Some(0), Some(1), Some(2), Some(3)];
-        let given = |at: usize| sysroot_given(at, all, deps.len(), &|g| deps[g]);
+        let given = |at: usize| sysroot_given(at != 5, at, all, deps[at]);
         assert_eq!(given(0), [false, false, false, false], "core");
         assert_eq!(given(1), [true, false, false, false], "alloc");
-        assert_eq!(given(2), [true, true, false, false], "std");
-        assert_eq!(given(3), [true, true, true, false], "bstd");
-        assert_eq!(given(4), [true, true, true, false], "blaze_core, built into bstd");
-        println!("sysroot given: bstd {:?}, blaze_core {:?}", given(3), given(4));
+        assert_eq!(given(2), [true, true, false, false], "std: never itself");
+        assert_eq!(given(3), [true, true, false, false], "bstd: no_std, its row names no std");
+        assert_eq!(given(4), [true, false, true, false], "blaze_ids: its row names std");
+        assert_eq!(given(5), [true, true, true, true], "a program crate: every sysroot crate");
+        println!("sysroot given: bstd {:?}, blaze_ids {:?}, app {:?}", given(3), given(4), given(5));
     }
 }

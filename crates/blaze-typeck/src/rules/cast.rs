@@ -11,16 +11,24 @@
 //! pointer to pointer or address, address to pointer, fn item or pointer to pointer or address,
 //! `&[T; N]` to `*const T`. A non-primitive side is E0605, anything else E0606.
 //!
+//! A fn item source (rustc's `do_check`, its `FnDef` case): an intrinsic has no address
+//! (core/src/intrinsics/mod.rs: "The actual implementations live in the compiler."), so any
+//! cast of it is E0606 (the coercion's `IntrinsicCast` becomes the cast's `IllegalCast`), a fn
+//! pointer target included; a fn pointer type is no cast target past a coercion (rustc's
+//! `(_, Int(CEnum) | FnPtr) => NonScalar`, E0605), so a safe `#[target_feature]` fn cast to a
+//! safe fn pointer outside its features (rules/target_feature.rs) is E0605.
+//!
 //! Omitted for now: the metadata rules of wide-pointer casts (`*const [T]` to `*const U`
 //! keeps or drops length), `dyn` upcasts, and the trivial-cast lint.
 
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
-use crate::ids::{ExprId, UintTy};
+use crate::ids::{ExprId, Safety, UintTy};
 use crate::machine::{CastCheck, Expectation, Flow, Frame, Machine, Then};
 use crate::portable::PTy;
+use crate::rules::target_feature::Gate;
 use crate::ty::{Ty, TyView, TypeCtx};
-use crate::world::{AdtKind, CtorKind, World};
+use crate::world::{AdtKind, CtorKind, TypeAttrs, World};
 
 /// rustc's `CastTy`, coarsened to what the rules need.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +101,31 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             if self.is_err(from) || self.is_err(to) {
                 continue;
             }
+            // A fn item's own rules (the module doc), before the trivial cast: an intrinsic is
+            // E0606 whatever the target; a gated `#[target_feature]` fn to a safe fn pointer is
+            // E0605. A body with features of its own goes on to the coercion, which refuses it
+            // by name (rules/reify.rs).
+            if let TyView::FnDef(k, _) = self.view(from) {
+                let attrs = self.reads.attrs(k)?;
+                if attrs.0 & TypeAttrs::INTRINSIC != 0 {
+                    self.diag(DiagCode::InvalidCast, At::Expr(c.expr), About::types(to, from));
+                    continue;
+                }
+                if let TyView::FnPtr(_, hb) = self.view(to)
+                    && hb.safety == Safety::Safe
+                {
+                    let own = match self.reads.fn_sig(k)? {
+                        Some(sig) => Some(sig.header.safety),
+                        None => None,
+                    };
+                    if let Some(own) = own
+                        && self.feature_gate(attrs, own)? == Gate::Unsafe
+                    {
+                        self.diag(DiagCode::NonPrimitiveCast, At::Expr(c.expr), About::types(to, from));
+                        continue;
+                    }
+                }
+            }
             // A trivial cast is a coercion.
             if self.commit_if(|m| -> Result<Option<()>, Stop> {
                 Ok(if m.coerce(Some(c.operand), from, to, false)? { Some(()) } else { None })
@@ -110,10 +143,13 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 (Kind::Int(_), Kind::Ptr) => Ok(()),
                 (Kind::RefArray, Kind::Ptr) => Ok(()),
                 (Kind::Other, _) | (_, Kind::Other) => Err(DiagCode::NonPrimitiveCast),
+                // A fn pointer is no cast target past a coercion (rustc's `do_check`,
+                // `(_, Int(CEnum) | FnPtr) => NonScalar`).
+                (_, Kind::FnPtr) => Err(DiagCode::NonPrimitiveCast),
                 _ => Err(DiagCode::InvalidCast),
             };
             if let Err(code) = ok {
-                self.diag(code, At::Expr(c.expr), Some(to), Some(from), None);
+                self.diag(code, At::Expr(c.expr), About::types(to, from));
             }
         }
         Ok(())

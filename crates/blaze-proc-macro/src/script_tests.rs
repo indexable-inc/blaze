@@ -1,8 +1,7 @@
 //! The build-script runner against small command modules written here byte by byte (the
 //! vendored Wasmtime takes no WAT text): each hostile script stopped by its own limit with a
-//! typed error naming the package; and, in the simulation, a changed file or environment value
-//! invalidating exactly the records that read it, with two planted bugs caught (a read left
-//! out of the record, a variable left out of the key).
+//! typed error naming the package. Invalidation is not tested here: the runner keeps nothing
+//! (its only cache is the command's `Script` task record, D115).
 
 use std::{
     path::PathBuf,
@@ -17,19 +16,16 @@ use blaze_build_script::{
     key::{CMode, RunLimits},
 };
 use blaze_own::Alloc;
-use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
-    record::{DirStore, native_world},
     script::{LoadedScript, ScriptError, ScriptLimit, ScriptRuntime, ScriptWhy},
     script_sandbox::{GitView, Read, Refusal, Script, SpawnRefusal, Tree, answer_now},
 };
 use blaze_build_script::git;
 
-/// The runtime over the folder `store`, its records through a world over that folder.
+/// The runtime over the folder `store` (its compiled modules).
 fn runtime_at(store: &std::path::Path) -> Result<ScriptRuntime, std::string::String> {
-    let (io, root) = native_world(store).map_err(|error| error.to_string())?;
-    ScriptRuntime::new(store, DirStore::build_scripts(&io, &root)).map_err(|error| error.to_string())
+    ScriptRuntime::new(store).map_err(|error| error.to_string())
 }
 
 /// A fresh folder under the system's temporary one, by this process and a count.
@@ -320,20 +316,25 @@ fn stopped(name: &str, body: &[u8]) -> ScriptError {
     }
 }
 
+/// A run is a function of its inputs (rule 25): two runs of one script give equal outputs
+/// bytes and equal reads; the runner keeps nothing between them.
 #[test]
-fn a_well_behaved_script_runs_and_its_second_run_is_the_record() {
+fn a_well_behaved_script_runs_and_two_runs_are_equal() {
     let runtime = runtime_at(&folder("store")).expect("the runtime");
     let mut body = open(A_TXT, 0, 2);
     body.extend(print_cfg());
     let loaded = load(&runtime, "good", &body);
     let vars = env_of("0");
     let first = runtime.run(&loaded, script("good", tree(0, 0), vars.clone()), &as_env(&vars), Alloc::global()).unwrap_or_else(|e| panic!("{e}"));
-    assert!(!first.from_record);
     assert_eq!(first.outputs.cfgs.len(), 1);
     assert_eq!(first.reads.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["file:a.txt"]);
     let second = runtime.run(&loaded, script("good", tree(0, 0), vars.clone()), &as_env(&vars), Alloc::global()).unwrap_or_else(|e| panic!("{e}"));
-    assert!(second.from_record);
-    assert_eq!(second.outputs.cfgs.len(), 1);
+    let (mut a, mut b) = (blaze_own::Vec::new_in(Alloc::global()), blaze_own::Vec::new_in(Alloc::global()));
+    first.outputs.encode(&mut a);
+    second.outputs.encode(&mut b);
+    assert_eq!(&a[..], &b[..], "two runs of one script gave other outputs");
+    assert_eq!(first.reads, second.reads);
+    assert_eq!(first.base, second.base);
 }
 
 #[test]
@@ -582,99 +583,4 @@ fn a_git_fact_reruns_its_script_only_when_its_answer_changes() {
     assert_ne!(answer_now(&tree, subject), Ok(first));
     std::fs::remove_file(root.join(".git/HEAD")).expect("break");
     assert_eq!(answer_now(&tree, subject), Ok(None));
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Plant {
-    None,
-    /// The record is kept without the run's reads.
-    UnrecordedRead,
-    /// The key is made from the environment without `X`.
-    VariableOutOfKey,
-}
-
-/// One case: four scripts, kept as records: 0 reads `a.txt`, 1 reads `b.txt`, 2 and 3 read
-/// nothing and are given `X` (each its own value). Then some of the four inputs change, and
-/// every script is looked up again. The oracle: a record answers exactly when its one input
-/// is unchanged.
-fn invalidation(runtime: &ScriptRuntime, loaded: &[LoadedScript; 3], tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let harness = |e: &dyn std::fmt::Debug| Broke::Harness(format!("{e:?}"));
-    let mut values = [0u8; 4];
-    for value in &mut values {
-        *value = tape.int_in(0u8..=3, "value");
-    }
-    // Script `at`'s module and its run's tree and environment under `values`.
-    let of = |at: usize, values: &[u8; 4]| {
-        let module = &loaded[at.min(2)];
-        // Scripts 2 and 3 run one module: their values differ by script, or one's changed input
-        // could equal the other's, whose record then rightly answers.
-        let vars = env_of(&if at >= 2 { format!("{at}-{}", values[at]) } else { "0".to_owned() });
-        (module, script(&format!("s{at}"), tree(values[0], values[1]), vars.clone()), vars)
-    };
-    let key_env = |vars: &[(String, String)]| match plant {
-        Plant::VariableOutOfKey => as_env(&vars.iter().filter(|(name, _)| name != "X").cloned().collect::<Vec<_>>()),
-        _ => as_env(vars),
-    };
-    for at in 0..4 {
-        let (module, script, vars) = of(at, &values);
-        let base = runtime.base(module, &script, &key_env(&vars));
-        let ran = runtime.fresh(module, script, base, Alloc::global()).map_err(|e| harness(&e))?;
-        let expected: &[&str] = match at {
-            0 => &["file:a.txt"],
-            1 => &["file:b.txt"],
-            _ => &[],
-        };
-        let read: Vec<&str> = ran.reads.iter().map(|r| r.subject.as_str()).collect();
-        if read != expected {
-            return Err(Broke::Oracle(format!("script {at} recorded {read:?}, not {expected:?}")));
-        }
-        let reads = if plant == Plant::UnrecordedRead { Vec::new() } else { ran.reads };
-        runtime.keep(base, &reads, &ran.outputs).map_err(|e| harness(&e))?;
-    }
-    let mut changed = [false; 4];
-    for (at, change) in changed.iter_mut().enumerate() {
-        *change = tape.bool("change");
-        if *change {
-            values[at] += 1;
-        }
-    }
-    for (at, changed) in changed.into_iter().enumerate() {
-        let (module, script, vars) = of(at, &values);
-        let base = runtime.base(module, &script, &key_env(&vars));
-        let found = runtime.find(&base, &script.tree, Alloc::global()).map_err(|e| harness(&e))?;
-        match (found.is_some(), changed) {
-            (true, true) => return Err(Broke::Oracle(format!("stale: script {at}'s record answered after its input changed"))),
-            (false, false) => return Err(Broke::Oracle(format!("script {at}'s record was lost, though its input did not change"))),
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// One case on a fresh store: the three modules (read `a.txt`, read `b.txt`, read nothing;
-/// each prints a cfg) loaded, then [`invalidation`].
-fn case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let runtime = runtime_at(&folder("store")).map_err(|e| Broke::Harness(e.to_string()))?;
-    let body = |read: Option<(i64, i64)>| {
-        let mut body = read.map_or_else(Vec::new, |path| open(path, 0, 2));
-        body.extend(print_cfg());
-        body
-    };
-    let loaded = [load(&runtime, "s0", &body(Some(A_TXT))), load(&runtime, "s1", &body(Some(B_TXT))), load(&runtime, "s2", &body(None))];
-    invalidation(&runtime, &loaded, tape, plant)
-}
-
-#[test]
-fn a_changed_file_or_variable_invalidates_exactly_the_records_that_read_it() {
-    blaze_sim::check(Config::cases(24), |tape| case(tape, Plant::None));
-}
-
-#[test]
-fn control_a_read_left_out_of_the_record_is_caught() {
-    blaze_sim::control(Config::cases(24), Plant::None, Plant::UnrecordedRead, "stale", case);
-}
-
-#[test]
-fn control_a_variable_left_out_of_the_key_is_caught() {
-    blaze_sim::control(Config::cases(24), Plant::None, Plant::VariableOutOfKey, "stale", case);
 }

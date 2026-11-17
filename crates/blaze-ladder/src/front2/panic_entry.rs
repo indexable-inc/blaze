@@ -170,7 +170,7 @@ pub fn bound<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, store: &Store<
 }
 
 fn failed(why: Refused) -> Reached {
-    Reached::Failed { class: why.form().into(), detail: why.form().into() }
+    Reached::Failed { class: why.form().into(), detail: why.form().into(), refusal: None }
 }
 
 /// The walk's outcome for `k`, a fn whose head says it has no body, and the fn to queue as

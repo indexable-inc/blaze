@@ -121,7 +121,7 @@ impl BackNeeds {
                     // A program declaring no such lang trait: the checker records no
                     // overloaded dereference through it.
                     Ok(None) => {}
-                    Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("deref lang fn"), detail: why })),
+                    Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("deref lang fn"), detail: why, refusal: None })),
                 }
             }
         }
@@ -160,7 +160,7 @@ impl BackNeeds {
         for t in wanted {
             match argument_new(r, owner, t) {
                 Ok(k) => queue.push((k, None)),
-                Err((at, why)) => fns.push((at.unwrap_or(owner), Reached::Failed { class: Box::from("fmt argument"), detail: why })),
+                Err((at, why)) => fns.push((at.unwrap_or(owner), Reached::Failed { class: Box::from("fmt argument"), detail: why, refusal: None })),
             }
         }
         // The builder names the TRAIT's fn at the index (`Adts::index_fn`) and reads its ABI
@@ -175,7 +175,7 @@ impl BackNeeds {
                     // A program declaring no such lang trait: the checker refused its `a[b]`
                     // already (`MissingLangItem`), or it never writes one in a mutable place.
                     Ok(None) => {}
-                    Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("index lang fn"), detail: why })),
+                    Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("index lang fn"), detail: why, refusal: None })),
                 }
             }
         }

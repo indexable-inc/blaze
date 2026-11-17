@@ -91,6 +91,8 @@ fn main() -> ExitCode {
         panic: Panic::Unwind,
         personality: None,
         profile: None,
+        natives: None,
+        exports: &[],
     };
     let mut file = Vec::new_in(Alloc::global());
     let exported = match export(&program, platform, &mut file, Alloc::global()) {

@@ -194,16 +194,18 @@ impl World for ToyWorld {
         Ok(&[])
     }
 
-    fn resolve_path(&self, _: Seal, scope: ScopeId, path: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
+    fn resolve_path(&self, _: Seal, scope: ScopeId, path: PathIdx, segments: &[Name]) -> Fetch<crate::path_miss::PathAnswer> {
         self.held(Question::Path(scope, path))?;
-        // `S<i>` names struct `i`, by the name `Name(i)` its variant has.
+        // `S<i>` names struct `i`, by the name `Name(i)` its variant has; a one-segment name
+        // that is none is its first segment's miss. The toy names no longer path.
         Ok(match segments {
             [n] => self
                 .adts
                 .iter()
                 .position(|(_, a)| a.variants[0].name == *n)
-                .map(|i| PathRes { def: Def::Adt(struct_key(i as u32)), consumed: 1 }),
-            _ => None,
+                .map(|i| PathRes { def: Def::Adt(struct_key(i as u32)), consumed: 1 })
+                .ok_or(crate::path_miss::PathMiss::FIRST),
+            _ => Err(crate::path_miss::PathMiss::Whole),
         })
     }
 

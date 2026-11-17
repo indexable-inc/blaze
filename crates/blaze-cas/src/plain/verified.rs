@@ -89,6 +89,18 @@ impl Unverified {
     pub(crate) fn len(&self) -> u64 {
         self.map.bytes().len() as u64
     }
+
+    /// Whether its index, NOT YET PROVED, names `key`: read only to decide whether the one
+    /// full check is due now (its first hit, probe.rs); nothing read here is returned or
+    /// trusted. Bounded on any bytes: the index's place is its row's (a manifest's, checked),
+    /// the length was compared with the row, and the search stays inside the run.
+    pub(crate) fn names(&self, key: &Key) -> bool {
+        let bytes = self.map.bytes();
+        if bytes.len() as u64 != self.seg.file_len() {
+            return false;
+        }
+        format::find(self.seg.run(bytes), &key.0).is_some()
+    }
 }
 
 /// A segment whose bytes are proved, for its [`Boot`]: read in place with no check.

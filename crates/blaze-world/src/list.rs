@@ -3,7 +3,8 @@
 //! crates, on which side, with their edges by index (AGENTS.md rule 30). This module was the
 //! second list (`held`, a walk of its own over the graph, and every proc macro kept without
 //! its dependencies); it is now the layer over the one list: where each crate's files are (the
-//! trees), its key, its environment, its build script's record, and the order.
+//! trees), its key, its environment and the order. A build script's record is not in it: the
+//! crate's task reads it (decision D115 (B), [`crate::joined`]).
 //!
 //! - **Which crates.** The list's: the target-side units the workspace members reach (a path
 //!   package placed in the checkout is a member, as D96 already took it), each proc macro, the
@@ -22,13 +23,13 @@
 //!   subset and only matched. Merging them waits on std's build-script cfg moving into the list.
 //! - **Keys.** A crate's key is from content, before any file is read (rules 21, 65): the
 //!   list's key (package, kind, binary, side, features), its crate name, root, implicit externs,
-//!   edition, cfg (with its build script's atoms), its dependencies' keys, its build script's
-//!   record digest, a member's directory (D96) and a source correction (D58).
+//!   edition, cfg (the unit's), its dependencies' keys, a member's directory (D96) and a source
+//!   correction (D58). Never a build script's outputs: they are not known before the script
+//!   runs, so they are a read of the crate's task (decision D115 (B)).
 //!
 //! Sans-IO but for [`open_list`], which reads the toolchain's manifest and packs from the
 //! caller's `Shelf`.
 
-use blaze_build_script::outputs::OutputsRef;
 use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::Lock;
@@ -41,7 +42,7 @@ use blaze_toolchain::{Shelf, ToolchainId, ToolchainView};
 use blaze_unit_graph::{StdIs, Unit, UnitGraph, UnitKind};
 
 use crate::{
-    Corrected, Crate, Needs, Origin, Packages, Place, Script, ScriptOutputs, Texts, Toolchain, Tree, World, WorldError, alloc_free_debug, correct_pack, implicit_key,
+    Corrected, Crate, Needs, Origin, Packages, Place, Script, Texts, Toolchain, Tree, World, WorldError, alloc_free_debug, correct_pack, implicit_key,
     join, keep, keep_slice, push_u32,
 };
 
@@ -134,16 +135,29 @@ pub fn crate_list<'w, P: Packages<'w>>(
     unit_crates(graph, lock, &members, view, triple, alloc).map_err(WorldError::Units)
 }
 
-/// The roles the list's crates need of the target's toolchain beyond core, alloc and Rust's std
-/// (always opened): bstd for a blaze-edition crate, and `proc_macro` for a proc macro (a
-/// dependency's names the target's).
+/// The roles the list's own crates need of the target's toolchain beyond core and alloc: Rust's
+/// std for a crate given it, bstd for a blaze-edition crate, and `proc_macro` for a proc macro
+/// (a dependency's names the target's). The toolchain crates' needs are their rows' edges
+/// (blaze-scope units.rs `toolchain_crates` seeds the same: `rust_std`, `blaze`).
 pub fn needs(list: &UnitCrates<'_>) -> Needs {
-    let mut n = Needs { bstd: false, proc_macro: false };
+    let mut n = Needs { std: false, bstd: false, proc_macro: false };
     for c in list.crates.iter().filter(|c| matches!(c.origin, ListOrigin::Unit(_))) {
+        n.std |= matches!(c.implicit.std, StdIs::Rust);
         n.bstd |= matches!(c.implicit.std, StdIs::Bstd(_));
         n.proc_macro |= c.implicit.proc_macro;
     }
     n
+}
+
+/// Two units placed under one crate key, `first` and `second` (each its crate name and
+/// [`Script`]), read one build-script run, or the world is refused naming both
+/// ([`WorldError::ScriptClash`]): one crate key, two runs would be two values under one key
+/// (rule 21).
+pub(crate) fn one_script<'w>(first: (&'w str, Script), second: (&'w str, Script)) -> Result<(), WorldError<'w>> {
+    if first.1 == second.1 {
+        return Ok(());
+    }
+    Err(WorldError::ScriptClash { first: first.0, second: second.0 })
 }
 
 /// One crate of the list past the target's toolchain crates, keyed, before its place is known.
@@ -153,7 +167,6 @@ struct Pending<'w> {
     key: CrateItemKey,
     cfg: &'w [(&'w str, Option<&'w str>)],
     script: Script,
-    outputs: Option<OutputsRef<'w>>,
     side: Side,
     /// How many units of the graph are this crate (0 for a macro-side toolchain crate).
     units: u32,
@@ -167,7 +180,6 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     listed: &'w Listed<'w, B>,
     packages: &mut P,
     checkout: &'w dyn Tree,
-    scripts: Option<&dyn ScriptOutputs<'w>>,
     alloc: Alloc<'w>,
 ) -> Result<World<'w>, WorldError<'w>> {
     let list = &listed.list;
@@ -238,16 +250,15 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
             deps.push((name, key_of[d].ok_or(WorldError::Cycle { krate: c.name })?));
         }
         let is_unit = matches!(c.origin, ListOrigin::Unit(_));
-        let (key, cfg, script, outputs) = match c.origin {
+        let (key, cfg, script) = match c.origin {
             ListOrigin::Unit(id) => {
                 let unit = &units[id.index()];
-                // A build script's record is its target-side run's: a macro-side copy (built for
-                // wasm32-wasip1) is given none, never another side's facts (rule 21).
-                let served = if side == Side::Target { unit.build_script.and_then(|_| scripts.and_then(|s| s.served(id))) } else { None };
-                let script = match (unit.build_script, served) {
-                    (None, _) => Script::None,
-                    (Some(_), Some(_)) => Script::Joined,
-                    (Some(_), None) => Script::Missing,
+                // Each crate reads the run of ITS side (ruling D115 (2)): a macro-side copy's is
+                // run for wasm32-wasip1, never the target side's facts (rule 21). One subject
+                // function, from the parts of the crate's list key ([`crate::script_subject`]).
+                let script = match unit.build_script {
+                    Some(_) => Script::Read { subject: crate::script_subject(unit.name.as_str(), unit.version.as_str(), side, &c.features, alloc.clone()) },
+                    None => Script::None,
                 };
                 // A path package is placed now: a member's directory is what it sees as its
                 // root (`/workspace/<dir>`, D96 (3)), so it is in its key (rule 21).
@@ -269,23 +280,25 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 };
                 let mut cfg: AVec<'w, (&'w str, Option<&'w str>)> = AVec::with_capacity_in(c.cfg.len(), alloc.clone());
                 cfg.extend_from_slice(&c.cfg);
-                if let Some(served) = served {
-                    cfg.extend_from_slice(served.cfg);
-                }
                 cfg.sort_unstable();
                 cfg.dedup();
                 let implicit_extern = implicit_key(toolchain, c.implicit)?;
-                let parts = UnitKeyParts { cfg: &cfg, deps: &deps, implicit_extern, script: served.map(|s| s.digest), member };
+                let parts = UnitKeyParts { cfg: &cfg, deps: &deps, implicit_extern, member };
                 let key = unit_crate_key(c, unit, lock, &parts, &corrections, alloc.clone());
                 let cfg: &'w [(&'w str, Option<&'w str>)] = cfg.leak();
-                (key, cfg, script, served.map(|s| s.outputs))
+                (key, cfg, script)
             }
-            ListOrigin::Toolchain { .. } => (side_toolchain_key(c, &deps, alloc.clone()), &c.cfg[..], Script::None, None),
+            ListOrigin::Toolchain { .. } => (side_toolchain_key(c, &deps, alloc.clone()), &c.cfg[..], Script::None),
         };
         key_of[at] = Some(key);
         keyed += 1;
         match by_key.get(&key.0.0) {
             Some(&p) => {
+                // Two units under one crate key read one build-script run (rule 21: the fix is
+                // the key). Unreachable by construction: the subject is made of the list key's
+                // parts; refused by name if it ever is not.
+                let first = &pending[p as usize];
+                one_script((list.crates[first.at].name, first.script), (c.name, script))?;
                 crate_of[at] = Some(p);
                 pending[p as usize].units += u32::from(is_unit);
             }
@@ -293,7 +306,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 let p = pending.len() as u32;
                 by_key.insert(key.0.0, p);
                 crate_of[at] = Some(p);
-                pending.push(Pending { at, key, cfg, script, outputs, side, units: u32::from(is_unit) });
+                pending.push(Pending { at, key, cfg, script, side, units: u32::from(is_unit) });
             }
         }
         for &d in dependents[at].iter() {
@@ -417,7 +430,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     seen,
                     read_folder: shown_from,
                     build_script: unit.build_script.is_some(),
-                    script: pend.outputs,
+                    script: None,
                     test_or_bench: matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_)),
                 };
                 (root, shown_from, facts, Origin::Unit(id), unit.kind == UnitKind::ProcMacro, unit.name.as_str(), unit.version.as_str())
@@ -471,7 +484,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 features: &c.features,
                 deps: deps.leak(),
                 cfg: pend.cfg,
-                script: pend.outputs,
+                script: None,
             },
             origin,
             units: pend.units,
@@ -504,14 +517,12 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
 
 /// The parts of a unit crate's key the world adds to the list's.
 struct UnitKeyParts<'k, 'w> {
-    /// Its cfg, with its build script's atoms, sorted and each once.
+    /// Its cfg (the unit's; never a build script's atoms, D115 (B)), sorted and each once.
     cfg: &'k [(&'w str, Option<&'w str>)],
     /// Each dependency's extern name and key.
     deps: &'k [(&'w str, CrateItemKey)],
     /// [`implicit_key`] of its implicit externs.
     implicit_extern: CrateItemKey,
-    /// Its build script's record digest ([`crate::Served::digest`]), when joined.
-    script: Option<ContentId>,
     /// A member's directory in the checkout (the root it sees, D96).
     member: Option<&'w str>,
 }
@@ -551,10 +562,6 @@ fn unit_crate_key<'w>(
     }
     put(&mut bytes, b"\0implicit");
     put(&mut bytes, &parts.implicit_extern.0.0);
-    if let Some(digest) = parts.script {
-        put(&mut bytes, b"\0script");
-        put(&mut bytes, &digest.0);
-    }
     // A member's directory: the root it sees is `/workspace/<dir>` (D96 (3), rule 21).
     if let Some(dir) = parts.member {
         put(&mut bytes, b"\0member");

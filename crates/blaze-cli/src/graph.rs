@@ -339,6 +339,8 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
                     return Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "the dependency graph's record", rule: "graph.rs" } }, held_str(words.as_str(), held)));
                 }
             }
+            // The `Script` parts are named with the `CrateScope` parts, a crate of the world each
+            // (work.rs, the `UnitGraph` arm; ruling D115 (2)).
             for finding in made.findings.iter() {
                 let words = bstd::mem::format_in!(held, "{finding}");
                 record.find(crate::fetch::SOURCE_REFUSED, (0, 0), &[words.as_str()]);

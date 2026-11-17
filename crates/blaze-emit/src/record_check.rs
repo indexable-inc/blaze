@@ -14,11 +14,18 @@ use blaze_code::record::{CodeRecord, CodeView, SiteKind};
 use blaze_lir::View;
 use blaze_own::Alloc;
 
-use crate::{BULK_INLINE_MOST, Isa, Names, RecordEmitError, record::emit_record_up_to};
+use crate::{BULK_INLINE_MOST, Called, Isa, Names, RecordEmitError, RoutinePlaces, record::emit_record_up_to};
 
-/// [`crate::emit_record`], and the bytes of instructions at the start of the record's code.
-pub fn emit_record_measured<'a>(func: View<'_>, names: &dyn Names, isa: Isa, alloc: Alloc<'a>) -> Result<(CodeRecord<'a>, u32), RecordEmitError> {
-    emit_record_up_to(func, names, isa, BULK_INLINE_MOST, alloc)
+/// [`crate::emit_record`], and the bytes of instructions at the start of the record's code;
+/// the routines the record calls ([`Called`]) last.
+pub fn emit_record_measured<'a>(
+    func: View<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    isa: Isa,
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+    emit_record_up_to(func, names, routines, isa, BULK_INLINE_MOST, alloc)
 }
 
 /// The first broken promise of a record's instructions, by its offset in the code.

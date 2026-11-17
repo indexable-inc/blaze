@@ -152,7 +152,7 @@ impl Actor {
     fn injecting(cfg: PlainConfig, plant: Plant, inject: Option<Place>) -> Actor {
         let mut store = Plain::planted(cfg, plant);
         let mut effects = Vec::new_in(Global);
-        store.open(&mut effects);
+        store.open_whole(&mut effects);
         Actor { store, effects, inject, armed: false, fired: false, kinds: BTreeMap::new() }
     }
 
@@ -1970,6 +1970,14 @@ fn driven(n: u64, reads: Vec<Namespace>) -> Driven<Sim> {
     Driven::with(Sim::new(n, Faults::default()), Path::new("/sim"), c).unwrap()
 }
 
+/// The record under `k` through `d`'s get (mapping at a first probe) and got: its bytes and
+/// namespace.
+fn read(d: &mut Driven<Sim>, k: &Key) -> Option<(Vec<u8>, Namespace)> {
+    let found = d.get(k).expect("a get with no failure")?;
+    let got = d.got(found);
+    Some((got.bytes.to_vec(), got.namespace))
+}
+
 fn refs(keys: std::ops::Range<u32>) -> Vec<RecordRef> {
     keys.map(|n| RecordRef { tag: TAG, key: key(n).0 }).collect()
 }
@@ -2008,11 +2016,11 @@ fn a_fetched_segment_is_verified_before_it_is_used() {
     let keys = refs(0..8);
 
     let mut me = driven(1, reads());
-    assert_eq!(me.get(&key(0)).map(|it| it.bytes.len()), None);
+    assert_eq!(read(&mut me, &key(0)).map(|it| it.0.len()), None);
     let pulled = me.fetch_missing(&mut source, &builder, Namespace::PUBLIC, &keys).unwrap();
     assert_eq!(pulled.len(), 1);
     for n in 0..8 {
-        assert_eq!(me.get(&key(n)).map(|it| (it.bytes.to_vec(), it.namespace)), Some((value(n), Namespace::PUBLIC)), "pulled record {n}");
+        assert_eq!(read(&mut me, &key(n)), Some((value(n), Namespace::PUBLIC)), "pulled record {n}");
         assert_eq!(me.core().get_in(&[Namespace::LOCAL, org()], &key(n)).map(|it| it.bytes.len()), None, "pulled record {n} answers for another namespace");
     }
     assert!(me.fetch_missing(&mut source, &builder, Namespace::PUBLIC, &keys).unwrap().is_empty(), "held records fetched again");
@@ -2025,7 +2033,7 @@ fn a_fetched_segment_is_verified_before_it_is_used() {
     let mut other = driven(2, vec![Namespace::LOCAL, Namespace::PUBLIC]);
     let why = other.fetch_missing(&mut source, &builder, Namespace::PUBLIC, &keys).expect_err("a forged segment is refused");
     assert!(matches!(why, StoreError::Layout { segment, .. } if segment == SegmentId(digest)), "{why}");
-    assert_eq!(other.get(&key(0)).map(|it| it.bytes.len()), None, "nothing of it was used");
+    assert_eq!(read(&mut other, &key(0)).map(|it| it.0.len()), None, "nothing of it was used");
 
     // A whole, consistent segment no trusted builder signed.
     std::fs::write(at.join(format!("{hex}.seg")), &bytes).unwrap();
@@ -2080,7 +2088,7 @@ fn a_fetched_segment_is_verified_before_it_is_used() {
     }
     let why = other.fetch_missing(&mut liar, &TrustsAll, Namespace::LOCAL, &keys).expect_err("a segment whose bytes say another namespace");
     assert_eq!(why, StoreError::Namespace { found: Namespace::PUBLIC, wanted: Namespace::LOCAL });
-    assert_eq!(other.get(&key(0)).map(|it| it.bytes.len()), None, "nothing of the lie was used");
+    assert_eq!(read(&mut other, &key(0)).map(|it| it.0.len()), None, "nothing of the lie was used");
     let _ = std::fs::remove_dir_all(&at);
 }
 
@@ -2377,7 +2385,7 @@ const SHARED: u32 = 900_000;
 
 /// A durable store over `sim` behind the handle, opened with `plant` at `boot`.
 fn handle(sim: Sim, n: u64, boot: u64, plant: Plant) -> PlainStore<Sim> {
-    PlainStore::new(Driven::planted(sim, Path::new("/sim"), cfg(n, boot, true), plant).expect("an open with no cut and no failure"))
+    PlainStore::new(Driven::planted(sim, Path::new("/sim"), cfg(n, boot, true), plant).expect("an open with no cut and no failure")).expect("made whole with no cut and no failure")
 }
 
 /// One history of the lanes (store-next.md, "Puts on every worker"): `workers` lanes put into

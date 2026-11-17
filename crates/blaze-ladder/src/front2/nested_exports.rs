@@ -466,7 +466,7 @@ impl<'a, 'c> Walker<'a, 'c> {
                 NestedKind::ExternBlock => {
                     // Its fns and statics are rows of this block (locals.rs `Locals::keep`):
                     // counted for the ordinals; a foreign item is never an export.
-                    let decls = match super::foreign_locals::declared(item_text, self.reading.edition, alloc) {
+                    let decls = match super::foreign_locals::declared(item_text, self.reading.edition, &mut CrateCfg(self.reading.atoms), alloc) {
                         Ok((_, decls)) => decls,
                         Err(r) => {
                             let path = self.out.path(at, "extern", alloc)?;

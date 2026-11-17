@@ -11,10 +11,14 @@
 //! version, then u32 counts and offsets of each section, the crate key, the root module key);
 //! module rows, sorted by key, FIXED 48 bytes (key, scope at u32 and length u32 into the blob,
 //! `u32::MAX` for a module whose task failed; first chain key u32 (`u32::MAX`: none), chain
-//! length u16, flags u16: bit 0 `#[no_implicit_prelude]`); the chain keys (32 bytes each);
+//! length u16, flags u16: bit 0 `#[no_implicit_prelude]`, bit 1 a block's module, anonymous to
+//! a written `self`/`super`: `crate::names::written_up`); the chain keys (32 bytes each);
 //! enum rows, sorted by owner, 40 bytes (owner, first variant u32, count u32); variant rows,
 //! 48 bytes (key, name at u32 and length u32 into the strings, record u8, pad); the strings; the
-//! crate's `CrateRoot` record; the blob, each module's blaze-surface `ModuleScope` record.
+//! crate's `CrateRoot` record; the blob, each module's blaze-surface `ModuleScope` record; the
+//! failed calls (version 2): per call of the crate whose expansion failed, sorted by call key,
+//! its macro path, whether it is D104's implicit `::std::main`, and the matcher's reason as
+//! blaze-expand's record of [`blaze_expand::Failed`] ([`NamesRecord::failed`]).
 //!
 //! A RECORD IS ITS OWN INDEX (D114 rule 1). The bytes are checked once in a process, whole:
 //! [`Verified::check`] reads every module's scope and the crate root with their own checks,
@@ -37,11 +41,19 @@ use blaze_surface::ScopeBuilder;
 
 use crate::facts::Name;
 use crate::names::{VariantHit, World};
-use crate::resolve::CrateNames;
+use crate::resolve::{CrateNames, ExpandNote, NamesNote};
 use crate::task::Variant;
 
 const MAGIC: [u8; 4] = *b"BZNM";
-const VERSION: u32 = 1;
+/// 2: the failed-calls section (implicit-main-reason, 2026-11-16). A version-1 record is
+/// [`NamesRecordError::NotThisRecord`]: an old home's names are made again (rule 26).
+/// 3: row flag bit 1, a block's module (super-in-block-1, 2026-11-16); an older record has it
+/// clear everywhere and would read `super` in a block wrong.
+/// Reading in place (D114 rule 1) changes no byte: the writer is the same, so the version stays.
+const VERSION: u32 = 3;
+/// A failed call's row: call key, path at and length, record at and length, flags, padding.
+const FAILED_ROW: usize = 64;
+const FAILED_IMPLICIT: u32 = 1;
 const ALIGN: usize = 16;
 const HEADER: usize = 128;
 const ROW: usize = 48;
@@ -50,6 +62,7 @@ const VARIANT_ROW: usize = 48;
 const KEY: usize = 32;
 const NONE: u32 = u32::MAX;
 const NO_IMPLICIT_PRELUDE: u16 = 1;
+const ANONYMOUS: u16 = 2;
 
 /// Why a names record was not written or not read.
 #[derive(Debug)]
@@ -74,6 +87,61 @@ pub enum NamesRecordError {
     Root(FormatError),
     /// A variant's name is not UTF-8.
     Name { owner: ItemKey },
+    /// A failed call's macro path is not UTF-8.
+    FailedPath { call: ItemKey },
+    /// A failed call's reason did not read as blaze-expand's record of a failure.
+    FailedRecord { call: ItemKey, error: blaze_expand::RecordError },
+}
+
+/// A failed macro call of the crate, read from its names record: the call, the macro's path as
+/// written (`::std::main` for D104's implicit call over the root `fn main`), and why it failed,
+/// the matcher's own typed reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FailedRow<'a> {
+    pub call: ItemKey,
+    pub path: &'a str,
+    pub implicit: bool,
+    pub failed: blaze_expand::Failed<'a>,
+}
+
+/// The failed-calls section of `names` (the module doc says its form). A function of the
+/// solve's notes alone, sorted at this boundary (rule 25).
+fn failed_section<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, NamesRecordError> {
+    let mut calls = AVec::new_in(alloc);
+    for note in names.notes.iter() {
+        if let NamesNote::Expand { call, note: ExpandNote::Failed { path, implicit, failed }, .. } = note {
+            calls.push((*call, *path, *implicit, failed.write_record(alloc)));
+        }
+    }
+    calls.sort_unstable_by(|a, b| (a.0, &a.3[..]).cmp(&(b.0, &b.3[..])));
+    calls.dedup_by_key(|(call, ..)| *call);
+    let mut paths = RecordBytes::new_in(alloc);
+    for (_, path, ..) in calls.iter() {
+        paths.extend_from_slice(path.as_bytes());
+    }
+    pad(&mut paths);
+    let records_at = ALIGN + calls.len() * FAILED_ROW + paths.len();
+    let mut out = RecordBytes::new_in(alloc);
+    out.extend_from_slice(&u32_of(calls.len(), "failed calls")?.to_le_bytes());
+    out.resize(ALIGN, 0);
+    let (mut path_at, mut record_at) = (0usize, records_at);
+    for (call, path, implicit, record) in calls.iter() {
+        out.extend_from_slice(&call.0.0);
+        out.extend_from_slice(&u32_of(path_at, "failed call paths")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(path.len(), "a failed call's path")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(record_at, "failed call records")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(record.len(), "a failed call's record")?.to_le_bytes());
+        out.extend_from_slice(&(if *implicit { FAILED_IMPLICIT } else { 0 }).to_le_bytes());
+        out.extend_from_slice(&[0u8; 12]);
+        path_at += path.len();
+        record_at = (record_at + record.len()).next_multiple_of(ALIGN);
+    }
+    out.extend_from_slice(&paths);
+    for (.., record) in calls.iter() {
+        out.extend_from_slice(record);
+        pad(&mut out);
+    }
+    Ok(out)
 }
 
 fn u32_of(n: usize, what: &'static str) -> Result<u32, NamesRecordError> {
@@ -180,7 +248,13 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
                 rows.extend_from_slice(&0u16.to_le_bytes());
             }
         }
-        let flags = if names.info(*m).is_some_and(|i| i.no_implicit_prelude) { NO_IMPLICIT_PRELUDE } else { 0 };
+        let mut flags = 0u16;
+        if names.info(*m).is_some_and(|i| i.no_implicit_prelude) {
+            flags |= NO_IMPLICIT_PRELUDE;
+        }
+        if names.anonymous(*m) {
+            flags |= ANONYMOUS;
+        }
         rows.extend_from_slice(&flags.to_le_bytes());
     }
 
@@ -215,7 +289,9 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
     let strings_at = variants_at + variant_rows.len();
     let root_at = strings_at + strings.len();
     let blob_at = (root_at + root.len()).next_multiple_of(ALIGN);
-    let mut out = RecordBytes::with_capacity_in(blob_at + blob.len(), alloc);
+    let failed = failed_section(names, alloc)?;
+    let failed_at = (blob_at + blob.len()).next_multiple_of(ALIGN);
+    let mut out = RecordBytes::with_capacity_in(failed_at + failed.len(), alloc);
     out.extend_from_slice(&MAGIC);
     let fields = [
         (VERSION as usize, "version"),
@@ -231,6 +307,8 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         (root.len(), "the crate root"),
         (blob_at, "names offsets"),
         (blob.len(), "names blob"),
+        (failed_at, "names offsets"),
+        (failed.len(), "names failed calls"),
     ];
     for (n, what) in fields {
         out.extend_from_slice(&u32_of(n, what)?.to_le_bytes());
@@ -246,6 +324,9 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
     out.extend_from_slice(&root);
     pad(&mut out);
     out.extend_from_slice(&blob);
+    pad(&mut out);
+    debug_assert_eq!(out.len(), failed_at);
+    out.extend_from_slice(&failed);
     Ok(out)
 }
 
@@ -282,6 +363,9 @@ struct Head {
     root_len: usize,
     blob_at: usize,
     blob_len: usize,
+    /// The failed-calls section (version 2).
+    failed_at: usize,
+    failed_len: usize,
 }
 
 impl Head {
@@ -309,6 +393,8 @@ impl Head {
             root_len: f(9),
             blob_at: f(10),
             blob_len: f(11),
+            failed_at: f(12),
+            failed_len: f(13),
         };
         let within = |what: &'static str, at: usize, count: usize, width: usize| match count.checked_mul(width).and_then(|len| at.checked_add(len)) {
             Some(end) if end <= bytes.len() => Ok(()),
@@ -324,6 +410,13 @@ impl Head {
         within("strings", head.strings_at, head.root_at - head.strings_at, 1)?;
         within("crate root", head.root_at, head.root_len, 1)?;
         within("blob", head.blob_at, head.blob_len, 1)?;
+        within("failed calls", head.failed_at, head.failed_len, 1)?;
+        if head.failed_len < ALIGN
+            || !head.failed_at.is_multiple_of(ALIGN)
+            || (le32(bytes, head.failed_at) as usize).checked_mul(FAILED_ROW).is_none_or(|rows| head.failed_len < ALIGN + rows)
+        {
+            return Err(NamesRecordError::Short { what: "failed call rows", at: head.failed_at });
+        }
         Ok(head)
     }
 }
@@ -400,6 +493,25 @@ impl<'m> Verified<'m> {
             }
         }
         CrateRootView::read(&bytes[head.root_at..head.root_at + head.root_len]).map_err(NamesRecordError::Root)?;
+        // The failed calls: rows by increasing call key, each path a UTF-8 range of the paths
+        // and each reason a range of the section. The reason's own record is read when asked
+        // ([`NamesRecord::failed`], blaze-expand's check of its record).
+        let s = &bytes[head.failed_at..head.failed_at + head.failed_len];
+        let count = le32(s, 0) as usize;
+        increasing("failed call rows", head.failed_at + ALIGN, count, FAILED_ROW)?;
+        let paths_at = ALIGN + count * FAILED_ROW;
+        for i in 0..count {
+            let row = ALIGN + i * FAILED_ROW;
+            let call = key_at(s, row);
+            let (path_at, path_len) = (le32(s, row + 32) as usize, le32(s, row + 36) as usize);
+            let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
+            let path = paths_at.checked_add(path_at).and_then(|start| Some(start..start.checked_add(path_len)?)).and_then(|r| s.get(r));
+            let path = path.ok_or(NamesRecordError::Short { what: "a failed call's path", at: head.failed_at + row })?;
+            core::str::from_utf8(path).map_err(|_| NamesRecordError::FailedPath { call })?;
+            if record_at.checked_add(record_len).is_none_or(|end| end > s.len()) {
+                return Err(NamesRecordError::Short { what: "a failed call's record", at: head.failed_at + row });
+            }
+        }
         Ok(Verified { bytes, head })
     }
 
@@ -493,6 +605,37 @@ impl<'m> NamesRecord<'m> {
     /// Whether `module` or an ancestor is `#[no_implicit_prelude]`.
     pub fn no_implicit_prelude(&self, module: ItemKey) -> bool {
         self.chain(module).is_some_and(|c| c.iter().any(|m| self.no_implicit_prelude_here(*m)))
+    }
+
+    /// Whether `module` is a block's module (row flag bit 1).
+    pub fn anonymous(&self, module: ItemKey) -> bool {
+        self.row(module).is_some_and(|row| le16(self.bytes, row + 46) & ANONYMOUS != 0)
+    }
+
+    /// The failed call of this crate under `call` (a [`crate::names::Why::Refused`]'s `call`):
+    /// its path, whether it is D104's implicit `::std::main`, and the matcher's reason, read back
+    /// equal to the solve's [`ExpandNote::Failed`]. `None`: no call of this crate failed under
+    /// that key. Found by binary search in place; the path is a slice of the bytes, and the
+    /// reason, the one part with a working form, is decoded into `alloc` (the caller's: the
+    /// record holds no allocator).
+    pub fn failed<'b>(&self, call: ItemKey, alloc: Alloc<'b>) -> Result<Option<FailedRow<'b>>, NamesRecordError>
+    where
+        'm: 'b,
+    {
+        let bytes: &'m [u8] = self.bytes;
+        let s = &bytes[self.head.failed_at..self.head.failed_at + self.head.failed_len];
+        let count = le32(s, 0) as usize;
+        let Some(i) = self.find(self.head.failed_at + ALIGN, FAILED_ROW, count, call) else { return Ok(None) };
+        let row = ALIGN + i * FAILED_ROW;
+        let paths_at = ALIGN + count * FAILED_ROW;
+        let (path_at, path_len) = (paths_at + le32(s, row + 32) as usize, le32(s, row + 36) as usize);
+        let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
+        // SAFETY: `Verified::check`, the one maker of this record's proof, checked this row's
+        // path range inside the section and its bytes UTF-8 (`str::from_utf8`), in the same
+        // immutable `'m` bytes.
+        let path: &'m str = unsafe { core::str::from_utf8_unchecked(&s[path_at..path_at + path_len]) };
+        let failed = blaze_expand::Failed::read_record(&s[record_at..record_at + record_len], alloc).map_err(|error| NamesRecordError::FailedRecord { call, error })?;
+        Ok(Some(FailedRow { call, path, implicit: le32(s, row + 48) & FAILED_IMPLICIT != 0, failed }))
     }
 
     /// The crate root, viewed in place.
@@ -680,6 +823,10 @@ impl<'a, N: Name, L: LoadNames<'a>> World<N> for RecordNames<'a, L> {
     fn no_implicit_prelude(&self, module: ItemKey) -> bool {
         self.of(module).is_some_and(|r| r.no_implicit_prelude(module))
     }
+
+    fn anonymous(&self, module: ItemKey) -> bool {
+        self.of(module).is_some_and(|r| r.anonymous(module))
+    }
 }
 
 /// One crate's record alone as a world: a walk through another crate's module stops with
@@ -716,5 +863,9 @@ impl<'m, N: Name> World<N> for NamesRecord<'m> {
 
     fn no_implicit_prelude(&self, module: ItemKey) -> bool {
         NamesRecord::no_implicit_prelude(self, module)
+    }
+
+    fn anonymous(&self, module: ItemKey) -> bool {
+        NamesRecord::anonymous(self, module)
     }
 }

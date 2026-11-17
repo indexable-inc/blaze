@@ -2,15 +2,16 @@
 //!
 //! - The clock reads 0 and randomness is zeros: an expansion is a function of its inputs.
 //! - There are no arguments, no environment list and no network. A variable is read one at a
-//!   time through the shim's `getenv`, from the package's variables the caller gave, and each
-//!   read is recorded.
-//! - Files are the calling PACKAGE's own and nothing else, read only, under the virtual root
-//!   [`PACKAGE`] (the same for every package, so no machine path reaches a key or an output):
-//!   `CARGO_MANIFEST_DIR` is [`PACKAGE`] and the macro runs in it. A workspace member's are its
-//!   folder on disk; a fetched package's are its fetch record's ([`Files`]). Each path opened or
-//!   looked at is recorded by its path from the package's folder with the digest of what was
-//!   found. A path that leaves the package (by `..` or a link) stops the run with
-//!   [`ProcLimit::Paths`], naming the path.
+//!   time through the shim's `getenv`, from the calling crate's variables the caller gave
+//!   ([`PackageEnv`]: set, unset, or unknown), and each answered read is recorded; a read of an
+//!   unknown one stops the run, naming it ([`EnvRefused`], package_env.rs).
+//! - Files are served at the package's mount row, [`Files::seen`] (decision D96): a fetched
+//!   package's own files at [`PACKAGE`], nothing above it; a workspace member's workspace at
+//!   `/workspace`, the member at its dir in it (no machine path reaches a key or an output).
+//!   `CARGO_MANIFEST_DIR` and `CARGO_MANIFEST_PATH` are derived from that row and nothing else
+//!   (`seen_env`), and the macro runs in it. Each path opened or looked at is recorded by its
+//!   path from the served tree's root with the digest of what was found. A path that leaves the
+//!   tree (by `..` or a link) stops the run with [`ProcLimit::Paths`], naming the path.
 //! - Standard output and error are dropped.
 
 use std::path::{Path, PathBuf};
@@ -19,8 +20,14 @@ use blaze_expand::ProcLimit;
 use blaze_ids::ContentId;
 use blaze_wasi::{Answer, Dirent, Errno, Filestat, Filetype, Open, ROOT_FD, Stop, System};
 
-/// The virtual folder the calling package's files are served at, and its `CARGO_MANIFEST_DIR`.
+use crate::package_env::{EnvAnswer, EnvRefused, PackageEnv};
+
+/// The virtual folder a fetched package's files are served at, and its `CARGO_MANIFEST_DIR`
+/// (a member's is `/workspace/<dir>`: [`Files::seen`]).
 pub const PACKAGE: &str = "/package";
+
+pub mod seen_env;
+pub use seen_env::SeenMismatch;
 
 /// A package's own files, the only ones its macros see.
 #[derive(Clone)]
@@ -139,11 +146,13 @@ pub struct Read {
 /// The package a call is expanded in.
 #[derive(Clone, Debug)]
 pub struct Package {
-    /// The package's own files, served at [`PACKAGE`].
+    /// The package's files, served at their row ([`Files::seen`]); the path variables are that
+    /// row's (`seen_env`). Made by [`Package::new`].
     pub files: Files,
-    /// The variables the macro may read (cargo's `CARGO_*` of the package and the like), with
-    /// paths in them under [`PACKAGE`].
-    pub env: Vec<(String, String)>,
+    /// The variables of the calling crate the macro may read (cargo's `CARGO_*` of the crate
+    /// and the like, paths in them under the root it is served), each set, unset or unknown
+    /// (package_env.rs; the truth's home is blaze-scope's `CrateEnv`).
+    pub env: PackageEnv,
 }
 
 impl Package {
@@ -169,6 +178,8 @@ pub struct Sandbox {
     pub(crate) reads: Vec<Read>,
     /// Why the sandbox stopped the run, when a limit did.
     pub(crate) refused: Option<(ProcLimit, String)>,
+    /// The first variable read whose value this build does not know: the run stops with it.
+    pub(crate) env_refused: Option<EnvRefused>,
 }
 
 fn digest(bytes: &[u8]) -> ContentId {
@@ -212,7 +223,8 @@ fn stat_of(path: &Path) -> Option<(Filetype, u64)> {
     Some((filetype, meta.len()))
 }
 
-/// Why a read's subject has no answer now.
+/// Why a read's subject has no answer now: a subject of no known form, or a variable whose
+/// value this build does not know in the package (package_env.rs).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct UnknownSubject(pub String);
 
@@ -224,7 +236,15 @@ pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>,
     let files = &package.files;
     // A link out of the package now answers as absent: the run that reads it is refused.
     Ok(match kind {
-        "env" => package.env.iter().find(|(it, _)| it == rest).map(|(_, value)| digest(value.as_bytes())),
+        // Set: the value's digest (`""` is a value); unset: absent. Unknown now: no answer, so
+        // a kept answer that read the name is not taken here, and the run that reads it again
+        // is refused by name.
+        "env" if let Some(row) = package.row_var(rest) => Some(digest(row.as_bytes())),
+        "env" => match package.env.get(rest) {
+            EnvAnswer::Set(value) => Some(digest(value.as_bytes())),
+            EnvAnswer::Unset => None,
+            EnvAnswer::Unknown => return Err(unknown()),
+        },
         "file" => files.bytes(rest).ok().flatten().map(|bytes| digest(&bytes)),
         "dir" => match files.find(rest) {
             Ok(Some(Found::Folder)) => files.listing(rest).ok().map(|entries| listing_digest(&entries)),
@@ -242,7 +262,7 @@ pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>,
 
 impl Sandbox {
     pub fn new(package: std::sync::Arc<Package>) -> Sandbox {
-        Sandbox { package, files: Vec::new(), reads: Vec::new(), refused: None }
+        Sandbox { package, files: Vec::new(), reads: Vec::new(), refused: None, env_refused: None }
     }
 
     pub fn package(&self) -> &Package {
@@ -255,11 +275,26 @@ impl Sandbox {
         }
     }
 
-    /// The variable `name`, recorded.
-    pub fn var(&mut self, name: &str) -> Option<String> {
-        let value = self.package.env.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
+    /// The variable `name`, recorded: `Ok(Some(value))` set, `Ok(None)` unset (the macro's
+    /// `Err(NotPresent)`). One whose value this build does not know is never answered: it is
+    /// not recorded, the sandbox keeps the first such refusal for the run's error, and the
+    /// caller stops the run with it.
+    pub fn var(&mut self, name: &str) -> Result<Option<String>, EnvRefused> {
+        // D96: `CARGO_MANIFEST_DIR` / `_PATH` from the package's mount row, the one fact the
+        // sandbox serves its files by (seen_env.rs), never a value given apart from it.
+        let row = self.package.row_var(name);
+        let value = match self.package.env.get(name) {
+            _ if row.is_some() => row,
+            EnvAnswer::Set(value) => Some(value.to_owned()),
+            EnvAnswer::Unset => None,
+            EnvAnswer::Unknown => {
+                let refused = EnvRefused { name: name.to_owned(), krate: self.package.env.crate_name().map(str::to_owned) };
+                self.env_refused.get_or_insert_with(|| refused.clone());
+                return Err(refused);
+            }
+        };
         self.record(format!("env:{name}"), value.as_deref().map(|it| digest(it.as_bytes())));
-        value
+        Ok(value)
     }
 
     /// A `track_path` of the macro: the file's digest, recorded like an open.
@@ -497,6 +532,7 @@ mod seen_tests {
     use std::sync::Arc;
 
     use super::{Files, Package, Sandbox};
+    use crate::package_env::PackageEnv;
     use crate::script_sandbox::ScriptRoot;
 
     /// D96 (3): a member's macro runs in `/workspace/<dir>` and opens its workspace's files by
@@ -507,9 +543,9 @@ mod seen_tests {
     #[test]
     fn a_member_s_macro_runs_in_its_workspace_dir() {
         let root = ScriptRoot::member("crates/m").unwrap_or_else(|e| panic!("{e}"));
-        let member = Package { files: Files::Member { workspace: PathBuf::from("/nonexistent-ws"), root }, env: Vec::new() };
+        let member = Package::new(Files::Member { workspace: PathBuf::from("/nonexistent-ws"), root }, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(member.cwd(), "/workspace/crates/m");
-        let dependency = Package { files: Files::Listed(Arc::from(Vec::new())), env: Vec::new() };
+        let dependency = Package::new(Files::Listed(Arc::from(Vec::new())), PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(dependency.cwd(), "/package");
         let mut sandbox = Sandbox::new(Arc::new(member));
         assert_eq!(sandbox.resolve(b"/workspace/crates/m/Cargo.toml").ok().as_deref(), Some("crates/m/Cargo.toml"));

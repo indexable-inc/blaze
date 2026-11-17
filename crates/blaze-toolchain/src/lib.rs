@@ -14,6 +14,7 @@
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+pub mod implied;
 pub mod record;
 pub mod shelf;
 pub mod side;
@@ -23,6 +24,7 @@ mod tests;
 
 use core::fmt;
 
+pub use implied::{ImplicitSysroot, RootFacts, SysrootUnits};
 pub use record::{CrateRow, Role, ToolchainView, UnitKind, UnitRow};
 pub use shelf::{Shelf, ToolchainError};
 pub use side::{MACRO_TRIPLE, MacroSide, Side, SideName, SideSysroot, SideTriple, TargetSide};

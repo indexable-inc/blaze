@@ -138,6 +138,13 @@ pub trait FrontEnd {
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError>;
     fn sig(&self, i: usize) -> FnSig<'_>;
     fn fn_index(&self, key: ItemKey) -> Option<usize>;
+    /// Each soft-float routine's fn in the program's compiler_builtins, found by its exported
+    /// name (front2/builtins_shim.rs `find`, INTRINSICS.md 3.5): asked once a run by the record
+    /// walk's maker; `alloc` holds the scratch. Default: not looked up, so an `f128` operation
+    /// is refused naming its routine.
+    fn soft_float_routines(&self, _alloc: Alloc<'_>) -> crate::front2::builtins_shim::Builtins {
+        crate::front2::builtins_shim::Builtins::NOT_LOOKED_UP
+    }
     /// The ABI fn `key` is declared with: a fact of its head, never of its body (the
     /// Reference, "Functions": "Functions may qualify their signatures with an ABI"). The
     /// builder asks it of every fn it builds or calls (`Adts::abi`), a dynamic call's trait fn
@@ -196,11 +203,32 @@ pub trait FrontEnd {
     fn nounwind(&self, _key: ItemKey) -> Option<bool> {
         None
     }
+    /// The program's Rust start (front2/start.rs): `Some` for a Rust-edition root with a root
+    /// `fn main() -> T`, which starts through the library's `#[lang = "start"]` item
+    /// (`lang_start::<T>`) called by the C entry shim (blaze-build start.rs), in the program's
+    /// own process (run.md piece 6). `None` for a blaze edition (bstd's hosted entry, or `fn
+    /// main()` called directly until run.md piece 13), and for a front end that does not
+    /// answer (the old front).
+    fn rust_start(&self) -> Option<&crate::front2::start::RustStart> {
+        None
+    }
     /// The item the library marks `#[lang = "name"]`, for the builder's own items the
     /// checker's `LangItem` has no variant for (front2/coroutines.rs: the `Poll` enum, the
     /// `Pin` struct, the coroutine resume fn). `None`: no such mark, or a front end that does
     /// not answer (the old front): the builder then refuses the form by name.
     fn lang_named(&self, _name: &str) -> Option<ItemKey> {
+        None
+    }
+    /// The state recipe of `owner`'s async block `ordinal` (blaze-flow-lower state_recipe.rs:
+    /// its saved locals as types), made WITH the owner's check (front2 coroutine_recipes.rs):
+    /// what run/lay_states.rs lays the state out from. `Some(Err)`: the block's flow was refused
+    /// (the refusal); `None`: no such block, or a front end that makes no recipes (the old
+    /// front): a state it needs is then refused by name.
+    fn coroutine_recipe(
+        &self,
+        _owner: ItemKey,
+        _ordinal: u32,
+    ) -> Option<Result<&blaze_flow_lower::state_recipe::StateRecipe<Global>, blaze_flow_lower::Refusal>> {
         None
     }
     /// The fn whose head made the opaque type `opaque` (an `impl Trait` in its return type, an

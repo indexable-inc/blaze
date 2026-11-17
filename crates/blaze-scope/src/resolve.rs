@@ -89,10 +89,12 @@ pub trait SourceTexts<'a> {
         self.read(krate, path).map(str::as_bytes)
     }
 
-    /// An include of the crate at `krate` that left its own package and stayed inside the
-    /// workspace (decision D111: allowed and reported): a source that files findings files it
-    /// as a warning at the call (blaze-cli names/include_outside.rs). Asked before the file
-    /// is read. By default nothing is filed (a source with no record: a test's table).
+    /// A read of a call in the crate at `krate` that left its own package and stayed inside
+    /// the workspace (decision D111: allowed and reported): an include's (asked before the
+    /// file is read) or a member's proc macro's (from its read list, after the run or the
+    /// kept answer: `Host::run_proc_macro`). A source that files findings files it as a
+    /// warning at the call (blaze-cli names/include_outside.rs). By default nothing is filed
+    /// (a source with no record: a test's table).
     fn left_package(&self, krate: usize, left: crate::include_place::LeftPackage<'_>) {
         let _ = (krate, left);
     }
@@ -258,7 +260,14 @@ impl<'a> Tables<'a> {
         }
         self.ctors.extend(ctors.into_iter().map(|k| (k, ())));
         self.macros.extend(macros);
-        self.calls.extend(calls);
+        // The one door a lowered call enters the tables by: its calling text is `at`
+        // (crate::expansion_origins `CallInText::text`).
+        self.calls.extend(calls.into_iter().map(|(call, mut src)| {
+            if let Some(place) = src.place.as_mut() {
+                place.text = Some(at);
+            }
+            (call, src)
+        }));
         self.enums.extend(enums);
         self.impls.extend(impls);
         self.langs.extend(langs);
@@ -304,11 +313,14 @@ pub struct MadeModule<'a> {
     pub item: Option<ItemIndex>,
 }
 
-/// An expansion's text, outlined.
+/// An expansion's text, outlined, with its origins (crate::expansion_origins: where each token
+/// came from, and the call it maps to). `Err`: the text is no rendering the column places, or the
+/// column could not be made: a finding in it says so, never maps by a guess.
 #[derive(Debug)]
 pub struct ExpansionText<'a> {
     pub text: &'a str,
     pub outline: Outline<'a>,
+    pub origins: Result<&'a [u8], crate::expansion_origins::OriginsError>,
 }
 
 /// A macro call's expansion: what it adds to its module.
@@ -493,37 +505,6 @@ pub struct CrateNames<'a> {
     pub failed: HashMap<ItemKey, TaskError, Alloc<'a>>,
     pub report: FillReport,
     pub notes: AVec<'a, NamesNote<'a>>,
-    /// The cell core's `Full` cell reads, for D116's counts.
-    pub d116_reads: AVec<'a, D116Read<'a>>,
-    pub d116_calls: AVec<'a, D116Call<'a>>,
-}
-
-/// (reader module, reader kind (0 a cell, 1 an import, 2 a call), module read, namespace, name,
-/// the module had calls not expanded then, reads).
-pub type D116Read<'a> = (ItemKey, u8, ItemKey, blaze_surface::Namespace, &'a str, bool, u64);
-
-/// A call's path answer, for D116's counts.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum D116Answer {
-    Found(Def),
-    Ambiguous(Def),
-    NotFound,
-    Outside,
-    /// Refused for another reason (private, wrong macro kind, ...).
-    Refused,
-}
-
-/// One macro call's path, answered from text, links and preludes with every pending call taken to
-/// have made nothing: `[static (all calls pending), dynamic (those not in at its first read)]`.
-#[derive(Debug)]
-pub struct D116Call<'a> {
-    pub module: ItemKey,
-    pub module_path: AVec<'a, &'a str>,
-    pub path: AVec<'a, &'a str>,
-    /// The module its leaf was looked up in.
-    pub cur: [ItemKey; 2],
-    pub spec: [D116Answer; 2],
-    pub last: D116Answer,
 }
 
 impl<'a> CrateNames<'a> {
@@ -1219,7 +1200,6 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let mut fill: Fill<'a, &'a str> = Fill::new_in(alloc);
     fill.first = first;
     let added_externs: AVec<'a, (&'a str, ItemKey)>;
-    let (d116_reads, d116_calls);
     {
         let base = Base {
             index,
@@ -1252,12 +1232,13 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
         };
         let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
-        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, alloc)
+        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, par.decide_check(), alloc)
             .map_err(|error| NamesError::Cells { krate: input.name, error })?;
+        if let Some(check) = &solved.decide {
+            par.decided(input.name, check);
+        }
         fill.done = solved.done;
         added_externs = solved.added_externs;
-        d116_reads = solved.d116_reads;
-        d116_calls = solved.d116_calls;
     }
     // The extern prelude of the record is the whole one: the root's macro-written `extern crate`
     // items' names too (libc's `cfg_if! { extern crate rustc_std_workspace_core as core; }`
@@ -1314,8 +1295,6 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         failed,
         report,
         notes,
-        d116_reads,
-        d116_calls,
     })
 }
 
@@ -1357,6 +1336,8 @@ fn lower_modules<'a, P: Par>(
                 depth: 0,
                 made: false,
                 members_of: None,
+                written: file.path,
+                kept: false,
             };
             // The root's fragment (the walk's first module) declares the module's list.
             let procs = match listed {
@@ -1750,6 +1731,11 @@ struct Host<'r, 'a, S> {
     /// `line!()` and `column!()` in eager input are counted.
     text: &'a str,
     call_at: u32,
+    /// The called macro's path as written at the call (`macros::sol`, `Abi`) and the call's
+    /// shape: what a D111 finding of a proc macro's read names
+    /// ([`LeftPackage::call`](crate::include_place::LeftPackage::call)).
+    call_name: &'a str,
+    call_shape: CallShape,
     /// The calling module's path (`krate::a::b`): what `module_path!()` answers; `None` for a
     /// module with no place (refused by name).
     module_path: Option<&'r str>,
@@ -1770,7 +1756,7 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
 
     /// A predicate the cfg does not read is false, as the lowering takes it.
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
-        Ok(self.cfg.eval(&render_with(predicate, None, |_| None, |_| false, self.alloc)).unwrap_or(false))
+        Ok(self.cfg.eval(&render_with(predicate, None, |_| None, |_| false, &mut |_, _, _| {}, self.alloc)).unwrap_or(false))
     }
 
     /// The Reference ("Macros", built-in `include!`; core's `include_str!`): "The file is
@@ -1801,7 +1787,7 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
                 IncludeAs::Str => "include_str",
                 IncludeAs::Bytes => "include_bytes",
             };
-            self.sources.left_package(self.krate, crate::include_place::LeftPackage { from: self.path, at: self.call_at, call, path: &path });
+            self.sources.left_package(self.krate, crate::include_place::LeftPackage { from: self.path, at: self.call_at, call, shape: CallShape::FnLike, path: &path });
         }
         let found = match how {
             IncludeAs::Tokens => self.sources.read(self.krate, &path).map(str::as_bytes),
@@ -1843,8 +1829,25 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
         }
     }
 
+    /// The sources' runner, then decision D111 for a member's macro: each file its run read
+    /// (a `file:<path from the served tree>` read, blaze-proc-macro sandbox.rs) outside the
+    /// member's own dir ([`SeenRoot::left_package`]) is told to the sources
+    /// ([`SourceTexts::left_package`]) as a finding at this call, named by the macro as
+    /// written, the file by its path in the reader's space ([`served_tree`] joined with it,
+    /// the form an include's finding has; the tree-relative path itself when the texts and the
+    /// environment disagree on the member's folder). Derived from the read list, which a kept
+    /// answer carries too (blaze-proc-macro's table, hook.rs `run`), so a kept answer gives the
+    /// finding its run gave, byte for byte. A crate with no environment, or a dependency, has
+    /// no such read: its sandbox serves its package alone and refuses a path leaving it by name.
+    ///
+    /// [`SeenRoot::left_package`]: blaze_expand::seen::SeenRoot::left_package
+    /// [`served_tree`]: crate::include_place::served_tree
     fn run_proc_macro<'b>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
-        self.sources.run_proc_macro(self.krate, def, call, alloc)
+        let produced = self.sources.run_proc_macro(self.krate, def, call, alloc)?;
+        // D111 through the one filing every host uses (left_reads.rs; the body host's too).
+        let at = crate::left_reads::CallAt { from: self.path, at: self.call_at, call: self.call_name, shape: self.call_shape };
+        crate::left_reads::file_left_reads(self.sources, self.krate, at, &produced.reads, 0..produced.reads.list().len(), self.alloc);
+        Ok(produced)
     }
 }
 
@@ -1869,6 +1872,9 @@ fn render_with<'a>(
     here: Option<CrateItemKey>,
     dollar: impl Fn(usize) -> Option<CrateItemKey>,
     def_crate: impl Fn(usize) -> bool,
+    // Told each written token's index and its bytes in the text (a `$crate` pair: the `$`'s
+    // index; a `crate::` written before a token: part of it): the origin column's places.
+    placed: &mut dyn FnMut(usize, usize, usize),
     alloc: Alloc<'a>,
 ) -> AString<'a> {
     let tokens = stream.tokens();
@@ -1910,6 +1916,7 @@ fn render_with<'a>(
         if !glued {
             out.push(' ');
         }
+        let (first, start) = (at, out.len());
         let named_def = def_head == 3;
         def_head = match (def_head, token.kind) {
             (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro_rules" => 1,
@@ -1972,6 +1979,7 @@ fn render_with<'a>(
             TokenKind::Close(Delim::Bracket) => out.push(']'),
             TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible) => {}
         }
+        placed(first, start, out.len());
         glued = !matches!(token.kind.spacing(), Spacing::Alone);
         at += 1;
     }
@@ -1996,6 +2004,10 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         return None;
     };
     let note = |note: ExpandNote<'a>| run.note(NamesNote::Expand { call, at: Some(src.loc), note });
+    // A derived item's keep call: no macro, its expansion the item itself (attr-bang-kind-2).
+    if request.def == crate::cells::KEEP_ITEM {
+        return keep_item(base, run, call, src, part);
+    }
     let def_key = request.def.key;
     let mac = base.tables.macros.get(&def_key).copied().or_else(|| held(run.tables.read(), "tables").macros.get(&def_key).copied());
     // A macro of another crate: its definition there, its `$crate` and edition that crate's.
@@ -2028,6 +2040,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     seen(def_key, src.input);
     let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
     let file = held(base_files(run), "files").files[src.loc.file as usize];
+    // The file the call is written in ([`CallSrc::written`]): where its `include!` reads from.
+    let calling: &'a str = src.written;
     // The calling module's path, for `module_path!()`: a walked module's, or one a macro made.
     let module_path: Option<&str> = match base.tree.by_key.get(&src.module) {
         Some(&i) => Some(base.tree.modules[i].path.as_str()),
@@ -2037,11 +2051,13 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         cfg: base.cfg,
         file: shown(file.path, base.shown_from),
         shown_file: core::cell::OnceCell::new(),
-        path: file.path,
+        path: calling,
         package: base.shown_from,
         krate: base.index,
         text: file.text,
         call_at: src.loc.offset,
+        call_name: src.name,
+        call_shape: src.kind,
         module_path,
         sources: base.sources,
         alloc,
@@ -2274,11 +2290,40 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     def_crate_starts.extend(expansion.nested.iter().filter(|c| c.scope == PathScope::DefCrate).map(|c| c.path.start));
     def_crate_starts.sort_unstable();
     let def_crate = |at: usize| def_crate_starts.binary_search(&(at as u32)).is_ok();
+    // The column's input indexes are the call's text as written (drive.md, ruled 20:57): a
+    // fn-like call's input is that text; an item macro's is the item its walk made, matched to
+    // the written item from its end (blaze-expand `align_suffix`). Lexed as `lexed` lexed it.
+    let written_input = match call_of.kind {
+        CallKind::FnLike { .. } => None,
+        CallKind::Attr { item, .. } | CallKind::Derive { item, .. } => {
+            let written = lexed(src.input, Lexed::Input)?;
+            Some(blaze_expand::origin_column::align_suffix(item, &written, alloc))
+        }
+    };
     part(ExpandPart::Render, mac.name, expansion.tokens.len());
-    let rendered = render_with(&expansion.tokens, Some(here), |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate), def_crate, alloc);
+    let mut places: AVec<'_, (usize, usize, usize)> = AVec::new_in(alloc);
+    let rendered = render_with(
+        &expansion.tokens,
+        Some(here),
+        |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
+        def_crate,
+        &mut |token, start, end| places.push((token, start, end)),
+        alloc,
+    );
     let text: &'a str = Box::leak(rendered.into_boxed_str());
+    let input_index = match written_input.as_deref() {
+        Some(map) => blaze_expand::origin_column::InputIndex::Aligned(map),
+        None => blaze_expand::origin_column::InputIndex::AsWritten,
+    };
+    let shape = match src.kind {
+        CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
+        CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
+    };
+    let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
+    let origins = crate::expansion_origins::column_of(call, &places, &expansion.origins, input_index, &mark_of, alloc)
+        .and_then(|column| crate::expansion_origins::write(call, src.place, shape, src.name, src.implicit, &column, alloc));
     part(ExpandPart::Outline, mac.name, text.len());
-    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, edition, alloc) }, alloc));
+    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, edition, alloc), origins }, alloc));
     part(ExpandPart::Lower, mac.name, text.len());
     let (text, made): (&'a str, &'a ExpansionText<'a>) = match made.outline.errors().first() {
         None => (text, made),
@@ -2305,7 +2350,14 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                     Ok(None) => return Some((DeclsBuilder::new_in(alloc), None)),
                     Ok(Some(items)) => {
                         let items: &'a str = Box::leak(items.into_boxed_str());
-                        let again: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text: items, outline: outline(items, edition, alloc) }, alloc));
+                        let again: &'a ExpansionText<'a> = Box::leak(Box::new_in(
+                            ExpansionText {
+                                text: items,
+                                outline: outline(items, edition, alloc),
+                                origins: Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+                            },
+                            alloc,
+                        ));
                         if let Some(error) = again.outline.errors().first() {
                             note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
                             return Some((DeclsBuilder::new_in(alloc), None));
@@ -2320,6 +2372,17 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             }
         }
     };
+    // An `include!`'s file is the current file of what it writes ([`crate::included`]): the
+    // calls in it read from it, and a `mod x;` at its top is found from its folder. A file
+    // outside the package (a build script's output) has no such path: the calling file stays.
+    let included: Option<&'a str> = match mac.body {
+        MacroBody::BuiltinFn("include") => {
+            let seen = base.sources.crate_env(base.index).map(|env| env.seen());
+            crate::included::included_read(base.shown_from, seen, calling, &expansion.reads, alloc).map(|path| keep(&path, alloc))
+        }
+        _ => None,
+    };
+    let written = included.unwrap_or(calling);
     let fragment = Fragment {
         module: src.module,
         owner: call,
@@ -2330,6 +2393,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         depth: src.depth + 1,
         made: false,
         members_of: src.owner,
+        written,
+        kept: false,
     };
     let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
@@ -2341,20 +2406,76 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let mods =core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
     // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
     // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
-    let included_dir: Option<&'a str> = match mac.body {
-        MacroBody::BuiltinFn("include") if !mods.is_empty() => {
-            let seen = base.sources.crate_env(base.index).map(|env| env.seen());
-            crate::included::included_dir(base.shown_from, seen, file.path, &expansion.reads, alloc).map(|dir| keep(&dir, alloc))
-        }
-        _ => None,
-    };
-    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: included_dir };
+    let included_dir: Option<&'a str> = included.filter(|_| !mods.is_empty()).map(|path| {
+        let mut dir = AString::from_str_in(path, alloc);
+        pop_dir(&mut dir);
+        keep(&dir, alloc)
+    });
+    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: included_dir, written };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
     make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
     part(ExpandPart::Tables, mac.name, 0);
     add_lowered(run, call, At::Expansion(call), out);
     part(ExpandPart::Blocks, mac.name, bodies.len());
+    make_blocks(base, run, &bodies);
+    Some((decls, Some(made)))
+}
+
+/// What [`ExpandNote`]s and part marks name a keep call's expansion by: no macro made it.
+const KEPT_ITEM_NAME: &str = "kept item";
+
+/// The expansion of keep call `call` (`src`), its item kept after the attributes written after
+/// its derives ([`crate::cells::KEEP_ITEM`], attr-bang-kind-2): the call's input, the item as
+/// written, lowered as the call's fragment with [`Fragment::kept`], so its derives,
+/// after-derive calls and helper checks, which the calling fragment sent, are not sent again.
+/// Its names are declared as an attribute macro's that returned the item would be; the item's
+/// key is under the call's (as any expansion's).
+fn keep_item<'a, S: SourceTexts<'a>>(
+    base: &Base<'_, 'a, S>,
+    run: &Run<'a>,
+    call: ItemKey,
+    src: CallSrc<'a>,
+    part: PartMark<'_>,
+) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
+    let alloc = base.alloc;
+    let text = src.input;
+    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(
+        ExpansionText {
+            text,
+            outline: outline(text, base.edition, alloc),
+            origins: Err(crate::expansion_origins::OriginsError::Rewritten { what: "a kept item's text" }),
+        },
+        alloc,
+    ));
+    if let Some(error) = made.outline.errors().first() {
+        run.note(NamesNote::Expand { call, at: Some(src.loc), note: ExpandNote::NotItems { macro_name: KEPT_ITEM_NAME, message: made.outline.message(error) } });
+        return None;
+    }
+    let fragment = Fragment {
+        module: src.module,
+        owner: call,
+        text,
+        outline: &made.outline,
+        items: None,
+        at: Where::Expansion(src.loc),
+        depth: src.depth + 1,
+        made: false,
+        members_of: src.owner,
+        written: src.written,
+        kept: true,
+    };
+    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
+    // A struct, an enum or a union makes no module; moved as `expand_decls` moves them so a
+    // change there stays one shape.
+    let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
+    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written };
+    let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
+    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
+    let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
+    part(ExpandPart::Tables, KEPT_ITEM_NAME, 0);
+    add_lowered(run, call, At::Expansion(call), out);
+    part(ExpandPart::Blocks, KEPT_ITEM_NAME, bodies.len());
     make_blocks(base, run, &bodies);
     Some((decls, Some(made)))
 }
@@ -2389,7 +2510,14 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
         }
         let rendered = crate::blocks::module_text(body.text, &nested, alloc);
         let text: &'a str = Box::leak(rendered.into_boxed_str());
-        let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, base.edition, alloc) }, alloc));
+        let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(
+            ExpansionText {
+                text,
+                outline: outline(text, base.edition, alloc),
+                origins: Err(crate::expansion_origins::OriginsError::Rewritten { what: "a block's module text" }),
+            },
+            alloc,
+        ));
         let call = crate::task::key_of(base.key, body.key, "blocks", "", 0);
         let fragment = Fragment {
             module: body.module,
@@ -2401,10 +2529,12 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
             depth: body.depth + 1,
             made: false,
             members_of: None,
+            written: body.written,
+            kept: false,
         };
         let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None };
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written };
         {
             let mut places = held(run.block_places.lock(), "block places");
             for m in mods.iter() {
@@ -2655,6 +2785,8 @@ struct Made<'a> {
     /// where a `mod x;` written at the fragment's top is found and what its `#[path]` is
     /// relative to, in place of the calling module's folder. `None` for any other fragment.
     dir: Option<&'a str>,
+    /// [`Fragment::written`] of this text: what an inline module made from it is written in.
+    written: &'a str,
 }
 
 /// Where a module of this crate is: its children's directory, what their `#[path]` is relative
@@ -2762,7 +2894,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
                 note(MadeNote::CfgOff);
                 continue;
             }
-            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None }, None, mdir, mpdir)
+            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None, written: file.path }, None, mdir, mpdir)
         };
         let fragment = Fragment {
             module: m.key,
@@ -2774,6 +2906,8 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             depth,
             made: true,
             members_of: None,
+            written: fragment_of.written,
+            kept: false,
         };
         let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
         bodies.extend(out.bodies.iter().copied());

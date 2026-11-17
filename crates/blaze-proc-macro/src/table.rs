@@ -75,7 +75,11 @@ const STALE: u8 = 2;
 /// only the rows that read it miss. (Layout 1 named the table by every variable's value: any
 /// change of one gave the crate an empty table.)
 pub fn crate_name(package: &Package) -> ContentId {
-    let name = package.env.iter().find(|(name, _)| name == "CARGO_PKG_NAME").map_or("", |(_, value)| value.as_str());
+    // A locator, never a key: a package with no known name (a toolchain crate) files under "".
+    let name = match package.env.get("CARGO_PKG_NAME") {
+        crate::package_env::EnvAnswer::Set(name) => name,
+        crate::package_env::EnvAnswer::Unset | crate::package_env::EnvAnswer::Unknown => "",
+    };
     ContentId::of("blaze proc-macro crate results 2", name.as_bytes())
 }
 

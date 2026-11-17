@@ -174,6 +174,15 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         }
         text
     }
+
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'n [u8]> {
+        // Asked only of a text `expansion` served: one it cannot serve is filed as that is.
+        let origins = self.crates.get(krate).and_then(|c| c.expansions.origins(call).ok().flatten());
+        if origins.is_none() {
+            self.unserved.borrow_mut().push((krate, call));
+        }
+        origins
+    }
 }
 
 #[cfg(test)]

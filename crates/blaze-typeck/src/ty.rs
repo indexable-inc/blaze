@@ -131,6 +131,11 @@ pub enum Cause {
     Expr(ExprId),
     Pat(PatId),
     Body,
+    /// The `nth` where-clause of the item the path or method call `expr` names: filed, when
+    /// unmet, at the text that introduced it (rules/obligation_site.rs), else at `expr`.
+    Clause { expr: ExprId, nth: u32 },
+    /// Text the user wrote that is no expression (a qualified path's anchor type), by its range.
+    Written(crate::ids::Range),
 }
 
 /// A goal and its cause.

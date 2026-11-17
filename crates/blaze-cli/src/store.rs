@@ -127,8 +127,6 @@ mod chunks;
 mod compact;
 /// Who made each record of a pack (pack format 3), and an old pack's refusal by name.
 mod producers;
-/// The store on blaze-cas's plain store (D114 (b)): `Maps` lends records in place.
-pub(crate) mod plain_place;
 pub use producers::PackError;
 use blaze_own::alloc_ref::SharedAlloc;
 /// The store at a real home's size: what a get reads, what a repeated command writes, the
@@ -1047,15 +1045,23 @@ impl Sharing for ToolchainCrates {
 
     fn place(&self, bytes: &[u8]) -> Place {
         let public = |name: Name| name.kind == Kind::CrateScope && self.subjects.binary_search(&name.subject).is_ok();
-        let (name, all_public) = match blaze_drive::record::open(bytes) {
-            Ok(Stored::Whole(view)) => (view.name, public(view.name) && view.reads().all(|(name, _)| public(name))),
-            Ok(Stored::Shape(view)) => (view.name, public(view.name) && view.names().all(public)),
+        // A `Script` record run natively (D112's runner: the machine's tools) says so in its own
+        // bytes (scripts.rs `RanAs`, D71): never public. A record reading it is not public either,
+        // because its read names a name that is not public.
+        let native = |view: &blaze_drive::record::WholeView<'_>| {
+            view.name.kind == Kind::Script && matches!(crate::scripts::payload_parts(view.payload), Some((crate::scripts::RanAs::Native, _)))
+        };
+        let (name, all_public, ran_native) = match blaze_drive::record::open(bytes) {
+            Ok(Stored::Whole(view)) => (view.name, public(view.name) && view.reads().all(|(name, _)| public(name)), native(&view)),
+            Ok(Stored::Shape(view)) => (view.name, public(view.name) && view.names().all(public), false),
             // Not a drive record (a certificate, a root, a page): the checkout's.
             Err(_) => return Place::Checkout,
         };
         match (name.kind, all_public) {
             // Fetched and adopted sources are this machine's (D78): never the shared namespace.
             (Kind::Fetch, _) => Place::Own,
+            // A natively run build script's outputs are this machine's (D71): never shared.
+            (Kind::Script, _) if ran_native => Place::Own,
             (_, true) => Place::Public,
             (_, false) => Place::Own,
         }

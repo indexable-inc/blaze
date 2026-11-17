@@ -903,6 +903,9 @@ pub(crate) fn metadata_ty<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: 
                 let l = cx.mk_list(&[t])?;
                 TyKind::Adt(dm, l)
             }
+            // An alias not yet normalized (`UnsafeCell<<bool as AtomicPrimitive>::Storage>`, the
+            // tail of core's `Atomic<bool>`): its metadata is that of what it normalizes to.
+            TyKind::Alias(Rigid::No, ..) => return Ok(Metadata::Normalize(t)),
             TyKind::Param(_) | TyKind::Placeholder(..) | TyKind::Alias(..) => {
                 let sized = require_lang(cx, Lang::Sized)?;
                 let known = cx.env.iter().any(|c| match c.pred {
@@ -933,6 +936,9 @@ pub(crate) enum Metadata {
     Rigid(Ty),
     /// The tail is a type variable: not decided yet.
     Ambiguous,
+    /// The tail is an alias not yet normalized: the walk goes on from what it normalizes to
+    /// (the reference's nested `<tail as Pointee>::Metadata` normalizes its self type first).
+    Normalize(Ty),
 }
 
 pub(crate) fn normalize_future_output<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, term: Ty) -> Result<Step, Stop> {

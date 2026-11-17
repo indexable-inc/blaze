@@ -302,6 +302,9 @@ pub struct ByName<'d, 'a, C> {
     expansions: AVec<'a, (ContentId, TokenStream<'a>)>,
     /// This body's calls whose path named no macro.
     findings: AVec<'a, MacroFinding<'a>>,
+    /// This body's calls whose expansion joined reads to `reads`, each with its span
+    /// ([`crate::call_reads::CallReads`]): where a proc macro's read is placed (D111).
+    call_reads: AVec<'a, crate::call_reads::CallReads<'a>>,
     /// This body's read list: every outside read its expansions made (an `env!` name and
     /// value, an `include_str!`/`include_bytes!`/`include!` path and content digest), in call
     /// order, eager inputs' included. The body's record keeps it: a changed answer reruns
@@ -340,6 +343,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
             cx,
             expansions: Vec::new_in(alloc),
             findings: Vec::new_in(alloc),
+            call_reads: Vec::new_in(alloc),
             reads: Reads::new_in(alloc),
             read_cap: BODY_READ_CAP,
             alloc,
@@ -370,6 +374,23 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
     /// The read list of the body lowered last ([`ByName::reads`]'s field doc).
     pub fn reads(&self) -> &Reads<'a> {
         &self.reads
+    }
+
+    /// The calls of the body lowered last whose expansion joined reads, in call order, each
+    /// with its span of [`ByName::reads`] (blaze-ladder front2 `body_left` files D111 from them).
+    pub fn call_reads(&self) -> &[crate::call_reads::CallReads<'a>] {
+        &self.call_reads
+    }
+
+    /// Keeps the span of the read list the call at `at` (written `path`) joined since `before`
+    /// reads, when it joined any.
+    fn note_reads(&mut self, at: Option<blaze_surface::Range>, path: &str, shape: blaze_surface::CallShape, before: usize) {
+        let after = self.reads.list().len();
+        if after > before {
+            let mut written = AString::new_in(self.alloc);
+            written.push_str(path);
+            self.call_reads.push(crate::call_reads::CallReads { at, path: written, shape, reads: before..after });
+        }
     }
 
     fn resolve(&self, path: &str, at: PathAt, kind: ProcKind) -> Result<Resolved<'d, 'a>, NoMacro<'a>> {
@@ -600,9 +621,13 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
 
     fn expand_body(&mut self, call: BodyCall<'_>, cfg: &mut dyn crate::Cfg, out: &mut BodyOut<'_>) -> Expansion {
         let at = self.path_at(call.input);
+        let before = self.reads.list().len();
         let result = self
             .input(call.input, call.edition)
             .and_then(|input| self.call(call.path, at, &input, call.edition, Inside::Plain, 0, call.locals, Some(cfg)));
+        // Its reads (an eager input's nested calls' included) joined on success and on the
+        // call's error alike (`call`): placed at this call.
+        self.note_reads(Some(call.range), call.path, blaze_surface::CallShape::FnLike, before);
         match result {
             Ok((key, tokens)) => {
                 out.key = key;
@@ -634,6 +659,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
     fn begin_body(&mut self) {
         self.expansions.clear();
         self.findings.clear();
+        self.call_reads.clear();
         self.reads = Reads::new_in(self.alloc);
     }
 
@@ -655,18 +681,22 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
         let call = Call::attr(args, item, site);
         let key = call_key(prepared.def(), &call).0;
-        match expand_prepared(prepared, &call, &self.cx, self.alloc) {
+        let before = self.reads.list().len();
+        let outcome = match expand_prepared(prepared, &call, &self.cx, self.alloc) {
             // Reads join the list on an error too (see `call`).
             Ok(Expanded::Expansion(exp)) => {
                 if self.join_reads(&exp.reads).is_err() || exp.diagnostics.iter().any(blaze_expand::Diagnostic::is_error) {
-                    return Expansion::Failed;
+                    Expansion::Failed
+                } else {
+                    out.key = key;
+                    out.words = blaze_expand::body_words(&exp.tokens, key, *out.words.words.allocator());
+                    Expansion::Expanded
                 }
-                out.key = key;
-                out.words = blaze_expand::body_words(&exp.tokens, key, *out.words.words.allocator());
-                Expansion::Expanded
             }
             _ => Expansion::Failed,
-        }
+        };
+        self.note_reads(None, path, blaze_surface::CallShape::Attr, before);
+        outcome
     }
 
     /// A derive: the language's (`Clone`, `Copy`, `Debug`, `Default`, `PartialEq`, `Eq`,
@@ -682,17 +712,21 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
         let call = Call::derive(item, facts, site);
         let key = call_key(&def, &call).0;
-        match expand(&def, &call, &self.cx, self.alloc) {
+        let before = self.reads.list().len();
+        let outcome = match expand(&def, &call, &self.cx, self.alloc) {
             // Reads join the list on an error too (see `call`).
             Ok(Expanded::Expansion(exp)) => {
                 if self.join_reads(&exp.reads).is_err() || exp.diagnostics.iter().any(blaze_expand::Diagnostic::is_error) {
-                    return Expansion::Failed;
+                    Expansion::Failed
+                } else {
+                    out.key = key;
+                    out.words = blaze_expand::body_words(&exp.tokens, key, *out.words.words.allocator());
+                    Expansion::Expanded
                 }
-                out.key = key;
-                out.words = blaze_expand::body_words(&exp.tokens, key, *out.words.words.allocator());
-                Expansion::Expanded
             }
             _ => Expansion::Failed,
-        }
+        };
+        self.note_reads(None, path, blaze_surface::CallShape::Derive, before);
+        outcome
     }
 }

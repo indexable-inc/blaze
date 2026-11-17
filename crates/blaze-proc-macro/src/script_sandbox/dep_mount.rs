@@ -32,13 +32,16 @@ use core::fmt;
 use std::sync::Arc;
 
 use blaze_build_script::Outputs;
-use blaze_build_script::dep_paths::{self, DEPS_ROOT, DepMount, DepPathError, Producer};
+use blaze_build_script::dep_paths::{self, DEPS_ROOT, DepMount, DepPathError, Producer, Sight};
 use blaze_build_script::env::DepMetadata;
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc};
 use blaze_wasi::{Answer, Errno, Filestat, Filetype, Open, Stop};
 
 use super::{Node, Opened, Place, Refusal, ScriptRoot, ScriptSandbox, Tree, digest, filestat, listing_digest, stat_digest};
+
+/// A native script's view: the same values laid as real read-only folders (D112, brief N8).
+pub mod native;
 
 /// One `links` dependency's script as its dependents' scripts are given it: the tree it was
 /// served, what it saw as its root, and its outputs' `OUT_DIR` and files.
@@ -224,10 +227,37 @@ pub struct Viewed<'a> {
 }
 
 /// Plans `deps` (the reader's metadata pairs) against `producers` (each with its `links`) and
-/// makes the mounts the plan names; `reader` is the tree the reading script is served.
+/// makes the mounts the plan names; `reader` is the tree the reading script is served. The
+/// wasm sight of [`resolve`].
 pub fn view<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMetadata<'_>], alloc: Alloc<'a>) -> Result<Viewed<'a>, DepViewError> {
-    let mut values: AVec<'a, AString<'a>> = AVec::with_capacity_in(deps.len(), alloc);
+    let resolved = resolve(Sight::Wasm, producers, deps, alloc)?;
     let mut mounts: Vec<Mounted> = Vec::new();
+    for &(mount, producer) in resolved.serve.iter() {
+        mounts.push(mounted(mount, producer, reader)?);
+    }
+    mounts.sort_by(|a, b| a.parts.cmp(&b.parts));
+    // One mount serves every pair under it (two pairs under one `OUT_DIR`, say).
+    mounts.dedup_by(|a, b| a.parts == b.parts);
+    let content = (!mounts.is_empty()).then(|| content_id(&mounts));
+    Ok(Viewed { values: resolved.values, views: DepViews { mounts, content } })
+}
+
+/// A reader's `links` values resolved for a run of one [`Sight`], and the trees they are under.
+pub(crate) struct Resolved<'p, 'a> {
+    /// Each pair's value as that run sees it, in the order of the `deps` given.
+    pub(crate) values: AVec<'a, AString<'a>>,
+    /// Each tree a value is under, with the producer that serves it, in the order met (one
+    /// tree may be named twice; the callers sort and keep each once).
+    pub(crate) serve: Vec<(DepMount<'p>, &'p DepProducer)>,
+}
+
+/// THE one resolution of a reader's `DEP_*` values (D112, brief N8): each value's tree (a
+/// producer's `OUT_DIR` tree or its served tree) and its place in it, written where a run of
+/// `sight` sees that tree. Used by the wasm sandbox ([`view`]) and the native run
+/// ([`native::lay`]) alike; a value under neither tree of any candidate is refused by name.
+pub(crate) fn resolve<'p, 'a>(sight: Sight<'_>, producers: &[(&'p str, &'p DepProducer)], deps: &[DepMetadata<'p>], alloc: Alloc<'a>) -> Result<Resolved<'p, 'a>, DepViewError> {
+    let mut values: AVec<'a, AString<'a>> = AVec::with_capacity_in(deps.len(), alloc);
+    let mut serve: Vec<(DepMount<'p>, &'p DepProducer)> = Vec::new();
     for dep in deps {
         let direct = find(producers, dep.links).map_err(|_| DepViewError::NoProducer { links: dep.links.to_owned(), key: dep.key.to_owned() })?;
         // The direct producer first, then each script upstream of it in `links` order (brief
@@ -238,7 +268,7 @@ pub fn view<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMe
         for (links, producer) in candidates {
             let one = [Producer { links, seen: producer.root.seen(), out_dir: producer.out_dir.as_str() }];
             let pair = [DepMetadata { links, key: dep.key, value: dep.value }];
-            match dep_paths::plan(&one, &pair, alloc) {
+            match dep_paths::plan_seen(sight, &one, &pair, alloc) {
                 Ok(plan) => {
                     planned = Some((plan, producer));
                     break;
@@ -251,7 +281,7 @@ pub fn view<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMe
             return Err(DepViewError::Outside { links: dep.links.to_owned(), key: dep.key.to_owned(), path: dep.value.to_owned() });
         };
         for mount in plan.mounts.iter() {
-            mounts.push(mounted(*mount, producer, reader)?);
+            serve.push((*mount, producer));
         }
         let mut value = AString::new_in(alloc);
         if let Some(seen) = plan.values.first() {
@@ -259,11 +289,7 @@ pub fn view<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMe
         }
         values.push(value);
     }
-    mounts.sort_by(|a, b| a.parts.cmp(&b.parts));
-    // One mount serves every pair under it (two pairs under one `OUT_DIR`, say).
-    mounts.dedup_by(|a, b| a.parts == b.parts);
-    let content = (!mounts.is_empty()).then(|| content_id(&mounts));
-    Ok(Viewed { values, views: DepViews { mounts, content } })
+    Ok(Resolved { values, serve })
 }
 
 /// The mount `mount` of a plan made against `producer`, as `reader`'s sandbox serves it.

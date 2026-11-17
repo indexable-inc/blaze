@@ -21,16 +21,18 @@
 //! The float functions (`fabs`, `sqrt`, the roundings, the min/max pairs, `fcopysign`, `fma`,
 //! `fmuladd`) are pass/float/math.rs's.
 //!
-//! Refused by name: `f16` and `f128`, and the two conditions that need two flags (`one`,
-//! `ueq`).
+//! `f16` and `f128` are only moved (pass/float_width.rs, which `lower` asks first); an
+//! operation on one that reaches here is refused by name, as are the two conditions that need
+//! two flags (`one`, `ueq`).
 
 use std::alloc::Allocator;
 
 mod math;
 
-use blaze_lir::{FloatCond, Op, Scalar, Ty, Value};
+use blaze_lir::{FloatCond, Op, Ty, Value};
 
 use super::{EmitError, Pass, unsupported};
+use super::float_width::FloatWidth;
 use crate::enc::{self, Cond, X9, X10};
 
 /// `d0`/`s0` and `d1`/`s1`: the vector registers an operation computes in.
@@ -40,14 +42,7 @@ const V1: u32 = 1;
 impl<A: Allocator> Pass<'_, '_, A> {
     /// Whether `ty` is an `f32` (`Some(false)`) or an `f64` (`Some(true)`).
     pub(super) fn float_ty(ty: Ty) -> Option<bool> {
-        if !ty.is_scalar() {
-            return None;
-        }
-        match ty.elem() {
-            Scalar::F32 => Some(false),
-            Scalar::F64 => Some(true),
-            _ => None,
-        }
+        FloatWidth::of(ty).and_then(FloatWidth::computed)
     }
 
     fn float_of(&self, inst: usize, op: Op, value: Value) -> Result<bool, EmitError> {

@@ -23,8 +23,27 @@
 //! `stp x29, x30, [sp, #-16]!` and instruction 1 `mov x29, sp`, so from instruction 2 on the
 //! canonical frame address (the caller's `sp`) is `x29 + 16`, `x29` is saved at `CFA - 16` and
 //! `x30` at `CFA - 8`. Each saved pair is then stored by one `stp` (instruction `2 + k` for the
-//! `k`th pair in the order of the table, `x` pairs first) at `x29 - 16 * (k + 1)`, that is
-//! `CFA - 16 - 16 * (k + 1)`, its lower register first.
+//! `k`th pair in the order of the table, `x` pairs first) at `x29 - 16 * (k + 1)`, its HIGHER
+//! register at the lower address: `stp x20, x19, [sp, #-16]!`, so x19 is at `CFA - 24 - 16k` and
+//! x20 at `CFA - 32 - 16k` (and d8 above d9 the same way). This is the platform's one order,
+//! which LLVM's prologue writes too and the system's unwinder reads (main's ruling,
+//! unwind-P8a-4; there is no second form):
+//!
+//! - MacOSX27.2.sdk/usr/include/mach-o/compact_unwind_encoding.h:309-315: "UNWIND_ARM64_MODE_FRAME:
+//!   This is a standard arm64 prolog where FP/LR are immediately pushed on the stack, then SP is
+//!   copied to FP. If there are any non-volatile registers saved, then are copied into the stack
+//!   frame in pairs in a contiguous range right below the saved FP/LR pair.  Any subset of the
+//!   five X pairs and four D pairs can be saved, but the memory layout must be in register number
+//!   order."
+//! - libunwind src/CompactUnwinder.hpp:621-631 (the pinned toolchain's llvm-project),
+//!   `stepWithCompactEncodingFrame`: "Registers_arm64::reg_t savedRegisterLoc =
+//!   registers.getFP() - 8; if (encoding & UNWIND_ARM64_FRAME_X19_X20_PAIR) {
+//!   registers.setRegister(UNW_AARCH64_X19, addressSpace.get64(savedRegisterLoc));
+//!   savedRegisterLoc -= 8; registers.setRegister(UNW_AARCH64_X20,
+//!   addressSpace.get64(savedRegisterLoc)); savedRegisterLoc -= 8; }".
+//!
+//! So a frame word's pair bits are the compact encoding's `UNWIND_ARM64_FRAME_*_PAIR` bits
+//! (x pairs at bits 0..5, d pairs at 8..12) and mean the same layout.
 //!
 //! The stack size is not in the word: with a frame record the frame address is `x29`-relative,
 //! so an unwinder never needs it (the frame may even be realigned below `x29`, as pass.rs does
@@ -105,11 +124,13 @@ impl Frame {
         Ok(Some(Frame { x_pairs: (word & X_PAIRS) as u8, d_pairs: ((word >> D_SHIFT) & D_PAIRS) as u8 }))
     }
 
-    /// The saved pairs, in the order their `stp`s come: `(the lower register, the higher)` as
-    /// DWARF numbers, the `k`th at `CFA - 16 - 16 * (k + 1)`.
+    /// The saved pairs, in the order their `stp`s come, each as its `stp` names them:
+    /// `(the register at the lower address, the one at the higher)` as DWARF numbers, the `k`th
+    /// at `CFA - 32 - 16k` and `CFA - 24 - 16k`. That is `(x20, x19)`: the platform's order
+    /// (module doc, "The frame word").
     pub fn pairs(self) -> impl Iterator<Item = (u16, u16)> {
-        let x = (0..5u16).filter(move |k| self.x_pairs & (1 << k) != 0).map(|k| (reg::X19 + 2 * k, reg::X19 + 2 * k + 1));
-        let d = (0..4u16).filter(move |k| self.d_pairs & (1 << k) != 0).map(|k| (reg::V8 + 2 * k, reg::V8 + 2 * k + 1));
+        let x = (0..5u16).filter(move |k| self.x_pairs & (1 << k) != 0).map(|k| (reg::X19 + 2 * k + 1, reg::X19 + 2 * k));
+        let d = (0..4u16).filter(move |k| self.d_pairs & (1 << k) != 0).map(|k| (reg::V8 + 2 * k + 1, reg::V8 + 2 * k));
         x.chain(d)
     }
 

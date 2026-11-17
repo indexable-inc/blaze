@@ -127,12 +127,21 @@ pub trait NamesSource<'n>: Copy {
     /// program's).
     fn proc_macro(self, krate: usize) -> Option<bool>;
 
+    /// Which `std` the crate's code names `std` (blaze-unit-graph's `implicit`): Rust's, or
+    /// bstd under a blaze edition. What an E0425 after a written `std` notes (std_is_bstd.rs).
+    fn std_is(self, krate: usize) -> Option<blaze_unit_graph::StdIs>;
+
     /// Question 16: whether the crate may write incoherent impls (its root text names
     /// `rustc_attrs` or `rustc_coherence_is_core`).
     fn may_write_incoherent(self, krate: usize) -> Option<bool>;
 
     /// Question 1: what `written` means in `module`, looked up in `ns`.
     fn walk(self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError>;
+
+    /// Question 1b: the module a path head `self` (`n == 0`) or `super` written `n` times names
+    /// from `module`, a block's module passed over (`names::written_module`): what a glob
+    /// `use self::*;` / `use super::*;` reads, with no segment to walk.
+    fn written_module(self, module: ItemKey, n: u8) -> Result<ItemKey, PathError>;
 
     /// Question 2: the traits method resolution may use in `module`, sorted.
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError>;
@@ -162,6 +171,11 @@ pub trait NamesSource<'n>: Copy {
     /// and its outline entry's first byte there. `None`: the item has no text (over records
     /// the row without a place is filed in the log). Reads no text.
     fn item_start(self, key: ItemKey) -> Option<(blaze_scope::resolve::At, u32)>;
+
+    /// Question 10d: the origins of the expansion `call` of crate `krate` made, with the text the
+    /// call is written in as it is now (front2 expansion_origin.rs): what a finding in the
+    /// expansion's text is filed through. `Err` names why it cannot be.
+    fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::expansion_origin::CallOrigin<'n>, super::expansion_origin::Unmapped>;
 
     /// Question 10c: the abi of the `extern` block that declares `key`, unquoted as written,
     /// `"C"` when none is written (the Reference, items.extern.abi.default): `Some(Some(abi))`;
@@ -325,6 +339,10 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         self.crates().get(krate).map(|c| c.implicit.proc_macro)
     }
 
+    fn std_is(self, krate: usize) -> Option<blaze_unit_graph::StdIs> {
+        self.crates().get(krate).map(|c| c.implicit.std)
+    }
+
     fn may_write_incoherent(self, krate: usize) -> Option<bool> {
         // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
         // read; a mention anywhere in that text keeps the crate on the wide side.
@@ -333,6 +351,10 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
 
     fn walk(self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
         names::path(self, module, ns, written, Alloc::global())
+    }
+
+    fn written_module(self, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
+        names::written_module::<&'n str, _>(self, module, n)
     }
 
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
@@ -373,6 +395,22 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         let Place { krate, at, item } = self.place(key)?;
         let (_, outline) = self.outline_at(krate, at)?;
         Some((at, outline.item(item).range.start))
+    }
+
+    fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::expansion_origin::CallOrigin<'n>, super::expansion_origin::Unmapped> {
+        use super::expansion_origin::{CallOrigin, Unmapped};
+        let c = self.crates().get(krate).ok_or(Unmapped::NoText { call })?;
+        let made = c.expansions.get(&call).and_then(|e| e.made).ok_or(Unmapped::NoText { call })?;
+        let bytes = made.origins.map_err(|error| Unmapped::Origins { call, error })?;
+        let view = blaze_scope::expansion_origins::OriginsView::open(bytes).map_err(|error| Unmapped::Origins { call, error })?;
+        let (text, outline) = self.outline_at(krate, view.text).ok_or(Unmapped::NoText { call })?;
+        let shown = match view.text {
+            blaze_scope::resolve::At::File(i) => c.files.get(i as usize).map(|f| f.shown).ok_or(Unmapped::NoText { call })?,
+            // An expansion's text has no file: it prints as its crate, as texts.rs `Row::shown`.
+            blaze_scope::resolve::At::Expansion(_) => c.name,
+        };
+        let entry = outline.item(view.item).range;
+        Ok(CallOrigin { view, text, shown, entry: (entry.start, entry.end), edition: c.edition })
     }
 
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
@@ -516,11 +554,12 @@ pub enum SourceError<'n> {
     /// key (a library key's first 16 bytes) would stand for both (`keys::KeyClash`, as the
     /// records path meets it: [`NamesSource::key_beginning`]).
     KeysBeginAlike { krate: usize, name: &'n str, first: ItemKey, second: ItemKey },
-    /// The item's file changed since its items record was written and the item's HEAD moved
-    /// (`found`: today's head) or no single entry of today's text has its chain (`found:
-    /// None`): this item's row is stale and no text of it is answered (item_grain.rs). The
-    /// crate's scope is remade by its own key.
-    ItemStale { krate: usize, name: &'n str, key: ItemKey, file: u32, saw: blaze_id::ContentId, found: Option<blaze_id::ContentId> },
+    /// The item's file changed since its items record was written and no single entry of
+    /// today's text has its chain `chain` (renamed, removed, or two entries share it): this
+    /// item's row is stale and no text of it is answered (item_grain.rs). A rename or removal
+    /// moves the file's `Surface`, so the crate's scope is remade by its own key. (A head edit
+    /// is not stale: the record holds no head, D114 ruling.)
+    ItemStale { krate: usize, name: &'n str, key: ItemKey, file: u32, chain: blaze_id::ContentId },
 }
 
 impl core::fmt::Display for SourceError<'_> {
@@ -535,11 +574,8 @@ impl core::fmt::Display for SourceError<'_> {
             SourceError::KeysBeginAlike { krate, name, first, second } => {
                 write!(f, "the records of crate `{name}` (crate {krate}) hold two keys that begin with the same 16 bytes, {first:x} and {second:x}: one checker key would stand for both")
             }
-            SourceError::ItemStale { krate, name, key, file, saw, found: Some(found) } => {
-                write!(f, "item {key:x} of crate `{name}` (crate {krate}), file {file}: its head changed since its items record was written (saw {saw:?}, today {found:?}): its crate's scope is remade by its own key")
-            }
-            SourceError::ItemStale { krate, name, key, file, saw, found: None } => {
-                write!(f, "item {key:x} of crate `{name}` (crate {krate}), file {file}: no single entry of the file as it is now has its place by names (head {saw:?} when written): its crate's scope is remade by its own key")
+            SourceError::ItemStale { krate, name, key, file, chain } => {
+                write!(f, "item {key:x} of crate `{name}` (crate {krate}), file {file}: no single entry of the file as it is now has its place by names (chain {chain:?} when written): its crate's scope is remade by its own key")
             }
         }
     }
@@ -602,6 +638,11 @@ pub trait Load<'n> {
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str>;
     /// The text the macro call `call` of the crate expanded to.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str>;
+    /// The origins of that text (`blaze_scope::expansion_origins` form; empty: the text keeps
+    /// none). No default (rule 3): every loader says what it serves; `None` is "this loader holds
+    /// no origins for the call", which a finding in the text files by name
+    /// (front2 expansion_origin.rs `Unmapped::NotServed`), never a quiet nothing.
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'n [u8]>;
     /// The entry of the crate's file at `path`, as it is now, whose item chain is `chain`: what
     /// an items record row whose file changed is checked against, item by item
     /// (`blaze_scope::items_record::ItemsRecord::item_now`). This one outlines the file's text
@@ -952,12 +993,20 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         Some(self.items_of(krate)?.proc_macro())
     }
 
+    fn std_is(self, krate: usize) -> Option<blaze_unit_graph::StdIs> {
+        Some(self.items_of(krate)?.std_is())
+    }
+
     fn may_write_incoherent(self, krate: usize) -> Option<bool> {
         Some(self.items_of(krate)?.may_write_incoherent())
     }
 
     fn walk(self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
         names::path(&self.paths, module, ns, self.kept(written), Alloc::global())
+    }
+
+    fn written_module(self, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
+        names::written_module::<&'n str, _>(&self.paths, module, n)
     }
 
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
@@ -1040,6 +1089,15 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             return None;
         };
         Some((span.at, span.start))
+    }
+
+    fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::expansion_origin::CallOrigin<'n>, super::expansion_origin::Unmapped> {
+        // Owed by name: the calling text's outline over the crates' records is not served (the
+        // `Texts` table over records is empty, texts.rs `Texts::empty`). The origins themselves
+        // are in the record (`Load::expansion_origins`); reading the calling entry is what is
+        // missing. Never guessed: the finding is filed with this reason.
+        let _ = krate;
+        Err(super::expansion_origin::Unmapped::OverRecords { call })
     }
 
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {

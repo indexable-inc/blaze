@@ -129,15 +129,21 @@ mod driven;
 mod format;
 mod handle;
 mod image;
+mod lent;
 mod verified;
 
+#[cfg(test)]
+mod lazy_tests;
+#[cfg(test)]
+mod root_commit_tests;
 #[cfg(test)]
 mod tests;
 
 pub use self::core::{
-    Batch, Committed, GRACE_NS, Got, Lost, Placed, Plain, PlainConfig, PutError, ROOT_TAG, Report,
-    SEGMENTS_MOST, SLICE_BYTES, Scrubbed, Sliced, TAGS, WINDOW,
+    Batch, Committed, Found, GRACE_NS, Got, Lost, Placed, Plain, PlainConfig, Probe, Probes, PutError,
+    ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, Scrubbed, Sliced, TAGS, WINDOW,
 };
+pub use self::lent::{Lend, Lent, LentCounts, LentError};
 pub use self::driven::{Driven, LocalDir, Opened, lower_this_thread};
 pub use self::format::{Described, Entry, FORMAT, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};

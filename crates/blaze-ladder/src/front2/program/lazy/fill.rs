@@ -91,10 +91,10 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
                     lens += 1;
                     let mut r = self.records(true);
                     if let Err(e) = eval_len(&mut r, c) {
-                        return Err(LazyRefusal::Head { item: self.shown(item).into_boxed_str(), why: format!("the constant {c:x} its head names: {e:?}").into_boxed_str() });
+                        return Err(LazyRefusal::Head { item: self.refused_shown(item), why: format!("the constant {c:x} its head names: {e:?}").into_boxed_str() });
                     }
                 }
-                Err(e) => return Err(LazyRefusal::Head { item: self.shown(item).into_boxed_str(), why: format!("{e:?}").into_boxed_str() }),
+                Err(e) => return Err(LazyRefusal::Head { item: self.refused_shown(item), why: crate::front2::item_shown::head_error_shown(names, &e).into_boxed_str() }),
                 Ok(()) => return Ok(()),
             }
         }
@@ -106,7 +106,10 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         if let Some(&i) = self.rows.by_key.get(&key) {
             return Ok(i as usize);
         }
-        let path = self.shown(key);
+        let row_path = crate::front2::row_path::RowPath::of(self.front.names, &self.front.keys, &self.store, key)
+            .map_err(|no| LazyRefusal::Row { function: no.item.boxed(), refusal: Box::new(Front2Refusal::NoRowPath(no)) })?;
+        // `path` is for messages; the item's identifier, data, is `row_path.ident()` (rule 30).
+        let path = String::from(row_path.text());
         let refuse = |refusal: Front2Refusal| LazyRefusal::Row { function: Box::from(path.as_str()), refusal: Box::new(refusal) };
         // A ctor is the language's: tabled as one; the build makes its value.
         if self.store.ctors.contains_key(&key) {
@@ -144,7 +147,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let (kind, symbol) = if panic_entry || alloc_shim.is_some() {
             (FnKind::Free, Box::<str>::from(""))
         } else if foreign.is_some() && !in_container {
-            let symbol = symbols.link_name.clone().unwrap_or_else(|| declared_name.unwrap_or_else(|| path.rsplit("::").next().unwrap_or(&path)).into());
+            let symbol = symbols.link_name.clone().unwrap_or_else(|| declared_name.unwrap_or(row_path.ident()).into());
             (FnKind::Foreign, symbol)
         } else if of_trait {
             (FnKind::Trait(0), Box::<str>::from(""))
@@ -152,7 +155,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             (FnKind::Free, Box::<str>::from(""))
         };
         let intrinsic = if symbols.intrinsic {
-            let name = path.rsplit("::").next().unwrap_or(&path);
+            let name = row_path.ident();
             match blaze_build::intrinsics::Which::named(name) {
                 Ok(which) => Some(Intrinsic::Table(which)),
                 Err(_) => return Err(refuse(Front2Refusal::Intrinsic { function: Box::from(path.as_str()) })),
@@ -202,17 +205,16 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         placed(self.front.names, lib).map_err(|_| LazyRefusal::Unanswered { question: "extern_abi", item: Box::from(item) })
     }
 
-    /// A fn's name for messages and its row's path, as reach.rs `fn_shown` makes it (a
-    /// member's as `container::name`) over this program's key map and source.
+    /// A fn's name for messages (front2 row_path.rs `shown_name`, the one printer): its row
+    /// path, else its `ItemShown`. A row's path is `row`'s `RowPath`, never this text.
     pub(super) fn shown(&self, k: ItemKey) -> String {
-        let item = |k: ItemKey| match self.front.keys.library_in(self.front.names, k).and_then(|lib| self.front.names.name_of(lib)) {
-            Some(n) => n.to_string(),
-            None => format!("{k:?}"),
-        };
-        match self.front.keys.origin(k) {
-            Some(Origin::Member { container, name, .. }) => format!("{}::{name}", item(*container)),
-            _ => item(k),
-        }
+        crate::front2::row_path::shown_name(self.front.names, &self.front.keys, &self.store, k)
+    }
+
+    /// `k` for a refusal (rule 19): its whole path and its key (front2 item_shown.rs
+    /// `ItemShown`); [`Self::shown`] stays the bare name a row's path is made from.
+    pub(super) fn refused_shown(&self, k: ItemKey) -> Box<str> {
+        crate::front2::item_shown::ItemShown::of(self.front.names, &self.front.keys, k).boxed()
     }
 
     /// The row of every ADT `checked`'s types and the heads' table name, in rounds as a row's
@@ -234,23 +236,23 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             missing.dedup();
             let Some(&first) = missing.first() else { break };
             if round == super::super::super::reach::MOST_FNS {
-                return Err(LazyRefusal::Adt { adt: self.shown(first).into_boxed_str(), why: Box::from("rows still missing after the most rounds") });
+                return Err(LazyRefusal::Adt { adt: self.refused_shown(first), why: Box::from("rows still missing after the most rounds") });
             }
             for &k in missing.iter() {
                 let Some(lib) = self.front.keys.library(k) else {
-                    return Err(LazyRefusal::Adt { adt: self.shown(k).into_boxed_str(), why: Box::from("no library key") });
+                    return Err(LazyRefusal::Adt { adt: self.refused_shown(k), why: Box::from("no library key") });
                 };
                 self.make_want(Want::Adt(lib), k).map_err(|e| match e {
                     LazyRefusal::Head { item, why } => LazyRefusal::Adt { adt: item, why },
                     other => other,
                 })?;
                 if !self.store.adts.contains_key(&k) {
-                    return Err(LazyRefusal::Adt { adt: self.shown(k).into_boxed_str(), why: Box::from("made, but no row filed under its key") });
+                    return Err(LazyRefusal::Adt { adt: self.refused_shown(k), why: Box::from("made, but no row filed under its key") });
                 }
             }
         }
         if let Some(k) = self.store.adts.iter().filter(|(_, a)| a.narrowed).map(|(k, _)| *k).min() {
-            let adt = self.shown(k).into_boxed_str();
+            let adt = self.refused_shown(k);
             return Err(LazyRefusal::Row { function: adt.clone(), refusal: Box::new(Front2Refusal::Layout { adt }) });
         }
         Ok(())
@@ -264,7 +266,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             const_values(&mut r, core::iter::once(checked))
         };
         if let Some((k, why)) = refused.into_iter().next() {
-            return Err(LazyRefusal::Const { constant: self.shown(k).into_boxed_str(), why });
+            return Err(LazyRefusal::Const { constant: self.refused_shown(k), why });
         }
         for (k, record) in values {
             if let Err(at) = self.const_values.binary_search_by_key(&k, |(x, _)| *x) {
@@ -291,7 +293,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             crate::front2::statics::static_values(&mut r, core::iter::once(checked))
         };
         if let Some((k, why)) = refused.into_iter().next() {
-            let static_ = self.shown(k).into_boxed_str();
+            let static_ = self.refused_shown(k);
             return Err(LazyRefusal::Row { function: Box::from(function), refusal: Box::new(Front2Refusal::Static { static_, why }) });
         }
         let crate::front2::statics::Statics { values, kinds } = made;

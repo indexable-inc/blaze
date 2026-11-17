@@ -36,6 +36,8 @@ pub mod fetch_task;
 pub mod items;
 pub mod key;
 pub mod lines;
+pub mod not_run;
+pub mod owners;
 pub mod pointers;
 pub mod profile;
 pub mod record;
@@ -50,6 +52,10 @@ mod wire;
 
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod sim_owners;
+#[cfg(test)]
+mod sim_scripts;
 
 pub use crate::condition::{Condition, ConditionError, Space, Var};
 pub use crate::key::{Key, Kind, Name, Tool};
@@ -64,7 +70,8 @@ pub use crate::wire::{WireError, WireWhy};
 /// Every byte form the drive writes, by name: what a tool's key holds (a bump changes every key,
 /// so a record of another form is never fetched, only made again) and what drive.md's formats
 /// table lists. A file at a fixed path (`last`) is checked by its magic instead.
-pub const FORMATS: [(&str, &[u8; 4]); 5] = [
+pub const FORMATS: [(&str, &[u8; 4]); 6] = [
+    ("owners payload", owners::MAGIC),
     ("record", record::MAGIC),
     ("answer page", answers::PAGE_MAGIC),
     ("answer root", answers::ROOT_MAGIC),
@@ -119,4 +126,14 @@ pub enum Plant {
     /// A task that read a file by path parses its bytes without comparing them with the
     /// content id its key was made from (`verified::verify`).
     SkipContentCompare,
+    /// A file part keeps only the last parent that listed it: a module of two crates is owned by
+    /// one (owners.rs).
+    OwnersLastParentWins,
+    /// A part a home lists anew does not dirty the part's `Owners`: a new `mod x;` leaves x's
+    /// owners and its bodies as they were.
+    OwnersAddedNotDirtied,
+    /// A part one home stops listing is dropped though another home still lists it.
+    OwnersDropListedElsewhere,
+    /// Every part of a record is made a job: a dependency's bodies run under `check` unasked.
+    EveryPartAJob,
 }

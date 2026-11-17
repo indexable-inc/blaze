@@ -114,6 +114,17 @@ pub fn assemble_auto<T: Tys, F: Facts>(
     let Some(shape) = crate::object_shape::shape_with_principal(k, |l| if l.len > 0 { Some(cx.tys.kind(cx.tys.list_get(l, 0))) } else { None }) else {
         return Err(malformed());
     };
+    // `simplify_type` takes a pattern type as its base (fast_reject.rs: "ty::Pat(ty, ..) =>
+    // simplify_type(cx, ty, treat_params)"): core's `impl<T> Unpin for pattern_type!(*const T
+    // is !null)` (core/src/pat.rs) is relevant to a `*const _` pattern type only, never to
+    // `usize is 0..=isize::MAX` (alloc's `Cap`), whose structural candidate stays.
+    let goal_base = match k {
+        TyKind::Pat(b, _) => {
+            let bk = cx.tys.kind(b);
+            crate::object_shape::shape_with_principal(bk, |l| if l.len > 0 { Some(cx.tys.kind(cx.tys.list_get(l, 0))) } else { None })
+        }
+        _ => None,
+    };
     let set = cx.impls(g.trait_, shape)?;
     for &i in set.impls {
         let h = cx.impl_header(i)?;
@@ -127,6 +138,19 @@ pub fn assemble_auto<T: Tys, F: Facts>(
         let first = |l: crate::term::List| if l.len > 0 { h.portable.lists.get(l.start as usize).and_then(|p| h.portable.nodes.get(p.0 as usize)).copied() } else { None };
         match crate::object_shape::shape_with_principal(sk, first) {
             Some(Shape::Blanket) => return Ok(()),
+            Some(Shape::Pat) if shape == Shape::Pat => {
+                // Both pattern types: relevant when the bases simplify alike (a parameter
+                // base, or one not read, is relevant to every base: it may be any).
+                let Some(goal_base) = goal_base else { return Ok(()) };
+                let TyKind::Pat(hb, _) = sk else { return Err(malformed()) };
+                let Some(&hbk) = h.portable.nodes.get(hb.0 as usize) else { return Err(malformed()) };
+                let first = |l: crate::term::List| if l.len > 0 { h.portable.lists.get(l.start as usize).and_then(|p| h.portable.nodes.get(p.0 as usize)).copied() } else { None };
+                match crate::object_shape::shape_with_principal(hbk, first) {
+                    Some(Shape::Blanket) | None => return Ok(()),
+                    Some(x) if x == goal_base => return Ok(()),
+                    _ => {}
+                }
+            }
             Some(x) if x == shape => return Ok(()),
             _ => {}
         }

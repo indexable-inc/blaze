@@ -1,6 +1,7 @@
 //! A unit graph's build scripts, run for the units they serve: each script's module record
 //! found by its package and exact feature set, its environment made from the unit, its outputs
-//! from the record or from a run in the sandbox ([`ScriptRuntime::run`]).
+//! from a run in the sandbox ([`ScriptRuntime::run`]; the command's `Script` task record is the
+//! only cache of a run, D115).
 //!
 //! This is the step a driver's build-script task takes, and what feeds the outputs' readers:
 //! the world's cfg of a crate (blaze-world's `ScriptOutputs`, by the served unit) and
@@ -20,7 +21,7 @@ use blaze_build_script::{
     toolchain::Mode,
 };
 use blaze_own::Alloc;
-use blaze_unit_graph::{Unit, UnitGraph, UnitId, UnitKind};
+use blaze_unit_graph::{CfgAtom, Unit, UnitGraph, UnitId, UnitKind};
 
 use crate::{
     native_unit::{NativeSetting, NativeUnitError, native_outputs, placed},
@@ -83,6 +84,9 @@ pub enum UnitScriptError {
     Native(NativeUnitError),
     /// A `links` dependency's metadata names a path the script cannot be served (brief S1).
     DepView { package: String, why: DepViewError },
+    /// A script placed native (D112) asked to run for a side's cfg (`target`): the native
+    /// runner builds for the machine, never for that side (ruling D115 (2), rule 3).
+    NativeOnSide { package: String, target: String },
 }
 
 impl std::fmt::Display for UnitScriptError {
@@ -106,6 +110,10 @@ impl std::fmt::Display for UnitScriptError {
             UnitScriptError::LinksCycle { package } => write!(f, "the build script of {package} is in a cycle of `links` metadata"),
             UnitScriptError::Native(error) => write!(f, "{error}"),
             UnitScriptError::DepView { package, why } => write!(f, "the build script of {package}: {why}"),
+            UnitScriptError::NativeOnSide { package, target } => write!(
+                f,
+                "the build script of {package} runs native (D112), and a native run builds for the machine, not for `{target}`: it is not run for that side (D115 (2))"
+            ),
         }
     }
 }
@@ -202,6 +210,26 @@ pub fn prepare_viewing<'a>(
     views: DepViews,
     alloc: Alloc<'a>,
 ) -> Result<Prepared<'a>, UnitScriptError> {
+    prepare_viewing_on(runtime, setting, graph, script, None, tree, root, deps, views, alloc)
+}
+
+/// [`prepare_viewing`] for the side whose cfg is `side_cfg` (sorted; `CARGO_CFG_*` and the
+/// `OUT_DIR` configuration are made from it): the cfg of the crate of the list the run is for
+/// (ruling D115 (2): a macro-side run sees wasm32-wasip1's atoms, with `setting.target` that
+/// triple). `None`: the served unit's cfg as the graph holds it.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_viewing_on<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
+    tree: Tree,
+    root: ScriptRoot,
+    deps: &[DepMetadata<'_>],
+    views: DepViews,
+    alloc: Alloc<'a>,
+) -> Result<Prepared<'a>, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
@@ -219,7 +247,11 @@ pub fn prepare_viewing<'a>(
     let wasm = std::fs::read(&path).map_err(|error| UnitScriptError::ReadModule { path, error })?;
     let loaded = runtime.load(&package, &wasm).map_err(UnitScriptError::Script)?;
     let facts = PackageFacts { name: unit.name.as_str(), version: unit.version.as_str(), links: unit.links.as_ref().map(|l| l.as_str()), ..PackageFacts::default() };
-    let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg: &serves.cfg, target: setting.target, host: setting.host, deps };
+    let target_cfg: &[CfgAtom<'_>] = match side_cfg {
+        Some(cfg) => cfg,
+        None => &serves.cfg,
+    };
+    let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg, target: setting.target, host: setting.host, deps };
     let env = blaze_build_script::env(&given, alloc);
     let script = Arc::new(Script {
         package,
@@ -239,8 +271,8 @@ pub fn prepare_viewing<'a>(
     Ok(Prepared { loaded, script, env })
 }
 
-/// `script`'s outputs, from its record when one answers, else run and kept: as wasm, or native
-/// when [`placed`] says so for the setting's mode (D65, D69). The choice is made here, before
+/// `script`'s outputs, run as wasm, or native when [`placed`] says so for the setting's mode
+/// (D65, D69). The choice is made here, before
 /// anything runs, and is in the run's key; a failure either way is returned, never tried the
 /// other way (rule 3).
 #[allow(clippy::too_many_arguments)]
@@ -265,22 +297,42 @@ pub fn outputs<'a>(
         }
         Runner::Native { because } => {
             let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
-            native_outputs(runtime, setting, graph, script, serves, because, tree, root, deps, alloc).map_err(UnitScriptError::Native)
+            // No producers given: a `links` value is refused by name (brief N8), never passed as written.
+            native_outputs(setting, graph, script, serves, because, tree, root, deps, &[], alloc).map_err(UnitScriptError::Native)
         }
     }
 }
 
 /// [`outputs`] for a script whose `links` dependencies' runs are `producers` (each with its
 /// `links`), so the paths in `deps` are served (brief S1): a wasm script is given the values
-/// as it sees them and the producers' files read-only ([`dep_mount::view`]). A native script
-/// (D112) is still given `deps` as written, with no mounts (not built yet: the native sandbox
-/// would need the same mounts as folders of the host).
+/// as it sees them and the producers' files read-only ([`dep_mount::view`]); a native script
+/// (D112) the same values as IT sees them, the producers' trees laid read-only under its own
+/// folder ([`dep_mount::native::lay`], brief N8): one resolver, two sights.
 #[allow(clippy::too_many_arguments)]
 pub fn outputs_viewing<'a>(
     runtime: &ScriptRuntime,
     setting: &Setting<'_>,
     graph: &UnitGraph<'_>,
     script: UnitId,
+    tree: Tree,
+    root: ScriptRoot,
+    deps: &[DepMetadata<'_>],
+    producers: &[(&str, &DepProducer)],
+    alloc: Alloc<'a>,
+) -> Result<ScriptRun<'a>, UnitScriptError> {
+    outputs_viewing_on(runtime, setting, graph, script, None, tree, root, deps, producers, alloc)
+}
+
+/// [`outputs_viewing`] for the side whose cfg is `side_cfg` ([`prepare_viewing_on`]). A script
+/// placed native is refused when given a side's cfg ([`UnitScriptError::NativeOnSide`]): the
+/// native runner builds for the machine. `None`: as [`outputs_viewing`].
+#[allow(clippy::too_many_arguments)]
+pub fn outputs_viewing_on<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
     tree: Tree,
     root: ScriptRoot,
     deps: &[DepMetadata<'_>],
@@ -296,12 +348,13 @@ pub fn outputs_viewing<'a>(
             let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
                 deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
-            let prepared = prepare_viewing(runtime, setting, graph, script, tree, root, &seen, viewed.views, alloc)?;
+            let prepared = prepare_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, alloc)?;
             runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
         }
+        Runner::Native { .. } if side_cfg.is_some() => Err(UnitScriptError::NativeOnSide { package: package(unit), target: setting.target.to_owned() }),
         Runner::Native { because } => {
             let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
-            native_outputs(runtime, setting, graph, script, serves, because, tree, root, deps, alloc).map_err(UnitScriptError::Native)
+            native_outputs(setting, graph, script, serves, because, tree, root, deps, producers, alloc).map_err(UnitScriptError::Native)
         }
     }
 }

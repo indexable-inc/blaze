@@ -161,10 +161,12 @@ unsafe extern "C" {
     pub fn LLVMInitializeAArch64Target();
     pub fn LLVMInitializeAArch64TargetMC();
     pub fn LLVMInitializeAArch64AsmPrinter();
+    pub fn LLVMInitializeAArch64AsmParser();
     pub fn LLVMInitializeX86TargetInfo();
     pub fn LLVMInitializeX86Target();
     pub fn LLVMInitializeX86TargetMC();
     pub fn LLVMInitializeX86AsmPrinter();
+    pub fn LLVMInitializeX86AsmParser();
 
     // Passes (Transforms/PassBuilder.h, Error.h).
     pub fn LLVMCreatePassBuilderOptions() -> PassBuilderOptionsRef;

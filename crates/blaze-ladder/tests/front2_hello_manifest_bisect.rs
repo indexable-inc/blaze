@@ -45,14 +45,14 @@ use blaze_surface::{Namespace, PathKind};
 const MAIN: &str = "use std::grant::{Grant, Kind, Manifest, Param};
 use std::out::Out;
 
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
     Ok(())
 }
 
 static SLICE: &[Param] = &[Param::new(\"out\", Kind::Out)];
 static ARRAY: [Param; 1] = [Param::new(\"out\", Kind::Out)];
 static EMPTY: Manifest = Manifest::new(&[]);
-static LITERAL: Manifest = Manifest { params: &[] };
+static LITERAL: Manifest = Manifest { params: &[], defaults: &[] };
 static PLAIN: Manifest = Manifest::new(&[Param::new(\"out\", Kind::Out)]);
 static MANIFEST: Manifest = Manifest::new(&[Param::new(\"out\", <Out as Grant>::KIND)]);
 ";

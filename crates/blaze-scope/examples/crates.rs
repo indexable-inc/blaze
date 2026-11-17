@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{OnceLock, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::time::Instant;
 
 use blaze_expand::Diagnostic;
@@ -102,6 +102,7 @@ fn main() {
                 };
             }
             "--verbose" => VERBOSE.store(true, Ordering::Relaxed),
+            "--d116-decide" => D116_DECIDE.store(true, Ordering::Relaxed),
             "--per-crate" => PER_CRATE.store(true, Ordering::Relaxed),
             "--show" => {
                 let _ = SHOW.set(args.next().unwrap_or_default());
@@ -138,6 +139,15 @@ fn main() {
 
 /// Examples kept per failure kind (`--examples N`).
 static EXAMPLES: AtomicUsize = AtomicUsize::new(3);
+
+/// `--d116-decide`: each crate's cells decided again on demand and compared (D116).
+static D116_DECIDE: AtomicBool = AtomicBool::new(false);
+
+/// The D116 check's clock: nanoseconds since its first call.
+fn decide_clock() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
 /// The fill's first tasks one module each (`--first alone`), else from the prefetch.
 static ALONE: AtomicBool = AtomicBool::new(false);
 /// A name whose bindings in every scope are printed (`--show NAME`).
@@ -354,6 +364,14 @@ fn at(c: &CrateNames<'static>, loc: Loc) -> String {
 struct Threads(usize);
 
 impl blaze_scope::task::Par for Threads {
+    fn decide_check(&self) -> Option<&dyn Fn() -> u64> {
+        if D116_DECIDE.load(Ordering::Relaxed) { Some(&decide_clock as &dyn Fn() -> u64) } else { None }
+    }
+
+    fn decided(&self, krate: &str, check: &blaze_scope::DecideCheck<'_, &str>) {
+        println!("d116 decide {krate}: {check}");
+    }
+
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
         let f = OnGlobal(f);
         // Through `Deref`, so the closure takes the whole wrapper (which is `Sync`), not its field.

@@ -77,7 +77,11 @@ pub fn row_of(kind: Kind) -> Row {
         | Kind::Signature
         | Kind::ImplBucket
         | Kind::Test
-        | Kind::MacroModule => Row::Whole,
+        | Kind::MacroModule
+        // Made by the request machine itself (blaze-drive owners.rs), never a task.
+        | Kind::Owners
+        // A script run is made by the sandbox runner, in no producer's row yet (D105 leg 2).
+        | Kind::Script => Row::Whole,
     }
 }
 

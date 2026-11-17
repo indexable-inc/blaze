@@ -465,6 +465,33 @@ pub(crate) const fn fmov_from_s(rd: Reg, rn: Reg) -> u32 {
     0x1e26_0000 | (rn << 5) | rd
 }
 
+// `f128` and `f16` moves (pass/float_width.rs).
+
+/// `ldr qt, [rn, #imm12 * 16]` (C7.2 LDR (immediate, SIMD&FP), unsigned offset: size=00, opc=11).
+pub(crate) const fn ldr_q(rt: Reg, rn: Reg, imm12: u32) -> u32 {
+    0x3dc0_0000 | (imm12 << 10) | (rn << 5) | rt
+}
+
+/// `str qt, [rn, #imm12 * 16]` (C7.2 STR (immediate, SIMD&FP), unsigned offset: size=00, opc=10).
+pub(crate) const fn str_q(rt: Reg, rn: Reg, imm12: u32) -> u32 {
+    0x3d80_0000 | (imm12 << 10) | (rn << 5) | rt
+}
+
+/// `umov wd, vn.h[0]`: the low 16 bits of `vn`, zero-extended (C7.2 UMOV, imm5=00010).
+pub(crate) const fn umov_h0(rd: Reg, rn: Reg) -> u32 {
+    0x0e02_3c00 | (rn << 5) | rd
+}
+
+/// `fcvt dd, hn` (`to_double`) or `fcvt sd, hn`: exact (C7.2 FCVT, ftype=11, opc 01 or 00).
+pub(crate) const fn fcvt_from_h(to_double: bool, rd: Reg, rn: Reg) -> u32 {
+    0x1ee2_4000 | ((to_double as u32) << 15) | (rn << 5) | rd
+}
+
+/// `fcvt hd, dn` (`from_double`) or `fcvt hd, sn`, rounding by FPCR (C7.2 FCVT, opc=11).
+pub(crate) const fn fcvt_to_h(from_double: bool, rd: Reg, rn: Reg) -> u32 {
+    0x1e23_c000 | ftype(from_double) | (rn << 5) | rd
+}
+
 /// `fadd`, `fsub`, `fmul`, `fdiv` (`opcode` 0010, 0011, 0000, 0001 at bits 12..16).
 pub(crate) const fn fbin(opcode: u32, double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x1e20_0800 | ftype(double) | (rm << 16) | (opcode << 12) | (rn << 5) | rd

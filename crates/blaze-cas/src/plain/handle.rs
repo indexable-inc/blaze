@@ -121,13 +121,15 @@ pub struct PlainStore<D: Driver = Native> {
 impl PlainStore<Native> {
     /// The plain store in `root/plain`, with the namespaces `settings` name.
     pub fn open(root: &std::path::Path, settings: &Settings) -> Result<PlainStore<Native>, StoreError> {
-        Driven::open(root, settings).map(PlainStore::new)
+        Driven::open(root, settings).and_then(PlainStore::new)
     }
 }
 
 impl<D: Driver> PlainStore<D> {
-    /// The handle over an opened store.
-    pub fn new(driven: Driven<D>) -> PlainStore<D> {
+    /// The handle over an opened store, made whole first ([`Driven::map_all`]): a reader of the
+    /// handle cannot map, so every row is mapped (and every parked row checked) here.
+    pub fn new(mut driven: Driven<D>) -> Result<PlainStore<D>, StoreError> {
+        driven.map_all()?;
         let mut reads = Vec::with_capacity_in(driven.core().reads().len(), Global);
         reads.extend_from_slice(driven.core().reads());
         let mut writes = Vec::with_capacity_in(driven.core().writes().len(), Global);
@@ -148,7 +150,7 @@ impl<D: Driver> PlainStore<D> {
             released: AtomicU64::new(0),
         };
         it.refresh(&it.writer.lock());
-        it
+        Ok(it)
     }
 
     /// The writer back, the handle let go of (a test's simulation, crashed and opened again).

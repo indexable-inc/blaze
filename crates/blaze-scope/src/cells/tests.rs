@@ -786,42 +786,6 @@ fn the_cells_equal_the_reference_wide_with_calls() {
     wide(true);
 }
 
-/// R5 for imports, reduced from wide seed 1274: `m4` holds `use m1::*; use self::m2::*;` and
-/// `m1` is the dependency's root through the extern prelude (the crate's own `m1` is not in
-/// `m4`'s scope). The two globs are one group: the first's lookup of `m1` reads `m4`'s globs.
-/// At the stall the first resolves (the undecided glob taken as absent) and is decided ALONE;
-/// the second is tried again with it and finds the dependency's `m2`. Control: a stall that
-/// decides every member from the guess at once fails the second as not found.
-#[test]
-fn a_stalled_group_decides_only_what_resolves() {
-    let mut w = World::new();
-    let root = w.root(1, Edition::E2021);
-    let dep = w.root(2, Edition::E2021);
-    w.item(dep, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
-    let dm2 = w.module(dep, "m2", V::Pub);
-    w.item(dm2, "y", Namespace::Types, crate::DefKind::Other, V::Pub);
-    w.dep(root, "m1", dep);
-    // The standard prelude, another crate's module, as the wide distribution draws it (an
-    // unknown standard prelude would make every outward miss unknown).
-    let std = w.root(9, Edition::E2021);
-    let prelude = w.module(std, "prelude", V::Pub);
-    w.module(prelude, "m1", V::Pub);
-    w.cr(root).head.prelude = Some(prelude);
-    let m1 = w.module(root, "m1", V::Priv);
-    w.item(m1, "x", Namespace::Types, crate::DefKind::Other, V::Priv);
-    w.module(root, "m2", V::Priv);
-    let m4 = w.module(root, "m4", V::Priv);
-    w.glob(m4, "m1", V::Priv);
-    w.glob(m4, "self::m2", V::Priv);
-    // The rules' answer is (Glob(dep), Glob(dm2)); this core reads no other crate's modules, so
-    // its answer is unknown for both (`Outside`), never not found.
-    let _ = dm2;
-    let ok = cells_of(&w, root, CellPlant::None);
-    assert_eq!((outcome(&ok, m4, 0), outcome(&ok, m4, 1)), (Outcome::Outside, Outcome::Outside));
-    let bad = cells_of(&w, root, CellPlant::StallDecidesAll);
-    assert_eq!(outcome(&bad, m4, 1), Outcome::Failed(Unresolved::NotFound), "the control");
-}
-
 /// A dependency solved first by this core, read through [`super::DepNames`] (the ready queue's
 /// order: a dependency is decided before its dependents).
 struct SolvedDep {

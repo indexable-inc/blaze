@@ -146,6 +146,10 @@ that error, by name.
 
 ### The gate
 
+> Changed 2026-11-16 evening (D113; run.md, stage 4): `run` uses `Before`, and its scope is the workspace
+> BODIES THE PROGRAM REACHES (the need-walk from `main`'s check), not whole packages; `Beside` is `test`'s.
+> The text below is the seam as built; its default and its scope move with that piece.
+
 `run` and `test` fail when the check of their program's scope fails, lints included (bottom.md
 11): the scope is the workspace packages the program's package depends on, whole. Findings carry
 no level (rule 81); `Config::is_error(rule)` is the command's policy. One seam, `Ask::gate`
@@ -1686,6 +1690,82 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       `an_edit_above`), BLAZE_SIM_TAPE='0*3 5'. Runner 5: removing the member reads turns (1)
       back into the history-dependent note, so both may change once the owners batch deletes
       `asked`/`members`; re-run both after item 1 before reading the cycle.
+    - RUNNER 19 2026-11-16 20:40-21:30 (uncommitted, tree 71eec5898c + the lanes' edits).
+      ITEM 1, OWNERS, GREEN IN SIM. blaze-drive owners.rs (payload `BDO1` + u32 count + per
+      root 32-byte FileItems subject and an asked byte, strictly increasing; `merge`,
+      `out_of`, `write_roots`, `roots` refusing magic/count/trailing/tag/unsorted by name);
+      key.rs `Kind::Owners = 16`, KINDS 16, `key::owners_of`; home.rs `row_of` Owners =>
+      Whole; work.rs `builds` Owners => false. request.rs: `parents` keeps every parent (no
+      overwrite); `outlines_open` counts unsettled Units/UnitGraph/FileItems jobs, and a cold
+      Owners waits for zero (`owners_waiting`); warm, an Owners row stands unless dirtied; an
+      added or removed FileItems part dirties its Owners; a removed part is dropped only
+      when no other parent lists it; ROOTS = FileItems parts of Units (asked) or UnitGraph
+      (not asked) records (coordinator option (c)); DEMAND (a): a BodyCheck part of a file
+      becomes a job only once its file's Owners holds an asked root (`gate`/`release`), else
+      only by a Need; empty owners with a FileItems parent is the finding `OWNERLESS_RULE`
+      (0xC110); a cycle of `mod`/`#[path]` files fails its Owners by name in `break_cycle`
+      (`owners_cycle`), never a hang. RULE 21: a body's read names follow from its owners, so
+      a BodyCheck task key folds its file's Owners out (`locate`); before that the sim found
+      "two values under one key ..., a shape of BodyCheck" when a file's owners moved. An
+      Owners job puts no shape (its value key only). Sim sim_owners.rs (own toy world): two
+      parents, a new mod, a removed parent + unowned file named, one failed scope, demand
+      (a bad dependency body fails `check` only when a workspace body reads it, then exactly
+      one dependency body runs), a cycle; controls OwnersLastParentWins,
+      OwnersAddedNotDirtied, OwnersDropListedElsewhere, a one-parent plant, EveryPartAJob.
+      sim.rs: Owners excluded from the "applied twice" and failure oracles (machine-made),
+      one-body-edit read bound 6 + pages (the roots read). "blaze-drive: check ok (all
+      targets)"; "test blaze-drive: exit 0; 64 passed, 0 failed".
+      NOT MEASURED: the clone run (greenmix at ~21:15 caught leg 6's D115 batch half-applied:
+      "work.rs:852:11 ... `blaze_drive::Kind::Script` not covered"). Note: in the real
+      command no dependency file is a FileItems part yet (a dependency root is a store file;
+      the drive locates FileItems only through the checkout sweep), so DEMAND changes no
+      clone count until a store-file locate exists: asked of main.
+      ITEMS 3, 4 and the Verified outline: designs sent to main 21:30, not written.
+      DOUBLE MAKE (PIPELINE runner 7, owners_tests.rs `an_export_edit_in_one_member_reruns_no_
+      body_of_another`, (2, 2) where (1, 1) is right): an edited file's body decided while its
+      file's Surface was being remade, so its crates' CrateScopes had no job yet, read as the old
+      digests, missed and ran over stale scopes, then ran again. Fix (request.rs `locate`,
+      BodyCheck): wait on the home's Surface while it has an unsettled job; it settling moved
+      dirties the scopes first. No store read. "test blaze-drive: exit 0; 74 passed, 0 failed"
+      (21:35, after leg 6's D115 batch, tree 87e792b994 + edits). NOT RUN: owners_tests (lanes
+      stopped testing 21:33). Owed: an edit in ANOTHER file of the crate still races; the class
+      fix is a body waiting for every Surface of its owners' crates that has a job.
+      COORDINATOR'S RULINGS 21:3x, NOT WRITTEN:
+      (1) STORE-FILE LOCATE (after (2)): a dependency root is a FileItems part of UnitGraph
+      located as a store file: a `Locate` with the pack's subject and the path inside it (never
+      a host path), opened by blaze-cli from the sources the fetch records name, bytes verified
+      against the pack's content ids (the same proof as checkout bytes); never swept or statted.
+      Names half: `names::dep_roots(&names)` in names.rs (PIPELINE runner 7's file; told).
+      (2) `Kind::Given` (next free number, 18 after Script 17): never a task or record, answered
+      before the store. `key::content_of(path)` = Name { Given, Name::file(path).subject }:
+      the sweep's id (file_at) for a path the table has; else the task's own read this command
+      (the digest of the bytes it read); a read path the table lacks JOINS the leaf table as the
+      command ends (an absent one joins as absent, so creating it moves the reader). A shape
+      lookup over a Given name with no answer yet is a miss (run the task), never ABSENT.
+      `key::fact_of(what)` = Name { Given, ContentId::of(FACT_DOMAIN, what) } and
+      `Ask::facts: &[(Name, ContentId)]` (sorted, refused unsorted), seeded into `now`.
+      Readers are kept by watch rows; a changed swept file seeds its Given name too (a
+      `FileEntry` read only by content must not seed a FileItems job: the leaf row needs a
+      content-only kind). Sim: a script reads a file the sweep never saw; the next command,
+      the file edited, reruns it; plant: the first-read path not joined. The scripts lane's
+      "files <sha256>" package digest is NOT content_of's form (told to D115 leg 5).
+      (3) VERIFIED OUTLINE: `outline` itself takes the proof; `VerifiedText` and the compare
+      move to blaze-ids: `verify(bytes, id)` (keyed callers; typed `Changed`) and `of(bytes)`
+      (unkeyed callers pay one hash); no `outline(&str)` left. blaze-ids needs the whole-tree
+      token: one small batch with every `outline` caller, after the open batches close.
+      HAND-ON (21:50, the owner's stop). IN THE TREE, green in sim at 21:35 ("test
+      blaze-drive: exit 0; 74 passed, 0 failed"): the Owners fact (owners.rs, sim_owners.rs,
+      key.rs Owners = 16, request.rs, sim.rs, home.rs/work.rs arms); a BodyCheck's key folding
+      its file's Owners out; the Surface wait (double make). WRITTEN, NOT IN: nothing
+      (`Kind::Given` not started; no half-written file of this runner's). RULED, NOT WRITTEN,
+      in order: `Kind::Given` ((2) above); the store-file Locate for dependency roots ((1));
+      the race of an edit in another file of the same crate remaking a scope a body already
+      ran over (a sim case with its plant first); part reads as one announced batch (RUNNER 17's
+      ten lines above); `outline` taking the proof type with the proof moved to blaze-ids ((3)).
+      Kind numbers: native-drive-kinds plans Links/Native as 18/19, Given was planned as 18:
+      taken at landing. NOT MEASURED: the clone cold and repeat; the command is
+      $N/rounds/RUNS.md section 5 (rows to quote against r17/c1: "jobs made: BodyCheck",
+      "machine step", the BodyCheck needs, peak footprint and real).
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.
@@ -1955,6 +2035,13 @@ for that side and takes that run's cfg (proc-macro2 and syn's dependencies set t
 the package has no script. The script a unit reads is named by one function of the parts of its crate key,
 so two units under one crate key cannot name two scripts; the world refuses the case by name all the same.
 (4) A kind's number is taken when its batch lands, never reserved: `Script` is 16.
+(5, 20:52) A `Script`'s source holds ITS OWN module's digest (its row of the module listing), never the
+listing whole: one script rebuilt moves one `Script`. While script modules are built by the interim
+bootstrap builder (D110), the row also carries the digest of the sources the module was built from, and a
+`Script` task whose `build.rs` no longer matches it stops with a typed `ModuleStale` naming the unit: a
+record of an older script never stands silently. (6) What was not checked is NAMED by cause, at crate grain:
+the answer groups the tasks that did not run by the failed task they wait on and lists, for each, the crates
+not checked because of it (at most 20 a cause, the count exact). A failed build script reads so by that rule.
 
 ## D114 rulings (2026-11-16 20:00; the coordinator's, on the implementing lanes' questions)
 
@@ -2019,9 +2106,13 @@ module's record, and no module waits for another unless a name can only come fro
    the crate's context; each member keeps its own record. Counted on tempo 20:29 under the first form of the
    rule (a wait for any name absent from text): 254,139 distinct waits, 173,829 of them macro names, 696
    cycles, the largest 88 modules (slatedb); and 0 bytes of today's 82.7 MB of scopes are glob names (129,707
-   glob edges, 8.8 MB). Owed under the corrected rule: macro paths not found from text, links and preludes
-   when pending calls are taken to have made nothing; the cycles among those; speculative answers the final
-   tables contradict (expected 0).
+   glob edges, 8.8 MB). Counted 20:42 under the corrected rule (tree 5dbe02b3d4; a link followed one level,
+   so near, not exact): of 277,672 expansion-driving macro lookups, 2,247 are not found from text, links and
+   preludes (0.8%); among those waits there is NO cycle (largest 1); speculative answers the settled tables
+   contradict: 0. So on tempo no `Group` forms. Build order follows: `ModuleScope` and `Imports` first; until
+   a real program shows a cycle, a wait cycle among `ModuleScope` tasks is a typed refusal naming its modules,
+   and `Group` is built when one does. Type and value lookups by imports that wait one way on a
+   `ModuleScope`: 68,262 distinct of 139,833.
 6. `ExportedMacros`, its own kind, one a crate: the `#[macro_export]` macros in text (from outlines, no wait)
    and those calls made (each `ModuleScope`'s column, by part read). A macro lookup at a crate's root answers
    from text first; only a name absent there, in a crate with pending calls, waits on this.
@@ -2098,8 +2189,15 @@ its caller; a const's value reaches `[u8; N]`; an impl removed inside a body is 
    probes a get. LATER, only when an after-restart profile names the store's page-ins: index runs apart from
    payload segments, merged geometrically after the answer (at most four; one interpolated page a run);
    durable and concurrent, so its own DST first.
-8. A RECORD RUN NATIVELY STAYS LOCAL. A `Script` record says how it was run; the sharing seam answers `LOCAL`
-   for one run through the native runner (D112), and so, by the public-reads rule, for everything that read it.
+8. WHAT IS PUBLIC IS A POSITIVE LIST BY SUBJECT (corrected 21:10: an arm keyed on "ran natively" could never
+   fire, and with only `CrateScope` names public, every registry crate with a build script was shut out of the
+   shared cache). A `Script` name is public exactly as a `CrateScope` name is: when its subject is in the
+   public set. The command adds a script's subject only when its crate is public AND it is placed on the wasm
+   path (decided where the part is named, before any run). A natively placed script's subject is never added,
+   so it and every reader of it are `LOCAL`; a subject forgotten is local, never public. Placement is in the
+   `Script`'s key, so a native and a wasm run are never one record. Until the deterministic sandbox replaces
+   the native runner, a crate whose script must run natively, and what reads it, stay out of the shared
+   cache: D112's "local records only".
 
 ### A body's owners, and what it waits for (ruled 20:07 to 20:31)
 
@@ -2121,3 +2219,48 @@ with a typed `Changed`, files nothing, and the command refuses its answer naming
 retry (rules 3, 74, 80). Before this, an edit between the sweep and the task filed new text under the old
 id, in a store every worktree reads. Owed: the parser's entry takes the proof type, so it holds in every
 crate, not only in blaze-cli.
+
+### A finding inside an expansion is reported where its tokens came from (ruled 20:57; not built)
+
+Found on D104's refusal: `fn main(cx: &Cx, io: Io)` is refused at bytes 321..423 of the expanded launcher
+item, which has no source file, not at `io: Io`. RULE: an expansion's record keeps, for each token it wrote,
+its ORIGIN: the n-th token of the call's input, a token of the macro's definition, or made by the macro
+(blaze-expand's `TokenOrigin`, kept as a column of the expansion's text; input tokens by index, never by a
+position: rule 71). The task that MAKES a finding in expanded text has that record in hand (it is already in
+its read list) and maps the finding's range before filing it: when the range's tokens are input tokens, the
+finding is filed at those tokens' range in the user's item; otherwise at the call, and it names the macro as
+written ("in the expansion of `m!`"). Mapping at the making, not at the printing, so a kept finding and a
+fresh one are equal bytes. A nested expansion maps through each level in turn. Tests: the `Io` parameter
+above is reported at `io: Io` in the user's file; a type error in a `sol!` input is reported inside the
+call's braces; an error wholly in a macro's own tokens is reported at the call and names it; control: the
+origin column dropped reports all three at the call.
+
+### The crate list is a record (ruled 21:00; not built)
+
+Measured on a one-line edit of the hello copy (20:58, tree d52bcecbf5): of 138.9 ms of main-thread job
+making, 85.1 ms is `names::world` remade whole (the unit graph decoded, the shelf and the package sources
+opened, the list and the world built, root files read), of which the body job uses a few fields. RULE: the
+world is made once, by the job that already makes it to name its parts (`UnitGraph`), and what readers need
+is columns of that record's payload: one row a crate, sorted by key, read in place: key, deps, side, the
+package's place (package-relative), lang and sysroot ids, the scope rule, its `Script` part's name. A body
+job opens its owners' rows and their closure by key; an edit makes no world on any thread. A fact of a root
+file's text is not in the list: it is read from that file's outline by whoever needs it.
+
+### A token keeps its mark (ruled 21:27 under rule 66; not built)
+
+Found on `const_eval_select` (13 of tempo's functions; core's `const_panic!` reaches a `macro` item whose
+body writes a bare name that resolves only where the macro is DEFINED). The mechanism: blaze-expand
+`body_words` turns an expansion's tokens into body text and DROPS their marks. The first fix carried one
+fact through by a spelled token (`$crate` as `__dollar_crate_<hex>`); the proposed second would carry one
+more (the definition's module, for an opaque mark). RULING: rebuild, once. Every token of an expansion
+keeps its MARK through `body_words`, the lowering and the front end: where it came from (the n-th input
+token, the macro's definition, made) and, for a definition token, the definition's site (crate, module) and
+the macro's kind of hygiene (a `macro` item: every name at the definition; `macro_rules!`: locals, labels and
+`$crate` at the definition, everything else at the call; a proc macro: by the span it chose). It is ONE
+column, the same one "A finding inside an expansion" needs. A path in expanded text is resolved by the mark
+of its first segment, in one function; `$crate`, a bare name in a `macro` body and a macro call's own name
+are three uses of that function, and the spelled `$crate` token and `ScopedBy::module_at`'s separate route
+go in the same piece. Tests: the first fix's cases; `const_eval_select`; a bare function name in a `macro`
+body resolves at its definition; an item name written by a `macro_rules!` resolves at the CALL (the control
+resolves it at the definition and must fail); a local written by a `macro_rules!` does not capture the
+caller's.

@@ -115,12 +115,14 @@ fn attempt_with_tools(place: &Place, attempt: &str, package: &str) -> std::strin
     let tools = host_tools::granted(&table, package, alloc);
     let exe = std::env::current_exe().expect("the test binary").canonicalize().expect("its real path");
     let exe = exe.to_str().expect("a UTF-8 path");
-    let exec: std::vec::Vec<&str> = tools.iter().flat_map(|t| t.programs()).collect();
+    // nm-row: the packages asked here (sha3-asm, zstd-sys) are granted no shelf row, so no
+    // program is under this shelf, which is not made.
+    let owned: std::vec::Vec<blaze_own::AString<'_>> = tools.iter().flat_map(|t| t.programs_in("/no-shelf", alloc)).collect();
+    let exec: std::vec::Vec<&str> = owned.iter().map(|p| p.as_str()).collect();
+    assert!(exec.iter().all(|p| !p.starts_with("/no-shelf/")), "{package}: a shelf row in this test's grant: {exec:?}");
     let mut reads: std::vec::Vec<&str> = vec![place.package.as_str()];
     reads.extend(tools.iter().flat_map(|t| t.read_folders()));
-    let mut folders: std::vec::Vec<&str> = tools.iter().map(|t| t.path.rsplit_once('/').map_or("/", |(d, _)| d)).collect();
-    folders.sort_unstable();
-    folders.dedup();
+    let folders = host_tools::path_folders(&tools, alloc);
     let path = folders.join(":");
     let writes = [place.out.as_str()];
     let run = NativeRun {

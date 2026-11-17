@@ -42,7 +42,8 @@
 
 use blaze_own::{AVec, Alloc};
 
-use crate::{Crate, Origin, Side, World};
+use crate::crate_list::CrateGraph;
+use crate::{Crate, Side, World};
 
 /// How an owner sees a crate of its scope.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -140,44 +141,48 @@ pub fn check_side(c: &Crate<'_>) -> Side {
     if c.proc_macro { Side::Macro } else { c.side }
 }
 
-/// How the owner's walk sees `c`, reached from a crate of its scope: a proc macro for its
-/// macros; else a crate of `side`, a toolchain crate or not; else the refusal.
-fn seen_as<'w>(world: &World<'w>, owner: usize, at: usize, side: Side) -> Result<Seen, ScopeError<'w>> {
-    let c = &world.crates[at];
-    if c.proc_macro {
+/// How the owner's walk sees crate `at`, reached from a crate of its scope: a proc macro for
+/// its macros; else a crate of `side`, a toolchain crate or not; else the refusal.
+fn seen_as<'n, G: CrateGraph<'n>>(graph: &G, owner: usize, at: usize, side: Side) -> Result<Seen, ScopeError<'n>> {
+    if graph.proc_macro(at) {
         return Ok(Seen::MacrosOnly);
     }
-    if c.side != side {
-        return Err(ScopeError::OtherSide { owner: world.crates[owner].input.name, krate: c.input.name, side });
+    if graph.side(at) != side {
+        return Err(ScopeError::OtherSide { owner: graph.name(owner), krate: graph.name(at), side });
     }
-    Ok(Seen::Linked { toolchain: matches!(c.origin, Origin::Toolchain(_)) })
+    Ok(Seen::Linked { toolchain: graph.toolchain(at) })
 }
 
 /// The check scope of `owner` (a world index) by the module's rule; `no_core`: the owner's
 /// root says `#![no_core]` (its names record's root head).
 pub fn check_scope<'w, 'a>(world: &World<'w>, owner: usize, no_core: bool, alloc: Alloc<'a>) -> Result<CheckScope<'a>, ScopeError<'w>> {
-    let crates = &world.crates;
-    if owner >= crates.len() {
-        return Err(ScopeError::NoSuchCrate { krate: owner, crates: crates.len() });
+    check_scope_in(world, owner, no_core, alloc)
+}
+
+/// [`check_scope`] over any crate graph: the world made fresh, or the crate list read in place
+/// (crate_list.rs), whose indices are its rows. One rule, two inputs, tested equal
+/// (list_tests.rs `the_crate_list_reads_back_as_its_world`).
+pub fn check_scope_in<'n, 'a, G: CrateGraph<'n>>(graph: &G, owner: usize, no_core: bool, alloc: Alloc<'a>) -> Result<CheckScope<'a>, ScopeError<'n>> {
+    let n = graph.len();
+    if owner >= n {
+        return Err(ScopeError::NoSuchCrate { krate: owner, crates: n });
     }
-    if world.refusal(owner).is_some() {
-        return Err(ScopeError::Refused { krate: crates[owner].input.name });
+    if graph.refused(owner) {
+        return Err(ScopeError::Refused { krate: graph.name(owner) });
     }
-    let side = check_side(&crates[owner]);
-    // By world index, how each crate is seen (`None`: not seen); the work list in the order
-    // reached.
-    let mut seen: AVec<'a, Option<Seen>> = AVec::with_capacity_in(crates.len(), alloc);
-    seen.extend((0..crates.len()).map(|_| None));
-    let mut order: AVec<'a, usize> = AVec::new_in(alloc);
+    let side = if graph.proc_macro(owner) { Side::Macro } else { graph.side(owner) };
+    // By index, how each crate is seen (`None`: not seen); the work list in the order reached.
+    let mut seen: AVec<'a, Option<Seen>> = AVec::with_capacity_in(n, alloc.clone());
+    seen.extend((0..n).map(|_| None));
+    let mut order: AVec<'a, usize> = AVec::new_in(alloc.clone());
     seen[owner] = Some(Seen::Owner);
     order.push(owner);
     // The target side's sysroot, which the extern prelude adds (unless `#![no_core]`); the
     // macro side's toolchain crates are the owner's own dependencies in the list.
     if !no_core && side == Side::Target {
-        let sysroot = [world.sysroot.core, world.sysroot.alloc, world.sysroot.std, world.sysroot.bstd];
-        for at in sysroot.iter().flatten().map(|id| id.0 as usize) {
+        for at in graph.sysroot().iter().flatten().copied() {
             if seen[at].is_none() {
-                seen[at] = Some(seen_as(world, owner, at, side)?);
+                seen[at] = Some(seen_as(graph, owner, at, side)?);
                 order.push(at);
             }
         }
@@ -189,14 +194,14 @@ pub fn check_scope<'w, 'a>(world: &World<'w>, owner: usize, no_core: bool, alloc
         if seen[at] == Some(Seen::MacrosOnly) {
             continue;
         }
-        for (_, dep) in crates[at].input.deps.iter() {
-            if seen[*dep].is_none() {
-                seen[*dep] = Some(seen_as(world, owner, *dep, side)?);
-                order.push(*dep);
+        for dep in graph.deps(at) {
+            if seen[dep].is_none() {
+                seen[dep] = Some(seen_as(graph, owner, dep, side)?);
+                order.push(dep);
             }
         }
     }
-    // The owner at 0, then the rest by index: the same world gives the same order.
+    // The owner at 0, then the rest by index: the same graph gives the same order.
     order[1..].sort_unstable();
     let mut readers: AVec<'a, (usize, Seen)> = AVec::with_capacity_in(order.len(), alloc);
     for at in order.iter().copied() {

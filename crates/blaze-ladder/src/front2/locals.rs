@@ -425,7 +425,10 @@ impl<'n> Locals<'n> {
                     // `Store::step`), and its block's ABI and its safety are kept beside it
                     // ([`Locals::foreign`]). The block itself binds no name: no row.
                     let edition = names.edition_of(at.krate).ok_or(HeadError::NoText(at.item))?;
-                    let (abi, decls) = super::foreign_locals::declared(text, edition, alloc).map_err(|r| bad(Why::Unsupported(r.form(), range)))?;
+                    // Which declarations exist is the crate's cfg's to say (`cfg`, `cfg_attr`).
+                    let atoms = names.cfg_atoms(at.krate).ok_or(HeadError::NoText(at.item))?;
+                    let (abi, decls) = super::foreign_locals::declared(text, edition, &mut super::heads::CrateCfg(atoms), alloc)
+                        .map_err(|r| bad(Why::Unsupported(r.form(), range)))?;
                     let from = view.item_relative(it.range).map(|r| r.start);
                     for d in decls.iter() {
                         let kind = match d.kind {

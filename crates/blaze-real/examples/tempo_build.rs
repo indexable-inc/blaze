@@ -23,7 +23,7 @@
 
 use std::{env, panic, process, time::Instant};
 
-use blaze_ladder::front2::program::Front2Program;
+use blaze_ladder::front2::program::{Front2Program, LeftOut};
 use blaze_ladder::run::{OverflowChecks, build_survey};
 use blaze_ladder::seam::FrontEnd;
 use blaze_own::{AString, AVec, Alloc, ASortedMap};
@@ -154,6 +154,46 @@ fn roots<'a>(names: &Names<'_>, member: &[bool], wanted: &str, alloc: Alloc<'a>)
     out
 }
 
+/// The front end's left-out fns by class (the cause's words with numbers, keys and paths taken
+/// out), largest first, each with its first fn and the whole cause; under each class, the
+/// causes behind it by the row's split (front2 program/left_out.rs `LeftOut::split`: a gap's
+/// own item by its path and why), kept whole, so "check gap: RefusedImpl" splits by impl and
+/// why. Printed before the survey, so a survey that stops still leaves them.
+fn print_left(left: &[(Box<str>, LeftOut)], alloc: Alloc<'_>) {
+    let mut lefts: ASortedMap<'_, AString<'_>, Row<'_>> = ASortedMap::with_capacity_in(64, alloc);
+    // Keyed `<class>\t<split>`: a class never holds a tab (its words are the refusal's).
+    let mut splits: ASortedMap<'_, AString<'_>, Row<'_>> = ASortedMap::with_capacity_in(256, alloc);
+    for (function, row) in left.iter() {
+        let function: &str = function;
+        let mut line = AString::from_str_in(function, alloc);
+        line.push_str(": ");
+        for c in row.whole.chars() {
+            line.push(if c == '\n' { ' ' } else { c });
+        }
+        let class = class_of(&row.class, alloc);
+        file(&mut lefts, class.as_str(), function, line.as_str(), alloc);
+        if !row.split.is_empty() {
+            let mut key = AString::from_str_in(class.as_str(), alloc);
+            key.push('\t');
+            key.push_str(&row.split);
+            file(&mut splits, key.as_str(), function, line.as_str(), alloc);
+        }
+    }
+    println!("LEFT OUT BY THE FRONT END ({} fns, {} classes, {} split rows)", left.len(), lefts.len(), splits.len());
+    let split_rows = sorted(&splits, alloc);
+    for (k, r) in sorted(&lefts, alloc).iter() {
+        println!("LEFT {} {k}", r.count);
+        println!("    e.g. {}", r.line.as_str());
+        for (sk, sr) in split_rows.iter() {
+            let Some((class, split)) = sk.split_once('\t') else { continue };
+            if class == *k {
+                println!("SPLIT {} {class} | {split}", sr.count);
+                println!("    e.g. {}", sr.line.as_str());
+            }
+        }
+    }
+}
+
 fn main() {
     let heap = blaze_own::Heap::process();
     let alloc = heap.alloc();
@@ -221,6 +261,7 @@ fn main() {
         // Printed before the survey, so a survey that stops still leaves the reach's counts.
         let left_n: usize = left_out.len();
         println!("REACH from {}: {fns} fns tabled ({bodied} with a body); {left_n} left out by the front end; {reach_s:.1}s", path(6));
+        print_left(&left_out, alloc);
         let t2 = Instant::now();
         let counts = match build_survey(&mut program, &mut refused, OverflowChecks::On) {
             Ok(c) => c,
@@ -277,19 +318,6 @@ fn main() {
     println!("REFUSALS BY THE REFUSED FN'S CRATE ({} crates)", crates.len());
     for (k, r) in sorted(&crates, alloc).iter() {
         println!("CRATE {} {k}", r.count);
-    }
-    let mut lefts: ASortedMap<'_, AString<'_>, Row<'_>> = ASortedMap::with_capacity_in(64, alloc);
-    for (function, said) in left.iter() {
-        let (function, said): (&str, &str) = (function, said);
-        let mut line = AString::from_str_in(function, alloc);
-        line.push_str(": ");
-        line.push_str(said);
-        file(&mut lefts, class_of(said, alloc).as_str(), function, line.as_str(), alloc);
-    }
-    println!("LEFT OUT BY THE FRONT END ({} fns, {} classes)", left.len(), lefts.len());
-    for (k, r) in sorted(&lefts, alloc).iter() {
-        println!("LEFT {} {k}", r.count);
-        println!("    e.g. {}", r.line.as_str());
     }
     println!("TOTAL {}: reached {fns} fns, left out {}; instances tried {tried}, built {built} ({:.1}%), refused at the builder {builder}, at a callee {callee}, at the tier {tier}; {:.1}s in all", path(6), left.len(), pct(built), t0.elapsed().as_secs_f64());
 }

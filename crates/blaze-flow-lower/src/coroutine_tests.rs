@@ -52,7 +52,8 @@ struct Items {
 /// `struct Ready; impl Future for Ready { type Output = (); }`, `struct Rc<T>`,
 /// `fn ready() -> Ready`, `fn make_rc() -> Rc<i32>` (the Reference's `Rc::new(1)`),
 /// `fn drop_rc(_: Rc<i32>)` (its `drop(r)`), `fn read(_: &u8) -> u8`, `fn spawn<T>(_: T)`,
-/// `fn owner()`.
+/// `fn take(_: &Rc<i32>, _: ())` (a call whose first argument is a temporary made before an
+/// `.await` in its second), `fn owner()`.
 fn world() -> (Fx, Items) {
     let mut fx = Fx::new();
     let (p0, unit, u8_) = (fx.param(0), fx.unit(), fx.u8());
@@ -88,6 +89,8 @@ fn world() -> (Fx, Items) {
     fx.func("drop_rc", 0, &[rc_i32], unit, vec::Vec::new());
     fx.func("read", 0, &[ru8], u8_, vec::Vec::new());
     fx.func("spawn", 1, &[p0], unit, vec::Vec::new());
+    let r_rc = fx.r(Mutbl::Not, rc_i32);
+    fx.func("take", 0, &[r_rc, unit], unit, vec::Vec::new());
     let owner = fx.func("owner", 0, &[], unit, vec::Vec::new());
     fx.finish();
     (fx, Items { owner, ready, rc })
@@ -284,3 +287,6 @@ mod send;
 
 /// An `.await` on a library future, held by the record's type (coroutine.rs `await_done`).
 mod await_operand;
+
+/// What a block's state saves, as types (state_recipe.rs; ASYNC.md P8).
+mod state_recipe;

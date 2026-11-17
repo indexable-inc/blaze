@@ -51,8 +51,8 @@ fn sample() -> (std::vec::Vec<u8>, std::vec::Vec<std::vec::Vec<u8>>) {
         },
     ];
     let units = [
-        UnitIn { krate: 0, kind: UnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[] },
-        UnitIn { krate: 1, kind: UnitKind::Lib, for_host: false, root: "src/lib.rs", features: &["default", "std"], deps: &[("core", 0)] },
+        UnitIn { krate: 0, kind: UnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[], sysroot: crate::ImplicitSysroot::None },
+        UnitIn { krate: 1, kind: UnitKind::Lib, for_host: false, root: "src/lib.rs", features: &["default", "std"], deps: &[("core", 0)], sysroot: crate::ImplicitSysroot::Core },
     ];
     let cfg = [("panic", Some("unwind")), ("target_os", Some("macos")), ("unix", None)];
     let targets = [TargetIn { triple: "aarch64-apple-darwin", units: &units, cfg: &cfg }];

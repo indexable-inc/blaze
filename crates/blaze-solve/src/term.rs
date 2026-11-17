@@ -186,6 +186,11 @@ pub enum Abi {
     /// At the type level a fn of it takes its last parameter, a tuple, as one value; only the
     /// call's ABI spreads that tuple. Not `Fn*`-compatible (`ExternAbi::is_fn_trait_compatible`).
     RustCall,
+    /// `extern "llvm-intrinsic"` (unstable `link_llvm_intrinsics`): rustc_abi's `LlvmIntrinsic`,
+    /// "Unstable ABI used to call LLVM intrinsics." The pinned library's `core::arch` declares
+    /// every target intrinsic in such a block; a declaration in a body carries it as its fn
+    /// header's ABI (blaze-ladder front2/heads.rs, a local foreign fn).
+    LlvmIntrinsic,
 }
 
 /// Whether calling through a fn pointer needs `unsafe`.
@@ -217,6 +222,7 @@ impl FnPtrHeader {
             Abi::System => 3,
             Abi::SystemUnwind => 4,
             Abi::RustCall => 5,
+            Abi::LlvmIntrinsic => 6,
         };
         match self.safety {
             Safety::Safe => abi,
@@ -233,6 +239,7 @@ impl FnPtrHeader {
             3 => Abi::System,
             4 => Abi::SystemUnwind,
             5 => Abi::RustCall,
+            6 => Abi::LlvmIntrinsic,
             _ => return None,
         };
         let safety = if b & 0x80 != 0 { Safety::Unsafe } else { Safety::Safe };

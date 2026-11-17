@@ -45,6 +45,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn push_val(&mut self, v: V, ty: Option<PTy>) {
         self.vals.push(v);
         self.val_tys.push(ty);
+        self.note_push();
         debug_assert_eq!(self.vals.len(), self.val_tys.len(), "the value stack and its types out of step");
     }
 
@@ -55,6 +56,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn pop_val(&mut self) -> V {
         self.val_tys.pop();
         let v = self.vals.pop().unwrap_or(V::None);
+        self.note_stack(self.vals.len(), None);
         debug_assert_eq!(self.vals.len(), self.val_tys.len(), "the value stack and its types out of step");
         v
     }
@@ -63,6 +65,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn truncate_vals(&mut self, len: usize) {
         self.vals.truncate(len);
         self.val_tys.truncate(len);
+        self.note_stack(self.vals.len(), None);
         debug_assert_eq!(self.vals.len(), self.val_tys.len(), "the value stack and its types out of step");
     }
 
@@ -70,6 +73,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn remove_val(&mut self, at: usize) -> V {
         self.val_tys.remove(at);
         let v = self.vals.remove(at);
+        self.note_stack(self.vals.len(), Some(at));
         debug_assert_eq!(self.vals.len(), self.val_tys.len(), "the value stack and its types out of step");
         v
     }

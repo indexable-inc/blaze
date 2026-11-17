@@ -20,6 +20,8 @@ blaze-typeck.workspace = true
 blaze-lir.workspace = true
 # `Alloc`: the allocator `Checked` is in.
 blaze-own.workspace = true
+# `Identity`: the flow layer's table of identities a coroutine's state is keyed by (ASYNC.md P8).
+blaze-flow-lower.workspace = true
 # `ContentId` and `Hasher`: an instance's key. By path: the workspace entry turns on serde adapters.
 blaze-ids = { path = "../blaze-ids" }
 # `testing`: `read_back`, a value's record read through emitted code (blaze-consteval's

@@ -48,10 +48,19 @@ pub enum Kind {
     /// body. Its source is that digest and its out is its source, so a body edit leaves it, and
     /// every `CrateScope` reading it, standing.
     Surface = 15,
+    /// One file's owners (owners.rs): the crate roots whose module tree reaches it. Computed by
+    /// the request machine from its parents' rows, never a task; a body reads it to know which
+    /// crates' scopes it needs.
+    Owners = 16,
+    /// One build script's run, one per crate of the world that reads it (decision D115): named
+    /// with the `CrateScope` parts, keyed by its crate's subject, never the machine. Its read
+    /// list names the `Script` records whose `links` metadata it was given. Its out is its
+    /// outputs record, which the crate's readers read.
+    Script = 17,
 }
 
 /// How many kinds there are: the profile's table size.
-pub const KINDS: usize = 15;
+pub const KINDS: usize = 17;
 
 impl Kind {
     pub const ALL: [Kind; KINDS] = [
@@ -70,6 +79,8 @@ impl Kind {
         Kind::CrateScope,
         Kind::MacroModule,
         Kind::Surface,
+        Kind::Owners,
+        Kind::Script,
     ];
 
     /// The stage of the compiler this kind is, as a person reads it in a note: kinds of one
@@ -79,13 +90,14 @@ impl Kind {
             Kind::Units | Kind::UnitGraph => "read the manifests",
             // Its sources in the store, checked against the lock; not their code read.
             Kind::Fetch => "fetch the dependencies' sources",
-            Kind::FileItems | Kind::Surface => "parse",
+            Kind::FileItems | Kind::Surface | Kind::Owners => "parse",
             Kind::ModuleScope | Kind::Group | Kind::CrateScope => "resolve names",
             Kind::MacroModule => "compile procedural macros",
             Kind::Expansion => "expand macros",
             Kind::Signature | Kind::ImplBucket | Kind::BodyCheck => "check types",
             Kind::Code => "generate code",
             Kind::Test => "run tests",
+            Kind::Script => "run build scripts",
         }
     }
 
@@ -123,6 +135,8 @@ impl Kind {
             Kind::CrateScope => "CrateScope",
             Kind::MacroModule => "MacroModule",
             Kind::Surface => "Surface",
+            Kind::Owners => "Owners",
+            Kind::Script => "Script",
         }
     }
 }
@@ -154,7 +168,7 @@ impl Name {
     /// Whether the name's subject is its source too, known from the name alone: a `Fetch`
     /// name's subject is its unit's record key (fetch_task.rs). A need of one is located by it.
     pub fn located_by_subject(self) -> bool {
-        self.kind == Kind::Fetch
+        matches!(self.kind, Kind::Fetch | Kind::Owners)
     }
 
     /// The units of the manifest at `path` (its package): a `Units` name whose subject is the
@@ -215,6 +229,12 @@ const CONTENT_DOMAIN: &str = "blaze-drive content 1";
 
 const CONDITION_DOMAIN: &str = "blaze-drive condition name 1";
 const SPACE_DOMAIN: &str = "blaze-drive space 1";
+
+/// The `Owners` name of the file `file` (a `FileItems` name): what a body asks, with its file as
+/// the want's home, to learn which crates own it (owners.rs).
+pub fn owners_of(file: Name) -> Name {
+    crate::owners::of(file)
+}
 
 /// The job of `base` under `condition` (drive.md, "One check covers every configuration"): a
 /// name of its own, so its record, row and readers are an ordinary job's. Under

@@ -131,7 +131,7 @@ pub(crate) struct NativeSummary {
 pub(crate) fn native_key<'a>(inputs: &NativeInputs<'a>, alloc: Alloc<'a>) -> Result<ContentId, NativeError<'a>> {
     let line = link_line(inputs, alloc)?;
     let roots = sorted_names(inputs.crates, |links| links.foreign.as_slice(), alloc)?;
-    let rust = sorted_names(inputs.crates, |links| links.exports.as_slice(), alloc)?;
+    let rust = export_names(inputs.crates, alloc)?;
     Ok(key_of(inputs, &line, &roots, &rust))
 }
 
@@ -147,7 +147,7 @@ pub(crate) fn native_library<'a>(
     let platform = inputs.platform;
     let line = link_line(inputs, alloc)?;
     let root_names = sorted_names(inputs.crates, |links| links.foreign.as_slice(), alloc)?;
-    let rust_names = sorted_names(inputs.crates, |links| links.exports.as_slice(), alloc)?;
+    let rust_names = export_names(inputs.crates, alloc)?;
     let key = key_of(inputs, &line, &root_names, &rust_names);
     let roots = mangled(platform, &root_names, alloc)?;
     let rust = mangled(platform, &rust_names, alloc)?;
@@ -421,6 +421,22 @@ fn sorted_names<'a>(
     for krate in crates {
         for &name in pick(krate.links) {
             push(&mut names, name)?;
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
+}
+
+/// Every crate's export names (links.rs `CrateLinks::exports`: one item a name within a crate),
+/// sorted, unique: the native library needs each Rust word once whichever crate exports it. Two
+/// crates exporting one name are refused where the program is assembled (blaze-export
+/// `MergeError::TwoExports`, from the exports' items), not here.
+fn export_names<'a>(crates: &'a [CrateNative<'a>], alloc: Alloc<'a>) -> Result<AVec<'a, &'a str>, NativeError<'a>> {
+    let mut names = AVec::new_in(alloc);
+    for krate in crates {
+        for export in krate.links.exports.iter() {
+            push(&mut names, export.name)?;
         }
     }
     names.sort_unstable();

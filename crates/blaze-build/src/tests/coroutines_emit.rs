@@ -389,8 +389,7 @@ impl LayoutFacts for FxAdts<'_> {
             return Err(BuildError::UnsupportedSig { what: "an opaque type that is no `async fn`'s of this test" });
         };
         let list = ground.intern_list(args).map_err(full)?;
-        let output = ground.intern(PNode::Uint(UintTy::U64)).map_err(full)?;
-        crate::coroutine_identity(ground, item, ordinal, list, output)
+        crate::coroutine_identity(ground, item, ordinal, list)
     }
 }
 
@@ -539,6 +538,12 @@ struct Ran {
 /// body; `drop_in_place` at each type that is no coroutine: its glue), all are placed callees
 /// first, and `main` runs natively under `script`.
 fn run(w: &World, progs: &[Prog<'_>], script: Script) -> Ran {
+    run_laid(w, progs, script, None).unwrap_or_else(|e| panic!("the coroutine build failed: {e}"))
+}
+
+/// [`run`], the last of `progs` (the one `main` drives) built into the state `laid` gives
+/// (coroutines_emit/state_names.rs); a build refused is the error.
+fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_names::Laid>) -> Result<Ran, BuildError> {
     let check = |view: &BodyView<'_>| {
         let mut ty = InferCtx::new_in(Alloc::global());
         let c = match blaze_typeck::check(view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
@@ -595,9 +600,10 @@ fn run(w: &World, progs: &[Prog<'_>], script: Script) -> Ran {
     for (i, p) in progs.iter().enumerate() {
         let ordinal = crate::coroutines_in(&views[i]).find(|c| c.1 == p.root).map(|c| c.0).expect("the body's root is its async block");
         let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
-        let co = crate::build_coroutine(&views[i], &checked[i], ordinal, &mut subst, &adts, Global).unwrap_or_else(|e| panic!("the coroutine of {:?} failed: {e}", p.item));
+        let plan = laid.filter(|_| i + 1 == progs.len()).map(state_names::Laid::plan);
+        let co = crate::build_coroutine(&views[i], &checked[i], ordinal, &mut subst, &adts, plan, Global)?;
         states.borrow_mut().push((p.item, ordinal, co.state));
-        let ty = crate::coroutine_identity(&mut ground, p.item, ordinal, none, u64g).unwrap_or_else(|e| panic!("the coroutine's type: {e}"));
+        let ty = crate::coroutine_identity(&mut ground, p.item, ordinal, none).unwrap_or_else(|e| panic!("the coroutine's type: {e}"));
         let at = ground.intern_list(&[ty]).expect("a list");
         let sig = w.fx.sig_of(p.item).expect("the fn's signature");
         let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
@@ -685,7 +691,7 @@ fn run(w: &World, progs: &[Prog<'_>], script: Script) -> Ran {
     POLLS.with(|p| p.set(0));
     SCRIPT.with(|s| s.set(script));
     let value = run_native_with(&host, &fns);
-    Ran { value, polls: POLLS.with(Cell::get), drops: DROPS.with(Cell::get), made: MADE.with(Cell::get) }
+    Ok(Ran { value, polls: POLLS.with(Cell::get), drops: DROPS.with(Cell::get), made: MADE.with(Cell::get) })
 }
 
 /// `async fn one() -> u64 { 7 }`.
@@ -854,3 +860,6 @@ fn an_async_fn_awaits_another_async_fn() {
 }
 
 mod async_unwind;
+
+/// Every slot kept across a suspension names a flow local (walk/state_names.rs; ASYNC.md P8).
+mod state_names;

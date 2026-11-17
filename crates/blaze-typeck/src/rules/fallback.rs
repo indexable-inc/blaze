@@ -52,6 +52,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     pub(crate) fn end_sequence(&mut self) -> Result<(), Stop> {
         self.fallback()?;
         self.check_casts()?;
+        self.check_asms()?;
         self.select()?;
         self.analyze_closures()?;
         // An async block's captures (rules/async_fn.rs): rows of the same table.

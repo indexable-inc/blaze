@@ -182,7 +182,7 @@ fn build_under(panic: Panic) -> Result<Made, BuildError> {
     let adts = UnwindAdts { inner: &inner, panic, resumed, resumed_panic, asked: Cell::new((false, false)) };
     let mut ground = PortableTys::new_in(Alloc::global());
     let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
-    let co = crate::build_coroutine(&view, &checked, ordinal, &mut subst, &adts, Global)?;
+    let co = crate::build_coroutine(&view, &checked, ordinal, &mut subst, &adts, None, Global)?;
     blaze_lir::verify(co.resume.func.view()).unwrap_or_else(|e| panic!("the split's poll does not verify: {e}"));
     let refs: StdVec<ItemKey> = co.resume.refs.iter().map(|it| it.item).collect();
     Ok(Made { poll: blaze_lir::print(co.resume.func.view()), refs, keys, asked: adts.asked.get() })

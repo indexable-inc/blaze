@@ -11,12 +11,14 @@
 //!
 //! - its file's text unchanged: the row as written (`ItemNow::Same`), its spans read through
 //!   the whole file's digest, checked once per file per command, as before;
-//! - its file changed but not the item's HEAD (the piece its row's facts are read from: for a
-//!   fn its signature): the row's facts hold, at TODAY's place (`ItemNow::Fresh`): its spans
-//!   are into today's text, never the record's old absolute offsets (rule 71);
-//! - its head changed, or no single entry of today's text has its chain: that item alone is
-//!   refused ([`SourceError::ItemStale`], naming the item and its file). The scope is then
-//!   remade by its own key; nothing here papers over it.
+//! - its file changed and one entry of today's text has its chain: the row's facts hold (the
+//!   record holds no head and every row fact is covered by the `Surface` its scope reads, D114
+//!   ruling), at TODAY's place (`ItemNow::Fresh`): its spans are into today's text, never the
+//!   record's old absolute offsets (rule 71), so a signature edited in type only is read as
+//!   it is today, and what reads it is moved by the item's `Signature` (blaze-cli);
+//! - no single entry of today's text has its chain: that item alone is refused
+//!   ([`SourceError::ItemStale`], naming the item and its file). The scope is then remade by
+//!   its own key (a rename or removal moves `Surface`); nothing here papers over it.
 //!
 //! A member of a trait or impl (a member row, read through its owner) whose file changed is read
 //! the same way, as its own item row; one with no item row keeps the whole file's refusal. An
@@ -51,8 +53,8 @@ impl<'n> Records<'n> {
         match self.read(krate, answer)?? {
             ItemNow::Same(row) => Some(RowNow { row, today: None }),
             ItemNow::Fresh { row, text, .. } => Some(RowNow { row, today: Some(text) }),
-            ItemNow::Stale { key, file, saw, found } => {
-                self.log.put(SourceError::ItemStale { krate, name: self.log.name(krate), key, file, saw, found });
+            ItemNow::Stale { key, file, chain } => {
+                self.log.put(SourceError::ItemStale { krate, name: self.log.name(krate), key, file, chain });
                 None
             }
         }
@@ -124,7 +126,7 @@ impl Log<'_> {
         self.errors().iter().filter(|e| matches!(e, SourceError::Items { error: ItemsRecordError::Stale { file: Some(_), .. }, .. })).count()
     }
 
-    /// How many items so far were refused at item grain ([`SourceError::ItemStale`]: their head
+    /// How many items so far were refused at item grain ([`SourceError::ItemStale`]: their chain
     /// moved or their place is gone).
     pub fn stale_items(&self) -> usize {
         self.errors().iter().filter(|e| matches!(e, SourceError::ItemStale { .. })).count()

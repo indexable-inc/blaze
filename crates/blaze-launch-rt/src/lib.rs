@@ -58,6 +58,7 @@ pub mod drive;
 pub mod fault;
 pub mod native_lib;
 pub mod observe;
+pub mod poll;
 pub mod records;
 pub mod retired;
 pub mod run_mode;
@@ -77,6 +78,10 @@ pub mod zygote;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod poll_tests;
+#[cfg(test)]
+mod unwind_pairs_tests;
 
 pub use control::{ControlError, Ready, Start, ready, run};
 pub use drive::{Config, Driver, EditError, Error, Place, REACH, Records};

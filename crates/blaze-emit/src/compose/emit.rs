@@ -1297,12 +1297,14 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                 (RegClass::Fpr, Some(bit)) => d_pairs |= 1 << bit,
                 _ => return Err(refused_fn("a saved pair the frame word cannot describe")),
             }
+            // The platform's one order (blaze-code unwind.rs, "The frame word"): the higher
+            // register at the lower address, `stp x20, x19`, so x19 sits at CFA - 24 - 16k.
             let form = Form::Reg(a.class());
             let mut args = none;
-            args[0] = Arg::Reg(a);
-            args[1] = Arg::Reg(b);
+            args[0] = Arg::Reg(b);
+            args[1] = Arg::Reg(a);
             self.put(glue::frame(glue::SAVE_PAIR, [form, form, Form::None, Form::None]), &args)?;
-            self.pairs.push((a, b));
+            self.pairs.push((b, a));
         }
         if !saved.minus(covered).is_empty() {
             return Err(refused_fn("a saved register in no pair of the description's"));

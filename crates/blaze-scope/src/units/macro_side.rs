@@ -39,7 +39,7 @@ use edition::PackageEdition;
 use super::{Origin, PROFILE, UnitCrate, UnitsError, edition_of, edition_text, joined_root, kind_name, numbered, toolchain_kind_name, unit_key};
 
 /// The target a proc macro is built for (rule 10).
-pub(super) const MACRO_TARGET: &str = "wasm32-wasip1";
+pub const MACRO_TARGET: &str = "wasm32-wasip1";
 
 /// The domain of a macro-side crate's key: the target-side key's bytes under it.
 const SIDE_DOMAIN: &str = "blaze-scope macro side v1";

@@ -20,8 +20,8 @@ doctest = false
 # wiring/llvm-sys/blaze-llvm-remarks-1.md). Every function this crate calls it declares itself
 # (src/ffi.rs).
 llvm-sys.workspace = true
-# `View`, `Op` and the tables: what is lowered.
-blaze-lir.workspace = true
+# `View`, `Op` and the tables: what is lowered; `eval`, the evaluator T2 validates templates against.
+blaze-lir = { workspace = true, features = ["eval"] }
 # `Names`, `Outside`, `Named`, `Machine`: how outside references are named and what is compiled for.
 blaze-tier.workspace = true
 # `Symbol`: the name of every function in a module and in a remark.
@@ -30,6 +30,10 @@ blaze-code = { path = "../blaze-code" }
 blaze-own.workspace = true
 # `lock::Lock`: `init`'s one-time registration, waited on with a deadline.
 blaze-core.workspace = true
+# table_gen.rs (T2): T1's recipes, `discover`, `fill` and the table's one writer.
+blaze-emit.workspace = true
+# table_gen.rs: each template run in this process (`Executable`).
+blaze-inproc.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["std", "testing"] }

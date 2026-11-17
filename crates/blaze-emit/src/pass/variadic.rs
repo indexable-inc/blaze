@@ -164,7 +164,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let ty = view.ty(value);
             match place_of(os, &mut walk, &mut slots, ty).map_err(|why| unsupported(inst, op, why.why()))? {
                 VarLoc::Reg(Loc::X(gpr)) => self.ld(gpr, value),
-                VarLoc::Reg(Loc::V(v)) => self.float_out(v, value, ty == Ty::F64),
+                VarLoc::Reg(Loc::V(v, w)) => self.v_out(v, value, w),
                 VarLoc::Reg(Loc::Pair(_)) => return Err(unsupported(inst, op, VarRefusal::Wide.why())),
                 VarLoc::Slot(_) => {}
             }

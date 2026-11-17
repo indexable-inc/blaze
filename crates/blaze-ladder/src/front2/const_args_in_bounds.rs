@@ -104,6 +104,11 @@ pub(super) fn angle_args<'t>(
             // clauses (`Builder::one_bound`, through `bound_segment_args`, which refuses the
             // form on a trait alias). Not in `binds`: that list has no place for them.
             lf::GenericArg::AssocType { .. } if declared.is_some() => {}
+            // An associated type bound on a generic associated type with type or const
+            // arguments (`U: ArraySize<ArrayType<T>: Copy>`): made by `Builder::gat_bounds`
+            // (gat_bounds.rs), which reads the segment again, for the one caller that knows the
+            // trait (`Builder::one_bound`; `bound_segment_args` refuses it on a trait alias).
+            lf::GenericArg::AssocBound { .. } if declared.is_some() => {}
             // A caller that does not know the trait (a trait object, `impl Trait`): refused
             // by name.
             lf::GenericArg::AssocType { .. } => return Err(Why::Unsupported("a binding of a generic associated type with type or const arguments (`Name<T> = U`)", r)),
@@ -132,10 +137,14 @@ impl<'b, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
             // under the same name.
             Bounded::Alias(key) => {
                 for &n in v.rows(seg.args)? {
-                    if let lf::GenericArg::AssocType { args, .. } = lf::GenericArg::decode(n)?
-                        && !lifetime_args(v, args)?
-                    {
-                        return Err(Why::Unsupported("an associated type binding on a trait alias (`Alias<Name = T>`)", r));
+                    match lf::GenericArg::decode(n)? {
+                        lf::GenericArg::AssocType { args, .. } if !lifetime_args(v, args)? => {
+                            return Err(Why::Unsupported("an associated type binding on a trait alias (`Alias<Name = T>`)", r));
+                        }
+                        lf::GenericArg::AssocBound { args, .. } if !lifetime_args(v, args)? => {
+                            return Err(Why::Unsupported("an associated type bound on a trait alias (`Alias<Name<T>: Bound>`)", r));
+                        }
+                        _ => {}
                     }
                 }
                 key

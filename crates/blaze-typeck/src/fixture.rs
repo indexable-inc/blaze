@@ -27,6 +27,8 @@ use crate::world::{
     World,
 };
 
+pub mod ranged;
+
 struct FnRow {
     key: ItemKey,
     name: Name,
@@ -61,6 +63,8 @@ struct TraitRow {
     /// Its members' dyn-compatibility facts, known: each associated type and fn as made,
     /// consts and the rest through [`Fx::trait_member`].
     dyn_members: Vec<crate::dyn_compat::MemberFacts>,
+    /// Its parameters' defaults after `Self` ([`Fx::trait_defaults`]); `None` each by default.
+    defaults: Vec<Option<PTy>>,
 }
 
 struct ImplRow {
@@ -468,7 +472,8 @@ impl Fx {
             .map(|&n| crate::dyn_compat::MemberFacts { name: Name::of(n), shape: crate::dyn_compat::MemberShape::Type { generic: false } })
             .collect();
         let assoc = assoc.iter().map(|&n| AssocTyDef { name: Name::of(n), item: ItemKey(crate::infer::assoc_def(key, Name::of(n))), default: None }).collect();
-        self.traits.push(TraitRow { key, generics, lang: None, auto: false, supers, assoc, dyn_members });
+        let defaults = std::vec![None; generics.saturating_sub(1) as usize];
+        self.traits.push(TraitRow { key, generics, lang: None, auto: false, supers, assoc, dyn_members, defaults });
         self.paths.push((std::vec![Name::of(name)], Def::Trait(key)));
         key
     }
@@ -478,6 +483,14 @@ impl Fx {
     pub fn set_supers(&mut self, trait_: ItemKey, supers: Vec<PClause>) {
         if let Some(t) = self.traits.iter_mut().find(|t| t.key == trait_) {
             t.supers = supers;
+        }
+    }
+
+    /// Sets `trait_`'s parameter defaults after `Self` (`Self` as `Param(0)`): one per
+    /// parameter, `None` where it has none (`trait Cmp<Rhs = Self>`: `&[Some(param(0))]`).
+    pub fn trait_defaults(&mut self, trait_: ItemKey, defaults: &[Option<PTy>]) {
+        if let Some(t) = self.traits.iter_mut().find(|t| t.key == trait_) {
+            t.defaults = defaults.to_vec();
         }
     }
 
@@ -943,14 +956,15 @@ impl World for Fx {
         Ok(&self.in_scope)
     }
 
-    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
-        // The longest prefix of `segments` that names an item.
+    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<crate::path_miss::PathAnswer> {
+        // The longest prefix of `segments` that names an item; with none, not even the first
+        // segment alone names one: the miss is the first segment's.
         for n in (1..=segments.len()).rev() {
             if let Some(&d) = self.path_ix.get(&segments[..n]) {
-                return Ok(Some(PathRes { def: d, consumed: n as u32 }));
+                return Ok(Ok(PathRes { def: d, consumed: n as u32 }));
             }
         }
-        Ok(None)
+        Ok(Err(crate::path_miss::PathMiss::FIRST))
     }
 
     fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
@@ -1003,6 +1017,7 @@ impl World for Fx {
             assoc_types: &t.assoc,
             types: self.t.view(),
             members: crate::world::TraitMembers::Known(&t.dyn_members),
+            defaults: crate::world::TraitDefaults::Known(&t.defaults),
         }))
     }
 
@@ -1046,6 +1061,11 @@ pub struct Bb {
     opt_types: Vec<Option<PTy>>,
     /// Segments' explicit generic arguments (`BodyView::type_lists`).
     type_lists: Vec<PTy>,
+    /// `BodyView::type_list_ranges`, `segment_ranges`, `method_name_ranges`: written only by the
+    /// ranged builders (fixture/ranged.rs); the plain builders leave them short (no range known).
+    type_list_ranges: Vec<Range>,
+    segment_ranges: Vec<Range>,
+    method_name_ranges: Vec<(ExprId, Range)>,
     params: Vec<PatId>,
     arms: Vec<Arm>,
     fmt_uses: Vec<FmtUse>,
@@ -1068,6 +1088,9 @@ impl Bb {
             segments: Vec::new(),
             opt_types: Vec::new(),
             type_lists: Vec::new(),
+            type_list_ranges: Vec::new(),
+            segment_ranges: Vec::new(),
+            method_name_ranges: Vec::new(),
             params: Vec::new(),
             arms: Vec::new(),
             fmt_uses: Vec::new(),
@@ -1154,7 +1177,7 @@ impl Bb {
             self.segments.push(Segment { name: Name::of(s), generic_args: List::EMPTY, has_args: false });
         }
         let at = self.paths.len() as u32;
-        let anchor = Some(crate::body::Anchor { ty, trait_: None });
+        let anchor = Some(crate::body::Anchor { ty, trait_: None, ty_range: Range::default() });
         self.paths.push(BodyPath { scope: ScopeId(0), segments: List { start, len: segments.len() as u32 }, lang: None, anchor });
         self.e(Expr::Path(PathIdx(at)))
     }
@@ -1170,7 +1193,7 @@ impl Bb {
             self.segments.push(Segment { name: Name::of(s), generic_args: List::EMPTY, has_args: false });
         }
         let at = self.paths.len() as u32;
-        let anchor = Some(crate::body::Anchor { ty, trait_: Some(PathIdx(tpath)) });
+        let anchor = Some(crate::body::Anchor { ty, trait_: Some(PathIdx(tpath)), ty_range: Range::default() });
         self.paths.push(BodyPath { scope: ScopeId(0), segments: List { start, len: segments.len() as u32 }, lang: None, anchor });
         self.e(Expr::Path(PathIdx(at)))
     }
@@ -1322,12 +1345,19 @@ impl Bb {
             field_pats: &[],
             paths: &self.paths,
             segments: &self.segments,
+            segment_ranges: &self.segment_ranges,
             types: self.t.view(),
             type_lists: &self.type_lists,
+            type_list_ranges: &self.type_list_ranges,
+            method_name_ranges: &self.method_name_ranges,
             opt_types: &self.opt_types,
             fmt_uses: &self.fmt_uses,
             coroutine: self.coroutine,
             super_lets: &[],
+            asm_pieces: &[],
+            asm_operands: &[],
+            asm_clobbers: &[],
+            asm_text: "",
         }
     }
 
@@ -1432,6 +1462,7 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
                 crate::ids::Abi::System => "extern \"system\" ",
                 crate::ids::Abi::SystemUnwind => "extern \"system-unwind\" ",
                 crate::ids::Abi::RustCall => "extern \"rust-call\" ",
+                crate::ids::Abi::LlvmIntrinsic => "extern \"llvm-intrinsic\" ",
             };
             // The list is the inputs, then the output.
             let all = t.list(l).expect("a shown list in its table");

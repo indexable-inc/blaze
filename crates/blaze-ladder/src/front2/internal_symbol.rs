@@ -277,14 +277,10 @@ fn is_defined_fn(names: &Names<'_>, lib: LibKey) -> bool {
     matches!(item.detail, ItemDetail::Fn { .. }) && item.body.is_some()
 }
 
-/// The item's path in the names library (`crate::module::Name`), for a refusal.
+/// The item for a refusal: front2 item_shown.rs `ItemShown` (its whole path and its key; never
+/// a `_` in place of a name).
 fn path_of(names: &Names<'_>, lib: LibKey) -> Box<str> {
-    let name = names.item_text(lib).and_then(|t| t.name).unwrap_or("_");
-    let module = names.crate_of(lib).zip(names.module_of(lib)).and_then(|(k, m)| names.krate(k).path_of(m));
-    match module {
-        Some(m) => format!("{m}::{name}").into_boxed_str(),
-        None => Box::from(name),
-    }
+    super::item_shown::ItemShown::of_lib(names, lib).boxed()
 }
 
 /// The definition a call of the std-internal declaration named `name` runs, under the
@@ -397,7 +393,7 @@ pub fn bound(names: &Names<'_>, index: &Index<'_>, store: &Store<'_>, item: Item
 }
 
 fn failed(why: &InternalRefused) -> Reached {
-    Reached::Failed { class: why.class().into(), detail: why.detail() }
+    Reached::Failed { class: why.class().into(), detail: why.detail(), refusal: None }
 }
 
 /// The walk's outcome for `k`, a fn whose head says it has no body, when it is a std-internal

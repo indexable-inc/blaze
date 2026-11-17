@@ -24,7 +24,7 @@
 //! is zero-sized and has no C form). Everything else passes here, an integer or float literal's
 //! variable included (it falls back to `i32` or `f64`, both promoted types already).
 
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, FloatTy, IntTy, ItemKey, UintTy};
 use crate::machine::Machine;
@@ -101,7 +101,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let t = self.try_structurally_resolve(t)?;
             let view = self.view(t);
             if promotion_refusal(view).is_some() {
-                self.diag(DiagCode::VariadicArg, At::Expr(arg), None, Some(t), None);
+                self.diag(DiagCode::VariadicArg, At::Expr(arg), About::found(t));
             }
         }
         Ok(())

@@ -21,9 +21,12 @@ use core::alloc::Allocator;
 
 use blaze_typeck::{ItemKey, PNode, PTy, PTys};
 
+/// A member of an impl: `Self::Name` and the impl's lifetimes (piece sig-assoc-projection).
+mod impl_life;
 mod outlives;
 mod value;
 
+pub use impl_life::{AssocWhy, ImplText, impl_header_end, read_impl_signature};
 pub use outlives::container_declares_type_outlives;
 
 pub use value::{CallableRefusal, read_callable_param};
@@ -107,6 +110,10 @@ pub enum SigRefusal {
     TypeNode,
     /// A walk passed its bound.
     Bound,
+    /// `Self::Name` (or `<Self as Tr>::Name`), or the header of the impl a member is read with,
+    /// that was not read, and why (impl_life.rs); `at`: the path's offset in the fn's text, 0
+    /// for the header.
+    Assoc { at: u32, why: AssocWhy },
 }
 
 /// The reader's bound on any one walk (tokens, types): a signature past it is refused.
@@ -339,6 +346,12 @@ struct Reader<'t, 'w, A: Allocator + Clone> {
     anon: u32,
     hidden: u32,
     alloc: A,
+    /// The impl the fn is a member of, when its text was given (impl_life.rs): its lifetimes
+    /// by name and its associated type members.
+    imp: Option<impl_life::ImplLife<'t, A>>,
+    /// The positions whose regions the fn's own text did not write (a `Self`'s, a
+    /// `Self::Name`'s): elision counts only what is written.
+    unwritten: Vec<u32, A>,
 }
 
 impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
@@ -421,6 +434,10 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
         let w = self.word(i);
         if w == "'_" {
             return None;
+        }
+        // A lifetime of the impl, held by its self type: that position of `Self` (impl_life.rs).
+        if let Some(r) = self.imp.as_ref().and_then(|m| m.region_of(w)) {
+            return Some(r);
         }
         if w == "'static" {
             return Some(Region::Static);
@@ -510,7 +527,13 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             if p.whole_self || (p.hi == p.lo + 1 && self.is_word(p.lo, p.hi, "Self")) {
                 for k in 0..n {
                     regions[(p.base + k) as usize] = Region::SelfTy(k);
+                    self.unwritten.push(p.base + k);
                 }
+                continue;
+            }
+            // `Self::Name`: the impl's own `type Name = ..;` text (impl_life.rs), never the path
+            // read as an ADT's name.
+            if self.assoc_path(p, regions)? {
                 continue;
             }
             let unaligned = SigRefusal::Unaligned { at: self.at(p.lo) };
@@ -720,6 +743,22 @@ pub fn read_signature<A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
+    read_signature_in(text, None, tys, inputs, output, adt_lifetimes, out, alloc)
+}
+
+/// [`read_signature`], of a member of the impl `imp` when given (impl_life.rs
+/// [`read_impl_signature`]): its lifetimes by name, its `Self::Name`, its header's bounds.
+#[expect(clippy::too_many_arguments, reason = "read_signature's inputs and the impl's reading")]
+fn read_signature_in<'t, A: Allocator + Clone>(
+    text: &'t str,
+    imp: Option<impl_life::ImplLife<'t, A>>,
+    tys: PTys<'_>,
+    inputs: &[PTy],
+    output: PTy,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<bool>,
+    out: &mut SigBuf<A>,
+    alloc: A,
+) -> Result<(), SigRefusal> {
     out.regions.clear();
     out.ends.clear();
     out.bounds.clear();
@@ -735,6 +774,8 @@ pub fn read_signature<A: Allocator + Clone>(
         anon: 0,
         hidden: 0,
         alloc: alloc.clone(),
+        imp,
+        unwritten: Vec::new_in(alloc.clone()),
     };
     lex(text, &mut r.toks)?;
     r.pair_brackets()?;
@@ -821,14 +862,15 @@ pub fn read_signature<A: Allocator + Clone>(
         out.ends.push(out.regions.len() as u32);
     }
     // The Reference, "Lifetime elision": the receiver's reference first, else the one lifetime
-    // used in the parameters. `Self`'s and hidden positions are not lifetimes the text uses.
+    // used in the parameters. `Self`'s, a `Self::Name`'s and hidden positions are not lifetimes
+    // the text uses; an impl's lifetime written by name (`&'a u8`, a `SelfTy`) is.
     let decided = if receiver == Receiver::Ref {
         out.regions.first().copied()
     } else {
         let mut one: Option<Region> = None;
         let mut many = false;
-        for &x in out.regions.iter() {
-            if matches!(x, Region::SelfTy(_) | Region::Hidden(_)) {
+        for (j, &x) in out.regions.iter().enumerate() {
+            if matches!(x, Region::Hidden(_)) || r.unwritten.contains(&(j as u32)) {
                 continue;
             }
             match one {
@@ -852,5 +894,9 @@ pub fn read_signature<A: Allocator + Clone>(
     }
     let wheres = if where_at < end { Some((where_at + 1, end)) } else { None };
     r.type_outlives(generics, wheres, &mut out.type_outlives, &mut out.type_outlives_unread)?;
+    // The impl's: its self type's equal and `'static` positions, its declared `'a: 'b`.
+    if let Some(imp) = r.imp.as_ref() {
+        out.bounds.extend_from_slice(&imp.bounds);
+    }
     Ok(())
 }

@@ -24,7 +24,7 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::body::{Lit, Pat};
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{Edition, Mutbl, PatId};
 use crate::machine::{Frame, Lower, Machine};
@@ -82,10 +82,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         match pat {
             Pat::Missing => Ok(self.common.err),
             Pat::Wild => Ok(expected),
-            Pat::Bind { ann, name: _, sub } => {
+            Pat::Bind { ann, name, sub } => {
                 let explicit = ann.mutable || ann.by_ref.is_some();
                 if explicit && mode != 0 && self.body.edition >= Edition::E2024 {
-                    self.diag(DiagCode::BindingModifier2024, at, None, None, None);
+                    self.diag(DiagCode::BindingModifier2024, at, About::found_named(expected, name));
                 }
                 let by_ref = match ann.by_ref {
                     Some(m) => Some(m),
@@ -125,7 +125,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             Pat::Ref { mutbl, inner } => {
                 if mode != 0 && self.body.edition >= Edition::E2024 {
-                    self.diag(DiagCode::BindingModifier2024, at, None, None, None);
+                    self.diag(DiagCode::BindingModifier2024, at, About::found(expected));
                 }
                 let t = self.try_structurally_resolve(expected)?;
                 let inner_ty = match self.view(t) {
@@ -173,7 +173,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 };
                 let Some((inputs, output)) = sig else {
                     if !self.is_err(t) {
-                        self.diag(DiagCode::NotAValue, at, None, Some(t), None);
+                        self.diag(DiagCode::NotAValue, at, About::found(t));
                     }
                     let errs = self.err_list(pats.len())?;
                     self.push_sub_pats(pats, None, errs, mode)?;
@@ -186,7 +186,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     None => pats.len() == n,
                 };
                 if !fits {
-                    self.diag(DiagCode::PatternArity, at, None, None, None);
+                    let (expected_n, got) = (self.ty.list_len(inputs), pats.len() as u32);
+                    self.diag(DiagCode::PatternArity, at, About::Count { expected: expected_n, got, found: Some(output) });
                     let errs = self.err_list(pats.len())?;
                     self.push_sub_pats(pats, None, errs, mode)?;
                     return Ok(expected);
@@ -212,13 +213,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     match declared.iter().find(|d| d.name == fp.name) {
                         Some(d) => tys.push(self.lower(adt.types, d.ty, Lower::Args(args), Cause::Pat(fp.pat))?),
                         None => {
-                            self.diag(DiagCode::NoSuchFieldPat, At::Pat(fp.pat), None, None, Some(fp.name));
+                            self.diag(DiagCode::NoSuchFieldPat, At::Pat(fp.pat), About::name(fp.name));
                             tys.push(self.common.err);
                         }
                     }
                 }
-                if !rest && declared.iter().any(|d| !fps.iter().any(|fp| fp.name == d.name)) {
-                    self.diag(DiagCode::MissingFieldPats, at, None, None, None);
+                if !rest && let Some(missing) = declared.iter().find(|d| !fps.iter().any(|fp| fp.name == d.name)) {
+                    self.diag(DiagCode::MissingFieldPats, at, About::found_named(expected, missing.name));
                 }
                 for (fp, &t) in fps.iter().zip(tys.iter()).rev() {
                     self.push_pat(fp.pat, t, mode)?;
@@ -251,23 +252,23 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         (None, None) => {
                             let count = self.len_value(fixed)?;
                             if !self.unify(len, count)? {
-                                self.diag(DiagCode::Mismatch, at, Some(expected), None, None);
+                                self.diag(DiagCode::Mismatch, at, About::expected(expected));
                             }
                             (e, self.common.err)
                         }
                         (None, Some(_)) => {
-                            self.diag(DiagCode::ArrayLenUnknown, at, None, Some(t), None);
+                            self.diag(DiagCode::ArrayLenUnknown, at, About::found(t));
                             (e, self.common.err)
                         }
                         (Some(_), _) => {
-                            self.diag(DiagCode::PatternArity, at, None, Some(t), None);
+                            self.diag(DiagCode::PatternArity, at, About::found(t));
                             (e, self.common.err)
                         }
                     },
                     TyView::Slice(e) => (e, t),
                     TyView::Error => (t, t),
                     _ => {
-                        self.diag(DiagCode::Mismatch, at, Some(expected), None, None);
+                        self.diag(DiagCode::Mismatch, at, About::expected(expected));
                         (self.common.err, self.common.err)
                     }
                 };
@@ -296,7 +297,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         TyView::Int(_) | TyView::Uint(_) | TyView::Float(_) | TyView::Char | TyView::Error | TyView::Infer(_)
                     );
                     if !numeric {
-                        self.diag(DiagCode::RangePatType, At::Pat(end), None, Some(r), None);
+                        self.diag(DiagCode::RangePatType, At::Pat(end), About::found(r));
                         self.pat_ty[end.ix()] = self.common.err;
                         continue;
                     }

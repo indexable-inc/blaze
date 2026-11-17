@@ -103,9 +103,9 @@ pub(crate) fn held_coroutines<'a>(
                 let env = blaze_build::ground(closure.types, closure.env, &args, ground, alloc, facts)?;
                 todo.push(env);
             }
-            PNode::Future(..) => {
+            PNode::Coroutine { .. } => {
                 let of = coroutine_of(ground.view(), t).ok_or(BuildError::Malformed {
-                    what: "a ground future not in its identity form (`Future(ordinal, output, FnDef(owner, args))`)",
+                    what: "a coroutine node `coroutine_of` does not read (held_coroutines)",
                 })?;
                 if !out.iter().any(|o| *o == of) {
                     if out.len() >= MOST_HELD {
@@ -118,11 +118,11 @@ pub(crate) fn held_coroutines<'a>(
             | PNode::ConstParam(_)
             | PNode::Alias { .. }
             | PNode::Opaque(..)
-            | PNode::Coroutine { .. }
+            | PNode::Future(..)
             | PNode::Infer
             | PNode::Error => {
                 return Err(BuildError::Malformed {
-                    what: "a parameter, alias, opaque type, hole or by-identity coroutine in a ground type (held_coroutines)",
+                    what: "a parameter, alias, opaque type, hole or future named by its expression in a ground type (held_coroutines)",
                 });
             }
         }
@@ -141,23 +141,22 @@ struct Frame<'a> {
 /// The coroutines whose states must be made before an instance is built, in dependency order
 /// (a state that holds another comes after it), each once: `roots` are the coroutines the
 /// instance's own types hold by value ([`held_coroutines`]; a coroutine instance lists ITSELF
-/// first, so a state holding itself is found). `made` says a state is made already (it is
-/// then neither listed nor entered); `held_by` lists the coroutines one coroutine's state holds
-/// by value, from that coroutine's own types. Refused by name: a coroutine reached while it is
-/// on the stack ([`HOLDS_ITSELF`], E0733), and a chain or a list past [`MOST_HELD`].
+/// first, so a state holding itself is found). `held_by` lists the coroutines one coroutine's
+/// state holds by value, from that coroutine's own types, or answers `None` when its state is
+/// made already (it is then neither listed nor entered). Refused by name: a coroutine reached
+/// while it is on the stack ([`HOLDS_ITSELF`], E0733), and a chain or a list past [`MOST_HELD`].
 pub(crate) fn layout_order<'a>(
     roots: &[CoroutineOf],
-    made: &mut dyn FnMut(CoroutineOf) -> bool,
-    held_by: &mut dyn FnMut(CoroutineOf) -> Result<Vec<CoroutineOf, Alloc<'a>>, BuildError>,
+    held_by: &mut dyn FnMut(CoroutineOf) -> Result<Option<Vec<CoroutineOf, Alloc<'a>>>, BuildError>,
     alloc: Alloc<'a>,
-) -> Result<Vec<CoroutineOf, Alloc<'a>>, BuildError> {
+) -> Result<Vec<CoroutineOf, Alloc<'a>>, OrderError<'a>> {
     let mut order: Vec<CoroutineOf, Alloc<'a>> = Vec::new_in(alloc);
     let mut stack: Vec<Frame<'a>, Alloc<'a>> = Vec::new_in(alloc);
     for &root in roots {
-        if order.iter().any(|o| *o == root) || made(root) {
+        if order.iter().any(|o| *o == root) {
             continue;
         }
-        let held = held_by(root)?;
+        let Some(held) = held_by(root).map_err(OrderError::Build)? else { continue };
         stack.push(Frame { of: root, held, next: 0 });
         while let Some(top) = stack.last_mut() {
             let Some(&child) = top.held.get(top.next) else {
@@ -165,24 +164,39 @@ pub(crate) fn layout_order<'a>(
                 let of = top.of;
                 stack.pop();
                 if order.len() >= MOST_HELD {
-                    return Err(BuildError::UnsupportedSig { what: "more than 4096 coroutine states demanded by one instance" });
+                    return Err(OrderError::Build(BuildError::UnsupportedSig { what: "more than 4096 coroutine states demanded by one instance" }));
                 }
                 order.push(of);
                 continue;
             };
             top.next += 1;
-            if stack.iter().any(|f| f.of == child) {
-                return Err(BuildError::UnsupportedSig { what: HOLDS_ITSELF });
+            if let Some(at) = stack.iter().position(|f| f.of == child) {
+                // The cycle, item by item: from the first frame that is `child` to the top,
+                // then `child` again.
+                let mut cycle: Vec<CoroutineOf, Alloc<'a>> = Vec::with_capacity_in(stack.len() - at + 1, alloc);
+                cycle.extend(stack[at..].iter().map(|f| f.of));
+                cycle.push(child);
+                return Err(OrderError::HoldsItself(cycle));
             }
-            if order.iter().any(|o| *o == child) || made(child) {
+            if order.iter().any(|o| *o == child) {
                 continue;
             }
             if stack.len() >= MOST_HELD {
-                return Err(BuildError::UnsupportedSig { what: "more than 4096 futures held one inside another by value" });
+                return Err(OrderError::Build(BuildError::UnsupportedSig { what: "more than 4096 futures held one inside another by value" }));
             }
-            let held = held_by(child)?;
+            let Some(held) = held_by(child).map_err(OrderError::Build)? else { continue };
             stack.push(Frame { of: child, held, next: 0 });
         }
     }
     Ok(order)
+}
+
+/// Why [`layout_order`] made no order.
+pub(crate) enum OrderError<'a> {
+    /// A state holds itself by value ([`HOLDS_ITSELF`], E0733): the coroutines of the cycle in
+    /// the order each holds the next, the first repeated last. The caller names each by its
+    /// owner fn's path.
+    HoldsItself(Vec<CoroutineOf, Alloc<'a>>),
+    /// A refusal of `held_by`, or a bound past [`MOST_HELD`].
+    Build(BuildError),
 }

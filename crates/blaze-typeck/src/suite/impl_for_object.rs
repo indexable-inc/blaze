@@ -24,7 +24,7 @@
 //! `Dynamic(0)` (`shape_of_kind` cannot read an object's principal) while the table filed the
 //! impl under `Dynamic(Tr)`: blaze-solve object_shape.rs. Without that fix,
 //! `impl_for_an_object_is_found` fails with
-//! "by_method: want [], got [(NoMethod, 1)]" and "by_bound: want [], got [(Unsatisfied, 0)]".
+//! "by_method: want [], got [(NoMethod, 1)]" and "by_bound: want [], got [(Unsatisfied, 1)]".
 
 use std::format;
 use std::string::String;
@@ -107,11 +107,12 @@ fn impl_for_an_object_is_found() {
 
 /// The control (the cause removed: no `impl Other for dyn Tr`): `t.o()` finds no method
 /// (E0599) and `need(t)` has an unmet bound (E0277), so the test above is about the impl.
-/// Prints "without the impl: by_method [(NoMethod, 1)], by_bound [(Unsatisfied, 0)]".
+/// Prints "without the impl: by_method [(NoMethod, 1)], by_bound [(Unsatisfied, 1)]".
 #[test]
 fn control_no_impl_for_the_object() {
-    // The bound a callee's where-clauses owe is placed at the callee's path (`need`, 0).
-    let got = diag_differences(false, &[(DiagCode::NoMethod, 1)], &[(DiagCode::Unsatisfied, 0)]);
-    std::println!("without the impl: by_method [(NoMethod, 1)], by_bound [(Unsatisfied, 0)]");
+    // The bound a callee's where-clauses owe is filed at the argument passed for the input that
+    // names it (`t` of `need(t)`, 1: rules/obligation_site.rs).
+    let got = diag_differences(false, &[(DiagCode::NoMethod, 1)], &[(DiagCode::Unsatisfied, 1)]);
+    std::println!("without the impl: by_method [(NoMethod, 1)], by_bound [(Unsatisfied, 1)]");
     assert!(got.is_empty(), "\n{}", got.join("\n"));
 }

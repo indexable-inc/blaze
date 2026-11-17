@@ -34,7 +34,7 @@
 //! and the reason; its printed place is left out (`gap_identity`).
 //!
 //! PLANTED BUG of the proof: a third fresh reader with ONE item row withheld
-//! (`Records::plant_no_item`: the row of `Io`, which `main`'s signature names) must give
+//! (`Records::plant_no_item`: the row of `Out`, which `main`'s signature names) must give
 //! `main` a different outcome, and the test checks it does.
 //!
 //! One `bool: Clone` question over a reader that was asked nothing else says how many source
@@ -106,8 +106,8 @@ use blaze_typeck::Shape;
 const EDITION: &str = "blaze-2026.11";
 
 /// His `src/main.rs`, as written.
-const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, \"Hello, world!\")?;
+const MAIN: &str = "fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    out.line(cx, \"Hello, world!\")?;
     Ok(())
 }
 ";
@@ -160,6 +160,11 @@ impl Load<'static> for Kept {
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
         self.expansions.get(krate)?.get(&call).copied()
+    }
+
+    /// This loader keeps texts, not their origins: a finding in one is filed `NotServed`.
+    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'static [u8]> {
+        None
     }
 }
 
@@ -503,7 +508,7 @@ fn records_answer_what_the_solved_names_answer() {
         }
         kept
     };
-    let (kept, kept_planted, kept_no_core, chosen, root, solved_items, solved_langs, solved_impls, solved_candidates, kept_bodies, kept_bodies_planted, kept_question, kept_question_text, solved_bodies, io, solved_heads) = {
+    let (kept, kept_planted, kept_no_core, chosen, root, solved_items, solved_langs, solved_impls, solved_candidates, kept_bodies, kept_bodies_planted, kept_question, kept_question_text, solved_bodies, (io, out_ty), solved_heads) = {
         let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
@@ -524,7 +529,10 @@ fn records_answer_what_the_solved_names_answer() {
         let (solved_impls, solved_candidates) = impl_answers(&names, front.index.lang("sized"), &frame, root, &mut buckets);
         // The proof's solved half: the eleven bodies lowered and checked over the solved names,
         // one store, key map, impl index and set of constants for the eleven.
-        let io = Paths { names: &names }.path(root, false, &["Io"], Ns::Type).unwrap_or_else(|e| panic!("`Io` from his crate root: {e}")).key;
+        // D104: `Io` is in no prelude; it is bstd's world type at `std::Io`.
+        let io = Paths { names: &names }.path(root, false, &["std", "Io"], Ns::Type).unwrap_or_else(|e| panic!("`std::Io` from his crate root: {e}")).key;
+        // `Out`: the type `main`'s signature names (D104), for the planted bug.
+        let out_ty = Paths { names: &names }.path(root, false, &["Out"], Ns::Type).unwrap_or_else(|e| panic!("`Out` from his crate root: {e}")).key;
         let prepared = Prepares::new_in(Alloc::global());
         let (mut store, mut body_buckets, mut consts) = (Store::new(front.index.lang("sized"), front.frame), None, Consts::default());
         let mut solved_bodies: Vec<String> = Vec::new();
@@ -546,7 +554,7 @@ fn records_answer_what_the_solved_names_answer() {
             make(&names, None),
             make(&names, None),
             solved_bodies,
-            io,
+            (io, out_ty),
             // The solved heads as text, only when a diff file is asked for.
             std::env::var_os("FRONT2_RECORDS_DIFF").map(|_| heads_dump(&names, &front.keys, &store)),
         )
@@ -667,15 +675,15 @@ fn records_answer_what_the_solved_names_answer() {
     }
     let body_opened = body_records.opened();
 
-    // The proof's planted bug: the item row of `Io` withheld. `main`'s signature names `Io`,
-    // so its head cannot be made and `main`'s outcome must differ.
+    // The proof's planted bug: the item row of `Out` withheld. `main`'s signature names `Out`
+    // (D104: `out: Out`), so its head cannot be made and `main`'s outcome must differ.
     let (withheld, withheld_frame) = reader(keys, crate_names, kept_bodies_planted);
-    withheld.plant_no_item(io);
+    withheld.plant_no_item(out_ty);
     let mut withheld_front = Front2::from_records(withheld, withheld_frame, &lang_crates).unwrap_or_else(|e| panic!("front2 over the withheld records: {e}"));
     let withheld_prepared = Prepares::new_in(Alloc::global());
     let (mut withheld_store, mut withheld_buckets, mut withheld_consts) = (Store::new(withheld_front.index.lang("sized"), withheld_frame), None, Consts::default());
     let withheld_main = body_checked(withheld, withheld_prepared, &mut withheld_front.keys, &withheld_front.index, &mut withheld_store, &mut withheld_buckets, &mut withheld_consts, chosen[0]);
-    assert_ne!(withheld_main, solved_bodies[0], "the planted bug (the item row of `Io` withheld) was not caught: `main` checks the same");
+    assert_ne!(withheld_main, solved_bodies[0], "the planted bug (the item row of `Out` withheld) was not caught: `main` checks the same");
 
     // One candidates question over a reader asked nothing else: the texts it opens.
     let (asked, asked_frame) = reader(keys, crate_names, kept_question);
@@ -824,7 +832,7 @@ fn records_answer_what_the_solved_names_answer() {
 
     // THE ARCHITECT'S TEST (drive.md, "End state: the whole pipeline on the command", piece
     // 12): "`Display for a::T` opens `core` and `a`". Here `a::T` is `Io` (a nominal type of
-    // blaze's own standard library, named by the program's `main`) and the trait is core's
+    // blaze's own standard library, in the prelude the program's root sees) and the trait is core's
     // `fmt::Display`. The Rust Reference, "Implementations", "Trait implementation coherence",
     // "Orphan rules": "Given `impl<P1..=Pn> Trait<T1..=Tn> for T0`, an `impl` is valid only if
     // at least one of the following is true: `Trait` is a local trait; All of: At least one of

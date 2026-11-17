@@ -36,18 +36,18 @@ pub fn included_file<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &st
     crate::include_place::include_place(package, seen, calling, written, alloc).map(|place| place.path)
 }
 
-/// The folder of the file one `include!` call read, from the call's own read list: the one
-/// file read as text that was there. `None` when the call read no file that was there (its
-/// diagnostic says so), read more than one (not an `include!` of one path: nothing is guessed),
-/// or read a file that is not under the package (a build script's output: its `mod x;` keeps
-/// the calling module's folder, as before this rule).
-pub(crate) fn included_dir<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &str, reads: &Reads<'_>, alloc: Alloc<'a>) -> Option<AString<'a>> {
+/// The file one `include!` call read, from the call's own read list: the one file read as text
+/// that was there. It is the current file of every call its text writes (an `include!` in it
+/// reads relative to it: icu_properties_data 2.3.0's `src/lib.rs` includes `data/mod.rs`, which
+/// includes `property_*.rs.data` beside itself), and its folder is where a `mod x;` at its top
+/// is found. `None` when the call read no file that was there (its diagnostic says so), read
+/// more than one (not an `include!` of one path: nothing is guessed), or read a file that is
+/// not under the package (a build script's output: the calling file and module folder stay).
+pub(crate) fn included_read<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &str, reads: &Reads<'_>, alloc: Alloc<'a>) -> Option<AString<'a>> {
     let mut found = reads.list().iter().filter(|read| read.kind == ReadKind::IncludeStr && matches!(read.answer, ReadAnswer::Digest(_)));
     let read = found.next()?;
     if found.next().is_some() {
         return None;
     }
-    let mut path = included_file(package, seen, calling, reads.subject(read), alloc)?;
-    crate::task::pop_dir(&mut path);
-    Some(path)
+    included_file(package, seen, calling, reads.subject(read), alloc)
 }

@@ -1026,3 +1026,8 @@ mod unwind;
 /// Overlap of kept slots (ASYNC.md D-A6), on this file's interpreter.
 #[path = "coroutine_overlap_tests.rs"]
 mod overlap;
+
+/// A split into a state laid out before the LIR, its slots named by the builder
+/// (coroutine_region.rs; ASYNC.md P8, async-P8-4).
+#[path = "coroutine_region_tests.rs"]
+mod region;

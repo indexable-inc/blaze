@@ -885,9 +885,9 @@ impl<A: Allocator + Clone> Layouts<A> {
             }
             // A coroutine's state (coroutine.rs): its upvars' tuple first, a fact of its
             // identity grounded at the owner's arguments; the rest is the pass's (`compute`).
-            PNode::Future(..) => {
+            PNode::Coroutine { .. } => {
                 let facts = cx.facts;
-                let of = crate::coroutine_of(view, t).ok_or(Refusal::Unsupported("an async block's future named by its expression (it has no identity form: coroutine.rs)"))?;
+                let of = crate::coroutine_of(view, t).ok_or(Refusal::Malformed("a coroutine node `coroutine_of` does not read"))?;
                 let c = facts.coroutine(of.owner, of.ordinal).ok_or(Refusal::Unsupported("a coroutine whose facts the world did not answer"))?;
                 let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
                 args.extend_from_slice(view.list(of.owner_args).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
@@ -959,9 +959,9 @@ impl<A: Allocator + Clone> Layouts<A> {
             ),
             PNode::Never => zst(true),
             PNode::FnDef(..) => zst(false),
-            PNode::Coroutine { .. } => {
+            PNode::Future(..) => {
                 return Err(Refusal::Unsupported(
-                    "an async block's future by identity (`PNode::Coroutine`): the builder grounds the `Future(ordinal, output, FnDef)` form (coroutine.rs) until it reads `World::coroutine`",
+                    "an async block's future named by its expression in a ground type (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
                 ));
             }
             PNode::FnPtr(..) => prim(Prim::Ptr, nonnull),
@@ -1089,9 +1089,9 @@ impl<A: Allocator + Clone> Layouts<A> {
             // offset 0, in the size and alignment the pass gave the instance's built body. No
             // scalar form: the bytes past the upvars are the pass's. Its niche is the tag's
             // invalid values (coroutine_niche.rs), when the world answers the tag's range.
-            PNode::Future(..) => {
+            PNode::Coroutine { .. } => {
                 let view = cx.ground.view();
-                let of = crate::coroutine_of(view, t).ok_or(Refusal::Unsupported("an async block's future named by its expression (it has no identity form: coroutine.rs)"))?;
+                let of = crate::coroutine_of(view, t).ok_or(Refusal::Malformed("a coroutine node `coroutine_of` does not read"))?;
                 let args = view.list(of.owner_args).map_err(|_| Refusal::Malformed("a list past the ground table"))?;
                 let state = match cx.facts.coroutine_state(of.owner, of.ordinal, args, view) {
                     Err(missing) => return Err(Refusal::Missing(missing)),

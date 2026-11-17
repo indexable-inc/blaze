@@ -6,12 +6,14 @@
 //! 1. the same text: written twice, equal bytes; both rows answered as written (`Same`);
 //! 2. `g`'s body edited: `f`'s row fresh, its body unchanged, its text read at today's place;
 //!    `g`'s row fresh too (its signature did not change), only its body digest differs;
-//! 3. `f`'s signature edited: `f` alone is `Stale`; `g`, moved, is fresh with its body unchanged;
+//! 3. `f`'s signature edited (a parameter added: a type-level edit `Surface` leaves out): `f` is
+//!    fresh with its body changed, read at today's place (the row holds no head: D114 ruling);
+//!    `g`, moved, is fresh with its body unchanged;
 //! 4. a blank line and a comment inserted above `f`: nothing is stale, and each row's text is
 //!    found at its new place (rule 71: no row holds a position from the file's start).
 //!
-//! A file-grain record (any edit voids every row of its file) fails 2, 3 and 4; a head that
-//! takes the body fails 2 (`g` stale); a chain that holds a file offset fails 4.
+//! A file-grain record (any edit voids every row of its file) fails 2, 3 and 4; a row that
+//! compares a head fails 3 (`f` stale); a chain that holds a file offset fails 4.
 //!
 //! Expected, from `LANECHECK_WAIT=540 bash /Volumes/Projects/blaze-int-1112-notes/lanecheck.sh
 //! blaze-scope test an_edit_voids_only_the_items_it_touches`:
@@ -23,7 +25,7 @@ use blaze_own::Alloc;
 use super::entry::{Texts, input};
 use crate::crate_scope::{Ready, resolve_by_records};
 use crate::graph::Sysroot;
-use crate::items_record::grain::{head_of, today};
+use crate::items_record::grain::today;
 use crate::items_record::{ItemNow, ItemRow, ItemsRecord, LoadItems, RecordItems, encode};
 use crate::resolve::{At, aligned};
 use crate::task::Serial;
@@ -130,14 +132,11 @@ fn an_edit_voids_only_the_items_it_touches() {
     fresh("`g` after its body edit", now(bytes, names.key, G_BODY, gk), &was_g, "fn g() -> u8 { 2 }", true);
     let outline = blaze_file_items::outline(G_BODY, record.edition(), g);
     let g_now = today(&outline, G_BODY, pieces_g.chain).unwrap_or_else(|| panic!("`g`'s chain is not in the edited text"));
-    assert!(head_of(&g_now.item) == pieces_g.head, "`g`'s head piece changed with its body");
     assert!(g_now.item.hash != pieces_g.body, "`g`'s body piece did not change with its body");
 
-    // 3. `f`'s signature edited: `f` alone is stale.
-    match now(bytes, names.key, F_SIGNATURE, f) {
-        ItemNow::Stale { key, found: Some(found), saw, .. } if key == f && found != saw => {}
-        other => panic!("`f` with a new signature is not stale: {other:?}"),
-    }
+    // 3. `f`'s signature edited: `f` is fresh at today's place, its body changed (the row
+    // holds no head; the edit moves `f`'s `Signature`, not its row).
+    fresh("`f` after its signature edit", now(bytes, names.key, F_SIGNATURE, f), &was_f, "fn f(a: u8, b: u8) -> u8 { a }", true);
     fresh("`g` after `f`'s signature edit", now(bytes, names.key, F_SIGNATURE, gk), &was_g, G_TEXT, false);
 
     // 4. Lines inserted above `f`: nothing stale, each row at its new place.

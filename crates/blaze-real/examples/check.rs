@@ -153,7 +153,7 @@ impl<W: World> World for Timed<'_, W> {
     fn traits_in_scope(&self, seal: Seal, scope: ScopeId) -> Fetch<&[ItemKey]> {
         self.time(7, || self.inner.traits_in_scope(seal, scope))
     }
-    fn resolve_path(&self, seal: Seal, scope: ScopeId, path: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
+    fn resolve_path(&self, seal: Seal, scope: ScopeId, path: PathIdx, segments: &[Name]) -> Fetch<blaze_typeck::PathAnswer> {
         self.time(8, || self.inner.resolve_path(seal, scope, path, segments))
     }
     fn lang_item(&self, seal: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
@@ -561,6 +561,7 @@ fn run_crate(dir: &Path, census: &mut Census, costs: &mut Vec<Cost>, restart: &m
                         CheckError::DiagWithoutPlace { code, .. } => format!("check: diagnostic without a place {}", code.code()),
                         CheckError::ImplTraitArity { .. } => "check: an impl header's trait arguments miscounted (Self first?)".to_string(),
                         CheckError::OpaqueHiddenUnknown { .. } => "check: an auto trait of an opaque whose hidden type was not given".to_string(),
+                        CheckError::TraitDefaultsNotKnown { .. } => "check: a qualified path's trait defaults not read".to_string(),
                         CheckError::Limit(l) => format!("check: limit {l:?}"),
                         CheckError::Malformed(m) => format!("check: malformed {}", variant(&format!("{m:?}"))),
                         CheckError::Solve(s) => format!("check: solver {}", variant(&format!("{s:?}"))),
@@ -867,8 +868,9 @@ impl World for Empty {
     fn traits_in_scope(&self, _: Seal, _: ScopeId) -> Fetch<&[ItemKey]> {
         Ok(&[])
     }
-    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, _: &[Name]) -> Fetch<Option<PathRes>> {
-        Ok(None)
+    /// A world with no names: every path's first segment names nothing.
+    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, _: &[Name]) -> Fetch<blaze_typeck::PathAnswer> {
+        Ok(Err(blaze_typeck::PathMiss::FIRST))
     }
     fn lang_item(&self, _: Seal, _: LangItem) -> Fetch<Option<ItemKey>> {
         Ok(None)
@@ -988,6 +990,7 @@ fn forms_file(rel: &str, text: &str, rules: &'static [(&'static str, blaze_expan
                         CheckError::DiagWithoutPlace { code, .. } => format!("check: diagnostic without a place {}", code.code()),
                         CheckError::ImplTraitArity { .. } => "check: an impl header's trait arguments miscounted (Self first?)".to_string(),
                         CheckError::OpaqueHiddenUnknown { .. } => "check: an auto trait of an opaque whose hidden type was not given".to_string(),
+                        CheckError::TraitDefaultsNotKnown { .. } => "check: a qualified path's trait defaults not read".to_string(),
                         CheckError::Limit(l) => format!("check: limit {l:?}"),
                         CheckError::Malformed(m) => format!("check: malformed {}", variant(&format!("{m:?}"))),
                         CheckError::Solve(s) => format!("check: solver {}", variant(&format!("{s:?}"))),

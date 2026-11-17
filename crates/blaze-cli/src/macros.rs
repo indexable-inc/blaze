@@ -65,7 +65,7 @@ impl Place<'_, '_> {
     /// package-relative paths and bytes (rule 25), and what the lookup's own key holds through
     /// the units' source (rule 21); `None` for a package that is no member, or a member no row
     /// of which was read (then `PathWithoutFolder`, by name).
-    fn member_files(&self, id: LockId) -> Option<std::string::String> {
+    pub(crate) fn member_files(&self, id: LockId) -> Option<std::string::String> {
         let (_, dir) = self.members?.iter().find(|(member, _)| *member == id)?;
         crate::macro_files::member_hex(self.rows, dir.as_str())
     }
@@ -171,7 +171,7 @@ pub(crate) fn run<'b>(
         };
         let read = crate::work::payload(&cx, store, graph, frame)?;
         let listed = match lock {
-            Some(lock) => list(read.payload(), lock, &modules, &place),
+            Some(lock) => list(read.unit_graph(graph.name)?.graph, lock, &modules, &place),
             None => Err(MacrosError::NoLock),
         };
         match listed {

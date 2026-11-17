@@ -13,7 +13,7 @@ use blaze_sim::{Broke, Config, Tape};
 
 use super::{KRATE, NAMES, SPACES, file, key, name, small};
 use crate::{
-    AmbiguityKind, AnonImport, Binding, BindingState, BuildError, CallShape, ChildModDecl,
+    AmbiguityKind, AnonImport, Binding, BindingState, BuildError, CallRole, CallShape, ChildModDecl,
     CrateRootBuilder, CrateRootHead, CrateRootView, DeclaredItem, DeclsBuilder, Def, DefKind, Dep,
     Edition, ExternCrateDecl, ExternTarget, MacroCallDecl, MacroRulesDecl, MacroShapes, ModuleDeclsView,
     ModuleInfo, Origin, Path, PathKind, Rename, ScopeBuilder, ScopeEntry, ScopeError, ScopeView,
@@ -157,7 +157,12 @@ fn full_scope(tape: &Tape) -> ScopeBuilder<'static, &'static str> {
         let (ns, name_) = (SPACES[usize::try_from(tape.below(3, "ns")).expect("below 3")], name(tape));
         let error = match tape.below(9, "error") {
             0 => ScopeError::Import { site: site(tape), path: path(tape), segment: small(tape, 4, "segment"), why: Unresolved::NotFound },
-            1 => ScopeError::Macro { call: key(90), path: path(tape), segment: 0, why: Unresolved::Ambiguous(AmbiguityKind::GlobVsOuter) },
+            1 => ScopeError::Macro {
+                call: key(90),
+                path: path(tape),
+                segment: 0,
+                why: if tape.coin("derive after") { Unresolved::DeriveAfterAttrMacro } else { Unresolved::Ambiguous(AmbiguityKind::GlobVsOuter) },
+            },
             2 => ScopeError::ExternCrate { name: name_ },
             3 => ScopeError::RestrictedNotAncestor { path: path(tape) },
             4 => ScopeError::Duplicate { ns, name: name_, first: def(tape), second: def(tape) },
@@ -269,7 +274,12 @@ fn module_decls_round_trip_in_source_order() {
         for n in 0..u8::try_from(tape.below(3, "calls")).expect("below 3") {
             let kind = [CallShape::FnLike, CallShape::Attr, CallShape::Derive][usize::from(n)];
             let item = (kind != CallShape::FnLike).then_some(u32::from(n));
-            decls.calls.push(MacroCallDecl { call: key(160 + n), path: path(tape), kind, pos: 30 + u32::from(n), item });
+            let role = match kind {
+                CallShape::Attr => [CallRole::Call, CallRole::AfterDerive, CallRole::Keep, CallRole::AfterDeriveBeforeDerive]
+                    [usize::try_from(tape.below(4, "role")).expect("below 4")],
+                CallShape::FnLike | CallShape::Derive => CallRole::Call,
+            };
+            decls.calls.push(MacroCallDecl { call: key(160 + n), path: path(tape), kind, pos: 30 + u32::from(n), item, role });
         }
         let info = ModuleInfo { krate: KRATE, parent: Some(key(199)), name: Some(name(tape)), no_implicit_prelude: tape.coin("nip") };
         let bytes = decls.write(key(200), &info, blaze_own::testing::heap().alloc()).map_err(|error| Broke::Oracle(error.to_string()))?;

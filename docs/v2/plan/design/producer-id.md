@@ -118,7 +118,14 @@ top-level `tests/`, `benches/`, `examples/` and `target/` and any name starting 
 root, length, bytes); then the `[workspace.dependencies]` entries the closure names (each value
 whole, so a header-form entry counts), `[workspace.package] edition`, the lock rows (name,
 version, source, checksum) of every outside crate reached and, transitively, of theirs, and the
-toolchain file. Nothing of the machine (rule 25). The core is a state machine (`Walk`: it asks
+toolchain file. A lock row with no source is a path crate (a `[patch]` under vendor/, which the
+walk reads like a path dependency): it joins the closure and is digested by its files. An
+`optional = true` dependency the lock lacks is one no feature turned on: not built, not an input.
+A name a closure reaches that the lock lacks (the lock and the sources of different moments, as
+a snapshot mix builds) refuses that row alone: the step warns naming the crate and the row,
+writes it `None`, and the entry keys it by the binary's build id (piece 1's key: made again by
+every rebuilt blaze, never read stale); the other rows stand. Only the disk failing under the
+step stops the build; nothing in it panics. Nothing of the machine (rule 25). The core is a state machine (`Walk`: it asks
 for a file or a listing by workspace-relative path, the driver answers), tested on an in-memory
 tree. It writes `$OUT_DIR/producer_sources.rs` (a `Sources` value of row names and digests,
 rewritten only when its bytes change) and `cargo::rerun-if-changed` for the root manifest, the
@@ -176,7 +183,9 @@ Merkle graph), and the over-approximations above go.
      key 1"): not counted;
    - a producer string is any of: a literal passed to `producer(..)` (blaze-units' and
      blaze-tree's `Query::PRODUCER`, "the number raised with every change to what the query
-     computes", sixteen on 2026-11-16); a date in the text ("2026-11-16.8"); two or more
+     computes": sixteen, in crates outside the workspace's members, which the walk skips, so
+     the list held 2 on 2026-11-16: blaze-cond `KEY_CONTEXT` and blaze-run `read_name`, both
+     dated); a date in the text ("2026-11-16.8"); two or more
      whole-word numbers ("lower body 10, parser 1"; `v2`, `x86-64`, `blake3` are words); a domain
      constant named for code (`CHECKER`, `EXPANDER`, `PRODUCER`, `LOWERING`, `SOLVER`, `BUILDER`
      as a `_` word) in a file that hashes (DWARF's `PRODUCER = b"blaze\0"` is in one that does

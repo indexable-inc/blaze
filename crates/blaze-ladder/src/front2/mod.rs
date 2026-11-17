@@ -15,17 +15,25 @@ mod async_output;
 mod back_needs;
 pub mod block_crates;
 pub mod expansion_blocks;
+pub mod expansion_origin;
 pub mod block_traits;
 pub mod body;
 pub mod body_host;
+pub mod body_left;
 pub mod body_reads;
 pub mod borrow_reads;
 pub mod borrows;
 pub mod borrows_print;
 pub mod borrows_nested;
+pub mod borrows_unmade;
 mod bound_kids;
 pub mod buckets;
 pub mod call_generics;
+/// The impl text a member's signature is read with, and its read row (sig-assoc-projection).
+pub mod sig_impl;
+/// The impl-text row keyed by the impl (sig-assoc-per-call, part L).
+#[cfg(test)]
+mod sig_impl_tests;
 pub mod check;
 pub mod by_origin;
 pub mod const_at;
@@ -35,25 +43,33 @@ mod const_open;
 mod const_param_ty;
 pub mod const_inherent;
 pub mod const_project;
+pub mod const_fn_fact;
 pub mod const_qpath;
 pub mod const_select;
+mod const_drop;
 pub mod consts;
+pub(crate) mod coroutine_needs;
+pub mod coroutine_recipes;
 pub(crate) mod coroutines;
 pub mod dyn_ty;
 pub mod fill;
 pub mod fn_attrs;
 pub(crate) mod fmt_template;
 pub mod gat;
+mod gat_bounds;
 pub mod glob_uses;
 pub mod foreign_closures;
 pub mod foreign_locals;
+pub mod llvm_intrinsic;
 pub mod head_record;
+pub mod head_text;
 pub mod heads;
 pub mod index;
 pub mod keys;
 pub mod linked;
 pub mod langs;
 pub mod lifetimes;
+pub(crate) mod links;
 pub mod locals;
 mod member_names;
 pub mod lower_made;
@@ -61,6 +77,10 @@ pub mod on_unimplemented;
 pub mod opaque_auto;
 pub mod own_trait;
 pub mod alloc_shim;
+pub mod internal_symbol;
+/// The soft-float routines (`__addtf3` ..) bound from the program's compiler_builtins
+/// (INTRINSICS.md 3.5, P5b).
+pub mod builtins_shim;
 pub mod panic_entry;
 pub mod pattern_ty;
 pub mod nested_exports;
@@ -84,11 +104,19 @@ pub mod texts;
 mod type_expand;
 pub mod types;
 pub mod world_items;
+/// The world's E0425 answer: the segment a body path stopped at.
+mod world_path_miss;
+/// The note an E0425 carries when the path's written `std` is bstd.
+mod std_is_bstd;
 pub mod world_paths;
+/// An E0425 finding's words.
+mod path_miss_shown;
 mod adt_paths;
 mod static_shown;
 mod written;
 pub mod header_written;
+pub mod item_shown;
+pub mod row_path;
 
 use blaze_scope::resolve::Names;
 

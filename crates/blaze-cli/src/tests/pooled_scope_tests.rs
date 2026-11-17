@@ -22,7 +22,11 @@ fn workspace(io: &Io) {
         ("x", None, "pub mod m;\n#[macro_export]\nmacro_rules! twice { ($e:expr) => { $e + $e } }\npub const NAME: &str = env!(\"CARGO_PKG_NAME\");\n"),
         ("y", None, "pub mod m;\npub struct Y;\npub const NAME: &str = env!(\"CARGO_PKG_NAME\");\n"),
         ("u", Some("x"), "pub mod m;\npub use x::m::f;\npub fn g() -> u32 { x::twice!(f()) }\n"),
-        ("v", Some("y"), "pub mod m;\npub use y::m::f;\npub fn g() -> y::Y { y::Y }\n"),
+        // `use y::Y`: a name only `y` exports, so a record read in `y`'s stead is an unresolved
+        // import (`y::m::f` alone is not: `x` has an `m::f` at the same place, and a type path
+        // in a signature is not the scope's to resolve; the control stopped failing that way,
+        // 2026-11-16 20:49, once the sysroot's crates joined each list).
+        ("v", Some("y"), "pub mod m;\npub use y::m::f;\npub use y::Y;\npub fn g() -> Y { Y }\n"),
     ] {
         let deps = dep.map_or(std::string::String::new(), |dep| std::format!("\n[dependencies]\n{dep} = {{ path = \"../{dep}\" }}\n"));
         write(io, &std::format!("{name}/Cargo.toml"), &std::format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{deps}"));

@@ -656,9 +656,16 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // The crate's host, the one item-level expansion answers from (census 13, brief 13): env,
     // includes, proc macros; `NoHost` refused them all.
     let host = super::body_host::BodyHost::of(names, store.sources, krate, item, module, Alloc::global());
+    let body_sources = store.sources;
     let mut expand = ByName::with_names(&scoped, host, Alloc::global());
     let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, text, blocks: None };
     let lowered = blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, Alloc::global());
+    // D111: a body call's proc-macro read outside the member is a finding at the call, filed
+    // through the item host's one filing (body_left.rs), whatever the body's own outcome.
+    if let Some(sources) = body_sources {
+        let place = super::body_left::body_place(names, krate, item, text.len());
+        super::body_left::file_body_left_reads(sources, krate, place, expand.call_reads(), expand.reads(), Alloc::global());
+    }
     match values.failed {
         Some(ValuesFail::Resolve(error)) => return Err(BodyError::PatternName { item, error }),
         Some(ValuesFail::Head(error)) => return Err(BodyError::Head { item, error }),

@@ -42,6 +42,9 @@ pub struct AsmForm {
     pub operands: List,
     pub options: u16,
     pub clobber_abis: List,
+    /// The target's architecture, read as `target_arch` atoms at the `asm!`
+    /// (machine/asm_arch.rs): `None` when no tabled one holds. Kept in `flags` bits 12..16.
+    pub arch: Option<blaze_typeck::AsmArch>,
 }
 
 impl AsmForm {
@@ -64,7 +67,12 @@ impl AsmForm {
         n.d = self.operands.len;
         n.e = self.clobber_abis.start;
         n.f = self.clobber_abis.len;
-        n.flags = self.options;
+        let arch: u16 = match self.arch {
+            None => 0,
+            Some(blaze_typeck::AsmArch::Aarch64) => 1,
+            Some(blaze_typeck::AsmArch::X86_64) => 2,
+        };
+        n.flags = (self.options & 0x0fff) | (arch << 12);
         n
     }
 
@@ -72,11 +80,18 @@ impl AsmForm {
         if n.tag != ROW_ASM {
             return Err(BadRow { column: "asm", tag: n.tag });
         }
+        let arch = match n.flags >> 12 {
+            0 => None,
+            1 => Some(blaze_typeck::AsmArch::Aarch64),
+            2 => Some(blaze_typeck::AsmArch::X86_64),
+            _ => return Err(BadRow { column: "asm", tag: n.tag }),
+        };
         Ok(AsmForm {
             pieces: List { start: n.a, len: n.b },
             operands: List { start: n.c, len: n.d },
-            options: n.flags,
+            options: n.flags & 0x0fff,
             clobber_abis: List { start: n.e, len: n.f },
+            arch,
         })
     }
 }
@@ -776,6 +791,8 @@ impl Machine<'_, '_, '_> {
             }
             None => malformed = true,
         }
+        // The target's architecture, a read of the record (main's ruling (A), P9b).
+        let arch = self.asm_arch(r);
         if broken {
             return Expr::Missing;
         }
@@ -783,7 +800,7 @@ impl Machine<'_, '_, '_> {
             self.diag(DiagKind::Asm(AsmRule::Malformed), r);
             return Expr::Missing;
         }
-        match self.asm_form(&templates, &kinds, &operands, options, &clobbers, r) {
+        match self.asm_form(&templates, &kinds, &operands, options, &clobbers, arch, r) {
             Ok(row) => Expr::Asm { row },
             Err(Refusal::Rule(rule, at)) => {
                 self.diag(DiagKind::Asm(rule), at);
@@ -804,6 +821,7 @@ impl Machine<'_, '_, '_> {
         operands: &[(Node, Range)],
         options: u16,
         clobbers: &[u32],
+        arch: Option<blaze_typeck::AsmArch>,
         r: Range,
     ) -> Result<RowIdx, Refusal> {
         if templates.is_empty() {
@@ -908,6 +926,6 @@ impl Machine<'_, '_, '_> {
         let pieces = self.put_rows_of(&pieces);
         let operands = self.put_rows_of(operands);
         let clobber_abis = self.put_ids_of(clobbers);
-        Ok(self.put_row(AsmForm { pieces, operands, options, clobber_abis }.encode(), r))
+        Ok(self.put_row(AsmForm { pieces, operands, options, clobber_abis, arch }.encode(), r))
     }
 }

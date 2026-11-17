@@ -69,7 +69,7 @@ fn tiny() -> (AVec<'static, u8>, AVec<'static, u8>) {
 }
 
 fn program<'r>(functions: &'r [Function<'r>], data: &'r [Data<'r>], profile: Option<Profile<'r>>) -> ProgramIn<'r> {
-    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile }
+    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile, natives: None, exports: &[] }
 }
 
 fn functions<'r>(main: &'r [u8], second: &'r [u8]) -> [Function<'r>; 2] {

@@ -88,8 +88,21 @@ pub const HEAD_BYTES: usize = 8 + 4 + 8 + 4 + 4 + 4;
 pub type Vals = [u64; OPERANDS];
 
 /// The placeholder register of each operand: distinct, never 31 (`sp`/`xzr`), never the scratch
-/// pair x16/x17 the templates name themselves.
-const PLACEHOLDER_REG: [u64; OPERANDS] = [1, 2, 3, 4, 5, 6, 7];
+/// pair x16/x17 the templates name themselves. Each has an even number of set bits, so one flip
+/// of one bit of one never makes another (two inputs in one register would be one value to a
+/// compiler generating through [`discover`], which folds `x - x`: the LLVM generator, T2); and
+/// no one-bit flip of any reaches x18 (reserved on macOS), x29, x30 or x31.
+const PLACEHOLDER_REG: [u64; OPERANDS] = [3, 5, 6, 9, 10, 12, 20];
+
+/// The placeholder of an immediate operand, masked to its slot's bits: never 0 (a compiler folds
+/// `a + 0` to a move), at least two bits set in every low run, so no single flip makes it 0.
+const PLACEHOLDER_IMM: u64 = 0x5555_5555_5555_5555;
+
+/// Operand `operand`'s value in the second linearity probe: [`IRREGULAR`] rotated by a byte per
+/// operand number, so no two operands share a register (5 bits: 15, 13, 14, 12, 7, 5, 25).
+pub const fn irregular_of(operand: u8) -> u64 {
+    IRREGULAR.rotate_right(8 * operand as u32)
+}
 
 /// A template's bytes as an encoder writes them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -251,12 +264,15 @@ pub(crate) enum Plant {
     DropFromBit,
 }
 
-/// The placeholder values of `slots`: a distinct register per register operand, 0 for the rest.
+/// The placeholder values of `slots`: a distinct register per register operand,
+/// [`PLACEHOLDER_IMM`] masked to its bits per immediate operand, 0 for the rest.
 pub fn placeholders(slots: &[Slot]) -> Vals {
     let mut vals = [0; OPERANDS];
     for slot in slots {
-        if let (SlotKind::Reg, Some(at)) = (slot.kind, vals.get_mut(usize::from(slot.operand))) {
-            *at = PLACEHOLDER_REG[usize::from(slot.operand)];
+        match (slot.kind, vals.get_mut(usize::from(slot.operand))) {
+            (SlotKind::Reg, Some(at)) => *at = PLACEHOLDER_REG[usize::from(slot.operand)],
+            (SlotKind::Imm, Some(at)) => *at = PLACEHOLDER_IMM & mask(u32::from(slot.bits)),
+            _ => {}
         }
     }
     vals
@@ -416,10 +432,10 @@ pub fn discover<'a>(recipe: &Recipe<'_>, bytes: &mut AVec<'a, u8>, fields: &mut 
     if probe[..len] != base.bytes[..len] {
         return Err(GenError::Nonlinear { pattern, operand: u8::MAX });
     }
-    // Probe 2: an irregular value in every operand at once.
+    // Probe 2: an irregular value in every operand at once, each operand its own.
     let mut vals = base_vals;
     for slot in recipe.slots {
-        vals[usize::from(slot.operand)] = IRREGULAR & mask(u32::from(slot.bits));
+        vals[usize::from(slot.operand)] = irregular_of(slot.operand) & mask(u32::from(slot.bits));
     }
     let mut want = Code::new();
     (recipe.encode)(&vals, &mut want);
@@ -436,15 +452,27 @@ pub fn discover<'a>(recipe: &Recipe<'_>, bytes: &mut AVec<'a, u8>, fields: &mut 
 /// bits of its operand.
 pub(crate) const IRREGULAR: u64 = 0x0123_4567_89ab_cdef ^ 0x5a5a_0000_a5a5_0000;
 
-/// One generated row before it is written.
+/// One generated row before it is written: its template's bytes and fields are
+/// `bytes[bytes_at..][..bytes_len]` and `fields[fields_at..][..fields_len]` of the buffers handed
+/// to [`write_table`] with it.
 #[derive(Clone, Copy, Debug)]
-struct Row {
-    pattern: Pattern,
-    bytes_at: usize,
-    bytes_len: usize,
-    fields_at: usize,
-    fields_len: usize,
-    clobbers: RegSet,
+pub struct Row {
+    pub pattern: Pattern,
+    pub bytes_at: usize,
+    pub bytes_len: usize,
+    pub fields_at: usize,
+    pub fields_len: usize,
+    pub clobbers: RegSet,
+}
+
+/// Every recipe of `machine`'s table, handed to `each` in a fixed order: the patterns and slots
+/// the LLVM generator (blaze-llvm table_gen.rs, T2) runs LLVM's code through. x86-64 places its
+/// fields by the manual's rules, not by recipes: [`GenError::Machine`].
+pub fn recipes(machine: Machine, each: &mut dyn FnMut(&Recipe<'_>) -> Result<(), GenError>) -> Result<(), GenError> {
+    match machine.arch {
+        Arch::Arm64 => arm64::recipes(each),
+        Arch::X86_64 => Err(GenError::Machine { machine }),
+    }
 }
 
 /// The table of `machine` in piece 0's record form, appended to `out`; its head (count and
@@ -508,6 +536,20 @@ pub(crate) fn generate_planted<'a>(
             }
         }
     }
+    write_table(machine, Source::Encoders, &mut rows, &bytes, &fields, out)
+}
+
+/// `rows` (sorted here by pattern; a pattern twice is [`GenError::Repeated`]) with their bytes and
+/// fields, in piece 0's record form, appended to `out`; the head (count and BLAKE3 of the bytes
+/// appended). The one writer of the form: the encoders' generator and LLVM's (T2) both end here.
+pub fn write_table(
+    machine: Machine,
+    source: Source,
+    rows: &mut [Row],
+    bytes: &[u8],
+    fields: &[Field],
+    out: &mut AVec<'_, u8>,
+) -> Result<TableHead, GenError> {
     rows.sort_unstable_by(|a, b| a.pattern.cmp(&b.pattern));
     for pair in rows.windows(2) {
         if pair[0].pattern == pair[1].pattern {
@@ -520,7 +562,7 @@ pub(crate) fn generate_planted<'a>(
     let fields_len = u32::try_from(fields.len()).map_err(|_| GenError::TooMany { what: "field count" })?;
     let start = out.len();
     out.extend_from_slice(&TABLE_MAGIC);
-    out.extend_from_slice(&[arch_byte(machine.arch), os_byte(machine.os), source_byte(Source::Encoders), 0]);
+    out.extend_from_slice(&[arch_byte(machine.arch), os_byte(machine.os), source_byte(source), 0]);
     out.extend_from_slice(&machine.features.to_le_bytes());
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&bytes_len.to_le_bytes());
@@ -548,7 +590,7 @@ pub(crate) fn generate_planted<'a>(
         }
     }
     let digest = blaze_blake3::hash(&out[start..]);
-    Ok(TableHead { machine, source: Source::Encoders, count, digest })
+    Ok(TableHead { machine, source, count, digest })
 }
 
 const fn arch_byte(arch: Arch) -> u8 {

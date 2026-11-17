@@ -100,7 +100,15 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         }
         let t = self.ret;
         if self.async_sites.last() != Some(&true) {
-            self.diag(DiagCode::AwaitOutsideAsync, At::Expr(e), None, None, None);
+            // The Reference, "Await expressions", [expr.await.allowed-positions].
+            self.diag(
+                DiagCode::AwaitOutsideAsync,
+                At::Expr(e),
+                crate::diag::About::Rule {
+                    rule: "expr.await.allowed-positions",
+                    says: "Await expressions are legal only within an async context, like an async fn, async closure, or async block.",
+                },
+            );
             return Ok(Flow::Done(self.common.err));
         }
         if self.is_err(t) {

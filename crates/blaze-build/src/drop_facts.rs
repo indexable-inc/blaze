@@ -129,10 +129,10 @@ pub fn needs_drop<'g, E>(
             // The underlying type is not known: its destructor may do anything.
             PNode::Dynamic(_) => return Ok(true),
             // A coroutine's drop is its pass's `drop`, which reads the state's tag.
-            PNode::Future(..) => return Ok(true),
-            PNode::Coroutine { .. } => {
+            PNode::Coroutine { .. } => return Ok(true),
+            PNode::Future(..) => {
                 return Err(NeedsDropError::Ground(BuildError::UnsupportedSig {
-                    what: "an async block's future by identity (`PNode::Coroutine`): the builder grounds the `Future(ordinal, output, FnDef)` form (coroutine.rs) until it reads `World::coroutine`",
+                    what: "an async block's future named by its expression in a ground type (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
                 }));
             }
             PNode::Closure { owner, ordinal, args: l } => {

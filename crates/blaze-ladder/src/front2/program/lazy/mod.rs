@@ -83,8 +83,8 @@ pub enum LazyRefusal {
 impl core::fmt::Display for LazyRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            LazyRefusal::UnknownKey { key } => write!(f, "front2 (lazy): no item, filed member or row has key {key:?}"),
-            LazyRefusal::AskedTwice { key } => write!(f, "front2 (lazy): the body of {key:?} was asked for twice in one run"),
+            LazyRefusal::UnknownKey { key } => write!(f, "front2 (lazy): no item, filed member or row has key {:032x}", key.0),
+            LazyRefusal::AskedTwice { key } => write!(f, "front2 (lazy): the body of the item with key {:032x} was asked for twice in one run", key.0),
             LazyRefusal::Lower { function, error } => write!(f, "front2 (lazy): `{function}`'s body did not lower: {error:?}"),
             LazyRefusal::Spell { function } => write!(f, "front2 (lazy): `{function}`'s names could not be spelled"),
             LazyRefusal::Check { function, error } => write!(f, "front2 (lazy): `{function}` did not check clean: {error:?}"),

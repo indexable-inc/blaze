@@ -1582,7 +1582,7 @@ impl<'a> Lower<'a> {
                 continue;
             };
             let pos = self.next_pos();
-            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Derive, pos, item: Some(idx.0) });
+            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Derive, pos, item: Some(idx.0), role: blaze_surface::CallRole::Call });
             let src = CallSrc { module: self.module, name: path, input: "", kind: CallShape::Derive, loc: self.loc(at), depth: self.depth };
             self.out.calls.push((call, src));
         }
@@ -1745,7 +1745,7 @@ impl<'a> Lower<'a> {
                 };
                 let call = key;
                 let pos = self.next_pos();
-                self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::FnLike, pos, item: None });
+                self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::FnLike, pos, item: None, role: blaze_surface::CallRole::Call });
                 let src = CallSrc {
                     module: self.module,
                     name: path_text,

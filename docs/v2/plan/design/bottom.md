@@ -693,7 +693,10 @@ port27/world-1116/nr.txt), `items.use`, and RFC 1560; no compiler's behaviour is
    so a plain first segment whose inner scope was undecided goes outward (R6) and the import may
    RESOLVE: then only the members that resolved are decided that round, and the rest are tried
    again with the facts ("nothing more comes" holds only for what fails); with none resolved,
-   all fail. A spared call still expands, so "nothing more comes" is false for whatever waits
+   all fail. The cell core needs no such round: it decides a stalled group from the group's
+   least fixed point, where the rest already read what the resolved members bring
+   (d116-decide-4: without the round, 0 differences on std's 12 crates and tempo's 506; the
+   oracle keeps the round). A spared call still expands, so "nothing more comes" is false for whatever waits
    on it: in a round with a spared call only the calls a spared call's textual read waits on
    fail (they define nothing first), and the rest are tried again (2026-11-16 08:00: the
    reference failed `use crate::m2::*` beside a spared `mk!` writing `mod m2`, contradicting

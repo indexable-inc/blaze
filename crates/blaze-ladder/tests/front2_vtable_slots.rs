@@ -39,7 +39,7 @@ use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 use blaze_typeck::{ItemKey, PNode};
 
-const SLOTS: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+const SLOTS: &str = "fn main(cx: &Cx) -> Result<(), Error> {
     Ok(())
 }
 

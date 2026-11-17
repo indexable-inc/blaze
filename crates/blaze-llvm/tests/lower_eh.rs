@@ -155,19 +155,45 @@ fn invoke_and_cleanup_reach_llvms_object() {
 }
 
 /// The lowered cleanup, compiled and read back by crate::read (D3 with P8b's LSDA reader), is a
-/// record whose rows hold a Cleanup row and nothing but Cleanup and Continue rows: the landing
-/// pad survived LLVM and reads as the action LIR gave it.
+/// record whose rows hold a Cleanup row and nothing but Cleanup and Continue rows, and whose
+/// frame saves the pair x19:x20. The exception is live across `dropper(e)` until `resume e`, so
+/// LLVM keeps it in x19 and saves the pair in the platform's order (x19 at CFA - 24), which is
+/// blaze-code unwind.rs's one frame form (unwind-P8a-4). Before that ruling the reader refused
+/// this frame: "a saved pair is not its lower register at CFA - 32 - 16k ...".
 /// Passes: "test a_lowered_cleanup_reads_back_as_a_cleanup_row ... ok".
 #[test]
 fn a_lowered_cleanup_reads_back_as_a_cleanup_row() {
     let obj = object(&ir_of(&invokes(BlockKind::Cleanup)));
-    let outside = [name(2), name(3)];
+    // LLVM lowers `resume` to a call of the unwinder's `_Unwind_Resume` (Mach-O `__Unwind_Resume`,
+    // read without the leading underscore): an outside C name the caller resolves, as it
+    // resolves every outside name (read.rs, D100 point 11).
+    let outside = [name(2), name(3), "_Unwind_Resume".to_owned()];
     let names = |text: &str| outside.iter().any(|n| n == text).then(|| Target { space: Space::Outside, symbol: Symbol::of_name(text) });
     let e = read_object(&obj, &name(1), &names, alloc()).unwrap_or_else(|e| panic!("{e}"));
     assert!(e.unwind.iter().any(|row| row.action == Action::Cleanup), "a Cleanup row: {:?}", &e.unwind[..]);
     assert!(
         e.unwind.iter().all(|row| matches!(row.action, Action::Cleanup | Action::Continue)),
         "only Cleanup and Continue rows: {:?}",
+        &e.unwind[..]
+    );
+    let frame = e.unwind_frame.expect("the cleanup's frame is described");
+    assert!(frame.x_pairs & 1 != 0, "the pair x19:x20 is saved (the exception is kept across the drop): {frame:?}");
+}
+
+/// The lowered catch, read back the same way, is a record whose rows hold a Catch row and
+/// nothing but Catch and Continue rows: its frame is the plain record (nothing is kept across a
+/// call).
+/// Passes: "test a_lowered_catch_reads_back_as_a_catch_row ... ok".
+#[test]
+fn a_lowered_catch_reads_back_as_a_catch_row() {
+    let obj = object(&ir_of(&invokes(BlockKind::Catch)));
+    let outside = [name(2), name(3)];
+    let names = |text: &str| outside.iter().any(|n| n == text).then(|| Target { space: Space::Outside, symbol: Symbol::of_name(text) });
+    let e = read_object(&obj, &name(1), &names, alloc()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(e.unwind.iter().any(|row| row.action == Action::Catch), "a Catch row: {:?}", &e.unwind[..]);
+    assert!(
+        e.unwind.iter().all(|row| matches!(row.action, Action::Catch | Action::Continue)),
+        "only Catch and Continue rows: {:?}",
         &e.unwind[..]
     );
 }

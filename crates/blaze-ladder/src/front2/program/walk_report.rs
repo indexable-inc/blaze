@@ -367,7 +367,7 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
     // The failure classes: a count and the first fn, by count, ties in the order first met.
     let mut causes: AVec<'_, (&str, usize, AString<'_>)> = AVec::new_in(alloc);
     for (k, r) in census.fns.iter() {
-        if let Reached::Failed { class, detail } = r {
+        if let Reached::Failed { class, detail, .. } = r {
             match causes.iter_mut().find(|x| x.0 == &**class) {
                 Some(x) => x.1 += 1,
                 None => {

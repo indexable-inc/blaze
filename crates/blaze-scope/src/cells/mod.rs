@@ -19,11 +19,12 @@ use core::fmt;
 
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc};
-use blaze_surface::{DeclsBuilder, SurfaceError};
+use blaze_surface::{CallRole, DeclsBuilder, SurfaceError};
 
 use crate::facts::ScopeFacts;
 use crate::{AmbiguityKind, CallShape, Def, DefKind, Edition, ExternTarget, Namespace, Origin, PathKind, Rename, Unresolved, UseForm, Visibility};
 
+mod decide;
 mod deps;
 mod early;
 mod switch;
@@ -40,6 +41,7 @@ use early::EarlyAmbiguity;
 pub(crate) use world::solve_world;
 
 pub(crate) use switch::solve_and_write;
+pub use decide::{DecideCheck, DecideError};
 pub use switch::{MOST_ROUNDS, Unwritten};
 
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames, EnumNames};
@@ -318,9 +320,6 @@ pub(crate) enum CellPlant {
     StallFailsOuterCall,
     /// An import through an enum is unknown in the macro namespace too.
     EnumHidesMacros,
-    /// R5 broken for imports: a stalled group decides every member from its guess at once,
-    /// the failed ones beside the resolved ones.
-    StallDecidesAll,
     /// R6 broken by order: a definition an earlier expansion wrote beside a different outer
     /// binding wins over it (the answer then depends on which came first).
     InnerAfterWrite,
@@ -367,6 +366,10 @@ pub(crate) enum CellPlant {
     /// A call takes the first candidate of its name whatever its sub-namespace ([`same_sub`]),
     /// and a macro of the wrong shape is called (the core's answer until runner 16).
     SubNamespaceIgnored,
+    /// D116's walk (decide.rs) keeps a node's value at once though it read a node still open on
+    /// the walk's stack, instead of answering `Absent` until their group closes: a glob cycle
+    /// keeps the bottom it saw.
+    DecideCachesOpenCycle,
 }
 
 type ModId = u32;
@@ -419,6 +422,39 @@ const BUILTIN_ATTR: Def = Def {
     key: ItemKey(blaze_id::ContentId(*b"builtin attribute\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0")),
     kind: DefKind::Other,
 };
+
+/// What a derived item's keep call ([`CallRole::Keep`]) is called with when no attribute written
+/// after its derives took the item ([`Cells::item_fate`], attr-bang-kind-2): no macro; the
+/// driver lowers the call's input, the item, as its expansion (resolve.rs `keep_item`). Never
+/// bound in a module, never written to a record. Its bytes are `BUILTIN_ATTR`'s neither and, but
+/// by a 2^-64 chance, no item's (an item key starts with its crate's hash).
+pub(crate) const KEEP_ITEM: Def = Def {
+    key: ItemKey(blaze_id::ContentId(*b"kept item after its derives\0\0\0\0\0")),
+    kind: DefKind::Other,
+};
+
+/// What the calls written after a derive on an item decided for one attribute call on it
+/// ([`Cells::item_fate`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fate {
+    /// Nothing took the item before the call: it resolves by its path.
+    Open,
+    /// An attribute macro took the item: the call is that macro's input, inert.
+    Taken,
+    /// The item's keep call, and nothing took the item: the item is kept.
+    Kept,
+    /// Under a group's guess, a call before it of the same group is not decided: no answer
+    /// that could expand ([`Cells::item_fate`]).
+    Undecided,
+}
+
+/// The [`CallRole::AfterDerive`] and [`CallRole::AfterDeriveBeforeDerive`] calls of one item of
+/// one fragment, in text order, the latter also listed alone, and its [`CallRole::Keep`] call.
+struct AfterDeriveCalls<'a> {
+    takers: AVec<'a, ItemId>,
+    before_derive: AVec<'a, ItemId>,
+    keep: Option<ItemId>,
+}
 
 fn same_sub(def: Def, shape: CallShape) -> bool {
     let DefKind::Macro(s) = def.kind else { return false };
@@ -631,6 +667,9 @@ pub(crate) struct Cells<'a, N> {
     call_on: ABTreeMap<'a, ItemId, u32>,
     /// The derive calls on each item of each fragment, in text order.
     derives_on: ABTreeMap<'a, (FragId, u32), AVec<'a, ItemId>>,
+    /// The calls written after a derive on each item of each fragment ([`CallRole`]): what
+    /// [`Cells::item_fate`] reads.
+    after_derive_on: ABTreeMap<'a, (FragId, u32), AfterDeriveCalls<'a>>,
     /// The last place of a one-segment attribute call on each item of each fragment: a derive
     /// before it has its helpers read when it expands ([`Cells::expand_call`]).
     attr_after: ABTreeMap<'a, (FragId, u32), u32>,
@@ -699,12 +738,8 @@ pub(crate) struct Cells<'a, N> {
     /// made come after (their `#[macro_export]` macros are published to the root by the
     /// record writer, not read from the root record).
     walked: ModId,
-    /// D116 counts (names example `--d116-counts`): each `Full` cell read by (reader module, module, namespace, name, module's growth > 0 then).
-    pub(crate) d116_reads: blaze_hash::HashMap<((ModId, u8), ModId, Namespace, N, bool), u64, Alloc<'a>>,
-    /// The reader: its module and kind (0 a cell, 1 an import, 2 a call).
-    d116_reader: (ModId, u8),
-    /// Each item's first evaluation: how many fragments were in then.
-    pub(crate) d116_first: blaze_hash::HashMap<ItemId, u32, Alloc<'a>>,
+    /// D116's read log (decide.rs): while a decision runs, every cell it reads, in order.
+    decide_log: Option<AVec<'a, CellId>>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -785,6 +820,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             arbitrary_ints: false,
             call_on: ABTreeMap::new_in(alloc),
             derives_on: ABTreeMap::new_in(alloc),
+            after_derive_on: ABTreeMap::new_in(alloc),
             attr_after: ABTreeMap::new_in(alloc),
             helpers: ABTreeMap::new_in(alloc),
             watches: ABTreeMap::new_in(alloc),
@@ -812,9 +848,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             taken: AVec::new_in(alloc),
             weak_error: None,
             walked: 0,
-            d116_reads: blaze_hash::HashMap::new_in(alloc),
-            d116_reader: (0, 0),
-            d116_first: blaze_hash::HashMap::new_in(alloc),
+            decide_log: None,
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
@@ -1106,6 +1140,21 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.call_ids.insert(c.call, id);
             if let Some(on) = c.item {
                 self.call_on.insert(id, on);
+                if c.role != CallRole::Call {
+                    let calls = self
+                        .after_derive_on
+                        .entry((fid, on))
+                        .or_insert_with(|| AfterDeriveCalls { takers: AVec::new_in(alloc), before_derive: AVec::new_in(alloc), keep: None });
+                    match c.role {
+                        CallRole::AfterDerive => calls.takers.push(id),
+                        CallRole::AfterDeriveBeforeDerive => {
+                            calls.takers.push(id);
+                            calls.before_derive.push(id);
+                        }
+                        CallRole::Keep => calls.keep = Some(id),
+                        CallRole::Call => {}
+                    }
+                }
                 match c.kind {
                     CallShape::Derive => self.derives_on.entry((fid, on)).or_insert_with(|| AVec::new_in(alloc)).push(id),
                     CallShape::Attr if c.path.kind == PathKind::Plain && c.path.segments.len() == 1 => {
@@ -1482,9 +1531,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     }
 
     fn cell(&mut self, m: ModId, ns: Namespace, name: N, layer: Layer) -> CellId {
-        if layer == Layer::Full {
-            *self.d116_reads.entry((self.d116_reader, m, ns, name, self.modules[m as usize].growth > 0)).or_insert(0) += 1;
+        let id = self.make_cell(m, ns, name, layer);
+        if let Some(log) = self.decide_log.as_mut() {
+            log.push(id);
         }
+        id
+    }
+
+    fn make_cell(&mut self, m: ModId, ns: Namespace, name: N, layer: Layer) -> CellId {
         let key = (m, cell_slot(ns, layer), name);
         if let Some(&c) = self.cell_ids.get(&key) {
             return c;
@@ -1568,12 +1622,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if self.cells[c as usize].value.is_some() {
             return;
         }
-        let reader = core::mem::replace(&mut self.d116_reader, (self.cells[c as usize].module, 0));
         match self.cell_value(c, None, Skip::No) {
             Step::Done(v) => self.decide(c, v),
             Step::Wait(on) => self.cell_waits(c, on),
         }
-        self.d116_reader = reader;
     }
 
     /// `c`'s value from its inputs; `guess` gives the current value of the cells of a cycle.
@@ -1703,11 +1755,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     return Step::Wait(Node::Cell(s));
                 }
                 let mut acc: Option<Value> = None;
-                // A glob of the module whose path stage 1 does not follow brings what is unknown.
-                let mut outside = self.modules[m as usize]
-                    .glob_items
-                    .iter()
-                    .any(|&g| self.items[g as usize].outcome == Some(Outcome::Outside) && !(ns == Namespace::Macros && self.items[g as usize].of_enum));
+                // A glob of the module whose path stage 1 does not follow brings what is unknown:
+                // decided so, or (a member of the group) guessed so, as its edge is read above.
+                let mut outside = self.modules[m as usize].glob_items.iter().any(|&g| {
+                    let o = self.items[g as usize].outcome.or_else(|| guess.and_then(|gs| gs.items.get(&g).copied().flatten()));
+                    o == Some(Outcome::Outside) && !(ns == Namespace::Macros && self.items[g as usize].of_enum)
+                });
                 for &(src, evis) in edges.iter() {
                     let s = self.cell(src, ns, name, Layer::Full);
                     let v = self.current(s, guess).unwrap_or(Value::NotFound);
@@ -1811,8 +1864,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
 
     /// Item `i`'s answer from its reads; `hold`: what holds a plain first segment's lookup.
     fn try_item(&mut self, i: ItemId, guess: Option<&Guess<'a>>, hold: Hold) -> Step<Outcome> {
-        self.d116_reader = (self.items[i as usize].module, 1 + u8::from(self.items[i as usize].call.is_some()));
-        self.d116_first.entry(i).or_insert(self.frags.len() as u32);
         let (m, kind, glob, binds, ivis) = {
             let it = &self.items[i as usize];
             (it.module, it.kind, it.glob, it.binds, it.vis)
@@ -1826,6 +1877,26 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         } else {
             kind
         };
+        // An attribute on an item whose attributes after a derive may take it is first answered
+        // by them (rustc's `take_first_attr`, attr-bang-kind-2): once one took the item, every
+        // later call on it is that macro's input (inert, never resolved); the keep call is called
+        // when none did, its expansion the item itself ([`KEEP_ITEM`]).
+        if let Some(at) = self.items[i as usize].call
+            && at.shape == CallShape::Attr
+        {
+            match self.item_fate(i, at, guess) {
+                Step::Done(Fate::Open) => {}
+                Step::Done(Fate::Taken) => return Step::Done(Outcome::Inert),
+                Step::Done(Fate::Kept) => return Step::Done(Outcome::Called(KEEP_ITEM)),
+                // Only under a group's guess: an answer no stall picks (`stall_with_calls`
+                // picks `Called`, `Inert` and `Outside`), so the call waits for the real one.
+                Step::Done(Fate::Undecided) => return Step::Done(Outcome::Failed(Unresolved::NotFound)),
+                Step::Wait(n) => {
+                    self.items[i as usize].waits.push(n);
+                    return Step::Wait(n);
+                }
+            }
+        }
         // A derive's helper (the Reference, "Procedural Macros", "Derive macro helper
         // attributes"): a one-segment attribute after a derive on its item, named in that
         // derive's helpers, is inert. The innermost scope of an attribute (rustc's
@@ -2697,21 +2768,77 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
     }
 
+    /// What the calls written after a derive on attribute call `i`'s item (`i` written at `at`)
+    /// decided for it (rustc's `take_first_attr`, attr-bang-kind-2): `Taken` when one of them is
+    /// called with a macro (only those written before `i` when `i` is one of them); else `Kept`
+    /// for the item's keep call, `Open` for any other. A call past the recursion limit (grown
+    /// with no outcome) takes nothing. One not decided is waited for; under a group's guess
+    /// (d116-decide-4's `fixpoint` and `stall_with_calls`) one of the group is never read from
+    /// the guess: the answer is `Undecided`, which no stall picks, so no call on the item (the
+    /// keep call, a later taker) is decided before the takers before it really are. Reads only
+    /// the calls of the call's own item.
+    fn item_fate(&self, i: ItemId, at: CallAt, guess: Option<&Guess<'a>>) -> Step<Fate> {
+        let Some(&on) = self.call_on.get(&i) else { return Step::Done(Fate::Open) };
+        let Some(calls) = self.after_derive_on.get(&(at.frag, on)) else { return Step::Done(Fate::Open) };
+        for &t in calls.takers.iter() {
+            if t == i {
+                break;
+            }
+            let it = &self.items[t as usize];
+            let outcome = if it.outcome.is_some() || it.grown {
+                it.outcome
+            } else if guess.is_some_and(|g| g.items.contains_key(&t)) {
+                return Step::Done(Fate::Undecided);
+            } else {
+                return Step::Wait(Node::Item(t));
+            };
+            if let Some(Outcome::Called(def)) = outcome
+                && def != KEEP_ITEM
+            {
+                return Step::Done(Fate::Taken);
+            }
+        }
+        Step::Done(if calls.keep == Some(i) { Fate::Kept } else { Fate::Open })
+    }
+
+    /// Whether call `i` (written at `at`) is a [`CallRole::AfterDerive`] call of its item.
+    fn is_taker(&self, i: ItemId, at: CallAt) -> bool {
+        let Some(&on) = self.call_on.get(&i) else { return false };
+        self.after_derive_on.get(&(at.frag, on)).is_some_and(|calls| calls.takers.contains(&i))
+    }
+
+    /// Whether call `i` (written at `at`) is a [`CallRole::AfterDeriveBeforeDerive`] call: a
+    /// `#[derive]` is written after it on its item.
+    fn derive_follows(&self, i: ItemId, at: CallAt) -> bool {
+        let Some(&on) = self.call_on.get(&i) else { return false };
+        self.after_derive_on.get(&(at.frag, on)).is_some_and(|calls| calls.before_derive.contains(&i))
+    }
+
     /// A call written at `at` that selected `def`: called when `def` takes the call's shape;
     /// else refused by name. Its sub-namespace's candidates alone were looked at
     /// ([`same_sub`]), so what is refused here is the other shape of that sub-namespace (an
     /// attribute macro named by `#[derive(..)]`, a derive by `#[..]`) or, for a path of two or
     /// more segments, any macro the path's module holds under that name. Call `i` in a derive
-    /// helper's place ([`Cells::after_derive`]: names-attr-4's helper checks, which have no
-    /// input) that is no helper and finds an attribute macro is refused `WrongMacroKind`, never
-    /// called: on a variant or a field rustc refuses it too ("expected non-macro attribute, found
-    /// attribute macro"); on the item itself rustc would expand it after the derives, which the
-    /// lowering does not build (it reads a one-segment name after a derive as a helper), so it
-    /// is refused by this name, never expanded with no input or dropped.
+    /// helper's place ([`Cells::after_derive`]) that is no helper and finds an attribute macro:
+    /// on the item itself (an after-derive call, [`Cells::is_taker`]) it is called and takes
+    /// the item, as rustc's `take_first_attr` expands it after the derives, unless a `#[derive]`
+    /// is written after it ([`Cells::derive_follows`]): that derive, sent on the item as
+    /// written, would run again on the macro's output, so the call is refused
+    /// `DeriveAfterAttrMacro` and the item kept; on a variant or a field (names-attr-4's helper
+    /// checks, which have no input) it is refused `WrongMacroKind`, as rustc refuses it
+    /// ("expected non-macro attribute, found attribute macro").
     fn called(&self, i: ItemId, at: CallAt, def: Def) -> Outcome {
         match def.kind {
             DefKind::Macro(s) if s.accepts(at.shape) || self.plant == CellPlant::SubNamespaceIgnored => {
-                if self.after_derive(i, at) { Outcome::Failed(Unresolved::WrongMacroKind) } else { Outcome::Called(def) }
+                if !self.after_derive(i, at) {
+                    Outcome::Called(def)
+                } else if !self.is_taker(i, at) {
+                    Outcome::Failed(Unresolved::WrongMacroKind)
+                } else if self.derive_follows(i, at) {
+                    Outcome::Failed(Unresolved::DeriveAfterAttrMacro)
+                } else {
+                    Outcome::Called(def)
+                }
             }
             _ => Outcome::Failed(Unresolved::WrongMacroKind),
         }
@@ -3215,6 +3342,21 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         Ok(true)
     }
 
+    /// One evaluation of `n` under `guess` (a group's member, or a node on D116's walk): the
+    /// value it takes as a guess (not found as the bottom), or the undecided node it read.
+    fn member_step(&mut self, n: Node, guess: &Guess<'a>) -> Step<GuessStep> {
+        match n {
+            Node::Cell(c) => match self.cell_value(c, Some(guess), Skip::No) {
+                Step::Done(v) => Step::Done(GuessStep::Cell(Some(v).filter(|v| *v != Value::NotFound))),
+                Step::Wait(on) => Step::Wait(on),
+            },
+            Node::Item(i) => match self.try_item(i, Some(guess), Hold::Undecided) {
+                Step::Done(o) => Step::Done(GuessStep::Item(Some(o))),
+                Step::Wait(on) => Step::Wait(on),
+            },
+        }
+    }
+
     /// Decides a sink of cells together as the least fixed point of their candidates (R3).
     fn fixpoint(&mut self, members: &[Node]) -> Result<(), CellError> {
         let mut guess = Guess { cells: ABTreeMap::new_in(self.alloc), items: ABTreeMap::new_in(self.alloc) };
@@ -3235,16 +3377,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         loop {
             let mut changed = false;
             for &n in members {
-                let step = match n {
-                    Node::Cell(c) => match (self.d116_reader = (self.cells[c as usize].module, 0), self.cell_value(c, Some(&guess), Skip::No)).1 {
-                        Step::Done(v) => Step::Done(GuessStep::Cell(Some(v).filter(|v| *v != Value::NotFound))),
-                        Step::Wait(on) => Step::Wait(on),
-                    },
-                    Node::Item(i) => match self.try_item(i, Some(&guess), Hold::Undecided) {
-                        Step::Done(o) => Step::Done(GuessStep::Item(Some(o))),
-                        Step::Wait(on) => Step::Wait(on),
-                    },
-                };
+                let step = self.member_step(n, &guess);
                 let on = match step {
                     Step::Wait(on) => on,
                     Step::Done(GuessStep::Cell(v)) => {
@@ -3291,32 +3424,18 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 return Err(CellError::NoFixpoint { module, cells: members.len() });
             }
         }
+        self.conclude(members, &guess)
+    }
+
+    /// A group at its least fixed point `guess` is decided: a stall with calls, or every member
+    /// (shared by the quiet point and D116's walk). R5's "only the members that resolved are
+    /// decided that round" needs no round here: `guess` is the group's least fixed point, so
+    /// what the resolved members bring is already read by the rest (d116-decide-4: without the
+    /// round, 0 differences on std's 12 crates and tempo's 506).
+    fn conclude(&mut self, members: &[Node], guess: &Guess<'a>) -> Result<(), CellError> {
         let has_call = members.iter().any(|&n| matches!(n, Node::Item(i) if self.items[i as usize].call.is_some()));
         if has_call {
-            return self.stall_with_calls(members, &guess);
-        }
-        // R5: in a stalled group what is undecided is taken as absent, and an import may RESOLVE
-        // so; then only the members that resolved are decided this round, and the rest (cells
-        // too: their guess read the failed members as absent) are tried again with the facts,
-        // woken by what the decided imports bring. Each such round decides one import at least,
-        // so the rounds are bounded by the group's imports.
-        if self.plant != CellPlant::StallDecidesAll {
-            let alloc = self.alloc;
-            let mut picked: AVec<'a, (ItemId, Outcome)> = AVec::new_in(alloc);
-            let mut failed = false;
-            for (&i, &o) in guess.items.iter() {
-                match o {
-                    Some(o @ (Outcome::Named(_) | Outcome::Glob(_) | Outcome::Outside)) => picked.push((i, o)),
-                    _ => failed = true,
-                }
-            }
-            if failed && !picked.is_empty() {
-                self.stats.stalls += 1;
-                for &(i, o) in picked.iter() {
-                    self.settle(i, o);
-                }
-                return Ok(());
-            }
+            return self.stall_with_calls(members, guess);
         }
         // Decided: a group holding an import is a stall (R5), one of cells alone a glob cycle.
         if guess.items.is_empty() {

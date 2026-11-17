@@ -633,6 +633,7 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         promoted: blaze_own::Vec::new_in(a),
         stalled: blaze_own::Vec::new_in(a),
         awaited: blaze_own::Vec::new_in(a),
+        selected: blaze_own::Vec::new_in(a),
     }
 }
 
@@ -668,12 +669,19 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
         field_pats: &[],
         paths: &[],
         segments: &[],
+        segment_ranges: &[],
         types: checked.types.view(),
         type_lists: &[],
+        type_list_ranges: &[],
+        method_name_ranges: &[],
         opt_types: &[],
         fmt_uses: &[],
         coroutine: None,
         super_lets: &[],
+        asm_pieces: &[],
+        asm_operands: &[],
+        asm_clobbers: &[],
+        asm_text: "",
     };
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_fn_shim(callee, tuple, which, sig)?;

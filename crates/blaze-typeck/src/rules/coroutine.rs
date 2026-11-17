@@ -248,6 +248,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             Expr::Tuple { elems } | Expr::Array { elems } => exprs.extend_from_slice(b.expr_list(elems)?),
             Expr::FormatArgs { args, .. } => exprs.extend_from_slice(b.expr_list(args)?),
+            Expr::Asm { operands, .. } => {
+                for o in b.asm_operand_list(operands)? {
+                    exprs.push(o.expr);
+                    if let Some(x) = o.out_expr {
+                        exprs.push(x);
+                    }
+                }
+            }
             Expr::Repeat { elem, .. } => exprs.push(elem),
             Expr::Struct { fields, base, .. } => {
                 for fi in b.field_init_list(fields)? {

@@ -44,7 +44,7 @@ pub(super) fn table_one<'n>(
     store: &Store<'n>,
     key: ItemKey,
     body: Option<(Body<'n>, Checked<'static>)>,
-    path: Box<str>,
+    path: crate::front2::row_path::RowPath,
     of_trait: bool,
 ) -> Verdict<'n> {
     match row(names, store, key, body, &path, of_trait) {
@@ -53,7 +53,7 @@ pub(super) fn table_one<'n>(
             body: r.body,
             checked: r.checked,
             kind: r.kind,
-            path,
+            path: path.into_text(),
             at: r.at,
             abi: r.abi,
             nounwind: r.nounwind,
@@ -62,7 +62,7 @@ pub(super) fn table_one<'n>(
             lits: r.lits,
             intrinsic: r.intrinsic,
         }),
-        Err(refusal) => Verdict::LeftOut { path, refusal },
+        Err(refusal) => Verdict::LeftOut { path: path.into_text(), refusal },
     }
 }
 
@@ -72,18 +72,15 @@ fn row<'n>(
     store: &Store<'n>,
     key: ItemKey,
     body: Option<(Body<'n>, Checked<'static>)>,
-    path: &str,
+    row_path: &crate::front2::row_path::RowPath,
     of_trait: bool,
 ) -> Result<Row<'n>, Front2Refusal> {
+    // `path` is for messages; the item's identifier, data, is `row_path.ident()` (rule 30).
+    let path = row_path.text();
     let function = || Box::<str>::from(path);
     let Some(head) = store.fns.get(&key) else {
         return Err(Front2Refusal::NoHead { function: function() });
     };
-    // The head's ABI, a foreign block's overriding it (head_abi.rs: one rule for the table's
-    // rows and for the builder's question of a fn left out).
-    // The calling convention AND the unwind category ("C" aborts, "C-unwind" unwinds: one
-    // `Abi::C` for the builder, the category kept beside it).
-    let own = super::head_abi::head_abi(names, store, key, &function)?;
     let symbols = symbols_of(names, head.lib, head.text, path)?;
     let (at, foreign) = placed(names, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
     // A fn an `extern` block in a BODY declares is foreign as a module-level one is: the
@@ -91,6 +88,21 @@ fn row<'n>(
     // store's (front2/panic_entry.rs `local_abi`, `local_name`).
     let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: function(), why: why.form().into() };
     let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(store, key));
+    // A declaration of an `extern "llvm-intrinsic"` block has no calling convention and is no
+    // symbol to link: it IS the LLVM intrinsic its `link_name` names (front2/llvm_intrinsic.rs).
+    // So it is routed here, one call before the ABI's one rule (head_abi.rs, where such a block
+    // has no builder ABI), and refused by name until the builder builds one (blaze-build
+    // `Intrinsic::Target`, intr-P7b).
+    if foreign == Some(crate::front2::llvm_intrinsic::ABI) {
+        let symbol = crate::front2::llvm_intrinsic::symbol(symbols.link_name.as_deref())
+            .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.form().into() })?;
+        return Err(Front2Refusal::TargetIntrinsic { function: function(), symbol: symbol.into() });
+    }
+    // The head's ABI, a foreign block's overriding it (head_abi.rs: one rule for the table's
+    // rows and for the builder's question of a fn left out): the calling convention AND the
+    // unwind category ("C" aborts, "C-unwind" unwinds: one `Abi::C` for the builder, the
+    // category kept beside it).
+    let own = super::head_abi::head_abi(names, store, key, &function)?;
     let declared_name = crate::front2::panic_entry::local_name(store, key).map_err(local)?;
     // Core's `#[lang = "panic_impl"]` declaration is no symbol: a call of it is a call of the
     // program's `#[panic_handler]` fn (the walk queued it; `resolve` answers it).
@@ -99,6 +111,11 @@ fn row<'n>(
     // call of its default (the walk queued it; `resolve` answers it), and the marker
     // `__rust_no_alloc_shim_is_unstable_v2` is built in place as nothing (front2/alloc_shim.rs).
     let alloc_shim = crate::front2::alloc_shim::declares(names, store, key, Alloc::global())
+        .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
+    // Every other `extern "Rust"` `#[rustc_std_internal_symbol]` declaration is no symbol
+    // either: a call of one is a call of its definition (the walk queued it; `resolve` answers
+    // it) (front2/internal_symbol.rs).
+    let internal_symbol = crate::front2::internal_symbol::declares(names, store, key, Alloc::global())
         .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
     let (body, checked, kind, symbol, lits) = match body {
         Some((body, checked)) => {
@@ -109,10 +126,11 @@ fn row<'n>(
         // names): no body, no symbol, never `Foreign`.
         None if panic_entry => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
         None if alloc_shim.is_some() => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
+        None if internal_symbol.is_some() => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
         // A declaration in an `extern` block is called by its symbol: its `#[link_name]`,
         // else its name.
         None if foreign.is_some() && head.container.is_none() => {
-            let symbol = symbols.link_name.unwrap_or_else(|| declared_name.unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path)).into());
+            let symbol = symbols.link_name.unwrap_or_else(|| declared_name.unwrap_or(row_path.ident()).into());
             (None, None, FnKind::Foreign, symbol, Literals::default())
         }
         // A trait's fn called on a parameter or `dyn`: never built (each instance resolves to
@@ -125,7 +143,7 @@ fn row<'n>(
     };
     let intrinsic = match (symbols.intrinsic, &body) {
         (true, None) => {
-            let name = path.rsplit("::").next().unwrap_or(path);
+            let name = row_path.ident();
             match blaze_build::intrinsics::Which::named(name) {
                 Ok(which) => Some(Intrinsic::Table(which)),
                 Err(_) => return Err(Front2Refusal::Intrinsic { function: function() }),
@@ -153,12 +171,14 @@ pub(super) fn class(refusal: &Front2Refusal) -> Box<str> {
         Front2Refusal::NoHead { .. } => Box::from("no head in the store (front2's)"),
         Front2Refusal::Abi { abi, .. } => format!("ABI {abi:?}: neither Rust nor C").into_boxed_str(),
         Front2Refusal::NoBody { .. } => Box::from("no body (front2's)"),
+        Front2Refusal::TargetIntrinsic { .. } => Box::from("a target intrinsic"),
         Front2Refusal::Intrinsic { function } => {
             let name = function.rsplit("::").next().unwrap_or(function);
             format!("the intrinsic `{name}`, which the build's table does not name").into_boxed_str()
         }
         Front2Refusal::Literal { what, .. } => format!("a literal front2 does not read: {what}").into_boxed_str(),
         Front2Refusal::Attrs { why, .. } => format!("its attributes do not read: {why}").into_boxed_str(),
+        Front2Refusal::NoRowPath(no) => format!("no row path: {}", no.why).into_boxed_str(),
         other => format!("{other}").into_boxed_str(),
     }
 }
@@ -171,13 +191,36 @@ pub(super) fn left_out_or_stop(
     path: Box<str>,
     refusal: Front2Refusal,
     left: &mut HashMap<ItemKey, Box<str>, Global>,
-    left_out: Option<&mut Vec<(Box<str>, Box<str>), Global>>,
+    left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
 ) -> Result<(), Front2Refusal> {
     let Some(out) = left_out else { return Err(refusal) };
     let class = class(&refusal);
     left.insert(key, class.clone());
-    out.push((path, class));
+    out.push((path, LeftOut::named(class, refusal)));
     Ok(())
+}
+
+/// A bodied fn's row before [`table_one`]: `body` lowered again into the program's table
+/// `tys`, with its row path. `Err` is that ONE fn's refusal for [`left_out_or_stop`], with the
+/// name it is filed under: no row path (`NoRowPath`, filed by the item's shown name; the body
+/// is then NOT lowered again: rule 77), or a body that does not lower again (`Lower`, filed by
+/// its row path). Before this, `make` returned either from the whole program, so in a survey
+/// one such fn ended the census (survey-left-out-1).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lowered_row<'n>(
+    names: &'n Names<'n>,
+    prepared: &Prepares<'n>,
+    keys: &mut crate::front2::keys::Keys,
+    store: &mut Store<'n>,
+    body: &Body<'n>,
+    tys: &mut PortableTys<'static>,
+    path: Result<crate::front2::row_path::RowPath, crate::front2::row_path::NoRowPath>,
+) -> Result<(Body<'n>, crate::front2::row_path::RowPath), (Box<str>, Front2Refusal)> {
+    let path = path.map_err(|no| (no.item.boxed(), Front2Refusal::NoRowPath(no)))?;
+    match lower_again(names, prepared, keys, store, body, tys) {
+        Ok(again) => Ok((again, path)),
+        Err(e) => Err((path.into_text(), Front2Refusal::Lower(e))),
+    }
 }
 
 #[cfg(test)]
@@ -202,11 +245,73 @@ mod tests {
         assert!(went_on.is_ok(), "a survey goes on after one fn's refusal");
         assert_eq!(out.len(), 1);
         assert_eq!(&*out[0].0, "core::default::default");
-        assert_eq!(&*out[0].1, "a literal front2 does not read: this float literal");
+        assert_eq!(&*out[0].1.class, "a literal front2 does not read: this float literal");
+        assert!(matches!(out[0].1.refusal, Front2Refusal::Literal { what: "this float literal", .. }), "the row keeps the typed refusal");
         assert_eq!(left.get(&key).map(|c| &**c), Some("a literal front2 does not read: this float literal"));
         // A run has no list to file in: the same refusal stops it, named.
         let stopped = left_out_or_stop(key, Box::from("core::default::default"), literal(), &mut left, None);
         assert!(matches!(stopped, Err(Front2Refusal::Literal { what: "this float literal", .. })));
+    }
+
+    /// Census run 3 (2026-11-16 21:00, tempo's build census walked from `main`) stopped the
+    /// WHOLE survey: "no row path is built for an item the names source holds no path for (key
+    /// 2980e808e42ac8c9..)". The rule (this file's, and `build_survey`'s doc): a survey files one
+    /// item's refusal under its cause and goes on; a run stops with it, named (rule 3).
+    ///
+    /// The item is the census's: checker key 0x2980e808e42ac8c9057e8231da5614fc (core's crate
+    /// prefix, an item no names source here holds), over hello world's names, so
+    /// `RowPath::of` refuses it the way it did in the census ("the key map and the names source
+    /// hold no item under its key"). That `NoRowPath`, given to `left_out_or_stop` as `make`
+    /// gives it (refusals-name-items-3's table loop; survey-left-out-1's `lowered_row` gives the
+    /// same pair): in a survey it is ONE row, by the item's shown name (its whole key), under
+    /// the class "no row path: <why>", and its key's cause is in `left` for a caller's build;
+    /// in a run it is `Front2Refusal::NoRowPath` naming the key.
+    /// CONTROL: the refusal before refusals-name-items-3, `row_path_of(..).map_err(NoRowPath)?`,
+    /// is mode-blind: the same `Err` in a survey, the census's stop (asserted last).
+    ///
+    /// Prints: `NO ROW PATH: survey: an item the names source holds no path for (key
+    /// 2980e808e42ac8c9057e8231da5614fc) -> no row path: the key map and the names source hold
+    /// no item under its key` and `NO ROW PATH: run: front2: no row path is built for ..`.
+    #[test]
+    fn a_survey_files_an_item_with_no_row_path_and_goes_on() {
+        const HELLO: &str = "fn main() {}\n";
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = crate::crates::Toolchain::open(&mut crate::crates::DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [(String::from("/hello-world/src/main.rs"), String::from(HELLO))];
+        let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
+        let user = crate::crates::UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+        let inputs = crate::crates::Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text: HELLO }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let front = crate::front2::Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let store = Store::new(front.index.lang("sized"), front.frame);
+        let ghost = ItemKey(0x2980e808e42ac8c9057e8231da5614fc);
+        let made = crate::front2::row_path::RowPath::of(&names, &front.keys, &store, ghost);
+        let no = made.clone().expect_err("no names source here holds the census's key");
+        assert_eq!(no.why, "the key map and the names source hold no item under its key");
+        // A survey: one row, by the item's whole key, under the class; `left` holds the cause.
+        let mut left = HashMap::new_in(Global);
+        let mut out = Vec::new_in(Global);
+        let went_on = left_out_or_stop(ghost, no.item.boxed(), Front2Refusal::NoRowPath(no.clone()), &mut left, Some(&mut out));
+        assert!(went_on.is_ok(), "a survey goes on past an item with no row path");
+        assert_eq!(out.len(), 1);
+        println!("NO ROW PATH: survey: {} -> {}", out[0].0, out[0].1);
+        assert!(out[0].0.contains("2980e808e42ac8c9057e8231da5614fc"), "filed by its whole key: {}", out[0].0);
+        assert_eq!(&*out[0].1.class, "no row path: the key map and the names source hold no item under its key");
+        assert_eq!(left.get(&ghost).map(|c| &**c), Some("no row path: the key map and the names source hold no item under its key"));
+        // A run: the same item refuses the program, named (no fallback, rule 3).
+        let stopped = left_out_or_stop(ghost, no.item.boxed(), Front2Refusal::NoRowPath(no.clone()), &mut left, None);
+        let Err(refusal) = stopped else { panic!("a run stops on an item with no row path") };
+        let said = format!("{refusal}");
+        println!("NO ROW PATH: run: {said}");
+        assert!(matches!(refusal, Front2Refusal::NoRowPath(ref r) if *r == no));
+        assert!(said.contains("2980e808e42ac8c9057e8231da5614fc"), "the run's refusal names the key: {said}");
+        // CONTROL: the form before -3 refused in every mode, a survey's too.
+        let before: Result<crate::front2::row_path::RowPath, Front2Refusal> = made.map_err(Front2Refusal::NoRowPath);
+        assert!(before.is_err(), "control: `row_path_of(..).map_err(NoRowPath)?` ends a survey");
     }
 
     /// The causes the loop filed before keep their texts (the walk's lists group by them).

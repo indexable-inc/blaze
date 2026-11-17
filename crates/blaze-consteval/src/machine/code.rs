@@ -506,6 +506,7 @@ impl Refusal<'_> {
             Refusal::MutableStatic { item } => Refusal::MutableStatic { item },
             Refusal::NotConstFn { item } => Refusal::NotConstFn { item },
             Refusal::UnknownIntrinsic { item } => Refusal::UnknownIntrinsic { item },
+            Refusal::FnFact { item, fact } => Refusal::FnFact { item, fact },
             Refusal::InvalidBool { value } => Refusal::InvalidBool { value },
             Refusal::InvalidChar { value } => Refusal::InvalidChar { value },
             Refusal::InvalidTag { bits } => Refusal::InvalidTag { bits },
@@ -1798,6 +1799,8 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             Expr::FormatArgs { .. } => return Err(unsupported("`format_args!` in a constant")),
             Expr::Await(_) | Expr::AsyncBlock { .. } => return Err(unsupported("`async` in a constant")),
             Expr::Underscore => return Err(unsupported("`_` (`_ = e`) in a constant")),
+            // The Reference, inline-assembly: "asm! ... cannot be used in const contexts".
+            Expr::Asm { .. } => return Err(unsupported("inline assembly in a constant")),
             Expr::RawRef { .. } => return Err(unsupported("a raw borrow in a constant")),
             // A field's offset is the container's layout's: `layout` gives sizes, not yet
             // where each field sits.
@@ -1940,6 +1943,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             }
             FnKind::NotConst => return Err(Stop::Refused(Refusal::NotConstFn { item })),
             FnKind::UnknownIntrinsic => return Err(Stop::Refused(Refusal::UnknownIntrinsic { item })),
+            FnKind::Missing(fact) => return Err(Stop::Refused(Refusal::FnFact { item, fact })),
             FnKind::Ctor { variant, .. } => {
                 let mut fields: Vec<(u32, Reg, PTy), Alloc<'a>> = Vec::new_in(self.alloc);
                 for (k, &(r, t)) in vals.iter().enumerate() {

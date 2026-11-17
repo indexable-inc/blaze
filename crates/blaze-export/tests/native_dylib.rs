@@ -105,6 +105,9 @@ fn image(word_pointer: bool) -> Image<'static> {
         inits: 1,
         descriptor_at: 0xC000,
         libraries,
+        unwind: Vec::new_in(a),
+        frames: Vec::new_in(a),
+        eh_pointers: Vec::new_in(a),
     }
 }
 

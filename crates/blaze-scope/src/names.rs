@@ -54,6 +54,16 @@ fn written_up<N: Name, W: World<N>>(world: &W, chain: &[ItemKey], n: u8) -> Opti
     chain.iter().copied().filter(|m| !world.anonymous(*m)).nth(usize::from(n))
 }
 
+/// The module a path head `self` (`n == 0`) or `super` written `n` times names from `module`,
+/// as [`path`] reads the head ([`written_up`]: a block's module is passed over). For a reader
+/// that holds no segment to walk: a glob `use self::*;` or `use super::*;` (blaze-ladder
+/// front2 block_traits.rs). `NotRead`: `module`'s chain is not held; `SuperPastRoot`: past
+/// the crate's root.
+pub fn written_module<N: Name, W: World<N>>(world: &W, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
+    let chain = world.chain(module).ok_or(PathError { module, at: 0, why: Why::NotRead { module } })?;
+    written_up::<N, W>(world, chain, n).ok_or(PathError { module, at: 0, why: Why::SuperPastRoot })
+}
+
 /// Why a path did not resolve; `at` is the index of the segment that did not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Why {

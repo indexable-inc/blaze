@@ -43,6 +43,12 @@ fn prefix_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, p: tc::PathPrefi
     match p {
         tc::PathPrefix::Module(k) => format!("the module {}", item_shown(r, k)),
         tc::PathPrefix::Item(k) => format!("the item {}", item_shown(r, k)),
+        // Rule 19: what `std` named, and that Rust's `std` has no name under the edition
+        // (blaze-unit-graph implicit.rs: "There is no opt-in to Rust's `std` under the edition").
+        tc::PathPrefix::Bstd { module, edition } => format!(
+            "the module {} (note: `std` here names bstd, under edition {edition}; that edition gives Rust's `std` no name)",
+            item_shown(r, module)
+        ),
         tc::PathPrefix::Def(d) => match d {
             tc::Def::Adt(k) => format!("the type {}", item_shown(r, k)),
             tc::Def::Trait(k) => format!("the trait {}", item_shown(r, k)),

@@ -293,14 +293,14 @@ impl Procs {
 /// The variables cargo sets for compiling a unit that the manifest decides (the cargo book,
 /// "Environment variables Cargo sets for crates"): `CARGO_PKG_NAME`, `CARGO_PKG_VERSION` and
 /// its `_MAJOR`, `_MINOR`, `_PATCH`, `_PRE` parts, `CARGO_CRATE_NAME`, and
-/// `CARGO_MANIFEST_DIR` / `CARGO_MANIFEST_PATH`. A path is under the sandbox's
-/// [`blaze_proc_macro::sandbox::PACKAGE`], the package's own folder, never the machine's, so no key holds where the checkout is (a reader maps it back to the
-/// checkout only to read a file). The `[package]` metadata family (`CARGO_PKG_AUTHORS`,
+/// `CARGO_MANIFEST_DIR` / `CARGO_MANIFEST_PATH`, derived from `seen`, the package's mount row (D96:
+/// `/package` for a fetched package, `/workspace/<dir>` for a member), never the machine's path, so
+/// no key holds where the checkout is. The `[package]` metadata family (`CARGO_PKG_AUTHORS`,
 /// `_DESCRIPTION`, `_HOMEPAGE`, `_REPOSITORY`, `_LICENSE`, `_LICENSE_FILE`, `_RUST_VERSION`,
 /// `_README`) is not read from the manifest yet: a call asking for one is refused, never
 /// answered unset ([`CARGO_SET`]).
-fn unit_env(package: &str, version: &str, crate_name: &str) -> Vec<(String, String)> {
-    let dir = blaze_proc_macro::sandbox::PACKAGE.to_string();
+fn unit_env(package: &str, version: &str, crate_name: &str, seen: blaze_expand::seen::SeenRoot<'_>) -> Vec<(String, String)> {
+    let dir = seen.to_string();
     let (core, pre) = version.split_once('-').unwrap_or((version, ""));
     let core = core.split_once('+').map_or(core, |(c, _)| c);
     let mut parts = core.splitn(3, '.');
@@ -349,6 +349,7 @@ pub const CARGO_SET: &[&str] = &[
 /// proc-macro-crate's lookup in jsonrpsee's `#[rpc(server)]` failed on it).
 #[expect(clippy::too_many_arguments, reason = "the run's facts, each read once by `load`")]
 fn procs_of(
+    root: &Path,
     modules: &Path,
     out: &Path,
     crates: &UnitCrates<'static>,
@@ -375,17 +376,32 @@ fn procs_of(
         };
         let version = unit.map_or("", |u| u.version.as_str());
         let package = unit.map_or(c.name, |u| u.name.as_str());
-        let env = unit_env(package, version, c.name);
         let (_, place) = places
             .get(i)
             .ok_or_else(|| LoadError::Procs(format!("crate {} ({i}) has no place: {} places for {} crates", c.name, places.len(), crates.crates.len())))?;
-        let at = match (unit, place) {
-            (None, _) => PackageAt::Toolchain,
-            (Some(_), Place::Disk(dir)) => PackageAt::Disk(dir.as_path()),
-            (Some(_), Place::Pack(view, dir)) => PackageAt::Pack { view: *view, dir: dir.as_str() },
+        let files = match (unit, place) {
+            (None, _) => sandbox_files(PackageAt::Toolchain),
+            // A member (D96 (3)): its workspace served at `/workspace`, the member at its dir in
+            // it (`load` placed a member at `root.join(<its dir>)`), so a macro's
+            // `$CARGO_MANIFEST_DIR/../sibling/x` lands in the workspace (D111), never refused as
+            // leaving `/package`.
+            (Some(_), Place::Disk(dir)) => {
+                let rel = dir
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .ok_or_else(|| LoadError::Procs(format!("crate {}: the member at {} is not a UTF-8 folder under the workspace {}", c.name, dir.display(), root.display())))?;
+                let member = blaze_proc_macro::script_sandbox::ScriptRoot::member(rel).map_err(|e| LoadError::Procs(format!("crate {}: {e}", c.name)))?;
+                blaze_proc_macro::sandbox::Files::Member { workspace: root.to_path_buf(), root: member }
+            }
+            (Some(_), Place::Pack(view, dir)) => sandbox_files(PackageAt::Pack { view: *view, dir: dir.as_str() }),
         };
-        let files = sandbox_files(at);
-        packages.push(std::sync::Arc::new(blaze_proc_macro::sandbox::Package { files, env }));
+        let env = unit_env(package, version, c.name, files.seen());
+        let unknown: Vec<String> = CARGO_SET.iter().filter(|name| !env.iter().any(|(set, _)| set == *name)).map(|name| (*name).to_string()).collect();
+        let env = blaze_proc_macro::package_env::PackageEnv::new(env, unknown, Vec::new())
+            .map_err(|e| LoadError::Procs(format!("crate {} ({i}): its variables: {e}", c.name)))?;
+        let shown = blaze_proc_macro::sandbox::Package::new(files, env).map_err(|e| LoadError::Procs(format!("crate {} ({i}): {e}", c.name)))?;
+        packages.push(std::sync::Arc::new(shown));
         if let Some(unit) = unit
             && matches!(unit.kind, blaze_unit_graph::UnitKind::ProcMacro)
         {
@@ -582,7 +598,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     let procs = match modules {
         Some((modules, out)) => {
             let lock_text = core::str::from_utf8(bytes).map_err(|_| LoadError::Lock("not UTF-8".to_string()))?;
-            Some(&*leak(procs_of(modules, out, crates, graph, lock, lock_text, &member_dirs, &places, heap)?))
+            Some(&*leak(procs_of(root, modules, out, crates, graph, lock, lock_text, &member_dirs, &places, heap)?))
         }
         None => None,
     };

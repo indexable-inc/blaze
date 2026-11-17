@@ -476,6 +476,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Await(operand) => exprs.push((operand, 0)),
             Expr::AsyncBlock { body, .. } => exprs.push((body, 0)),
             Expr::Underscore | Expr::OffsetOf { .. } => {}
+            // An output writes its place (as an assignment's left side does); the rest read.
+            Expr::Asm { operands, .. } => {
+                for o in self.body.asm_operand_list(operands)? {
+                    exprs.push((o.expr, u8::from(o.kind.is_output() && o.out_expr.is_none())));
+                    if let Some(x) = o.out_expr {
+                        exprs.push((x, 1));
+                    }
+                }
+            }
         }
         Ok(())
     }

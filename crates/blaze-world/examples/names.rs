@@ -17,7 +17,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// `--d116-decide`: each crate's cells decided again on demand and compared (D116).
+static D116_DECIDE: AtomicBool = AtomicBool::new(false);
 use std::time::{Duration, Instant};
 
 use blaze_fetch::{PackView, SourceId};
@@ -689,6 +692,14 @@ impl blaze_scope::task::Par for Threads {
         parts::seen(def, input);
     }
 
+    fn decide_check(&self) -> Option<&dyn Fn() -> u64> {
+        if D116_DECIDE.load(Ordering::Relaxed) { Some(&proc_clock as &dyn Fn() -> u64) } else { None }
+    }
+
+    fn decided(&self, krate: &str, check: &blaze_scope::DecideCheck<'_, &str>) {
+        println!("d116 decide {krate}: {check}");
+    }
+
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
         if self.0 <= 1 {
             for at in 0..n {
@@ -1092,8 +1103,11 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
             }
             blaze_world::Origin::Toolchain(_) => sandbox_files(PackageAt::Toolchain),
         };
-        env.sort();
-        let package = blaze_proc_macro::sandbox::Package { files, env };
+        // Every name cargo always sets that this example does not give is unknown (refused by
+        // name if a macro reads it), never unset (macro-env-unknown, rule 3).
+        let unknown: Vec<String> = blaze_scope::crate_env::CARGO_ALWAYS.iter().filter(|name| !env.iter().any(|(set, _)| set == *name)).map(|name| (*name).to_string()).collect();
+        let env = blaze_proc_macro::package_env::PackageEnv::new(env, unknown, Vec::new()).unwrap_or_else(|e| panic!("{} {}: {e}", c.package, c.version));
+        let package = blaze_proc_macro::sandbox::Package::new(files, env).unwrap_or_else(|e| panic!("{} {}: {e}", c.package, c.version));
         packages.push(std::sync::Arc::new(package));
         let blaze_world::Origin::Unit(uid) = c.origin else { continue };
         if c.proc_macro {
@@ -1180,7 +1194,7 @@ struct Facts {
 }
 
 /// How a name is written in a crate's text (a heuristic over its files' lines, for the causes
-/// only): defined by an item with a non-builtin attribute before it and no derive (an attribute
+/// only): defined by an item with a non-builtin attribute before it, derives or not (an attribute
 /// proc macro's input, which the names library does not see until it is expanded), defined
 /// plainly, or not written as an item at all (made by a macro or a build script).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1210,7 +1224,7 @@ impl Defs {
             let mut map = std::collections::HashMap::new();
             for file in names.krate(krate).files.iter() {
                 let text: &'static str = file.text;
-                let (mut proc_attr, mut derive) = (false, false);
+                let mut proc_attr = false;
                 for line in text.lines() {
                     let line = line.trim_start();
                     if line.is_empty() || line.starts_with("//") {
@@ -1220,7 +1234,6 @@ impl Defs {
                         let attr: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
                         let last = attr.rsplit("::").next().unwrap_or("");
                         if last == "derive" {
-                            derive = true;
                         } else if !INERT.contains(&last) {
                             proc_attr = true;
                         }
@@ -1229,16 +1242,18 @@ impl Defs {
                     let words: Vec<&'static str> = text_words(line);
                     for w in 0..words.len().saturating_sub(1) {
                         if ITEM_WORDS.contains(&words[w]) {
-                            let def = if proc_attr && !derive { Def::UnderProcAttr } else { Def::Plain };
+                            // An attribute macro takes the item whatever derives sit beside it, and one
+                            // sighting under an attribute macro is enough to name the cause: a plain twin
+                            // (another cfg's copy) does not make the miss "written plainly".
+                            let def = if proc_attr { Def::UnderProcAttr } else { Def::Plain };
                             let e = map.entry(words[w + 1]).or_insert(def);
-                            if def == Def::Plain {
-                                *e = Def::Plain;
+                            if def == Def::UnderProcAttr {
+                                *e = Def::UnderProcAttr;
                             }
                             break;
                         }
                     }
                     proc_attr = false;
-                    derive = false;
                 }
             }
             map
@@ -1406,7 +1421,11 @@ fn count(names: &blaze_scope::resolve::Names<'static>, inners: Option<&[blaze_sc
                     } else {
                         format!("REAL MISS? macro {why:?}: `{last}`")
                     };
-                    add(causes, format!("[{pkg}] {cause}"), || format!("{place}: {}!", show_path(path)));
+                    add(causes, format!("[{pkg}] {cause}"), || match shape {
+                        Some(CallShape::Attr) => format!("{place}: #[{}]", show_path(path)),
+                        Some(CallShape::Derive) => format!("{place}: #[derive({})]", show_path(path)),
+                        _ => format!("{place}: {}!", show_path(path)),
+                    });
                 }
                 ScopeError::ExternCrate { name } => {
                     let cause = if f.cfg_if { "extern crate written in a crate that calls cfg_if!".to_string() } else { format!("REAL MISS? extern crate `{name}` not found") };
@@ -1477,300 +1496,6 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
-/// The strongly connected components of a graph over `0..n` (`adj[v]`: v's successors),
-/// iterative Tarjan.
-fn sccs(n: usize, adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
-    let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0usize; n], vec![false; n]);
-    let (mut stack, mut out, mut next) = (Vec::new(), Vec::new(), 0usize);
-    for s in 0..n {
-        if index[s] != usize::MAX {
-            continue;
-        }
-        let mut work: Vec<(usize, usize)> = vec![(s, 0)];
-        index[s] = next;
-        low[s] = next;
-        next += 1;
-        stack.push(s);
-        on[s] = true;
-        while let Some(&mut (v, ref mut at)) = work.last_mut() {
-            if let Some(&w) = adj[v].get(*at) {
-                *at += 1;
-                if index[w] == usize::MAX {
-                    index[w] = next;
-                    low[w] = next;
-                    next += 1;
-                    stack.push(w);
-                    on[w] = true;
-                    work.push((w, 0));
-                } else if on[w] {
-                    low[v] = low[v].min(index[w]);
-                }
-                continue;
-            }
-            work.pop();
-            if let Some(&(u, _)) = work.last() {
-                low[u] = low[u].min(low[v]);
-            }
-            if low[v] == index[v] {
-                let mut comp = Vec::new();
-                while let Some(w) = stack.pop() {
-                    on[w] = false;
-                    comp.push(w);
-                    if w == v {
-                        break;
-                    }
-                }
-                out.push(comp);
-            }
-        }
-    }
-    out
-}
-
-/// `--d116-counts`: the four facts D116 ("Names at module grain", drive.md "D114 rulings") is
-/// decided by, over every crate resolved.
-fn d116_counts(t: usize, names: &blaze_scope::resolve::Names<'static>) {
-    use blaze_id::ItemKey;
-    use blaze_surface::{ExternTarget, Namespace, Origin, Rename, UseForm};
-    use std::collections::{HashMap, HashSet};
-    let crates = names.crates();
-    // 1. Modules, and those with item-position calls (their outline's calls).
-    let (mut text_all, mut text_calls, mut made_all, mut made_calls, mut text_call_n, mut made_call_n) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-    // 2 and 3: per variant (0: the module has item-position calls at all; 1: it had calls not
-    // expanded yet when the cell core read the cell): distinct cells, reads, by namespace.
-    let mut distinct = [[0u64; 3]; 2];
-    let mut reads = [[0u64; 3]; 2];
-    let (mut all_distinct, mut all_reads) = (0u64, 0u64);
-    let mut graphs: [Vec<(usize, Vec<ItemKey>)>; 2] = [Vec::new(), Vec::new()];
-    use blaze_scope::resolve::D116Answer;
-    // Calls per variant: all, NOT FOUND (reads), NOT FOUND distinct, spec unknown, spec refused,
-    // settled unknown or refused, agreeing, contradicting.
-    let mut call_counts = [[0u64; 8]; 2];
-    let mut rows: Vec<String> = Vec::new();
-    // 4. Scope bytes.
-    let (mut scope_bytes, mut glob_binding_bytes, mut glob_edge_bytes, mut bindings, mut glob_bindings, mut edges) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-    let mut glob_by_crate: Vec<(u64, u64, &str)> = Vec::new();
-    for (ci, cn) in crates.iter().enumerate() {
-        // Each module of the crate: its outline's declarations and whether it has calls.
-        let mut text_names: HashMap<ItemKey, (HashSet<(Namespace, &str)>, HashSet<&str>, bool)> = HashMap::new();
-        let mut add = |m: ItemKey, d: &blaze_surface::DeclsBuilder<'static, &'static str>| {
-            let (mut by_ns, mut any) = (HashSet::new(), HashSet::new());
-            for it in d.items.iter() {
-                by_ns.insert((it.ns, it.name));
-            }
-            for it in d.mods.iter() {
-                by_ns.insert((Namespace::Types, it.name));
-            }
-            for u in d.uses.iter() {
-                if let UseForm::Named { rename, .. } = u.leaf {
-                    let segs = &u.path.segments;
-                    let last = match segs.last() {
-                        Some(&"self") if segs.len() > 1 => Some(segs[segs.len() - 2]),
-                        other => other.copied(),
-                    };
-                    match rename {
-                        Rename::To(n) => {
-                            any.insert(n);
-                        }
-                        Rename::Same => {
-                            if let Some(n) = last {
-                                any.insert(n);
-                            }
-                        }
-                        Rename::Underscore => {}
-                    }
-                }
-            }
-            for e in d.extern_crates.iter() {
-                match (e.rename, e.target) {
-                    (Rename::To(n), _) | (Rename::Same, ExternTarget::Dep(n)) => {
-                        by_ns.insert((Namespace::Types, n));
-                    }
-                    _ => {}
-                }
-            }
-            text_names.insert(m, (by_ns, any, !d.calls.is_empty()));
-            d.calls.len() as u64
-        };
-        for (&m, (_, d)) in cn.decls.iter() {
-            let n = add(m, d);
-            text_all += 1;
-            text_calls += u64::from(n > 0);
-            text_call_n += n;
-        }
-        for (&m, made) in cn.made.iter() {
-            let n = add(m, &made.decls);
-            made_all += 1;
-            made_calls += u64::from(n > 0);
-            made_call_n += n;
-        }
-        let mut seen: [HashSet<(ItemKey, Namespace, &str)>; 2] = [HashSet::new(), HashSet::new()];
-        let mut all_seen: HashSet<(ItemKey, Namespace, &str)> = HashSet::new();
-        let mut adj: [HashMap<ItemKey, HashSet<ItemKey>>; 2] = [HashMap::new(), HashMap::new()];
-        let mut call_seen: [HashSet<(ItemKey, &str)>; 2] = [HashSet::new(), HashSet::new()];
-        // (4): type and value lookups by imports.
-        for &(_, rk, module, ns, name, pending, n) in cn.d116_reads.iter() {
-            if rk != 1 || ns == Namespace::Macros {
-                continue;
-            }
-            let Some((by_ns, any, has_calls)) = text_names.get(&module) else { continue };
-            if all_seen.insert((module, ns, name)) {
-                all_distinct += 1;
-            }
-            all_reads += n;
-            if by_ns.contains(&(ns, name)) || any.contains(name) {
-                continue;
-            }
-            let nsi = ns as usize;
-            for (v, waits) in [*has_calls, pending].into_iter().enumerate() {
-                if !waits {
-                    continue;
-                }
-                if seen[v].insert((module, ns, name)) {
-                    distinct[v][nsi] += 1;
-                }
-                reads[v][nsi] += n;
-            }
-        }
-        // (1)-(3): each macro call's path, with what expansions wrote left out.
-        for call in cn.d116_calls.iter() {
-            let leaf = call.path.last().copied().unwrap_or("");
-            for v in 0..2 {
-                let k = &mut call_counts[v];
-                k[0] += 1;
-                match (call.spec[v], call.last) {
-                    (D116Answer::NotFound, _) => {
-                        k[1] += 1;
-                        if call_seen[v].insert((call.cur[v], leaf)) {
-                            k[2] += 1;
-                        }
-                        if call.cur[v] != call.module && text_names.contains_key(&call.cur[v]) {
-                            adj[v].entry(call.module).or_default().insert(call.cur[v]);
-                        }
-                    }
-                    (D116Answer::Outside, _) => k[3] += 1,
-                    (D116Answer::Refused, _) => k[4] += 1,
-                    (_, D116Answer::Outside | D116Answer::Refused) => k[5] += 1,
-                    (D116Answer::Found(x), D116Answer::Found(y)) if x == y => k[6] += 1,
-                    (D116Answer::Ambiguous(_), D116Answer::Ambiguous(_)) => k[6] += 1,
-                    (spec, last) => {
-                        k[7] += 1;
-                        rows.push(format!(
-                            "d116 3 row ({}): crate `{}` module `{}` call `{}`: speculative {spec:?}, settled {last:?}",
-                            ["static", "dynamic"][v],
-                            cn.name,
-                            call.module_path.join("::"),
-                            call.path.join("::")
-                        ));
-                    }
-                }
-            }
-        }
-        for v in 0..2 {
-            let mut ids: HashMap<ItemKey, usize> = HashMap::new();
-            let mut keys: Vec<ItemKey> = Vec::new();
-            let mut id = |k: ItemKey, keys: &mut Vec<ItemKey>| *ids.entry(k).or_insert_with(|| {
-                keys.push(k);
-                keys.len() - 1
-            });
-            let mut list: Vec<(usize, usize)> = Vec::new();
-            let mut froms: Vec<&ItemKey> = adj[v].keys().collect();
-            froms.sort();
-            for from in froms {
-                let a = id(*from, &mut keys);
-                let mut tos: Vec<&ItemKey> = adj[v][from].iter().collect();
-                tos.sort();
-                for to in tos {
-                    let b = id(*to, &mut keys);
-                    list.push((a, b));
-                }
-            }
-            let mut g: Vec<Vec<usize>> = vec![Vec::new(); keys.len()];
-            for (a, b) in list {
-                g[a].push(b);
-            }
-            for comp in sccs(keys.len(), &g) {
-                if comp.len() > 1 {
-                    graphs[v].push((ci, comp.iter().map(|&i| keys[i]).collect()));
-                }
-            }
-        }
-        // 4. Every module's scope record: the bytes of its glob-origin bindings and glob edges.
-        let (mut cg, mut ct) = (0u64, 0u64);
-        let mut mods: Vec<&ItemKey> = cn.done.keys().collect();
-        mods.sort();
-        for m in mods {
-            let scope = &cn.done[m].scope;
-            let whole = scope.write(g()).unwrap_or_else(|e| panic!("`{}` scope {m:?}: {e:?}", cn.name)).len() as u64;
-            let mut no_globs = scope.clone();
-            no_globs.bindings.retain(|b| b.binding.origin != Origin::Glob);
-            let without = no_globs.write(g()).unwrap_or_else(|e| panic!("`{}` scope {m:?}: {e:?}", cn.name)).len() as u64;
-            no_globs.globs.clear();
-            let no_edges = no_globs.write(g()).unwrap_or_else(|e| panic!("`{}` scope {m:?}: {e:?}", cn.name)).len() as u64;
-            scope_bytes += whole;
-            glob_binding_bytes += whole - without;
-            glob_edge_bytes += without - no_edges;
-            bindings += scope.bindings.len() as u64;
-            let gb = scope.bindings.iter().filter(|b| b.binding.origin == Origin::Glob).count() as u64;
-            glob_bindings += gb;
-            edges += scope.globs.len() as u64;
-            cg += whole - without;
-            ct += whole;
-        }
-        glob_by_crate.push((cg, ct, cn.name));
-    }
-    let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
-    println!("\nd116 threads {t}: crates {}", crates.len());
-    println!(
-        "d116 1 modules: {} in all; text modules {} ({} with item-position calls, {:.1}%; {} calls); made modules (expansions' and blocks') {} ({} with item-position calls, {:.1}%; {} calls); with calls in all {} ({:.1}%)",
-        text_all + made_all,
-        text_all,
-        text_calls,
-        pct(text_calls, text_all),
-        text_call_n,
-        made_all,
-        made_calls,
-        pct(made_calls, made_all),
-        made_call_n,
-        text_calls + made_calls,
-        pct(text_calls + made_calls, text_all + made_all)
-    );
-    println!("d116 R4 type/value lookups by imports (Full cells of this crate's modules): {all_distinct} distinct (module, ns, name), {all_reads} reads");
-    for (v, what) in ["static: the module has item-position calls at all", "dynamic: the module had calls not expanded yet when read"].iter().enumerate() {
-        let d: u64 = distinct[v].iter().sum();
-        let r: u64 = reads[v].iter().sum();
-        println!(
-            "d116 R4 import waits on a ModuleScope ({what}), name absent from the module's text: {d} distinct (types {}, values {}), {r} reads (types {}, values {})",
-            distinct[v][0], distinct[v][1], reads[v][0], reads[v][1]
-        );
-        let k = call_counts[v];
-        let what1 = ["static: every call pending", "dynamic: calls not expanded at the call's first read pending"][v];
-        println!(
-            "d116 R1 expansion-driving macro lookups ({what1}): {} calls (built-in attributes and helpers left out); NOT FOUND {} reads, {} distinct (module, name); speculative unknown {}, refused {}; settled unknown or refused {}; found and agreeing {}; contradicting {}",
-            k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]
-        );
-        let mut comps = core::mem::take(&mut graphs[v]);
-        comps.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-        println!("d116 R2 NOT FOUND wait cycles ({what1}): largest SCC {} modules; SCCs above 1: {}", comps.first().map_or(1, |c| c.1.len()), comps.len());
-        for (ci, comp) in comps.iter().take(5) {
-            println!("d116 R2   {} modules in crate `{}`", comp.len(), crates[*ci].name);
-        }
-    }
-    println!("d116 R3 contradicting rows: {}", rows.len());
-    for r in rows.iter().take(500) {
-        println!("{r}");
-    }
-    println!(
-        "d116 4 scope records: {scope_bytes} bytes in all; glob-origin bindings {glob_binding_bytes} bytes ({:.2}%; {glob_bindings} of {bindings} bindings); glob edges {glob_edge_bytes} bytes ({:.2}%; {edges} edges)",
-        pct(glob_binding_bytes, scope_bytes),
-        pct(glob_edge_bytes, scope_bytes)
-    );
-    glob_by_crate.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(b.2)));
-    for (gb, tb, name) in glob_by_crate.iter().take(5) {
-        println!("d116 4   `{name}`: glob-origin binding bytes {gb} of {tb}");
-    }
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // The example's build identity (D105): its own bytes, from the path it was started by
@@ -1781,6 +1506,9 @@ fn main() {
         std::process::exit(2);
     };
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    if args.iter().any(|a| a == "--d116-decide") {
+        D116_DECIDE.store(true, Ordering::Relaxed);
+    }
     let threads: Vec<usize> = flag("--threads").unwrap_or_else(|| "1,18".into()).split(',').map(|t| t.parse().expect("a thread count")).collect();
     let roots: Option<Vec<String>> = flag("--roots").map(|r| r.split(',').map(str::to_string).collect());
     let per_crate = args.iter().any(|a| a == "--crates");
@@ -1839,9 +1567,10 @@ fn main() {
     let checkout: &'static Checkout = Box::leak(Box::new(Checkout::new(root.clone())));
     let mut packages = Fetched { store: sources, paths: &paths, lock, alloc: g() };
     // The crate list (blaze-scope's units list) and the toolchain crates it needs.
-    let listed: &'static blaze_world::Listed<'static, &'static [u8]> = Box::leak(Box::new(
+    let listed: &'static blaze_world::Listed<'static, &'static [u8]> = blaze_own::Box::leak(blaze_own::Box::new_in(
         blaze_world::open_list(&mut DirShelf(format!("{home}/.blaze/v2/toolchain")), blaze_toolchain::PINNED, "aarch64-apple-darwin", graph, lock, &mut packages, g())
             .unwrap_or_else(|e| panic!("{e}")),
+        g(),
     ));
     for refused in listed.list.refused.iter() {
         println!("refused       crate {} ({}): {}", listed.list.crates[refused.krate].name, refused.krate, refused.why);
@@ -1868,8 +1597,12 @@ fn main() {
         println!("scripts       {} units given their build script's outputs from {dir}", records.len());
         &*Box::leak(Box::new(records))
     });
-    let scripts = records.as_ref().map(|r| r as &dyn blaze_world::ScriptOutputs<'static>);
-    let world: &'static World<'static> = Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, scripts, g()).unwrap_or_else(|e| panic!("{e}"))));
+    let world: &'static World<'static> = Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, g()).unwrap_or_else(|e| panic!("{e}"))));
+    // The record a crate's task would join (D115 (B)): its unit's, from `--scripts`.
+    let given = |c: &blaze_world::Crate<'static>| match (c.script, c.origin) {
+        (Script::Read { .. }, blaze_world::Origin::Unit(unit)) => records.and_then(|r| r.outputs(unit)),
+        _ => None,
+    };
     let world_time = t2.elapsed();
     for used in world.corrections.iter() {
         println!("{used}");
@@ -1896,7 +1629,7 @@ fn main() {
     world.write(&mut bytes);
     let digest = blaze_id::ContentId::of("blaze world example inputs", &bytes);
     let held_units = world.crate_of_unit.iter().filter(|c| c.is_some()).count();
-    let missing = world.crates.iter().filter(|c| c.script == Script::Missing).count();
+    let missing = world.crates.iter().filter(|c| matches!(c.script, Script::Read { .. }) && given(c).is_none()).count();
     let pms = world.crates.iter().filter(|c| c.proc_macro).count();
     println!("workspace     {}", root.display());
     println!("graph         {} units ({} of them crates of the names set), {:.1} ms", graph.units.len(), held_units, ms(graph_time));
@@ -1914,7 +1647,7 @@ fn main() {
         digest.0[3]
     );
     if records.is_some() {
-        for c in world.crates.iter().filter(|c| c.script == Script::Missing) {
+        for c in world.crates.iter().filter(|c| matches!(c.script, Script::Read { .. }) && given(c).is_none()) {
             println!("  without     {} {} ({})", c.package, c.version, c.input.name);
         }
     }
@@ -1937,7 +1670,11 @@ fn main() {
             read: (0..world.crates.len()).map(|_| std::sync::Mutex::new(Vec::new())).collect(),
         };
         let texts: &'static Timed<'static> = Box::leak(Box::new(texts));
-        let inputs: &'static [CrateInput<'static>] = world.inputs(g()).leak();
+        // Each crate's input with its script's record joined, as its task would (D115 (B)).
+        // The crate environments (`OUT_DIR`, `rustc-env` pairs) are not joined here: an
+        // `env!`/`include!` of them is refused by name in this example (CrateEnv::joined is
+        // the command's, names/scope.rs).
+        let inputs: &'static [CrateInput<'static>] = world.crates.iter().map(|c| given(c).map_or(c.input, |outputs| blaze_world::joined(&c.input, outputs, g()))).collect::<Vec<_>>().leak();
         if by_owner {
             println!("threads {t}: before the resolve: footprint {:.1} MB, its peak so far {:.1} MB", now_footprint() as f64 / 1e6, max_footprint() as f64 / 1e6);
             print_owners();
@@ -2121,9 +1858,6 @@ fn main() {
                 continue;
             }
         };
-        if args.iter().any(|a| a == "--d116-counts") {
-            d116_counts(t, &names);
-        }
         // `--ask a,b`: each plain name in the type namespace at the LAST crate's root (the
         // program's), through the names library: what a check of `main`'s head asks first.
         if let Some(asked) = flag("--ask") {
@@ -2224,7 +1958,7 @@ fn main() {
         let mut waits: Vec<bool> = Vec::with_capacity(world.crates.len());
         for (i, c) in world.crates.iter().enumerate() {
             let cn = names.krate(i);
-            let mut facts = Facts { proc_macro: c.proc_macro, script_missing: c.script == Script::Missing, out_dir: false, cfg_if: false, deps: Vec::new() };
+            let mut facts = Facts { proc_macro: c.proc_macro, script_missing: matches!(c.script, Script::Read { .. }) && given(c).is_none(), out_dir: false, cfg_if: false, deps: Vec::new() };
             for call in cn.tables.calls.values() {
                 facts.out_dir |= call.name == "include" && call.input.contains("OUT_DIR");
                 facts.cfg_if |= call.name == "cfg_if";

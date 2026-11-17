@@ -20,7 +20,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Got, Plain, PlainConfig, PutError, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, Committed, Found, Got, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::{Form, Settings},
 };
@@ -220,16 +220,18 @@ impl Driven<Native> {
 
     /// The record under `key` read into `out` by one `pread` of its proved segment (no mapping
     /// is touched, nothing is checked); its tag, or `None` when no namespace read holds it.
-    pub fn get_into(&self, key: &Key, out: &mut Vec<u8>) -> Result<Option<Tag>, StoreError> {
+    pub fn get_into(&mut self, key: &Key, out: &mut Vec<u8>) -> Result<Option<Tag>, StoreError> {
         use std::os::unix::fs::FileExt;
-        let Some(placed) = self.core.locate(key) else {
+        let Some(found) = self.get(key)? else { return Ok(None) };
+        let Some(placed) = self.core.placed(found) else {
             // Put and not yet committed: in memory.
-            return Ok(self.core.get(key).map(|got| {
-                out.clear();
-                out.extend_from_slice(got.bytes);
-                got.tag
-            }));
+            let got = self.core.got(found);
+            out.clear();
+            out.extend_from_slice(got.bytes);
+            return Ok(Some(got.tag));
         };
+        // A segment mapped at this probe is opened for pread now, once.
+        self.open_files()?;
         let file = self.files.get(&placed.file).ok_or(StoreError::Other { what: "a segment mapped and not opened for pread" })?;
         out.resize(placed.len as usize, 0);
         file.read_exact_at(out, placed.at).map_err(|e| os("pread", "a plain store's segment", &e))?;
@@ -397,17 +399,82 @@ impl<D: Driver> Driven<D> {
         self.core.report()
     }
 
-    pub fn get(&self, key: &Key) -> Option<Got<'_>> {
-        self.core.get(key)
+    /// The record under `key` in the namespaces read, found by [`Plain::find`]: a segment
+    /// mapped at the first probe that reaches it (at most one a step, each step run to its
+    /// completion), an earlier boot's unsealed segment checked whole at its first hit. Read the
+    /// bytes with [`Driven::got`]. `None`: absent. The command's main thread reads this way;
+    /// pool tasks read through the handle after [`Driven::map_all`].
+    pub fn get(&mut self, key: &Key) -> Result<Option<Found>, StoreError> {
+        let before = self.core.probes().probes;
+        let lost = self.core.report().lost.len();
+        // Bounded: each map is of a row not mapped before, and the generation names few.
+        let found = loop {
+            let now = self.driver.wall_ns();
+            match self.core.find_read(key, now, &mut self.effects)? {
+                Probe::Hit(found) => break Some(found),
+                Probe::Absent => break None,
+                Probe::Map => self.run("mapping a segment at its first probe")?,
+            }
+        };
+        self.core.count_get(before);
+        self.hand_losses(lost);
+        Ok(found)
     }
 
-    pub fn has(&self, key: &Key) -> bool {
-        self.core.has(key)
+    /// The bytes of what [`Driven::get`] found, in place, borrowed from the store.
+    pub fn got(&self, found: Found) -> Got<'_> {
+        self.core.got(found)
     }
 
-    /// The explicit scrub ([`Plain::scrub`]): every record's CRC-32C against its bytes now.
-    pub fn scrub(&self) -> Vec<Corrupt> {
-        self.core.scrub()
+    pub fn has(&mut self, key: &Key) -> Result<bool, StoreError> {
+        Ok(self.get(key)?.is_some())
+    }
+
+    /// Every row mapped and every parked row checked: whole from now on ([`Plain::map_all`]).
+    /// The command asks it once, when the request's first pool task is about to start (the
+    /// handle cannot map); a commit, a compaction slice, a scrub and a fetch ask it first.
+    pub fn map_all(&mut self) -> Result<(), StoreError> {
+        let lost = self.core.report().lost.len();
+        let now = self.driver.wall_ns();
+        if !self.core.map_all(now, &mut self.effects)? {
+            return Ok(());
+        }
+        self.run("mapping every segment named")?;
+        if !self.core.whole() {
+            return Err(StoreError::Unfinished { what: "mapping every segment named" });
+        }
+        self.hand_losses(lost);
+        Ok(())
+    }
+
+    /// Losses found after the open (a first probe's check, a map of a file gone): logged and
+    /// handed, as the open's are ([`Driven::opened`]).
+    fn hand_losses(&mut self, from: usize) {
+        let lost = &self.core.report().lost;
+        if lost.len() <= from {
+            return;
+        }
+        for lost in &lost[from..] {
+            blaze_trace::warn!(target: "blaze_cas::plain", file = %lost.file, records = ?lost.records, "lost in a power cut: {}", lost.why);
+        }
+        self.core.handed();
+    }
+
+    /// `(segments mapped, segments named)`: `--stats` "segments mapped N of M named".
+    pub fn mapped_of_named(&self) -> (u32, u32) {
+        self.core.mapped_of_named()
+    }
+
+    /// What the gets probed: `--stats` "probes per get (mean, most)".
+    pub fn probes(&self) -> Probes {
+        self.core.probes()
+    }
+
+    /// The explicit scrub ([`Plain::scrub`]): every record's CRC-32C against its bytes now,
+    /// over a whole store.
+    pub fn scrub(&mut self) -> Result<Vec<Corrupt>, StoreError> {
+        self.map_all()?;
+        Ok(self.core.scrub())
     }
 
     pub fn put(&mut self, key: Key, namespace: Namespace, tag: Tag, value: &[u8]) -> Result<Put, PutError> {
@@ -425,6 +492,11 @@ impl<D: Driver> Driven<D> {
     /// Writes the store's puts and `batches` as one segment for each namespace that holds
     /// records, and flips to a generation naming them, driven until done.
     pub fn commit_with(&mut self, batches: &[&Batch]) -> Result<Committed, StoreError> {
+        // After the answer: what is left unmapped is mapped, so the layout refuses two values
+        // under one key against every row. A commit with nothing to lay out maps nothing.
+        if self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) {
+            self.map_all()?;
+        }
         let now = self.driver.wall_ns();
         self.core.commit(batches, now, &mut self.effects)?;
         self.run("committing")?;
@@ -445,6 +517,7 @@ impl<D: Driver> Driven<D> {
     /// [`Driven::compact`] on the calling thread as it is: for a caller that runs it beside
     /// builds on a thread it lowered itself.
     pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced>, StoreError> {
+        self.map_all()?;
         let mut out = Vec::new_in(Global);
         for _ in 0..slices {
             if !self.core.compact(&mut self.effects) {
@@ -479,6 +552,7 @@ impl<D: Driver> Driven<D> {
     /// [`Driven::report`]'s losses, handed to the caller with the slice.
     pub fn scrub_next(&mut self, budget_bytes: u64) -> Result<Option<Scrubbed>, StoreError> {
         lower_this_thread()?;
+        self.map_all()?;
         let Some(slice) = self.core.scrub_next(budget_bytes, &mut self.effects) else { return Ok(None) };
         if !self.core.ready() {
             self.run("recording the background pass")?;
@@ -511,6 +585,8 @@ impl<D: Driver> Driven<D> {
         if !self.core.reads().contains(&namespace) {
             return Err(StoreError::Other { what: "a fetch from a namespace this store does not read: a key is never answered from a namespace the caller did not ask for" });
         }
+        // What is held is asked of every row, not of the mapped ones alone.
+        self.map_all()?;
         let mut missing: Vec<RecordRef> = Vec::with_capacity_in(keys.len(), Global);
         missing.extend(keys.iter().filter(|it| self.core.get_in(&[namespace], &Key(it.key)).is_none()).copied());
         missing.sort_unstable_by(|a, b| a.key.cmp(&b.key));
@@ -533,6 +609,8 @@ impl<D: Driver> Driven<D> {
     /// Fetches whole segments a source names (a bundle: std for a toolchain, target and cfg
     /// set), each verified and checked as [`Driven::fetch_missing`] says, and names them here.
     pub fn pull(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, wanted: &[SegmentRef]) -> Result<Vec<u64>, StoreError> {
+        // The adopted segments are mapped as their flip lands: a whole store.
+        self.map_all()?;
         let mut adopted = Vec::with_capacity_in(wanted.len(), Global);
         let mut ids = Vec::with_capacity_in(wanted.len(), Global);
         for (i, want) in wanted.iter().enumerate() {

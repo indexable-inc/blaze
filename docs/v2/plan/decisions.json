@@ -961,7 +961,7 @@
    "decision": "Names are resolved by walking links over tables made from text; nothing of another module is copied into a module's record. A module's outline (declarations, use links, glob links, item-position macro calls) is its table; `ModuleScope` exists only for a module with item-position macro calls and holds only what those calls made; `Imports`, a leaf kind a module, holds its own use items resolved and its traits in scope; `ExportedMacros` is its own kind a crate; a `Group` is a wait cycle among `ModuleScope` tasks, found as the drive runs. Lookup is the cell core deciding one cell on demand over settled tables. Every read is of one cell: the drive's read list gains a part (a record's cell, with its digest or `Absent`). `CrateScope` and the materialised scopes are deleted once this path gives equal answers on tempo. Design text: docs/v2/plan/design/drive.md, \"D114 rulings\", \"Part reads\" and \"Names at module grain\".",
    "recommended": "Count on tempo first (modules with item-position calls, waits, the largest group); then one writer a piece: part reads in the drive, the on-demand cell, `ModuleScope` made-only, `Imports`, the readers.",
    "why": "The names lane's page (19:5x) proposed a record a module with every glob's names materialised and a wait on any unsolved module read. Read by the coordinator: a wait a module for explicit imports ties a crate's root and its children into one group (the crate again), and a materialised glob copies its source's names into every importer (libc's names times its importers) and makes each export change of the source a change of every importer.",
-   "state": "decided and written by the coordinator 20:00; the names lane counts, then builds"
+   "state": "decided 20:00; corrected 20:31 by the count on tempo (73.7% of 144,679 modules have item-position calls; a wait for every name absent from text gave 254,139 waits and cycles of up to 88 modules): a lookup that drives an expansion never waits when it finds something (rustc's own speculation; a contradicted one reruns over settled tables), only a macro path not found waits; type and value lookups by `Imports` and bodies wait one way. The names lane builds `decide` and recounts."
   },
   {
    "id": "D117",
@@ -970,6 +970,14 @@
    "recommended": "The store lane writes the generic place and its simulation tests now; the bstd lend is its own batch; the switch follows both. The signature lane's successor finishes the command half, then the three owed stale-check tests.",
    "why": "The store lane stopped on two questions (which driver; how many roots). store-next.md already says one store a user; a chain of three was the stand-in's shape, and a second native driver a command is cost against a 2 ms floor. The critic of run.md found edits where a kept check or code record is wrong (a future's layout, a const's value, an impl in a body, lines).",
    "state": "decided and written by the coordinator 20:00"
+  },
+  {
+   "id": "D118",
+   "date": "2026-11-16",
+   "decision": "A body waits only for its file's owners and their dependency closure, and reads only the scopes its check opened. Owners is a kept fact the machine computes from the module tree (a crate root, a member's or a dependency's alike, is a part of the record that names the crate), never from scopes; the one barrier allowed is that every reachable file is outlined. Under `check` a dependency's body gets no check because it exists: the asked set is the bodies of files owned by the roots asked about, and a dependency body is checked only when a task needs one of its facts (a hidden type, a const's value, under `run` its code). A task that reads a file hashes what it read and stops with a typed `Changed` when that is not the id in its key. Design text: docs/v2/plan/design/drive.md, \"A body's owners, and what it waits for\" and \"The bytes a task parses are the bytes its key names\".",
+   "recommended": "The driver lane builds the owners fact and the demand rule with the pipeline lane's body side in one batch, then quotes the clone's body-job count before and after.",
+   "why": "Measured on blaze's own clone 20:03: every body needed every workspace member's scope (about 1,400 names a body): 51.6 s of main-thread job making, 5.2 GB of need lists, one failed crate blocking 110,962 bodies, any crate's name change invalidating every body. A critic of run.md found that a file re-read at task time was filed under the sweep's content id, in a store every worktree reads.",
+   "state": "decided by the coordinator 20:07 to 20:41; verified bytes in the tree and green 20:33; the owners fact and the demand rule being built"
   }
  ]
 }

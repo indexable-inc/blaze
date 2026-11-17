@@ -173,6 +173,27 @@ byte_enum! {
     }
 }
 
+byte_enum! {
+    /// What a macro call is to the item it is written on (attr-bang-kind-2). rustc takes an
+    /// item's derive first, then resolves each later one-segment attribute with the derive's
+    /// helpers innermost (`InvocationCollector::take_first_attr`): a helper is inert, an
+    /// attribute macro takes the item. The lowering cannot tell which, so it sends both kinds of
+    /// call below and the cells decide.
+    pub enum CallRole, refused as "a byte that is no macro call role" {
+        /// Any other call: answered by its path alone.
+        Call = 0 => "call",
+        /// A one-segment attribute written after a derive on the item itself: inert as a
+        /// derive's helper; an attribute macro takes the item unless one written before it did.
+        AfterDerive = 1 => "after derive",
+        /// The item itself, kept after its `AfterDerive` calls: lowered when none took it.
+        Keep = 2 => "keep",
+        /// An `AfterDerive` call with a `#[derive]` written after it on the same item: when it
+        /// names an attribute macro the call is refused (`Unresolved::DeriveAfterAttrMacro`),
+        /// since that derive would run on the item here and again on the macro's output.
+        AfterDeriveBeforeDerive = 3 => "after derive, before a derive",
+    }
+}
+
 /// The call shapes a macro takes: never empty. A `macro_rules!` takes each shape one of its
 /// arms is written for (`attr(..)` arms: attribute, `derive(..)` arms: derive, plain arms:
 /// function-like, as the pinned nightly reads them); a builtin or procedural macro takes one.

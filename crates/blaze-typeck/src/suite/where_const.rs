@@ -81,8 +81,8 @@ const WANT: Want<'static> = Want {
         (ExprId(9), "()"),
     ],
     pats: &[(PatId(0), "P0")],
-    // `u8` meets the condition; `u32` does not; `U` is not decided.
-    diags: &[(DiagCode::Unsatisfied, ExprId(3)), (DiagCode::Unsatisfied, ExprId(6))],
+    // `u8` meets the condition; `u32` does not; `U` is not decided. Each at the argument.
+    diags: &[(DiagCode::Unsatisfied, ExprId(4)), (DiagCode::Unsatisfied, ExprId(7))],
 };
 
 #[test]

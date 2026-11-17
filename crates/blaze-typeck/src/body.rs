@@ -143,6 +143,11 @@ pub enum Expr {
     /// `const { stmts; tail }`: an inline constant, a block typed in this body's inference (as
     /// rustc types it with its typeck root) that sees no local of the body.
     ConstBlock { stmts: List, tail: Option<ExprId>, scope: ScopeId },
+    /// `asm!` (blaze-lower's `AsmForm`, asm.rs): `pieces` in `BodyView::asm_pieces`,
+    /// `operands` in `asm_operands`, `clobber_abis` in `asm_clobbers` (ranges of `asm_text`),
+    /// `options` the `AsmForm` bits (`ASM_NORETURN` ..), `arch` the target's, which the
+    /// lowering read as `cfg` atoms at the `asm!`. `()`, or `!` with `noreturn`.
+    Asm { pieces: List, operands: List, options: u16, clobber_abis: List, arch: crate::asm::AsmArch },
 }
 
 /// How a closure or an async block captures what it names.
@@ -297,6 +302,8 @@ pub struct BodyPath {
 pub struct Anchor {
     pub ty: PTy,
     pub trait_: Option<PathIdx>,
+    /// Where `ty` is written (a site, as `expr_ranges`); empty when not known.
+    pub ty_range: Range,
 }
 
 /// One body, borrowed from its lowering.
@@ -322,10 +329,19 @@ pub struct BodyView<'b> {
     pub field_pats: &'b [FieldPat],
     pub paths: &'b [BodyPath],
     pub segments: &'b [Segment],
+    /// Where each segment is written, by index into `segments`. Shorter than `segments`, or an
+    /// empty range, means no range is known: the finding falls back to the whole expression.
+    pub segment_ranges: &'b [Range],
     /// Written types (let annotations, casts, turbofish, closure params), with `Infer` holes.
     pub types: PTys<'b>,
     /// Lists of written types (turbofish arguments).
     pub type_lists: &'b [PTy],
+    /// Where each turbofish argument is written, by index into `type_lists`; short or empty as
+    /// `segment_ranges`.
+    pub type_list_ranges: &'b [Range],
+    /// Where a method call's name is written, ascending by the call's id; a call missing here has
+    /// no range known.
+    pub method_name_ranges: &'b [(ExprId, Range)],
     /// A closure parameter's written type, if any.
     pub opt_types: &'b [Option<PTy>],
     /// `Expr::FormatArgs`' uses.
@@ -335,6 +351,14 @@ pub struct BodyView<'b> {
     /// The `let` statements written `super let` (the library's `pin!`), in ascending order: each
     /// binding is owned by the scope a temporary of its block's value would be (async plan P11).
     pub super_lets: &'b [StmtId],
+    /// `Expr::Asm`'s template pieces.
+    pub asm_pieces: &'b [crate::asm::AsmPiece],
+    /// `Expr::Asm`'s operands.
+    pub asm_operands: &'b [crate::asm::AsmOperand],
+    /// `Expr::Asm`'s `clobber_abi` names, each a range `(first, len)` of `asm_text`.
+    pub asm_clobbers: &'b [(u32, u32)],
+    /// Every text an `asm!` names: templates (cooked), class and register names, ABI names.
+    pub asm_text: &'b str,
 }
 
 fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], CheckError> {
@@ -364,6 +388,20 @@ impl<'b> BodyView<'b> {
 
     pub(crate) fn fmt_use_list(&self, l: List) -> Result<&'b [FmtUse], CheckError> {
         slice("fmt_uses", self.fmt_uses, l)
+    }
+
+    pub(crate) fn asm_operand_list(&self, l: List) -> Result<&'b [crate::asm::AsmOperand], CheckError> {
+        slice("asm_operands", self.asm_operands, l)
+    }
+
+    /// The `len` bytes of `asm_text` at `first`.
+    pub(crate) fn asm_text_at(&self, first: u32, len: u32) -> Result<&'b str, CheckError> {
+        let end = first.checked_add(len);
+        end.and_then(|end| self.asm_text.get(first as usize..end as usize)).ok_or(CheckError::Malformed(Malformed::List {
+            column: "asm_text",
+            start: first,
+            len,
+        }))
     }
 
     pub(crate) fn pat_list(&self, l: List) -> Result<&'b [PatId], CheckError> {
@@ -412,6 +450,22 @@ impl<'b> BodyView<'b> {
 
     pub(crate) fn pat_range(&self, p: PatId) -> Range {
         self.pat_ranges.get(p.ix()).copied().unwrap_or_default()
+    }
+
+    /// Where `type_lists[i]` is written, when known (not empty).
+    pub(crate) fn type_arg_range(&self, i: u32) -> Option<Range> {
+        self.type_list_ranges.get(i as usize).copied().filter(|r| r.end > r.start)
+    }
+
+    /// Where `segments[i]` is written, when known (not empty).
+    pub(crate) fn segment_range(&self, i: u32) -> Option<Range> {
+        self.segment_ranges.get(i as usize).copied().filter(|r| r.end > r.start)
+    }
+
+    /// Where the method call `e`'s name is written, when known (not empty).
+    pub(crate) fn method_name_range(&self, e: ExprId) -> Option<Range> {
+        let i = self.method_name_ranges.binary_search_by_key(&e, |&(x, _)| x).ok()?;
+        self.method_name_ranges.get(i).map(|&(_, r)| r).filter(|r| r.end > r.start)
     }
 
     /// The number of nodes, which sizes the frame column.

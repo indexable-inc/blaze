@@ -12,9 +12,27 @@
 //! (`legalize: the routine `__addtf3` is not bound`).
 
 use blaze_lir::func::{RefId, RefKind, RefRec};
-use blaze_lir::legalize::{LegalizeError, QuadRoutines, SoftFloat};
-use blaze_lir::Func;
+use blaze_lir::legalize::{self, LegalizeError, QuadRoutines, SoftFloat};
+use blaze_lir::{Func, View};
 use blaze_own::Alloc;
+
+/// The record emitter's first step (record.rs `emit_record_up_to`): a function holding a vector,
+/// `f16` or `f128` value, copied into `alloc` with a reference row per routine `routines` binds,
+/// legalized, and the routines it now calls; `None` (and no routine) for a function holding none,
+/// which is emitted as it is.
+pub(crate) fn legalized<'a>(
+    func: View<'_>,
+    routines: &RoutinePlaces,
+    alloc: Alloc<'a>,
+) -> Result<(Option<Func<Alloc<'a>>>, Called), LegalizeError> {
+    if !legalize::needed(&func)? {
+        return Ok((None, Called::NONE));
+    }
+    let mut owned = func.to_func_in(alloc);
+    let rows = routines.add_rows(&mut owned)?;
+    let done = legalize::legalize(&mut owned, &rows, alloc)?;
+    Ok((Some(owned), Called::of_bits(done.routines)))
+}
 
 /// How many routines there are: [`SoftFloat::ALL`]'s length.
 const COUNT: usize = SoftFloat::ALL.len();
@@ -118,21 +136,9 @@ mod tests {
     use blaze_lir::{BlockKind, Builder, Flags, Full, Func, Op, Ty};
     use blaze_own::Alloc;
 
-    use super::{Called, RoutinePlaces};
-    use crate::{Named, Names, Outside, RecordEmitError, emit_record, tests::ISA};
+    use blaze_lir::func::RefKind;
 
-    /// Function reference `k` is routine `SoftFloat::ALL[k]`, by its C symbol (a stand-in for
-    /// the program's compiler_builtins instance: the emitter names a place, whatever it is).
-    struct EachRoutine;
-
-    impl Names for EachRoutine {
-        fn name(&self, of: Outside) -> Option<Named<'_>> {
-            match of {
-                Outside::Func(place) => SoftFloat::ALL.get(place as usize).map(|r| Named::C(r.symbol())),
-                _ => None,
-            }
-        }
-    }
+    use super::{Called, RoutinePlaces, legalized};
 
     /// `fn(a: f128, b: f128) -> f128 { a + b }`, with no reference of its own.
     fn add_f128() -> Func<Global> {
@@ -149,9 +155,12 @@ mod tests {
     }
 
     /// INTRINSICS.md 3.5: "every f128 op becomes a call to the pinned compiler_builtins'
-    /// `#[no_mangle]` routines (`__addtf3`, ...)". With all 24 routines bound, a function
-    /// holding one `f128` add calls `__addtf3` and nothing else of the 24, and says so; with
-    /// none bound, the add is refused naming `__addtf3`.
+    /// `#[no_mangle]` routines (`__addtf3`, ...)". With all 24 routines bound (routine `k` at
+    /// function reference place `100 + k`), the record emitter's first step makes a function
+    /// holding one `f128` add call `__addtf3` and nothing else of the 24, says so, and the call
+    /// names a reference row at `__addtf3`'s place; with none bound, the add is refused naming
+    /// `__addtf3`. (Codegen of the call is not reached: the Reference tier takes no `f128`
+    /// signature yet, pass.rs `check_sig`.)
     ///
     /// Prints: `test routines::tests::one_f128_add_calls_addtf3_only ... ok`
     #[test]
@@ -159,16 +168,26 @@ mod tests {
         let func = add_f128();
         let mut places = RoutinePlaces::NONE;
         for (k, r) in SoftFloat::ALL.into_iter().enumerate() {
-            places.bind(r, k as u32);
+            places.bind(r, 100 + k as u32);
         }
         let heap = blaze_own::testing::heap();
         let alloc: Alloc<'_> = heap.alloc();
-        let (_, called) = emit_record(func.view(), &EachRoutine, &places, ISA, alloc)
-            .unwrap_or_else(|why| panic!("an f128 add with every routine bound emits: {why}"));
+        let (legal, called) = legalized(func.view(), &places, alloc).unwrap_or_else(|why| panic!("an f128 add with every routine bound legalizes: {why}"));
         assert_eq!(called.iter().collect::<std::vec::Vec<_>>(), [SoftFloat::AddTf3], "{called:?}");
         assert_eq!(called, Called::of_bits(SoftFloat::AddTf3.bit()));
+        let legal = legal.expect("an f128 add is rewritten");
+        let view = legal.view();
+        let add_place = 100 + SoftFloat::AddTf3 as u32;
+        let text = blaze_lir::print(view);
+        let row = view
+            .refs
+            .iter()
+            .position(|r| r.kind == RefKind::Func as u32 && r.place == add_place)
+            .unwrap_or_else(|| panic!("no reference row at __addtf3's place {add_place}:\n{text}"));
+        assert!(text.lines().any(|l| l.contains("= call") && l.contains(&format!("ref{row}"))), "no call of ref{row} (__addtf3):\n{text}");
+        assert!(!text.contains("fadd"), "an `fadd` is left:\n{text}");
 
-        let refused = emit_record(func.view(), &EachRoutine, &RoutinePlaces::NONE, ISA, alloc).map(|_| ());
-        assert_eq!(refused, Err(RecordEmitError::Legalize(LegalizeError::NoRoutine(SoftFloat::AddTf3))));
+        let refused = legalized(func.view(), &RoutinePlaces::NONE, alloc).map(|_| ());
+        assert_eq!(refused, Err(LegalizeError::NoRoutine(SoftFloat::AddTf3)));
     }
 }

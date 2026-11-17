@@ -55,6 +55,8 @@ mod expect_inputs;
 mod expect_fudge;
 mod fn_ptr;
 mod fn_item_lub;
+mod fn_lub_earlier;
+mod fn_lub_gates;
 mod fn_traits;
 mod gat;
 mod holes;
@@ -65,11 +67,16 @@ mod neg_unsigned;
 mod op_callees;
 mod op_fast_path;
 mod op_literal_vars;
+mod obligation_range;
 mod opaque;
+mod qpath_defaults;
 mod opaque_supertraits;
 mod opaque_nested;
+/// E0425 names the segment that failed (rules/lit_path.rs `path_miss`).
+mod path_miss;
 mod pattern_types;
 mod pin_unsize;
+mod pin_unsize_interior;
 mod self_impl_args;
 mod self_paths;
 mod self_ty_paths;
@@ -711,9 +718,9 @@ fn control_ambiguity_by_order() {
 /// ```text
 /// fn c_missing_impl(b: B) -> usize { of(&b) }
 /// ```
-/// `B: Size` has no impl and no bound: E0277, on the obligation's cause (the path `of`, whose
-/// where-clauses it is; rustc then points the span at the argument, `adjust_fulfillment_errors_
-/// for_expr_obligation`). The call's type is still the signature's output, `usize`.
+/// `B: Size` has no impl and no bound: E0277, at `&b`, the argument passed for the input that
+/// names the clause's parameter (rules/obligation_site.rs; rustc's `adjust_fulfillment_errors_
+/// for_expr_obligation` points there too). The call's type is still the signature's output, `usize`.
 #[test]
 fn missing_impl_reported() {
     let (fx, it) = world();
@@ -732,7 +739,7 @@ fn missing_impl_reported() {
         &Want {
             exprs: &[(ExprId(0), "fn of<B>"), (ExprId(1), "B"), (ExprId(2), "&B"), (ExprId(3), "usize"), (ExprId(4), "usize")],
             pats: &[(PatId(0), "B")],
-            diags: &[(DiagCode::Unsatisfied, ExprId(0))],
+            diags: &[(DiagCode::Unsatisfied, ExprId(2))],
         },
     );
     let _ = it.b;

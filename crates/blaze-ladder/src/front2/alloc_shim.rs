@@ -231,13 +231,10 @@ pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKe
     Ok(Some(shim))
 }
 
-/// The item's path in the names library (`crate::module::Name`), for a refusal.
+/// The item for a refusal: front2 item_shown.rs `ItemShown` (its whole path and its key; never
+/// a `_` in place of a name).
 fn path_of<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Box<str> {
-    let name = names.name_of(lib).unwrap_or("_");
-    match names.home_of(lib).and_then(|m| names.module_path(m)) {
-        Some(m) => format!("{m}::{name}").into_boxed_str(),
-        None => Box::from(name),
-    }
+    super::item_shown::ItemShown::of_lib(names, lib).boxed()
 }
 
 /// The one fn of the graph named `name` (a proc-macro unit's items are never linked into the
@@ -298,7 +295,7 @@ pub fn bound<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, store: &Store<
 }
 
 fn failed(why: &Refused) -> Reached {
-    Reached::Failed { class: why.class().into(), detail: why.detail() }
+    Reached::Failed { class: why.class().into(), detail: why.detail(), refusal: None }
 }
 
 /// The walk's outcome for `k`, a fn whose head says it has no body, when it is an allocator

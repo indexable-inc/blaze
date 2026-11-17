@@ -173,7 +173,7 @@ fn with_suite<R>(tc: &Toolchain, text: &str, f: impl FnOnce(&Names<'_>, &Suite<'
         let bytes = encode(names.krate(0), g).unwrap_or_else(|e| panic!("the tests record: {e}"));
         let record = TestsRecord::open(aligned(&bytes, g)).unwrap_or_else(|e| panic!("the tests record does not open: {e}"));
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
-        let mut left: Vec<(Box<str>, Box<str>)> = Vec::new();
+        let mut left: Vec<(Box<str>, blaze_ladder::front2::program::LeftOut)> = Vec::new();
         let suite = Front2Program::suite(names, &frame, sources, &record, Some(&mut left), g).unwrap_or_else(|e| panic!("the suite: {e}"));
         for (what, why) in &left {
             println!("SUITE left out {what}: {why}");

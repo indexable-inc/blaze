@@ -180,6 +180,35 @@ pub struct FetchEnv<'f> {
     pub toolchain: blaze_toolchain::ToolchainId,
     /// The command's files: the toolchain's shelf and the names step read through them.
     pub fs: bstd::fs::Fs,
+    /// `SDKROOT`, read at the edge (rule 75): the macOS SDK folder the native build-script
+    /// runner (D112) is given (scripts.rs); `None` when it is not set, and a script placed
+    /// native then fails naming it.
+    pub sdk: Option<&'f str>,
+    /// The folder of the running blaze, read once at the edge (rule 75; main's ruling for N7):
+    /// the fact shim (`blaze-fact-shim`) is looked for beside it (scripts.rs). A native script
+    /// is refused naming why when it is not known.
+    pub exe_dir: Result<&'f str, ExeDirWhy>,
+}
+
+/// Why the running blaze's own folder is not known (FetchEnv::exe_dir).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExeDirWhy {
+    /// `std::env::current_exe` failed with this kind.
+    Unknown { kind: std::io::ErrorKind },
+    /// Its path has no parent folder, or that folder's path is not UTF-8.
+    NotUtf8,
+    /// This caller did not read it (a test that runs no native script).
+    NotRead,
+}
+
+impl core::fmt::Display for ExeDirWhy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ExeDirWhy::Unknown { kind } => write!(f, "the running blaze's own path is not known (current_exe: {kind})"),
+            ExeDirWhy::NotUtf8 => f.write_str("the running blaze's own folder is not a UTF-8 path"),
+            ExeDirWhy::NotRead => f.write_str("the running blaze's own folder was not read by this caller (a test)"),
+        }
+    }
 }
 
 /// One `Fetch` task: its unit's record held in the machine's sources store (never the

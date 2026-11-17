@@ -11,6 +11,9 @@ use crate::form::{ExprId, TypeId};
 use crate::typeck::{Refused, Types, to_typeck};
 use crate::{Cfg, CfgAnswer, Edition, lower_body};
 
+/// `_` as an inferred const in each const-argument position, lowered from text and checked.
+mod infer_const;
+
 struct NoCfg;
 
 impl Cfg for NoCfg {
@@ -771,6 +774,35 @@ fn underscore_on_the_left_of_an_assignment() {
     let wrong = "fn tail() -> u32 {\n    _\n}";
     let (c, _, _) = lower_and_check(&fx, tail, wrong);
     assert_eq!(findings(wrong, &c), [(blaze_typeck::DiagCode::UnderscoreExpr, "_")]);
+}
+
+/// The finding for `_` outside an assignment's left side says what refuses it: the Reference,
+/// "Underscore expressions", [expr.placeholder.lhs-assignment-only] ("They may only appear in the
+/// left-hand side of an assignment."), as its `because`. Before diag-names-something-1 it was
+/// E0000 with no type, no name and no reason (std census 3: `check: Diags: E0000 found None,
+/// expected None,` on 46 of 49 rungs, from `panic_unwind::imp::panic`'s `[core::ptr::null(); _]`).
+/// Prints `underscore finding: E0000 UnderscoreExpr Some(Reference { rule:
+/// "expr.placeholder.lhs-assignment-only", says: "They may only appear in the left-hand side of an
+/// assignment." })` once, for the tail. (A repeat count `_` is an inferred const, no expression:
+/// typeck_tests/infer_const.rs.)
+#[test]
+fn underscore_finding_names_its_rule() {
+    let (mut fx, _) = make_world();
+    let u32_ = fx.u32();
+    let tail = fx.func("tail", 0, &[], u32_, std::vec::Vec::new());
+    fx.finish();
+    let says = |text: &str, f| {
+        let (c, _, _) = lower_and_check(&fx, f, text);
+        let all: std::vec::Vec<blaze_typeck::Diag> = c.diags.iter().copied().collect();
+        let [d] = all.as_slice() else { panic!("one finding wanted in {text:?}, got {all:?}") };
+        assert_eq!(d.code, blaze_typeck::DiagCode::UnderscoreExpr, "{text:?}");
+        assert!(
+            matches!(d.because, Some(blaze_typeck::Because::Reference { rule: "expr.placeholder.lhs-assignment-only", .. })),
+            "the finding for {text:?} says nothing: {d:?}"
+        );
+        std::println!("underscore finding: {} {:?} {:?}", d.code.code(), d.code, d.because);
+    };
+    says("fn tail() -> u32 {\n    _\n}", tail);
 }
 
 /// Destructuring assignments (the Reference, "Assignment expressions", "Destructuring

@@ -76,6 +76,10 @@ pub(super) fn of_head(abi: tc::Abi) -> Option<BuildAbi> {
         tc::Abi::CUnwind => Some(BuildAbi { abi: Abi::C, nounwind: false }),
         tc::Abi::System => Some(BuildAbi { abi: Abi::C, nounwind: true }),
         tc::Abi::SystemUnwind => Some(BuildAbi { abi: Abi::C, nounwind: false }),
+        // No builder ABI: a declaration of an `extern "llvm-intrinsic"` block is routed by
+        // tabled.rs `row` before its ABI is asked (a target intrinsic: front2/llvm_intrinsic.rs);
+        // a fn DEFINED with this ABI, or one left out whose ABI the builder asks, is refused.
+        tc::Abi::LlvmIntrinsic => None,
     }
 }
 

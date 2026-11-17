@@ -105,6 +105,9 @@ pub(crate) fn normalize_ground(
                 PNode::Closure { owner, ordinal, args } => {
                     PNode::Closure { owner, ordinal, args: remap_list(ground, args, &mapped, &mut list)? }
                 }
+                PNode::Coroutine { owner, ordinal, args } => {
+                    PNode::Coroutine { owner, ordinal, args: remap_list(ground, args, &mapped, &mut list)? }
+                }
                 PNode::Opaque(k, l) =>PNode::Opaque(k, remap_list(ground, l, &mapped, &mut list)?),
                 PNode::Dynamic(l) => PNode::Dynamic(remap_list(ground, l, &mapped, &mut list)?),
                 PNode::ExTrait(k, l) => PNode::ExTrait(k, remap_list(ground, l, &mapped, &mut list)?),

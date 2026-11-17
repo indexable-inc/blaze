@@ -1,7 +1,8 @@
 //! The toolchain's crates a graph reaches, read from the shelf's verified packs: core and alloc
 //! always, Rust's `std` for a Rust-edition crate, bstd for a blaze-edition one, `proc_macro`
-//! for a proc-macro crate, and what each is built from (target side; a proc-macro unit's own
-//! dependencies are the host's, not followed).
+//! for a proc-macro crate, and what each is built from by its row's edges, the sysroot crates
+//! its root names among them (so std comes in iff a crate of the closure names it; target
+//! side; a proc-macro unit's own dependencies are the host's, not followed).
 //!
 //! A crate's cfg is the target's atoms as the toolchain record states them, the profile's
 //! (`debug_assertions`), and a `feature` atom per feature on.
@@ -42,11 +43,14 @@ fn std_script_cfg<'w>(triple: &'w str) -> Result<&'static [&'static str], WorldE
     STD_SCRIPT_CFG.iter().find(|(t, _)| *t == triple).map(|(_, atoms)| *atoms).ok_or(WorldError::NoStdScriptCfg { triple })
 }
 
-/// Which toolchain crates a graph needs beyond core, alloc and Rust's std ([`crate::needs`]).
-/// Rust's std is not asked: every toolchain crate's implicit is Rust's (bstd's closure included),
-/// so every world names it, and blaze-scope's list keeps it for every program (units.rs).
+/// Which toolchain crates the PROGRAM's own units need beyond core and alloc
+/// ([`crate::needs`]): Rust's std for a unit given it, bstd for a blaze-edition one,
+/// `proc_macro` for a proc macro. A toolchain crate's own need is its row's edges
+/// (blaze_toolchain::implied), followed by [`Toolchain::open`]'s walk: so a crate of bstd's
+/// closure that uses std's prelude brings std in, and a closure of `no_std` crates does not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Needs {
+    pub std: bool,
     pub bstd: bool,
     pub proc_macro: bool,
 }
@@ -61,6 +65,9 @@ pub struct ToolchainCrate<'w> {
     pub key: CrateItemKey,
     pub edition: Edition,
     pub implicit: Implicit,
+    /// What its root's text gives it from the sysroot, as the cutter read it (its unit row's
+    /// `sysroot`); the crates it names are among [`ToolchainCrate::deps`].
+    pub sysroot: blaze_toolchain::ImplicitSysroot,
     pub root: &'w str,
     pub shown_from: &'w str,
     pub features: &'w [&'w str],
@@ -103,9 +110,13 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
         let mut keep_unit: AVec<'w, bool> = AVec::with_capacity_in(all.len(), alloc.clone());
         keep_unit.extend(all.iter().map(|_| false));
         let mut todo: AVec<'w, usize> = AVec::new_in(alloc.clone());
-        // core, alloc and Rust's std always: every toolchain crate's implicit (below) is Rust's,
-        // so bstd and its closure (blaze_ids, ...) name Rust's `std` too.
-        todo.extend([sys.core.0 as usize, sys.alloc.0 as usize, sys.std.0 as usize]);
+        // core and alloc; std for the program's own need. Every other toolchain crate comes in
+        // by an edge: a row's deps hold the sysroot crates its root names (the cutter's
+        // implied edges), so std is opened iff a crate of the closure names it.
+        todo.extend([sys.core.0 as usize, sys.alloc.0 as usize]);
+        if needs.std {
+            todo.push(sys.std.0 as usize);
+        }
         if needs.bstd {
             todo.push(sys.bstd.0 as usize);
         }
@@ -132,9 +143,6 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
             }
             v
         };
-        let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
-        let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
-        let proc = implicit(rust, &blaze_unit_graph::UnitKind::ProcMacro);
         // First the rows, then their dependencies by index among the kept.
         let mut raw_deps: AVec<'w, AVec<'w, (&'w str, usize)>> = AVec::new_in(alloc.clone());
         for (u, row) in all.iter().enumerate() {
@@ -145,6 +153,11 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
             let krate = view.krate(row.krate);
             let name = keep(krate.lib, alloc.clone());
             let edition = edition_of(krate.edition).ok_or(WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc.clone()) })?;
+            // Its implicit is its own, from its row: its crate's edition (the prelude's
+            // `rust_20xx`), never one uniform Rust 2024; what it is given from the sysroot is
+            // its row's value and edges (`row.sysroot`, `row.deps()`).
+            let own = PackageEdition::of_manifest(krate.edition).map_err(|_| WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc.clone()) })?;
+            let own_implicit = implicit(own, if proc_macro { &blaze_unit_graph::UnitKind::ProcMacro } else { &blaze_unit_graph::UnitKind::Lib });
             let pack = blaze_toolchain::shelf::open_pack(shelf, id, &krate).map_err(WorldError::Toolchain)?;
             let index = crates.len();
             let mut base = blaze_own::AString::with_capacity_in(16, alloc.clone());
@@ -187,7 +200,8 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 unit: u as u32,
                 key: CrateItemKey(ContentId::of("blaze toolchain unit", &key_bytes)),
                 edition,
-                implicit: if proc_macro { proc } else { lib },
+                implicit: own_implicit,
+                sysroot: row.sysroot,
                 root: keep(&root, alloc.clone()),
                 shown_from: keep(&base, alloc.clone()),
                 features: features.leak(),
@@ -252,7 +266,7 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
         if tc.core().is_none() {
             return Err(WorldError::NoToolchainCrate { role: "core" });
         }
-        if tc.std().is_none() {
+        if needs.std && tc.std().is_none() {
             return Err(WorldError::NoToolchainCrate { role: "std" });
         }
         if needs.bstd && tc.bstd().is_none() {

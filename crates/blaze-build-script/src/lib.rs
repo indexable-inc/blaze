@@ -25,6 +25,7 @@ pub mod cx;
 pub mod dep_paths;
 pub mod env;
 pub mod fact_pins;
+pub mod fact_shim;
 pub mod facts;
 pub mod git;
 mod git_attributes;

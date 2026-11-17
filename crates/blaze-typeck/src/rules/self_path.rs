@@ -31,7 +31,7 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::body::Segment;
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Stop};
 use crate::ids::ItemKey;
 use crate::machine::{Lower, Machine};
@@ -69,13 +69,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     pub(crate) fn impl_self_adt_args(&mut self, at: At, cause: Cause, adt: ItemKey) -> Result<Option<TyList>, Stop> {
         let self_name = Some(crate::ids::Name::of("Self"));
         let Some(self_ty) = self.impl_self_ty(cause)? else {
-            self.diag(DiagCode::UnresolvedPath, at, None, None, self_name);
+            self.diag(DiagCode::UnresolvedPath, at, About::path(self_name));
             return Ok(None);
         };
         match self.view(self_ty) {
             TyView::Adt(k, args) if k == adt => Ok(Some(args)),
             _ => {
-                self.diag(DiagCode::UnresolvedPath, at, None, Some(self_ty), self_name);
+                self.diag(DiagCode::UnresolvedPath, at, About::found_maybe_named(self_ty, self_name));
                 Ok(None)
             }
         }
@@ -108,12 +108,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 };
                 // `Self` where the body is in no impl: the path names nothing.
                 let Some(h) = header else {
-                    self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+                    self.diag(DiagCode::UnresolvedPath, at, About::path(name));
                     return Ok(None);
                 };
                 let self_ty = self.lower(h.types, h.self_ty, Lower::Body, cause)?;
                 let Some(tr) = h.trait_ else {
-                    self.diag(DiagCode::AmbiguousAssocTy, at, None, Some(self_ty), name);
+                    self.diag(DiagCode::AmbiguousAssocTy, at, About::found_maybe_named(self_ty, name));
                     return Ok(None);
                 };
                 let rest = h.types.list(h.trait_args.list())?;
@@ -128,7 +128,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self_ty
             }
             AssocPrefix::Other => {
-                self.diag(DiagCode::AmbiguousAssocTy, at, None, None, name);
+                self.diag(DiagCode::AmbiguousAssocTy, at, About::path(name));
                 return Ok(None);
             }
         };
@@ -138,7 +138,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut count = 0u32;
         for &tr in cands.iter() {
             let Some(def) = self.reads.trait_def(tr)? else {
-                self.diag(DiagCode::UnresolvedPath, at, None, Some(self_ty), name);
+                self.diag(DiagCode::UnresolvedPath, at, About::found_maybe_named(self_ty, name));
                 return Ok(None);
             };
             if def.assoc_types.iter().any(|a| a.name == assoc.name) {
@@ -151,11 +151,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let (tr, generics) = match (count, picked) {
             (1, Some(p)) => p,
             (0, _) | (_, None) => {
-                self.diag(DiagCode::NoAssocTy, at, None, Some(self_ty), name);
+                self.diag(DiagCode::NoAssocTy, at, About::found_maybe_named(self_ty, name));
                 return Ok(None);
             }
             _ => {
-                self.diag(DiagCode::AmbiguousAssocTyInBounds, at, None, Some(self_ty), name);
+                self.diag(DiagCode::AmbiguousAssocTyInBounds, at, About::found_maybe_named(self_ty, name));
                 return Ok(None);
             }
         };

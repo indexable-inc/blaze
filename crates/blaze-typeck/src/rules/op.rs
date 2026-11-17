@@ -21,7 +21,7 @@
 use blaze_own::Alloc;
 
 use crate::body::{BinOp, Expr, UnOp};
-use crate::diag::{At, Because, DiagCode};
+use crate::diag::{About, At, Because, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, LangItem, Mutbl, Name};
 use crate::machine::{Expectation, Flow, Frame, Machine, Then};
@@ -119,6 +119,21 @@ fn binop_method(op: BinOp, assign: bool) -> Option<&'static str> {
 /// Why `-x` on an unsigned integer is refused (E0600): the Reference, "Negation operators",
 /// [expr.negate.results], its table's note on `-` for integers.
 const NEG_UNSIGNED: Because = Because::Reference { rule: "expr.negate.results", says: "Negation: Only for signed integer types." };
+
+/// Why `_` is refused outside an assignment's left side: the Reference, "Underscore
+/// expressions", [expr.placeholder.lhs-assignment-only].
+const UNDERSCORE_LHS_ONLY: About = About::Rule {
+    rule: "expr.placeholder.lhs-assignment-only",
+    says: "They may only appear in the left-hand side of an assignment.",
+};
+
+/// Why a value expression is refused where a place is wanted (an assignment's left side, a
+/// compound assignment's, `&raw`'s operand): the Reference, "Place expressions and value
+/// expressions", [expr.place-value.place-memory-location].
+const PLACE_EXPR: About = About::Rule {
+    rule: "expr.place-value.place-memory-location",
+    says: "A place expression is an expression that represents a memory location.",
+};
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// Whether callee row `(e, _, args)` is an operator's whose FINAL operand types are that
@@ -374,7 +389,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(Flow::Done(self.common.err));
                 }
                 if !self.is_err(lhs_ty) {
-                    self.diag(DiagCode::BinOp, At::Expr(e), None, Some(lhs_ty), None);
+                    self.diag(DiagCode::BinOp, At::Expr(e), About::found(lhs_ty));
                 }
                 Ok(Flow::Done(self.common.err))
             }
@@ -408,7 +423,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 if self.need_lang(LangItem::Deref, At::Expr(e))?.is_none() {
                     return Ok(Flow::Done(self.common.err));
                 }
-                self.diag(DiagCode::CantDeref, At::Expr(e), None, Some(t), None);
+                self.diag(DiagCode::CantDeref, At::Expr(e), About::found(t));
                 Ok(Flow::Done(self.common.err))
             }
             UnOp::Not | UnOp::Neg => {
@@ -442,7 +457,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                     return Ok(Flow::Done(out));
                 }
-                self.diag(DiagCode::UnOp, At::Expr(e), None, Some(t), None);
+                self.diag(DiagCode::UnOp, At::Expr(e), About::found(t));
                 if op == UnOp::Neg
                     && matches!(self.view(t), TyView::Uint(_))
                     && let Some(d) = self.diags.last_mut()
@@ -499,7 +514,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `_` outside the left side of an assignment, which `expr_assign` types without this rule.
     pub(crate) fn expr_underscore(&mut self, e: ExprId) -> Result<Flow, Stop> {
-        self.diag(DiagCode::UnderscoreExpr, At::Expr(e), None, None, None);
+        self.diag(DiagCode::UnderscoreExpr, At::Expr(e), UNDERSCORE_LHS_ONLY);
         Ok(Flow::Done(self.common.err))
     }
 
@@ -545,7 +560,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// `is_syntactic_place_expr`, else `code` at `lhs`.
-    fn check_place_code(&mut self, lhs: ExprId, code: DiagCode) -> Result<(), Stop> {
+    pub(crate) fn check_place_code(&mut self, lhs: ExprId, code: DiagCode) -> Result<(), Stop> {
         let mut cur = lhs;
         for _ in 0..=self.body.exprs.len() {
             match self.body.expr(cur)? {
@@ -559,7 +574,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     let bp = self.body.path(p)?;
                     // `<T as Tr>::x` names an associated fn or const: never a place.
                     if bp.anchor.is_some() {
-                        self.diag(code, At::Expr(lhs), None, None, None);
+                        self.diag(code, At::Expr(lhs), PLACE_EXPR);
                         return Ok(());
                     }
                     let segs = self.body.segment_list(bp.segments)?;
@@ -569,12 +584,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                     let res = self.path_res(bp, p, &names, At::Expr(lhs))?;
                     if !matches!(res.map(|r| r.def), Ok(Def::Static(..)) | Err(_)) {
-                        self.diag(code, At::Expr(lhs), None, None, None);
+                        self.diag(code, At::Expr(lhs), PLACE_EXPR);
                     }
                     return Ok(());
                 }
                 _ => {
-                    self.diag(code, At::Expr(lhs), None, None, None);
+                    self.diag(code, At::Expr(lhs), PLACE_EXPR);
                     return Ok(());
                 }
             }

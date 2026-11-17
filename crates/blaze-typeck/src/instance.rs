@@ -467,7 +467,7 @@ pub fn select_impl<W: World>(
     select_in(&mut cx, &mut reads, trait_, args, ground)
 }
 
-fn select_in<W: World>(
+pub(crate) fn select_in<W: World>(
     cx: &mut InferCtx<'_>,
     reads: &mut Reads<'_, '_, W>,
     trait_: ItemKey,

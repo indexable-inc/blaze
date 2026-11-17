@@ -9,10 +9,11 @@
 //! - [`prepare`]: per run, a fresh folder `<work>/facts/<run key>` holding `bin/<program>` (a
 //!   link to the shim for each of [`fact_shim::PROGRAMS`], first on the script's `PATH`), the
 //!   pins file, and the writable `log/`.
-//! - [`reads`]: after the run, each question the shim logged as one of the run's reads, its
-//!   digest worked out again here from the pins ([`crate::fact_pins::fact_now`]), so the record
-//!   is found again exactly when the same pins give the same answers
-//!   (`ScriptRuntime::find_answering`).
+//! - [`reads`]: after the run, each question the shim logged as one of the run's reads (its
+//!   subject in `facts::subject`'s form), its digest worked out here from the pins
+//!   ([`crate::fact_pins::fact_now`]), the same form and digest a wasm run's fact reads carry,
+//!   so whatever checks a script record's reads against today's facts
+//!   ([`crate::fact_pins::read_now`] with the command's pins) treats both runners alike.
 //! - [`shim_main`]: the shim binary's whole body.
 //!
 //! Interim (D112): native runs and their records stay local; the shim goes when native scripts
@@ -101,6 +102,9 @@ pub struct ShimRun {
     pub bin: std::string::String,
     /// Its `log/`: the one folder of it granted write.
     pub log_dir: std::string::String,
+    /// Each `bin/<program>` link: granted execute as well as the shim it resolves to, so the
+    /// grant holds whether the sandbox checks the path started or the resolved one.
+    pub links: std::vec::Vec<std::string::String>,
 }
 
 /// A fresh facts folder for the run keyed `key_hex` under `work`, answering from `pins`
@@ -126,7 +130,8 @@ pub fn prepare(shim: &str, work: &str, key_hex: &str, pins: Option<&FactPins>, a
     // Canonical, as Seatbelt matches resolved paths.
     let real = std::fs::canonicalize(&folder).map_err(files(&folder))?;
     let folder = real.to_str().ok_or(NativeFactsError::Files { path: folder.clone(), why: "not UTF-8".to_owned() })?.to_owned();
-    Ok(ShimRun { shim: shim.to_owned(), bin: format!("{folder}/{BIN_DIR}"), log_dir: format!("{folder}/{LOG_DIR}"), folder })
+    let links = PROGRAMS.iter().map(|program| format!("{folder}/{BIN_DIR}/{program}")).collect();
+    Ok(ShimRun { shim: shim.to_owned(), bin: format!("{folder}/{BIN_DIR}"), log_dir: format!("{folder}/{LOG_DIR}"), links, folder })
 }
 
 /// What the run asked: its reads (sorted by subject, one each, the digest from `pins` now:

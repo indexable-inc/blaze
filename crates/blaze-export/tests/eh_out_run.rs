@@ -140,6 +140,8 @@ fn eh_out_exported_program_lands_and_exits_42() {
         panic: Panic::Unwind,
         personality: Some(sym("personality")),
         profile: None,
+        natives: None,
+        exports: &[],
     };
     let mut file = Vec::new_in(Alloc::global());
     export(&program, Platform::MacosArm64, &mut file, Alloc::global()).unwrap();

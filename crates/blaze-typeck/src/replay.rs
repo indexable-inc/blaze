@@ -106,7 +106,8 @@ fn ask<'w, 'a, W: World>(reads: &mut Reads<'w, 'a, W>, body: &BodyView<'_>, q: Q
             for segment in body.segment_list(written.segments)? {
                 names.push(segment.name);
             }
-            reads.resolve_path(scope, path, names)?;
+            // Asked again for its read (and its digest): the answer itself is not used here.
+            let _answer = reads.resolve_path(scope, path, names)?;
         }
         Question::Lang(item) => {
             reads.lang_item(item)?;
@@ -209,12 +210,19 @@ mod tests {
             field_pats: &[],
             paths: &[],
             segments: &[],
+            segment_ranges: &[],
             types: PTys::EMPTY,
             type_lists: &[],
+            type_list_ranges: &[],
+            method_name_ranges: &[],
             opt_types: &[],
             fmt_uses: &[],
             coroutine: None,
             super_lets: &[],
+            asm_pieces: &[],
+            asm_operands: &[],
+            asm_clobbers: &[],
+            asm_text: "",
         }
     }
 

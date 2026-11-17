@@ -39,6 +39,12 @@ pub enum Locate {
     Key(Key),
 }
 
+/// A [`Locate::File`] byte that is no edition (blaze-surface's are 0 to 3): the file is read as
+/// DATA (`include_str!`, `include_bytes!`), not as Rust. Its task reads the bytes and its out is
+/// their content id (blaze-cli data_include.rs); listed and not there, its record carries no
+/// finding (`absent_module`): the call that reads it reports it at the call.
+pub const DATA_FILE: u8 = 0xD0;
+
 /// A name a record lists: what the driver walks to.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Part {
@@ -90,6 +96,21 @@ pub(crate) struct Whole<'a> {
     /// once per value the space allows (`Locate` as its own; each fork's name is
     /// `key::at_condition`). `None` for every other record.
     pub(crate) split: Option<Var>,
+}
+
+/// A whole record with no parts, paths, findings or split: the bytes the drive would put for a
+/// task that answered `out` with these reads and this payload. For a consumer that reads
+/// records at a seam of its own (the cli's sharing choice, D115), so its tests take the drive's
+/// envelope instead of a copy of its form.
+pub fn write_plain<'a>(
+    name: Name,
+    source: ContentId,
+    out: ContentId,
+    reads: &[(Name, ContentId)],
+    payload: &[u8],
+    alloc: Alloc<'a>,
+) -> AVec<'a, u8> {
+    write_whole(&Whole { name, source, out, reads, parts: &[], paths: &[], findings: &[], payload, split: None }, alloc)
 }
 
 pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u8> {

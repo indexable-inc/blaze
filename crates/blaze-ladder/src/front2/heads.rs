@@ -119,6 +119,10 @@ pub struct Maps {
     /// Iter<'a> where Self: 'a;`), by the trait and the name: read and kept, not checked
     /// (gat.rs [`super::gat::OUTLIVES_NOT_CHECKED`]).
     pub assoc_where: HashMap<(LibKey, Name), super::gat::AssocWhere, Global>,
+    /// Each trait's associated type's own const parameters (own position, declared type), by
+    /// the trait and the name, filed with the trait's members ([`Heads::assoc_const_params`]):
+    /// the type a constant written in `Tr<Buf<3>: Bound>` is made at (gat_bounds.rs).
+    pub assoc_consts: HashMap<(LibKey, Name), Vec<(u32, PTy), Global>, Global>,
     /// Each trait's supertraits written as bounds on `Self` (see [`Heads::trait_supers`]):
     /// made with its members ([`Want::Members`]), since a supertrait's head may need the
     /// trait's (`FromResidual<R = <Self as Try>::Residual>`).
@@ -239,6 +243,9 @@ impl Heads for Maps {
     }
     fn assoc_generics(&self, trait_: LibKey, name: Name) -> Option<u32> {
         self.assoc_generics.get(&(trait_, name)).copied()
+    }
+    fn assoc_const_params(&self, trait_: LibKey, name: Name) -> Option<&[(u32, PTy)]> {
+        self.assoc_consts.get(&(trait_, name)).map(|c| &c[..])
     }
     fn trait_auto(&self, trait_: LibKey) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.flags.has(tc::TraitFlags::AUTO))
@@ -1022,6 +1029,11 @@ impl<'n> Store<'n> {
         // `#[rustc_coinductive]` (core's `Sized`, `MetaSized`, `PointeeSized`): a cycle through
         // the trait's own steps holds (library/core/src/marker.rs: "`Sized` being coinductive,
         // despite having supertraits, is okay as there are no user-written impls").
+        for &n in v.rows(v.list(head::ATTRS))? {
+            if v.text_at(v.attr(n)?.path)?.trim() == "rustc_coinductive" {
+                flags |= tc::TraitFlags::COINDUCTIVE;
+            }
+        }
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
         let b = Builder { resolver: Paths { names }, heads: &self.maps };
@@ -1137,6 +1149,9 @@ impl<'n> Store<'n> {
         self.maps.supers.insert(key, supers);
         let mut assoc = Vec::new_in(Global);
         let mut consts: Vec<(Name, ItemKey), Global> = Vec::new_in(Global);
+        // Each associated type's own const parameters (own position, type): filed after the
+        // loop into `Maps::assoc_consts`.
+        let mut assoc_consts: Vec<(Name, Vec<(u32, PTy), Global>), Global> = Vec::new_in(Global);
         for m in &members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))? {
             let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let mv = low.view();
@@ -1179,6 +1194,13 @@ impl<'n> Store<'n> {
                             continue;
                         }
                     };
+                    // Its own const parameters: those of `own_cs` past the trait's (indices
+                    // `own + 1 ..`), at their position among its own parameters.
+                    let mut mine = Vec::new_in(Global);
+                    for &(i, t) in own_cs.iter().filter(|(i, _)| *i > own) {
+                        mine.push((i - own - 1, t));
+                    }
+                    assoc_consts.push((Name::of(m.name), mine));
                     let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
                     let alias_args = params(&mut self.tys, 0, own + 1 + of_type, &own_cs)?;
                     let alias = intern(&mut self.tys, PNode::Alias { trait_: ck, name: Name::of(m.name), args: alias_args })?;
@@ -1238,6 +1260,9 @@ impl<'n> Store<'n> {
                 }
                 _ => {}
             }
+        }
+        for (name, mine) in assoc_consts {
+            self.maps.assoc_consts.insert((key, name), mine);
         }
         self.trait_defs.insert(ck, TraitExtra { supertraits, assoc, consts });
         self.preds.insert(ck, preds);

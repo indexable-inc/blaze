@@ -105,7 +105,8 @@ fn lib_path<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<String> {
     let (owner, last) = match names.member_owner(lib) {
         Some((owner, name)) => (owner, Some(name)),
         None => match names.variant_of(lib) {
-            Some((enum_, _)) => (enum_, Some(names.name_of(lib)?)),
+            // A variant has no item row (no `name_of`): its name is its enum's list's.
+            Some((enum_, index)) => (enum_, Some(names.variants(enum_)?.get(index as usize)?.name)),
             None => (lib, None),
         },
     };

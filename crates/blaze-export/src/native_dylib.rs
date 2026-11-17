@@ -110,7 +110,7 @@ const N_SECT_EXT: u8 = 0x0E | 0x01;
 const EXPORT_KIND_REGULAR: u64 = 0;
 const EXPORT_KIND_THREAD_LOCAL: u64 = 1;
 /// 1.0.0: the image's own versions, and what it asks of every library but libSystem.
-const DYLIB_VERSION: u32 = 1 << 16;
+pub(crate) const DYLIB_VERSION: u32 = 1 << 16;
 /// `dylib_command::name.offset`: the name follows the 24-byte command.
 const DYLIB_NAME_AT: u64 = 24;
 const UUID_DOMAIN: &str = "blaze-export native dylib uuid 1";
@@ -445,7 +445,7 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
 }
 
 /// `dylib_command`: the name after the 24-byte command, NUL-padded to 8.
-fn dylib_command(out: &mut AVec<'_, u8>, cmd: u32, name: &str, timestamp: u32, current: u32, compat: u32) {
+pub(crate) fn dylib_command(out: &mut AVec<'_, u8>, cmd: u32, name: &str, timestamp: u32, current: u32, compat: u32) {
     let size = DYLIB_NAME_AT + up(name.len() as u64 + 1, 8);
     bytes::u32(out, cmd);
     bytes::u32(out, size as u32);

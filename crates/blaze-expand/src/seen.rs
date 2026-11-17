@@ -93,6 +93,19 @@ impl<'a> SeenRoot<'a> {
         (!rest.split('/').any(|part| part == "..")).then_some(rest)
     }
 
+    /// Whether `in_tree`, a path from the served tree's root (what [`SeenRoot::in_tree`] gives,
+    /// and what a sandbox's read list names a file by: `crates/sibling/x.json`), lies outside
+    /// the package's own folder (decision D111: a member's read of a sibling, allowed and
+    /// reported). Never for a dependency (its tree is its package) or the workspace's root
+    /// package (dir `""`: every path of the tree is under it); for a member, every path not
+    /// its dir nor under it (`crates/app2/x` is outside `crates/app`).
+    pub fn left_package(&self, in_tree: &str) -> bool {
+        match *self {
+            SeenRoot::Package | SeenRoot::Member { dir: "" } => false,
+            SeenRoot::Member { dir } => !(in_tree == dir || in_tree.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))),
+        }
+    }
+
     /// The part of the absolute `written` path under this root: `Some("data/x.txt")` for
     /// `/package/data/x.txt` when the crate sees `/package`. `None` when `written` is not under
     /// it (any other absolute path names the machine: an include of it stays refused).
@@ -204,6 +217,23 @@ mod tests {
         assert_eq!(SeenRoot::Package.in_tree("/package/../etc"), None);
         assert_eq!(member.in_tree("/workspace/README.md"), Some("README.md"));
         assert_eq!(member.in_tree("/package/README.md"), None);
+    }
+
+    /// D111: a member's path outside its own dir left its package, its own (and its dir) did
+    /// not; a dependency's and the root package's never do. CONTROL (rule 8): write the member
+    /// arm as `!in_tree.starts_with(dir)`: `crates/app2/x.json` is taken as the member's own
+    /// and the third assertion fails. Prints nothing; passes.
+    #[test]
+    fn a_member_s_path_outside_its_dir_left_its_package() {
+        let member = SeenRoot::member("crates/app").expect("a plain dir");
+        assert!(!member.left_package("crates/app/abi/x.json"), "its own file");
+        assert!(!member.left_package("crates/app"), "its own dir");
+        assert!(member.left_package("crates/app2/x.json"), "a sibling sharing its name's start");
+        assert!(member.left_package("crates/sibling/x.json"), "a sibling");
+        assert!(member.left_package("README.md"), "the workspace's root");
+        assert!(!SeenRoot::Package.left_package("src/x.rs"), "a dependency's tree is its package");
+        let root = SeenRoot::member("").expect("the root package");
+        assert!(!root.left_package("crates/app/x.json"), "the root package's folder is the tree");
     }
 
     /// `file!()`: a dependency's `<name>-<version>/<path>`, a member's workspace-relative path.

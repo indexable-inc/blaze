@@ -68,6 +68,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             self.stats.calls_by_signature += 1;
             return Ok(());
         }
+        if facts.sig(item).is_some_and(|l| l.holds_hidden()) {
+            self.stats.calls_hidden += 1;
+        }
         if sig.is_some_and(|s| s.writes_lifetimes) {
             return self.refuse(Form::CallWritesLifetimes, e);
         }

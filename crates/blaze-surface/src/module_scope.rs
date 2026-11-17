@@ -107,6 +107,13 @@ pub enum Unresolved {
     Ambiguous(AmbiguityKind),
     /// A macro of the wrong call shape (a function-like macro used as an attribute, ...).
     WrongMacroKind,
+    /// An attribute macro written after a derive on an item takes the item, and a `#[derive]`
+    /// is written after the attribute on the same item: rustc runs that derive only on the
+    /// macro's output; blaze sends it on the item as written (its helpers are in scope for the
+    /// attributes before it), so it would run twice. Refused by name instead (attr-bang-kind-2,
+    /// rule 3): move the `#[derive]` before the attribute macro, or into its output. The error's
+    /// path is the attribute macro's, its place the item's.
+    DeriveAfterAttrMacro,
 }
 
 byte_enum! {
@@ -119,6 +126,7 @@ byte_enum! {
         NoCrate = 4 => "no crate",
         Ambiguous = 6 => "ambiguous",
         WrongMacroKind = 7 => "wrong macro kind",
+        DeriveAfterAttrMacro = 8 => "derive after attribute macro",
     }
 }
 
@@ -133,6 +141,7 @@ impl Unresolved {
             Unresolved::NoCrate => (UnresolvedTag::NoCrate, none),
             Unresolved::Ambiguous(kind) => (UnresolvedTag::Ambiguous, kind),
             Unresolved::WrongMacroKind => (UnresolvedTag::WrongMacroKind, none),
+            Unresolved::DeriveAfterAttrMacro => (UnresolvedTag::DeriveAfterAttrMacro, none),
         }
     }
 
@@ -145,6 +154,7 @@ impl Unresolved {
             UnresolvedTag::NoCrate => Unresolved::NoCrate,
             UnresolvedTag::Ambiguous => Unresolved::Ambiguous(kind),
             UnresolvedTag::WrongMacroKind => Unresolved::WrongMacroKind,
+            UnresolvedTag::DeriveAfterAttrMacro => Unresolved::DeriveAfterAttrMacro,
         }
     }
 }
@@ -396,7 +406,7 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct ErrorRow: 1 {
+    pub(crate) struct ErrorRow: 2 {
         pub(crate) name: Text,
         pub(crate) path: u32,
         pub(crate) segment: u32,

@@ -173,11 +173,15 @@ mod enc_tls;
 mod pass;
 mod record;
 mod record_check;
+/// The soft-float routine table a record's caller hands in, and the routines it calls
+/// (INTRINSICS.md 3.5, P5b).
+mod routines;
 pub mod table_gen;
 mod tier;
 pub use tier::Reference;
 
 pub use record::{Named, Names, Outside, RecordEmitError, emit_record};
+pub use routines::{Called, RoutinePlaces};
 pub use compose::Fast;
 pub use record_check::{AddressWord, emit_record_measured, no_address_word};
 
@@ -230,6 +234,10 @@ mod num_tests;
 
 #[cfg(test)]
 mod target_tests;
+
+/// `f128` and `f16` in the Reference tier (pass/float_width.rs).
+#[cfg(test)]
+mod quad_tests;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tier_tests;

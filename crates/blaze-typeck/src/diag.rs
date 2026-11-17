@@ -6,6 +6,16 @@ use crate::ids::{ExprId, ItemKey, LangItem, List, Name, PatId, Range};
 use crate::portable::PTy;
 use crate::ty::{Ty, TyList};
 
+mod about;
+pub(crate) use about::About;
+
+/// The mark of a finding built by a constructor of src/diag/about.rs, each of which takes what
+/// the finding is about (rule 76). Private to `diag`, so no struct literal of [`Diag`] or
+/// [`PendingDiag`] compiles anywhere else: a finding with a code and nothing in it cannot be
+/// written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Said(());
+
 /// What went wrong, by rustc's code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiagCode {
@@ -17,6 +27,19 @@ pub enum DiagCode {
     /// where `T` is expected or the reverse; `expected` and `found` name both. Only
     /// `transmute` goes between them.
     PatternNotBase,
+    /// E0308, a compiler intrinsic (`#[rustc_intrinsic]`, e.g. `transmute`) where a fn pointer
+    /// is wanted: it has no address, so it is never reified (rules/reify.rs; core/src/intrinsics/
+    /// mod.rs: "The actual implementations live in the compiler."). `found` is its fn item type.
+    IntrinsicToFnPointer,
+    /// E0308, a safe `#[target_feature]` fn where a SAFE fn pointer is wanted, in a body that
+    /// enables none of its features (rules/target_feature.rs; the Reference, "The
+    /// `target_feature` attribute"): only an `unsafe fn` pointer takes it. `found` is its fn item
+    /// type, `expected` the pointer.
+    TargetFeatureToSafeFnPointer,
+    /// A safe `#[target_feature]` fn as a fn pointer in a body with `#[target_feature]` of its
+    /// own: allowed when the body enables every feature of the fn, which the world does not
+    /// answer yet (only the attribute): refused by name, never guessed. `found` is the fn item.
+    TargetFeatureContextUnread,
     /// E0317: `if` without `else` whose type is not `()`.
     IfWithoutElse,
     /// E0282: type annotations needed.
@@ -125,6 +148,14 @@ pub enum DiagCode {
     /// E0223: `P::Assoc` where `P` is no parameter and no `Self` of a trait or of a trait's
     /// impl, so no bound says which trait's `Assoc` is meant (`<P as Trait>::Assoc` does).
     AmbiguousAssocTy,
+    /// An `asm!` operand whose type its kind or class does not take (the Reference,
+    /// inline-assembly, "Register operands", "Operand type"): `found` the type, `name` the
+    /// class (`reg`, `vreg` ..), or `sym`/`const`; for a split `inout`, `expected` is the
+    /// input's type and `found` the output's. rustc gives these no code.
+    AsmOperandType,
+    /// An `asm!` register that is no class or register of the target, a reserved one, or one
+    /// explicit register twice among the inputs or the outputs; `name` the register.
+    AsmRegister,
 }
 
 impl DiagCode {
@@ -139,7 +170,12 @@ impl DiagCode {
     /// rustc's error code, for printing.
     pub const fn code(self) -> &'static str {
         match self {
-            DiagCode::Mismatch | DiagCode::IncompatibleArms | DiagCode::PatternNotBase => "E0308",
+            DiagCode::Mismatch
+            | DiagCode::IncompatibleArms
+            | DiagCode::PatternNotBase
+            | DiagCode::IntrinsicToFnPointer
+            | DiagCode::TargetFeatureToSafeFnPointer => "E0308",
+            DiagCode::TargetFeatureContextUnread => "E0000",
             DiagCode::IfWithoutElse => "E0317",
             DiagCode::AnnotationsNeeded => "E0282",
             DiagCode::CannotSatisfy => "E0283",
@@ -185,6 +221,7 @@ impl DiagCode {
             DiagCode::NoAssocTy => "E0220",
             DiagCode::AmbiguousAssocTyInBounds => "E0221",
             DiagCode::AmbiguousAssocTy => "E0223",
+            DiagCode::AsmOperandType | DiagCode::AsmRegister => "E0000",
         }
     }
 }
@@ -221,6 +258,16 @@ pub enum Because {
     /// A rule of the Rust Reference refuses the construct outright, no trait asked: `rule` is
     /// its identifier (`expr.negate.results`) and `says` its words, quoted.
     Reference { rule: &'static str, says: &'static str },
+    /// E0425: the written segment of the path that named nothing, why, and what the segments
+    /// before it named (the world's [`crate::PathMiss`]); the diagnostic's `name` is that
+    /// segment's, not the path's last one.
+    Path(crate::path_miss::PathMiss),
+    /// How many were wanted and how many written, where no item owns the count: a call's
+    /// arguments (E0061, E0057), a tuple-struct pattern's subpatterns (E0023).
+    Count { expected: u32, got: u32 },
+    /// The finding is about the path written at its range, and the body keeps no segment of it
+    /// to name (src/diag/about.rs, `About::Path`): the range is the thing.
+    NoSegment,
 }
 
 /// A goal as a finding keeps it: every argument, `Self` first, a list of the record's type
@@ -246,6 +293,9 @@ pub(crate) enum At {
     Expr(ExprId),
     Pat(PatId),
     Body,
+    /// Written text that is no expression or pattern (a turbofish argument, a segment, an
+    /// anchor's type, a method's name), by its range (rules/obligation_site.rs).
+    Written(crate::ids::Range),
 }
 
 impl At {
@@ -255,6 +305,9 @@ impl At {
             crate::ty::Cause::Expr(e) => At::Expr(e),
             crate::ty::Cause::Pat(p) => At::Pat(p),
             crate::ty::Cause::Body => At::Body,
+            // The whole use; `Machine::clause_at` narrows it when the clause is reported unmet.
+            crate::ty::Cause::Clause { expr, .. } => At::Expr(expr),
+            crate::ty::Cause::Written(r) => At::Written(r),
         }
     }
 
@@ -264,6 +317,7 @@ impl At {
             At::Expr(e) => crate::ty::Cause::Expr(e),
             At::Pat(p) => crate::ty::Cause::Pat(p),
             At::Body => crate::ty::Cause::Body,
+            At::Written(r) => crate::ty::Cause::Written(r),
         }
     }
 }
@@ -280,6 +334,8 @@ pub(crate) struct PendingDiag {
     /// An unmet goal and its leaf, exported at writeback as `Because::Unmet` (set only with
     /// `because: None`).
     pub unmet: Option<(PendingGoal, Option<PendingGoal>)>,
+    /// Built only by a constructor of src/diag/about.rs.
+    said: Said,
 }
 
 /// A diagnostic of the record.
@@ -292,9 +348,12 @@ pub struct Diag {
     pub expected: Option<PTy>,
     /// The type found.
     pub found: Option<PTy>,
-    /// The name the error is about (a method, a field, a path's last segment).
+    /// The name the error is about (a method, a field, the path segment that failed: see
+    /// [`Because::Path`]).
     pub name: Option<Name>,
     /// For an unmet bound (E0277): the impl's `where const` condition that is the reason, with
     /// `found` the bound's self type.
     pub because: Option<Because>,
+    /// Built only by [`PendingDiag::export`] or [`Diag::dyn_incompatible`].
+    said: Said,
 }

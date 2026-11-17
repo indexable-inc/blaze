@@ -16,7 +16,7 @@
 //! Omitted for now: recording `IndexMut` for an overloaded index in a mutable place (the record
 //! has no column naming the index method; the builder refuses it by name), and privacy.
 
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, ItemKey, LangItem, Name};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
@@ -95,7 +95,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
         } else {
             DiagCode::NoField
         };
-        self.diag(code, At::Expr(e), None, Some(base_ty), name);
+        self.diag(code, At::Expr(e), About::found_maybe_named(base_ty, name));
         Ok(Flow::Done(self.common.err))
     }
 
@@ -154,7 +154,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
             match next {
                 Some(t) => cur = t,
                 None => {
-                    self.diag(DiagCode::NoField, at, None, Some(here), Some(want));
+                    self.diag(DiagCode::NoField, at, About::found_named(here, want));
                     return Ok(Flow::Done(usize_));
                 }
             }
@@ -162,7 +162,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
         if variant.is_some() {
             // `offset_of!(E, V)`: a variant is no field.
             let last = steps.last().map(|s| s.name);
-            self.diag(DiagCode::NoField, at, None, Some(cur), last);
+            self.diag(DiagCode::NoField, at, About::found_maybe_named(cur, last));
         }
         Ok(Flow::Done(usize_))
     }
@@ -216,7 +216,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                     self.missing_lang(LangItem::Index, At::Expr(e));
                     return Ok(Flow::Done(self.common.err));
                 }
-                self.diag(DiagCode::CantIndex, At::Expr(e), None, Some(base_ty), None);
+                self.diag(DiagCode::CantIndex, At::Expr(e), About::found(base_ty));
                 Ok(Flow::Done(self.common.err))
             }
         }

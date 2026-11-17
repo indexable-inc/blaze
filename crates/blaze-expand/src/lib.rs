@@ -92,6 +92,9 @@ mod key;
 mod limit;
 mod literal;
 mod nested;
+pub mod origin_column;
+#[cfg(test)]
+mod origin_column_tests;
 mod record;
 mod rules;
 pub mod seen;

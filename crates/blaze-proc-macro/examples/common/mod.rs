@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use blaze_proc_macro::{
     module::{CrateId, ModuleRecord, Source, files_digest, lock_closure, package_files, read_module},
     record::{DirStore, native_world},
-    sandbox::{Files, PACKAGE, Package},
+    sandbox::{Files, Package},
 };
 
 /// The expansion records under the folder `store`, through a world this program opens over it.
@@ -123,8 +123,14 @@ pub fn package_of(root: &Path, file: &Path) -> Package {
         .lines()
         .find_map(|line| line.trim().strip_prefix("name").map(|it| it.trim().trim_start_matches('=').trim().trim_matches('"').to_owned()))
         .unwrap_or_default();
+    // A member (D96 (3)): its workspace served at `/workspace`, the member at its dir in it;
+    // the path variable is the row's (src/sandbox/seen_env.rs).
+    let files = Files::Member {
+        workspace: root.to_path_buf(),
+        root: blaze_proc_macro::script_sandbox::ScriptRoot::member(&folder).unwrap_or_else(|e| panic!("{}: {e}", dir.display())),
+    };
     let mut env = vec![
-        ("CARGO_MANIFEST_DIR".to_owned(), PACKAGE.to_owned()),
+        ("CARGO_MANIFEST_DIR".to_owned(), files.seen().to_string()),
         ("CARGO_PKG_NAME".to_owned(), name.clone()),
         ("CARGO_CRATE_NAME".to_owned(), name.replace('-', "_")),
     ];
@@ -161,5 +167,6 @@ pub fn package_of(root: &Path, file: &Path) -> Package {
         };
         env.push((var.to_owned(), value));
     }
-    Package { files: Files::Folder(root.join(folder)), env }
+    let env = blaze_proc_macro::package_env::PackageEnv::set_only(env).unwrap_or_else(|e| panic!("the variables of `{folder}`: {e}"));
+    Package::new(files, env).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
 }

@@ -9,6 +9,9 @@ use blaze_code::place::PlaceError;
 use blaze_code::record::{RecordError, Symbol, Target};
 use blaze_code::unwind::UnwindError;
 use blaze_tier::record::FormError;
+use blaze_native::unwind::UnwindInfoError;
+
+use crate::native_merge::MergeError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExportError {
@@ -73,6 +76,11 @@ pub enum ExportError {
     /// An address relocation (`Page21`, `PageOff12`, `Branch26` aside) names a C name: only the
     /// loader knows its address, through its GOT word.
     AddressOfOutside { from: Symbol, target: Target, at: u32 },
+    /// The program's native image could not be merged (native_merge.rs, NATIVE.md W9).
+    Native(MergeError),
+    /// The file's one `__unwind_info` (Rust rows and the native image's) was refused by its
+    /// writer (blaze-native unwind.rs).
+    NativeUnwind { error: UnwindInfoError },
 }
 
 impl From<ImageError> for ExportError {
@@ -165,6 +173,10 @@ impl fmt::Display for ExportError {
                 "export: function {from}: the address relocation at byte {at} names the C name {}, whose address only the loader knows; a C name is reached through its GOT word (rule: export never leaves a hole (run.md, \"Export\"))",
                 target.symbol
             ),
+            ExportError::Native(error) => write!(f, "export: {error} (NATIVE.md 3.9)"),
+            ExportError::NativeUnwind { error } => {
+                write!(f, "export: the unwind index over the program's and the native image's rows is refused: {error:?} (NATIVE.md 3.9)")
+            }
         }
     }
 }

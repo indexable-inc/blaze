@@ -15,8 +15,9 @@
 //! - **Each crate's input.** Its root file, found by the names library's own walker from there;
 //!   its extern prelude from the unit's dependency edges (renames as written) plus the implicit
 //!   toolchain crates (blaze-unit-graph's `implicit`, through [`Sysroot`]); `proc_macro` as an
-//!   edge of a proc-macro crate; its cfg the unit's atoms joined with its build script's
-//!   `cargo::rustc-cfg` lines when [`ScriptOutputs`] holds them.
+//!   edge of a proc-macro crate; its cfg the unit's atoms. A build script's outputs are NOT in
+//!   the world (decision D115 (B)): the crate's task reads its unit's `Script` record and joins
+//!   it then ([`joined`]: its `cargo::rustc-cfg` atoms, `CrateInput::script`).
 //! - **Where files are.** Every crate's paths are `/<tree>/<path in the tree>`: tree 0 the
 //!   checkout (workspace members and path dependencies, one tree so a `#[path]` between them
 //!   resolves as on disk), then one tree per toolchain pack, then one per fetched package's
@@ -37,10 +38,12 @@ extern crate std;
 #[cfg(feature = "std")]
 mod checkout;
 pub mod check_scope;
+pub mod crate_list;
 pub mod fixture;
 #[cfg(feature = "procs")]
 pub mod procs;
 mod list;
+pub mod panic;
 mod script;
 mod toolchain;
 #[cfg(test)]
@@ -48,7 +51,6 @@ mod tests;
 
 use core::fmt;
 
-use blaze_build_script::outputs::OutputsRef;
 use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::{Lock, LockId};
@@ -64,7 +66,7 @@ use blaze_unit_graph::sources::Records;
 #[cfg(feature = "std")]
 pub use checkout::Checkout;
 pub use list::{Listed, Side, crate_list, needs, open_list, world};
-pub use script::{ScriptRecords, ScriptRecordsError};
+pub use script::{ScriptRecords, ScriptRecordsError, joined, script_subject};
 pub use toolchain::{Needs, Toolchain, ToolchainCrate};
 
 /// A tree of files a crate is read from: a path is `/`-separated, relative to the tree's root,
@@ -120,23 +122,6 @@ impl<'w, R: Records<'w>> Packages<'w> for Fetched<'_, '_, 'w, R> {
     }
 }
 
-/// A build script's outputs that join its package's library, by the library unit (the record
-/// the build-scripts lane writes).
-pub trait ScriptOutputs<'w> {
-    fn served(&self, lib: UnitId) -> Option<Served<'w>>;
-}
-
-/// One library's build-script outputs as its crate takes them.
-#[derive(Clone, Copy)]
-pub struct Served<'w> {
-    /// The record, read in place: the expansion host's `OUT_DIR`, `env!` pairs and files.
-    pub outputs: OutputsRef<'w>,
-    /// Its `cargo::rustc-cfg` atoms, sorted and each once: joined to the unit's cfg.
-    pub cfg: &'w [(&'w str, Option<&'w str>)],
-    /// [`OutputsRef::crate_digest`]: in the crate's key.
-    pub digest: ContentId,
-}
-
 /// What a crate is made from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Origin {
@@ -146,15 +131,16 @@ pub enum Origin {
     Unit(UnitId),
 }
 
-/// Whether a crate's build script's outputs are in its input.
+/// Whether a crate has a build script whose outputs its tasks read (decision D115 (B)).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Script {
-    /// No build script.
+    /// Its package has no build script.
     None,
-    /// Its cfg atoms joined.
-    Joined,
-    /// It has one, whose outputs were not given: resolved without them.
-    Missing,
+    /// It has one, run for THIS crate's side (ruling D115 (2): a macro-side copy reads its
+    /// macro-side run, TARGET wasm32-wasip1): each task of the crate Needs the `Script` record
+    /// named by `subject` ([`script_subject`]) and joins it ([`joined`]); the world's input
+    /// holds the unit's cfg alone and no record.
+    Read { subject: ContentId },
 }
 
 /// One crate of the world.
@@ -247,7 +233,13 @@ impl<'w> World<'w> {
                     None => out.push(0),
                 }
             }
-            out.push(c.script as u8);
+            match c.script {
+                Script::None => out.push(0),
+                Script::Read { subject } => {
+                    out.push(1);
+                    out.extend_from_slice(&subject.0);
+                }
+            }
             out.push(u8::from(c.proc_macro));
             out.push(c.side as u8);
         }
@@ -385,6 +377,9 @@ pub enum WorldError<'w> {
     MemberDir { package: &'w str, error: MemberDirError<'w> },
     /// A crate's environment cannot be made (its version has not three parts).
     Env(blaze_scope::crate_env::CrateEnvError<'w>),
+    /// Two units under one crate key name two build-script runs ([`script_subject`]): the key
+    /// misses what tells the runs apart (rule 21). Unreachable by construction.
+    ScriptClash { first: &'w str, second: &'w str },
 }
 
 impl fmt::Display for WorldError<'_> {
@@ -393,6 +388,10 @@ impl fmt::Display for WorldError<'_> {
             WorldError::Source(e) => write!(f, "{e}"),
             WorldError::MemberDir { package, error } => write!(f, "the member `{package}`: {error}"),
             WorldError::Env(e) => write!(f, "{e}"),
+            WorldError::ScriptClash { first, second } => write!(
+                f,
+                "the crates `{first}` and `{second}` have one crate key but name two build-script runs: the key misses what tells the runs apart (rule 21; blaze-world `script_subject`)"
+            ),
             WorldError::PathNotPlaced { package } => write!(f, "the path package `{package}` is in no directory the workspace's layout found"),
             WorldError::Correction { package, version, why } => write!(f, "{package} {version}: {why}"),
             WorldError::Units(e) => write!(f, "the crate list: {e}"),

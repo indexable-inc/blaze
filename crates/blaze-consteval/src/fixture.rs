@@ -389,6 +389,23 @@ impl World {
         k
     }
 
+    /// `const fn NAME(PARAMS) -> OUT BODY` whose kind the world does not hold yet
+    /// (`FnKind::Missing(fact)`): a call of it is refused as `Refusal::FnFact`.
+    pub fn unread_fn(&mut self, name: &str, params: &[(&str, &str)], out: &str, body: &str, fact: crate::Fact) -> ItemKey {
+        let k = self.any_fn(name, params, out, body, FnKind::Const);
+        self.set_kind(name, FnKind::Missing(fact));
+        k
+    }
+
+    /// The world now answers `name`'s kind as `kind` (a fact read after a first evaluation).
+    pub fn set_kind(&mut self, name: &str, kind: FnKind) {
+        let k = self.key(name);
+        match self.kinds.iter_mut().find(|(x, _)| *x == k) {
+            Some(row) => row.1 = kind,
+            None => self.kinds.push((k, kind)),
+        }
+    }
+
     /// An intrinsic `name` with `own` type parameters (`size_of::<T>()`), its inputs and output.
     pub fn intrinsic(&mut self, name: &str, own: u32, inputs: &[PTy], out: PTy, what: Intrinsic) -> ItemKey {
         let k = self.fx.func(name, own, inputs, out, StdVec::new());

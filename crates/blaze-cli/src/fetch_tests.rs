@@ -76,6 +76,8 @@ fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
         start: Some("/"),
         toolchain: blaze_toolchain::PINNED,
         fs: io.need_fs().expect("files"),
+        sdk: None,
+        exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
     }
 }
 

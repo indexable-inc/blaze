@@ -323,6 +323,9 @@ pub enum CodeRecordError {
     Getter(blaze_lir::BuildError),
     /// The thread-local ender (blaze-build `tls::index::ender`) did not build.
     Ender(blaze_lir::BuildError),
+    /// An `f128` operation needs a soft-float routine the program's compiler_builtins does
+    /// not give (front2/builtins_shim.rs).
+    Routine(crate::front2::builtins_shim::BuiltinsRefused),
 }
 
 impl fmt::Display for CodeRecordError {
@@ -337,6 +340,7 @@ impl fmt::Display for CodeRecordError {
             CodeRecordError::NoReads { item } => write!(f, "fn {:#x} has a checked body but no read-list digest was filed for it (front2 body_reads.rs): its record's key would miss what its check read", item.0),
             CodeRecordError::Getter(why) => write!(f, "the thread-local getter did not build: {why}"),
             CodeRecordError::Ender(why) => write!(f, "the thread-local ender did not build: {why}"),
+            CodeRecordError::Routine(why) => why.fmt(f),
         }
     }
 }
@@ -352,14 +356,21 @@ impl core::error::Error for CodeRecordError {}
 /// the code's start (4), the record's length (4) and bytes (blaze-code `Sealed::encode`), the
 /// count of declared instances (4), and each: its tabled fn's key (16), its name's length (4)
 /// and bytes, sorted by (tabled, name) and each once.
-pub fn make_entry<'a>(
+pub fn make_entry<'a, 'd>(
     func: &Func<Global>,
     names: &InstanceNames<'_>,
-    declared: &mut AVec<'_, Declared<'_>>,
+    routines: crate::front2::builtins_shim::Routines<'d>,
+    declared: &mut AVec<'_, Declared<'d>>,
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
-    let (record, insts) = emit_record_measured(func.view(), names, isa, alloc).map_err(CodeRecordError::Emit)?;
+    let (record, insts, called) =
+        emit_record_measured(func.view(), names, routines.places(), isa, alloc).map_err(|why| routines.refusal(why))?;
+    // Which soft-float routines the record calls is the emitter's answer (only legalize maps an
+    // `f128` operation to its routine): exactly those are declared, as any instance it reaches.
+    for r in called.iter() {
+        declared.push(routines.declared(r)?);
+    }
     // No landing pads or unwind word yet: the emitter refuses `Invoke` and `Resume` (piece 11).
     let sealed = record.seal().map_err(CodeRecordError::Seal)?;
     let mut code: AVec<'_, u8> = Vec::new_in(alloc);
@@ -411,7 +422,7 @@ pub fn make_getter_entry<'a>(isa: Isa, alloc: Alloc<'a>) -> Result<AVec<'a, u8>,
     let funcs = tls::index::GETTER_IMPORTS.map(Callee::C);
     let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
-    make_entry(&func, &names, &mut declared, isa, alloc)
+    make_entry(&func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
 }
 
 /// Why an entry's bytes do not read.

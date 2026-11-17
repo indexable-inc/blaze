@@ -174,10 +174,6 @@ fn sync_atomic_usize() { is_sync::<core::sync::atomic::AtomicUsize>(); }
 fn unpin_atomic_usize() { is_unpin::<core::sync::atomic::AtomicUsize>(); }
 fn sync_atomic_ptr() { is_sync::<core::sync::atomic::AtomicPtr<()>>(); }
 fn unpin_atomic_ptr() { is_unpin::<core::sync::atomic::AtomicPtr<()>>(); }
-fn unpin_once() { is_unpin::<std::sync::Once>(); }
-fn unpin_once_lock() { is_unpin::<std::sync::OnceLock<u8>>(); }
-fn send_once_lock() { is_send::<std::sync::OnceLock<u8>>(); }
-fn sync_once_lock() { is_sync::<std::sync::OnceLock<u8>>(); }
 fn sync_tracing_shape() { is_sync::<D>(); }
 fn main() {}
 ";
@@ -323,12 +319,12 @@ fn lib_atomic_goals() {
         "unpin_atomic_usize",
         "sync_atomic_ptr",
         "unpin_atomic_ptr",
-        "unpin_once",
-        "unpin_once_lock",
-        "send_once_lock",
-        "sync_once_lock",
         "sync_tracing_shape",
     ];
+    // Rust std's `Once` and `OnceLock` are not asked here: this file's crate is a blaze edition,
+    // where `std` is bstd and Rust's std is unreachable (blaze-unit-graph implicit.rs: "bstd;
+    // Rust's `std` none"); bstd's `Once<T>` takes one parameter and its `sync` has no
+    // `OnceLock`. Their goals live in tests/front2_auto_shape.rs `rust_edition_std` (edition 2024).
     expect_clean("lib", &check_fns(LIB, &fns));
 }
 

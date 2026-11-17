@@ -34,6 +34,10 @@ use crate::refusal::SourceFile;
 /// A head as the drive's `Signature` record (D114): the unit, its digest, its place.
 pub mod head_digest;
 
+/// Every body of the program, each checked once: the listed bodies and, through each body's
+/// lowering, the fns declared in it ([`ProjectWorld::each_body`]).
+pub mod every_body;
+
 /// How many constants an array length in one body's heads may name before the body is
 /// refused ([`Refused::Lengths`]): reach.rs's and the census's `MOST_LENS`.
 pub(super) const MOST_LENS: u32 = 64;

@@ -47,6 +47,11 @@ blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
 # `ContentId`: a placed body's record id, by its bytes.
 blaze-ids = { path = "../blaze-ids" }
+# The program's native library record (src/natives.rs, NATIVE.md W7): blaze-native's readers, resolve
+# and layout, blaze-export's Mach-O dylib writer, and the build script's outputs record it reads.
+blaze-native = { path = "../blaze-native" }
+blaze-export = { path = "../blaze-export" }
+blaze-build-script.workspace = true
 # Code records (src/code_records.rs): `Symbol`, the sealed record and its reader. By path, as
 # blaze-emit names it: it has no workspace entry.
 blaze-code = { path = "../blaze-code" }

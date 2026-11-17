@@ -86,12 +86,19 @@ impl BodyBuf {
             field_pats: &[],
             paths: &[],
             segments: &[],
+            segment_ranges: &[],
             types: PTys::EMPTY,
             type_lists: &[],
+            type_list_ranges: &[],
+            method_name_ranges: &[],
             opt_types: &[],
             fmt_uses: &[],
             coroutine: None,
             super_lets: &[],
+            asm_pieces: &[],
+            asm_operands: &[],
+            asm_clobbers: &[],
+            asm_text: "",
         }
     }
 }
@@ -470,7 +477,7 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
     };
     // Every undoable write a rule makes, then the variable's binding.
     let write = |m: &mut Machine<'_, '_, '_, '_, ToyWorld, InferCtx<'static>>| -> Result<Option<()>, Stop> {
-        m.diag(DiagCode::Mismatch, At::Body, None, None, None);
+        m.diag(DiagCode::Mismatch, At::Body, crate::diag::About::found(var));
         let n = m.fresh_int()?;
         let unit = m.common.unit;
         m.ty.register(Obligation { goal: Goal::WellFormed(unit), cause: Cause::Body })?;
@@ -527,7 +534,8 @@ fn a_diagnostic_with_no_place_is_an_internal_error() {
             Ok(m) => m,
             Err(e) => panic!("the machine could not be made: {e}"),
         };
-        m.diag(code, At::Body, None, None, None);
+        let unit = m.common.unit;
+        m.diag(code, At::Body, crate::diag::About::found(unit));
         match m.writeback() {
             Ok(c) => Ok(c.diags.len()),
             Err(e) => Err(e),

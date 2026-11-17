@@ -65,7 +65,7 @@ impl Names for AllC {
 
 /// `func` in the record form, sealed, and its bytes of instructions.
 fn sealed_of(func: View<'_>, names: &dyn Names, isa: Isa) -> Result<(Sealed<'static>, u32), RecordEmitError> {
-    let (record, insts) = emit_record_up_to(func, names, isa, BULK_INLINE_MOST, Alloc::global())?;
+    let (record, insts, _) = emit_record_up_to(func, names, &crate::RoutinePlaces::NONE, isa, BULK_INLINE_MOST, Alloc::global())?;
     let sealed = record.seal().unwrap_or_else(|why| panic!("the emitted record does not seal: {why}\n{}", blaze_lir::print(func)));
     Ok((sealed, insts))
 }

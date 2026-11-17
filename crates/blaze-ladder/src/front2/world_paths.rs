@@ -6,7 +6,7 @@
 use std::alloc::Global;
 use std::vec::Vec;
 
-use blaze_typeck::{Def, Fetch, Name, PNode, PTy, PathRes, Prim, ScopeId};
+use blaze_typeck::{Def, Fetch, MissWhy, Name, PNode, PTy, PathAnswer, PathMiss, PathRes, Prim, ScopeId};
 
 use super::locals::{LocalGap, LocalKind, LocalNs};
 
@@ -17,8 +17,9 @@ use super::world_items::{BodyWorld, Fill, Gap};
 use crate::resolve::{Kind, Ns, ResolveError};
 
 impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
-    /// What `segments`, written in the body, name.
-    pub(super) fn path(&self, scope: ScopeId, segments: &[Name]) -> Fetch<Option<PathRes>> {
+    /// What `segments`, written in the body, name; when nothing, which segment failed, why,
+    /// and what the segments before it named ([`Self::path_miss`]).
+    pub(super) fn path(&self, scope: ScopeId, segments: &[Name]) -> Fetch<PathAnswer> {
         let mut written = Vec::with_capacity_in(segments.len(), Global);
         for &s in segments {
             match self.spell.get(s) {
@@ -26,24 +27,26 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 Err(u) => return self.gap(Gap::Unspelled(u)),
             }
         }
-        let Some(&first) = written.first() else { return Ok(None) };
+        // A path with no segment names nothing and has no segment to name.
+        let Some(&first) = written.first() else { return Ok(Err(PathMiss::Whole)) };
         if first == "Self" {
             return Ok(match self.self_ {
-                SelfTy::Trait(_) => Some(PathRes { def: Def::TyParam(0), consumed: 1 }),
+                SelfTy::Trait(_) => Ok(PathRes { def: Def::TyParam(0), consumed: 1 }),
                 SelfTy::Ty(t, _) => match self.store.tys.view().get(*t) {
-                    Some(PNode::Adt(k, _)) => Some(PathRes { def: Def::Adt(*k), consumed: 1 }),
+                    Some(PNode::Adt(k, _)) => Ok(PathRes { def: Def::Adt(*k), consumed: 1 }),
                     // Any other implementing type (a parameter, an array, a primitive, a
                     // tuple, a reference): the Reference, "Paths", "`Self`": "In an
                     // implementation, it refers to the type being implemented." The checker
                     // reads the type from the impl's header (blaze-typeck rules/self_path.rs).
-                    Some(_) => Some(PathRes { def: Def::SelfTy, consumed: 1 }),
-                    None => None,
+                    Some(_) => Ok(PathRes { def: Def::SelfTy, consumed: 1 }),
+                    None => Err(PathMiss::FIRST),
                 },
-                SelfTy::None => None,
+                // `Self` outside an impl or trait: the first segment names nothing here.
+                SelfTy::None => Err(PathMiss::FIRST),
             });
         }
         if let Some(&(_, i)) = self.params.iter().find(|(n, _)| *n == segments[0]) {
-            return Ok(Some(PathRes { def: Def::TyParam(i), consumed: 1 }));
+            return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
         }
         // The items of the body's blocks, innermost first, before the module's
         // ([`super::locals`]); a local `use` names its path, resolved at the module.
@@ -109,7 +112,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 _ => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.form(), range: row.range })),
             };
             if let Some(def) = def {
-                return Ok(Some(PathRes { def, consumed: 1 }));
+                return Ok(Ok(PathRes { def, consumed: 1 }));
             }
         }
         // A local `use`'s binding stands for its path: `max` of `use core::cmp::max` is
@@ -151,16 +154,19 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // A block's item the body's lowering listed, which the name solver does not find
             // under its block's module (a later segment it cannot read): never "the program
             // names nothing" for a name that is declared.
-            Err(ResolveError::Path(_)) if written.len() == 1 => match local_type {
-                Some(row) => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
-                None => return Ok(None),
+            Err(ResolveError::Path(e)) => match local_type {
+                Some(row) if written.len() == 1 => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
+                // The program names nothing: the checker's own diagnostic, naming the segment
+                // the library stopped at (world_path_miss.rs).
+                _ => return self.path_miss(at_module, abs, rest, lead, shift, e),
             },
-            // The program names nothing: the checker's own diagnostic.
-            Err(ResolveError::Path(_)) => return Ok(None),
             Err(e @ ResolveError::NoText { .. }) => return self.gap(Gap::Resolve(e)),
         };
-        // Counted in the segments as written (a `use`'s path stands for its one binding).
-        let Some(consumed) = (target.consumed + lead).checked_sub(shift) else { return Ok(None) };
+        // Counted in the segments as written (a `use`'s path stands for its one binding). A
+        // resolution that stops inside the `use`'s or glob's own path: its binding names no item.
+        let Some(consumed) = (target.consumed + lead).checked_sub(shift) else {
+            return Ok(Err(PathMiss::At { segment: 0, after: None, why: MissWhy::ThroughUse }));
+        };
         let written = &written[shift as usize..];
         let all = consumed as usize == written.len();
         let k = checker_of(target.key);
@@ -181,7 +187,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                         return self.fill(Fill::Store(Want::Head(target.key)));
                     };
                     if let Some(&(_, f)) = t.fns.iter().find(|(n, _)| *n == next) {
-                        return Ok(Some(PathRes { def: Def::Fn(f), consumed: consumed + 1 }));
+                        return Ok(Ok(PathRes { def: Def::Fn(f), consumed: consumed + 1 }));
                     }
                 }
                 Def::Trait(k)
@@ -220,9 +226,12 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 None => return self.gap(Gap::BuiltinTypePath(written.join("::").into_boxed_str())),
             },
             Kind::WideInt { .. } => return self.gap(Gap::BuiltinTypePath(written.join("::").into_boxed_str())),
-            Kind::Module | Kind::Macro | Kind::TraitAlias | Kind::Other(_) => return Ok(None),
+            // The whole path names an item that is no value: the segment that named it.
+            Kind::Module | Kind::Macro | Kind::TraitAlias | Kind::Other(_) => {
+                return Ok(Err(PathMiss::At { segment: consumed.saturating_sub(1), after: None, why: MissWhy::NotAValue(k) }));
+            }
         };
-        Ok(Some(PathRes { def, consumed }))
+        Ok(Ok(PathRes { def, consumed }))
     }
 
     /// The path `Def` of an alias with `generics` parameters whose aliased type is `ty`: the

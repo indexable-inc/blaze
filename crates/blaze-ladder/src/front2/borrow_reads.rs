@@ -103,6 +103,7 @@ fn refusal(h: &mut StableHasher, why: SigRefusal) {
         SigRefusal::Unknown => (7, 0, 0),
         SigRefusal::TypeNode => (8, 0, 0),
         SigRefusal::Bound => (9, 0, 0),
+        SigRefusal::Assoc { at, why } => (10, at, why as u32),
     };
     h.tag(tag);
     h.u32(a);

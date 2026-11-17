@@ -520,6 +520,56 @@ Pieces left, one writer each:
 6. Range-extension thunks when the code passes `bl`'s 128 MiB (refused today by name).
 7. The Linux run test on blaze-vm (the facts elf.rs marks "to verify").
 
+### The export command on the rebuilt path (the coordinator's design, 2026-11-16 20:55; not built)
+
+Today `blaze export` answers `NotBuilt`: the exporter takes a `ProgramIn` and only its own tests and example
+make one. The command is the same request machine as `check` and `run`, with one difference: an export
+leaves no hole, so it CLOSES the program before it writes.
+
+1. Stages 1 to 4 as `run` (sweep, certificate, forward, the gate before: the workspace bodies the program
+   reaches are checked, and an error stops the export).
+2. THE CLOSURE: the root task needs the entry's code; each code record found or built is followed to
+   everything its declared section names (functions, statics, vtables, C names), on the pool, until no new
+   name appears. Found by key, a record costs a lookup; only what is missing is lowered and built. The
+   closed set is the request's task set, kept with its answer: after an edit, only dirty code is rebuilt and
+   only new names extend it. ONE seam gives the closed set: until `Code` is a drive task (stage 5), the run
+   path's own reach (the set it builds and binds today) stands behind that seam; nothing else in the command
+   knows which.
+3. The tier: the optimized record where one exists, else the fast one; the report's first line says which.
+4. `ProgramIn` is assembled from the records IN PLACE, sorted by symbol: the functions and data of the
+   closure, the entry, the panic strategy from the program's inputs, the personality, the exports list
+   (name, symbol) from the items that export a C name, the native image record when the program has
+   natives, the name from the manifest. A blaze-edition program is exported with bstd's ORDINARY start (its
+   grants made from the process, their manifest baked in as data); the hosted entry stays refused.
+5. The bytes are written whole to a temporary name beside the destination and renamed. An `Export` record
+   under (certificate, target, tier, profile) holds the file's content id and the report: a repeat with
+   nothing changed compares the destination's id and writes nothing.
+
+Floors: nothing changed, 3 ms (certificate, one compare); one body edited: its code, then the layout and the
+write of the whole file (about 25 ms a 50 MB file each for the write and the page hashes): an export is
+written whole by design, and its floor is the file's size, not the program's source.
+
+### What a run takes from the request, and the native image as a task (the coordinator's design, 21:20; not built)
+
+Found by the NATIVE plan's last piece: `blaze run` reads only the source files again (blaze-cli program.rs
+`run`); the build scripts' outputs stay inside the drive, each crate's `CrateLinks` (front2 links.rs) has
+no caller, and nothing gives the parent a native image to send. RULE: a run takes its inputs from the
+request's RECORDS, never from a second reading of the tree. Two kinds, in the same machine as the checks:
+
+- `Links`, one a crate: what the crate says about C names: its `#[link]` lines, its `extern` blocks' names,
+  the items that export a C name. Keyed from the crate's outlines; its out is that table.
+- `Native`, one a program (root, target, profile): the native image (the BNL2 record). It Needs, for each
+  crate of the program's closure (the crate list record's rows), that crate's `Links` and its `Script`
+  record (the link lines and the archives a build script made). Found by key on a repeat: a hit links
+  nothing. A program with no C input has a real record that links only the system library: there is no
+  empty case.
+
+`StartProgram` hands the run the names of those records; the parent sends `Down::Native` first, with the
+image's place, then answers first calls. ORDER OF BUILDING: (1) `blaze run` through the parent (pieces 5
+and 6 above; it waits on the ladder's L1b); (2) `Links` and `Native` as drive kinds; (3) the parent's send
+with the launcher's half of it, one batch. Until (1) is in, the in-process run stays the path a hello world
+is debugged on, and it links nothing.
+
 ## Records, keys and read lists
 
 | Record | Key | Read list / validity |

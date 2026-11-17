@@ -116,6 +116,10 @@ pub enum CheckError {
     /// (blaze-ladder front2/opaque_auto.rs) does and checks the body again; any other world
     /// reports it as this named gap (rules/opaque_def.rs `opaque_ambiguity_gap`).
     OpaqueHiddenUnknown { opaque: crate::ids::ItemKey, trait_: crate::ids::ItemKey },
+    /// A qualified path `<T as Tr>::x` writing no arguments for a trait with parameters after
+    /// `Self`, where the world did not read the trait's defaults (`TraitDefaults::NotKnown`):
+    /// a named gap, never an inferred argument (rules/qpath_defaults.rs).
+    TraitDefaultsNotKnown { trait_: crate::ids::ItemKey },
 }
 
 /// Which recorded fact of a body: the one [`CheckError::UnknownInCleanBody`] names.
@@ -158,6 +162,11 @@ impl core::fmt::Display for CheckError {
                 f,
                 "blaze-typeck: a goal of the trait {:032x} reaches an auto trait of the opaque type {:032x}: its hidden type was not given by the world",
                 trait_.0, opaque.0
+            ),
+            CheckError::TraitDefaultsNotKnown { trait_ } => write!(
+                f,
+                "blaze-typeck: a qualified path names the trait {:032x} with no arguments, and the world did not read its parameters' defaults",
+                trait_.0
             ),
         }
     }

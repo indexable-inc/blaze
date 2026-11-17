@@ -9,7 +9,9 @@
 //!   root (tempo's `crates/precompiles/src/zone_verifier/attestation.rs` reads
 //!   `../../../nitro-attestation/testdata/..`); the file is named by its path under that root;
 //!   one outside its own package is ALLOWED and REPORTED ([`IncludePlace::outside_package`],
-//!   [`LeftPackage`]: a finding at the call, a warning, never an error);
+//!   [`LeftPackage`]: a finding at the call, a warning, never an error). A member's proc
+//!   macro's read is the same (resolve.rs `Host::run_proc_macro`, from its read list:
+//!   [`SeenRoot::left_package`], the path made by [`served_tree`]);
 //! - a DEPENDENCY (it sees `/package`) reads only inside its own package, as does a crate whose
 //!   environment is not known;
 //! - a path leaving that bound, or absolute and not under the root the crate sees for its own
@@ -20,6 +22,7 @@
 use blaze_expand::seen::SeenRoot;
 use blaze_expand::{ReadRoot, SourceOrigin, include_target};
 use blaze_own::{AString, Alloc};
+use blaze_surface::CallShape;
 
 /// The file an include reads: its path in the reader's path space (the package's or the
 /// workspace's tree, as the texts hold it: `/0/crates/x/data.json`), and whether it lies
@@ -30,19 +33,37 @@ pub struct IncludePlace<'a> {
     pub outside_package: bool,
 }
 
-/// An include that left its own package and stayed inside the workspace, told to the sources
-/// (`SourceTexts::left_package`) so the names record files it as a finding at the call
-/// (blaze-cli names/include_outside.rs).
+/// A read of a call that left its own package and stayed inside the workspace (an include, a
+/// member's proc macro), told to the sources (`SourceTexts::left_package`) so the names record
+/// files it as a finding at the call (blaze-cli names/include_outside.rs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LeftPackage<'p> {
     /// The calling file's path (absolute in the reader's path space, `/0/crates/x/src/a.rs`).
     pub from: &'p str,
     /// The byte in the calling file where the (topmost) call's path starts.
     pub at: u32,
-    /// The macro's name: `include`, `include_str` or `include_bytes`.
-    pub call: &'static str,
+    /// The called macro's path AS WRITTEN at the call, never resolved: `include_str` for a
+    /// builtin, `macros::sol` or `Abi` for a proc macro. So the finding is printed with no
+    /// resolution, and two spellings of one macro (`sol`, `alloy::sol`) give two messages.
+    pub call: &'p str,
+    /// The call's shape: how the message writes `call` (`call!`, `#[call]`, `#[derive(call)]`).
+    pub shape: CallShape,
     /// The file read, as [`IncludePlace::path`].
     pub path: &'p str,
+}
+
+/// The folder, in the reader's path space, of the tree a crate whose package folder is
+/// `package` (`/0/crates/x/`) is served in when it sees `seen` (D96): a dependency's tree is
+/// its package (`/package`), a member's the workspace (`/workspace`): its package folder less
+/// its dir (`/0`). `None` when the folder does not end in the member's dir (the texts and the
+/// environment disagree: nothing is guessed). A path a sandbox records from its tree's root
+/// (`crates/y/x.json`) is this folder joined with it: the form [`IncludePlace::path`] has.
+pub fn served_tree<'p>(package: &'p str, seen: SeenRoot<'_>) -> Option<&'p str> {
+    let package = package.trim_end_matches('/');
+    match seen {
+        SeenRoot::Package | SeenRoot::Member { dir: "" } => Some(package),
+        SeenRoot::Member { dir } => package.strip_suffix(dir)?.strip_suffix('/'),
+    }
 }
 
 /// The file an include written in the file `calling` (absolute, under the package folder
@@ -62,8 +83,7 @@ pub fn include_place<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &st
     };
     // The folder the path is spelled from and the bound it may not leave.
     let (base, dir, origin) = match seen {
-        Some(SeenRoot::Member { dir }) if dir.is_empty() => (package, "", SourceOrigin::Workspace),
-        Some(SeenRoot::Member { dir }) => (package.strip_suffix(dir)?.strip_suffix('/')?, dir, SourceOrigin::Workspace),
+        Some(seen @ SeenRoot::Member { dir }) => (served_tree(package, seen)?, dir, SourceOrigin::Workspace),
         Some(SeenRoot::Package) | None => (package, "", SourceOrigin::Package),
     };
     let target = include_target(ReadRoot { origin, package: dir }, folder, written, alloc).ok()?;

@@ -15,12 +15,15 @@ use std::vec;
 use blaze_own::Alloc;
 use blaze_typeck::fixture::{Bb, Fx};
 use blaze_typeck::{
-    Capture, Checked, Def, DiagCode, ExprId, IntTy, InferCtx, ItemKey, LangItem, Needs, Outcome, PNode, check_deferring,
-    decide_stalled,
+    Capture, Checked, Def, DiagCode, ExprId, IntTy, InferCtx, ItemKey, LangItem, Mutbl, Needs, Outcome, PNode,
+    check_deferring, decide_stalled,
 };
 
 use super::{AsyncFacts, live_across, moved_before};
 use crate::{interior, lower_async};
+
+/// A temporary made in a statement after the `.await` (the `format!` class).
+mod after_await;
 
 /// The parent's world (`Future`, `IntoFuture`, `Ready`, `Rc<T>`, `make_rc`, `drop_rc`) with
 /// `#[lang = "send"] auto trait Send {}`, `Rc<T>` not `Send` (the library's alloc/src/rc.rs:
@@ -65,6 +68,8 @@ fn send_world() -> (Fx, ItemKey, ItemKey) {
     fx.func("ready", 0, &[], ready_t, vec::Vec::new());
     fx.func("make_rc", 0, &[], rc_i32, vec::Vec::new());
     fx.func("drop_rc", 0, &[rc_i32], unit, vec::Vec::new());
+    let r_rc = fx.r(Mutbl::Not, rc_i32);
+    fx.func("take", 0, &[r_rc, unit], unit, vec::Vec::new());
     let is_send = fx.bound(send, &[p0]);
     fx.func("spawn", 1, &[p0], unit, vec![is_send]);
     let owner = fx.func("owner", 0, &[], unit, vec::Vec::new());
@@ -136,4 +141,19 @@ fn rc_dropped_before_await_is_send() {
     assert_eq!(stalled, 1, "the superset holds `Rc<i32>`: the goal stalls");
     assert!(got.is_empty(), "no finding on the exact interior: {got:?}");
     std::println!("rc dropped before the await: Send");
+}
+
+/// `async { take(&make_rc(), ready().await) }` given to `spawn<F: Send>`: the `Rc<i32>`
+/// temporary is made before the `.await` (arguments are evaluated left to right, the Reference,
+/// "Call expressions") and lives to the end of the statement ("Temporary scopes"), so the state
+/// holds it across the `.await` and the future is not `Send`: one E0277. Main's ruling of
+/// 2026-11-16: a pre-await temporary is a flow local; a flow that did not name it would answer
+/// `Send` here, wrongly.
+/// Prints "a temporary held across the await: E0277".
+#[test]
+fn a_temporary_held_across_an_await_is_not_send() {
+    let (stalled, got) = send_findings(super::state_recipe::temp_across);
+    assert_eq!(stalled, 1, "the superset holds `Rc<i32>`: the goal stalls");
+    assert_eq!(got, vec![DiagCode::Unsatisfied]);
+    std::println!("a temporary held across the await: E0277");
 }

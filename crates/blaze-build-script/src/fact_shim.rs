@@ -186,7 +186,7 @@ pub fn ask<'a>(argv0: &str, args: &[&str], pins: Option<&Pins<'_>>, alloc: Alloc
     };
     let Some(fact) = question else {
         if !PROGRAMS.contains(&name) {
-            return refuse(format_args!("`{name}` is not a program the fact shim answers ({})", PROGRAMS.join(" ")), subject);
+            return refuse(format_args!("`{name}` is not a program the fact shim answers (fact_shim::PROGRAMS)"), subject);
         }
         return refuse(format_args!("not a question the pinned facts table answers (blaze_build_script::facts)"), subject);
     };

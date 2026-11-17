@@ -44,7 +44,7 @@ use blaze_lir::{
 
 use crate::enc::{self, SP, Size, X9, X16};
 use crate::pass::variadic::{MOST_STACKED, VarLoc, area_of, place_of};
-use crate::pass::{Loc, Regs};
+use crate::pass::{FloatWidth, Loc, Regs};
 use crate::tests::emitted_for;
 use crate::{Isa, Named, Names, Os, Outside, Via, emit_record};
 
@@ -107,7 +107,7 @@ fn variadic_places_follow_the_platform() {
     let mut linux = named(Os::Linux);
     let mut slots = 0;
     assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::I32), Ok(VarLoc::Reg(Loc::X(3))), "Linux: the int in x3");
-    assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::F64), Ok(VarLoc::Reg(Loc::V(0))), "Linux: the double in v0");
+    assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::F64), Ok(VarLoc::Reg(Loc::V(0, FloatWidth::Double))), "Linux: the double in v0");
     assert_eq!(area_of(slots), 0, "Linux: nothing stacked");
     // Linux past x7: x4..x7 take four more, the fifth is the first stacked slot; a float still
     // takes v1 (the vector registers are counted apart).
@@ -115,7 +115,7 @@ fn variadic_places_follow_the_platform() {
         assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::I64), Ok(VarLoc::Reg(Loc::X(x))), "Linux: x{x}");
     }
     assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::PTR), Ok(VarLoc::Slot(0)), "Linux: past x7, slot 0");
-    assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::F64), Ok(VarLoc::Reg(Loc::V(1))), "Linux: the next double in v1");
+    assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::F64), Ok(VarLoc::Reg(Loc::V(1, FloatWidth::Double))), "Linux: the next double in v1");
     assert_eq!(place_of(Os::Linux, &mut linux, &mut slots, Ty::I32), Ok(VarLoc::Slot(8)), "Linux: an int past x7 takes 8 bytes");
     assert_eq!(area_of(slots), 16);
     // C's promotions are the checker's: an unpromoted `f32` or `i8` is refused by name here.
@@ -163,7 +163,7 @@ fn variadic_stores_precede_the_record_call_site() {
     let func = caller();
     let heap = blaze_own::testing::heap();
     for isa in [APPLE, LINUX] {
-        let record = emit_record(func.view(), &ByC, isa, heap.alloc()).unwrap_or_else(|why| panic!("{isa:?}: {why}"));
+        let (record, _) = emit_record(func.view(), &ByC, &crate::RoutinePlaces::NONE, isa, heap.alloc()).unwrap_or_else(|why| panic!("{isa:?}: {why}"));
         let code: Vec<u32, Global> =
             record.code.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
         let calls: Vec<u32, Global> = record.sites.iter().filter(|s| s.kind == SiteKind::Call).map(|s| s.at / 4).collect();

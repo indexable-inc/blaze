@@ -266,7 +266,8 @@ fn setup(body: &[u8], macros: u32) -> Setup {
 }
 
 fn package(root: &Path, env: &[(&str, &str)]) -> Arc<Package> {
-    Arc::new(Package { files: Files::Folder(root.to_owned()), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect() })
+    let env = crate::package_env::PackageEnv::set_only(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()).unwrap_or_else(|e| panic!("{e}"));
+    Arc::new(Package::new(Files::Folder(root.to_owned()), env).unwrap_or_else(|e| panic!("the test's package at {}: {e}", root.display())))
 }
 
 fn run<'a>(setup: &Setup, index: u32, package: Arc<Package>, limits: Limits, alloc: Alloc<'a>) -> Result<Produced<'a>, CallError> {
@@ -979,9 +980,10 @@ fn a_fetched_package_s_macro_reads_its_own_manifest_and_nothing_above_it() {
     use blaze_wasi::{Open, ROOT_FD, System};
     const MANIFEST: &[u8] = b"[package]\nname = \"reth-rpc-api\"\n[dependencies]\njsonrpsee = \"0.26\"\n";
     let files: Arc<[(String, &'static [u8])]> = Arc::from(vec![("Cargo.toml".to_owned(), MANIFEST), ("src/lib.rs".to_owned(), &b"//"[..])]);
-    let package = Arc::new(Package { files: Files::Listed(files), env: vec![("CARGO_MANIFEST_DIR".to_owned(), PACKAGE.to_owned())] });
+    let env = crate::package_env::PackageEnv::set_only(vec![("CARGO_MANIFEST_DIR".to_owned(), PACKAGE.to_owned())]).unwrap_or_else(|e| panic!("{e}"));
+    let package = Arc::new(Package::new(Files::Listed(files), env).unwrap_or_else(|e| panic!("{e}")));
     let mut sandbox = Sandbox::new(package);
-    let dir = sandbox.var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is given");
+    let dir = sandbox.var("CARGO_MANIFEST_DIR").ok().flatten().expect("CARGO_MANIFEST_DIR is given");
     let how = Open { dirflags: 0, oflags: 0, rights_base: 0, rights_inheriting: 0, fdflags: 0 };
     let fd = sandbox.open(ROOT_FD, format!("{dir}/Cargo.toml").as_bytes(), how).expect("not stopped").expect("the manifest opens");
     let mut bytes = vec![0; 256];

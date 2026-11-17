@@ -20,6 +20,7 @@
 extern crate std;
 
 mod asks;
+mod asm;
 mod body;
 mod columns;
 /// A coroutine's identity across bodies: an async block's ordinal (the rule blaze-build's
@@ -40,12 +41,16 @@ mod instance;
 mod intern;
 mod specialize;
 mod machine;
+/// Why a written path names nothing: the world's answer E0425 names the failing segment by.
+mod path_miss;
 mod portable;
 /// A kept check's read list asked again of today's world (read-addressed.md, "End state").
 mod replay;
 mod rules;
 /// Auto-trait goals of an async block's future decided on its exact interior (async plan P13).
 mod stalled;
+/// The impl chosen for each projection of a callee's signature at each call (impl-per-call).
+mod selected;
 mod ty;
 mod world;
 
@@ -76,7 +81,10 @@ pub use body::{
     IntSuffix, Lit, Pat, Segment, Stmt, UnOp,
 };
 pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, PatDefs};
+pub use selected::{Projected, Selected};
 pub use diag::{Because, Diag, DiagCode, UnmetGoal};
+pub use asm::{ASM_NORETURN, AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg};
+pub use path_miss::{MissWhy, PathAnswer, PathMiss, PathPrefix};
 /// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.
 pub use rules::suggest;
 pub use error::{CheckError, Limit, Malformed, Recorded, Stop};
@@ -91,7 +99,7 @@ pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligatio
 pub use world::{
     Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, CoroutineFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
     Hidden, ImplHeader, ImplPolarity, Missing, Needs, PClause, PathRes, Predicates, Prim, Question, ReadList, Reads, RecordKind, Seal, Shape,
-    TraitDef, TraitFlags, TraitMembers, TypeAttrs, DiscrRepr, Variant, World, ground_args_digest,
+    TraitDef, TraitDefaults, TraitFlags, TraitMembers, TypeAttrs, DiscrRepr, Variant, World, ground_args_digest,
 };
 
 use machine::{Machine, Plant};

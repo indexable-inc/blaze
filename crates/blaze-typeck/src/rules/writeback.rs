@@ -17,6 +17,9 @@ use blaze_own::{Alloc, Soa, Vec};
 
 use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, PatDefs};
 use crate::ty::ClosureKind;
+
+/// `Checked::selected`'s rows (impl-per-call).
+mod selected_rows;
 use crate::diag::{At, Diag, DiagCode};
 use crate::error::{CheckError, Limit};
 use blaze_hash::HashMap;
@@ -172,7 +175,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             if holds_var {
                 if self.errors == 0 && !ex.reported {
-                    self.diag(DiagCode::AnnotationsNeeded, at, None, None, None);
+                    self.diag(DiagCode::AnnotationsNeeded, at, crate::diag::About::found(t));
                     ex.reported = true;
                 }
                 let p = ex.out.intern(PNode::Error)?;
@@ -323,7 +326,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             match at {
                 At::Expr(e) => expr_defs.push((e, d)),
                 At::Pat(p) => pat_defs.push((p, d)),
-                At::Body => {}
+                At::Body | At::Written(_) => {}
             }
         }
         expr_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
@@ -384,7 +387,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 None => d.because,
             };
-            let diag = Diag { code: d.code, at, expected: None, found, name: d.name, because };
+            let diag = d.export(at, None, found, because);
             stalled.push(crate::stalled::Stalled { trait_: s.trait_, ty, diag });
         }
         let mut diags: Vec<Diag, Alloc<'a>> = Vec::with_capacity_in(self.diags.len(), alloc);
@@ -416,7 +419,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 None => d.because,
             };
-            diags.push(Diag { code: d.code, at, expected, found, name: d.name, because });
+            diags.push(d.export(at, expected, found, because));
         }
         // Writeback runs only when the walk finished (`needs` here are prefetch hints for next
         // time, not open questions): with no diagnostic, every recorded type must be named.
@@ -527,6 +530,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         awaited.sort_unstable_by_key(|r| r.0);
+        // The impl chosen for each projection of a callee's signature at each call
+        // (writeback/selected_rows.rs), over the body's own reads: before they are finished.
+        let selected = self.selected_rows(&mut ex)?;
         let (reads, needs) = self.reads.finish(alloc);
         Ok(Checked {
             suggests,
@@ -534,6 +540,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             promoted,
             stalled,
             awaited,
+            selected,
             types: ex.out,
             expr_ty,
             pat_ty,

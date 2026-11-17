@@ -211,12 +211,19 @@ impl BodyBuf {
             field_pats: &self.field_pats,
             paths: &self.paths,
             segments: &self.segments,
+            segment_ranges: &[],
             types: self.types.view(),
             type_lists: &[],
+            type_list_ranges: &[],
+            method_name_ranges: &[],
             opt_types: &[],
             fmt_uses: &[],
             coroutine: None,
             super_lets: &[],
+            asm_pieces: &[],
+            asm_operands: &[],
+            asm_clobbers: &[],
+            asm_text: "",
         }
     }
 }
@@ -551,8 +558,10 @@ impl World for TestWorld {
         Ok(&[])
     }
 
-    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
-        let [n] = segments else { return Ok(None) };
+    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<blaze_typeck::PathAnswer> {
+        // This world names one-segment paths only: a longer one is a miss it does not locate,
+        // a one-segment name that is none is its first segment's.
+        let [n] = segments else { return Ok(Err(blaze_typeck::PathMiss::Whole)) };
         if let Some(f) = self.fns.iter().find(|f| f.name == *n) {
             // A static or a const is a `Fun` of no inputs, for its type.
             let def = match (self.statics.iter().find(|(k, _)| *k == f.key), self.consts.iter().any(|(k, _)| *k == f.key)) {
@@ -560,19 +569,20 @@ impl World for TestWorld {
                 (None, true) => Def::Const(f.key),
                 (None, false) => Def::Fn(f.key),
             };
-            return Ok(Some(PathRes { def, consumed: 1 }));
+            return Ok(Ok(PathRes { def, consumed: 1 }));
         }
         for s in self.structs.iter().filter(|s| s.kind == AdtKind::Enum) {
             if let Some(v) = s.variants.iter().position(|v| v.name == *n) {
                 let def = Def::Ctor { adt: s.key, variant: v as u32, kind: s.variants[v].ctor };
-                return Ok(Some(PathRes { def, consumed: 1 }));
+                return Ok(Ok(PathRes { def, consumed: 1 }));
             }
         }
         Ok(self
             .structs
             .iter()
             .find(|s| s.kind != AdtKind::Enum && s.variants[0].name == *n)
-            .map(|s| PathRes { def: Def::Adt(s.key), consumed: 1 }))
+            .map(|s| PathRes { def: Def::Adt(s.key), consumed: 1 })
+            .ok_or(blaze_typeck::PathMiss::FIRST))
     }
 
     fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
@@ -611,6 +621,7 @@ impl World for TestWorld {
                 members: blaze_typeck::TraitMembers::NotKnown,
                 assoc_types: &self.index_defs,
                 types: self.types.view(),
+                defaults: blaze_typeck::TraitDefaults::Known(&[None]),
             }));
         }
         Ok((item == DEREF && self.deref.is_some()).then(|| blaze_typeck::TraitDef {
@@ -621,6 +632,7 @@ impl World for TestWorld {
             members: blaze_typeck::TraitMembers::NotKnown,
             assoc_types: &self.deref_defs,
             types: self.types.view(),
+            defaults: blaze_typeck::TraitDefaults::Known(&[]),
         }))
     }
 
@@ -3490,6 +3502,7 @@ mod halfquad;
 mod index;
 mod fmt;
 mod coroutines;
+mod coroutine_held;
 mod coroutine_id_agree;
 #[cfg(target_arch = "aarch64")]
 mod coroutines_emit;

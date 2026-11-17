@@ -1,20 +1,18 @@
 //! A build script's run: its `wasm32-wasip1` module (`_start`, built with the process shim
 //! `guest/script_process.rs`) in a fresh Wasmtime instance over the [`ScriptSandbox`], within
-//! fuel and memory limits, and its outputs kept as a record (docs/v2/plan/design/build-scripts.md).
+//! fuel and memory limits (docs/v2/plan/design/build-scripts.md).
 //!
-//! - The record's base is [`blaze_build_script::key::base`]: the module's SHA-256, the whole
-//!   environment, the answers it could be given, the C mode and the limits. Its read-list is
-//!   what the script read of its workspace (`file:`, `dir:`, `stat:` subjects, valued now by
-//!   [`crate::script_sandbox::answer_now`]), so a changed file misses exactly the runs that read
-//!   it; a derived fact's subject is answered again with the command's pins
-//!   ([`crate::fact_pins::read_now`]), so other pins miss exactly the runs that asked it.
-//! - The answer is [`Outputs`] in canonical bytes: the instructions, the files of `OUT_DIR`
-//!   and the C requests deferred.
-//! - A failed run is not kept: a script that exits non-zero, traps or is stopped gives a
-//!   [`ScriptError`] naming the package.
+//! - The run's base is [`blaze_build_script::key::base`]: the module's SHA-256, the whole
+//!   environment, the answers it could be given, the C mode and the limits; it seeds a spawn's
+//!   clock and randomness. Its reads are what the script read of its workspace (`file:`, `dir:`,
+//!   `stat:` subjects, valued by [`crate::script_sandbox::answer_now`]).
+//! - The answer is [`Outputs`]: the instructions, the files of `OUT_DIR` and the C requests
+//!   deferred. A failed run gives a [`ScriptError`] naming the package.
+//! - Nothing is kept here: the only cache of a run is the command's `Script` task record
+//!   (decision D115, docs/v2/plan/design/drive.md, "Two rulings (19:48)"), whose read list the
+//!   task makes from [`ScriptRun::reads`].
 //!
-//! The compiled-for-host module is `<store>/build-script/compiled/<key>/code`; records are
-//! under `<store>/build-script/records/{list,answer}/<id>`.
+//! The compiled-for-host module is `<store>/build-script/compiled/<key>/code`.
 
 use std::{
     hash::{Hash as _, Hasher as _},
@@ -23,7 +21,7 @@ use std::{
 };
 
 use blaze_build_script::{
-    Env, Outputs, OutputsRef,
+    Env, Outputs,
     instr::{OutputError, OutputLimits},
     key::{self, KeyInputs, RunnerKey},
     outputs::{FileError, FileLimits},
@@ -31,16 +29,13 @@ use blaze_build_script::{
 };
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
-use blaze_record::{AnswerKey, Bounds, Digest, Filing, Found, keep_answer, lookup, write_list};
 use blaze_wasi::{Answer, Errno, Stop, W32};
 use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, OptLevel, ResourceLimiter, Store as WasmStore, Trap, TypedFunc, WasmBacktraceDetails};
 
 use crate::{
     host::{MAX_WASM_STACK, fuel_cost},
     module::sha256_hex,
-    record::DirStore,
-    script_sandbox::{Read, Refusal, Script, ScriptSandbox, Tree},
-    spawn_route::FactPins,
+    script_sandbox::{Read, Refusal, Script, ScriptSandbox},
 };
 
 /// The import module of the process shim's calls.
@@ -83,8 +78,6 @@ pub enum ScriptWhy {
     File { name: String, error: FileError },
     /// The module does not load or link.
     Load(String),
-    /// The records could not be read or written.
-    Record(RecordError),
 }
 
 /// A [`ScriptWhy`] with the package it is about.
@@ -110,30 +103,11 @@ impl std::fmt::Display for ScriptError {
             ScriptWhy::Output(error) => write!(f, "the build script of {package} printed what blaze does not take: {error:?}"),
             ScriptWhy::File { name, error } => write!(f, "the build script of {package} left OUT_DIR/{name}, which the record does not take: {error:?}"),
             ScriptWhy::Load(why) => write!(f, "the build script of {package} does not load: {why}"),
-            ScriptWhy::Record(why) => write!(f, "the build-script records of {package}: {why}"),
         }
     }
 }
 
 impl std::error::Error for ScriptError {}
-
-/// Why the build-script records could not be read or written.
-#[derive(Debug)]
-pub enum RecordError {
-    /// The read-list chain or the store under it.
-    Chain(blaze_record::Error<crate::record::FilesError>),
-    /// The answer under `base` is not a run's outputs.
-    NotOutputs { base: ContentId, why: blaze_build_script::outputs::RecordError },
-}
-
-impl std::fmt::Display for RecordError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecordError::Chain(error) => write!(f, "{error}"),
-            RecordError::NotOutputs { base, why } => write!(f, "the record of base {:02x?} is not outputs: {why:?}", &base.0[..8]),
-        }
-    }
-}
 
 /// Why the runtime could not be made.
 #[derive(Debug)]
@@ -155,13 +129,12 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-/// The engine and linker build scripts run in, and the store they are kept in.
+/// The engine and linker build scripts run in, and the store their compiled modules are kept in.
 pub struct ScriptRuntime {
     engine: Engine,
     linker: Linker<ScriptHost>,
     code_id: String,
     store: PathBuf,
-    records: DirStore,
 }
 
 /// A script's module compiled for this host.
@@ -176,11 +149,9 @@ pub struct LoadedScript {
 /// What one run gave.
 pub struct ScriptRun<'a> {
     pub outputs: Outputs<'a>,
-    /// The record's base key.
+    /// The run's base key.
     pub base: ContentId,
-    /// Whether the record answered it (nothing ran).
-    pub from_record: bool,
-    /// What it read (empty when the record answered).
+    /// What it read.
     pub reads: Vec<Read>,
     pub fuel: u64,
     pub peak_memory: usize,
@@ -327,9 +298,8 @@ impl std::hash::Hasher for Bytes {
 }
 
 impl ScriptRuntime {
-    /// The runtime keeping compiled modules under `store` and its records in `records`
-    /// ([`DirStore::build_scripts`] over the same folder, through the caller's world).
-    pub fn new(store: &Path, records: DirStore) -> Result<ScriptRuntime, RuntimeError> {
+    /// The runtime keeping compiled modules under `store` (`build-script/compiled`).
+    pub fn new(store: &Path) -> Result<ScriptRuntime, RuntimeError> {
         let mut config = Config::new();
         config
             .cranelift_opt_level(OptLevel::Speed)
@@ -351,7 +321,7 @@ impl ScriptRuntime {
         let mut linker = Linker::new(&engine);
         imports(&mut linker).map_err(RuntimeError::Link)?;
         blaze_wasi::link::<W32, ScriptHost>(&mut linker).map_err(RuntimeError::Link)?;
-        Ok(ScriptRuntime { engine, linker, code_id, store: store.to_owned(), records })
+        Ok(ScriptRuntime { engine, linker, code_id, store: store.to_owned() })
     }
 
     /// `wasm`, the module of `package`'s script, compiled for this host: from its compiled
@@ -401,22 +371,14 @@ impl ScriptRuntime {
         script.deps.key(key::base(&inputs, &mut scratch))
     }
 
-    /// `script`'s outputs: from its record when one answers under what its reads are now, else
-    /// run by `loaded` and kept. `env` is the environment `script.env` was made from.
+    /// `script` run by `loaded`: its outputs and reads. `env` is the environment `script.env`
+    /// was made from. Nothing is looked up or kept (the `Script` task's record is the cache).
     pub fn run<'a>(&self, loaded: &LoadedScript, script: Arc<Script>, env: &Env<'_>, alloc: Alloc<'a>) -> Result<ScriptRun<'a>, ScriptError> {
-        let package = script.package.clone();
-        let named = |why: ScriptWhy| ScriptError { package: package.clone(), why };
         let base = self.base(loaded, &script, env);
-        let pins = script.spawn_setting.pins.as_ref();
-        if let Some(outputs) = self.find_answering(&base, &script.tree, pins, alloc).map_err(|why| named(ScriptWhy::Record(why)))? {
-            return Ok(ScriptRun { outputs, base, from_record: true, reads: Vec::new(), fuel: 0, peak_memory: 0, spawns: 0 });
-        }
-        let ran = self.fresh(loaded, script, base, alloc)?;
-        self.keep(base, &ran.reads, &ran.outputs).map_err(|why| named(ScriptWhy::Record(why)))?;
-        Ok(ran)
+        self.fresh(loaded, script, base, alloc)
     }
 
-    /// `script` run by `loaded`, nothing looked up or kept: its outputs and reads.
+    /// `script` run by `loaded` under `base`: its outputs and reads.
     pub(crate) fn fresh<'a>(&self, loaded: &LoadedScript, script: Arc<Script>, base: ContentId, alloc: Alloc<'a>) -> Result<ScriptRun<'a>, ScriptError> {
         // A spawn's clock and randomness are seeded by the run's base key (W2): the copy is
         // made only when the caller's `Script` does not hold it yet.
@@ -454,54 +416,7 @@ impl ScriptRuntime {
             outputs.c_requests.push(blaze_own::String::from_str_in(request, alloc));
         }
         let reads = std::mem::take(&mut host.sandbox.reads);
-        Ok(ScriptRun { outputs, base, from_record: false, reads, fuel, peak_memory: host.limiter.peak, spawns: host.sandbox.spawns })
-    }
-
-    /// The outputs kept under `base` for what its reads are in `tree` now, with no fact pins: a
-    /// list that read a derived fact is passed over (a native run, which asks none).
-    pub fn find<'a>(&self, base: &ContentId, tree: &Tree, alloc: Alloc<'a>) -> Result<Option<Outputs<'a>>, RecordError> {
-        self.find_answering(base, tree, None, alloc)
-    }
-
-    /// [`Self::find`] with each derived fact's read answered again with `pins`, the command's
-    /// (brief P, rule 21): the same pins reuse the record, other pins miss it, and `None` passes
-    /// over a list that read a fact, so its script runs again and is refused there by name.
-    pub fn find_answering<'a>(&self, base: &ContentId, tree: &Tree, pins: Option<&FactPins>, alloc: Alloc<'a>) -> Result<Option<Outputs<'a>>, RecordError> {
-        let found = lookup(&self.records, Bounds::STANDARD, base, |name| {
-            let subject = std::str::from_utf8(name).ok()?;
-            crate::fact_pins::read_now(tree, subject, pins, alloc)
-        })
-        .map_err(RecordError::Chain)?;
-        match found {
-            Found::Hit { answer, .. } => {
-                let opened = OutputsRef::open(&answer).map_err(|why| RecordError::NotOutputs { base: *base, why })?;
-                Ok(Some(opened.to_owned(alloc)))
-            }
-            Found::Miss { .. } => Ok(None),
-        }
-    }
-
-    pub(crate) fn keep(&self, base: ContentId, reads: &[Read], outputs: &Outputs<'_>) -> Result<(), RecordError> {
-        self.keep_as(base, reads, outputs, blaze_build_script::host_tools::RUN_KIND)
-    }
-
-    /// [`Self::keep`] with the read list filed under `kind`: a native run granted a host tool
-    /// passes [`blaze_build_script::host_tools::RUN_KIND_HOST_TOOL`], the `host-tool` mark the
-    /// shared-cache origin refuses to seal (D71).
-    pub(crate) fn keep_as(&self, base: ContentId, reads: &[Read], outputs: &Outputs<'_>, kind: &[u8]) -> Result<(), RecordError> {
-        let mut list = Vec::new();
-        write_list(&mut list, &base, kind, reads.iter().map(|read| read.subject.as_bytes()));
-        let mut key = AnswerKey::new(&list);
-        for read in reads {
-            key.value(read.digest.map_or(Digest::Nothing, Digest::Is));
-        }
-        let key = key.finish();
-        let mut filing = Filing::new(base, Bounds::STANDARD);
-        filing.place(&self.records, &list).map_err(RecordError::Chain)?;
-        let mut bytes = blaze_own::Vec::new_in(Alloc::global());
-        outputs.encode(&mut bytes);
-        keep_answer(&self.records, key, &bytes).map_err(RecordError::Chain)?;
-        Ok(())
+        Ok(ScriptRun { outputs, base, reads, fuel, peak_memory: host.limiter.peak, spawns: host.sandbox.spawns })
     }
 }
 

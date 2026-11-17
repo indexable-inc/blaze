@@ -116,6 +116,11 @@ impl Load<'static> for Kept {
     fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<&'static str> {
         None
     }
+
+    /// No texts, so no origins.
+    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'static [u8]> {
+        None
+    }
 }
 
 /// The records of the world crates `readers` (the owner first), as `blaze check`'s body job

@@ -16,6 +16,7 @@ use crate::Plant;
 use crate::answers::{self, Last, Page, Root, Row};
 use crate::condition::{Condition, ConditionError, MOST_ATOMS, MOST_CONDITIONS, OVER_CAP_RULE, Space, Var};
 use crate::key::{self, ABSENT, Key, Kind, Name, Tool};
+use crate::owners::{self, Root as OwnerRoot};
 use crate::profile::Profile;
 use crate::record::{self, Finding, Locate, Part, PathOf, Stored, Whole, WholeView};
 use crate::table::{Hashed, Set, Table, spread};
@@ -94,10 +95,11 @@ impl Command {
     /// caller whose worker builds fewer says which stages it left out (blaze-cli's closing
     /// note), so the note shrinks as kinds are built and is gone when all are.
     pub fn needs(self) -> &'static [Kind] {
-        const CHECK: [Kind; 10] = [
+        const CHECK: [Kind; 11] = [
             Kind::Units,
             Kind::UnitGraph,
             Kind::Fetch,
+            Kind::Script,
             Kind::FileItems,
             Kind::ModuleScope,
             Kind::Group,
@@ -106,10 +108,11 @@ impl Command {
             Kind::ImplBucket,
             Kind::BodyCheck,
         ];
-        const RUN: [Kind; 11] = [
+        const RUN: [Kind; 12] = [
             Kind::Units,
             Kind::UnitGraph,
             Kind::Fetch,
+            Kind::Script,
             Kind::FileItems,
             Kind::ModuleScope,
             Kind::Group,
@@ -605,6 +608,12 @@ enum Purpose {
     Page(u32),
     Look(Name),
     Value(Name),
+    /// An `Owners` record read for its roots (owners.rs): a standing row's, which this run did
+    /// not compute.
+    Roots(Name),
+    /// A standing home's record read for its parts' locates: a part of it this run asks for
+    /// (a body made a job only now, by a need) whose home was not re-made.
+    Parts(Name),
 }
 
 enum PageState<'a> {
@@ -716,6 +725,25 @@ pub struct Request<'a> {
     dropped: Set<Name, Alloc<'a>>,
     /// The locates of the parts of homes loaded or made this run.
     part_locs: Table<Name, (Locate, u32, Name), Alloc<'a>>,
+    /// Every home this run settled that lists each file part, sorted: a file that is a module
+    /// of two crates has two (`part_locs` keeps where to find a part, this who lists it).
+    parents: Table<Name, AVec<'a, Name>, Alloc<'a>>,
+    /// Outline jobs (`Units`, `UnitGraph`, `FileItems`) not settled: an `Owners` with no row
+    /// waits for zero, the one barrier allowed (outlines only, never a scope).
+    outlines_open: usize,
+    /// `Owners` jobs waiting for `outlines_open` to reach zero.
+    owners_waiting: AVec<'a, Name>,
+    /// Each `Owners` name's roots known this run: computed here, or read from its record.
+    owner_roots: Table<Name, AVec<'a, OwnerRoot>, Alloc<'a>>,
+    /// `Owners` records being read for their roots, and the jobs waiting on each.
+    roots_loading: Table<Name, AVec<'a, Name>, Alloc<'a>>,
+    /// A file's body parts not made jobs yet, each with its home: made once the file's owners
+    /// are known and one of them is asked (a member's); any other body runs only when Needed.
+    gated: Table<Name, AVec<'a, (Name, Name)>, Alloc<'a>>,
+    /// Standing homes whose records are being read for their parts' locates, with the jobs
+    /// waiting; and the homes read so.
+    parts_loading: Table<Name, AVec<'a, Name>, Alloc<'a>>,
+    parts_read: Set<Name, Alloc<'a>>,
     /// Readers posted this run: read name to the names that read it (a name settled twice
     /// posts twice; `dirty_readers` dedups).
     posted: Table<Name, Vec<Name, Alloc<'a>>, Alloc<'a>>,
@@ -859,6 +887,14 @@ impl<'a> Request<'a> {
             now,
             dropped: Set::new_in(a.clone()),
             part_locs: Table::new_in(a.clone()),
+            parents: Table::new_in(a.clone()),
+            outlines_open: 0,
+            owners_waiting: Vec::new_in(a.clone()),
+            owner_roots: Table::new_in(a.clone()),
+            roots_loading: Table::new_in(a.clone()),
+            gated: Table::new_in(a.clone()),
+            parts_loading: Table::new_in(a.clone()),
+            parts_read: Set::new_in(a.clone()),
             posted: Table::new_in(a.clone()),
             jobs: Table::new_in(a.clone()),
             settled: 0,
@@ -1413,6 +1449,8 @@ impl<'a> Request<'a> {
                 }
                 Purpose::Look(name) => self.looked(name, key, bytes, out)?,
                 Purpose::Value(name) => self.valued(name, key, bytes, out)?,
+                Purpose::Roots(name) => self.roots_got(name, key, bytes, out)?,
+                Purpose::Parts(home) => self.parts_got(home, key, bytes)?,
             }
         }
         Ok(())
@@ -1507,6 +1545,15 @@ impl<'a> Request<'a> {
         if self.jobs.len() as u64 >= u64::from(self.config.most_jobs) {
             return Err(DriveError::TooManyJobs { most: self.config.most_jobs, name });
         }
+        // An `Owners` is located by its subject and homed at its file, however it was asked
+        // (a body's want, a gate, a child's owners, a dirtied part).
+        let (home, locate) = match name.kind {
+            Kind::Owners => (owners::file_of(name), locate.or(Some(Locate::Source(name.subject)))),
+            _ => (home, locate),
+        };
+        if outline(name.kind) {
+            self.outlines_open += 1;
+        }
         let a = self.alloc;
         self.jobs.insert(
             name,
@@ -1549,18 +1596,39 @@ impl<'a> Request<'a> {
     /// 111,403 lists at 45 s (RUNNER 17, `malloc_history`, 2026-11-16).
     fn set_state(&mut self, name: Name, state: State) {
         let (alloc, keep) = (self.alloc, self.plant == Plant::KeepSettledNeeds);
+        let mut closed = false;
         if let Some(job) = self.jobs.get_mut(&name) {
             match (job.state == State::Settled, state == State::Settled) {
                 (false, true) => {
                     self.settled += 1;
+                    closed = true;
                     if !keep {
                         job.needs = Vec::new_in(alloc);
                     }
                 }
-                (true, false) => self.settled -= 1,
+                (true, false) => {
+                    self.settled -= 1;
+                    if outline(name.kind) {
+                        self.outlines_open += 1;
+                    }
+                }
                 _ => {}
             }
             job.state = state;
+        }
+        if closed && outline(name.kind) {
+            self.outline_closed();
+        }
+    }
+
+    /// An outline job settled or left: at zero open, the `Owners` waiting on the walk go on.
+    fn outline_closed(&mut self) {
+        self.outlines_open -= 1;
+        if self.outlines_open == 0 {
+            let waiting = core::mem::replace(&mut self.owners_waiting, Vec::new_in(self.alloc));
+            for name in waiting.iter() {
+                self.wake.push_back(*name);
+            }
         }
     }
 
@@ -2185,14 +2253,23 @@ impl<'a> Request<'a> {
                 }
                 None if seed => {
                     // A changed file no answer holds: outside the build, until a module lists it.
-                    // It is in `Start`, so the settled count is untouched.
+                    // It is in `Start`, so the settled count is untouched; it was an open outline.
                     self.jobs.remove(&name);
+                    if outline(name.kind) {
+                        self.outline_closed();
+                    }
                     return Ok(());
                 }
                 None if home != name && self.state(home).is_none() => {
                     let class = self.jobs.get(&name).map_or(self.walk, |job| job.class);
                     self.add_job(home, home, None, false, class)?;
                     self.wait_on(home, name);
+                    return Ok(());
+                }
+                // A part its home's row lists, asked only now (a body made a job by a need) of a
+                // home that stood: the home's record says where it is.
+                None if self.parts_unread(home, name) => {
+                    self.read_parts(home, name, out);
                     return Ok(());
                 }
                 // A workspace's member units list their files after the root lists them: a file
@@ -2258,6 +2335,32 @@ impl<'a> Request<'a> {
                 }
             },
         };
+        // A body's read names follow from its owners (it reads their crates' scopes), which no
+        // text of its own holds: its key holds its file's `Owners` out, so one key never names
+        // two read lists (rule 21) and a body whose owners moved is a new key.
+        let key = match name.kind {
+            Kind::BodyCheck => {
+                let home = self.jobs.get(&name).expect("a job").home;
+                // Its file's Surface remade this request: when it settles moved, its crates'
+                // scopes are dirtied (their jobs made) before this body reads them, so it never
+                // runs over a scope about to be remade and then again (PIPELINE runner 7,
+                // owners_tests.rs). Owed: an edit in ANOTHER file of the crate still races.
+                let surface = Name::new(Kind::Surface, self.cond_of(home).0.subject);
+                if self.state(surface).is_some_and(|state| state != State::Settled) {
+                    self.wait_on(surface, name);
+                    return Ok(());
+                }
+                let owned = owners::of(self.cond_of(home).0);
+                if self.state(owned).is_none() {
+                    self.add_job(owned, home, None, false, self.walk)?;
+                }
+                match self.digest(owned, name, out) {
+                    Digest::Wait => return Ok(()),
+                    Digest::Ready(now) => key::value_key(key, &[(owned, now.map_or(ABSENT, |now| now.out))]),
+                }
+            }
+            _ => key,
+        };
         let job = self.jobs.get_mut(&name).expect("a job");
         job.locate = Some(locate);
         job.place = place;
@@ -2297,7 +2400,11 @@ impl<'a> Request<'a> {
         job.source = source;
         job.key = key::task_key(self.config.tool_of(name.kind), name, &source);
         let findings = [Finding { rule, start: 0, end: 0, message: &message }];
-        let output = Output { name, out: source, reads: &[], parts: &[], paths: &[], findings: &findings, payload: &[] };
+        // A data file (`include_str!`, `include_bytes!`, [`crate::record::DATA_FILE`]) that is
+        // not there is no finding of the drive's: the expansion that reads it reports it at its
+        // call, and a call the cfg turns off reads nothing and reports nothing, as rustc.
+        let findings: &[Finding<'_>] = if edition == crate::record::DATA_FILE { &[] } else { &findings };
+        let output = Output { name, out: source, reads: &[], parts: &[], paths: &[], findings, payload: &[] };
         self.made(&output, out)
     }
 
@@ -2308,6 +2415,16 @@ impl<'a> Request<'a> {
             self.set_state(name, State::Queued);
             self.queue(self.walk, name);
             return Ok(());
+        }
+        // An `Owners` row stands unless dirtied (a parent added or removed, a parent's row
+        // moved); else the machine computes it, never from the store: its parents are not in
+        // its key, so a record found by value could be another checkout's tree.
+        if name.kind == Kind::Owners {
+            if !recheck && self.current(name).is_some_and(|row| row.key == key) {
+                return self.stand(name, out);
+            }
+            self.set_state(name, State::Gather);
+            return self.owners(name, out);
         }
         // A split (or an over-cap finding) read the space: under another space its forks are
         // others, so it stands only on the same space. No reader of the space is posted (it is
@@ -2443,6 +2560,9 @@ impl<'a> Request<'a> {
 
     /// Wait for every need to settle, then queue the run.
     fn gather(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        if name.kind == Kind::Owners {
+            return self.owners(name, out);
+        }
         let needs = core::mem::replace(&mut self.jobs.get_mut(&name).expect("a job").needs, Vec::new_in(self.alloc));
         let (_, under) = self.cond_of(name);
         let mut waiting = false;
@@ -2529,6 +2649,10 @@ impl<'a> Request<'a> {
         let bytes = record::write_whole(&whole, self.alloc);
         let at = match reads.is_empty() {
             true => key,
+            // An `Owners` key holds no text its parents follow from, so its read names move
+            // under one key: no shape there (it is never looked up by one, `decide`), only the
+            // record at its value key, which its reads make unique.
+            false if output.name.kind == Kind::Owners => key::value_key(key, &reads),
             false => {
                 let shape = record::write_shape(output.name, &reads, self.alloc);
                 self.put(key, shape, out);
@@ -2621,7 +2745,24 @@ impl<'a> Request<'a> {
                 parts_now.extend_from_slice(&parts);
                 for gone in old_parts.iter() {
                     if parts.binary_search(gone).is_err() {
+                        // A file another home may still list stays: its `Owners`, dirtied,
+                        // reads every parent and drops it only if none lists it now.
+                        if gone.kind == Kind::FileItems {
+                            self.unparent(*gone, name);
+                            self.dirty_owners(*gone)?;
+                            if self.plant != Plant::OwnersDropListedElsewhere && self.maybe_listed(*gone, name) {
+                                continue;
+                            }
+                        }
                         self.drop_name(*gone)?;
+                    }
+                }
+                // A file this home lists anew has a new parent: its owners are computed again.
+                if self.plant != Plant::OwnersAddedNotDirtied {
+                    for added in parts.iter().filter(|part| part.kind == Kind::FileItems) {
+                        if old_parts.binary_search(added).is_err() {
+                            self.dirty_owners(*added)?;
+                        }
                     }
                 }
                 for (read, _) in reads.iter() {
@@ -2654,9 +2795,14 @@ impl<'a> Request<'a> {
             self.units_at = Some(now.at);
             self.units_known(now.at, out);
         }
-        // Every part of a record walked: a standing one stands on its row at no store read.
+        self.note_parents(name, &parts_now);
+        // Every part of a record walked: a standing one stands on its row at no store read. A
+        // file's bodies wait for its owners: a job only under an asked root (`release`).
+        let gates = name.kind == Kind::FileItems && self.plant != Plant::EveryPartAJob;
+        let file = self.cond_of(name).0;
         for part in parts_now.iter() {
             match self.state(*part) {
+                None if gates && part.kind == Kind::BodyCheck => self.gate(file, *part, name),
                 None => self.add_job(*part, name, None, false, self.walk)?,
                 Some(State::Start) => self.wake.push_back(*part),
                 Some(_) => {}
@@ -2694,7 +2840,337 @@ impl<'a> Request<'a> {
         if redo {
             self.dirty(name)?;
         }
+        match name.kind {
+            Kind::FileItems => self.release(file, out)?,
+            Kind::Owners => self.release(owners::file_of(name), out)?,
+            _ => {}
+        }
         Ok(())
+    }
+
+    // --- Owners (owners.rs) --------------------------------------------------------------------
+
+    /// `home` lists `parts`: each file part has it as a parent (sorted, no repeat).
+    fn note_parents(&mut self, home: Name, parts: &[Name]) {
+        for part in parts.iter().filter(|part| part.kind == Kind::FileItems) {
+            match self.parents.get_mut(part) {
+                Some(list) if self.plant == Plant::OwnersLastParentWins => {
+                    list.clear();
+                    list.push(home);
+                }
+                Some(list) => {
+                    if let Err(at) = list.binary_search(&home) {
+                        list.insert(at, home);
+                    }
+                }
+                None => {
+                    let mut list = Vec::new_in(self.alloc);
+                    list.push(home);
+                    self.parents.insert(*part, list);
+                }
+            }
+        }
+    }
+
+    /// `home` no longer lists `file`.
+    fn unparent(&mut self, file: Name, home: Name) {
+        if let Some(list) = self.parents.get_mut(&file)
+            && let Ok(at) = list.binary_search(&home)
+        {
+            list.remove(at);
+        }
+    }
+
+    /// `file`'s parents moved: its `Owners` is computed again. Only one this run made or one an
+    /// old answer may hold: a first build computes each when asked, after the walk.
+    fn dirty_owners(&mut self, file: Name) -> Result<(), DriveError> {
+        let name = owners::of(self.cond_of(file).0);
+        if self.jobs.contains_key(&name) || self.last.is_some() {
+            self.dirty(name)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `file`, no longer listed by `home`, may still be listed by another home: a parent
+    /// this run noted, or one its `Owners` row read; unknown (its page not loaded) counts as
+    /// may. Then its `Owners` decides, reading every parent (`owners`).
+    fn maybe_listed(&self, file: Name, home: Name) -> bool {
+        if self.parents.get(&file).is_some_and(|list| list.iter().any(|parent| *parent != home)) {
+            return true;
+        }
+        let name = owners::of(self.cond_of(file).0);
+        let other = |row: &Row<'a>| row.reads.iter().any(|(parent, _)| *parent != home && parent.kind != Kind::Owners);
+        if let Some(row) = self.new.get(&name) {
+            return other(row);
+        }
+        let Some(root) = self.root.as_ref() else { return false };
+        match self.pages.get(&answers::page_of(name, root.bits)) {
+            Some(PageState::Loaded(page)) => page.get(&name).is_some_and(other),
+            _ => true,
+        }
+    }
+
+    /// A body part of `file` (listed by `home`) waits for the file's owners.
+    fn gate(&mut self, file: Name, body: Name, home: Name) {
+        match self.gated.get_mut(&file) {
+            Some(list) => list.push((body, home)),
+            None => {
+                let mut list = Vec::new_in(self.alloc);
+                list.push((body, home));
+                self.gated.insert(file, list);
+            }
+        }
+    }
+
+    /// Makes jobs of `file`'s gated bodies once its owners are known, if one is asked; drops
+    /// them unmade otherwise (a dependency's body runs only when a task Needs it), or when its
+    /// owners failed (that failure is printed by name).
+    fn release(&mut self, file: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        if !self.gated.contains_key(&file) {
+            return Ok(());
+        }
+        let name = owners::of(file);
+        match self.state(name) {
+            None => return self.add_job(name, file, None, false, self.walk),
+            Some(State::Settled) => {}
+            // It releases them as it settles.
+            Some(_) => return Ok(()),
+        }
+        let asked = match (self.now.get(&name).copied(), self.owner_roots.get(&name)) {
+            (None, _) => false,
+            (Some(_), Some(roots)) => roots.iter().any(|root| root.asked),
+            (Some(now), None) => {
+                self.load_roots(name, now.at, None, out);
+                return Ok(());
+            }
+        };
+        let bodies = self.gated.remove(&file).expect("checked above");
+        if asked {
+            for (body, home) in bodies.iter() {
+                if self.state(*body).is_none() {
+                    self.add_job(*body, *home, None, false, self.walk)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads an `Owners` record for its roots; `waiter` (an `Owners` computing) waits for it.
+    fn load_roots(&mut self, name: Name, at: Key, waiter: Option<Name>, out: &mut AVec<'_, Effect<'a>>) {
+        let waiter = waiter.filter(|waiter| self.park(*waiter));
+        match self.roots_loading.get_mut(&name) {
+            Some(list) => list.extend(waiter),
+            None => {
+                let mut list = Vec::new_in(self.alloc);
+                list.extend(waiter);
+                self.roots_loading.insert(name, list);
+                self.get(at, Purpose::Roots(name), out);
+            }
+        }
+    }
+
+    fn roots_got(&mut self, name: Name, key: Key, bytes: Option<&[u8]>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        // The row stood on this record: the store lost it, which no rebuild here repairs.
+        let Some(bytes) = bytes else {
+            return Err(DriveError::Wire { key, error: WireError { what: "owners record", at: 0, why: crate::wire::WireWhy::Short } });
+        };
+        let view = match record::open(bytes).map_err(|error| DriveError::Wire { key, error })? {
+            Stored::Whole(view) if view.name == name => view,
+            Stored::Whole(view) => return Err(DriveError::WrongRecord { key, asked: name, held: view.name }),
+            Stored::Shape(shape) => return Err(DriveError::WrongRecord { key, asked: name, held: shape.name }),
+        };
+        let mut roots = Vec::new_in(self.alloc);
+        roots.extend(owners::roots(view.payload).map_err(|error| DriveError::Wire { key, error })?);
+        self.owner_roots.insert(name, roots);
+        if let Some(waiters) = self.roots_loading.remove(&name) {
+            for waiter in waiters.iter() {
+                self.wake.push_back(*waiter);
+            }
+        }
+        self.release(owners::file_of(name), out)
+    }
+
+    /// Whether `name`'s home stood this run and its row lists `name`, its record not read for
+    /// its parts' locates yet.
+    fn parts_unread(&self, home: Name, name: Name) -> bool {
+        home != name
+            && self.state(home) == Some(State::Settled)
+            && !self.parts_read.contains(&home)
+            && self.current(home).is_some_and(|row| row.parts.binary_search(&name).is_ok())
+    }
+
+    fn read_parts(&mut self, home: Name, waiter: Name, out: &mut AVec<'_, Effect<'a>>) {
+        let parked = self.park(waiter);
+        match self.parts_loading.get_mut(&home) {
+            Some(list) => {
+                if parked {
+                    list.push(waiter);
+                }
+            }
+            None => {
+                let mut list = Vec::new_in(self.alloc);
+                if parked {
+                    list.push(waiter);
+                }
+                self.parts_loading.insert(home, list);
+                let at = self.current(home).expect("checked by `parts_unread`").at;
+                self.get(at, Purpose::Parts(home), out);
+            }
+        }
+    }
+
+    fn parts_got(&mut self, home: Name, key: Key, bytes: Option<&[u8]>) -> Result<(), DriveError> {
+        let Some(bytes) = bytes else {
+            return Err(DriveError::Wire { key, error: WireError { what: "home record", at: 0, why: crate::wire::WireWhy::Short } });
+        };
+        let view = match record::open(bytes).map_err(|error| DriveError::Wire { key, error })? {
+            Stored::Whole(view) if view.name == home => view,
+            Stored::Whole(view) => return Err(DriveError::WrongRecord { key, asked: home, held: view.name }),
+            Stored::Shape(shape) => return Err(DriveError::WrongRecord { key, asked: home, held: shape.name }),
+        };
+        for part in view.parts() {
+            if !self.part_locs.contains_key(&part.name) {
+                self.part_locs.insert(part.name, (part.locate, part.place, home));
+            }
+        }
+        self.parts_read.insert(home);
+        if let Some(waiters) = self.parts_loading.remove(&home) {
+            for waiter in waiters.iter() {
+                self.wake.push_back(*waiter);
+            }
+        }
+        Ok(())
+    }
+
+    /// Computes the `Owners` row `name` (owners.rs): the union of its file's parents' owners,
+    /// a parent that names crates adding the file itself. Its job is in `Gather` while it waits.
+    fn owners(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        let a = self.alloc;
+        let file = owners::file_of(name);
+        if self.dropped.contains(&file) {
+            return self.drop_name(name);
+        }
+        let old_reads: Option<AVec<'a, Name>> =
+            self.current(name).map(|row| row.reads.iter().map(|(read, _)| *read).filter(|read| read.kind != Kind::Owners).collect_in(a));
+        // A first computation waits for the outline walk: the one barrier allowed (outlines
+        // only, never a scope). A row's parents are known: no wait.
+        if old_reads.is_none() && self.outlines_open > 0 {
+            if self.park(name) {
+                self.owners_waiting.push(name);
+            }
+            return Ok(());
+        }
+        let mut candidates: AVec<'a, Name> = Vec::new_in(a);
+        if let Some(list) = self.parents.get(&file) {
+            candidates.extend_from_slice(list);
+        }
+        if self.plant != Plant::OwnersLastParentWins {
+            if let Some(reads) = &old_reads {
+                candidates.extend_from_slice(reads);
+            }
+            let homes = [self.jobs.get(&file).map(|job| job.home), self.current(file).map(|row| row.home)];
+            candidates.extend(homes.into_iter().flatten().filter(|home| *home != file));
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let by_parent = candidates.iter().any(|parent| parent.kind == Kind::FileItems);
+        let mut reads: AVec<'a, (Name, ContentId)> = Vec::new_in(a);
+        let mut roots: AVec<'a, OwnerRoot> = Vec::new_in(a);
+        let (mut waiting, mut listed) = (false, false);
+        for parent in candidates.iter().copied() {
+            let now = match self.digest(parent, name, out) {
+                Digest::Wait => {
+                    waiting = true;
+                    continue;
+                }
+                Digest::Ready(None) => continue,
+                Digest::Ready(Some(now)) => now,
+            };
+            if !self.current(parent).is_some_and(|row| row.parts.binary_search(&file).is_ok()) {
+                continue;
+            }
+            listed = true;
+            reads.push((parent, now.out));
+            if owners::names_crates(parent.kind) {
+                roots.push(OwnerRoot { file, asked: parent.kind == Kind::Units });
+                continue;
+            }
+            if parent.kind != Kind::FileItems {
+                continue;
+            }
+            let up = owners::of(parent);
+            match self.state(up) {
+                None => {
+                    self.add_job(up, parent, None, false, self.walk)?;
+                    self.wait_on(up, name);
+                    waiting = true;
+                    continue;
+                }
+                Some(State::Settled) => {}
+                Some(_) => {
+                    self.wait_on(up, name);
+                    waiting = true;
+                    continue;
+                }
+            }
+            // Its owners failed (a cycle, named): no owner comes through it.
+            let Some(up_now) = self.now.get(&up).copied() else { continue };
+            reads.push((up, up_now.out));
+            match self.owner_roots.get(&up) {
+                Some(theirs) => roots.extend_from_slice(theirs),
+                None => {
+                    self.load_roots(up, up_now.at, Some(name), out);
+                    waiting = true;
+                }
+            }
+        }
+        if waiting {
+            return Ok(());
+        }
+        if !listed && by_parent && self.current(file).is_some_and(|row| row.home != file) {
+            // No home lists it any more: it goes, and its owners with it.
+            self.drop_name(file)?;
+            return self.drop_name(name);
+        }
+        owners::merge(&mut roots);
+        reads.sort_unstable_by_key(|(read, _)| *read);
+        let payload = owners::write_roots(&roots, a);
+        // A file a parent reaches that no root owns: its bodies are not checked, and it says so.
+        let named = roots.is_empty() && by_parent;
+        let path = match (named, self.file_index(&file.subject)) {
+            (true, Some(index)) => self.path(index as u32),
+            _ => &[],
+        };
+        let mut message = Vec::with_capacity_in(path.len(), a);
+        message.extend_from_slice(path);
+        let finding = [Finding { rule: OWNERLESS_RULE, start: 0, end: 0, message: &message }];
+        let findings: &[Finding<'_>] = if named { &finding } else { &[] };
+        let output = Output { name, out: owners::out_of(&roots), reads: &reads, parts: &[], paths: &[], findings, payload: &payload };
+        self.owner_roots.insert(name, roots.clone());
+        self.made(&output, out)
+    }
+
+    /// At a quiet point with the outline walk done, `Owners` jobs still waiting wait on each
+    /// other: their files are each other's ancestors (a cycle of `mod` or `#[path]` files).
+    /// Each fails by name (rule 20) and its bodies are not run; `true` when any did.
+    fn owners_cycle(&mut self) -> bool {
+        if self.outlines_open > 0 {
+            return false;
+        }
+        let mut stuck: AVec<'a, Name> =
+            self.jobs.iter().filter(|(name, job)| name.kind == Kind::Owners && job.state == State::Gather).map(|(name, _)| *name).collect_in(self.alloc);
+        stuck.sort_unstable();
+        for name in stuck.iter() {
+            self.failures.push(TaskFailure {
+                name: *name,
+                why: Why::Refused { what: "a module file that is its own ancestor (a cycle of `mod` or `#[path]` files)", rule: "owners" },
+            });
+            self.now.remove(name);
+            self.set_state(*name, State::Settled);
+            self.wake_waiters(*name);
+            self.gated.remove(&owners::file_of(*name));
+        }
+        !stuck.is_empty()
     }
 
     /// A re-made home no longer lists `name`: its row goes, with the rows it listed whose pages
@@ -2783,6 +3259,9 @@ impl<'a> Request<'a> {
     /// Nothing is out and jobs are unsettled: they wait on each other. A cycle of module scopes
     /// becomes one `Group` task; any other is an error naming it.
     fn break_cycle(&mut self) -> Result<(), DriveError> {
+        if self.owners_cycle() {
+            return Ok(());
+        }
         let mut cycle = Vec::new_in(self.alloc);
         for (name, job) in self.jobs.iter() {
             if job.state != State::Settled {
@@ -3236,6 +3715,14 @@ const MESSAGE_BYTES: usize = 192;
 pub const MODULE_FILE_MISSING_RULE: u16 = 0xC0F7;
 /// The rule of a `#[path]` module whose file is not in the checkout (argument: the path).
 pub const PATH_FILE_MISSING_RULE: u16 = 0xC0F8;
+/// The rule of a file a `mod` (or `#[path]`) parent reaches and no crate root owns: its bodies
+/// are not checked (argument: the file's path). On its file's `Owners` record (owners.rs).
+pub const OWNERLESS_RULE: u16 = 0xC110;
+
+/// Whether a job of `kind` is the outline walk's: what a first `Owners` waits for.
+fn outline(kind: Kind) -> bool {
+    matches!(kind, Kind::Units | Kind::UnitGraph | Kind::FileItems)
+}
 
 /// The over-cap finding's text: [`ConditionError::OverCap`] with the variables the item reads,
 /// `var` included.

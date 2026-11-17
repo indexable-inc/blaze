@@ -3,9 +3,9 @@
 //! [`native_outputs`]: its host binary from the module records (`script.bin`, built by the
 //! interim builder's `native` mode), the same environment the wasm path gives (the unit's own
 //! features, the served unit's cfg), its run key with the pinned compiler, the SDK's version
-//! and any granted host tool's digest, its record found or run confined
-//! ([`crate::native_script::run_script`]) and kept. A native failure is a typed error: it is
-//! never tried again as wasm (rule 3), and a wasm failure never native.
+//! and any granted host tool's digest, run confined ([`crate::native_script::run_script`];
+//! nothing kept here: the `Script` task's record is the cache, D115). A native failure is a
+//! typed error: it is never tried again as wasm (rule 3), and a wasm failure never native.
 
 use std::{path::Path, time::Duration};
 
@@ -26,10 +26,14 @@ use bstd::{
 };
 
 use crate::{
+    native_facts,
     native_script::{NativeScript, NativeScriptError, files_under, remove, run_script},
     record::native_world,
-    script::{RecordError, ScriptRun, ScriptRuntime},
-    script_sandbox::{Read, Tree, answer_now},
+    script::ScriptRun,
+    script_sandbox::{
+        Read, Tree, answer_now,
+        dep_mount::{self, DepProducer, native::LayError},
+    },
     script_unit::module_of_native,
 };
 
@@ -103,10 +107,14 @@ pub enum NativeUnitError {
     Shelf { shelf: String },
     /// The package's or the run's folder could not be made or read.
     Files { package: String, folder: String, why: String },
-    /// The record could not be found or kept.
-    Record { package: String, error: RecordError },
     /// The run itself: refused, failed, or its outputs.
     Run(NativeScriptError),
+    /// The fact shim could not be placed, prepared or read (D112, N7).
+    Facts { package: String, why: String },
+    /// The run failed after the fact shim refused questions, each named (D112, N7).
+    FactRefused { package: String, refused: std::vec::Vec<String>, run: NativeScriptError },
+    /// A `links` dependency's metadata could not be resolved or laid for the run (brief N8).
+    DepLinks { package: String, why: LayError },
 }
 
 impl std::fmt::Display for NativeUnitError {
@@ -131,8 +139,14 @@ impl std::fmt::Display for NativeUnitError {
             NativeUnitError::SdkVersion { sdk } => write!(f, "{sdk}/SDKSettings.json: no `Version`, which a native script's key holds (D69)"),
             NativeUnitError::Shelf { shelf } => write!(f, "{shelf}: the C toolchain's shelf folder is not named by its SHA-256 (D69)"),
             NativeUnitError::Files { package, folder, why } => write!(f, "{folder} (the native build script of {package}): {why}"),
-            NativeUnitError::Record { package, error } => write!(f, "the native build script of {package}: {error}"),
             NativeUnitError::Run(error) => write!(f, "{error}"),
+            NativeUnitError::DepLinks { package, why } => write!(f, "the native build script of {package}: {why}"),
+            NativeUnitError::Facts { package, why } => write!(f, "the native build script of {package}: {why}"),
+            NativeUnitError::FactRefused { package, refused, run } => write!(
+                f,
+                "the native build script of {package} asked what no pinned fact answers (the fact shim refused with exit 127, D112): {}; then: {run}",
+                refused.join("; ")
+            ),
         }
     }
 }
@@ -206,12 +220,13 @@ fn fresh_folder(work: &str, rel: &str, files: &[(String, std::vec::Vec<u8>)], pa
     Ok(folder)
 }
 
-/// `script`'s outputs, run native: from its record when one answers, else run confined and
-/// kept. `serves` is the unit it serves (its cfg is the script's `CARGO_CFG_*`), `because` the
-/// toolchain-class unit that made it native (for the error when no setting is given).
+/// `script`'s outputs, run native and confined. `serves` is the unit it serves (its cfg is the
+/// script's `CARGO_CFG_*`), `because` the toolchain-class unit that made it native (for the
+/// error when no setting is given).
+/// `producers` are the runs of its `links` dependencies, each with its `links` (brief N8):
+/// `deps`' paths are resolved against them, laid read-only for the run.
 #[allow(clippy::too_many_arguments)]
 pub fn native_outputs<'a>(
-    runtime: &ScriptRuntime,
     setting: &crate::script_unit::Setting<'_>,
     graph: &UnitGraph<'_>,
     script: UnitId,
@@ -220,6 +235,7 @@ pub fn native_outputs<'a>(
     tree: Tree,
     root: crate::script_sandbox::ScriptRoot,
     deps: &[DepMetadata<'_>],
+    producers: &[(&str, &DepProducer)],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, NativeUnitError> {
     let unit = &graph.units[script.index()];
@@ -246,39 +262,47 @@ pub fn native_outputs<'a>(
     // The same environment as the wasm path: the unit's features, the served unit's cfg.
     let serves_unit = &graph.units[serves.index()];
     let facts = PackageFacts { name, version, links: unit.links.as_ref().map(|l| l.as_str()), ..PackageFacts::default() };
-    let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg: &serves_unit.cfg, target: setting.target, host: setting.host, deps };
+    // Brief N8: the key holds each `links` value in the record's form (the wasm sight: a
+    // function of the producers' records alone) and what the producers serve (`views.key`
+    // below), as a wasm reader's key does; the run is given the values as IT sees them (laid
+    // below). A value under neither of a producer's trees is refused here, naming it.
+    let dep_error = |why: LayError| NativeUnitError::DepLinks { package: package.clone(), why };
+    let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|e| dep_error(LayError::View(e)))?;
+    let mut keyed: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
+    for (dep, value) in deps.iter().zip(viewed.values.iter()) {
+        keyed.push(DepMetadata { links: dep.links, key: dep.key, value: value.as_str() });
+    }
+    let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg: &serves_unit.cfg, target: setting.target, host: setting.host, deps: &keyed };
     let env = blaze_build_script::env(&given, alloc);
 
     // D71: the host tools the table grants this package, each at its real path, by digest.
     let pin = |why: String| NativeUnitError::PinTable { package: package.clone(), why };
     let table = host_tools::host_tools(PIN, setting.host, alloc).map_err(|e| pin(e.to_string()))?;
     let tools: AVec<'a, HostTool<'_>> = host_tools::granted(&table, name, alloc);
-    // Every granted program is keyed: the tool under its name, then each program it starts
-    // under `<tool>+<path>` (sorted after the tool's own name, in the table's sorted order).
-    let mut names: AVec<'a, blaze_own::AString<'a>> = Vec::new_in(alloc);
+    // Every granted program is keyed at its real path: the tool under its name, then each
+    // program it starts under `<tool>+<path>` (sorted after the tool's own name, in the table's
+    // sorted order); a shelf row's program (nm-row: nm, the shelf's llvm-nm) under the shelf.
+    let mut programs: AVec<'a, (blaze_own::AString<'a>, blaze_own::AString<'a>, HostTool<'_>)> = Vec::new_in(alloc);
     for tool in tools.iter() {
-        for program in tool.programs() {
+        for (at, program) in tool.programs_in(native.shelf, alloc).into_iter().enumerate() {
             let mut name: blaze_own::AString<'a> = blaze_own::String::from_str_in(tool.name, alloc);
-            if program != tool.path {
+            if at > 0 {
                 name.push('+');
-                name.push_str(program);
+                name.push_str(program.as_str());
             }
-            names.push(name);
+            programs.push((name, program, *tool));
         }
     }
     let mut tool_keys: AVec<'a, HostToolKey<'_>> = Vec::new_in(alloc);
-    let mut at = 0;
-    for tool in tools.iter() {
-        for program in tool.programs() {
-            let real = std::fs::canonicalize(program).map_err(|e| NativeUnitError::Read { path: program.to_owned(), why: e.to_string() })?;
-            if real.as_os_str() != program {
-                return Err(NativeUnitError::ToolNotReal { package: package.clone(), tool: tool.name.to_owned(), path: program.to_owned(), real: real.display().to_string() });
-            }
-            let (dir, file) = program.rsplit_once('/').unwrap_or(("/", program));
-            let digest = blaze_sha256::digest(&read_file(if dir.is_empty() { "/" } else { dir }, file)?);
-            tool_keys.push(HostToolKey::of(tool, names[at].as_str(), digest));
-            at += 1;
+    for (name, program, tool) in programs.iter() {
+        let program = program.as_str();
+        let real = std::fs::canonicalize(program).map_err(|e| NativeUnitError::Read { path: program.to_owned(), why: e.to_string() })?;
+        if real.as_os_str() != program {
+            return Err(NativeUnitError::ToolNotReal { package: package.clone(), tool: tool.name.to_owned(), path: program.to_owned(), real: real.display().to_string() });
         }
+        let (dir, file) = program.rsplit_once('/').unwrap_or(("/", program));
+        let digest = blaze_sha256::digest(&read_file(if dir.is_empty() { "/" } else { dir }, file)?);
+        tool_keys.push(HostToolKey::of(tool, name.as_str(), digest));
     }
 
     // The key: the compiler by its shelf digest, the SDK by its version (D69), the tools.
@@ -300,12 +324,8 @@ pub fn native_outputs<'a>(
         runner: runner_key(Runner::Native { because }, &parts),
     };
     let mut scratch: AVec<'_, u8> = Vec::new_in(alloc);
-    let base: ContentId = key::base(&inputs, &mut scratch);
-    let record = |error| NativeUnitError::Record { package: package.clone(), error };
-    if let Some(outputs) = runtime.find(&base, &tree, alloc).map_err(record)? {
-        return Ok(ScriptRun { outputs, base, from_record: true, reads: std::vec::Vec::new(), fuel: 0, peak_memory: 0, spawns: 0 });
-    }
-
+    // What the producers serve is in the key, as for a wasm reader (rule 21).
+    let base: ContentId = viewed.views.key(key::base(&inputs, &mut scratch));
     // The package on disk (a workspace member's folder as it is; a fetched package written out
     // under its key) and an empty `OUT_DIR`.
     let key_hex = hex(&base.0);
@@ -325,8 +345,47 @@ pub fn native_outputs<'a>(
     let out_dir = fresh_folder(native.work, &format!("out/{key_hex}"), &[], &package)?;
     let clang_major = toolchain::clang_major(PIN).map_err(|e| pin(e.to_string()))?;
     let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
-    let run = NativeScript { program: &program, c, env: &env, reads: &[], host_tools: &tools, limits: RunLimits::STANDARD, deadline: native.deadline };
-    let ran = run_script(&run, alloc).map_err(NativeUnitError::Run)?;
+    // N7: the fact shim the command placed in its work folder, and this run's facts folder.
+    // A native run's probes are answered from the pins through the fact shim; the questions
+    // asked become reads in the wasm path's fact form (native_facts::reads).
+    let pins = setting.spawn_setting.pins.as_ref();
+    let facts_error = |e: native_facts::NativeFactsError| NativeUnitError::Facts { package: package.clone(), why: e.to_string() };
+    let shim = native_facts::placed_shim(native.work).map_err(facts_error)?;
+    let facts = native_facts::prepare(&shim, native.work, &key_hex, pins, alloc).map_err(facts_error)?;
+    // Brief N8: the producers' trees laid read-only under this run's own folder, each value as
+    // this run sees it; what the script prints under them is kept in the record's form.
+    let laid = dep_mount::native::lay(native.work, &format!("deps/{key_hex}"), producers, deps, alloc).map_err(dep_error)?;
+    let mut run_deps: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
+    for (dep, value) in deps.iter().zip(laid.values.iter()) {
+        run_deps.push(DepMetadata { links: dep.links, key: dep.key, value: value.as_str() });
+    }
+    let run_env = blaze_build_script::env(&Given { deps: &run_deps, ..given }, alloc);
+    let mut dep_reads: AVec<'a, &str> = Vec::new_in(alloc);
+    for folder in laid.folders.iter() {
+        dep_reads.push(folder.as_str());
+    }
+    let mut dep_shown: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
+    for (real, shown) in laid.shown.iter() {
+        dep_shown.push((real.as_str(), shown.as_str()));
+    }
+    let run = NativeScript {
+        program: &program,
+        c,
+        env: &run_env,
+        reads: &dep_reads,
+        shown: &dep_shown,
+        host_tools: &tools,
+        facts: Some(&facts),
+        limits: RunLimits::STANDARD,
+        deadline: native.deadline,
+    };
+    let ran = run_script(&run, alloc);
+    let asked = native_facts::reads(&facts, pins, alloc).map_err(facts_error)?;
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(run) if !asked.refused.is_empty() => return Err(NativeUnitError::FactRefused { package: package.clone(), refused: asked.refused, run }),
+        Err(run) => return Err(NativeUnitError::Run(run)),
+    };
 
     // The read list, coarse and correct: every file of the package by its digest now (a native
     // run's own reads are not seen; build-scripts.md, "The record").
@@ -336,8 +395,9 @@ pub fn native_outputs<'a>(
         let digest = answer_now(&tree, &subject).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: package_dir.clone(), why: e.0 })?;
         reads.push(Read { subject, digest });
     }
-    runtime.keep_as(base, &reads, &ran.outputs, host_tools::run_kind(!tools.is_empty())).map_err(record)?;
-    Ok(ScriptRun { outputs: ran.outputs, base, from_record: false, reads, fuel: 0, peak_memory: 0, spawns: 0 })
+    // The facts the script asked (N7), each with the pins' answer now (`None` where refused).
+    reads.extend(asked.reads);
+    Ok(ScriptRun { outputs: ran.outputs, base, reads, fuel: 0, peak_memory: 0, spawns: 0 })
 }
 
 #[cfg(test)]

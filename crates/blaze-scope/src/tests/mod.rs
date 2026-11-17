@@ -23,6 +23,7 @@ use crate::{
 
 mod asked;
 mod asked_digest;
+mod attr_after_derive;
 mod attr_value;
 mod attrs;
 mod blocks;
@@ -34,6 +35,8 @@ mod failed_record;
 mod implicit_main;
 mod main_call;
 mod include_data;
+mod include_macros;
+mod include_nested_mods;
 mod include_roots;
 mod expansions;
 mod exports;
@@ -42,6 +45,7 @@ mod items;
 mod items_attr_text;
 mod items_record;
 mod items_grain;
+mod items_head_free;
 mod items_owners;
 mod items_buckets;
 mod more;
@@ -56,6 +60,8 @@ pub(crate) use oracle::{B, Imp, reference_imports, reference_world};
 mod per_crate;
 mod prelude_records;
 mod super_in_block;
+mod written_module;
+mod proc_left_package;
 mod procs;
 mod records;
 mod refused;
@@ -312,7 +318,7 @@ impl World {
     pub(crate) fn call_on(&mut self, at: ItemKey, p: &'static str, kind: CallShape, item: Option<u32>) -> ItemKey {
         let call = self.key(World::krate_byte(at));
         let pos = self.next_pos(at);
-        self.d(at).calls.push(MacroCallDecl { call, path: path(p), kind, pos, item });
+        self.d(at).calls.push(MacroCallDecl { call, path: path(p), kind, pos, item, role: blaze_surface::CallRole::Call });
         let module = self.module_of(at);
         self.owner.insert(call, module);
         self.decls.insert(call, DeclsBuilder::new_in(Alloc::global()));

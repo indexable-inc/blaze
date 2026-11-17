@@ -2839,24 +2839,26 @@ impl World for FrontWorld<'_, '_> {
         Ok(self.front.module_traits.get(m as usize).map_or(&[] as &[ItemKey], |v| v.as_slice()))
     }
 
-    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
+    /// The old front's names walk whole paths and do not say which segment failed: a miss
+    /// past `Self` and the parameters is [`tc::PathMiss::Whole`].
+    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<tc::PathAnswer> {
         let names = &self.front.names;
         let env = &self.front.fns[self.f].env;
-        let Some(&first) = segments.first() else { return Ok(None) };
+        let Some(&first) = segments.first() else { return Ok(Err(tc::PathMiss::Whole)) };
         if first == SELF_TY {
             return Ok(match env.self_ {
-                SelfTy::Trait(_) => Some(PathRes { def: Def::TyParam(0), consumed: 1 }),
+                SelfTy::Trait(_) => Ok(PathRes { def: Def::TyParam(0), consumed: 1 }),
                 SelfTy::Ty(t) => match self.front.tys.view().get(t) {
-                    Some(PNode::Adt(k, _)) => Some(PathRes { def: Def::Adt(*k), consumed: 1 }),
-                    _ => None,
+                    Some(PNode::Adt(k, _)) => Ok(PathRes { def: Def::Adt(*k), consumed: 1 }),
+                    _ => Err(tc::PathMiss::FIRST),
                 },
-                SelfTy::None => None,
+                SelfTy::None => Err(tc::PathMiss::FIRST),
             });
         }
         if let Some(&(_, i)) = env.params.iter().find(|(n, _)| *n == first) {
-            return Ok(Some(PathRes { def: Def::TyParam(i), consumed: 1 }));
+            return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
         }
-        let Some((res, consumed)) = names.walk(env.module, segments, Ns::Value) else { return Ok(None) };
+        let Some((res, consumed)) = names.walk(env.module, segments, Ns::Value) else { return Ok(Err(tc::PathMiss::Whole)) };
         let all = consumed as usize == segments.len();
         let def = match res {
             Res::Fn(i) => {
@@ -2887,14 +2889,14 @@ impl World for FrontWorld<'_, '_> {
                 let tr = &names.traits[t as usize];
                 if let Some(&next) = segments.get(consumed as usize) {
                     if let Some(&(_, f)) = tr.fns.iter().find(|(n, _)| *n == next) {
-                        return Ok(Some(PathRes { def: Def::Fn(f), consumed: consumed + 1 }));
+                        return Ok(Ok(PathRes { def: Def::Fn(f), consumed: consumed + 1 }));
                     }
                 }
                 Def::Trait(tr.key)
             }
-            Res::Mod(_) => return Ok(None),
+            Res::Mod(_) => return Ok(Err(tc::PathMiss::Whole)),
         };
-        Ok(Some(PathRes { def, consumed }))
+        Ok(Ok(PathRes { def, consumed }))
     }
 
     fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
@@ -2931,6 +2933,7 @@ impl World for FrontWorld<'_, '_> {
             // The old front end does not read members: a `dyn` of its traits is the checker's
             // named gap (`CheckError::DynUndecided`); front2 hands them.
             members: blaze_typeck::TraitMembers::NotKnown,
+            defaults: blaze_typeck::TraitDefaults::NotKnown,
         }))
     }
 

@@ -2,19 +2,22 @@
 //! piece 4): each item row has a grain row beside it, so an edit to one item's text voids that
 //! item's row alone, never its whole file's.
 //!
-//! A grain row (96 bytes, one per item row, in the item rows' key order) holds three digests of
+//! A grain row (64 bytes, one per item row, in the item rows' key order) holds two digests of
 //! the item as the solve's outline saw it ([`ItemPieces`]):
 //!
 //! - its CHAIN ([`item_chain`]): where it is by names from its text's root (each enclosing
 //!   entry's kind, name as written and disambiguator, up to the item), so no edit elsewhere in
 //!   the file moves it (rule 71);
-//! - its HEAD ([`head_of`]): the piece of its bytes the row's facts are read from. For most
-//!   kinds that is the signature piece (blaze-file-items' `signature_hash`: attributes,
-//!   visibility, name, generics, everything before the body), which also holds the name, so it
-//!   is the names piece too. For a struct, enum, union or variant the fields are the body and
-//!   say whether it is its own constructor; for a macro definition or an item-position macro
-//!   call the tokens make names: those take the whole item's digest;
-//! - its BODY: the whole item's digest (`hash`), which the body's records are keyed by.
+//! - its BODY: the whole item's digest (`hash`): a proof, never a fact (`body_changed`).
+//!
+//! It holds NO head (D114 rulings, "Signatures"; a record holds nothing its read list does not
+//! cover): the record's `CrateScope` reads its files' `Surface` (blaze-file-items
+//! names_digest.rs), which leaves out every type, generic and bound, and every fact of a row is
+//! one the `Surface` covers (key, kind, module, outline entry, name, flags, impl row: the
+//! impl's header is in its names digest). So a row read against a changed text whose chain is
+//! found is fresh by construction; a type edit moves the item's `Signature` (blaze-cli), never
+//! its row. A grain row with a head (until 2026-11-16) went stale on a type edit while its
+//! scope stood valid by its reads, and nothing remade it.
 //!
 //! The section starts at the offset in the header's last free field ([`F_GRAIN_AT`]), after
 //! the strings, 16-aligned. Its rows hold no position: a row's place in today's text is found
@@ -22,14 +25,14 @@
 //!
 //! A reader asks [`ItemsRecord::item_now`]. Its text unchanged (the whole file's digest equal,
 //! the one hash [`ItemsRecord::whole`] already does): every row is answered as written, no
-//! per-item work. Its file changed: the item is found by its chain in today's outline; its head
-//! equal, the row's facts hold and are answered at today's place ([`ItemNow::Fresh`], saying
-//! whether its body changed); its head changed or its chain is gone, that item alone is
-//! [`ItemNow::Stale`]. An expansion's text that changed stays refused whole
-//! ([`ItemsRecordError::Stale`]): an expansion is remade as one record.
+//! per-item work. Its file changed: the item is found by its chain in today's outline, and the
+//! row's facts hold and are answered at today's place ([`ItemNow::Fresh`], saying whether its
+//! body changed); its chain gone, that item alone is [`ItemNow::Stale`]. An expansion's text
+//! that changed stays refused whole ([`ItemsRecordError::Stale`]): an expansion is remade as
+//! one record.
 //!
-//! One home: the chain and the head are `blaze_file_items::item_chain` and `head_of` (drive.md's
-//! piece 5); [`item_chain`] and [`head_of`] here call them. blaze-cli work.rs `item_chain`
+//! One home: the chain is `blaze_file_items::item_chain` (drive.md's piece 5); [`item_chain`]
+//! here calls it. blaze-cli work.rs `item_chain`
 //! (the same walk without an unnamed entry's head, cut to 64 bits, for findings) moves to the
 //! same function in the driver's lane.
 
@@ -44,17 +47,15 @@ use crate::resolve::{At, CrateNames};
 /// The header field (u32, at byte `8 + 4 * 37` = 156, the last before the keys at 160) that
 /// holds the grain section's offset.
 pub(super) const F_GRAIN_AT: usize = 37;
-/// A grain row: chain 32, head 32, body 32.
-const GRAIN_ROW: usize = 96;
+/// A grain row: chain 32, body 32.
+const GRAIN_ROW: usize = 64;
 
-/// An item's three digests, as a grain row holds them.
+/// An item's two digests, as a grain row holds them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ItemPieces {
     /// Its place by names ([`item_chain`]).
     pub chain: ContentId,
-    /// The piece the row's facts are read from ([`head_of`]).
-    pub head: ContentId,
-    /// The whole item, body included.
+    /// The whole item, body included: a proof, never a fact.
     pub body: ContentId,
 }
 
@@ -73,13 +74,14 @@ pub struct ItemToday<'a> {
 pub enum ItemNow<'a> {
     /// Its text is the one the record saw: the row as written.
     Same(ItemRow<'a>),
-    /// Its text changed but not its head: the row's facts hold, at today's place in `text`
-    /// (the row's text span, impl header, outline entry and whether its body holds items are
-    /// today's). `body_changed`: its whole digest differs from the record's.
+    /// Its text changed and one entry of today's text has its chain: the row's facts hold (the
+    /// record's `Surface` reads cover every one; a type edit is fresh), at today's place in
+    /// `text` (the row's text span, impl header, outline entry and whether its body holds items
+    /// are today's). `body_changed`: its whole digest differs from the record's.
     Fresh { row: ItemRow<'a>, text: &'a str, body_changed: bool },
-    /// Its head changed (`found`: today's head), or no single entry of today's text has its
-    /// chain (`found: None`): this item's row is stale, and no fact of it is answered.
-    Stale { key: ItemKey, file: u32, saw: ContentId, found: Option<ContentId> },
+    /// No single entry of today's text has its chain `chain` (renamed, removed, or two entries
+    /// share it): this item's row is stale, and no fact of it is answered.
+    Stale { key: ItemKey, file: u32, chain: ContentId },
 }
 
 /// `item`'s chain in `outline` of `text`: for it and each entry it is written in, up to the
@@ -93,18 +95,9 @@ pub fn item_chain(outline: &Outline<'_>, item: &Item, text: &str) -> ContentId {
     blaze_file_items::item_chain(outline, item, text)
 }
 
-/// The piece of `item`'s bytes its row's facts (kind, name, module, key, constructor, impl
-/// header) are read from: its signature's digest, or its whole digest where the body is part of
-/// those facts (see the module docs).
-///
-/// One home: `blaze_file_items::head_of`, which the chain of an unnamed entry also hashes.
-pub fn head_of(item: &Item) -> ContentId {
-    blaze_file_items::head_of(item)
-}
-
-/// `item`'s three digests.
+/// `item`'s two digests.
 pub fn pieces_of(outline: &Outline<'_>, item: &Item, text: &str) -> ItemPieces {
-    ItemPieces { chain: item_chain(outline, item, text), head: head_of(item), body: item.hash }
+    ItemPieces { chain: item_chain(outline, item, text), body: item.hash }
 }
 
 /// The one entry of `outline` (of `text`) whose chain is `chain`; `None` when there is none or
@@ -140,7 +133,6 @@ pub(super) fn append(out: &mut RecordBytes<'_>, names: &CrateNames<'_>, items: &
         let item = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
         let p = pieces_of(outline, item, text);
         out.extend_from_slice(&p.chain.0);
-        out.extend_from_slice(&p.head.0);
         out.extend_from_slice(&p.body.0);
     }
     let field = 8 + 4 * F_GRAIN_AT;
@@ -159,7 +151,7 @@ impl<'a> ItemsRecord<'a> {
         let Some(r) = i.checked_mul(GRAIN_ROW).and_then(|o| base.checked_add(o)).filter(|r| r.checked_add(GRAIN_ROW).is_some_and(|end| end <= self.bytes.len())) else {
             return Err(short);
         };
-        Ok(ItemPieces { chain: id_at(self.bytes, r), head: id_at(self.bytes, r + 32), body: id_at(self.bytes, r + 64) })
+        Ok(ItemPieces { chain: id_at(self.bytes, r), body: id_at(self.bytes, r + 32) })
     }
 
     /// The item `key`'s pieces; `Ok(None)` when the crate has no item with text under that key.
@@ -191,17 +183,15 @@ impl<'a> ItemsRecord<'a> {
         let file = self.file(index)?.ok_or(ItemsRecordError::Short { what: "a file row", at: index as usize })?;
         let was = self.pieces_at(i)?;
         let Some(now) = today(file.path, was.chain) else {
-            return Ok(Some(ItemNow::Stale { key, file: index, saw: was.head, found: None }));
+            return Ok(Some(ItemNow::Stale { key, file: index, chain: was.chain }));
         };
-        let head = head_of(&now.item);
-        if head != was.head {
-            return Ok(Some(ItemNow::Stale { key, file: index, saw: was.head, found: Some(head) }));
-        }
+        // No head is compared: every fact of the row is covered by the record's `Surface`
+        // reads (module docs); a type edit is fresh, and moves the item's `Signature`.
         let range = ItemsRecordError::Range { krate: self.key, start: span.start, len: span.len };
         let start = now.item.range.start;
         let len = now.item.range.end.checked_sub(start).ok_or(range)?;
-        // The impl header lies in the signature, which is unchanged: the same offset from the
-        // item's start.
+        // The impl header is in its names digest, hence in the `Surface` the record stands on:
+        // unchanged, at the same offset from the item's start.
         let impl_header = match row.impl_header {
             Some(h) => {
                 let at = h.start.checked_sub(span.start).and_then(|rel| rel.checked_add(start));

@@ -90,7 +90,7 @@ impl World for FmtWorld {
         self.w.traits_in_scope(s, scope)
     }
 
-    fn resolve_path(&self, s: Seal, scope: ScopeId, path: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
+    fn resolve_path(&self, s: Seal, scope: ScopeId, path: PathIdx, segments: &[Name]) -> Fetch<blaze_typeck::PathAnswer> {
         self.w.resolve_path(s, scope, path, segments)
     }
 
@@ -128,6 +128,7 @@ impl World for FmtWorld {
                 members: blaze_typeck::TraitMembers::NotKnown,
                 assoc_types: &[],
                 types: self.w.types.view(),
+                defaults: blaze_typeck::TraitDefaults::Known(&[]),
             }));
         }
         self.w.trait_def(s, item)

@@ -38,6 +38,7 @@ use blaze_manifest::layout::{Entry, Layout, Need, Pass as LayoutPass, Units};
 use blaze_manifest::lock::{Checksum, Lock, LockId, LockSource};
 use blaze_own::{Alloc, Vec as AVec};
 use blaze_script::input::{self, Fields, Input, InputError};
+use blaze_toolchain::implied::{ImplicitSysroot, SysrootUnits, first_in_cycle, implied_edges, root_facts};
 use blaze_toolchain::record::{self, CrateIn, Role, TargetIn, UnitIn, UnitKind};
 use blaze_toolchain::side::{SideTriple, TargetSide, cut_triples};
 use blaze_toolchain::{Hex, ToolchainView, parse_hex};
@@ -536,6 +537,8 @@ struct CutUnit {
     root: String,
     features: Vec<String>,
     deps: Vec<(String, u32)>,
+    /// Read from its root's text once the packs are made (`main`).
+    sysroot: Option<ImplicitSysroot>,
 }
 
 /// One target's units: library's, then the workspace's, dependency indices made one list's.
@@ -579,6 +582,7 @@ fn cut_target(graphs: &[(Origin, &UnitGraph<'static>, &Side)], facts: &mut BTree
                 root: u.root.to_string(),
                 features: u.features.iter().map(|f| f.to_string()).collect(),
                 deps,
+                sysroot: None,
             });
         }
     }
@@ -677,6 +681,46 @@ fn main() {
         })
         .collect();
     let index_of = |key: &CrateKey| keys.binary_search(key).expect("every unit's crate has facts") as u32;
+    // The implicit sysroot, a fact of each unit's root text (blaze_toolchain::implied): its
+    // value on the unit's row, and the sysroot crates a target-side library names as real
+    // edges, so a reader opens Rust's std exactly when a crate of its closure names it.
+    let mut opened: BTreeMap<CrateKey, PackView<'static>> = BTreeMap::new();
+    for (t, (triple, units)) in cut.iter_mut().enumerate() {
+        let role_at = |role: Role| units.iter().position(|u| u.kind == UnitKind::Lib && !u.for_host && crates[index_of(&u.krate) as usize].role == role).map(|at| at as u32);
+        let (Some(core), Some(alloc_unit), Some(std_unit)) = (role_at(Role::Core), role_at(Role::Alloc), role_at(Role::Std)) else {
+            fail(&format!("{triple}: its sysroot graph has no core, alloc or std library unit"));
+        };
+        let sys = SysrootUnits { core, alloc: alloc_unit, std: std_unit };
+        for u in units.iter_mut() {
+            let key = u.krate;
+            let (name, version, dir) = (&facts[&key].0, &facts[&key].1, &facts[&key].5);
+            let view = *opened.entry(key).or_insert_with(|| {
+                let (pack, _) = pack_of(&key);
+                PackView::open_verified(pack).unwrap_or_else(|e| fail(&format!("{name} {version}: {}", blaze_text::Shown(&e))))
+            });
+            let path = if dir.is_empty() || u.root.starts_with(dir.as_str()) { u.root.clone() } else { format!("{dir}/{}", u.root) };
+            let text = view
+                .find(&path)
+                .and_then(|f| std::str::from_utf8(f.bytes).ok())
+                .unwrap_or_else(|| fail(&format!("{name} {version}: its root {path} is not a UTF-8 file of its pack")));
+            let mut cfg: Vec<(&str, Option<&str>)> = target_cfgs[t].iter().map(|(n, v)| (n.as_str(), v.as_deref())).collect();
+            cfg.extend(u.features.iter().map(|f| ("feature", Some(f.as_str()))));
+            let read = root_facts(text, &cfg).unwrap_or_else(|e| fail(&format!("{triple}: {name} {version} ({path}): {e}")));
+            u.sysroot = Some(read.sysroot);
+            if u.kind == UnitKind::Lib && !u.for_host {
+                let explicit: Vec<String> = u.deps.iter().map(|(n, _)| n.clone()).collect();
+                for (edge, unit) in implied_edges(&read, sys, |n| explicit.iter().any(|e| e == n)).into_iter().flatten() {
+                    u.deps.push((edge.to_string(), unit));
+                }
+            }
+        }
+        let deps: Vec<Vec<u32>> = units.iter().map(|u| u.deps.iter().map(|(_, d)| *d).collect()).collect();
+        let slices: Vec<&[u32]> = deps.iter().map(Vec::as_slice).collect();
+        if let Some(at) = first_in_cycle(&slices, alloc).unwrap_or_else(|e| fail(&e.to_string())) {
+            let key = units[at].krate;
+            fail(&format!("{triple}: {} {} is on or above a dependency cycle once each crate's implied sysroot edges are added", facts[&key].0, facts[&key].1));
+        }
+    }
     let unit_rows: Vec<(String, Vec<Vec<&str>>, Vec<Vec<(&str, u32)>>)> = cut
         .iter()
         .map(|(triple, units)| {
@@ -694,7 +738,15 @@ fn main() {
             units
                 .iter()
                 .enumerate()
-                .map(|(at, u)| UnitIn { krate: index_of(&u.krate), kind: u.kind, for_host: u.for_host, root: &u.root, features: &features[at], deps: &deps[at] })
+                .map(|(at, u)| UnitIn {
+                    krate: index_of(&u.krate),
+                    kind: u.kind,
+                    for_host: u.for_host,
+                    root: &u.root,
+                    features: &features[at],
+                    deps: &deps[at],
+                    sysroot: u.sysroot.expect("read for every unit above"),
+                })
                 .collect()
         })
         .collect();

@@ -352,7 +352,10 @@ pub enum Mode {
 
 /// The scripts of the toolchain class that give nothing as wasm (bindgen, or a program they
 /// start is their output): native in every mode. Sorted; from tempo's census (D69).
-pub const NATIVE_EVERY_MODE: [&str; 5] = ["libproc", "librocksdb-sys", "libusb1-sys", "reth-mdbx-sys", "sha3-asm"];
+/// libusb1-sys is not here (N7): as wasm its build.rs asks no `sw_vers`, pkg-config is answered
+/// from the pins, and its cc compile defers, so check gives its outputs (census 2, 19:29);
+/// build and run place it native for that compile, where the fact shim answers `sw_vers`.
+pub const NATIVE_EVERY_MODE: [&str; 4] = ["libproc", "librocksdb-sys", "reth-mdbx-sys", "sha3-asm"];
 
 /// Where a script runs in `mode` (D69 (3)), and so its key: a script [`crate::native::runner`]
 /// calls native runs native for `build` and `run`; for `check` it runs as wasm with its C

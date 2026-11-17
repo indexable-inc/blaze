@@ -15,7 +15,14 @@
 //!
 //! Expected lines of `a_world_over_records_checks_every_body_as_the_solved_names_do`:
 //! `PROJECT RECORDS: 4 bodies, every verdict equal over both sources`
-//! `BODY IDENTITY: 4 bodies found by (file, chain) over both sources, 0 unplaced`
+//! `BODY IDENTITY: 3 bodies found by (file, chain) over both sources, 1 unplaced (main written by an expansion)`
+//!
+//! D104: the root's `main` is `std::main`'s input, and bstd's `main!` replaces it with the
+//! launcher `fn main() -> Exit`, text a macro wrote: it has no entry in the file's outline and is
+//! the one body counted unplaced (front2/project_records.rs: such a body is named by its call's
+//! expansion, which the (file, chain) identity does not cover yet). Unplaced is not unchecked:
+//! `ProjectWorld::each_body` checks the launcher and, inside it, the written `main` (a local fn
+//! of the launcher's body): tests/front2_check_written_bodies.rs.
 //! `PLANT caught: a chain without its impl's part: ... have one item chain ...`
 //!
 //! `every_rung_body_checks_the_same_over_records` does the same for every program under
@@ -38,16 +45,17 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::project::{BodyRef, BodyVerdict, ProjectWorld};
 use blaze_ladder::front2::project_records::ChainError;
-use blaze_ladder::front2::source::{Load, Log, Records};
+use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
 use blaze_ladder::refusal::SourceFile;
 use blaze_own::Alloc;
-use blaze_scope::resolve::aligned;
+use blaze_scope::resolve::{At, aligned};
 use blaze_scope::{items_record, names_record};
 use blaze_surface::Item;
 
 const EDITION: &str = "blaze-2026.11";
 
-/// Four bodies: `main`, `bad` (one E0308), and two members of one name in two impls.
+/// Four bodies: `main` (D104: std::main's launcher, which a macro wrote), `bad` (one E0308), and
+/// two members of one name in two impls.
 const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     io.need_out()?.line(cx, \"Hello, world!\")?;
     Ok(())
@@ -102,6 +110,11 @@ impl Load<'static> for Kept {
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
         self.expansions.get(krate)?.get(&call).copied()
     }
+
+    /// This loader keeps texts, not their origins: a finding in one is filed `NotServed`.
+    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'static [u8]> {
+        None
+    }
 }
 
 /// A verdict as text, for comparing the two sources (module docs).
@@ -132,6 +145,9 @@ fn chain_without_parents(_outline: &Outline<'_>, item: &Item, text: &str) -> Con
 struct Compared {
     bodies: usize,
     unplaced: u32,
+    /// Each unplaced body over the solved names: `<name> written by an expansion` when its place
+    /// is an expansion, else `<body> at <place>` (which no listed body should be).
+    unplaced_bodies: Vec<String>,
     /// The planted index's refusal, as text; `None` when the planted chain collided nothing.
     planted: Option<String>,
 }
@@ -157,7 +173,7 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
 
     // Over the solved names: every verdict, the bodies by chain, the planted index, and the
     // records written from the solve. Nothing else of the solved names leaves this block.
-    let (kept, solved_bodies, solved_verdicts, solved_rows, unplaced, planted) = {
+    let (kept, solved_bodies, solved_verdicts, solved_rows, unplaced, unplaced_bodies, planted) = {
         let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("{label}: resolve_crates: {e}"));
         let sources: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
@@ -174,6 +190,23 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
             assert_eq!(found, Some(*body), "{label}: the body at file {file} chain {chain:?} over the solved names");
         }
         assert_eq!(rows.len() + unplaced as usize, listed.len(), "{label}: every listed body is indexed or counted unplaced");
+        // The unplaced bodies by name and place: a body with no outline entry must be one a macro
+        // wrote (its place an expansion), never one of the file's that lost its entry.
+        let unplaced_bodies: Vec<String> = world
+            .listed(g)
+            .iter()
+            .filter(|l| l.entry.is_none())
+            .map(|l| match l.body {
+                BodyRef::Free(key) => {
+                    let name = (&names).name_of(key).unwrap_or_else(|| panic!("{label}: the unplaced body {key:x} has no name"));
+                    match (&names).place_of(key).map(|p| p.at) {
+                        Some(At::Expansion(_)) => format!("{name} written by an expansion"),
+                        other => format!("{name} at {other:?}"),
+                    }
+                }
+                member => format!("{member:?}"),
+            })
+            .collect();
         let planted = match world.index_with(&chain_without_parents) {
             Err(e @ ChainError::Collision { .. }) => Some(e.to_string()),
             Err(e) => panic!("{label}: the planted index failed another way: {e}"),
@@ -188,7 +221,7 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         }
         let shown: Vec<String> = rows.iter().map(|(file, chain, body)| format!("{file} {chain:?} {body:?}")).collect();
-        (kept, bodies, verdicts, shown, unplaced, planted)
+        (kept, bodies, verdicts, shown, unplaced, unplaced_bodies, planted)
     };
 
     // Over the records alone.
@@ -224,17 +257,29 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
     }
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "{label}: the records filed {errors:?}");
-    Compared { bodies: listed.len(), unplaced, planted }
+    Compared { bodies: listed.len(), unplaced, unplaced_bodies, planted }
 }
 
 #[test]
 fn a_world_over_records_checks_every_body_as_the_solved_names_do() {
     let files = [("src/main.rs".to_string(), MAIN.to_string())];
     let got = compare("hello", &files);
-    assert_eq!(got.bodies, 4, "`main`, `bad`, `A::get` and `B::get`");
-    assert_eq!(got.unplaced, 0, "every body is written in the file");
+    assert_eq!(got.bodies, 4, "`main` (std::main's launcher), `bad`, `A::get` and `B::get`");
+    // D104: every body is written in the file but `main`, which std::main's expansion wrote in
+    // place of the written `fn main` (the Reference, "Attribute macros": the item is replaced by
+    // the macro's output). Such a body is placed at its call's expansion, not in the file's
+    // outline (front2/project_records.rs, module doc). The written body inside it is a local fn
+    // of the launcher, not a listed body: `ProjectWorld::each_body` checks it
+    // (tests/front2_check_written_bodies.rs).
+    assert_eq!(got.unplaced_bodies, vec!["main written by an expansion".to_string()], "the one unplaced body is std::main's launcher");
+    assert_eq!(got.unplaced, 1, "only `main` has no entry in the file's outline");
     println!("PROJECT RECORDS: {} bodies, every verdict equal over both sources", got.bodies);
-    println!("BODY IDENTITY: {} bodies found by (file, chain) over both sources, {} unplaced", got.bodies - got.unplaced as usize, got.unplaced);
+    println!(
+        "BODY IDENTITY: {} bodies found by (file, chain) over both sources, {} unplaced ({})",
+        got.bodies - got.unplaced as usize,
+        got.unplaced,
+        got.unplaced_bodies.join(", ")
+    );
     let planted = got.planted.expect("the planted bug (a chain without its impl's part) was not caught: `A::get` and `B::get` did not collide");
     assert!(planted.contains("have one item chain"), "the refusal names the collision: {planted}");
     println!("PLANT caught: a chain without its impl's part: {planted}");

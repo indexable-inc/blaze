@@ -136,7 +136,7 @@ impl<'n> Front2Program<'n> {
         frame: &'n blaze_mem::Frame,
         user: &[SourceFile<'_>],
         tests: &TestsRecord<'r>,
-        left_out: Option<&mut Vec<(Box<str>, Box<str>), Global>>,
+        left_out: Option<&mut Vec<(Box<str>, super::LeftOut), Global>>,
         alloc: Alloc<'a>,
     ) -> Result<Suite<'n, 'r, 'a>, SuiteError> {
         // The roots: every `#[test]` row, in the record's (path) order; a bench is not entered.

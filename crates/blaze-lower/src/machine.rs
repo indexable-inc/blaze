@@ -34,6 +34,8 @@ use crate::{Cfg, CfgAnswer, Lowered, Need, ValueName, ValueNames, lit};
 
 /// Where a body-local `macro_rules!` template's locals and labels resolve: at its definition.
 mod def_site;
+/// `asm!`'s `target_arch`, read as `cfg` atoms at the `asm!` (INTRINSICS.md P9b).
+mod asm_arch;
 
 /// What an item declared in one of the body's blocks makes `name` at `scope`, for a pattern:
 /// `None` when no such item is in the value namespace there (the module's answer is asked).

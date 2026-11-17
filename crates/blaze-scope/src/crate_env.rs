@@ -249,6 +249,44 @@ impl<'a> CrateEnv<'a> {
         Ok(CrateEnv { vars, unknown, bin_exe_unknown: self.bin_exe_unknown, seen, package, read_folder: text(self.read_folder.as_str()), script })
     }
 
+    /// This environment with its crate's build-script outputs `script` joined (decision D115:
+    /// a script's outputs are read by the crate's task, never made into the world): `OUT_DIR`
+    /// and each `cargo::rustc-env` pair given after cargo's own, a later pair of one name
+    /// winning as in [`CrateEnv::of`] (so the result equals `of` with `script` in its facts);
+    /// `OUT_DIR` no longer unknown; `script` the record its `OUT_DIR` files are read from.
+    /// Copied whole into `alloc`, borrowing nothing of `self`.
+    pub fn joined<'b>(&self, script: OutputsRef<'b>, alloc: Alloc<'b>) -> CrateEnv<'b> {
+        let text = |s: &str| AString::from_str_in(s, alloc);
+        // (name, value, the order it was given in): cargo's pairs first, then the script's.
+        let mut given: AVec<'b, (AString<'b>, AString<'b>, u32)> = AVec::with_capacity_in(self.vars.len() + 1, alloc);
+        for (name, value) in self.vars.iter() {
+            let order = given.len() as u32;
+            given.push((text(name.as_str()), text(value.as_str()), order));
+        }
+        let order = given.len() as u32;
+        given.push((text("OUT_DIR"), text(script.out_dir()), order));
+        for (name, value) in script.env() {
+            let order = given.len() as u32;
+            given.push((text(name), text(value), order));
+        }
+        given.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then(a.2.cmp(&b.2)));
+        let mut vars: AVec<'b, (AString<'b>, AString<'b>)> = AVec::with_capacity_in(given.len(), alloc);
+        for (name, value, _) in given {
+            match vars.last_mut() {
+                Some(last) if last.0.as_str() == name.as_str() => last.1 = value,
+                _ => vars.push((name, value)),
+            }
+        }
+        let mut unknown: AVec<'b, &'static str> = AVec::with_capacity_in(self.unknown.len(), alloc);
+        unknown.extend(self.unknown.iter().copied().filter(|name| *name != "OUT_DIR"));
+        let seen = match self.seen {
+            SeenRoot::Package => SeenRoot::Package,
+            SeenRoot::Member { dir } => SeenRoot::Member { dir: blaze_own::Box::leak(text(dir).into_boxed_str()) },
+        };
+        let package = self.package.as_ref().map(|(name, version)| (text(name.as_str()), text(version.as_str())));
+        CrateEnv { vars, unknown, bin_exe_unknown: self.bin_exe_unknown, seen, package, read_folder: text(self.read_folder.as_str()), script: Some(script) }
+    }
+
     /// The variable `name`: its value, `None` when the crate is compiled without it (`env!` of
     /// it is the Reference's compile error), or [`EnvUnknown`] when cargo sets it and this
     /// build does not know its value.
@@ -296,6 +334,20 @@ impl<'a> CrateEnv<'a> {
     /// Every variable with its value, sorted by name.
     pub fn vars(&self) -> impl Iterator<Item = (&str, &str)> {
         self.vars.iter().map(|(n, v)| (n.as_str(), v.as_str()))
+    }
+
+    /// Every name cargo sets for this crate whose value this build does not know, sorted: what
+    /// [`CrateEnv::get`] answers [`EnvUnknown`] for, besides [`CrateEnv::unknown_prefixes`].
+    /// A proc macro's sandbox is given these, so its `getenv` of one is refused by name too
+    /// (blaze-proc-macro package_env.rs, macro-env-unknown).
+    pub fn unknown(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.unknown.iter().copied()
+    }
+
+    /// The name prefixes every unset name under which is [`EnvUnknown`]: `CARGO_BIN_EXE_` for
+    /// an integration test or a bench, none otherwise.
+    pub fn unknown_prefixes(&self) -> impl Iterator<Item = &'static str> {
+        self.bin_exe_unknown.then_some("CARGO_BIN_EXE_").into_iter()
     }
 }
 
@@ -458,6 +510,31 @@ mod tests {
     /// `clone_in` gives an environment that answers every read as the original does and
     /// borrows nothing of it: the facts' member dir is a string dropped before the copy is
     /// read (a pool body job holds its crates' environments so, past the world's borrow).
+    /// A script's outputs joined at task time (D115) give what [`CrateEnv::of`] gives with the
+    /// record in its facts: `OUT_DIR` and the `rustc-env` pairs set, a script pair of a name
+    /// cargo also sets winning (cargo's documentation of `cargo::rustc-env`: the variable is set
+    /// when the package is compiled, after cargo's own), and `OUT_DIR` no longer unknown.
+    /// Expected line: `test crate_env::tests::a_joined_env_gives_the_scripts_pairs_after_cargos ... ok`.
+    /// Control: keep "OUT_DIR" in `unknown` in `joined`: "OUT_DIR is still unknown after the join".
+    #[test]
+    fn a_joined_env_gives_the_scripts_pairs_after_cargos() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let printed = "cargo:rustc-env=VERSION=7\ncargo:rustc-env=CARGO_PKG_NAME=renamed\n";
+        let out = blaze_build_script::Outputs::read(printed.as_bytes(), "/out", blaze_build_script::instr::OutputLimits::DEFAULT, alloc).expect("the instructions read");
+        let mut bytes = blaze_own::AVec::new_in(alloc);
+        out.encode(&mut bytes);
+        let record = blaze_build_script::OutputsRef::open(bytes.leak()).expect("an outputs record");
+        let bare = CrateEnv::of(EnvFacts { build_script: true, ..facts("1.0.0") }, alloc).expect("a SemVer version");
+        assert_eq!(bare.get("OUT_DIR"), Err(EnvUnknown), "OUT_DIR is unknown before the join");
+        let joined = bare.joined(record, alloc);
+        assert_eq!(joined.get("OUT_DIR"), Ok(Some("/out")), "OUT_DIR is still unknown after the join");
+        assert_eq!(joined.get("VERSION"), Ok(Some("7")));
+        assert_eq!(joined.get("CARGO_PKG_NAME"), Ok(Some("renamed")), "the script's pair is given after cargo's");
+        let whole = CrateEnv::of(EnvFacts { build_script: true, script: Some(record), ..facts("1.0.0") }, alloc).expect("a SemVer version");
+        assert_eq!(joined.vars().collect::<std::vec::Vec<_>>(), whole.vars().collect::<std::vec::Vec<_>>(), "the join differs from `of` with the record");
+        assert!(joined.script().is_some());
+    }
+
     /// Expected line: `test crate_env::tests::a_copied_environment_answers_alone ... ok`.
     #[test]
     fn a_copied_environment_answers_alone() {

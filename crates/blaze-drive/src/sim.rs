@@ -977,7 +977,8 @@ fn request_with(
             for (key, bytes) in puts.drain(..) {
                 store.put(key, &bytes)?;
             }
-            let made: u32 = answer.profile.kinds.iter().map(|k| k.made).sum();
+            // `Owners` records are the machine's own (owners.rs), never delivered by a batch.
+            let made: u32 = Kind::ALL.iter().zip(answer.profile.kinds.iter()).filter(|(kind, _)| **kind != Kind::Owners).map(|(_, k)| k.made).sum();
             // Fewer when a run of a dropped name was answered for nothing; never more.
             oracle(made <= ended.delivered, || {
                 format!("a batch result applied twice: {made} records made from {} delivered", ended.delivered)
@@ -1229,9 +1230,11 @@ fn a_one_body_edit_runs_one_file_and_one_body() {
             format!("a one-body edit ran {:?}", ended.runs)
         })?;
         // drive.md's count: certificate, old certificate, root, the pages, the file's key, the
-        // body's key; the body's inputs stand on their rows.
+        // file's owners (its standing `Owners` record, read for whether a root is asked before
+        // its bodies are made jobs: owners.rs), the body's key; the body's inputs stand on
+        // their rows.
         let pages = answer.profile.pages;
-        oracle(store.reads <= 5 + pages, || format!("a one-body edit read the store {} times ({pages} pages)", store.reads))?;
+        oracle(store.reads <= 6 + pages, || format!("a one-body edit read the store {} times ({pages} pages)", store.reads))?;
         same_as_fresh(tape, &next, &store, &ended)
     });
 }
@@ -2022,7 +2025,11 @@ fn a_failure_keeps_the_rest(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     oracle(answer.failed > 0, || "the planted crate did not fail".into())?;
     let (again, _) = finished(request(tape, &world, Some(&world), &mut store, first.last.as_deref(), plant)?)?;
     let kept: u32 = again.profile.kinds.iter().map(|k| k.found + k.standing).sum();
-    let remade: u32 = again.profile.kinds.iter().map(|k| k.made).sum();
+    // An `Owners` row with no answer to stand on is computed again from its parents' rows (its
+    // key holds no text its parents follow from, owners.rs): no task, so not counted.
+    let owners_made = again.profile.kinds[Kind::Owners.index()].made;
+    let remade: u32 = again.profile.kinds.iter().map(|k| k.made).sum::<u32>() - owners_made;
+    let made = made - answer.profile.kinds[Kind::Owners.index()].made;
     oracle(kept >= made && remade == 0, || {
         format!("a request with a failure put {} records of {made} made; the repeat found or stood {kept} and made {remade}", answer.profile.puts)
     })

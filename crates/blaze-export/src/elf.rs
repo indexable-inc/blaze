@@ -29,8 +29,8 @@ use crate::layout::{FixTo, Laid, Plan};
 
 pub const PAGE: u64 = 0x1_0000;
 
-const EHDR: u64 = 64;
-const PHDR: u64 = 56;
+pub(crate) const EHDR: u64 = 64;
+pub(crate) const PHDR: u64 = 56;
 /// Every program header at the most: PHDR, INTERP, NOTE, four LOADs, DYNAMIC, GNU_RELRO,
 /// GNU_EH_FRAME, GNU_STACK.
 const MAX_PHDRS: u64 = 11;
@@ -41,47 +41,47 @@ const NOTE_AT: u64 = (INTERP_AT + INTERP.len() as u64 + 1 + 3) & !3;
 const NOTE_LEN: u64 = 12 + 4 + 16;
 pub const TEXT_AT: u64 = (NOTE_AT + NOTE_LEN + 15) & !15;
 
-const PT_LOAD: u32 = 1;
-const PT_DYNAMIC: u32 = 2;
+pub(crate) const PT_LOAD: u32 = 1;
+pub(crate) const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
 const PT_PHDR: u32 = 6;
 /// `.eh_frame_hdr`, which glibc's and libgcc's unwinders find through `dl_iterate_phdr`.
-const PT_GNU_EH_FRAME: u32 = 0x6474_E550;
-const PT_GNU_STACK: u32 = 0x6474_E551;
-const PT_GNU_RELRO: u32 = 0x6474_E552;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
+pub(crate) const PT_GNU_EH_FRAME: u32 = 0x6474_E550;
+pub(crate) const PT_GNU_STACK: u32 = 0x6474_E551;
+pub(crate) const PT_GNU_RELRO: u32 = 0x6474_E552;
+pub(crate) const PF_X: u32 = 1;
+pub(crate) const PF_W: u32 = 2;
+pub(crate) const PF_R: u32 = 4;
 const NT_GNU_BUILD_ID: u32 = 3;
 
-const DT_NULL: u64 = 0;
-const DT_NEEDED: u64 = 1;
+pub(crate) const DT_NULL: u64 = 0;
+pub(crate) const DT_NEEDED: u64 = 1;
 const DT_HASH: u64 = 4;
-const DT_STRTAB: u64 = 5;
-const DT_SYMTAB: u64 = 6;
-const DT_RELA: u64 = 7;
-const DT_RELASZ: u64 = 8;
-const DT_RELAENT: u64 = 9;
-const DT_STRSZ: u64 = 10;
-const DT_SYMENT: u64 = 11;
+pub(crate) const DT_STRTAB: u64 = 5;
+pub(crate) const DT_SYMTAB: u64 = 6;
+pub(crate) const DT_RELA: u64 = 7;
+pub(crate) const DT_RELASZ: u64 = 8;
+pub(crate) const DT_RELAENT: u64 = 9;
+pub(crate) const DT_STRSZ: u64 = 10;
+pub(crate) const DT_SYMENT: u64 = 11;
 const DT_DEBUG: u64 = 21;
-const DT_FLAGS: u64 = 30;
-const DT_RELACOUNT: u64 = 0x6FFF_FFF9;
-const DT_FLAGS_1: u64 = 0x6FFF_FFFB;
-const DF_BIND_NOW: u64 = 0x8;
+pub(crate) const DT_FLAGS: u64 = 30;
+pub(crate) const DT_RELACOUNT: u64 = 0x6FFF_FFF9;
+pub(crate) const DT_FLAGS_1: u64 = 0x6FFF_FFFB;
+pub(crate) const DF_BIND_NOW: u64 = 0x8;
 /// `DF_1_NOW | DF_1_PIE`.
 const DF_1: u64 = 0x1 | 0x0800_0000;
 /// The dynamic section's entries, in order (`dynamic` writes them).
 const DYN_COUNT: u64 = 14;
 
-const R_AARCH64_ABS64: u64 = 257;
-const R_AARCH64_GLOB_DAT: u64 = 1025;
-const R_AARCH64_RELATIVE: u64 = 1027;
+pub(crate) const R_AARCH64_ABS64: u64 = 257;
+pub(crate) const R_AARCH64_GLOB_DAT: u64 = 1025;
+pub(crate) const R_AARCH64_RELATIVE: u64 = 1027;
 /// `STB_GLOBAL << 4 | STT_FUNC`.
 const GLOBAL_FUNC: u8 = 0x12;
 
-const LIBC: &str = "libc.so.6";
+pub(crate) const LIBC: &str = "libc.so.6";
 const ID_DOMAIN: &str = "blaze-export elf build id 1";
 
 /// The layout plan an ELF file needs: the dynamic section heads the const region.
@@ -94,7 +94,7 @@ fn up(n: u64, to: u64) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn phdr(out: &mut AVec<'_, u8>, kind: u32, flags: u32, offset: u64, vaddr: u64, filesz: u64, memsz: u64, align: u64) {
+pub(crate) fn phdr(out: &mut AVec<'_, u8>, kind: u32, flags: u32, offset: u64, vaddr: u64, filesz: u64, memsz: u64, align: u64) {
     bytes::u32(out, kind);
     bytes::u32(out, flags);
     bytes::u64(out, offset);

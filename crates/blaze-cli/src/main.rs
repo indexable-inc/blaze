@@ -34,7 +34,15 @@ mod home;
 mod job_texts;
 mod macro_files;
 mod macros;
+mod proc_callers;
+mod proc_env;
+#[cfg(test)]
+mod proc_env_unknown_tests;
+mod proc_runner;
 mod names;
+mod script_modules;
+mod scripts;
+mod not_checked;
 mod phases;
 mod print;
 mod producers;
@@ -54,6 +62,7 @@ mod seal;
 mod store;
 mod sweep;
 mod graph;
+mod graph_payload;
 mod test_args;
 mod test_loop;
 mod test_run;
@@ -432,9 +441,19 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
         (None, Some(home)) => Some(bstd::mem::format_in!(frame, "{}/.cargo", home.trim_end_matches('/'))),
         (None, None) => None,
     };
+    // The running blaze's folder, read once here at the edge (rule 75; main's ruling for N7):
+    // the fact shim ships beside it, and a native build script's probes are answered by it.
+    let exe_dir = match std::env::current_exe() {
+        Err(error) => Err(fetch::ExeDirWhy::Unknown { kind: error.kind() }),
+        Ok(exe) => match exe.parent().and_then(|dir| dir.to_str()) {
+            Some(dir) => Ok(bstd::mem::format_in!(frame, "{dir}")),
+            None => Err(fetch::ExeDirWhy::NotUtf8),
+        },
+    };
     // The request as this command makes it; it takes what it prints into and gives it back.
     let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
-        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
+        let exe_dir = exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why);
+        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, var("SDKROOT"), exe_dir), origin.as_ref(), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
         finished.map(|finished| (finished, shown))
     };
     // The whole request, behind the command's one edge for a panic (rule 20): a command that
@@ -663,8 +682,20 @@ fn request<'f>(
     // then `SSL_CERT_FILE` and `SSL_CERT_DIR`, where the HTTPS client's roots are looked for;
     // then `HOME`, cargo's home (`CARGO_HOME`, else `<HOME>/.cargo`: its archive cache, fetch.rs)
     // and `PWD`, where the toolchain's shelf is (the target's cfg, graph.rs); then the toolchain
-    // the command opens (`blaze_toolchain::PINNED` from `main`, a fixture's in tests).
-    (checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain): (&'f str, Option<&'f str>, Option<&'f str>, Option<&'f str>, Option<&'f str>, Option<&'f str>, blaze_toolchain::ToolchainId),
+    // the command opens (`blaze_toolchain::PINNED` from `main`, a fixture's in tests); then
+    // `SDKROOT`, the macOS SDK folder the native build-script runner is given (scripts.rs); then
+    // the running blaze's folder, where the fact shim is (D112, N7).
+    (checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, sdk, exe_dir): (
+        &'f str,
+        Option<&'f str>,
+        Option<&'f str>,
+        Option<&'f str>,
+        Option<&'f str>,
+        Option<&'f str>,
+        blaze_toolchain::ToolchainId,
+        Option<&'f str>,
+        Result<&'f str, fetch::ExeDirWhy>,
+    ),
     origin: Option<&store::NamedOrigin>,
     (command, word): (Command, &'static str),
     workers: u32,
@@ -767,13 +798,16 @@ fn request<'f>(
     // of its own, so it is erased into one here, on this stack, for this request.
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
-    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()? }, macros: None, names: None, bodies: body_types::Kept::default() };
+    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()?, sdk, exe_dir }, macros: None, names: None, bodies: body_types::Kept::default(), scripts: None };
     if cold || followed.layout_moved {
         facts.laid = Some(units::lay(&cx, root, &stamps, &mut facts.rows, toolchain, frame, alloc)?);
         // The proc-macro module store's listing, read with the layout: in the units' source, so
         // a module that comes or goes moves the certificate and the dependency graph's source,
         // and with it each `MacroModule` part's (macros.rs).
         sweep::read_home_listing(&cx, home_dir, &stamps, macros::MODULE_LISTING, &mut facts.rows, frame)?;
+        // The build-script module store's listing, the same way: in every `Script` part's
+        // source, so a module the bootstrap builder adds or replaces asks again (scripts.rs).
+        sweep::read_home_listing(&cx, home_dir, &stamps, scripts::MODULE_LISTING, &mut facts.rows, frame)?;
     } else {
         for leaf in followed.now.rows.iter().filter(|leaf| leaf.kind != LeafKind::Slot) {
             facts.rows.push(leaf.kind, leaf.flags, followed.now.path(leaf), leaf.stamp, leaf.id);
@@ -1055,7 +1089,7 @@ fn request<'f>(
     // One file's findings at a time, in frames of a task's scratch size: freed a file and a
     // finding, and gone with the drawing.
     let mut scratch = print::Scratch::new(sizes.scratch)?;
-    draw(&cx, root, &req, command, &facts.found, &prints, program.as_ref(), &failed, &notices, shown, &mut scratch, frame, out)?;
+    draw(&cx, root, &req, command, &facts.found, &prints, program.as_ref(), &failed, facts.names.as_ref(), &notices, shown, &mut scratch, frame, out)?;
     drop(scratch);
     // The names step (names.rs): what this command resolved, never printed as errors.
     // Nothing follows a program that ran (`close`): its output is the command's, and a note
@@ -1072,6 +1106,7 @@ fn request<'f>(
     phases.request.prints += phases.since(at);
     let checked = rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent()).count();
     high.request = frame.peak();
+    phases.worlds = u32::from(facts.names.is_some());
     let resolved = facts.names.as_ref().map_or(0, |names| names.resolved);
     // Whether the answer holds the crates' names. A walk forward from this request's own last
     // answer, and a certificate, stand on an answer that passed this test when it was made; a
@@ -1135,6 +1170,7 @@ fn draw<'f>(
     prints: &[Print<'_>],
     program: Option<&Refused<'_>>,
     failed: &[work::Failed<'_>],
+    names: Option<&crate::names::Names<'_>>,
     notices: &[Notice],
     shown: &mut print::Shown<'f>,
     scratch: &mut print::Scratch,
@@ -1216,12 +1252,10 @@ fn draw<'f>(
     // whose 227 units could not be fetched is four lines and a count).
     const SAME_SHOWN: usize = 4;
     let mut same = 0usize;
-    // A task that failed only because one it needed failed prints nothing of its own (the
-    // cause is printed): counted in one note.
-    let mut waited = 0usize;
+    // A task that failed only because one it needed failed prints nothing of its own: what
+    // was not checked is named below by cause, at crate grain (not_checked.rs, D115 (6)).
     for (i, failure) in failed.iter().enumerate() {
         if matches!(failure.failure.why, Why::Waited { .. }) {
-            waited += 1;
             continue;
         }
         let kind = |at: usize| (failed[at].failure.name.kind, failed[at].failure.why);
@@ -1246,10 +1280,9 @@ fn draw<'f>(
         }
         print::note(cx, words.as_str(), shown, frame, out)?;
     }
-    if waited > 0 {
-        let words = bstd::mem::format_in!(frame, "{waited} task(s) not run: each needs one that failed above");
-        print::note(cx, words.as_str(), shown, frame, out)?;
-    }
+    // Over the drive's whole list: the machine's own `Waited` failures (a part whose home
+    // failed) are in it and not in `failed`.
+    not_checked::lines(req.failures(), failed, names, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
     for notice in notices {
         let mut words = bstd::mem::String::new_in(frame);
         core::fmt::write(&mut words, format_args!("{notice}")).map_err(|_| CliError::Text { what: "a note's words" })?;
@@ -1436,6 +1469,7 @@ mod tests {
     mod fix_tests;
     mod members_tests;
     mod names_records_tests;
+    mod owners_tests;
     mod pooled_scope_tests;
     mod refused_targets_tests;
     mod signature_grain_tests;
@@ -1537,7 +1571,7 @@ mod tests {
         let toolchain = shelf(io);
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
             let workers = WORKERS.with(core::cell::Cell::get);
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain), None, command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, None, Err(fetch::ExeDirWhy::NotRead)), None, command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {
@@ -1960,7 +1994,7 @@ mod tests {
         let words = left_out_note(Command::Run, frame).expect("words").expect("run leaves stages out today");
         assert_eq!(
             words.as_str(),
-            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources, parse and check the bodies' syntax and types, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
+            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources, run build scripts, parse and check the bodies' syntax and types, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
         );
         for command in [Command::Check, Command::Run, Command::Test] {
             let left: std::vec::Vec<&str> = work::left_out(command).collect();

@@ -18,7 +18,7 @@
 //! it is always a coercion.
 
 use crate::body::Stmt;
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, List, StmtId};
 use crate::machine::{BreakCtx, Expectation, Flow, Frame, Machine, Source, Then};
@@ -132,7 +132,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 Some(e) => At::Expr(e),
                 None => At::Body,
             };
-            self.diag(DiagCode::Mismatch, at, Some(never), Some(else_ty), None);
+            self.diag(DiagCode::Mismatch, at, About::types(never, else_ty));
         }
         self.diverges = f.b != 0;
         Ok(true)

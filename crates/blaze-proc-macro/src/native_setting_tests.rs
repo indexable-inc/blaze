@@ -25,7 +25,6 @@ use edition::PackageEdition;
 use crate::{
     native_setting::{NATIVE_RUN_DEADLINE, NATIVE_WORK_DIR, NativeSettingError, OwnedNativeSetting, SHELF_DIR, command_native_setting},
     native_unit::{NativeSetting, NativeUnitError},
-    record::{DirStore, native_world},
     script::ScriptRuntime,
     script_sandbox::{ScriptRoot, Tree},
     script_unit::{Setting, UnitScriptError, outputs},
@@ -162,8 +161,7 @@ fn a_native_placed_script_with_a_setting_reaches_its_binary_lookup() {
     let graph = UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3 };
 
     let store = folder("reaches-store");
-    let (io, root) = native_world(&store).unwrap_or_else(|e| panic!("{}: {e}", store.display()));
-    let runtime = ScriptRuntime::new(&store, DirStore::build_scripts(&io, &root)).unwrap_or_else(|e| panic!("{e}"));
+    let runtime = ScriptRuntime::new(&store).unwrap_or_else(|e| panic!("{e}"));
     let setting_with = |native| setting(&store, native);
     let run = |setting: &Setting<'_>| {
         let tree = Tree::Mem { files: Arc::new(Vec::new()), git: None };

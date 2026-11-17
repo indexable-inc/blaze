@@ -196,10 +196,11 @@ fn method_differences(plant: Plant) -> Vec<String> {
         out.push(std::format!("x.m() on &dyn Sub: callee {got}, want m<dyn Sub> (a dynamic call)"));
     }
     let (b, c) = method_on_x(&fx, "c_sized", "s", plant);
+    // `where Self: Sized` names `Self`, which input 0 (`&self`) mentions: filed at the receiver.
     let want = Want {
         exprs: &[(ExprId(0), "&dyn Tr"), (ExprId(1), "u16"), (ExprId(2), "u16")],
         pats: &[(PatId(0), "&dyn Tr")],
-        diags: &[(DiagCode::Unsatisfied, ExprId(1))],
+        diags: &[(DiagCode::Unsatisfied, ExprId(0))],
     };
     out.extend(differences(&fx, &b, &c, &want));
     out

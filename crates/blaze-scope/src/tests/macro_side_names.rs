@@ -101,7 +101,7 @@ pub(super) fn toolchain(macro_side: bool) -> AVec<'static, u8> {
         krate("proc_macro", Role::ProcMacro, 4),
         krate("bstd", Role::Bstd, 5),
     ];
-    let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn { krate, kind: ToolchainKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps };
+    let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn { krate, kind: ToolchainKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps, sysroot: blaze_toolchain::ImplicitSysroot::Core };
     let units = [lib(0, &[]), lib(1, &[("core", 0)]), lib(2, &[("alloc", 1), ("core", 0)]), lib(3, &[("core", 0), ("std", 2)]), lib(4, &[("core", 0)])];
     let host_cfg = [("target_arch", Some("aarch64")), ("target_os", Some("macos")), ("unix", None)];
     let wasm_cfg = [

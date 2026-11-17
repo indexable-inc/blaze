@@ -114,6 +114,13 @@ fn block_trait_out_of_block(x: u8) -> u8 {
     x.tripled()
 }
 fn block_trait_path_elsewhere(w: &mut u8) -> u8 { SpecPut::spec_put(w, 1) }
+mod quad {
+    pub trait Quad { fn quad(&self) -> u8; }
+    impl Quad for u8 { fn quad(&self) -> u8 { *self * 4 } }
+    pub mod deep {
+        pub fn block_glob_super(x: u8) -> u8 { { use super::*; x.quad() } }
+    }
+}
 ";
 
 /// The bodies that must check clean, each with the rule it proves.
@@ -150,6 +157,16 @@ const REFUSED: &[(&str, &str)] = &[
     ("block_trait_path_elsewhere", "UnresolvedPath"),
 ];
 
+/// Bodies below the root that must check clean, by path from the root. `block_glob_super`: a
+/// block's `use super::*;` names `quad`, the parent of the body's module (front2
+/// block_traits.rs `Reader::glob` through `names::written_module`), so `Quad`'s method is in
+/// scope there.
+const CLEAN_AT: &[(&str, &[&str], &str)] = &[(
+    "block_glob_super",
+    &["quad", "deep", "block_glob_super"],
+    "a block's `use super::*;` brings the parent module's traits",
+)];
+
 /// Library fns that use `assert_unsafe_precondition!`, by path from their crate's root.
 const LIBRARY: &[(&str, &[&str])] = &[("core", &["ptr", "read"]), ("core", &["ptr", "write_bytes"])];
 
@@ -185,6 +202,9 @@ fn items_inside_bodies_through_front2() {
     }
     for &(n, w) in REFUSED {
         cases.push((n.to_string(), find(0, &[n]), "must be refused", Some(w)));
+    }
+    for &(n, path, p) in CLEAN_AT {
+        cases.push((n.to_string(), find(0, path), p, None));
     }
     for &(krate, path) in LIBRARY {
         let ix = crates.iter().position(|c| c.name == krate).unwrap_or_else(|| panic!("{krate} among the crates"));

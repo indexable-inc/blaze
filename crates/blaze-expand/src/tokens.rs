@@ -706,6 +706,18 @@ pub fn lex<'a>(
     edition: Edition,
     alloc: Alloc<'a>,
 ) -> Result<TokenStream<'a>, LexError> {
+    lex_placed(text, edition, alloc, None)
+}
+
+/// [`lex`]; with `places`, each token's bytes in `text` are pushed in token order, one entry
+/// per token (crate::origin_column `input_places`: an input token's index mapped to its bytes).
+/// One lexer: the places are the lexer's own offsets, never a second reading of the text.
+pub(crate) fn lex_placed<'a>(
+    text: &str,
+    edition: Edition,
+    alloc: Alloc<'a>,
+    mut places: Option<&mut AVec<'_, (u32, u32)>>,
+) -> Result<TokenStream<'a>, LexError> {
     use parser::SyntaxKind::{
         INNER_DOC_COMMENT, L_BRACK, L_CURLY, L_PAREN, LIFETIME_IDENT, OUTER_DOC_COMMENT, R_BRACK,
         R_CURLY, R_PAREN, UNDERSCORE,
@@ -799,13 +811,28 @@ pub fn lex<'a>(
             last = Some((out.len() - 1, offset));
         }
         // Anything else (spaces, comments, a shebang) is not a token.
+        place_new(&mut places, out.len(), start, offset)?;
     }
     // A group the text leaves open is closed at its end.
     while let Some(delim) = open.pop() {
         joined_to(&mut out, &mut last, 0usize);
         out.close(delim, ctx)?;
     }
+    place_new(&mut places, out.len(), text.len(), text.len())?;
     Ok(out)
+}
+
+/// Gives each token pushed since the last call the bytes `start..end`: a doc comment's tokens,
+/// a lifetime's two and the groups one closer closes all stand at the text they were read from;
+/// a group the text left open closes at its end.
+fn place_new(places: &mut Option<&mut AVec<'_, (u32, u32)>>, tokens: usize, start: usize, end: usize) -> Result<(), LexError> {
+    let Some(places) = places.as_deref_mut() else { return Ok(()) };
+    let too_large = |_| StreamError::TooLarge { table: Table::Text };
+    let (start, end) = (u32::try_from(start).map_err(too_large)?, u32::try_from(end).map_err(too_large)?);
+    while places.len() < tokens {
+        places.push((start, end));
+    }
+    Ok(())
 }
 
 /// Whether a punctuation token is joint with a next token of `kind`: one that is punctuation

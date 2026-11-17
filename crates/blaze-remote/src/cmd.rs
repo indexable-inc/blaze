@@ -272,6 +272,9 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
 
     let mut ids = Vec::new();
     let mut other = 0usize;
+    // The store opens lazily (a segment mapped at its first probe): a push reads every
+    // segment's bytes, so every one is mapped first.
+    driven.map_all().map_err(|it| it.to_string())?;
     let mut segments: Vec<&[u8]> = Vec::new();
     let mut digests = Vec::new();
     for (id, _) in driven.core().segments() {

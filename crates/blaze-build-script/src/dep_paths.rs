@@ -37,6 +37,45 @@ use crate::env::DepMetadata;
 /// Where a reading script finds the tree a producer was served: `/deps/<links>`.
 pub const DEPS_ROOT: &str = "/deps";
 
+/// Where one consuming run sees a producer's two trees (its `OUT_DIR` tree and the tree it was
+/// served): a fact of THAT run, never of a record (D112, brief N8). A value keeps its place
+/// inside its tree; only where the tree is seen differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sight<'r> {
+    /// A wasm sandbox: the `OUT_DIR` tree at the path its record names, the served tree at
+    /// [`DEPS_ROOT`]`/<links>` (mounted read-only).
+    Wasm,
+    /// A native run: both trees laid as real folders under `root`, the run's own:
+    /// `<root>/<links>/out` and `<root>/<links>/package` (granted read-only).
+    Native { root: &'r str },
+}
+
+impl Sight<'_> {
+    /// Writes where this run sees the tree `mount` names (no trailing `/`).
+    pub fn seen_at(&self, mount: DepMount<'_>, out: &mut AString<'_>) {
+        match (*self, mount) {
+            (Sight::Wasm, DepMount::Out { at, .. }) => out.push_str(at.trim_end_matches('/')),
+            (Sight::Wasm, DepMount::Tree { links }) => {
+                out.push_str(DEPS_ROOT);
+                out.push('/');
+                out.push_str(links);
+            }
+            (Sight::Native { root }, DepMount::Out { links, .. }) => {
+                out.push_str(root.trim_end_matches('/'));
+                out.push('/');
+                out.push_str(links);
+                out.push_str("/out");
+            }
+            (Sight::Native { root }, DepMount::Tree { links }) => {
+                out.push_str(root.trim_end_matches('/'));
+                out.push('/');
+                out.push_str(links);
+                out.push_str("/package");
+            }
+        }
+    }
+}
+
 /// One producer of `links` metadata, as the reading script's plan needs it.
 #[derive(Clone, Copy, Debug)]
 pub struct Producer<'s> {
@@ -95,8 +134,16 @@ pub struct DepPlan<'s, 'a> {
     pub mounts: AVec<'a, DepMount<'s>>,
 }
 
-/// Plans `deps` (the reading script's metadata pairs) against `producers`: see the module's doc.
+/// Plans `deps` (the reading script's metadata pairs) against `producers` for a wasm run: see
+/// the module's doc.
 pub fn plan<'s, 'a>(producers: &[Producer<'s>], deps: &[DepMetadata<'s>], alloc: Alloc<'a>) -> Result<DepPlan<'s, 'a>, DepPathError<'s>> {
+    plan_seen(Sight::Wasm, producers, deps, alloc)
+}
+
+/// Plans `deps` against `producers` for a run that sees the producers' trees by `sight`: THE
+/// one resolution of a `links` metadata value (D112, brief N8); [`plan`] is its wasm form. The
+/// mounts are the same for every sight; only the values' text differs.
+pub fn plan_seen<'s, 'a>(sight: Sight<'_>, producers: &[Producer<'s>], deps: &[DepMetadata<'s>], alloc: Alloc<'a>) -> Result<DepPlan<'s, 'a>, DepPathError<'s>> {
     let mut values: AVec<'a, AString<'a>> = AVec::with_capacity_in(deps.len(), alloc);
     let mut mounts: AVec<'a, DepMount<'s>> = AVec::new_in(alloc);
     for dep in deps {
@@ -117,7 +164,7 @@ pub fn plan<'s, 'a>(producers: &[Producer<'s>], deps: &[DepMetadata<'s>], alloc:
                     out.push(':');
                 }
                 first = false;
-                mounts.push(one_path(producer, dep, part, &mut out)?);
+                mounts.push(one_path(sight, producer, dep, part, &mut out)?);
                 if !joined {
                     break;
                 }
@@ -130,31 +177,26 @@ pub fn plan<'s, 'a>(producers: &[Producer<'s>], deps: &[DepMetadata<'s>], alloc:
     Ok(DepPlan { values, mounts })
 }
 
-/// Writes the one absolute `path` of `dep` as the reader sees it and says what serves it.
-fn one_path<'s>(producer: &Producer<'s>, dep: &DepMetadata<'s>, path: &'s str, out: &mut AString<'_>) -> Result<DepMount<'s>, DepPathError<'s>> {
+/// Writes the one absolute `path` of `dep` as a run of `sight` sees it and says what serves
+/// it: its tree, and its place in that tree kept as written.
+fn one_path<'s>(sight: Sight<'_>, producer: &Producer<'s>, dep: &DepMetadata<'s>, path: &'s str, out: &mut AString<'_>) -> Result<DepMount<'s>, DepPathError<'s>> {
     let climbs = |rest: &str| rest.split('/').any(|part| part == "..");
-    if let Some(rest) = under(path, producer.out_dir) {
-        if climbs(rest) {
-            return Err(DepPathError::Climbs { links: dep.links, key: dep.key, path });
-        }
-        out.push_str(path);
-        return Ok(DepMount::Out { links: producer.links, at: producer.out_dir });
+    let (mount, rest) = if let Some(rest) = under(path, producer.out_dir) {
+        (DepMount::Out { links: producer.links, at: producer.out_dir }, rest)
+    } else if let Some(rest) = under(path, producer.seen.mount()) {
+        (DepMount::Tree { links: producer.links }, rest)
+    } else {
+        return Err(DepPathError::Outside { links: dep.links, key: dep.key, path });
+    };
+    if climbs(rest) {
+        return Err(DepPathError::Climbs { links: dep.links, key: dep.key, path });
     }
-    let mount = producer.seen.mount();
-    if let Some(rest) = under(path, mount) {
-        if climbs(rest) {
-            return Err(DepPathError::Climbs { links: dep.links, key: dep.key, path });
-        }
-        out.push_str(DEPS_ROOT);
+    sight.seen_at(mount, out);
+    if !rest.is_empty() {
         out.push('/');
-        out.push_str(producer.links);
-        if !rest.is_empty() {
-            out.push('/');
-            out.push_str(rest);
-        }
-        return Ok(DepMount::Tree { links: producer.links });
+        out.push_str(rest);
     }
-    Err(DepPathError::Outside { links: dep.links, key: dep.key, path })
+    Ok(mount)
 }
 
 /// The part of `path` under the folder `root` (`""` for `root` itself), or `None`.

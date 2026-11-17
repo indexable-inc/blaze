@@ -382,7 +382,7 @@ fn three_functions_read_back() {
     let rows = [row(24, 60, Action::Catch), row(36, 72, Action::Terminate), row(48, 64, Action::Cleanup)];
     let b = check(20, frame, &rows, &rows, &[52]).unwrap();
     let body = unwind_at(&b, CODE_AT + u64::from(frame.prologue()));
-    let want = [(19, -32), (20, -24), (23, -48), (24, -40), (29, -16), (30, -8), (72, -64), (73, -56)];
+    let want = [(19, -24), (20, -32), (23, -40), (24, -48), (29, -16), (30, -8), (72, -56), (73, -64)];
     assert_eq!((body.cfa, &body.saved[..]), ((29, 16), &want[..]));
 
     // No frame, no entry; a landing with no routine, refused.

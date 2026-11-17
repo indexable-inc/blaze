@@ -51,7 +51,12 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         };
         let k = checker_of(target.key);
         let after = match target.kind {
-            Kind::Module => PathPrefix::Module(k),
+            // A module reached through a written `std` that is bstd: the finding notes what
+            // `std` named (std_is_bstd.rs, rule 19).
+            Kind::Module => match self.std_is_bstd(module, rest, shift, why)? {
+                Some(edition) => PathPrefix::Bstd { module: k, edition },
+                None => PathPrefix::Module(k),
+            },
             Kind::Struct | Kind::Enum | Kind::Union => PathPrefix::Def(Def::Adt(k)),
             Kind::Trait => PathPrefix::Def(Def::Trait(k)),
             _ => PathPrefix::Item(k),

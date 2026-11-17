@@ -51,8 +51,10 @@ pub mod apart;
 pub mod asked;
 pub mod blocks;
 pub mod expanded_blocks;
+pub mod expansion_origins;
 mod builtin;
 // The cell core (bottom.md section 6): the names records' one writer.
+pub mod cell_key;
 mod cells;
 pub mod crate_env;
 pub mod crate_scope;
@@ -65,6 +67,7 @@ mod finish;
 pub mod graph;
 mod group;
 pub mod include_place;
+pub mod left_reads;
 pub mod included;
 pub mod items_record;
 mod lookup;
@@ -90,7 +93,7 @@ pub use builtin::{BUILTIN_TYPES, Builtin, builtin_of, builtin_type, builtin_type
 pub use error::{GlobBug, ResolveError};
 pub use facts::{Name, RecordFacts, ScopeFacts};
 
-pub use cells::{ItemResult as CellResult, Outcome as CellOutcome};
+pub use cells::{DecideCheck, DecideError, ItemResult as CellResult, Outcome as CellOutcome};
 
 /// The cell core (bottom.md section 6) on one crate's module tree under `root`, for measuring
 /// it on real trees: `expand(call, def)` makes the call's expansion, which `facts.expansion`

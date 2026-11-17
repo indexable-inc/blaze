@@ -99,7 +99,7 @@ pub use crate::impl_row::{ImplFlags, ImplRow, UnknownFlags};
 pub use crate::items::{Items, Source};
 pub use crate::key_index::{KeyEntry, KeyIndex, KeyIndexView};
 pub use crate::kind::{
-    AmbiguityKind, Binding, BindingState, CallShape, Def, DefKind, Edition, ItemIndex, ItemKind,
+    AmbiguityKind, Binding, BindingState, CallRole, CallShape, Def, DefKind, Edition, ItemIndex, ItemKind,
     MacroShapes, Namespace, Origin, Place, Range, ScopeEntry, Visibility, VisibilityClass, WrittenVis,
 };
 pub use crate::lang_items::{

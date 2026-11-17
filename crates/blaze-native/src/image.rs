@@ -35,6 +35,7 @@ use blaze_own::AVec;
 
 use crate::Platform;
 use crate::libraries::Library;
+use crate::unwind::Row;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Region { Text, Const, EhFrame, UnwindInfo, Got, Data, Words, Inits, ThreadVars, ThreadData, ThreadZero, Zero }
@@ -72,10 +73,32 @@ pub struct Image<'a> {
     pub inits: u32,
     pub descriptor_at: u64,
     pub libraries: AVec<'a, Library<'a>>, // Plan::libraries, load order
+    /// Mach-O: the unwind rows the `UnwindInfo` region encodes, as data (sorted by start; a
+    /// DWARF-mode row's low 24 bits are its FDE's offset in the `EhFrame` region). Empty on ELF.
+    /// An executable writer (blaze-export eh_out.rs, W9) builds its one `__unwind_info` from them.
+    pub unwind: AVec<'a, Row>,
+    /// Every FDE of the `EhFrame` region, sorted by `at`.
+    pub frames: AVec<'a, Frame>,
+    /// Every pc-relative field of the `EhFrame` region, sorted by `at`.
+    pub eh_pointers: AVec<'a, EhPointer>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Import<'a> { pub name: &'a [u8], pub weak: bool }
+
+/// One FDE of the merged eh_frame, at image addresses: the record `[at, at + len)` in the
+/// `EhFrame` region (its length field included), and the code `[start, start + range)` it
+/// describes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Frame { pub at: u64, pub len: u32, pub start: u64, pub range: u32 }
+
+/// A pc-relative field of the merged eh_frame (an FDE's `pc_begin`, an LSDA or personality
+/// pointer): `width` bytes (4 or 8, signed) at `at`, holding `to - minus`, both image
+/// addresses (`minus` is `at` for a plain pc-relative field; another place of the eh_frame for a
+/// Mach-O subtractor pair). A writer that moves the eh_frame's bytes away from what they point
+/// at re-encodes each from these two addresses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EhPointer { pub at: u64, pub width: u8, pub to: u64, pub minus: u64 }
 
 impl Image<'_> {
     /// The placed region `region` (every region is listed, so this always answers).

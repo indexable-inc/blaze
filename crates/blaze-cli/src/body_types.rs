@@ -2,16 +2,19 @@
 //! pipeline on the command", piece 7).
 //!
 //! On the main thread, once a task ([`prepare`]): the names world (made from the `UnitGraph`
-//! record, which the task needs first, as names.rs `run` does), then the `CrateScope` record of
-//! each workspace member (needed by the task), read once a command from the store
-//! ([`Kept`]); the crates whose items record holds the body's file are its OWNERS; each owner's
-//! dependencies, followed to the end, and the sysroot's crates are needed in turn. With all of
+//! record, which the task needs first, as names.rs `run` does), then the file's `Owners` record
+//! (blaze-drive owners.rs: the crate roots whose module tree reaches the file, kept by the
+//! machine from the outlines); each owner's `CrateScope` and its check scope's crates
+//! (blaze-world check_scope.rs), read once a command from the store ([`Kept`]), are needed in
+//! turn: no other crate's, so one failed scope blocks only the bodies its crates own. With all of
 //! them handed in, the file's job gets a [`TypesJob`]: per owner, its crates' records in reader
 //! order (the owner at 0), all of it read-only and `Sync`.
 //!
 //! On the pool, once a file job ([`FileTypes`]): per owner one front2 `Records` over
 //! front_load's `StoreLoad` and one `ProjectWorld::from_records`; the file's bodies indexed by
-//! (file, chain); then each body asked is checked ([`FileTypes::check`]). Its diagnostics are
+//! (file, chain); then each body asked is checked ([`FileTypes::check`]) WITH every body it
+//! covers (covered.rs: each fn declared in it at any depth; for the root's `fn main` an
+//! attribute replaced, the body the expansion wrote, the user's body inside). Its diagnostics are
 //! [`TYPES`] findings, entry-relative (rule 71). A body the check could not finish (a refusal,
 //! a gap, a record that did not answer, an expansion not served, a `const` or `static` body) is
 //! one [`TYPES_NOT_CHECKED`] finding saying why: never a pass, and the command's closing line
@@ -40,6 +43,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_scope::items_record::{ItemsRecord, ItemsRecordError};
 use blaze_scope::resolve::SourceTexts;
 use blaze_surface::ItemKind;
+use blaze_world::crate_list::{CrateGraph, CrateList};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Bytes, Frame};
@@ -51,6 +55,10 @@ use crate::front_load::{CrateRecords, StoreLoad};
 use crate::job_texts::JobTexts;
 use crate::store::Store;
 use crate::work::{Facts, Record, held_str};
+
+/// Which bodies an outline entry's check covers: its root, and each fn declared in a body it
+/// reaches (front2 every_body.rs's work list); the one home of it.
+mod covered;
 
 /// The finding number of a body's type error: its arguments are the checker's code and words.
 pub const TYPES: u16 = 17;
@@ -75,10 +83,10 @@ pub const BORROWS_NOT_CHECKED: u16 = 20;
 /// changes at the flip: every body's borrow verdict is already in its record.
 pub const BORROWS_ARE_ERRORS: bool = false;
 
-/// The domain of a body part's source ([`body_source`]). 3: every member asked for the file is
-/// in the read list (`TypesJob::members`); a "2" record of a file no member listed read only the
-/// graph and could stand after its crate came to list it, so none is found again.
-const SOURCE_DOMAIN: &str = "blaze-cli body check source 3";
+/// The domain of a body part's source ([`body_source`]). 4: a body reads its file's `Owners`
+/// and only the crates its owners' checks open, no longer every member ("3"), so no "3" record
+/// is found again.
+const SOURCE_DOMAIN: &str = "blaze-cli body check source 4";
 
 /// The body checker's identity is not typed in here (decision D105): it is the table's
 /// `Row::BodyChecker` (blaze_ids::producer), handed to the drive's tool by the entry
@@ -119,6 +127,9 @@ pub(crate) fn around_bodies(text: &str, bodies: &[(u32, u32)]) -> ContentId {
 #[derive(Default)]
 pub struct Kept {
     read: std::vec::Vec<(Name, Key, CrateRecords<'static>), Global>,
+    /// The `UnitGraph` input's out and its crate list (graph_payload.rs), opened (checked
+    /// whole) once a command; `None` in the list when the world could not be made.
+    list: Option<(ContentId, Option<CrateList<'static>>)>,
     /// How many records were read from the store, and how many were found here again.
     pub gets: u32,
     pub hits: u32,
@@ -136,6 +147,25 @@ impl Kept {
         self.read.push((input.name, input.at, records));
         Ok(records)
     }
+
+    /// The crate list of the `UnitGraph` input `graph`, read and opened once a command (its
+    /// bytes copied out of `scratch` into `Global`, named: the command's own lifetime, as the
+    /// records above). `None`: the graph's world could not be made (its record says why).
+    fn list(&mut self, cx: &Cx, store: &mut dyn Store, graph: &Input, scratch: &Frame) -> Result<Option<CrateList<'static>>, CliError> {
+        if let Some((out, list)) = self.list
+            && out == graph.out
+        {
+            return Ok(list);
+        }
+        let read = crate::work::payload(cx, store, graph, scratch)?;
+        let sections = read.unit_graph(graph.name)?;
+        let mut held = std::vec::Vec::with_capacity_in(sections.list.len(), Global);
+        held.extend_from_slice(sections.list);
+        let bytes: &'static [u8] = held.leak();
+        let list = crate::graph_payload::Sections { graph: &[], list: bytes }.crates().map_err(|error| CliError::Input { name: graph.name, why: crate::work::InputWhy::Graph(error) })?;
+        self.list = Some((graph.out, list));
+        Ok(list)
+    }
 }
 
 /// One crate as a body's check reads it: its `CrateScope` input and its records.
@@ -147,6 +177,9 @@ pub(crate) struct Reader<'j> {
     /// The directory the world placed its package at (`CrateInput::shown_from`): what its
     /// items record's package paths are joined onto to read (D96).
     package: &'j str,
+    /// Its index in the names world: the proc-macro runner's key for a call written in it
+    /// (one per unit: a package's lib and bin share `package` and differ here).
+    world_at: usize,
     records: CrateRecords<'j>,
 }
 
@@ -154,7 +187,16 @@ pub(crate) struct Reader<'j> {
 pub(crate) struct Owner<'j> {
     readers: &'j [Reader<'j>],
     lang: &'j [usize],
+    /// Why this owner has no crates: its root is no crate of the names world ([`NOT_IN_WORLD`]).
+    missing: Option<&'j str>,
+    /// The body's file is this owner's crate root (its `CrateInput::root` after `/0/`): where
+    /// the root's `fn main` is (covered.rs `root_of`).
+    root_file: bool,
 }
+
+/// The note of an owner whose root file the file's `Owners` names and no crate of the names
+/// world has as its root (a unit the graph does not make, such as a test target's root).
+const NOT_IN_WORLD: &str = "an owner of this file (a crate root its `Owners` record names) is no crate of the names world, so no crate's names are read for it";
 
 /// What a file's body job needs for its bodies' types: all read-only and `Sync`.
 pub(crate) struct TypesJob<'j> {
@@ -172,18 +214,20 @@ pub(crate) struct TypesJob<'j> {
     /// note standing (rule 21: the note's input is whether there is a graph; the root's units
     /// do not hold the dependencies, so their out does not move). `None` with a graph.
     units: Option<(Name, ContentId)>,
-    /// Every member's `CrateScope` (name, out) whose items record was asked whether it lists
-    /// the file: read by every body, owner or not, since "no crate's names record lists this
-    /// file" is an answer from them (rule 21: without them a module file created under a
-    /// standing crate left the note standing in that home, never in a fresh one).
-    members: &'j [(Name, ContentId)],
+    /// The file's `Owners` input (name, out): which crate roots reach the file (blaze-drive
+    /// owners.rs). Its roots decide the owners below; none is an answer (the `Owners` record
+    /// carries the ownerless finding), so a body of no owner is checked by no one and says
+    /// nothing. `None` with no graph.
+    owned: Option<(Name, ContentId)>,
     /// All of the above as each body reads them ([`reads_of`]): sorted by name, one each.
     reads: &'j [(Name, ContentId)],
+    /// The command's proc-macro runner (`Names::procs`): a body's proc-macro calls run through it.
+    procs: Option<&'j crate::proc_runner::ProcRunner<'static>>,
 }
 
 impl TypesJob<'_> {
     /// Whether a body task handed `inputs` reads what this job was prepared from: every read
-    /// it lists ([`FileTypes::new`]: the graph, the members asked, each owner's crates) is an
+    /// it lists ([`FileTypes::new`]: the graph, the file's `Owners`, each owner's crates) is an
     /// input with the same out, and with no graph, the task was handed none either. Then
     /// [`prepare`] over `inputs` makes this job again, so the task joins it unprepared: one
     /// prepare a file a round, not one a body (RUNNER 17, the blaze clone: 331,542 prepares,
@@ -208,13 +252,13 @@ impl TypesJob<'_> {
     }
 }
 
-/// A job's reads, sorted by name, one each: the graph or the absent units, the members
-/// asked, each owner's crates. Every body of the job reads exactly these.
-fn reads_of<'j>(graph: Option<(Name, ContentId)>, units: Option<(Name, ContentId)>, members: &[(Name, ContentId)], owners: &[Owner<'_>], jobs: &'j Frame) -> &'j [(Name, ContentId)] {
+/// A job's reads, sorted by name, one each: the graph or the absent units, the file's
+/// `Owners`, the crates each owner's check opened. Every body of the job reads exactly these.
+fn reads_of<'j>(graph: Option<(Name, ContentId)>, units: Option<(Name, ContentId)>, owned: Option<(Name, ContentId)>, owners: &[Owner<'_>], jobs: &'j Frame) -> &'j [(Name, ContentId)] {
     let mut reads: Vec<(Name, ContentId), &'j Frame> = Vec::new_in(jobs);
     reads.extend(graph);
     reads.extend(units);
-    reads.extend(members.iter().copied());
+    reads.extend(owned);
     for owner in owners {
         reads.extend(owner.readers.iter().map(|r| (r.name, r.out)));
     }
@@ -235,9 +279,9 @@ pub(crate) enum Prepared<'j> {
 }
 
 /// The command's names world (`facts.names`) over the unit graph `graph`, made once a command
-/// when none is made yet: its own step, so the work list times it apart from the reads of the
-/// crates' records ([`prepare`]; work.rs's row `BODY_WORLD`). Inner `Err`: the world could not
-/// be made (the `CrateScope` tasks say why).
+/// when none is made yet: for a task that needs the world itself (work.rs, a `MacroModule`
+/// task's script module); a body reads the crate list instead ([`prepare`]). Inner `Err`: the
+/// world could not be made (the `CrateScope` tasks say why).
 pub(crate) fn names_world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
@@ -258,7 +302,7 @@ pub(crate) fn names_world<'f>(
     let read = crate::work::payload(cx, store, graph, frame)?;
     let made = {
         let _cx = cx.span("names: make the world");
-        crate::names::world(cx, root, read.payload(), lock, members, &facts.fetch_env)
+        crate::names::world(cx, root, read.unit_graph(graph.name)?.graph, lock, members, &facts.fetch_env)
     };
     match made {
         Ok(made) => {
@@ -288,9 +332,14 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     if let Some(on) = task.failed.first() {
         return Ok(Prepared::Waited(*on));
     }
-    let need_one = |name: Name| {
-        let mut wants = std::vec::Vec::with_capacity_in(1, Global);
-        wants.push(Want { name, home: Name::unit_graph() });
+    // The file's `Owners` (with `first` before it): asked beside the graph when both are
+    // missing, one entry for the two (neither depends on the other).
+    let need_owners = |first: Option<Name>| {
+        let mut wants = std::vec::Vec::with_capacity_in(2, Global);
+        wants.extend(first.map(|name| Want { name, home: Name::unit_graph() }));
+        if !task.inputs.iter().any(|input| input.name.kind == blaze_drive::Kind::Owners) {
+            wants.push(Want { name: blaze_drive::key::owners_of(task.home), home: task.home });
+        }
         wants
     };
     // The graph is always read and read-listed: a body edit's task is entered with it among
@@ -305,21 +354,20 @@ pub(crate) fn prepare<'f: 'j, 'j>(
         // lock matched (`Laid::has_graph`): the want is then answered by the last answer's row.
         if facts.laid.as_ref().is_some_and(|laid| !laid.has_graph()) {
             let units = Some((Name::unit_graph(), blaze_drive::key::ABSENT));
-            let reads = reads_of(None, units, &[], &[], jobs);
-            let job = TypesJob { owners: &[], packs: &[], corrected: &[], path: held_str(real, jobs), graph: None, units, members: &[], reads };
+            let reads = reads_of(None, units, None, &[], jobs);
+            let job = TypesJob { owners: &[], packs: &[], corrected: &[], path: held_str(real, jobs), graph: None, units, owned: None, reads, procs: None };
             return Ok(Prepared::Ready(blaze_own::Box::leak(blaze_own::Box::new_in(job, jobs))));
         }
-        return Ok(Prepared::Need(need_one(Name::unit_graph())));
+        return Ok(Prepared::Need(need_owners(Some(Name::unit_graph()))));
     };
     let graph_read = (graph.name, graph.out);
-    if let Err(what) = names_world(&cx, root, store, facts, graph, frame, alloc)? {
-        return Ok(Prepared::Refused(what));
-    }
-    let Some(names) = facts.names.as_ref() else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
+    // The crates as the `UnitGraph` record lists them, one row a crate read in place (drive.md,
+    // "The crate list is a record"): no world is made here, on a cold check or an edit.
     let kept = &mut facts.bodies;
-    let world = names.world();
-    let crates = &world.crates;
-    let name_at = |at: usize| crate::names::name_of(crates[at].input.key);
+    let Some(list) = kept.list(&cx, store, graph, jobs)? else {
+        return Ok(Prepared::Refused("the crates' inputs could not be made (names.rs `world`): the `UnitGraph` record's finding says why"));
+    };
+    let name_at = |at: usize| crate::names::name_of(list.key(at));
     // The name is hashed once per lookup, never per input compared: inside `find` it was a
     // blake3 key derivation per (crate, input) pair, per member, per body (RUNNER 16: 1226 of
     // 3213 main-thread samples of a cold clone check in `derive_key_with`).
@@ -334,41 +382,59 @@ pub(crate) fn prepare<'f: 'j, 'j>(
             wants.push(Want { name, home: Name::unit_graph() });
         }
     };
-    // The workspace's crates: those whose root is in the checkout (tree 0).
-    let mut members: std::vec::Vec<usize, Global> = std::vec::Vec::new_in(Global);
-    members.extend((0..crates.len()).filter(|at| crates[*at].input.root.starts_with("/0/")));
-    for at in members.iter().copied() {
+    // The file's owners (drive.md, "A body's owners, and what it waits for"): the crate roots
+    // whose module tree reaches it, a fact the machine keeps from the outlines (blaze-drive
+    // owners.rs), never a scan of the members' scopes. Each root is a crate of the world by its
+    // root file (`/0/` and the checkout path the units record named it by, units.rs). The
+    // `Owners` input is found by kind: a body reads one, its file's.
+    let Some(owned) = task.inputs.iter().find(|input| input.name.kind == blaze_drive::Kind::Owners) else {
+        return Ok(Prepared::Need(need_owners(None)));
+    };
+    let owned_read = (owned.name, owned.out);
+    let roots = {
+        let read = crate::work::payload(&cx, store, owned, jobs)?;
+        let roots = blaze_drive::owners::roots(read.payload()).map_err(|error| CliError::Input { name: owned.name, why: crate::work::InputWhy::Malformed(error) })?;
+        let mut held: Vec<blaze_drive::owners::Root, &'j Frame> = Vec::new_in(jobs);
+        held.extend(roots);
+        held.leak()
+    };
+    // Each root's crates (a root file may be more than one crate's: never assumed one), or the
+    // root's path when the world has no crate of it: that owner's bodies say so.
+    let mut owners: std::vec::Vec<usize, Global> = std::vec::Vec::new_in(Global);
+    let mut missing: std::vec::Vec<blaze_drive::owners::Root, Global> = std::vec::Vec::new_in(Global);
+    for root in roots.iter() {
+        let before = owners.len();
+        // A member's root is named by its checkout path (units.rs); any other crate's by its path
+        // in the world's form (DRIVER runner 19, `names::dep_roots`, ruled 21:3x).
+        let named = |path: &str| Name::file(path.strip_prefix("/0/").unwrap_or(path).as_bytes());
+        owners.extend((0..CrateGraph::len(&list)).filter(|at| named(list.root(*at)) == root.file));
+        if owners.len() == before {
+            missing.push(*root);
+        }
+    }
+    // Each owner's crate and its check scope's crates, asked in ONE need: the scope is a function
+    // of the world alone but for `no_core` (its names record's, read below), and the scope
+    // with the sysroot is the larger, so asking that one never needs a second entry (a third
+    // need a body was one entry more than the members scan's two: blaze-cli test
+    // `a_body_edit_reruns_no_surface_and_a_signature_edit_one`, 21:29). A `#![no_core]` owner
+    // then waits on its sysroot's scopes, which it does not read.
+    for at in owners.iter().copied() {
         if input_at(at).is_none() {
             want(at, &mut wants);
+        }
+        match blaze_world::check_scope::check_scope_in(&list, at, false, alloc) {
+            Ok(scope) => {
+                for seen in scope.crates() {
+                    if input_at(seen).is_none() {
+                        want(seen, &mut wants);
+                    }
+                }
+            }
+            Err(refused) => return Ok(Prepared::Refused(refused.rule())),
         }
     }
     if !wants.is_empty() {
         return Ok(Prepared::Need(wants));
-    }
-    // The owners: the members whose items record lists the file; `asked`: every member asked,
-    // the body's reads whatever the answer (`TypesJob::members`).
-    let mut owners: std::vec::Vec<usize, Global> = std::vec::Vec::new_in(Global);
-    let mut asked: Vec<(Name, ContentId), &'j Frame> = Vec::with_capacity_in(members.len(), jobs);
-    for at in members.iter().copied() {
-        let Some(input) = input_at(at) else { continue };
-        let records = match kept.records(&cx, store, input, crates[at].input.key, jobs) {
-            Ok(records) => records,
-            Err(what) => return Ok(Prepared::Refused(what)),
-        };
-        let Ok(items) = ItemsRecord::open(records.items, Alloc::global()) else {
-            return Ok(Prepared::Refused("a member's items record does not open (body_types.rs)"));
-        };
-        // A row holds the file's path in the member's package (D96): joined onto the member's
-        // directory, past the checkout's tree `/0/`.
-        let package = crates[at].input.shown_from;
-        // Each joined path is freed as soon as compared (`Global`, named): this runs per body
-        // and member, and the command's frame must not grow with that (a 4,000-body check
-        // filled it: draw_tests, 2026-11-16).
-        let holds = (0..items.files()).any(|i| matches!(items.file(i as u32), Ok(Some(row)) if row.path.in_package(package, Alloc::global()).as_deref().and_then(|p| p.strip_prefix("/0/")) == Some(real)));
-        asked.push((input.name, input.out));
-        if holds {
-            owners.push(at);
-        }
     }
     // Each owner's crates and its lang crates: the ONE rule of which crates a body's checking
     // may see (blaze-world check_scope.rs): one side's dependency closure (a proc macro's bodies
@@ -383,7 +449,7 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     let mut no_core: std::vec::Vec<bool, Global> = std::vec::Vec::new_in(Global);
     for owner in owners.iter().copied() {
         let Some(input) = input_at(owner) else { continue };
-        let records = match kept.records(&cx, store, input, crates[owner].input.key, jobs) {
+        let records = match kept.records(&cx, store, input, list.key(owner), jobs) {
             Ok(records) => records,
             Err(what) => return Ok(Prepared::Refused(what)),
         };
@@ -396,7 +462,7 @@ pub(crate) fn prepare<'f: 'j, 'j>(
         no_core.push(root.head.no_core);
     }
     for (owner, no_core) in owners.iter().copied().zip(no_core.iter().copied()) {
-        let scope = match blaze_world::check_scope::check_scope(world, owner, no_core, alloc) {
+        let scope = match blaze_world::check_scope::check_scope_in(&list, owner, no_core, alloc) {
             Ok(scope) => scope,
             // A refused owner's own names task names it; a broken list is named by the rule.
             Err(refused) => return Ok(Prepared::Refused(refused.rule())),
@@ -412,30 +478,38 @@ pub(crate) fn prepare<'f: 'j, 'j>(
         return Ok(Prepared::Need(wants));
     }
     let mut built: Vec<Owner<'j>, &'j Frame> = Vec::with_capacity_in(scopes.len(), jobs);
-    for scope in scopes.iter() {
-        // The owner at 0, then the rest in the world's order (the scope's order).
+    for (scope, owner_at) in scopes.iter().zip(owners.iter().copied()) {
+        let root_file = list.root(owner_at).strip_prefix("/0/") == Some(real);
+        // The owner at 0, then the rest in the list's order, by crate key (the scope's order).
         let mut readers: Vec<Reader<'j>, &'j Frame> = Vec::with_capacity_in(scope.readers().len(), jobs);
         let mut lang: Vec<usize, &'j Frame> = Vec::new_in(jobs);
         lang.extend(scope.lang_places());
         for at in scope.crates() {
             let Some(input) = input_at(at) else { return Err(CliError::Text { what: "a crate needed above has no input" }) };
-            let records = match kept.records(&cx, store, input, crates[at].input.key, jobs) {
+            let records = match kept.records(&cx, store, input, list.key(at), jobs) {
                 Ok(records) => records,
                 Err(what) => return Ok(Prepared::Refused(what)),
             };
-            let crate_name = crates[at].input.name;
-            let package = held_str(crates[at].input.shown_from, jobs);
-            readers.push(Reader { name: input.name, out: input.out, crate_name, package, records });
+            // The list's strings live for the command (`Kept::list`, `Global`).
+            let crate_name = CrateGraph::name(&list, at);
+            let package = list.shown_from(at);
+            readers.push(Reader { name: input.name, out: input.out, crate_name, package, world_at: at, records });
         }
-        built.push(Owner { readers: readers.leak(), lang: lang.leak() });
+        built.push(Owner { readers: readers.leak(), lang: lang.leak(), missing: None, root_file });
     }
-    // The packs' views and the corrections, copied into the round's frame (each a few words):
-    // the world is borrowed through `facts` here, the job outlives that borrow.
-    let packs: &'j [PackView<'j>] = Vec::from_slice_in(world.texts.packs(), jobs).leak();
-    let corrected: &'j [(u32, &'j str, &'j str)] = Vec::from_slice_in(world.texts.corrected(), jobs).leak();
-    let (owners, members) = (built.leak(), asked.leak());
-    let reads = reads_of(Some(graph_read), None, members, owners, jobs);
-    let job = TypesJob { owners, packs, corrected, path: held_str(real, jobs), graph: Some(graph_read), units: None, members, reads };
+    for _ in missing.iter() {
+        built.push(Owner { readers: &[], lang: &[], missing: Some(NOT_IN_WORLD), root_file: false });
+    }
+    // No packs and no corrections: they are the world's, and a body job makes none, cold or
+    // after an edit (rule 25: one answer whatever made the world first). A body whose check
+    // reads another tree's file text then gets no text, and says so in its not-checked note
+    // ("the records did not answer"): a FINDING for the crate list's design if it happens
+    // (RECORDS-PIPELINE.md, runner 6's spec), never a world made to serve it.
+    let packs: &'j [PackView<'j>] = &[];
+    let corrected: &'j [(u32, &'j str, &'j str)] = &[];
+    let owners = built.leak();
+    let reads = reads_of(Some(graph_read), None, Some(owned_read), owners, jobs);
+    let job = TypesJob { owners, packs, corrected, path: held_str(real, jobs), graph: Some(graph_read), units: None, owned: Some(owned_read), reads, procs: facts.names.as_ref().and_then(|names| names.procs()) };
     Ok(Prepared::Ready(blaze_own::Box::leak(blaze_own::Box::new_in(job, jobs))))
 }
 
@@ -448,6 +522,11 @@ struct Checker<'n> {
     by_chain: ByChain<'n>,
     /// The file's index in the owner's items record.
     file: u32,
+    /// The listed bodies whose entry is in this file: what `by_chain` indexes, and a root's
+    /// `Listed` (its place) is taken from (covered.rs `root_of`).
+    mine: AVec<'n, Listed<'n>>,
+    /// [`Owner::root_file`].
+    root_file: bool,
 }
 
 /// A file job's type checks: per owner its checker, or why none could be made.
@@ -479,7 +558,11 @@ impl<'n> FileTypes<'n> {
     pub(crate) fn check(&mut self, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str, made: &mut Record<Global>) {
         made.reads.extend(self.reads.iter().copied());
         if self.owners.is_empty() {
-            made.find(TYPES_NOT_CHECKED, (0, 0), &[if self.graphless { NO_GRAPH } else { "no crate's names record lists this file" }]);
+            // With a graph, no owner is the file's `Owners` answer: that record carries the one
+            // ownerless finding (blaze-drive `OWNERLESS_RULE`), so its bodies say nothing more.
+            if self.graphless {
+                made.find(TYPES_NOT_CHECKED, (0, 0), &[NO_GRAPH]);
+            }
             return;
         }
         if !matches!(item.kind(), ItemKind::Function) {
@@ -487,7 +570,9 @@ impl<'n> FileTypes<'n> {
             return;
         }
         let chain = blaze_file_items::item_chain(outline, item, text);
+        let name = crate::item_name::shown_name(item, text);
         let g = Alloc::global();
+        let (cx, frame) = (self.cx, self.frame);
         for owner in self.owners.iter_mut() {
             let checker = match owner {
                 Ok(checker) => checker,
@@ -496,22 +581,30 @@ impl<'n> FileTypes<'n> {
                     continue;
                 }
             };
-            let Some(body) = checker.by_chain.get(checker.file, chain) else {
-                made.find(TYPES_NOT_CHECKED, (0, 0), &["front2 lists no body at this item"]);
-                continue;
+            // Which bodies this entry covers: one home, covered.rs. An entry with no root is
+            // a note naming the item: never a pass, never left out.
+            let root = match covered::root_of(checker.records, &checker.by_chain, &checker.mine, checker.file, chain, item, text, checker.root_file) {
+                Ok(root) => root,
+                Err(no) => {
+                    let words = bstd::mem::format_in!(frame, "item `{name}`: {no}");
+                    made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
+                    continue;
+                }
             };
             let (errors, unserved) = (checker.records.errors().len(), checker.load.unserved().len());
-            // The types, then (when they were checked clean) the moves and borrows over the same
-            // lowered body and `Checked` record (front2/borrows.rs `check_borrows`).
-            let (verdict, borrows) = {
-                let _checking = self.cx.span("body types: check a body");
-                checker.world.check_borrows(body, g)
-            };
+            // The root and every fn declared in a body it reaches, at any depth (front2
+            // every_body.rs's work list): each one's types, then (when they were checked clean)
+            // its moves and borrows over the same lowered body and `Checked` record (front2/
+            // borrows.rs `check_borrows`).
+            let reached = covered::each_covered(checker.world, root, g, |w, body| {
+                let _checking = cx.span("body types: check a body");
+                w.check_borrows(body, g)
+            });
             let new_error = checker.records.errors().get(errors).map(|error| {
                 let asked = checker.load.unserved();
                 let asked = asked.get(unserved..).unwrap_or(&[]);
                 match error {
-                    SourceError::Items { error: ItemsRecordError::Gone { krate, file: None, call: Some(call) }, name, .. } => {
+                    SourceError::Items { error: ItemsRecordError::Gone { krate, file: None, call: Some(call) }, name: krate_name, .. } => {
                         // `ItemsRecord::whole` files `Gone` for an expansion in two places: no
                         // row for the call, or the loader gave no text. The loader files every
                         // call it was asked in `unserved`, so which one it is shows here.
@@ -520,79 +613,81 @@ impl<'n> FileTypes<'n> {
                         } else {
                             "the record has no expansion row for the call (the loader was never asked)"
                         };
-                        bstd::mem::format_in!(self.frame, "the records did not answer: the expansion text of macro call {call:x} in crate `{name}` ({krate:x}), read while checking item `{}`: {which}", crate::item_name::shown_name(item, text))
+                        bstd::mem::format_in!(frame, "the records did not answer: the expansion text of macro call {call:x} in crate `{krate_name}` ({krate:x}), read while checking item `{name}`: {which}")
                     }
-                    _ => bstd::mem::format_in!(self.frame, "the records did not answer: {error}"),
+                    _ => bstd::mem::format_in!(frame, "the records did not answer while checking item `{name}`: {error}"),
                 }
             });
             if let Some(words) = new_error {
                 made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
                 continue;
             }
-            // One finding per place and words: two owners of the file (a library and its test
-            // unit) that agree on a body say it once.
-            for d in verdict.diagnostics.iter() {
-                let said = made.findings.iter().any(|&(rule, start, end, from, to)| {
-                    let words = &made.messages[from..to];
-                    rule == TYPES
-                        && (start, end) == (d.start, d.end)
-                        && words.len() == d.code.len() + 1 + d.text.len()
-                        && words.starts_with(d.code.as_bytes())
-                        && words.ends_with(d.text.as_bytes())
-                });
-                if !said {
-                    made.find(TYPES, (d.start, d.end), &[d.code, "\x1f", d.text.as_str()]);
-                }
-            }
-            if checker.load.unserved().len() > unserved {
-                made.find(TYPES_NOT_CHECKED, (0, 0), &["a macro call's expansion text is not in its crate's record (StoreLoad::expansion, names/expansion_texts.rs)"]);
-            } else if let Some(refused) = &verdict.refused {
-                // A head that did not resolve names its item by name and quotes the item's
-                // text from the records (rule 19): a key alone says nothing to a reader.
-                let named = match refused {
-                    blaze_ladder::front2::project::Refused::Check(blaze_ladder::front2::check::CheckFail::Head {
-                        error: blaze_ladder::front2::heads::HeadError::Item(key, _),
-                        ..
-                    }) => blaze_ladder::front2::source::NamesSource::text_of(checker.records, *key),
-                    _ => None,
+            let unserved_now = checker.load.unserved().len() > unserved;
+            for (at, r) in reached.iter().enumerate() {
+                let (verdict, borrows) = &r.got;
+                let shown = covered::Shown { reached: &reached, at, root: root.label(name) };
+                let place = covered::place(root, r);
+                // The entry's own written body says its findings as before; every other body
+                // covered says which it is, and a body a macro wrote that its place is not
+                // known (covered.rs, "WHERE A FINDING GOES").
+                let prefix = match place {
+                    Some(_) if r.within.is_none() => bstd::mem::format_in!(frame, ""),
+                    Some(_) => bstd::mem::format_in!(frame, "in `{shown}`: "),
+                    None => bstd::mem::format_in!(
+                        frame,
+                        "in `{shown}`, a body a macro wrote (where its text came from in yours is not in the records yet: blaze-scope expansion_origins.rs), shown at the item's start: "
+                    ),
                 };
-                let words = match named {
-                    Some(it) => {
-                        let shown = it.text.get(..it.text.len().min(240)).unwrap_or(it.text);
-                        bstd::mem::format_in!(self.frame, "{}: {refused:?}; the item is `{}`: {shown:?}", refused.text(), it.name.unwrap_or("_"))
+                let at_entry = |start: u32, end: u32| -> (u32, u32) {
+                    match place.and_then(|shift| Some((shift.checked_add(start)?, shift.checked_add(end)?))) {
+                        Some(range) => range,
+                        None => (0, 0),
                     }
-                    None => bstd::mem::format_in!(self.frame, "{}: {refused:?}", refused.text()),
                 };
-                made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
-            } else if let Some(gap) = verdict.gaps.first() {
-                let words = bstd::mem::format_in!(self.frame, "{} questions the front end cannot answer yet, the first {gap:?}", verdict.gaps.len());
-                made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
-            }
-            // The move and borrow check's verdict, filed whatever `BORROWS_ARE_ERRORS` says
-            // (print.rs decides how it is shown), so the day it flips no body is made again. One
-            // finding per place and words, as the types' above. A body whose types were not
-            // checked clean was not borrow checked: its type errors or its `TYPES_NOT_CHECKED`
-            // note stand for it (the borrows of an ill-typed body are not asked), so no note
-            // repeats it.
-            for d in borrows.findings.iter() {
-                let said = made.findings.iter().any(|&(rule, start, end, from, to)| {
-                    let words = &made.messages[from..to];
-                    rule == BORROWS
-                        && (start, end) == (d.start, d.end)
-                        && words.len() == d.code.len() + 1 + d.text.len()
-                        && words.starts_with(d.code.as_bytes())
-                        && words.ends_with(d.text.as_bytes())
-                });
-                if !said {
-                    made.find(BORROWS, (d.start, d.end), &[d.code, "\x1f", d.text]);
+                for d in verdict.diagnostics.iter() {
+                    covered::find_once(made, TYPES, at_entry(d.start, d.end), d.code, prefix.as_str(), d.text.as_str());
+                }
+                if unserved_now {
+                    // Said once, after every body (below).
+                } else if let Some(refused) = &verdict.refused {
+                    // A head that did not resolve names its item by name and quotes the item's
+                    // text from the records (rule 19): a key alone says nothing to a reader.
+                    let named = match refused {
+                        blaze_ladder::front2::project::Refused::Check(blaze_ladder::front2::check::CheckFail::Head {
+                            error: blaze_ladder::front2::heads::HeadError::Item(key, _),
+                            ..
+                        }) => blaze_ladder::front2::source::NamesSource::text_of(checker.records, *key),
+                        _ => None,
+                    };
+                    let words = match named {
+                        Some(it) => {
+                            let quoted = it.text.get(..it.text.len().min(240)).unwrap_or(it.text);
+                            bstd::mem::format_in!(frame, "body `{shown}`: {}: {refused:?}; the item is `{}`: {quoted:?}", refused.text(), it.name.unwrap_or("_"))
+                        }
+                        None => bstd::mem::format_in!(frame, "body `{shown}`: {}: {refused:?}", refused.text()),
+                    };
+                    made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
+                } else if let Some(gap) = verdict.gaps.first() {
+                    let words = bstd::mem::format_in!(frame, "body `{shown}`: {} questions the front end cannot answer yet, the first {gap:?}", verdict.gaps.len());
+                    made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
+                }
+                // The move and borrow check's verdict, filed whatever `BORROWS_ARE_ERRORS` says
+                // (print.rs decides how it is shown), so the day it flips no body is made again.
+                // A body whose types were not checked clean was not borrow checked: its type
+                // errors or its `TYPES_NOT_CHECKED` note stand for it, so no note repeats it.
+                for d in borrows.findings.iter() {
+                    covered::find_once(made, BORROWS, at_entry(d.start, d.end), d.code, prefix.as_str(), d.text);
+                }
+                if let Some(refused) = &borrows.refused
+                    && !matches!(refused, BorrowRefused::Untyped(_))
+                {
+                    let words = bstd::mem::format_in!(frame, "body `{shown}`: {}: {refused:?}", refused.text());
+                    let range = refused.range().map_or((0, 0), |(start, end)| at_entry(start, end));
+                    made.find(BORROWS_NOT_CHECKED, range, &[words.as_str()]);
                 }
             }
-            if let Some(refused) = &borrows.refused
-                && !matches!(refused, BorrowRefused::Untyped(_))
-            {
-                let name = crate::item_name::shown_name(item, text);
-                let words = bstd::mem::format_in!(self.frame, "body `{name}`: {}: {refused:?}", refused.text());
-                made.find(BORROWS_NOT_CHECKED, refused.range().unwrap_or((0, 0)), &[words.as_str()]);
+            if unserved_now {
+                made.find(TYPES_NOT_CHECKED, (0, 0), &["a macro call's expansion text is not in its crate's record (StoreLoad::expansion, names/expansion_texts.rs)"]);
             }
         }
     }
@@ -600,6 +695,9 @@ impl<'n> FileTypes<'n> {
 
 /// One owner's checker, or why none: its records, its world, its file's bodies by chain.
 fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owner: &'n Owner<'n>, text: &'n str, frame: &'n Frame, g: Alloc<'n>) -> Result<Checker<'n>, &'n str> {
+    if let Some(missing) = owner.missing {
+        return Err(missing);
+    }
     let words = |what: core::fmt::Arguments<'_>| held_str(bstd::mem::format_in!(frame, "{what}").as_str(), frame);
     let mut crates: Vec<CrateRecords<'n>, &'n Frame> = Vec::with_capacity_in(owner.readers.len(), frame);
     let mut crate_names: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(owner.readers.len(), frame);
@@ -612,8 +710,17 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
     let (crates, crate_names, packages): (&'n [CrateRecords<'n>], &'n [&'n str], &'n [&'n str]) = (crates.leak(), crate_names.leak(), packages.leak());
     let mut read = std::vec::Vec::new_in(Global);
     read.push((job.path, Some(text)));
+    // Each reader as a proc-macro caller, by its place, which is its `krate` in the world made
+    // below from `crates` in this order: its index in the names world (the runner's key, one per
+    // unit) and its edition (its items record's).
+    let mut callers: Vec<(usize, usize, blaze_expand::Edition), &'n Frame> = Vec::with_capacity_in(owner.readers.len(), frame);
+    for (at, reader) in owner.readers.iter().enumerate() {
+        let edition = ItemsRecord::open(reader.records.items, g).map_err(|e| words(format_args!("the items record of `{}`: {e:?}", reader.crate_name)))?.edition();
+        callers.push((at, reader.world_at, edition));
+    }
+    let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.leak();
     let texts: &'n JobTexts<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(
-        JobTexts { cx, root, frame, packs: job.packs, corrected: job.corrected, env: None, read: RefCell::new(read) },
+        JobTexts { cx, root, frame, packs: job.packs, corrected: job.corrected, env: None, read: RefCell::new(read), procs: job.procs, own: None, callers },
         frame,
     ));
     let load: &'n StoreLoad<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(StoreLoad::new(crates, packages, texts, g), frame));
@@ -625,6 +732,11 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
         ProjectWorld::from_records(records, frame, owner.lang, g).map_err(|e| words(format_args!("the front end over records: {e}")))?
     };
     let world: &'n mut ProjectWorld<'n, &'n Records<'n>> = blaze_own::Box::leak(blaze_own::Box::new_in(world, frame));
+    // A body's macro calls expand with the same texts, environment and proc-macro runner as
+    // its crate's item-level expansion (front2 body_host.rs; pm-call-expand), set before any body.
+    let sources: &'n blaze_ladder::front2::body_host::Sourced<'n, JobTexts<'n>> =
+        blaze_own::Box::leak(blaze_own::Box::new_in(blaze_ladder::front2::body_host::Sourced(texts), frame));
+    world.set_body_sources(sources);
     let own = owner.readers.first().ok_or("an owner with no crates")?;
     let items = ItemsRecord::open(own.records.items, g).map_err(|e| words(format_args!("the items record of `{}`: {e:?}", own.crate_name)))?;
     let file = (0..items.files() as u32)
@@ -640,5 +752,5 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
     if let Some(error) = records.errors().first() {
         return Err(words(format_args!("the records did not answer: {error}")));
     }
-    Ok(Checker { records, load, world, by_chain, file })
+    Ok(Checker { records, load, world, by_chain, file, mine, root_file: owner.root_file })
 }

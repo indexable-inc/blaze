@@ -1630,7 +1630,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let (size, align) = self.size_align(t)?;
                 s(if i == Intrinsic::SizeOf { u128::from(size) } else { 1u128 << align })
             }
-            Intrinsic::Transmute => {
+            // `transmute_unchecked` is `transmute` without the compile-time size check (the
+            // pinned core, library/core/src/intrinsics/mod.rs: different sizes are "Undefined
+            // Behavior at runtime"): in a constant that is refused, so both take one arm.
+            Intrinsic::Transmute | Intrinsic::TransmuteUnchecked => {
                 let (&from, &to) = (targs.first().ok_or(malformed("`transmute` types"))?, targs.get(1).ok_or(malformed("`transmute` types"))?);
                 let (fs, ts) = (self.size_align(from)?.0, self.size_align(to)?.0);
                 if fs != ts {

@@ -7,11 +7,12 @@ use core::fmt;
 use blaze_code::record::Symbol;
 use blaze_own::{AVec, Alloc, Vec};
 
-use crate::eh_out::{eh_room, eh_sections};
+use crate::eh_out::{Outside, eh_room_with, eh_sections_with};
 use crate::error::ExportError;
 use crate::input::{Entry, Panic, Platform, ProgramIn, Tier};
 use crate::layout::{Member, lay_out};
 use crate::start::{main_of, start};
+use crate::native_merge::{self, MergeError};
 use crate::{elf, macho};
 
 /// What a panic does in the exported file, said in its report. Unwind tables are written under
@@ -116,19 +117,34 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
     for (symbol, record) in start.views() {
         members.push(Member { symbol, record, tier: None });
     }
+    // The native image (native_merge.rs): its libraries first, as the header's room depends on them.
+    let natives = match (program.natives, platform) {
+        (None, _) => None,
+        (Some(_), Platform::LinuxArm64) => return Err(ExportError::Native(MergeError::ElfNotBuilt)),
+        (Some(image), Platform::MacosArm64) => Some((image, native_merge::libraries(image, alloc).map_err(ExportError::Native)?)),
+    };
     let plan = match platform {
-        Platform::MacosArm64 => macho::plan(),
+        Platform::MacosArm64 => macho::plan_with(natives.as_ref().map_or(0, |(_, libraries)| native_merge::command_room(libraries))),
         Platform::LinuxArm64 => elf::plan(),
     };
-    let room = eh_room(&members, program.personality, platform, alloc)?;
+    let room = eh_room_with(&members, program.personality, platform, program.natives, alloc)?;
     let laid = lay_out(&members, program.data, start.entry, program.profile, plan, room, alloc)?;
-    let eh = eh_sections(&laid, &members, program.personality, platform, alloc)?;
+    let merged = match natives {
+        None => None,
+        Some((image, libraries)) => Some(native_merge::merge(&laid, image, program.exports, libraries, alloc).map_err(ExportError::Native)?),
+    };
+    let outside = match (program.natives, merged.as_ref()) {
+        (Some(image), Some(m)) => Some(Outside { image, shift: m.shift }),
+        _ => None,
+    };
+    let eh = eh_sections_with(&laid, &members, program.personality, platform, outside.as_ref(), alloc)?;
     let panics = panics(program, eh.functions);
     let seed = program.profile.map_or([0u8; 32], |p| p.digest);
     let identity = match platform {
-        Platform::MacosArm64 => macho::write(&laid, &eh, program.name, &seed, out, alloc)?,
+        Platform::MacosArm64 => macho::write_native(&laid, &eh, merged.as_ref(), program.name, &seed, out, alloc)?,
         Platform::LinuxArm64 => elf::write(&laid, &eh, &seed, out, alloc)?,
     };
+    let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len()));
     let (mut functions, mut folded, mut fast, mut optimized, mut made) = (0u32, 0u32, 0u32, 0u32, 0u32);
     for p in laid.placed.iter() {
         match p.tier {
@@ -150,7 +166,7 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
         fast,
         optimized,
         made,
-        imports: laid.imports.len() as u32,
+        imports: bound as u32,
         len: out.len() as u64,
         identity,
         profile: program.profile.map(|p| p.digest),

@@ -24,7 +24,7 @@ use crate::column::{
 };
 use crate::error::BuildError;
 use crate::kind::{
-    CallShape, Def, DefKind, DefKindTag, MacroShapes, Namespace, WrittenVis, WrittenVisTag,
+    CallRole, CallShape, Def, DefKind, DefKindTag, MacroShapes, Namespace, WrittenVis, WrittenVisTag,
     byte_enum,
 };
 use crate::path::{
@@ -99,6 +99,8 @@ pub struct MacroCallDecl<P> {
     /// The item an attribute or a derive is on, an index unique in the fragment: a derive's
     /// helper attributes are in scope for the attributes written after it on the same item.
     pub item: Option<u32>,
+    /// What the call is to its item ([`CallRole`]); `Call` for every call not on a derived item.
+    pub role: CallRole,
 }
 
 /// A module's place in its crate, read from its parent's `mod` line and its own attributes.
@@ -257,13 +259,13 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct CallRow: 1 {
+    pub(crate) struct CallRow: 2 {
         pub(crate) path: u32,
         pub(crate) pos: u32,
         pub(crate) item: u32,
         pub(crate) call: ContentId,
         pub(crate) kind: CallShape,
-        pub(crate) pad: u8,
+        pub(crate) role: CallRole,
         pub(crate) pad2: u16,
     }
 }
@@ -404,7 +406,7 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
                 Some(item) => item,
                 None => NONE,
             };
-            calls.push(CallRow { path, pos: c.pos, item, call: c.call.0, kind: c.kind, pad: 0, pad2: 0 });
+            calls.push(CallRow { path, pos: c.pos, item, call: c.call.0, kind: c.kind, role: c.role, pad2: 0 });
         }
 
         let mut out = Writer::new_in(<ModuleDeclsRoot as Record>::SCHEMA, alloc);
@@ -465,6 +467,7 @@ impl<'a, 'b> DeclsBuilder<'b, &'a str> {
             kind: c.kind,
             pos: c.pos,
             item: c.item,
+            role: c.role,
         }));
         out
     }
@@ -624,6 +627,7 @@ impl<'a> ModuleDeclsView<'a> {
             kind: row.kind,
             pos: row.pos,
             item: (row.item != NONE).then_some(row.item),
+            role: row.role,
         })
     }
 }

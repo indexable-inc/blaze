@@ -44,6 +44,11 @@ pub enum PathPrefix {
     /// An item of another kind the world names by key (an alias, an enum's variant, a fn):
     /// nothing follows it.
     Item(ItemKey),
+    /// A module of bstd, reached through a written first segment `std` that names bstd: the
+    /// failing segment is not among its items, and the finding says what `std` named. Under a
+    /// blaze edition `std` is bstd and Rust's `std` has no name (blaze-unit-graph implicit.rs:
+    /// "bstd; Rust's `std` none"); `edition` is that edition's manifest name (`blaze-2026.11`).
+    Bstd { module: ItemKey, edition: &'static str },
 }
 
 /// Why the segment named nothing. The names library's own reasons, without their payloads
@@ -93,6 +98,13 @@ impl ContentHash for PathMiss {
                     Some(PathPrefix::Item(k)) => {
                         h.tag(3);
                         k.hash_into(h);
+                    }
+                    Some(PathPrefix::Bstd { module, edition }) => {
+                        h.tag(4);
+                        module.hash_into(h);
+                        // The name's bytes, ended by 0xff (no byte of UTF-8 text).
+                        *h = h.bytes(edition.as_bytes());
+                        h.tag(0xff);
                     }
                 }
                 why.hash_into(h);

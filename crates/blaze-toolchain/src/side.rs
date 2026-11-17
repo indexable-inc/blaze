@@ -273,7 +273,7 @@ mod tests {
             pack_len: 0,
             pack: [3; 32],
         }];
-        let units = [UnitIn { krate: 0, kind: UnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[] }];
+        let units = [UnitIn { krate: 0, kind: UnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[], sysroot: crate::ImplicitSysroot::None }];
         let cfg = [("target_os", Some(os))];
         let targets = [TargetIn { triple, units: &units, cfg: &cfg }];
         record::write(&crates, &targets, alloc).expect("a record").to_vec()

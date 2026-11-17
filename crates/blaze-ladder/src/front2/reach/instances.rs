@@ -369,7 +369,7 @@ impl Instances {
                 // Two origins under the fn's key: refused by name, as the walk's own entries are.
                 Err(clash) => {
                     if !census.fns.iter().any(|(k, _)| *k == clash.key) {
-                        census.fns.push((clash.key, Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str() }));
+                        census.fns.push((clash.key, Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str(), refusal: None }));
                     }
                 }
             }

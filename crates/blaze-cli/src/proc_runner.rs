@@ -23,11 +23,14 @@
 //! is refused by the hook, and the `MacroModule` task's failure names the crate and the command
 //! that builds its module (rule 3, 19), never `NoDefinition`.
 //!
+//! A call is routed by the calling crate's index in the names world, and the macro reads that
+//! crate's own environment (`CrateEnv`, per unit: a package's lib and bin are two callers),
+//! through proc_env.rs (macro-env-per-unit).
+//!
 //! Made once a command on the main thread, by the first `CrateScope` task after the names
 //! world ([`make`], held in `Names`), and lent read-only to the pool's names and body jobs.
-//! The calling crate's package (what the macro is shown) is a checkout crate's folder; a
-//! crate of a fetched package (a tree other than the checkout's) has none here yet, and its
-//! calls are refused (`HostWhy::Refused`) rather than shown another package.
+//! The calling crate's package (what the macro is shown) is where the names world placed it
+//! (proc_callers.rs): a checkout folder, or a fetched package's record read in place.
 
 use blaze_expand::{Edition, HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, Produced};
 use blaze_id::CrateItemKey;
@@ -56,6 +59,19 @@ pub(crate) enum MakeError {
     Runtime(std::string::String),
     /// A macro crate whose module is in the store and could not be read.
     Module { krate: std::string::String, why: std::string::String },
+    /// A crate of a unit whose package the names world was never told the place of: the
+    /// macro could not be shown its package (proc_callers.rs).
+    NotPlaced { krate: std::string::String },
+    /// A crate the names world made no environment for (blaze-world makes one per crate): the
+    /// macro could not be shown the crate's variables.
+    NoEnv { krate: std::string::String },
+    /// Two packages made for one crate of the world: a bug of `make`'s loop, named.
+    GivenTwice { krate: std::string::String },
+    /// The crate's environment named one variable both set and unknown: a bug of blaze-scope's
+    /// `CrateEnv`, named.
+    EnvList { krate: std::string::String, why: blaze_proc_macro::package_env::PackageEnvError },
+    /// A member whose dir no sandbox can mount at `/workspace/<dir>` (D96).
+    MemberDir { krate: std::string::String, why: std::string::String },
 }
 
 impl core::fmt::Display for MakeError {
@@ -67,6 +83,11 @@ impl core::fmt::Display for MakeError {
             MakeError::Store(why) => write!(f, "the proc-macro module store: {why}"),
             MakeError::Runtime(why) => write!(f, "the proc-macro runtime (Wasmtime): {why}"),
             MakeError::Module { krate, why } => write!(f, "the proc-macro module of {krate} could not be read: {why}"),
+            MakeError::NotPlaced { krate } => write!(f, "{krate}: the names world never placed its package, so a proc macro called in it cannot be shown its files"),
+            MakeError::NoEnv { krate } => write!(f, "{krate}: the names world made no environment for this crate, so a proc macro called in it cannot be shown its variables"),
+            MakeError::GivenTwice { krate } => write!(f, "{krate}: the proc-macro runner was given two packages for this one crate"),
+            MakeError::EnvList { krate, why } => write!(f, "{krate}: the variables a proc macro called in it is shown: {why}"),
+            MakeError::MemberDir { krate, why } => write!(f, "{krate}: {why}"),
         }
     }
 }
@@ -86,7 +107,7 @@ mod with_sandbox {
 
     use blaze_proc_macro::hook::{ProcMacros, crate_key};
     use blaze_proc_macro::module::{LockedPackages, ModuleError, module_key, read_module};
-    use blaze_proc_macro::sandbox::Package;
+    use blaze_scope::resolve::SourceTexts;
     use blaze_world::procs::files::{PackageAt, sandbox_files};
     use blaze_world::procs::{git_folders, identify_files};
 
@@ -95,8 +116,8 @@ mod with_sandbox {
         procs: ProcMacros<'r>,
         /// Each macro crate by its world index: its key. Sorted by index.
         keys: std::vec::Vec<(usize, CrateItemKey), Global>,
-        /// Each checkout crate's package as the macro is shown it, by `shown_from`, sorted.
-        callers: std::vec::Vec<(std::string::String, Arc<Package>), Global>,
+        /// Each crate's package as the macro is shown it, by its index in the names world (proc_env.rs).
+        callers: crate::proc_env::Callers,
     }
 
     impl<'r> ProcRunner<'r> {
@@ -108,21 +129,22 @@ mod with_sandbox {
             Some(self.keys[at].1)
         }
 
-        /// Runs the proc macro `def` on `call`, written in the crate whose package the world
-        /// placed at `shown_from`, at `edition`: through `ProcMacros::run` alone. A caller with
-        /// no package here is refused (the macro is never shown another package).
+        /// Runs the proc macro `def` on `call`, written in the crate at index `krate` of the
+        /// names world, at `edition`: through `ProcMacros::run` alone, shown that crate's own
+        /// package and variables (a lib's and a bin's of one package are two). A caller with no
+        /// package here is refused (the macro is never shown another crate's).
         pub(crate) fn run<'a>(
             &self,
-            shown_from: &str,
+            krate: usize,
             edition: Edition,
             def: &MacroDefinition<'_>,
             call: ProcCall<'_>,
             alloc: Alloc<'a>,
         ) -> Result<Produced<'a>, HostError> {
-            let Ok(at) = self.callers.binary_search_by(|(from, _)| from.as_str().cmp(shown_from)) else {
+            let Some(package) = self.callers.of(krate) else {
                 return Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused });
             };
-            self.procs.run(def, &call, edition, &self.callers[at].1, alloc)
+            self.procs.run(def, &call, edition, package, alloc)
         }
     }
 
@@ -147,14 +169,28 @@ mod with_sandbox {
         let world = names.world();
         let graph = names.graph();
         let mut keys = std::vec::Vec::new_in(Global);
-        let mut callers = std::vec::Vec::new_in(Global);
+        let mut callers = crate::proc_env::Callers::new();
+        let placed = names.placed();
         for (at, krate) in world.crates.iter().enumerate() {
-            if let Some(inner) = krate.input.shown_from.strip_prefix("/0/").or_else(|| (krate.input.shown_from == "/0").then_some("")) {
-                let dir: PathBuf = std::path::Path::new(side.place.checkout).join(inner);
-                let files = sandbox_files(PackageAt::Disk(&dir));
-                let env = package_env(krate.package, krate.version, krate.input.name);
-                callers.push((std::string::String::from(krate.input.shown_from), Arc::new(Package { files, env })));
-            }
+            // The package the macro is shown: where the world placed the crate's package, by the
+            // one path that read it (proc_callers.rs): a checkout folder, a fetched package's
+            // record read in place, a toolchain crate's nothing (blaze-world procs/files.rs).
+            // A member is its workspace at `/workspace` with the member at its dir (D96, as build
+            // scripts get it); a fetched package its record at `/package`.
+            let files = match krate.origin {
+                blaze_world::Origin::Toolchain(_) => sandbox_files(PackageAt::Toolchain),
+                blaze_world::Origin::Unit(unit) => match placed.of(graph.units[unit.0 as usize].package) {
+                    Some(place) => crate::proc_callers::shown(place, side.place.checkout)
+                        .map_err(|e| MakeError::MemberDir { krate: std::format!("{} {}", krate.package, krate.version), why: e.to_string() })?,
+                    None => return Err(MakeError::NotPlaced { krate: std::format!("{} {}", krate.package, krate.version) }),
+                },
+            };
+            // The crate's OWN environment, the one `env!` reads (blaze-world made it per unit):
+            // a lib and a bin of one package are two callers (proc_env.rs, rule 21).
+            let named = || std::format!("{} {} (crate {})", krate.package, krate.version, krate.input.name);
+            let env = world.texts.crate_env(at).ok_or_else(|| MakeError::NoEnv { krate: named() })?;
+            let package = crate::proc_env::unit_package(env, files).map_err(|why| MakeError::EnvList { krate: named(), why })?;
+            callers.put(at, Arc::new(package)).map_err(|_| MakeError::GivenTwice { krate: named() })?;
             let blaze_world::Origin::Unit(unit) = krate.origin else { continue };
             if !krate.proc_macro {
                 continue;
@@ -172,33 +208,10 @@ mod with_sandbox {
             procs.add_crate(key, &identity.package, &identity.version, module);
             keys.push((at, key));
         }
-        callers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let runner = ProcRunner { procs, keys, callers };
         Ok(std::boxed::Box::leak(std::boxed::Box::new_in(runner, Global)))
     }
 
-    /// The `CARGO_*` variables a proc macro may read of the package it is expanded in, paths
-    /// under the sandbox's package folder (cargo's "Environment variables Cargo sets for
-    /// crates"); the version parts as cargo splits a semver version.
-    fn package_env(package: &str, version: &str, crate_name: &str) -> std::vec::Vec<(std::string::String, std::string::String)> {
-        let (core, pre) = version.split_once('-').unwrap_or((version, ""));
-        let core = core.split_once('+').map_or(core, |(c, _)| c);
-        let mut parts = core.splitn(3, '.');
-        let (major, minor, patch) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-        let pre = pre.split_once('+').map_or(pre, |(p, _)| p);
-        let pairs: [(&str, std::string::String); 9] = [
-            ("CARGO_CRATE_NAME", crate_name.replace('-', "_")),
-            ("CARGO_MANIFEST_DIR", std::string::String::from(blaze_proc_macro::sandbox::PACKAGE)),
-            ("CARGO_PKG_NAME", std::string::String::from(package)),
-            ("CARGO_PKG_VERSION", std::string::String::from(version)),
-            ("CARGO_PKG_VERSION_MAJOR", std::string::String::from(major)),
-            ("CARGO_PKG_VERSION_MINOR", std::string::String::from(minor)),
-            ("CARGO_PKG_VERSION_PATCH", std::string::String::from(patch)),
-            ("CARGO_PKG_VERSION_PRE", std::string::String::from(pre)),
-            ("CARGO_MANIFEST_PATH", std::format!("{}/Cargo.toml", blaze_proc_macro::sandbox::PACKAGE)),
-        ];
-        pairs.into_iter().map(|(k, v)| (std::string::String::from(k), v)).collect()
-    }
 }
 
 #[cfg(not(feature = "sandbox"))]
@@ -218,7 +231,7 @@ mod without_sandbox {
             }
         }
 
-        pub(crate) fn run<'a>(&self, _: &str, _: Edition, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+        pub(crate) fn run<'a>(&self, _: usize, _: Edition, _: &MacroDefinition<'_>, _: ProcCall<'_>, _: Alloc<'a>) -> Result<Produced<'a>, HostError> {
             match self {
                 ProcRunner::Never(never, _) => match *never {},
             }

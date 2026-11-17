@@ -1739,6 +1739,7 @@ fn header_of(b: u8) -> Result<tc::FnPtrHeader, E> {
         3 => tc::Abi::System,
         4 => tc::Abi::SystemUnwind,
         5 => tc::Abi::RustCall,
+        6 => tc::Abi::LlvmIntrinsic,
         _ => return Err(E::Byte { what: "a fn header's ABI", byte: b }),
     };
     let safety = if b & 0x80 != 0 { tc::Safety::Unsafe } else { tc::Safety::Safe };

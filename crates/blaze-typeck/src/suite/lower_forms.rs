@@ -526,7 +526,8 @@ fn a_projection_that_cannot_hold_names_the_projection_and_its_term() {
             format!("{} at {} {goal}", d.code.code(), d.at.start)
         })
         .collect();
-    let want = format!("E0277 at {} <B as Tr>::{:?} == u8", e0.0, Name::of("Out"));
+    // At `b` of `wants(b)`, the argument for the input that names the clause's `T`.
+    let want = format!("E0277 at {} <B as Tr>::{:?} == u8", e1.0, Name::of("Out"));
     assert_eq!(got, [want], "{:?}", c.diags);
 }
 
