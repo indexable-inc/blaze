@@ -23,7 +23,7 @@ fn ran(pool: &Pool, job: JobPtr) -> &'static str {
 }
 
 /// A starter that starts nothing: the workers stay unstarted, and the test is their thread.
-fn no_threads(_pool: &Pool) {}
+fn no_threads(_pool: &Pool, _at: u32) {}
 
 /// What worker 0 of a one-group, two-worker foreground pool is handed, in order, after three
 /// foreground tasks and one background task were spawned from outside (the background one

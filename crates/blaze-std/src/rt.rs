@@ -81,8 +81,8 @@ impl std::process::Termination for Exit {
 ///
 /// `main`'s context is the root of the process's `Threads` pool (task/threads.rs): one worker
 /// per core of the machine's [`topology`], read when a scope first asks about the workers,
-/// their threads started by the first spawn ([`pool::lazy`]). A program that spawns nothing
-/// starts no thread. When `main` returns, the effects it left in flight are drained (within
+/// each worker's thread started by the first wake that reaches it ([`pool::lazy`]). A program
+/// that spawns nothing starts no thread, and one that runs k tasks at once starts about k. When `main` returns, the effects it left in flight are drained (within
 /// [`POOL_STOP`], else the process fails naming them) and the process exits at once: the
 /// kernel frees the threads and tables, with no teardown.
 pub fn run<R: Outcome>(main: impl FnOnce(&Cx, Io) -> R) -> Exit {
@@ -211,7 +211,8 @@ pub(crate) mod pool {
     /// queued tasks on top of the wait, so it is deeper than a thread's usual 2 MiB.
     pub(crate) const WORKER_STACK: usize = 16 << 20;
 
-    /// A pool and the stop of its threads, which start at its first spawn ([`starter`]).
+    /// A pool and the stop of its threads, each started by the first wake that reaches its
+    /// worker ([`starter`]).
     pub(crate) struct Running {
         pool: Pool,
     }
@@ -236,9 +237,9 @@ pub(crate) mod pool {
     }
 
     /// The machine's pool, nothing of it made: the topology is read when the pool is first
-    /// asked about its workers ([`read`]), its threads start at the first spawn ([`starter`]),
-    /// so a program that makes no scope reads no topology and one that spawns nothing makes
-    /// no thread.
+    /// asked about its workers ([`read`]), a worker's thread starts at the first wake that
+    /// reaches it ([`starter`]), so a program that makes no scope reads no topology, one that
+    /// spawns nothing makes no thread, and one with k tasks runnable at once makes about k.
     pub(crate) fn lazy(plants: Plants) -> Running {
         lazy_on(read, starter, plants)
     }
@@ -249,11 +250,11 @@ pub(crate) mod pool {
         Running { pool: Pool::lazy(read, Monotonic::new(), plants, starter) }
     }
 
-    /// The pool of `topology`, its threads started now: a test's pool, which begins as the
-    /// first spawn would begin it.
+    /// The pool of `topology`, every worker's thread started now (each parked until a wake
+    /// reaches it): a test's pool, whose tests want every worker up.
     pub(crate) fn start(topology: &Topology, plants: Plants) -> Result<Running, StartError> {
         let running = Running { pool: Pool::new(topology, Monotonic::new(), plants, starter) };
-        running.pool.begin();
+        running.pool.start_all();
         Ok(running)
     }
 
@@ -266,24 +267,15 @@ pub(crate) mod pool {
         }
     }
 
-    /// The pool's [`Starter`](crate::task::threads::Starter): the calling thread (the first
-    /// spawner) starts worker 0 and returns at once, without waiting for any worker; each
-    /// worker's thread starts its two children in the tree (`2n + 1`, `2n + 2`) before it
-    /// places itself and runs, so the threads come up in parallel, about log2 of the count
-    /// deep, each stack mapped by the thread that starts it rather than all by the spawner.
-    /// A task spawned meanwhile waits on a worker that is parked until its thread runs
-    /// (task/idle.rs). A thread the system refuses, or a placement it refuses, stops the
-    /// process naming the worker (rule no-fallback): a pool with a hole in it would hold the
-    /// tasks reserved to that worker forever.
-    pub(crate) fn starter(pool: &Pool) {
-        spawn_worker(pool, 0);
-    }
-
-    /// Starts worker `at`'s thread, if the pool has one so numbered.
-    fn spawn_worker(pool: &Pool, at: u32) {
-        if at >= pool.workers() {
-            return;
-        }
+    /// The pool's [`Starter`](crate::task::threads::Starter): the calling thread (the waker
+    /// whose wake first reached worker `at`) starts that worker's thread and returns at once,
+    /// without waiting for it. A burst of spawns fans out one worker at a time (task/idle.rs),
+    /// so the threads come up as the work asks, each by the worker before it. The woken task
+    /// waits on a worker that is parked until its thread runs (task/idle.rs). A thread the
+    /// system refuses, or a placement it refuses, stops the process naming the worker (rule
+    /// no-fallback): a pool with a hole in it would hold the tasks reserved to that worker
+    /// forever.
+    pub(crate) fn starter(pool: &Pool, at: u32) {
         // clone: one handle on the pool per thread.
         let mine = pool.clone();
         let spawned = thread::Builder::new()
@@ -291,8 +283,6 @@ pub(crate) mod pool {
             .name(format!("bstd-worker-{at}"))
             .stack_size(WORKER_STACK)
             .spawn(move || {
-                spawn_worker(&mine, 2 * at + 1);
-                spawn_worker(&mine, 2 * at + 2);
                 if let Some((cpu, class)) = mine.placement(at)
                     && let Err(why) = machine::place(cpu, class)
                 {
