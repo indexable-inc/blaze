@@ -199,9 +199,9 @@ mod footprint {
     /// The process's lifetime peak `phys_footprint` (rule 50's measure; RSS also counts pages
     /// the allocator freed and the kernel has not taken back): `ri_lifetime_max_phys_footprint`
     /// of libproc's `proc_pid_rusage`, `rusage_info_v4`, the 29th 64-bit field after the
-    /// 16-byte uuid. macOS only.
+    /// 16-byte uuid.
     #[cfg(target_os = "macos")]
-    pub fn max_footprint() -> Option<u64> {
+    pub fn max_footprint() -> u64 {
         unsafe extern "C" {
             fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
         }
@@ -209,12 +209,34 @@ mod footprint {
         let mut info = [0u64; 40];
         // SAFETY: flavor 4 writes one rusage_info_v4, which the buffer outsizes.
         let ok = unsafe { proc_pid_rusage(std::process::id() as i32, 4, info.as_mut_ptr()) };
-        (ok == 0).then_some(info[2 + 28])
+        if ok != 0 {
+            panic!("proc_pid_rusage of this process: {}", std::io::Error::last_os_error());
+        }
+        info[2 + 28]
     }
 
-    #[cfg(not(target_os = "macos"))]
-    pub fn max_footprint() -> Option<u64> {
-        None
+    /// The process's lifetime peak resident set, in bytes: `getrusage(RUSAGE_SELF)`'s
+    /// `ru_maxrss`, which Linux counts in kibibytes (as `blaze_core::process` reads a child's).
+    #[cfg(target_os = "linux")]
+    pub fn max_footprint() -> u64 {
+        /// `struct rusage` on 64-bit Linux: two 16-byte `timeval`s, then fourteen `long`s,
+        /// `ru_maxrss` first.
+        #[repr(C)]
+        struct Rusage {
+            _times: [i64; 4],
+            maxrss: i64,
+            _rest: [i64; 13],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        let mut usage = Rusage { _times: [0; 4], maxrss: 0, _rest: [0; 13] };
+        // SAFETY: `Rusage` has `struct rusage`'s layout; `RUSAGE_SELF` is 0. The call writes
+        // it and does not keep it.
+        if unsafe { getrusage(0, &mut usage) } != 0 {
+            panic!("getrusage of this process: {}", std::io::Error::last_os_error());
+        }
+        usage.maxrss as u64 * 1024
     }
 }
 
@@ -353,9 +375,7 @@ fn main() {
         mib(big.iter().sum()),
         big.iter().take(12).map(|it| (mib(*it) * 10.0).round() / 10.0).collect::<std::vec::Vec<f64>>()
     );
-    if let Some(most) = footprint::max_footprint() {
-        println!("footprint: lifetime peak phys_footprint {:.1} MiB", most as f64 / (1 << 20) as f64);
-    }
+    println!("footprint: lifetime peak phys_footprint {:.1} MiB", footprint::max_footprint() as f64 / (1 << 20) as f64);
     for (phase, peak) in footprint::PHASES.iter().zip(peaks) {
         println!("  high-water in {phase}: {:.1} MiB", peak as f64 / (1 << 20) as f64);
     }

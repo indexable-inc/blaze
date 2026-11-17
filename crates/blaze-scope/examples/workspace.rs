@@ -152,15 +152,45 @@ fn map(path: &Path) -> std::io::Result<&'static [u8]> {
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
 }
 
 /// The lifetime peak `phys_footprint` (`rusage_info_v4`'s `ri_lifetime_max_phys_footprint`).
+#[cfg(target_os = "macos")]
 fn max_footprint() -> u64 {
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+    }
     let mut info = [0u64; 40];
     // SAFETY: flavor 4 writes one rusage_info_v4 (296 bytes), which the buffer outsizes.
     let ok = unsafe { proc_pid_rusage(std::process::id() as i32, 4, info.as_mut_ptr()) };
-    if ok == 0 { info[2 + 28] } else { 0 }
+    if ok != 0 {
+        panic!("proc_pid_rusage of this process: {}", std::io::Error::last_os_error());
+    }
+    info[2 + 28]
+}
+
+/// The lifetime peak resident set, in bytes: `getrusage(RUSAGE_SELF)`'s `ru_maxrss`, which
+/// Linux counts in kibibytes (as `blaze_core::process` reads a child's).
+#[cfg(target_os = "linux")]
+fn max_footprint() -> u64 {
+    /// `struct rusage` on 64-bit Linux: two 16-byte `timeval`s, then fourteen `long`s,
+    /// `ru_maxrss` first.
+    #[repr(C)]
+    struct Rusage {
+        _times: [i64; 4],
+        maxrss: i64,
+        _rest: [i64; 13],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut usage = Rusage { _times: [0; 4], maxrss: 0, _rest: [0; 13] };
+    // SAFETY: `Rusage` has `struct rusage`'s layout; `RUSAGE_SELF` is 0. The call writes it
+    // and does not keep it.
+    if unsafe { getrusage(0, &mut usage) } != 0 {
+        panic!("getrusage of this process: {}", std::io::Error::last_os_error());
+    }
+    usage.maxrss as u64 * 1024
 }
 
 /// blaze-fetch's store folder: one file a record, `records/<hex of the key>`.

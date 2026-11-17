@@ -111,7 +111,6 @@ const OP_SEND_ZC: u8 = 47;
 const SETUP_SQPOLL: u32 = 1 << 1;
 const SETUP_CQSIZE: u32 = 1 << 3;
 const SETUP_SUBMIT_ALL: u32 = 1 << 7;
-const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
 const FEAT_SINGLE_MMAP: u32 = 1 << 0;
 const FEAT_NODROP: u32 = 1 << 1;
 const FEAT_SQPOLL_NONFIXED: u32 = 1 << 7;
@@ -910,14 +909,17 @@ struct Ring {
 impl Ring {
     /// Submitted by a kernel thread of its own (`IORING_SETUP_SQPOLL`), which takes requests
     /// from the ring as they are written, with no system call, and sleeps after
-    /// [`SQ_THREAD_IDLE_MS`] of nothing to do. For one issuing thread (a [`Uring`] is not
-    /// `Send`; `IORING_SETUP_SINGLE_ISSUER`). With a thread of its own the kernel runs every
-    /// completion's work there, so `IORING_SETUP_DEFER_TASKRUN`, `COOP_TASKRUN` and
-    /// `TASKRUN_FLAG`, which say when the issuing thread runs it, mean nothing with SQPOLL, and
-    /// the kernel refuses them with it.
+    /// [`SQ_THREAD_IDLE_MS`] of nothing to do. Not `IORING_SETUP_SINGLE_ISSUER`: that binds the
+    /// ring to the thread that made it (from 6.1 the kernel refuses `io_uring_register`, which
+    /// a file's install calls, from any other with EEXIST), and a [`Uring`] is `Send`, driven
+    /// by whichever thread holds its world's lock; with SQPOLL the kernel's thread is the one
+    /// submitter anyway. With a thread of its own the kernel runs every completion's work
+    /// there, so `IORING_SETUP_DEFER_TASKRUN`, `COOP_TASKRUN` and `TASKRUN_FLAG`, which say
+    /// when the issuing thread runs it, mean nothing with SQPOLL, and the kernel refuses them
+    /// with it.
     fn new(entries: u32, completions: u32) -> io::Result<Ring> {
         let mut params = Params {
-            flags: SETUP_SQPOLL | SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER,
+            flags: SETUP_SQPOLL | SETUP_CQSIZE | SETUP_SUBMIT_ALL,
             sq_thread_idle: SQ_THREAD_IDLE_MS,
             cq_entries: completions,
             ..Params::default()
@@ -1168,7 +1170,7 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
         (libc::EINVAL, _) => write!(
             out,
             "this kernel (Linux {kernel}) lacks IORING_SETUP_SQPOLL with \
-             IORING_SETUP_SINGLE_ISSUER, which Linux 6.0 and later have. \
+             IORING_SETUP_SUBMIT_ALL, which Linux 5.18 and later have. \
              Fix: run on Linux 6.0 or later"
         ),
         (libc::ENOMEM, _) => write!(
@@ -1929,6 +1931,17 @@ pub struct Uring {
     /// turned a caller's loop into a spin).
     waker_given: Cell<bool>,
 }
+
+// SAFETY: what is not `Send` in the driver is the raw pointers into the ring's mappings and
+// the provided buffers, which it maps and unmaps itself, and the `Rc`s and `RefCell`s of its
+// ring's file and table, every clone of which is held inside this driver, so they all move
+// together. None is tied to the thread that made it: the ring is set up without
+// `IORING_SETUP_SINGLE_ISSUER` (see `Ring::new`), the kernel's SQPOLL thread submits, and
+// every `io_uring_enter` and `io_uring_register` names the ring's file, which any thread may.
+// The driver is used from one thread at a time (`&mut self`; bstd drives it under its world's
+// `Lock`), and that lock's hand-over orders the plain reads and writes of the ring's local
+// counters between threads.
+unsafe impl Send for Uring {}
 
 /// Where the host's effects are told: the channel of the work off the ring, and its wake.
 struct HostSink {
@@ -5740,7 +5753,7 @@ mod tests {
                 "io_uring_setup, io_uring_enter and io_uring_register",
             ),
             (libc::ENOSYS, None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
-            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "Linux 6.0 or later"),
+            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SUBMIT_ALL", "Linux 6.0 or later"),
             (libc::ENOMEM, None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),
             (libc::EBADF, None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
         ];

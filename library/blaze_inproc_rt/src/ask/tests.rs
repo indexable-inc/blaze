@@ -4,6 +4,7 @@
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -74,15 +75,14 @@ fn echo(mut reader: Reader, sender: Sender) -> std::thread::JoinHandle<usize> {
 /// Aborts the test process unless dropped within a minute: a deadlock fails instead of hanging.
 struct Watchdog {
     /// Dropped with the watchdog, which ends its thread's wait.
-    _done: crossbeam_channel::Sender<()>,
+    _done: mpsc::Sender<()>,
 }
 
 impl Watchdog {
     fn new(what: &'static str) -> Watchdog {
-        let (done, seen) = crossbeam_channel::bounded::<()>(0);
+        let (done, seen) = mpsc::channel::<()>();
         std::thread::spawn(move || {
-            if seen.recv_timeout(Duration::from_secs(60))
-                == Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            if seen.recv_timeout(Duration::from_secs(60)) == Err(RecvTimeoutError::Timeout)
             {
                 eprintln!("{what}: deadlocked");
                 std::process::abort();
@@ -181,7 +181,7 @@ fn a_signal_handler_that_asks_inside_its_threads_ask_is_answered_first() {
         action.sa_sigaction = asks_inside as extern "C" fn(libc::c_int) as usize;
         assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
     }
-    let (thread_tx, thread_rx) = crossbeam_channel::unbounded();
+    let (thread_tx, thread_rx) = mpsc::channel();
     let thread = std::thread::spawn(move || {
         // SAFETY: the calling thread's own handle.
         thread_tx.send(unsafe { libc::pthread_self() }).unwrap();

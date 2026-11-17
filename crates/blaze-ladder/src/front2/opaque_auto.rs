@@ -43,6 +43,7 @@
 use std::boxed::Box;
 use std::format;
 
+use blaze_flow_lower::InteriorPart;
 use blaze_hash::HashMap;
 use blaze_own::{Alloc, Vec};
 use blaze_typeck as tc;
@@ -50,6 +51,7 @@ use blaze_typeck::{Checked, CoroutineFacts, Hidden, ItemKey, List, PNode, PTy, P
 
 use super::body::{Body, lower_fn, lower_member};
 use super::check::{CheckFail, Records, check_body, item_shown};
+use super::exact_interior::{BlockInterior, Exacts, exact_interiors};
 use super::source::NamesSource;
 use super::spell::Spelling;
 use super::world_items::Gap;
@@ -145,20 +147,29 @@ impl<'a> HiddenTable<'a> {
         self.rows.get(&owner).is_some_and(|row| row.hidden.iter().any(|h| h.0 == opaque))
     }
 
-    /// `owner`'s clean check `done` (its body's expressions `exprs`) filed, when it defines an
-    /// opaque and is not filed yet (a second clean check of one body reads the same answers:
-    /// rule 21, `Digests::file`).
-    fn file_row(&mut self, owner: ItemKey, exprs: &[tc::Expr], done: &Checked<'_>) -> Result<(), HiddenFail> {
-        if done.hidden.is_empty() || self.filed(owner) {
+    /// Whether `owner`'s clean check is to be filed: it defines an opaque and is not filed yet
+    /// (a second clean check of one body reads the same answers: rule 21, `Digests::file`).
+    fn wants(&self, owner: ItemKey, done: &Checked<'_>) -> bool {
+        !done.hidden.is_empty() && !self.filed(owner)
+    }
+
+    /// `owner`'s clean check `done` (its body's expressions `exprs`) filed, when [`Self::wants`]
+    /// it. Each async block's interior is its EXACT interior where `exacts` gives one
+    /// (exact_interior.rs: what the state stores), else the check's superset (a block whose
+    /// flow was refused: exact_interior.rs's module doc).
+    fn file_row(&mut self, owner: ItemKey, exprs: &[tc::Expr], done: &Checked<'_>, exacts: Option<&Exacts<'_>>) -> Result<(), HiddenFail> {
+        if !self.wants(owner, done) {
             return Ok(());
         }
         let from = done.types.view();
-        // The roots: each hidden type, then each async block's output and interior.
+        // The roots: each hidden type, then each async block's output and its interior (the
+        // superset, one root, or the exact interior's parts, one root each).
         let mut roots: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(done.hidden.len(), self.alloc);
         for &(_, t) in done.hidden.iter() {
             roots.push(t);
         }
-        let mut blocks: Vec<u32, Alloc<'a>> = Vec::new_in(self.alloc);
+        // Per block: its ordinal, its output's index in `roots`, and its exact parts if any.
+        let mut blocks: Vec<(u32, usize, Option<&[InteriorPart]>), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut ordinal = 0u32;
         for (i, e) in exprs.iter().enumerate() {
             if !matches!(e, tc::Expr::AsyncBlock { .. }) {
@@ -172,9 +183,21 @@ impl<'a> HiddenTable<'a> {
             // A block not typed as its own future gets no row: the world's gap by name
             // (`Question::Coroutine`) if it is ever asked, never a guess.
             if let Ok(PNode::Future(_, output, interior)) = from.node(t) {
-                blocks.push(at);
+                let exact = match exacts.and_then(|x| x.of(tc::ExprId(i as u32))) {
+                    Some(BlockInterior::Exact(parts)) => Some(&parts[..]),
+                    // Its flow was refused, or no exact interior was made: the superset stands.
+                    Some(BlockInterior::Refused(_)) | None => None,
+                };
+                blocks.push((at, roots.len(), exact));
                 roots.push(output);
-                roots.push(interior);
+                match exact {
+                    Some(parts) => {
+                        for p in parts {
+                            roots.push(p.ty);
+                        }
+                    }
+                    None => roots.push(interior),
+                }
             }
         }
         let copied = copy_reached(from, &roots, &mut self.tys, self.alloc).map_err(|why| HiddenFail::Copy { owner, why })?;
@@ -183,12 +206,33 @@ impl<'a> HiddenTable<'a> {
             hidden.push((k, copied[i]));
         }
         let mut coroutines = Vec::with_capacity_in(blocks.len(), self.alloc);
-        let base = done.hidden.len();
-        for (j, &at) in blocks.iter().enumerate() {
-            coroutines.push((at, copied[base + 2 * j], copied[base + 2 * j + 1]));
+        for &(at, first, exact) in blocks.iter() {
+            let interior = match exact {
+                None => copied[first + 1],
+                Some(parts) => self.exact_tuple(parts, &copied[first + 1..first + 1 + parts.len()]).map_err(|why| HiddenFail::Copy { owner, why })?,
+            };
+            coroutines.push((at, copied[first], interior));
         }
         self.rows.insert(owner, Row { hidden, coroutines });
         Ok(())
+    }
+
+    /// An exact interior as the tuple the type check's interior is (blaze-flow-lower
+    /// coroutine.rs `interior`: its elements sorted and deduplicated), in the table's own types:
+    /// `tys` are `parts`' types already copied, each wrapped in its reference here.
+    fn exact_tuple(&mut self, parts: &[InteriorPart], tys: &[PTy]) -> Result<PTy, &'static str> {
+        const FULL: &str = "the hidden types' table is full";
+        let mut elems: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(parts.len(), self.alloc);
+        for (p, &t) in parts.iter().zip(tys) {
+            elems.push(match p.wrap {
+                Some(m) => self.tys.intern(PNode::Ref(m, t)).map_err(|_| FULL)?,
+                None => t,
+            });
+        }
+        elems.sort_unstable();
+        elems.dedup();
+        let list = self.tys.intern_list(&elems).map_err(|_| FULL)?;
+        self.tys.intern(PNode::Tuple(list)).map_err(|_| FULL)
     }
 }
 
@@ -251,10 +295,15 @@ fn shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Box<str>
 
 /// Files `body`'s clean check `done` in `Store::hidden` when it defines an opaque. Called where
 /// a clean check's read list is filed (front2 body_reads.rs), so every clean check is filed
-/// once, the driver's and the work list's alike.
+/// once, the driver's and the work list's alike. Its async blocks' exact interiors are made
+/// here, only for a body that is filed (rule 77: exact_interior.rs).
 pub(crate) fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Body<'_>, done: &Checked<'_>) -> Result<(), CheckFail> {
     let owner = body.typeck.owner;
-    r.store.hidden.file_row(owner, &body.typeck.exprs, done).map_err(|f| gap(owner, f))
+    if !r.store.hidden.wants(owner, done) {
+        return Ok(());
+    }
+    let exacts = exact_interiors(r, body, done, Alloc::global()).map_err(|error| CheckFail::Check { owner, error })?;
+    r.store.hidden.file_row(owner, &body.typeck.exprs, done, exacts.as_ref()).map_err(|f| gap(owner, f))
 }
 
 /// After a round of `owner`'s check stopped with `error`: whether the round is to run again

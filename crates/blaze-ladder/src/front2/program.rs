@@ -707,11 +707,13 @@ impl<'n> Front2Program<'n> {
         // Each checked body's async blocks' state recipes, made with its check (coroutine_recipes.rs).
         let mut recipes: Vec<super::coroutine_recipes::RecipeRow, Global> = Vec::new_in(Global);
         for (m, scope) in mains.iter().zip(scopes.iter()) {
-            checked.push(match check_body(&mut records, m, scope) {
-                Ok(c) => {
-                    super::coroutine_recipes::recipes_of(&mut records, m.owner, &m.lowered.view(), &c, &mut recipes, blaze_own::Alloc::global());
-                    Some(c)
-                }
+            let done = check_body(&mut records, m, scope).and_then(|c| {
+                super::coroutine_recipes::recipes_of(&mut records, m, &c, &mut recipes, blaze_own::Alloc::global())
+                    .map_err(|error| CheckFail::Check { owner: m.owner, error })?;
+                Ok(c)
+            });
+            checked.push(match done {
+                Ok(c) => Some(c),
                 Err(e) => match left_out.as_deref_mut() {
                     Some(out) => {
                         let d = format!("{e:?}");
@@ -1420,6 +1422,15 @@ impl FrontEnd for Front2Program<'_> {
     /// By the library's `#[lang]` table, as [`super::langs::find`] reads a marked item.
     fn lang_named(&self, name: &str) -> Option<ItemKey> {
         self.front.index.lang(name).map(checker_of)
+    }
+
+    /// The Rust start the program was made with (start.rs [`super::start::Entry2::Rust`]);
+    /// `None` for every other start, and for a test unit's suite (no start).
+    fn rust_start(&self) -> Option<&super::start::RustStart> {
+        match &self.start {
+            Some(super::start::Entry2::Rust(s)) => Some(s),
+            _ => None,
+        }
     }
 
     /// From the rows made with each body's check (coroutine_recipes.rs).

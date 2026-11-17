@@ -315,6 +315,7 @@ name = "blaze-build"
 version = "0.0.0"
 dependencies = [
  "blaze-emit",
+ "blaze-flow-lower",
  "blaze-ids",
  "blaze-inproc",
  "blaze-lir",
@@ -411,6 +412,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-drive",
  "blaze-emit",
+ "blaze-expand",
  "blaze-fetch",
  "blaze-file-items",
  "blaze-h1",
@@ -1032,11 +1034,13 @@ name = "blaze-ladder"
 version = "0.0.0"
 dependencies = [
  "blaze-build",
+ "blaze-build-script",
  "blaze-code",
  "blaze-consteval",
  "blaze-core",
  "blaze-emit",
  "blaze-expand",
+ "blaze-export",
  "blaze-fetch",
  "blaze-file-items",
  "blaze-flow",
@@ -1049,6 +1053,7 @@ dependencies = [
  "blaze-lir",
  "blaze-lower",
  "blaze-mem",
+ "blaze-native",
  "blaze-own",
  "blaze-run",
  "blaze-scope",

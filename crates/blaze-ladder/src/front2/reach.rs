@@ -480,12 +480,17 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             }
         };
         let scope = body.scope(&spell);
-        let checked = match check_body(r, &body, &scope) {
+        // Each async block's state recipe is made with the check (coroutine_recipes.rs).
+        let done = check_body(r, &body, &scope).and_then(|c| {
+            super::coroutine_recipes::recipes_of(r, &body, &c, &mut census.recipes, blaze_own::Alloc::global())
+                .map_err(|error| CheckFail::Check { owner: body.owner, error })?;
+            Ok(c)
+        });
+        let checked = match done {
             Ok(mut c) => {
                 queue_targets(r, &scope, body.owner, &mut c, &mut queue);
                 census.fns.push((k, Reached::Checked));
                 needs.read(r, body.owner, Some(&body), &c, &mut queue, &mut census.fns);
-                super::coroutine_recipes::recipes_of(r, body.owner, &view, &c, &mut census.recipes, blaze_own::Alloc::global());
                 Some(c)
             }
             Err(e) => {

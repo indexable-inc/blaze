@@ -61,6 +61,7 @@ mod fn_traits;
 mod gat;
 mod holes;
 mod impl_const_params;
+mod infer_const_arg;
 mod lower_forms;
 mod mut_places;
 mod neg_unsigned;

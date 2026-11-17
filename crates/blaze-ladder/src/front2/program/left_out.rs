@@ -70,7 +70,7 @@ impl LeftOut {
                 Some(g) => (gap_split(r, g).into_boxed_str(), gap_at(g)),
                 None => (Box::default(), None),
             },
-            Front2Refusal::Check(CheckFail::Diags { owner, diags }) => (Box::default(), diags.first().map(|(_, range, _)| LeftAt::In { item: *owner, range: *range })),
+            Front2Refusal::Check(CheckFail::Diags { owner, diags, .. }) => (Box::default(), diags.first().map(|(_, range, _)| LeftAt::In { item: *owner, range: *range })),
             _ => (Box::default(), None),
         };
         LeftOut { class, split, whole, at, refusal }

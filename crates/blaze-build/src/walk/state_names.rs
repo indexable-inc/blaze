@@ -128,7 +128,9 @@ fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::ArgCopy(e)
         | Task::Repeat(e)
         | Task::FormatArgs(e)
-        | Task::Await(e) => Some(e),
+        | Task::Await(e)
+        | Task::Asm(e) => Some(e),
+        Task::AsmLabel { body, .. } => Some(body),
         Task::If { expr, .. }
         | Task::IfThen { expr, .. }
         | Task::IfElse { expr, .. }
@@ -151,6 +153,8 @@ fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::ShortEnd(_)
         | Task::InitAt { .. }
         | Task::DerefPlace
+        | Task::AsmLabelEnd(_)
+        | Task::AsmJoin(_)
         | Task::Ref => None,
     }
 }

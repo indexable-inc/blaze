@@ -16,7 +16,7 @@ use blaze_scope::resolve::{At, Names};
 use blaze_surface::ItemDetail;
 use blaze_typeck as tc;
 use blaze_typeck::{
-    AssocItem, AssocKind, AssocParent, Def, Fetch, FnSig, Hidden, ImplHeader, ItemKey, LangItem, Missing, Name, PTy, PTys, PathIdx, PathRes,
+    AssocItem, AssocKind, AssocParent, Def, Fetch, FnSig, Hidden, ImplHeader, ItemKey, LangItem, Missing, Name, PTy, PTys, PathIdx,
     Predicates, ScopeId, Seal, Shape, TraitDef, TypeAttrs, World,
 };
 
@@ -572,14 +572,17 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// the open item "attrs" in the README; answered empty as the old front end did.
     /// An enum's discriminant type ([`super::heads::discr_ty`]: `isize` with no primitive
     /// repr, else the repr's integer), from its made head; a struct or union has none to give.
+    /// A `#[repr(simd)]` struct is [`TypeAttrs::SIMD`] (intr-P9b: an `asm!` operand's vector
+    /// type, blaze-typeck asm.rs), from the same made repr (`ReprAttrs::simd`).
     /// A fn item's (the callee of a borrowed call, blaze-typeck rules/promote.rs): read from
-    /// its made head's text ([`super::fn_attrs::fn_type_attrs`], `#[rustc_promotable]`); a
-    /// ctor fn carries none. A fn's key is never asked for as an ADT (rung
-    /// x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
+    /// its made head's text ([`super::fn_attrs::fn_type_attrs`], `#[rustc_promotable]`,
+    /// `#[rustc_intrinsic]`, `#[target_feature]`); a ctor fn carries none. A fn's key is never
+    /// asked for as an ADT (rung x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
     fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {
             return Ok(match a.kind {
                 tc::AdtKind::Enum => TypeAttrs(0).with_discr(super::heads::discr_ty(a.repr)),
+                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD),
                 _ => TypeAttrs(0),
             });
         }

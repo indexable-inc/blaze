@@ -139,7 +139,8 @@ pub fn lay_state<A: Allocator + Clone>(
     scratch: Alloc<'_>,
     alloc: A,
 ) -> Result<Laid<A>, BuildError> {
-    let too_big = BuildError::UnsupportedSig { what: "a coroutine state past 4 GiB" };
+    // Built at each use: `BuildError` is not `Clone`.
+    let too_big = || BuildError::UnsupportedSig { what: "a coroutine state past 4 GiB" };
     let too_aligned = BuildError::UnsupportedSig { what: "a coroutine state field aligned past 2^31" };
     if needs_flag.len() != saved.len() {
         return Err(BuildError::Malformed { what: "a coroutine state's drop-flag rows not one per saved local" });
@@ -171,14 +172,14 @@ pub fn lay_state<A: Allocator + Clone>(
     for &i in order.iter() {
         let (size, align) = saved[i as usize];
         let here = align_up(at, align);
-        field[i as usize] = u32::try_from(here).map_err(|_| too_big)?;
-        at = here.checked_add(size).ok_or(too_big)?;
+        field[i as usize] = u32::try_from(here).map_err(|_| too_big())?;
+        at = here.checked_add(size).ok_or_else(too_big)?;
     }
     // The drop flags, a byte each, in recipe order.
     let mut flag: Vec<Option<u32>, A> = Vec::with_capacity_in(saved.len(), alloc);
     for &needs in needs_flag {
         if needs {
-            flag.push(Some(u32::try_from(at).map_err(|_| too_big)?));
+            flag.push(Some(u32::try_from(at).map_err(|_| too_big())?));
             at += 1;
         } else {
             flag.push(None);
@@ -188,7 +189,7 @@ pub fn lay_state<A: Allocator + Clone>(
     let align = env.1.max(region_align).max(tag_align);
     let size = align_up(tag_offset + (1u64 << tag_align), align);
     if size > u64::from(u32::MAX) {
-        return Err(too_big);
+        return Err(too_big());
     }
     // Every value below fits: `size` does; `points + 2` does, `tags` fit an i32 tag.
     let shape = StateShape { size: size as u32, align, tag_offset: tag_offset as u32, tag_ty };

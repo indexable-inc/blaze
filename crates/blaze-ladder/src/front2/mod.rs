@@ -52,6 +52,7 @@ pub(crate) mod coroutine_needs;
 pub mod coroutine_recipes;
 pub(crate) mod coroutines;
 pub mod dyn_ty;
+pub mod exact_interior;
 pub mod fill;
 pub mod fn_attrs;
 pub(crate) mod fmt_template;

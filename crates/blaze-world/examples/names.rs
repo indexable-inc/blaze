@@ -51,8 +51,14 @@ fn g() -> Alloc<'static> {
 mod owners {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
+    #[cfg(target_os = "macos")]
     use std::ffi::c_void;
+    #[cfg(target_os = "macos")]
     use std::sync::atomic::{AtomicPtr, Ordering};
+
+    /// Why `--owners` stops on other hosts: the zones are libmalloc's.
+    #[cfg(not(target_os = "macos"))]
+    const NEEDS_MACOS: &str = "--owners needs macOS: it counts the heap by libmalloc zone (malloc_create_zone)";
 
     /// The owners, by index: 0 is everything not tagged (the world, the graph, the counting).
     pub const NAMES: [&str; 5] = ["untagged (world, graph, counts, results' shells)", "a crate's own solve (its tables, expansions, its records)", "decoded dependency scopes (shared for the run)", "proc-macro runs (the runtime, produced tokens)", "source texts read to the heap"];
@@ -63,6 +69,7 @@ mod owners {
 
     #[repr(C)]
     #[derive(Default)]
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "made only by libmalloc's malloc_zone_statistics, on macOS"))]
     pub struct Stats {
         pub blocks_in_use: u32,
         pub size_in_use: usize,
@@ -70,6 +77,7 @@ mod owners {
         pub size_allocated: usize,
     }
 
+    #[cfg(target_os = "macos")]
     unsafe extern "C" {
         fn malloc_create_zone(start_size: usize, flags: u32) -> *mut c_void;
         fn malloc_zone_malloc(zone: *mut c_void, size: usize) -> *mut c_void;
@@ -79,6 +87,7 @@ mod owners {
         fn malloc_default_zone() -> *mut c_void;
     }
 
+    #[cfg(target_os = "macos")]
     static ZONES: [AtomicPtr<c_void>; 5] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 5];
 
     thread_local! {
@@ -86,11 +95,17 @@ mod owners {
     }
 
     /// Makes the zones (owner 0 keeps the default zone): before any owner is set.
+    #[cfg(target_os = "macos")]
     pub fn enable() {
         for zone in &ZONES[1..] {
             // SAFETY: `malloc_create_zone` takes a size hint and flags (0, 0) and returns a new zone.
             zone.store(unsafe { malloc_create_zone(0, 0) }, Ordering::Release);
         }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn enable() {
+        panic!("{NEEDS_MACOS}")
     }
 
     /// Sets this thread's owner, giving back the one before.
@@ -104,6 +119,13 @@ mod owners {
     }
 
     /// Each owner's statistics: `None` for one without its zone.
+    #[cfg(not(target_os = "macos"))]
+    pub fn stats() -> [Option<Stats>; 5] {
+        panic!("{NEEDS_MACOS}")
+    }
+
+    /// Each owner's statistics: `None` for one without its zone.
+    #[cfg(target_os = "macos")]
     pub fn stats() -> [Option<Stats>; 5] {
         let mut out = [None, None, None, None, None];
         for (at, zone) in ZONES.iter().enumerate() {
@@ -125,6 +147,7 @@ mod owners {
 
     pub struct ByOwner;
 
+    #[cfg(target_os = "macos")]
     fn zone() -> *mut c_void {
         let owner = OWNER.try_with(Cell::get).unwrap_or(0);
         ZONES[owner as usize].load(Ordering::Relaxed)
@@ -135,23 +158,29 @@ mod owners {
     // realloc call `free`/`realloc`, which find a block's zone.
     unsafe impl GlobalAlloc for ByOwner {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let z = zone();
-            if z.is_null() {
-                // SAFETY: the caller's layout, passed on.
-                return unsafe { System.alloc(layout) };
+            #[cfg(target_os = "macos")]
+            {
+                let z = zone();
+                if !z.is_null() {
+                    // SAFETY: `z` is a live zone; the size and alignment are the layout's.
+                    return unsafe { if layout.align() <= 16 { malloc_zone_malloc(z, layout.size()) } else { malloc_zone_memalign(z, layout.align(), layout.size()) }.cast() };
+                }
             }
-            // SAFETY: `z` is a live zone; the size and alignment are the layout's.
-            unsafe { if layout.align() <= 16 { malloc_zone_malloc(z, layout.size()) } else { malloc_zone_memalign(z, layout.align(), layout.size()) }.cast() }
+            // SAFETY: the caller's layout, passed on.
+            unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            let z = zone();
-            if z.is_null() || layout.align() > 16 {
-                // SAFETY: the caller's layout, passed on.
-                return unsafe { System.alloc_zeroed(layout) };
+            #[cfg(target_os = "macos")]
+            {
+                let z = zone();
+                if !z.is_null() && layout.align() <= 16 {
+                    // SAFETY: `z` is a live zone; one element of the layout's size.
+                    return unsafe { malloc_zone_calloc(z, 1, layout.size()).cast() };
+                }
             }
-            // SAFETY: `z` is a live zone; one element of the layout's size.
-            unsafe { malloc_zone_calloc(z, 1, layout.size()).cast() }
+            // SAFETY: the caller's layout, passed on.
+            unsafe { System.alloc_zeroed(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -259,7 +288,6 @@ fn layout(anchor: &FsPath) -> blaze_manifest::layout::Units<'static> {
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
 }
 
 /// A file mapped read-only and private for the rest of the run.
@@ -280,20 +308,64 @@ fn map(path: &FsPath) -> std::io::Result<&'static [u8]> {
     Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
-/// The lifetime peak `phys_footprint` (`rusage_info_v4`'s `ri_lifetime_max_phys_footprint`).
-fn max_footprint() -> u64 {
+/// The process's `rusage_info_v4` (libproc's `proc_pid_rusage`, flavor 4) as 64-bit words.
+#[cfg(target_os = "macos")]
+fn rusage_info() -> [u64; 40] {
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+    }
     let mut info = [0u64; 40];
     // SAFETY: flavor 4 writes one rusage_info_v4 (296 bytes), which the buffer outsizes.
     let ok = unsafe { proc_pid_rusage(std::process::id() as i32, 4, info.as_mut_ptr()) };
-    if ok == 0 { info[2 + 28] } else { 0 }
+    if ok != 0 {
+        panic!("proc_pid_rusage of this process: {}", std::io::Error::last_os_error());
+    }
+    info
+}
+
+/// The lifetime peak `phys_footprint` (`rusage_info_v4`'s `ri_lifetime_max_phys_footprint`).
+#[cfg(target_os = "macos")]
+fn max_footprint() -> u64 {
+    rusage_info()[2 + 28]
 }
 
 /// The footprint now (`rusage_info_v4`'s `ri_phys_footprint`, the eighth field after the uuid).
+#[cfg(target_os = "macos")]
 fn now_footprint() -> u64 {
-    let mut info = [0u64; 40];
-    // SAFETY: as `max_footprint`.
-    let ok = unsafe { proc_pid_rusage(std::process::id() as i32, 4, info.as_mut_ptr()) };
-    if ok == 0 { info[2 + 7] } else { 0 }
+    rusage_info()[2 + 7]
+}
+
+/// The lifetime peak resident set, in bytes: `getrusage(RUSAGE_SELF)`'s `ru_maxrss`, which
+/// Linux counts in kibibytes (as `blaze_core::process` reads a child's).
+#[cfg(target_os = "linux")]
+fn max_footprint() -> u64 {
+    /// `struct rusage` on 64-bit Linux: two 16-byte `timeval`s, then fourteen `long`s,
+    /// `ru_maxrss` first.
+    #[repr(C)]
+    struct Rusage {
+        _times: [i64; 4],
+        maxrss: i64,
+        _rest: [i64; 13],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut usage = Rusage { _times: [0; 4], maxrss: 0, _rest: [0; 13] };
+    // SAFETY: `Rusage` has `struct rusage`'s layout; `RUSAGE_SELF` is 0. The call writes it
+    // and does not keep it.
+    if unsafe { getrusage(0, &mut usage) } != 0 {
+        panic!("getrusage of this process: {}", std::io::Error::last_os_error());
+    }
+    usage.maxrss as u64 * 1024
+}
+
+/// The resident set now, in bytes: `/proc/self/status`'s `VmRSS`, in kibibytes.
+#[cfg(target_os = "linux")]
+fn now_footprint() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_else(|e| panic!("/proc/self/status: {e}"));
+    let line = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).unwrap_or_else(|| panic!("/proc/self/status has no VmRSS line"));
+    let kib = line.trim().strip_suffix("kB").map(str::trim).and_then(|n| n.parse::<u64>().ok());
+    kib.unwrap_or_else(|| panic!("/proc/self/status: VmRSS is not `<n> kB`: {line:?}")) * 1024
 }
 
 /// blaze-fetch's store folder: one file a record, `records/<hex of the key>`.

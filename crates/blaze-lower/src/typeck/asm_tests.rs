@@ -16,6 +16,9 @@
 //! `the_architecture_is_a_read_of_the_record` must fail: the x86-64 lowering records no read
 //! and its `u8` in `reg` is accepted.
 
+use std::vec;
+use std::vec::Vec as StdVec;
+
 use blaze_typeck::fixture::Fx;
 use blaze_typeck::{DiagCode, InferCtx, ItemKey, Needs, Outcome, PNode, PortableTys, TypeAttrs, UintTy, check};
 
@@ -53,14 +56,14 @@ impl Cfg for Arch {
 
 /// `text` lowered for `arch`, converted and checked as `owner` of `fx`: each finding as its
 /// code and the text at its range, and the record's `cfg` reads.
-fn check_for(fx: &Fx, owner: ItemKey, arch: &'static str, text: &'static str) -> (Vec<(DiagCode, &'static str)>, Vec<CfgRead>) {
+fn check_for(fx: &Fx, owner: ItemKey, arch: &'static str, text: &'static str) -> (StdVec<(DiagCode, &'static str)>, StdVec<CfgRead>) {
     let alloc = blaze_own::testing::heap().alloc();
     let lowered = match lower_body(text, Edition::E2024, &mut Arch(arch), &mut crate::NoModule, alloc) {
         Ok(l) => l,
         Err(need) => panic!("{text}: needs {:?}", need.atoms),
     };
     let view = lowered.view();
-    let reads: Vec<CfgRead> = view.cfg_reads().collect();
+    let reads: StdVec<CfgRead> =view.cfg_reads().collect();
     let mut tys = PortableTys::new_in(alloc);
     let body = match to_typeck(&view, owner, &mut tys, &mut NoWrittenTypes, alloc) {
         Ok(b) => b,
@@ -97,7 +100,7 @@ fn class_type_rules() {
     fx.set_attrs(v, TypeAttrs(TypeAttrs::SIMD));
     let v_ty = fx.adt(v, &[]);
     let unit = fx.unit();
-    let f = fx.func("f", 0, &[u64_, s_ty, v_ty], unit, Vec::new());
+    let f = fx.func("f", 0, &[u64_, s_ty, v_ty], unit, StdVec::new());
     fx.finish();
     let text = r#"fn f(a: u64, s: S, v: F64x2) { unsafe { builtin # asm("{} {} {}", in(reg) a, in(reg) s, in(vreg) v) } }"#;
     let (found, _) = check_for(&fx, f, "aarch64", text);
@@ -114,8 +117,8 @@ fn the_architecture_is_a_read_of_the_record() {
     let mut fx = Fx::new();
     let u8_ = fx.u8();
     let unit = fx.unit();
-    let g = fx.func("g", 0, &[u8_], unit, Vec::new());
-    let h = fx.func("h", 0, &[u8_], u8_, Vec::new());
+    let g = fx.func("g", 0, &[u8_], unit, StdVec::new());
+    let h = fx.func("h", 0, &[u8_], u8_, StdVec::new());
     fx.finish();
     let with_asm = r#"fn g(b: u8) { unsafe { builtin # asm("{}", in(reg) b) } }"#;
     let (a64, a64_reads) = check_for(&fx, g, "aarch64", with_asm);

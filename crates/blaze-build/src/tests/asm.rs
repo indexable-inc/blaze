@@ -71,7 +71,7 @@ fn quanta_cntvct() {
     let block = "asm a0 = options [nomem nostack] clobbers \"\" pieces [\"mrs \", {0}, \", cntvct_el0\"] operands [out class \"reg\" 0]";
     assert!(text.contains(block), "the block is not `{block}`:\n{text}");
     // The output is written to `t`: a store after the `asm` whose value is its result.
-    let stored = (asms[0] + 1..view.ops.len()).any(|i| view.op(i) == Op::Store && view.operands(i).values().first() == Some(&Value(asms[0] as u32)));
+    let stored = (asms[0] + 1..view.ops.len()).any(|i| view.op(i) == Op::Store && view.operands(i).values().iter().next() == Some(Value(asms[0] as u32)));
     assert!(stored, "the output is not stored to `t`:\n{text}");
     println!("asm \"mrs {{0}}, cntvct_el0\": one out(reg) output of i64, options [nomem nostack], stored to t");
 }

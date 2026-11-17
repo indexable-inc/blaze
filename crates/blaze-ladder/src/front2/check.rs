@@ -494,11 +494,52 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
         // E0425: the segment that named nothing, by its spelling (rule 19).
         Some(tc::Because::Path(miss)) => super::path_miss_shown::path_miss_shown(r, spell, d.name, miss),
         // Every goal's finding (E0277, E0283) carries `Unmet`; what is left is about a node, not a
-        // goal: its types and the name it looked up.
-        Some(other) => format!("because {other:?}, found {:?}, expected {:?}", ty(d.found), ty(d.expected)),
-        None => format!("found {:?}, expected {:?}, name {:?}", ty(d.found), ty(d.expected), d.name),
+        // goal: its reason by its content, then its types and the name it looked up, each only
+        // where the finding has it (diag-names-something-1: blaze-typeck builds no finding with
+        // nothing in it, so this never prints an empty one).
+        Some(other) => {
+            let why = match other {
+                tc::Because::False(k) => format!("the `where const` condition {} is false here", item_shown(r, k)),
+                tc::Because::Error(k) => format!("the `where const` condition {} did not evaluate", item_shown(r, k)),
+                tc::Because::Generic(k) => format!("the `where const` condition {} is over a generic parameter here", item_shown(r, k)),
+                tc::Because::Dyn { trait_, by, member, rule } => {
+                    let at = match member.map(|n| spell.get(n)) {
+                        Some(Ok(text)) => format!(" at `{text}`"),
+                        Some(Err(unspelled)) => format!(" at {unspelled:?}"),
+                        None => String::from(" (`Sized` is a supertrait)"),
+                    };
+                    format!("the trait {} is not dyn compatible: {} breaks {rule:?}{at}", item_shown(r, trait_), item_shown(r, by))
+                }
+                tc::Because::ArgCount { item, expected, got } => format!("{} takes {expected} generic arguments, {got} written", item_shown(r, item)),
+                tc::Because::Reference { rule, says } => format!("the Reference, `{rule}`: \"{says}\""),
+                tc::Because::Count { expected, got } => format!("{expected} wanted, {got} written"),
+                tc::Because::NoSegment => String::from("the path written here (the body keeps no segment of it to name)"),
+                tc::Because::Unmet { .. } | tc::Because::NoLangItem(_) | tc::Because::Path(_) => format!("{other:?}"),
+            };
+            node_about(Some(why), ty(d.found), ty(d.expected), spell, d.name)
+        }
+        None => node_about(None, ty(d.found), ty(d.expected), spell, d.name),
     };
     s.into_boxed_str()
+}
+
+/// A node's finding in words: its reason where it has one, then the type found, the type
+/// expected and the name looked up (by its spelling), each only where the finding holds it.
+/// A finding holding none of them is not built (blaze-typeck diag/about.rs); one met anyway
+/// is said to be empty, never printed as `None`s.
+fn node_about(why: Option<String>, found: Option<String>, expected: Option<String>, spell: &Spelling<'_>, name: Option<tc::Name>) -> String {
+    let mut parts: Vec<String, Global> = Vec::new_in(Global);
+    parts.extend(why);
+    parts.extend(found.map(|t| format!("found `{t}`")));
+    parts.extend(expected.map(|t| format!("expected `{t}`")));
+    parts.extend(name.map(|n| match spell.get(n) {
+        Ok(text) => format!("about `{text}`"),
+        Err(unspelled) => format!("about {unspelled:?} (a name the body does not spell)"),
+    }));
+    if parts.is_empty() {
+        return String::from("a finding with nothing in it (no reason, type or name: a checker bug)");
+    }
+    parts.join(", ")
 }
 
 /// The words a trait gives by `#[diagnostic::on_unimplemented]` for its bound unmet at `g`

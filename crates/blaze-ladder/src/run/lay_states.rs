@@ -32,7 +32,6 @@ use core::cell::Cell;
 use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state};
 use blaze_build::layout::{LayoutCx, Layouts};
 use blaze_build::{CoroutineOf, coroutine_identity, coroutines_in};
-use blaze_flow_lower::state_recipe::SavedLocal;
 use blaze_own::AVec;
 use blaze_typeck::BodyView;
 
@@ -65,11 +64,14 @@ fn refuse(function: Named, what: &'static str) -> RunError {
 
 /// Record type `t` of `owner`'s body `view` (table `record`) at the owner's ground arguments:
 /// an `async` block of that body still named by its expression is its identity (as blaze-build
-/// `Walk::ground_ty` makes it); `wrap` makes the reference the flow holds.
+/// `Walk::ground_ty` makes it); `wrap` makes the reference the flow holds (a saved local's
+/// `SavedLocal::wrap`; `None` for a type of the record itself).
+#[expect(clippy::too_many_arguments, reason = "the type, its wrap and the grounding's tables")]
 fn ground_saved(
     view: &BodyView<'_>,
     record: PTys<'_>,
-    saved: SavedLocal,
+    ty: PTy,
+    wrap: Option<Mutbl>,
     args: &[PTy],
     ground: &mut PortableTys<'_>,
     facts: &dyn LayoutFacts,
@@ -78,7 +80,7 @@ fn ground_saved(
     let full = |_| BuildError::Malformed { what: "the ground table is full" };
     // In its own body's record a block is named by its expression (`PNode::Future`); its
     // identity is `PNode::Coroutine` (blaze-build coroutine.rs), its output a fact of that.
-    let own = match record.node(saved.ty) {
+    let own = match record.node(ty) {
         Ok(PNode::Future(e, ..)) => Some(e),
         _ => None,
     };
@@ -91,9 +93,9 @@ fn ground_saved(
             let list = ground.intern_list(args).map_err(full)?;
             coroutine_identity(ground, view.owner, ordinal, list)?
         }
-        None => blaze_build::ground(record, saved.ty, args, ground, scratch, facts)?,
+        None => blaze_build::ground(record, ty, args, ground, scratch, facts)?,
     };
-    match saved.wrap {
+    match wrap {
         None => Ok(g),
         Some(m) => ground.intern(PNode::Ref(m, g)).map_err(full),
     }
@@ -123,7 +125,7 @@ pub(super) fn roots_of_instance<P: FrontEnd>(
     tys.dedup();
     let mut roots: AVec<'_, PTy> = AVec::new_in(alloc);
     for &t in tys.iter() {
-        if let Ok(g) = ground_saved(&view, record, SavedLocal { ty: t, wrap: None }, args, ground, adts.facts(), alloc) {
+        if let Ok(g) = ground_saved(&view, record, t, None, args, ground, adts.facts(), alloc) {
             roots.push(g);
         }
     }
@@ -317,7 +319,7 @@ fn held_types<P: FrontEnd>(
     out.push(blaze_build::ground(facts.types, facts.env, &args, ground, alloc, adts.facts())?);
     let record = done.types.view();
     for &s in recipe.saved.iter() {
-        out.push(ground_saved(&view, record, s, &args, ground, adts.facts(), alloc)?);
+        out.push(ground_saved(&view, record, s.ty, s.wrap, &args, ground, adts.facts(), alloc)?);
     }
     Ok(out)
 }

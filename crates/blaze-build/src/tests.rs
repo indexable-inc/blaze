@@ -45,6 +45,10 @@ struct BodyBuf {
     pat_strs: Vec<(PatId, &'static str), Global>,
     /// Struct patterns' `name: pat` fields (`BodyView::field_pats`).
     field_pats: Vec<FieldPat, Global>,
+    /// `asm!`s' template pieces, operands and text (`BodyView::asm_*`; tests/asm.rs).
+    asm_pieces: Vec<blaze_typeck::AsmPiece, Global>,
+    asm_operands: Vec<blaze_typeck::AsmOperand, Global>,
+    asm_text: &'static str,
 }
 
 impl BodyBuf {
@@ -69,6 +73,9 @@ impl BodyBuf {
             strs: Vec::new_in(Global),
             pat_strs: Vec::new_in(Global),
             field_pats: Vec::new_in(Global),
+            asm_pieces: Vec::new_in(Global),
+            asm_operands: Vec::new_in(Global),
+            asm_text: "",
         }
     }
 
@@ -220,10 +227,10 @@ impl BodyBuf {
             fmt_uses: &[],
             coroutine: None,
             super_lets: &[],
-            asm_pieces: &[],
-            asm_operands: &[],
+            asm_pieces: &self.asm_pieces,
+            asm_operands: &self.asm_operands,
             asm_clobbers: &[],
-            asm_text: "",
+            asm_text: self.asm_text,
         }
     }
 }
@@ -835,6 +842,20 @@ fn build_instance(
     args: &[PTy],
     ground: &mut PortableTys<'static>,
 ) -> Result<Built<Global>, String> {
+    build_instance_refusing(world, body, owner, root, args, ground, &[])
+}
+
+/// [`build_instance`], with the ops `refused` the baseline tier is expected to refuse
+/// ([`emits`]; tests/asm.rs: `asm` goes to the Optimized tier).
+fn build_instance_refusing(
+    world: &TestWorld,
+    body: &BodyBuf,
+    owner: ItemKey,
+    root: ExprId,
+    args: &[PTy],
+    ground: &mut PortableTys<'static>,
+    refused: &[blaze_lir::Op],
+) -> Result<Built<Global>, String> {
     let view = body.view(owner, root);
     let mut ty = InferCtx::new_in(Alloc::global());
     let checked = match blaze_typeck::check(&view, world, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
@@ -850,7 +871,7 @@ fn build_instance(
     let built = crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world, body }, Global)
         .map_err(|error| format!("the build failed: {error}"))?;
     blaze_lir::verify(built.func.view()).map_err(|error| format!("does not verify: {error}"))?;
-    emits(&built, &[]);
+    emits(&built, refused);
     Ok(built)
 }
 
@@ -3501,6 +3522,7 @@ mod wide;
 mod halfquad;
 mod index;
 mod fmt;
+mod asm;
 mod coroutines;
 mod coroutine_held;
 mod coroutine_id_agree;

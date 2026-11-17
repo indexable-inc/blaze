@@ -35,11 +35,6 @@ impl LoadItems<'static> for OneItems {
     fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<&'static str> {
         None
     }
-
-    /// No texts, so no origins.
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'static [u8]> {
-        None
-    }
 }
 
 /// A virtual workspace of two members: `filed`, whose lib is `pub mod m { pub fn f() {} }`, and

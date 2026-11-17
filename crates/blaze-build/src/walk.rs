@@ -29,6 +29,7 @@ pub(crate) use closure::{build_fn_shim, closures_in};
 pub(crate) mod coroutine;
 
 pub(crate) mod arith_checks;
+mod asm;
 mod c_variadic;
 mod casts;
 mod const_scalar;
@@ -414,6 +415,14 @@ enum Task {
     FormatArgs(ExprId),
     /// The poll loop of `.await` `e`, its operand's value on top (coroutine.rs `await_poll`).
     Await(ExprId),
+    /// Build `asm!` `e` from its operands' values and places on top (walk/asm.rs `asm_done`).
+    Asm(ExprId),
+    /// An `asm!`'s `label` block `block`: its body `body`, then a jump to `join`.
+    AsmLabel { block: Block, body: ExprId, join: Block },
+    /// The end of an `asm!`'s label block: its value dropped, a jump to the join.
+    AsmLabelEnd(Block),
+    /// The code after an `asm!` with `label` operands, at its join.
+    AsmJoin(Block),
 }
 
 struct Walk<'x, 'c, 't, A: Allocator + Clone> {
@@ -2387,13 +2396,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 Expr::Closure { body: c, .. } => kids.push((c, true)),
                 Expr::FormatArgs { args, .. } => kids.extend(list(args)?.iter().map(|&c| (c, false))),
-                Expr::Asm { operands, .. } => {
-                    let ops = body.asm_operands.get(operands.range()).ok_or(malformed("an `asm!`'s operands past `asm_operands`"))?;
-                    for o in ops {
-                        kids.push((o.expr, false));
-                        kids.extend(o.out_expr.map(|c| (c, false)));
-                    }
-                }
+                Expr::Asm { operands, .. } => asm::asm_kids(body, operands, &mut kids)?,
                 Expr::Await(c) => kids.push((c, false)),
                 Expr::AsyncBlock { body: c, .. } => kids.push((c, true)),
                 Expr::Underscore | Expr::OffsetOf { .. } => {}
@@ -3531,6 +3534,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::Repeat(e) => self.repeat(e)?,
             Task::FormatArgs(e) => self.format_args_done(e)?,
             Task::Await(e) => self.await_poll(e)?,
+            Task::Asm(e) => self.asm_done(e)?,
+            Task::AsmLabel { block, body, join } => self.asm_label(block, body, join),
+            Task::AsmLabelEnd(join) => self.asm_label_end(join)?,
+            Task::AsmJoin(join) => self.asm_join(join),
             Task::Ref => {
                 let v = match self.pop()? {
                     // A borrow of an unsized place is the wide pointer that reached it.
@@ -4585,7 +4592,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // coroutine.rs: the operand, then `Task::Await`; the state, its tag `Unresumed`.
             Expr::Await(operand) => self.await_operand(e, operand)?,
             Expr::AsyncBlock { .. } => self.coroutine_value(e)?,
-            Expr::Asm { .. } => return Err(unsupported(e, "inline assembly (`asm!` to LIR is INTRINSICS.md P10)")),
+            // walk/asm.rs: the operands' values and places, then `Task::Asm`.
+            Expr::Asm { .. } => self.asm_operands(e)?,
             // `_ = e` is built by its assignment (walk/discard.rs); `_` anywhere else is the
             // check's `UnderscoreExpr` error.
             Expr::Underscore => return Err(malformed("`_` outside the whole left side of an assignment (the check's `UnderscoreExpr`)")),

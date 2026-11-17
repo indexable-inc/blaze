@@ -16,6 +16,7 @@ use blaze_flow_lower::{Refusal, lower_async};
 use blaze_own::Alloc;
 use blaze_typeck as tc;
 
+use super::body::Body;
 use super::borrows::{BorrowLangs, gather_facts};
 use super::borrows_nested::NestedFacts;
 use super::check::Records;
@@ -25,26 +26,31 @@ use super::source::NamesSource;
 /// or why the block's flow was refused.
 pub type RecipeRow = (tc::ItemKey, u32, Result<StateRecipe<Global>, Refusal>);
 
-/// Appends to `rows` the recipe of every async block of `owner`'s body `view`, checked as
-/// `done`. A body with no async block asks nothing (no facts gathered: rule 77).
+/// Appends to `rows` the recipe of every async block of `body`, checked as `done`, read over
+/// the body's types as its check read them (`body.tys` with the store's table: exact_interior.rs
+/// does the same). A body with no async block asks nothing (no facts gathered: rule 77). Refused
+/// only when the body's type table does not read, as the check would have refused it.
 pub fn recipes_of<'n, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
-    owner: tc::ItemKey,
-    view: &tc::BodyView<'_>,
+    body: &Body<'_>,
     done: &tc::Checked<'_>,
     rows: &mut Vec<RecipeRow, Global>,
     alloc: Alloc<'_>,
-) {
-    if blaze_build::coroutines_in(view).next().is_none() {
-        return;
+) -> Result<(), tc::CheckError> {
+    if !body.typeck.exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. })) {
+        return Ok(());
     }
+    let owner = body.typeck.owner;
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts(r, owner, done, langs, alloc);
     let nested = NestedFacts::new(&facts);
-    for (ordinal, block) in blaze_build::coroutines_in(view) {
-        let recipe = lower_async(view, done, block, &nested, alloc).and_then(|lowered| state_recipe(view, &lowered, Global));
+    let tys = body.tys.view(&r.store.tys)?;
+    let view = body.typeck.view(tys);
+    for (ordinal, block) in blaze_build::coroutines_in(&view) {
+        let recipe = lower_async(&view, done, block, &nested, alloc).and_then(|lowered| state_recipe(&view, &lowered, Global));
         rows.push((owner, ordinal, recipe));
     }
+    Ok(())
 }
 
 /// `rows` sorted by (owner, ordinal) for [`find`].
