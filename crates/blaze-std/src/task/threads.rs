@@ -1,10 +1,14 @@
 //! The `Threads` layout (std.md, "`Threads`: the runtime of every bstd program"): a
 //! thread-per-core pool that every bstd program, and the compiler's driver, runs its tasks on.
 //!
-//! - **Workers.** One OS thread per core the [`Topology`] names, started and stopped by
-//!   `crate::rt` (the only module that names std's threads); this module is the pool's state
-//!   and each worker's loop ([`Pool::work`]), with no thread, clock or kernel of its own but the
-//!   `Parker` each worker sleeps on and the clock passed in.
+//! - **Workers.** At most one OS thread per core the [`Topology`] names, started and stopped
+//!   by `crate::rt` (the only module that names std's threads); this module is the pool's
+//!   state and each worker's loop ([`Pool::work`]), with no thread, clock or kernel of its own
+//!   but the `Parker` each worker sleeps on and the clock passed in. A worker's thread starts
+//!   when a wake first reaches it ([`Pool::rouse`]), not with the pool: a wake tries the
+//!   started workers first ([`Pool::wake_order`]), so a command with k tasks runnable at once
+//!   starts about k threads, not one a core (bottom.md section 9, "Workers start in
+//!   proportion to queued work").
 //! - **Queues** (all bounded, never grown: std.md's backpressure rule). Each worker has a
 //!   one-task LIFO slot that only it reads, a Chase-Lev deque of [`DEQUE`] slots
 //!   (task/deque.rs) that the others steal from, a mailbox `must_overlap` hands a reserved
@@ -157,13 +161,16 @@ impl Plants {
     pub(crate) const NONE: Plants = Plants { deque: DequePlant::None, idle: IdlePlant::None, find: FindPlant::None };
 }
 
-/// A planted bug in [`Pool::find`]'s class order (threads/find_tests.rs's control).
+/// A planted bug in [`Pool::find`]'s order (threads/find_tests.rs's controls).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FindPlant {
     None,
     /// A foreground worker looks at its group's background queue before the foreground one.
     #[cfg_attr(not(test), expect(dead_code, reason = "the test's control"))]
     BackgroundFirst,
+    /// A thief tries the next group's deques before its own group's.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the test's control"))]
+    FarFirst,
 }
 
 #[cfg(all(test, not(blaze_check)))]
@@ -540,6 +547,8 @@ struct Worker {
     /// The task it runs now, for a stop's report: written by this worker alone at each task's
     /// start and end, with no lock (task/seat.rs `Current`).
     current: Current,
+    /// Its thread was started: set once, by the compare-and-swap of [`Pool::rouse`].
+    thread: AtomicBool,
     /// Its thread left its loop.
     exited: AtomicBool,
     /// Why its loop stopped early (a park the kernel refused): reported at the pool's stop.
@@ -597,11 +606,12 @@ struct Lazy {
     read: Option<Reader>,
     plants: Plants,
     clock: Monotonic,
-    /// Whether the threads were asked for: set once, by the first spawn ([`Pool::begin`]).
-    begun: AtomicBool,
-    /// What starts the threads: the driver's (rt.rs), called once by the first spawn.
+    /// What starts a worker's thread: the driver's (rt.rs), called once a worker, by the first
+    /// wake that reaches it ([`Pool::rouse`]).
     starter: Starter,
-    /// How many workers have left their loops: the last one wakes [`Lazy::stopper`].
+    /// How many workers' threads were started: what a stop waits to see leave.
+    started: AtomicU32,
+    /// How many workers have left their loops: the last started one wakes [`Lazy::stopper`].
     left: AtomicU32,
     /// Where a stop waits for the last worker to leave.
     stopper: Parker,
@@ -622,9 +632,9 @@ impl Drop for Lazy {
     }
 }
 
-/// Starts a pool's threads, from the first spawn on it (the caller's thread): the driver's,
-/// since threads are Rust std's (rt.rs). Each thread runs [`Pool::work`] for its worker.
-pub(crate) type Starter = fn(&Pool);
+/// Starts worker `at`'s thread, from the first wake that reaches it (the waker's thread): the
+/// driver's, since threads are Rust std's (rt.rs). The thread runs [`Pool::work`] for `at`.
+pub(crate) type Starter = fn(&Pool, u32);
 
 /// Reads the machine's topology for a pool, when it is first asked about its workers: the
 /// driver's (rt.rs). It returns the topology or stops the process naming why.
@@ -678,8 +688,8 @@ pub(crate) struct Full(pub(crate) JobPtr);
 
 impl Pool {
     /// The pool of `topology`, its tables made now and no thread of it started: `starter`
-    /// starts them at the first spawn, and until it has, every worker is parked (task/idle.rs,
-    /// "A worker whose thread has not started is parked"). A test's pool.
+    /// starts each worker's at the first wake that reaches it, and until then the worker is
+    /// parked (task/idle.rs, "A worker whose thread has not started is parked"). A test's pool.
     pub(crate) fn new(topology: &Topology, clock: Monotonic, plants: Plants, starter: Starter) -> Pool {
         let made = Box::into_raw_with_allocator(Box::new_in(Pool::make(topology, plants), Global)).0;
         Pool::with(AtomicPtr::new(made), None, clock, plants, starter)
@@ -688,7 +698,7 @@ impl Pool {
     /// The pool of the machine `read` reads, nothing of it made: the topology is read and the
     /// tables made when it is first asked about its workers (a scope's layout, a spawn), and
     /// its threads start at the first spawn. A program that does neither reads no topology,
-    /// makes no table and starts no thread.
+    /// makes no table and starts no thread, and one that spawns k tasks at once starts about k.
     pub(crate) fn lazy(read: Reader, clock: Monotonic, plants: Plants, starter: Starter) -> Pool {
         Pool::with(AtomicPtr::new(ptr::null_mut()), Some(read), clock, plants, starter)
     }
@@ -699,8 +709,8 @@ impl Pool {
             read,
             plants,
             clock,
-            begun: AtomicBool::new(false),
             starter,
+            started: AtomicU32::new(0),
             left: AtomicU32::new(0),
             stopper: Parker::new(),
             #[cfg(test)]
@@ -769,6 +779,7 @@ impl Pool {
                     group: at,
                     class: group.class,
                     current: Current::new(),
+                    thread: AtomicBool::new(false),
                     exited: AtomicBool::new(false),
                     broken: Lock::new("bstd.task.broken", None),
                     stole_near: AtomicU64::new(0),
@@ -795,16 +806,32 @@ impl Pool {
         }
     }
 
-    /// The threads are started if they were not: the first caller, of any thread, calls the
-    /// starter, once (the compare-and-swap); every other returns at once. A task published
-    /// after this, before the threads run, waits as for a parked worker (task/idle.rs).
-    pub(crate) fn begin(&self) {
-        let lazy = &*self.0;
-        if lazy.begun.load(Ordering::Acquire) {
+    /// Unparks worker `at`, whose mark a wake has just moved out of `Parked` (to `Searching` or
+    /// `Reserved`), and starts its thread if it has none: the first caller for that worker, of
+    /// any thread, calls the starter, once (the compare-and-swap); every other only unparks.
+    /// The unpark comes first and is a token, so a thread started after it, or still starting,
+    /// finds its wake: its first act reads the mark as after a park (task/idle.rs).
+    fn rouse(&self, at: usize) {
+        let worker = &self.shared().workers[at].0;
+        worker.parker.unpark();
+        if worker.thread.load(Ordering::Acquire) {
             return;
         }
-        if lazy.begun.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            (lazy.starter)(self);
+        if worker.thread.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            self.0.started.fetch_add(1, Ordering::AcqRel);
+            (self.0.starter)(self, u32::try_from(at).unwrap_or(u32::MAX));
+        }
+    }
+
+    /// Starts every worker's thread that has none, now: a test's pool, which then waits for
+    /// all of them to park. Each is still parked until a wake reaches it.
+    pub(crate) fn start_all(&self) {
+        for at in 0..self.shared().workers.len() {
+            let worker = &self.shared().workers[at].0;
+            if worker.thread.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                self.0.started.fetch_add(1, Ordering::AcqRel);
+                (self.0.starter)(self, u32::try_from(at).unwrap_or(u32::MAX));
+            }
         }
     }
 
@@ -815,21 +842,18 @@ impl Pool {
         self.shared().pin.then_some((worker.cpu, worker.class))
     }
 
-    /// Whether the threads were asked for ([`Pool::begin`]).
-    pub(crate) fn begun(&self) -> bool {
-        self.0.begun.load(Ordering::Acquire)
+    /// How many workers' threads were started: for a test.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> u32 {
+        self.0.started.load(Ordering::Acquire)
     }
 
-    /// Waits until every worker has left its loop, or `until` on the pool's clock: whether all
-    /// have. The last to leave unparks this wait; a pool whose threads never began has none
-    /// to wait for. One thread waits at a time (the stop's).
+    /// Waits until every started worker has left its loop, or `until` on the pool's clock:
+    /// whether all have. The last to leave unparks this wait; a pool that started no thread has
+    /// none to wait for. One thread waits at a time (the stop's).
     pub(crate) fn wait_left(&self, until: Deadline) -> Result<bool, WaitError> {
         let lazy = &*self.0;
-        if !self.begun() {
-            return Ok(true);
-        }
-        let count = self.shared().workers.len();
-        while lazy.left.load(Ordering::Acquire) as usize != count {
+        while lazy.left.load(Ordering::Acquire) != lazy.started.load(Ordering::Acquire) {
             if until.passed(lazy.clock.now()) {
                 return Ok(false);
             }
@@ -857,7 +881,6 @@ impl Pool {
     /// is a worker and the task is foreground, else onto an injection queue; then at most one
     /// worker woken. `Err` when the queue is full: the caller runs it inline.
     pub(crate) fn spawn(&self, here: Here, class: Class, job: JobPtr) -> Result<(), Full> {
-        self.begin();
         let shared = self.shared();
         let near = match (here, class) {
             (Here::Worker(at), Class::Foreground) => {
@@ -933,47 +956,57 @@ impl Pool {
     }
 
     /// After a task is published: wakes at most one parked worker, its group `near` first,
-    /// when no worker is searching (task/idle.rs).
+    /// when no worker is searching (task/idle.rs), and starts its thread if it has none.
     fn notify(&self, near: u32) {
         let shared = self.shared();
-        let groups = shared.groups.len();
-        let order = (0..groups).flat_map(move |step| {
-            let group = &shared.groups[(near as usize + step) % groups];
-            (group.first..group.first + group.len).map(|at| (at as usize, &shared.workers[at as usize].0.mark))
-        });
+        let order = self.wake_order(near).map(|at| (at as usize, &shared.workers[at as usize].0.mark));
         if let Some(at) = shared.idle.wake_one(order) {
-            shared.workers[at].0.parker.unpark();
+            self.rouse(at);
         }
     }
 
+    /// The workers a wake from group `near` tries, in order: those whose threads are started,
+    /// the groups from `near` on, then those not started, in the same order. So a wake starts a
+    /// thread only when no started worker is parked, and the threads started stay about as
+    /// many as the tasks runnable at once, however many groups the machine has (a machine
+    /// whose sysfs names only per-core caches is a group a core).
+    fn wake_order(&self, near: u32) -> impl Iterator<Item = u32> + '_ {
+        let shared = self.shared();
+        let groups = shared.groups.len();
+        let all = move || {
+            (0..groups).flat_map(move |step| {
+                let group = &shared.groups[(near as usize + step) % groups];
+                group.first..group.first + group.len
+            })
+        };
+        let started = move |at: &u32| shared.workers[*at as usize].0.thread.load(Ordering::Acquire);
+        all().filter(started).chain(all().filter(move |at| !started(at)))
+    }
+
     /// `must_overlap`: hands `job` to a worker that is idle now (searching or parked), not
-    /// `here`, its own group first, which starts it next. `Err` when none is.
+    /// `here`, in [`Pool::wake_order`] (started ones, its own group first), which starts it
+    /// next. `Err` when none is.
     pub(crate) fn reserve(&self, here: Here, job: JobPtr) -> Result<u32, JobPtr> {
-        self.begin();
         let shared = self.shared();
         let (near, me) = match here {
             Here::Worker(at) => (shared.workers[at as usize].0.group, Some(at)),
             Here::Outside => (0, None),
         };
-        let groups = shared.groups.len();
-        for step in 0..groups {
-            let group = &shared.groups[(near as usize + step) % groups];
-            for at in group.first..group.first + group.len {
-                let worker = &shared.workers[at as usize].0;
-                if Some(at) == me || !shared.idle.idle(&worker.mark) {
-                    continue;
-                }
-                // The mailbox first, so no two reservers fill one; the reservation's
-                // compare-and-swap then publishes it.
-                if worker.mailbox.compare_exchange(ptr::null_mut(), job.0.as_ptr(), Ordering::Relaxed, Ordering::Relaxed).is_err() {
-                    continue;
-                }
-                if shared.idle.reserve(&worker.mark) {
-                    worker.parker.unpark();
-                    return Ok(at);
-                }
-                worker.mailbox.store(ptr::null_mut(), Ordering::Relaxed);
+        for at in self.wake_order(near) {
+            let worker = &shared.workers[at as usize].0;
+            if Some(at) == me || !shared.idle.idle(&worker.mark) {
+                continue;
             }
+            // The mailbox first, so no two reservers fill one; the reservation's
+            // compare-and-swap then publishes it.
+            if worker.mailbox.compare_exchange(ptr::null_mut(), job.0.as_ptr(), Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                continue;
+            }
+            if shared.idle.reserve(&worker.mark) {
+                self.rouse(at as usize);
+                return Ok(at);
+            }
+            worker.mailbox.store(ptr::null_mut(), Ordering::Relaxed);
         }
         Err(job)
     }
@@ -981,7 +1014,6 @@ impl Pool {
     /// A task that must run on worker `at` (a fold's visit): onto its pinned queue, and it
     /// woken if parked. `Err` when the queue is full.
     pub(crate) fn spawn_on(&self, at: u32, job: JobPtr) -> Result<(), Full> {
-        self.begin();
         let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
         {
@@ -992,7 +1024,7 @@ impl Pool {
             worker.pinned_count.fetch_add(1, Ordering::Release);
         }
         if shared.idle.wake_this(&worker.mark) {
-            worker.parker.unpark();
+            self.rouse(at as usize);
         }
         Ok(())
     }
@@ -1213,7 +1245,7 @@ impl Pool {
             searching = woke == Woke::Searching;
         }
         worker.exited.store(true, Ordering::Release);
-        if self.0.left.fetch_add(1, Ordering::AcqRel) as usize + 1 == shared.workers.len() {
+        if self.0.left.fetch_add(1, Ordering::AcqRel) + 1 == self.0.started.load(Ordering::Acquire) {
             self.0.stopper.unpark();
         }
     }
@@ -1238,8 +1270,8 @@ impl Pool {
             return Some(job);
         }
         let classes = match (worker.class, self.0.plants.find) {
-            (Class::Foreground, FindPlant::None) => [Class::Foreground, Class::Background],
             (Class::Foreground, FindPlant::BackgroundFirst) => [Class::Background, Class::Foreground],
+            (Class::Foreground, FindPlant::None | FindPlant::FarFirst) => [Class::Foreground, Class::Background],
             (Class::Background, _) => [Class::Background, Class::Foreground],
         };
         if let Some(job) = take(own, classes[0]) {
@@ -1253,8 +1285,11 @@ impl Pool {
         }
         let groups = shared.groups.len();
         let me = worker.group as usize;
+        // The planted control starts one group on: the thief's own group comes last.
+        let first = usize::from(self.0.plants.find == FindPlant::FarFirst);
         for step in 0..groups {
-            let group = &shared.groups[(me + step) % groups];
+            let at_group = (me + first + step) % groups;
+            let group = &shared.groups[at_group];
             // Start past the thief in its own group, so thieves spread over victims.
             for k in 0..group.len {
                 let victim = group.first + (at + 1 + k) % group.len;
@@ -1263,14 +1298,14 @@ impl Pool {
                 }
                 match shared.workers[victim as usize].0.deque.steal_half_into(&worker.deque) {
                     Steal::Taken(job) => {
-                        let counter = if step == 0 { &worker.stole_near } else { &worker.stole_far };
+                        let counter = if at_group == me { &worker.stole_near } else { &worker.stole_far };
                         counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
                         return Some(JobPtr(job));
                     }
                     Steal::Empty | Steal::Lost => {}
                 }
             }
-            if step != 0
+            if at_group != me
                 && let Some(job) = take(group, classes[0])
             {
                 return Some(job);
@@ -1308,11 +1343,15 @@ impl Pool {
     }
 
     /// The workers left running after a stop, or broken, by worker: `None` when there are none.
+    /// A worker whose thread never started ran nothing and is not one.
     pub(crate) fn hung(&self) -> Option<Hung> {
         let mut stuck = Vec::new_in(Global);
         let Some(shared) = self.made() else { return None };
         for (at, worker) in shared.workers.iter().enumerate() {
             let at = u32::try_from(at).unwrap_or(u32::MAX);
+            if !worker.0.thread.load(Ordering::Acquire) {
+                continue;
+            }
             let broken = worker.0.broken.lock().take();
             if broken.is_some() || !worker.0.exited.load(Ordering::Acquire) {
                 let task = match worker.0.current.read() {

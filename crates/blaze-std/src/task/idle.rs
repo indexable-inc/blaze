@@ -15,11 +15,13 @@
 //! ```
 //!
 //! **A worker whose thread has not started is parked** ([`Idle::unstarted`]): the pool starts
-//! its threads at the first spawn, not at its own making, and every worker's mark begins at
-//! `Parked`, counted. A spawn's wake moves one to `Searching`, a `must_overlap` to `Reserved`,
-//! with an unpark token kept for it; the thread's first act is [`Idle::back`], the step after
-//! a park. So a task published before the worker's thread exists is found as one published
-//! while it slept: no wake is lost and the protocol has no fifth state.
+//! a worker's thread when a wake first reaches it, not at its own making, and every worker's
+//! mark begins at `Parked`, counted. A spawn's wake moves one to `Searching`, a `must_overlap`
+//! to `Reserved`, with an unpark token kept for it, and then the waker starts its thread if it
+//! has none (`Pool::rouse`, once a worker by a compare-and-swap); the thread's first act is
+//! [`Idle::back`], the step after a park. A wake's order puts the started workers first
+//! (`Pool::wake_order`), so a new thread starts only when no started worker is parked. So a task published before the worker's thread exists is found
+//! as one published while it slept: no wake is lost and the protocol has no fifth state.
 //!
 //! Every move out of `Searching` or `Parked` is a compare-and-swap, since another thread may
 //! move it to `Reserved` at the same moment; a move out of `Busy` or `Reserved` is the worker's
@@ -242,9 +244,9 @@ impl Idle {
 /// Under the model checker (`RUSTFLAGS="--cfg blaze_check" cargo test -p blaze-std --release
 /// model_idle`): a worker that finds nothing goes to sleep while a spawner publishes a task and
 /// wakes; the worker never sleeps through the task (the model reports a deadlock if it does).
-/// The control drops the spawner's fence. And the lazy start (`model_lazy_start`): two first
-/// spawns at once on a worker whose thread does not exist yet start it once and lose neither
-/// task; the control begins without the compare-and-swap.
+/// The control drops the spawner's fence. And the lazy start (`model_lazy_start`): two wakers
+/// at once on a worker whose thread does not exist yet start it once and lose neither task;
+/// the control starts it without the compare-and-swap.
 #[cfg(all(test, blaze_check))]
 mod model {
     use std::{
@@ -300,12 +302,12 @@ mod model {
         worker.join().expect("the worker ends");
     }
 
-    /// The control of the lazy start: how the pool is begun.
+    /// The control of the lazy start: how a waker starts the worker's thread.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Begin {
-        /// A compare-and-swap of `begun`, as `Pool::begin` (task/threads.rs).
+        /// A compare-and-swap of the worker's `thread`, as `Pool::rouse` (task/threads.rs).
         Once,
-        /// A load, then a store: two first spawns can both start the thread.
+        /// A load, then a store: two wakers can both start the thread.
         Racy,
     }
 
@@ -382,8 +384,15 @@ mod model {
         *world.handle.lock().expect("the handle's slot") = Some(handle);
     }
 
-    /// A spawn, as `Pool::spawn`: begin, publish, wake.
+    /// A spawn, as `Pool::spawn` then `Pool::rouse`: publish, wake (the unpark's token), then
+    /// start the thread if it has none. Both spawners rouse: one stands for a spawn whose wake
+    /// reached the worker, the other for a second wake of it before its thread runs (a
+    /// `must_overlap`'s reservation moves a searching mark too), so the start races itself.
     fn spawn(world: &Arc<Lazy>) {
+        world.tasks.fetch_add(1, Ordering::SeqCst);
+        if world.idle.wake_one([(0, &world.mark)].into_iter()).is_some() {
+            unpark(world);
+        }
         match world.begin {
             Begin::Once => {
                 if !world.begun.load(Ordering::Acquire)
@@ -398,10 +407,6 @@ mod model {
                     start(world);
                 }
             }
-        }
-        world.tasks.fetch_add(1, Ordering::SeqCst);
-        if world.idle.wake_one([(0, &world.mark)].into_iter()).is_some() {
-            unpark(world);
         }
     }
 
@@ -448,6 +453,246 @@ mod model {
             .or_else(|| report.downcast_ref::<&'static str>().copied())
             .expect("the model's report is text");
         assert!(text.contains("started other than once"), "the model found something else: {text}");
+    }
+
+    /// What the pool model plants (rule 53), each the removal of one safeguard of the lazy
+    /// worker start (task/threads.rs, `Pool::rouse`, `Pool::wake_order`, `Pool::wait_left`).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PoolPlant {
+        None,
+        /// The wake's order leaves out the workers with no thread (`wake_order` without its
+        /// second half): a task queued while no started worker is parked wakes nobody, and
+        /// its join waits forever (a deadlock to the model).
+        WakeSkipsUnstarted,
+        /// `rouse` counts a start after it makes the thread: the started thread can leave
+        /// before it is counted, so the last leave's wake of the stop is missed (the stop
+        /// waits forever), or the stop sees every counted worker left while a thread runs.
+        CountsAfterStart,
+    }
+
+    /// Two workers, neither with a thread, as the pool lays them out; the pool's own steps
+    /// (`rouse`, `wake_order`, the worker's loop, the stop's wait) written over the protocol
+    /// as task/threads.rs writes them, with a count of published tasks for its queues.
+    struct Pool2 {
+        idle: Idle,
+        marks: [Mark; 2],
+        /// Each worker's `thread` flag (`Pool::rouse`'s compare-and-swap).
+        thread: [AtomicBool; 2],
+        /// Each worker's parker: a token kept for a wake before its park, or before its thread.
+        tokens: [AtomicBool; 2],
+        threads: [Mutex<Option<thread::Thread>>; 2],
+        handles: Mutex<Vec<thread::JoinHandle<()>>>,
+        started: AtomicU32,
+        left: AtomicU32,
+        /// Threads that exist and have not left their loops: the oracle's.
+        alive: AtomicU32,
+        published: AtomicU32,
+        taken: AtomicU32,
+        stop: AtomicBool,
+        /// The main thread's parker: a task's end and the last leave each unpark it.
+        stopper: AtomicBool,
+        stopper_thread: Mutex<Option<thread::Thread>>,
+        plant: PoolPlant,
+    }
+
+    fn unpark_main(pool: &Pool2) {
+        pool.stopper.store(true, Ordering::SeqCst);
+        if let Some(thread) = &*pool.stopper_thread.lock().expect("the stopper's slot") {
+            thread.unpark();
+        }
+    }
+
+    fn park_main(pool: &Pool2) {
+        while !pool.stopper.swap(false, Ordering::SeqCst) {
+            thread::park();
+        }
+    }
+
+    fn unpark_worker(pool: &Pool2, at: usize) {
+        pool.tokens[at].store(true, Ordering::SeqCst);
+        if let Some(thread) = &*pool.threads[at].lock().expect("the thread's slot") {
+            thread.unpark();
+        }
+    }
+
+    fn park_worker(pool: &Pool2, at: usize) {
+        while !pool.tokens[at].swap(false, Ordering::SeqCst) {
+            thread::park();
+        }
+    }
+
+    /// `Pool::wake_order`: the started workers, then the others (unless planted out).
+    fn wake_order(pool: &Pool2) -> Vec<usize> {
+        let started = |at: &usize| pool.thread[*at].load(Ordering::Acquire);
+        let mut order: Vec<usize> = (0..2).filter(started).collect();
+        if pool.plant != PoolPlant::WakeSkipsUnstarted {
+            order.extend((0..2).filter(|at| !started(at)));
+        }
+        order
+    }
+
+    /// `Pool::notify`.
+    fn notify(pool: &Arc<Pool2>) {
+        let order = wake_order(pool);
+        if let Some(at) = pool.idle.wake_one(order.iter().map(|&at| (at, &pool.marks[at]))) {
+            rouse(pool, at);
+        }
+    }
+
+    /// `Pool::rouse`: the unpark's token, then the thread once.
+    fn rouse(pool: &Arc<Pool2>, at: usize) {
+        unpark_worker(pool, at);
+        if pool.thread[at].load(Ordering::Acquire) {
+            return;
+        }
+        if pool.thread[at].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if pool.plant == PoolPlant::CountsAfterStart {
+                start_thread(pool, at);
+                pool.started.fetch_add(1, Ordering::AcqRel);
+            } else {
+                pool.started.fetch_add(1, Ordering::AcqRel);
+                start_thread(pool, at);
+            }
+        }
+    }
+
+    fn start_thread(pool: &Arc<Pool2>, at: usize) {
+        pool.alive.fetch_add(1, Ordering::SeqCst);
+        let mine = Arc::clone(pool);
+        let handle = thread::spawn(move || pool_work(&mine, at));
+        pool.handles.lock().expect("the handles").push(handle);
+    }
+
+    /// One task off the published count, if any is left.
+    fn take(pool: &Pool2) -> bool {
+        loop {
+            let taken = pool.taken.load(Ordering::SeqCst);
+            if taken >= pool.published.load(Ordering::SeqCst) {
+                return false;
+            }
+            if pool.taken.compare_exchange(taken, taken + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    /// `Pool::work`: back as from a park, then find, run, park, until the stop.
+    fn pool_work(pool: &Arc<Pool2>, at: usize) {
+        *pool.threads[at].lock().expect("the thread's slot") = Some(thread::current());
+        let mark = &pool.marks[at];
+        let mut searching = pool.idle.back(mark) == Woke::Searching;
+        loop {
+            if take(pool) {
+                // The task ran: its joiner is woken (a join, as the scope's `Tally::ended`).
+                unpark_main(pool);
+                if searching {
+                    searching = false;
+                    let (_busy, last) = pool.idle.found(mark);
+                    if last {
+                        notify(pool);
+                    }
+                }
+                continue;
+            }
+            if pool.stop.load(Ordering::Acquire) {
+                if searching {
+                    pool.idle.leave_search();
+                }
+                break;
+            }
+            assert!(pool.idle.to_park(mark, searching), "nothing reserves in this model");
+            let visible = pool.taken.load(Ordering::SeqCst) < pool.published.load(Ordering::SeqCst);
+            let woke = if visible || pool.stop.load(Ordering::Acquire) {
+                pool.idle.back(mark)
+            } else {
+                park_worker(pool, at);
+                pool.idle.back(mark)
+            };
+            searching = woke == Woke::Searching;
+        }
+        pool.alive.fetch_sub(1, Ordering::SeqCst);
+        if pool.left.fetch_add(1, Ordering::AcqRel) + 1 == pool.started.load(Ordering::Acquire) {
+            unpark_main(pool);
+        }
+    }
+
+    /// Two spawns from outside the pool on two workers with no thread, a join of both (the
+    /// main thread parks until each has run: a task no worker runs is a deadlock to the
+    /// model), then the stop (as `Running::stop`, which is called with nothing queued: the
+    /// flag, every worker's parker, the wait for every started worker to leave). The second
+    /// spawn can meet the first worker parking, searching or not yet running, so its wake may
+    /// choose the worker with no thread; the worker that finds the last task wakes the other,
+    /// which can start it while the stop runs, so the stop can meet a start in flight. The
+    /// oracle: no lost task (no deadlock), and once the stop's wait ends no worker's thread is
+    /// running.
+    fn lazy_pool(plant: PoolPlant) {
+        let pool = Arc::new(Pool2 {
+            idle: Idle::unstarted(2, IdlePlant::None),
+            marks: [Mark::unstarted(), Mark::unstarted()],
+            thread: [AtomicBool::new(false), AtomicBool::new(false)],
+            tokens: [AtomicBool::new(false), AtomicBool::new(false)],
+            threads: [Mutex::new(None), Mutex::new(None)],
+            handles: Mutex::new(Vec::new()),
+            started: AtomicU32::new(0),
+            left: AtomicU32::new(0),
+            alive: AtomicU32::new(0),
+            published: AtomicU32::new(0),
+            taken: AtomicU32::new(0),
+            stop: AtomicBool::new(false),
+            stopper: AtomicBool::new(false),
+            stopper_thread: Mutex::new(None),
+            plant,
+        });
+        *pool.stopper_thread.lock().expect("the stopper's slot") = Some(thread::current());
+        for _ in 0..2 {
+            pool.published.fetch_add(1, Ordering::SeqCst);
+            notify(&pool);
+        }
+        while pool.taken.load(Ordering::SeqCst) < 2 {
+            park_main(&pool);
+        }
+        pool.stop.store(true, Ordering::SeqCst);
+        for at in 0..2 {
+            unpark_worker(&pool, at);
+        }
+        while pool.left.load(Ordering::Acquire) != pool.started.load(Ordering::Acquire) {
+            park_main(&pool);
+        }
+        assert_eq!(pool.alive.load(Ordering::SeqCst), 0, "a worker's thread outlived the stop");
+        let handles: Vec<_> = pool.handles.lock().expect("the handles").drain(..).collect();
+        for handle in handles {
+            handle.join().expect("a worker ends");
+        }
+    }
+
+    fn finding(plant: PoolPlant) -> std::string::String {
+        let found = catch_unwind(AssertUnwindSafe(|| blaze_check::model(move || lazy_pool(plant))));
+        let report = found.err().expect("the model must find the planted bug");
+        report
+            .downcast_ref::<std::string::String>()
+            .cloned()
+            .or_else(|| report.downcast_ref::<&'static str>().map(|it| (*it).to_string()))
+            .expect("the model's report is text")
+    }
+
+    #[test]
+    fn model_lazy_pool_runs_every_task_and_stops_after_every_start() {
+        blaze_check::model(|| lazy_pool(PoolPlant::None));
+    }
+
+    #[test]
+    fn the_oracle_catches_a_wake_that_skips_an_unstarted_worker() {
+        let text = finding(PoolPlant::WakeSkipsUnstarted);
+        assert!(text.contains("deadlock"), "the model found something else: {text}");
+    }
+
+    #[test]
+    fn the_oracle_catches_a_start_counted_after_its_thread() {
+        let text = finding(PoolPlant::CountsAfterStart);
+        assert!(
+            text.contains("outlived the stop") || text.contains("deadlock"),
+            "the model found something else: {text}"
+        );
     }
 
     #[test]

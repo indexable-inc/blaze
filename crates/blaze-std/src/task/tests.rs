@@ -243,15 +243,30 @@ fn a_thief_tries_its_own_group_first() {
     let pool = running.pool();
     assert_eq!(&pool.victims(0)[..], [1, 3, 2], "worker 0: its group-mate, then the other group");
     assert_eq!(&pool.victims(3)[..], [2, 0, 1], "worker 3: its group-mate, then the other group");
-    // Counted: one task fans out slow tasks onto its worker's deque; the rest steal.
+    // The order a thief's `find` walks is checked on `find` itself, with no threads and a
+    // planted control (threads/find_tests.rs, `a_thief_steals_from_its_own_group_before_another`).
+    // Here, under real threads, one task fans out slow tasks onto its worker's deque and the
+    // rest steal: every item runs once, and the steals are counted and printed, not asserted.
+    // How many there are is the machine's scheduler's to decide (this thread's join steals from
+    // that deque too, and a loaded machine may run no woken worker for the fan's length), and a
+    // count of near steals cannot tell a thief that tries the other group first, which still
+    // steals near while the other group's deques are empty.
+    // Every worker up and parked, and the fan reserved to one of them (`must_overlap`): a
+    // `may_overlap` fan would mostly be run by this thread's own join before a worker woke
+    // (task/help.rs `finish`), and its items, spawned from outside the pool, would go to the
+    // injection queues, from which nothing is stolen.
+    all_parked(pool);
     let io = Io::sim(9);
     let cx = root_on(&io, pool);
     let scope = cx.scope();
-    let outer = scope.may_overlap("fan", TASK_FRAME, |cx| -> Result<(), String> {
-        let xs: Vec<u32> = (0..256).collect();
+    let ran: Vec<AtomicU32> = (0..256).map(|_| AtomicU32::new(0)).collect();
+    let outer = scope.must_overlap("fan", TASK_FRAME, |cx| -> Result<(), String> {
         let inner = cx.scope();
         let grain = Grain::new(NonZeroUsize::new(1).expect("1"), 64 << 10);
-        let done = par::for_each(cx, &inner, &xs[..], grain, |_x: &[u32]| {
+        let done = par::for_each(cx, &inner, &ran[..], grain, |chunk: &[AtomicU32]| {
+            for it in chunk {
+                it.fetch_add(1, Ordering::Relaxed);
+            }
             let until = Instant::now() + Duration::from_micros(50);
             while Instant::now() < until {
                 core::hint::spin_loop();
@@ -260,6 +275,10 @@ fn a_thief_tries_its_own_group_first() {
         inner.join(cx).map_err(|error| error.to_string())?;
         done.map_err(|error| error.to_string())
     });
+    let outer = match outer {
+        Ok(task) => task,
+        Err(refused) => panic!("four parked workers, and must_overlap refused: {refused}"),
+    };
     let fanned = outer.join(&cx);
     let joined = scope.join(&cx);
     fanned.expect("the fan");
@@ -271,7 +290,7 @@ fn a_thief_tries_its_own_group_first() {
         far += f;
     }
     eprintln!("threads steals: {near} from the thief's own group, {far} from another");
-    assert!(near > 0, "a thief stole from its own group at least once ({near} near, {far} far)");
+    assert!(ran.iter().all(|it| it.load(Ordering::Relaxed) == 1), "each fanned item ran exactly once");
     drop(cx);
     stopped(running);
 }
@@ -454,29 +473,30 @@ fn the_fold_control_reading_slots_directly_sees_one_torn() {
     assert!(torn > 0, "the planted fold read every slot from its own thread and never saw a write half done");
 }
 
-/// How many times [`counted`] started a pool: only the lazy-start test's pools use it.
-static STARTS: AtomicU32 = AtomicU32::new(0);
+/// How many times [`counted`] started each worker's thread: only the lazy-start test's pools
+/// use it.
+static STARTS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 
-/// The driver's starter, counted.
-fn counted(pool: &Pool) {
-    STARTS.fetch_add(1, Ordering::SeqCst);
-    pool::starter(pool);
+/// The driver's starter, counted by worker.
+fn counted(pool: &Pool, at: u32) {
+    STARTS[at as usize].fetch_add(1, Ordering::SeqCst);
+    pool::starter(pool, at);
 }
 
 fn four() -> Topology {
     Topology::flat(4)
 }
 
-/// The lazy start (task/threads.rs, `Pool::begin`): two threads make the first spawns on a
-/// pool nothing of which is made, released together by a barrier, in each of 200 rounds. The
-/// pool starts exactly once, and neither spawn is lost: each spawner waits (bounded) for a
+/// The lazy start (task/threads.rs, `Pool::rouse`): two threads make the first spawns on a
+/// pool nothing of which is made, released together by a barrier, in each of 200 rounds. No
+/// worker's thread starts twice, and neither spawn is lost: each spawner waits (bounded) for a
 /// worker to run its task before it joins it, since a join runs an unstarted task itself and
-/// would hide a lost one. Then the stop waits for the last worker's leave.
+/// would hide a lost one. Then the stop waits for the last started worker's leave.
 #[test]
-fn two_first_spawns_at_once_start_the_pool_once_and_neither_is_lost() {
+fn two_first_spawns_at_once_start_no_worker_twice_and_neither_is_lost() {
     let io = native();
     for round in 0..200 {
-        let before = STARTS.load(Ordering::SeqCst);
+        let before: [u32; 4] = core::array::from_fn(|at| STARTS[at].load(Ordering::SeqCst));
         let running = pool::lazy_on(four, counted, Plants::NONE);
         let gate = std::sync::Barrier::new(2);
         std::thread::scope(|threads| {
@@ -502,9 +522,95 @@ fn two_first_spawns_at_once_start_the_pool_once_and_neither_is_lost() {
                 });
             }
         });
-        assert_eq!(STARTS.load(Ordering::SeqCst) - before, 1, "round {round}: the pool started other than once");
+        let starts: [u32; 4] = core::array::from_fn(|at| STARTS[at].load(Ordering::SeqCst) - before[at]);
+        assert!(starts.iter().all(|&n| n <= 1), "round {round}: a worker's thread started more than once: {starts:?}");
+        assert!(starts.iter().sum::<u32>() >= 1, "round {round}: no thread started, yet both tasks ran on workers");
         stopped(running);
     }
+}
+
+/// How many threads [`counted_eight`] started: only the start-as-asked test's pool uses it.
+static EIGHT_STARTS: AtomicU32 = AtomicU32::new(0);
+
+fn counted_eight(pool: &Pool, at: u32) {
+    EIGHT_STARTS.fetch_add(1, Ordering::SeqCst);
+    pool::starter(pool, at);
+}
+
+fn eight_flat() -> Topology {
+    Topology::flat(8)
+}
+
+/// A worker's thread starts when a wake first reaches it, and a wake tries started workers
+/// first (task/threads.rs, `Pool::rouse`, `Pool::wake_order`; bottom.md section 9: workers
+/// start in proportion to queued work). A pool of eight given one task starts at most two
+/// threads (the one that finds the task wakes one more, which finds nothing); given three more
+/// that must all run at once (each waits, bounded, until all three have begun), at most four
+/// in all. Each phase waits for its tasks to be running on workers before it joins, so the
+/// joiner runs none inline. Control: with every worker's thread started at the first wake (the
+/// form before), it fails at the one task with 8 of 8 started.
+#[test]
+fn workers_start_as_tasks_ask_not_one_a_core() {
+    let io = native();
+    let running = pool::lazy_on(eight_flat, counted_eight, Plants::NONE);
+    let pool = running.pool();
+    let cx = root_on(&io, pool);
+    // Every started worker back asleep (bounded), then the count of threads started.
+    let settled = |what: &str| {
+        let until = Instant::now() + Duration::from_secs(5);
+        while pool.arrived() != pool.started() || pool.parked() != pool.workers() {
+            assert!(Instant::now() < until, "{what}: the started workers did not all park within 5 s");
+            std::thread::yield_now();
+        }
+        assert_eq!(pool.started(), EIGHT_STARTS.load(Ordering::SeqCst), "{what}: the pool's count is the starter's");
+        pool.started()
+    };
+    let wait_for = |count: &AtomicU32, n: u32, what: &str| {
+        let until = Instant::now() + Duration::from_secs(5);
+        while count.load(Ordering::SeqCst) < n {
+            assert!(Instant::now() < until, "{what}: {} of {n} tasks began on workers within 5 s", count.load(Ordering::SeqCst));
+            std::thread::yield_now();
+        }
+    };
+
+    let began = AtomicU32::new(0);
+    let scope = cx.scope();
+    let one = scope.may_overlap("one", TASK_FRAME, |_cx| {
+        began.fetch_add(1, Ordering::SeqCst);
+        Ok::<u64, String>(1)
+    });
+    wait_for(&began, 1, "one task");
+    one.join(&cx).expect("the one task");
+    scope.join(&cx).expect("its scope");
+    let after_one = settled("one task");
+    assert!((1..=2).contains(&after_one), "one task: {after_one} of 8 workers' threads started, not 1 or 2");
+
+    let began = AtomicU32::new(0);
+    let began = &began;
+    let scope = cx.scope();
+    let tasks: Vec<_> = (0..3)
+        .map(|at| {
+            scope.may_overlap(NAMES[at], TASK_FRAME, move |_cx| {
+                began.fetch_add(1, Ordering::SeqCst);
+                let until = Instant::now() + Duration::from_secs(5);
+                while began.load(Ordering::SeqCst) < 3 {
+                    if Instant::now() >= until {
+                        return Err(format!("task {at}: the three did not all begin within 5 s"));
+                    }
+                    std::hint::spin_loop();
+                }
+                Ok::<u64, String>(at as u64)
+            })
+        })
+        .collect();
+    wait_for(began, 3, "three tasks at once");
+    for task in tasks {
+        task.join(&cx).expect("each of the three");
+    }
+    scope.join(&cx).expect("their scope");
+    let after_three = settled("three tasks at once");
+    assert!((3..=4).contains(&after_three), "three tasks at once: {after_three} of 8 workers' threads started, not 3 or 4");
+    stopped(running);
 }
 
 /// The threads of this process, as the platform counts them.
