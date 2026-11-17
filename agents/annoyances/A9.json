@@ -1,0 +1,11 @@
+{
+ "id": "A9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: dev builds",
+ "what": "A dev-built blaze looks for the standard library's source in the checkout it was built in; on any other machine it fails after 15 s trying to download from a release URL that does not exist.",
+ "cost": "two failed VM jobs",
+ "cause": "the library is found by the build's own path",
+ "workaround": "`BLAZE_LIBRARY_FROM=<checkout>/library`",
+ "state": "open"
+}

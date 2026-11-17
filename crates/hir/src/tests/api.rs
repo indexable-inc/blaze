@@ -69,7 +69,7 @@ fn takes_opaque(o: Opaque) {}
 #[test]
 fn a_variant_s_fields_have_the_type_s_arguments() {
     let db = fixture::db(ITEMS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let f = func(&db, "takes_e");
         let sig = f.signature(&db).expect("a function has a signature");
         let params = sig.params(&db);
@@ -79,7 +79,7 @@ fn a_variant_s_fields_have_the_type_s_arguments() {
         let fields = params[0].variant_fields(&db, a);
         let shown: Vec<_> = fields.iter().map(|(_, ty)| show(&db, ty, target(&db, f))).collect();
         assert_eq!(shown, ["Vec<T>"]);
-
+    
         let round = params[0].derived_from_next_solver(params[0].to_next_solver());
         assert_eq!(round, params[0], "a type comes back from the next solver's the same");
     });
@@ -98,7 +98,7 @@ enum One { A(u32) }
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let layout = |name: &str| {
             let ModuleDef::Adt(adt @ Adt::Enum(_)) = item(&db, name) else {
                 panic!("`{name}` is an enum")
@@ -115,7 +115,7 @@ enum One { A(u32) }
         let size = direct.size();
         assert!(sizes.iter().all(|&it| tag <= it && it <= size), "{sizes:?} in {size}");
         assert_eq!(direct.enum_tag_size(), Some(1));
-
+    
         assert!(
             layout("Niche").direct_tag_variant_sizes().is_none(),
             "a niche holds `Niche`'s tag"
@@ -127,7 +127,7 @@ enum One { A(u32) }
 #[test]
 fn an_array_s_element_whatever_its_length() {
     let db = fixture::db(ITEMS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let f = func(&db, "takes_s");
         let s = f.signature(&db).unwrap().params(&db).remove(0);
         let (_, field) = s.fields(&db).remove(0);
@@ -140,7 +140,7 @@ fn an_array_s_element_whatever_its_length() {
 #[test]
 fn a_parameter_no_field_or_projection_uses_is_unused() {
     let db = fixture::db(ITEMS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let unused = |name: &str| -> Vec<String> {
             let ModuleDef::Adt(adt) = item(&db, name) else { panic!("`{name}` is an ADT") };
             adt.unused_params(&db).iter().map(|it| it.name(&db).as_str().to_owned()).collect()
@@ -154,7 +154,7 @@ fn a_parameter_no_field_or_projection_uses_is_unused() {
 #[test]
 fn where_predicates_are_the_written_ones() {
     let db = fixture::db(ITEMS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let f = func(&db, "bounded");
         let preds = crate::GenericDef::Function(f).where_predicates(&db);
         let traits: Vec<_> = preds
@@ -181,7 +181,7 @@ fn where_predicates_are_the_written_ones() {
 #[test]
 fn a_foreign_type_is_its_alias() {
     let db = fixture::db(ITEMS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let f = func(&db, "takes_opaque");
         let ty = f.signature(&db).unwrap().params(&db).remove(0);
         let alias = ty.as_foreign(&db).expect("`Opaque` is a foreign type");
@@ -213,7 +213,7 @@ impl Foo for Bar {
 #[test]
 fn an_impl_method_s_signature_is_compared_with_the_trait_s() {
     let db = fixture::db(E0053).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let foo = impl_method(&db, "foo");
         let it = foo.impl_signature_mismatch(&db).expect("`i16` is not `u16`: E0053");
         assert_eq!(it.at, SignatureMismatchAt::Param(0));
@@ -221,14 +221,14 @@ fn an_impl_method_s_signature_is_compared_with_the_trait_s() {
         let (expected, found) = it.types.expect("a parameter's types");
         assert_eq!(show(&db, &expected, target(&db, foo)), "u16");
         assert_eq!(show(&db, &found, target(&db, foo)), "i16");
-
+    
         let bar = impl_method(&db, "bar").impl_signature_mismatch(&db).expect("E0053");
         assert_eq!(bar.at, SignatureMismatchAt::ParamMutability(0), "`&mut Bar` is not `&Bar`");
         assert_eq!(bar.types, None);
-
+    
         let ret = impl_method(&db, "ret").impl_signature_mismatch(&db).expect("E0053");
         assert_eq!(ret.at, SignatureMismatchAt::Return);
-
+    
         let same = impl_method(&db, "same");
         assert_eq!(same.impl_signature_mismatch(&db), None, "`<u8 as Assoc>::Out` is `u32`");
         let (trait_method, sig) = same.trait_signature_in_impl(&db).unwrap();
@@ -255,7 +255,7 @@ unsafe fn not_safe(x: TokenStream) -> TokenStream { x }
 #[test]
 fn a_proc_macro_s_signature_is_fn_token_stream_to_token_stream() {
     let db = fixture::db(PROC_MACRO).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let at = |name, attribute| {
             func(&db, name).proc_macro_signature_mismatch(&db, attribute).map(|it| it.at)
         };
@@ -270,7 +270,7 @@ fn a_proc_macro_s_signature_is_fn_token_stream_to_token_stream() {
             show(&db, &params[0], target(&db, func(&db, "bad")))
         };
         assert_eq!((shown(bad.expected), shown(bad.found)), ("TokenStream".into(), "Text".into()));
-
+    
         let main = func(&db, "good").module(&db).krate(&db);
         let ModuleDef::Adt(token_stream) = item(&db, "TokenStream") else { panic!() };
         let name = crate::Symbol::intern("TokenStream");
@@ -289,7 +289,7 @@ fn f() {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let f = func(&db, "f");
         let crate::AnyFunctionId::FunctionId(id) = f.id else { panic!() };
         let def = hir_def::DefWithBodyId::FunctionId(id);
@@ -317,7 +317,7 @@ fn f(r: &mut S, mut t: (u8, u8)) {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let f = func(&db, "f");
         let crate::AnyFunctionId::FunctionId(id) = f.id else { panic!() };
         let def = hir_def::DefWithBodyId::FunctionId(id);
@@ -357,7 +357,7 @@ pub fn current() {}
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let note = |def: ModuleDef| {
             let entry = def.deprecation(&db)?;
             Some(entry.deprecation.note.as_ref().map(|it| it.as_str().to_owned()))
@@ -390,7 +390,7 @@ fn main() {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let found = crate::check::check_workspace(&db, false);
         let skipped: usize = found
             .iter()
@@ -431,6 +431,7 @@ fn adjustments_convert_as_before() {
                 Adjust::Borrow(AutoBorrow::Ref(mutability(m.into())))
             }
             hir_ty::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+            hir_ty::Adjust::ErrorUnion => Adjust::ErrorUnion,
         }
     };
     let mut cases = vec![
@@ -438,6 +439,7 @@ fn adjustments_convert_as_before() {
         hir_ty::Adjust::Deref(None),
         hir_ty::Adjust::Pointer(PointerCast::ReifyFnPointer),
         hir_ty::Adjust::Pointer(PointerCast::Unsize),
+        hir_ty::Adjust::ErrorUnion,
         hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::Ref(AutoBorrowMutability::Not)),
     ];
     for two_phase in [AllowTwoPhase::Yes, AllowTwoPhase::No] {

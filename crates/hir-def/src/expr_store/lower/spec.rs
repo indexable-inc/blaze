@@ -16,7 +16,8 @@
 //! it), name resolution and inference type them like any expression, and a function's `ensures`
 //! sees its named return as the closure's parameter. The groups are ghost: MIR building leaves
 //! out every statement whose expression is a group (`ExpressionStore::spec_clause`), so they
-//! never run and never borrow; `hir-ty-verus` reads them from here.
+//! never run and never borrow; `hir-ty-lean` (their Lean statements) and `hir-ty-contracts`
+//! (the facts the optimizer may use) read them from here.
 //!
 //! A crate without `#![feature(blaze_verify)]` gets `VerifyRefused` for each clause and named
 //! return type, as does a function whose body also has nightly's `#[core::contracts::*]`

@@ -13,6 +13,9 @@
 //! distinct: those are [`Target::Static`], keyed by which item they are, never by content.
 
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 // Unsafe code is in `memo` alone (docs/v2/plan/design/unsafe.md).
 #![deny(unsafe_code)]
 
@@ -41,13 +44,15 @@ pub mod plan;
 pub mod query;
 pub mod relocs;
 pub mod settings;
+pub mod slot;
 pub mod summary;
 pub mod template;
+pub mod text;
 pub mod unwind;
 pub mod wasm;
 
-pub use driver::Owner;
-pub use exec::ExecTable;
+pub use driver::{BuiltId, Changes, Delta, Fresh, Owner, StaticId};
+pub use exec::{ExecTable, JumpTable};
 pub use relocs::{Reloc, Relocation, Relocs, RelocsView};
 
 /// A function instance: what is compiled.
@@ -411,6 +416,22 @@ pub enum RelocKind {
     WasmMemory64,
 }
 
+/// How Rust code defines a symbol outside code names it by ([`backend::Described::symbol`]):
+/// what a whole link does when another input defines the same name. The front end decides it
+/// from the item's `#[linkage]` (hir-ty-codegen's `exported_linkage`); nothing downstream
+/// derives it again.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Linkage {
+    /// A plain definition: another strong one on the link is the duplicate symbol error.
+    #[default]
+    Strong,
+    /// `#[linkage = "weak"]` (or `weak_odr`, `linkonce`, `linkonce_odr`): a strong definition
+    /// elsewhere on the link wins, as ld64 and lld take it, and every reference to the name,
+    /// Rust's own included, binds to that one. Rust code refers to such a definition only
+    /// by its name ([`Target::Extern`]), never by key, as LLVM treats it as interposable.
+    Weak,
+}
+
 /// What a relocation points at.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: a function owns its targets, so an instantiate copies each place's; only an outside symbol's name allocates
 pub enum Target {
@@ -431,6 +452,14 @@ pub enum Target {
     /// A position the program observes (`line!()`, `#[track_caller]`'s `Location`): the
     /// span side table's entry, filled at link time, so a reformat compiles nothing.
     Position(SpanRef),
+    /// A `&str` whose text names files (`concat!` with `file!()`), composed by the link: the
+    /// address of a record of the `&str` (pointer, then length, as [`Target::Position`]'s
+    /// `Location` begins) over bytes the link writes, made from the function's own datum of
+    /// this ID, a text recipe ([`text::recipe`]: its literal bytes, and a hole per file whose
+    /// relocation is the [`Target::Position`] of the span whose file it names). What the
+    /// program's text holds of the machine (a file's name) is then the link's, from the span
+    /// side table, and no key or record holds it (rules 25, 71).
+    Text(ContentId),
     /// The function's own SanitizerCoverage array ([`CompiledFunction::coverage`]): 0 its
     /// counters, 1 its flags, 2 its guards; the relocation's addend is into it. A function
     /// names no other's, and nothing else names one.

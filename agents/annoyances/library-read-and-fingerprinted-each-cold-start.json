@@ -1,0 +1,14 @@
+{
+ "id": "library-read-and-fingerprinted-each-cold-start",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 6c S2, int-1112",
+ "where": "crates/blaze-cargo/src/serve/unit.rs Real::library; crates/blaze-cargo/src/toolchain/library.rs fetch_tree",
+ "what": "A cold hello-world read and fingerprinted all 3,130 files (80 MB) of the standard library's sources: `std library` 1,099 ms (1,013 cpu), the texts on the heap (tag `vfs` 77 MB idle) and copied into each daemon image. The competitor's whole cold run is 229 ms.",
+ "cost": "about 1.1 s of every cold start and 77 MB of every daemon's heap",
+ "cause": "a tree blaze placed once a machine and sealed by its digest was read as if it were a developer's directory: walked, stat'ed and read file by file into the heap on every daemon's first mount",
+ "class": "an immutable, content-named input re-derived from its parts at each process start instead of kept once in a form that is read in place",
+ "prevention": "every shipped tree (one list: cli::store::shipped; placed by toolchain::library::place) gets one texts file beside it, made by one function from any tree's directory and digest, mapped by daemons; nothing names a tree",
+ "workaround": "none",
+ "fix": "toolchain/library/texts.rs (layout, Place's steps) and library.rs write_texts/open_texts; unit.rs library_from_texts lends each file's bytes from the mapping (blaze_vfs::lent). Not yet measured: the main agent's cold run is the check (`std library` under 10 ms, `vfs` under 4 MB).",
+ "state": "built, not compiled"
+}

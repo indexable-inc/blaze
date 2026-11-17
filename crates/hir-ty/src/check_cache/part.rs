@@ -64,13 +64,17 @@ blaze_format::record! {
 
 blaze_format::record! {
     /// One body: where its constants' type table is, its inference record's buffer, its ids,
-    /// and its borrow check's verdict.
+    /// its borrow check's verdict, and how many expressions and patterns the body's store had
+    /// where it was written (2: a reader bounds the record's nodes by them, and lowers no body
+    /// to count them again).
     #[derive(Clone, Copy)]
-    struct BodyRoot: 1 {
+    struct BodyRoot: 2 {
         locs: u64,
         record: Slice<u8>,
         ids: Slice<u8>,
         passed: u32,
+        exprs: u32,
+        pats: u32,
         reserved: u32,
     }
 }
@@ -78,7 +82,7 @@ blaze_format::record! {
 const _: () = {
     assert!(size_of::<Place>() == 8);
     assert!(size_of::<PartRoot>() == 64);
-    assert!(size_of::<BodyRoot>() == 32);
+    assert!(size_of::<BodyRoot>() == 40);
 };
 
 /// The schema of the part, and the version of everything its bytes are made with: the records,
@@ -215,6 +219,7 @@ fn body<'db>(
     items: &mut Items,
 ) -> R<Vec<u8>> {
     let result = InferenceResult::of(db, def);
+    let nodes = Nodes::of(hir_def::expr_store::Body::of(db, def));
     let mut table = Table::default();
     let record =
         ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
@@ -235,6 +240,8 @@ fn body<'db>(
         record: Slice::between(field(offset_of!(BodyRoot, record)), record_at as u64, record.len()),
         ids: words.slice(field(offset_of!(BodyRoot, ids))),
         passed: u32::from(passed),
+        exprs: nodes.exprs,
+        pats: nodes.pats,
         reserved: 0,
     };
     let written = out.push(&root);
@@ -351,12 +358,26 @@ impl<'a> PartRef<'a> {
 
     /// The crate's items, made in this database: what each body's ids name by index.
     pub(crate) fn items(&self, db: &Db, krate: Crate) -> R<Box<[(IdKind, u64)]>> {
-        let ids = PortableIds::decode(db, krate, self.items)?;
-        if ids.len() != self.kinds.len() {
+        items_of(db, krate, self.items, self.kinds)
+    }
+}
+
+/// The items of the portable table `items` of `krate`, whose kinds are `kinds` at the same
+/// index, made in this database as `(kind, bits)`: a part's ([`PartRef::items`]) and one
+/// entry's of a crate's bodies value (`super::runtime`), the one reader of both.
+pub(crate) fn items_of(
+    db: &Db,
+    krate: Crate,
+    items: &[u8],
+    kinds: &[u8],
+) -> R<Box<[(IdKind, u64)]>> {
+    {
+        let ids = PortableIds::decode(db, krate, items)?;
+        if ids.len() != kinds.len() {
             // alloc: the reason of a refusal
-            return Err(format!("{} items and {} kinds", ids.len(), self.kinds.len()));
+            return Err(format!("{} items and {} kinds", ids.len(), kinds.len()));
         }
-        self.kinds
+        kinds
             .iter()
             .enumerate()
             .map(|(at, &kind)| {
@@ -394,6 +415,12 @@ impl BodyRef<'_> {
     /// Whether the body's borrow check passed in the database that wrote it.
     pub(crate) fn passed(&self) -> bool {
         self.root.passed == 1
+    }
+
+    /// How many expressions and patterns the body's store had where the record was written:
+    /// the store's now, since the part's key covers the crate's sources.
+    pub(crate) fn nodes(&self) -> Nodes {
+        Nodes { exprs: self.root.exprs, pats: self.root.pats }
     }
 
     /// The body's inference result, made in this database: its ids first, against `items`

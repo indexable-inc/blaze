@@ -1,0 +1,14 @@
+{
+  "id": "harness-ui-1113-6",
+  "date": "2026-11-13",
+  "who": "Codex GPT-6, main agent",
+  "where": "Harness restored-chat labels and Command-O caret integration",
+  "what": "Andrew saw lost on resumable chats after a daemon update and reported that Command-O did not behave like the shared cursor primitive.",
+  "cost": "An idle saved conversation appeared broken, and search cursor behavior diverged from the composer.",
+  "cause": "Rows showed provider-process status as conversation availability. Palette binding forced blink=true and kept a separate caret timestamp; frame scheduling enumerated chat/rename owners while excluding palette fields.",
+  "class": "Presentation confuses independent lifecycle concepts, or shared primitive behavior depends on an incomplete list of feature owners.",
+  "prevention": "A row presentation rule distinguishes resumable chat availability from lost processes and preserves real exit failures. Draft editors share one TextEdit/caret binding; the renderer reports actual visible caret activity for frame scheduling, independent of field ownership.",
+  "workaround": "None.",
+  "fix": "Resumable chats have no lost label/failure mark and explain Ready to resume on hover. Command-O and chat share caret state/blink policy; visible blinking carets own the calm frame clock. Tests cover restored chats vs real failures and visible/hidden/steady caret activity.",
+  "state": "fixed in this change"
+}

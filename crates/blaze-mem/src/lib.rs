@@ -33,6 +33,9 @@
 //! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree; the
 //! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
+//! Nothing here limits memory: a commit the kernel refuses is a typed [`MemError`], and the
+//! kernel's limit is the one ceiling.
+//!
 //! The store's buffer pool reads and gives back pages of one sparse [`Region`] by ranges
 //! ([`Region::reuse`], [`Region::evict`]), counted to [`Tag::Pool`], and copies bytes the evictor
 //! may drop meanwhile through [`racy`]'s atomic copies (docs/v2/plan/design/store-pool.md).
@@ -41,9 +44,16 @@
 //! allocator that turn a committed address into a typed place; every block says which
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_ext)]
 // `memory.grow` on wasm64 (`os.rs`), whose intrinsics are not stable there yet.
 #![cfg_attr(target_arch = "wasm64", feature(simd_wasm64))]
+// blaze's lints (`blaze::process_static`, ...) name their tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "blaze's allocators: the kernel's virtual memory (`os`), racy copies of bytes an evictor may drop (`racy`), and the lines of each allocator that turn a committed address into a typed place, each block naming the invariant it relies on"
+)]
 
 pub mod align;
 pub mod append;
@@ -57,6 +67,9 @@ pub mod handle;
 pub mod huge;
 mod os;
 pub mod pool;
+// A 32-bit offset of 8-byte units reaches 32 GiB: only where an address is 64 bits.
+#[cfg(target_pointer_width = "64")]
+pub mod program;
 pub mod racy;
 pub mod region;
 pub mod region_vec;
@@ -67,6 +80,10 @@ pub mod swiss;
 pub mod syscalls;
 mod sync;
 pub mod tag;
+// `macro_use`: the crate's own code names `format_in!` and `format_into!` by textual scope; a
+// path (`crate::format_in!`) to an exported macro is refused in a crate whose root carries a
+// tool attribute (`blaze::trust`), which rustc treats as expanded.
+#[macro_use]
 pub mod text;
 
 pub use append::AppendVec;
@@ -77,6 +94,8 @@ pub use error::MemError;
 pub use frame::{Frame, Marker};
 pub use handle::{Handle, Slab};
 pub use pool::{Cache, Pool, Pooled, Shared};
+#[cfg(target_pointer_width = "64")]
+pub use program::{ProgramArena, ProgramError, ProgramLifetime, Ref32};
 pub use region::Region;
 pub use region_vec::RegionVec;
 pub use revision::{Built, Revisions};

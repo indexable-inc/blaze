@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-keyed-by-name",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 4b task C, int-1112",
+ "where": "crates/blaze-cargo/src/serve/front_carry.rs (bodies), serve/unit/deps.rs, serve/unit/compile.rs",
+ "what": "The daemon's body entries mapped the syntax to the database by a body's name and inline modules (entries::bodies, def_of), so every `impl` and trait body was passed over, the borrow check was refused by the world, and a closure's MIR had no entry: most of reth's 12,234 `evicted_asked` inference runs were bodies no entry could ever serve. The keep also ran before fallible store() work, so a claim could be marked for puts that never reached the loop.",
+ "cost": "the body edit under dependents on reth at 58-77 s; one plan and three executors to undo",
+ "cause": "a map from syntax to database chosen by what was easy to name (a path), not by what both sides share (where the body is written and what kind it is)",
+ "class": "an identity joined through a derived name that only part of the domain has",
+ "prevention": "join two views of one thing on a field both own (file, start, kind); count every row either side has that the join leaves out, by why",
+ "workaround": "none",
+ "fix": "front_carry::bodies keys by entries::keyed/written/join, serves and keeps inference, every MIR owner and the borrow check, counts in_macros/unmapped/unkeyed/refused, and keep_bodies is the last statement of store(). Controls: BODY_ONLY and BLIND in serve::unit::tests.",
+ "state": "fixed, not yet built"
+}

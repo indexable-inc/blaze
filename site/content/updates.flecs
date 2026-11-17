@@ -9,11 +9,11 @@ site {
   updates : Page {
     Narrow
     Title: {"What's new"}
-    Nav: {"What's new", -1}
+    Nav: {"What's new", 2}
     Icon: {"sparkle"}
     (InGroup, nav.learn)
     Description: {"What has changed in blaze, as short lessons on the course: newest first, with the ones new since your last visit marked."}
-    Lede lede("What has changed in blaze, newest first. Each update is a short lesson that extends one on the [course](/), and sits next to it on the path.")
+    Lede lede("What has changed in blaze, newest first. Each update is a short lesson that extends one on the [course](/learn), and sits next to it on the path.")
     Dim channels("Updates tagged Canary are in canary releases or behind an experimental flag; the rest are on stable. [Install](/install) says how to pick a channel.")
     UpdateLog log
     Dim kept("Which updates are new is worked out in this browser, from when you last came by. Nothing is sent anywhere.")

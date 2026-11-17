@@ -1,0 +1,78 @@
+about = "One front end a checkout serves every request of it: build, test, build, test, run, check, release build, dev build, then each again, with no edit between. After the first occurrence of a request, every later one makes no unit again and runs at most the oracle's 2,000 engine memos, whatever was asked between: its units are a view over the crate graph the front end keeps (`blaze_lower::Lowered::relower`), not the front end's identity (2026-11-12: every switch lowered the workspace again, 618,000 to 820,000 memos and 4.5 s on a hello-world). Its control is `a_switch_of_request_with_the_plan_as_identity`."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+
+[[revision]]
+steps = []
+action = "test"
+says = ["test tests::f_adds_one ... ok"]
+
+[[revision]]
+steps = []
+action = "build"
+redone = []
+max_units = 0
+max_executed = 2000
+
+[[revision]]
+steps = []
+action = "test"
+says = ["test tests::f_adds_one ... ok"]
+redone = []
+max_units = 0
+max_executed = 2000
+
+[[revision]]
+steps = []
+action = "run"
+prints = "2 4\n"
+redone = []
+max_units = 0
+
+[[revision]]
+steps = []
+action = "check"
+
+[[revision]]
+steps = []
+action = "build"
+args = ["--release"]
+
+[[revision]]
+steps = []
+action = "build"
+redone = []
+max_units = 0
+max_executed = 2000
+
+[[revision]]
+steps = []
+action = "test"
+says = ["test tests::f_adds_one ... ok"]
+redone = []
+max_units = 0
+max_executed = 2000
+
+[[revision]]
+steps = []
+action = "check"
+max_units = 0
+max_executed = 2000
+
+[[revision]]
+steps = []
+action = "build"
+args = ["--release"]
+redone = []
+max_units = 0
+max_executed = 2000
+
+[[revision]]
+steps = []
+action = "run"
+prints = "2 4\n"
+redone = []
+max_units = 0
+max_executed = 2000

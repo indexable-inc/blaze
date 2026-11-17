@@ -19,6 +19,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic) -> Vec<Found> 
         // alloc: the error's text, for an error hir found
         hir::Unplaced::TailCall(message) => format!("{message}"),
         // alloc: the error's text, for an error hir found
+        hir::Unplaced::LoopMatch(message) => format!("{message}"),
+        // alloc: the error's text, for an error hir found
         hir::Unplaced::MissingUnsafe { reason, lint } => {
             format!("{reason:?} ({lint:?}) needs `unsafe`")
         }

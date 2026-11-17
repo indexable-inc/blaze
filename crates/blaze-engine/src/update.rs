@@ -59,8 +59,9 @@ pub(crate) const RUN_AS_DEFAULT: &str = "BLAZE_RUN_AS_DEFAULT";
 /// What blaze's updates can't do, naming the file or the setting.
 #[derive(Debug)]
 pub(crate) enum UpdateError {
-    /// No home directory, where blaze keeps its releases and its update state.
-    NoHome,
+    /// No home directory, where blaze keeps its releases and its update state, and what was
+    /// tried to find one.
+    NoHome(blaze_core::home::NoHome),
     /// A file that is there and can't be read.
     Unread { file: PathBuf, error: std::io::Error },
     /// `config.toml` that can't be read, is not TOML, or sets `[update]` to what it doesn't take.
@@ -74,9 +75,10 @@ pub(crate) enum UpdateError {
 impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateError::NoHome => f.write_str(
+            UpdateError::NoHome(why) => write!(
+                f,
                 "blaze keeps its releases and its update state in .blaze in your home directory, and \
-                 there is none (`BLAZE_HOME` names where)",
+                 {why} (`BLAZE_HOME` names another place)"
             ),
             UpdateError::Unread { file, error } => write!(f, "reading {}: {error}", file.display()),
             UpdateError::Config(error) => std::fmt::Display::fmt(error, f),
@@ -99,7 +101,7 @@ impl std::error::Error for UpdateError {}
 
 /// blaze's home: where `versions/` and `config.toml` are.
 fn home() -> Result<PathBuf, UpdateError> {
-    user_config::home().ok_or(UpdateError::NoHome)
+    user_config::home().map_err(UpdateError::NoHome)
 }
 
 fn state_file(home: &Path) -> PathBuf {
@@ -191,7 +193,7 @@ fn set(home: &Path, key: &str, value: &str) -> anyhow::Result<()> {
     update.insert(key, toml_edit::value(value));
     versions::kept(&file, doc.to_string().as_bytes())
         .with_context(|| format!("writing {shown}"))?;
-    println!("{shown}: [update] {key} = \"{value}\"");
+    blaze_report::outln!("{shown}: [update] {key} = \"{value}\"");
     Ok(())
 }
 
@@ -451,7 +453,7 @@ pub(crate) fn tick() -> Duration {
     match refresh(false) {
         Ok(next) => next,
         Err(error) => {
-            eprintln!("blaze: the update check: {error:#}");
+            blaze_report::errln!("blaze: the update check: {error:#}");
             CHECK_EVERY
         }
     }
@@ -466,7 +468,7 @@ fn refresh(forced: bool) -> anyhow::Result<Duration> {
     let home = home()?;
     let file = state_file(&home);
     let mut state = State::read(&file).unwrap_or_else(|error| {
-        eprintln!("blaze: {error}");
+        blaze_report::errln!("blaze: {error}");
         State::default()
     });
     let now = now();
@@ -502,7 +504,7 @@ fn refresh(forced: bool) -> anyhow::Result<Duration> {
                 .with_context(|| format!("writing {}", updated_file(&home).display()))?,
             Err(why) => {
                 let why = printable(&format!("{why:#}"));
-                eprintln!(
+                blaze_report::errln!(
                     "blaze: `[update] mode = \"auto\"` could not install blaze {version}: {why}"
                 );
                 state.problem = Some(format!(
@@ -578,7 +580,7 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
         std::env::var_os("CI").is_some_and(|it| !it.is_empty()) || !std::io::stderr().is_terminal();
     let config = config(&home).unwrap_or_else(|error| {
         if !quiet {
-            eprintln!("warning: {error}; blaze says only what is yanked until it is fixed");
+            blaze_report::errln!("warning: {error}; blaze says only what is yanked until it is fixed");
         }
         Config { mode: Mode::Off, ..Config::DEFAULT }
     });
@@ -586,13 +588,13 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
         Ok(state) => state,
         Err(error) => {
             if !quiet {
-                eprintln!("warning: {error}");
+                blaze_report::errln!("warning: {error}");
             }
             return;
         }
     };
     if let Some(problem) = state.problem.as_deref().filter(|_| !quiet) {
-        eprintln!("warning: {problem}");
+        blaze_report::errln!("warning: {problem}");
     }
     let latest = state.latest();
     let updated_file = updated_file(&home);
@@ -645,15 +647,14 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
                 format!("blaze updated to {version}; notes: {url}")
             }
         };
-        eprintln!("{line}");
+        blaze_report::errln!("{line}");
     }
 }
 
-const USAGE: &str = "blaze update                     installs the newest release of the channel, which then runs \
-                     outside pinned workspaces\n\
-                     blaze update --check             reads latest.json now and says what is out; installs nothing\n\
-                     blaze update --mode warn|auto|off|offline   what blaze does about newer releases ([update] mode)\n\
-                     blaze update --channel stable|canary   which releases count ([update] channel)";
+const USAGE: &str = r"blaze update                     installs the newest release of the channel, which then runs outside pinned workspaces
+blaze update --check             reads latest.json now and says what is out; installs nothing
+blaze update --mode warn|auto|off|offline   what blaze does about newer releases ([update] mode)
+blaze update --channel stable|canary   which releases count ([update] channel)";
 
 /// `blaze update`: [`USAGE`].
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32> {
@@ -685,7 +686,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
                 })?);
             }
             "-h" | "--help" => {
-                println!("{USAGE}");
+                blaze_report::outln!("{USAGE}");
                 return Ok(0);
             }
             _ => bail!("`blaze update` takes no {arg}\n{USAGE}"),
@@ -729,18 +730,18 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
     let pinned = pinned_here();
     if only_check {
         if let Some(corrupt) = &corrupt {
-            println!("{corrupt}");
+            blaze_report::outln!("{corrupt}");
         }
-        println!(
+        blaze_report::outln!(
             "blaze {runs} runs outside pinned workspaces; the newest {} release is blaze {}",
             channel.name(),
             newest.version
         );
         if let Some(reason) = latest.yanked(&runs) {
-            println!("blaze {runs} is YANKED: {reason}");
+            blaze_report::outln!("blaze {runs} is YANKED: {reason}");
         }
         if let Some((manifest, version)) = &pinned {
-            println!("{} pins blaze {version}", manifest.display());
+            blaze_report::outln!("{} pins blaze {version}", manifest.display());
         }
         print_notes(newest);
         return Ok(0);
@@ -768,9 +769,9 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
     let yanked = latest.yanked(&runs);
     if corrupt.is_none() && (to == from || (to < from && yanked.is_none())) {
         if to == from {
-            println!("blaze {runs} is the newest {} release", channel.name());
+            blaze_report::outln!("blaze {runs} is the newest {} release", channel.name());
         } else {
-            println!(
+            blaze_report::outln!(
                 "blaze {runs} is newer than the newest {} release, blaze {}: nothing to install \
                  (`blaze update --channel canary` follows every release)",
                 channel.name(),
@@ -781,7 +782,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
         install(&home, &newest.version)?;
         _ = std::fs::remove_file(updated_file(&home));
         if let Some(corrupt) = &corrupt {
-            println!("{corrupt}; replaced with blaze {}", newest.version);
+            blaze_report::outln!("{corrupt}; replaced with blaze {}", newest.version);
         }
         let how = match yanked {
             Some(reason) if to < from => {
@@ -790,7 +791,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
             Some(reason) => format!(", off a yanked release ({reason})"),
             None => String::new(),
         };
-        println!(
+        blaze_report::outln!(
             "blaze {runs} → {} ({}{how}): it runs outside pinned workspaces from the next command",
             newest.version,
             channel.name()
@@ -798,7 +799,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
         print_notes(newest);
     }
     if let Some((manifest, version)) = pinned.filter(|(_, version)| *version != newest.version) {
-        println!(
+        blaze_report::outln!(
             "{} pins blaze {version}, which `blaze update` never moves: `blaze pin {}` does",
             manifest.display(),
             newest.version
@@ -817,13 +818,13 @@ fn pinned_here() -> Option<(PathBuf, String)> {
 
 fn print_notes(newest: &Newest) {
     if !newest.notes.is_empty() {
-        println!();
+        blaze_report::outln!();
         for line in newest.notes.lines() {
-            println!("    {line}");
+            blaze_report::outln!("    {line}");
         }
-        println!();
+        blaze_report::outln!();
     }
-    println!("notes: {}", newest.url);
+    blaze_report::outln!("notes: {}", newest.url);
 }
 
 #[cfg(test)]
@@ -834,8 +835,7 @@ mod tests {
     /// to the same bytes; none there reads as no check yet.
     #[test]
     fn the_state_round_trips() {
-        let dir = std::env::temp_dir().join(format!("blaze-update-state-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = blaze_core::temp::TempDir::for_test("blaze-update-state-");
         let file = dir.join("update").join("state.json");
         let page = |version: &str| {
             format!("https://github.com/indexable-inc/blaze/releases/tag/v{version}")
@@ -864,6 +864,5 @@ mod tests {
         State::default().write(&file).unwrap();
         assert_eq!(State::read(&file).unwrap(), State::default());
         assert_eq!(State::read(&dir.join("none.json")).unwrap(), State::default());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

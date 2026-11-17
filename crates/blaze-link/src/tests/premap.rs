@@ -676,6 +676,43 @@ fn two_strong_definitions_across_the_images_are_the_duplicate_symbol_error() {
     assert!(error.what.contains("duplicate symbol `dep_strong`: Rust code defines it"), "{error}");
 }
 
+/// A name Rust defines weakly (`#[linkage = "weak"]`) loses to the image beside's strong
+/// definition, where a strong one is the duplicate symbol error: Rust's own call by name binds
+/// to theirs. Beside their weak one, Rust's, first on the line, wins.
+#[test]
+fn a_weak_rust_name_loses_to_a_strong_one_beside_and_beats_a_weak_one() {
+    let start =
+        calls(10, &[Target::Extern("dep_strong".into()), Target::Extern("weak_late".into())]);
+    let rust = function(11, &returns(1), Vec::new());
+    let mut image = Image::beside(name("out/ws"), output(false), &Dep, BIAS).unwrap();
+    let change = Change {
+        added: vec![&start, &rust],
+        names: vec![
+            ("_start".into(), Target::Direct(key(10))),
+            ("dep_strong".into(), Target::Direct(key(11))),
+            ("weak_late".into(), Target::Direct(key(11))),
+        ],
+        weak_names: vec!["dep_strong".into(), "weak_late".into()],
+        ..Change::default()
+    };
+    let staged = image.stage_beside(change, &Dep).unwrap();
+    let state = &staged.state;
+    let symbols = &image.symbols;
+    let code = state.addr_of(symbols.find_body(&key(10)).unwrap()).unwrap();
+    let ours = state.addr_of(symbols.find_body(&key(11)).unwrap()).unwrap();
+    assert_eq!(call(state, code, 1), 0x7000_0200, "the image beside's strong definition");
+    assert_eq!(call(state, code, 6), ours, "of two weak ones Rust's, first on the line");
+
+    let mut disk = Disk::default();
+    let mut effects = Vec::new();
+    image.commit(staged, &mut effects).unwrap();
+    disk.run(&mut image, effects).unwrap();
+    let layout = layout(&image);
+    let def = |name: &str| layout.names.iter().find(|it| it.0 == name).map(|it| it.1);
+    assert_eq!(def("dep_strong"), None, "a name the image beside took is not this image's");
+    assert_eq!(def("weak_late").map(|it| it.strength), Some(Strength::Weak));
+}
+
 #[test]
 fn a_definition_that_would_win_over_a_weak_one_the_image_beside_reaches_directly_is_an_error() {
     let start =

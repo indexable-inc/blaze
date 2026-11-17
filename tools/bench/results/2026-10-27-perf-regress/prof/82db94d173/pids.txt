@@ -1,3 +1,0 @@
-daemon pids: 82111 82137 82140 84783
-  82137 47496 /root/perf/bin/82db94d173/blaze daemon
-  82140 3162764 /root/perf/bin/82db94d173/blaze /root/perf/prof-ws/82db94d173/rg/ --own-target --profile dev --asked-in /root/perf/prof-ws/82db94d173/rg --crate crates/core/main.rs --out /root/perf/prof-ws/82db94d173/rg/target/blaze/whole/e45efac8e2ec7376/rg.o --patch /root/perf/prof-ws/82db94d173/rg/target/blaze/whole/e45efac8e2ec7376/rg.patch.o --exe /root/perf/prof-ws/82db94d173/rg/target/blaze/whole/e45efac8e2ec7376/rg --socket /root/perf/prof-ws/82db94d173/home/workers/e45efac8e2ec7376/sock --symbols-in /root/perf/prof-ws/82db94d173/home/workers/e45efac8e2ec7376/symbols

@@ -63,6 +63,26 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstParamTyNotAllowed<'db>)
             "requires `const_param_ty` lang_item",
             cx.span(node.map(|it| it.text_range())),
         ),
+        // rustc refuses core's `ConstParamTy_` impl for `str`, `[T]` and `&T` through its
+        // `#[unstable_feature_bound(unsized_const_params)]`; this says which feature it is.
+        ConstParamTyReason::UnsizedConstParams => {
+            let mut diag = Diag::error(
+                Some("E0658"),
+                // alloc: the error's text, for an error hir found
+                format!(
+                    "`{ty}` as the type of a const generic parameter needs \
+                     `unsized_const_params`"
+                ),
+                span,
+            );
+            diag.help("add `#![feature(unsized_const_params)]` to the crate attributes to enable");
+            diag
+        }
+        ConstParamTyReason::DependsOnGenerics => Diag::error(
+            Some("E0770"),
+            "the type of const parameters must not depend on other generic parameters",
+            span,
+        ),
     };
     code_fact(cx, &mut diag, at);
     // alloc: the error found

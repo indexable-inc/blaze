@@ -7,6 +7,7 @@ pub mod format;
 // holds the included bytes to it again, so bytes put in `OUT_DIR` after the build script ran are
 // refused, never used as a template key.
 #[allow(dead_code, reason = "shared with build.rs and blaze-codegen-code; this reads the parser")]
+#[expect(blaze::unwired, reason = "wired: one file shared with build.rs and blaze-codegen-code, which call the rest")]
 #[path = "../pin.rs"]
 mod pin;
 

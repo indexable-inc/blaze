@@ -21,7 +21,7 @@ fn check_(
     expect: &expect_test::Expect,
     parse: parser::TopEntryPoint,
 ) {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let decl_tt = &syntax_bridge::parse_to_token_tree(
         def_edition,
         SpanAnchor {
@@ -52,7 +52,7 @@ fn check_(
         &db,
         &arg_tt,
         |_| (),
-        crate::MacroCallStyle::FnLike,
+        crate::MacroCall::FnLike,
         Span {
             range: TextRange::up_to(TextSize::of(arg)),
             anchor: call_anchor,
@@ -526,7 +526,7 @@ fn minus_belongs_to_literal() {
 /// window of the level, not the rest of it, into the thread's input words.
 #[test]
 fn a_fragment_allocates_the_same_however_much_follows_it() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -562,7 +562,7 @@ fn a_fragment_allocates_the_same_however_much_follows_it() {
 /// grow with it, so the counts are compared, not the bytes.
 #[test]
 fn a_warm_expansion_allocates_the_same_for_any_input() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -576,7 +576,7 @@ fn a_warm_expansion_allocates_the_same_for_any_input() {
         let text = "x ".repeat(trees);
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &text).unwrap();
         let expand = || {
-            let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+            let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
             assert!(expanded.err.is_none());
             expanded.value.0.view().token_trees().len()
         };
@@ -593,7 +593,7 @@ fn a_warm_expansion_allocates_the_same_for_any_input() {
 /// the global expansion gives.
 #[test]
 fn an_expansion_into_a_frame_allocates_nothing() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -605,7 +605,7 @@ fn an_expansion_into_a_frame_allocates_nothing() {
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &"x ".repeat(100))
         .unwrap();
-    let style = crate::MacroCallStyle::FnLike;
+    let style = crate::MacroCall::FnLike;
     let global = mac.expand(&db, &arg, |_| (), style, call_site).value.0;
     assert!(global.keeps_words());
     // The first task warms the thread's two frame levels, the builder's buffers and tt's walk
@@ -628,7 +628,7 @@ fn an_expansion_into_a_frame_allocates_nothing() {
 /// `$s:stmt`'s statement at the metavariable.
 #[test]
 fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let def = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -642,7 +642,7 @@ fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
     let input = "let x = 1 ; { x }";
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, call, ctx, input).unwrap();
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor: call, ctx };
-    let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+    let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
     assert!(expanded.err.is_none(), "{:?}", expanded.err);
     let tree = expanded.value.0;
 
@@ -678,7 +678,7 @@ fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
 /// `${concat(..)}` gives the spans of the identifiers it made, which no source has.
 #[test]
 fn concat_gives_the_spans_of_the_identifiers_it_made() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -689,7 +689,7 @@ fn concat_gives_the_spans_of_the_identifiers_it_made() {
     let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT);
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, "a").unwrap();
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
-    let expanded = mac.expand_making(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+    let expanded = mac.expand_making(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
     assert!(expanded.err.is_none(), "{:?}", expanded.err);
     let (tree, _, made) = expanded.value;
     let idents: Vec<(String, Span)> = tree
@@ -734,11 +734,11 @@ fn a_repetitions_separator_is_one_glued_token_and_its_operator_is_one_character(
 "#,
     );
     assert!(mac.err().is_none(), "{:?}", mac.err());
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let expand = |arg: &str| {
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, arg).unwrap();
         let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
-        let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+        let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
         assert!(expanded.err.is_none(), "{:?}", expanded.err);
         let leaves: Vec<String> = expanded
             .value
@@ -761,4 +761,282 @@ fn a_repetitions_separator_is_one_glued_token_and_its_operator_is_one_character(
     // `?` takes no separator, and a separator is followed by one operator token, not a glued one.
     assert!(parse("($($a:ident),?) => {}").err().is_some());
     assert!(parse("($($a:ident),+=) => {}").err().is_some());
+}
+
+/// What `decl`, a `macro_rules!` body written in a crate whose syntax extensions are `def`,
+/// expands `arg` to when a crate whose extensions are `call` calls it: whether a rule matched,
+/// and the expansion parsed as items, as its dump and its syntax errors. Each token's span is
+/// anchored in its crate's file, whose id holds the crate's extensions, as every span is.
+fn expanded_across(
+    def: span::Extensions,
+    decl: &str,
+    call: span::Extensions,
+    arg: &str,
+) -> (bool, String, usize) {
+    let edition = Edition::CURRENT;
+    let anchor = |file: u32, extensions| SpanAnchor {
+        file_id: EditionedFileId::new_with_extensions(FileId::from_raw(file), edition, extensions),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(edition);
+    let db = base_db::Db::for_tests(|_| {});
+    let decl = syntax_bridge::parse_to_token_tree(edition, anchor(0, def), ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| edition);
+    assert!(mac.err().is_none(), "{:?}", mac.err());
+    let call_anchor = anchor(1, call);
+    let arg_tt = syntax_bridge::parse_to_token_tree(edition, call_anchor, ctx, arg).unwrap();
+    let call_site = Span { range: TextRange::up_to(TextSize::of(arg)), anchor: call_anchor, ctx };
+    let res = mac.expand(&db, &arg_tt, |_| (), crate::MacroCall::FnLike, call_site);
+    let entry = parser::TopEntryPoint::MacroItems;
+    let (node, _) =
+        syntax_bridge::token_tree_to_syntax_node(res.value.0.view(), entry, &mut |_| edition);
+    let (old, _) =
+        syntax_bridge::reference::token_tree_to_syntax_node(&res.value.0, entry, &mut |_| edition);
+    assert_eq!(node.debug_dump(), old.debug_dump(), "the tree the old conversion parses");
+    (res.err.is_none(), node.debug_dump(), node.errors().len())
+}
+
+/// Whether `dump` has a `mut` token spelled `uniq`: the keyword of `#![blaze::uniq]`.
+fn has_uniq_keyword(dump: &str) -> bool {
+    dump.lines().any(|line| line.contains("MUT_KW") && line.contains("\"uniq\""))
+}
+
+/// A token is parsed under the syntax extensions of the crate whose source wrote it, in a
+/// matcher's fragment and in the expansion: the macro's own tokens under its crate's, what the
+/// caller handed it under the caller's, whichever of the two crates has the extensions.
+#[test]
+fn a_token_keeps_its_crates_syntax_extensions_through_a_macro() {
+    use span::Extensions;
+    let both = Extensions::UNIQ.with(Extensions::ERROR_UNIONS);
+    let none = Extensions::NONE;
+
+    // The macro's own `&uniq` and `|`: its crate's, also when a crate with no extension calls.
+    let own = "($e:expr, $a:ty, $b:ty) => { fn f(x: $a | $b) { let r = &uniq $e; } };";
+    for call in [none, both] {
+        let (matched, dump, errors) = expanded_across(both, own, call, "n, A, B");
+        assert!(matched && errors == 0, "{call:?}: {errors} errors in\n{dump}");
+        assert!(dump.contains("UNION_TYPE") && has_uniq_keyword(&dump), "{call:?}:\n{dump}");
+    }
+    // The same macro written in a crate with no extension is Rust's, whoever calls it.
+    for call in [none, both] {
+        let (matched, dump, errors) = expanded_across(none, own, call, "n, A, B");
+        assert!(matched && errors > 0, "{call:?}: Rust has no `A | B` type or `&uniq e`\n{dump}");
+        assert!(!dump.contains("UNION_TYPE") && !has_uniq_keyword(&dump), "{call:?}:\n{dump}");
+    }
+
+    // What the caller hands a macro: the caller's. Its fragments are matched under its
+    // extensions (`$e:expr` takes `&uniq n` whole, `$t:ty` takes `A | B`), and parse so in
+    // the expansion of a macro whose crate has none.
+    let handed = "($e:expr, $t:ty) => { fn f(x: $t) { let r = $e; } };";
+    for def in [none, both] {
+        let (matched, dump, errors) = expanded_across(def, handed, both, "&uniq n, A | B");
+        assert!(matched && errors == 0, "{def:?}: {errors} errors in\n{dump}");
+        assert!(dump.contains("UNION_TYPE") && has_uniq_keyword(&dump), "{def:?}:\n{dump}");
+    }
+    // A caller with no extension hands Rust: no rule takes `&uniq n` as an expression, also
+    // in a macro of a crate with the extension.
+    for def in [none, both] {
+        let (matched, _, _) = expanded_across(def, handed, none, "&uniq n, A");
+        assert!(!matched, "{def:?}: `&uniq n` is no expression in a crate without the gate");
+    }
+    // And its tokens stay Rust's where a macro with the extension only passes them on.
+    let passed = "($($t:tt)*) => { fn f() { let r = $($t)*; } };";
+    let (matched, dump, errors) = expanded_across(both, passed, none, "&uniq n");
+    assert!(matched && errors > 0 && !has_uniq_keyword(&dump), "{dump}");
+    let (matched, dump, errors) = expanded_across(none, passed, both, "&uniq n");
+    assert!(matched && errors == 0 && has_uniq_keyword(&dump), "{dump}");
+
+    // A `$p:pat` fragment: `&uniq x` is a pattern of a caller with the gate only.
+    let pattern = "($p:pat) => { fn f() { let $p = r; } };";
+    let (matched, dump, errors) = expanded_across(none, pattern, Extensions::UNIQ, "&uniq x");
+    assert!(matched && errors == 0 && has_uniq_keyword(&dump), "{dump}");
+    assert!(dump.contains("REF_PAT"), "{dump}");
+    let (matched, _, _) = expanded_across(Extensions::UNIQ, pattern, none, "&uniq x");
+    assert!(!matched, "`&uniq x` is no pattern in a crate without the gate");
+
+    // Each extension by itself turns on its own form only.
+    let borrow = "($e:expr) => { fn f() { let r = &uniq $e; } };";
+    let (_, dump, errors) = expanded_across(Extensions::UNIQ, borrow, none, "n");
+    assert!(errors == 0 && has_uniq_keyword(&dump), "{dump}");
+    let (_, dump, errors) = expanded_across(Extensions::ERROR_UNIONS, borrow, none, "n");
+    assert!(errors > 0 && !has_uniq_keyword(&dump), "{dump}");
+    let union = "($a:ty, $b:ty) => { fn f(x: $a | $b) {} };";
+    let (_, dump, errors) = expanded_across(Extensions::ERROR_UNIONS, union, none, "A, B");
+    assert!(errors == 0 && dump.contains("UNION_TYPE"), "{dump}");
+    let (_, dump, errors) = expanded_across(Extensions::UNIQ, union, none, "A, B");
+    assert!(errors > 0 && !dump.contains("UNION_TYPE"), "{dump}");
+}
+
+/// The error, if any, of expanding `arg` by the `macro_rules` rules `decl`.
+fn expansion_error(decl: &str, arg: &str) -> Option<String> {
+    let db = base_db::Db::for_tests(|_| {});
+    let anchor = |file: u32| SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(file), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let decl_tt =
+        syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor(0), ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl_tt, |_| Edition::CURRENT);
+    let arg_tt = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor(1), ctx, arg).unwrap();
+    let res = mac.expand(
+        &db,
+        &arg_tt,
+        |_| (),
+        crate::MacroCall::FnLike,
+        Span { range: TextRange::up_to(TextSize::of(arg)), anchor: anchor(1), ctx },
+    );
+    res.err.map(|err| format!("{err:?}"))
+}
+
+/// konst 0.2.20's `__declare_string_cmp_fns` (reth, tempo): a doc comment between two
+/// `key = $value:ident,` pairs of a matcher. rustc's matcher steps over a matcher's doc comment
+/// (`macro_parser.rs`, `MatcherLoc::Token`), so the call that has no comment there matches.
+#[test]
+fn a_doc_comment_in_a_matcher_matches_nothing() {
+    let decl = r#"
+(
+    ordering_fn = $cmp:ident,
+    /// Equivalent to ordering_fn, but returns a U8Ordering
+    ordering_fn_inner = $inner:ident,
+    $(
+        /** one per key */
+        $key:ident
+    )*
+    //! an inner one, last
+) => { fn $cmp() {} fn $inner() {} };
+"#;
+    let call = "ordering_fn = cmp_str, ordering_fn_inner = cmp_str_inner, a b";
+    assert_eq!(expansion_error(decl, call), None);
+}
+
+/// The control of `a_doc_comment_in_a_matcher_matches_nothing`: only a comment is stepped
+/// over. An attribute written out in the matcher is still tokens the call has to have, and a
+/// call's own doc comment is still its attribute, which a matcher's comment does not take.
+#[test]
+fn a_doc_attribute_in_a_matcher_is_still_matched() {
+    let decl = r#"
+(#[doc = "written out"] $name:ident) => { fn $name() {} };
+"#;
+    assert_eq!(expansion_error(decl, r#"#[doc = "written out"] f"#), None);
+    assert!(expansion_error(decl, "f").is_some(), "the attribute is no comment");
+
+    let commented = r#"
+(
+    /// a comment
+    $name:ident
+) => { fn $name() {} };
+"#;
+    assert_eq!(expansion_error(commented, "f"), None);
+    assert!(
+        expansion_error(commented, "/// the call's\nf").is_some(),
+        "a call's doc comment is its `#[doc]` attribute, which nothing here matches"
+    );
+}
+
+/// `m`, defined by `decl`, called in `call` style on `item`, with `args` as an attribute's
+/// arguments: its expansion as text, after its error if it has one.
+fn expand_as(
+    decl: &str,
+    item: &str,
+    call: impl Fn(Option<&tt::TopSubtree>) -> crate::MacroCall<'_>,
+    args: Option<&str>,
+) -> String {
+    let db = base_db::Db::for_tests(|_| {});
+    let def = SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let at =
+        SpanAnchor { file_id: EditionedFileId::new(FileId::from_raw(1), Edition::CURRENT), ..def };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let decl = syntax_bridge::parse_to_token_tree(Edition::CURRENT, def, ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT);
+    assert!(mac.err().is_none(), "{:?}", mac.err());
+    let item = syntax_bridge::parse_to_token_tree(Edition::CURRENT, at, ctx, item).unwrap();
+    let args = args
+        .map(|args| syntax_bridge::parse_to_token_tree(Edition::CURRENT, at, ctx, args).unwrap());
+    let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor: at, ctx };
+    let expanded = mac.expand(&db, &item, |_| (), call(args.as_ref()), call_site);
+    let mut out = String::new();
+    if let Some(err) = expanded.err {
+        format_to!(out, "error: {err}\n");
+        if let crate::ExpandErrorKind::MatchFailure(failure) = &err.inner.1 {
+            format_to!(out, "while trying to match {}\n", failure.remaining);
+        }
+    }
+    format_to!(out, "{}", expanded.value.0);
+    out
+}
+
+const ATTR_WITH_ARGS: &str = r#"
+attr($(without($($fault:ident),+ $(,)?))?) ($(#[$meta:meta])* $vis:vis fn $name:ident($($params:tt)*) $body:block) => {
+    $(#[$meta])*
+    #[test]
+    $vis fn $name() {
+        fn $name($($params)*) $body
+        run(Seeds::DEFAULT $($(.without(Fault::$fault))+)?, $name)
+    }
+};
+($name:ident) => { fn $name() {} };
+"#;
+
+fn attr(args: Option<&tt::TopSubtree>) -> crate::MacroCall<'_> {
+    crate::MacroCall::Attr { args }
+}
+
+/// An `attr(..)` rule's first pattern matches the attribute's arguments and its second the
+/// item, and the template uses the metavariables of both, in repetitions too.
+#[test]
+fn an_attr_rule_matches_the_attributes_arguments() {
+    let item = "#[inline] pub fn opted(x: u32) { x; }";
+    expect!["# [inline] # [test] pub fn opted () {fn opted (x : u32) {x ;} run (Seeds :: DEFAULT . without (Fault ::Crashes) . without (Fault ::Hangs) , opted)}"].assert_eq(&expand_as(
+        ATTR_WITH_ARGS,
+        item,
+        attr,
+        Some("without(Crashes, Hangs,)"),
+    ));
+}
+
+/// `#[m]` and `#[m()]` give an `attr(..)` rule's arguments pattern no tokens.
+#[test]
+fn an_attr_rule_matches_empty_arguments() {
+    let item = "fn plain(x: u32) {}";
+    let none = expand_as(ATTR_WITH_ARGS, item, attr, None);
+    expect!["# [test] fn plain () {fn plain (x : u32) {} run (Seeds :: DEFAULT , plain)}"]
+        .assert_eq(&none);
+    assert_eq!(none, expand_as(ATTR_WITH_ARGS, item, attr, Some("")));
+}
+
+/// Arguments no `attr(..)` rule matches are the error of a call no rule matches, not a match
+/// of the item alone.
+#[test]
+fn arguments_no_attr_rule_matches_are_no_rule_matched() {
+    let item = "fn opted(x: u32) {}";
+    expect![[r#"
+        error: no rules expected `with`
+        while trying to match `)`
+        # [test] $ vis fn $ name () {fn $ name () $ body run (Seeds :: DEFAULT , $ name)}"#]]
+    .assert_eq(&expand_as(ATTR_WITH_ARGS, item, attr, Some("with(Crashes)")));
+    expect![[r#"
+        error: no rules expected `)`
+        while trying to match meta-variable `$fault:ident`
+        # [test] $ vis fn $ name () {fn $ name () $ body run (Seeds :: DEFAULT , $ name)}"#]]
+    .assert_eq(&expand_as(ATTR_WITH_ARGS, item, attr, Some("without()")));
+}
+
+/// A macro with a fn-like rule and an `attr(..)` rule expands a call by the rule of its style.
+#[test]
+fn a_call_takes_the_rule_of_its_style() {
+    expect!["fn f () {}"].assert_eq(&expand_as(
+        ATTR_WITH_ARGS,
+        "f",
+        |_| crate::MacroCall::FnLike,
+        None,
+    ));
+    expect![[r#"
+        error: no rules expected `f`
+        while trying to match keyword `fn`
+        # [test] fn $ name () {fn $ name () $ body run (Seeds :: DEFAULT , $ name)}"#]]
+    .assert_eq(&expand_as(ATTR_WITH_ARGS, "f", attr, None));
 }

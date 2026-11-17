@@ -1,0 +1,15 @@
+about = "A revision that does not type-check fails naming the error, as a clean build does, and the fixed revision after it builds and runs."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+
+[[revision]]
+action = "build"
+fails = "E0277"
+
+[[revision]]
+action = "run"
+prints = "4 4\n"
+redone = ["app::f"]

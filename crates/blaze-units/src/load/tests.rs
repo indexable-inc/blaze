@@ -302,6 +302,7 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     assert!(!units.target_dir.starts_with("/home/u/ws/"));
     assert_eq!(units.finished, "`dev` profile [unoptimized + debuginfo]");
     assert!(units.warnings.is_empty(), "{:?}", units.warnings);
+    assert!(units.notes.is_empty(), "{:?}", units.notes);
     let lock = units.lock.as_ref().and_then(|it| it.file("Cargo.lock")).expect("a new lock file");
     assert_eq!(lock.path, "/home/u/ws/Cargo.lock");
     assert_eq!(lock.text, format!("{HEADER}\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\n"));
@@ -443,6 +444,54 @@ fn std_panic_abort_aborts_by_its_profile_not_its_rustflags() {
     assert_eq!(unit.profile.rustflags, ["-Cpanic=abort"]);
     let plan = &units.plans[at];
     assert!(!plan.rustflags.iter().any(|it| it.contains("panic")), "{plan:?}");
+}
+
+// A `strip` blaze accepts and does not honour yet (ledger D44) is said on every build that sets
+// it, one named note per setting, the inherited one included, and nothing for `strip = false`.
+// Not a refusal: real projects set it.
+#[test]
+fn a_strip_blaze_does_not_honour_is_a_note_on_every_build_that_sets_it() {
+    let fixture = Fixture::new();
+    let notes = |manifest: &str| {
+        let files = [("ws/Cargo.toml", manifest), ("ws/src/main.rs", "fn main() {}\n")];
+        ready(fixture.plan(fixture.open(&ask(&files)))).notes
+    };
+    let not_yet = "blaze accepts it and does not strip yet: its linker writes the symbol table \
+                   and debug info all the same (ledger D44)";
+    assert_eq!(
+        notes(&format!(
+            "{A}\n[profile.dev]\nstrip = true\n[profile.dev.build-override]\nstrip = \"debuginfo\"\n"
+        )),
+        [
+            format!("profile `dev` sets `strip = true`: {not_yet}"),
+            format!("profile `dev`'s `build-override` sets `strip = \"debuginfo\"`: {not_yet}"),
+        ]
+    );
+    assert_eq!(notes(&format!("{A}\n[profile.dev]\nstrip = false\n")), Vec::<String>::new());
+    assert_eq!(notes(&format!("{A}\n[profile.release]\nstrip = \"symbols\"\n")), Vec::<String>::new(), "another profile's");
+    let files = [("ws/Cargo.toml", A), ("ws/src/main.rs", "fn main() {}\n")];
+    let view = fixture.open(&Ask { env: &[("RUSTFLAGS", "-Cstrip=symbols")], ..ask(&files) });
+    assert_eq!(ready(fixture.plan(view)).notes, [format!("the rustflags pass `-C strip=symbols`: {not_yet}")]);
+}
+
+#[test]
+fn a_strip_in_the_rustflags_is_one_note_per_value() {
+    let flags = |words: &[&str]| words.iter().map(|it| (*it).to_owned()).collect::<Vec<String>>();
+    let (a, b, c) = (
+        flags(&["-C", "strip=symbols", "-Copt-level=1"]),
+        flags(&["-Cstrip=symbols", "--codegen=strip=debuginfo"]),
+        flags(&["-C", "strip=none", "--codegen", "opt-level=2"]),
+    );
+    let notes = super::units::strip_notes(&[], [a.as_slice(), b.as_slice(), c.as_slice()]);
+    let not_yet = "blaze accepts it and does not strip yet: its linker writes the symbol table \
+                   and debug info all the same (ledger D44)";
+    assert_eq!(
+        notes,
+        [
+            format!("the rustflags pass `-C strip=debuginfo`: {not_yet}"),
+            format!("the rustflags pass `-C strip=symbols`: {not_yet}"),
+        ]
+    );
 }
 
 // The standard library is built to unwind whatever the profile's `panic`, as the toolchain's
@@ -689,9 +738,10 @@ fn a_second_workspace_plans_the_standard_library_the_first_did() {
     let first = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "pub fn f() {}\n")];
     let first = ready(fixture.plan(fixture.open(&ask(&first))));
     let b = "[package]\nname = \"b\"\nversion = \"0.2.0\"\nedition = \"2021\"\n";
-    // A library too: a binary brings the dev runtime into its std (`DEV_RUNTIME`), another set
-    // of crates and so another std; what this checks is that the workspace and its target
-    // directory are not among std's inputs.
+    // A library too: a binary brings the dev runtime into its std (`DEV_RUNTIME`), one more
+    // unit of it (`a_test_build_plans_the_standard_library_the_program_build_did` is about
+    // those); what this checks is that the workspace and its target directory are not among
+    // std's inputs.
     let second = [("ws/Cargo.toml", b), ("ws/src/lib.rs", "pub fn g() {}\n")];
     let env = [("CARGO_TARGET_DIR", "/home/u/elsewhere"), ("TERM", "dumb")];
     let second = ready(fixture.plan(fixture.open(&Ask { env: &env, ..ask(&second) })));
@@ -703,6 +753,113 @@ fn a_second_workspace_plans_the_standard_library_the_first_did() {
     for (_, plan) in &first {
         assert!(plan.outputs.iter().all(|it| it.starts_with(&format!("{STD}/"))), "{plan:?}");
     }
+}
+
+/// Each unit of the standard library that both `a` and `b` plan whose plan (its outputs, its
+/// `OUT_DIR`, its variables, its hashes) is not the same in both, by package, target and mode;
+/// and how many units they share.
+fn shared_std_plans_apart<'a>(
+    a: &[((&'a str, &'a str, Mode), &UnitPlan)],
+    b: &[((&'a str, &'a str, Mode), &UnitPlan)],
+) -> (usize, Vec<(&'a str, &'a str, Mode)>) {
+    let mut shared = 0;
+    let mut apart = Vec::new();
+    for (key, plan) in a {
+        let Some((_, other)) = b.iter().find(|(it, _)| it == key) else { continue };
+        shared += 1;
+        if plan != other {
+            apart.push(*key);
+        }
+    }
+    (shared, apart)
+}
+
+/// A program and its test, in one file: `blaze run` plans the program, `blaze test` its test in
+/// libtest's harness, which asks the standard library for `test` too.
+const PROGRAM_WITH_A_TEST: [(&str, &str); 2] =
+    [("ws/Cargo.toml", A), ("ws/src/main.rs", "fn main() {}\n\n#[test]\nfn t() {}\n")];
+
+/// The invariant: a unit of the standard library is planned from what it is made from (the
+/// library, the platform, the profile's settings, std's features, the rustflags), never from
+/// which of the library's crates the build asks for. So a program's build and its tests' build
+/// give every std unit they share one plan, byte for byte: one record key, one `OUT_DIR`, one
+/// crate in the front end, and the second build makes none of it again. The tests' build has
+/// units the program's lacks (`test` and what only it depends on), each of its own.
+#[test]
+fn a_test_build_plans_the_standard_library_the_program_build_did() {
+    let fixture = Fixture::new();
+    let built = ready(fixture.plan(fixture.open(&ask(&PROGRAM_WITH_A_TEST))));
+    let test = Ask { command: Command::Test, ..ask(&PROGRAM_WITH_A_TEST) };
+    let tested = ready(fixture.plan(fixture.open(&test)));
+    let (built, tested) = (std_plans(&built), std_plans(&tested));
+    let (shared, apart) = shared_std_plans_apart(&built, &tested);
+    assert_eq!(shared, built.len(), "the tests' build has every std unit the program's has");
+    assert!(shared > 0);
+    assert!(apart.is_empty(), "a std unit both builds have is planned twice: {apart:?}");
+    let only_tested: Vec<&str> = tested
+        .iter()
+        .filter(|(key, _)| !built.iter().any(|(it, _)| it == key))
+        .map(|((_, target, _), _)| *target)
+        .collect();
+    assert!(only_tested.contains(&"test"), "{only_tested:?}");
+    for (_, plan) in &tested {
+        assert!(plan.outputs.iter().all(|it| it.starts_with(&format!("{STD}/"))), "{plan:?}");
+    }
+}
+
+/// The control of `a_test_build_plans_the_standard_library_the_program_build_did`: with the
+/// standard library's directory named by the crates asked too, as it was, every unit the two
+/// builds share is planned apart, and the oracle says each.
+#[test]
+fn the_oracle_catches_a_standard_library_placed_by_the_crates_asked() {
+    struct Planted;
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            super::units::PLACES_BY_CRATES_ASKED.set(false);
+        }
+    }
+    super::units::PLACES_BY_CRATES_ASKED.set(true);
+    let _planted = Planted;
+    let fixture = Fixture::new();
+    let built = ready(fixture.plan(fixture.open(&ask(&PROGRAM_WITH_A_TEST))));
+    let test = Ask { command: Command::Test, ..ask(&PROGRAM_WITH_A_TEST) };
+    let tested = ready(fixture.plan(fixture.open(&test)));
+    let (built, tested) = (std_plans(&built), std_plans(&tested));
+    let (shared, apart) = shared_std_plans_apart(&built, &tested);
+    assert!(shared > 0);
+    assert_eq!(apart.len(), shared, "every shared unit's outputs are under another directory");
+}
+
+/// What a unit of the standard library is made from still tells two stds apart (rule 21): a
+/// build with other features of std plans no unit where the first build's are.
+#[test]
+fn another_std_feature_set_is_placed_apart() {
+    let fixture = Fixture::new();
+    let built = ready(fixture.plan(fixture.open(&ask(&PROGRAM_WITH_A_TEST))));
+    let featured = Ask {
+        args: &["-Z", "build-std=std", "-Z", "build-std-features=panic-unwind"],
+        ..ask(&PROGRAM_WITH_A_TEST)
+    };
+    let featured = ready(fixture.plan(fixture.open(&featured)));
+    let (built, featured) = (std_plans(&built), std_plans(&featured));
+    let (shared, apart) = shared_std_plans_apart(&built, &featured);
+    assert!(shared > 0);
+    assert_eq!(apart.len(), shared, "a std of other features shares no unit's plan");
+    let dir = |plans: &[((&str, &str, Mode), &UnitPlan)]| -> Vec<String> {
+        let mut dirs: Vec<String> = plans
+            .iter()
+            .flat_map(|(_, plan)| plan.outputs.iter())
+            .filter_map(|it| it.strip_prefix(&format!("{STD}/")))
+            .filter_map(|it| it.split('/').next())
+            .map(str::to_owned)
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    };
+    let (first, second) = (dir(&built), dir(&featured));
+    assert_eq!((first.len(), second.len()), (1, 1), "{first:?} {second:?}");
+    assert_ne!(first, second);
 }
 
 #[test]
@@ -911,6 +1068,80 @@ fn the_lock_file_pins_a_registry_package_which_is_fetched_then_built() {
     );
 }
 
+/// Two packages the lock file pins to one commit of one git repository (a workspace whose
+/// member inherits its package table and a `path` dependency from `[workspace.dependencies]`,
+/// as `uzaaft/libghostty-rs` is) are in one checkout: the load asks for it once, never once per
+/// package, which the daemon refuses as a place asked twice.
+#[test]
+fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
+    let commit = "575ed6b8ceb79ffaf247ecf7e34333876b0d5be4";
+    let source = format!("git+https://github.com/o/r?rev={commit}#{commit}");
+    let ident = blaze_resolve::SourceId::from_url(&source).unwrap().git_ident();
+    let at = format!("{SOURCES}/git/checkouts/{ident}/{commit}");
+    let tree = format!("blake3:{}", "ab".repeat(32));
+    let blaze_lock = format!("version = 1\n\n[git.\"https://github.com/o/r\"]\n{commit} = \"{tree}\"\n");
+    let fetch = Fetch {
+        what: "git repository `https://github.com/o/r`".to_owned(),
+        url: "https://github.com/o/r".to_owned(),
+        kind: FetchKind::Git { commit: commit.to_owned(), tree },
+        at: at.clone(),
+    };
+    let manifest =
+        format!("{A}\n[dependencies]\nr = {{ git = \"https://github.com/o/r\", rev = \"{commit}\" }}\n");
+    let lock = format!(
+        "{HEADER}\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \"r\",\n]\n\n\
+         [[package]]\nname = \"r\"\nversion = \"0.1.0\"\nsource = \"{source}\"\ndependencies = [\n \"r-sys\",\n]\n\n\
+         [[package]]\nname = \"r-sys\"\nversion = \"0.1.0\"\nsource = \"{source}\"\n"
+    );
+    let fixture = Fixture::new();
+    // Without its tree pinned in `blaze.lock`, the git package is refused before its
+    // checkout is asked for: the commit (SHA-1) pins nothing.
+    let unpinned = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/src/lib.rs", ""),
+    ];
+    let Planned::Failed(error) = fixture.plan(fixture.open(&ask(&unpinned))) else {
+        panic!("an unpinned git package was located");
+    };
+    assert!(
+        error.what.contains("weak_source_pin") && error.what.contains("blaze audit pin") && error.what.contains(commit),
+        "{}",
+        error.what
+    );
+    let files = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/blaze.lock", blaze_lock.as_str()),
+        ("ws/src/lib.rs", ""),
+    ];
+    assert_eq!(fixture.plan(fixture.open(&ask(&files))), Planned::Needs(vec![fetch]));
+
+    let root = "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n\n\
+                [workspace.package]\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                [workspace.dependencies]\nr = { path = \"crates/r\" }\nr-sys = { path = \"crates/r-sys\" }\n";
+    let r = "[package]\nname = \"r\"\nversion.workspace = true\nedition.workspace = true\n\n\
+             [dependencies]\nr-sys.workspace = true\n";
+    let r_sys = "[package]\nname = \"r-sys\"\nversion.workspace = true\nedition.workspace = true\n";
+    let fetched = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/blaze.lock", blaze_lock.as_str()),
+        ("ws/src/lib.rs", ""),
+        ("co/Cargo.toml", root),
+        ("co/crates/r/Cargo.toml", r),
+        ("co/crates/r/src/lib.rs", ""),
+        ("co/crates/r-sys/Cargo.toml", r_sys),
+        ("co/crates/r-sys/src/lib.rs", ""),
+    ];
+    let mounted = Ask { mounts: vec![mount(&at, "co")], ..ask(&fetched) };
+    let units = ready(fixture.plan(fixture.open(&mounted)));
+    assert_eq!(units.lock, None, "the lock file is up to date");
+    let (r_sys_at, _, _) = lib_of(&units, "r-sys");
+    let (_, r_lib, _) = lib_of(&units, "r");
+    assert!(r_lib.dependencies.iter().any(|it| it.index == r_sys_at));
+}
+
 /// What one step over the view's workspace saw: whether its lock file's bytes were lent from
 /// the database rather than copied, and whether it resolved.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -964,7 +1195,7 @@ impl Query for HostMacros {
     const KIND: blaze_query::QueryKind = blaze_query::QueryKind(0x63f3);
     const NAME: &'static str = "cargo test plan with host macros";
     const PRODUCER: ContentId =
-        crate::query::producer("blaze v2 cargo test plan with host macros 1");
+        crate::query::producer("blaze v2 cargo test plan with host macros 2");
     type Key = ();
     type Value = crate::query::Cbor<Planned>;
 
@@ -988,11 +1219,11 @@ impl Query for HostMacros {
                 packages: built.packages,
                 lock: built.lock,
                 warnings: built.warnings,
+                notes: built.notes,
                 target_dir: built.target_dir,
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
-                sandboxed_tests: built.sandboxed_tests,
                 native: built.native,
             }),
             super::Staged::Needs(fetches) => Planned::Needs(fetches),
@@ -1214,6 +1445,89 @@ fn only_a_unit_that_uses_an_artifact_dependency_is_refused() {
     assert!(refused.contains("of `a` depends on `b`"), "{refused}");
 }
 
+/// blaze's `artifact = "gpu"` (docs/future/gpu/shaders.md): no `-Z bindeps`, a device unit of
+/// the dependency for `naga-unknown-unknown` that is built even by a check (the dependent's front
+/// end reads its MSL), the MSL among that unit's outputs and named to the dependent alone, and a
+/// library edge too only with `lib = true`.
+#[test]
+fn a_gpu_artifact_dependency_is_built_for_the_device_and_names_its_msl_to_the_dependent() {
+    let fixture = Fixture::new();
+    let shaders = "[package]\nname = \"shaders\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    let with_lib =
+        format!("{A}\n[dependencies]\nshaders = {{ path = \"../shaders\", artifact = \"gpu\", lib = true }}\n");
+    let gpu_only = format!("{A}\n[dependencies]\nshaders = {{ path = \"../shaders\", artifact = \"gpu\" }}\n");
+    for (manifest, linked) in [(with_lib.as_str(), true), (gpu_only.as_str(), false)] {
+        let files = [
+            ("ws/Cargo.toml", "[workspace]\nmembers = [\"a\", \"shaders\"]\nresolver = \"2\"\n"),
+            ("ws/a/Cargo.toml", manifest),
+            ("ws/a/src/lib.rs", ""),
+            ("ws/shaders/Cargo.toml", shaders),
+            ("ws/shaders/src/lib.rs", ""),
+        ];
+        for command in [Command::Build, Command::Check] {
+            let units = ready(fixture.plan(fixture.open(&Ask { command, args: &["-p", "a"], ..ask(&files) })));
+            let device: Vec<(usize, &Unit)> = units_of(&units, "shaders")
+                .into_iter()
+                .filter(|(_, it)| it.platform.as_deref() == Some(crate::GPU_DEVICE))
+                .collect();
+            let [(gpu_at, gpu)] = device.as_slice() else {
+                panic!("one device unit of `shaders` under {command:?}, not {device:?}")
+            };
+            assert!(gpu.target.is_lib() && gpu.mode == Mode::Build && !gpu.macro_wasm, "{gpu:?}");
+            assert_eq!(gpu.profile.panic, "abort", "the device has no unwinding");
+            let msl = units.plans[*gpu_at].gpu_msl.as_deref().expect("the device unit writes MSL");
+            assert!(msl.ends_with(".msl") && msl.contains("shaders"), "{msl}");
+            assert!(units.plans[*gpu_at].outputs.iter().any(|it| it == msl), "{:?}", units.plans[*gpu_at].outputs);
+
+            let (a_at, a, a_plan) = units_of(&units, "a")
+                .into_iter()
+                .find(|(_, it)| it.target.is_lib())
+                .map(|(at, it)| (at, it, &units.plans[at]))
+                .expect("a's library unit");
+            assert_eq!(env_of(a_plan, "BLAZE_GPU_MSL_SHADERS"), Some(msl), "a is told the MSL's path");
+            let edges: Vec<(bool, Option<&str>)> = a
+                .dependencies
+                .iter()
+                .filter(|it| units.graph.units[it.index].pkg_id == gpu.pkg_id)
+                .map(|it| (it.gpu, units.graph.units[it.index].platform.as_deref()))
+                .collect();
+            assert!(edges.contains(&(true, Some(crate::GPU_DEVICE))), "{edges:?}");
+            assert_eq!(edges.iter().any(|(gpu, _)| !gpu), linked, "a links shaders only with `lib = true`: {edges:?}");
+            // Only the edge's unit writes MSL, and only its dependent is told of it.
+            for (at, plan) in units.plans.iter().enumerate() {
+                assert_eq!(plan.gpu_msl.is_some(), at == *gpu_at, "{:?}", units.graph.units[at].target.name);
+                if at != a_at {
+                    assert_eq!(env_of(plan, "BLAZE_GPU_MSL_SHADERS"), None, "{:?}", units.graph.units[at].target.name);
+                }
+            }
+        }
+    }
+}
+
+/// `artifact = "gpu"` is the device build alone: no other kind with it, no `target`, and not
+/// a build dependency, each refused naming the dependency.
+#[test]
+fn a_gpu_artifact_dependency_refuses_what_it_has_no_meaning_for() {
+    let fixture = Fixture::new();
+    let shaders = "[package]\nname = \"shaders\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    for (dep, says) in [
+        ("[dependencies]\nshaders = { path = \"../shaders\", artifact = [\"gpu\", \"cdylib\"] }", "takes no other artifact kind"),
+        ("[dependencies]\nshaders = { path = \"../shaders\", artifact = \"gpu\", target = \"x86_64-unknown-linux-gnu\" }", "takes no `target`"),
+        ("[build-dependencies]\nshaders = { path = \"../shaders\", artifact = \"gpu\" }", "not a build dependency (shaders)"),
+    ] {
+        let a = format!("{A}\n{dep}\n");
+        let files = [
+            ("ws/Cargo.toml", "[workspace]\nmembers = [\"a\", \"shaders\"]\nresolver = \"2\"\n"),
+            ("ws/a/Cargo.toml", a.as_str()),
+            ("ws/a/src/lib.rs", ""),
+            ("ws/shaders/Cargo.toml", shaders),
+            ("ws/shaders/src/lib.rs", ""),
+        ];
+        let refused = failed(fixture.plan(fixture.open(&Ask { args: &["-p", "a"], ..ask(&files) })));
+        assert!(refused.contains(says), "{dep}: {refused}");
+    }
+}
+
 #[test]
 fn a_workspace_that_is_not_there_is_cargos_error() {
     let fixture = Fixture::new();
@@ -1307,14 +1621,19 @@ fn the_sandbox_opt_outs_are_the_manifests() {
     );
 }
 
-// The tests' opt-ins as the plan carries them: the workspace's `sandboxed-tests` experiment,
-// `a`'s `tests = true` with one test out, `b`'s `tests = false`, and `d`, outside the
-// workspace, whose own table is not read.
+// The tests' sandbox as the plan carries it, for a Linux host (`HOST`), which sandboxes tests by
+// default: `c`, which says nothing, is; `a`'s `tests = true` (the default said out loud) with
+// one test out; `b`'s `tests = false`; and `d`, outside the workspace, whose own table is not
+// read. A workspace that still lists `sandboxed-tests` plans the same there, with one note
+// (on macOS it is the opt-in: `sandbox::tests_on`).
 #[test]
 fn the_tests_opt_ins_are_the_manifests() {
     let fixture = Fixture::new();
-    let root = "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n\n\
-                [workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n";
+    let root = |experimental: &str| {
+        format!(
+            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n{experimental}"
+        )
+    };
     let package = |name: &str, extra: &str| {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{extra}")
     };
@@ -1326,34 +1645,50 @@ fn the_tests_opt_ins_are_the_manifests() {
     let b = package("b", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
     let c = package("c", "");
     let d = package("d", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
-    let files = [
-        ("ws/Cargo.toml", root),
-        ("ws/a/Cargo.toml", a.as_str()),
-        ("ws/a/src/lib.rs", ""),
-        ("ws/b/Cargo.toml", b.as_str()),
-        ("ws/b/src/lib.rs", ""),
-        ("ws/c/Cargo.toml", c.as_str()),
-        ("ws/c/src/lib.rs", ""),
-        ("d/Cargo.toml", d.as_str()),
-        ("d/src/lib.rs", ""),
-    ];
-    let units = ready(
-        fixture.plan(fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) })),
-    );
-    assert!(units.sandboxed_tests);
+    let plain = root("");
+    let retired = root("\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n");
+    let plan = |root: &str| {
+        let files = [
+            ("ws/Cargo.toml", root),
+            ("ws/a/Cargo.toml", a.as_str()),
+            ("ws/a/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", b.as_str()),
+            ("ws/b/src/lib.rs", ""),
+            ("ws/c/Cargo.toml", c.as_str()),
+            ("ws/c/src/lib.rs", ""),
+            ("d/Cargo.toml", d.as_str()),
+            ("d/src/lib.rs", ""),
+        ];
+        ready(fixture.plan(
+            fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) }),
+        ))
+    };
+    let units = plan(&plain);
+    assert!(units.notes.is_empty(), "{:?}", units.notes);
     let of = |name: &str| units.packages.iter().find(|it| it.name == name).unwrap();
     assert_eq!(
         of("a").tests,
-        TestSandbox { all: false, opted_in: true, tests: vec!["net::reaches".to_owned()] }
+        TestSandbox { tests: vec!["net::reaches".to_owned()], ..TestSandbox::default() }
     );
-    assert_eq!(of("b").tests, TestSandbox { all: true, opted_in: false, tests: Vec::new() });
+    assert_eq!(of("b").tests, TestSandbox { all: true, ..TestSandbox::default() });
     assert_eq!(of("c").tests, TestSandbox::default());
     assert_eq!(of("d").tests, TestSandbox::default());
     for (name, sandboxed) in [("a", true), ("b", false), ("c", true), ("d", true)] {
-        assert_eq!(of(name).tests_sandboxed(units.sandboxed_tests), sandboxed, "{name}");
+        assert_eq!(of(name).tests_sandboxed(), sandboxed, "{name}");
     }
-    assert!(!of("c").tests_sandboxed(false) && of("a").tests_sandboxed(false));
     assert!(units.packages.iter().all(|it| it.checksum.is_none()), "no package is from crates.io");
+
+    let listed = plan(&retired);
+    assert_eq!(listed.packages, units.packages, "the retired experiment changes no package");
+    assert_eq!(listed.notes.len(), 1, "{:?}", listed.notes);
+    assert!(
+        listed.notes[0].starts_with(
+            "`sandboxed-tests` in `experimental` under [workspace.metadata.blaze] of \
+             /home/u/ws/Cargo.toml does nothing on x86_64-unknown-linux-gnu"
+        ),
+        "{}",
+        listed.notes[0]
+    );
 
     let unknown = "[workspace]\nmembers = [\"c\"]\nresolver = \"3\"\n\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-test\"]\n";
     let files =

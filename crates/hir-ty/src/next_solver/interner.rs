@@ -255,12 +255,46 @@ macro_rules! interned_slice {
         }
 
         $crate::next_solver::interner::impl_stored_interned_slice!($name, $stored_name);
+        $crate::next_solver::interner::table::holds_by_visit!($ty_static);
+
+        impl<'db> $crate::next_solver::interner::table::Homed for $name<'db> {
+            /// The greatest of its items' homes, written when the list was added.
+            #[inline]
+            fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                $storage::table().home(self.index)
+            }
+        }
+
+        $crate::next_solver::interner::memo_home!($name<'db>);
     };
 }
 pub(crate) use interned_slice;
 
+/// [`blaze_memo::Home`] for a handle of a solver table (and its `Stored` form): its row's home
+/// ([`table::Homed`]), so a key holding it is homed with the most downstream crate it names. A
+/// row of plain data names no arena (`None`), and names none here: a key of nothing else is
+/// homed at the asking snapshot's own session arena (`blaze_memo`'s `home_of`), at whatever
+/// generation that snapshot holds.
+macro_rules! memo_home {
+    ($($ty:ty),+ $(,)?) => {$(
+        #[allow(unused_lifetimes)]
+        impl<'db> ::blaze_memo::Home for $ty {
+            #[inline]
+            fn home(&self, homes: &mut ::blaze_memo::Homes<'_>) {
+                if let ::core::option::Option::Some(arena) =
+                    $crate::next_solver::interner::table::Homed::home(self)
+                {
+                    homes.arena(arena);
+                }
+            }
+        }
+    )+};
+}
+pub(crate) use memo_home;
+
 /// `$stored_name`, the list `$name` as kept in a query result: its index, which stays valid in
-/// every revision, as an interned value is never freed.
+/// every revision of its database, as an interned value is freed only by a release of the
+/// tables (`table::release_all`), which runs once no database is left.
 macro_rules! impl_stored_interned_slice {
     ( $name:ident, $stored_name:ident $(,)? ) => {
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -275,9 +309,14 @@ macro_rules! impl_stored_interned_slice {
             }
         }
 
-        // SAFETY: `$stored_name` is a row number and borrows nothing, and the row it names is
-        // never freed, so it is valid in every revision (unlike `$name`, which carries `'db`).
-        unsafe impl blaze_query::db::Value for $stored_name {}
+        impl $crate::next_solver::interner::table::Homed for $stored_name {
+            #[inline]
+            fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                $crate::next_solver::interner::table::Homed::home(&self.as_ref())
+            }
+        }
+
+        $crate::next_solver::interner::memo_home!($stored_name);
 
         impl std::fmt::Debug for $stored_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -356,11 +395,12 @@ macro_rules! impl_foldable_for_stored_type {
 pub(crate) use impl_foldable_for_stored_type;
 
 /// `$stored_name`, the interned `$name` as kept in a query result: its index, which stays valid
-/// in every revision, as an interned value is never freed. `$name` has an `index: NonZeroU32`
+/// in every revision of its database, as an interned value is freed only by a release of the
+/// tables, which runs once no database is left. `$name` has an `index: NonZeroU32`
 /// field and an `at(NonZeroU32)` constructor.
 macro_rules! impl_stored_interned {
     ( $name:ident, $stored_name:ident $(,)? ) => {
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $stored_name {
             index: ::std::num::NonZeroU32,
         }
@@ -373,6 +413,15 @@ macro_rules! impl_stored_interned {
                 $name::at(self.index)
             }
         }
+
+        impl $crate::next_solver::interner::table::Homed for $stored_name {
+            #[inline]
+            fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                $crate::next_solver::interner::table::Homed::home(&self.as_ref())
+            }
+        }
+
+        $crate::next_solver::interner::memo_home!($stored_name, $name<'db>);
 
         impl std::fmt::Debug for $stored_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -415,7 +464,7 @@ pub struct DbInterner<'db> {
     features: Option<Features<'db>>,
 }
 
-// The database is `Send + Sync` (`blaze_query::db::Database`), so an interner is, by the auto traits.
+// The database is `Send + Sync` (`blaze_memo::Database`), so an interner is, by the auto traits.
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<DbInterner<'static>>();
@@ -604,9 +653,11 @@ const PARAM_ENV_CACHE_ENTRIES: usize = 1 << 14;
 thread_local! {
     /// rustc's `canonical_param_env_cache`, one per thread. An entry is a function of its key
     /// alone: a param env with no type or const inference variables, whose free regions all
-    /// become placeholders of the root universe, of interned values that are never freed. So
-    /// it holds for every interner and database of the process.
-    static PARAM_ENV_CACHE: std::cell::Cell<Option<Box<ParamEnvCache<'static>>>> =
+    /// become placeholders of the root universe, of interned values. So it holds for every
+    /// interner and database of the process until a release of the tables (`table::release_all`)
+    /// frees the rows it names: it is kept with the count of releases it was filled under
+    /// (`table::releases`) and starts over when that moved.
+    static PARAM_ENV_CACHE: std::cell::Cell<Option<(u64, Box<ParamEnvCache<'static>>)>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -625,13 +676,155 @@ interned_slice!(
 #[derive(Debug)]
 pub struct Tracked<T: fmt::Debug + Clone> {
     value: T,
-    reads: Option<blaze_query::db::Reads>,
+    reads: Option<Reads>,
+}
+
+/// What a piece of solving read, as blaze-memo's recorder listed it: sorted, deduplicated and
+/// shared, so a cache that keeps an answer for every query of the snapshot keeps its list once.
+/// Its rows name entries of this snapshot (`Read::Query`'s key), so it is kept only in a cache
+/// a later snapshot starts over or carries with those entries' arenas (`tls_cache`).
+#[derive(Clone, Debug)]
+pub struct Reads(std::sync::Arc<[blaze_memo::Read]>);
+
+impl Reads {
+    /// The rows, sorted and deduplicated, as the recorder listed them.
+    #[inline]
+    pub fn rows(&self) -> &[blaze_memo::Read] {
+        &self.0
+    }
+}
+
+const _: fn() = || {
+    fn shared<T: Send + Sync + 'static>() {}
+    shared::<Reads>();
+};
+
+thread_local! {
+    /// How many times this thread's solving used something a query computed earlier, outside
+    /// the [`recorded`] frames open now, whose reads those frames did not make ([`unshareable`]).
+    /// A frame whose count moved gives no list, as the old engine's `unshareable_reads` made
+    /// every open capture frame give none. A count, not a stack, so every frame open at the
+    /// mark sees it; a frame is closed on the thread it opened on, as blaze-memo's recorder
+    /// frame is.
+    static UNSHAREABLE_MARKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `work` under blaze-memo's recorder and gives what it read; `None` when what it computed
+/// must not be shared with another query: the snapshot keeps no read lists, it made an
+/// untracked read, or it used an answer of its query's own cache ([`unshareable`]), here or in a
+/// frame nested in this one.
+pub(crate) fn recorded<T>(db: &Db, work: impl FnOnce() -> T) -> (T, Option<Reads>) {
+    let memo = blaze_memo::Database::memo(db);
+    let marks = UNSHAREABLE_MARKS.with(std::cell::Cell::get);
+    let mut work = Some(work);
+    match blaze_memo::record(memo, || (work.take().expect("`record` runs its work once"))()) {
+        Ok((value, reads)) => {
+            let shareable = UNSHAREABLE_MARKS.with(std::cell::Cell::get) == marks
+                && !reads.iter().any(|read| read.is_untracked());
+            (value, shareable.then(|| Reads(std::sync::Arc::from(reads))))
+        }
+        Err(blaze_memo::RecorderOff) => {
+            (work.take().expect("`record` refused before running its work")(), None)
+        }
+    }
+}
+
+/// Makes the running work depend on `reads` as if it had made them: the running query's list,
+/// and every [`recorded`] frame open in it, takes them.
+pub(crate) fn replay(db: &Db, reads: &Reads) {
+    let memo = blaze_memo::Database::memo(db);
+    for &read in reads.0.iter() {
+        blaze_memo::read(memo, read);
+    }
+}
+
+/// Makes every [`recorded`] frame open on this thread give no list: the caller used something
+/// its query computed earlier, outside those frames, whose reads they did not make.
+fn unshareable() {
+    UNSHAREABLE_MARKS.with(|marks| marks.set(marks.get() + 1));
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct AllocId;
 
 interned_slice!(VariancesOfStorage, VariancesOf, StoredVariancesOf, variances, Variance, Variance);
+
+/// A variance is plain data. (Its `Holds` comes from [`VariancesOf`]'s `interned_slice!`.)
+impl table::Homed for Variance {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        None
+    }
+}
+
+/// A canonical variable's home: its placeholder's, if it is one; the others are plain data.
+/// By hand, as `CanonicalVarKind` has no codec.
+impl<'db> table::Homed for CanonicalVarKind<'db> {
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        match self {
+            rustc_type_ir::CanonicalVarKind::PlaceholderTy(placeholder) => {
+                table::Homed::home(placeholder)
+            }
+            rustc_type_ir::CanonicalVarKind::PlaceholderRegion(placeholder) => {
+                table::Homed::home(placeholder)
+            }
+            rustc_type_ir::CanonicalVarKind::PlaceholderConst(placeholder) => {
+                table::Homed::home(placeholder)
+            }
+            rustc_type_ir::CanonicalVarKind::Ty { .. }
+            | rustc_type_ir::CanonicalVarKind::Int
+            | rustc_type_ir::CanonicalVarKind::Float
+            | rustc_type_ir::CanonicalVarKind::Region(_)
+            | rustc_type_ir::CanonicalVarKind::Const(_) => None,
+        }
+    }
+}
+
+/// The list of opaque types a typing mode names, if it names one.
+fn typing_mode_opaques<'db>(
+    mode: &rustc_type_ir::TypingMode<DbInterner<'db>, rustc_type_ir::MayBeErased>,
+) -> Option<SolverDefIds<'db>> {
+    match *mode {
+        rustc_type_ir::TypingMode::Typeck { defining_opaque_types_and_generators: ids }
+        | rustc_type_ir::TypingMode::PostTypeckThroughBorrowck { defining_opaque_types: ids }
+        | rustc_type_ir::TypingMode::PostBorrowck { defined_opaque_types: ids } => Some(ids),
+        rustc_type_ir::TypingMode::Coherence
+        | rustc_type_ir::TypingMode::Reflection
+        | rustc_type_ir::TypingMode::PostAnalysis
+        | rustc_type_ir::TypingMode::Codegen
+        | rustc_type_ir::TypingMode::ErasedNotCoherence(_) => None,
+    }
+}
+
+/// The newest arena a canonical goal names: its environment's, predicate's, opaques',
+/// variables' and typing mode's. By hand, as `CanonicalQueryInput` has no codec and no visit.
+impl<'db> table::Homed for CanonicalInputData<'db> {
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        let input = &self.canonical.value;
+        let mut home = table::Homed::home(&input.goal.param_env.clauses)
+            .max(table::Homed::home(&input.goal.predicate))
+            .max(table::Homed::home(&input.predefined_opaques_in_body))
+            .max(table::Homed::home(&self.canonical.var_kinds));
+        if let Some(ids) = typing_mode_opaques(&self.typing_mode.0) {
+            home = home.max(table::Homed::home(&ids));
+        }
+        home
+    }
+}
+
+/// The rows a canonical goal holds: the same fields [`table::Homed`] reads, each a handle.
+impl table::Holds for CanonicalInputData<'static> {
+    fn hold(&self, held: &mut table::Held) {
+        let input = &self.canonical.value;
+        GenericTypeVisitable::generic_visit_with(&input.goal.param_env.clauses, held);
+        GenericTypeVisitable::generic_visit_with(&input.goal.predicate, held);
+        GenericTypeVisitable::generic_visit_with(&input.predefined_opaques_in_body, held);
+        GenericTypeVisitable::generic_visit_with(&self.canonical.var_kinds, held);
+        if let Some(ids) = typing_mode_opaques(&self.typing_mode.0) {
+            GenericTypeVisitable::generic_visit_with(&ids, held);
+        }
+    }
+}
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -659,7 +852,9 @@ enum AdtDefInner {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdtDef(AdtDefInner);
 
-const _: () = assert!(size_of::<AdtDef>() == 8);
+// 12 bytes: an 8-byte `Gid` id (arena and local; blaze-query's id was 4), its flags and the
+// variant's tag in the padding after them (it was 8). Held in `TyKind::Adt`, within its 48.
+const _: () = assert!(size_of::<AdtDef>() == 12);
 
 impl AdtDef {
     pub fn new<'db>(def_id: AdtId, interner: DbInterner<'db>) -> Self {
@@ -1018,6 +1213,18 @@ const _: () = assert!(size_of::<Option<Pattern<'static>>>() == 4);
 // A row costs `table::ROW_BYTES` hot bytes and its kind, at most 48 cold ones.
 const _: () = assert!(size_of::<PatternKind<'static>>() <= 48);
 
+table::holds_by_visit!(PatternKind<'static>);
+
+impl<'db> table::Homed for Pattern<'db> {
+    /// Its row's home, written when the row was added.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        PATTERNS.home(self.index)
+    }
+}
+
+memo_home!(Pattern<'db>);
+
 impl<'db> Pattern<'db> {
     pub fn new(_interner: DbInterner<'db>, kind: PatternKind<'db>) -> Self {
         Self::intern(kind)
@@ -1027,7 +1234,8 @@ impl<'db> Pattern<'db> {
     pub(super) fn intern(kind: PatternKind<'db>) -> Self {
         Self::at(PATTERNS.intern(kind, || {
             let (flags, binder) = pattern_flags(kind);
-            table::RowInfo { tag: persist::tag(&kind), flags, binder }
+            let (tag, home) = persist::tag_and_home(&kind);
+            table::RowInfo { tag, flags, binder, home }
         }))
     }
 
@@ -1054,7 +1262,9 @@ fn pattern_flags(kind: PatternKind<'_>) -> (TypeFlags, rustc_type_ir::DebruijnIn
             .fold((TypeFlags::empty(), rustc_type_ir::INNERMOST), |(flags, binder), pat| {
                 (flags | pat.flags(), binder.max(pat.outer_exclusive_binder()))
             }),
-        PatternKind::NotNull => (TypeFlags::empty(), rustc_type_ir::INNERMOST),
+        PatternKind::NotNull | PatternKind::Variant { .. } => {
+            (TypeFlags::empty(), rustc_type_ir::INNERMOST)
+        }
     }
 }
 
@@ -1142,9 +1352,18 @@ impl<'db> rustc_type_ir::relate::Relate<DbInterner<'db>> for Pattern<'db> {
                 Ok(Pattern::new(tcx, PatternKind::Or(pats)))
             }
             (PatternKind::NotNull, PatternKind::NotNull) => Ok(a),
-            (PatternKind::Range { .. } | PatternKind::Or(_) | PatternKind::NotNull, _) => {
-                Err(TypeError::Mismatch)
+            // blaze: a variant of the base enum (`#![blaze::pattern_types]`); a set is
+            // canonical (sorted, no variant twice), so equal sets are equal patterns.
+            (PatternKind::Variant { index: a_index }, PatternKind::Variant { index: b_index }) => {
+                if a_index == b_index { Ok(a) } else { Err(TypeError::Mismatch) }
             }
+            (
+                PatternKind::Range { .. }
+                | PatternKind::Or(_)
+                | PatternKind::NotNull
+                | PatternKind::Variant { .. },
+                _,
+            ) => Err(TypeError::Mismatch),
         }
     }
 }
@@ -1251,7 +1470,7 @@ impl<'db> Interner for DbInterner<'db> {
         ExternalConstraints::new(self, data)
     }
 
-    type DepNodeIndex = Option<blaze_query::db::Reads>;
+    type DepNodeIndex = Option<Reads>;
 
     type Tracked<T: fmt::Debug + Clone> = Tracked<T>;
 
@@ -1320,28 +1539,27 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn get_tracked<T: fmt::Debug + Clone>(self, tracked: &Self::Tracked<T>) -> T {
-        match tracked.reads {
+        match &tracked.reads {
             // From the shared cache: the query taking it reruns when the reads change, and so
-            // does any goal it is solving in a capture of its own, which takes them too.
-            Some(reads) => blaze_query::db::replay_reads(self.db, reads),
+            // does any goal it is solving in a frame of its own, which takes them too.
+            Some(reads) => replay(self.db, reads),
             // From this query's own cache: the query made the reads itself, but a goal being
-            // captured now did not, and so must not be shared either.
-            None => blaze_query::db::unshareable_reads(self.db),
+            // recorded now did not, and so must not be shared either.
+            None => unshareable(),
         }
         tracked.value.clone() // clone: `get_tracked` hands out an owned value; the solver's are handles
     }
 
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex) {
-        // Every goal the solver computes runs in here, a nested goal inside its parent's. A
-        // goal can take minutes of solving that asks the database nothing, so a cancelled one
-        // is noticed here rather than at the next query.
-        blaze_query::db::unwind_if_cancelled(self.db);
-        blaze_query::db::capture_reads(self.db, || super::ensure_sufficient_stack(task))
+        // Every goal the solver computes runs in here, a nested goal inside its parent's. (The
+        // old engine checked for a newer revision's cancellation here; a blaze-memo snapshot is
+        // never cancelled by a newer one, so there is nothing to check.)
+        recorded(self.db, || super::ensure_sufficient_stack(task))
     }
 
     fn cache_scope(self, reads: &Self::DepNodeIndex) -> rustc_type_ir::search_graph::CacheScope {
-        // A goal is shared only with its reads, which `capture_reads` gives only when any
-        // query may replay them.
+        // A goal is shared only with its reads, which `recorded` gives only when any query
+        // may replay them.
         match reads {
             Some(_) => rustc_type_ir::search_graph::CacheScope::Shared,
             None => rustc_type_ir::search_graph::CacheScope::Query,
@@ -1390,6 +1608,12 @@ impl<'db> Interner for DbInterner<'db> {
     fn assert_evaluation_is_concurrent(&self) {
         // Turns out, the assumption for this function isn't perfect.
         // See https://github.com/rust-lang/trait-system-refactor-initiative/issues/234
+    }
+
+    /// blaze: whether two constants that are not the same constant are the same expression
+    /// of the same constants ([`crate::const_exprs`], `#![feature(blaze_const_exprs)]`).
+    fn same_const_expression(self, a: Const<'db>, b: Const<'db>) -> bool {
+        crate::const_exprs::same_expression(self.db, a, b)
     }
 
     fn expand_abstract_consts<T: rustc_type_ir::TypeFoldable<Self>>(self, _: T) -> T {
@@ -1844,6 +2068,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverProjectionLangItem::FieldBase => lang_items.FieldBase,
             SolverProjectionLangItem::FieldType => lang_items.FieldType,
             SolverProjectionLangItem::ReflectVariantView => lang_items.ReflectVariantView,
+            SolverProjectionLangItem::ReflectTypeOfType => lang_items.ReflectTypeOfType,
         };
         lang_item.expect("Lang item required but not found.").into()
     }
@@ -1886,11 +2111,14 @@ impl<'db> Interner for DbInterner<'db> {
             SolverTraitLangItem::ArbitrarySigned => lang_items.ArbitrarySigned,
             SolverTraitLangItem::IntFrom => lang_items.IntFrom,
             SolverTraitLangItem::IntTryFrom => lang_items.IntTryFrom,
+            SolverTraitLangItem::ErrorUnionFrom => lang_items.ErrorUnionFrom,
             SolverTraitLangItem::ReflectEnum => lang_items.ReflectEnum,
             SolverTraitLangItem::ReflectField => lang_items.ReflectField,
             SolverTraitLangItem::ReflectFnItem => lang_items.ReflectFnItem,
+            SolverTraitLangItem::ReflectMemoPoint => lang_items.ReflectMemoPoint,
             SolverTraitLangItem::ReflectStruct => lang_items.ReflectStruct,
             SolverTraitLangItem::ReflectVariant => lang_items.ReflectVariant,
+            SolverTraitLangItem::ReflectTypeOf => lang_items.ReflectTypeOf,
         };
         lang_item.expect("Lang item required but not found.").into()
     }
@@ -1902,6 +2130,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverAdtLangItem::Poll => lang_items.Poll.map(Into::into),
             SolverAdtLangItem::DynMetadata => lang_items.DynMetadata.map(Into::into),
             SolverAdtLangItem::OwnedBox => lang_items.OwnedBox.map(Into::into),
+            SolverAdtLangItem::ErrorUnion => lang_items.ErrorUnion.map(Into::into),
         };
         AdtIdWrapper(lang_item.expect("Lang item required but not found."))
     }
@@ -1954,11 +2183,14 @@ impl<'db> Interner for DbInterner<'db> {
             ArbitrarySigned,
             IntFrom,
             IntTryFrom,
+            ErrorUnionFrom,
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
+            ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
+            ReflectTypeOf,
         )
     }
 
@@ -1980,6 +2212,7 @@ impl<'db> Interner for DbInterner<'db> {
             FieldBase,
             FieldType,
             ReflectVariantView,
+            ReflectTypeOfType,
         )
     }
 
@@ -2022,11 +2255,14 @@ impl<'db> Interner for DbInterner<'db> {
             ArbitrarySigned,
             IntFrom,
             IntTryFrom,
+            ErrorUnionFrom,
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
+            ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
+            ReflectTypeOf,
         )
     }
 
@@ -2054,8 +2290,24 @@ impl<'db> Interner for DbInterner<'db> {
         crate::comptime::reflect_variant_view(self, member)
     }
 
+    fn reflect_described_desc(self, ty: Ty<'db>) -> Option<Const<'db>> {
+        crate::type_of::described_desc(self, ty)
+    }
+
+    fn reflect_type_of(
+        self,
+        ty: Ty<'db>,
+        desc: Const<'db>,
+    ) -> rustc_type_ir::reflect::TypeOfAnswer<Self> {
+        crate::type_of::type_of(self, ty, desc)
+    }
+
     fn reflect_is_enum(self, ty: Ty<'db>) -> bool {
         matches!(ty.kind(), TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::EnumId(_)))
+    }
+
+    fn reflect_is_memo_point(self, ty: Ty<'db>) -> bool {
+        crate::comptime::reflect_is_memo_point(self, ty)
     }
 
     fn param_env_with_clauses(
@@ -2074,6 +2326,7 @@ impl<'db> Interner for DbInterner<'db> {
             Poll,
             DynMetadata,
             OwnedBox,
+            ErrorUnion,
         )
     }
 
@@ -2270,14 +2523,21 @@ impl<'db> Interner for DbInterner<'db> {
             // This is only for diagnostics and normally ty vars should be handled by the callers.
             TyKind::Infer(InferTy::TyVar(_)) => {
                 let mut seen: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
-                TraitImpls::for_each_crate_and_block(self.db, krate, trait_block, &mut |impls| {
+                // The blocks' tables, then each loaded crate's table of this trait alone (as
+                // `TraitImpls::for_each_crate_and_block` orders them): never a crate's whole
+                // table, which for a crate read from impl table pages is the whole record.
+                let mut visit = |impls: &TraitImpls<'_>| {
                     impls.for_trait_non_blanket(trait_def_id.0, |run| match run {
                         Either::Left(run) => seen.extend(run.iter().map(|&it| AnyImplId::from(it))),
                         Either::Right(run) => {
                             seen.extend(run.iter().map(|&it| AnyImplId::from(it)))
                         }
                     });
-                });
+                };
+                TraitImpls::for_each_block(self.db, trait_block, &mut visit);
+                for &dep in crate::method_resolution::loaded_crates(self.db, krate) {
+                    visit(TraitImpls::for_crate_and_trait(self.db, dep, trait_def_id.0));
+                }
                 // The impls of a block are among those of its crate as well as its own.
                 let mut visited: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
                 for impl_ in seen {
@@ -3024,13 +3284,163 @@ fn fully_generic_for_reflection<'db>(
 /// Runs `f` on this thread's [`PARAM_ENV_CACHE`], taken out while `f` runs, so a call within
 /// it gets a cache of its own.
 fn with_param_env_cache<'db, R>(f: impl FnOnce(&mut ParamEnvCache<'db>) -> R) -> R {
-    let mut cache = PARAM_ENV_CACHE.take().unwrap_or_default();
-    if cache.0.len() >= PARAM_ENV_CACHE_ENTRIES {
+    let releases = table::releases();
+    let (filled_under, mut cache) = PARAM_ENV_CACHE.take().unwrap_or_default();
+    if filled_under != releases || cache.0.len() >= PARAM_ENV_CACHE_ENTRIES {
         cache.0.clear();
     }
     let result = f(table::unerase_mut::<ParamEnvCache<'db>>(&mut cache));
-    PARAM_ENV_CACHE.set(Some(cache));
+    PARAM_ENV_CACHE.set(Some((releases, cache)));
     result
+}
+
+/// The rows a static of the process names, by table name and row: what a release of the tables
+/// ([`table::release_all`]) keeps at their numbers, as the statics outlive it. They are the
+/// default types ([`crate::next_solver::default_types`], made once and never remade) and every
+/// row those reach. Every other static of the process that holds a row is emptied before a
+/// release (`crate::evict::release_process_tables`) or is keyed by a database's nonce, which
+/// no later database has.
+///
+/// The walk covers every field of [`DefaultAny`](crate::next_solver::DefaultAny): the size
+/// checks below fail to compile when a field is added, so the walk is extended with it.
+pub(crate) fn rows_held_by_process_statics() -> Vec<(&'static str, u32)> {
+    use crate::next_solver::{
+        BoundExistentialPredicates, BoundVarKinds, Clauses, Consts, DefaultAny, DefaultConsts,
+        DefaultEmpty, DefaultRegions, DefaultTypes, GenericArgs, PatList, PredefinedOpaques,
+        RegionAssumptions, SolverDefIds, Tys, VariancesOf,
+    };
+    const TY: usize = size_of::<Ty<'static>>();
+    const _: () = assert!(size_of::<DefaultTypes<'static>>() == 27 * TY);
+    const _: () =
+        assert!(size_of::<DefaultConsts<'static>>() == 257 * size_of::<Const<'static>>());
+    const _: () = assert!(size_of::<DefaultRegions<'static>>() == 3 * size_of::<Region<'static>>());
+    const _: () = assert!(
+        size_of::<DefaultEmpty<'static>>()
+            == size_of::<Tys<'static>>()
+                + size_of::<GenericArgs<'static>>()
+                + size_of::<BoundVarKinds<'static>>()
+                + size_of::<CanonicalVarKinds<'static>>()
+                + size_of::<VariancesOf<'static>>()
+                + size_of::<PatList<'static>>()
+                + size_of::<PredefinedOpaques<'static>>()
+                + size_of::<SolverDefIds<'static>>()
+                + size_of::<BoundExistentialPredicates<'static>>()
+                + size_of::<Clauses<'static>>()
+                + size_of::<RegionAssumptions<'static>>()
+                + size_of::<Consts<'static>>()
+                + size_of::<crate::mir::Projection<'static>>()
+    );
+    const _: () = assert!(
+        size_of::<DefaultAny<'static>>()
+            == size_of::<DefaultTypes<'static>>()
+                + size_of::<DefaultConsts<'static>>()
+                + size_of::<DefaultRegions<'static>>()
+                + size_of::<DefaultEmpty<'static>>()
+                + 2 * size_of::<VariancesOf<'static>>()
+                + size_of::<BoundVarKinds<'static>>()
+    );
+
+    /// Every row a walk reaches, each once.
+    struct Held(Vec<(&'static str, u32)>);
+    impl WorldExposer for Held {
+        fn on_interned(&mut self, table: &'static str, index: u32) -> ControlFlow<()> {
+            if self.0.contains(&(table, index)) {
+                return ControlFlow::Break(());
+            }
+            self.0.push((table, index));
+            ControlFlow::Continue(())
+        }
+    }
+
+    let any: &'static DefaultAny<'static> = crate::next_solver::default_types();
+    let DefaultAny {
+        types,
+        consts,
+        regions,
+        empty,
+        one_invariant,
+        one_covariant,
+        coroutine_captures_by_ref_bound_var_kinds,
+    } = any;
+    let DefaultTypes {
+        usize,
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        isize,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        f16,
+        f32,
+        f64,
+        f128,
+        unit,
+        bool,
+        char,
+        str,
+        never,
+        error,
+        static_str_ref,
+        u8_slice,
+        static_u8_slice,
+        mut_unit_ptr,
+        dyn_trait_dummy_self,
+    } = types;
+    let DefaultConsts { error: error_const, u8_values } = consts;
+    let DefaultRegions { error: error_region, statik, erased } = regions;
+    let DefaultEmpty {
+        tys,
+        generic_args,
+        bound_var_kinds,
+        canonical_vars,
+        variances,
+        pat_list,
+        predefined_opaques,
+        def_ids,
+        bound_existential_predicates,
+        clauses,
+        region_assumptions,
+        consts: empty_consts,
+        projection,
+    } = empty;
+    // alloc: the rows the statics name, once a release (about 300)
+    let mut held = Held(Vec::with_capacity(512));
+    for ty in [
+        usize, u8, u16, u32, u64, u128, isize, i8, i16, i32, i64, i128, f16, f32, f64, f128, unit,
+        bool, char, str, never, error, static_str_ref, u8_slice, static_u8_slice, mut_unit_ptr,
+        dyn_trait_dummy_self,
+    ] {
+        ty.generic_visit_with(&mut held);
+    }
+    error_const.generic_visit_with(&mut held);
+    for value in u8_values {
+        value.generic_visit_with(&mut held);
+    }
+    for region in [error_region, statik, erased] {
+        region.generic_visit_with(&mut held);
+    }
+    tys.generic_visit_with(&mut held);
+    generic_args.generic_visit_with(&mut held);
+    bound_var_kinds.generic_visit_with(&mut held);
+    canonical_vars.generic_visit_with(&mut held);
+    variances.generic_visit_with(&mut held);
+    pat_list.generic_visit_with(&mut held);
+    predefined_opaques.generic_visit_with(&mut held);
+    def_ids.generic_visit_with(&mut held);
+    bound_existential_predicates.generic_visit_with(&mut held);
+    clauses.generic_visit_with(&mut held);
+    region_assumptions.generic_visit_with(&mut held);
+    empty_consts.generic_visit_with(&mut held);
+    projection.generic_visit_with(&mut held);
+    one_invariant.generic_visit_with(&mut held);
+    one_covariant.generic_visit_with(&mut held);
+    coroutine_captures_by_ref_bound_var_kinds.generic_visit_with(&mut held);
+    held.0
 }
 
 /// The item an alias names.
@@ -3262,10 +3672,10 @@ mod attached_db {
     /// (`stdx::assert::reported`), after the value kind.
     pub const DETACHED: &str = "formatted with no database attached";
 
-    /// Formats `what` with the database `blaze_query::db::attach` lent the task.
+    /// Formats `what` with the database `blaze_memo::attach` lent the task.
     ///
     /// Text a user reads (a diagnostic, an error) is rendered with the database in hand
-    /// (`HirDisplay`, or inside `blaze_query::db::attach` where the text is made), never through
+    /// (`HirDisplay`, or inside `blaze_memo::attach` where the text is made), never through
     /// a `Debug` that reads the task's: a query's text must not depend on which thread ran it
     /// (rule 20, rule 25). Every query's run has its database attached, so this reads none only
     /// outside one, where a driver formats a value it holds: a bug at the caller.
@@ -3284,7 +3694,7 @@ mod attached_db {
         op: impl FnOnce(&Db, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
     ) -> std::fmt::Result {
         let at = std::panic::Location::caller();
-        blaze_query::db::with_attached_db(|db: Option<&Db>| match db {
+        blaze_memo::with_attached_db::<Db, _>(|db: Option<&Db>| match db {
             Some(db) => op(db, f),
             None => detached(f, what, at),
         })
@@ -3302,7 +3712,7 @@ mod attached_db {
         if cfg!(debug_assertions) && !std::thread::panicking() {
             panic!(
                 "a `{what}` was formatted with no database attached: render text a user reads with the \
-                 database in hand (`HirDisplay`), or inside `blaze_query::db::attach` where it is made"
+                 database in hand (`HirDisplay`), or inside `blaze_memo::attach` where it is made"
             );
         }
         stdx::assert::reported::report_at(what, DETACHED, at);
@@ -3320,7 +3730,7 @@ mod attached_db {
         use hir_expand::fixture;
 
         fn attached_here() -> Option<usize> {
-            blaze_query::db::with_attached_db(|it: Option<&base_db::Db>| {
+            blaze_memo::with_attached_db::<base_db::Db, _>(|it: Option<&base_db::Db>| {
                 it.map(|it| std::ptr::from_ref(it).addr())
             })
         }
@@ -3329,7 +3739,7 @@ mod attached_db {
         fn adt_of_s(db: &base_db::Db) -> super::super::AdtDef {
             use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
 
-            blaze_query::db::attach(db, || {
+            blaze_memo::attach(db, || {
                 let mut found = None;
                 for &krate in base_db::all_crates(db).iter() {
                     for (_, module) in crate_def_map(db, krate).modules(db) {
@@ -3510,10 +3920,10 @@ mod attached_db {
                                     );
                                 };
                                 if at == 0 {
-                                    blaze_query::db::attach(&*db, wait);
+                                    blaze_memo::attach(&*db, wait);
                                 } else {
-                                    blaze_query::db::attach(&*other, || {
-                                        blaze_query::db::attach(&*db, wait)
+                                    blaze_memo::attach(&*other, || {
+                                        blaze_memo::attach(&*db, wait)
                                     });
                                 }
                                 assert_eq!(
@@ -3540,7 +3950,7 @@ mod attached_db {
                 });
                 assert_eq!(held, Ok(round));
                 for _ in 0..2 {
-                    rx.recv().unwrap().unwrap();
+                    rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
                 }
                 for _ in 0..4 {
                     let tx = tx.clone();
@@ -3561,7 +3971,7 @@ mod attached_db {
                     );
                 }
                 for _ in 0..4 {
-                    rx.recv().unwrap().unwrap();
+                    rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
                 }
             }
         }
@@ -3580,7 +3990,7 @@ mod attached_db {
                 pool.submit(None, f, move |it| {
                     _ = tx.send(it.map_err(|_| format!("{what} panicked")))
                 });
-                rx.recv().unwrap().unwrap();
+                rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
             };
             for round in 0..20u32 {
                 let [first, second] = [2 * round, 2 * round + 1].map(|at| {
@@ -3630,10 +4040,10 @@ mod attached_db {
                                 );
                             };
                             if mine == 0 {
-                                blaze_query::db::attach(&*db, wait);
+                                blaze_memo::attach(&*db, wait);
                             } else {
-                                blaze_query::db::attach(&*other, || {
-                                    blaze_query::db::attach(&*db, wait)
+                                blaze_memo::attach(&*other, || {
+                                    blaze_memo::attach(&*db, wait)
                                 });
                             }
                             assert_eq!(attached_here(), None, "a job kept a database it detached");
@@ -3662,7 +4072,7 @@ mod attached_db {
                     Ok(round)
                 });
                 assert_eq!(held, Ok(round));
-                let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
+                let mut ended = [rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended"), rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended")];
                 ended.sort();
                 assert_eq!(ended, [Ok(0), Ok(1)]);
                 assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
@@ -3680,8 +4090,10 @@ mod attached_db {
 mod tls_cache;
 
 /// The tables every interned kind is an index into (`docs/v2/plan/design/data.md`, "types"). A
-/// value is written once, at a row that never moves and is never freed, so its index names it
-/// for the life of the process, on every thread, in every revision. A value is found by its
+/// value is written once, at a row that never moves and is not freed while any database lives,
+/// so its index names it on every thread, in every revision; a release of the tables
+/// ([`table::release_all`]), once no front end is kept and no task runs, frees them all but the
+/// rows the process's statics name ([`rows_held_by_process_statics`]). A value is found by its
 /// hash in an [`Index`]: no lock on a hit, the lock of one shard of the index to add a value.
 ///
 /// - [`Rows`], for the kinds with a structure (types, regions, constants, predicates,
@@ -3711,16 +4123,86 @@ pub(crate) mod table {
         alloc::{self, Layout},
         hash::{BuildHasher, Hash},
         marker::PhantomData,
-        mem::ManuallyDrop,
+        mem::{ManuallyDrop, needs_drop},
         num::NonZeroU32,
         ptr,
         sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
     };
 
+    use std::{alloc::Global, ops::ControlFlow};
+
     use blaze_core::lock::{Lock, LockGuard};
     use blaze_hash::{FixedState, SipKey, adaptive};
-    use blaze_reclaim::{Horizon, Limbo};
+    use blaze_memo::ArenaId;
+    use blaze_reclaim::{Grace, Horizon};
+
+    use crate::evict::Released;
     use rustc_type_ir::{DebruijnIndex, TypeFlags};
+
+    /// What a value a [`Lists`] or [`Values`] keeps names: its home, the greatest arena of the
+    /// ids in it and of the rows it holds, `None` for plain data (it names no arena). `None`
+    /// orders below every arena, so a whole's home is the `max` of its parts'. Never an arena
+    /// standing for "the session": the session arena is made again at each commit that drops
+    /// it, so a row of plain data names none, lives in every snapshot, and a key of it is homed
+    /// at the asking snapshot's own session ([`super::memo_home`]). Asked once, as the value is
+    /// added (the miss path); a row lives no longer than its home's arena in a release of the
+    /// dead ([`release_dead`]). [`Rows`] are told theirs ([`RowInfo::home`]), computed with
+    /// their tag in one pass of the codec (`persist::tag`).
+    pub(crate) trait Homed {
+        fn home(&self) -> Option<ArenaId>;
+    }
+
+    /// The rows of any table a value a table keeps holds directly: what a release of the dead
+    /// ([`release_dead`]) keeps of a row it keeps, so that no row kept names a freed one.
+    pub(crate) trait Holds {
+        fn hold(&self, held: &mut Held);
+    }
+
+    /// [`Homed`] and [`Holds`] for values that hold no id and no row: homed nowhere (`None`),
+    /// holding nothing.
+    macro_rules! plain_data {
+        ($($ty:ty),+ $(,)?) => {$(
+            impl $crate::next_solver::interner::table::Homed for $ty {
+                #[inline]
+                fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                    ::core::option::Option::None
+                }
+            }
+            impl $crate::next_solver::interner::table::Holds for $ty {
+                #[inline]
+                fn hold(&self, _: &mut $crate::next_solver::interner::table::Held) {}
+            }
+        )+};
+    }
+    pub(crate) use plain_data;
+
+    /// [`Holds`] for values whose rows the walk over interned values
+    /// ([`super::WorldExposer`]) reaches: each handle in them, not what it holds.
+    macro_rules! holds_by_visit {
+        ($($ty:ty),+ $(,)?) => {$(
+            impl $crate::next_solver::interner::table::Holds for $ty {
+                #[inline]
+                fn hold(&self, held: &mut $crate::next_solver::interner::table::Held) {
+                    ::rustc_type_ir::GenericTypeVisitable::generic_visit_with(self, held);
+                }
+            }
+        )+};
+    }
+    pub(crate) use holds_by_visit;
+
+    /// The rows a value holds directly, as [`Holds::hold`] lists them: each handle's table and
+    /// row, not descended into (the walk stops at every row it is told of).
+    pub(crate) struct Held {
+        rows: Vec<(&'static str, u32), Global>,
+    }
+
+    impl super::WorldExposer for Held {
+        #[inline]
+        fn on_interned(&mut self, table: &'static str, index: u32) -> ControlFlow<()> {
+            self.rows.push((table, index));
+            ControlFlow::Break(())
+        }
+    }
 
     /// A count of the slots the indexes look at, kept only under `cfg(test)`: what the test
     /// that bounds a lookup's probes reads. A no-op in every other build.
@@ -3858,8 +4340,10 @@ pub(crate) mod table {
         (segment, (at - segment_start(segment)) as usize)
     }
 
-    /// Values by position, appended and never moved or freed: segments allocated on first use,
-    /// so a reference into one lives as long as the column (a `static`). Each position is
+    /// Values by position, appended and never moved: segments allocated on first use, so a
+    /// reference into one lives as long as the column (a `static`), until a release of the
+    /// tables ([`release_all`]), which frees them only once nothing that could hold such a
+    /// reference is left (no front end kept, no task running). Each position is
     /// written once, by the thread that claimed it, before anything naming it is published by
     /// a release store that the reader's acquire load pairs with.
     ///
@@ -3946,8 +4430,8 @@ pub(crate) mod table {
         unsafe fn write(&self, at: u64, value: T) {
             let (segment, offset) = locate(at);
             let slot = self.segment(segment).wrapping_add(offset);
-            // SAFETY: `slot` is in its segment (`locate`), allocated and never freed, and the
-            // caller alone writes it (the caller's precondition).
+            // SAFETY: `slot` is in its segment (`locate`), allocated and not freed before a release
+            // (which no write overlaps), and the caller alone writes it (the caller's precondition).
             unsafe { slot.write(value) }
         }
 
@@ -3962,7 +4446,7 @@ pub(crate) mod table {
             let (segment, offset) = locate(at);
             let slot = self.segment(segment).wrapping_add(offset);
             // SAFETY: `slot` is in its segment, allocated zeroed, which is a `T` (the caller's
-            // precondition), and never freed.
+            // precondition), and not freed before a release.
             unsafe { &*slot }
         }
 
@@ -3992,7 +4476,8 @@ pub(crate) mod table {
         unsafe fn get(&self, at: u64) -> &T {
             let (segment, offset) = locate(at);
             let slot = self.segments[segment].load(Ordering::Relaxed).wrapping_add(offset);
-            // SAFETY: the caller's precondition; segments are never freed.
+            // SAFETY: the caller's precondition; segments are freed only by a release, which
+            // no read overlaps.
             unsafe { &*slot }
         }
 
@@ -4011,6 +4496,64 @@ pub(crate) mod table {
             let first = self.segments[segment].load(Ordering::Relaxed).wrapping_add(offset);
             // SAFETY: the caller's precondition.
             unsafe { std::slice::from_raw_parts(first, len) }
+        }
+
+        /// Moves the value at `at` out.
+        ///
+        /// # Safety
+        ///
+        /// `at` was written, that write happens before this call, and nothing reads the
+        /// position again before a new write: the caller frees the column ([`Column::free`])
+        /// without dropping it.
+        unsafe fn take(&self, at: u64) -> T {
+            let (segment, offset) = locate(at);
+            let slot = self.segments[segment].load(Ordering::Acquire).wrapping_add(offset);
+            // SAFETY: the caller's precondition.
+            unsafe { slot.read() }
+        }
+
+        /// Drops the value at `at` in place.
+        ///
+        /// # Safety
+        ///
+        /// As [`Column::take`].
+        unsafe fn drop_at(&self, at: u64) {
+            let (segment, offset) = locate(at);
+            let slot = self.segments[segment].load(Ordering::Acquire).wrapping_add(offset);
+            // SAFETY: the caller's precondition.
+            unsafe { ptr::drop_in_place(slot) }
+        }
+
+        /// The bytes its segments hold, as the global allocator handed each out: what the
+        /// memory line counts of it.
+        fn bytes(&self) -> u64 {
+            (0..SEGMENTS)
+                .filter(|&segment| !self.segments[segment].load(Ordering::Acquire).is_null())
+                .map(|segment| segment_len(segment) * size_of::<T>() as u64)
+                .sum()
+        }
+
+        /// Frees every segment, leaving the column as at process start: how many bytes.
+        ///
+        /// # Safety
+        ///
+        /// No thread reads or writes the column during the call or holds a reference into it
+        /// after, and every value in it that needs a drop was dropped or moved out.
+        unsafe fn free(&self) -> u64 {
+            let mut freed = 0;
+            for (segment, base) in self.segments.iter().enumerate() {
+                let base = base.swap(ptr::null_mut(), Ordering::AcqRel);
+                if base.is_null() {
+                    continue;
+                }
+                let layout = Layout::array::<T>(segment_len(segment) as usize)
+                    .expect("a column segment fits in memory");
+                // SAFETY: `allocate` made the segment with this layout; the swap unlinked it,
+                // and the caller's precondition leaves no reader of it.
+                unsafe { alloc::dealloc(base.cast(), layout) };
+                freed += layout.size() as u64;
+            }
+            freed
         }
     }
 
@@ -4142,12 +4685,29 @@ pub(crate) mod table {
     }
 
     /// The shards' tables grown ones replaced, of every index (each [`Rows`], [`Lists`] and
-    /// [`Values`], both sets of shards), each held until no lookup that may have loaded it can
-    /// still be probing it ([`Vacant::retire`]). One limbo for all, so a release lets go of
-    /// every one past its grace at once ([`collect`]); only an insert that grows a table takes
-    /// its lock, after letting go of its shard's, and it holds it for a push and a walk of the
-    /// held graces, never a scan of the reclaim slots nor a free.
-    static RETIRED: Lock<Limbo> = Lock::new("ty.interner.retired", Limbo::new());
+    /// [`Values`], both sets of shards), each held with the grace it was retired under until no
+    /// lookup that may have loaded it can still be probing it ([`Vacant::retire`]). One list for
+    /// all, so a release lets go of every one past its grace at once ([`collect`]); only an
+    /// insert that grows a table takes its lock, after letting go of its shard's, and it holds
+    /// it for a push and a walk of the held graces, never a scan of the reclaim slots nor a
+    /// free. Typed, not a `blaze_reclaim::Limbo` of boxes: a release of the tables takes out
+    /// the retired tables of the indexes it frees by their owner ([`free_retired_of`]).
+    #[expect(
+        blaze::process_static,
+        reason = "retired tables are held only until their grace passes and a release collects them; the interner is process-wide by design"
+    )]
+    static RETIRED: Lock<Vec<(Grace, Retired)>> = Lock::new("ty.interner.retired", Vec::new());
+
+    /// Takes out of `held` the tables whose grace had passed by `horizon`, for the caller to
+    /// drop once it has let go of [`RETIRED`]'s lock.
+    fn take_passed(held: &mut Vec<(Grace, Retired)>, horizon: Horizon) -> Vec<Retired> {
+        if !held.iter().any(|(grace, _)| horizon.passed(*grace)) {
+            return Vec::new();
+        }
+        // alloc: the list of the tables passed, dropped by the caller with the lock let go;
+        // charged to the tag the caller runs under
+        held.extract_if(.., |(grace, _)| horizon.passed(*grace)).map(|(_, table)| table).collect()
+    }
 
     /// Frees every retired table of every index whose grace has passed: what a front end
     /// release calls ([`crate::evict::free_retired_intern_tables`]), as otherwise a table is
@@ -4156,10 +4716,45 @@ pub(crate) mod table {
     pub(crate) fn collect() -> usize {
         // The scan before the lock, as `Vacant::retire`.
         let horizon = Horizon::now();
-        let passed = RETIRED.lock().collect_passed(horizon);
+        let passed = take_passed(&mut RETIRED.lock(), horizon);
         let freed = passed.len();
         drop(passed);
         freed
+    }
+
+    /// Frees every retired table of `index`, past its grace or not: how many bytes.
+    ///
+    /// # Safety
+    ///
+    /// No lookup of `index` is probing during the call, nor any that began before it: the
+    /// precondition of [`Index::free`].
+    unsafe fn free_retired_of(index: &Index) -> u64 {
+        #[cfg(test)]
+        if plant::KEEPS_RETIRED.get() {
+            return 0;
+        }
+        let owner = ptr::from_ref(index);
+        // alloc: the list of the index's retired tables, dropped with the lock let go
+        let gone: Vec<Retired> = RETIRED
+            .lock()
+            .extract_if(.., |(_, table)| ptr::eq(table.owner, owner))
+            .map(|(_, table)| table)
+            .collect();
+        let bytes = gone.iter().map(|table| Slots::layout(table.slots.len()).size() as u64).sum();
+        drop(gone);
+        bytes
+    }
+
+    /// Plants for the tests' controls: each makes the release they name wrong in one way, which
+    /// the test's oracle must catch.
+    #[cfg(test)]
+    pub(super) mod plant {
+        thread_local! {
+            /// A release leaves the retired tables of the indexes it frees in [`super::RETIRED`].
+            pub(crate) static KEEPS_RETIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            /// [`super::refuse_unless_quiet`] lets a release by while a front end is kept.
+            pub(crate) static UNCHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
     }
 
     struct Shard {
@@ -4176,7 +4771,8 @@ pub(crate) mod table {
     const LOG_LEN_MASK: usize = SLOTS_ALIGN - 1;
 
     /// A shard's table, as its word names it: `len` zeroed `AtomicU64`s in one allocation, freed
-    /// only as a [`Retired`] table once a grown one replaced it and its grace has passed. So a
+    /// as a [`Retired`] table once a grown one replaced it and its grace has passed, or by a
+    /// release of the tables ([`Index::free`]) with no reader left. So a
     /// `Slots` is read only by the holder of its shard's lock, which alone replaces it, or
     /// inside a task entered before its shard's word was loaded.
     #[derive(Clone, Copy)]
@@ -4195,6 +4791,251 @@ pub(crate) mod table {
     #[cold]
     fn for_the_tables<R>(f: impl FnOnce() -> R) -> R {
         blaze_mem::frame::task(blaze_mem::Tag::Intern, |_| f())
+    }
+
+    /// A table of the process as a release sees it: its name, what it holds, and how it lets
+    /// go of all of it but the rows something outliving the release still names.
+    trait Table: Sync {
+        fn name(&self) -> &'static str;
+
+        /// The bytes its columns' segments, its index's tables and its retired tables hold.
+        fn held_bytes(&self) -> u64;
+
+        /// Frees every row but `keep`'s (rows of this table, each written, sorted, none twice)
+        /// and leaves the table as at process start but for them: each kept row at its own
+        /// number with what it held, found again by its value, and the next row added numbered
+        /// one past the last kept. Every other number reads as never written, so a stale one
+        /// read is a panic naming it, never another row's value; new rows reuse the numbers
+        /// past the last kept. How many bytes it held before, less after.
+        ///
+        /// # Safety
+        ///
+        /// No thread reads or writes the table during the call or holds a reference into it,
+        /// and nothing that outlives the call names a row of it but `keep`'s.
+        unsafe fn release(&self, keep: &[NonZeroU32]) -> u64;
+
+        /// Every row written whose home `live` accepts, in order, onto `out`.
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>);
+
+        /// The rows `row` (written) holds directly, of any table, onto `held`.
+        fn hold(&self, row: NonZeroU32, held: &mut Held);
+    }
+
+    /// The rows `next` (one past the last claimed) leaves written whose home `live` accepts:
+    /// what [`Table::homed_in`] lists of a table with a home column and a publish check.
+    fn rows_homed_in(
+        next: u64,
+        written: impl Fn(NonZeroU32) -> bool,
+        home: impl Fn(NonZeroU32) -> Option<ArenaId>,
+        live: &dyn Fn(Option<ArenaId>) -> bool,
+        out: &mut Vec<NonZeroU32, Global>,
+    ) {
+        for at in 1..next.min(u64::from(u32::MAX)) {
+            let row = NonZeroU32::new(at as u32).expect("rows start at 1");
+            if written(row) && live(home(row)) {
+                out.push(row);
+            }
+        }
+    }
+
+    /// Every table that has added a row, each once, in the order they first did: what
+    /// [`release_all`] releases. A table registers itself as it adds its first row
+    /// ([`register`]), so no table can hold a row a release does not see.
+    #[expect(
+        blaze::process_static,
+        reason = "one entry per static table, each registered once: bounded by the interner's fixed set of tables"
+    )]
+    static TABLES: Lock<Vec<&'static dyn Table>> = Lock::new("ty.interner.tables", Vec::new());
+
+    /// How many releases of the tables there have been: what a cache kept outside them of
+    /// rows (a thread's [`super::PARAM_ENV_CACHE`]) is filled under, and starts over when it
+    /// moved, as each row it holds may since name another value.
+    static RELEASES: AtomicU64 = AtomicU64::new(0);
+
+    /// [`RELEASES`] now.
+    pub(crate) fn releases() -> u64 {
+        RELEASES.load(Ordering::Acquire)
+    }
+
+    /// Adds `table` to [`TABLES`] unless `registered` says it is there: from a table's `add`,
+    /// before its first row.
+    #[cold]
+    #[inline(never)]
+    fn register(registered: &AtomicBool, table: &'static dyn Table) {
+        let mut tables = TABLES.lock();
+        if registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // alloc: one entry a table of the process, kept for its life, charged to `intern`
+        for_the_tables(|| tables.push(table));
+    }
+
+    /// Panics, naming what it found, unless nothing can still read a row: no front end is kept
+    /// (`crate::evict::FRONT_ENDS`, which every database a daemon keeps counts in), the
+    /// calling thread is in no task, and every task that began before the call has ended. A
+    /// stale row read after a release is not a crash but a wrong answer (its number names
+    /// another value), so the release refuses rather than trusts its caller.
+    pub(crate) fn refuse_unless_quiet() {
+        refuse_unless_quiet_with(0);
+    }
+
+    /// [`refuse_unless_quiet`], with up to `front_ends` front ends kept: a release of the dead
+    /// ([`release_dead`]) runs beside the one front end whose snapshot it is told of.
+    fn refuse_unless_quiet_with(front_ends: u32) {
+        let kept = crate::evict::front_ends_kept();
+        let here = blaze_reclaim::in_task();
+        let grace = Grace::start();
+        let running = !Horizon::now().passed(grace);
+        #[cfg(test)]
+        if plant::UNCHECKED.get() {
+            return;
+        }
+        if kept > front_ends || here || running {
+            panic!(
+                "the trait solver's interner tables were asked to be released while their rows \
+                 can still be read: {kept} front ends kept (`hir_ty::evict::FRONT_ENDS`, at \
+                 most {front_ends} allowed), the releasing thread {} a task, and {} task that \
+                 began before the release still running; a release runs with no other front \
+                 end kept and no task running",
+                if here { "in" } else { "in no" },
+                if running { "a" } else { "no" },
+            );
+        }
+    }
+
+    /// Releases every row of every table of the process ([`TABLES`]) whose home is an arena
+    /// `memo` no longer holds (dropped, or of an older generation), once nothing can read one:
+    /// what keeps the tables per arena, as blaze-memo keeps entries, so a dropped crate's types
+    /// go with its arena instead of living to the process's end.
+    ///
+    /// Kept: every row of plain data (homed nowhere, `None`), every row homed in an arena of
+    /// `memo` ([`blaze_memo::Memo::arenas`], its session arena's making among them), every row the process's statics name ([`super::rows_held_by_process_statics`]),
+    /// and, to a fixpoint, every row a kept row holds ([`Holds`]), each at its number. A row
+    /// homed live can hold a row homed in a dropped arena (a type naming two unrelated crates
+    /// is homed in the greater, and the lesser may drop alone): that row is kept with it, as
+    /// freeing it would leave a kept row naming a number a later row is given.
+    ///
+    /// The caller, between snapshots: `memo` is the newest snapshot of the one front end the
+    /// process keeps (at most one is counted in `crate::evict::FRONT_ENDS`, as two front ends'
+    /// arenas are numbered apart and one's ids say nothing of the other's), and it has let go
+    /// of every holder of a row outside the memo that a dropped arena's queries filled: each
+    /// dropped crate's shared solver caches (`interner::drop_shared_solver_caches`) and every
+    /// thread's (`interner::clear_tls_solver_cache`). A thread's param-env cache starts over by
+    /// [`releases`], which this moves. Panics, naming what it found, unless no task runs.
+    pub(crate) fn release_dead(memo: &blaze_memo::Memo) -> Released {
+        refuse_unless_quiet_with(1);
+        let mut live: Vec<ArenaId, Global> = Vec::new_in(Global);
+        live.extend(memo.arenas());
+        live.sort_unstable();
+        let live = |home: Option<ArenaId>| home.is_none_or(|home| live.binary_search(&home).is_ok());
+        let tables: Vec<&'static dyn Table, Global> = TABLES.lock().to_vec_in(Global);
+        let keep = reached(&tables, &live, super::rows_held_by_process_statics());
+        // SAFETY: `refuse_unless_quiet_with` found at most the one front end `memo` is of and
+        // no task running, so no thread reads, writes or holds a reference into a table; that
+        // front end's live entries are homed in `live` arenas, and every row they name is homed
+        // there too (a row's home is the greatest of what it names) or held by such a row, all
+        // of which `reached` keeps; the caller let go of every other holder of a row.
+        let released = unsafe { release_tables(&tables, &keep) };
+        RELEASES.fetch_add(1, Ordering::AcqRel);
+        released
+    }
+
+    /// The rows of `tables` homed where `live` accepts, the rows of `roots`, and every row any
+    /// of them holds, to a fixpoint: by table name and row, as [`release_tables`] keeps them.
+    fn reached(
+        tables: &[&'static dyn Table],
+        live: &dyn Fn(Option<ArenaId>) -> bool,
+        roots: Vec<(&'static str, u32)>,
+    ) -> Vec<(&'static str, u32)> {
+        let at = |name: &str| {
+            tables.iter().position(|table| table.name() == name).unwrap_or_else(|| {
+                panic!("a row of the {name} table is held, and no table of the process is named so")
+            })
+        };
+        let mut seen: Vec<blaze_hash::HashSet<u32, Global>, Global> = Vec::new_in(Global);
+        seen.resize_with(tables.len(), || blaze_hash::HashSet::new_in(Global));
+        let mut todo: Vec<(usize, NonZeroU32), Global> = Vec::new_in(Global);
+        let mut homed: Vec<NonZeroU32, Global> = Vec::new_in(Global);
+        for (index, table) in tables.iter().enumerate() {
+            homed.clear();
+            table.homed_in(live, &mut homed);
+            todo.extend(homed.iter().map(|&row| (index, row)));
+        }
+        todo.extend(roots.into_iter().map(|(name, row)| {
+            (at(name), NonZeroU32::new(row).unwrap_or_else(|| panic!("row 0 of the {name} table is held")))
+        }));
+        let mut held = Held { rows: Vec::new_in(Global) };
+        while let Some((index, row)) = todo.pop() {
+            if !seen[index].insert(row.get()) {
+                continue;
+            }
+            held.rows.clear();
+            tables[index].hold(row, &mut held);
+            for &(name, child) in &held.rows {
+                let child = NonZeroU32::new(child)
+                    .unwrap_or_else(|| panic!("row 0 of the {name} table is held"));
+                todo.push((at(name), child));
+            }
+        }
+        let mut keep = Vec::new_in(Global);
+        for (index, rows) in seen.iter().enumerate() {
+            let name = tables[index].name();
+            keep.extend(rows.iter().map(|&row| (name, row)));
+        }
+        keep
+    }
+
+    /// Releases every table of the process ([`TABLES`]) once nothing can read a row
+    /// ([`refuse_unless_quiet`]), keeping only the rows the process's own statics name
+    /// ([`super::rows_held_by_process_statics`]: the default types and what they reach), each
+    /// at its number: what the tables, the indexes and their retired tables held is freed, and
+    /// each table is as at process start but for those rows. The caller has let go of every
+    /// other holder of a row first ([`crate::evict::release_process_tables`]).
+    pub(crate) fn release_all() -> Released {
+        refuse_unless_quiet();
+        let keep = super::rows_held_by_process_statics();
+        // alloc: the list of the process's tables, once a release
+        let tables: Vec<&'static dyn Table> = TABLES.lock().to_vec();
+        // SAFETY: `refuse_unless_quiet` found no front end kept and no task running, so no
+        // thread reads, writes or holds a reference into a table, and the caller let go of
+        // every holder of a row but the statics `keep` names.
+        let released = unsafe { release_tables(&tables, &keep) };
+        RELEASES.fetch_add(1, Ordering::AcqRel);
+        released
+    }
+
+    /// Releases `tables`, keeping in each the rows of `keep` that name it (by table name and
+    /// row number): what [`release_all`] does for the process's tables, and a test for its own.
+    ///
+    /// # Safety
+    ///
+    /// [`Table::release`]'s, for each of `tables`.
+    unsafe fn release_tables(tables: &[&dyn Table], keep: &[(&'static str, u32)]) -> Released {
+        for (name, row) in keep {
+            let named = tables.iter().filter(|table| table.name() == *name).count();
+            assert!(
+                named == 1,
+                "row {row} of the {name} table is to be kept across a release, and {named} tables \
+                 of the process are named {name}"
+            );
+        }
+        let mut bytes = 0;
+        for table in tables {
+            // alloc: the rows kept of one table, once a release
+            let mut rows: Vec<NonZeroU32> = keep
+                .iter()
+                .filter(|(name, _)| *name == table.name())
+                .map(|&(name, row)| {
+                    NonZeroU32::new(row)
+                        .unwrap_or_else(|| panic!("row 0 of the {name} table is to be kept"))
+                })
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            // SAFETY: the caller's precondition.
+            bytes += unsafe { table.release(&rows) };
+        }
+        Released { tables: tables.len(), bytes }
     }
 
     impl Slots {
@@ -4296,6 +5137,9 @@ pub(crate) mod table {
     /// taken off `intern`, which [`for_the_tables`] charged it to.
     struct Retired {
         slots: Slots,
+        /// The index it was a table of, a `static` as every index is: what a release of that
+        /// index takes it out by ([`free_retired_of`]) and counts its bytes to.
+        owner: *const Index,
         /// Its index's count of tables retired and not freed ([`Index::retired`]), which lives
         /// as long: every index a test grows is in a `static`.
         #[cfg(test)]
@@ -4351,6 +5195,8 @@ pub(crate) mod table {
         shard: &'a Shard,
         len: LockGuard<'a, usize>,
         hash: u32,
+        /// The index the shard is of: the owner of a table the insert retires.
+        owner: &'a Index,
         /// The index's count of retired tables, for the test that they are freed.
         #[cfg(test)]
         retired: &'a AtomicU32,
@@ -4486,6 +5332,7 @@ pub(crate) mod table {
                             shard,
                             len,
                             hash: hash as u32,
+                            owner: self,
                             #[cfg(test)]
                             retired: &self.retired,
                         });
@@ -4540,6 +5387,7 @@ pub(crate) mod table {
                         shard: into,
                         len: into.len.lock(),
                         hash: hash as u32,
+                        owner: self,
                         #[cfg(test)]
                         retired: &self.retired,
                     }
@@ -4557,6 +5405,55 @@ pub(crate) mod table {
         fn keyed(&self) -> bool {
             self.keyed.load(Ordering::Acquire)
         }
+
+        /// The bytes its shards' tables hold, both sets, and its retired tables not freed yet.
+        fn bytes(&self) -> u64 {
+            let live: u64 = self
+                .fixed
+                .iter()
+                .chain(&self.secret)
+                .filter_map(|shard| Slots::unpack(shard.slots.load(Ordering::Acquire)))
+                .map(|slots| Slots::layout(slots.len()).size() as u64)
+                .sum();
+            let owner = ptr::from_ref(self);
+            let retired: u64 = RETIRED
+                .lock()
+                .iter()
+                .filter(|(_, table)| ptr::eq(table.owner, owner))
+                .map(|(_, table)| Slots::layout(table.slots.len()).size() as u64)
+                .sum();
+            live + retired
+        }
+
+        /// Frees every shard's table, of both sets, and every table it retired, and leaves it
+        /// as at process start (not switched, so placing by the fixed hash): how many bytes.
+        ///
+        /// # Safety
+        ///
+        /// No thread probes or inserts into the index during the call, and no lookup that began
+        /// before it is still probing.
+        unsafe fn free(&self) -> u64 {
+            let mut freed = 0;
+            for shard in self.fixed.iter().chain(&self.secret) {
+                let mut len = shard.len.lock();
+                if let Some(slots) =
+                    Slots::unpack(shard.slots.swap(ptr::null_mut(), Ordering::AcqRel))
+                {
+                    let layout = Slots::layout(slots.len());
+                    // SAFETY: `Slots::allocate` made the table with this layout; the swap under
+                    // the shard's lock unlinked it, and the caller's precondition leaves no
+                    // reader of it.
+                    unsafe { alloc::dealloc(slots.words.cast(), layout) };
+                    freed += layout.size() as u64;
+                }
+                *len = 0;
+            }
+            self.key[0].store(0, Ordering::Relaxed);
+            self.key[1].store(0, Ordering::Relaxed);
+            self.keyed.store(false, Ordering::Release);
+            // SAFETY: the caller's precondition.
+            freed + unsafe { free_retired_of(self) }
+        }
     }
 
     impl Vacant<'_> {
@@ -4567,6 +5464,7 @@ pub(crate) mod table {
                 shard,
                 len: mut held,
                 hash,
+                owner,
                 #[cfg(test)]
                 retired,
             } = self;
@@ -4597,6 +5495,7 @@ pub(crate) mod table {
                 retired.fetch_add(1, Ordering::Relaxed);
                 Vacant::retire(Retired {
                     slots: old,
+                    owner: ptr::from_ref(owner),
                     #[cfg(test)]
                     live: retired,
                 });
@@ -4605,21 +5504,24 @@ pub(crate) mod table {
 
         /// Holds `old`, a table the release store of a grown one unlinked, in [`RETIRED`] until
         /// its grace has passed, and frees the tables whose grace has, after letting go of the
-        /// limbo's lock: the scan of every thread's slot that says which passed is taken before
+        /// list's lock: the scan of every thread's slot that says which passed is taken before
         /// it locks, so the lock covers a push and a walk of the held graces (`blaze_reclaim`'s
         /// `scans`). Under no shard's lock (but in a switch, which holds every `fixed` shard's
-        /// lock once in the index's life). Should the box or the list fail to allocate, `old`
-        /// is leaked, not freed under its readers (`Limbo::hold`).
+        /// lock once in the index's life). Should the list fail to grow, `old` is leaked, not
+        /// freed under its readers: it is pushed only once the room for it is reserved.
         #[cold]
         fn retire(old: Retired) {
+            let old = ManuallyDrop::new(old);
             let horizon = Horizon::now();
             let passed = {
-                let mut limbo = RETIRED.lock();
-                // alloc: the limbo's box of the table, its list and the list of those passed,
-                // charged to `intern` as the tables it holds are
+                let mut held = RETIRED.lock();
+                // alloc: the list's room for the table and the list of those passed, charged to
+                // `intern` as the tables it holds are
                 for_the_tables(|| {
-                    limbo.retire(old);
-                    limbo.collect_passed(horizon)
+                    held.reserve(1);
+                    // The grace starts after the release store that unlinked `old`.
+                    held.push((Grace::start(), ManuallyDrop::into_inner(old)));
+                    take_passed(&mut held, horizon)
                 })
             };
             drop(passed);
@@ -4627,12 +5529,14 @@ pub(crate) mod table {
     }
 
     /// What [`Rows::intern`] computes once, when it adds a value: its tag (its codec's first
-    /// word, in `persist.rs`), flags and outer exclusive binder.
+    /// word, in `persist.rs`), flags, outer exclusive binder, and home (the greatest arena of
+    /// the ids and rows it names, from the same pass of the codec as the tag).
     #[derive(Clone, Copy)]
     pub(crate) struct RowInfo {
         pub(crate) tag: u8,
         pub(crate) flags: TypeFlags,
         pub(crate) binder: DebruijnIndex,
+        pub(crate) home: Option<ArenaId>,
     }
 
     /// The rows of one kind with a structure, `K` its kind (`TyKind<'static>`, ...), kept whole
@@ -4642,18 +5546,23 @@ pub(crate) mod table {
     /// - `flags` and `binder`, what every `has_type_flags`/`has_escaping_bound_vars` reads;
     /// - `tag`, the kind's tag plus one (0 for a row not written yet, so storing it publishes
     ///   the row): a scan by kind reads one byte a row;
-    /// - `kinds`, the value, read by `kind()` and by the index's equality check.
+    /// - `kinds`, the value, read by `kind()` and by the index's equality check;
+    /// - `home`, written once with the row: what a release of the dead ([`release_dead`]) and
+    ///   a key holding the row as an argument ([`blaze_memo::Home`]) read.
     ///
     /// Lookup: one hash of the kind (no encoding), one probe of the index (a cache line), one
     /// equality check of the row it names.
     pub(crate) struct Rows<K> {
         what: &'static str,
         last: u32,
+        /// Whether it is in [`TABLES`].
+        registered: AtomicBool,
         next: AtomicU64,
         tag: Column<AtomicU8>,
         flags: Column<u32>,
         binder: Column<u32>,
         kinds: Column<K>,
+        home: Column<Option<ArenaId>>,
         index: Index,
     }
 
@@ -4661,17 +5570,19 @@ pub(crate) mod table {
     pub(crate) const ROW_BYTES: usize = size_of::<AtomicU8>() + size_of::<u32>() + size_of::<u32>();
     const _: () = assert!(ROW_BYTES == 9);
 
-    impl<K: Copy + Hash + Eq> Rows<K> {
+    impl<K: Copy + Hash + Eq + Sync + Holds + 'static> Rows<K> {
         /// A table of rows 1 to `last`, named `what` in what it panics with.
         pub(crate) const fn new(what: &'static str, last: u32) -> Rows<K> {
             Rows {
                 what,
                 last,
+                registered: AtomicBool::new(false),
                 next: AtomicU64::new(1),
                 tag: Column::zeroed(),
                 flags: Column::new(),
                 binder: Column::new(),
                 kinds: Column::new(),
+                home: Column::new(),
                 index: Index::new(),
             }
         }
@@ -4685,7 +5596,7 @@ pub(crate) mod table {
         /// nothing and allocates nothing.
         #[inline]
         pub(crate) fn intern<V: Erase<Static = K>>(
-            &self,
+            &'static self,
             kind: V,
             info: impl FnOnce() -> RowInfo,
         ) -> NonZeroU32 {
@@ -4710,7 +5621,10 @@ pub(crate) mod table {
         }
 
         #[cold]
-        fn add(&self, kind: K, info: impl FnOnce() -> RowInfo) -> NonZeroU32 {
+        fn add(&'static self, kind: K, info: impl FnOnce() -> RowInfo) -> NonZeroU32 {
+            if !self.registered.load(Ordering::Acquire) {
+                register(&self.registered, self);
+            }
             let info = info();
             assert!(info.tag < u8::MAX, "a {} tag of {}", self.what, info.tag);
             let vacant =
@@ -4731,6 +5645,8 @@ pub(crate) mod table {
             unsafe { self.flags.write(row, info.flags.bits()) };
             // SAFETY: as above.
             unsafe { self.binder.write(row, info.binder.as_u32()) };
+            // SAFETY: as above.
+            unsafe { self.home.write(row, info.home) };
             // SAFETY: the tag column is zeroed and of atomics, and `row` is below 2^32.
             let tag = unsafe { self.tag.place(row) };
             // Publishes the row to `tag_of`'s acquire load.
@@ -4789,6 +5705,102 @@ pub(crate) mod table {
             // SAFETY: as in `kind`.
             DebruijnIndex::from_u32(unsafe { *self.binder.get(row.get().into()) })
         }
+
+        /// The home of `row`: the greatest arena of what its kind names.
+        #[inline]
+        pub(crate) fn home(&self, row: NonZeroU32) -> Option<ArenaId> {
+            self.tag_of(row);
+            // SAFETY: as in `kind`.
+            unsafe { *self.home.get(row.get().into()) }
+        }
+    }
+
+    impl<K: Copy + Hash + Eq + Sync + Holds + 'static> Table for Rows<K> {
+        fn name(&self) -> &'static str {
+            self.what
+        }
+
+        fn held_bytes(&self) -> u64 {
+            self.tag.bytes()
+                + self.flags.bytes()
+                + self.binder.bytes()
+                + self.kinds.bytes()
+                + self.home.bytes()
+                + self.index.bytes()
+        }
+
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>) {
+            rows_homed_in(
+                self.next.load(Ordering::Acquire),
+                |row| self.published(row),
+                |row| self.home(row),
+                live,
+                out,
+            );
+        }
+
+        fn hold(&self, row: NonZeroU32, held: &mut Held) {
+            self.tag_of(row);
+            // SAFETY: `tag_of` checked the row was written and published.
+            unsafe { *self.kinds.get(row.get().into()) }.hold(held);
+        }
+
+        unsafe fn release(&self, keep: &[NonZeroU32]) -> u64 {
+            let before = self.held_bytes();
+            let mut kept: Vec<(NonZeroU32, K, u8, u32, u32, Option<ArenaId>), Global> =
+                Vec::with_capacity_in(keep.len(), Global);
+            kept.extend(keep.iter().map(|&row| {
+                let tag = self.tag_of(row);
+                let at = u64::from(row.get());
+                // SAFETY: `tag_of` checked the row was written and published.
+                unsafe {
+                    (
+                        row,
+                        *self.kinds.get(at),
+                        tag,
+                        *self.flags.get(at),
+                        *self.binder.get(at),
+                        *self.home.get(at),
+                    )
+                }
+            }));
+            // SAFETY: the caller's precondition; `K` and the hot columns are `Copy`, so nothing
+            // in them needs a drop.
+            unsafe {
+                self.index.free();
+                self.tag.free();
+                self.flags.free();
+                self.binder.free();
+                self.kinds.free();
+                self.home.free();
+            }
+            self.next.store(1, Ordering::Relaxed);
+            for &(row, kind, tag, flags, binder, home) in &kept {
+                let at = u64::from(row.get());
+                // SAFETY: every position was freed above, so none is written, and the caller's
+                // precondition leaves this thread alone in the table.
+                unsafe {
+                    self.kinds.write(at, kind);
+                    self.flags.write(at, flags);
+                    self.binder.write(at, binder);
+                    self.home.write(at, home);
+                }
+                let vacant =
+                    match self.index.lock(&kind, |it| self.indexed(it) == kind, self.rehash()) {
+                        Entry::Vacant(vacant) => vacant,
+                        Entry::Found(other) => panic!(
+                            "rows {other} and {row} of the {} table, both kept by a release, hold \
+                             one kind",
+                            self.what
+                        ),
+                    };
+                // SAFETY: the tag column is zeroed and of atomics, and `at` is below 2^32.
+                unsafe { self.tag.place(at) }.store(tag, Ordering::Release);
+                vacant.insert(row);
+                self.next.fetch_max(at + 1, Ordering::Relaxed);
+            }
+            before.saturating_sub(self.held_bytes())
+        }
     }
 
     /// Interned lists of `T`: each row a start and a length over one column of items. A list's
@@ -4801,11 +5813,15 @@ pub(crate) mod table {
         /// Whether the lists have flags: [`Lists::with_flags`], all interned by
         /// [`Lists::intern_with`].
         flagged: bool,
+        /// Whether it is in [`TABLES`].
+        registered: AtomicBool,
         next: AtomicU64,
         start: Column<u32>,
         len: Column<AtomicU32>,
         flags: Column<u32>,
         binder: Column<u32>,
+        /// The greatest of its items' homes ([`Homed`]), written once with the row.
+        home: Column<Option<ArenaId>>,
         items: Run<T>,
         index: Index,
     }
@@ -4815,7 +5831,7 @@ pub(crate) mod table {
     pub(crate) const LIST_BYTES: usize = size_of::<u32>() + size_of::<AtomicU32>();
     const _: () = assert!(LIST_BYTES == 8);
 
-    impl<T: Copy + Hash + Eq> Lists<T> {
+    impl<T: Copy + Hash + Eq + Sync + Homed + Holds + 'static> Lists<T> {
         /// A table of lists without flags, interned by [`Lists::intern`].
         pub(crate) const fn new(what: &'static str) -> Lists<T> {
             Lists::make(what, false)
@@ -4830,11 +5846,13 @@ pub(crate) mod table {
             Lists {
                 what,
                 flagged,
+                registered: AtomicBool::new(false),
                 next: AtomicU64::new(1),
                 start: Column::new(),
                 len: Column::zeroed(),
                 flags: Column::new(),
                 binder: Column::new(),
+                home: Column::new(),
                 items: Run::new(),
                 index: Index::new(),
             }
@@ -4847,13 +5865,13 @@ pub(crate) mod table {
 
         /// The row of the list `items`, added if it is not there. Panics on a table
         /// [`Lists::with_flags`].
-        pub(crate) fn intern<V: Erase<Static = T>>(&self, items: &[V]) -> NonZeroU32 {
+        pub(crate) fn intern<V: Erase<Static = T>>(&'static self, items: &[V]) -> NonZeroU32 {
             self.put(erase_slice(items), || None)
         }
 
         /// As [`Lists::intern`], for a table [`Lists::with_flags`]: `info` computes them.
         pub(crate) fn intern_with<V: Erase<Static = T>>(
-            &self,
+            &'static self,
             items: &[V],
             info: impl FnOnce() -> (TypeFlags, DebruijnIndex),
         ) -> NonZeroU32 {
@@ -4862,7 +5880,7 @@ pub(crate) mod table {
 
         #[inline]
         fn put(
-            &self,
+            &'static self,
             items: &[T],
             info: impl FnOnce() -> Option<(TypeFlags, DebruijnIndex)>,
         ) -> NonZeroU32 {
@@ -4874,10 +5892,13 @@ pub(crate) mod table {
 
         #[cold]
         fn add(
-            &self,
+            &'static self,
             items: &[T],
             info: impl FnOnce() -> Option<(TypeFlags, DebruijnIndex)>,
         ) -> NonZeroU32 {
+            if !self.registered.load(Ordering::Acquire) {
+                register(&self.registered, self);
+            }
             let info = info();
             assert_eq!(info.is_some(), self.flagged, "the flags of a list of {}", self.what);
             let vacant = match self.index.lock(items, |row| self.items(row) == items, self.rehash())
@@ -4898,8 +5919,11 @@ pub(crate) mod table {
                 // yet.
                 unsafe { self.items.column.write(start + i as u64, item) };
             }
+            let home = items.iter().map(Homed::home).max().flatten();
             // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
             unsafe { self.start.write(row, start as u32) };
+            // SAFETY: as above.
+            unsafe { self.home.write(row, home) };
             if let Some((flags, binder)) = info {
                 // SAFETY: as above.
                 unsafe { self.flags.write(row, flags.bits()) };
@@ -4978,25 +6002,138 @@ pub(crate) mod table {
             assert!(self.flagged, "the lists of {} have no flags", self.what);
             self.written(row);
         }
+
+        /// The home of `row`: the greatest of its items' homes. Panics if it is not a row of
+        /// this table.
+        #[inline]
+        pub(crate) fn home(&self, row: NonZeroU32) -> Option<ArenaId> {
+            self.written(row);
+            // SAFETY: `written` checked the row was written and published, with its home.
+            unsafe { *self.home.get(row.get().into()) }
+        }
+    }
+
+    impl<T: Copy + Hash + Eq + Sync + Homed + Holds + 'static> Table for Lists<T> {
+        fn name(&self) -> &'static str {
+            self.what
+        }
+
+        fn held_bytes(&self) -> u64 {
+            self.start.bytes()
+                + self.len.bytes()
+                + self.flags.bytes()
+                + self.binder.bytes()
+                + self.home.bytes()
+                + self.items.column.bytes()
+                + self.index.bytes()
+        }
+
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>) {
+            rows_homed_in(
+                self.next.load(Ordering::Acquire),
+                |row| self.published(row),
+                |row| self.home(row),
+                live,
+                out,
+            );
+        }
+
+        fn hold(&self, row: NonZeroU32, held: &mut Held) {
+            self.items(row).iter().for_each(|item| item.hold(held));
+        }
+
+        unsafe fn release(&self, keep: &[NonZeroU32]) -> u64 {
+            let before = self.held_bytes();
+            #[expect(clippy::type_complexity, reason = "a kept list's row, items, flags and home")]
+            let mut kept: Vec<(NonZeroU32, Vec<T, Global>, Option<(u32, u32)>, Option<ArenaId>), Global> =
+                Vec::with_capacity_in(keep.len(), Global);
+            kept.extend(keep.iter().map(|&row| {
+                let items = self.items(row).to_vec_in(Global);
+                let at = u64::from(row.get());
+                // SAFETY: `items` checked the row was written and published, with its flags
+                // when the table has them (`add`'s assertion) and its home.
+                let flags =
+                    self.flagged.then(|| unsafe { (*self.flags.get(at), *self.binder.get(at)) });
+                // SAFETY: as above.
+                let home = unsafe { *self.home.get(at) };
+                (row, items, flags, home)
+            }));
+            // SAFETY: the caller's precondition; every column is of `Copy` values, so nothing
+            // in them needs a drop.
+            unsafe {
+                self.index.free();
+                self.start.free();
+                self.len.free();
+                self.flags.free();
+                self.binder.free();
+                self.home.free();
+                self.items.column.free();
+            }
+            self.items.next.store(0, Ordering::Relaxed);
+            self.next.store(1, Ordering::Relaxed);
+            for (row, items, flags, home) in &kept {
+                let at = u64::from(row.get());
+                let start = match items.is_empty() {
+                    true => 0,
+                    false => self.items.claim(items.len() as u64, self.what),
+                };
+                for (i, &item) in items.iter().enumerate() {
+                    // SAFETY: the positions `claim` gave are ours alone, below 2^32 and not
+                    // written since the free above.
+                    unsafe { self.items.column.write(start + i as u64, item) };
+                }
+                // SAFETY: freed above, so not written, and the caller's precondition leaves
+                // this thread alone in the table.
+                unsafe { self.start.write(at, start as u32) };
+                // SAFETY: as above.
+                unsafe { self.home.write(at, *home) };
+                if let Some((flags, binder)) = *flags {
+                    // SAFETY: as above.
+                    unsafe { self.flags.write(at, flags) };
+                    // SAFETY: as above.
+                    unsafe { self.binder.write(at, binder) };
+                }
+                let items = &items[..];
+                let vacant =
+                    match self.index.lock(items, |it| self.items(it) == items, self.rehash()) {
+                        Entry::Vacant(vacant) => vacant,
+                        Entry::Found(other) => panic!(
+                            "lists {other} and {row} of {}, both kept by a release, hold one list",
+                            self.what
+                        ),
+                    };
+                // SAFETY: the length column is zeroed and of atomics, and `at` is below 2^32.
+                unsafe { self.len.place(at) }.store(items.len() as u32 + 1, Ordering::Release);
+                vacant.insert(*row);
+                self.next.fetch_max(at + 1, Ordering::Relaxed);
+            }
+            before.saturating_sub(self.held_bytes())
+        }
     }
 
     /// Interned values kept whole, for the kinds whose API hands out a reference to the value.
     /// The mark column is 1 for a row written in full, and storing it publishes the row.
     pub(crate) struct Values<T> {
         what: &'static str,
+        /// Whether it is in [`TABLES`].
+        registered: AtomicBool,
         next: AtomicU64,
         marks: Column<AtomicU8>,
         values: Column<T>,
+        /// The value's home ([`Homed`]), written once with the row.
+        home: Column<Option<ArenaId>>,
         index: Index,
     }
 
-    impl<T: Hash + Eq> Values<T> {
+    impl<T: Hash + Eq + Send + Sync + Homed + Holds + 'static> Values<T> {
         pub(crate) const fn new(what: &'static str) -> Values<T> {
             Values {
                 what,
+                registered: AtomicBool::new(false),
                 next: AtomicU64::new(1),
                 marks: Column::zeroed(),
                 values: Column::new(),
+                home: Column::new(),
                 index: Index::new(),
             }
         }
@@ -5007,11 +6144,14 @@ pub(crate) mod table {
         }
 
         /// The row of `value`, added if it is not there.
-        pub(crate) fn intern<V: Erase<Static = T>>(&self, value: V) -> NonZeroU32 {
+        pub(crate) fn intern<V: Erase<Static = T>>(&'static self, value: V) -> NonZeroU32 {
             let value = to_static(value);
             let same = |row| self.indexed(row) == &value;
             if let Some(row) = self.index.find(&value, same) {
                 return row;
+            }
+            if !self.registered.load(Ordering::Acquire) {
+                register(&self.registered, self);
             }
             let vacant = match self.index.lock(&value, same, self.rehash()) {
                 Entry::Found(row) => return row,
@@ -5020,6 +6160,8 @@ pub(crate) mod table {
             let row = self.next.fetch_add(1, Ordering::Relaxed);
             assert!(row <= u64::from(LAST_ROW), "the {} table holds {LAST_ROW} rows", self.what);
             // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
+            unsafe { self.home.write(row, value.home()) };
+            // SAFETY: as above.
             unsafe { self.values.write(row, value) };
             // SAFETY: the mark column is zeroed and of atomics, and `row` is below 2^32.
             let mark = unsafe { self.marks.place(row) };
@@ -5066,6 +6208,111 @@ pub(crate) mod table {
             // release store that published it.
             unerase_ref(unsafe { self.values.get(row.get().into()) })
         }
+
+        /// Whether `row` was written in full: its mark is set.
+        fn marked(&self, at: u64) -> bool {
+            // SAFETY: the mark column is zeroed and of atomics, and a row is below 2^32.
+            let mark = unsafe { self.marks.peek(at) };
+            mark.is_some_and(|mark| mark.load(Ordering::Acquire) != 0)
+        }
+
+        /// The home of `row`: its value's. Panics if it is not a row of this table.
+        #[inline]
+        pub(crate) fn home(&self, row: NonZeroU32) -> Option<ArenaId> {
+            if !self.marked(row.get().into()) {
+                never_written(self.what, row);
+            }
+            // SAFETY: the row was written, its home with it, before the release store of its
+            // mark that `marked`'s acquire load saw.
+            unsafe { *self.home.get(row.get().into()) }
+        }
+    }
+
+    impl<T: Hash + Eq + Send + Sync + Homed + Holds + 'static> Table for Values<T> {
+        fn name(&self) -> &'static str {
+            self.what
+        }
+
+        fn held_bytes(&self) -> u64 {
+            self.marks.bytes() + self.values.bytes() + self.home.bytes() + self.index.bytes()
+        }
+
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>) {
+            rows_homed_in(
+                self.next.load(Ordering::Acquire),
+                |row| self.marked(row.get().into()),
+                |row| self.home(row),
+                live,
+                out,
+            );
+        }
+
+        fn hold(&self, row: NonZeroU32, held: &mut Held) {
+            if !self.marked(row.get().into()) {
+                never_written(self.what, row);
+            }
+            // The row was written: its mark's acquire load above pairs with its publication.
+            self.indexed(row).hold(held);
+        }
+
+        unsafe fn release(&self, keep: &[NonZeroU32]) -> u64 {
+            let before = self.held_bytes();
+            let next = self.next.load(Ordering::Relaxed);
+            let mut kept: Vec<(NonZeroU32, T, Option<ArenaId>), Global> =
+                Vec::with_capacity_in(keep.len(), Global);
+            for &row in keep {
+                let at = u64::from(row.get());
+                if !self.marked(at) {
+                    never_written(self.what, row);
+                }
+                // SAFETY: the row was written (its mark), its home with it.
+                let home = unsafe { *self.home.get(at) };
+                // SAFETY: the row was written (its mark), and it is moved out once: the columns
+                // are freed below without dropping it.
+                kept.push((row, unsafe { self.values.take(at) }, home));
+            }
+            if needs_drop::<T>() {
+                for at in 1..next {
+                    let row = NonZeroU32::new(at as u32).expect("rows start at 1");
+                    if keep.binary_search(&row).is_ok() || !self.marked(at) {
+                        continue;
+                    }
+                    // SAFETY: the row was written (its mark), not moved out (not kept), and the
+                    // caller's precondition leaves no reader of it; it is dropped once.
+                    unsafe { self.values.drop_at(at) };
+                }
+            }
+            // SAFETY: the caller's precondition; every value was moved out or dropped above.
+            unsafe {
+                self.index.free();
+                self.marks.free();
+                self.values.free();
+                self.home.free();
+            }
+            self.next.store(1, Ordering::Relaxed);
+            for (row, value, home) in kept {
+                let at = u64::from(row.get());
+                let vacant =
+                    match self.index.lock(&value, |it| self.indexed(it) == &value, self.rehash()) {
+                        Entry::Vacant(vacant) => vacant,
+                        Entry::Found(other) => panic!(
+                            "rows {other} and {row} of the {} table, both kept by a release, hold \
+                             one value",
+                            self.what
+                        ),
+                    };
+                // SAFETY: freed above, so not written, and the caller's precondition leaves this
+                // thread alone in the table.
+                unsafe { self.home.write(at, home) };
+                // SAFETY: as above.
+                unsafe { self.values.write(at, value) };
+                // SAFETY: the mark column is zeroed and of atomics, and `at` is below 2^32.
+                unsafe { self.marks.place(at) }.store(1, Ordering::Release);
+                vacant.insert(row);
+                self.next.fetch_max(at + 1, Ordering::Relaxed);
+            }
+            before.saturating_sub(self.held_bytes())
+        }
     }
 
     #[cfg(test)]
@@ -5082,8 +6329,8 @@ pub(crate) mod table {
         use rustc_type_ir::{DebruijnIndex, INNERMOST, TypeFlags};
 
         use super::{
-            Erase, FIRST_BITS, FIRST_SLOTS, Lists, RowInfo, Rows, SEGMENTS, Slots, Values, collect,
-            fit, locate, segment_len, segment_start,
+            Erase, FIRST_BITS, FIRST_SLOTS, Lists, RowInfo, Rows, SEGMENTS, Slots, Table, Values,
+            collect, fit, locate, plant, release_tables, segment_len, segment_start,
         };
 
         macro_rules! erase_static {
@@ -5092,6 +6339,7 @@ pub(crate) mod table {
                 unsafe impl Erase for $ty {
                     type Static = $ty;
                 }
+                super::plain_data!($ty);
             )+};
         }
         erase_static!(u32, u64, (u32, u64), [u32; 3], String);
@@ -5101,7 +6349,12 @@ pub(crate) mod table {
         fn tagged(tag: u32) -> impl FnOnce() -> RowInfo {
             let fits = u8::try_from(tag).ok().filter(|&it| it < u8::MAX);
             let tag = fits.unwrap_or_else(|| panic!("a test tag of {tag}, not a row's (0 to 254)"));
-            move || RowInfo { tag, flags: TypeFlags::empty(), binder: INNERMOST }
+            move || RowInfo {
+                tag,
+                flags: TypeFlags::empty(),
+                binder: INNERMOST,
+                home: None,
+            }
         }
 
         /// The safe reference version of a table: a map from value to row under one lock, rows
@@ -5262,6 +6515,7 @@ pub(crate) mod table {
                 tag: 2,
                 flags: TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR,
                 binder: DebruijnIndex::from_u32(3),
+                home: None,
             });
             assert_eq!(ROWS.flags(row), TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR);
             assert_eq!(ROWS.binder(row), DebruijnIndex::from_u32(3));
@@ -5298,6 +6552,191 @@ pub(crate) mod table {
                 assert_eq!(ROWS.kind::<u32>(row), value);
             }
             assert!(!ROWS.index.keyed(), "5000 honest values switched the index to its key");
+        }
+
+        /// A release's three tables, filled the same way each run: 2^14 rows, lists and values,
+        /// enough that every shard of each index grew and retired its first tables.
+        struct Three {
+            rows: &'static Rows<u32>,
+            lists: &'static Lists<u32>,
+            values: &'static Values<String>,
+        }
+
+        impl Three {
+            fn tables(&self) -> [&'static dyn Table; 3] {
+                [self.rows, self.lists, self.values]
+            }
+
+            fn fill(&self, count: u32) -> Vec<(NonZeroU32, NonZeroU32, NonZeroU32)> {
+                (0..count)
+                    .map(|i| {
+                        (
+                            self.rows.intern(i, tagged(i % 7)),
+                            self.lists.intern(&[i, i ^ 1][..]),
+                            self.values.intern(format!("value {i}")),
+                        )
+                    })
+                    .collect()
+            }
+
+            fn held_bytes(&self) -> u64 {
+                self.tables().iter().map(|table| table.held_bytes()).sum()
+            }
+
+            fn retired(&self) -> u32 {
+                [&self.rows.index, &self.lists.index, &self.values.index]
+                    .iter()
+                    .map(|index| index.retired.load(Ordering::Relaxed))
+                    .sum()
+            }
+
+            /// The oracle: what a fresh process's tables hold, nothing, with no retired table
+            /// left; `Err` names what is left.
+            fn as_fresh(&self) -> Result<(), String> {
+                match (self.held_bytes(), self.retired()) {
+                    (0, 0) => Ok(()),
+                    (bytes, retired) => Err(format!("{bytes} bytes and {retired} retired tables")),
+                }
+            }
+        }
+
+        /// The invariant: a release with no row kept leaves its tables as a fresh process's:
+        /// every column segment, shard table and retired table freed (no byte held), and the
+        /// same values added again are numbered and held as a fresh table's are, each read back
+        /// as itself. The retired tables are kept from their grace by a reader held over the
+        /// release, which frees them anyway. Control: a release that leaves the retired
+        /// tables (`plant::KEEPS_RETIRED`) is caught by the oracle.
+        #[test]
+        fn a_release_leaves_the_tables_as_a_fresh_process() {
+            static ROWS: Rows<u32> = Rows::new("released rows", 1 << 20);
+            static LISTS: Lists<u32> = Lists::new("released lists");
+            static VALUES: Values<String> = Values::new("released values");
+            static FRESH_ROWS: Rows<u32> = Rows::new("fresh rows", 1 << 20);
+            static FRESH_LISTS: Lists<u32> = Lists::new("fresh lists");
+            static FRESH_VALUES: Values<String> = Values::new("fresh values");
+            static PLANTED_ROWS: Rows<u32> = Rows::new("planted rows", 1 << 20);
+            static PLANTED_LISTS: Lists<u32> = Lists::new("planted lists");
+            static PLANTED_VALUES: Values<String> = Values::new("planted values");
+            const COUNT: u32 = 1 << 14;
+
+            let released = Three { rows: &ROWS, lists: &LISTS, values: &VALUES };
+            let reader = blaze_reclaim::enter();
+            released.fill(COUNT);
+            assert!(released.retired() > 0, "2^14 rows grew every index past its first tables");
+            // SAFETY: the tables are this test's alone, and no row of them is kept.
+            let freed = unsafe { release_tables(&released.tables(), &[]) };
+            drop(reader);
+            assert_eq!(freed.tables, 3);
+            assert!(freed.bytes > 0);
+            released.as_fresh().expect("a release leaves nothing held");
+
+            let fresh = Three { rows: &FRESH_ROWS, lists: &FRESH_LISTS, values: &FRESH_VALUES };
+            // Held over both fills, so each keeps every table it retires: what both hold is then
+            // what they made, not what another test's tasks let a grace pass on.
+            let reader = blaze_reclaim::enter();
+            let again = released.fill(COUNT);
+            assert_eq!(again, fresh.fill(COUNT), "rows are numbered as a fresh table's");
+            for (i, &(row, list, value)) in (0..COUNT).zip(&again) {
+                assert_eq!(ROWS.kind::<u32>(row), i);
+                assert_eq!(LISTS.get::<u32>(list), &[i, i ^ 1]);
+                assert_eq!(VALUES.get::<String>(value), &format!("value {i}"));
+            }
+            assert_eq!(
+                released.held_bytes(),
+                fresh.held_bytes(),
+                "the tables hold what a fresh process's hold"
+            );
+            drop(reader);
+
+            // The control: the planted release leaves the retired tables, and the oracle says so.
+            let planted = Three { rows: &PLANTED_ROWS, lists: &PLANTED_LISTS, values: &PLANTED_VALUES };
+            let reader = blaze_reclaim::enter();
+            planted.fill(COUNT);
+            plant::KEEPS_RETIRED.set(true);
+            // SAFETY: as above.
+            unsafe { release_tables(&planted.tables(), &[]) };
+            plant::KEEPS_RETIRED.set(false);
+            drop(reader);
+            let left = planted.as_fresh().expect_err("the oracle catches retired tables left");
+            assert!(left.contains("retired tables"), "{left}");
+        }
+
+        /// The invariant: a release keeps each row it is told to at its number, holding what it
+        /// held and found again by it; a row it did not keep reads as never written (a panic
+        /// naming it, not another row's value), and the next row added is numbered one past the
+        /// last kept.
+        #[test]
+        fn a_release_keeps_the_rows_it_is_told_at_their_numbers() {
+            static ROWS: Rows<u32> = Rows::new("kept rows", 1 << 20);
+            static LISTS: Lists<u32> = Lists::new("kept lists");
+            static VALUES: Values<String> = Values::new("kept values");
+            let three = Three { rows: &ROWS, lists: &LISTS, values: &VALUES };
+            let made = three.fill(1000);
+            let (kept, dropped, last) = (made[7], made[8], made[500]);
+            let keep = [
+                ("kept rows", kept.0.get()),
+                ("kept rows", last.0.get()),
+                ("kept lists", kept.1.get()),
+                ("kept lists", last.1.get()),
+                ("kept values", kept.2.get()),
+                ("kept values", last.2.get()),
+            ];
+            // SAFETY: the tables are this test's alone, and only `keep`'s rows are read after.
+            unsafe { release_tables(&three.tables(), &keep) };
+            for (i, row) in [(7, kept), (500, last)] {
+                assert_eq!(ROWS.kind::<u32>(row.0), i);
+                assert_eq!(ROWS.intern(i, tagged(i % 7)), row.0, "found again at its number");
+                assert_eq!(LISTS.get::<u32>(row.1), &[i, i ^ 1]);
+                assert_eq!(LISTS.intern(&[i, i ^ 1][..]), row.1);
+                assert_eq!(VALUES.get::<String>(row.2), &format!("value {i}"));
+                assert_eq!(VALUES.intern(format!("value {i}")), row.2);
+            }
+            let stale = std::panic::catch_unwind(|| ROWS.kind::<u32>(dropped.0))
+                .expect_err("a row not kept reads as never written");
+            let message = stdx::panic_text(&*stale).unwrap_or("");
+            assert!(message.contains("was never written"), "{message}");
+            let next = ROWS.intern(5000u32, tagged(0));
+            assert_eq!(next.get(), last.0.get() + 1, "new rows follow the last kept");
+        }
+
+        /// The invariant: a release while a front end is kept (`crate::evict::FRONT_ENDS`) is
+        /// refused, naming the count, and lets go of nothing: a row the front end holds still
+        /// reads as its value. Control: the check planted off (`plant::UNCHECKED`), the same
+        /// release frees the row, and the next value added is given its number: the front
+        /// end's row now reads as another value, the wrong answer the refusal prevents.
+        #[test]
+        fn a_release_while_a_front_end_is_kept_is_refused() {
+            static ROWS: Rows<u32> = Rows::new("front end rows", 1 << 20);
+            static LISTS: Lists<u32> = Lists::new("front end lists");
+            static VALUES: Values<String> = Values::new("front end values");
+            let three = Three { rows: &ROWS, lists: &LISTS, values: &VALUES };
+            let release = || {
+                super::refuse_unless_quiet();
+                // SAFETY: what `refuse_unless_quiet` checks, but for the control, whose stale
+                // read is of this test's own table.
+                unsafe { release_tables(&three.tables(), &[]) }
+            };
+            let db = hir_expand::fixture::db("struct S;").into_db();
+            crate::evict::front_end_kept();
+            let held = ROWS.intern(41u32, tagged(0));
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(release))
+                .expect_err("a release with a front end kept is refused");
+            let message = stdx::panic_text(&*refused).unwrap_or("");
+            assert!(
+                message.contains("front ends kept (`hir_ty::evict::FRONT_ENDS`, at most 0 allowed)"),
+                "{message}"
+            );
+            assert!(!message.contains(" 0 front ends kept"), "{message}");
+            assert_eq!(ROWS.kind::<u32>(held), 41, "a refused release frees nothing");
+
+            plant::UNCHECKED.set(true);
+            release();
+            plant::UNCHECKED.set(false);
+            let other = ROWS.intern(42u32, tagged(0));
+            assert_eq!(other, held, "the unchecked release gave the held row's number away");
+            assert_ne!(ROWS.kind::<u32>(held), 41, "and the front end's row reads another value");
+
+            crate::evict::front_end_dropped(&db);
         }
 
         /// A shard's table a grown one replaced is held while a task that began before it was
@@ -5658,7 +7097,7 @@ mod tests {
     use crate::next_solver::{CanonicalVarKinds, Goal, PredicateKind, default_types};
 
     fn function() -> GenericDefId {
-        GenericDefId::FunctionId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)))
+        GenericDefId::FunctionId(blaze_memo::Id::from_gid(blaze_memo::Gid::for_test(1)))
     }
 
     fn early(index: u32) -> Region<'static> {

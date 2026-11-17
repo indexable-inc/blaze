@@ -12,7 +12,7 @@ use std::{
 };
 
 use super::{
-    ops::{ABANDONED, DIRECT, FINISHED, LINKS, NO_BUFFER, STDERR, STOPPING, ZERO_COPY},
+    ops::{ABANDONED, DIRECT, FINISHED, LINKS, PART, STDERR, STOPPING, ZERO_COPY},
     *,
 };
 
@@ -113,10 +113,9 @@ impl Uring {
     }
 
     /// Writes the request `id` as it now stands to the ring, or keeps it for when there is
-    /// room (or for its kept file's open, the slots its opens fill, or, bypassing the page
-    /// cache, a registered buffer).
+    /// room (or for its kept file's open, or the slots its opens fill).
     pub(super) fn queue(&mut self, id: Id) {
-        if !self.admitted(id) || !self.prepared(id) || !self.slotted(id) || !self.buffered(id) {
+        if !self.admitted(id) || !self.prepared(id) || !self.slotted(id) {
             return;
         }
         let mut sqes = [Sqe::default(); LINKS];
@@ -132,32 +131,6 @@ impl Uring {
     fn asked(&mut self, id: Id, sqes: &[Sqe]) {
         let links = sqes.iter().fold(0u8, |links, it| links | 1 << (it.user_data & LINK_MASK));
         self.ops.get_mut(id).expect("a request in flight").links |= links;
-    }
-
-    /// Whether the request `id` has the registered buffer it needs, given one if it needs one
-    /// and one is free; one that finds none waits in [`ops::Lent`] for the next given back.
-    fn buffered(&mut self, id: Id) -> bool {
-        let Uring { ops, lent, .. } = self;
-        let hot = ops.get_mut(id).expect("a request in flight");
-        if hot.kind != Kind::WriteAt || hot.flags & DIRECT == 0 || hot.buffer != NO_BUFFER {
-            return true;
-        }
-        match lent.take(id) {
-            Some(buffer) => {
-                hot.buffer = buffer;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// The registered buffer of a write that ended free again, for the write that has waited
-    /// longest.
-    pub(super) fn unbuffer(&mut self, buffer: u16) {
-        let Uring { ops, lent, .. } = self;
-        let Some((id, buffer)) = lent.give(buffer, |it| ops.contains(it)) else { return };
-        ops.get_mut(id).expect("in flight, as `give` checked").buffer = buffer;
-        self.queue(id);
     }
 
     /// The request `id` taken out of its slot, and what it held let go: the file it used, its
@@ -247,7 +220,10 @@ impl Uring {
             }
             Kind::Sync => {
                 let (fd, flags) = kept();
-                Sqe { opcode: OP_FSYNC, flags, fd, user_data, ..Sqe::default() }
+                // `fsync_flags`: the data and the length alone for a barrier, which is all
+                // an ordering needs; everything of the inode for a sync.
+                let op_flags = if hot.flags & ops::DATA != 0 { IORING_FSYNC_DATASYNC } else { 0 };
+                Sqe { opcode: OP_FSYNC, flags, fd, op_flags, user_data, ..Sqe::default() }
             }
             // The asker's memory, which stays where it is until the request's last completion
             // (`Effect::ReadInto`'s and `Effect::WriteFrom`'s contract, `Spans::register`'s).
@@ -407,7 +383,7 @@ impl Uring {
             }
             Kind::Wake => Sqe {
                 opcode: OP_READ,
-                fd: self.offload.wake.as_raw_fd(),
+                fd: self.offload.wake.fd.as_raw_fd(),
                 off: u64::MAX,
                 addr: self.offload.count.get() as u64,
                 len: 8,
@@ -506,6 +482,8 @@ impl Uring {
                 | Kind::Wake
                 | Kind::Open
                 | Kind::Close => {}
+                // A part of a batched read fails with its batch, below.
+                Kind::ReadInto if hot.flags & PART != 0 => {}
                 // The kernel may still read or write the asker's memory: the failure says so, and
                 // the span is never to be used again (`crate::ABANDONED_SPAN`).
                 Kind::ReadInto | Kind::WriteFrom => {
@@ -521,6 +499,25 @@ impl Uring {
                 }
                 _ => ready.push(failed(hot.tag)),
             }
+        }
+        // Each batched read in flight is told once: a part already in keeps how it went, and
+        // every other fails, its span the kernel's still (`crate::ABANDONED_SPAN`).
+        // alloc: the error path, once: the batches in tag order, so they are told the same way
+        // every run.
+        let mut batches: Vec<(Tag, Batch)> = self.batches.drain().collect();
+        batches.sort_unstable_by_key(|it| it.0.0);
+        for (tag, mut batch) in batches {
+            for part in batch.parts.iter_mut().filter(|it| it.got == crate::Got::Asked) {
+                // alloc: the error path, once per part in flight.
+                part.got = crate::Got::Failed(IoError(format!(
+                    "{} at {} ({} bytes): {why}: {}",
+                    part.file,
+                    part.at,
+                    part.into.len,
+                    crate::ABANDONED_SPAN
+                )));
+            }
+            self.ready.push(Completion { tag, done: Done::ReadMany(batch.parts) });
         }
         // Timers need no ring, but end with it as everything in flight does.
         self.timers.drain(|_, tag| self.ready.push(failed(tag)));
@@ -550,7 +547,6 @@ impl Uring {
         self.on_open.clear();
         self.slot_waiting.clear();
         self.load_waiting.clear();
-        drop(self.lent.clear_waiting());
         self.ring.unsubmitted = 0;
     }
 
@@ -571,6 +567,9 @@ impl Uring {
             hot.links &= !(1 << link);
         }
         let (tag, kind) = (hot.tag, hot.kind);
+        // A part of a batched read ends into its batch, told once the batch's last part is in.
+        let is_part = kind == Kind::ReadInto && hot.flags & PART != 0;
+        let part = is_part.then(|| self.ops.cold(id).names[3]);
         // A zero-copy send's result carries `CQE_F_MORE` for the notification that follows: it
         // is not a multishot request, and its step says when it is asked again.
         let more = flags & CQE_F_MORE != 0 && kind != Kind::Send;
@@ -588,8 +587,10 @@ impl Uring {
             }
             Step::Held => {}
             Step::Ends(done) => {
-                if let Some(done) = done {
-                    self.ready.push(Completion { tag, done });
+                match (done, part) {
+                    (Some(done), Some(index)) => self.read_part_ended(tag, index, done),
+                    (Some(done), None) => self.ready.push(Completion { tag, done }),
+                    (None, _) => {}
                 }
                 self.end(id);
             }
@@ -657,7 +658,14 @@ impl Uring {
                 }
             }
             Kind::Sync if res < 0 => Step::Ends(failed(res)),
-            Kind::Sync => Step::Ends(Some(self.synced(Handle::from_bits(hot.of)))),
+            Kind::Sync => {
+                let done = match (self.synced(Handle::from_bits(hot.of)), hot.flags & ops::DATA) {
+                    (Done::Synced, 0) => Done::Synced,
+                    (Done::Synced, _) => Done::Ordered,
+                    (failed, _) => failed,
+                };
+                Step::Ends(Some(done))
+            }
             Kind::WriteAt
             | Kind::Write
             | Kind::Rename
@@ -747,6 +755,15 @@ impl Uring {
 
     /// The read of the watch `hot` completed with `res`.
     fn watched(&mut self, hot: Hot, res: i32) -> Step {
+        let step = self.watched_read(hot, res);
+        // Directories the read (or a flush's drain) heard made are walked off the loop.
+        if matches!(step, Step::Again) {
+            self.grow(hot.tag, Handle::from_bits(hot.of));
+        }
+        step
+    }
+
+    fn watched_read(&mut self, hot: Hot, res: i32) -> Step {
         let tag = hot.tag;
         let Uring { watchings, ready, watches, .. } = self;
         let Watching { tree, buffer, stopping, flushes, journal } =
@@ -1020,14 +1037,126 @@ impl Uring {
             return Err(io::Error::other("the watch ended before the flush"));
         }
         flushes.push(tag);
+        let handle = Handle::from_bits(hot.of);
         if waiting {
             flushed(&mut self.ready, watch, tree, buffer, flushes, journal.as_ref());
+            self.grow(watch, handle);
             return Ok(());
         }
-        if flushes.len() == 1 {
+        // While a grow is pending the flush waits for its merge, which cancels the read then
+        // ([`Uring::answer_flushes`]).
+        if flushes.len() == 1 && !tree.pending() {
             self.cancel(id);
         }
         Ok(())
+    }
+
+    /// Hands the [`Walker`] the directories the watch `tag` heard made
+    /// ([`crate::watch::Tree::grow`]), where it has any and none of its grows is out. With no
+    /// room on the walker the watch waits in [`Uring::ungrown`] until a walk ends. A grow that
+    /// cannot be made or handed over is merged at once as failed, which tells the watch's
+    /// changes lost (whoever watches looks again) and lets its flushes go.
+    pub(super) fn grow(&mut self, tag: Tag, handle: Handle<Watching>) {
+        let bits = handle.to_bits();
+        let Some(watching) = self.watchings.get_mut(handle) else { return };
+        if watching.stopping || !watching.tree.pending() {
+            return;
+        }
+        if self.starting.len() + self.grows_out >= STARTS {
+            if !self.ungrown.contains(&(tag, bits)) {
+                self.ungrown.push((tag, bits));
+            }
+            return;
+        }
+        let grow = match watching.tree.grow() {
+            Ok(Some(grow)) => grow,
+            Ok(None) => return,
+            Err(_) => {
+                let done = told(watching.journal.as_ref(), crate::watch::lost());
+                self.ready.push(Completion { tag, done });
+                self.answer_flushes(tag, handle);
+                return;
+            }
+        };
+        let sent = match self.walker() {
+            Ok(walker) => {
+                walker.inbox.try_send(Walking::Grow(tag, bits, grow)).map_err(|refused| {
+                    let Walking::Grow(_, _, grow) = refused.into_inner() else {
+                        unreachable!("the grow sent")
+                    };
+                    let why = io::Error::other("the thread that walks inotify's watches has ended");
+                    (grow, why)
+                })
+            }
+            Err(why) => Err((grow, why)),
+        };
+        match sent {
+            Ok(()) => {
+                self.grows_out += 1;
+                self.offloaded(tag);
+            }
+            Err((grow, why)) => {
+                self.merge(Grown { tag, watching: bits, grown: grow.refused(why) });
+            }
+        }
+    }
+
+    /// A grow the [`Walker`] is done with, merged into its watch: what it found told, the
+    /// watch's next grow handed over (directories heard made meanwhile), and its flushes
+    /// answered once nothing is pending. A grow of a watch that ended is dropped (its watches
+    /// went with the instance). Then watches waiting for room on the walker get it.
+    pub(super) fn merge(&mut self, Grown { tag, watching, grown }: Grown) {
+        let handle = Handle::from_bits(watching);
+        if let Some(it) = self.watchings.get_mut(handle) {
+            let done = it.tree.grown(grown);
+            if !matches!(&done, Done::Changed { files, lost: false } if files.is_empty()) {
+                let done = told(it.journal.as_ref(), done);
+                self.ready.push(Completion { tag, done });
+            }
+            self.grow(tag, handle);
+            self.answer_flushes(tag, handle);
+        }
+        while self.starting.len() + self.grows_out < STARTS && !self.ungrown.is_empty() {
+            let (tag, watching) = self.ungrown.remove(0);
+            self.grow(tag, Handle::from_bits(watching));
+        }
+    }
+
+    /// The flushes of the watch `tag` that waited for its grows, answered once none is
+    /// pending: drained here where its read still waits for room in the ring, else its read
+    /// cancelled and the flushes answered as the cancel completes ([`flushed`]).
+    pub(super) fn answer_flushes(&mut self, tag: Tag, handle: Handle<Watching>) {
+        let Some(&id) = self.watches.get(&tag) else { return };
+        if self.ops.get(id).is_none_or(|hot| hot.kind != Kind::Watch || hot.of != handle.to_bits())
+        {
+            return;
+        }
+        let waiting = self.waiting.contains(&id);
+        let Some(watching) = self.watchings.get_mut(handle) else { return };
+        if watching.flushes.is_empty() || watching.stopping || watching.tree.pending() {
+            return;
+        }
+        if waiting {
+            let Watching { tree, buffer, flushes, journal, .. } = watching;
+            flushed(&mut self.ready, tag, tree, buffer, flushes, journal.as_ref());
+            self.grow(tag, handle);
+        } else {
+            self.cancel(id);
+        }
+    }
+
+    /// The [`Walker`], made for the first walk with the test's gate where it has one.
+    fn walker(&mut self) -> io::Result<&Walker> {
+        if self.walker.is_none() {
+            #[cfg(test)]
+            let gate = self.walk_gate.take();
+            #[cfg(not(test))]
+            let gate = ();
+            let walker =
+                Walker::new(Arc::clone(&self.root), Arc::clone(&self.offload.wake), gate)?;
+            self.walker = Some(walker);
+        }
+        Ok(self.walker.as_ref().expect("made above"))
     }
 
     pub(super) fn spawn(&mut self, tag: Tag, command: Box<Command>) -> io::Result<()> {
@@ -1146,21 +1275,60 @@ impl Uring {
     }
 
     /// Starts the watch `tag` of `dir`, into the tables of one that ended where there is one;
-    /// an [`Effect::Journal`]'s with `journal`.
-    pub(super) fn watch(&mut self, tag: Tag, dir: FileName, journal: bool) -> io::Result<()> {
+    /// an [`Effect::Journal`]'s with its `first` batch. fanotify's start is a constant number
+    /// of system calls, made here; inotify's is a walk of the tree, handed to the [`Walker`],
+    /// so this returns at once whatever the tree's size, and the watch is in place once the
+    /// walk is done ([`Uring::put_in_place`]): until then a look under it waits
+    /// ([`Uring::holds`]).
+    pub(super) fn watch(&mut self, tag: Tag, dir: FileName, first: Option<Done>) -> io::Result<()> {
         let (spare, flushes) = match self.trees.pop() {
             Some((spare, flushes)) => (Some(spare), flushes),
-            None => (None, Vec::new()), // alloc: empty until a flush; kept for the next watch.
+            None => (None, Vec::new_in(Global)),
         };
-        let tree = crate::watch::Tree::reusing(spare, &self.root, &dir, true)?;
+        let walk = match crate::watch::Tree::begin(spare, &self.root, &dir, true)? {
+            crate::watch::Begun::Watching(tree) => {
+                self.in_place(tag, tree, Starting { dir, first, flushes, stop: false });
+                return Ok(());
+            }
+            #[cfg(test)]
+            crate::watch::Begun::Walk(walk) if self.walks_here => {
+                let tree = walk.run(&self.root)?;
+                self.in_place(tag, tree, Starting { dir, first, flushes, stop: false });
+                return Ok(());
+            }
+            crate::watch::Begun::Walk(walk) => walk,
+        };
+        if self.starting.len() + self.grows_out >= STARTS {
+            return Err(io::Error::other(format!(
+                "watching {dir}: {STARTS} walks of inotify are out already (watches starting, \
+                 each a walk of its tree, and new directories being watched), the most at once"
+            )));
+        }
+        // Bounded by `STARTS`, as the walks out are: never full here.
+        if self.walker()?.inbox.try_send(Walking::Start(tag, walk)).is_err() {
+            return Err(io::Error::other(format!(
+                "watching {dir}: the thread that walks inotify starts has ended"
+            )));
+        }
+        self.starting.insert(tag, Starting { dir, first, flushes, stop: false });
+        self.offloaded(tag);
+        Ok(())
+    }
+
+    /// The watch `tag` in place, `tree` its start: its read in flight, and a journal's first
+    /// batch told.
+    pub(super) fn in_place(&mut self, tag: Tag, tree: crate::watch::Tree, start: Starting) {
+        let Starting { dir, first, flushes, .. } = start;
         let buffer = self.buffer();
-        let journal = journal.then_some(dir);
+        let journal = first.is_some().then_some(dir);
         let watch =
             self.watchings.insert(Watching { tree, buffer, stopping: false, flushes, journal });
         let id =
             self.start(Hot::new(tag, Kind::Watch, watch.to_bits()), ops::NO_BYTES, Cold::EMPTY);
         self.watches.insert(tag, id);
-        Ok(())
+        if let Some(first) = first {
+            self.ready.push(Completion { tag, done: first });
+        }
     }
 
     /// Watches memory pressure as `tag` ([`Effect::Pressure`]): a PSI trigger ([`PSI_TRIGGER`])
@@ -1270,7 +1438,6 @@ impl Drop for Uring {
         self.on_open.clear();
         self.slot_waiting.clear();
         self.load_waiting.clear();
-        drop(self.lent.clear_waiting());
         // alloc: drop, once.
         let mut owed: HashMap<Id, usize, std::alloc::Global> =
             self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();

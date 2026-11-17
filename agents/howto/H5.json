@@ -1,0 +1,9 @@
+{
+ "id": "H5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Run a lane",
+ "do": "One worktree and one branch per lane, named with the date; a lane that needs to run code gets its own ix VM (`ix new --name <lane> --no-shell --arch arm64 --cpus 32 --memory 128 --ttl 3d`) and removes it when done; small commits pushed to its branch; the main agent merges, measures on the exact tip and lands. The brief gives the outcome, the check, the measured facts with their source, the paths, what other lanes own, and what done prints.",
+ "why": "Rules fan-out-write-only, worktree-per-lane, every-agent-has-a-task.",
+ "state": "superseded by H9"
+}

@@ -32,11 +32,11 @@
 //! [`KeyIndex`] over a reserved region ([`RegionVec`], [`Tag::Other`]: an item's identity is no
 //! one subsystem's) that grows in place while the crate's items are walked, then is sorted once.
 
-use std::{fmt, mem};
+use std::{alloc::Global, fmt, mem};
 
-use base_db::{Crate, Db};
+use base_db::{Crate, CrateKey, Db};
 use blaze_format::cursor::Put;
-use blaze_ids::{ContentId, Hasher, radix};
+use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, MemError, RegionVec, Tag, frame, scratch};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId,
@@ -62,12 +62,11 @@ use hir_ty::{
     next_solver::{Ctor, SolverDefId},
 };
 use span::ErasedFileAstId;
-use syntax::view::HasName;
 
 use crate::{ItemId, ItemKey, NAME_DOMAIN, NameHash, SimplifiedType};
 
 pub const KEY_DOMAIN: &str = "blaze v2 item key 2";
-pub const CRATE_DOMAIN: &str = "blaze v2 crate key 5";
+pub const CRATE_DOMAIN: &str = base_db::CRATE_ITEM_KEY_DOMAIN;
 pub const SIMPLIFIED_DOMAIN: &str = "blaze v2 simplified type 1";
 
 /// What a key names, in the current database.
@@ -101,82 +100,13 @@ pub enum Resolved {
 }
 
 /// The key of a crate: its content, never its id (see the module doc).
-#[blaze_query::tracked(returns(copy))]
+/// Its hash is base-db's [`base_db::crate_item_key`], the one home of it, which the commit's
+/// prefix index of the listed crates ([`base_db::listed_by_prefix`]) is made with too.
+#[blaze_memo::tracked(returns(copy))]
 pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
-    let data = krate.data(db);
-    let extra = krate.extra_data(db);
-    let mut h = Hasher::new(CRATE_DOMAIN);
-    h.opt_part(extra.display_name.as_ref().map(|name| name.canonical_name().as_str()))
-        .opt_part(extra.version.as_deref());
-    data.origin.hash_into(&mut h);
-    // What it is built for: the host, a target or the wasm proc macros. Two builds of one
-    // package and cfg for two of these (std for the host and for `--target` of the host's own
-    // triple, or for `wasm32-wasip1` and its proc macros) differ in what the key leaves out,
-    // their `OUT_DIR` and build script runs, so they are two crates. Within one of these, the
-    // runs of one build script apart only in their `OUT_DIR` are one run in the front end, so
-    // their crates are one; runs apart in their profile's `OPT_LEVEL` or `DEBUG` too (a
-    // release build's host package as a normal and as a `build-override` dependency) may give
-    // other output, so their crates are two, told apart by the cfg atom
-    // `blaze::build_script_profile` below (`blaze_lower`'s `run_classes`).
-    extra.built_for.hash_into(&mut h);
-    h.update(&(extra.build_script_runs.len() as u64).to_le_bytes());
-    for run in &extra.build_script_runs {
-        h.part(run.as_bytes());
-    }
-    // Which of its package's targets it is, as cargo's units tell them apart: the kind of
-    // the manifest's target with its name above, and what it is built as (`--test` makes any
-    // target a test). An example and an integration test of one name are two crates, both
-    // `Test` under `--all-targets`.
-    h.update(&[data.target_kind.tag(), data.manifest_kind.tag()]);
-    // What a path in it resolves to: its edition, its `-Z crate-attr`s and each dependency by
-    // its name, its flags and its own key. One package of one cfg built twice in one graph (a
-    // build dependency reached from the host side and the target side) has two `Crate`s only
-    // when these differ, and its items then name different things.
-    h.update(&[data.edition as u8]);
-    h.update(&(data.crate_attrs.len() as u64).to_le_bytes());
-    for attr in data.crate_attrs.iter() {
-        h.part(attr.as_bytes());
-    }
-    h.update(&(data.dependencies.len() as u64).to_le_bytes());
-    for dep in &data.dependencies {
-        h.part(dep.name.symbol().as_str().as_bytes())
-            .update(&[
-                u8::from(dep.is_prelude()),
-                u8::from(dep.is_sysroot()),
-                u8::from(dep.is_private()),
-            ])
-            .id(&crate_key(db, dep.crate_id));
-    }
-    // Every atom's bytes in one buffer, sorted as byte strings; an atom is its start and end
-    // in the buffer, packed into a `u64`.
-    let range = |atom: u64| (atom >> 32) as usize..(atom as u32) as usize;
-    scratch::with_bytes(|bytes| {
-        scratch::with_u64s(|atoms| {
-            for atom in krate.cfg_options(db) {
-                let start = bytes.len();
-                match atom {
-                    cfg::CfgAtom::Flag(name) => {
-                        bytes.push(0);
-                        bytes.put_bytes_u64(name.as_str().as_bytes());
-                    }
-                    cfg::CfgAtom::KeyValue { key, value } => {
-                        bytes.push(1);
-                        bytes.put_bytes_u64(key.as_str().as_bytes());
-                        bytes.put_bytes_u64(value.as_str().as_bytes());
-                    }
-                }
-                let end =
-                    u32::try_from(bytes.len()).expect("blaze-items: a crate's cfg under 4 GiB");
-                atoms.push(u64::from(start as u32) << 32 | u64::from(end));
-            }
-            atoms.sort_unstable_by(|&a, &b| bytes[range(a)].cmp(&bytes[range(b)]));
-            h.update(&(atoms.len() as u64).to_le_bytes());
-            for &atom in atoms.iter() {
-                h.part(&bytes[range(atom)]);
-            }
-        })
-    });
-    h.finish()
+    // `Crate::item_key` is the same hash, asked by base-db's own readers (a page's closure
+    // names its crates by it): one computation, so the two can never disagree.
+    krate.item_key(db)
 }
 
 /// A key's preimage: the bytes a [`Hasher`] would be given (`part` is length-prefixed, `id`
@@ -219,27 +149,13 @@ fn hashed<R>(write: impl FnOnce(&mut Bytes) -> R) -> (R, ContentId) {
     })
 }
 
-/// The top bit of a key's byte 8: the key is of something inside a body (an item of a block,
-/// a block's module, a closure, an anonymous constant, an opaque type).
-const INNER: u8 = 0x80;
-
-/// A key has rustc's `DefPathHash` shape, so [`resolve`] goes straight to one index of one
-/// crate: bytes 0..8 are the first 8 of its crate's key, byte 8's top bit is [`INNER`], and the
-/// other 247 bits are the hash of its preimage.
-impl ItemKey {
-    fn crate_prefix(&self) -> [u8; 8] {
-        *self.0.0.first_chunk().expect("a key is 32 bytes")
-    }
-
-    fn is_inner(&self) -> bool {
-        self.0.0[8] & INNER != 0
-    }
-}
-
+/// A key of rustc's `DefPathHash` shape (`blaze_id::ItemKey`), so [`resolve`] goes straight to
+/// one index of one crate: bytes 0..8 are the first 8 of its crate's key, byte 8's top bit is
+/// [`ItemKey::INNER`], and the other 247 bits are `hash`.
 fn shaped(prefix: [u8; 8], inner: bool, hash: ContentId) -> ItemKey {
     let mut bytes = hash.0;
     bytes[..8].copy_from_slice(&prefix);
-    bytes[8] = (bytes[8] & !INNER) | if inner { INNER } else { 0 };
+    bytes[8] = (bytes[8] & !ItemKey::INNER) | if inner { ItemKey::INNER } else { 0 };
     ItemKey(ContentId(bytes))
 }
 
@@ -255,7 +171,8 @@ fn crate_prefix(krate: &ContentId) -> [u8; 8] {
 /// The preimages of many keys in one buffer, `ends[i]` where the `i`th ends, hashed in one
 /// batch: BLAKE3 over 16 inputs at a time with AVX-512, 4 with NEON, each exactly
 /// `ContentId::of(KEY_DOMAIN, it)`. The preimages and their ends are written into the worker's
-/// scratch buffers, so a warm batch allocates only its rows, which the query keeps.
+/// scratch buffers, so a warm batch allocates only its rows, which the query keeps in its
+/// arena ([`Batch::finish`]).
 struct Batch<T> {
     rows: Vec<(T, ItemKey)>,
     bytes: Bytes,
@@ -264,25 +181,29 @@ struct Batch<T> {
     lent: (scratch::Lent<Vec<u8>>, scratch::Lent<Vec<u32>>),
 }
 
-impl<T: Copy + Ord> Batch<T> {
+impl<T: Copy + Ord + Send + Sync> Batch<T> {
     fn with_capacity(count: usize) -> Batch<T> {
         let mut lent = (scratch::lend_bytes(), scratch::lend_u32s());
         let mut bytes = mem::take(&mut *lent.0);
         bytes.reserve(count * 96);
         let mut ends = mem::take(&mut *lent.1);
         ends.reserve(count);
-        Batch { rows: Vec::with_capacity(count), bytes: Bytes(bytes), ends, lent }
+        Batch { rows: Vec::with_capacity_in(count, Global), bytes: Bytes(bytes), ends, lent }
     }
 
     /// Adds `id`, whose preimage `write` appends and whose parent it returns.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a batch's ends are u32 offsets into its preimage bytes, and nothing caps a batch's bytes: a batch past 4 GiB needs a typed refusal or a split into batches"
+    )]
     fn push(&mut self, id: T, write: impl FnOnce(&mut Bytes) -> ItemKey) {
         let parent = write(&mut self.bytes);
         self.rows.push((id, parent));
         self.ends.push(u32::try_from(self.bytes.0.len()).expect("a batch of keys under 4 GiB"));
     }
 
-    /// The keys, sorted by id for [`find`].
-    fn finish(self) -> Vec<(T, ItemKey)> {
+    /// The keys, sorted by id for [`find`], kept in the arena of the query that runs this.
+    fn finish<'db>(self, memo: &'db blaze_memo::Memo) -> &'db [(T, ItemKey)] {
         let Batch { mut rows, bytes, ends, mut lent } = self;
         let hashes = frame::task(Tag::Other, |frame| {
             let mut inputs: Vec<&[u8], &Frame> = Vec::with_capacity_in(ends.len(), frame);
@@ -299,7 +220,7 @@ impl<T: Copy + Ord> Batch<T> {
         *lent.0 = bytes.0;
         *lent.1 = ends;
         rows.sort_unstable_by_key(|&(id, _)| id);
-        rows
+        blaze_memo::keep_slice(memo, &rows)
     }
 }
 
@@ -314,7 +235,7 @@ pub fn module_key(db: &Db, module: ModuleId) -> ItemKey {
     module_key_in(db, module)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn module_key_in<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> ItemKey {
     // Each parent's key is had before the preimage is written, so the recursion up to the
     // crate's root holds no scratch buffer.
@@ -416,7 +337,7 @@ fn siblings(db: &Db, id: ItemId) -> Siblings {
 }
 
 /// The key of an item (see the module doc), hashed in one batch with its siblings'.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub fn item_key(db: &Db, id: ItemId) -> ItemKey {
     let batch = match siblings(db, id) {
         Siblings::Module(it) => module_item_keys(db, it),
@@ -439,11 +360,10 @@ pub(crate) fn item_key_alone(db: &Db, id: ItemId) -> ItemKey {
 
 /// The keys of the items a module's scope declares, sorted by id: 40 bytes per item, found by
 /// binary search.
-#[blaze_query::tracked(returns(ref))]
-fn module_item_keys<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> Vec<(ItemId, ItemKey)> {
+#[blaze_memo::tracked(returns(copy))]
+fn module_item_keys<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> &'db [(ItemId, ItemKey)] {
     let scope = module.def_map(db).module(db, module).scope(db);
-    // alloc: the memo's own list, its length known only once the scope is walked.
-    let mut ids = Vec::new();
+    let mut ids = Vec::new_in(Global);
     for def in scope.declarations() {
         match def {
             ModuleDefId::FunctionId(it) => ids.push(ItemId::Function(it)),
@@ -463,36 +383,38 @@ fn module_item_keys<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> Vec<(ItemId, I
     for (_, macros) in scope.legacy_macros() {
         ids.extend(macros.iter().map(|&it| ItemId::Macro(it)));
     }
-    let here = blaze_query::db::AsId::as_id(&module);
-    ids.retain(|&id| {
-        matches!(siblings(db, id), Siblings::Module(it) if blaze_query::db::AsId::as_id(&it) == here)
-    });
+    let here = module.to_static();
+    ids.retain(|&id| matches!(siblings(db, id), Siblings::Module(it) if it == here));
     ids.sort_unstable();
     ids.dedup();
     let mut batch = Batch::with_capacity(ids.len());
     for id in ids {
         batch.push(id, |b| item_preimage(db, id, b));
     }
-    batch.finish()
+    batch.finish(blaze_memo::Database::memo(db))
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn impl_item_keys(db: &Db, impl_: ImplId) -> Vec<(ItemId, ItemKey)> {
+#[blaze_memo::tracked(returns(copy))]
+fn impl_item_keys<'db>(db: &'db Db, impl_: ImplId) -> &'db [(ItemId, ItemKey)] {
     assoc_item_keys(db, &impl_.impl_items(db).items)
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn trait_item_keys(db: &Db, trait_: TraitId) -> Vec<(ItemId, ItemKey)> {
+#[blaze_memo::tracked(returns(copy))]
+fn trait_item_keys<'db>(db: &'db Db, trait_: TraitId) -> &'db [(ItemId, ItemKey)] {
     assoc_item_keys(db, &trait_.trait_items(db).items)
 }
 
-/// The keys of an impl's or a trait's associated items, in order.
-fn assoc_item_keys(db: &Db, items: &[(Name, hir_def::AssocItemId)]) -> Vec<(ItemId, ItemKey)> {
+/// The keys of an impl's or a trait's associated items, sorted by id, kept in the arena of the
+/// query that asks.
+fn assoc_item_keys<'db>(
+    db: &'db Db,
+    items: &[(Name, hir_def::AssocItemId)],
+) -> &'db [(ItemId, ItemKey)] {
     let mut batch = Batch::with_capacity(items.len());
     for &(_, it) in items {
         batch.push(ItemId::from(it), |b| item_preimage(db, it.into(), b));
     }
-    batch.finish()
+    batch.finish(blaze_memo::Database::memo(db))
 }
 
 /// Appends the bytes an item's key is the hash of to `b`: its parent's key, its kind, its name
@@ -557,26 +479,30 @@ fn item_preimage(db: &Db, id: ItemId, b: &mut Bytes) -> ItemKey {
             head(b, parent, prefix, b"type", Some(TypeAliasSignature::of(db, it).name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
-        // hir-def keeps no macro's name but in its syntax.
+        // A macro's name is its kept entry ([`MacroId::name`]), never its syntax: of a crate
+        // given by its pages the file is not parsed. Two `macro_rules!` of one name in one
+        // module are told apart by where they are written: the raw AST id hashed below holds
+        // their order among the file's items of that kind and name, and the page holds it.
         ItemId::Macro(MacroId::MacroRulesId(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_view(db).name();
-            head(b, parent, b"", b"macro_rules", name.map(|it| it.text()));
+            let name = MacroId::MacroRulesId(it).name(db);
+            head(b, parent, b"", b"macro_rules", Some(name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::Macro2Id(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_view(db).name();
-            head(b, parent, b"", b"macro", name.map(|it| it.text()));
+            let name = MacroId::Macro2Id(it).name(db);
+            head(b, parent, b"", b"macro", Some(name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::ProcMacroId(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_view(db).name();
-            head(b, parent, b"", b"proc_macro", name.map(|it| it.text()));
+            // A derive's is the trait it derives; the function's own name is in its AST id.
+            let name = MacroId::ProcMacroId(it).name(db);
+            head(b, parent, b"", b"proc_macro", Some(name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
     };
@@ -617,14 +543,14 @@ fn variant_preimage(
     parent
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn enum_variant_keys(db: &Db, enum_: EnumId) -> Vec<(EnumVariantId, ItemKey)> {
+#[blaze_memo::tracked(returns(copy))]
+fn enum_variant_keys<'db>(db: &'db Db, enum_: EnumId) -> &'db [(EnumVariantId, ItemKey)] {
     let variants = &enum_.enum_variants(db).variants;
     let mut batch = Batch::with_capacity(variants.len());
     for (name, &(variant, _)) in variants.iter() {
         batch.push(variant, |b| variant_preimage(db, enum_, name, variant, b));
     }
-    batch.finish()
+    batch.finish(blaze_memo::Database::memo(db))
 }
 
 fn variant_id_key(db: &Db, variant: VariantId) -> ItemKey {
@@ -635,7 +561,9 @@ fn variant_id_key(db: &Db, variant: VariantId) -> ItemKey {
     }
 }
 
-pub(crate) fn generic_def_item(def: GenericDefId) -> ItemId {
+/// The item a generic definition is: the one home of this mapping (blaze-item-hash's read
+/// classifier asks it too).
+pub fn generic_def_item(def: GenericDefId) -> ItemId {
     match def {
         GenericDefId::AdtId(it) => ItemId::Adt(it),
         GenericDefId::ConstId(it) => ItemId::Const(it),
@@ -925,11 +853,9 @@ fn module_path<'db>(db: &'db Db, module: ModuleIdLt<'db>, write: &mut impl FnMut
     }
 }
 
-/// Writes an item's name, `_` for one without.
+/// Writes an item's name, `_` for one without. A macro's is its kept entry ([`MacroId::name`]),
+/// never its syntax (a derive's is the trait it derives, the name it is used by).
 fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
-    fn macro_name(name: Option<syntax::view::Name<'_>>, write: &mut impl FnMut(&str)) {
-        write(name.map_or("_", |it| it.text()))
-    }
     match id {
         ItemId::Function(it) => write(FunctionSignature::of(db, it).name.as_str()),
         ItemId::Adt(AdtId::StructId(it)) => write(StructSignature::of(db, it).name.as_str()),
@@ -942,16 +868,7 @@ fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
         }
         ItemId::Static(it) => write(StaticSignature::of(db, it).name.as_str()),
         ItemId::Alias(it) => write(TypeAliasSignature::of(db, it).name.as_str()),
-        // hir-def keeps no macro's name but in its syntax.
-        ItemId::Macro(MacroId::MacroRulesId(it)) => {
-            macro_name(it.lookup(db).id.to_view(db).name(), write)
-        }
-        ItemId::Macro(MacroId::Macro2Id(it)) => {
-            macro_name(it.lookup(db).id.to_view(db).name(), write)
-        }
-        ItemId::Macro(MacroId::ProcMacroId(it)) => {
-            macro_name(it.lookup(db).id.to_view(db).name(), write)
-        }
+        ItemId::Macro(it) => write(it.name(db).as_str()),
     }
 }
 
@@ -972,21 +889,26 @@ impl ItemId {
 
 /// The item of the current database a key names, if one still has it (see the module doc).
 pub fn resolve(db: &Db, key: ItemKey) -> Option<Resolved> {
-    let krates = checked_crates(db);
-    let prefix = u64::from_le_bytes(key.crate_prefix());
-    let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
-    let krate = krates[at].1;
+    let krate = crate_of_key(db, &key.0)?;
     let index =
         if key.is_inner() { crate_inner_items(db, krate) } else { &crate_items(db, krate).index };
     index.get(&key)
 }
 
+/// The crate of the current database an item key or a crate key is of: the one whose
+/// [`crate_key`] begins with the key's first 8 bytes (an [`ItemKey`]'s crate prefix), if one
+/// does: base-db's index of the list ([`base_db::listed_by_prefix`]), whose reads are its
+/// answer's inputs alone. A crate found is read in its own arena, so the asker borrows that
+/// crate and nothing else of the list; none found reads the list's arena, which a crate that
+/// takes the prefix moves. What a query that must name the crate it reads
+/// ([`crate::goals::FactRefKey`]) is keyed by.
+pub fn crate_of_key(db: &Db, key: &ContentId) -> Option<Crate> {
+    base_db::listed_by_prefix(db, u64::from_le_bytes(crate_prefix(key)))
+}
+
 /// The crate of the current database whose [`crate_key`] is `key`, if one has it.
 pub fn resolve_crate(db: &Db, key: &ContentId) -> Option<Crate> {
-    let krates = checked_crates(db);
-    let prefix = u64::from_le_bytes(crate_prefix(key));
-    let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
-    let krate = krates[at].1;
+    let krate = crate_of_key(db, key)?;
     (crate_key(db, krate) == *key).then_some(krate)
 }
 
@@ -1235,42 +1157,34 @@ impl std::error::Error for CrateKeyClash {}
 /// once its crate graph is set and before any key is resolved: [`resolve`] and
 /// [`resolve_crate`] hold it.
 pub fn check_crate_keys(db: &Db) -> Result<(), CrateKeyClash> {
-    match crates_by_prefix(db) {
-        Ok(_) => Ok(()),
-        Err(clash) => Err(clash.clone()), // clone: an error, once
+    match base_db::listed_clash(db) {
+        None => Ok(()),
+        Some(pair) => Err(CrateKeyClash::of(db, pair)),
     }
 }
 
-/// Every crate of the build by the first 8 bytes of its key, sorted; the first two crates found
-/// with one prefix as an error.
-#[blaze_query::tracked(returns(ref))]
-fn crates_by_prefix(db: &Db) -> Result<Vec<(u64, Crate)>, CrateKeyClash> {
-    let mut krates: Vec<(u64, Crate)> = base_db::all_crates(db)
-        .iter()
-        .map(|&krate| (u64::from_le_bytes(crate_prefix(&crate_key(db, krate))), krate))
-        // alloc: the memo's list, one per build, at its final length.
-        .collect();
-    radix::sort_copy_by_key(&mut krates, |&(prefix, _)| prefix);
-    for pair in krates.windows(2) {
-        let ((prefix, krate), (other_prefix, other)) = (pair[0], pair[1]);
-        if prefix == other_prefix {
-            return Err(CrateKeyClash {
-                crates: [ClashingCrate::of(db, krate), ClashingCrate::of(db, other)],
-                same_key: crate_key(db, krate) == crate_key(db, other),
-            });
+impl CrateKeyClash {
+    /// The clash of `pair`, two crates [`base_db::listed_clash`] found with one key prefix,
+    /// named.
+    fn of(db: &Db, pair: [CrateKey; 2]) -> CrateKeyClash {
+        let [krate, other] = pair.map(|key| listed_crate(db, key));
+        CrateKeyClash {
+            crates: [ClashingCrate::of(db, krate), ClashingCrate::of(db, other)],
+            same_key: crate_key(db, krate) == crate_key(db, other),
         }
     }
-    Ok(krates)
 }
 
-/// [`crates_by_prefix`] of a build [`check_crate_keys`] let through.
-fn checked_crates(db: &Db) -> &[(u64, Crate)] {
-    match crates_by_prefix(db) {
-        Ok(it) => it,
-        Err(clash) => {
-            panic!("blaze-items: a key resolved in a build check_crate_keys stops: {clash}")
-        }
-    }
+/// The crate of this snapshot listed under `key`, named by base-db's clash
+/// ([`base_db::listed_clash`]), which lists only this snapshot's listed crates: a key with no
+/// crate is a broken base-db table, and it stops naming the key.
+fn listed_crate(db: &Db, key: CrateKey) -> Crate {
+    db.crate_at(key).unwrap_or_else(|| {
+        panic!(
+            "blaze-items: base-db's clash names the crate {key:?}, which this snapshot's table has no \
+             crate for (base-db's prefix index and its table disagree)"
+        )
+    })
 }
 
 /// Every item of `krate` with an [`ItemId`], those of its bodies' blocks included.
@@ -1284,13 +1198,14 @@ pub(crate) fn crate_item_ids(db: &Db, krate: Crate) -> impl Iterator<Item = Item
 }
 
 /// What has a key inside a crate's stores and items' types, in one index: a key that is no
-/// module, impl or trait item is one lookup, not one per store of every crate.
-#[blaze_query::tracked(returns(ref))]
+/// module, impl or trait item is one lookup, not one per store of every crate. `owns`: the
+/// index's rows grow in place in a reserved region ([`KeyIndex`]), unmapped with the arena.
+#[blaze_memo::tracked(returns(ref), owns)]
 fn crate_inner_items(db: &Db, krate: Crate) -> KeyIndex<Resolved> {
     const WHAT: &str = "a crate's index of keys inside bodies";
     let mut rows = key_rows(WHAT);
     for &inner in crate_items(db, krate).inner.iter() {
-        if let Err(error) = rows.try_extend_from_slice(inner_items(db, inner, ())) {
+        if let Err(error) = rows.try_extend_from_slice(inner_items(db, inner)) {
             stop(WHAT, &error)
         }
     }
@@ -1299,7 +1214,7 @@ fn crate_inner_items(db: &Db, krate: Crate) -> KeyIndex<Resolved> {
 
 /// Where else an item has things with keys: a store, with its closures and the items of its
 /// blocks, or the opaque types of an item's type, which are counted by lowering it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
 enum Inner {
     Store(ExpressionStoreOwnerId),
     Opaques(ItemId),
@@ -1372,8 +1287,9 @@ impl Sink for FrameRows<'_> {
     }
 }
 
-/// The items of a crate's modules, impls and traits, and where to look for the rest.
-#[blaze_query::tracked(returns(ref))]
+/// The items of a crate's modules, impls and traits, and where to look for the rest. `owns`:
+/// both columns grow in place in reserved regions ([`KeyIndex`]), unmapped with the arena.
+#[blaze_memo::tracked(returns(ref), owns)]
 fn crate_items(db: &Db, krate: Crate) -> Items {
     let mut rows = CrateRows { rows: key_rows(CRATE_KEYS), inner: key_rows(CRATE_STORES) };
     def_map_items(db, hir_def::nameres::crate_def_map(db, krate), &mut rows);
@@ -1385,13 +1301,13 @@ fn crate_items(db: &Db, krate: Crate) -> Items {
 
 /// What has a key inside one store or one item's type, transitively (the items of a block
 /// have stores of their own), sorted by [`order`] and distinct.
-// The unit makes the arguments an interned key: `Inner` alone is no ID.
-#[blaze_query::tracked(returns(ref))]
-fn inner_items(db: &Db, inner: Inner, _: ()) -> Box<[Row<Resolved>]> {
+/// Kept in the query's arena.
+#[blaze_memo::tracked(returns(copy))]
+fn inner_items<'db>(db: &'db Db, inner: Inner) -> &'db [Row<Resolved>] {
     frame::task(Tag::Other, |frame| inner_rows(db, inner, frame))
 }
 
-fn inner_rows(db: &Db, inner: Inner, frame: &Frame) -> Box<[Row<Resolved>]> {
+fn inner_rows<'db>(db: &'db Db, inner: Inner, frame: &Frame) -> &'db [Row<Resolved>] {
     let mut items = FrameRows::new(frame);
     match inner {
         Inner::Opaques(owner) => {
@@ -1439,13 +1355,13 @@ fn inner_rows(db: &Db, inner: Inner, frame: &Frame) -> Box<[Row<Resolved>]> {
                 def_map_items(db, block, &mut blocks);
             }
             for &inner in blocks.inner.iter() {
-                items.rows.extend_from_slice(inner_items(db, inner, ()));
+                items.rows.extend_from_slice(inner_items(db, inner));
             }
             items.rows.extend_from_slice(&blocks.rows);
         }
     }
     let kept = sort_distinct(&mut items.rows);
-    Box::from(&items.rows[..kept])
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &items.rows[..kept])
 }
 
 /// The items of a def map's modules, and where to look inside them.

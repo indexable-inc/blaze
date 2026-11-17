@@ -15,17 +15,38 @@
 //! foreign functions, inline assembly, intrinsics not known to be pure, state that changes
 //! (`static mut`, thread-locals, foreign statics, statics with interior mutability), bodies
 //! that do not lower, code pointers made of bytes, and instances past [`LONGEST`].
+//!
+//! Proofs are an input of a summary ([`Proofs`], in its key: [`summary_in`]'s, and every
+//! callee is asked with its caller's, [`Cx::summary`]). Under [`Proofs::None`] no site is
+//! discharged by the reachability prover and the prover never runs; under [`Proofs::Spent`]
+//! it does ([`proof_of`]). Who asks for which is decided once, `hir_ty::facts::proofs_at` of
+//! the asking body's tier: a tier 0 body and the library's as shipped ask for no summary at
+//! all (`SpendFacts` is not in their pass list, `hir_ty_mir::mir::passes_at`); the optimizing
+//! tier and the checks (`nopanic`, `pure`, `noalloc`, `nonblocking`, the role lints,
+//! `unreachable`, `proved_unreachable`) ask `Spent`.
+//!
+//! The floor (rule 67). A summary of an instance is one pass over its body's sites and calls,
+//! plus a read of each callee's summary: an oracle redoing only what an edit changed walks
+//! exactly the edited bodies and re-reads their callers' rows, so the walk is at the floor
+//! per body (one scan, no fixpoint outside a call cycle). Under `None` that is all of it: at
+//! tier 0 the floor of a fact is zero prover work, and the walk spends zero. Under `Spent` the
+//! prover's own floor is one proof per body as written, which [`proof_of`] reaches for a
+//! function with no `for const` loop (one `reach::of_body` row per definition, shared by
+//! every instance); a closure, a coroutine and a `for const` body are proved once per
+//! instance, which is above the floor by the number of instances of each. Not measured.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
-use base_db::{Crate, Db};
+use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::{Home as _, Id as _};
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup as _,
     ModuleDefId, ModuleIdLt, StaticId,
     attrs::AttrFlags,
+    expr_store::Body as HirBody,
     find_path::{FindPathConfig, PrefixKind, find_path},
+    hir::{Expr, Unsafe},
     item_scope::ItemInNs,
     lang_item::{LangItems, lang_items},
     nameres::crate_def_map,
@@ -34,12 +55,13 @@ use hir_def::{
         TraitSignature, UnionSignature,
     },
 };
-use hir_expand::{mod_path::PathKind, name::Name};
+use hir_expand::{HirFileId, mod_path::PathKind, name::Name};
 use hir_ty::{
     InferBodyId, MemoryMap, ParamEnvAndCrate, PointerCast,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     display::{DisplayTarget, HirDisplay as _},
     drop::is_freeze,
+    facts::Proofs,
     intrinsic::{Intrinsic, SimdOp},
     next_solver::{
         AllocationData, ConstKind, DbInterner, GenericArg, GenericArgs, ParamEnv,
@@ -64,11 +86,12 @@ use rustc_type_ir::{
 };
 use smallvec::SmallVec;
 use std::alloc::Global;
+use syntax::{SyntaxKind, TextRange};
 
 use crate::{
     Abs, Effects, Impure, Proof, Purity, allowed_env, effect_attrs,
     effects::{self, EFFECTS, EffectDef, EffectSet, Rule},
-    identity,
+    identity, loops,
     memory::{self, CallKind, MemoryEffects, Origin, SiteFacts},
     models::{Applied, Leaf, Model, Transfer, apply_leaf, effect_row, model_of, tag},
     values::{Flow, Spread, Values, evaluate},
@@ -83,10 +106,24 @@ pub(crate) enum Def {
 
 /// An instance: what it runs and its generic arguments (a closure's or coroutine's are its
 /// parent's; a leaf's are none).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Instance {
     pub(crate) def: Def,
     pub(crate) args: StoredGenericArgs,
+}
+
+/// The body it runs (the function a leaf models) and what its arguments name: the arenas a
+/// query keyed by it is homed by, the greatest of them its home (spec rule 2).
+impl blaze_memo::Home for Instance {
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
+        match self.def {
+            Def::Body(Body::Fn(it)) | Def::Leaf(it, _) => it.home(homes),
+            Def::Body(Body::Closure(it) | Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
+                it.home(homes)
+            }
+        }
+        self.args.home(homes);
+    }
 }
 
 /// A leaf whose arguments depend on the instance's parameters: each caller applies it again
@@ -116,7 +153,7 @@ pub(crate) struct Summary {
     pub(crate) kinds: EffectSet,
     /// Per effect of [`EFFECTS`], by index: the kinds the effect refuses that it may have through
     /// no function trusted for the effect. Missing past the end: none.
-    pub(crate) sets: SmallVec<[EffectSet; 4]>,
+    pub(crate) sets: Sets,
     /// How it has each kind of `sets`, by effect and then kind, each once.
     pub(crate) witnesses: Box<[Witness]>,
     /// The sites the effects go through, in order: its callees, and the closures and functions
@@ -127,9 +164,49 @@ pub(crate) struct Summary {
     /// The functions trusted for some effect it calls with no site of their own, sorted, each
     /// once: foreign functions, and methods of a trusted trait called through `dyn`.
     pub(crate) trusted_calls: Box<[FunctionId]>,
+    /// The lock classes it takes, the lock order it makes and the guards it holds across a
+    /// wait (crate::locks).
+    pub(crate) locks: crate::locks::Locks,
 }
 
+/// A set of kinds per effect of [`EFFECTS`], inline: as many as there are effects.
+pub(crate) type Sets = SmallVec<[EffectSet; 10]>;
+const _: () = assert!(EFFECTS.len() <= 10, "`Sets` keeps one set per effect inline");
+
+/// The depth of every witness of [`Rule::Recursion`]: the calls around a cycle have no fewest,
+/// so a depth that grew by one per call (as every other kind's does) would grow each round of
+/// the cycle's fixpoint and never settle. A constant does: the first site that has it stays.
+const RECURSION_DEPTH: u16 = 1;
+
 impl Summary {
+    /// The summary a cycle of instances starts from: no effect but that it is one
+    /// ([`Rule::Recursion`], for each effect that keeps it), and the memory of a call that may
+    /// not return. Every instance of the cycle reads it, of itself or through the others, so at
+    /// the fixpoint each of them, and each of their callers, has the kind through a site.
+    pub(crate) fn recursive() -> Summary {
+        let recursion = EffectSet::one(Rule::Recursion);
+        let mut sets = Sets::new();
+        let mut witnesses = Vec::new(); // alloc: one witness per effect that keeps it, per cycle
+        for (index, effect) in EFFECTS.iter().enumerate() {
+            let keeps = kept(effect).has(Rule::Recursion);
+            sets.push(if keeps { recursion } else { EffectSet::EMPTY });
+            if keeps {
+                witnesses.push(Witness {
+                    effect: index as u8,
+                    rule: Rule::Recursion,
+                    depth: RECURSION_DEPTH,
+                    how: How::Own { what: "is called again by what it calls".into(), span: None },
+                });
+            }
+        }
+        Summary {
+            kinds: recursion,
+            sets,
+            witnesses: witnesses.into_boxed_slice(),
+            ..Summary::default()
+        }
+    }
+
     /// The kinds effect `index` refuses that the instance has.
     pub(crate) fn set(&self, index: usize) -> EffectSet {
         self.sets.get(index).copied().unwrap_or(EffectSet::EMPTY)
@@ -142,8 +219,8 @@ impl Summary {
 }
 
 impl Default for Summary {
-    /// The empty summary a cycle of instances starts from: no effect, and the memory of a call
-    /// that may not return (recursion is not known to end).
+    /// The empty summary: no effect, and the memory of a call that may not return (what a
+    /// cycle of instances starts from, with its recursion: [`Summary::recursive`]).
     fn default() -> Summary {
         Summary {
             effects: Effects::NONE,
@@ -158,6 +235,7 @@ impl Default for Summary {
             sites: Box::default(),
             memory: MemoryEffects::RECURSIVE,
             trusted_calls: Box::default(),
+            locks: crate::locks::Locks::default(),
         }
     }
 }
@@ -210,8 +288,8 @@ pub struct ScriptProof {
     pub purity: Purity,
     /// The body instances the walk reaches ([`walk_steps`]), each from the environment that asks
     /// for it: each one a step of the bound its caller puts on the proof
-    /// (`blaze_query::db::with_steps`). It counts the script's code,
-    /// never what was cached or what another task ran, so a cold, warm or busy database gives
+    /// ([`crate::with_steps`]). It counts the script's code,
+    /// never what was cached or what another task ran, so a cold, warm or busy memo gives
     /// the same count, and a proof runs out of steps on all of them or on none.
     pub steps: u32,
 }
@@ -224,10 +302,11 @@ pub fn script_purity(db: &Db, main: FunctionId) -> &Purity {
 
 /// Whether the build script whose `main` is `main` is pure, its proof if it is, and how many
 /// instances its walk takes.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn script_proof(db: &Db, main: FunctionId) -> ScriptProof {
     let stored = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store();
-    let cx = Cx::new(db, stored);
+    // A build script's purity is a check: it spends proofs.
+    let cx = Cx::new(db, stored, Proofs::Spent);
     let mut roots: SmallVec<[(Instance, String); 2]> = SmallVec::new();
     let empty = GenericArgs::new_from_slice(&[]).store();
     roots.push((Instance { def: Def::Body(Body::Fn(main)), args: empty }, "`main`".to_owned())); // alloc: once per script
@@ -371,7 +450,11 @@ fn prove<'db>(db: &'db Db, cx: &Cx<'db>, roots: &[(Instance, String)]) -> Purity
         }
     }
     let (order, index) = reached(db, &cx.stored, roots.iter().map(|(it, _)| it));
-    let callees: Vec<&[Instance]> = order.iter().map(|it| callees_of(db, &cx.stored, it)).collect(); // alloc: one slice per instance, once per script
+    // alloc: one summary per instance, once per script
+    let summaries: Vec<Option<Arc<Summary>>> =
+        order.iter().map(|it| callees_of(db, &cx.stored, it)).collect();
+    let callees: Vec<&[Instance]> =
+        summaries.iter().map(|it| it.as_deref().map_or(&[][..], |it| &it.callees[..])).collect(); // alloc: one slice per instance, once per script
     let identity = match identity::of(db, &cx.stored, &order, &callees, &index) {
         Ok(it) => it,
         Err(what) => return Purity::Impure(Impure { what, through: vec!["`main`".to_owned()] }), // alloc: an impure script's reason, once
@@ -425,8 +508,8 @@ fn reached<'a>(
         stack.push((order.len() - 1, 0));
         while let Some(top) = stack.last_mut() {
             let (at, next) = *top;
-            let callees = callees_of(db, stored, &order[at]);
-            let Some(callee) = callees.get(next) else {
+            let summary = callees_of(db, stored, &order[at]);
+            let Some(callee) = summary.as_ref().and_then(|it| it.callees.get(next)) else {
                 stack.pop();
                 continue;
             };
@@ -441,14 +524,15 @@ fn reached<'a>(
     (order, index)
 }
 
-fn callees_of<'db>(
-    db: &'db Db,
+/// The summary whose `callees` are `instance`'s: a body's; none for a leaf, which calls none.
+fn callees_of(
+    db: &Db,
     stored: &StoredParamEnvAndCrate,
     instance: &Instance,
-) -> &'db [Instance] {
+) -> Option<Arc<Summary>> {
     match instance.def {
-        Def::Leaf(..) => &[],
-        _ => &summary(db, stored.clone(), instance.clone()).callees, // clone: the query's key, reference counts
+        Def::Leaf(..) => None,
+        _ => Some(summary(db, stored.clone(), instance.clone())), // clone: the query's key, reference counts
     }
 }
 
@@ -472,74 +556,194 @@ pub(crate) fn home_env(
 pub(crate) fn def_crate(db: &Db, def: Def) -> Crate {
     match def {
         Def::Body(Body::Fn(func)) | Def::Leaf(func, _) => func.krate(db),
-        Def::Body(Body::Closure(id)) => InternedClosureId::from_id(id).loc(db).owner.krate(db),
+        Def::Body(Body::Closure(id)) => InternedClosureId::from_gid(id).loc(db).owner.krate(db),
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
-            InternedCoroutineId::from_id(id).loc(db).owner.krate(db)
+            InternedCoroutineId::from_gid(id).loc(db).owner.krate(db)
         }
     }
-}
-
-/// What the instance does, asked from `env`: worked out in its home ([`home_env`]), so every
-/// build script that reaches it shares one summary. A body instance is a step of the walk's
-/// bound, if one is set (`blaze_query::db::with_steps`), however often it is asked for.
-pub(crate) fn summary<'db>(
-    db: &'db Db,
-    env: StoredParamEnvAndCrate,
-    instance: Instance,
-) -> &'db Summary {
-    if let Def::Body(body) = instance.def {
-        blaze_query::db::step(|| step_key(body, &instance.args), || name_of(db, &instance));
-    }
-    summary_in(db, home_env(db, &env, &instance), instance)
 }
 
 /// The body instance `body<args>` as one number, a different one for each instance: what its
 /// step is known by.
-fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
+pub(crate) fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
     let (kind, id) = match body {
-        Body::Fn(func) => (0u128, func.as_id()),
+        Body::Fn(func) => (0u128, func.gid()),
         Body::Closure(id) => (1, id),
         Body::Coroutine(id) => (2, id),
         Body::CoroutineByMove(id) => (3, id),
     };
-    (kind << 64) | (u128::from(id.as_u32()) << 32) | u128::from(args.as_ref().index())
+    // The arena's index and generation, as one word (20 and 12 bits), then the id in it.
+    let arena = (id.arena().index() << 12) | id.arena().generation();
+    (kind << 96)
+        | (u128::from(arena) << 64)
+        | (u128::from(id.local()) << 32)
+        | u128::from(args.as_ref().index())
 }
 
-/// What the instance does, in `env`. A cycle of instances starts from the empty summary and
-/// iterates to its fixpoint: each local's value only rises, in a lattice three high.
-#[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
+/// What the instance does, asked from `env`: worked out in its home ([`home_env`]), so every
+/// build script that reaches it shares one summary. A body instance is a step of the walk's
+/// bound, if one is set ([`crate::with_steps`]), however often it is asked for, whether its
+/// summary runs or is found in the memo.
+///
+/// This is the checks' summary: proofs spent ([`Proofs::Spent`]), as every effect and role
+/// lint asks, on demand. What a tier asks for code is [`summary_at`].
+pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Arc<Summary> {
+    summary_at(db, Proofs::Spent, env, instance)
+}
+
+/// [`summary`] made with `proofs`: [`Proofs::None`] for the facts a tier 0 body spends. A
+/// summary asks its callees with its own `proofs`, so one made without proofs never reads one
+/// made with them.
+pub(crate) fn summary_at(
+    db: &Db,
+    proofs: Proofs,
+    env: StoredParamEnvAndCrate,
+    instance: Instance,
+) -> Arc<Summary> {
+    if let Def::Body(body) = instance.def {
+        crate::steps::step(|| step_key(body, &instance.args), || name_of(db, &instance));
+    }
+    summary_in(db, home_env(db, &env, &instance), proofs, instance)
+}
+
+/// What the instance does, in `env`, its home, made with `proofs`: a summary of one mode is a
+/// row of its own and never read for the other's. Keyed by the instance, the home and the
+/// mode, so it is homed by the greatest arena they name (spec rule 2): a crate's arena drops
+/// with what it read. A cycle of instances starts from the summary of a recursion
+/// (`Summary::recursive`) and iterates to its fixpoint: each local's value only rises, in a
+/// lattice three high, and the recursion's witness keeps one depth.
+#[blaze_memo::tracked(returns(clone), owns, cycle_initial = |_, _, _, _| Arc::new(Summary::recursive()))]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+    reason = "a tracked query's arguments are its key, which `blaze_memo::tracked` hands the body by value"
 )]
-pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
-    let Some(body) = body_of(db, &env, &instance) else { return Summary::default() };
-    match body {
-        Ok(body) => {
-            let cx = Cx::new(db, env);
-            summarize(&cx, body)
-        }
-        Err(error) => {
-            let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
-            let mut own = Own::default();
-            own.add(EffectSet::one(Rule::Unchecked), &what, None, 0);
-            let (sets, witnesses) = own.into_sets();
-            Summary {
-                impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
-                kinds: EffectSet::one(Rule::Unchecked),
-                sets,
-                witnesses,
-                memory: MemoryEffects::UNKNOWN,
-                ..Summary::default()
-            }
-        }
+pub(crate) fn summary_in(
+    db: &Db,
+    env: StoredParamEnvAndCrate,
+    proofs: Proofs,
+    instance: Instance,
+) -> Arc<Summary> {
+    summarized(db, proofs, env, &instance)
+}
+
+/// What the instance does, in `env`: the body of [`summary_in`]. Made with `proofs`, which its
+/// callees are asked with too.
+pub(crate) fn summarized(
+    db: &Db,
+    proofs: Proofs,
+    env: StoredParamEnvAndCrate,
+    instance: &Instance,
+) -> Arc<Summary> {
+    let Def::Body(of) = instance.def else { return Arc::new(Summary::default()) }; // alloc: a leaf's summary, empty
+    #[cfg(test)]
+    plant::count_summary();
+    let cx = Cx::new(db, env, proofs);
+    // The body is read here once and only the summary is kept: made for this run and dropped
+    // with it ([`dispatch::body_once`]), never the memo `dispatch::body_of` reads, which would keep one
+    // monomorphized body an instance the walk reaches until the build lets every MIR go.
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count test: the memoized body, as until 2026-11-12.
+        // clone: the body query's keys, reference counts
+        return Arc::new(match dispatch::body_of(db, cx.stored.clone(), of, instance.args.clone()) {
+            Ok(body) => summarize(&cx, body, instance.def),
+            Err(error) => unlowered(db, instance, &error),
+        }); // alloc: the summary, once per instance
+    }
+    // alloc: the summary, once per instance
+    Arc::new(match dispatch::body_once(db, &cx.stored, of, &instance.args) {
+        // The callees' summaries are asked one after another on this stack, by the walk
+        // itself. A pre-ask of them on the pool (`ask_ahead`, 2026-11-11 to 12) is gone: an
+        // ask that would wait on its own asker gave way and ran again, with no bound, and on
+        // mutually recursive functions (syn's `to_tokens`) the smoke's second build made 5.6
+        // to 6.8 million waits on this query (one key changed owner 486,616 times) and did not
+        // end in 600 s; with the pre-ask off the same daemon's builds made 954 and 27.
+        Ok(body) => summarize(&cx, &body, instance.def),
+        Err(error) => unlowered(db, instance, &error),
+    })
+}
+
+/// What a test plants in the walk.
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+        /// How many proofs summaries on this thread asked for ([`super::proof_of`]).
+        static PROOFS_ASKED: Cell<u64> = const { Cell::new(0) };
+        /// How many summaries were made on this thread ([`super::summarized`]).
+        static SUMMARIES_MADE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn keeps_bodies() -> bool {
+        KEEPS_BODIES.with(Cell::get)
+    }
+
+    pub(super) fn count_proof() {
+        PROOFS_ASKED.with(|it| it.set(it.get() + 1));
+    }
+
+    pub(super) fn count_summary() {
+        SUMMARIES_MADE.with(|it| it.set(it.get() + 1));
+    }
+
+    /// What `work` gives, and how many summaries it made on this thread.
+    pub(crate) fn counting_summaries<R>(work: impl FnOnce() -> R) -> (R, u64) {
+        let before = SUMMARIES_MADE.with(Cell::get);
+        let made = work();
+        (made, SUMMARIES_MADE.with(Cell::get) - before)
+    }
+
+    /// What `work` gives, and how many proofs the summaries it made on this thread asked for.
+    pub(crate) fn counting_proofs<R>(work: impl FnOnce() -> R) -> (R, u64) {
+        let before = PROOFS_ASKED.with(Cell::get);
+        let made = work();
+        (made, PROOFS_ASKED.with(Cell::get) - before)
+    }
+
+    /// `work` with every summary made on this thread reading its body from the memo that
+    /// keeps it.
+    pub(crate) fn keeping_bodies<R>(work: impl FnOnce() -> R) -> R {
+        KEEPS_BODIES.with(|it| it.set(true));
+        let made = work();
+        KEEPS_BODIES.with(|it| it.set(false));
+        made
+    }
+}
+
+/// The summary of an instance whose body did not lower to MIR, for `error`.
+fn unlowered(db: &Db, instance: &Instance, error: &MirLowerError<'_>) -> Summary {
+    let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
+    let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
+    let mut own = Own::trusted(trust);
+    own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
+    let (sets, witnesses) = own.into_sets();
+    Summary {
+        impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
+        kinds: EffectSet::one(Rule::Unchecked),
+        sets,
+        witnesses,
+        memory: MemoryEffects::UNKNOWN,
+        // What it takes is not known (crate::locks).
+        locks: crate::locks::Locks { wide: true, ..crate::locks::Locks::default() },
+        ..Summary::default()
     }
 }
 
 /// The kinds an effect keeps in a summary's set: those it refuses, and [`Rule::Open`], which a
 /// generic check reports as left to each instance.
+/// The kinds a summary keeps for `effect`: those it refuses, a call only an instance decides,
+/// a call through a `dyn` nothing answers for ([`Rule::Dyn`], refused by a check whose root
+/// takes such a `dyn`), and, for an effect that refuses a panic, an `unsafe` precondition check not answered for
+/// yet ([`Rule::Precondition`]), which is a panic where code outside the toolchain calls the
+/// `unsafe fn`.
 pub(crate) fn kept(effect: &EffectDef) -> EffectSet {
-    effect.refuses.union(EffectSet::one(Rule::Open))
+    let kept = effect.refuses.union(EffectSet::of(&[Rule::Open, Rule::Dyn]));
+    match effect.refuses.has(Rule::Panic) {
+        true => kept.union(EffectSet::one(Rule::Precondition)),
+        false => kept,
+    }
 }
 
 /// Bit `i` set for each effect `EFFECTS[i]` that `func` is trusted for.
@@ -555,24 +759,33 @@ pub(crate) fn trust_mask(db: &Db, func: FunctionId) -> u32 {
 /// counted for every effect, and before it any counted for fewer (a call of a function trusted
 /// for some effects: `except` has a bit per effect of [`EFFECTS`] it does not count for).
 #[derive(Default)]
-struct Own {
+pub(crate) struct Own {
+    /// The effects the body's crate is trusted for (`effect_attrs::crate_trust`): every place's
+    /// `except` has them, so a place counted for every other effect is full.
+    base: u32,
     /// Every kind, trust not applied.
-    kinds: EffectSet,
-    /// The kinds with a place counted for every effect.
+    pub(crate) kinds: EffectSet,
+    /// The kinds with a place counted for every effect but `base`'s.
     full: EffectSet,
     // alloc: the body's own kinds, few, once per instance
     first: Vec<(Rule, Box<str>, Option<MirSpan>, u32)>,
 }
 
 impl Own {
+    /// No kind yet, of a body of a crate trusted for the effects of `base`.
+    fn trusted(base: u32) -> Own {
+        Own { base, ..Own::default() }
+    }
+
     fn add(&mut self, kinds: EffectSet, what: &str, span: Option<MirSpan>, except: u32) {
+        let except = except | self.base;
         for rule in kinds.without(self.full).iter() {
             // A place counted for at least the effects this one is already stands for it.
             let known = self.first.iter().any(|it| it.0 == rule && it.3 & !except == 0);
             if !known {
                 self.first.push((rule, what.into(), span, except));
             }
-            if except == 0 {
+            if except == self.base {
                 self.full = self.full.union(EffectSet::one(rule));
             }
         }
@@ -580,7 +793,7 @@ impl Own {
     }
 
     /// The sets and witnesses of these kinds alone.
-    fn into_sets(self) -> (SmallVec<[EffectSet; 4]>, Box<[Witness]>) {
+    pub(crate) fn into_sets(self) -> (Sets, Box<[Witness]>) {
         let mut sets = SmallVec::new();
         let mut witnesses = Vec::new(); // alloc: an instance's witnesses, once per instance
         for (index, effect) in EFFECTS.iter().enumerate() {
@@ -599,17 +812,25 @@ impl Own {
     }
 }
 
-/// The monomorphized body of `instance` in `env`; none for a leaf, which has no body walked.
-pub(crate) fn body_of<'db>(
+/// The monomorphized body of `instance` in `env`, made for the caller and dropped by it
+/// ([`dispatch::body_once`]); none for a leaf, which has no body walked. Each reader keeps what
+/// it worked out of the body (an instance's identity part, a refusal's place), never the body:
+/// a memo of it would hold one body an instance the walk reaches.
+pub(crate) fn body_once<'db>(
     db: &'db Db,
     env: &StoredParamEnvAndCrate,
     instance: &Instance,
-) -> Option<Result<&'db MirBody<'db>, MirLowerError<'db>>> {
-    match instance.def {
-        // clone: handles of interned values, for the body query's key
-        Def::Body(body) => Some(dispatch::body_of(db, env.clone(), body, instance.args.clone())),
-        Def::Leaf(..) => None,
+) -> Option<Result<MirBody<'db>, MirLowerError<'db>>> {
+    let Def::Body(body) = instance.def else { return None };
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count tests: the memoized body, as until 2026-11-13.
+        // clone: the body query's keys, reference counts; the memo's body, a planted bug's copy
+        return Some(
+            dispatch::body_of(db, env.clone(), body, instance.args.clone()).map(Clone::clone),
+        );
     }
+    Some(dispatch::body_once(db, env, body, &instance.args))
 }
 
 /// What the queries of one environment share.
@@ -620,14 +841,23 @@ pub(crate) struct Cx<'db> {
     pub(crate) env: ParamEnvAndCrate<'db>,
     pub(crate) stored: StoredParamEnvAndCrate,
     lang: &'db LangItems,
+    /// Whether the summaries made and asked from here spend proofs: part of every summary's
+    /// key ([`summary_in`]), so a callee is asked with the caller's.
+    pub(crate) proofs: Proofs,
 }
 
 impl<'db> Cx<'db> {
-    pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate) -> Cx<'db> {
+    /// The context of a summary or check asked in `stored`, made with `proofs`.
+    pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate, proofs: Proofs) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate) }
+        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), proofs }
+    }
+
+    /// The summary of `instance` asked from this environment, with this context's proofs.
+    pub(crate) fn summary(&self, instance: Instance) -> Arc<Summary> {
+        summary_at(self.db, self.proofs, self.stored, instance)
     }
 
     pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
@@ -665,23 +895,32 @@ impl std::fmt::Display for Shown<'_> {
 
 /// What a site reaches, and how its parameters take the site's operands.
 #[derive(Clone)]
-enum Reached {
+pub(crate) enum Reached {
     Walk(Instance, Spread),
     Leaf(Instance, Spread),
 }
 
-struct Site {
-    reached: Reached,
+impl Reached {
+    /// The instance the site reaches, and how its parameters take the site's operands.
+    pub(crate) fn instance(&self) -> (&Instance, Spread) {
+        match self {
+            Reached::Walk(instance, spread) | Reached::Leaf(instance, spread) => (instance, *spread),
+        }
+    }
+}
+
+pub(crate) struct Site {
+    pub(crate) reached: Reached,
     /// The block whose call's operands the parameters are taken from; none for a site that
     /// is not a call.
-    call: Option<BasicBlockId>,
+    pub(crate) call: Option<BasicBlockId>,
     /// Where in the body: the statement or terminator it is of.
-    span: Option<MirSpan>,
+    pub(crate) span: Option<MirSpan>,
     /// What the memory pass applies its callee's facts to.
-    origin: Origin,
+    pub(crate) origin: Origin,
     /// A closure or function given to a trusted function: for the effects alone, not a callee
     /// of a build script's graph.
-    given: bool,
+    pub(crate) given: bool,
 }
 
 /// One body's walk: its sites in order, the flow of each block's call and the first thing it
@@ -705,49 +944,161 @@ struct Walk<'a, 'db> {
     workspace: bool,
     /// Functions trusted for some effect called with no site (Summary::trusted_calls).
     trusted_calls: SmallVec<[FunctionId; 2]>,
+    /// The calls of foreign functions that may block the thread ([`crate::locks::ForeignBlock`]).
+    foreign: Vec<crate::locks::ForeignBlock>,
     dropped: HashSet<Ty<'db>, Global>,
     statics: HashSet<StaticId, Global>,
     code: HashMap<(Ty<'db>, Reach), bool, Global>,
+    /// Per type dropped, whether a value of it may hold a `dyn` ([`Walk::holds_dyn`]).
+    dyns: HashMap<Ty<'db>, bool, Global>,
+    /// Per type dropped, whether a value of it owns a `dyn` ([`Walk::owns_dyn`]).
+    owned_dyns: HashMap<Ty<'db>, bool, Global>,
 }
 
-fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
+/// What one body instance gives its summary by itself: everything [`summarize`] works out of
+/// the body before it reads any callee's summary ([`own_part`]). [`fold`] makes the summary
+/// of it, the summaries of its sites' callees and the body, which it reads again for the
+/// three passes this part does not reduce: the locals' values (`Values::solve`), the memory
+/// (`memory::infer`) and the locks (`locks::of`), each a fixpoint over the body's statements
+/// with the callees' parts (returned values, memory facts, lock summaries) as its inputs.
+///
+/// The refinement: `summary_in(i)` is `fold(own_part(i), [summary(c) for each site's callee
+/// c of i])`, a fixpoint where the call graph has a cycle (`Summary::recursive` is its
+/// start). An instance's part reads its own monomorphized body and the signatures, impls
+/// and attributes its calls resolve through; never another body.
+pub(crate) struct OwnPart {
+    /// The sites, in the order the walk meets them: what each reaches, how, and where.
+    pub(crate) sites: Vec<Site>,
+    /// Per block, what its call's destination gets; a walked callee's value by its site.
+    pub(crate) flows: Vec<Flow>,
+    /// The first thing the body does itself that a build script may not.
+    pub(crate) script: Option<String>,
+    /// The kinds the body has itself, each with its first place.
+    pub(crate) kinds: Own,
+    /// Per block, what its call is past its sites.
+    pub(crate) calls: Vec<CallKind>,
+    /// Whether the body is a workspace crate's (`effects::workspace`).
+    pub(crate) workspace: bool,
+    /// The functions trusted for some effect it calls with no site of their own, sorted, each
+    /// once.
+    pub(crate) trusted_calls: SmallVec<[FunctionId; 2]>,
+    /// Its calls of foreign functions that may block the thread.
+    pub(crate) foreign: Vec<crate::locks::ForeignBlock>,
+    /// Per site, whether its call is proved to have no panic here: in a block no path reaches,
+    /// or of a modeled function proved not to panic with these arguments.
+    pub(crate) discharged: Vec<bool>,
+    /// Per local, whether a value of its type holds no pointer.
+    pub(crate) pointerless: SmallVec<[bool; 16]>,
+}
+
+/// The part of `def`'s summary its body `body` gives by itself ([`OwnPart`]), in `cx`'s
+/// environment: one walk of the body's sites, its reach proof and its `unsafe` scan. Asks no
+/// summary.
+pub(crate) fn own_part<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> OwnPart {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
-    walk.gather(body);
-    let mut values = Values::solve(db, cx.env, &cx.infcx, body, &walk.flows);
+    // What is proved dead or unable to fail is not a panic of this body
+    // (docs/v2/plan/design/proved-unreachable.md): asked only where proofs are spent.
+    let proof = proof_of(cx, body, def);
+    let reach = proof.as_deref();
+    walk.gather(body, reach);
+    // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
+    // source, which holds them.
+    if let Def::Body(Body::Fn(func)) = def {
+        walk.unsafe_code(func);
+    }
+    let mut discharged = Vec::with_capacity_in(walk.sites.len(), Global);
+    discharged.extend(walk.sites.iter().map(|site| {
+        !site.given
+            && site.call.is_some_and(|block| reach.is_some_and(|it| it.discharged_block(block)))
+    }));
+    let pointerless: SmallVec<[bool; 16]> =
+        body.locals.iter().map(|(_, local)| walk.pointerless(local.ty.as_ref())).collect(); // alloc: inline up to sixteen locals
+    walk.trusted_calls.sort();
+    OwnPart {
+        sites: walk.sites,
+        flows: walk.flows,
+        script: walk.own,
+        kinds: walk.kinds,
+        calls: walk.calls,
+        workspace: walk.workspace,
+        trusted_calls: walk.trusted_calls,
+        foreign: walk.foreign,
+        discharged,
+        pointerless,
+    }
+}
+
+fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
+    fold(cx, body, own_part(cx, body, def))
+}
+
+/// The summary of the instance whose body is `body` and whose own part is `own`: each site's
+/// callee's summary folded in, in site order ([`OwnPart`] says what it reads).
+pub(crate) fn fold<'db>(cx: &Cx<'db>, body: &MirBody<'db>, own: OwnPart) -> Summary {
+    let db = cx.db;
+    let OwnPart {
+        sites: own_sites,
+        flows,
+        script,
+        kinds: own_kinds,
+        calls,
+        workspace,
+        trusted_calls,
+        foreign,
+        discharged: own_discharged,
+        pointerless,
+    } = own;
+    // What each walked callee returns, from its summary, asked in site order: the order the
+    // walk asked them in before the own part was cut out of it.
+    let mut rets = Vec::with_capacity_in(own_sites.len(), Global);
+    rets.extend(own_sites.iter().map(|site| match &site.reached {
+        Reached::Walk(instance, _) => cx.summary(instance.clone()).ret, // clone: the query's key, reference counts
+        Reached::Leaf(..) => Abs::Unset,
+    }));
+    let mut values = Values::solve(db, cx.env, &cx.infcx, body, &flows, &rets);
     let mut out = Out::default();
-    if let Some(what) = walk.own.take() {
+    if let Some(what) = script {
         out.impure(Impure { what, through: Vec::new() }); // alloc: empty, allocates nothing
     }
     // Memory the walk cannot follow, or state no argument reaches, is any memory.
-    let refused = walk.kinds.kinds.intersect(EffectSet::of(&[
+    let refused = own_kinds.kinds.intersect(EffectSet::of(&[
         Rule::Unchecked,
         Rule::Open,
         Rule::MutableState,
     ]));
-    let mut fold = Fold::new(std::mem::take(&mut walk.kinds));
-    let mut callees = Vec::with_capacity(walk.sites.len()); // alloc: the summary's callees, once per instance
-    let mut sites = Vec::with_capacity(walk.sites.len()); // alloc: the summary's effect sites, once per instance
-    let mut facts = Vec::with_capacity(walk.sites.len()); // alloc: one site's memory facts each, once per instance
-    for (at, site) in walk.sites.iter().enumerate() {
-        let (instance, spread) = match &site.reached {
-            Reached::Walk(instance, spread) | Reached::Leaf(instance, spread) => {
-                (instance, *spread)
-            }
-        };
+    let mut fold = Fold::new(own_kinds, body.owner.krate(db));
+    let mut callees = Vec::with_capacity(own_sites.len()); // alloc: the summary's callees, once per instance
+    let mut sites = Vec::with_capacity(own_sites.len()); // alloc: the summary's effect sites, once per instance
+    let mut facts = Vec::with_capacity(own_sites.len()); // alloc: one site's memory facts each, once per instance
+    for (at, site) in own_sites.iter().enumerate() {
+        let (instance, spread) = site.reached.instance();
         sites.push(EffectSite { instance: instance.clone(), span: site.span, given: site.given }); // clone: reference counts
+        let discharged = own_discharged[at];
         let at = at as u32;
         let memory = match instance.def {
             Def::Leaf(func, leaf) => {
                 let (kinds, does) = effects::leaf_kinds(leaf);
+                let kinds = match discharged {
+                    true => kinds.without(EffectSet::one(Rule::Panic)),
+                    false => kinds,
+                };
                 fold.row(db, func, kinds, EffectSet::EMPTY, at, || {
                     format!("calls {}, which {does}", fn_name(db, func))
                 }); // alloc: a witness's text
                 memory::leaf_memory(leaf)
             }
             Def::Body(def) => {
-                let callee = summary(db, cx.stored.clone(), instance.clone()); // clone: the query's key, reference counts
-                fold.callee(db, def, instance.args.as_ref(), callee, walk.workspace, at);
+                let callee = cx.summary(instance.clone()); // clone: the query's key, reference counts
+                fold.callee(
+                    db,
+                    def,
+                    instance.args.as_ref(),
+                    &callee,
+                    workspace,
+                    at,
+                    discharged,
+                );
                 callee.memory
             }
         };
@@ -774,43 +1125,118 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
         match instance.def {
             Def::Leaf(func, leaf) => out.leaf(db, func, leaf, &params, None),
             _ => {
-                let callee = summary(db, cx.stored.clone(), instance.clone()); // clone: the query's key, reference counts
-                out.callee(db, instance, callee, &params);
+                let callee = cx.summary(instance.clone()); // clone: the query's key, reference counts
+                out.callee(db, instance, &callee, &params);
             }
         }
         callees.push(instance.clone()); // clone: reference counts
     }
     let ret = values.local(return_slot());
-    let pointerless: SmallVec<[bool; 16]> =
-        body.locals.iter().map(|(_, local)| walk.pointerless(local.ty.as_ref())).collect(); // alloc: inline up to sixteen locals
-    let memory = memory::infer(body, &pointerless, &walk.calls, &facts, !refused.is_empty());
+    let memory = memory::infer(body, &pointerless, &calls, &facts, !refused.is_empty());
     let (kinds, sets, witnesses) = fold.finish();
-    walk.trusted_calls.sort();
+    let lock_sites: Vec<crate::locks::LockSite<'_>> = own_sites
+        .iter()
+        .map(|site| crate::locks::LockSite {
+            instance: site.reached.instance().0,
+            call: site.call,
+            given: site.given,
+        })
+        .collect(); // alloc: a view of the body's sites, once per instance
+    let locks = crate::locks::of(cx, body, &lock_sites, &foreign, &|instance| match instance.def {
+        // clone: the query's key, reference counts
+        Def::Body(_) => Some(cx.summary(instance.clone())),
+        Def::Leaf(..) => None,
+    });
     Summary {
         kinds,
         sets,
         witnesses,
         sites: sites.into_boxed_slice(),
+        locks,
         memory,
-        trusted_calls: walk.trusted_calls.into_iter().collect(), // alloc: once per instance, mostly empty
+        trusted_calls: trusted_calls.into_iter().collect(), // alloc: once per instance, mostly empty
         ..out.finish(ret, callees.into_boxed_slice())
     }
+}
+
+/// The proof the walk reads of `body`, `def`'s instance, under `cx.proofs`.
+///
+/// - Under [`Proofs::None`] there is none: tier 0 runs no prover, by construction, and every
+///   site counts as reached.
+/// - Under [`Proofs::Spent`], for a function whose generic body has no `for const` loop, the
+///   definition's proof ([`crate::reach::of_body`], one row per definition): monomorphization
+///   folds types into a clone of the generic body (`monomorphization::monomorphized`), so its
+///   blocks keep their ids and the definition's verdict per block is the instance's. A
+///   `for const` loop is expanded per instance (`comptime::expand` adds blocks), and closures
+///   and coroutines are not definitions `of_body` takes: those are proved per instance.
+///
+/// What the definition's proof loses against an instance's: a discharge that needs a value
+/// only the instance has (a const generic `N`, `size_of::<T>()`, an associated const, the
+/// concrete integer type behind a normalized alias); the prover takes those as unknown.
+fn proof_of<'db>(
+    cx: &Cx<'db>,
+    body: &MirBody<'db>,
+    def: Def,
+) -> Option<std::borrow::Cow<'db, crate::reach::Reach>> {
+    if cx.proofs == Proofs::None || !crate::reach::worth(body) {
+        return None;
+    }
+    #[cfg(test)]
+    plant::count_proof();
+    let db = cx.db;
+    if let Def::Body(Body::Fn(func)) = def
+        && let Ok(generic) =
+            db.runtime_mir_body(InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)))
+        && !generic.has_comptime_loop()
+    {
+        // The invariant the definition's proof rests on: the instance is the generic body
+        // with types folded in, block for block. A body that breaks it is refused loudly,
+        // never read against another body's block ids.
+        assert_eq!(
+            generic.basic_blocks.len(),
+            body.basic_blocks.len(),
+            "the instance of {func:?} does not keep its definition's blocks, so the \
+             definition's proof (reach::of_body) cannot be read for it",
+        );
+        return Some(std::borrow::Cow::Borrowed(crate::reach::of_body(
+            db,
+            DefWithBodyId::FunctionId(func),
+        )));
+    }
+    Some(std::borrow::Cow::Owned(crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[])))
 }
 
 /// The effects of a body as its sites are taken in: per effect, each kind once with its
 /// witness of the fewest calls (the first site of those).
 struct Fold {
     kinds: EffectSet,
-    sets: SmallVec<[EffectSet; 4]>,
+    sets: Sets,
     // alloc: the body's witnesses, few, once per instance
     witnesses: Vec<Witness>,
+    /// The crate of the body, and the crate-wide effects it is trusted for
+    /// (`effect_attrs::crate_trust`).
+    home: Crate,
+    trust: u32,
 }
 
 impl Fold {
-    fn new(own: Own) -> Fold {
-        let kinds = own.kinds;
+    fn new(own: Own, home: Crate) -> Fold {
+        // `Rule::Dyn` is a check's alone (its root's parameters decide it): no kind of the
+        // instance, which the facts and a destructor's kinds read.
+        let (kinds, trust) = (own.kinds.without(EffectSet::one(Rule::Dyn)), own.base);
         let (sets, witnesses) = own.into_sets();
-        Fold { kinds, sets, witnesses: witnesses.into_vec() }
+        Fold { kinds, sets, witnesses: witnesses.into_vec(), home, trust }
+    }
+
+    /// The effects a call of code of `krate` does not count for: those the body's crate is
+    /// trusted for, when `krate` is that crate or one it depends on (code it rests on); none for
+    /// code of another crate (a closure or impl a caller gives it), which counts as anywhere.
+    fn trusted_for(&self, db: &Db, krate: Crate) -> u32 {
+        if self.trust != 0 && self.home.transitive_deps(db).contains(&krate) {
+            self.trust
+        } else {
+            0
+        }
     }
 
     fn add(&mut self, effect: usize, rule: Rule, depth: u16, how: impl FnOnce() -> How) {
@@ -848,9 +1274,13 @@ impl Fold {
         said: impl Fn() -> String,
     ) {
         self.kinds = self.kinds.union(kinds);
+        let trusted = self.trusted_for(db, func.krate(db));
         for (index, effect) in EFFECTS.iter().enumerate() {
             let counted = kinds.intersect(kept(effect));
-            if counted.is_empty() || !Fold::counts(db, Some(func), effect) {
+            if counted.is_empty()
+                || trusted & 1 << index != 0
+                || !Fold::counts(db, Some(func), effect)
+            {
                 continue;
             }
             for rule in counted.iter() {
@@ -869,32 +1299,44 @@ impl Fold {
         callee: &Summary,
         workspace: bool,
         at: u32,
+        discharged: bool,
     ) {
         let func = match def {
             Body::Fn(func) => Some(func),
             Body::Closure(_) | Body::Coroutine(_) | Body::CoroutineByMove(_) => None,
         };
-        if let Some(func) = func
-            && let Some(rule) = effect_attrs::allocator_rule(db, func, args)
-        {
-            // The allocator's own body is not walked: its kind is the call's.
-            return self.row(db, func, EffectSet::one(rule), EffectSet::EMPTY, at, || {
-                format!("calls {}, a method of an allocator", fn_name(db, func)) // alloc: a witness's text
-            });
-        }
-        let (row, covers, said): (EffectSet, EffectSet, Option<&'static str>) =
-            match func.and_then(|it| effect_row(db, it)) {
-                Some(modeled) if !modeled.from_workspace || workspace => {
-                    (modeled.kinds, modeled.covers, Some(modeled.does))
-                }
-                _ => match func.and_then(|it| effect_attrs::row_of(db, it)) {
-                    Some(row) => (row.kinds(), row.kinds(), Some(row.says)),
-                    None => (EffectSet::EMPTY, EffectSet::EMPTY, None),
-                },
-            };
+        let found = func.and_then(|func| Some((func, call_row(db, func, args, workspace)?)));
+        let (row, covers, said): (EffectSet, EffectSet, Option<&'static str>) = match found {
+            Some((func, CallRow::Allocator(rule))) => {
+                // The allocator's own body is not walked: its kind is the call's.
+                return self.row(db, func, EffectSet::one(rule), EffectSet::EMPTY, at, || {
+                    format!("calls {}, a method of an allocator", fn_name(db, func)) // alloc: a witness's text
+                });
+            }
+            Some((_, CallRow::Row { kinds, covers, does })) => (kinds, covers, Some(does)),
+            None => (EffectSet::EMPTY, EffectSet::EMPTY, None),
+        };
         self.kinds = self.kinds.union(row).union(callee.kinds);
+        let trusted = self.trusted_for(db, def_crate(db, Def::Body(def)));
+        // The toolchain's `unsafe` precondition checks (`Rule::Precondition`): what the check
+        // itself aborts with is the precondition of the function it is written in; a safe
+        // function of the toolchain upholds what it calls; a body outside the toolchain that
+        // calls one still pending (an `unsafe fn` of the toolchain) has to uphold it itself.
+        let toolchain = |krate: Crate| matches!(krate.data(db).origin, CrateOrigin::Lang(_));
+        let here = toolchain(self.home);
+        let check = func.is_some_and(|it| effects::precondition_check(db, it));
+        let upholds = func.is_some_and(|it| {
+            !check && toolchain(it.krate(db)) && !FunctionSignature::of(db, it).is_unsafe()
+        });
         for (index, effect) in EFFECTS.iter().enumerate() {
-            if !Fold::counts(db, func, effect) {
+            if trusted & 1 << index != 0 || !Fold::counts(db, func, effect) {
+                // A callee trusted for the effect answers for its own code, not for the object
+                // it is given: a call it makes through a `dyn` is still the root's to answer.
+                if callee.set(index).has(Rule::Dyn) {
+                    let depth =
+                        callee.witness(index, Rule::Dyn).map_or(0, |it| it.depth).saturating_add(1);
+                    self.add(index, Rule::Dyn, depth, || How::Site { site: at, said: None });
+                }
                 continue;
             }
             if let (Some(func), Some(does)) = (func, said) {
@@ -906,15 +1348,81 @@ impl Fold {
                 }
             }
             for rule in callee.set(index).without(covers).iter() {
-                let depth = callee.witness(index, rule).map_or(0, |it| it.depth).saturating_add(1);
+                // Proved not to panic at this site.
+                if discharged && rule == Rule::Panic {
+                    continue;
+                }
+                let depth = match rule {
+                    Rule::Recursion => RECURSION_DEPTH,
+                    _ => callee.witness(index, rule).map_or(0, |it| it.depth).saturating_add(1),
+                };
+                let rule = match rule {
+                    Rule::Panic if check && here => Rule::Precondition,
+                    Rule::Precondition if upholds => continue,
+                    Rule::Precondition if !here => {
+                        self.add(index, Rule::Panic, 1, || How::Site {
+                            site: at,
+                            said: Some(
+                                match func {
+                                    // alloc: a witness's text
+                                    Some(func) => format!(
+                                        "calls {}, an `unsafe fn` of the toolchain whose precondition check aborts when its caller breaks the precondition",
+                                        fn_name(db, func)
+                                    ),
+                                    None => "calls code of the toolchain with an `unsafe` precondition, whose check aborts when its caller breaks it".to_owned(), // alloc: a witness's text
+                                }
+                                .into(),
+                            ),
+                        });
+                        continue;
+                    }
+                    rule => rule,
+                };
                 self.add(index, rule, depth, || How::Site { site: at, said: None });
             }
         }
     }
 
-    fn finish(mut self) -> (EffectSet, SmallVec<[EffectSet; 4]>, Box<[Witness]>) {
+    fn finish(mut self) -> (EffectSet, Sets, Box<[Witness]>) {
         self.witnesses.sort_by_key(|it| (it.effect, it.rule));
         (self.kinds, self.sets, self.witnesses.into_boxed_slice())
+    }
+}
+
+/// What a call of `func` adds at its site beside what its body does ([`call_row`]).
+#[derive(Clone, Copy)]
+pub(crate) enum CallRow {
+    /// A method of an allocator: its kind is the call's, and its body is not walked.
+    Allocator(Rule),
+    /// A row of a toolchain table ([`crate::effects::MODELS`]) or of an effect attribute: the
+    /// kinds it adds, the kinds of the body it answers for, and what it says the call does.
+    Row { kinds: EffectSet, covers: EffectSet, does: &'static str },
+}
+
+/// The one lookup of what a call of `func<args>` adds at its site, from a body of a workspace
+/// crate when `workspace`: an allocator's kind first, then the toolchain table's row (one
+/// counted only from a workspace crate's body is skipped otherwise), then an effect attribute's
+/// row; `None` when nothing is added beside the body.
+pub(crate) fn call_row<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: GenericArgs<'db>,
+    workspace: bool,
+) -> Option<CallRow> {
+    if let Some(rule) = effect_attrs::allocator_rule(db, func, args) {
+        return Some(CallRow::Allocator(rule));
+    }
+    match effect_row(db, func) {
+        Some(modeled) if !modeled.from_workspace || workspace => Some(CallRow::Row {
+            kinds: modeled.kinds,
+            covers: modeled.covers,
+            does: modeled.does,
+        }),
+        _ => effect_attrs::row_of(db, func).map(|row| CallRow::Row {
+            kinds: row.kinds(),
+            covers: row.kinds(),
+            does: row.says,
+        }),
     }
 }
 
@@ -1071,12 +1579,12 @@ pub(crate) fn name_of(db: &Db, instance: &Instance) -> String {
     match instance.def {
         Def::Body(Body::Fn(func)) | Def::Leaf(func, _) => fn_name(db, func),
         Def::Body(Body::Closure(id)) => {
-            format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner)) // alloc: an impure script's reason
+            format!("a closure in {}", parent(InternedClosureId::from_gid(id).loc(db).owner)) // alloc: an impure script's reason
         }
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
             format!(
                 "an `async` block in {}",
-                parent(InternedCoroutineId::from_id(id).loc(db).owner)
+                parent(InternedCoroutineId::from_gid(id).loc(db).owner)
             ) // alloc: an impure script's reason
         }
     }
@@ -1114,7 +1622,7 @@ pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
     };
     let path = path.or_else(|| {
         let args = GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
-        blaze_query::db::attach(db, || hir_ty_print::rustc_function_name(db, func, args.as_slice()))
+        blaze_memo::attach(db, || hir_ty_print::rustc_function_name(db, func, args.as_slice()))
     });
     path.unwrap_or_else(|| name.to_owned()) // alloc: an impure script's reason
 }
@@ -1122,7 +1630,7 @@ pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
 /// The path to `item` a user writes: the shortest from its crate's root that reaches it, the
 /// crate's name first; the modules it is written in when no path from the root reaches it (a
 /// private item).
-fn item_path(db: &Db, item: ModuleDefId) -> String {
+pub(crate) fn item_path(db: &Db, item: ModuleDefId) -> String {
     let Some(module) = item.module(db) else { return String::new() }; // alloc: empty
     let krate = module.krate(db);
     let crate_name = krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().as_str());
@@ -1194,6 +1702,15 @@ fn open_or_unchecked(args: GenericArgs<'_>) -> Rule {
     if args.has_param() { Rule::Open } else { Rule::Unchecked }
 }
 
+/// rustc's `span.allows_unsafe()` for `range` of `file`: it is of the expansion of a macro
+/// defined `#[allow_internal_unsafe]`. A file's own text is of no expansion: no span map is read.
+fn allows_unsafe(db: &Db, file: HirFileId, range: TextRange) -> bool {
+    file.macro_file().is_some()
+        && file.span_map(db).span_for_range(range).ctx.outer_expn(db, file.context_arena()).is_some_and(|call| {
+            hir_expand::MacroCallId::from(call).loc(db).def.allow_internal_unsafe
+        })
+}
+
 fn compose(outer: Spread, inner: Spread) -> Spread {
     match (outer, inner) {
         (Spread::Direct, it) | (it, Spread::Direct) => it,
@@ -1210,7 +1727,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             // alloc: one flow per block, once per body
             flows: vec![Flow::Unknown; body.map_or(0, |it| it.basic_blocks.len())],
             own: None,
-            kinds: Own::default(),
+            kinds: Own::trusted(
+                body.map_or(0, |it| effect_attrs::crate_trust(cx.db, it.owner.krate(cx.db))),
+            ),
             span: None,
             origin: Origin::Made,
             giving: false,
@@ -1218,9 +1737,12 @@ impl<'a, 'db> Walk<'a, 'db> {
             calls: vec![CallKind::Sites; body.map_or(0, |it| it.basic_blocks.len())],
             workspace: body.is_some_and(|it| effects::workspace(cx.db, it.owner.krate(cx.db))),
             trusted_calls: SmallVec::new(),
+            foreign: Vec::new_in(Global),
             dropped: HashSet::new_in(Global),
             statics: HashSet::new_in(Global),
             code: HashMap::new_in(Global),
+            dyns: HashMap::new_in(Global),
+            owned_dyns: HashMap::new_in(Global),
         }
     }
 
@@ -1235,14 +1757,37 @@ impl<'a, 'db> Walk<'a, 'db> {
 
     /// A reason names types, whose `Debug` reads the attached database.
     fn refuse_with(&mut self, rule: Rule, what: impl FnOnce() -> String) {
+        self.refuse_except(rule, 0, what);
+    }
+
+    /// [`Walk::refuse_with`], not counted for the effects of `except` (a bit per effect of
+    /// [`EFFECTS`]: a trait's method whose `#[blaze::expect(..)]` bounds what every impl does).
+    fn refuse_except(&mut self, rule: Rule, except: u32, what: impl FnOnce() -> String) {
         let script = self.own.is_none() && !self.giving;
         if !script && self.kinds.full.has(rule) {
             return;
         }
-        let what = blaze_query::db::attach(self.cx.db, what);
-        self.observe(EffectSet::one(rule), &what);
+        let what = blaze_memo::attach(self.cx.db, what);
+        self.observe_except(EffectSet::one(rule), &what, except);
         if script {
             self.own = Some(what);
+        }
+    }
+
+    /// A call through a function pointer or a `dyn` ([`Rule::Indirect`]): what it reaches was
+    /// walked where the pointer or vtable was made, but it may reach this body again, which no
+    /// cycle of instances shows. Not counted for the effects of `except`.
+    fn indirect(&mut self, what: &str, except: u32) {
+        self.observe_except(EffectSet::one(Rule::Indirect), what, except);
+    }
+
+    /// The effects (a bit per effect of [`EFFECTS`]) a call of the trait's method `f` that only
+    /// an instance decides cannot have, when `rule` is [`Rule::Open`]: the method's
+    /// `#[blaze::expect(..)]` bounds every impl.
+    fn open_bound(&self, rule: Rule, f: FunctionId) -> u32 {
+        match rule {
+            Rule::Open => effects::bound_mask(self.cx.db, f),
+            _ => 0,
         }
     }
 
@@ -1267,6 +1812,54 @@ impl<'a, 'db> Walk<'a, 'db> {
         mask
     }
 
+    /// The `unsafe` code of `func`'s own source, the closures and `async` blocks in it included:
+    /// its body when it is an `unsafe fn`, and the first `unsafe` block written in it. A block
+    /// lowering makes (`format_args!`'s: no `unsafe {` is written there) is none, nor one a macro
+    /// defined `#[allow_internal_unsafe]` expands to (`thread_local!`'s), as rustc's
+    /// `unsafe_code` lint says. Not scanned in a crate trusted for `unsafe` (the toolchain's), so
+    /// its source map is never read there.
+    #[expect(
+        blaze::reads_positions,
+        reason = "whether an `unsafe` block was written, and under which macro's `#[allow_internal_unsafe]`, is \
+                  read off the source map: the lowered body must say both of each block"
+    )]
+    fn unsafe_code(&mut self, func: FunctionId) {
+        let db = self.cx.db;
+        let unsafe_bit = effects::effect_index(&effect_attrs::UNSAFE).map_or(0, |it| 1 << it);
+        if self.kinds.base & unsafe_bit != 0 || self.kinds.full.has(Rule::Unsafe) {
+            return;
+        }
+        let was = self.span.take();
+        if FunctionSignature::of(db, func).is_unsafe() {
+            let what = format!("is {}, an `unsafe fn`, whose body is `unsafe` code", fn_name(db, func)); // alloc: a witness's text, once
+            self.observe(EffectSet::one(Rule::Unsafe), &what);
+        }
+        let owner = DefWithBodyId::FunctionId(func);
+        let source = HirBody::of(db, owner);
+        let mut blocks = source
+            .exprs()
+            .filter(|(_, expr)| matches!(expr, Expr::Block { unsafe_: Unsafe::Yes, .. }))
+            .map(|(id, _)| id)
+            .peekable();
+        // Most bodies have no `unsafe` block: their source map is not read.
+        if blocks.peek().is_some() {
+            let map = HirBody::source_map(db, owner);
+            for block in blocks {
+                // An expression with no syntax is one lowering made.
+                let Ok(syntax) = map.expr_syntax(block) else { continue };
+                if syntax.value.kind() != SyntaxKind::BLOCK_EXPR
+                    || allows_unsafe(db, syntax.file_id, syntax.value.text_range())
+                {
+                    continue;
+                }
+                self.span = Some(MirSpan::ExprId(block));
+                self.observe(EffectSet::one(Rule::Unsafe), "runs an `unsafe` block");
+                break;
+            }
+        }
+        self.span = was;
+    }
+
     /// Of a call at `at`, what it is past its sites.
     fn call_kind(&mut self, at: Option<BasicBlockId>, kind: CallKind) {
         if let Some(at) = at {
@@ -1275,7 +1868,7 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// The sites of every block, cleanup blocks too, in block order.
-    fn gather(&mut self, body: &'a MirBody<'db>) {
+    fn gather(&mut self, body: &'a MirBody<'db>, reach: Option<&crate::reach::Reach>) {
         for (id, block) in body.basic_blocks.iter() {
             for statement in &block.statements {
                 (self.span, self.origin) = (Some(statement.span), Origin::Made);
@@ -1307,8 +1900,20 @@ impl<'a, 'db> Walk<'a, 'db> {
                     self.origin = Origin::Drop(id);
                     let ty = self.place_ty(place);
                     self.drop_glue(ty);
+                    self.dyn_drop(ty);
+                    // A `dyn` it owns is dropped through its vtable: a call like any through one.
+                    if !self.kinds.full.has(Rule::Indirect) && self.holds_dyn(ty) {
+                        self.indirect(
+                            "drops a value that may hold a `dyn`, whose drop may call this function again",
+                            0,
+                        );
+                    }
                 }
                 TerminatorKind::Assert { msg, .. } => {
+                    // A check proved to hold, or never reached, is no panic.
+                    if reach.is_some_and(|it| it.discharged_block(id)) {
+                        continue;
+                    }
                     if let Some(rule) = effect_attrs::assert_rule(body, id) {
                         self.observe(EffectSet::one(rule), assertion(msg));
                     }
@@ -1316,7 +1921,48 @@ impl<'a, 'db> Walk<'a, 'db> {
                 _ => {}
             }
         }
+        // A loop not known to end, at the loop's line.
+        if let Some(span) = loops::unbounded_loop(body) {
+            self.span = Some(span);
+            self.observe(EffectSet::one(Rule::Loop), "has a loop that is not known to end");
+        }
         (self.span, self.origin) = (None, Origin::Made);
+    }
+
+    /// The drop of a value of `ty` that owns a `dyn` runs the drop of whatever object it is
+    /// ([`Rule::Dyn`]): drop glue does nothing for a `dyn` itself, whose own was walked where
+    /// its vtable was made.
+    fn dyn_drop(&mut self, ty: Ty<'db>) {
+        if !self.kinds.full.has(Rule::Dyn) && self.owns_dyn(ty) {
+            let ty = self.cx.shown(ty);
+            let what = blaze_memo::attach(self.cx.db, || {
+                format!("drops a `{ty}`, which owns a `dyn` whose drop is the object's")
+            }); // alloc: a witness's text, once per body
+            self.observe(EffectSet::one(Rule::Dyn), &what);
+        }
+    }
+
+    /// Whether a value of `ty` owns a `dyn`: in its own bytes or behind a raw pointer (a
+    /// `Box`'s, a `Vec`'s), never behind a reference, which owns nothing.
+    fn owns_dyn(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&known) = self.owned_dyns.get(&ty) {
+            return known;
+        }
+        let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
+        self.scan(ty, Reach::Owned, &mut HashSet::new_in(Global), &mut dyns);
+        self.owned_dyns.insert(ty, !dyns.is_empty());
+        !dyns.is_empty()
+    }
+
+    /// Whether a value of `ty` may hold a `dyn`, in its own bytes or behind a pointer.
+    fn holds_dyn(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&known) = self.dyns.get(&ty) {
+            return known;
+        }
+        let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
+        self.scan(ty, Reach::Pointees, &mut HashSet::new_in(Global), &mut dyns);
+        self.dyns.insert(ty, !dyns.is_empty());
+        !dyns.is_empty()
     }
 
     fn place_ty(&self, place: &StoredPlace) -> Ty<'db> {
@@ -1351,6 +1997,10 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             None => {
                 self.call_kind(Some(at), CallKind::Indirect);
+                self.indirect(
+                    "calls through a function pointer, whose target may call this function again",
+                    0,
+                );
                 Flow::Unknown
             }
         }
@@ -1376,9 +2026,11 @@ impl<'a, 'db> Walk<'a, 'db> {
             return Flow::Unknown;
         }
         let instance = Instance { def, args: args.store() };
-        let ret = summary(self.cx.db, self.cx.stored.clone(), instance.clone()).ret; // clone: the query's key, reference counts
+        // What the callee returns is its summary's, which the fold gives `Values::solve` by
+        // this site: the walk of a body asks no callee's summary (`own_part`).
+        let site = u32::try_from(self.sites.len()).expect("a body has fewer than 2^32 sites");
         self.push(Reached::Walk(instance, spread), call);
-        Flow::Ret { ret, spread }
+        Flow::Ret { site, spread }
     }
 
     /// What calling `f` with `args` runs, as the code generator dispatches it.
@@ -1400,6 +2052,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             Call::DropGlue(ty) => {
                 let before = self.sites.len();
                 self.drop_glue(ty);
+                self.dyn_drop(ty);
                 if self.sites.len() == before {
                     self.call_kind(at, CallKind::Nothing);
                 }
@@ -1441,8 +2094,20 @@ impl<'a, 'db> Walk<'a, 'db> {
             Call::FnItem(CallableDefId::FunctionId(g), g_args) => {
                 self.call(g, g_args, compose(spread, Spread::Tuple { from: 1 }), at)
             }
-            Call::FnItem(..) | Call::Indirect => {
+            Call::FnItem(..) => {
                 self.call_kind(at, CallKind::Indirect);
+                Flow::Unknown
+            }
+            Call::Indirect => {
+                self.call_kind(at, CallKind::Indirect);
+                self.observe(
+                    EffectSet::one(Rule::Dyn),
+                    "calls through a function pointer or a `dyn Fn`, whose target is the object's",
+                );
+                self.indirect(
+                    "calls through a function pointer or a `dyn Fn`, whose target may call this function again",
+                    0,
+                );
                 Flow::Unknown
             }
             Call::AsyncClosure => {
@@ -1454,7 +2119,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             Call::Method(Err(why)) => {
                 let receiver = self.cx.shown(args.type_at(0));
-                self.refuse_with(open_or_unchecked(args), || {
+                let rule = open_or_unchecked(args);
+                self.refuse_except(rule, self.open_bound(rule, f), || {
                     format!(
                         "calls {} for `{receiver}`, which no impl's method is found for: {}",
                         fn_name(db, f),
@@ -1484,9 +2150,26 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             Callee::Virtual | Callee::FnPtr(_) => {
                 // What a `dyn` call reaches was walked where its vtable was made; a method of a
-                // trait trusted for an effect (a door) is trusted wherever the vtable is from.
+                // trait trusted for an effect (a door) is trusted wherever the vtable is from,
+                // and one whose `#[blaze::expect(..)]` leaves `diverge` out ends in every impl.
                 if matches!(callee, Callee::Virtual) {
-                    self.trusted_call(f);
+                    let except = self.trusted_call(f) | effects::bound_mask(db, f);
+                    // The method's own `#[blaze::expect(..)]`, or its trait's trust, says what a
+                    // call of it through any object cannot do; for the rest nothing does.
+                    if !self.kinds.full.has(Rule::Dyn) {
+                        let what = format!(
+                            "calls {} through a `dyn`: nothing says the object's method cannot do this (a `#[blaze::expect(..)]` on the trait's method that leaves it out would)",
+                            fn_name(db, f)
+                        ); // alloc: a witness's text, once per body
+                        self.observe_except(EffectSet::one(Rule::Dyn), &what, except);
+                    }
+                    if !self.kinds.full.has(Rule::Indirect) {
+                        let what = format!(
+                            "calls {} through a `dyn`, whose target may call this function again",
+                            fn_name(db, f)
+                        ); // alloc: a witness's text, once per body
+                        self.indirect(&what, except);
+                    }
                 }
                 self.call_kind(at, CallKind::Indirect);
                 Flow::Unknown
@@ -1507,7 +2190,8 @@ impl<'a, 'db> Walk<'a, 'db> {
                     && !FunctionSignature::of(db, f).has_body() =>
             {
                 let receiver = self.cx.shown(args.type_at(0));
-                self.refuse_with(open_or_unchecked(args), || {
+                let rule = open_or_unchecked(args);
+                self.refuse_except(rule, self.open_bound(rule, f), || {
                     format!("calls {} for `{receiver}`, which no impl gives a body", fn_name(db, f)) // alloc: an impure script's reason
                 });
                 Flow::Unknown
@@ -1552,6 +2236,21 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             let except = self.trusted_call(g);
             self.observe_except(kinds, &what, except);
+            // No site is made of a foreign function: the lock pass sees a guard held across one
+            // that may block only through this list.
+            let nonblocking =
+                effects::effect_index(&effect_attrs::NONBLOCKING).map_or(0, |it| 1 << it);
+            if let Some(call) = at
+                && !self.giving
+                && kinds.has(Rule::Block)
+                && (except | self.kinds.base) & nonblocking == 0
+            {
+                self.foreign.push(crate::locks::ForeignBlock {
+                    call,
+                    link: link.as_str().into(), // alloc: a name, once per blocking foreign call
+                    span: self.span,
+                });
+            }
             // A build script may call none: its sandbox is the proof.
             if self.own.is_none() && !self.giving {
                 self.own = Some(what);
@@ -1591,7 +2290,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                         self.observe(EffectSet::one(Rule::MutableState), &what);
                     }
                     let parent = GenericArgs::new_from_slice(closure.parent_args());
-                    self.walk(Def::Body(Body::Closure(id.0.as_id())), parent, Spread::Opaque, None);
+                    self.walk(Def::Body(Body::Closure(id.0.gid())), parent, Spread::Opaque, None);
                     self.drop_glue(ty);
                 }
                 TyKind::FnDef(def, fn_args) => {
@@ -1712,7 +2411,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                     Some(TyKind::Closure(id, args)) => {
                         let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
                         self.walk(
-                            Def::Body(Body::Closure(id.0.as_id())),
+                            Def::Body(Body::Closure(id.0.gid())),
                             parent,
                             Spread::Opaque,
                             None,
@@ -1952,7 +2651,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                 }
                 TyKind::Closure(id, args) => {
                     let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                    self.walk(Def::Body(Body::Closure(id.0.as_id())), parent, Spread::Opaque, None);
+                    self.walk(Def::Body(Body::Closure(id.0.gid())), parent, Spread::Opaque, None);
                 }
                 _ => match dyns.as_slice() {
                     &[dyn_ty] => self.vtable(pointee, dyn_ty),
@@ -2034,6 +2733,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             TyKind::RawPtr(pointee, _) => {
                 self.scan(pointee, reach, seen, dyns) | (reach == Reach::Raw)
             }
+            // A reference owns nothing.
+            TyKind::Ref(..) if reach == Reach::Owned => false,
             TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => {
                 self.scan(pointee, reach, seen, dyns)
             }
@@ -2109,6 +2810,9 @@ enum Reach {
     Pointees,
     /// Those, and any raw pointer itself, which may be a function pointer cast.
     Raw,
+    /// Its own bytes and what its raw pointers point to (a `Box`'s, a `Vec`'s), not what its
+    /// references do: what dropping the value drops.
+    Owned,
 }
 
 /// Whether an intrinsic other than `const_eval_select`, a transmute, `read_via_copy` and
@@ -2296,6 +3000,8 @@ fn pure_intrinsic(intrinsic: Intrinsic) -> bool {
         | I::BlazeFieldAttrs
         | I::BlazeFieldIndex
         | I::BlazeVariantDiscriminant
-        | I::BlazeVariantIndex => true,
+        | I::BlazeVariantIndex
+        | I::BlazeCodeId
+        | I::BlazeTypeNameOf => true,
     }
 }

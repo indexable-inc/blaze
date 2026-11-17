@@ -15,7 +15,8 @@
 //!   `DropAndReplace`'s) is kept as the generic body has it.
 //!
 //! The identity holds the body's item key and code hash ([`blaze_items`]: each item it refers
-//! to by interface, never a position or a path), the code of each body inlined into it, and,
+//! to by interface, never a position or a path), the code of each body inlined into it, each
+//! fact of another item its passes relied on (`Inlined::relied`), and,
 //! where a type or constant of the generic body names a parameter, what an instance has in its
 //! place:
 //!
@@ -64,7 +65,7 @@ use base_db::Db;
 use blaze_hash::{Blake3Hasher, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key, key};
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::{Database as _, Id as _};
 use either::Either;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, hir::ExprId,
@@ -236,23 +237,18 @@ pub fn instance_identity<'db>(
     env: &StoredParamEnvAndCrate,
     compiled: Compiled,
 ) -> &'db Result<CompileIdentity, Unshared> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         // Free regions erased, bound ones kept, as every callee's key is
         // (`Walk::instance_callee`): two instances equal but for their regions are one key, and
         // a call of the instance itself is `CALLEE_SELF` whatever regions it was asked with.
         let interner = DbInterner::new_with(db, env.as_ref(db).krate);
         let args = erased(interner, instance.args.as_ref());
         let instance = Instance { subject: instance.subject, args: args.store() };
-        // clone: the query's key, a reference count
-        identity_of(db, instance, env.clone(), compiled)
+        identity_of(db, instance, *env, compiled)
     })
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = identity_cycle)]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
-)]
+#[blaze_memo::tracked(returns(ref), owns, cycle_result = identity_cycle)]
 fn identity_of(
     db: &Db,
     instance: Instance,
@@ -356,7 +352,6 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Parts<'db> {
 
 fn identity_cycle(
     _: &Db,
-    _: blaze_query::db::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
     _: Compiled,
@@ -391,7 +386,7 @@ fn bodies<'db>(
             InferBodyId::DefWithBodyId(func.into())
         }
         Body::Closure(id) => {
-            let closure = InternedClosureId::from_id(id);
+            let closure = InternedClosureId::from_gid(id);
             let lowered = || db.mir_body_for_closure(closure).err();
             let code =
                 closure_code(db, closure).map_err(unhashable_nested(db, subject, lowered))?;
@@ -399,7 +394,7 @@ fn bodies<'db>(
             closure.loc(db).owner
         }
         Body::Coroutine(id) | Body::CoroutineByMove(id) => {
-            let coroutine = InternedCoroutineId::from_id(id);
+            let coroutine = InternedCoroutineId::from_gid(id);
             let lowered = || db.mir_body_for_coroutine(coroutine).err();
             let code =
                 coroutine_code(db, coroutine).map_err(unhashable_nested(db, subject, lowered))?;
@@ -437,10 +432,10 @@ fn unhashable_body(db: &Db) -> impl Fn(blaze_items::Unhashable) -> Unshared + '_
             body: match within {
                 None => format!("`{}`", key::path(db, item)), // alloc: error path
                 Some(blaze_items::Nested::Closure(closure)) => {
-                    name_of(db, Subject::Body(Body::Closure(closure.as_id())))
+                    name_of(db, Subject::Body(Body::Closure(closure.gid())))
                 }
                 Some(blaze_items::Nested::Coroutine(coroutine)) => {
-                    name_of(db, Subject::Body(Body::Coroutine(coroutine.as_id())))
+                    name_of(db, Subject::Body(Body::Coroutine(coroutine.gid())))
                 }
             },
             through: match within {
@@ -497,9 +492,10 @@ fn body_of<'db>(
         .map_err(|error| Unshared::NoMir(format!("{error:?}"))) // alloc: error path
 }
 
-/// What the instances of one generic body under one options read their records from.
+/// What the instances of one generic body under one options read their records from, kept in
+/// the memo's arena.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Sites {
+pub(crate) struct Sites<'db> {
     /// The type of each local, by its index, then each value a site reads that `monomorphized`
     /// fills: substituted per instance by one fold.
     pub(crate) filled: StoredGenericArgs,
@@ -507,7 +503,7 @@ pub(crate) struct Sites {
     /// them.
     kept: StoredGenericArgs,
     /// What the records are made of, in walk order.
-    ops: Box<[Op]>,
+    ops: &'db [Op],
     /// The code of every body MIR inlining built into this one ([`inlined_code`]).
     inlined: ContentId,
 }
@@ -583,8 +579,12 @@ enum Op {
 
 /// The sites of `subject`'s generic body under `options`. It reads no argument, so every
 /// instance of the body shares one.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn sites(db: &Db, subject: Subject, options: MirOptions) -> Result<Sites, Unshared> {
+#[blaze_memo::tracked(returns(ref), owns)]
+pub(crate) fn sites<'db>(
+    db: &'db Db,
+    subject: Subject,
+    options: MirOptions,
+) -> Result<Sites<'db>, Unshared> {
     let body = body_of(db, subject, options)?;
     if body.has_comptime_loop() {
         // Its expansion depends on the domain's fields (their types, names and attributes),
@@ -603,14 +603,14 @@ pub(crate) fn sites(db: &Db, subject: Subject, options: MirOptions) -> Result<Si
         // alloc: once per generic body and options, this query's miss
         filled: Vec::with_capacity(body.locals.len() + 16),
         kept: Vec::new(), // alloc: once per generic body and options, this query's miss
-        ops: Vec::new(),  // alloc: once per generic body and options, this query's miss
+        ops: Vec::new_in(Global),
         derefs: HashSet::new_in(Global),
     };
     collect.body()?;
     Ok(Sites {
         filled: GenericArgs::new_from_slice(&collect.filled).store(),
         kept: GenericArgs::new_from_slice(&collect.kept).store(),
-        ops: collect.ops.into_boxed_slice(),
+        ops: blaze_memo::keep_iter(db.memo(), collect.ops),
         inlined,
     })
 }
@@ -618,7 +618,8 @@ pub(crate) fn sites(db: &Db, subject: Subject, options: MirOptions) -> Result<Si
 /// The code of every body MIR inlining built into `body`, in the order it inlined them: which
 /// body ([`code`]: its code hash, its bindings' names and its span-table indices) and whether
 /// its arithmetic is checked. A callee's body edit changes it only where it was inlined: a
-/// plain call names its callee by interface. What the inlined code does with an instance's
+/// plain call names its callee by interface, and by each fact of it a pass relied on
+/// (`Inlined::relied`), hashed after the callees. What the inlined code does with an instance's
 /// arguments is in the body's sites, as the rest of it is; which instance of the callee it is,
 /// the unit's template key holds (`Described::built_in`).
 fn inlined_code(db: &Db, body: &MirBody<'_>) -> Result<ContentId, Unshared> {
@@ -631,6 +632,15 @@ fn inlined_code(db: &Db, body: &MirBody<'_>) -> Result<ContentId, Unshared> {
             InlinedBody::Closure(it) => (tag::DEF_CLOSURE, code::of_closure(db, it)),
         };
         h.update(&[tag, callee.written_checked as u8]).id(code.as_ref().map_err(Clone::clone)?);
+    }
+    // The facts of other items the body's passes relied on (`Inlined::relied`,
+    // docs/v2/plan/design/facts.md), in the order first relied on: the body is the code
+    // they changed. A fact the body did not rely on is not here, so proving more of a
+    // callee, or less of what no pass spent, changes no identity.
+    let relied = &body.inlined.relied;
+    h.update(&(relied.len() as u64).to_le_bytes());
+    for digest in relied {
+        h.update(digest);
     }
     Ok(h.finish())
 }
@@ -1091,7 +1101,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         instance: &'a Instance,
         compiled: Compiled,
         sites_body: &'db MirBody<'db>,
-        sites: &'db Sites,
+        sites: &'db Sites<'db>,
         nesting: u32,
     ) -> Result<ContentId, Unshared> {
         let filled = monomorphized_args(cx.db, sites.filled.as_ref(), &instance.args, &cx.stored)
@@ -1109,7 +1119,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             out,
             nesting,
         };
-        for op in &sites.ops {
+        for op in sites.ops {
             walk.op(op)?;
         }
         Ok(walk.out.finish())
@@ -1510,7 +1520,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         // Which closure, as its parent's arguments are all a closure of a body with no
         // generics has: two closures of one signature are two callees.
         if let Body::Closure(id) = body {
-            h.id(&key::closure_key(db, InternedClosureId::from_id(id)).0);
+            h.id(&key::closure_key(db, InternedClosureId::from_gid(id)).0);
         }
         let generic = args.iter().any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
         if !generic {
@@ -1612,7 +1622,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         match self_ty.kind() {
             TyKind::Closure(id, closure_args) => {
                 let parent = GenericArgs::new_from_slice(closure_args.as_closure().parent_args());
-                let body = Body::Closure(id.0.as_id());
+                let body = Body::Closure(id.0.gid());
                 h.id(&self.instance_callee(body, parent, tag::CALLEE_CLOSURE, None)?);
                 // A closure passed by value to a body that borrows it is the caller's to drop.
                 h.id(&drop::key(self.cx, self_ty)?);
@@ -1690,10 +1700,10 @@ pub(crate) fn body_tag(body: Body) -> u8 {
 pub(crate) fn own_code(db: &Db, body: Body) -> Result<ContentId, String> {
     let code = match body {
         Body::Fn(f) => code::of_item(db, f.into()),
-        Body::Closure(id) => code::of_closure(db, InternedClosureId::from_id(id)),
-        Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_id(id)),
+        Body::Closure(id) => code::of_closure(db, InternedClosureId::from_gid(id)),
+        Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_gid(id)),
         Body::CoroutineByMove(id) => {
-            code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id))
+            code::of_coroutine_by_move(db, InternedCoroutineId::from_gid(id))
         }
     };
     code.as_ref().copied().map_err(|it| format!("its code has no hash: {it}")) // alloc: error path
@@ -1702,9 +1712,9 @@ pub(crate) fn own_code(db: &Db, body: Body) -> Result<ContentId, String> {
 pub(crate) fn mir_owner<'db>(_: &'db Db, body: Body) -> MirOwner<'db> {
     match body {
         Body::Fn(f) => MirOwner::Body(InferBodyId::from(f)),
-        Body::Closure(id) => MirOwner::Closure(InternedClosureId::from_id(id)),
-        Body::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_id(id)),
-        Body::CoroutineByMove(id) => MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id)),
+        Body::Closure(id) => MirOwner::Closure(InternedClosureId::from_gid(id)),
+        Body::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_gid(id)),
+        Body::CoroutineByMove(id) => MirOwner::CoroutineByMove(InternedCoroutineId::from_gid(id)),
     }
 }
 
@@ -1721,7 +1731,7 @@ fn no_promoted_mir<E: std::fmt::Debug>(
         InferBodyId::AnonConstId(_) => "an anonymous constant".to_owned(), // alloc: error path
     };
     // alloc: error path
-    Unshared::NoMir(blaze_query::db::attach(db, || {
+    Unshared::NoMir(blaze_memo::attach(db, || {
         format!("the promoted constant {expr:?} of {owner} has no MIR: {error:?}")
     }))
 }

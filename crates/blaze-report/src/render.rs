@@ -22,8 +22,19 @@ const DIM: &str = "\x1b[2m";
 const ERROR: &str = "\x1b[1m\x1b[91m";
 const WARN: &str = "\x1b[1m\x1b[93m";
 const NOTE: &str = "\x1b[1m\x1b[92m";
-/// A code span: red-ish text on a dim background, as a notebook shows inline code.
-const CODE: &str = "\x1b[38;5;203m\x1b[48;5;236m";
+/// A code span and a command, as the palette gives them to a terminal of 16 colours: a
+/// report's renderer is told only whether there is colour ([`Caps`]), so it takes the values
+/// every terminal has.
+const CODE: &str = "\x1b[1m";
+const COMMAND: &str = "\x1b[1;4m";
+
+/// `text` as one line for `caps`, its paths shown from `roots`: a message outside a report's
+/// box.
+pub fn text_into(out: &mut String, text: &crate::Text, caps: Caps, roots: &Roots<'_>) {
+    for span in &text.0 {
+        piece(out, span, caps, roots);
+    }
+}
 
 /// What the terminal a report is rendered for can do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -188,7 +199,10 @@ fn boxed(
         }
         spaces(out, space);
         for atom in &atoms.list[at..end] {
-            out.push_str(&atoms.text[atom.start..atom.end]);
+            match atom.what {
+                Piece::Word(word) => out.push_str(word),
+                Piece::Span(span) => piece(out, span, Atoms::caps(caps), roots),
+            }
         }
         column += space + group;
         at = end;
@@ -305,6 +319,15 @@ fn piece(out: &mut String, span: &Span, caps: Caps, roots: &Roots<'_>) {
             let cut = hash.char_indices().nth(8).map_or(hash.len(), |(at, _)| at);
             painted(out, caps, DIM, &hash[..cut]);
         }
+        Span::Command(command) => match caps.color {
+            true => painted(out, caps, COMMAND, command),
+            false => {
+                out.push('`');
+                out.push_str(command);
+                out.push('`');
+            }
+        },
+        Span::Strong(words) => painted(out, caps, BOLD, words),
         Span::Count(count) => styled(out, caps, DIM, |out| crate::push_number(out, *count)),
         Span::Took(ns) => styled(out, caps, DIM, |out| took_into(out, *ns)),
     }
@@ -404,58 +427,63 @@ fn spaces(out: &mut String, count: usize) {
 }
 
 /// A text cut at its spaces for wrapping: each atom a word or a styled span, the spaces
-/// before it, and its width on the terminal.
+/// before it, and its width on the terminal. A word is the text's own; a span is rendered
+/// once into `scratch` to be measured and again where it is written, so no atom is an index
+/// into a buffer.
 #[derive(Default)]
-struct Atoms {
-    text: String,
-    list: Vec<Atom>,
+struct Atoms<'t> {
+    /// The span being measured, cleared for each.
+    scratch: String,
+    list: Vec<Atom<'t>>,
 }
 
-struct Atom {
+struct Atom<'t> {
     space: usize,
-    start: usize,
-    end: usize,
+    what: Piece<'t>,
     width: usize,
 }
 
-impl Atoms {
-    fn of(&mut self, text: &Text, caps: Caps, roots: &Roots<'_>) {
+/// What an atom writes: a word of a plain span, or a whole styled span.
+#[derive(Clone, Copy)]
+enum Piece<'t> {
+    Word(&'t str),
+    Span(&'t Span),
+}
+
+impl<'t> Atoms<'t> {
+    /// The caps a span of the box is rendered with, measured and written alike: never wrapped
+    /// inside.
+    fn caps(caps: Caps) -> Caps {
+        Caps { width: None, ..caps }
+    }
+
+    fn of(&mut self, text: &'t Text, caps: Caps, roots: &Roots<'_>) {
+        // The spaces before the next atom; those at the end of a span carry into the next.
         let mut space = 0;
         for span in &text.0 {
             match span {
                 Span::Plain(words) => {
-                    let mut rest = words.as_str();
-                    loop {
-                        let word = rest.trim_start_matches(' ');
-                        space += rest.len() - word.len();
-                        if word.is_empty() {
-                            break;
+                    // Each `' '` is one column of space; the empty pieces between two in a row
+                    // are no word.
+                    for (at, word) in words.split(' ').enumerate() {
+                        if at > 0 {
+                            space += 1;
                         }
-                        let end = word.find(' ').unwrap_or(word.len());
-                        let start = self.text.len();
-                        self.text.push_str(&word[..end]);
+                        if word.is_empty() {
+                            continue;
+                        }
+                        let width = word.width();
                         // alloc: a report's atoms, once
-                        self.list.push(Atom {
-                            space,
-                            start,
-                            end: self.text.len(),
-                            width: word[..end].width(),
-                        });
+                        self.list.push(Atom { space, what: Piece::Word(word), width });
                         space = 0;
-                        rest = &word[end..];
                     }
                 }
                 span => {
-                    let start = self.text.len();
-                    piece(
-                        &mut self.text,
-                        span,
-                        Caps { color: caps.color, links: caps.links, width: None },
-                        roots,
-                    );
-                    let width = visible_width(&self.text[start..]);
+                    self.scratch.clear();
+                    piece(&mut self.scratch, span, Atoms::caps(caps), roots);
+                    let width = visible_width(&self.scratch);
                     // alloc: as above
-                    self.list.push(Atom { space, start, end: self.text.len(), width });
+                    self.list.push(Atom { space, what: Piece::Span(span), width });
                     space = 0;
                 }
             }
@@ -464,28 +492,51 @@ impl Atoms {
 }
 
 /// The columns `text` takes on a terminal, its escapes (CSI to the final byte, OSC to ST or
-/// BEL) taking none.
+/// BEL, whichever comes first) taking none; an escape never ended takes the rest.
 fn visible_width(text: &str) -> usize {
     let mut width = 0;
     let mut rest = text;
-    while let Some(at) = rest.find('\x1b') {
-        width += rest[..at].width();
-        let after = &rest[at + 1..];
-        rest = match after.as_bytes().first() {
-            Some(b'[') => {
-                let params = &after[1..];
-                params
-                    .find(|c: char| ('\x40'..='\x7e').contains(&c))
-                    .map_or("", |end| &params[end + 1..])
-            }
-            Some(b']') => match (after.find('\x07'), after.find("\x1b\\")) {
-                (Some(bel), Some(st)) if bel < st => &after[bel + 1..],
-                (_, Some(st)) => &after[st + 2..],
-                (Some(bel), None) => &after[bel + 1..],
+    while let Some((before, after)) = rest.split_once('\x1b') {
+        width += before.width();
+        rest = if let Some(params) = after.strip_prefix('[') {
+            params
+                .split_once(|c: char| ('\x40'..='\x7e').contains(&c))
+                .map_or("", |(_, past)| past)
+        } else if let Some(osc) = after.strip_prefix(']') {
+            match (osc.split_once('\x07'), osc.split_once("\x1b\\")) {
+                (Some((to_bel, past_bel)), Some((to_st, past_st))) => {
+                    match to_bel.len() < to_st.len() {
+                        true => past_bel,
+                        false => past_st,
+                    }
+                }
+                (Some((_, past)), None) | (None, Some((_, past))) => past,
                 (None, None) => "",
-            },
-            _ => after,
+            }
+        } else {
+            after
         };
     }
     width + rest.width()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_width;
+
+    #[test]
+    fn escapes_take_no_columns_around_multi_byte_characters() {
+        // CSI, ended by its final byte.
+        assert_eq!(visible_width("\u{e9}\x1b[1m\u{1f980}\x1b[0m\u{fc}"), 4);
+        // OSC ended by BEL, and by ST.
+        assert_eq!(visible_width("\x1b]0;t\u{ee}tle\x07\u{e9}"), 1);
+        assert_eq!(visible_width("\x1b]8;;file:///\u{e9}\x1b\\\u{1f980}\x1b]8;;\x1b\\"), 2);
+        // An OSC with both: the first of them ends it.
+        assert_eq!(visible_width("\x1b]8;;\u{e9}\x1b\\\u{fc}\x1b]0;x\x07"), 1);
+        assert_eq!(visible_width("\x1b]0;\u{e9}\x07\u{fc}\x1b]8;;\x1b\\"), 1);
+        // An escape never ended takes the rest; a lone ESC takes only itself.
+        assert_eq!(visible_width("\u{e9}\x1b]8;;\u{1f980}"), 1);
+        assert_eq!(visible_width("\u{e9}\x1b[\u{1f980}"), 1);
+        assert_eq!(visible_width("\u{e9}\x1b\u{fc}"), 2);
+    }
 }

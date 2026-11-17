@@ -26,7 +26,6 @@ use base_db::Db;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Domain, Hasher};
 use blaze_mem::Frame;
-use blaze_query::db::{Durability, Setter as _};
 use hir_def::{
     AdtId, EnumVariantId, LocalFieldId, VariantId,
     attrs::AttrFlags,
@@ -66,34 +65,52 @@ pub struct AdtPlan {
     pub variants: Box<[Box<[Name]>]>,
 }
 
-/// A profile's field order for one tree: the ADTs it ranks, by their ids in this database (the
-/// driver resolves the plan file's item keys, `blaze_items::field_order`), and the plan's
-/// content ID. Equal plans are plans with equal IDs.
-#[derive(Debug)]
+/// The stable key a plan names an ADT by: one no commit changes while the item is the same, so
+/// the driver names it without a snapshot (the plan file's item key, `blaze_items::key`), and
+/// a layout finds it from the ADT's id in whatever snapshot it runs in. Given by the plan's
+/// writer: the key is made in a crate above this one.
+pub type AdtKeyOf = fn(&Db, AdtId) -> ContentId;
+
+/// A profile's field order for one tree: the ADTs it ranks, by their stable keys ([`AdtKeyOf`];
+/// never by an id, which dies at the commit that drops its arena, while a plan is installed
+/// once and holds across commits), and the plan's content ID. Equal plans are plans with
+/// equal IDs.
 pub struct FieldOrderPlan {
     id: ContentId,
-    by_adt: HashMap<AdtId, AdtPlan, Global>,
+    key_of: AdtKeyOf,
+    by_key: HashMap<ContentId, AdtPlan, Global>,
+}
+
+impl fmt::Debug for FieldOrderPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FieldOrderPlan").field("id", &self.id).field("by_key", &self.by_key).finish()
+    }
 }
 
 impl FieldOrderPlan {
-    pub fn new(id: ContentId, by_adt: HashMap<AdtId, AdtPlan, Global>) -> FieldOrderPlan {
-        FieldOrderPlan { id, by_adt }
+    /// The plan `id` ranking each ADT whose key ([`AdtKeyOf`]) `key_of` gives under `by_key`.
+    pub fn new(id: ContentId, key_of: AdtKeyOf, by_key: HashMap<ContentId, AdtPlan, Global>) -> FieldOrderPlan {
+        FieldOrderPlan { id, key_of, by_key }
     }
 
     pub fn id(&self) -> ContentId {
         self.id
     }
 
-    pub fn get(&self, adt: AdtId) -> Option<&AdtPlan> {
-        self.by_adt.get(&adt)
+    /// The plan for `adt`, found by its stable key in `db`'s snapshot.
+    pub fn get(&self, db: &Db, adt: AdtId) -> Option<&AdtPlan> {
+        if self.by_key.is_empty() {
+            return None;
+        }
+        self.by_key.get(&(self.key_of)(db, adt))
     }
 
     pub fn len(&self) -> usize {
-        self.by_adt.len()
+        self.by_key.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_adt.is_empty()
+        self.by_key.is_empty()
     }
 }
 
@@ -106,27 +123,30 @@ impl PartialEq for FieldOrderPlan {
 impl Eq for FieldOrderPlan {}
 
 /// The field order plan every layout reads: absent, or holding `None`, means no plan, and every
-/// layout is rustc's. Set once per job, at high durability: a plan changes with the profile, not
-/// with an edit.
-#[blaze_query::input(singleton, debug)]
+/// layout is rustc's. Given by the driver while it builds a snapshot: a plan changes with the
+/// profile, not with an edit.
+#[blaze_memo::input(singleton, debug)]
 pub struct FieldOrder {
     #[returns(ref)]
     pub plan: Option<Arc<FieldOrderPlan>>,
 }
 
-/// Makes `plan` the plan of every query from now on (`None`: no plan). Sets the input only when
-/// the plan changed, so an unchanged plan invalidates nothing.
-pub fn install(db: &mut Db, plan: Option<Arc<FieldOrderPlan>>) {
-    match FieldOrder::try_get(db) {
-        None => {
-            _ = FieldOrder::new(db, Durability::HIGH, plan);
-        }
-        Some(input) => {
-            if *input.plan(db) != plan {
-                input.set_plan(db).with_durability(Durability::HIGH).to(plan);
-            }
-        }
-    }
+/// Makes `plan` the plan of every query of the snapshot `builder` builds (`None`: no plan),
+/// in its session arena. Read by its fact, the plan's content ID ([`FieldOrderPlan::id`]), so
+/// an unchanged plan is read as before by every record that read it.
+pub fn install(builder: &blaze_memo::Builder, plan: Option<Arc<FieldOrderPlan>>) {
+    FieldOrder::set(&builder.inputs(builder.session()), plan_fact(plan.as_deref()), plan);
+}
+
+/// The fact [`install`] gives [`FieldOrder`] by.
+pub fn plan_fact(plan: Option<&FieldOrderPlan>) -> blaze_memo::Fact {
+    let id = Hasher::new("hir-ty field order slot").finish();
+    let mut digest = Hasher::new("hir-ty field order plan");
+    match plan {
+        Some(plan) => digest.part(&[1]).id(&plan.id()),
+        None => digest.part(&[0]),
+    };
+    blaze_memo::Fact { id, digest: digest.finish() }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -178,10 +198,10 @@ static ORDER_DOMAIN: Domain = Domain::new("blaze v2 field order 1");
 /// The plan's ranks for `adt`, its field names resolved to ids: `None` without a plan or when
 /// the plan does not rank it. A field's rename that the plan does not name leaves this equal,
 /// so the layout is not asked again.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn field_ranks(db: &Db, adt: AdtId) -> Option<Ranks> {
     let input = FieldOrder::try_get(db)?;
-    let planned = input.plan(db).as_ref()?.get(adt)?;
+    let planned = input.plan(db).as_ref()?.get(db, adt)?;
     Some(resolve(db, adt, planned))
 }
 

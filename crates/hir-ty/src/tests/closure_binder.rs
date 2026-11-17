@@ -47,7 +47,7 @@ fn bound_vars<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Vec<Option<u32>> {
 #[test]
 fn a_closures_binder_gives_its_signature_its_late_bound_lifetimes() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())

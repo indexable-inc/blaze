@@ -89,6 +89,22 @@ impl Thread {
     pub(crate) fn leave(&mut self) {
         self.live = false;
     }
+
+    /// The CPU time the thread has used, read from another thread: `clock_gettime` of the
+    /// thread's own CPU clock, whose id the kernel makes from its tid (`MAKE_THREAD_CPUCLOCK`:
+    /// `!tid << 3 | CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_SCHED`, include/linux/posix-timers.h).
+    /// `None` for a thread that left (its tid may be another's by now) or a clock that fails.
+    /// The caller holds the lock the thread takes to leave, so the tid is its.
+    pub(crate) fn cpu_ns(&self) -> Option<u64> {
+        if !self.live {
+            return None;
+        }
+        let clock = (!(self.tid as libc::clockid_t)) << 3 | 6;
+        let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `at` is a timespec to fill; an id of no thread fails with EINVAL.
+        let got = unsafe { libc::clock_gettime(clock, &mut at) };
+        (got == 0).then(|| at.tv_sec as u64 * 1_000_000_000 + at.tv_nsec as u64)
+    }
 }
 
 /// The event on one thread, and what its switches left owed.
@@ -205,6 +221,12 @@ fn drain(
     let mut sample = |at_ns: u64, on_cpu: bool, (span, job, fiber): (u64, u64, u32), pcs: &[u64]| {
         let depth = pcs.len().min(DEPTH);
         if on_cpu && depth == 0 {
+            return;
+        }
+        // A block in a span of no build while no build runs is not sampled unless asked, as
+        // on macOS (`super::samples_blocked`); judged as the drain reads it, so a block that
+        // ended as its build did may be judged a moment late.
+        if !on_cpu && !super::samples_blocked(crate::flight::build_of(span)) {
             return;
         }
         let mut it = Sample {
@@ -337,6 +359,10 @@ pub(super) fn run(hz: u32) {
 }
 
 /// Why the sampler's loop ended, if it did: its tick's wait failed. Said in every dump after.
+#[expect(
+    blaze::process_static,
+    reason = "set once, as the sampler's loop ends: one message"
+)]
 static STOPPED: Lock<Option<String>> = Lock::unrecorded("profile.sampler.stopped", None);
 
 /// What the sampler counted that a dump should say: samples older than their context log,

@@ -551,9 +551,9 @@ fn written(db: &Db, body: &MirBody<'_>) -> Vec<u8> {
 /// the sample's binding ids index, and no location literals.
 fn locations(db: &Db) -> Locations<'_> {
     let ModuleDefId::FunctionId(owner) = item(db, "owner") else { panic!("`owner` is a function") };
-    let store =
-        ExpressionStore::of(db, ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(owner)));
-    Locations { store, exprs: &[], word: 8 }
+    let owner = ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(owner));
+    let store = ExpressionStore::of(db, owner);
+    Locations { db, owner, store, exprs: &[], word: 8 }
 }
 
 fn read_back<'db>(db: &'db Db, bytes: &[u8]) -> Result<MirBody<'db>, FormatError> {
@@ -1199,6 +1199,10 @@ fn a_body_with_inlined_code_is_refused_on_write() {
             "a body with devirtualized calls, which only optimized MIR has",
         ),
         (
+            Box::new(|body: &mut MirBody<'_>| body.inlined.rely([7; 32])),
+            "a body that relied on facts, which only optimized MIR has",
+        ),
+        (
             Box::new(|body: &mut MirBody<'_>| {
                 body.basic_blocks[idx(0)].statements[0].span = MirSpan::Inlined(0)
             }),
@@ -1399,6 +1403,7 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         devirtualized,
         specialized,
         moved_to_frame: _,
+        relied,
     } = &body.inlined;
     blocks += vec(&body.param_locals)
         + vec(&body.promoted_locals)
@@ -1417,7 +1422,8 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         + vec(bindings)
         + vec(promoted)
         + vec(devirtualized)
-        + vec(specialized);
+        + vec(specialized)
+        + vec(relied);
     blocks
 }
 

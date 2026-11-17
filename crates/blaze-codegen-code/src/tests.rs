@@ -147,8 +147,10 @@ fn the_code_is_of_the_contents_alone() {
         a.crates,
         [
             "blaze_codegen_code",
+            "blaze_inproc_rt",
             "blaze_item_hash",
             "blaze_macro_eval",
+            "blaze_usercode",
             "front",
             "hir_def",
             "hir_ty",
@@ -530,10 +532,19 @@ fn the_front_end_is_keyed_by_its_own_code_alone() {
     let worked = work_out_of(&read, &FRONT_END, &env()).unwrap();
     assert_eq!(
         worked.packages,
-        ["blaze-codegen-code", "blaze-item-hash", "blaze-macro-eval", "front", "hir-def", "hir-ty"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        [
+            "blaze-codegen-code",
+            "blaze-inproc-rt",
+            "blaze-item-hash",
+            "blaze-macro-eval",
+            "blaze-usercode",
+            "front",
+            "hir-def",
+            "hir-ty",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     );
     let mut other = env();
     other.vars.insert("CARGO_ENCODED_RUSTFLAGS".to_owned(), Some("-Copt-level=1".to_owned()));

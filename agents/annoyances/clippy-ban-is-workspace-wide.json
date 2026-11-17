@@ -1,0 +1,14 @@
+{
+ "id": "clippy-ban-is-workspace-wide",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane http-off-tokio (blaze-http drivers on blaze-core's effects)",
+ "where": ".clippy.toml; crates/blaze-http, crates/blaze-registry, crates/blaze-remote Cargo.toml",
+ "what": "The brief asked for a `.clippy.toml` ban on `tokio::` paths for the four HTTP crates only. clippy reads one config per crate: the root .clippy.toml, or a crate's own clippy.toml, which replaces the root's whole (the hot crates copy ~300 lines of it). A per-crate ban means another full copy; a root ban hits harness, ix-prof, blaze-ci and blaze-api, which use tokio on purpose.",
+ "cost": "no lint-level ban landed; the guard is that the manifests no longer name tokio, so a `tokio::` path in those crates does not resolve",
+ "cause": "clippy's disallowed-* lists are global paths with no per-crate scope, and a crate's clippy.toml does not extend the root's",
+ "class": "a rule that applies to a set of crates, put in a config that only scopes per workspace or per replaced file",
+ "prevention": "a blaze lint (blaze-lints) with a per-crate allow-list of crates a path may be used from, read from one table, as env-read-allowed does for modules",
+ "workaround": "the dependency's absence from Cargo.toml is the ban for blaze-http, blaze-registry and blaze-remote; blaze-cargo still depends on tokio for its toolchain downloads' executor",
+ "fix": "not yet",
+ "state": "open"
+}

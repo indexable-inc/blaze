@@ -1,0 +1,11 @@
+{
+ "id": "edit3-10",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "blaze: an output a build does not name, right after its answer",
+ "what": "`blaze build -q` answered, and an `exec` of `<build dir>/debug/build/hello/<id>/out/hello` (the path the `link:` line prints) 0.3 s later failed once in four with `Permission denied` on the base binaries: the answer waits for the files it names (`debug/hello`) and places the rest after, and a file being placed is a clone with a new file's mode until its mode is set.",
+ "cost": "one measurement script that died",
+ "cause": "the `link:` line names a path the answer does not wait for",
+ "workaround": "run `debug/hello`, the path the build names",
+ "state": "open: the `link:` line should name the path the answer waits for, or the staged file should have its mode before the rename"
+}

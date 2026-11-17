@@ -192,6 +192,44 @@ impl<'db> TypeRelation<DbInterner<'db>> for LatticeOp<'_, 'db> {
                 TyKind::Alias(_, AliasTy { kind: Opaque { def_id: b_def_id }, .. }),
             ) if a_def_id == b_def_id => super_combine_tys(infcx, self, a, b),
 
+            // blaze: refinements by enum variants (`#![blaze::pattern_types]`), which widen to
+            // a larger set and to their base type for free (docs/v2/plan/design/edition.md,
+            // section 8). The bound is the larger set when one set holds the other, else the
+            // base type; never a set the two did not name.
+            (TyKind::Pat(a_base, a_pat), TyKind::Pat(b_base, b_pat))
+                if a_pat.kind().is_variants() && b_pat.kind().is_variants() =>
+            {
+                let a_within_b = a_pat.kind().variants_within(b_pat.kind());
+                let b_within_a = b_pat.kind().variants_within(a_pat.kind());
+                let base = self.tys(a_base, b_base)?;
+                Ok(match (self.kind, a_within_b, b_within_a) {
+                    (LatticeOpKind::Lub, true, _) => b,
+                    (LatticeOpKind::Lub, _, true) => a,
+                    (LatticeOpKind::Lub, false, false) => base,
+                    (LatticeOpKind::Glb, true, _) => a,
+                    (LatticeOpKind::Glb, _, true) => b,
+                    (LatticeOpKind::Glb, false, false) => {
+                        return Err(rustc_type_ir::error::TypeError::Sorts(
+                            rustc_type_ir::error::ExpectedFound::new(a, b),
+                        ));
+                    }
+                })
+            }
+            (TyKind::Pat(a_base, a_pat), _) if a_pat.kind().is_variants() => {
+                self.tys(a_base, b)?;
+                Ok(match self.kind {
+                    LatticeOpKind::Lub => b,
+                    LatticeOpKind::Glb => a,
+                })
+            }
+            (_, TyKind::Pat(b_base, b_pat)) if b_pat.kind().is_variants() => {
+                self.tys(a, b_base)?;
+                Ok(match self.kind {
+                    LatticeOpKind::Lub => a,
+                    LatticeOpKind::Glb => b,
+                })
+            }
+
             _ => super_combine_tys(infcx, self, a, b),
         }
     }

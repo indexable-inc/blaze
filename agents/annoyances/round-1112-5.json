@@ -1,0 +1,18 @@
+{
+ "id": "round-1112-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), round runner for the main agent",
+ "where": "blaze-vm: memory while the measuring lane waited",
+ "what": "The runner ran two whole test suites (60 executables each, six at a time), a test compile and the lanes` functional runs at once: two simulated-oracle executables at 19 GiB each, three test-started daemons at 19 to 22 GiB, the functional runs` daemon at 21 GiB, 8 GiB of tmpfs homes and 29 GiB of /tmp: 233 of 251 GiB used, and lane reth`s cold build was admitted 37 GiB where it needs about 70.",
+ "cost": "lane reth (the owner`s priority) blocked until the main agent noticed; all of the round`s running units killed and to be rerun",
+ "whys": [
+  "no measure of free memory before starting a unit",
+  "every unit was started as soon as it could be, to shorten the round",
+  "a daemon`s 15 to 20 GiB is not visible in a unit`s own description",
+  "the VM is shared and nobody holds a reservation"
+ ],
+ "class": "the round runner starving the measuring lane",
+ "prevention": "one launcher for round units (u.sh) that refuses to start when `free -g` available is under the reserve the measuring lane asked for (100 GiB), and a cap of one memory-heavy unit; the reserve is a file on the VM the measuring lane writes and removes",
+ "workaround": "systemctl kill the round`s units; rm the round`s tmpfs homes",
+ "state": "open: u.sh has no such check yet"
+}

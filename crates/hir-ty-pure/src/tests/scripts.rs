@@ -6,7 +6,7 @@ use base_db::Db;
 use blaze_ids::ContentId;
 use hir_def::FunctionId;
 
-use super::fixture::{crate_named, db_with};
+use super::fixture::{crate_named, db_with, give_build};
 use crate::{Effects, Proof, Purity, ScriptProof, main_of, script_proof, script_purity};
 
 /// The `main` of the build script crate `build_script` of a fixture of the toolchain and
@@ -14,7 +14,7 @@ use crate::{Effects, Proof, Purity, ScriptProof, main_of, script_proof, script_p
 #[track_caller]
 fn script(crates: &str) -> (Db, FunctionId) {
     let mut db = db_with(crates);
-    blaze_item_hash::identity::set_build(&mut db, ContentId([7; 32]));
+    give_build(&mut db);
     let krate = crate_named(&db, "build_script");
     let main = main_of(&db, krate).expect("the script has a `main`");
     (db, main)
@@ -24,7 +24,7 @@ fn script(crates: &str) -> (Db, FunctionId) {
 #[track_caller]
 fn purity_of(crates: &str) -> Purity {
     let (db, main) = script(crates);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         // Every fixture is a test of the summaries' keys: through its home or in the script,
         // each instance's summary is the same (hir_ty_mir::mir::home).
         super::share::keys_agree(&db, crate_named(&db, "build_script"));
@@ -92,18 +92,16 @@ fn bounded(
     db: &Db,
     main: FunctionId,
     steps: u64,
-) -> Result<(ScriptProof, u64), blaze_query::db::OutOfSteps> {
+) -> Result<(ScriptProof, u64), crate::OutOfSteps> {
     // clone: a test's answer
-    blaze_query::db::attach(db, || {
-        blaze_query::db::with_steps(steps, || script_proof(db, main).clone())
-    })
+    blaze_memo::attach(db, || crate::with_steps(steps, || script_proof(db, main).clone()))
 }
 
 /// The script in `crates` with every summary its walk reaches made first, under no bound: what
 /// a warm daemon has, or a busy one whose other tasks ran them.
 fn warmed(crates: &str) -> (Db, FunctionId) {
     let (db, main) = script(crates);
-    blaze_query::db::attach(&db, || crate::walk::identity_parts(&db, main));
+    blaze_memo::attach(&db, || crate::walk::identity_parts(&db, main));
     (db, main)
 }
 
@@ -210,6 +208,36 @@ fn a_build_scripts_steps_follow_each_generic_from_the_crate_that_asks_for_it() {
         (cold.steps, warm.steps),
         (short, short),
         "both took all they were given: {cold}; {warm}"
+    );
+}
+
+/// std's randomness and wall clock are leaves a build script's provider answers
+/// (docs/v2/plan/design/determinism.md): the walk stops at them, and the proof says which it
+/// uses, so the driver keys the run by `SOURCE_DATE_EPOCH` when it asks the time.
+#[test]
+fn a_hash_maps_keys_and_the_wall_clock_are_the_providers() {
+    pure(
+        r#"
+//- /build.rs crate:build_script deps:std
+fn main() {
+    let keys = std::hash::RandomState::new();
+    let _ = keys.k0;
+    println!("cargo:rustc-cfg=has_x");
+}
+"#,
+        Effects::PRINT.union(Effects::SEEDED),
+        &[],
+    );
+    pure(
+        r#"
+//- /build.rs crate:build_script deps:std
+fn main() {
+    let now = std::time::SystemTime::now();
+    let _ = now.seconds;
+}
+"#,
+        Effects::WALL,
+        &[],
     );
 }
 
@@ -620,8 +648,8 @@ fn main() {
 fn same_parts(a: &str, b: &str, how: &str) {
     let parts = |crates: &str| {
         let (db, main) = script(crates);
-        blaze_query::db::attach(&db, || {
-            let main_body = blaze_item_hash::identity::identity_parts(&db, main.into());
+        blaze_memo::attach(&db, || {
+            let main_body = blaze_item_hash::identity::early_parts(&db, main.into());
             (main_body, crate::walk::identity_parts(&db, main))
         })
     };
@@ -668,7 +696,7 @@ fn main()
     println!( "cargo:rerun-if-changed=build.rs" );
 }
 
-/// Writes `text` at `path`.
+// Writes `text` at `path`. (A doc comment is an attribute, part of the item's own text.)
 fn emit(path: &Path, text: &str)
 {
     fs::write(path, text).unwrap();

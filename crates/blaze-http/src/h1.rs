@@ -378,9 +378,7 @@ impl Chunked {
                     }
                     self.state = match (self.state, byte) {
                         (ChunkState::Trailer, b'\r') => ChunkState::EndLf,
-                        (ChunkState::Trailer | ChunkState::TrailerLine, b'\r') => {
-                            ChunkState::TrailerLf
-                        }
+                        (ChunkState::TrailerLine, b'\r') => ChunkState::TrailerLf,
                         (ChunkState::Trailer | ChunkState::TrailerLine, _) => {
                             ChunkState::TrailerLine
                         }

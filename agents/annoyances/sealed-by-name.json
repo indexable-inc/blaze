@@ -1,0 +1,14 @@
+{
+ "id": "sealed-by-name",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 3h, int-1112",
+ "where": "crates/blaze-cargo/src/serve/unit/compile.rs pin_kept and sealed, serve/unit/deps.rs store, crates/hir-def/src/deps/key.rs sealed_in",
+ "what": "Whether a crate is built once a machine was decided in four places by four rules: the package name \"bstd\" (pin_kept, deps::store), a crate origin that is not local (hir_def::deps::sealed), and a shipped tree under the manifest dir (compile::sealed). A registry crate and a git dependency at a locked commit were sealed in one place and not another, so their front-end records went to the home while their units' records went to the layer.",
+ "cost": "every home rebuilt the front end of every registry crate; no daemon of a second home could reuse a sealed crate whole",
+ "cause": "sealing was inferred where it was needed from whatever that code had at hand (a name, an origin) instead of being a fact the planner records once",
+ "class": "a property recomputed at each use site from proxies instead of stated once at its source",
+ "prevention": "one rule in serve::sealed::pin (a digest that pins the tree: shipped, registry checksum, git locked commit), recorded by the planner as CrateData::sealed and read by everyone else; the name checks are deleted",
+ "workaround": "none",
+ "fix": "serve::sealed::pin; Lower::sealed and CrateData::sealed; hir_def::deps::sealed_in reads the pin only; KeptPut::into routes a sealed crate's records to the layer, waited on with the layer's own durable. Tests: a_package_is_sealed_exactly_when_a_digest_pins_its_tree, a_crate_is_sealed_by_its_pin_and_nothing_else, a_sealed_crate_one_home_built_on_the_machine_layer_another_home_builds_none_of (controls: the origin rule; records routed to the home).",
+ "state": "written, not yet built"
+}

@@ -23,7 +23,14 @@
 //! depends on, uses it, so it can depend on nothing that takes `blaze-check`
 //! (docs/v2/plan/design/model-checker.md). `blaze-ids` re-exports it as `blaze_ids::radix`.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_ext)]
+// `#![blaze::trust]` below names blaze's tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "a parallel scatter: jobs write disjoint ranges of one buffer at once (`Parts`), which the `unsafe trait Workers` promises run exactly once each before `run` returns; and a CSR's items set to their length once every place is written"
+)]
 
 use std::{
     mem::MaybeUninit,

@@ -8,14 +8,21 @@
 //! system ([`fs::CrashFs`]) and a scheduler of actor threads ([`actors`]) are all it takes.
 //!
 //! - [`fs`]: what a crash keeps, as ALICE models it (Pillai et al., OSDI 2014): a prefix of
-//!   each file's unsynced changes, the last perhaps torn, and the directory entries a
-//!   [`fs::Persist`] model allows.
+//!   each file's unsynced changes, the last perhaps torn, the directory entries a
+//!   [`fs::Persist`] model allows, what a barrier orders, and whether a clone is made or
+//!   refused ([`fs::Clones`]: a store's open tries one, so every scenario runs on both).
 //! - [`explore`]: stateless depth-first search over the choices, bounded, with a seeded random
 //!   mode, shrinking, and a report naming the schedule and the crash point.
 //! - [`store`]: the controller every scenario runs on, the checks of a restore, and the
 //!   store's scenario.
 //! - [`kernel`]: the kernel's scenario: two gets racing for one shape slot, and an impure step
 //!   whose second value must be refused.
+//!
+//! A build answers without waiting for the store: what it left settles after its answer, kept
+//! for reuse only once it is durable and said lost when it never is ([`store::Op::Settle`]).
+//! The store's own properties (a restore serves only what a writer fully wrote, opens with
+//! what was durable, and equals a fresh build) are checked at every crash whenever answers
+//! are sent; they never rested on the answer's wait.
 //!
 //! Each property is a test named for it in `tests.rs`.
 
@@ -37,7 +44,10 @@ pub mod properties {
     pub const NEVER_SILENTLY_EMPTY: &str = "a restore never silently starts empty";
     pub const REFUSED_NOT_OVERWRITTEN: &str =
         "two different values under one identity are refused, never overwritten";
-    pub const ANSWERED_SURVIVES: &str = "after a build answers, its results survive any crash";
+    pub const KEPT_SURVIVES: &str =
+        "what the store called durable, and what an answered build kept for reuse once it was, survives any crash";
+    pub const LOSS_IS_SAID: &str =
+        "what an answered build left that was not kept is said lost, never dropped silently";
     pub const RESTORE_EQUALS_FRESH: &str = "the restore after any crash equals a fresh build";
     pub const EVERY_WAIT_ENDS: &str = "every wait ends";
     pub const KERNEL_GETS_END: &str =

@@ -1,0 +1,19 @@
+{
+ "id": "sealed-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sealed-1112",
+ "where": "the brief's cause for std's rows being MEDIUM",
+ "what": "The brief and restore.md said std's rows are MEDIUM because they read Resolutions, ImplSlices, the crate graph and source roots. A census of the rows (Storage::durability_census) showed 28 rows read Resolutions directly and 7,191 ImplSlices; the 1.9 million are MEDIUM through the tracked structs those few rows make (DefMapPair read by 466,718 rows, ModuleScope 117,442, ItemBodySyntax 116,449, Modules 65,809) and through each file's source root (7,586) and each root's file set (7,546); the crate graph (AllCrates) held none of the top twenty.",
+ "cost": "none: the census was written before the fix; a fix from the brief's list would have left source roots' MEDIUM setters in view.rs and files.rs",
+ "cause": "a row's kind is the lowest it read and nothing said which read set it",
+ "workaround": "BLAZE_DURABILITY_CENSUS=1 in the daemon's environment prints the fields by rows after each build",
+ "fix": "built: crates/blaze-query/src/db/census.rs",
+ "whys": [
+  "a row keeps only the minimum of what it read",
+  "the minimum is all a verify needs",
+  "nothing asked 'which input' until a whole library was below HIGH"
+ ],
+ "class": "a derived property with no way to ask what it derives from",
+ "prevention": "the census is in the tree; a test holds a library's def map at HIGH (a_library_crates_def_map_reads_nothing_below_high)",
+ "state": "fixed in 73e94c355f"
+}

@@ -5,10 +5,13 @@
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin, all_crates};
 use hir_expand::fixture;
 
-/// The minicore regions the stand-ins use, then `alloc` and `std`. A test appends its crates.
+/// The minicore regions the stand-ins use, then `alloc` and `std`, in a library root as a
+/// build's toolchain is (blaze-lower gives a crate the origin of its root: base-db
+/// `crate_durability`), so their files are `HIGH` and their crates are sealed. A test appends its crates with
+/// [`with_toolchain`], which starts a local root for them.
 pub(super) const TOOLCHAIN: &str = r#"
 //- minicore: sized, copy, clone, drop, deref, fmt, result, option, panic, as_ref, from, try, fn, transmute, unsize, coerce_unsized, dispatch_from_dyn, builtin_impls, index, slice, str, borrow, asm, write
-//- /alloc.rs crate:alloc
+//- /alloc.rs crate:alloc new_source_root:library
 pub mod alloc {
     unsafe extern "Rust" {
         #[rustc_allocator]
@@ -218,6 +221,8 @@ mod sys {
         pub fn mkdir(path: *const u8, mode: u32) -> i32;
         pub fn posix_spawnp(pid: *mut i32, file: *const u8) -> i32;
         pub fn exit(code: i32) -> !;
+        pub fn getrandom(buf: *mut u8, len: usize, flags: u32) -> isize;
+        pub fn clock_gettime(clock: i32, time: *mut i64) -> i32;
     }
 
     pub mod io {
@@ -580,6 +585,35 @@ pub mod fs {
     }
 }
 
+pub mod hash {
+    pub struct RandomState {
+        pub k0: u64,
+        pub k1: u64,
+    }
+
+    impl RandomState {
+        pub fn new() -> RandomState {
+            let mut keys = [0u8; 16];
+            unsafe { crate::sys::getrandom(keys.as_mut_ptr(), 16, 0) };
+            RandomState { k0: keys[0] as u64, k1: keys[8] as u64 }
+        }
+    }
+}
+
+pub mod time {
+    pub struct SystemTime {
+        pub seconds: i64,
+    }
+
+    impl SystemTime {
+        pub fn now() -> SystemTime {
+            let mut time = [0i64; 2];
+            unsafe { crate::sys::clock_gettime(0, time.as_mut_ptr()) };
+            SystemTime { seconds: time[0] }
+        }
+    }
+}
+
 pub mod process {
     use crate::ffi::OsStr;
     use crate::io;
@@ -608,12 +642,89 @@ pub mod process {
         unsafe { crate::sys::exit(code) }
     }
 }
+
+/// The shapes of the pinned library's `unsafe` precondition checks
+/// (`core::ub_checks::assert_unsafe_precondition!`): the check is a function written inside
+/// the `unsafe fn` whose precondition it is, and aborts when the caller broke it.
+pub mod unchecked {
+    /// `core::hint::assert_unchecked`.
+    pub unsafe fn assert_unchecked(cond: bool) {
+        #[rustc_no_mir_inline]
+        #[rustc_nounwind]
+        fn precondition_check(cond: bool) {
+            if !cond {
+                core::panicking::panic("unsafe precondition(s) violated: hint::assert_unchecked");
+            }
+        }
+        precondition_check(cond);
+    }
+
+    /// An `unsafe fn` over another, as `NonNull::new_unchecked` is over the pointer's check.
+    pub unsafe fn new_unchecked(at: usize) -> usize {
+        unsafe { assert_unchecked(at != 0) };
+        at
+    }
+
+    /// A safe function that upholds what it calls, as `CStr::to_bytes` does.
+    pub fn to_bytes(len: usize) -> usize {
+        // SAFETY: the stand-in's: what it asserts holds.
+        unsafe { assert_unchecked(true) };
+        len
+    }
+
+    /// The same through a closure, as `MaybeUninit::zeroed` and the iterators are written.
+    pub fn zeroed() -> usize {
+        // SAFETY: as above.
+        let make = || unsafe { new_unchecked(1) };
+        make()
+    }
+
+    /// A panic that is no precondition check: `Option::unwrap`'s.
+    pub fn unwrap(value: Option<usize>) -> usize {
+        match value {
+            Some(it) => it,
+            None => core::panicking::panic("called `Option::unwrap()` on a `None` value"),
+        }
+    }
+
+    /// Named as the check is, but not one: at the module's level, with no attribute.
+    pub fn precondition_check(cond: bool) {
+        if !cond {
+            core::panicking::panic("not a precondition check");
+        }
+    }
+}
 "#;
 
 /// The database of the toolchain with `crates` appended (each starting `//- /path crate:..`).
 pub(super) fn db_with(crates: &str) -> Db {
-    // alloc: a test's fixture text
-    fixture::db(&format!("{TOOLCHAIN}{crates}")).into_db()
+    fixture::db(&with_toolchain(TOOLCHAIN, crates)).into_db()
+}
+
+/// The fixture of `toolchain` (TOOLCHAIN, or a test's edit of it) with `crates` after it, in a
+/// local root of their own: the first file of `crates` starts one, unless it starts a root
+/// itself (a test's library crate).
+#[track_caller]
+pub(super) fn with_toolchain(toolchain: &str, crates: &str) -> String {
+    let start = crates.find("//- /").expect("the appended crates start with a `//- /path` line");
+    let end = crates[start..].find('\n').map_or(crates.len(), |it| start + it);
+    let first = &crates[start..end];
+    assert!(first.contains(" crate:"), "the first appended file names its crate: {first}");
+    match first.contains("new_source_root:") {
+        // alloc: a test's fixture text
+        true => format!("{toolchain}{crates}"),
+        // alloc: a test's fixture text
+        false => format!("{toolchain}{}{first} new_source_root:local{}", &crates[..start], &crates[end..]),
+    }
+}
+
+/// Tells `db` that front end 7 computes its bodies' identities, from a commit of its own on
+/// (`blaze_item_hash::identity::give_build`, as a driver does): take every id but a file's and
+/// a crate key after it.
+pub(super) fn give_build(db: &mut Db) {
+    let mut edit = db.edit();
+    blaze_item_hash::identity::give_build(&mut edit, blaze_ids::ContentId([7; 32]));
+    _ = edit.commit();
 }
 
 /// The crate named `name` in `db`.

@@ -1,0 +1,8 @@
+[package]
+name = "m2015"
+version = "0.1.0"
+edition = "2015"
+
+[lib]
+proc-macro = true
+doctest = false

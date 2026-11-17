@@ -10,7 +10,9 @@
 //! release does, saying so in one line. `--ignore-pin` runs this blaze, release or not,
 //! whatever the workspace pins ([`choose`]).
 //!
-//! Asked before every command (`program.rs`), so it stays small and quick: std, `toml` and blaze-units' version rule only.
+//! Asked before every command (`program.rs`), so it stays small and quick: std, `toml`,
+//! blaze-units' version rule, and a hash to name the file a lookup is kept in ([`found`]): once
+//! kept, a lookup stats the manifests on the way and reads and parses none.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -241,8 +243,83 @@ pub(crate) fn root_manifest(dir: &Path) -> Result<Option<PathBuf>, PinError> {
 /// `Err` is a manifest that can't be read, or a pin that is not a version.
 pub(crate) fn pinned(manifest: &Path) -> Result<Option<String>, PinError> {
     let Some(text) = manifest_text(manifest)? else { return Ok(None) };
-    let table = toml::from_str::<toml::Table>(&text)
-        .map_err(|error| PinError::NotToml { manifest: manifest.to_owned(), error })?;
+    pin_of(manifest, &table_of(manifest, &text)?)
+}
+
+/// A workspace found from a directory and what it pins ([`found`]), a manifest's stamp, and
+/// the kept lookup's first line: blaze-thin's, whose reader of the kept file ([`kept`]) the thin
+/// `blaze` asks too, so the launcher and it read one file one way.
+pub(crate) use blaze_thin::pin::Found;
+use blaze_thin::pin::{Stamp, stamp};
+
+/// How old a manifest's modification must be before a lookup that read it is kept: an edit
+/// that keeps its length and inode within the file system's time step of the last one would
+/// leave its stamp as it was (git's "racily clean" file), and a pin's version is often edited
+/// to one of the same length. Two seconds is past every file system's step blaze runs on.
+const SETTLED_NS: u128 = 2_000_000_000;
+
+/// Where the lookup from `start` is kept: `pins/<hash of start>` in blaze's home, beside
+/// [`versions`]. None with no home, or for a directory that is not UTF-8 or has a tab or a
+/// newline in its name (the file's lines could not name it): each lookup there reads the
+/// manifests.
+fn kept_at(start: &Path) -> Option<PathBuf> {
+    blaze_thin::pin::kept_at(versions()?.parent()?, start)
+}
+
+/// The lookup from `start` as `file` keeps it, when every manifest it read, and every place it
+/// found none, is as it was: a stat of each, and no manifest read or parsed. `None` when there
+/// is none kept, one of them moved, or the file is not what [`keep`] writes: the manifests are
+/// read then, and the file written again.
+fn kept(file: &Path, start: &Path) -> Option<Found> {
+    blaze_thin::pin::kept(file, start, |version| is_version(version) || is_channel(version))
+}
+
+/// Keeps the lookup from `start` that read `seen` and found `found`, in `file`, for [`kept`].
+/// Nothing is kept when a manifest's stamp could not be had, changed while it was read, is
+/// newer than [`SETTLED_NS`] (or the clock can't say), or a path can't be a line's. A file
+/// that can't be written is no error: the next lookup reads the manifests, as this one did.
+fn keep(file: &Path, start: &Path, seen: &[(PathBuf, Result<Option<Stamp>, ()>)], found: &Found) {
+    use std::fmt::Write as _;
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    fn line(path: &Path) -> Option<&str> {
+        path.to_str().filter(|it| !it.contains(['\t', '\n']))
+    }
+    let Some(start) = line(start) else { return };
+    let mut text = format!("{}\nstart\t{start}\n", blaze_thin::pin::KEPT); // alloc: the file's text, once a lookup kept
+    for (path, was) in seen {
+        let (Ok(was), Some(named)) = (was, line(path)) else { return };
+        // As it was before it was read: a manifest written meanwhile is not what was read.
+        if stamp(path) != Ok(*was) {
+            return;
+        }
+        // Writing to a String cannot fail.
+        let _ = match was {
+            Some(it) if now.as_nanos().saturating_sub(it.modified_ns) < SETTLED_NS => return,
+            Some(it) => writeln!(text, "read\t{named}\t{}\t{}\t{}", it.len, it.modified_ns, it.inode),
+            None => writeln!(text, "none\t{named}"),
+        };
+    }
+    if let Some(manifest) = &found.manifest {
+        let Some(named) = line(manifest) else { return };
+        let _ = writeln!(text, "root\t{named}");
+    }
+    if let Some(pin) = &found.pinned {
+        let _ = writeln!(text, "pin\t{pin}");
+    }
+    text.push_str("end\n");
+    _ = crate::versions::kept(file, text.as_bytes());
+}
+
+/// The table of `manifest`'s `text`.
+fn table_of(manifest: &Path, text: &str) -> Result<toml::Table, PinError> {
+    toml::from_str::<toml::Table>(text)
+        .map_err(|error| PinError::NotToml { manifest: manifest.to_owned(), error })
+}
+
+/// What `table`, the root manifest `manifest`'s, pins ([`pinned`]).
+fn pin_of(manifest: &Path, table: &toml::Table) -> Result<Option<String>, PinError> {
     let blaze =
         table.get("workspace").and_then(|it| it.get("metadata")).and_then(|it| it.get("blaze"));
     let Some(version) = blaze.and_then(|it| it.get("version")) else { return Ok(None) };
@@ -250,6 +327,67 @@ pub(crate) fn pinned(manifest: &Path) -> Result<Option<String>, PinError> {
         Some(version) if is_version(version) || is_channel(version) => Ok(Some(version.to_owned())),
         _ => Err(PinError::NotAVersion { manifest: manifest.to_owned(), pinned: version.clone() }),
     }
+}
+
+/// [`root_manifest`] of `dir` and what it [`pinned`], each manifest read and parsed once, and
+/// each place a manifest was looked for noted in `seen` with its stamp as it was before the
+/// read.
+fn find(
+    dir: &Path,
+    seen: &mut Vec<(PathBuf, Result<Option<Stamp>, ()>)>,
+) -> Result<Found, PinError> {
+    let mut nearest = None;
+    for dir in dir.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        seen.push((manifest.clone(), stamp(&manifest))); // clone: a path, once a directory on the way
+        let Some(text) = manifest_text(&manifest)? else { continue };
+        let table = table_of(&manifest, &text)?;
+        if table.contains_key("workspace") {
+            let pinned = pin_of(&manifest, &table)?;
+            return Ok(Found { manifest: Some(manifest), pinned });
+        }
+        let named = table.get("package").and_then(|it| it.get("workspace"));
+        if let Some(root) = named.and_then(toml::Value::as_str) {
+            let manifest = dir.join(root).join("Cargo.toml");
+            seen.push((manifest.clone(), stamp(&manifest))); // clone: a path, once
+            let pinned = pinned(&manifest)?;
+            return Ok(Found { manifest: Some(manifest), pinned });
+        }
+        if nearest.is_none() {
+            nearest = Some((manifest, table));
+        }
+    }
+    match nearest {
+        Some((manifest, table)) => {
+            let pinned = pin_of(&manifest, &table)?;
+            Ok(Found { manifest: Some(manifest), pinned })
+        }
+        None => Ok(Found { manifest: None, pinned: None }),
+    }
+}
+
+/// The workspace `start` is in and what it pins: [`root_manifest`] and [`pinned`] as one
+/// lookup, which the launcher makes before every command. Kept in blaze's home by `start`
+/// ([`kept_at`]) with the stamp of every manifest it read and every place it found none, so
+/// the next lookup from `start` is a stat of each and one small read, and reads and parses no
+/// manifest; a stamp that moved (a manifest edited, added or removed anywhere on the way)
+/// reads them all again. What a lookup answers is the same either way, and an error is never
+/// kept.
+pub(crate) fn found(start: &Path) -> Result<Found, PinError> {
+    found_kept_in(start, kept_at(start).as_deref())
+}
+
+/// [`found`], its lookup kept in `file` when there is one.
+fn found_kept_in(start: &Path, file: Option<&Path>) -> Result<Found, PinError> {
+    if let Some(found) = file.and_then(|file| kept(file, start)) {
+        return Ok(found);
+    }
+    let mut seen = Vec::new(); // alloc: a place a directory on the way, once a lookup not kept
+    let found = find(start, &mut seen)?;
+    if let Some(file) = file {
+        keep(file, start, &seen, &found);
+    }
+    Ok(found)
 }
 
 /// Whether a pin names a channel (docs/release.md): `stable`, the releases that passed the heavy
@@ -283,7 +421,7 @@ pub(crate) fn channel_known(file: &Path) -> Option<(String, bool)> {
 /// Where blaze keeps the releases a pin ran: `versions` in `BLAZE_HOME`, else in `.blaze` in
 /// the user's home.
 pub(crate) fn versions() -> Option<PathBuf> {
-    Some(blaze_manifest::user_config::home()?.join("versions"))
+    Some(blaze_manifest::user_config::home().ok()?.join("versions"))
 }
 
 /// The `blaze` of `version` where [`versions`] keeps it.
@@ -294,6 +432,16 @@ pub(crate) fn installed(version: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The thin `blaze` links none of blaze-manifest, so it has the rule of blaze's home a
+    /// second time (`blaze_thin::pin::home`): held here to the launcher's.
+    #[test]
+    fn the_thin_blaze_finds_blazes_home_where_the_launcher_does() {
+        assert_eq!(
+            blaze_thin::pin::home(|name| std::env::var_os(name), blaze_core::home::record),
+            blaze_manifest::user_config::home()
+        );
+    }
 
     #[test]
     fn versions_read() {
@@ -316,13 +464,119 @@ mod tests {
     fn the_variables_hold_only_for_the_manifest_they_name() {
         let here = Path::new("/w/a/Cargo.toml");
         assert!(names(Some(OsStr::new("/w/a/Cargo.toml")), here));
-        assert!(!names(Some(OsStr::new("/tmp/test-ws/Cargo.toml")), here));
+        assert!(!names(Some(OsStr::new("/srv/test-ws/Cargo.toml")), here));
         assert!(!names(None, here));
+    }
+
+    /// A manifest holding `text`, last modified `ago` seconds ago: past [`SETTLED_NS`], so a
+    /// lookup that reads it is kept.
+    fn manifest_aged(path: &Path, text: &str, ago: u64) {
+        std::fs::write(path, text).unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(ago);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(then).unwrap();
+    }
+
+    /// The invariant: a kept lookup answers what reading the manifests answers, whatever
+    /// changed on the way since it was kept (the pin edited to one of the same length, a
+    /// manifest added nearer, the root removed), and an unsettled manifest keeps nothing.
+    /// The control at its end shows the kept answer is the one served while every stamp
+    /// stands: a manifest rewritten in place with its stamp put back answers as kept, which is
+    /// the very case [`SETTLED_NS`] keeps out of the file.
+    #[test]
+    fn a_kept_lookup_answers_as_the_manifests_do() {
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-kept-");
+        let root = tmp.path();
+        let start = root.join("crates/a/src");
+        std::fs::create_dir_all(&start).unwrap();
+        let file = root.join("kept");
+        let manifest = root.join("Cargo.toml");
+        let pins = |version: &str| {
+            format!("[workspace]\n\n[workspace.metadata.blaze]\nversion = \"{version}\"\n")
+        };
+        let both = |file: &Path| {
+            let kept = found_kept_in(&start, Some(file)).unwrap();
+            assert_eq!(kept, found_kept_in(&start, None).unwrap(), "kept and read agree");
+            kept
+        };
+        // Just written: read, and not kept.
+        std::fs::write(&manifest, pins("0.20261027.0")).unwrap();
+        assert_eq!(both(&file).pinned.as_deref(), Some("0.20261027.0"));
+        assert!(!file.exists(), "a manifest modified this second keeps no lookup");
+        // Settled: kept, and answered from the file.
+        manifest_aged(&manifest, &pins("0.20261027.0"), 60);
+        assert_eq!(both(&file).pinned.as_deref(), Some("0.20261027.0"));
+        assert!(kept(&file, &start).is_some(), "a settled lookup is kept");
+        // The pin edited to one of the same length: its stamp moved.
+        manifest_aged(&manifest, &pins("0.20261027.1"), 30);
+        assert_eq!(both(&file).pinned.as_deref(), Some("0.20261027.1"));
+        // A manifest added nearer, naming no workspace: the root is still the root; one that
+        // is a workspace is the root now, and pins nothing.
+        manifest_aged(&root.join("crates/a/Cargo.toml"), "[package]\nname = \"a\"\n", 30);
+        assert_eq!(both(&file).manifest.as_deref(), Some(manifest.as_path()));
+        manifest_aged(&root.join("crates/a/Cargo.toml"), "[workspace]\n", 20);
+        let nearer = both(&file);
+        assert_eq!(nearer.manifest, Some(root.join("crates/a/Cargo.toml")));
+        assert_eq!(nearer.pinned, None);
+        std::fs::remove_file(root.join("crates/a/Cargo.toml")).unwrap();
+        assert_eq!(both(&file).pinned.as_deref(), Some("0.20261027.1"));
+        // The control: the manifest's bytes changed with its stamp put back is answered as
+        // kept, so the file is what answers while the stamps stand.
+        let was = std::fs::metadata(&manifest).unwrap().modified().unwrap();
+        assert!(kept(&file, &start).is_some());
+        std::fs::File::options()
+            .write(true)
+            .open(&manifest)
+            .and_then(|mut it| {
+                std::io::Write::write_all(&mut it, pins("0.20261027.2").as_bytes())?;
+                it.set_modified(was)
+            })
+            .unwrap();
+        assert_eq!(
+            found_kept_in(&start, Some(&file)).unwrap().pinned.as_deref(),
+            Some("0.20261027.1"),
+            "the kept lookup answers while every stamp stands"
+        );
+        assert_eq!(found_kept_in(&start, None).unwrap().pinned.as_deref(), Some("0.20261027.2"));
+    }
+
+    /// The control: a manifest rewritten in place with its stamp put back is the one change
+    /// the kept file cannot see, so there the oracle (kept and read agree) fails. It shows the
+    /// kept file is what answers while every stamp stands, and is the case [`SETTLED_NS`]
+    /// keeps out of the file.
+    #[test]
+    fn the_oracle_catches_a_manifest_rewritten_under_its_stamp() {
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-control-");
+        let root = tmp.path();
+        let start = root.join("src");
+        std::fs::create_dir_all(&start).unwrap();
+        let file = root.join("kept");
+        let manifest = root.join("Cargo.toml");
+        let pins = |version: &str| {
+            format!("[workspace]\n\n[workspace.metadata.blaze]\nversion = \"{version}\"\n")
+        };
+        manifest_aged(&manifest, &pins("0.20261027.1"), 60);
+        found_kept_in(&start, Some(&file)).unwrap();
+        assert!(kept(&file, &start).is_some(), "a settled lookup is kept");
+        let was = std::fs::metadata(&manifest).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&manifest)
+            .and_then(|mut it| {
+                std::io::Write::write_all(&mut it, pins("0.20261027.2").as_bytes())?;
+                it.set_modified(was)
+            })
+            .unwrap();
+        assert_ne!(
+            found_kept_in(&start, Some(&file)).unwrap(),
+            found_kept_in(&start, None).unwrap(),
+            "kept and read disagree: the oracle sees it"
+        );
     }
 
     #[test]
     fn the_root_manifest_holds_the_pin() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-{}", std::process::id()));
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-");
+        let root = tmp.path();
         let member = root.join("crates/a");
         std::fs::create_dir_all(member.join("src")).unwrap();
         std::fs::write(
@@ -343,13 +597,12 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[workspace\n").unwrap();
         assert!(matches!(pinned(&found), Err(PinError::NotToml { .. })));
         assert!(matches!(root_manifest(&member), Err(PinError::NotToml { .. })));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn a_pin_names_a_channel() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-channel-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-channel-");
+        let root = tmp.path();
         let manifest = root.join("Cargo.toml");
         for (pin, read) in
             [("stable", Ok(Some("stable"))), ("canary", Ok(Some("canary"))), ("nightly", Err(()))]
@@ -369,7 +622,6 @@ mod tests {
         assert_eq!(channel_known(&file), Some(("0.20261028.1".to_owned(), false)), "dated ahead");
         std::fs::write(&file, "../x\n").unwrap();
         assert_eq!(channel_known(&file), None);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A build of blaze's tree builds any checkout of that tree whatever it pins (the
@@ -377,8 +629,8 @@ mod tests {
     /// another pinned workspace it hands off to the pinned release as a release does.
     #[test]
     fn a_tree_build_runs_itself_in_blazes_tree_and_hands_off_elsewhere() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-tree-");
+        let root = tmp.path();
         let tree = |at: &str, name: &str| {
             let engine = root.join(at).join("crates/blaze-engine");
             std::fs::create_dir_all(&engine).unwrap();
@@ -424,7 +676,6 @@ mod tests {
         assert_eq!(choose("0.20261101.0", &own, "0.20261030.1", false).unwrap(), Choice::Release);
         assert_eq!(choose("0.20261101.0", &own, "0.20261030.1", true).unwrap(), Choice::Ignored);
         assert_eq!(choose("0.20261030.1", &own, "0.20261030.1", false).unwrap(), Choice::Pinned);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// `--ignore-pin` is blaze's only as the first word after `blaze`; anywhere else it is the

@@ -84,7 +84,7 @@ fn has_host_effect(clauses: &[Clause<'_>]) -> bool {
 #[test]
 fn an_associated_type_and_an_opaque_imply_their_const_bounds() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let tr = trait_named(&db, "Tr");
         let out = trait_named(&db, "Holder")
             .trait_items(&db)
@@ -97,7 +97,7 @@ fn an_associated_type_and_an_opaque_imply_their_const_bounds() {
             !has_host_effect(type_alias_bounds(&db, out).skip_binder()),
             "the item bounds stay without host effects"
         );
-
+    
         let opaque = InternedOpaqueTyId::new(
             &db,
             ImplTraitId::ReturnTypeImplTrait(
@@ -128,7 +128,7 @@ const trait Foo {
 fn a_const_traits_impl_trait_implies_its_const_bounds() {
     use rustc_type_ir::Interner as _;
     let db = fixture::db(RPITIT_FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let bar = trait_named(&db, "Bar");
         let method = trait_named(&db, "Foo")
             .trait_items(&db)

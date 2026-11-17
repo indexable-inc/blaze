@@ -22,7 +22,7 @@ either.workspace = true
 hashbrown.workspace = true
 la-arena.workspace = true
 postcard.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 smallvec.workspace = true
@@ -44,17 +44,20 @@ hir-ty.workspace = true
 hir-ty-print.workspace = true
 hir-ty-mir.workspace = true
 hir-ty-identity.workspace = true
+hir-ty-pure.workspace = true
 hir-ty-share.workspace = true
 intern.workspace = true
 span.workspace = true
 stdx.workspace = true
 syntax.workspace = true
 
+blaze-cas.workspace = true
 blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+blaze-item-hash.workspace = true
 blaze-mem.workspace = true
 blaze-stencil.workspace = true
 # The CPUs of `-C target-cpu` and their features (target_features::cpus): the toolchain's CPU.
@@ -80,12 +83,17 @@ blaze-alloc-count.workspace = true
 # The code identity, held to what rustc says each of the code generator's crates read
 # (`toolchain/tests.rs`).
 blaze-codegen-code.workspace = true
-blaze-cas.workspace = true
+blaze-sim.workspace = true
 blaze-v2-proof.workspace = true
 blaze-store-check.workspace = true
-hegeltest.workspace = true
+# The revision tests' cases (`v2/edits/revisions.rs`): each `test.toml`, and the report's lines.
+toml.workspace = true
+serde_json.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
+# Runs what `wasm::lower` writes: a function whose values share locals computes what its IR says
+# (`wasm.rs`'s tests).
+wasmtime.workspace = true
 
 [features]
 # LLVM, linked in (inkwell over llvm-sys): the producer of std and every opt-level 2/3 unit, and
@@ -99,11 +107,6 @@ rsasm = ["dep:rsasm"]
 # llvm.py building that target (2026-11-01); once llvm.json pins ones that have it, this folds
 # into `llvm`.
 llvm-wasm = ["llvm", "inkwell/target-webassembly"]
-# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`, a workspace of its own
-# and the only one that turns it on, so it never unifies into the native build. It decides only what is
-# about that program, where it runs (`Target::host`) and that it links what it compiles into the
-# page's table (`Target::calls`), never anything of a target's code (`target.rs` tests).
-wasm = []
 
 [lints]
 workspace = true

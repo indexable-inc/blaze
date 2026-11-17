@@ -1,0 +1,15 @@
+{
+ "id": "describes-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane describes-1112",
+ "where": "crates/hir-ty/src/check_cache/ids.rs, crates/hir-ty-codegen/v2/frontend.rs",
+ "state": "open",
+ "what": "The describe (`described_memo`) could not be looked up in another database because three things a lookup needs were private to one crate or one process: the type and id codec that already writes values by content (`hir_ty::check_cache::ids`, pub(crate) and tied to one crate`s portable table), the units as a place in a process list (`Facing::units`), and `Counted`, which the walk asks of a callee before its describe and which costs the callee`s optimized body. Finding that the codec existed took reading four files after first planning to write a second one.",
+ "whys": [
+  "the codec was written for one consumer (a crate`s bodies part) and kept its item naming inside",
+  "nothing lists which persisted codecs exist, so the next record of types starts by not knowing there is one",
+  "rule one-concept-one-home is checked for types and paths, not for codecs"
+ ],
+ "class": "discoverability",
+ "prevention": "docs/v2/plan/design/data.md (or the `memory-and-data` skill) names the one codec for types and ids across databases (`hir_ty::check_cache::port` over `ids` and `next_solver::persist`) and says a new record of types uses it; done in this lane only as the module`s own doc."
+}

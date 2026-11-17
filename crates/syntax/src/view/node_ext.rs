@@ -525,6 +525,15 @@ impl<'t> ast::Impl<'t> {
     }
 }
 
+impl<'t> ast::WherePred<'t> {
+    /// The block of a `where const { COND }` predicate (blaze's `#![feature(blaze_comptime)]`):
+    /// such a predicate has no type, lifetime or bounds, only the `const` block.
+    #[inline]
+    pub fn const_condition(self) -> Option<ast::BlockExpr<'t>> {
+        support::child(self.syntax)
+    }
+}
+
 impl<'t> ast::Trait<'t> {
     /// The `const` of `const trait Tr`, which the parser keeps as a modifier of the item.
     #[inline]
@@ -859,6 +868,13 @@ impl<'t> ast::SelfParam<'t> {
         } else {
             SelfParamKind::Owned
         }
+    }
+
+    /// `#![blaze::views]`'s view, `&self.{a, b}`: the fields written, or `None` for a receiver
+    /// written without one.
+    pub fn view_fields(self) -> Option<AstChildren<'t, ast::NameRef<'t>>> {
+        support::token(self.syntax, T![.])?;
+        Some(support::children(self.syntax))
     }
 }
 

@@ -143,6 +143,9 @@ pub(crate) fn leaf_memory(leaf: Leaf) -> MemoryEffects {
         },
         Leaf::Panic => MemoryEffects { unwinds: true, ..MemoryEffects::NONE },
         Leaf::ErrorText => MemoryEffects { writes: Access::Direct, ..MemoryEffects::NONE },
+        // Each writes what it returns and std's own state (a thread's keys), nothing the
+        // caller holds.
+        Leaf::Seeded | Leaf::Wall => MemoryEffects::NONE,
         Leaf::EnvVar
         | Leaf::Print
         | Leaf::ReadFile

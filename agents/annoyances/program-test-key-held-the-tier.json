@@ -1,0 +1,14 @@
+{
+ "id": "program-test-key-held-the-tier",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: crates/blaze-program, merge-1113, round 5",
+ "where": "crates/blaze-program/src/reach.rs (Reach, test_key), src/tests/world.rs (model_reach), src/walk.rs (new nodes in a tier-up walk)",
+ "what": "A test's key was over the instance keys of the rows it reaches, and the oracle's model of what a test observes hashed the tier of each row. Both carried the tier, a quantity that changes no behaviour, and they disagreed on which rows: the oracle counted the tier of rows of instances the test only took in. Separately, a tier-up walk made a node new to the program at the fast tier, so the tier-up left a row that the next tier-up remakes.",
+ "cost": "one compile-and-test round; a design decision (a tier-up must never rerun a test) the key did not hold",
+ "cause": "an identity that holds more than the thing it identifies: the instance key is the identity of the code record, not of the behaviour a test observes; and a tier for new nodes fixed at Edit instead of derived from the delta",
+ "class": "a key over a code identity used where a behaviour identity is meant (it moves on changes no reader can observe), and a default standing in for a rule",
+ "prevention": "a test key is over tier-free plan keys of every instance a test can run, placed or taken in (FnRow::plan, FnRow::inlined with plan keys); the oracle reads the model only; the tier of a new node is Delta::new_at, stated in the row rule",
+ "workaround": "none needed now",
+ "fix": "reach.rs over (Symbol, PlanKey) of rows and their inline closures; Walked/FnRow carry plan keys; WalkConfig::new_at and Delta::new_at; model_reach drops the tier",
+ "state": "fixed, unverified until the main agent runs the tests"
+}

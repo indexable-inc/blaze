@@ -77,7 +77,7 @@ impl PatOrigin {
 }
 
 #[derive(Copy, Clone)]
-struct PatInfo {
+pub(super) struct PatInfo {
     binding_mode: ByRef,
     max_ref_mutbl: MutblCap,
     pat_origin: PatOrigin,
@@ -297,7 +297,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     ///
     /// Outside of this module, `check_pat_top` should always be used.
     /// Conversely, inside this module, `check_pat_top` should never be used.
-    fn infer_pat(&mut self, pat_id: PatId, expected: Ty<'db>, pat_info: PatInfo) {
+    pub(super) fn infer_pat(&mut self, pat_id: PatId, expected: Ty<'db>, pat_info: PatInfo) {
         // For patterns containing paths, we need the path's resolution to determine whether to
         // implicitly dereference the scrutinee before matching.
         let pat = self.store.pat(pat_id);
@@ -307,7 +307,15 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             Pat::TupleStruct { path, .. } => Some(self.resolve_tuple_struct_pat(pat_id, path)),
             _ => None,
         };
-        let adjust_mode = self.calc_adjust_mode(pat_id, pat, opt_path_res);
+        let mut adjust_mode = self.calc_adjust_mode(pat_id, pat, opt_path_res);
+        // blaze: `x @ FsError { .. }` on an error union binds the member, so the binding is
+        // of the pattern after its `@`, a constructor pattern, and peels references as it
+        // does (`Self::error_union_member_bound`).
+        if let Pat::Bind { subpat: Some(subpat), .. } = pat
+            && self.error_union_member_bound(expected, subpat, true).is_some()
+        {
+            adjust_mode = AdjustMode::peel_all();
+        }
         let ty = self.infer_pat_inner(pat_id, opt_path_res, adjust_mode, expected, pat_info);
         let ty = self.insert_type_vars_shallow(ty);
         self.write_pat_ty(pat_id, ty);
@@ -322,7 +330,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 pat_id,
                 derefed_tys.iter().filter_map(|adjust| match adjust.kind {
                     PatAdjust::OverloadedDeref => Some(adjust.source.as_ref()),
-                    PatAdjust::BuiltinDeref => None,
+                    PatAdjust::BuiltinDeref | PatAdjust::UnionMember => None,
                 }),
             );
             self.table.register_infer_ok(infer_ok);
@@ -369,6 +377,78 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         //
         // 2. An outdated issue related to the old HIR borrowck. See the test
         // `regions-relate-bound-regions-on-closures-to-inference-variables.rs`,
+    }
+
+    /// The member of the error union `expected` that a pattern resolved as `opt_path_res`
+    /// is of: the one member whose type is the pattern's own struct, enum or union. `None`
+    /// when `expected` is no error union, the crate has no unions, the pattern is of the
+    /// union's own struct or of no nominal type, or no member (or more than one) is of the
+    /// pattern's type.
+    fn error_union_member_of_pat(
+        &mut self,
+        expected: Ty<'db>,
+        opt_path_res: Option<Result<ResolvedPat<'db>, ()>>,
+    ) -> Option<Ty<'db>> {
+        let Ok(resolved) = opt_path_res? else { return None };
+        let expected = self.table.shallow_resolve(expected);
+        let members = crate::error_union::members(self.interner(), expected)?;
+        if !self.interner().krate()?.extensions(self.db).error_unions() {
+            return None;
+        }
+        let pat_ty = self.table.shallow_resolve(resolved.ty);
+        let at = crate::error_union::member_index(members, pat_ty)?;
+        Some(members.as_slice()[at])
+    }
+
+    /// The member of the error union `expected` that `x @ subpat` binds: the one member
+    /// whose struct or enum the constructor pattern `subpat` (under further `y @`s) names by
+    /// its path. With `through_references`, `expected` may also be references to the union,
+    /// which a constructor pattern peels. `None` when the crate has no unions, `expected`
+    /// is no union, or `subpat` is another kind of pattern or names its type through an
+    /// alias, `Self` or an associated item: then `x` binds what Rust binds, the union, and
+    /// `subpat` is matched by member on its own.
+    fn error_union_member_bound(
+        &mut self,
+        expected: Ty<'db>,
+        mut subpat: PatId,
+        through_references: bool,
+    ) -> Option<Ty<'db>> {
+        if !self.interner().krate()?.extensions(self.db).error_unions() {
+            return None;
+        }
+        let mut expected = self.table.shallow_resolve(expected);
+        while through_references && let TyKind::Ref(_, inner, _) = expected.kind() {
+            expected = self.table.shallow_resolve(inner);
+        }
+        let members = crate::error_union::members(self.interner(), expected)?;
+        let of_variant = |db, variant: hir_def::EnumVariantId| {
+            hir_def::AdtId::EnumId(hir_def::Lookup::lookup(&variant, db).parent)
+        };
+        let adt = loop {
+            match self.store.pat(subpat) {
+                Pat::Bind { subpat: Some(inner), .. } => subpat = inner,
+                Pat::Record { path, .. } => {
+                    break match self.resolver.resolve_path_in_type_ns_fully(self.db, path)? {
+                        TypeNs::AdtId(adt) => adt,
+                        TypeNs::EnumVariantId(variant) => of_variant(self.db, variant),
+                        _ => return None,
+                    };
+                }
+                Pat::TupleStruct { path, .. } | Pat::Path(path) => {
+                    let hygiene = self.store.pat_path_hygiene(subpat);
+                    let found =
+                        self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene)?;
+                    break match found {
+                        ValueNs::StructId(it) => it.into(),
+                        ValueNs::EnumVariantId(variant) => of_variant(self.db, variant),
+                        _ => return None,
+                    };
+                }
+                _ => return None,
+            }
+        };
+        let at = crate::error_union::member_index_of(members, adt)?;
+        Some(members.as_slice()[at])
     }
 
     // Helper to avoid resolving the same path pattern several times.
@@ -445,6 +525,48 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     pat_info,
                 )
             }
+            // blaze: a constructor pattern on a refinement by variants (`Conn is Conn::Open
+            // { .. }`, `#![blaze::pattern_types]`) is a pattern of its base enum, as the
+            // constructor is (docs/v2/plan/design/edition.md, section 8): the refinement widens
+            // for free, and a variant outside its set is an unreachable arm (matchck).
+            Pat::Path(_) | Pat::TupleStruct { .. } | Pat::Record { .. }
+                if let Some((base, _)) =
+                    crate::pattern_types::refinement(self.table.shallow_resolve(expected)) =>
+            {
+                self.infer_pat_inner(pat, opt_path_res, adjust_mode, base, pat_info)
+            }
+            // blaze: a constructor pattern of a member of an error union (`FsError { .. }`
+            // where the scrutinee is `Missing | FsError`, `#![blaze::error_unions]`) matches
+            // when the union holds that member, against the member's value
+            // (docs/v2/plan/design/error-sets.md, "Matching"). A pattern of the union's own
+            // struct is not one, and with no member of the pattern's type the pattern is
+            // checked against the union as it is, which reports the mismatch.
+            Pat::Path(_) | Pat::TupleStruct { .. } | Pat::Record { .. }
+                if let Some(member) = self.error_union_member_of_pat(expected, opt_path_res) =>
+            {
+                self.result.pat_adjustments.push(
+                    pat,
+                    PatAdjustment {
+                        kind: PatAdjust::UnionMember,
+                        source: self.table.shallow_resolve(expected).store(),
+                    },
+                );
+                self.infer_pat_inner(pat, opt_path_res, adjust_mode, member, pat_info)
+            }
+            // blaze: and `x @ FsError { .. }` binds that member: the binding and the pattern
+            // after its `@` are both of it.
+            Pat::Bind { subpat: Some(subpat), .. }
+                if let Some(member) = self.error_union_member_bound(expected, subpat, false) =>
+            {
+                self.result.pat_adjustments.push(
+                    pat,
+                    PatAdjustment {
+                        kind: PatAdjust::UnionMember,
+                        source: self.table.shallow_resolve(expected).store(),
+                    },
+                );
+                self.infer_pat_inner(pat, opt_path_res, AdjustMode::Pass, member, pat_info)
+            }
             Pat::Missing => self.types.types.error,
             Pat::Wild | Pat::Rest | Pat::NotNull => expected,
             // We allow any type here; we ensure that the type is uninhabited during match checking.
@@ -479,6 +601,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     }
                     Ok(pr) => panic!("tuple struct pattern resolved to {pr:?}"),
                 }
+            }
+            Pat::Record { path, args: fields, ellipsis: has_rest_pat }
+                if let Some(record) = self.record_path(path) =>
+            {
+                self.infer_record_pattern(pat, record, fields, has_rest_pat, expected, pat_info)
             }
             Pat::Record { args: fields, ellipsis: has_rest_pat, .. } => {
                 match opt_path_res.unwrap() {
@@ -1008,6 +1135,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     }
 
     fn resolve_record_pat(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
+        // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`) has no path to resolve;
+        // it is checked against the record the value is (`infer_record_pattern`), and peels
+        // references as a struct pattern does.
+        if let Some(record) = self.record_path(path) {
+            let kind = ResolvedPatKind::Struct { variant: record.into() };
+            return Ok(ResolvedPat { ty: self.types.types.error, kind });
+        }
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, false) else {
             self.report_unresolved_pat_path(pat, path);
@@ -1251,7 +1385,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // `check_struct_pat_fields`).
         for (field_idx, field) in fields.iter().enumerate() {
             let hygiene = self.store.record_field_hygiene(field.pat);
-            let name = VariantFields::name_written(self.db, variant, field.name, hygiene);
+            let name = VariantFields::name_written(
+                self.db,
+                self.resolver.ctx_table(),
+                variant,
+                field.name,
+                hygiene,
+            );
             match used_fields.entry(name) {
                 Occupied(_occupied) => {
                     self.push_diagnostic(InferenceDiagnostic::DuplicateField {

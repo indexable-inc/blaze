@@ -1,0 +1,18 @@
+{
+ "id": "onefront-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onefront-1112",
+ "where": "crates/blaze-engine/tests/revisions (spec.rs `Expect`), crates/blaze-lower/src/code.rs (`Plant`)",
+ "what": "A revision case cannot plant a bug in the daemon (plants are `#[cfg(test)]` thread-locals of unit tests) and cannot bound inputs written (`max_inputs` does not exist), so the control of a real-driver case needed a request variable read by the daemon (`BLAZE_FRONT_END_PER_PLAN`), and `no input written` is asserted only in blaze-lower's unit test.",
+ "cost": "a control knob in production code; one invariant checked a level below where it was asked for",
+ "cause": "the revision harness observes a real daemon only through what `blaze why` and `blaze explain` print",
+ "whys": [
+  "a planted bug must be in the binary under test",
+  "the daemon binary is built without `cfg(test)`"
+ ],
+ "class": "missing harness feature",
+ "prevention": "proposed to lane sound-1112: an `inputs` expectation (`max_inputs`) read from the profile's write counts, and a documented list of control variables the daemon reads of a request",
+ "workaround": "`BLAZE_FRONT_END_PER_PLAN=1`, read of the request alone, with the miss listed as `known` in the control case",
+ "fix": "none yet",
+ "state": "open"
+}

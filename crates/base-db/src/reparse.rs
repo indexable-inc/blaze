@@ -10,26 +10,33 @@
 //!   while it holds both texts.
 //!
 //! `parse` reparses the kept parse when the slot is of the edit's "before" text and of the same
-//! edition and kind (full or outline), else it parses the whole text. A reparse is the parse a
-//! whole parse makes (`syntax::Parse::reparse_onto`; debug builds check each one against a whole
-//! parse), so what `parse` returns is a function of the text and edition alone and the slot
-//! only changes how long it takes.
+//! edition, syntax extensions and kind (full or outline), else it parses the whole text. A
+//! reparse is the parse a whole parse makes (`syntax::Parse::reparse_onto`; debug builds check
+//! each one against a whole parse), so what `parse` returns is a function of the text, edition
+//! and extensions alone and the slot only changes how long it takes.
 //!
 //! A slot holds its parse weakly: it lives as long as the query engine keeps the parse, so the slots add
-//! no tree to what its `lru` cap keeps. Reading a slot is acquire loads (a `OnceLock` each, never
-//! a lock, docs/v2/plan/design/concurrency.md) and a weak count, done only when `parse` runs:
-//! a cache hit of `parse` reads none, and nothing here allocates outside the setter.
+//! no tree to what its `lru` cap keeps. Reading a slot is acquire loads (a `OnceLock` each,
+//! docs/v2/plan/design/concurrency.md) and a weak count, done only when `parse` runs: a cache
+//! hit of `parse` reads none, and nothing here allocates outside the setter.
+//!
+//! The one strong hold: the commit after an edit drops the arena that held the old text's parse
+//! (it is homed with the text), so a weak hold alone would lose every edit's base. The setter
+//! runs while the old snapshot still lives, so it upgrades the base's live parses and pins them
+//! in the new text's slot ([`Slot::pinned`]), in place, no allocation; `parse` unpins a kind once
+//! it has parsed the new text in it. The cost: one old tree per edited file, from the setter to
+//! that file's next parse of the kind.
 
 use std::{
     fmt,
     sync::{Arc, OnceLock},
 };
 
+use blaze_core::lock::Lock;
 use blaze_ids::ContentId;
 use span::Edition;
-use syntax::{Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
+use syntax::{Extensions, Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
 
-use crate::trees::{TreeError, Trees};
 
 /// How many parses of one text a slot keeps: one per edition and kind it is parsed in, and
 /// again after the query engine let one go. Past that, the file's next edit is a whole parse.
@@ -42,6 +49,19 @@ pub struct Reparse {
     from: Option<(Arc<Slot>, TextEdit)>,
 }
 
+/// The same text's slot, edited from the same one, by their handles: what an input's setter
+/// compares to write nothing for an equal value. A slot made anew for an equal text is another.
+impl PartialEq for Reparse {
+    fn eq(&self, other: &Reparse) -> bool {
+        Arc::ptr_eq(&self.slot, &other.slot)
+            && match (&self.from, &other.from) {
+                (None, None) => true,
+                (Some((a, _)), Some((b, _))) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
 /// One text of a file and the parses made of it.
 struct Slot {
     /// The text, shared with its `FileText` and its parse's tree.
@@ -49,10 +69,25 @@ struct Slot {
     /// Its blaze-vfs content ID ([`blaze_vfs::FILE_DOMAIN`]).
     id: ContentId,
     kept: [OnceLock<Kept>; KEPT],
+    /// Parses of the base text (`Reparse::from`'s slot), held strongly from the setter until
+    /// this text is parsed in their kind: what the next parse is made from once the commit has
+    /// dropped the base's own (see the module). The invariant: each is a parse of the text of
+    /// the slot this text's `from` names, never of another.
+    pinned: Lock<[Option<Pinned>; KEPT]>,
+}
+
+/// A parse of a base text held strongly, with what it was made in.
+#[derive(Clone)]
+struct Pinned {
+    edition: Edition,
+    extensions: Extensions,
+    outline: bool,
+    parse: Parse<SourceFile>,
 }
 
 struct Kept {
     edition: Edition,
+    extensions: Extensions,
     outline: bool,
     parse: WeakParse<SourceFile>,
 }
@@ -67,6 +102,15 @@ pub(crate) struct TextEdit {
     pub(crate) insert: TextSize,
 }
 
+/// The same handles: the world's entry of a file and the input a snapshot is made with share
+/// one slot, so the parse kept for the text is the one the next snapshot's text is made from.
+impl Clone for Reparse {
+    fn clone(&self) -> Reparse {
+        // clone: refcounts of the slots and the edit, once per input made from the world
+        Reparse { slot: self.slot.clone(), from: self.from.clone() }
+    }
+}
+
 impl fmt::Debug for Reparse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Reparse")
@@ -77,9 +121,24 @@ impl fmt::Debug for Reparse {
 }
 
 impl Slot {
-    fn new(text: &Text, id: ContentId) -> Arc<Slot> {
+    fn new(text: &Text, id: ContentId, pinned: [Option<Pinned>; KEPT]) -> Arc<Slot> {
         // alloc: one slot per text set, in the setter; `text.clone()` is a refcount.
-        Arc::new(Slot { text: text.clone(), id, kept: [const { OnceLock::new() }; KEPT] })
+        Arc::new(Slot {
+            text: text.clone(),
+            id,
+            kept: [const { OnceLock::new() }; KEPT],
+            pinned: Lock::new("base_db.reparse.pinned", pinned),
+        })
+    }
+
+    /// Lets go of the pinned base parse of the kind: this text has its own parse of it now.
+    fn unpin(&self, edition: Edition, extensions: Extensions, outline: bool) {
+        let mut pinned = self.pinned.lock();
+        for at in pinned.iter_mut() {
+            if at.as_ref().is_some_and(|it| it.is(edition, extensions, outline)) {
+                *at = None;
+            }
+        }
     }
 
     /// Whether a parse of the text is kept and still alive.
@@ -91,19 +150,44 @@ impl Slot {
 impl Reparse {
     /// The first text of a file, `id` its blaze-vfs content ID: parsed whole.
     pub(crate) fn new(text: &Text, id: ContentId) -> Reparse {
-        Reparse { slot: Slot::new(text, id), from: None }
+        Reparse { slot: Slot::new(text, id, [const { None }; KEPT]), from: None }
     }
 
     /// The text a file is set to after the one `self` is of: made from that text's parse if
-    /// one is kept, else from the parse the text before it was made from.
+    /// one is kept, else from the parse the text before it was made from. The base's parses
+    /// are pinned in the new slot, while the snapshot that holds them still lives (the setter
+    /// runs before the commit drops it): see the module.
     pub(crate) fn after(&self, text: &Text, id: ContentId) -> Reparse {
+        let mut pinned: [Option<Pinned>; KEPT] = [const { None }; KEPT];
         let base = match self.slot.has_parse() {
-            true => Some(&self.slot),
-            false => self.from.as_ref().map(|(slot, _)| slot),
+            true => {
+                // This text's live parses, upgraded: refcounts.
+                let live = self.slot.kept.iter().filter_map(OnceLock::get).filter_map(|kept| {
+                    Some(Pinned {
+                        edition: kept.edition,
+                        extensions: kept.extensions,
+                        outline: kept.outline,
+                        parse: kept.parse.upgrade()?,
+                    })
+                });
+                for (at, it) in pinned.iter_mut().zip(live) {
+                    *at = Some(it);
+                }
+                Some(&self.slot)
+            }
+            false => {
+                // Never parsed: the base stays this text's own base, and so do its pins
+                // (clone: refcounts).
+                let held = self.slot.pinned.lock();
+                for (at, it) in pinned.iter_mut().zip(held.iter()) {
+                    *at = it.clone();
+                }
+                self.from.as_ref().map(|(slot, _)| slot)
+            }
         };
         // clone: a refcount of the base slot, in the setter.
         let from = base.map(|base| (base.clone(), TextEdit::between(&base.text, text, base.id)));
-        Reparse { slot: Slot::new(text, id), from }
+        Reparse { slot: Slot::new(text, id, pinned), from }
     }
 
     /// The edit `parse` makes this text's parse with, if it has one to make it from.
@@ -112,21 +196,20 @@ impl Reparse {
         self.from.as_ref().map(|(_, edit)| *edit)
     }
 
-    /// The parse of `text` (this one's text) in `edition`, an outline when `outline`, made from
-    /// the kept parse when there is one, else read from `stored` when it has the text's
-    /// ([`Trees`]); kept for the next text. A stored parse that is not the text's is an error.
+    /// The parse of `text` (this one's text) in `edition` and under `extensions`, an outline
+    /// when `outline`, made from the kept parse when there is one; kept for the next text.
     pub(crate) fn parse(
         &self,
         text: &Text,
         edition: Edition,
+        extensions: Extensions,
         outline: bool,
-        stored: Option<&Trees>,
-    ) -> Result<Parse<SourceFile>, TreeError> {
+    ) -> Parse<SourceFile> {
         debug_assert!(text.ptr_eq(&self.slot.text), "a reparse of another text");
-        if let Some(own) = self.own(edition, outline) {
-            return Ok(own);
+        if let Some(own) = self.own(edition, extensions, outline) {
+            return own;
         }
-        let parse = match self.previous(edition, outline) {
+        let parse = match self.previous(edition, extensions, outline) {
             Some((previous, delete)) => {
                 #[cfg(test)]
                 REPARSED.with(|it| it.set(it.get() + 1));
@@ -137,16 +220,13 @@ impl Reparse {
                 }
                 parse
             }
-            None => match stored {
-                Some(stored) => match stored.map(self.slot.id, text, edition, outline)? {
-                    Some(parse) => parse,
-                    None => whole(text.clone(), edition, outline), // clone: a refcount, as above.
-                },
-                None => whole(text.clone(), edition, outline), // clone: a refcount, as above.
-            },
+            // clone: a refcount, as above.
+            None => whole(text.clone(), edition, extensions, outline),
         };
-        self.keep(&parse, edition, outline);
-        Ok(parse)
+        self.keep(&parse, edition, extensions, outline);
+        // The base's tree goes now, whether or not a slot was free to keep this one.
+        self.slot.unpin(edition, extensions, outline);
+        parse
     }
 
     /// Whether a parse of this text is kept and alive.
@@ -159,46 +239,57 @@ impl Reparse {
         self.slot.id
     }
 
-    /// The live outlines of this text, by edition: what the image stores of a library file.
-    pub(crate) fn kept_outlines(&self) -> impl Iterator<Item = (Edition, Parse<SourceFile>)> + '_ {
-        self.slot
-            .kept
-            .iter()
-            .filter_map(OnceLock::get)
-            .filter(|kept| kept.outline)
-            .filter_map(|kept| Some((kept.edition, kept.parse.upgrade()?)))
-    }
-
     /// Takes `parse`, a full parse its caller made of this text in `edition` (an edit's tree
     /// reparsed in place, `blaze_intent::Seed`), as the text's parse: [`Reparse::parse`] returns
     /// it while it lives. It is kept weakly, as the parses `parse` makes are, so the caller holds
-    /// it until the file is parsed. `false`, and nothing kept, when its text is not this one or
-    /// the slot has a live parse of the edition already.
-    pub(crate) fn seed(&self, text: &Text, edition: Edition, parse: &Parse<SourceFile>) -> bool {
+    /// it until the file is parsed. `false`, and nothing kept, when its text is not this one,
+    /// it was made under other syntax extensions than `extensions`, or the slot has a live
+    /// parse of the edition and extensions already.
+    pub(crate) fn seed(
+        &self,
+        text: &Text,
+        edition: Edition,
+        extensions: Extensions,
+        parse: &Parse<SourceFile>,
+    ) -> bool {
         debug_assert!(text.ptr_eq(&self.slot.text), "a seed of another text");
-        if parse.root().text() != text.as_str() {
+        if parse.root().text() != text.as_str() || parse.extensions() != extensions {
             return false;
         }
         if cfg!(debug_assertions) {
             assert_whole(parse, text, edition, false);
         }
-        self.keep(parse, edition, false)
+        let kept = self.keep(parse, edition, extensions, false);
+        if kept {
+            self.slot.unpin(edition, extensions, false);
+        }
+        kept
     }
 
-    /// A live parse of this text in `edition` and of the kind: a seed, or one `parse` made
-    /// that something still holds.
-    fn own(&self, edition: Edition, outline: bool) -> Option<Parse<SourceFile>> {
+    /// A live parse of this text in `edition`, under `extensions` and of the kind: a seed, or
+    /// one `parse` made that something still holds.
+    fn own(
+        &self,
+        edition: Edition,
+        extensions: Extensions,
+        outline: bool,
+    ) -> Option<Parse<SourceFile>> {
         self.slot
             .kept
             .iter()
             .filter_map(OnceLock::get)
-            .filter(|kept| kept.edition == edition && kept.outline == outline)
+            .filter(|kept| kept.is(edition, extensions, outline))
             .find_map(|kept| kept.parse.upgrade())
     }
 
-    /// The kept parse of the edit's "before" text in `edition` and of the kind, and the range
-    /// of that text the edit replaces.
-    fn previous(&self, edition: Edition, outline: bool) -> Option<(Parse<SourceFile>, TextRange)> {
+    /// The kept parse of the edit's "before" text in `edition`, under `extensions` and of the
+    /// kind, and the range of that text the edit replaces.
+    fn previous(
+        &self,
+        edition: Edition,
+        extensions: Extensions,
+        outline: bool,
+    ) -> Option<(Parse<SourceFile>, TextRange)> {
         let (slot, edit) = self.from.as_ref()?;
         if slot.id != edit.before {
             return None;
@@ -208,29 +299,48 @@ impl Reparse {
             slot.text.len() + usize::from(edit.insert),
             "an edit that does not make the one text the other"
         );
-        let parse = slot
-            .kept
+        // Pinned first: the base's parse once the commit has dropped its own hold (clone: a
+        // refcount).
+        let pinned = self
+            .slot
+            .pinned
+            .lock()
             .iter()
-            .rev()
-            .filter_map(OnceLock::get)
-            .filter(|kept| kept.edition == edition && kept.outline == outline)
-            .find_map(|kept| kept.parse.upgrade())?;
+            .flatten()
+            .find(|it| it.is(edition, extensions, outline))
+            .map(|it| it.parse.clone());
+        let parse = match pinned {
+            Some(parse) => parse,
+            None => slot
+                .kept
+                .iter()
+                .rev()
+                .filter_map(OnceLock::get)
+                .filter(|kept| kept.is(edition, extensions, outline))
+                .find_map(|kept| kept.parse.upgrade())?,
+        };
         Some((parse, edit.delete))
     }
 
-    /// Keeps `parse` in this text's slot, unless a live one of its edition and kind is kept:
-    /// whether it kept this one.
-    fn keep(&self, parse: &Parse<SourceFile>, edition: Edition, outline: bool) -> bool {
+    /// Keeps `parse` in this text's slot, unless a live one of its edition, extensions and kind is
+    /// kept: whether it kept this one.
+    fn keep(
+        &self,
+        parse: &Parse<SourceFile>,
+        edition: Edition,
+        extensions: Extensions,
+        outline: bool,
+    ) -> bool {
         for kept in &self.slot.kept {
             match kept.get() {
-                Some(it) if it.edition == edition && it.outline == outline => {
+                Some(it) if it.is(edition, extensions, outline) => {
                     if it.parse.upgrade().is_some() {
                         return false;
                     }
                 }
                 Some(_) => {}
                 None => {
-                    let made = Kept { edition, outline, parse: parse.downgrade() };
+                    let made = Kept { edition, extensions, outline, parse: parse.downgrade() };
                     if kept.set(made).is_ok() {
                         return true;
                     }
@@ -238,6 +348,20 @@ impl Reparse {
             }
         }
         false
+    }
+}
+
+impl Pinned {
+    /// Whether this is a parse in `edition`, under `extensions` and of the kind.
+    fn is(&self, edition: Edition, extensions: Extensions, outline: bool) -> bool {
+        self.edition == edition && self.extensions == extensions && self.outline == outline
+    }
+}
+
+impl Kept {
+    /// Whether this is a parse in `edition`, under `extensions` and of the kind.
+    fn is(&self, edition: Edition, extensions: Extensions, outline: bool) -> bool {
+        self.edition == edition && self.extensions == extensions && self.outline == outline
     }
 }
 
@@ -253,19 +377,25 @@ thread_local! {
     pub(crate) static WHOLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn whole(text: Text, edition: Edition, outline: bool) -> Parse<SourceFile> {
+pub(crate) fn whole(
+    text: Text,
+    edition: Edition,
+    extensions: Extensions,
+    outline: bool,
+) -> Parse<SourceFile> {
     #[cfg(test)]
     WHOLE.with(|it| it.set(it.get() + 1));
     match outline {
-        true => SourceFile::parse_outline(text, edition),
-        false => SourceFile::parse_shared(text, edition),
+        true => SourceFile::parse_outline_with(text, edition, extensions),
+        false => SourceFile::parse_shared_with(text, edition, extensions),
     }
 }
 
-/// Panics unless `made` is the parse a whole parse of `text` makes: the same tree and errors.
+/// Panics unless `made` is the parse a whole parse of `text` makes (under `made`'s
+/// extensions): the same tree and errors.
 pub(crate) fn assert_whole(made: &Parse<SourceFile>, text: &Text, edition: Edition, outline: bool) {
     // clone: the check of debug builds and tests, not of a release parse.
-    let whole = whole(text.clone(), edition, outline);
+    let whole = whole(text.clone(), edition, made.extensions(), outline);
     assert!(
         made.root().file() == whole.root().file(),
         "a reparse whose tree is not the whole parse's"
@@ -383,34 +513,49 @@ mod seed_tests {
     use std::cell::Cell;
 
     use crate::{FileId, FileSet, VfsPath};
-    use blaze_query::db::Durability;
     use span::Edition;
     use syntax::SourceFile;
     use triomphe::Arc;
 
     use super::{REPARSED, assert_whole};
+    use crate::tests::{EditDb as _, test_db};
     use crate::{Db, EditionedFileId, SourceRoot, SourceRootId};
 
-    fn one_file(db: &mut Db, text: &str) -> (FileId, EditionedFileId) {
+    fn one_file(db: &mut Db, text: &str) -> FileId {
         let file = FileId::from_raw(0);
-        db.set_file_text_with_durability(file, text, Durability::LOW);
-        db.set_file_source_root_with_durability(file, SourceRootId(0), Durability::MEDIUM);
         let mut set = FileSet::default();
         set.insert(file, VfsPath::new_virtual_path("/a/lib.rs".to_owned()));
         let root = Arc::new(SourceRoot::new_local(set));
-        db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
-        (file, EditionedFileId::new(db, file, Edition::Edition2021))
+        db.commit_with(|edit| {
+            edit.set_file_text(file, text)
+                .set_file_source_root(file, SourceRootId(0))
+                .set_source_root(SourceRootId(0), root);
+        });
+        file
+    }
+
+    /// The file's id in the database's snapshot: an id is of one snapshot, so it is interned
+    /// again after each commit.
+    fn id_of(db: &Db, file: FileId) -> EditionedFileId {
+        EditionedFileId::new(db, file, Edition::Edition2021)
+    }
+
+    fn set_text(db: &mut Db, file: FileId, text: &str) {
+        db.commit_with(|edit| {
+            edit.set_file_text(file, text);
+        });
     }
 
     /// fastcompile-intent 3: a seed is the file's parse, with no parse of its own, and is the
     /// tree a whole parse makes.
     #[test]
     fn a_seeded_parse_is_the_seed() {
-        let mut db = Db::for_tests();
-        let (file, id) = one_file(&mut db, "fn f() {}\n");
-        let _ = id.parse(&db);
+        let mut db = test_db();
+        let file = one_file(&mut db, "fn f() {}\n");
+        let _ = id_of(&db, file).parse(&db);
         let text = "fn f() { 1 + 2 }\nstruct S;\n";
-        db.set_file_text(file, text);
+        set_text(&mut db, file, text);
+        let id = id_of(&db, file);
         let seed = SourceFile::parse_shared(text, Edition::Edition2021);
         let content = db.file_text(file).content(&db);
         assert!(id.seed_parse(&db, content, &seed));
@@ -424,10 +569,11 @@ mod seed_tests {
 
     #[test]
     fn a_seed_of_another_text_is_refused() {
-        let mut db = Db::for_tests();
-        let (file, id) = one_file(&mut db, "fn f() {}\n");
+        let mut db = test_db();
+        let file = one_file(&mut db, "fn f() {}\n");
         let old = db.file_text(file).content(&db);
-        db.set_file_text(file, "fn g() {}\n");
+        set_text(&mut db, file, "fn g() {}\n");
+        let id = id_of(&db, file);
         let stale = SourceFile::parse_shared("fn f() {}\n", Edition::Edition2021);
         assert!(!id.seed_parse(&db, old, &stale), "the file moved on from the seed's text");
         let content = db.file_text(file).content(&db);
@@ -439,10 +585,11 @@ mod seed_tests {
 
     #[test]
     fn a_dropped_seed_is_parsed_again() {
-        let mut db = Db::for_tests();
-        let (file, id) = one_file(&mut db, "fn f() {}\n");
+        let mut db = test_db();
+        let file = one_file(&mut db, "fn f() {}\n");
         let text = "fn h() -> u8 { 0 }\n";
-        db.set_file_text(file, text);
+        set_text(&mut db, file, text);
+        let id = id_of(&db, file);
         let content = db.file_text(file).content(&db);
         let seed = SourceFile::parse_shared(text, Edition::Edition2021);
         assert!(id.seed_parse(&db, content, &seed));

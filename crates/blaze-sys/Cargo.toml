@@ -1,0 +1,23 @@
+[package]
+name = "blaze-sys"
+description = "blaze's one home for system calls (docs/v2/plan/design/sys.md): `#![no_std]`, no dependency but `core`, typed per operation. Linux by raw system call (no libc), macOS through libSystem's symbols, Windows through ntdll and kernel32; what is not built is a typed refusal naming it"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# No dependencies: `core` only. The `libc` crate is the tests' oracle (the number table, the
+# constants, the struct layouts, the same call made both ways) and is never linked into a build
+# of user code.
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

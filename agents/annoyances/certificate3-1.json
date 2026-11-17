@@ -1,0 +1,20 @@
+{
+ "id": "A-certificate3-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane certificate3",
+ "where": "crates/blaze-cargo/src/serve/job/certificate.rs (as lane certificate2 left it), crates/blaze-record",
+ "what": "The first certificate core was one record under key(shape, root, blaze) with stamps in its bytes, a slot pointer per checkout and its own `holds` and `walk_from`: none of which a write-once store can hold (a slot moves; a record's bytes were no function of its key) and all of which `blaze-record` already does (base key, read-lists, answer by digests). A read-list names reads without values, so a miss has nothing in the store to compare with: what moved can only be named from local evidence of the checkout's last build.",
+ "cost": "one lane's core rewritten whole (658 lines) before any wiring; the rewrite and the request machine took this lane's whole context, so the wiring is a successor's",
+ "cause": "the record was designed before the store's write-once rule and the shared record primitive were read",
+ "whys": [
+  "why rewritten: the key held content (the root id) and the bytes held stamps",
+  "why that fails: Store::put of other bytes under a kept key is a Mismatch",
+  "why not seen: the core was written and tested against a map, never against the store's rule",
+  "why: the design doc preceded end-state.md's shared page, which fixed one lookup form for every area"
+ ],
+ "class": "a record designed against a mutable map and then met by a write-once store",
+ "prevention": "every kept result goes through blaze-record (shared page 2); a test store that refuses a second put of other bytes under a key (the model `Shelf` in serve/job/request/tests.rs does)",
+ "workaround": "none",
+ "fix": "certificate.rs is now the record in blaze-record's form (base = shape and tool; reads as a list; content-only answer; stamps as local Evidence); serve/job/request.rs is the sans-IO request machine with its model test",
+ "state": "open"
+}

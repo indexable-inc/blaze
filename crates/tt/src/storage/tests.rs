@@ -6,7 +6,7 @@ use std::{fmt::Write as _, hash::BuildHasher, path::Path};
 
 use blaze_hash::FixedState;
 use blaze_ids::rng::SplitMix64;
-use hegel::generators as gs;
+use blaze_sim::Config;
 use span::ErasedFileAstId;
 use std::alloc::Global;
 
@@ -265,29 +265,32 @@ fn walk_cursor(tree: &TopSubtree) -> Vec<TokenTree> {
 
 /// The tokens of flat token trees as a parser reads them, each with its context, from the
 /// token trees alone.
-fn reference_tokens(tokens: &[TokenTree]) -> Vec<(FlatToken, SyntaxContext)> {
-    fn seq(mut tokens: &[TokenTree], out: &mut Vec<(FlatToken, SyntaxContext)>) {
+fn reference_tokens(tokens: &[TokenTree]) -> Vec<(FlatToken, SyntaxContext, Extensions)> {
+    fn of(token: FlatToken, span: Span) -> (FlatToken, SyntaxContext, Extensions) {
+        (token, span.ctx, span.anchor.file_id.extensions())
+    }
+    fn seq(mut tokens: &[TokenTree], out: &mut Vec<(FlatToken, SyntaxContext, Extensions)>) {
         while let Some((first, rest)) = tokens.split_first() {
             tokens = rest;
             let token = match first {
                 TokenTree::Leaf(Leaf::Punct(it)) => {
-                    (FlatToken::Punct { char: it.char, spacing: it.spacing }, it.span.ctx)
+                    of(FlatToken::Punct { char: it.char, spacing: it.spacing }, it.span)
                 }
                 TokenTree::Leaf(Leaf::Ident(it)) => {
-                    (FlatToken::Ident { sym: it.sym, is_raw: it.is_raw }, it.span.ctx)
+                    of(FlatToken::Ident { sym: it.sym, is_raw: it.is_raw }, it.span)
                 }
                 TokenTree::Leaf(Leaf::Literal(it)) => {
                     let sym = it.text_and_suffix;
                     let (kind, suffix_len) = (it.kind, it.suffix_len);
-                    (FlatToken::Literal { sym, kind, suffix_len }, it.span.ctx)
+                    of(FlatToken::Literal { sym, kind, suffix_len }, it.span)
                 }
                 TokenTree::Subtree(subtree) => {
                     let (children, after) = rest.split_at(subtree.usize_len());
                     let delimiter = subtree.delimiter;
-                    out.push((FlatToken::Open(delimiter.kind), delimiter.open.ctx));
+                    out.push(of(FlatToken::Open(delimiter.kind), delimiter.open));
                     seq(children, out);
                     tokens = after;
-                    (FlatToken::Close(delimiter.kind), delimiter.close.ctx)
+                    of(FlatToken::Close(delimiter.kind), delimiter.close)
                 }
             };
             out.push(token);
@@ -299,9 +302,9 @@ fn reference_tokens(tokens: &[TokenTree]) -> Vec<(FlatToken, SyntaxContext)> {
 }
 
 /// The tokens of `view`, through [`TokenTreesView::for_each_token`].
-fn walk_tokens(view: TokenTreesView<'_>) -> Vec<(FlatToken, SyntaxContext)> {
+fn walk_tokens(view: TokenTreesView<'_>) -> Vec<(FlatToken, SyntaxContext, Extensions)> {
     let mut out = Vec::new();
-    view.for_each_token(|token, ctx| out.push((token, ctx)));
+    view.for_each_token(|token, ctx, extensions| out.push((token, ctx, extensions)));
     out
 }
 
@@ -1127,10 +1130,10 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
     assert!(!big.wide().is_empty());
     for tree in [&small, &big] {
         let view = tree.token_trees();
-        view.for_each_token(|_, _| ());
+        view.for_each_token(|_, _, _| ());
         let walked = blaze_alloc_count::assert_at_most(0, "walking a tree's tokens", || {
             let mut tokens = 0;
-            view.for_each_token(|_, _| tokens += 1);
+            view.for_each_token(|_, _, _| tokens += 1);
             tokens
         });
         assert!(walked >= view.len());
@@ -1219,30 +1222,33 @@ fn a_framed_tree_is_the_global_tree_in_the_frame() {
 
 /// A tree built, written to the wire and read back has the very block it was built with,
 /// and its header describes that block.
-#[hegel::test]
-fn a_tree_read_from_the_wire_has_the_built_block(tc: hegel::TestCase) {
-    let seed: u64 = tc.draw(gs::integers());
-    let parts: usize = tc.draw(gs::integers().min_value(1).max_value(11));
-    let budget: u64 = tc.draw(gs::integers().max_value(79));
-    let mut trees = Gen::new(seed, parts);
-    let tree = TopSubtree::from_serialized(trees.tree(budget));
-    assert_eq!(Layout::of_header(tree.block()), Some(tree.layout));
-    let mut bytes = Vec::new();
-    tree.write_wire(&mut bytes);
-    let parts = wire::parts_of(&tree);
-    let mut resolve = |part: WirePart| {
-        parts
-            .iter()
-            .find(|(it, _)| *it == part)
-            .map(|&(_, it)| it)
-            .ok_or_else(|| "a part the tree didn't have".to_owned())
-    };
-    let (read, used) = TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
-        .expect("a tree's own bytes");
-    assert_eq!(used, bytes.len());
-    assert_eq!(read.block(), tree.block());
-    assert_eq!(read.layout, tree.layout);
-    assert_eq!((read.top_open, read.top_close), (tree.top_open, tree.top_close));
+#[test]
+fn a_tree_read_from_the_wire_has_the_built_block() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        // `Gen` is the large tree builder the seeded tests above share: seeded from the tape.
+        let seed: u64 = tape.next_u64("data seed");
+        let parts: usize = tape.int_in(1..=11, "parts");
+        let budget: u64 = tape.int_in(0..=79, "budget");
+        let mut trees = Gen::new(seed, parts);
+        let tree = TopSubtree::from_serialized(trees.tree(budget));
+        assert_eq!(Layout::of_header(tree.block()), Some(tree.layout));
+        let mut bytes = Vec::new();
+        tree.write_wire(&mut bytes);
+        let parts = wire::parts_of(&tree);
+        let mut resolve = |part: WirePart| {
+            parts
+                .iter()
+                .find(|(it, _)| *it == part)
+                .map(|&(_, it)| it)
+                .ok_or_else(|| "a part the tree didn't have".to_owned())
+        };
+        let (read, used) = TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
+            .expect("a tree's own bytes");
+        assert_eq!(used, bytes.len());
+        assert_eq!(read.block(), tree.block());
+        assert_eq!(read.layout, tree.layout);
+        assert_eq!((read.top_open, read.top_close), (tree.top_open, tree.top_close));
+    });
 }
 
 /// Every kind, with 0, 1 and 255 `#`s for a raw one, comes back from its number.
@@ -1309,16 +1315,18 @@ fn old_lit_kind(code: u8, hashes: u8) -> LitKind {
 
 /// `code`, and a node's literal kind read back, are the old `match`es for any number and
 /// count of `#`s.
-#[hegel::test]
-fn literal_codes_are_the_old_ones(tc: hegel::TestCase) {
-    let code: u8 = tc.draw(gs::integers().max_value(15));
-    let hashes: u8 = tc.draw(gs::integers());
-    let kind = old_lit_kind(code, hashes);
-    assert_eq!(kind.code(), old_code(kind));
-    let node = Node::literal(kind, 0, 0);
-    assert_eq!(node.lit_kind(), kind);
-    let head = LITERAL | u32::from(code) << 2 | u32::from(hashes) << 6;
-    assert_eq!(Node { head, data: 0 }.lit_kind(), old_lit_kind(code, hashes));
+#[test]
+fn literal_codes_are_the_old_ones() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let code: u8 = tape.int_in(0..=15, "code");
+        let hashes: u8 = tape.int("hashes");
+        let kind = old_lit_kind(code, hashes);
+        assert_eq!(kind.code(), old_code(kind));
+        let node = Node::literal(kind, 0, 0);
+        assert_eq!(node.lit_kind(), kind);
+        let head = LITERAL | u32::from(code) << 2 | u32::from(hashes) << 6;
+        assert_eq!(Node { head, data: 0 }.lit_kind(), old_lit_kind(code, hashes));
+    });
 }
 
 /// The scan-then-map index the in-process bridge's `Parts::index` had, before it took
@@ -1346,27 +1354,31 @@ fn old_index(
     })
 }
 
-#[hegel::test]
-fn index_table_numbers_as_the_old_parts_did(tc: hegel::TestCase) {
-    let values: Vec<u32> = tc.draw(gs::vecs(gs::integers().max_value(39)).max_size(199));
-    let mut table = IndexTable::default();
-    let (mut list, mut map) = (Vec::new(), blaze_hash::HashMap::new_in(Global));
-    for &value in &values {
-        assert_eq!(table.index(value), old_index(&mut list, &mut map, value));
-    }
-    assert_eq!(table.list(), &list[..]);
-    table.clear();
-    assert!(table.list().is_empty());
+#[test]
+fn index_table_numbers_as_the_old_parts_did() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let values: Vec<u32> = tape.vec(0..=199, "values", |tape| tape.int_in(0..=39, "value"));
+        let mut table = IndexTable::default();
+        let (mut list, mut map) = (Vec::new(), blaze_hash::HashMap::new_in(Global));
+        for &value in &values {
+            assert_eq!(table.index(value), old_index(&mut list, &mut map, value));
+        }
+        assert_eq!(table.list(), &list[..]);
+        table.clear();
+        assert!(table.list().is_empty());
+    });
 }
 
-#[hegel::test]
-fn aligned_bytes_are_the_bytes_at_a_word(tc: hegel::TestCase) {
-    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(63));
-    let skip: usize = tc.draw(gs::integers().max_value(3));
-    let backing = [&[0u8; 4][..skip], &bytes].concat();
-    let given = &backing[skip..];
-    let mut scratch = Vec::new();
-    let out = aligned(given, &mut scratch);
-    assert_eq!(out, given);
-    assert!(out.as_ptr().addr().is_multiple_of(4));
+#[test]
+fn aligned_bytes_are_the_bytes_at_a_word() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let bytes: Vec<u8> = tape.bytes(0..=63, "bytes");
+        let skip: usize = tape.int_in(0..=3, "skip");
+        let backing = [&[0u8; 4][..skip], &bytes].concat();
+        let given = &backing[skip..];
+        let mut scratch = Vec::new();
+        let out = aligned(given, &mut scratch);
+        assert_eq!(out, given);
+        assert!(out.as_ptr().addr().is_multiple_of(4));
+    });
 }

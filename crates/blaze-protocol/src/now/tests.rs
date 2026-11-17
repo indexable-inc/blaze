@@ -377,6 +377,14 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
             "convoy: 61 behind thread 7 on lock flight.intern (oldest 2400 ms); the head is running"
                 .into(),
         ),
+        stuck: vec![Stuck {
+            what: "codegen of seq-macro 0.3.6".into(),
+            cycle: Vec::new(),
+            waits: "lock store.packs".into(),
+            for_ms: 240_000,
+            inside: Some("write the pack (240.0 s)".into()),
+            held_by: Some("thread blaze-worker-9 (tid 41)".into()),
+        }],
         tally: Tally { waiting: 81, ready: 2, running: 1, done: 488, failed: 3, total: 575 },
         workers: 16,
         busy: vec![Busy {
@@ -385,6 +393,24 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
             span: span.clone(),
             path: vec!["codegen".into(), "copy_prop".into()],
         }],
+        running: vec![Running {
+            task: task.clone(),
+            for_ms: 270_000,
+            thread: Some("blaze-worker-3".into()),
+            span: Some(span.clone()),
+            path: vec!["codegen".into(), "copy_prop".into()],
+        }],
+        recent: 12,
+        failures: vec![task.clone()],
+        expanding: Expansion {
+            threads: 4,
+            busy: vec![Busy {
+                thread: "blaze-expand-1".into(),
+                task: None,
+                span: span.clone(),
+                path: Vec::new(),
+            }],
+        },
         blockers: vec![Blocker {
             task: task.clone(),
             running: true,
@@ -430,22 +456,26 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
 /// settled), said in one batch: under the cap, the blockers are the frontier, ranked, each
 /// holding exactly the unfinished tasks off the frontier that wait on it with the longest
 /// chain behind it, and every such task is held by one.
-#[hegel::test]
-fn every_task_off_the_frontier_is_held_by_a_blocker(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let len: usize = tc.draw(gs::integers::<usize>().max_value(24));
+#[test]
+fn every_task_off_the_frontier_is_held_by_a_blocker() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, frontier_case);
+}
+
+/// One case of [`every_task_off_the_frontier_is_held_by_a_blocker`].
+fn frontier_case(tape: &blaze_sim::Tape) {
+    let len = tape.int_in(0usize..=24, "tasks");
     let (mut deps, mut states): (Vec<Vec<u32>>, Vec<NodeState>) = (vec![], vec![]);
     for id in 0..len {
         let mut mine = vec![];
         if id > 0 {
-            for _ in 0..tc.draw(gs::integers::<usize>().max_value(3)) {
-                mine.push(tc.draw(gs::integers::<u32>().max_value(id as u32 - 1)));
+            for _ in 0..tape.int_in(0usize..=3, "deps") {
+                mine.push(tape.int_in(0u32..=id as u32 - 1, "dep"));
             }
         }
         let state = if mine.iter().any(|&dep| !states[dep as usize].settled()) {
             NodeState::Waiting
         } else {
-            match tc.draw(gs::integers::<u8>().max_value(6)) {
+            match tape.int_in(0u8..=6, "state") {
                 0 => NodeState::Waiting,
                 1 => NodeState::Ready,
                 2 => NodeState::Running,
@@ -525,4 +555,32 @@ fn every_task_off_the_frontier_is_held_by_a_blocker(tc: hegel::TestCase) {
     }
     let holds: u32 = now.blockers.iter().map(|it| it.holds).sum();
     assert!(holds as usize >= off.len(), "{holds} held of {} off the frontier", off.len());
+}
+
+/// A stuck task is said with what it does, what it waits on, who holds that and what the
+/// holder is inside; a cycle with every edge.
+#[test]
+fn a_stuck_task_says_its_wait_and_its_holder() {
+    let stuck = Stuck {
+        what: "codegen of seq-macro 0.3.6".into(),
+        cycle: Vec::new(),
+        waits: "lock store.packs".into(),
+        for_ms: 240_000,
+        inside: Some("write the pack (240.0 s)".into()),
+        held_by: Some("thread blaze-worker-9 (tid 41)".into()),
+    };
+    assert_eq!(
+        stuck.to_string(),
+        "stuck 4 min: codegen of seq-macro 0.3.6 waits on lock store.packs, held by thread \
+         blaze-worker-9 (tid 41) inside write the pack (240.0 s)"
+    );
+    let cycle = Stuck {
+        cycle: vec!["a waits on lock x, held by b".into(), "b waits on lock y, held by a".into()],
+        for_ms: 6_000,
+        ..Stuck::default()
+    };
+    assert_eq!(
+        cycle.to_string(),
+        "stuck 6 s: a cycle of waits: a waits on lock x, held by b; b waits on lock y, held by a"
+    );
 }

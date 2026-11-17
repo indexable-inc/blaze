@@ -7,21 +7,20 @@
 
 use std::path::PathBuf;
 
+use blaze_core::temp::TempDir;
 use blaze_ids::rng::SplitMix64;
 
 use super::*;
 use crate::unit::{Package, Profile};
 
-/// A package in a fresh directory, its script never made.
-fn package(test: &str) -> Unit {
-    let dir =
-        std::env::temp_dir().join(format!("blaze-build-script-{test}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let dir = dir.canonicalize().unwrap();
+/// A package in a fresh directory, its script never made; the directory goes when the first
+/// drops.
+fn package(test: &str) -> (TempDir, Unit) {
+    let tmp = TempDir::for_test(&format!("blaze-build-script-{test}-"));
+    let dir = tmp.path().canonicalize().unwrap();
     let manifest_dir = dir.join("foo");
     fs::create_dir_all(&manifest_dir).unwrap();
-    Unit {
+    let unit = Unit {
         package: Package {
             name: "foo".into(),
             version: "0.5.0".into(),
@@ -36,7 +35,8 @@ fn package(test: &str) -> Unit {
         script: dir.join("target/debug/build/foo-1/build-script-build"),
         out_dir: dir.join("target/debug/build/foo-2/out"),
         ..Unit::default()
-    }
+    };
+    (tmp, unit)
 }
 
 fn exited(code: i32) -> Ended {
@@ -50,7 +50,7 @@ fn judged(unit: &Unit, status: Ended, stdout: &[u8], stderr: &[u8]) -> Result<Ou
 /// What cargo does before a run, and the files it keeps of one, in its first layout.
 #[test]
 fn a_run_begins_and_its_files() {
-    let unit = package("where");
+    let (_dir, unit) = package("where");
     let began = begin(&unit).unwrap();
     assert!(unit.out_dir.is_dir());
     let dir = run_dir(&unit);
@@ -71,7 +71,7 @@ fn a_run_begins_and_its_files() {
 /// An elided script is judged as a run that printed what elision says and succeeded.
 #[test]
 fn an_elided_run() {
-    let unit = package("elided");
+    let (_dir, unit) = package("elided");
     let files = std::collections::BTreeMap::from([(
         PathBuf::from("build.rs"),
         b"fn main() { println!(\"cargo:rustc-cfg=foo\"); }".to_vec(),
@@ -91,7 +91,7 @@ fn an_elided_run() {
 
 #[test]
 fn a_script_that_fails() {
-    let unit = package("fails");
+    let (_dir, unit) = package("fails");
     let stdout = b"cargo:warning=careful\ncargo::error=oh no\nout\n";
     let failed = judged(&unit, exited(101), stdout, b"err\n").unwrap_err();
     assert_eq!(
@@ -111,7 +111,7 @@ fn a_script_that_fails() {
 
 #[test]
 fn a_script_that_logs_an_error() {
-    let unit = package("logs");
+    let (_dir, unit) = package("logs");
     let failed =
         judged(&unit, exited(0), b"cargo::warning=foo\ncargo::error=bar\n", b"").unwrap_err();
     assert_eq!(failed.error.0, "build script logged errors");
@@ -128,14 +128,14 @@ fn a_script_that_logs_an_error() {
 
 #[test]
 fn output_cargo_refuses() {
-    let unit = package("refused");
+    let (_dir, unit) = package("refused");
     let failed = judged(&unit, exited(0), b"cargo::rustc-what=1\n", b"").unwrap_err();
     assert!(failed.error.0.starts_with("invalid output in build script of `foo v0.5.0`"));
 }
 
 #[test]
 fn a_run_in_cargos_second_layout() {
-    let mut unit = package("second");
+    let (_dir, mut unit) = package("second");
     let target = unit.script.ancestors().nth(4).unwrap().to_owned();
     unit.out_dir = target.join("debug/build/foo/0123456789abcdef/out");
     begin(&unit).unwrap();
@@ -196,7 +196,7 @@ fn what_is_logged_is_read_as_the_lossy_lines_have_it() {
 /// what it logged; any other is what [`output::parse`] makes of it.
 #[test]
 fn judged_from_the_bytes() {
-    let mut unit = package("judged");
+    let (_dir, mut unit) = package("judged");
     let first = unit.out_dir.clone();
     let target = unit.script.ancestors().nth(4).unwrap().to_owned();
     let second = target.join("debug/build/foo/0123456789abcdef/out");

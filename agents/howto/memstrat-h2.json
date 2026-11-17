@@ -1,0 +1,9 @@
+{
+ "id": "memstrat-h2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "task": "Copy blaze's pinned LLVM from one ix VM to another",
+ "do": "ix shell <from> -- bash -c 'cd /root/.blaze/native && tar -cf - sha256-<hash> | zstd -9 -T8 -q' | ix shell <to> -- bash -c 'mkdir -p /root/.blaze/native && cd /root/.blaze/native && zstd -d -q | tar -xf -'",
+ "why": "Compressed in the pipe the 356 MB tree moved in under two minutes; uncompressed it took about 20 (rows records-6, edit2-3).",
+ "state": "current"
+}

@@ -4,7 +4,7 @@
  *
  * Inside the worker every path is a site path, without the base (`/rfcs/x`, `/learn/builds`), as the renderer lists pages
  * and as dist/ is laid out; `index.ts` strips the base on the way in. Anything going back to the browser as a path
- * (a Location, a cookie's Path, an OAuth redirect_uri) goes through `outer`.
+ * (a Location) goes through `outer`.
  *
  * Any other host the worker is reached on (the custom domains blaze.ix.dev and blaze.ix.dev, the site's old homes)
  * is answered with a redirect to the same path and query under ORIGIN + BASE. localhost (`wrangler dev`) is served.
@@ -20,9 +20,6 @@ const HOST = ORIGIN ? new URL(ORIGIN).host : '';
 /** A site path (`/rfcs/x`, `/`) as the browser sees it (`/blaze/rfcs/x`, `/blaze/`). */
 export const outer = (sitePath: string): string => BASE + sitePath;
 
-/** The path the cookies are scoped to: the base, so they never go to the rest of ix.dev. */
-export const COOKIE_PATH = BASE || '/';
-
 const isLocal = (host: string) => host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
 
 /**
@@ -33,7 +30,7 @@ export function enter(request: Request): Request | Response {
 	const url = new URL(request.url);
 	if (HOST && url.host !== HOST && !isLocal(url.hostname)) {
 		// The old homes: same path and query under the base. GET and HEAD get a 301; anything else a 308, which keeps
-		// the method and body (a form posted from a page still open on the old host).
+		// the method and body.
 		const to = `${ORIGIN}${outer(url.pathname)}${url.search}`;
 		return moved(to, request.method === 'GET' || request.method === 'HEAD' ? 301 : 308);
 	}

@@ -17,7 +17,7 @@ use crate::{
 fn with_cx<R>(fixture: &str, check: impl FnOnce(&Cx<'_, '_>) -> R) -> R {
     let checked = crate::tests::checked(fixture);
     let db = &checked.db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = hir::check::workspace_crates(db)
             .into_iter()
             .find(|it| it.display_name(db).is_some_and(|name| name.to_string() == "main"))

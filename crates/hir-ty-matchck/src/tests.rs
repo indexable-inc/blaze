@@ -112,7 +112,7 @@ fn check(#[rust_analyzer::rust_fixture] fixture: &str, expected: &[(&str, &str)]
     let fx = fixture::db(fixture);
     let file = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let hir_db: &Db = &db;
         let text = db.file_text(file.file_id(&db)).text(&db);
         let mut bodies = Vec::new();
@@ -553,7 +553,7 @@ fn plain(a: u8) -> u8 { let b = a; b }
     );
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
             for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -597,7 +597,7 @@ fn refutable_param((1, _): (u8, u8)) {}
     );
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
             for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -683,7 +683,7 @@ fn mismatched() {
     );
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
             for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -696,4 +696,111 @@ fn mismatched() {
             }
         }
     });
+}
+
+/// blaze: a `match` on a refinement by enum variants (`#![blaze::pattern_types]`,
+/// docs/v2/plan/design/edition.md, section 8) is exhaustive over its set alone; the enum
+/// itself still needs every variant.
+#[test]
+fn a_match_on_a_refinement_needs_only_its_variants() {
+    check(
+        r#"
+#![blaze::pattern_types]
+enum Conn { Open { socket: u32 }, Closed, Pending(u8) }
+
+fn one(c: Conn is Conn::Open { .. }) -> u32 {
+    match c { Conn::Open { socket } => socket }
+}
+
+fn two(c: Conn is Conn::Open { .. } | Conn::Closed) -> u32 {
+    match c { Conn::Open { socket } => socket }
+}
+
+fn base(c: Conn) -> u32 {
+    match c { Conn::Open { socket } => socket }
+}
+"#,
+        &[("c", "E0004: Conn::Closed"), ("c", "E0004: Conn::Closed | Conn::Pending(_)")],
+    );
+}
+
+/// blaze's error unions (`#![blaze::error_unions]`, docs/v2/plan/design/error-sets.md,
+/// "Matching"): a `match` on a union is exhaustive when its arms cover every member, each by
+/// a pattern of that member, and a member left out is the witness, written as the pattern
+/// that covers it; an arm of a member already covered is unreachable.
+#[test]
+fn a_match_on_an_error_union_is_exhaustive_over_its_members() {
+    check(
+        r#"
+//- minicore: sized, error_union, result, str, slice
+#![blaze::error_unions]
+pub struct Missing { pub capability: &'static str }
+pub enum FsKind { NotFound, NotADirectory }
+pub struct FsError { pub op: u8, pub kind: FsKind }
+pub enum Stopped { Deadline { at: u32 }, Cancelled }
+
+fn every_member(e: Missing | FsError | Stopped) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        FsError { kind: FsKind::NotFound, .. } => 1,
+        FsError { .. } => 2,
+        Stopped::Deadline { .. } | Stopped::Cancelled => 3,
+    }
+}
+
+fn a_struct_member_left_out(e: Missing | FsError) -> u8 {
+    match e {
+        Missing { .. } => 0,
+    }
+}
+
+fn an_enum_member_left_out(r: Result<u8, Stopped | Missing>) -> u8 {
+    match r {
+        Ok(n) => n,
+        Err(Missing { .. }) => 0,
+    }
+}
+
+fn a_variant_of_a_member_left_out(e: &(Missing | Stopped)) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        Stopped::Cancelled => 1,
+    }
+}
+
+fn a_part_of_a_member_left_out(e: Missing | FsError) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        FsError { kind: FsKind::NotFound, .. } => 1,
+    }
+}
+
+fn a_member_covered_twice(e: Missing | FsError) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        FsError { .. } => 1,
+        Missing { capability: _ } => 2,
+    }
+}
+
+fn a_let_of_one_member(e: Missing | FsError) {
+    let FsError { op: _, .. } = e;
+}
+
+fn a_member_bound_whole_through_a_reference(e: &(Missing | FsError)) -> usize {
+    match e {
+        m @ Missing { .. } => m.capability.as_bytes().len(),
+    }
+}
+"#,
+        &[
+            ("e", "E0004: FsError { .. }"),
+            ("r", "E0004: Err(Stopped::_)"),
+            ("e", "E0004: &Stopped::Deadline { .. }"),
+            ("e", "E0004: FsError { kind: FsKind::NotADirectory, .. }"),
+            ("Missing { capability: _ }", "unreachable_patterns"),
+            ("FsError { op: _, .. }", "E0005 local binding: Missing { .. }"),
+            ("e", "E0004: &FsError { .. }"),
+        ],
+    );
 }

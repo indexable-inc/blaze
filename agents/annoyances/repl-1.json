@@ -1,0 +1,18 @@
+{
+ "id": "repl-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+ "where": "crates/harness/mcp/src/daemon.ts `SOCK`; every test that runs a cell",
+ "what": "The daemon socket's path ignored HARNESS_HOME (`$HOME/.harness/harnessd.sock` unless HARNESS_SOCK was set), so a test or script that set only HARNESS_HOME to a scratch directory would still post its cells to, and run its `sh` through, the person's live daemon. I noticed only because the live socket exists on this Mac.",
+ "cost": "ten minutes; no harm found, but any new test that ran a cell would have written `repl` objects into the live index",
+ "cause": "two derivations of one path: the Rust daemon uses home().join(\"harnessd.sock\"), the kernel had its own",
+ "whys": [
+  "why possible: the kernel computed the socket path from $HOME, not from the state directory",
+  "why not caught: each test that ran cells remembered to set HARNESS_SOCK by hand",
+  "property: isolation from the live harness was each test's own job"
+ ],
+ "class": "a test or script reaching the person's live state because isolation is opt-in per file",
+ "prevention": "SOCK() derives from HOME() (src/self.ts) as the daemon does; bunfig.toml preloads src/test-setup.ts, which gives every `bun test` run its own empty HARNESS_HOME and unsets HARNESS_SOCK and HARNESS_SESSION",
+ "fix": "done in this lane",
+ "state": "fixed on branch repl-clean-1112 (not merged)"
+}

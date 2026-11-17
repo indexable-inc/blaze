@@ -1,0 +1,12 @@
+{
+ "id": "repl-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+ "where": "Bun 1.4.2: process.on('unhandledRejection'), node:worker_threads",
+ "what": "Two engine behaviours cost time. (1) Bun calls unhandledRejection with no AsyncLocalStorage store and, in the kernel, only after the cell that dropped the promise had replied, so it cannot be attributed by context: it is attributed by the cell's name in the stack (each cell is compiled with `//# sourceURL=t3.cell.ts`). uncaughtException does keep the store. (2) A watchdog Worker created just before a synchronous loop never started, and a worker's process.stderr write did not appear while the main thread was held.",
+ "cost": "about forty minutes across both",
+ "cause": "engine behaviour found by experiment, not read in documentation",
+ "workaround": "sourceURL per cell for attribution; the watchdog is started at kernel start, takes its inputs as workerData, and writes only to the journal file before it kills",
+ "fix": "none here; e2e.test.ts ('an unawaited rejection…') and kernel.test.ts ('a cell that never awaits…') fail if a Bun update changes either",
+ "state": "accepted"
+}

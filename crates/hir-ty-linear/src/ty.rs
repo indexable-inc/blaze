@@ -1,12 +1,19 @@
 //! Which types are linear, and which hold a linear value.
 //!
 //! A type is linear itself when it is a struct, enum or union marked `#[blaze::linear]`, a type
-//! parameter or a trait's `Self` marked so, a projection of an associated type marked so, a
-//! `dyn` of a trait marked so, or an opaque type whose hidden type is one. It holds a linear
+//! parameter or a trait's `Self` marked so, a projection of an associated type marked so or of
+//! any associated type of a type parameter marked so, a `dyn` of a trait marked so, or an
+//! opaque type whose hidden type is one. It holds a linear
 //! value when it is one or a part of it does: a field of a struct, a variant's field, a tuple's
 //! or an array's element, a closure's, coroutine's or `async` block's capture, a `Box`'s
 //! contents. A reference, a raw pointer, `ManuallyDrop` and `PhantomData` hold none: dropping
 //! them drops nothing they point at.
+//!
+//! A value is abandoned by an error exit ([`Types::abandons`]) when every linear value it
+//! holds is of a marked type with an abandonment path, a `Drop` impl its author wrote for it
+//! that a panic runs too: the type's own, or for a struct that of a field whose type its
+//! crate defines (the guard a type keeps in a field so that its finishing call can still take
+//! its other fields out, which a `Drop` impl of its own would forbid).
 
 use base_db::Db;
 use blaze_mem::Frame;
@@ -15,6 +22,7 @@ use hir_ty::{
     FrameMap, FrameSet,
     consteval::try_const_usize,
     db::HirDatabase,
+    drop::destructor,
     frame_map, frame_set,
     layout::{enum_variant_ids, struct_flags},
     next_solver::{AliasTy, AssocTyId, DbInterner, ParamEnv, TermKind, Ty, TyKind},
@@ -31,6 +39,12 @@ use crate::BodyKind;
 /// Whether `adt` is marked `#[blaze::linear]`.
 pub fn is_linear_adt(db: &Db, adt: AdtId) -> bool {
     AttrFlags::query(db, AttrDefId::AdtId(adt)).contains(AttrFlags::LINEAR)
+}
+
+/// Whether `adt` is marked `#[blaze::holds]`: a value of it holds a value of each of its type
+/// arguments where no field shows one (a counted handle, a container over a raw pointer).
+pub fn is_holder_adt(db: &Db, adt: AdtId) -> bool {
+    AttrFlags::query(db, AttrDefId::AdtId(adt)).contains(AttrFlags::HOLDS)
 }
 
 /// Whether a value of `ty` holds a linear value ([`self`]). Read off `ty` alone: a type
@@ -66,6 +80,38 @@ impl<'db> Walk<'_, '_, 'db> {
         self.visiting.remove(&ty);
         held
     }
+
+    /// Whether every linear value a value of `ty` holds has an abandonment path: it is of a
+    /// marked struct, enum or union with a `Drop` impl of its own, or of a marked struct with
+    /// a field of a type its crate defines that has one. A marked type with neither (a type
+    /// parameter, an associated type and a `dyn` among them: nothing says what dropping one
+    /// runs) has no such path, whatever else it holds.
+    fn abandons(&mut self, ty: Ty<'db>) -> bool {
+        if is_marked(self.db, ty) && !self.exempt.contains(&ty) {
+            let TyKind::Adt(def, args) = ty.kind() else { return false };
+            let adt = def.def_id();
+            if destructor(self.db, adt).is_some() {
+                return true;
+            }
+            let AdtId::StructId(id) = adt else { return false };
+            let krate = adt.krate(self.db);
+            return self.db.field_types(id.into()).iter().any(|(_, field)| {
+                let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+                matches!(
+                    field.kind(),
+                    TyKind::Adt(guard, _) if guard.def_id().krate(self.db) == krate
+                        && destructor(self.db, guard.def_id()).is_some()
+                )
+            });
+        }
+        // A type met again on its way back to itself: the part that decides is seen there.
+        if !self.visiting.insert(ty) {
+            return true;
+        }
+        let kept = parts(self.db, self.interner, ty, &mut |part| !self.abandons(part));
+        self.visiting.remove(&ty);
+        !kept
+    }
 }
 
 /// Whether `ty` is linear itself (not by a part of it).
@@ -75,14 +121,23 @@ pub(crate) fn is_marked(db: &Db, ty: Ty<'_>) -> bool {
         TyKind::Param(param) => {
             AttrFlags::query_type_or_const_param(db, param.id.into()).contains(AttrFlags::LINEAR)
         }
-        TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) => {
-            match def_id.0 {
+        TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, args, .. }) => {
+            let marked = match def_id.0 {
                 AssocTyId::TypeAliasId(alias) => {
                     AttrFlags::query(db, AttrDefId::TypeAliasId(alias)).contains(AttrFlags::LINEAR)
                 }
                 // A trait method's `impl Trait` has no attributes of its own.
                 AssocTyId::RpititId(_) => false,
-            }
+            };
+            // An associated type of a marked type parameter (`<T as Try>::Output` of a
+            // `#[blaze::linear] T`): an impl may bind it to its own marked parameter
+            // (`generic::check_impl_bindings`), so what it is may be linear.
+            marked
+                || matches!(
+                    args.type_at(0).kind(),
+                    TyKind::Param(param) if AttrFlags::query_type_or_const_param(db, param.id.into())
+                        .contains(AttrFlags::LINEAR)
+                )
         }
         TyKind::Dynamic(predicates, ..) => predicates.principal_def_id().is_some_and(|it| {
             AttrFlags::query(db, AttrDefId::TraitId(it.0)).contains(AttrFlags::LINEAR)
@@ -103,6 +158,10 @@ fn parts<'db>(
         TyKind::Adt(def, args) => {
             if def.is_box() {
                 return part(args.type_at(0));
+            }
+            // A `#[blaze::holds]` type holds its type arguments, whatever its fields are.
+            if is_holder_adt(db, def.def_id()) && args.types().any(&mut *part) {
+                return true;
             }
             let fields = |variant: VariantId, part: &mut dyn FnMut(Ty<'db>) -> bool| {
                 db.field_types(variant)
@@ -139,6 +198,34 @@ fn parts<'db>(
     }
 }
 
+/// The type arguments of the `#[blaze::holds]` type that `body`'s item is a method of, when
+/// its impl is in the crate that defines the type; none otherwise.
+fn holder_args<'db>(
+    db: &'db Db,
+    body: &MirBody<'db>,
+    krate: base_db::Crate,
+) -> impl Iterator<Item = Ty<'db>> {
+    let impl_ = match body.owner.generic_def(db) {
+        hir_def::GenericDefId::FunctionId(func) => match hir_def::Lookup::lookup(&func, db).container {
+            hir_def::ItemContainerId::ImplId(impl_) => Some(impl_),
+            _ => None,
+        },
+        _ => None,
+    };
+    let args = impl_.and_then(|impl_| {
+        let self_ty: Ty<'db> = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
+        match self_ty.kind() {
+            TyKind::Adt(def, args)
+                if is_holder_adt(db, def.def_id()) && def.def_id().krate(db) == krate =>
+            {
+                Some(args)
+            }
+            _ => None,
+        }
+    });
+    args.into_iter().flat_map(|args| args.types())
+}
+
 /// What the checks of one body ask of its types.
 pub(crate) struct Types<'a, 'db> {
     pub(crate) db: &'db Db,
@@ -152,6 +239,8 @@ pub(crate) struct Types<'a, 'db> {
     /// [`Types::holds`] of each type asked, which a body asks of the same types many times.
     held: RefCell<FrameMap<'a, Ty<'db>, bool>>,
     deep: RefCell<FrameMap<'a, Ty<'db>, bool>>,
+    /// [`Types::abandons`] of each type asked.
+    abandoned: RefCell<FrameMap<'a, Ty<'db>, bool>>,
 }
 
 impl<'a, 'db> Types<'a, 'db> {
@@ -167,6 +256,11 @@ impl<'a, 'db> Types<'a, 'db> {
         {
             exempt.extend(body.param_locals.iter().map(|&it| body.locals[it].ty.as_ref()));
         }
+        // The impls of a `#[blaze::holds]` type in its own crate are where the values it
+        // holds are moved in and out, by code the check cannot follow (a raw pointer, a
+        // count): in their bodies, closures included, the type's arguments are linear
+        // nowhere (rule 7). What they hand back is linear again in the caller.
+        exempt.extend(holder_args(db, body, krate));
         Types {
             db,
             interner,
@@ -176,6 +270,7 @@ impl<'a, 'db> Types<'a, 'db> {
             exempt: exempt.leak(),
             held: RefCell::new(frame_map(frame)),
             deep: RefCell::new(frame_map(frame)),
+            abandoned: RefCell::new(frame_map(frame)),
         }
     }
 
@@ -201,10 +296,49 @@ impl<'a, 'db> Types<'a, 'db> {
         parts(self.db, self.interner, ty, part)
     }
 
+    /// Whether an error exit abandons a value of `ty` (rule 6): it holds no linear value, or
+    /// every one it holds is of a marked type with an abandonment path, which dropping the
+    /// value there runs as a panic would.
+    pub(crate) fn abandons(&self, ty: Ty<'db>) -> bool {
+        if !self.holds(ty) {
+            return true;
+        }
+        if let Some(&known) = self.abandoned.borrow().get(&ty) {
+            return known;
+        }
+        let visiting = frame_set(self.frame);
+        let abandons =
+            Walk { db: self.db, interner: self.interner, exempt: self.exempt, visiting }.abandons(ty);
+        self.abandoned.borrow_mut().insert(ty, abandons);
+        abandons
+    }
+
+    /// Whether a value of `ty` is a value of `part` or holds one by value.
+    pub(crate) fn holds_a(&self, ty: Ty<'db>, part: Ty<'db>) -> bool {
+        fn walk<'db>(
+            types: &Types<'_, 'db>,
+            visiting: &mut FrameSet<'_, Ty<'db>>,
+            ty: Ty<'db>,
+            part: Ty<'db>,
+        ) -> bool {
+            if ty == part {
+                return true;
+            }
+            if !visiting.insert(ty) {
+                return false;
+            }
+            let held = types.parts(ty, &mut |it| walk(types, visiting, it, part));
+            visiting.remove(&ty);
+            held
+        }
+        walk(self, &mut frame_set(self.frame), ty, part)
+    }
+
     /// Whether code generic over a parameter given `ty` may come to drop a linear value: `ty`
-    /// holds one, or it is a function, a closure or a `dyn` whose signature or projections
-    /// take or give one, which calling it hands that code (`<F as FnOnce<()>>::Output`), seen
-    /// through references and raw pointers.
+    /// holds one, or it is a function, a closure or a `dyn` that gives one back, which calling
+    /// it hands that code (`<F as FnOnce<()>>::Output`), seen through references and raw
+    /// pointers. What it takes does not count: that code can only call it with a value it
+    /// holds, and it holds a linear one only through a parameter that admits it.
     pub(crate) fn reaches(&self, ty: Ty<'db>) -> bool {
         if let Some(&known) = self.deep.borrow().get(&ty) {
             return known;
@@ -221,22 +355,22 @@ impl<'a, 'db> Types<'a, 'db> {
             TyKind::FnDef(callable, args) => {
                 let sig = self.db.callable_item_signature(callable.0);
                 let sig = sig.instantiate(interner, args.skip_binder()).skip_norm_wip();
-                sig.skip_binder().inputs_and_output.iter().any(|it| self.holds(it))
+                self.gives(sig.skip_binder().inputs_and_output.iter())
             }
-            TyKind::FnPtr(sig, _) => {
-                sig.skip_binder().inputs_and_output.iter().any(|it| self.holds(it))
+            TyKind::FnPtr(sig, _) => self.gives(sig.skip_binder().inputs_and_output.iter()),
+            TyKind::Closure(_, args) => {
+                self.gives(args.as_closure().sig().skip_binder().inputs_and_output.iter())
             }
-            TyKind::Closure(_, args) => args
-                .as_closure()
-                .sig()
-                .skip_binder()
-                .inputs_and_output
-                .iter()
-                .any(|it| self.holds(it)),
             TyKind::Dynamic(predicates, ..) => predicates.projection_bounds().into_iter().any(
                 |it| matches!(it.skip_binder().term.kind(), TermKind::Ty(it) if self.holds(it)),
             ),
             _ => false,
         }
+    }
+
+    /// Whether the output of a signature, the last of its `inputs_and_output`, holds a linear
+    /// value.
+    fn gives(&self, inputs_and_output: impl Iterator<Item = Ty<'db>>) -> bool {
+        inputs_and_output.last().is_some_and(|it| self.holds(it))
     }
 }

@@ -69,7 +69,7 @@ impl Build {
     ) -> NodeId {
         let id = NodeId(self.next);
         self.next += 1;
-        self.specs.push(Spec { id, kind, name, deps: deps.into(), pool, cost, key, memory: 0 });
+        self.specs.push(Spec { id, kind, name, deps: deps.into(), pool, cost, key });
         id
     }
 
@@ -245,7 +245,7 @@ mod tests {
             let db = Arc::clone(&db);
             move |key: Key| db.lock().get(&key).cloned()
         };
-        let config = PlaneConfig { io: 1, work: 1, budget: None, starve_after: 4 };
+        let config = PlaneConfig { io: 1, work: 1 };
         let mut plane = Plane::with_memo(config, memo).unwrap();
         let mut at = 0;
         let mut run = |plane: &mut Plane<_>, request: RequestId, specs: Vec<Spec>| {
@@ -274,8 +274,7 @@ mod tests {
                         PlaneOutput::Run { id, .. } => running.push(id),
                         PlaneOutput::Finished { ok, .. } => finished = Some(ok),
                         PlaneOutput::Said { .. } => {}
-                        PlaneOutput::Yield { .. } => unreachable!("no request is idle"),
-                    }
+                        PlaneOutput::Yield { .. } => unreachable!("no request is idle"),                    }
                 }
                 if let Some(ok) = finished {
                     return (ran, together, ok);

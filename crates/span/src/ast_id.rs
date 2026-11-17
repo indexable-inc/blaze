@@ -334,6 +334,17 @@ pub struct FileAstId<N> {
     _marker: PhantomData<fn() -> N>,
 }
 
+/// An id within one file's tree: it names no arena (`blaze_memo::Home`).
+impl blaze_memo::Home for ErasedFileAstId {
+    #[inline]
+    fn home(&self, _: &mut blaze_memo::Homes<'_>) {}
+}
+
+impl<N> blaze_memo::Home for FileAstId<N> {
+    #[inline]
+    fn home(&self, _: &mut blaze_memo::Homes<'_>) {}
+}
+
 /// Traits are manually implemented because `derive` adds redundant bounds.
 impl<N> Clone for FileAstId<N> {
     #[inline]
@@ -788,6 +799,10 @@ fn home(word: u32, bits: u32) -> usize {
     (u64::from(word).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The sorts' scratch of the maps built on this thread, kept at the largest they grew to.
     static ENTRY_SCRATCH: RefCell<Scratch<Entry>> = const { RefCell::new(Scratch::new()) };

@@ -1,0 +1,17 @@
+{
+ "id": "driver-patch-has-no-empty-base",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane code (program wiring)",
+ "where": "crates/blaze-keyed/src/front.rs (Patch) against crates/blaze-link/src/patch.rs (Patch::applies_to)",
+ "what": "blaze-link's patch says whether it applies to an empty file (a full patch leaves zero runs unwritten) or to a clone; the driver's Patch has no such flag and is always applied to a clone of the old image. Fitting one to the other, program::patch_of writes zeros over every unwritten run below the old length when a full patch follows an earlier image.",
+ "cost": "On a relink that found no room in place, up to a whole image of zeros copied into the patch and written, where an empty file would cost none.",
+ "cause": "The two patch types were designed in two lanes; the driver's dropped the base the linker's carries.",
+ "whys": [
+  "Why zeros? The clone holds the old image's bytes where the full patch assumes zeros.",
+  "Why no flag? The driver's doc says a first link writes over an empty file, which is the only full patch it imagined."
+ ],
+ "class": "A seam type that drops a variant its producer has.",
+ "prevention": "Give the driver's Patch a `base: PatchBase` (or `from_empty: bool`) and let Images::make start an empty file for it.",
+ "workaround": "program::patch_of fills the gaps with zero writes.",
+ "state": "resolved: the driver's Patch has `base: PatchBase`; program::patch_of sets it and the zero fill is gone (2026-11-14)"
+}

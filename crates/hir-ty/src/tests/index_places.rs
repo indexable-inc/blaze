@@ -1,5 +1,5 @@
 //! Nested indexing through slices, arrays and references infers with no error: `grid[i][j] += 1`
-//! through `IndexMut`, `rows[1][i]` through two `Index`es (queue 01396: hir-ty-borrowck's
+//! through `IndexMut`, `rows[1][i]` through two `Index`es (hir-ty-borrowck's
 //! `CLEAN` fixture left `indexes` not checked for its type errors). On a failure the message has
 //! inference's diagnostics and each node whose type has an error.
 
@@ -29,7 +29,7 @@ fn indexes(rows: &[&[u32]], grid: &mut [[u32; 4]; 4], i: usize, j: usize) -> u32
 #[test]
 fn nested_indexing_infers_with_no_error() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut failed = String::new();
         let fns = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)

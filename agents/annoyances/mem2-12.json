@@ -1,0 +1,11 @@
+{
+ "id": "mem2-12",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "the agent's Bash tool",
+ "what": "A command that starts with `sleep N;` is refused, and a foreground wait loop is moved to the background after three minutes, so waiting for a four-minute measurement on a VM takes two or three tool calls.",
+ "cost": "a minute each time, about fifteen times",
+ "cause": "the harness's rule against sleeping",
+ "workaround": "an `until ... do sleep 20; done` loop, read when its notification comes",
+ "state": "open"
+}

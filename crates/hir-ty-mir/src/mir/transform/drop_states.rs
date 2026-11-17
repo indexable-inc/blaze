@@ -6,6 +6,10 @@
 //! `hir-ty-linear` asks it for the locals that hold a `#[blaze::linear]` value
 //! (docs/v2/plan/design/linear.md). It reads the body and changes nothing: drop elaboration
 //! runs its own analysis, rooted as before, so no body's code depends on it.
+//!
+//! The caller may also name locations where values are abandoned (the linear check's error
+//! exits): from each on, the locals whose type its second predicate picks hold nothing, as if
+//! moved out there. That is an effect of this analysis only, never of drop elaboration's.
 
 use blaze_mem::{Tag, frame};
 
@@ -15,13 +19,14 @@ use crate::{
     mir::{
         BasicBlockId, MirBody, MirSpan, PlaceTy, StoredPlace, TerminatorKind,
         framed::{bits_in, block_index},
+        return_slot,
     },
     next_solver::Ty,
 };
 
 use super::{
     Ctx,
-    move_paths::{Effects, InitAnalysis, InitState, Lookup, MoveData, live_blocks},
+    move_paths::{Change, Effect, Effects, InitAnalysis, InitState, Lookup, MoveData, live_blocks},
 };
 
 /// A drop of a built body, with what may be held there of the paths below the place it drops.
@@ -65,10 +70,19 @@ pub struct HeldPath<'db> {
 /// The drops of `body`, a [`crate::mir::MirPhase::Built`] body, in the order of their blocks,
 /// with what the paths of the locals `root` picks may hold at each. A drop in a block no way
 /// leads to is left out.
+///
+/// After each location of `abandoned_at` (a block and the index of one of its statements, or
+/// the number of them for its terminator), every local whose type `abandons` picks holds
+/// nothing, in any of its paths: the value is given up there whole, and a drop that only such
+/// locations lead to with the value drops nothing the caller is told of. A part of a local is
+/// never given up on its own, and neither is the return place. With no location, `abandons`
+/// is not asked.
 pub fn drop_states<'db>(
     db: &'db Db,
     body: &MirBody<'db>,
     root: impl FnMut(Ty<'db>) -> bool,
+    abandoned_at: &[(BasicBlockId, usize)],
+    mut abandons: impl FnMut(Ty<'db>) -> bool,
 ) -> Vec<DropState<'db>> {
     frame::task(Tag::Mir, |frame| {
         let ctx = Ctx::new(db, body.owner, frame);
@@ -80,6 +94,19 @@ pub fn drop_states<'db>(
         let live = live_blocks(body, &unreached, frame);
         let data = MoveData::gather_rooted(&ctx, body, &live, frame, root);
         let mut effects = Effects::new_in(blocks, frame);
+        if !abandoned_at.is_empty() {
+            for (path, held) in data.paths.iter().enumerate() {
+                if held.place.local == return_slot()
+                    || !held.place.projection.as_slice().is_empty()
+                    || !abandons(held.ty.ty)
+                {
+                    continue;
+                }
+                for &(block, at) in abandoned_at {
+                    effects.add(block, at, Effect { path, change: Change::Uninit });
+                }
+            }
+        }
         let none = bits_in(blocks, frame);
         let analysis =
             InitAnalysis::run(&ctx, &data, body, &live, &unreached, &none, &mut effects, frame);

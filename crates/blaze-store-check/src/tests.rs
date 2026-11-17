@@ -1,24 +1,28 @@
 use blaze_ids::ContentId;
 use blaze_ids::rng::SplitMix64;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
 /// The offset `compare` names is the first at which the two differ, or the shorter's length
 /// when one is the other's prefix, and equal bytes compare equal.
-#[hegel::test(test_cases = 200)]
-fn the_named_byte_is_the_first_that_differs(tc: TestCase) {
-    let stored: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>().max_value(3)).max_size(40));
+#[test]
+fn the_named_byte_is_the_first_that_differs() {
+    blaze_sim::check(Config::cases(200), first_difference_case);
+}
+
+/// One case of [`the_named_byte_is_the_first_that_differs`].
+fn first_difference_case(tape: &Tape) {
+    let stored: Vec<u8> = tape.vec(0..=40, "stored", |tape| tape.int_in(0u8..=3, "stored byte"));
     let mut recomputed = stored.clone();
-    match tc.draw(gs::integers::<u8>().max_value(3)) {
+    match tape.int_in(0u8..=3, "edit") {
         0 => {}
         1 if !recomputed.is_empty() => {
-            let at: usize = tc.draw(gs::integers().max_value(recomputed.len() - 1));
-            recomputed[at] ^= 1 + tc.draw(gs::integers::<u8>().max_value(254));
+            let at = tape.index(recomputed.len(), "flip at");
+            recomputed[at] ^= 1 + tape.int_in(0u8..=254, "flip bits");
         }
-        2 => recomputed.truncate(tc.draw(gs::integers().max_value(stored.len()))),
-        _ => recomputed.push(tc.draw(gs::integers::<u8>())),
+        2 => recomputed.truncate(tape.int_in(0usize..=stored.len(), "cut to")),
+        _ => recomputed.push(tape.int::<u8>("pushed")),
     }
     let naive =
         (0..stored.len().max(recomputed.len())).find(|&n| stored.get(n) != recomputed.get(n));
@@ -177,4 +181,14 @@ fn every_simd_path_finds_each_difference_in_a_block_and_the_overlapping_tail() {
             }
         }
     }
+}
+
+/// A build that must be checked runs at the least rate whatever its request asked: an unset
+/// or lower setting is raised, its seed kept, and a higher one stays.
+#[test]
+fn at_least_raises_a_lower_rate_and_keeps_the_seed() {
+    assert_eq!(Setting::OFF.at_least(0.05), Setting { rate: 0.05, seed: 0 });
+    assert_eq!(Setting { rate: 0.01, seed: 7 }.at_least(0.05), Setting { rate: 0.05, seed: 7 });
+    assert_eq!(Setting::ALL.at_least(0.05), Setting::ALL);
+    assert!(!Setting::OFF.at_least(0.05).is_off());
 }

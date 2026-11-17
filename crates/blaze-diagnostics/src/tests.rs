@@ -6,7 +6,9 @@ mod check;
 mod db;
 mod emit;
 mod items;
+mod stabilized;
 pub(crate) mod lints;
+mod passes_named;
 
 use std::collections::HashMap;
 
@@ -154,7 +156,77 @@ fn checked_as(
     expand_derives: bool,
     appended: Option<&'static str>,
 ) -> Checked {
+    if !expand_derives && appended.is_none() {
+        // clone: the fixture and its options, kept for the by-piece check's refinement
+        CHECKED.lock().push((fixture.to_owned(), prefix.to_owned(), options.clone()));
+    }
     checked_from(fixture::db(fixture), fixture, prefix, options, expand_derives, appended)
+}
+
+/// Each fixture a test checked through [`checked_as`] with neither derives expanded nor a
+/// module appended, with its prefix and options, in the order checked: what
+/// `pieces::tests::the_pieces_check_equals_the_whole_check` checks again by piece, beside its
+/// own fixtures, after every edit kind.
+pub(crate) static CHECKED: blaze_core::lock::Lock<Vec<(String, String, Options)>> =
+    blaze_core::lock::Lock::new("test.diagnostics.checked", Vec::new());
+
+/// A fixture's database as [`checked_with`] makes it, nothing checked yet, with the names of
+/// its files and its first file: what a test edits and checks again ([`check_all`]).
+pub(crate) fn fixture_db(
+    fixture: &str,
+    prefix: &str,
+) -> (base_db::Db, HashMap<FileId, String>, FileId) {
+    let fx = fixture::db(fixture);
+    let files = fx.files().to_vec();
+    let sysroot = fx.sysroot_files().to_vec();
+    let db = fx.into_db();
+    let first = files[0].file_id(&db);
+    let (names, _) = names_of(&db, fixture, prefix, &files, sysroot);
+    (db, names, first)
+}
+
+/// The diagnostics of every workspace crate of `db`, checked as [`checked_with`] checks them,
+/// `options` as given.
+pub(crate) fn check_all(
+    db: &base_db::Db,
+    names: &HashMap<FileId, String>,
+    options: &Options,
+) -> Vec<Diag> {
+    blaze_memo::attach(db, || {
+        hir::check::workspace_crates(db)
+            .into_iter()
+            .flat_map(|krate| crate::check::check_crate(db, krate, Files::new(names, ""), options))
+            .collect()
+    })
+}
+
+/// The names of a fixture's files: each as the fixture names it, with `prefix` before it, and
+/// minicore's and the proc macros' crate's as compiletest names them; and minicore's file, if
+/// the fixture has it.
+fn names_of(
+    db: &base_db::Db,
+    fixture: &str,
+    prefix: &str,
+    files: &[base_db::EditionedFileId],
+    sysroot: Vec<FileId>,
+) -> (HashMap<FileId, String>, Option<FileId>) {
+    let mut names: HashMap<FileId, String> = files
+        .iter()
+        .zip(paths(fixture))
+        .map(|(file, path)| (file.file_id(db), format!("{prefix}{path}")))
+        .collect();
+    let (has_core, has_proc_macros) = sysroot_of(fixture);
+    let mut sysroot = sysroot.into_iter();
+    let core = has_core.then(|| sysroot.next().expect("a fixture with minicore has its file"));
+    if let Some(core) = core {
+        names.insert(core, CORE_NAME.to_owned());
+    }
+    if has_proc_macros {
+        let proc_macros =
+            sysroot.next().expect("a fixture with proc macros has their crate's file");
+        names.insert(proc_macros, format!("{prefix}auxiliary/proc_macros.rs"));
+    }
+    (names, core)
 }
 
 fn checked_from(
@@ -179,37 +251,32 @@ fn checked_from(
     let files = fx.files().to_vec();
     let sysroot = fx.sysroot_files().to_vec();
     let mut db = fx.into_db();
-    if expand_derives {
-        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+    // The files' names by their stable `FileId`s, taken before the commit below: `files` are
+    // interned ids of this snapshot, dead once a commit drops their arena.
+    let (names, core) = names_of(&db, fixture, prefix, &files, sysroot);
+    // The fixture's settings in one commit, none when it has none: a commit drops arenas.
+    let root = appended.map(|module| (files[0].file_id(&db), module));
+    if expand_derives || root.is_some() {
+        let mut edit = db.edit();
+        if expand_derives {
+            // An input of the session arena, made each time it is, as the driver sets it.
+            edit.set_given(
+                None,
+                hir_def::nameres::builtin_derives_fact(true),
+                Box::new_in(
+                    |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                        hir_def::nameres::set_expand_builtin_derives(inputs, true);
+                    },
+                    std::alloc::Global,
+                ),
+            );
+        }
+        if let Some((root, module)) = root {
+            edit.set_appended_root_module(root, Some(module));
+        }
+        _ = edit.commit();
     }
-    if let Some(module) = appended {
-        let root = files[0].file_id(&db);
-        db.set_appended_root_module(root, Some(module), blaze_query::db::Durability::LOW);
-    }
-    let mut names: HashMap<FileId, String> = files
-        .iter()
-        .zip(paths(fixture))
-        .map(|(file, path)| (file.file_id(&db), format!("{prefix}{path}")))
-        .collect();
-    let (has_core, has_proc_macros) = sysroot_of(fixture);
-    let mut sysroot = sysroot.into_iter();
-    let core = has_core.then(|| sysroot.next().expect("a fixture with minicore has its file"));
-    if let Some(core) = core {
-        names.insert(core, CORE_NAME.to_owned());
-    }
-    if has_proc_macros {
-        let proc_macros =
-            sysroot.next().expect("a fixture with proc macros has their crate's file");
-        names.insert(proc_macros, format!("{prefix}auxiliary/proc_macros.rs"));
-    }
-    let diags = blaze_query::db::attach(&db, || {
-        hir::check::workspace_crates(&db)
-            .into_iter()
-            .flat_map(|krate| {
-                crate::check::check_crate(&db, krate, Files::new(&names, ""), options)
-            })
-            .collect()
-    });
+    let diags = check_all(&db, &names, options);
     Checked { db, names, core, diags }
 }
 
@@ -222,6 +289,15 @@ const CORE_NAME: &str = "$SRC_DIR/core/src/lib.rs";
 fn sysroot_of(fixture: &str) -> (bool, bool) {
     let says = |meta: &str| fixture.lines().any(|line| line.trim_start().starts_with(meta));
     (says("//- minicore:"), says("//- proc_macros:"))
+}
+
+/// `file`'s text set to `text` in one edit, committed: every id of the arenas the commit drops
+/// (the file's crate's, and those above it) is dead after it, so a test takes again what it
+/// holds of them.
+pub(crate) fn set_file_text(db: &mut TestDB, file: FileId, text: &str) {
+    let mut edit = db.edit();
+    edit.set_file_text(file, text);
+    _ = edit.commit();
 }
 
 /// A frame for a test that makes its own [`crate::Cx`], as a check's task has one.

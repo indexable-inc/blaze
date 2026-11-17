@@ -1151,6 +1151,13 @@ where
         self.delegate.cx()
     }
 
+    /// blaze: whether the `where const { COND }` constant `ct` holds in `param_env`
+    /// ([`SolverDelegate::const_condition`]), re-declared here as the delegate's other methods
+    /// are.
+    pub(super) fn const_condition(&self, param_env: I::ParamEnv, ct: Const<I>) -> Option<bool> {
+        self.delegate.const_condition(param_env, ct)
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub(super) fn add_goal(
         &mut self,

@@ -1,0 +1,23 @@
+[package]
+name = "blaze-record"
+description = "blaze v2's one form for a result kept with what it read: base key, read-lists, answer, in a write-once content-addressed store; sans-IO, over a get and a put"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-ids.workspace = true
+
+[dev-dependencies]
+blaze-rng.workspace = true
+
+[lints]
+workspace = true

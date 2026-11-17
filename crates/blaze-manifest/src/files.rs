@@ -494,10 +494,8 @@ pub(crate) mod tests {
     /// same `cargo metadata --no-deps`.
     #[test]
     fn a_workspace_reads_the_same_through_any_files() {
-        let scratch =
-            std::env::temp_dir().join(format!("blaze-manifest-files-{}", std::process::id()));
-        std::fs::create_dir_all(&scratch).unwrap();
-        let root = scratch.canonicalize().unwrap().display().to_string();
+        let scratch = blaze_core::temp::TempDir::for_test("blaze-manifest-files-");
+        let root = scratch.path().canonicalize().unwrap().display().to_string();
         let mut mem = Mem::default().dir(&format!("{root}/home"));
         for (path, text) in workspace_files(&root) {
             std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
@@ -506,7 +504,7 @@ pub(crate) mod tests {
         }
         std::fs::create_dir_all(format!("{root}/home")).unwrap();
         let on_disk = metadata(&root, Disk);
-        std::fs::remove_dir_all(&scratch).unwrap();
+        drop(scratch);
         let in_memory = metadata(&root, mem);
         assert_eq!(in_memory, on_disk);
         for name in ["\"tool\"", "\"multi\"", "\"demo\"", "\"build-script-build\"", "\"it\""] {
@@ -532,7 +530,8 @@ pub(crate) mod tests {
     /// On the machine's disk the port gives what glob itself gives.
     #[test]
     fn on_disk_it_is_glob() {
-        let root = std::env::temp_dir().join(format!("blaze-manifest-glob-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-manifest-glob-");
+        let root = made.path();
         for dir in ["m/a/src", "m/b", "m/.c", "n"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
@@ -546,6 +545,5 @@ pub(crate) mod tests {
             let theirs: Vec<PathBuf> = glob::glob(&pattern).unwrap().map(Result::unwrap).collect();
             assert_eq!(ours, theirs, "{pattern}");
         }
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

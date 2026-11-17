@@ -177,6 +177,16 @@ impl Flights {
         self.landed.pin().len()
     }
 
+    /// Each landing, by its flight key, sorted: what a test asks of which key a compile flew
+    /// under.
+    #[cfg(test)]
+    pub(crate) fn landings(&self) -> Vec<(InstanceKey, ContentId)> {
+        let mut landings: Vec<(InstanceKey, ContentId)> =
+            self.landed.pin().iter().map(|(key, shape)| (*key, *shape)).collect();
+        landings.sort_unstable();
+        landings
+    }
+
     /// Keeps `summary`, made under the flight key `key` a build runs, for the builds that take
     /// it once it lands. Only a run of `key` keeps under it, and [`Flights::retain`] drops a
     /// summary with its landing, so `key` holds a summary already only when a build runs it

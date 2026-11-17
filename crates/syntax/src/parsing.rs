@@ -5,7 +5,7 @@ mod reparsing;
 
 use std::sync::Arc;
 
-use parser::{Edition, OutlineStrStep, StrStep};
+use parser::{Edition, Extensions, OutlineStrStep, StrStep};
 use syntax_tree::{FlatTree, Text, TextRange, TextSize};
 
 use crate::{SyntaxError, SyntaxKind, SyntaxTreeBuilder, Tree, syntax_node::RustLanguage};
@@ -14,42 +14,56 @@ pub(crate) use crate::parsing::reparsing::{
     edit_between, incremental_reparse, incremental_reparse_onto, reparse_all,
 };
 
-/// A source file's tree: in full, or as an outline whose `fn` bodies are lazy nodes.
-pub(crate) fn parse_text(text: &Text, edition: Edition, outline: bool) -> (Tree, Vec<SyntaxError>) {
+/// A source file's tree under `extensions` (its crate's syntax extensions): in full, or as an
+/// outline whose `fn` bodies are lazy nodes.
+pub(crate) fn parse_text(
+    text: &Text,
+    edition: Edition,
+    extensions: Extensions,
+    outline: bool,
+) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!(target: "blaze", "parse_text", outline).entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
+    let tokens = parser_input.tokens().with_extensions(extensions);
     let parser_output = match outline {
-        true => parser::TopEntryPoint::SourceFile.parse_outline(&parser_input),
-        false => parser::TopEntryPoint::SourceFile.parse(&parser_input),
+        true => parser::TopEntryPoint::SourceFile.parse_outline(tokens),
+        false => parser::TopEntryPoint::SourceFile.parse(tokens),
     };
-    let (tree, errors, _eof) = build_tree(text.clone(), &lexed, &parser_output, edition);
+    let (tree, errors, _eof) =
+        build_tree(text.clone(), &lexed, &parser_output, edition, extensions);
     (Tree::new(Arc::new(tree)), errors)
 }
 
+/// The tree of `text` read at `entry` under `extensions`, those of the crate that wrote it.
 pub(crate) fn parse_text_at(
     text: &Text,
     entry: parser::TopEntryPoint,
     edition: Edition,
+    extensions: Extensions,
 ) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!(target: "blaze", "parse_text_at").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
-    let parser_output = entry.parse(&parser_input);
-    let (tree, errors, _eof) = build_tree(text.clone(), &lexed, &parser_output, edition);
+    let parser_output = entry.parse(parser_input.tokens().with_extensions(extensions));
+    let (tree, errors, _eof) =
+        build_tree(text.clone(), &lexed, &parser_output, edition, extensions);
     (Tree::new(Arc::new(tree)), errors)
 }
 
-/// The tree of `lexed`, the lexing of `source`, from the parser's output (full or outline),
-/// its parser errors then its lexer errors, and whether every token was taken.
+/// The tree of `lexed`, the lexing of `source`, from the parser's output (full or outline,
+/// under `extensions`, in which its lazy nodes are parsed too), its parser errors then its
+/// lexer errors, and whether every token was taken.
 pub(crate) fn build_tree(
     source: Text,
     lexed: &parser::LexedStr<'_>,
     parser_output: &parser::Output,
     edition: Edition,
+    extensions: Extensions,
 ) -> (FlatTree, Vec<SyntaxError>, bool) {
     let range = TextRange::up_to(TextSize::of(&*source));
-    let (tree, mut errors, is_eof) = build_parsed(source, range, lexed, parser_output, edition);
+    let (tree, mut errors, is_eof) =
+        build_parsed(source, range, lexed, parser_output, edition, extensions);
     errors.extend(lexer_errors(lexed, TextSize::new(0)));
     (tree, errors, is_eof)
 }
@@ -62,6 +76,7 @@ fn build_parsed(
     lexed: &parser::LexedStr<'_>,
     parser_output: &parser::Output,
     edition: Edition,
+    extensions: Extensions,
 ) -> (FlatTree, Vec<SyntaxError>, bool) {
     let _p = tracing::info_span!(target: "blaze", "build_tree").entered();
     debug_assert_eq!(lexed.as_str(), &source[range]);
@@ -78,7 +93,7 @@ fn build_parsed(
         OutlineStrStep::Lazy { kind, text } => builder.lazy(kind, TextSize::of(text)),
     });
 
-    let (tree, errors) = builder.finish_raw(edition);
+    let (tree, errors) = builder.finish_raw(edition, extensions);
     (tree, errors, is_eof)
 }
 
@@ -91,6 +106,7 @@ pub(crate) fn build_node(
     lexed: &parser::LexedStr<'_>,
     parser_output: &parser::Output,
     edition: Edition,
+    extensions: Extensions,
     kind: SyntaxKind,
 ) -> Option<(FlatTree, Vec<SyntaxError>)> {
     let (mut depth, mut roots, mut stray) = (0usize, 0usize, false);
@@ -111,7 +127,8 @@ pub(crate) fn build_node(
     if !is_eof || stray || roots != 1 {
         return None;
     }
-    let (tree, errors, _eof) = build_parsed(source, range, lexed, parser_output, edition);
+    let (tree, errors, _eof) =
+        build_parsed(source, range, lexed, parser_output, edition, extensions);
     let start = range.start();
     // A parser error is at its offset in `source`; the node's are given from its start.
     let mut errors: Vec<SyntaxError> = errors
@@ -140,10 +157,17 @@ pub(crate) fn lexer_errors<'a>(
     })
 }
 
+/// The `data` of an outline's lazy nodes ([`expand_lazy`]): the file's edition in the low
+/// byte, its syntax extensions in the next.
+pub(crate) fn lazy_data(edition: Edition, extensions: Extensions) -> u32 {
+    edition as u32 | u32::from(extensions.bits()) << 8
+}
+
 /// What parses an outline's lazy node: the body block of a `fn`, its text parsed alone as a
-/// block in the file's edition (`data`), which is exactly the subtree a full parse of the
-/// file makes there (`parser`'s outline module says why), with that parse's parser errors in
-/// the text ([`body_errors`] reads them). Its lexer errors are the outline's, which lexed it.
+/// block in the file's edition and under its syntax extensions (`data`, [`lazy_data`]), which
+/// is exactly the subtree a full parse of the file makes there (`parser`'s outline module says
+/// why), with that parse's parser errors in the text ([`body_errors`] reads them). Its lexer
+/// errors are the outline's, which lexed it.
 pub(crate) fn expand_lazy(
     kind: syntax_tree::SyntaxKind,
     source: &Text,
@@ -151,13 +175,19 @@ pub(crate) fn expand_lazy(
     data: u32,
 ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
     let kind = <RustLanguage as syntax_tree::Language>::kind_from_raw(kind);
-    let edition = Edition::from_u32(data);
+    let edition = Edition::from_u32(data & 0xFF);
+    let extensions = u8::try_from(data >> 8)
+        .ok()
+        .and_then(Extensions::from_bits)
+        .unwrap_or_else(|| panic!("a lazy {kind:?} under unknown syntax extensions {data:#x}"));
     let reparser = parser::Reparser::for_node(kind, None, None)
         .unwrap_or_else(|| panic!("a lazy {kind:?}: only blocks are left unparsed"));
     let lexed = parser::LexedStr::new(edition, &source[range]);
-    let output = reparser.parse(&lexed.to_input(edition));
+    let input = lexed.to_input(edition);
+    let output = reparser.parse(input.tokens().with_extensions(extensions));
     // clone: one count of the file's text, which the part shares
-    let (tree, errors, is_eof) = build_parsed(source.clone(), range, &lexed, &output, edition);
+    let (tree, errors, is_eof) =
+        build_parsed(source.clone(), range, &lexed, &output, edition, extensions);
     assert!(is_eof, "a lazy {kind:?} of {} bytes parsed short of its end", u32::from(range.len()));
     let errors = errors
         .into_iter()

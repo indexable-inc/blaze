@@ -1,8 +1,9 @@
 //! The advisory file locks of [`Effect::Lock`] and [`Effect::Unlock`], for every native driver:
 //! each takes a lock with one call that never waits (std's `File::try_lock`, `flock` on Unix and
 //! `LockFileEx` on Windows), so a driver makes it inline as it is submitted. A lock lives as long
-//! as its open file, which this keeps under the lock's tag until it is let go of; the process
-//! ending lets every lock go, as the system does on a crash.
+//! as its open file, which this keeps under the lock's tag until it is let go of (by an unlock,
+//! not by the close alone: a forked child's copy of the descriptor keeps the open file); the
+//! process ending lets every lock go, as the system does on a crash.
 //!
 //! [`Effect::Lock`]: crate::Effect::Lock
 //! [`Effect::Unlock`]: crate::Effect::Unlock
@@ -27,6 +28,17 @@ pub(crate) fn failed(error: &io::Error) -> Done {
 /// The locks a driver holds, each by the tag of the [`crate::Effect::Lock`] that took it.
 pub(crate) struct Locks {
     held: HashMap<Tag, File, Global>,
+}
+
+impl Drop for Locks {
+    /// A driver dropped with locks held lets each go as an unlock does, so none stands on in
+    /// a forked child's copy of its descriptor.
+    fn drop(&mut self) {
+        for file in self.held.values() {
+            // An unlock that fails leaves the lock to the close, which is all that can be done.
+            _ = file.unlock();
+        }
+    }
 }
 
 impl Locks {
@@ -64,6 +76,13 @@ impl Locks {
         // alloc: an error path.
         let named = |error: io::Error| io::Error::new(error.kind(), format!("{file}: {error}"));
         let opened = opened.map_err(named)?;
+        // blaze-core is below stdx, whose `file_lock::Locked` is the one way to lock a file
+        // elsewhere; what it promises (the lock is let go of by an unlock, not by the close)
+        // is kept here by `unlock`.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "stdx depends on blaze-core, so its `Locked` cannot be used here: `Locks::unlock` unlocks before it closes, as `Locked` does"
+        )]
         let taken = match mode {
             LockMode::Shared => opened.try_lock_shared(),
             LockMode::Exclusive => opened.try_lock(),
@@ -80,17 +99,36 @@ impl Locks {
         }
     }
 
-    /// The lock `lock` took let go of, its file closed: [`Done::Unlocked`], or an error naming
-    /// `lock` when it holds none.
+    /// The lock `lock` took let go of, whoever else has its open file (a child forked while it
+    /// was held), and its file closed: [`Done::Unlocked`], or an error naming `lock` when it
+    /// holds none.
     pub(crate) fn unlock(&mut self, lock: Tag) -> io::Result<Done> {
         match self.held.remove(&lock) {
-            // Closing the file lets its lock go.
+            // Unlocked by name, then closed. Closing alone lets the lock go only when this is
+            // the last descriptor of the open file, and it is not while a child this process
+            // forked has yet to reach its exec (which closes its copy): until then the lock
+            // would stand, held by no one who knows of it, and the next taker would contend.
             Some(file) => {
+                // alloc: an error path.
+                file.unlock().map_err(|error| {
+                    io::Error::new(error.kind(), format!("unlock of lock {}: {error}", lock.0))
+                })?;
                 drop(file);
                 Ok(Done::Unlocked)
             }
             // alloc: an error path.
             None => Err(io::Error::other(format!("unlock of lock {}: it holds no lock", lock.0))),
+        }
+    }
+
+    /// Another descriptor of the open file `lock` holds, as a fork gives a child: for the test
+    /// that an unlock frees the lock while one is open.
+    #[cfg(all(test, unix))]
+    pub(crate) fn copy_of(&self, lock: Tag) -> io::Result<File> {
+        match self.held.get(&lock) {
+            Some(file) => file.try_clone(),
+            // alloc: an error path.
+            None => Err(io::Error::other(format!("copy of lock {}: it holds no lock", lock.0))),
         }
     }
 }

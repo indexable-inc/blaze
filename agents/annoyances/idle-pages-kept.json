@@ -1,0 +1,14 @@
+{
+ "id": "idle-pages-kept",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of plan 5 T3/T4, int-1112",
+ "where": "crates/blaze-engine/src/heaps.rs, crates/blaze-macro-eval/src/wasm/thread.rs, crates/blaze-graph/src/pool.rs, crates/blaze-graph/src/sched/stack/native.rs, crates/blaze-profile/src/flight/names.rs",
+ "what": "An idle hello-world daemon held 4,912 MB of footprint, 1,131 MB of it an unattributed 'allocator kept' remainder: freed mimalloc pages of threads that never collected (expansion threads waiting on a channel were never woken for a give-back), fiber stacks and parked workers' stack pages nobody advised away, and a names reader keeping 64 generations, each name its own Arc<str>. heaps.rs's doc also said mimalloc's committed count never falls on a purge, which is false (mi_arena_purge decommits).",
+ "cost": "a gigabyte held idle with no row naming it, read as 'allocator overhead'",
+ "cause": "a give-back reached only threads that registered as a pool worker, and nothing counted stacks, so pages held by a thread outside the pool or below a parked stack had no owner that would let them go",
+ "class": "memory held by a thread that no give-back reaches and no counter names",
+ "prevention": "every thread that allocates counts in the give-back handshake (count_heap_settles) and is woken through heap_wakes_by; stacks are counted (stack bytes) and given back below the frame as a worker parks; the threads row names how many threads hold heaps",
+ "workaround": "none",
+ "fix": "expansion threads settle as they go idle and are woken for a give-back; parked pool workers exit their idle fibers and advise their stack below the frame away (MADV_DONTNEED / MADV_FREE_REUSABLE); the names reader keeps WINDOW + 1 generations in one buffer each; stack bytes, threads and idle-over rows; a modelled raise is held to one work thread's share. Controls: a give-back with the wake off stays Pending; 3 of 4 makers settling stays committed; the stack test without the advice keeps its pages; RetainSixtyFour exceeds the bound; the whole-budget forecast starts one node, not two. Not built or run yet.",
+ "state": "written, not built"
+}

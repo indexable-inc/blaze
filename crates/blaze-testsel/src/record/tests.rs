@@ -47,35 +47,45 @@ fn the_header_is_the_copy_it_replaced() {
     }
 }
 
+/// A table of `slots` slots, of one lineage and generation.
+fn table(slots: u32) -> Table {
+    Table { lineage: [1; 16], generation: 2, slots }
+}
+
 #[test]
 fn a_region_is_whole_only_when_armed_and_ended() {
     let mut region = header(20).to_vec();
     region.resize(HEADER + 20, 0);
     region[HEADER + 3] = 1;
     region[HEADER + 19] = 1;
-    assert!(Record::of_region(&region, Ok(())).why().unwrap().contains("armed 0 of its 20"));
+    let of = table(20);
+    assert!(Record::of_region(&region, of, Ok(())).why().unwrap().contains("armed 0 of its 20"));
     assert!(mark_armed(&mut region));
     assert_eq!(
-        Record::of_region(&region, Ok(())),
-        Record::Complete { slots: 20, hits: vec![3, 19] }
+        Record::of_region(&region, of, Ok(())),
+        Record::Complete { table: of, hits: vec![3, 19] }
     );
     assert!(
-        Record::of_region(&region, Err("ended by signal 9")).why().unwrap().contains("signal 9")
+        Record::of_region(&region, of, Err("ended by signal 9"))
+            .why()
+            .unwrap()
+            .contains("signal 9")
     );
-    assert!(Record::of_region(&region[..HEADER + 10], Ok(())).why().is_some());
-    assert!(Record::of_region(&region[..4], Ok(())).why().is_some());
+    assert!(Record::of_region(&region[..HEADER + 10], of, Ok(())).why().is_some());
+    assert!(Record::of_region(&region[..4], of, Ok(())).why().is_some());
     let mut other = region.clone();
     other[0] = b'x';
-    assert!(Record::of_region(&other, Ok(())).why().unwrap().contains("magic"));
+    assert!(Record::of_region(&other, of, Ok(())).why().unwrap().contains("magic"));
     assert!(!mark_armed(&mut other));
     assert!(!mark_armed(&mut [0u8; 3]));
 }
 
 #[test]
 fn hits_out_of_order_or_range_are_no_record() {
-    assert_eq!(Record::of_hits(4, vec![0, 3]), Record::Complete { slots: 4, hits: vec![0, 3] });
-    assert_eq!(Record::of_hits(4, Vec::new()), Record::Complete { slots: 4, hits: Vec::new() });
-    assert!(Record::of_hits(4, vec![4]).why().unwrap().contains("slot 4"));
-    assert!(Record::of_hits(4, vec![2, 2]).why().unwrap().contains("out of order"));
-    assert!(Record::of_hits(4, vec![3, 1]).why().is_some());
+    let of = table(4);
+    assert_eq!(Record::of_hits(of, vec![0, 3]), Record::Complete { table: of, hits: vec![0, 3] });
+    assert_eq!(Record::of_hits(of, Vec::new()), Record::Complete { table: of, hits: Vec::new() });
+    assert!(Record::of_hits(of, vec![4]).why().unwrap().contains("slot 4"));
+    assert!(Record::of_hits(of, vec![2, 2]).why().unwrap().contains("out of order"));
+    assert!(Record::of_hits(of, vec![3, 1]).why().is_some());
 }

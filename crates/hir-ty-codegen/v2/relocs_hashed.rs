@@ -271,7 +271,7 @@ const CORPUS: &[(&str, &str)] = &[
          #[repr(C, packed(2))] pub struct Pk<X: ?Sized>(pub u16, pub core::mem::ManuallyDrop<Wrap2<X>>);\n\
          static PK: &Pk<dyn Tr + Sync> = &Pk(1, core::mem::ManuallyDrop::new(Wrap2(&77, Holder(&A(9)))));",
     ),
-    // The key review's (`/tmp/blaze-lanes/v2-xcheck-review.md`, C1 and C2): values whose bytes
+    // The key review's cases C1 and C2: values whose bytes
     // an edit keeps and whose emitted code it changes.
     (
         "which_static",
@@ -473,7 +473,7 @@ fn check_item(db: &TestDB, item: &Item, found: &mut Found) {
             CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => true,
         },
         TyKind::Closure(id, _) => {
-            closures.contains(&Body::Closure(blaze_query::db::AsId::as_id(&id.0)))
+            closures.contains(&Body::Closure(blaze_memo::Id::gid(id.0)))
         }
         _ => false,
     };
@@ -580,7 +580,7 @@ fn every_vtable_and_function_a_value_relocates_to_is_hashed() {
         .into_db();
         let items = items(&db, case);
         assert!(!items.is_empty(), "{case}: no constant or static");
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             for item in &items {
                 check_item(&db, item, &mut found);
             }
@@ -1157,14 +1157,13 @@ impl<'a> Emitted<'a> {
                     blaze_items::key::path(self.db, blaze_items::ItemId::Function(*f))
                 );
             }
-            DataRequest::FilePath(_) => self.out.push_str("a file's path\n"),
             DataRequest::Text(parts) => {
                 for part in parts {
                     match part {
                         crate::fragment::TextPart::Text(it) => {
                             let _ = write!(self.out, "{it:?} ");
                         }
-                        crate::fragment::TextPart::FilePath(_) => self.out.push_str("<file> "),
+                        crate::fragment::TextPart::FileOf(..) => self.out.push_str("<file> "),
                     }
                 }
                 self.out.push('\n');
@@ -1340,7 +1339,7 @@ fn sides(case: &str, text: &str) -> Vec<Side> {
     );
     let reads = read_consts(&db);
     assert_eq!(reads.len(), items.len(), "{case}: the readers' constants are not one per item");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         (items.iter())
             .map(|item| {
                 let short = item.name.rsplit("::").next().expect("a name");

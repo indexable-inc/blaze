@@ -1,0 +1,48 @@
+SOURCE_FILE
+  TYPE_ALIAS
+    TYPE_KW "type"
+    WHITESPACE " "
+    NAME
+      IDENT "A"
+    WHITESPACE " "
+    EQ "="
+    WHITESPACE " "
+    PATTERN_TYPE
+      PATH_TYPE
+        PATH
+          PATH_SEGMENT
+            NAME_REF
+              IDENT "E"
+      WHITESPACE " "
+      IS_KW "is"
+      WHITESPACE " "
+      OR_PAT
+        TUPLE_STRUCT_PAT
+          PATH
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "E"
+            COLON2 "::"
+            PATH_SEGMENT
+              NAME_REF
+                IDENT "A"
+          L_PAREN "("
+          REST_PAT
+            DOT2 ".."
+          R_PAREN ")"
+        WHITESPACE " "
+        PIPE "|"
+        WHITESPACE " "
+        PATH_PAT
+          PATH
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "E"
+            COLON2 "::"
+            PATH_SEGMENT
+              NAME_REF
+                IDENT "B"
+    SEMICOLON ";"
+  WHITESPACE "\n"

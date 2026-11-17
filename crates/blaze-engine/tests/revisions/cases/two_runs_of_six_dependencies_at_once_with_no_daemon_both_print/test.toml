@@ -1,0 +1,27 @@
+about = "Two runs at once with nothing changed and no daemon both print (track 10, task C), over six registry crates (regex, hashbrown, bitflags, itoa, memchr, smallvec, pinned by harness/v2/versus/six's lock): run, run, `blaze stop`, then two runs started together: each prints the built program's output and exits with its status, neither starts a daemon, and the slot both read is the one the daemon wrote. The control of each revision is its expected output altered, which fails."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = []
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = ["stop"]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+max_units = 0
+max_records = 0
+daemon_after = false
+starts = 0
+at_once = 2

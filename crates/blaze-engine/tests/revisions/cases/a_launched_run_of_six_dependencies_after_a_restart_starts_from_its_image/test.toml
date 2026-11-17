@@ -1,0 +1,34 @@
+about = "A launched run after `blaze stop` of a program over six registry crates (regex, hashbrown, bitflags, itoa, memchr, smallvec, pinned by harness/v2/versus/six's lock) starts from its start image: build and run, run again, `blaze stop`, run; its output and status are those of the file `blaze build` makes, and the run after the stop makes no unit, lowers no workspace, links no launcher, restores the program from its image once and reads no bind record. A function naming only statics of the registry crates is a bind record (hir-ty-codegen's `static_key`), so the image's slots and statics are all the start needs. Then a body edit of `main`, and last `edit, build, stop, run`, which prints the edited output only when the image marked is the edited build's. Track 7c, task B; it passes once task C is in."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = []
+action = "run"
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = ["stop"]
+action = "run"
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+max_units = 0
+max_records = 0
+spans = { "codegen walk" = 0, "lower workspace" = 0, "launch link" = 0, "launch: restore a program from its start image" = 1, "launch: read a bind record" = 0 }
+
+[[revision]]
+action = "run"
+prints = "a lookup of a missing key panicked in cargo-first\nsix again: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = ["edit", "build", "stop"]
+action = "run"
+prints = "a lookup of a missing key panicked in cargo-first\nsix at last: 55 8 true\n"
+as_built = true

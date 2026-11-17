@@ -15,20 +15,16 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-hash.workspace = true
-crossbeam-queue.workspace = true
 la-arena.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 hashbrown.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true
 semver.workspace = true
 tracing.workspace = true
 indexmap.workspace = true
-inventory.workspace = true
 
 # local deps
-blaze-bytes.workspace = true
-blaze-dbsp.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
@@ -43,8 +39,8 @@ intern.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
-hegeltest.workspace = true
 
 [lints]
 workspace = true

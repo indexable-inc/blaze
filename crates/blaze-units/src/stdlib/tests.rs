@@ -357,6 +357,35 @@ fn a_targets_facts_and_file_names() {
     assert!(target::triples().any(|it| it == "aarch64-unknown-linux-gnu"));
 }
 
+/// blaze's GPU device target (docs/future/gpu/shaders.md, "Phase 2 as built"): `target_arch =
+/// "naga"`, 32-bit `usize`, little endian, `panic = "abort"`, no family and `target_os =
+/// "unknown"` (std's unsupported platform layer), std built for it, nothing linked, and its
+/// scripts run as bootstrap runs a synthetic target's.
+#[test]
+fn the_device_target_is_blazes_own() {
+    let triple = "naga-unknown-unknown";
+    let cfgs = target_cfg(triple, &CfgArgs::default()).unwrap();
+    for cfg in [
+        "target_arch=\"naga\"",
+        "target_pointer_width=\"32\"",
+        "target_endian=\"little\"",
+        "target_os=\"unknown\"",
+        "panic=\"abort\"",
+    ] {
+        assert!(cfgs.iter().any(|it| it == cfg), "{triple} has no {cfg}: {cfgs:?}");
+    }
+    assert!(!cfgs.iter().any(|it| it.starts_with("target_family")), "{cfgs:?}");
+    assert!(!cfgs.iter().any(|it| it == "unix" || it == "windows"), "{cfgs:?}");
+    let facts = target_facts(triple).unwrap();
+    assert_eq!((facts.panic.as_str(), facts.has_std), ("abort", true));
+    assert_eq!(data_layout(triple).unwrap(), "e-m:e-p:32:32-i64:64-n32-S128");
+    assert_eq!(file_name(triple, "lib", "gpu").unwrap().as_deref(), Some("libgpu.rlib"));
+    assert_eq!(file_name(triple, "bin", "a").unwrap(), None);
+    assert!(target::is_synthetic(triple).unwrap());
+    assert!(!target::is_synthetic("wasm32-unknown-unknown").unwrap());
+    assert!(!has_dev_runtime(triple));
+}
+
 /// `rustc +nightly --print target-spec-json -Z unstable-options --target <triple>`'s
 /// `data-layout` of the pinned nightly (1.101.0-nightly 16d1ffac1), for each tier-1 target.
 #[test]
@@ -644,6 +673,54 @@ fn another_panic_strategy_is_another_graph() {
     assert_ne!(unwind, aborting);
     assert_eq!(lib_of(&aborting, "std").profile.panic, "abort");
     assert_eq!(RUNS.with(|it| it.get()), 2);
+}
+
+/// The invariant: where a standard library's units are placed ([`StdKey::placement`]) moves
+/// with every field of its key but the crates asked, and never with those. Each field is an
+/// input of every unit (rule 21); the crates asked only choose which units there are.
+#[test]
+fn a_std_is_placed_by_every_input_of_its_units_and_not_by_the_crates_asked() {
+    let tree = MemTree::default();
+    let root = library(&tree);
+    let other_root = tree.root(&[("UPSTREAM", b"commit 0".as_slice())]);
+    let base = key(root);
+    let with_test =
+        StdKey { crates: vec!["std".to_owned(), "test".to_owned()], ..key(root) };
+    assert_ne!(base.id(), with_test.id(), "the units' query is keyed by the crates asked");
+    assert_eq!(base.placement(), with_test.placement());
+    let moved: [(&str, StdKey); 15] = [
+        ("library", StdKey { library: library_mount(other_root, COMMIT), ..key(root) }),
+        ("triple", StdKey { triple: "aarch64-unknown-linux-gnu".to_owned(), ..key(root) }),
+        ("profile", StdKey { profile: "fast".to_owned(), ..key(root) }),
+        ("panic", StdKey { panic: "abort".to_owned(), ..key(root) }),
+        ("opt_level", StdKey { opt_level: "3".to_owned(), ..key(root) }),
+        ("debug_assertions", StdKey { debug_assertions: false, ..key(root) }),
+        ("overflow_checks", StdKey { overflow_checks: false, ..key(root) }),
+        ("debuginfo", StdKey { debuginfo: "0".to_owned(), ..key(root) }),
+        ("features", StdKey { features: vec!["panic-unwind".to_owned()], ..key(root) }),
+        ("host", StdKey { host: "aarch64-unknown-linux-gnu".to_owned(), ..key(root) }),
+        ("rustflags", StdKey { rustflags: vec!["--cfg=x".to_owned()], ..key(root) }),
+        ("profile_root", StdKey { profile_root: "release".to_owned(), ..key(root) }),
+        ("macro_wasm", StdKey { macro_wasm: true, ..key(root) }),
+        ("runs_here", StdKey { runs_here: false, ..key(root) }),
+        ("codegen_backend", StdKey { codegen_backend: Some("stencil".to_owned()), ..key(root) }),
+    ];
+    for (field, key) in &moved {
+        assert_ne!(base.placement(), key.placement(), "`{field}` moved and the place did not");
+    }
+}
+
+/// The control of `a_std_is_placed_by_every_input_of_its_units_and_not_by_the_crates_asked`: a
+/// placement that is the whole key's ID, as it was, is told apart by the crates asked.
+#[test]
+fn the_oracle_catches_a_place_that_moves_with_the_crates_asked() {
+    let tree = MemTree::default();
+    let root = library(&tree);
+    let base = key(root);
+    let with_test =
+        StdKey { crates: vec!["std".to_owned(), "test".to_owned()], ..key(root) };
+    let planted = |key: &StdKey| key.id();
+    assert_ne!(planted(&base), planted(&with_test));
 }
 
 #[test]

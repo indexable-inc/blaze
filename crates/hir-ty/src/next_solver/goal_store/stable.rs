@@ -175,6 +175,12 @@ impl<'db, O: Out> Sink<'db> for Stable<'_, 'db, O> {
         self.word(u32::from(adt.flag_bits()));
     }
 
+    /// Never reached: `persist` writes ids only through a definition ([`Self::def`]), which a
+    /// stable form names by its item key. An id's bits mean nothing past its snapshot.
+    fn id<T: crate::check_cache::Relocate>(&mut self, _: T) {
+        panic!("a stable goal form names an id outside a definition, which it has no key for")
+    }
+
     fn def(&mut self, def: SolverDefId<'db>) {
         self.word(def_variant(def));
         if self.len > MAX_WORDS {

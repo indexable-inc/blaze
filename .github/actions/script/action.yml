@@ -1,0 +1,57 @@
+# The repository's scripts (scripts/src/bin/<name>.rs, docs/v2/plan/design/scripts.md), built,
+# as BLAZE_SCRIPTS: a step runs one as `"$BLAZE_SCRIPTS/<name>" '<json>'`. The binaries are kept
+# in the Actions cache under key.sh's key, which covers every input of the build (the comment at
+# its top says why), so a hit runs no blaze and costs the key's hashing and the restore: seconds,
+# needing only the files key.sh reads (a sparse checkout may have just those). A miss checks the
+# whole tree out, installs the release .github/blaze-version names (./.github/actions/blaze)
+# unless that blaze is already on PATH, builds them with it (build.sh) and saves them: they are
+# blaze's output alone, never cargo's (AGENTS.md blaze-builds-blaze). A restored entry that is
+# not what build.sh made is an error (check.sh), never rebuilt in place. `local.sh CACHE` runs
+# these steps outside Actions. The cached directory (~1.4 GB) is mostly zeros, the patch room
+# blaze-link writes into every dev executable (build.sh's header; ledger D44), which the cache's
+# zstd compresses away; it stays so until the linker stops writing the room.
+name: script
+description: the repository's built scripts, from the Actions cache or built by the pinned blaze
+inputs:
+  job:
+    description: the job whose blaze store a miss builds in (./.github/actions/blaze's `job`)
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: |
+        echo "key=$("$GITHUB_ACTION_PATH/key.sh")" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TEMP/blaze-scripts" >> "$GITHUB_OUTPUT"
+    - id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+    - if: steps.restore.outputs.cache-hit == 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/check.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
+    # A miss: the whole tree (blaze loads the workspace), then the release unless a step before
+    # installed it.
+    - id: need
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        if [ "$(git config --bool core.sparseCheckout || echo false)" = true ]; then git sparse-checkout disable; fi
+        have=$(blaze-engine --version 2>/dev/null | awk '$1 == "blaze" { print $2 }' || true)
+        echo "install=$([ "$have" = "$(cat .github/blaze-version)" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+    - if: steps.need.outputs.install == 'true'
+      uses: ./.github/actions/blaze
+      with:
+        job: ${{ inputs.job }}
+    - if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
+    - if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+    - shell: bash
+      run: echo "BLAZE_SCRIPTS=${{ steps.key.outputs.dir }}" >> "$GITHUB_ENV"

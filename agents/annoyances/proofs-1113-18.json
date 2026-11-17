@@ -1,0 +1,19 @@
+{
+ "id": "proofs-1113-18",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "blaze-cargo, placing a build script`s output from the store; met with `blaze prove -p blaze-core` in a second checkout on blaze-vm",
+ "what": "`blaze prove -p blaze-core --json` with a release blaze of proofs-1113 df5f4e445b, a fresh `BLAZE_HOME` (/root/wt/proofs-1113/home11) and the checkout /root/wt/proofs-1113/lints-src (a git worktree at 59129f676c, clean), while another blaze of the same build ran in /root/wt/proofs-1113/src on its own home: after 65 s, exit 101 with `error: placing /root/wt/proofs-1113/home11/build/lints-src-149262755c2779feab107f21b8acd2dc/debug/build/parking_lot_core/c3e1dd0501dde395/out/build_script_build: the derived value Key(89d748e56f29) is made from Key(c2c437977a99): the store has no value under its key`. Run again at once: the same error, the same two keys. The same binary and command in /root/wt/proofs-1113/src, on fresh homes, worked every time that day.",
+ "cost": "the model of a new theorem could not be emitted beside a landing round; it waited for the round to free the one checkout that works",
+ "cause": "not found. The two keys are the same in both runs, so it is not a race of that moment; what differs from the runs that work is the checkout`s directory (and so the build directory`s name) and that another daemon was building at the time.",
+ "whys": [
+  "a build script`s output could not be placed: the value its key is derived from is not in the store",
+  "the record that says how the output is derived was there and the value was not",
+  "which store (this home`s, or the one shared by the machine) held the record and lacked the value is not said by the error"
+ ],
+ "class": "a store answer that names keys and not where each was looked for: a record without its value is a broken invariant of some store, and the message does not say which",
+ "prevention": "the refusal names the store it read the derivation from and the stores it looked in for the value, and the item (the unit) by name; a derivation is written only after its value (or with it), held by a test that restores a home beside a shared store. Not built: outside this lane.",
+ "workaround": "run in the lane`s first checkout (/root/wt/proofs-1113/src)",
+ "fix": "",
+ "state": "open"
+}

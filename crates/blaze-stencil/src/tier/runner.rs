@@ -263,6 +263,7 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Shared<M, R> {
                     if let Some(promote) = state.queue.pop_front() {
                         break promote;
                     }
+                    // wakes: a promotion queued, `close` and a stop each notify `work`; the runner serves until `closing`
                     self.work.wait(&mut state);
                 }
             };

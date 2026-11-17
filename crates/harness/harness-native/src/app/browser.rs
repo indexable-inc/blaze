@@ -134,6 +134,9 @@ pub(super) struct Browser {
     reconnects: Vec<std::time::Instant>, // alloc: at most RECONNECTS
     /// The host was lost and the link is being made again: the pane's view is the old host's, to let go of.
     lost: bool,
+    /// The pid the host's last `Hello` gave. A host with another pid numbers its views from one again, so every view
+    /// number the app holds from the old one (the pane's, the cards', a chat's links) names nothing, or another page.
+    host_pid: Option<u32>,
     latch_set: bool,
     pub(in crate::app) media: Option<Rc<RefCell<Media>>>,
     wake: Wake,
@@ -186,6 +189,7 @@ impl Browser {
             latch_errors: Rc::default(),
             reconnects: Vec::new(),
             lost: false,
+            host_pid: None,
             latch_set: false,
             media: None,
             wake,
@@ -306,6 +310,10 @@ impl Browser {
             }),
         )
         .map_err(|e| format!("draining the app's port on the main queue: {e}"))?;
+        // What was asked on an earlier link is answered on that link's port, which is gone: an open still waiting
+        // would hold the pane (it opens nothing while one is) forever.
+        self.opening.clear();
+        self.ext_req = None;
         host.send(&cbor::encode(&AppUp::Hello { schema: harness_proto::SCHEMA }), &[&mine])
             .map_err(|e| format!("sending hello to {service}: {e}"))?;
         *self.host.borrow_mut() = Some(host);
@@ -430,7 +438,8 @@ impl App {
             if matches!(self.browser.conn, Conn::Failed(_)) {
                 self.browser.conn = Conn::Idle;
             }
-            if s.view == 0 || self.browser.closed.contains_key(&s.view) {
+            let b = &self.browser;
+            if s.view == 0 || b.closed.contains_key(&s.view) || (b.listed && !b.views.contains_key(&s.view)) {
                 s.view = self.browser.views.keys().copied().filter(|v| !self.browser.closed.contains_key(v)).max().unwrap_or(0);
             }
             self.set_web(s);
@@ -590,8 +599,20 @@ impl App {
 
     /// A `web:` action (scene/widgets/web.flecs, a card's press).
     pub(super) fn web_action(&mut self, a: &str) {
-        if let Some(v) = a.strip_prefix("show:").and_then(|v| v.parse().ok()) {
-            self.web_show(v);
+        // `show:<view>` (a card) or `show:<view>:<url>` (a chat's page row): the view, while the host still has it;
+        // else the page at its address, opened again.
+        if let Some(rest) = a.strip_prefix("show:") {
+            let (v, url) = rest.split_once(':').map_or((rest, None), |(v, u)| (v, Some(u)));
+            let Ok(v) = v.parse::<u64>() else {
+                eprintln!("harness-native: browser: no action web:{a}");
+                return;
+            };
+            let b = &self.browser;
+            let there = !b.closed.contains_key(&v) && (b.views.contains_key(&v) || !b.listed);
+            match url {
+                Some(url) if !there => self.web_open(url),
+                _ => self.web_show(v),
+            }
             return;
         }
         if let Some(url) = a.strip_prefix("open:") {
@@ -640,13 +661,6 @@ impl App {
     /// Before the world's progress: the link (asked, answered, its messages handled), the pane's fold, and every
     /// ui.Browser node's picture key, pointer shape and plate (and a card's title, address and hairline).
     pub(super) fn browser_frame_start(&mut self, dt: f32) {
-        // A page the focused chat's agent opened for the person shows in the pane: there they scroll, click and type
-        // in it. The keyboard stays where it is (the composer): the person is mid-conversation.
-        if let Some(view) = self.chat_pane_page() {
-            let s = self.web();
-            self.browser.note = None;
-            self.set_web(WebState { view, open: true, ..s });
-        }
         let mut nodes: Vec<(u64, BrowserView)> = Vec::new(); // alloc: this frame's browser nodes
         self.world.new_query::<&BrowserView>().each_entity(|e, bv| nodes.push((*e.id(), bv.clone())));
         if std::mem::take(&mut self.browser.lost) {
@@ -743,13 +757,77 @@ impl App {
         }
     }
 
+    /// A host other than the one the app last knew answered (the old one crashed or was restarted, and the daemon
+    /// started another): forget the old host's views, their pictures included, and let the pane go of its page.
+    fn browser_new_host(&mut self, media: Option<&Rc<RefCell<Media>>>) {
+        let b = &mut self.browser;
+        let old: BTreeSet<u64> = b.views.keys().chain(b.opened.values()).chain(b.closed.keys()).chain(b.popup.iter()).copied().collect();
+        if let Some(m) = media {
+            let mut m = m.borrow_mut();
+            for v in &old {
+                m.browser_forget(*v);
+            }
+        }
+        b.views.clear();
+        b.listed = false;
+        b.opened.clear();
+        b.refused.clear();
+        b.closed.clear();
+        b.errors.clear();
+        b.watched.clear();
+        b.sized.clear();
+        b.cursors.clear();
+        b.ime_rect.clear();
+        b.popup = None;
+        b.grab = None;
+        b.over = None;
+        let s = self.web();
+        self.set_web(WebState { view: 0, ..s });
+    }
+
+    /// The pane's view is gone (the host closed it, or no longer lists it): it moves to the newest page left, or shuts
+    /// when none is. The pane never stands on a view that names nothing.
+    fn web_gone(&mut self, view: u64) {
+        let s = self.web();
+        if s.view != view {
+            return;
+        }
+        let b = &self.browser;
+        match b.views.keys().copied().filter(|v| *v != view && !b.closed.contains_key(v)).max() {
+            Some(next) => self.set_web(WebState { view: next, ..s }),
+            None => self.web_shut(WebState { view: 0, ..s }),
+        }
+    }
+
     fn browser_down(&mut self, d: AppDown, ports: Vec<SendRight>, media: Option<&Rc<RefCell<Media>>>) {
         let b = &mut self.browser;
         match d {
-            AppDown::Hello { .. } => {}
+            AppDown::Hello { pid, .. } => {
+                if b.host_pid.replace(pid).is_some_and(|old| old != pid) {
+                    self.browser_new_host(media);
+                }
+            }
             AppDown::Views { views } => {
                 b.views = views.into_iter().map(|v| (v.view, v)).collect();
                 b.listed = true;
+                // Whatever the app held that the host no longer lists is gone with it. The host lists a view before it
+                // answers its open (host.rs `open`), so a view just opened is never mistaken for a gone one.
+                let gone: Vec<u64> = b.opened.values().chain(b.popup.iter()).chain(b.watched.iter()).copied().filter(|v| !b.views.contains_key(v)).collect(); // alloc: rarely any
+                b.opened.retain(|_, v| b.views.contains_key(v));
+                if b.popup.is_some_and(|p| !b.views.contains_key(&p)) {
+                    b.popup = None;
+                }
+                for v in &gone {
+                    b.watched.remove(v);
+                    b.sized.remove(v);
+                    if let Some(m) = media {
+                        m.borrow_mut().browser_forget(*v);
+                    }
+                }
+                let pane = self.web().view;
+                if pane != 0 && !self.browser.views.contains_key(&pane) {
+                    self.web_gone(pane);
+                }
             }
             AppDown::Ring { view, generation, w, h, slots } => {
                 let Some(media) = media else { return };
@@ -811,15 +889,7 @@ impl App {
                 if let Some(m) = media {
                     m.borrow_mut().browser_forget(view);
                 }
-                // The pane never stands empty: it moves to the newest page left, or shuts when none is.
-                let s = self.web();
-                if s.view == view {
-                    let next = self.browser.views.keys().copied().filter(|v| !self.browser.closed.contains_key(v)).max();
-                    match next {
-                        Some(next) => self.set_web(WebState { view: next, ..s }),
-                        None => self.web_shut(WebState { view: 0, ..s }),
-                    }
-                }
+                self.web_gone(view);
             }
             AppDown::Extensions { req, extensions } => {
                 if b.ext_req == Some(req) {

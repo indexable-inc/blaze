@@ -1,0 +1,12 @@
+{
+ "id": "A-bstd-entry-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+ "where": "blaze, a program's `main`",
+ "what": "Reading the entry code showed `fn main(x: u32) {}` compiled and ran with `x` whatever was in the first argument register: nothing checked `main`'s parameters (rustc's E0580).",
+ "cost": "none; found while reading",
+ "cause": "`start_shim` stores `main`'s address as a `fn() -> T` without comparing signatures, and blaze-diagnostics' `entry` check stops at finding a function",
+ "workaround": "",
+ "fix": "fixed on this branch: `hir_ty::entry::takes` refuses a `main` with parameters outside the blaze edition (crates/blaze-diagnostics/src/checks/krate.rs)",
+ "state": "fixed on bstd-entry-1112"
+}

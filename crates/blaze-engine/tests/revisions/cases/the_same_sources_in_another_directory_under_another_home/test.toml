@@ -1,0 +1,14 @@
+about = "The same sources in another directory, under another home and another machine directory that start with a copy of the first home's store (a store fetched from another machine): no unit misses its record, the standard library's or the project's own, and no function is compiled. A unit's key and its record say nothing of where the checkout, its build directory, the machine's shared directory or blaze's programs are (docs/v2/plan/design/store.md, Content keys). The planted control is in process: `serve::unit::tests::portable::a_unit_is_keyed_the_same_in_another_directory_under_another_home` puts the workspace's path back into the key and the same comparison fails."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "42\n"
+
+[[revision]]
+steps = ["home elsewhere", "project moved", "edit"]
+action = "run"
+prints = "42\n"
+redone = []
+max_units = 0
+max_records = 0

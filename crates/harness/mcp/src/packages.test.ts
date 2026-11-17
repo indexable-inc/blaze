@@ -4,7 +4,7 @@ import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PackageError, Packages, parseSpec, pickVersion, type Installer } from "./packages.ts";
-import { rewrite } from "./repl.ts";
+import { prepare } from "./evaluator.ts";
 
 const scratch = mkdtempSync(join(tmpdir(), "harness-packages-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
@@ -102,7 +102,7 @@ test("a registry refusal and a failed install are errors naming the package; not
 });
 
 test("a cell's dynamic import goes through __import like a static one", () => {
-  const { body } = rewrite(`const m = await import("zod@3.23.8"); const f = async () => (await import('lodash')).default; f`);
+  const { js: body } = prepare(`const m = await import("zod@3.23.8"); const f = async () => (await import('lodash')).default; f`);
   expect(body).toContain(`__import("zod@3.23.8")`);
   expect(body).toContain(`__import('lodash')`);
   expect(body).not.toMatch(/(?<!_)import\(/);

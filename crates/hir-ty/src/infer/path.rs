@@ -85,6 +85,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 it.into()
             }
             ValueNs::LocalBinding(pat) => {
+                // blaze: a local narrowed by a match arm, `if let` or `let else`
+                // (`#![blaze::pattern_types]`, `infer::narrow`).
+                if let Some(ty) = self.narrowed_type(pat) {
+                    return Some(ValuePathResolution::NonGeneric(ty));
+                }
                 return match self.result.type_of_binding.get(pat) {
                     Some(ty) => Some(ValuePathResolution::NonGeneric(ty.as_ref())),
                     None => unreachable!("no type for local variable {pat:?}"),
@@ -373,7 +378,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
         let trait_ = trait_ref.def_id.0;
-        let name = trait_item_name(self.db, trait_, *name, hygiene);
+        let name = trait_item_name(self.db, self.resolver.ctx_table(), trait_, *name, hygiene);
         let item = method_resolution::trait_value_item(self.db, trait_, name)?;
         let def = match item {
             CandidateId::FunctionId(f) => ValueNs::FunctionId(f),
@@ -494,7 +499,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             Some((AdtId::EnumId(e), subst)) => (e, subst),
             _ => return None,
         };
-        let variant = EnumVariants::variant_written(self.db, enum_id, name, ctxt)?;
+        let table = self.resolver.ctx_table();
+        let variant = EnumVariants::variant_written(self.db, table, enum_id, name, ctxt)?;
         self.write_variant_resolution(id, variant.into());
         Some((ValueNs::EnumVariantId(variant), subst))
     }

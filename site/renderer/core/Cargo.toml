@@ -1,6 +1,6 @@
 [package]
 name = "site-render"
-description = "The blaze site's renderer: a Flecs world of pages, comments and a viewer in, one page's HTML out. Sans-IO: no files, clock or globals."
+description = "The blaze site's renderer: a Flecs world of pages in, one page's HTML out. Sans-IO: no files, clock or globals."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,8 +13,6 @@ scripts = ["dep:flecs-snapshot"]
 
 [dependencies]
 ipld-core.workspace = true
-serde.workspace = true
 serde_ipld_dagcbor.workspace = true
-ciborium.workspace = true
 regex-lite.workspace = true
 flecs-snapshot = { workspace = true, optional = true }

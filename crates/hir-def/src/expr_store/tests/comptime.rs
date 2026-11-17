@@ -179,3 +179,30 @@ fn an_unbounded_binder_parameter_without_the_feature_is_as_before() {
     assert_eq!(forms(source_map.diagnostics()), []);
     assert_eq!(signature.generic_params.iter_binder_params().count(), 0);
 }
+
+/// `where const { COND }` is a condition of the generics, an expression of the signature's
+/// store and no where predicate; without the feature it is the lowering error and nothing.
+#[test]
+fn a_where_const_condition_is_a_condition_of_the_generics() {
+    let text = "trait Tr {}\nfn f<T, const N: usize>() where T: Tr, const { N > 0 } {}";
+    let (db, function) = first_function(&format!("{FEATURE}{text}"));
+    let (signature, source_map) = FunctionSignature::with_source_map(&db, function);
+    assert_eq!(forms(source_map.diagnostics()), []);
+    let params = &signature.generic_params;
+    let [condition] = params.where_consts() else {
+        panic!("one condition, not {:?}", params.where_consts());
+    };
+    assert!(
+        matches!(signature.store.expr(condition.expr), Expr::Block { .. }),
+        "the condition's block"
+    );
+    assert_eq!(params.where_predicates().len(), 1, "`T: Tr` alone is a where predicate");
+    assert!(!params.has_no_predicates());
+    crate::expr_store::persist::assert_store_round_trip(&signature.store, source_map);
+
+    let (db, function) = first_function(text);
+    let (signature, source_map) = FunctionSignature::with_source_map(&db, function);
+    assert_eq!(forms(source_map.diagnostics()), [ComptimeForm::WhereConst]);
+    assert!(signature.generic_params.where_consts().is_empty());
+    assert_eq!(signature.generic_params.where_predicates().len(), 1);
+}

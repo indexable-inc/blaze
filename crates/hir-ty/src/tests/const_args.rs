@@ -1,6 +1,5 @@
 //! A const argument in a body that is not a constant is an error at the argument, as rustc's
-//! resolver and const checking give it, never a fresh inference variable the body goes on with
-//! (queue 01168).
+//! resolver and const checking give it, never a fresh inference variable the body goes on with.
 
 use hir_def::{
     AdtId, DefWithBodyId, ModuleDefId, VariantId,
@@ -35,7 +34,7 @@ fn fine() {
 /// The inference diagnostics of the fixture's function `name`.
 fn diagnostics(name: &str) -> Vec<InferenceDiagnostic> {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
@@ -115,7 +114,7 @@ struct V {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let v = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())

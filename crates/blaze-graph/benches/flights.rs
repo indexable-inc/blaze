@@ -143,7 +143,7 @@ fn main() {
     let flights = Arc::new(Flights::<u64>::new()); // alloc: the table measured, once
     println!("{cores} cores, {OPS} operations a thread, best of {ROUNDS}; ns/op (Mops/s)");
     println!(
-        "threads  {SPREAD:>3} shards        one shard         one key           pairs             one shard/{SPREAD}"
+        r"threads  {SPREAD:>3} shards        one shard         one key           pairs             one shard/{SPREAD}"
     );
     for threads in counts {
         let [spread, one_shard, one_key] = [Layout::Spread, Layout::OneShard, Layout::OneKey]

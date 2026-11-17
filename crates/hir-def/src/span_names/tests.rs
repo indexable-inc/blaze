@@ -4,15 +4,12 @@
 
 use std::{
     fmt::Write as _,
-    ops::ControlFlow,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::Database as _;
-use hegel::generators as gs;
-use hegel::{Hegel, Settings};
+use blaze_sim::Config;
 use hir_expand::fixture;
 use blaze_core::lock::Lock;
 use std::alloc::Global;
@@ -89,13 +86,12 @@ fn crate_text(types: u8, blocks: usize, nested: bool, unnamed: usize, called: us
 
 #[test]
 fn no_two_bodies_of_a_crate_share_a_span_name() {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(48);
-    Hegel::new(|tc| {
-        let types = tc.draw(gs::integers::<u8>().max_value(63));
-        let blocks = tc.draw(gs::integers::<usize>().max_value(4));
-        let nested = tc.draw(gs::booleans());
-        let unnamed = tc.draw(gs::integers::<usize>().max_value(3));
-        let called = tc.draw(gs::integers::<usize>().max_value(3));
+    blaze_sim::check(Config::cases(48), |tape| {
+        let types = tape.int_in(0..=63u8, "types");
+        let blocks = tape.int_in(0..=4usize, "blocks");
+        let nested = tape.bool("nested");
+        let unnamed = tape.int_in(0..=3usize, "unnamed");
+        let called = tape.int_in(0..=3usize, "called");
         let text = crate_text(types, blocks, nested, unnamed, called);
         let fixture = fixture::db(&text);
         let db = fixture.db();
@@ -106,9 +102,7 @@ fn no_two_bodies_of_a_crate_share_a_span_name() {
             blocks * (1 + usize::from(nested)),
             "a block's `inner` lost to another of\n{text}"
         );
-    })
-    .settings(Settings::new().test_cases(cases).database(None))
-    .run();
+    });
 }
 
 const EXACT: &str = r#"
@@ -243,28 +237,27 @@ impl tracing::Subscriber for &'static Named {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-/// What a query that opens `def`'s body span and reads its body read, each read as
-/// `ingredient(id) kind`. `traced` only keys the run: the test asks once with no subscriber and
-/// once under one that records, and so names, the span.
-#[blaze_query::tracked(returns(ref))]
-fn reads_beside_a_named_span(db: &Db, def: DefWithBodyId, traced: bool) -> Vec<String> {
+/// What a query that opens `def`'s body span and reads its body read, each row of its read
+/// list (`blaze_memo::record`) as its `Debug` text. `traced` only keys the run: the test asks
+/// once with no subscriber and once under one that records, and so names, the span. Both runs
+/// are in one snapshot, so a boundary row's id means the same in both.
+#[blaze_memo::tracked(returns(ref), owns)]
+fn reads_beside_a_named_span(db: &Db, def: DefWithBodyId, traced: bool) -> Vec<String, Global> {
     _ = traced;
-    let ((), reads) = blaze_query::db::capture_reads(db, || {
+    let recorded = blaze_memo::record(blaze_memo::Database::memo(db), || {
         let _p = crate::body_span!(db, def, "span_names_reads_query").entered();
         _ = Body::of(db, def);
     });
-    let Some(reads) = reads else { panic!("{def:?}: a span and a body read are shareable") };
-    let mut out = Vec::new();
-    reads.for_each_read(db.storage(), |read| {
-        out.push(format!("{:?} {:?}", read.key, read.kind));
-        ControlFlow::<()>::Continue(())
-    });
+    let ((), reads) = recorded.unwrap_or_else(|off| panic!("{def:?}: {off}"));
+    let mut out = Vec::new_in(Global);
+    out.extend(reads.iter().map(|read| format!("{read:?}")));
     out
 }
 
 #[test]
 fn naming_a_span_reads_nothing_into_its_query() {
-    let fixture = fixture::db(EXACT);
+    // A database that keeps read lists, which `blaze_memo::record` answers only on.
+    let fixture = fixture::db_with_reads(EXACT);
     let db = fixture.db();
     let named: &'static Named = Box::leak(Box::default());
     for def in local_bodies(db) {

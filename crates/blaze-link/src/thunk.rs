@@ -20,7 +20,19 @@
 //!   code), takes the island nearest it in reach: the last one, for `.init` after the code.
 //! - An incremental link puts the thunks its written code needs in the patch region, after the
 //!   code it places: one island for the stage, a new index ([`State::islands`]). A thunk of any
-//!   island already in reach is used instead.
+//!   island already in reach is used instead. New code is in the patch region, so in reach of
+//!   that island. Code the stage writes again where it is (a direct caller, in the full
+//!   link's code, of a function the stage moved to the patch region) may be past 128 MiB from
+//!   the patch region, and no island of the full link holds a thunk of the moved function
+//!   when the two were in reach before: no thunk can be put in that branch's reach without
+//!   moving code, so the stage is refused, typed ([`Refusal::NoThunk`]), and the build links
+//!   the image from scratch, saying so. That is the last resort, not the plan: a build whose
+//!   edited code is reached through slots calls every function an edit can replace through
+//!   its slot (`blaze_codegen::driver`'s `rebind`; docs/v2/plan/design/codegen.md, "Slots
+//!   and a splice's reach"), so the callers of replaced code hold a branch to a slot's stub,
+//!   which no stage moves, and are never written again. What still gets here is a direct
+//!   caller of code the classification did not name, or an image of a build with no slots
+//!   in its calls; `tests/thunks.rs` holds the invariant.
 //!
 //! [`Stage::thunks`] runs in each placement round (`Image::stage_with`) until it makes nothing,
 //! and never removes a thunk within a stage after its first round, so the rounds settle: each
@@ -34,11 +46,11 @@ use std::alloc::Allocator;
 use blaze_codegen::Arch;
 use blaze_mem::align::align_up_u64;
 
-use crate::LinkError;
 use crate::arena::FrameVec;
 use crate::model::{Apply, Class, Fixup, Region, Sym};
-use crate::stage::{Content, Stage, error, function_of, named_in};
-use crate::state::{PieceId, State, What};
+use crate::stage::{Content, Stage, error, function_of, named_in, refused};
+use crate::state::{PieceId, PieceRef, State, What};
+use crate::{LinkError, Refusal};
 use crate::symbols::{SymKey, Symbols};
 use crate::write::{Resolver, Value};
 
@@ -92,6 +104,17 @@ pub(crate) fn weak_branch(apply: Apply, p: u64) -> Option<u64> {
 #[inline]
 pub(crate) fn reaches(p: u64, to: u64, reach: i64) -> bool {
     (-reach..reach).contains(&(to.wrapping_sub(p) as i64))
+}
+
+/// How far `to` is from a branch at `p`, as an error says it: signed (`-` is below the
+/// branch) and in MiB to a tenth, the unit of a branch's reach. Never the difference as
+/// hexadecimal: a backward one prints as a number near 2^64.
+pub(crate) fn away(p: u64, to: u64) -> String {
+    let by = to.wrapping_sub(p) as i64;
+    let size = by.unsigned_abs();
+    let sign = if by < 0 { '-' } else { '+' };
+    // alloc: error path
+    format!("{sign}{}.{} MiB", size >> 20, ((size & 0xf_ffff) * 10) >> 20)
 }
 
 /// Where a full link cuts `pieces` (each `(align, size)`, laid out from 0 in this order) into
@@ -347,7 +370,7 @@ impl<'a> Stage<'a> {
         p: u64,
         islands: impl Iterator<Item = u32> + Clone,
     ) -> Result<(), LinkError> {
-        let Some(target) = self.far(resolver, fixup, p) else { return Ok(()) };
+        let Some((target, _)) = self.far(resolver, fixup, p) else { return Ok(()) };
         let addend = self.thunk_addend(caller, target, fixup)?;
         let reused = islands.clone().find_map(|island| {
             let sym = self.symbols.find(SymKey::Thunk(target, island, addend))?;
@@ -380,10 +403,23 @@ impl<'a> Stage<'a> {
             }
             for fixup in piece.fixups().iter().filter(|it| extends(it.apply)) {
                 let p = piece.addr + fixup.at;
-                let Some(target) = self.far(&resolver, fixup, p) else { continue };
+                let Some((target, to)) = self.far(&resolver, fixup, p) else { continue };
                 let addend = self.thunk_addend(piece.sym, target, fixup)?;
                 if through(self.symbols, &self.new, target, i64::from(addend), p).is_some() {
                     continue;
+                }
+                // This stage's thunk of it, made in an earlier round and placed since, in the
+                // patch region: out of this branch's reach, as any other this stage could
+                // make there would be. A branch within the planner's margin of its reach
+                // still reaches its target, and the writer sends it there.
+                let made = self.island.and_then(|island| {
+                    placed(self.symbols, &self.new, SymKey::Thunk(target, island, addend))
+                });
+                if let Some(thunk) = made {
+                    if reaches(p, to, REACH) {
+                        continue;
+                    }
+                    return Err(self.no_thunk(piece, fixup, target, p, to, thunk));
                 }
                 needs.push(Need { target, island: u32::MAX, addend });
             }
@@ -410,10 +446,42 @@ impl<'a> Stage<'a> {
         Ok(changed)
     }
 
-    /// The target a branch at `p` reaches (its PLT stub for an import) when where it goes is
-    /// past what the planner lets it reach; `None` for one in reach, or one no thunk serves (a
-    /// weak name nothing defines, an import with no stub), which the writer reports.
-    fn far(&self, resolver: &Resolver<'_>, fixup: &Fixup, p: u64) -> Option<Sym> {
+    /// The refusal of an incremental stage whose branch at `p` in `piece`, written again where
+    /// it is, goes to `target` at `to`, with the stage's thunk of it at `thunk`: both out of
+    /// reach ([`Refusal::NoThunk`]).
+    fn no_thunk(
+        &self,
+        piece: PieceRef<'_>,
+        fixup: &Fixup,
+        target: Sym,
+        p: u64,
+        to: u64,
+        thunk: u64,
+    ) -> LinkError {
+        // alloc: error path
+        let branch = format!(
+            "{:?} at {:#x} in {}, a branch to {} at {to:#x}, {} away",
+            fixup.apply,
+            fixup.at,
+            named_in(self.symbols, &[&self.new], self.writer, piece.sym),
+            named_in(self.symbols, &[&self.new], self.writer, target),
+            away(p, to),
+        );
+        // alloc: error path
+        let what = format!(
+            "{branch}: past its 128 MiB reach, in code this link keeps where it is, and the thunk this link \
+             made of it in the patch region, at {thunk:#x}, is {} away: only a link of the image from scratch \
+             puts a thunk in its reach",
+            away(p, thunk),
+        );
+        refused(function_of(piece), Refusal::NoThunk { branch }, what)
+    }
+
+    /// The target a branch at `p` reaches (its PLT stub for an import) and where the branch
+    /// goes, when that is past what the planner lets it reach; `None` for one in reach, or one
+    /// no thunk serves (a weak name nothing defines, an import with no stub), which the writer
+    /// reports.
+    fn far(&self, resolver: &Resolver<'_>, fixup: &Fixup, p: u64) -> Option<(Sym, u64)> {
         let (target, s) = if self.through_plt(fixup) {
             let stub = self.plt_stub(fixup.target)?;
             (stub, self.new.addr_of(stub)?)
@@ -423,7 +491,8 @@ impl<'a> Stage<'a> {
                 _ => return None,
             }
         };
-        (!reaches(p, s.wrapping_add(fixup.addend as u64), REACH - MARGIN)).then_some(target)
+        let to = s.wrapping_add(fixup.addend as u64);
+        (!reaches(p, to, REACH - MARGIN)).then_some((target, to))
     }
 
     /// A far branch's addend as a thunk's key holds it.
@@ -482,6 +551,17 @@ mod tests {
         assert_eq!(cut(&[(16, 40 * MIB), (16, 40 * MIB), (16, 20 * MIB)]), [1, 3]);
         // A 200 MiB function between two small ones: an island on each side of it.
         assert_eq!(cut(&[(16, 16), (16, 200 * MIB), (16, 16)]), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_distance_is_said_signed_in_mib() {
+        // The dogfood report's branch: from 0x12ef3a5a4 back to 0x10002ca70, which printed as
+        // `0xffffffffd10f24cc bytes away`.
+        assert_eq!(away(0x1_2ef3_a5a4, 0x1_0002_ca70), "-751.0 MiB");
+        assert_eq!(away(0x1_0002_ca70, 0x1_2ef3_a5a4), "+751.0 MiB");
+        assert_eq!(away(0, 200 << 20), "+200.0 MiB");
+        assert_eq!(away(1 << 20, (1 << 19) - 1), "-0.5 MiB");
+        assert_eq!(away(8, 8), "+0.0 MiB");
     }
 
     #[test]

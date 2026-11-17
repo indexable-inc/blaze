@@ -379,6 +379,9 @@ pub macro Clone($item:item) {
 /// assert_eq!(received, [3, 4]);
 /// ```
 #[unstable(feature = "share_trait", issue = "156756")]
+// blaze: the trait `#![blaze::handles]` copies values of (`library/UPSTREAM` lists it among
+// blaze's changes).
+#[lang = "blaze_handle"]
 pub trait Share: Clone {
     /// Creates another alias to the same underlying resource or shared state.
     ///

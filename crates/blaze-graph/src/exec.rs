@@ -7,8 +7,7 @@
 //! one wait is for the next input; it never waits for a worker. Its tasks run on the process's
 //! [`shared`] pool, near the group the plane names, each in a frame of its own
 //! ([`blaze_mem::frame::task`]) inside [`arena::account`] and [`blaze_mem::frame::measure`],
-//! and what each held and how long it ran teach the [`Predict`] the next task's cost and
-//! memory come from.
+//! and how long each ran teaches the [`Predict`] the next task's cost comes from.
 
 use std::{
     any::Any,
@@ -104,8 +103,7 @@ pub fn shared() -> &'static Workers {
 ///
 /// A node whose work panics fails, and once the build is over the panic goes on on the calling
 /// thread, as from a thread of [`std::thread::scope`]: a panic that unwinds on purpose, as
-/// the query engine's cancellation does, reaches whoever catches it. Work the frames' cap cancels
-/// ([`blaze_mem::frame::Cancelled`]) runs again on the same thread.
+/// the query engine's cancellation does, reaches whoever catches it.
 pub fn drive<W, S>(
     machine: &mut Machine,
     nodes: Vec<Spec>,
@@ -142,15 +140,7 @@ where
                 let done = move |did: thread::Result<Did>| {
                     _ = done_tx.send((id, did.unwrap_or_else(failed), now()));
                 };
-                let run = move || loop {
-                    match catch_unwind(AssertUnwindSafe(|| {
-                        frame::task(MemTag::Other, |_| work(id))
-                    })) {
-                        Ok(did) => break did,
-                        Err(panic) if panic.is::<frame::Cancelled>() => {}
-                        Err(panic) => resume_unwind(panic),
-                    }
-                };
+                let run = move || frame::task(MemTag::Other, |_| work(id));
                 match at {
                     Pool::Io => waits.submit(None, run, done),
                     Pool::Work => jobs.submit(None, run, done),
@@ -215,6 +205,10 @@ where
 /// The pools no [`drive`] is using, each kept for the next build of its size, so a build
 /// starts no thread once one of its size has run. Taken only to take or give back a pool.
 // alloc: empty, allocates nothing; a pool's entry is pushed once per pool size
+#[expect(
+    blaze::process_static,
+    reason = "one idle pool per pool size built, uncapped: the daemon should own its spare pools"
+)]
 static SPARE: Lock<Vec<Workers>> = Lock::new("graph.exec.spare_pools", Vec::new());
 
 /// A pool of `workers` threads that only one [`drive`] uses, handed back to [`SPARE`] when
@@ -430,11 +424,6 @@ const RUNS: usize = blaze_mem::pool::BATCH;
 /// owner itself never sends to it ([`Owner::later`]), so it always drains.
 const MAILBOX: usize = 1 << 12;
 
-/// The most messages the owner takes, without waiting, between two readings of what blaze
-/// holds ([`arena::own`] reads every subsystem's counters, lines the workers keep writing): so
-/// a reading costs a run 1/64 of it, and a stream of messages never holds it back for long.
-const HELD_EVERY: usize = 64;
-
 /// A run under way in the owner's [`Table`]: its slot, and what holding it back needs.
 struct Slot<R: Runner> {
     run: Pooled<'static, Run<R>>,
@@ -529,107 +518,6 @@ impl<R: Runner> Table<R> {
     }
 }
 
-/// No run: the end of a [`Throttle`]'s queue.
-const NO_RUN: u64 = u64::MAX;
-
-#[derive(Clone, Copy)]
-struct Queue {
-    head: u64,
-    tail: u64,
-}
-
-/// A run held back, and the one behind it.
-struct Waiting {
-    run: u64,
-    next: u64,
-}
-
-/// Holds back the runs of a subsystem over its budget (docs/v2/plan/design/memory.md, "Each
-/// subsystem has a budget"; `blaze_mem::tag::over_budget`), before the machine's budget is
-/// reached: such a run waits while another of its subsystem runs, and starts once one ends with
-/// the subsystem under its budget again, or once none of it runs. So a subsystem whose memory
-/// sits in tables its tasks do not free still has its tasks run, one at a time, and nothing
-/// waits for an end that never comes. Runs of one subsystem start in the order the plane
-/// started them. The plane counts a held run as running, with its memory granted: holding it
-/// back never lets the plane grant more.
-struct Throttle {
-    running: [u32; MemTag::COUNT],
-    queues: [Queue; MemTag::COUNT],
-    waiting: Slab<Waiting>,
-}
-
-impl Throttle {
-    fn new() -> Result<Throttle, MemError> {
-        Ok(Throttle {
-            running: [0; MemTag::COUNT],
-            queues: [Queue { head: NO_RUN, tail: NO_RUN }; MemTag::COUNT],
-            waiting: Slab::new(MAX_RUNS, MemTag::Plane)?,
-        })
-    }
-
-    /// Whether `run`, of subsystem `tag`, starts now, `over` saying which subsystems are over
-    /// their budgets; if not, it waits in its subsystem's queue.
-    fn admit(&mut self, tag: MemTag, run: u64, over: impl Fn(MemTag) -> bool) -> bool {
-        let at = tag.index();
-        if self.running[at] > 0 && (self.queues[at].head != NO_RUN || over(tag)) {
-            let waiting = self.waiting.insert(Waiting { run, next: NO_RUN }).to_bits();
-            let queue = &mut self.queues[at];
-            match queue.tail {
-                NO_RUN => queue.head = waiting,
-                tail => {
-                    let tail = blaze_mem::Handle::from_bits(tail);
-                    self.waiting.get_mut(tail).expect("a queued run is waiting").next = waiting;
-                }
-            }
-            self.queues[at].tail = waiting;
-            return false;
-        }
-        self.running[at] += 1;
-        true
-    }
-
-    /// A run of `tag` that started has ended.
-    fn ended(&mut self, tag: MemTag) {
-        self.running[tag.index()] -= 1;
-    }
-
-    /// The next held run that may start now, and its subsystem, `over` saying which are over
-    /// their budgets: asked until `None` after each end.
-    fn next(&mut self, over: impl Fn(MemTag) -> bool) -> Option<u64> {
-        if self.waiting.is_empty() {
-            return None;
-        }
-        let tag = MemTag::ALL.into_iter().find(|&tag| {
-            let at = tag.index();
-            self.queues[at].head != NO_RUN && (self.running[at] == 0 || !over(tag))
-        })?;
-        Some(self.start(tag))
-    }
-
-    /// Any held run, started whatever the budgets: the scheduler is stopping.
-    fn any(&mut self) -> Option<u64> {
-        let tag = MemTag::ALL.into_iter().find(|&tag| self.queues[tag.index()].head != NO_RUN)?;
-        Some(self.start(tag))
-    }
-
-    fn start(&mut self, tag: MemTag) -> u64 {
-        let at = tag.index();
-        let head = blaze_mem::Handle::from_bits(self.queues[at].head);
-        let Waiting { run, next } = self.waiting.remove(head).expect("a queue's head is waiting");
-        self.queues[at].head = next;
-        if next == NO_RUN {
-            self.queues[at].tail = NO_RUN;
-        }
-        self.running[at] += 1;
-        run
-    }
-
-    #[cfg(test)]
-    fn held(&self) -> usize {
-        self.waiting.len()
-    }
-}
-
 /// The one name of a filled slot, held by the thread that runs it: made by [`Table::ran`] once
 /// per run, as the owner starts it, consumed by [`Ran::done`] or by posting it again.
 struct Ran<R: Runner>(NonNull<Run<R>>);
@@ -696,8 +584,8 @@ impl<W> Handle<W> {
     }
 
     /// Tasks of `request`, besides those it had; each one's spec takes the scheduler's
-    /// [`Prediction`](crate::admission::Prediction) for its kind and key (its memory never
-    /// under the predicted peak, its cost the predicted one when there is one).
+    /// [`Prediction`](crate::admission::Prediction) for its kind and key (its cost the
+    /// predicted one when there is one).
     pub fn add(&self, request: RequestId, tasks: Vec<Task<W>>) {
         _ = self.tx.send(Msg::Add { request, tasks });
     }
@@ -757,22 +645,17 @@ impl<W> Handle<W> {
 /// A run is a slot of the scheduler's blaze-mem pool, named by a generational handle in the
 /// owner's table and reused once its `Done` is in, and the slot itself is the pool's job:
 /// posting a task allocates nothing and clones no `Arc` or sender, and its end is one message
-/// to the owner. A run whose subsystem ([`admission::tag_of`]) is over its budget waits while
-/// another run of that subsystem is under way ([`Throttle`]).
+/// to the owner. A run starts as the plane runs it: nothing holds it back for memory.
 ///
 /// A task's work runs in a frame of its own ([`blaze_mem::frame::task`], tagged with its
 /// subsystem: a pool worker's chunks are on its NUMA node, and the frame is freed when the task
 /// ends) inside [`arena::account`] and [`blaze_mem::frame::measure`], and its `Done` gives the
-/// plane the peak it held in both and the group it ran on. With a budget, the frames grow
-/// under its [`admission::share`] for [`MemTag::Frames`] ([`blaze_mem::frame::Cap`]); a task
-/// the cap cancels is posted again, as one that gives way. With a budget, the plane hears
-/// what blaze holds ([`arena::own`]) after the `Done`s the owner took without waiting, at
-/// most [`HELD_EVERY`] messages apart, and before it waits again. The scheduler's
-/// [`Predict`] gives each task added or found its cost and memory before the plane sees it,
-/// and learns the peak and own run time of each run that ends with a result (a run that gave
-/// way and one that panicked teach it nothing), under the task's kind and its spec's key. A
-/// task the plane says is on its request's
-/// critical path runs on a fast group of the pool ([`Workers::submit_critical`]). Work that
+/// plane the peak it held in both and the group it ran on, for the profile: the plane admits
+/// by threads alone, and the kernel's limit is the one ceiling. The scheduler's [`Predict`]
+/// gives each task added or found its cost before the plane sees it, and learns the peak and
+/// own run time of each run that ends with a result (a run that gave way and one that
+/// panicked teach it nothing), under the task's kind and its spec's key. A task the plane says
+/// is on its request's critical path runs on a fast group of the pool ([`Workers::submit_critical`]). Work that
 /// returns [`Cancelled`] is posted again (the plane still sees it running), behind what is
 /// ready on its group. The clock is read here, never by the plane.
 ///
@@ -791,8 +674,8 @@ pub struct Scheduler<W> {
 impl<W: Send + 'static> Scheduler<W> {
     /// A scheduler of the plane `config` says, on the process's [`shared`] pool. `runner`, the
     /// database, runs each task's work; the plane asks `memo`, the database's, whether a key is
-    /// settled before it runs a node of it; `predict` gives each task's cost and memory and
-    /// learns from each run that ends.
+    /// settled before it runs a node of it; `predict` gives each task's cost and learns from
+    /// each run that ends.
     pub fn new<R, P, M>(
         config: PlaneConfig,
         runner: R,
@@ -825,14 +708,6 @@ impl<W: Send + 'static> Scheduler<W> {
         M: Memo + Send + 'static,
     {
         let io_threads = config.io;
-        if let Some(budget) = &config.budget {
-            admission::set_budgets(budget.bytes);
-            // The frames' share of the budget is their hard backstop. Nothing spills frame
-            // memory (a frame is freed when its task ends), so the spills go unheard.
-            let limit = budget.bytes / 64 * admission::share(MemTag::Frames);
-            let (cap, _spills) = frame::Cap::new(limit, limit);
-            frame::set_cap(Some(cap));
-        }
         let plane = Plane::with_memo(config, memo)?;
         let (tx, rx) = bounded::<Msg<W>>(MAILBOX);
         // Each message is a run under way or the stop of one thread, so a send never waits.
@@ -868,8 +743,6 @@ impl<W: Send + 'static> Scheduler<W> {
         }));
         let table =
             Table::new(ctx).unwrap_or_else(|why| panic!("the scheduler's run table: {why}"));
-        let throttle =
-            Throttle::new().unwrap_or_else(|why| panic!("the scheduler's throttle: {why}"));
         let owner = Owner {
             plane,
             predict,
@@ -877,12 +750,10 @@ impl<W: Send + 'static> Scheduler<W> {
             works: HashMap::new_in(Global), // alloc: the executor's state, for its life
             ctx,
             table,
-            throttle,
             later: VecDeque::new(),
             io_threads,
             said: Vec::new(), // alloc: none, empty; the owner's buffer, kept across steps
             new: Vec::new(),  // alloc: none, empty; the owner's buffer, kept across adds
-            held_due: false,
         };
         let owner = thread::Builder::new()
             // alloc: a thread's name, once per scheduler
@@ -952,7 +823,6 @@ struct Owner<R: Runner, P, M> {
     works: HashMap<NodeId, Entry<R::Work>, Global>, // alloc: the executor's state, for its life
     ctx: &'static Ctx<R>,
     table: Table<R>,
-    throttle: Throttle,
     /// What the owner tells itself (a node it cannot run fails), taken after the message at
     /// hand: never through its own mailbox, which could be full.
     later: VecDeque<Msg<R::Work>>,
@@ -964,9 +834,6 @@ struct Owner<R: Runner, P, M> {
     /// The nodes of an add whose work is new, kept empty between adds: an add the plane
     /// refuses takes their work back out.
     new: Vec<NodeId>,
-    /// A run ended since the plane last heard what blaze holds: with a budget, it hears before
-    /// the owner next waits. Without one the plane reads no holding, so it is never told.
-    held_due: bool,
 }
 
 impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
@@ -981,38 +848,22 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
             }
         }
         let _stop_io = StopIo(self.ctx, self.io_threads);
-        // The owner's one wait. What is already in the mailbox is taken before the plane hears
-        // what blaze holds, up to `HELD_EVERY` messages, and it hears before the next wait.
+        // The owner's one wait.
         'serve: while let Ok(msg) = recv_said(&rx, "the scheduler's mailbox") {
-            let mut next = Some(msg);
-            let mut taken = 0;
-            while let Some(msg) = next {
+            if !self.take(msg) {
+                break 'serve;
+            }
+            while let Some(msg) = self.later.pop_front() {
                 if !self.take(msg) {
                     break 'serve;
                 }
-                while let Some(msg) = self.later.pop_front() {
-                    if !self.take(msg) {
-                        break 'serve;
-                    }
-                }
-                taken += 1;
-                next = if taken < HELD_EVERY { rx.try_recv().ok() } else { None };
             }
-            self.hear_held();
-        }
-        // A run held back is under way to the plane: it runs, its budget aside, so that the
-        // table empties.
-        while let Some(at) = self.throttle.any() {
-            self.start(at);
         }
         // Each run under way reads a slot of the table: it ends before the table goes, and
         // nothing more comes of it.
         while self.table.running() > 0 {
             match recv_said(&rx, "the scheduler's runs ending") {
-                Ok(Msg::Done { slot: Some(slot), .. }) => {
-                    let tag = self.table.free(slot);
-                    self.throttle.ended(tag);
-                }
+                Ok(Msg::Done { slot: Some(slot), .. }) => _ = self.table.free(slot),
                 Ok(_) => {}
                 Err(_) => unreachable!("the scheduler's context keeps a sender"),
             }
@@ -1072,8 +923,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
             }
             Msg::Done { at_ns, slot, id, request, kind, key, did, measure, group } => {
                 if let Some(slot) = slot {
-                    let tag = self.table.free(slot);
-                    self.throttle.ended(tag);
+                    _ = self.table.free(slot);
                 }
                 if let Some(Measure { peak, ran_ns }) = measure {
                     self.predict.observe(kind, key, ran_ns, peak);
@@ -1109,10 +959,6 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                         PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
                     self.step(request, input);
                 }
-                self.held_due = self.plane.config().budget.is_some();
-                while let Some(at) = self.throttle.next(blaze_mem::tag::over_budget) {
-                    self.start(at);
-                }
             }
             Msg::Estimates { reply } => _ = reply.send(self.predict.encode()),
             #[cfg(test)]
@@ -1127,17 +973,6 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
         let mut said = std::mem::take(&mut self.said);
         let taken = self.plane.step_into(input, &mut said);
         self.outputs(request, taken, said)
-    }
-
-    /// Tells the plane what blaze holds now, if a run ended since it was last told. The plane
-    /// takes every `Held`, so no opener hears of it.
-    fn hear_held(&mut self) {
-        if !self.held_due {
-            return;
-        }
-        self.held_due = false;
-        let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::own() };
-        self.step(RequestId(u32::MAX), held);
     }
 
     /// Hands on what the plane appended to `said` (nothing when it refused), then keeps `said`,
@@ -1218,9 +1053,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                 return;
             }
         };
-        if self.throttle.admit(tag, at, blaze_mem::tag::over_budget) {
-            self.start(at);
-        }
+        self.start(at);
     }
 
     /// Starts run `at`, of the table.
@@ -1289,14 +1122,12 @@ unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
     match result {
         Ok((Ok(did), measure)) => run.done(did, Some(measure), group),
         Ok((Err(Cancelled), _)) => post(ctx, group, critical, run),
-        Err(panic) if panic.is::<frame::Cancelled>() => post(ctx, group, critical, run),
         Err(panic) => run.done(Did::failed(panicked(&*panic)), None, group),
     }
 }
 
 /// `live`'s work run by `runner` in a frame of its own, freed when it ends, the peak it held
-/// (through the global allocator and in its frames) and the time it took. The frames' cap
-/// cancelling it unwinds from here with [`frame::Cancelled`].
+/// (through the global allocator and in its frames) and the time it took.
 fn measured<R: Runner>(runner: &R, live: &Live<R::Work>) -> (Result<Did, Cancelled>, Measure) {
     let start = Instant::now();
     let (did, spent) = admission::run_as(live.kind, || runner.run(&live.work));
@@ -1314,7 +1145,6 @@ fn run_io<R: Runner>(run: Ran<R>) {
             crate::pump::rerun_later();
             _ = ctx.io.send(Some(run));
         }
-        Err(panic) if panic.is::<frame::Cancelled>() => _ = ctx.io.send(Some(run)),
         Err(panic) => run.done(Did::failed(panicked(&*panic)), None, None),
     }
 }
@@ -1345,7 +1175,6 @@ mod tests {
     };
 
     use blaze_hash::{HashMap, HashSet};
-    use blaze_ids::rng::SplitMix64;
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use crossbeam_channel::bounded;
     use blaze_core::lock::Lock;
@@ -1355,11 +1184,11 @@ mod tests {
 
     use super::{
         Ctx, Did, Heard, Live, Opened, RUNS, RequestId, Runner, SPARE, Scheduler, Table, Task,
-        Throttle, Workers, drive,
+        Workers, drive,
     };
     use crate::{
         Cancelled, Key,
-        admission::{Estimates, Predict, Prediction, TaskKind},
+        admission::{Predict, Prediction, TaskKind},
         machine::{Config, Machine, NodeId, Outcome, Pool, Spec},
         plane::PlaneConfig,
         pool::group,
@@ -1377,7 +1206,6 @@ mod tests {
             pool,
             cost: 1,
             key: key.map(|it| Key([it; 32])),
-            memory: 0,
         }
     }
 
@@ -1410,7 +1238,26 @@ mod tests {
 
     /// A scheduler on a pool of `topology`'s shape, and the pool.
     fn scheduler_on(topology: &Topology) -> ((Scheduler<Work>, Db), &'static Workers) {
-        scheduler_with(topology, Estimates::default())
+        scheduler_with(topology, Counting::default())
+    }
+
+    /// A predictor that predicts nothing and counts the runs it is taught: its estimates are
+    /// the count, little-endian.
+    #[derive(Default)]
+    struct Counting(u64);
+
+    impl Predict for Counting {
+        fn predict(&self, _kind: TaskKind, _key: Option<Key>) -> Prediction {
+            Prediction { cost: None }
+        }
+
+        fn observe(&mut self, _kind: TaskKind, _key: Option<Key>, _ran_ns: u64, _peak: u64) {
+            self.0 += 1;
+        }
+
+        fn encode(&self) -> Vec<u8> {
+            self.0.to_le_bytes().to_vec()
+        }
     }
 
     fn scheduler_with(
@@ -1419,7 +1266,7 @@ mod tests {
     ) -> ((Scheduler<Work>, Db), &'static Workers) {
         let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
         let workers = pool.workers();
-        let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
+        let config = PlaneConfig { io: 1, work: workers };
         let db: Db = Arc::new(Lock::new("graph.test.exec.db", HashMap::default()));
         let memo = {
             let db = Arc::clone(&db);
@@ -1465,7 +1312,7 @@ mod tests {
         let asked: Arc<Lock<Vec<Asked>>> = Arc::new(Lock::new("graph.test.exec.asked", Vec::new()));
         let recorder = Recorder {
             asked: Arc::clone(&asked),
-            prediction: Prediction { cost: Some(5), peak: 1 << 10 },
+            prediction: Prediction { cost: Some(5) },
         };
         let ((scheduler, _), _) = scheduler_with(&Topology::flat(2), recorder);
         let opened = scheduler.open(1, false);
@@ -1584,11 +1431,11 @@ mod tests {
         let seen: Arc<Lock<Vec<u32>>> = Arc::new(Lock::new("graph.test.exec.seen", Vec::new()));
         let pool = Workers::new(&Topology::flat(2), false).unwrap();
         let pool: &'static Workers = Box::leak(Box::new(pool));
-        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 4 };
+        let config = PlaneConfig { io: 1, work: 2 };
         let runner = Squares(Arc::clone(&seen));
         let memo = crate::plane::NoMemo;
         let scheduler =
-            Scheduler::with_pool(config, runner, Estimates::default(), memo, pool).unwrap();
+            Scheduler::with_pool(config, runner, Counting::default(), memo, pool).unwrap();
         let opened = scheduler.open(1, false);
         let tasks = (0..20u32)
             .map(|id| {
@@ -1809,8 +1656,7 @@ mod tests {
                 .any(|it| matches!(it.event, Event::Moved { id: 7, state: NodeState::Built }))
         );
         // Measured once: the tries that gave way taught nothing.
-        let estimates = Estimates::decode(&scheduler.estimates()).unwrap();
-        assert_eq!(estimates.by_kind.get(&TaskKind(1)).map(|it| it.seen), Some(1));
+        assert_eq!(scheduler.estimates(), 1u64.to_le_bytes());
     }
 
     /// Nodes a task finds, their work given through a handle, run after it once the request is
@@ -1883,109 +1729,6 @@ mod tests {
         }
     }
 
-    /// What the throttle replaces when every subsystem is under its budget (a run starts as
-    /// the plane runs it), and what it must be: per subsystem a count and a FIFO queue.
-    #[derive(Default)]
-    struct Model {
-        running: [u32; MemTag::COUNT],
-        queues: [std::collections::VecDeque<u64>; MemTag::COUNT],
-    }
-
-    impl Model {
-        fn admit(&mut self, tag: MemTag, run: u64, over: bool) -> bool {
-            let at = tag.index();
-            if self.running[at] > 0 && (!self.queues[at].is_empty() || over) {
-                self.queues[at].push_back(run);
-                return false;
-            }
-            self.running[at] += 1;
-            true
-        }
-
-        fn next(&mut self, over: impl Fn(MemTag) -> bool) -> Option<u64> {
-            let tag = MemTag::ALL.into_iter().find(|&tag| {
-                let at = tag.index();
-                !self.queues[at].is_empty() && (self.running[at] == 0 || !over(tag))
-            })?;
-            self.running[tag.index()] += 1;
-            self.queues[tag.index()].pop_front()
-        }
-
-        fn held(&self) -> usize {
-            self.queues.iter().map(|it| it.len()).sum()
-        }
-    }
-
-    /// Two hundred seeds of admits, ends and restarts across four subsystems, each over its
-    /// budget or not at random: the throttle starts and holds exactly what the model does, in
-    /// the same order; with every subsystem under budget it holds nothing.
-    #[test]
-    fn the_throttle_matches_a_queue_per_subsystem() {
-        let tags = [MemTag::Infer, MemTag::Codegen, MemTag::Vfs, MemTag::Mir];
-        for seed in 0..200u64 {
-            let mut rng = SplitMix64::new(seed);
-            let mut throttle = Throttle::new().unwrap();
-            let mut model = Model::default();
-            let mut over = [false; MemTag::COUNT];
-            let mut started: Vec<MemTag> = Vec::new();
-            // Each run's subsystem, by run.
-            let mut tag_of = [MemTag::Other; 400];
-            let quiet = seed % 4 == 0;
-            for run in 0..400u64 {
-                if !quiet && rng.one_in(8) {
-                    let tag = tags[rng.index(4)];
-                    over[tag.index()] = !over[tag.index()];
-                }
-                let is_over = |tag: MemTag| over[tag.index()];
-                if started.is_empty() || !rng.one_in(3) {
-                    let tag = tags[rng.index(4)];
-                    tag_of[run as usize] = tag;
-                    let now = throttle.admit(tag, run, is_over);
-                    assert_eq!(now, model.admit(tag, run, is_over(tag)), "seed {seed} run {run}");
-                    if now {
-                        started.push(tag);
-                    }
-                } else {
-                    let tag = started.swap_remove(rng.index(started.len()));
-                    throttle.ended(tag);
-                    model.running[tag.index()] -= 1;
-                    loop {
-                        let (got, want) = (throttle.next(is_over), model.next(is_over));
-                        assert_eq!(got, want, "seed {seed} run {run}");
-                        let Some(run) = got else { break };
-                        started.push(tag_of[run as usize]);
-                    }
-                }
-                assert_eq!(throttle.held(), model.held(), "seed {seed} run {run}");
-                assert_eq!(throttle.running, model.running, "seed {seed} run {run}");
-                if quiet {
-                    assert_eq!(throttle.held(), 0, "under budget nothing waits");
-                }
-            }
-        }
-    }
-
-    /// Every subsystem over its budget for good: each run held back still starts once those
-    /// before it end, so nothing waits forever.
-    #[test]
-    fn a_subsystem_over_its_budget_still_runs_one_at_a_time() {
-        let mut throttle = Throttle::new().unwrap();
-        let over = |_: MemTag| true;
-        assert!(throttle.admit(MemTag::Infer, 0, over));
-        for run in 1..100 {
-            assert!(!throttle.admit(MemTag::Infer, run, over));
-        }
-        assert!(throttle.admit(MemTag::Codegen, 100, over), "another subsystem is not held");
-        for want in 1..100 {
-            throttle.ended(MemTag::Infer);
-            assert_eq!(throttle.next(over), Some(want));
-            assert_eq!(throttle.next(over), None, "one at a time");
-        }
-        throttle.ended(MemTag::Infer);
-        assert_eq!(throttle.held(), 0);
-        assert_eq!(throttle.any(), None);
-    }
-
     /// A `Done` naming a run whose slot was freed is a stale handle, caught before its slot is
     /// read: the slot it named may hold another run by now.
     #[test]
@@ -2002,27 +1745,23 @@ mod tests {
         table.free(first);
     }
 
-    /// Once warm, a run's table slot taken, named and freed, with its admission check against
-    /// its subsystem's budget and its end, calls the global allocator zero times.
+    /// Once warm, a run's table slot taken, named and freed calls the global allocator zero
+    /// times.
     #[test]
-    fn a_warm_run_and_its_admission_allocate_nothing() {
+    fn a_warm_run_allocates_nothing() {
         let ctx = ctx();
         let mut table = Table::new(ctx).unwrap();
-        let mut throttle = Throttle::new().unwrap();
         let built: Work = Arc::new(|| Ok(Did::built()));
         let mut cycle = |id: u32| {
             let at = table.take(ctx, live(id, &built), MemTag::Infer, Pool::Work, None).unwrap();
-            assert!(throttle.admit(MemTag::Infer, at, blaze_mem::tag::over_budget));
             let (ran, pool, near) = table.ran(at);
             assert_eq!((ran.live().id, pool, near), (NodeId(id), Pool::Work, None));
-            let tag = table.free(at);
-            throttle.ended(tag);
-            assert_eq!(throttle.next(blaze_mem::tag::over_budget), None);
+            assert_eq!(table.free(at), MemTag::Infer);
         };
         for id in 0..2 * RUNS as u32 {
             cycle(id);
         }
-        blaze_alloc_count::assert_at_most(0, "a warm run and its admission", || {
+        blaze_alloc_count::assert_at_most(0, "a warm run", || {
             for id in 0..10_000 {
                 cycle(id);
             }

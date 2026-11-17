@@ -1,0 +1,32 @@
+[package]
+name = "blaze-audit"
+description = "blaze audit, sans-IO: every dependency source pinned by a strong digest (a git source by the BLAKE3 of its tree, recorded in blaze.lock; an unpinned path refused), every locked package checked against a RustSec advisory database and the registry's yanked versions, acceptances with a reason and an expiry, and one report in text and versioned JSON"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The one tree listing (`blaze tree 2`) a git source's digest is over, and `Digest`'s one
+# spelling (`blake3:<hex>`) and refusal of weak algorithms by name.
+blaze-fetch.workspace = true
+# The advisories' version ranges and the lock's exact versions.
+semver.workspace = true
+# The advisories' front matter, blaze.lock's tables and the workspace's settings.
+toml.workspace = true
+# `--json`, and the sparse index's lines the yanked check reads.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

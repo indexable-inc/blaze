@@ -1,0 +1,14 @@
+{
+ "id": "const-ast-keywords-numbered-after-nodes",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of plan 9 task 1, int-1112",
+ "where": "crates/parser/src/syntax_kind/generated.rs:345-361; crates/const-ast/src/kinds.rs; const-ast tests::kinds_are_the_grammars",
+ "what": "Making every node kind public as a const_ast::Kind, 'every SyntaxKind from ABI on' is not every node kind: eight contextual keywords (UNWRAP_BINDER_KW .. UNIQ_KW) are numbered after the nodes to keep older kinds' numbers, and kinds_are_the_grammars decided token-or-node by `number < ABI`, so it would have written a keyword's line without TOKEN.",
+ "cost": "one wrong rule found by reading; would have made 8 token kinds openable as nodes",
+ "cause": "whether a kind is a token is read off its position in the numbering, which stopped being true when kinds were appended out of order",
+ "class": "a property derived from an order that later appends do not keep",
+ "prevention": "token-or-node is `number < ABI || !SyntaxKind::text().is_empty()` in both kinds tests; the parser could carry an is_token table generated with the enum",
+ "workaround": "none",
+ "fix": "kinds.rs holds the 178 node kinds; kinds_are_the_grammars and every_node_kind_is_public use the text rule; every_node_kind_is_public's control drops IMPL and is caught naming it.",
+ "state": "fixed"
+}

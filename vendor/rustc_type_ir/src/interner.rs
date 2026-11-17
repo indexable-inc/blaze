@@ -301,6 +301,12 @@ pub trait Interner:
 
     fn expand_abstract_consts<T: TypeFoldable<Self>>(self, t: T) -> T;
 
+    /// blaze: whether the constants `a` and `b`, which are not one constant, are the same
+    /// expression of the same constants (`#![feature(blaze_const_exprs)]`: `{ N + M }` and
+    /// `{ M + N }`), by a normal form the interner computes. `false` wherever no generic const
+    /// expression is involved.
+    fn same_const_expression(self, a: Const<Self>, b: Const<Self>) -> bool;
+
     type GenericsOf: GenericsOf<Self>;
     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf;
 
@@ -518,8 +524,22 @@ pub trait Interner:
     /// an existing variant `v`: `VariantOf<E, v>`. `None` for any other type.
     fn reflect_variant_view(self, member: Self::Ty) -> Option<Self::Ty>;
 
+    /// blaze: the description `D` of `ty` when `ty` is `core::reflect::Described<'a, D, Args>`,
+    /// for the solver to normalize before [`Interner::reflect_type_of`] reads it. `None` for
+    /// any other type.
+    fn reflect_described_desc(self, ty: Self::Ty) -> Option<Const<Self>>;
+
+    /// blaze: `<Described<'a, D, Args> as core::reflect::TypeOf>::Type` of `ty`, with `desc`
+    /// for `D`, normalized (`type_of!`).
+    fn reflect_type_of(self, ty: Self::Ty, desc: Const<Self>)
+    -> crate::reflect::TypeOfAnswer<Self>;
+
     /// blaze: whether `ty` is an enum (`core::reflect::Enum`).
     fn reflect_is_enum(self, ty: Self::Ty) -> bool;
+
+    /// blaze: whether `ty` is the item type of a function written `#[blaze::memo]`
+    /// (`core::reflect::MemoPoint`).
+    fn reflect_is_memo_point(self, ty: Self::Ty) -> bool;
 
     /// blaze: `env` with `clauses` added, for a member of a field binder entering the
     /// environment (`rustc_next_trait_solver`'s `env_with_reflected_member`).

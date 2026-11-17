@@ -36,21 +36,26 @@ function unique(body: (Ent | string)[]) {
 	}
 }
 
-const value = (v: Field) => (typeof v === 'number' ? (Number.isFinite(v) ? String(v) : '0') : str(v));
+/** A field's value as the script writes it. */
+export const literal = (v: Field) => (typeof v === 'number' ? (Number.isFinite(v) ? String(v) : '0') : str(v));
 
 function print(e: Ent, indent: string): string {
-	const fields = e.fields ? `(${Object.entries(e.fields).map(([k, v]) => `${k}: ${value(v)}`).join(', ')})` : '';
+	const fields = e.fields ? `(${Object.entries(e.fields).map(([k, v]) => `${k}: ${literal(v)}`).join(', ')})` : '';
 	const head = `${indent}${e.kind} ${e.name}${fields}`;
 	if (!e.body.length) return e.fields ? head : `${head} {}`;
 	const inner = e.body.map((b) => (typeof b === 'string' ? `${indent}  ${b}` : print(b, `${indent}  `))).join('\n');
 	return `${head} {\n${inner}\n${indent}}`;
 }
 
-/** A script that opens the entity at `path` (dotted, made already) and adds `body` to its scope, in order. */
-export function script(path: string, body: Ent[]): string {
+/**
+ * A script that opens the entity at `path` (dotted, made already) and adds `body` to its scope, in order: entities,
+ * or a line as written (a component set on the entity itself).
+ */
+export function script(path: string, body: (Ent | string)[]): string {
 	unique(body);
 	const parts = path.split('.');
+	const indent = '  '.repeat(parts.length);
 	const open = parts.map((p, i) => `${'  '.repeat(i)}${p} {`).join('\n');
 	const close = parts.map((_, i) => `${'  '.repeat(parts.length - 1 - i)}}`).join('\n');
-	return `${open}\n${body.map((b) => print(b, '  '.repeat(parts.length))).join('\n')}\n${close}\n`;
+	return `${open}\n${body.map((b) => (typeof b === 'string' ? `${indent}${b}` : print(b, indent))).join('\n')}\n${close}\n`;
 }

@@ -65,11 +65,21 @@ impl Probe for Recorder {
         };
         // alloc: once a contended wait, its span's `awaits` (interned by the span)
         let awaited = format!("{said} {name}");
-        crate::wait_began(kind, &awaited, None)
+        // A lock's holder is a thread, named by the wait's `lock_waits` row; a signal's sender
+        // is whoever signals: neither is a job the span could name.
+        crate::wait_began(kind, &awaited, kind.unowned())
     }
 
     fn wait_end(&self, token: u64) {
         crate::wait_ended(token);
+    }
+
+    /// A `wait` span of kind io whose `awaits` is `io <op> <file>`: a driver's thread off its
+    /// loop in a clone, a write-back or a listing (`blaze_core::lock::io_wait`).
+    fn io_begin(&self, op: &'static str, file: &str) -> Option<u64> {
+        // alloc: once a file call off a driver's loop, its span's `awaits` (interned by the span)
+        let awaited = format!("io {op} {file}");
+        Some(crate::wait_began(WaitKind::Io, &awaited, WaitKind::Io.unowned()))
     }
 
     fn record(&self, wait: &LockWait) {

@@ -1,0 +1,11 @@
+{
+ "id": "records-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+ "where": "the task's premise: a library's rows are durable",
+ "what": "The brief and blaze-query's docs say library inputs are `HIGH` and a durable row is current without walking its edges. On hello-world 181,865 of 2,105,574 rows are at `HIGH`; 1,906,504 are at `MEDIUM`, because std's rows read inputs of kind `MEDIUM` (the maintainers' `Resolutions` and `ImplSlices`, the crate graph after a change, files' source roots, crate attributes). The first version of shedding durable readers from the reverse index took 64,000 of 2.9 million readers.",
+ "cost": "one build and measurement that bought nothing, an hour",
+ "cause": "nothing reported rows by kind; a row's kind is the lowest it read, and one shared table of kind `MEDIUM` lowers every reader",
+ "workaround": "the pack's span says rows_low, rows_medium, rows_high now; the shed is from `MEDIUM`",
+ "state": "open: a library crate's published tables should be inputs of their own at `HIGH` (restore.md, step 2)"
+}

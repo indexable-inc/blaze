@@ -47,6 +47,8 @@ const ROOT_FILE: &str = "probe.rs";
 
 const VIEW_DOMAIN: &str = "blaze v2 rustc stand-in probe view 1";
 const LIBRARY_DOMAIN: &str = "blaze v2 rustc stand-in library root 1";
+/// A directory of the library on disk ([`Tree::dir`]): each entry's name, kind and ID.
+const LIBRARY_DIR_DOMAIN: &str = "blaze v2 rustc stand-in library directory 1";
 
 /// The editions rustc's `--edition` takes.
 const EDITIONS: [&str; 4] = ["2015", "2018", "2021", "2024"];
@@ -165,30 +167,38 @@ pub(super) fn check(
         .iter()
         .position(|it| !it.is_std && it.mode != UnitMode::RunCustomBuild && it.target.is_lib())
         .context("the load made no unit of the probe's crate")?;
+    // A probe keeps no records: nothing of it is sealed.
+    let sealed = blaze_lower::unsealed(&units);
     let lower = blaze_lower::Lower {
         units: &units,
         config: &config,
         files: &*tree,
         root: tree.view,
         host_cpu: None,
+        sealed: &sealed,
     };
-    let mut lowered =
-        blaze_lower::lower(lower).context("lowering the probe with the standard library")?;
+    // A probe files no records, so its queries keep no read lists and no fact boundary cuts
+    // them.
+    let mut lowered = blaze_lower::lower(lower, |_| {}, blaze_memo::Reads::Off)
+        .context("lowering the probe with the standard library")?;
     tree.failed()?;
     std_script(&mut lowered, &units, library)?;
-    let krate = lowered.krate(index).context("the probe's unit has no crate in the front end")?;
+    let key = lowered.crates().key(index).context("the probe's unit has no crate in the front end")?;
     let cfg: CfgOptions = asked.cfgs.iter().map(|it| atom(it)).collect::<anyhow::Result<_>>()?;
     let process: Env = std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    let trigger = base_db::Trigger::named("the probe's cfgs and environment set");
-    lowered.served_db().batch(trigger, |db| {
-        krate.set_cfg_options(db, cfg);
-        krate.set_env(db, Env::default());
-        base_db::set_process_env(db, process);
+    lowered.batch(blaze_lower::Trigger::named("the probe's cfgs and environment set"), |lowered| {
+        let mut edit = lowered.served_db().edit();
+        edit.set_crate_cfg_options(key, cfg)
+            .set_crate_env(key, Env::default())
+            .set_process_env(process);
+        _ = edit.commit();
     });
 
     let db = lowered.db();
+    // Taken in the snapshot the edit committed: the crate's id of the one before is dead.
+    let krate = db.krate(key);
     let root_file = krate.data(db).root_file_id;
     let mut paths: HashMap<FileId, String> = (**lowered.paths()).clone();
     paths.insert(root_file, shown.to_owned());
@@ -242,7 +252,8 @@ fn std_script(
                 && it.mode != UnitMode::RunCustomBuild
         })
         .context("the probe's load made no unit of std")?;
-    let krate = lowered.krate(index).context("std's unit has no crate in the front end")?;
+    let key = lowered.crates().key(index).context("std's unit has no crate in the front end")?;
+    let krate = lowered.db().krate(key);
     let mut cfg = krate.cfg_options(lowered.db()).clone();
     let mut env = krate.env(lowered.db()).clone();
     let value = |key: &str| cfg.get_cfg_values(key).next().map_or("", |it| it.as_str());
@@ -276,9 +287,10 @@ fn std_script(
             }
         }
     }
-    lowered.served_db().batch(base_db::Trigger::named("std's build script's run applied"), |db| {
-        krate.set_cfg_options(db, cfg);
-        krate.set_env(db, env);
+    lowered.batch(blaze_lower::Trigger::named("std's build script's run applied"), |lowered| {
+        let mut edit = lowered.served_db().edit();
+        edit.set_crate_cfg_options(key, cfg).set_crate_env(key, env);
+        _ = edit.commit();
     });
     Ok(())
 }
@@ -488,6 +500,27 @@ impl ProbeFiles {
     }
 }
 
+impl ProbeFiles {
+    /// [`Tree::dir`] of a directory of the library below its root. This tree holds no ID of
+    /// what is on disk, so unlike the VFS's it reads every file below `path` to make one;
+    /// nothing in a probe asks (a probe keys nothing by a directory), and a caller that does
+    /// gets a true ID. A file [`Tree::file`] does not answer for is not in it.
+    fn library_dir(&self, path: &str) -> Option<ContentId> {
+        let names = self.library_names(path)?;
+        let mut hasher = blaze_ids::Hasher::new(LIBRARY_DIR_DOMAIN);
+        for (name, dir) in &names {
+            let at = format!("{path}/{name}");
+            if *dir {
+                let id = self.library_dir(&at)?;
+                hasher.part(name.as_bytes()).update(&[1]).id(&id);
+            } else if let Some((id, mode, _)) = self.library_file(&at) {
+                hasher.part(name.as_bytes()).update(&[0]).update(&mode.git().to_le_bytes()).id(&id);
+            }
+        }
+        Some(hasher.finish())
+    }
+}
+
 fn gone(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
 }
@@ -533,5 +566,19 @@ impl Tree for ProbeFiles {
         let Some(names) = self.library_names(path) else { return false };
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
         true
+    }
+
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        if root == self.view {
+            // The package is two files and no directory below its root.
+            return path.is_empty().then_some(self.view);
+        }
+        if root != self.library {
+            return None;
+        }
+        if path.is_empty() {
+            return Some(self.library);
+        }
+        self.library_dir(path)
     }
 }

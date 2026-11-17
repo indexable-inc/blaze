@@ -1,6 +1,7 @@
 //! Where cargo has each package the resolve pins, and the registries' indexes the resolve reads
-//! (docs/v2/plan.md section 3): every file read through the view's mounts,
-//! never the disk or the network. What is not mounted yet is a [`Fetch`] the daemon makes and
+//! (docs/v2/plan.md section 3): every file read through the mounts of the configuration the
+//! workspace is read with ([`ConfigOf`]: the view's, or a fixed one's for a workspace keyed by
+//! nothing of the view, as the standard library's is), never the disk or the network. What is not mounted yet is a [`Fetch`] the daemon makes and
 //! mounts where cargo keeps it; offline, it is cargo's error.
 //!
 //! - `[source]` replacement is cargo 1.99's `SourceConfigMap` (`src/sources/config.rs`):
@@ -28,7 +29,8 @@ use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{CRATES_IO_REGISTRY, PackageId, SourceId, SourceKind};
 
 use crate::index::{self, RegistryConfig, crate_url, index_path};
-use crate::load::files::{Found, normal, read_dir, read_file};
+use crate::load::config::ConfigOf;
+use crate::load::files::{Found, normal};
 use crate::load::load_error;
 use crate::query::{Fetch, FetchKind, LoadError};
 use crate::sources::SourceMap;
@@ -38,10 +40,17 @@ pub(crate) use self::registry::Index;
 /// The sources a build reads packages from, as its configuration names them.
 pub(crate) struct Sources {
     map: SourceMap,
+    /// Whose mounts every read goes through: the workspace's configuration. A workspace keyed
+    /// by nothing of the view reads nothing of it, so its vendored packages are found under its
+    /// own mounts whatever the view mounts.
+    config: ConfigOf,
     /// Where fetched packages are kept ([`crate::query::BuildConfig::sources`]), absolute,
     /// `/`-separated.
     kept: String,
     offline: Option<&'static str>,
+    /// What `blaze.lock` pins each git source's tree by: a git package is located only when
+    /// its source is pinned here (rule `weak_source_pin`, [`blaze_audit::source`]).
+    pins: blaze_audit::pins::SourcePins,
 }
 
 /// Where a package is.
@@ -73,16 +82,26 @@ impl Sources {
     /// `[registries]`, `registry.index`, `registries.crates-io.protocol` (sparse by default).
     /// `kept` is where the daemon keeps fetched packages ([`crate::query::BuildConfig::sources`]).
     /// `offline` is `Some("--offline")` or `Some("--frozen")` when the command line or
-    /// `net.offline` makes the build offline.
+    /// `net.offline` makes the build offline. `pins` is what the workspace's `blaze.lock` pins
+    /// git trees by ([`crate::lock::source_pins`]). `config_of` is which configuration
+    /// `config` is, whose mounts every read goes through.
     pub(crate) fn new<F: Files>(
         config: &Config<F>,
+        config_of: &ConfigOf,
         kept: &str,
         offline: Option<&'static str>,
+        pins: blaze_audit::pins::SourcePins,
     ) -> anyhow::Result<Sources> {
         let kept = normal(std::path::Path::new(kept)).ok_or_else(|| {
             anyhow!("the daemon names `{kept}`, no absolute directory, for where it keeps the packages it fetches")
         })?;
-        Ok(Sources { map: source_map(config)?, kept, offline })
+        // clone: the configuration once per resolve, which every read keys by.
+        Ok(Sources { map: source_map(config)?, config: config_of.clone(), kept, offline, pins })
+    }
+
+    /// What `blaze.lock` pins git trees by.
+    pub(crate) fn pins(&self) -> &blaze_audit::pins::SourcePins {
+        &self.pins
     }
 
     /// A package the resolve pins that is not a path package: where cargo has its `Cargo.toml`,
@@ -119,7 +138,7 @@ impl Sources {
                 let Some(root) = local_path(from) else {
                     return Ok(failed(anyhow!("{from} is not a directory blaze can name")));
                 };
-                match tree::vendored_package(cx, &root, &from.to_string(), id, checksum)? {
+                match tree::vendored_package(cx, &self.config, &root, &from.to_string(), id, checksum)? {
                     Ok(manifest) => Located::Here { manifest },
                     Err(error) if from != source => failed(
                         error.context(format!("failed to download replaced source {source}")),
@@ -154,7 +173,7 @@ impl Sources {
             ))));
         }
         let at = self.package_dir(from, name, &version);
-        if let Found::Here(_) = read_dir(cx, &at)? {
+        if let Found::Here(_) = self.config.read_dir(cx, &at)? {
             return Ok(Ok(Located::Here { manifest: format!("{at}/Cargo.toml") }));
         }
         if let Some(flag) = self.offline
@@ -191,7 +210,7 @@ impl Sources {
                 return Ok(Err(anyhow!("{from} is not a directory blaze can name")));
             };
             let file = format!("{root}/{name}-{version}.crate");
-            match read_file(cx, &file)? {
+            match self.config.read_file(cx, &file)? {
                 Found::Here(_) => format!("file://{file}"),
                 Found::Absent => return Ok(Err(anyhow!("failed to read `{file}`"))),
                 Found::Unmounted => return Ok(Err(unmounted_local(&root))),
@@ -204,7 +223,7 @@ impl Sources {
                 Err(error) => return Ok(Err(error)),
             };
             let config_path = format!("{}/config.json", self.index_dir(from));
-            let config = match read_file(cx, &config_path)? {
+            let config = match self.config.read_file(cx, &config_path)? {
                 Found::Here(bytes) => match serde_json::from_slice::<RegistryConfig>(&bytes) {
                     Ok(config) => config,
                     Err(error) => {
@@ -239,7 +258,10 @@ impl Sources {
         })))
     }
 
-    /// A package of a git source: in the checkout of the commit the lock file pins.
+    /// A package of a git source: in the checkout of the commit the lock file pins, whose tree
+    /// `blaze.lock` pins by its digest. A commit id (SHA-1) is no pin, so a package whose tree
+    /// is not pinned is refused before its checkout is read or fetched, and the fetch carries
+    /// the digest the fetcher checks the tree against before it is mounted.
     fn git_package(
         &self,
         cx: &mut Cx<'_>,
@@ -266,10 +288,15 @@ impl Sources {
                 id.version()
             )));
         }
+        let package = format!("{} v{}", id.name(), id.version());
+        let tree = match blaze_audit::source::require_git(&self.pins, &package, source.url().as_str(), commit) {
+            Ok(tree) => tree.to_string(),
+            Err(refused) => return Ok(Err(anyhow!("{refused}"))),
+        };
         let at = format!("{}/git/checkouts/{}/{commit}", self.kept, from.git_ident());
-        if let Found::Here(_) = read_dir(cx, &at)? {
+        if let Found::Here(_) = self.config.read_dir(cx, &at)? {
             return Ok(
-                tree::checkout_package(cx, &at, id)?.map(|manifest| Located::Here { manifest })
+                tree::checkout_package(cx, &self.config, &at, id)?.map(|manifest| Located::Here { manifest })
             );
         }
         if let Some(flag) = self.offline {
@@ -278,7 +305,7 @@ impl Sources {
         Ok(Ok(Located::Needs(Fetch {
             what: format!("git repository `{}`", from.url()),
             url: from.url().to_string(),
-            kind: FetchKind::Git { commit: commit.to_owned() },
+            kind: FetchKind::Git { commit: commit.to_owned(), tree },
             at,
         })))
     }
@@ -299,7 +326,7 @@ impl Sources {
                     Err(error) => return Ok(IndexFile::Failed(error)),
                 };
                 let at = format!("{}/.cache/{relative}", self.index_dir(from));
-                match read_file(cx, &at)? {
+                match self.config.read_file(cx, &at)? {
                     Found::Here(bytes) => IndexFile::Here(bytes),
                     Found::Absent => IndexFile::Absent,
                     Found::Unmounted if self.offline.is_some() => IndexFile::Absent,
@@ -317,7 +344,7 @@ impl Sources {
                         "{from} is not a directory blaze can name"
                     )));
                 };
-                match read_dir(cx, &root)? {
+                match self.config.read_dir(cx, &root)? {
                     Found::Here(_) => {}
                     Found::Absent => {
                         return Ok(IndexFile::Failed(anyhow!(
@@ -327,12 +354,12 @@ impl Sources {
                     Found::Unmounted => return Ok(IndexFile::Failed(unmounted_local(&root))),
                 }
                 let index = format!("{root}/index");
-                if !matches!(read_dir(cx, &index)?, Found::Here(_)) {
+                if !matches!(self.config.read_dir(cx, &index)?, Found::Here(_)) {
                     return Ok(IndexFile::Failed(anyhow!(
                         "local registry index path is not a directory: {index}"
                     )));
                 }
-                match read_file(cx, &format!("{index}/{relative}"))? {
+                match self.config.read_file(cx, &format!("{index}/{relative}"))? {
                     Found::Here(bytes) => IndexFile::Here(bytes),
                     Found::Absent => IndexFile::Absent,
                     Found::Unmounted => IndexFile::Failed(unmounted_local(&root)),
@@ -356,7 +383,7 @@ impl Sources {
             return Ok(true);
         }
         let at = self.package_dir(from, name, &version.to_string());
-        Ok(matches!(read_dir(cx, &at)?, Found::Here(_)))
+        Ok(matches!(self.config.read_dir(cx, &at)?, Found::Here(_)))
     }
 
     pub(crate) fn offline(&self) -> Option<&'static str> {

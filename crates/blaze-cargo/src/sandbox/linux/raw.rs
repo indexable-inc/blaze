@@ -13,7 +13,8 @@ use std::{
 use libc::{c_int, c_long, c_uint, c_ulong, gid_t, pid_t, uid_t};
 
 use super::{
-    IfReq, MountAttr, Notif, NotifResp, SECCOMP_FILTER_FLAG_NEW_LISTENER, SECCOMP_IOCTL_NOTIF_RECV,
+    IfReq, MountAttr, Notif, NotifAddFd, NotifResp, SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    SECCOMP_IOCTL_NOTIF_ADDFD, SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV,
     SECCOMP_IOCTL_NOTIF_SEND, SECCOMP_IOCTL_NOTIF_SET_FLAGS, SECCOMP_SET_MODE_FILTER,
     SYS_MOUNT_SETATTR, SYS_PIDFD_OPEN,
     landlock::{self, PathBeneath, RulesetAttr},
@@ -24,6 +25,8 @@ use super::{
 // out of place would have the kernel write past `Notif` or read past `NotifResp`.
 const _: () = assert!(size_of::<Notif>() == 80);
 const _: () = assert!(size_of::<NotifResp>() == 24);
+// `_IOW('!', 3, struct seccomp_notif_addfd)` is 0x18 bytes.
+const _: () = assert!(size_of::<NotifAddFd>() == 24);
 const _: () = assert!(size_of::<MountAttr>() == 32);
 const _: () = assert!(size_of::<IfReq>() == 40);
 const _: () = assert!(size_of::<RulesetAttr>() == 24);
@@ -492,6 +495,62 @@ pub(super) fn notif_send(listener: c_int, resp: &NotifResp) -> c_int {
     unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND as _, resp as *const NotifResp) }
 }
 
+/// Whether the call of notification `id` on `listener` is still waiting for its answer
+/// (`SECCOMP_IOCTL_NOTIF_ID_VALID`): false once its thread was killed, when the thread's id
+/// may be another process's.
+pub(super) fn notif_id_valid(listener: c_int, id: u64) -> bool {
+    // SAFETY: `id` is a `__u64` borrowed for the call, which only reads it; the ioctl
+    // number names its eight bytes.
+    unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID as _, &raw const id) == 0 }
+}
+
+/// Puts a descriptor of this process into the one a notification on `listener` is of
+/// (`SECCOMP_IOCTL_NOTIF_ADDFD`): the descriptor's number there, or below zero with `errno`
+/// set. With `SECCOMP_ADDFD_FLAG_SEND` it is the call's answer as well.
+pub(super) fn notif_addfd(listener: c_int, add: &NotifAddFd) -> c_int {
+    // SAFETY: `add` is a `struct seccomp_notif_addfd` (`repr(C)`, 24 bytes, the size the
+    // ioctl number names, checked above) borrowed for the call, which only reads it.
+    unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_ADDFD as _, add as *const NotifAddFd) }
+}
+
+/// Writes `bytes` into `pid`'s memory at `at` (an address of that process, never
+/// dereferenced here): what `process_vm_writev` returned, the bytes written, fewer than all
+/// where the memory ends, or below zero with `errno` set.
+pub(super) fn write_memory(pid: pid_t, at: u64, bytes: &[u8]) -> isize {
+    let local = libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
+    let remote = libc::iovec { iov_base: at as *mut libc::c_void, iov_len: bytes.len() };
+    // SAFETY: `local` is `bytes`, borrowed for the call, which only reads it (the kernel's
+    // `iovec` has no const pointer). `remote` only names addresses of the other process,
+    // which the kernel checks against that process's mappings.
+    unsafe { libc::process_vm_writev(pid, &local, 1, &remote, 1, 0) }
+}
+
+/// A new file in memory named `name`, closed on exec, or `None` with `errno` set.
+pub(super) fn memfd(name: &CStr) -> Option<OwnedFd> {
+    // SAFETY: `name` is a nul-terminated string borrowed for the call, which copies it.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is >= 0, so `memfd_create` just made it, and the `OwnedFd` is its one owner.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// How far into its file the open file `fd` is a descriptor of has been read: below zero with
+/// `errno` set when it has no place (a pipe).
+pub(super) fn offset(fd: BorrowedFd<'_>) -> i64 {
+    // SAFETY: `lseek` takes integers only and touches no memory of this process.
+    unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) }
+}
+
+/// Asks the kernel for random bytes into `into` without waiting, as an allocator seeding a
+/// heap does: the planted call of the launcher window's test.
+#[cfg(test)]
+pub(super) fn random_now(into: &mut [u8]) -> isize {
+    // SAFETY: `into` is exclusive for the call, which writes at most `into.len()` bytes.
+    unsafe { libc::getrandom(into.as_mut_ptr().cast(), into.len(), libc::GRND_NONBLOCK) }
+}
+
 /// A pidfd of `pid`, or `None` with `errno` set.
 pub(super) fn pidfd_open(pid: pid_t) -> Option<OwnedFd> {
     // SAFETY: `pidfd_open` takes integers only and touches no memory of this process.
@@ -539,17 +598,50 @@ pub(super) fn readlink_into(path: &CStr, into: &mut Vec<u8>) -> isize {
     read
 }
 
-/// Runs `argv[0]` with `argv` and `env` in place of this process. It returns only where it
-/// couldn't, with `errno` set.
-pub(super) fn execve(argv: &[CString], env: &[CString]) {
-    let mut args: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
-    args.extend(argv.iter().map(|it| it.as_ptr()));
-    args.push(std::ptr::null());
-    let mut envp: Vec<*const libc::c_char> = Vec::with_capacity(env.len() + 1);
-    envp.extend(env.iter().map(|it| it.as_ptr()));
-    envp.push(std::ptr::null());
-    // SAFETY: `args` and `envp` end with null and each other entry is a nul-terminated string
-    // of `argv` or `env`, borrowed for the call; `args[0]` is the program's path, or null with
-    // no `argv`, which the kernel refuses (EFAULT). Nothing is written through them.
-    unsafe { libc::execve(args[0], args.as_ptr(), envp.as_ptr()) };
+/// What an `execve` of `argv[0]` with `argv` and `env` takes, made ahead of it: the two
+/// vectors of pointers are allocated here, so that [`Exec::run`], made after a seccomp filter
+/// that reports the process's calls is installed, allocates nothing. An allocation there is
+/// the program's as far as the supervisor can tell: blaze's allocator seeds a heap it makes
+/// with `getrandom`, which a traced run records as randomness the program read.
+pub(super) struct Exec<'a> {
+    args: Vec<*const libc::c_char>,
+    envp: Vec<*const libc::c_char>,
+    of: std::marker::PhantomData<&'a [CString]>,
+}
+
+impl<'a> Exec<'a> {
+    pub(super) fn new(argv: &'a [CString], env: &'a [CString]) -> Exec<'a> {
+        // alloc: the two vectors of an exec, once a program run, before its filter
+        let mut args: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
+        args.extend(argv.iter().map(|it| it.as_ptr()));
+        args.push(std::ptr::null());
+        // alloc: as above
+        let mut envp: Vec<*const libc::c_char> = Vec::with_capacity(env.len() + 1);
+        envp.extend(env.iter().map(|it| it.as_ptr()));
+        envp.push(std::ptr::null());
+        Exec { args, envp, of: std::marker::PhantomData }
+    }
+
+    /// Runs the program in place of this process. It returns only where it couldn't, with
+    /// `errno` set. One system call and nothing else: no allocation, no lock.
+    pub(super) fn run(&self) {
+        // SAFETY: `args` and `envp` end with null and each other entry is a nul-terminated
+        // string of the `argv` or `env` this was made of, borrowed for `'a`; `args[0]` is the
+        // program's path, or null with no `argv`, which the kernel refuses (EFAULT). Nothing
+        // is written through them.
+        unsafe { libc::execve(self.args[0], self.args.as_ptr(), self.envp.as_ptr()) };
+    }
+}
+
+/// What the system says of `errno`, into `room`, without allocating (`strerror_r`); nothing
+/// where it has no text for it.
+pub(super) fn error_text(errno: c_int, room: &mut [u8; 128]) -> &[u8] {
+    // SAFETY: `room` is writable for its length, which the call is given; it writes a
+    // nul-terminated string there or nothing.
+    let said = unsafe { libc::strerror_r(errno, room.as_mut_ptr().cast(), room.len()) };
+    let len = match said {
+        0 => room.iter().position(|it| *it == 0).unwrap_or(room.len()),
+        _ => 0,
+    };
+    &room[..len]
 }

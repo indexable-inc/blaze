@@ -158,7 +158,7 @@ fn plain() {
 #[test]
 fn an_elided_impl_header_lifetime_holds_for_every_lifetime() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);
@@ -207,7 +207,7 @@ fn an_elided_impl_header_lifetime_holds_for_every_lifetime() {
 
 /// The proc-macro bridge's `Decode` impls (`rpc.rs`, `client.rs`), each leaving its header's
 /// lifetimes out, and `run_client`'s closure calling `<(ExpnGlobals<Span>, A)>::decode`: the
-/// 00:49 self-run's serde derives stopped there, the callee typeless (queue 01481).
+/// 00:49 self-run's serde derives stopped there, the callee typeless.
 const BRIDGE: &str = r#"
 //- minicore: sized, fn, copy, slice, index, range, deref, coerce_unsized
 pub trait Decode<'a, 's, S>: Sized {
@@ -305,7 +305,7 @@ pub fn run_client<A: for<'a, 's> Decode<'a, 's, ()>>(
 #[test]
 fn the_bridges_decode_impls_resolve_for_run_client() {
     let db = fixture::db(BRIDGE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);

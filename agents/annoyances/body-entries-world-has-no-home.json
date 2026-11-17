@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-world-has-no-home",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), body-driver lane, int-1112",
+ "where": "crates/blaze-cargo/src/serve/front_carry.rs bodies, serve/unit/deps.rs serve_bodies/keep_bodies, hir-ty body_store/entries.rs",
+ "what": "Since ce65e6d7bd the body store reads only kernel-served answers, but nothing in production served them: the carry's world has no db, deps::serve runs on the loop (Writer::apply), and the kernel's steps need a 'static world, so no borrowed db view could be one. Finding a place that owns a db, runs off the loop and outlives the borrow took most of the lane; the borrow-check step still has no route (its checker lives pub(crate) in hir-ty-borrowck, which blaze-cargo does not depend on).",
+ "cost": "body-entry hits 0 in every build since ce65e6d7bd; most of a lane's context on placement",
+ "cause": "the kernel's world, the db and the carry were each designed alone: the world type is fixed per kernel and 'static, the db lives in a task-scoped reader, and the end-of-build carry has neither",
+ "class": "a cache's producer and consumer split across two lifetimes with no owner holding both",
+ "prevention": "one world type per front end that owns an Arc of the lowered front end, served and kept on the unit task; the borrowck checker gets one home in hir-ty with a run hook",
+ "workaround": "borrowck entries not served; MIR served at the Bodies phase's revision misses if a write moves the revision before codegen",
+ "fix": "front_carry::bodies (world owns Arc<Lowered>), deps::serve_bodies at compile::bodies, deps::keep_bodies into Compiled.puts at compile::store, claims under Posted",
+ "state": "open"
+}

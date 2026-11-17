@@ -1,0 +1,33 @@
+about = "A launched run after `blaze stop` of a program of the blaze edition on bstd (crates/blaze-std, shaped as harness/v2/smoke/edition) starts from its start image: build and run, run again, `blaze stop`, run; its output and status are those of the file `blaze build` makes, and the run after the stop makes no unit, lowers no workspace, links no launcher, restores the program from its image once and reads no bind record. bstd's crates are sealed roots as a registry crate's are, so their statics have keys. Then a body edit of `main`, and last `edit, build, stop, run`, which prints the edited output only when the image marked is the edited build's. Track 7c, task B; it passes once task C is in."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "hello: 55\n"
+as_built = true
+
+[[revision]]
+steps = []
+action = "run"
+prints = "hello: 55\n"
+as_built = true
+
+[[revision]]
+steps = ["stop"]
+action = "run"
+prints = "hello: 55\n"
+as_built = true
+max_units = 0
+max_records = 0
+spans = { "codegen walk" = 0, "lower workspace" = 0, "launch link" = 0, "launch: restore a program from its start image" = 1, "launch: read a bind record" = 0 }
+
+[[revision]]
+action = "run"
+prints = "hello again: 55\n"
+as_built = true
+
+[[revision]]
+steps = ["edit", "build", "stop"]
+action = "run"
+prints = "hello at last: 55\n"
+as_built = true

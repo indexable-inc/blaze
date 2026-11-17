@@ -1,0 +1,82 @@
+[package]
+name = "blaze-command"
+description = "`blaze check --no-daemon`: one process resolves the checkout into a unit graph, sweeps its leaves, runs the keyed driver's host with the ported front end, files its records under `<home>/v2/keyed` and prints what it did"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The front end's databases: crate graph, workspace data, files and roots (front.rs, snapshot.rs).
+base-db.workspace = true
+# The std script's environment, output and context (graph.rs: std's ported scripts).
+blaze-build-script.workspace = true
+# The plain store the records are filed in.
+blaze-cas.workspace = true
+# The per-instance dev compile, templates and their store keys (code.rs).
+blaze-codegen.workspace = true
+# The link step: a kept image opened, a change staged and committed, kept again (program.rs).
+blaze-link.workspace = true
+# The walk's reader and a program's roots (program.rs).
+blaze-program.workspace = true
+# Named locks, the core budget, a file's `Stamp`.
+blaze-core.workspace = true
+# The record bytes at the format's alignment.
+blaze-format.workspace = true
+# The front end's two tasks (front.rs, snapshot.rs).
+blaze-front.workspace = true
+# Maps and sets with blaze's hasher (front.rs, snapshot.rs).
+blaze-hash.workspace = true
+# The host: the request, the disk, the outside reads and their answers.
+blaze-host.workspace = true
+# `ContentId`, `Hasher`, crc32c.
+blaze-ids.workspace = true
+# Item hashing and the item store (snapshot.rs).
+blaze-item-hash.workspace = true
+blaze-items.workspace = true
+# The driver's vocabulary: plans, keys, records, the front seam.
+blaze-keyed.workspace = true
+# Allocator-explicit text.
+blaze-mem.workspace = true
+# The memo the snapshots keep their reads in (snapshot.rs).
+blaze-memo.workspace = true
+# The leaf table and its sans-IO sweep.
+blaze-solo.workspace = true
+# A unit's keys from its own text (front.rs).
+blaze-unitkey.workspace = true
+# The load: the `Plan` query, its schema, std's target cfg and ported scripts.
+blaze-units.workspace = true
+# The tree's view, a file's bytes and mode.
+blaze-vfs.workspace = true
+# Cfg options and blaze's contract atom.
+cfg.workspace = true
+# The front end's def and type queries (snapshot.rs).
+hir-def.workspace = true
+hir-ty.workspace = true
+# The front end of codegen: plans and the IR builder (code.rs).
+hir-ty-codegen.workspace = true
+intern.workspace = true
+# Editions.
+span.workspace = true
+syntax.workspace = true
+# The spans every phase and wait opens.
+tracing.workspace = true
+# The workspace data the crate graph shares.
+triomphe.workspace = true
+
+[dev-dependencies]
+# The property test of edits.
+blaze-sim.workspace = true
+# The code path's tests (code/tests.rs): fixture databases with the item store's boundaries
+# marked, so a plan's describe leaves a read list.
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

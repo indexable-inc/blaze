@@ -1,0 +1,11 @@
+{
+ "id": "A17",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "the harness (Claude Code)",
+ "what": "A foreground tool call ends at 600 s and `sleep` is refused, so every long step is a background task plus a notification, and a build-then-measure sequence is spread over several turns.",
+ "cost": "constant; shapes every script",
+ "cause": "limits of the harness",
+ "workaround": "`run_in_background`, systemd units on VMs",
+ "state": "accepted"
+}

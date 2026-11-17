@@ -73,6 +73,10 @@ pub mod boxed {
 ";
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_array_of_a_generic_length_cannot_be_matched() {
     // tests/ui/error-codes/E0730.rs
     let source = r#"fn is_123<const N: usize>(x: [u32; N]) -> bool {
@@ -98,6 +102,10 @@ For more information about this error, try `rustc --explain E0730`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_slice_pattern_of_a_float_is_refused() {
     // tests/ui/error-codes/E0529.rs
     let source = "fn main() {
@@ -123,6 +131,10 @@ For more information about this error, try `rustc --explain E0529`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_slice_pattern_of_unit_is_refused() {
     // tests/ui/match/match-vec-mismatch-2.rs
     let source = "fn main() {
@@ -146,6 +158,10 @@ For more information about this error, try `rustc --explain E0529`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_slice_pattern_of_an_option_of_a_vec_suggests_as_deref_or_slicing() {
     // tests/ui/typeck/issue-91328.rs
     let fixture = format!(
@@ -254,6 +270,10 @@ For more information about this error, try `rustc --explain E0529`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn slicing_is_suggested_only_for_the_whole_pattern() {
     // tests/ui/suggestions/suppress-consider-slicing-issue-120605.rs
     let fixture = format!(
@@ -310,6 +330,10 @@ LL |         if let [Struct { a: [] }] = &self.a[..] {
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_range_of_strings_labels_both_ends() {
     // tests/ui/error-codes/E0029.rs
     let source = r#"fn main() {
@@ -339,6 +363,10 @@ For more information about this error, try `rustc --explain E0029`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_half_open_range_of_a_string_points_at_its_end() {
     // tests/ui/half-open-range-patterns/half-open-range-pats-bad-types.rs
     let source = r#"fn main() {
@@ -373,6 +401,10 @@ For more information about this error, try `rustc --explain E0029`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_range_with_one_bad_end_names_the_type_of_the_other() {
     // tests/ui/match/match-range-fail.rs
     let source = r#"fn main() {
@@ -485,6 +517,10 @@ LL |     [_] = [1, 2];
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_array_pattern_with_a_rest_of_too_many_elements_is_refused() {
     // tests/ui/error-codes/E0528.rs
     let source = "fn main() {
@@ -544,6 +580,10 @@ impl String {
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_tuple_variant_pattern_of_wildcards_suggests_a_rest() {
     // tests/ui/match/match-pattern-field-mismatch.rs
     let source = "fn main() {
@@ -591,6 +631,10 @@ For more information about this error, try `rustc --explain E0023`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_empty_tuple_struct_pattern_of_another_type_suggests_no_parentheses() {
     // tests/ui/pattern/issue-67037-pat-tup-scrut-ty-diff-less-fields.rs
     let fixture =
@@ -640,6 +684,10 @@ LL |     let P(..) = U {};
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_tuple_struct_pattern_counts_a_binding_of_a_rest_as_a_field() {
     // tests/ui/pattern/issue-72574-2.rs
     let fixture = "//- /issue-72574-2.rs crate:other:main edition:2015
@@ -675,6 +723,10 @@ LL |         Binder(_a, _x @ .., _) => {}
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_tuple_struct_destructuring_assignment_of_the_wrong_field_count_is_refused() {
     // tests/ui/destructuring-assignment/tuple_struct_destructure_fail.rs
     let fixture = "//- /tuple_struct_destructure_fail.rs crate:other:main edition:2015
@@ -807,6 +859,10 @@ fn main() {
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_union_pattern_names_exactly_one_field_and_no_rest() {
     // tests/ui/union/union-fields-2.rs
     let fixture = "//- /union-fields-2.rs crate:other:main edition:2015
@@ -878,6 +934,10 @@ LL |     let U { a, .. } = u;
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_struct_pattern_of_another_crates_non_exhaustive_struct_needs_a_rest() {
     // tests/ui/rfcs/rfc-2008-non-exhaustive/struct.rs, with auxiliary/structs.rs
     let fixture = "//- minicore: default, derive, fmt
@@ -1050,6 +1110,10 @@ pub fn main() {
 ";
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_mutable_binding_by_reference_is_behind_the_mut_ref_feature() {
     let fixture = format!(
         "//- /mut-ref-mut.rs crate:other:main edition:2024 cfg:structural2024\n{MUT_REF_MUT}"
@@ -1138,6 +1202,10 @@ pub fn main() {
 
 /// The errors of `ref-mut-inside-shared-ref-pat.rs` all its revisions but `stable2021` give,
 /// before the one of `&[x]` only the classic ones give.
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 const REF_MUT_INSIDE_SHARED_REF_PAT_ERRORS: &str =
     "error[E0596]: cannot borrow as mutable inside an `&` pattern
   --> $DIR/ref-mut-inside-shared-ref-pat.rs:16:31
@@ -1182,6 +1250,10 @@ LL |     let &(ref mut a, ref mut b) = &mut (true, false);
 ";
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_mutable_borrow_inside_a_shared_reference_pattern_suggests_mut() {
     let fixture = format!(
         "//- minicore: option

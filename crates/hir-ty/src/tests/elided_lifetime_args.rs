@@ -1,6 +1,6 @@
 //! rustc's rule for a path that gives type arguments but no lifetime arguments: every lifetime
 //! is inferred and the type arguments start at the first type parameter, so
-//! `S::<Mode>::size()` of `struct S<'a, 'b, M>` is `S<'_, '_, Mode>` (queue 01099: the
+//! `S::<Mode>::size()` of `struct S<'a, 'b, M>` is `S<'_, '_, Mode>` (the
 //! bootstrap gave it `S<'{region error}, '{region error}, {type error}>`).
 
 use hir_def::{
@@ -32,7 +32,7 @@ fn main() {
 #[test]
 fn type_args_with_no_lifetime_args_infer_the_lifetimes() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())

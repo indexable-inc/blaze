@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 smallvec.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 rustc_apfloat.workspace = true
 
 ra-ap-rustc_pattern_analysis.workspace = true

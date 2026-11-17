@@ -58,8 +58,7 @@ every symbol a relocation reaches resolves to it:
 - **statics' values (new).** A `static TABLE: [fn() -> u32; 2] = [f::<u32>, f::<i32>]` names
   both instances. Before this change dedupe left the static naming the instance it merged
   away, which no piece defines, and the link failed with an undefined symbol. Now the value's
-  relocations and its data's are renamed. Its digest (`digests::static_definition`, which
-  `blaze_premap` keys and checks images by) is made again from the renamed value;
+  relocations and its data's are renamed. Its digest (`digests::static_definition`) is made again from the renamed value;
 - **data, in one forward pass.** A datum's ID is its content, relocations included, so
   renaming one renames whatever points at it. A datum names only data before it
   (`Template::of` refuses others, `TemplateError::DataOrder`), so one pass in list order gives
@@ -93,8 +92,9 @@ piece. Nothing references a folded key any more, so that would only matter for n
   `equal_code_is_one_function_unless_its_address_is_significant` (driver) and
   `equal_instances_are_one_address_and_an_exported_one_keeps_its_own` (linker, end to end)
   check it.
-- **A patchable function of a live build**, and a tiered one: each keeps its slot, which an
-  edit or a tier-up replaces alone.
+- **A function of a live build reached through its slot**: an edited one, a rebound one (an
+  instance an edit fills again under its own key, [codegen.md](codegen.md#slots-and-a-splices-reach))
+  and a tiered one. Each keeps its slot, which an edit or a tier-up replaces alone.
 - **A covered, counting or PGO-instrumented function**: merged, two would share counters.
 - **Statics, never.** A static is `Target::Static`, by its item, and is never a candidate.
   `#[used]` applies only to statics, so it is covered. A static's writable data has an ID of
@@ -171,8 +171,8 @@ Nothing here was run (lanes don't build). The coordinator runs:
   computed on, as its layout, not its identity. That belongs to `hir-ty-share`.
 - **Dependency images.** If a dependency's function folds into a workspace function with a
   smaller key, a dependency static that named it now names the workspace function, and
-  `blaze_premap::split` refuses that ("points at ... which is the workspace's"), as it already
-  does for dependency code. Whether dev builds can fold across that line, and whether
+  a dependency image has to refuse that, as it does for dependency code (`blaze-premap`'s
+  `split` did, until the crate was deleted on 2026-11-12: caches.md). Whether dev builds can fold across that line, and whether
   `mergeable` should stop at it, is open. Code compiled after the build (`driver/later.rs`, a
   live patch) still names keys merged away. Both predate this lane.
 - **Lines.** `code_id` hashes the function's line table, so two *different* source functions

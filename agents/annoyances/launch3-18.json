@@ -1,0 +1,21 @@
+{
+ "id": "launch3-18",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "the VM: first `run` of a new project in a warm daemon",
+ "what": "A warm daemon gives a new hello-world project nothing: 11.9 and 12.7 s against 11.2 s cold. 13,873 `codegen describe` spans (44.5 s of CPU) and `mir` 13.7 s are made again for the same standard library the daemon described for the project before.",
+ "cost": "every new project, every restart and every cold start pays about 12 s that is the same work each time",
+ "cause": "a describe is kept by the walk of one program in one front end's memory, not as a record by code identity",
+ "whys": [
+  "why slow: the describes are remade",
+  "why remade: they are keyed by a program's walk, not by what the function is",
+  "why not seen: the edit loop of one project never asks",
+  "why easy: the kept walk was built for the edit loop",
+  "property: work that is a function of content, kept under a key that is not"
+ ],
+ "class": "content-determined work kept under a session key: results that depend only on code identity stored where another project, a restart or a cold start cannot find them",
+ "prevention": "rule cache-by-code-id; the ledger row for cold and new-project time checks that a second project's first build makes no describe of std (a count from the profile, not a time)",
+ "workaround": "none",
+ "state": "open; sent to lanes content-keys-1112 and memstrat-1111 by the coordinator",
+ "fix": ""
+}

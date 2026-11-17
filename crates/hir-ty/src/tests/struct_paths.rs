@@ -1,7 +1,7 @@
 //! A struct literal's or pattern's path that resolves to something it can't be is an error
 //! naming what it found, as rustc's resolver (E0574, E0532), `check_struct_path` (E0071),
 //! `check_pat_tuple_struct` (E0164) and `check_pat_path` (E0533) give it, never an error type
-//! with no diagnostic (queue 01168).
+//! with no diagnostic.
 
 use hir_def::{
     AssocItemId, DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
@@ -83,7 +83,7 @@ fn fine(e: E) {
 /// The inference diagnostics of the fixture's function `name`, free or in an impl.
 fn diagnostics(name: &str) -> Vec<InferenceDiagnostic> {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut functions = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);

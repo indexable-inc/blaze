@@ -1046,13 +1046,11 @@ fn c_variadic<'db>(
 ) {
     let Some(last) = inputs.last().filter(|it| it.variadic) else { return };
     let variadic = v.span(last.range);
-    let sig_span = v.span(signature_range(item));
     if item.const_token().is_some() && !v.feature("const_c_variadic") {
-        // clone: a span, on the error path
         let diag = feature_err(
             "const_c_variadic",
             "c-variadic const function definitions are unstable",
-            sig_span.clone(),
+            v.span(signature_range(item)),
         );
         v.emit(out, node, diag);
     }
@@ -1097,7 +1095,7 @@ fn c_variadic<'db>(
     let abi_range = abi.syntax().text_range();
     if let Some(string) = abi_string(abi) {
         let Some(name) = known_abi_of(string) else { return };
-        c_variadic_abi(v, node, name, &variadic, v.span(abi_range), sig_span, out);
+        c_variadic_abi(v, node, name, &variadic, v.span(abi_range), out);
     }
     if item.unsafe_token().is_none() {
         // `FnSig::safety_span`: the `safe`, else before the ABI.
@@ -1116,42 +1114,36 @@ fn c_variadic<'db>(
 }
 
 /// `check_c_variadic_abi`: the ABIs a C-variadic definition may have, of a naked function and
-/// of any other.
+/// of any other. A naked one takes every ABI a C-variadic foreign function may have
+/// (`ExternAbi::supports_c_variadic`), with no gate since Rust 1.99
+/// (`c_variadic_naked_functions`, rust-lang/rust#159746).
 fn c_variadic_abi(
     v: &V<'_, '_, '_>,
     node: ast::Node<'_>,
     abi: &str,
     variadic: &Span,
     extern_span: Span,
-    sig_span: Span,
     out: &mut Out,
 ) {
     let is_c = matches!(abi, "C" | "C-unwind");
     if v.has_attr(node, "naked") {
         // `ExternAbi::supports_c_variadic`.
-        let supported = matches!(
-            abi,
-            "cdecl"
-                | "cdecl-unwind"
-                | "aapcs"
-                | "aapcs-unwind"
-                | "win64"
-                | "win64-unwind"
-                | "sysv64"
-                | "sysv64-unwind"
-                | "efiapi"
-                | "system"
-                | "system-unwind"
-        );
-        if is_c {
-            // A naked C-variadic `extern "C"` function is allowed.
-        } else if supported {
-            if !v.feature("c_variadic_naked_functions") {
-                // alloc: the error's message
-                let message = format!("Naked c-variadic `extern \"{abi}\"` functions are unstable");
-                v.emit(out, node, feature_err("c_variadic_naked_functions", message, sig_span));
-            }
-        } else {
+        let supported = is_c
+            || matches!(
+                abi,
+                "cdecl"
+                    | "cdecl-unwind"
+                    | "aapcs"
+                    | "aapcs-unwind"
+                    | "win64"
+                    | "win64-unwind"
+                    | "sysv64"
+                    | "sysv64-unwind"
+                    | "efiapi"
+                    | "system"
+                    | "system-unwind"
+            );
+        if !supported {
             // alloc: the error's message
             let message = format!("`...` is not supported for `extern \"{abi}\"` naked functions");
             // clone: a span, on the error path

@@ -42,14 +42,14 @@ impl UnstableFeatures {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl UnstableFeatures {
     /// Query unstable features for a crate.
     ///
     /// This is also available as `DefMap::features()`. Use that if you have a DefMap available.
     /// Otherwise, use this, to not draw a dependency to the def map. While the crate's own def
     /// map is being built (a proc macro it calls), use [`UnstableFeatures::of_root`].
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn query(db: &Db, krate: Crate) -> UnstableFeatures {
         // clone: once per def-map change of the crate; the copy lets its readers backdate
         crate::crate_def_map(db, krate).features().clone()
@@ -104,6 +104,26 @@ define_unstable_features! {
     forced_keywords,
     // blaze's compile-time reflection (`docs/v2/plan/design/comptime.md`).
     blaze_comptime,
+    // blaze's generic const expressions (`docs/v2/plan/design/ownership.md`): its own gate, not
+    // `generic_const_exprs`, whose unfinished rustc rules (`thir_abstract_const`) blaze does
+    // not have and the solver's own code paths for it must not take.
+    blaze_const_exprs,
     // blaze's native verification clauses (`docs/v2/plan/design/verus.md`).
     blaze_verify,
+    // blaze's implied bounds: the bounds a type's or a trait's definition declares hold where
+    // an item's header names it (`docs/v2/plan/design/implied-bounds.md`).
+    blaze_implied_bounds,
+    // blaze's anonymous parameters: a `_` in a function's parameter types or an impl's header
+    // is a type parameter of the item (`docs/v2/plan/design/implied-bounds.md`); it implies
+    // `blaze_implied_bounds` ([`UnstableFeatures::implied_bounds`]).
+    blaze_anon_params,
+}
+
+impl UnstableFeatures {
+    /// Whether the crate's items get the bounds their headers imply: `blaze_implied_bounds`,
+    /// or `blaze_anon_params`, whose `_` is bounded by them and nothing else.
+    #[inline]
+    pub fn implied_bounds(&self) -> bool {
+        self.blaze_implied_bounds || self.blaze_anon_params
+    }
 }

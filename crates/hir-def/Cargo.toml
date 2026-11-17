@@ -52,9 +52,13 @@ blaze-format.workspace = true
 blaze-dbsp.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+# `blaze_vfs::FILE_DOMAIN` alone: the id a late read of an included file is asked by
+# (`deps::late`), the host's answer to a file ask.
+blaze-vfs.workspace = true
 inventory.workspace = true
 blaze-phf.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
+blaze-record.workspace = true
 
 # This is a transitive dep, but we need to specify this
 # for the workspace-wide pinning
@@ -63,10 +67,16 @@ unicode-ident.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
 expect-test.workspace = true
 fst.workspace = true
-hegeltest.workspace = true
+# The census of std's surfaces (`deps::std_census`): the one gather (`gather::gather`), the
+# tool id it is keyed under, and std's graph, cfg and target data from the one source the
+# command takes them from (`stdlib::cfg`, `stdlib::target`).
+blaze-unitkey.workspace = true
+blaze-keyed.workspace = true
+blaze-units.workspace = true
 
 # local deps
 test-utils.workspace = true

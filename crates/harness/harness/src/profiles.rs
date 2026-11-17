@@ -33,7 +33,9 @@ pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 /// a blank line between them, then the session's AGENTS.md files (instructions.rs), then the skills index ([`Note`]). A topic only some tasks need is a skill (skills.rs),
 /// not a part here.
 pub const SYSTEM_NOTE_PARTS: &[(&str, &str)] = &[
+    ("goals", include_str!("system_note/goals.md")),     // the root objective, concrete success criteria and ranked priorities
     ("tools", include_str!("system_note/tools.md")),     // the one tool, ts, and its typed calls
+    ("emotions", include_str!("system_note/emotions.md")), // honest work state, uncertainty and progress cues
     ("output", include_str!("system_note/output.md")),   // the person already sees every cell: don't restate it
     ("ui", include_str!("system_note/ui.md")),           // cells as Svelte 5 UI: read the ui skill first
     ("replies", include_str!("system_note/replies.md")), // how replies to Andrew read

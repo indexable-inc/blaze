@@ -14,7 +14,8 @@ use hir_def::{
         },
     },
     hir::generics::{
-        GenericParamDataRef, TypeOrConstParamData, TypeParamData, TypeParamProvenance,
+        GenericParamDataRef, GenericParams, TypeOrConstParamData, TypeParamData,
+        TypeParamProvenance,
     },
     nameres::{assoc_item_binding_name, impl_item_name, trait_item_name, written_name},
     resolver::{ResolveValueResult, Resolver, TypeNs, ValueNs},
@@ -258,6 +259,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         let db = self.ctx.db;
                         let name = trait_item_name(
                             db,
+                            self.ctx.resolver.ctx_table(),
                             trait_id,
                             *segment.name,
                             self.current_segment_hygiene(),
@@ -557,6 +559,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         let segment = self.current_or_prev_segment;
         let assoc_name = segment.name;
         let hygiene = self.current_segment_hygiene();
+        let table = self.ctx.resolver.ctx_table();
         let inherent = match res {
             Some(TypeNs::SelfType(impl_)) => db.impl_trait(impl_).is_none(),
             Some(TypeNs::AdtId(_) | TypeNs::AdtSelfType(_) | TypeNs::TypeAliasId(_)) => true,
@@ -573,11 +576,12 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         }
         let (assoc_type, trait_args) = match res {
             Some(TypeNs::GenericParam(param)) => {
-                let resolution = super::resolve_type_param_assoc_type_shorthand(
+                let resolution = super::assoc_type_shorthand(
                     db,
                     def,
                     param,
-                    written_name(db, *assoc_name, hygiene),
+                    written_name(db, table, *assoc_name, hygiene),
+                    table,
                 );
                 let assoc_type =
                     match self.resolved_shorthand(AssocTypeQself::Param(param), resolution) {
@@ -595,11 +599,12 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 let impl_trait = impl_trait.instantiate_identity().skip_norm_wip();
                 // Searching for `Self::Assoc` in `impl Trait for Type` is like searching for `Self::Assoc` in `Trait`.
                 let self_param = TypeParamId::trait_self(impl_trait.def_id.0);
-                let resolution = super::resolve_type_param_assoc_type_shorthand(
+                let resolution = super::assoc_type_shorthand(
                     db,
                     impl_trait.def_id.0.into(),
                     self_param,
-                    written_name(db, *assoc_name, hygiene),
+                    written_name(db, table, *assoc_name, hygiene),
+                    table,
                 );
                 let assoc_type =
                     match self.resolved_shorthand(AssocTypeQself::Param(self_param), resolution) {
@@ -612,6 +617,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 if let Some((AdtId::EnumId(enum_), _)) = ty.as_adt()
                     && let Some(variant) = hir_def::signatures::EnumVariants::variant_written(
                         db,
+                        table,
                         enum_,
                         assoc_name,
                         self.path.segment_hygiene(self.current_segment_idx).syntax_context(),
@@ -665,8 +671,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         let (adt, args) = ty.as_adt()?;
         // `name` keyed for each impl's items (rustc's `adjust_ident_and_get_scope` in
         // `probe_inherent_assoc_item`), compared with each alias's binding name.
+        let table = self.ctx.resolver.ctx_table();
         let named = inherent_assoc_types(db, adt).iter().filter(|(it, _, impl_)| {
-            it.unkeyed() == name.unkeyed() && *it == impl_item_name(db, *impl_, *name, hygiene)
+            it.unkeyed() == name.unkeyed()
+                && *it == impl_item_name(db, table, *impl_, *name, hygiene)
         });
         for &(_, alias, impl_) in named {
             let own = GenericArgs::identity_for_item(interner, impl_.into());
@@ -877,9 +885,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         let GenericParamId::ConstParamId(const_id) = param_id else {
                             unreachable!("non-const param ID for const param");
                         };
+                        let generic = self.ctx.ctx.const_exprs();
                         self.ctx
                             .ctx
-                            .lower_const(konst, const_param_ty(self.ctx.ctx.db, const_id), false)
+                            .lower_const(konst, const_param_ty(self.ctx.ctx.db, const_id), generic)
                             .into()
                     }
                     _ => unreachable!("unmatching param kinds were passed to `provided_kind()`"),
@@ -1068,6 +1077,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     self.ctx.db,
                     trait_ref,
                     *binding.name,
+                    self.ctx.resolver.ctx_table(),
                 );
                 let (associated_ty, super_trait_args) = match found {
                     None => return Vec::new_in(frame),
@@ -1461,10 +1471,12 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
         match (args.peek(), params.peek()) {
             (Some(&(arg_idx, arg)), Some(&(param_id, param))) => match (arg, param) {
                 (HirGenericArg::Type(_), GenericParamDataRef::TypeParamData(type_param))
-                    if type_param.provenance == TypeParamProvenance::ArgumentImplTrait =>
+                    if type_param.provenance.is_synthetic() =>
                 {
                     // Do not allow specifying `impl Trait` explicitly. We already err at that, but if we won't handle it here
                     // we will handle it as if it was specified, instead of inferring it.
+                    // An anonymous `_` (`#![feature(blaze_anon_params)]`) is never given
+                    // either: explicit arguments are the named parameters'.
                     substs.push(ctx.inferred_kind(
                         def,
                         param_id,
@@ -1514,7 +1526,7 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
                     force_infer_lt = Some((arg_idx as u32, param_id));
                 }
                 (HirGenericArg::Type(type_ref), GenericParamDataRef::ConstParamData(_)) => {
-                    if let Some(konst) = type_looks_like_const(store, *type_ref) {
+                    if let Some(konst) = type_looks_like_const(db, store, *type_ref) {
                         let GenericParamId::ConstParamId(param_id) = param_id else {
                             panic!("unmatching param kinds");
                         };
@@ -1642,10 +1654,11 @@ fn object_lifetime_default<'db>(
     }
 }
 
-fn type_looks_like_const(
-    store: &ExpressionStore,
+fn type_looks_like_const<'s>(
+    db: &Db,
+    store: &'s ExpressionStore,
     type_ref: TypeRefId,
-) -> Option<TypeLikeConst<'_>> {
+) -> Option<TypeLikeConst<'s>> {
     // A path/`_` const will be parsed as a type, instead of a const, because when parsing/lowering
     // in hir-def we don't yet know the expected argument kind. rustc does this a bit differently,
     // when lowering to HIR it resolves the path, and if it doesn't resolve to the type namespace
@@ -1655,6 +1668,17 @@ fn type_looks_like_const(
     match type_ref {
         TypeRef::Path(path) => Some(TypeLikeConst::Path(path)),
         TypeRef::Placeholder => Some(TypeLikeConst::Infer),
+        // A `_` that `#![feature(blaze_anon_params)]` made a type parameter, given for a const
+        // parameter: the `_` it is written as, which a signature refuses (E0121, with the
+        // note that a const argument is never an anonymous parameter). Only type arguments
+        // are (docs/v2/plan/design/implied-bounds.md).
+        TypeRef::TypeParam(param)
+            if GenericParams::of(db, param.parent())[param.local_id()]
+                .type_param()
+                .is_some_and(|it| it.provenance == TypeParamProvenance::Anonymous) =>
+        {
+            Some(TypeLikeConst::Infer)
+        }
         _ => None,
     }
 }
@@ -1665,10 +1689,13 @@ fn type_looks_like_const(
 /// name ([`assoc_item_binding_name`]), so a `macro`'s alias and its caller's of one text are
 /// two. One read per ADT, so a lowering that looks a name up depends on this list, not on every
 /// module scope of the crate.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAliasId, ImplId)]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn inherent_assoc_types<'db>(
+    db: &'db Db,
+    adt: AdtId,
+) -> &'db [(Name, TypeAliasId, ImplId)] {
     let def_map = hir_def::nameres::crate_def_map(db, adt.module(db).krate(db));
-    let mut found = Vec::new(); // alloc: the memo's value, once per ADT
+    let mut found = Vec::new_in(std::alloc::Global);
     for (_, module) in def_map.modules(db) {
         for impl_ in module.scope(db).inherent_impls() {
             let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
@@ -1685,5 +1712,5 @@ pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAlias
             }
         }
     }
-    found.into_boxed_slice()
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &found)
 }

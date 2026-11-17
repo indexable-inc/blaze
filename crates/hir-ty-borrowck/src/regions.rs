@@ -11,6 +11,7 @@
 use crate::mem::{self, FMap, FSet, FVec, Frame, filled};
 use base_db::Db;
 use blaze_ids::radix;
+use blaze_memo::Database as _;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, GenericDefId, ItemContainerId, Lookup as _, hir::Pat,
     resolver::HasResolver as _, signatures::FunctionSignature,
@@ -816,12 +817,13 @@ struct Builder<'c, 'a, 'db> {
     scratch: Scratch<'a, 'db>,
 }
 
+/// The expressions of the body's store lowering made with no syntax of their own, as the
+/// store records them ([`ExpressionStore::is_synthesized`](hir_def::expr_store::ExpressionStore::is_synthesized)):
+/// a fact of the lowered body, read with it, and not of its source map, whose positions no
+/// verdict depends on and whose read would keep the check's trace out of the store.
 fn synthesized<'a>(ctx: &Ctx<'a, '_>) -> BitSet<'a> {
-    let exprs = ctx.store.expr_ids();
-    let mut out = bits(ctx.frame, exprs.len());
-    let InferBodyId::DefWithBodyId(def) = ctx.owner else { return out };
-    let source_map = hir_def::expr_store::Body::unmoved_source_map(ctx.db, def);
-    for expr in exprs.filter(|&expr| source_map.expr_syntax(expr).is_err()) {
+    let mut out = bits(ctx.frame, ctx.store.expr_count());
+    for &expr in ctx.store.synthesized_exprs() {
         out.insert(expr.into_raw().into_u32() as usize);
     }
     out
@@ -1773,8 +1775,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
 
     /// The closure's parameter `index` written `&dyn Trait`, as `&'r (dyn Trait + 'r)` with
     /// its reference's lifetime, as rustc's object lifetime default, where inference gave the
-    /// object a region of its own. A trait bounded by `'static` (`trait Db: 'static`, as
-    /// `blaze_query::db::Database` is) defaults its objects to `'static` instead, as rustc's
+    /// object a region of its own. A trait bounded by `'static` (`trait Db: 'static`) defaults its objects to `'static` instead, as rustc's
     /// `object_region_bounds` does before it looks at the reference.
     fn written_object_default(&mut self, index: usize, ty: Ty<'db>) -> Option<Ty<'db>> {
         let closure = self.ctx.closure_expr?;
@@ -2028,12 +2029,14 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 let Some(variant) = self.ctx.infer.variant_resolution_for_pat(pat) else { return };
                 let fields = hir_def::signatures::VariantFields::of(self.ctx.db, variant);
                 let types = self.ctx.db.field_types(variant);
+                // The pattern's hygiene is of its body's crate's syntax-context table.
+                let table = hir_ty::ctx_table(self.ctx.krate);
                 let parts = mem::collect(
                     self.ctx.frame,
                     args.iter().filter_map(|it| {
                         let hygiene = self.ctx.store.record_field_hygiene(it.pat);
                         let field =
-                            fields.field_written(self.ctx.db, variant, &it.name, hygiene)?;
+                            fields.field_written(self.ctx.db, table, variant, &it.name, hygiene)?;
                         Some((it.pat, types[field].ty().instantiate(interner, adt_args)))
                     }),
                 );
@@ -3885,6 +3888,12 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => {
                 self.relate(x, y, variance, at)
             }
+            // blaze: a pattern type holds its base's regions (`&'a T is PAT` none of its own),
+            // so it relates as its base: a variant refinement's MIR local is its base enum
+            // (`#![blaze::pattern_types]`) where a signature still names the refinement.
+            (TyKind::Pat(x, _), TyKind::Pat(y, _)) => self.relate(x, y, variance, at),
+            (TyKind::Pat(x, _), _) => self.relate(x, b, variance, at),
+            (_, TyKind::Pat(y, _)) => self.relate(a, y, variance, at),
             // Higher-ranked subtyping, as rustc's `TypeRelating::binders`: `a <: b` holds
             // when `b`'s `for<'a>` instantiated with placeholders is a supertype of `a`'s
             // instantiated with variables; invariant, both ways, each still invariant. A region
@@ -6934,7 +6943,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         let (answer_pairs, answer_obligations, universes) = match prove_query(
             self.ctx.db,
             env.store(),
-            hir_ty::next_solver::StoredTraitRef::new(canonical),
+            canonical.def_id.0,
+            canonical.args.store(),
             vars.len() as u32,
         ) {
             Proven::Here => {
@@ -6983,19 +6993,19 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
 /// universes it names past the root, of the placeholders of a `for<'a>` it proved and of the
 /// variables made in them, are the query's own, `1..=universes`, which the body makes anew in
 /// the same order, as rustc's canonical query response does.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
-enum Proven {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proven<'db> {
     /// What it gives names a variable the query resolved, which the body would have to see
     /// resolved too.
     Here,
     /// It does not hold; whether that is a true error.
     Error(bool),
     Gives {
-        pairs: Vec<(StoredRegion, StoredRegion)>,
-        obligations: Vec<(StoredTy, StoredRegion)>,
+        pairs: &'db [(StoredRegion, StoredRegion)],
+        obligations: &'db [(StoredTy, StoredRegion)],
         universes: u32,
         /// Each variable it made outside the root universe, and that universe.
-        in_universe: Vec<(u32, u32)>,
+        in_universe: &'db [(u32, u32)],
     },
 }
 
@@ -7046,22 +7056,21 @@ fn constraint_pairs<'db>(
     out.extend(constraints.into_iter().map(|constraint| constraint.regions(interner)));
 }
 
-/// Proves `trait_ref`, whose region variables are the first `vars`, in `env`, as rustc's
-/// canonical `type_op_prove_predicate`: a query, so a goal is proven once for every body of the
-/// same environment, and an edit proves again only the goals of what it changes.
-#[blaze_query::tracked(returns(ref))]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
-)]
-fn prove_query(
-    db: &Db,
+/// Proves the trait ref `trait_id` of `args`, whose region variables are the first `vars`, in
+/// `env`, as rustc's canonical `type_op_prove_predicate`: a query, so a goal is proven once for
+/// every body of the same environment, and an edit proves again only the goals of what it
+/// changes. The trait ref is keyed by its two Copy parts, the trait and its interned arguments
+/// (a tracked query's key is Copy).
+#[blaze_memo::tracked(returns(ref))]
+fn prove_query<'db>(
+    db: &'db Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
-    trait_ref: hir_ty::next_solver::StoredTraitRef,
+    trait_id: hir_def::TraitId,
+    args: hir_ty::next_solver::StoredGenericArgs,
     vars: u32,
-) -> Proven {
+) -> Proven<'db> {
     use hir_ty::next_solver::{
-        DbInterner, TypingMode,
+        DbInterner, TraitRef, TypingMode,
         infer::{
             DbInternerInferExt as _,
             traits::{Obligation, ObligationCause},
@@ -7077,7 +7086,7 @@ fn prove_query(
         for _ in 0..vars {
             infcx.next_region_var(hir_ty::Span::Dummy);
         }
-        let trait_ref = trait_ref.get(interner);
+        let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), args.as_ref());
         let mut ocx = ObligationCtxt::new(&infcx);
         ocx.register_obligation(Obligation::new(
             interner,
@@ -7139,13 +7148,15 @@ fn prove_query(
         }
         let mut in_universe = mem::owned(in_universe.into_iter());
         radix::sort_copy_by_key(&mut in_universe, |&(vid, universe)| radix::pack_32(vid, universe));
+        let memo = db.memo();
         Proven::Gives {
-            pairs: mem::owned(pairs.iter().map(|&(a, b)| (a.store(), b.store()))),
-            obligations: mem::owned(
+            pairs: blaze_memo::keep_iter(memo, pairs.iter().map(|&(a, b)| (a.store(), b.store()))),
+            obligations: blaze_memo::keep_iter(
+                memo,
                 obligations.iter().map(|&(ty, region)| (ty.store(), region.store())),
             ),
             universes,
-            in_universe,
+            in_universe: blaze_memo::keep_slice(memo, &in_universe),
         }
     })
 }
@@ -7462,16 +7473,16 @@ pub(super) fn path_binding(
 /// The variable each path of `owner`'s store names, by expression, of those that name one:
 /// resolved with one resolver moved into each path's scope and back, so a deep scope chain
 /// grows its stack once, and a query, so checking a body reads it without building one.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref))]
 fn path_bindings<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
-) -> Box<[(hir_def::hir::ExprId, hir_def::hir::BindingId)]> {
+) -> &'db [(hir_def::hir::ExprId, hir_def::hir::BindingId)] {
     use hir_def::resolver::ValueNs;
     let store_owner = owner.expression_store_owner(db);
     let store = hir_def::expr_store::ExpressionStore::of(db, store_owner);
     let mut resolver = owner.resolver(db);
-    let mut out = Vec::new();
+    let mut out = Vec::new_in(std::alloc::Global);
     for (expr, it) in store.exprs() {
         let hir_def::hir::Expr::Path(path) = it else { continue };
         let guard = resolver.update_to_inner_scope(db, store_owner, expr);
@@ -7479,11 +7490,11 @@ fn path_bindings<'db>(
             resolver.resolve_path_in_value_ns_fully(db, path, store.expr_path_hygiene(expr));
         resolver.reset_to_guard(guard);
         if let Some(ValueNs::LocalBinding(binding)) = resolved {
-            out.push((expr, binding)); // alloc: the query's result, once per owner
+            out.push((expr, binding));
         }
     }
     out.sort_unstable_by_key(|&(expr, _)| expr);
-    out.into_boxed_slice()
+    blaze_memo::keep_slice(db.memo(), &out)
 }
 
 pub(super) fn spells_generics(path: hir_def::expr_store::path::Path<'_>) -> bool {
@@ -7772,13 +7783,46 @@ fn normalizes_to_error<'db>(ctx: &Ctx<'_, 'db>, tys: impl IntoIterator<Item = Ty
             }
             _ => Region::new_static(interner),
         });
-        !ty.references_error()
-            && ctx.infcx.probe(|_| {
-                ObligationCtxt::new(&ctx.infcx)
-                    .deeply_normalize(&ObligationCause::dummy(), ctx.env, ty)
-                    .is_ok_and(|it| it.references_error())
-            })
+        if ty.references_error() {
+            return false;
+        }
+        // A type with no inference variable is asked of the query, as `is_copy` asks: the
+        // solver's reads are the query's, which a kept trace reads through, and the answer is
+        // the same in every body of the environment.
+        if !ty.has_non_region_infer() {
+            let env = hir_ty::ParamEnvAndCrate { param_env: ctx.env, krate: ctx.krate };
+            return *normalizes_to_error_query(ctx.db, env.store(), ty.store());
+        }
+        ctx.infcx.probe(|_| {
+            ObligationCtxt::new(&ctx.infcx)
+                .deeply_normalize(&ObligationCause::dummy(), ctx.env, ty)
+                .is_ok_and(|it| it.references_error())
+        })
     })
+}
+
+/// Whether `ty`, its regions `'static` but those bound in it, has an error type in it once
+/// deeply normalized in `env`: [`normalizes_to_error`] as a query, as `is_copy_query` is, so
+/// it is asked once per environment and its solver reads are its own.
+#[blaze_memo::tracked]
+fn normalizes_to_error_query(
+    db: &Db,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    ty: StoredTy,
+) -> bool {
+    use hir_ty::next_solver::{
+        DbInterner, TypingMode,
+        infer::{DbInternerInferExt as _, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    use rustc_type_ir::TypeVisitableExt as _;
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
+    ObligationCtxt::new(&infcx)
+        .deeply_normalize(&ObligationCause::dummy(), env.param_env, ty.as_ref())
+        .is_ok_and(|it| it.references_error())
 }
 
 fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Option<Ty<'db>> {
@@ -7958,27 +8002,27 @@ fn normalize_canonical<'db>(
 
 /// What normalizing a type gives, as the query database keeps it, its region variables numbered as
 /// [`Proven`]'s.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
-enum Normalized {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Normalized<'db> {
     /// What it gives names a placeholder, a variable of another universe or a type variable.
     Here,
     Fails,
     Gives {
         ty: StoredTy,
-        pairs: Vec<(StoredRegion, StoredRegion)>,
+        pairs: &'db [(StoredRegion, StoredRegion)],
     },
 }
 
 /// Normalizes `ty`, whose region variables are the first `vars`, in `env`, with the region
 /// constraints that records: as [`prove_query`], once per environment and not again after an
 /// edit.
-#[blaze_query::tracked(returns(ref))]
-fn normalize_query(
-    db: &Db,
+#[blaze_memo::tracked(returns(ref))]
+fn normalize_query<'db>(
+    db: &'db Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
     ty: StoredTy,
     vars: u32,
-) -> Normalized {
+) -> Normalized<'db> {
     use hir_ty::next_solver::{
         DbInterner, TypingMode,
         infer::{DbInternerInferExt as _, traits::ObligationCause},
@@ -8031,7 +8075,10 @@ fn normalize_query(
         }
         Normalized::Gives {
             ty: normalized.store(),
-            pairs: mem::owned(pairs.iter().map(|&(a, b)| (a.store(), b.store()))),
+            pairs: blaze_memo::keep_iter(
+                db.memo(),
+                pairs.iter().map(|&(a, b)| (a.store(), b.store())),
+            ),
         }
     })
 }

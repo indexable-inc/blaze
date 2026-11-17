@@ -8,19 +8,21 @@ The long version, with the rules for code and how to change the vendored rust-an
 ```
 git clone https://github.com/indexable-inc/blaze
 cd blaze
-nix develop            # rustup at the nightly in harness/toolchain, Python, and the LLVM 23 of `--features llvm`
-cargo build -p blaze-engine --release
+sh site/install.sh --version "$(cat .github/blaze-version)"   # stage 0: the pinned release of blaze, with its own Rust
+blaze build --release --locked -p blaze-engine               # blaze builds blaze; it fetches the pinned LLVM itself
 ```
+
+blaze is never built with cargo or rustc (AGENTS.md, rule blaze-builds-blaze).
 
 ## Test
 
 ```
 blaze fmt --all --check
-cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax
+blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax
 ```
 
-`python3 harness/unittests.py` is the one `cargo test` CI runs, over blaze's crates and the
-front end's (`hir-ty`, `hir-def`, `parser`, `syntax` and the rest), all in `crates/`.
+`python3 harness/unittests.py` is what CI runs: `blaze test --workspace`, every test of every
+crate, held to `harness/known-failures.toml`, the one list of tests that may fail.
 
 The real gate is real crates' own test suites passing under blaze, and tests that state their
 expected result: see [docs/harness.md](../docs/harness.md). Run what fits your change and say in the pull request

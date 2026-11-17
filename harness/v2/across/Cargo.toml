@@ -1,0 +1,5 @@
+# determinism.py's "across units" workspace: two programs that reach the same functions of the
+# standard library by different ways, so each one's unit walks them in another order.
+[workspace]
+members = ["first", "second"]
+resolver = "2"

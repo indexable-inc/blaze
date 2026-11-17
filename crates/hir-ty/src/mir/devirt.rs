@@ -33,7 +33,7 @@ use crate::next_solver::{
 
 /// The content ID of a program's [`World`]: what an optimized body is devirtualized against,
 /// in its [`super::MirOptions`]. Equal IDs are equal facts.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_memo::Home)]
 pub struct DevirtWorld(pub [u8; 32]);
 
 impl fmt::Debug for DevirtWorld {
@@ -171,6 +171,10 @@ impl fmt::Debug for World {
 
 /// The worlds given and still held, by ID: a handful a process (one a final binary being
 /// built), so a list.
+#[expect(
+    blaze::process_static,
+    reason = "a handful of worlds per process held by Weak; dead entries must be pruned or the code generator must own the list"
+)]
 static GIVEN: Lock<Vec<(DevirtWorld, Weak<World>)>> = Lock::new("ty.devirt.given", Vec::new());
 
 /// A world [`given`] hands out while this is held: the code generator holds it for as long as

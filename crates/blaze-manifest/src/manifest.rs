@@ -1684,7 +1684,11 @@ fn dep_to_dependency<F: Files>(
         dep.public = p;
     }
 
-    if orig.artifact.is_some() && !manifest_ctx.config.bindeps() {
+    // blaze's `artifact = "gpu"` is its own opt-in extension, outside cargo's unstable bindeps.
+    if let Some(artifact) = &orig.artifact
+        && !crate::dependency::Artifact::asks_gpu(&artifact.0)
+        && !manifest_ctx.config.bindeps()
+    {
         bail!("`artifact = …` requires `-Z bindeps` ({name_in_toml})");
     }
     match (&orig.artifact, orig.lib, orig.target.as_deref()) {
@@ -1694,6 +1698,11 @@ fn dep_to_dependency<F: Files>(
             if dep.kind != DepKind::Build && artifact.target.as_deref() == Some("target") {
                 bail!(
                     r#"`target = "target"` in normal- or dev-dependencies has no effect ({name_in_toml})"#
+                );
+            }
+            if artifact.is_gpu() && dep.kind == DepKind::Build {
+                bail!(
+                    "artifact `gpu` (blaze's device build) is for a normal or dev dependency, not a build dependency ({name_in_toml})"
                 );
             }
             dep.artifact = Some(artifact);

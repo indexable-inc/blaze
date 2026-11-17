@@ -1,0 +1,14 @@
+{
+ "id": "plan-reads-need-a-body",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane plans-and-code of the no-daemon command",
+ "where": "crates/blaze-item-hash/src/reads.rs (`fact_of(db, def, step, read)`), called by crates/blaze-command/src/code.rs `plan`",
+ "what": "A plan task records the describe's reads and must classify them, but the item store's one classifier took the asking body (`DefWithBodyId`) and a body step. Drop glue, the call-once, fn-pointer and reify shims and `asm!` functions have no body, so their plans could not classify a read and were refused (`code::NO_ANCHOR`); every program reaches drop glue. A body's own text, which a body record covers, is no cover for a plan, so `Covered` rows were re-mapped to the body's `StepMir` fact by hand in code.rs. Covering the instance's body at `Step::Mir` was also wrong: `Step::Mir.reads(Step::Mir)` is false, so a plan's read of its own body's MIR was refused.",
+ "cost": "a refusal of every no-body instance until fixed; about half an hour to see",
+ "cause": "the classifier was written for body records, the only reader of facts until plans",
+ "whys": "fact_of decided `Covered` and resolved relative subjects against the asking body; the asker's crate (for Asker-owned facts) was read off that body",
+ "class": "a classifier keyed by the kind of record that asks, rather than by the asker's crate and what its key covers",
+ "prevention": "built (not compiled yet): `blaze_item_hash::reads::fact_of_in(db, asker: Crate, covers: Option<Cover>, read) -> Classified`, `Cover { body, step }`; `fact_of` is its body-record instance. A plan passes its home (`HirFrontend::plan_home`) and covers nothing: no row is `Covered`, no subject relative, a body's syntax read is that body's `StepMir` fact, a stored answer is refused as `UNCOVERED_ANSWER`",
+ "workaround": "none needed once it compiles",
+ "state": "fixed (not compiled)"
+}

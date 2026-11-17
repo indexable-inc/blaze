@@ -1,0 +1,11 @@
+{
+ "id": "real-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "blaze: unresolved method diagnostics",
+ "what": "tempo-contracts' body check spent more than 15 minutes on one worker in `unresolved_method_call::similar_candidate` (a probe over every trait per unresolved call, 0.2-1.1 s each) for diagnostics the build then did not print.",
+ "cost": "a 30 minute build in place of 13",
+ "cause": "the suggestion is computed before it is known the diagnostic is kept",
+ "workaround": "none",
+ "state": "open"
+}

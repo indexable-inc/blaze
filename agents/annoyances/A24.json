@@ -1,0 +1,11 @@
+{
+ "id": "A24",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "write-only lanes",
+ "what": "Lanes that could not build produced code that mostly compiled but twice gave confident wrong diagnoses of a runtime hang, and one design (the cycle join) whose benefit nobody could measure.",
+ "cost": "hours",
+ "cause": "reading cannot find a runtime bug",
+ "workaround": "lanes whose bug shows only at run time get a build directory",
+ "state": "changed: debugging lanes build"
+}

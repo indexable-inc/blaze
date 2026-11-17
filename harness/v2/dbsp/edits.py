@@ -139,8 +139,8 @@ BAD = 0.25
 MAINTAINED = "blaze-maintained"
 WORK_FIELDS = ("ops", "woken", "rebuilt", "region", "slices", "keys")
 MAX_OPS, MAX_SLICES = 1, 2
-REQUESTED = ("blaze prints no such line yet: queue 00819 (lane ci: the line, in blaze-api and blaze-ui) and "
-             "00820 (dbsp-engine: the per-write records in base-db's maintain.rs)")
+REQUESTED = ("blaze prints no such line yet: it needs the line in blaze-api and blaze-ui, and "
+             "the per-write records in base-db's maintain.rs")
 FIXTURE_FILE = "base/src/lib.rs"
 FIXTURE_PROGRAM = "oracle_app"
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

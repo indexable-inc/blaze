@@ -1,0 +1,14 @@
+{
+ "id": "inproc-socket-writable-in-test-sandbox",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane sandboxed-tests-default on fix-hello-1113",
+ "where": "crates/blaze-inproc/src/host.rs (Host::launch) against crates/blaze-cargo/src/sandbox/linux.rs (Passed::open) and crates/blaze-usercode/src/test/queue.rs (spawn_server)",
+ "what": "With sandboxed tests on, every test of a dev test binary failed before it ran: `the writable entry BLAZE_HOME/v2/inproc/inproc-<pid>.sock is a socket`. The code-memory host listed its own socket as a writable entry of the run's sandbox, while the fork server's socket, the same kind of channel, was already given as readable (connect by that exact path). Finding it took reading three crates: the entry is added after the queue builds the sandbox, inside `Program::command`, so nothing in the test path showed it.",
+ "cost": "about an hour of reading across blaze-inproc, blaze-usercode and the Linux and macOS sandboxes",
+ "cause": "two homes for 'a channel a sandboxed process connects to': the queue gave its socket as readable, the host gave its own as writable; and the host's unit test asserted `write.len() == 1`, enshrining it",
+ "whys": "sandboxed tests were opt-in, so no default run ever sandboxed a dev test binary; the host's launch was written for `blaze run` and tested only for its shape; the queue trusted whatever `Program::command` returned; and the token's secrecy rested on the sandbox hiding other processes' environments, which Seatbelt does not (no rule closes kern.procargs2), found only by a probe on macOS 27.0.1",
+ "class": "a layer below the planner widens a sandbox (a writable entry) that the planner never sees",
+ "prevention": "the queue's `launch` refuses any writable entry a launch adds beyond the plan's, naming it (`adds_no_write`, test `a_launch_adds_nothing_writable_to_a_tests_sandbox`); host.rs gives its socket as readable and its test asserts nothing writable is added; a hook in the sandbox's own PID namespace is matched by its NSpid (`is_peer`), which would have been the next refusal",
+ "workaround": "BLAZE_SANDBOX=off",
+ "state": "fixed on Linux (unrun); on macOS tests stay opt-in because a sandboxed run reads other processes' environments (sysctl KERN_PROCARGS2), so another launch's BLAZE_INPROC token, a known hole asserted by crates/blaze-cargo/src/sandbox/macos.rs a_sandboxed_run_reads_another_processs_environment; closed only by an inherited channel"
+}

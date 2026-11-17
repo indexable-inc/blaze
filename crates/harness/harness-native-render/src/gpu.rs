@@ -77,7 +77,7 @@ pub struct Renderer {
     image: Pso,
     surface: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
-    /// Kip's pictures and pipelines (kip.rs, shaders/mascot.slang).
+    /// Kip's pictures and pipelines (kip.rs, harness-native-shaders' `mascot`).
     kips: crate::kip::Mascots,
     pub atlas: Tex,
     /// The brand marks' Slug curves and bands (icons.rs), uploaded once.

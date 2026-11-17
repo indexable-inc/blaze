@@ -1,0 +1,11 @@
+{
+ "id": "mem2-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze-mem and blaze-cas: give-backs nobody calls",
+ "what": "`frame::trim_spare` says it is \"what a worker does when it goes idle after a burst\" and `Store::evict_pool` says it is \"what the daemon's ceiling guard asks before it gives up\"; neither had a caller outside its crate's tests. An idle daemon kept 278 MiB of frame shelves and 68 MiB of pool pages for good.",
+ "cost": "found only by the table; the comments said it was done",
+ "cause": "the function landed, the call site did not, and a doc comment in the present tense reads as built",
+ "workaround": "none",
+ "state": "trim_spare is called by the idle give-back on mem2-1111; evict_pool still has no caller (open)"
+}

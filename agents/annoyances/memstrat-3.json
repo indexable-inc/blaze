@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "ix VM: memory hot-add",
+ "what": "The VM boots with 3 GB and virtio-mem adds memory in bursts as the guest uses more (dmesg: add_memory, about 50 ms each), up to its 128 GB. While that went on, edit-loop rows of one binary differed by up to 6 times between runs (no-op build 13.9 and 81.4 ms). Two hours later the host took memory back (MemTotal 132 to 121 GB, dmesg: `splits a leaf entry in vmemmap`, compact_stall 62,349) and the rows were noisy again: a cold build 25 to 35 s, a no-op 90 ms; holding 84 GiB in a process did not bring them back.",
+ "cost": "six measurement runs thrown away, about 50 minutes, an hour of believing a variant was slow, and the branch's last full run of rows",
+ "cause": "the guest is resized under the measurement",
+ "workaround": "hold about 116 GiB once before measuring (memstrat-h1); it held for about two hours",
+ "state": "open: `ix new --memory N` could plug all of N at boot, or say that it does not"
+}

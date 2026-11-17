@@ -35,6 +35,7 @@ fn span(
         unit: None,
         awaits: None,
         owner: None,
+        owned_by: None,
         job: Some(job),
         creator: None,
         start_ns: start * U,
@@ -89,13 +90,164 @@ fn report(switches: Vec<SwitchIn>, spans: Vec<SpanIn>, wall: i64, facts: &Facts)
     let path = path::critical(&model);
     let one = analyse(&model, &path, facts);
     assert_eq!(one, analyse(&model, &path, facts), "the same rows give the same report");
+    let ranked: Vec<&Finding> = one
+        .findings
+        .iter()
+        .filter(|it| !matches!(it.kind, Kind::NotKept | Kind::Unfinished))
+        .collect();
     assert!(
-        one.findings
+        ranked
             .windows(2)
             .all(|it| it[0].saves_ns >= it[1].saves_ns || it[1].estimate == Estimate::Unknown),
         "ranked by saving"
     );
     one
+}
+
+/// A build whose checkout's last build lost what it left for the store says so first, with the
+/// daemon's reason, before the serial work that is its consequence: on 2026-11-10 the line the
+/// daemon had printed after every build of ripgrep ("were not kept after its answer was sent")
+/// took an hour of reading a profile to find.
+#[test]
+fn what_the_last_build_lost_is_the_first_finding() {
+    let switches = || {
+        let mut switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+        for it in 2..=4 {
+            switches.extend([
+                switch(it, 0, Event::Started, u64::from(it)),
+                switch(it, 10, Event::Ended, u64::from(it)),
+            ]);
+        }
+        switches
+    };
+    let lowering = || vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let why = "the last build of /w (`build`) answered before what it left for the store was \
+               durable, and it was not kept: the item store: keeping the shape of the MIR of \
+               StaticId(StaticId(ae34)): two images were made under d1eed1fd";
+    let mut facts = workers(1..=4);
+    facts.misses = vec![
+        MissGroup {
+            step: "unit".to_owned(),
+            cause: "changed".to_owned(),
+            count: 40,
+            example: "ripgrep".to_owned(),
+            what: None,
+        },
+        MissGroup {
+            step: NOT_KEPT_STEP.to_owned(),
+            cause: "always".to_owned(),
+            count: 1,
+            example: "the last build of /w".to_owned(),
+            what: Some(why.to_owned()),
+        },
+    ];
+    let it = report(switches(), lowering(), 100, &facts);
+    let first = &it.findings[0];
+    assert_eq!((first.kind, first.fix), (Kind::NotKept, Fix::KeepResults), "{:#?}", it.findings);
+    assert_eq!(first.evidence, [why]);
+    assert!(it.findings.len() >= 2, "what it cost follows: {:#?}", it.findings);
+    assert!(it.findings[1..].iter().all(|it| it.kind != Kind::NotKept));
+    let text = text(&it, 1);
+    assert!(text.contains(" 1. saves ?  the last build's results were not kept"), "{text}");
+    assert!(text.contains("two images were made under"), "{text}");
+
+    // The control: with no such row, the same build's first finding is its serial work.
+    facts.misses.truncate(1);
+    let without = report(switches(), lowering(), 100, &facts);
+    assert!(without.findings.iter().all(|it| it.kind != Kind::NotKept), "{:#?}", without.findings);
+}
+
+/// A build that did the work its checkout's last, failed build left says so before its serial
+/// work: on 2026-11-10 the builds after a failed cold build took 56 s, 10 s and 22 s and read
+/// as slow no-ops.
+#[test]
+fn a_build_finishing_a_failed_one_says_so_first() {
+    let switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let why = "the last build of /w (build 41, `build`) failed with 212 of its 340 units not built";
+    let mut facts = workers(1..=4);
+    facts.misses = vec![MissGroup {
+        step: UNFINISHED_STEP.to_owned(),
+        cause: "always".to_owned(),
+        count: 1,
+        example: "the last build of /w".to_owned(),
+        what: Some(why.to_owned()),
+    }];
+    let it = report(switches, spans, 100, &facts);
+    let first = &it.findings[0];
+    assert_eq!((first.kind, first.fix), (Kind::Unfinished, Fix::CompareAfter), "{:#?}", it.findings);
+    assert_eq!(first.evidence, [why]);
+    assert!(text(&it, 1).contains(" 1. saves ?  the last build did not end well"));
+}
+
+/// What blaze said was wrong in a build is listed before its findings, each once with its
+/// count, and a build that said nothing lists nothing.
+#[test]
+fn the_problems_blaze_said_come_before_the_findings() {
+    let switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let mut facts = workers(1..=1);
+    facts.problems = vec![Problem {
+        level: "WARN".to_owned(),
+        source: "blaze event crates/blaze-cargo/src/serve/job.rs:3288".to_owned(),
+        what: "a build's results were not kept after its answer was sent: two images".to_owned(),
+        count: 12,
+        first_ns: 400_000_000,
+        last_ns: 900_000_000,
+    }];
+    let it = report(switches.clone(), spans.clone(), 100, &facts);
+    assert_eq!(it.problems, facts.problems);
+    let said = text(&it, 10);
+    let problems = said.find("problems blaze said in it: 1 (`blaze explain problems build=").unwrap();
+    assert!(said.contains("    WARN x12 from 0.4 s: a build's results were not kept"), "{said}");
+    assert!(problems < said.find("critical path").unwrap(), "before the path and findings: {said}");
+
+    facts.problems.clear();
+    let quiet = text(&report(switches, spans, 100, &facts), 10);
+    assert!(!quiet.contains("problems blaze said"), "{quiet}");
+}
+
+/// Time on the critical path under no span says where it is: the stretch, its thread, and the
+/// spans of its lane before and after it. On 2026-11-10 an edit's build had 650 ms between its
+/// lowering and its first unit's task; the report said how much was unnamed and not where. A
+/// stretch under [`GAP_NS`] is not listed, and a build whose path is under spans lists none.
+#[test]
+fn a_stretch_of_the_critical_path_under_no_span_says_where_it_is() {
+    let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let mut lower = span(1, 1, None, "lower", 0, 30, 1);
+    lower.function = Some("serde".to_owned());
+    let spans = vec![
+        lower.clone(),
+        span(1, 2, None, "tiny", 95, 1, 1),
+        span(1, 3, None, "unit bodies", 97, 3, 1),
+    ];
+    let it = report(switches(), spans, 100, &workers(1..=1));
+    assert_eq!(it.gaps.len(), 1, "the 10 ms between `tiny` and `unit bodies` is under the bound: {:#?}", it.gaps);
+    let gap = &it.gaps[0];
+    assert_eq!((gap.from_ns, gap.dur_ns, gap.kind.as_str()), (30 * U, 65 * U, "no_span"));
+    assert_eq!((gap.process, gap.thread, gap.thread_name.as_deref()), (P, Some(1), Some("blaze-work-1")));
+    assert_eq!((gap.before.as_deref(), gap.after.as_deref()), (Some("`lower` serde"), Some("`tiny`")));
+    assert_eq!((gap.start_ns, gap.end_ns), (30 * U, 95 * U), "what a query over `samples` filters by");
+    let said = text(&it, 10);
+    assert!(said.contains("critical-path time under no span, by stretch (20.0 ms or more each):"), "{said}");
+    assert!(said.contains(" - 650.0 ms at 0.3 s on blaze-work-1 (tid 1), job 0.1: its lane ran inside no span"), "{said}");
+    assert!(said.contains("     after `lower` serde, before `tiny`"), "{said}");
+    assert!(said.contains("no sample fell in it"), "{said}");
+
+    // With the stacks the driver read in it, the text shows them and no longer says how to
+    // get them.
+    let mut sampled = it.clone();
+    sampled.gaps[0].stacks.off_cpu =
+        vec![StackSeen { frames: vec!["turn".to_owned(), "ioctl".to_owned()], samples: 31 }];
+    let said = text(&sampled, 10);
+    assert!(said.contains("     sampled blocked in it 31x: ioctl < turn"), "{said}");
+    assert!(!said.contains("no sample fell in it"), "{said}");
+
+    // The control: the same build with a span over the stretch has no gap.
+    let covered = vec![lower, span(1, 2, None, "place outputs", 30, 67, 1), span(1, 3, None, "unit bodies", 97, 3, 1)];
+    let none = report(switches(), covered, 100, &workers(1..=1));
+    assert!(none.gaps.is_empty(), "{:#?}", none.gaps);
+    assert!(!text(&none, 10).contains("under no span, by stretch"));
 }
 
 fn finding(report: &Report, kind: Kind) -> &Finding {
@@ -321,6 +473,10 @@ fn waits_the_record_never_ends_are_told_apart_by_the_wall_they_cover() {
 /// starts build 1, closes one span in it, enters a wait it never leaves, flushes, says it is
 /// ready, and sleeps until it is killed.
 #[cfg(unix)]
+#[expect(
+    blaze::unbounded_test_wait,
+    reason = "the child process's wait it never leaves, as the daemon it stands for; the parent test kills it within 60 s of its start"
+)]
 fn killed_daemon(dir: &std::path::Path) -> ! {
     use std::io::Write as _;
     crate::install();
@@ -328,7 +484,7 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
     owner.lock().unwrap();
     write!(&owner, "{}", std::process::id()).unwrap();
     let mut history =
-        crate::history::History::open(dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+        crate::history::History::open(dir, crate::history::CAP_MOST, crate::sampler::unsampled())
             .unwrap();
     history.build_started(crate::history::BuildRow {
         build_id: 1,
@@ -359,7 +515,14 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
                 let awaits = crate::span::Name::of("the lock no one lets go");
                 let on = blaze_graph::wait::WaitKind::Key;
                 let _wait =
-                    crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
+                    crate::span::Wait {
+                        awaits,
+                        function: awaits,
+                        owner: Some(7),
+                        on,
+                        by: blaze_graph::wait::OwnedBy::Job,
+                    }
+                    .open();
                 entered.wait();
                 loop {
                     std::thread::park();
@@ -396,9 +559,8 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     let duckdb = std::path::PathBuf::from(
         std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
     );
-    let dir = std::env::temp_dir().join(format!("blaze-slow-killed-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = blaze_core::temp::TempDir::for_test("blaze-slow-killed-");
+    let dir = tmp.path().to_path_buf();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "slow::tests::a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running",
@@ -408,6 +570,7 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
         ])
         .env(CHILD, &dir)
         .spawn()
+        .map(stdx::JodChild)
         .unwrap();
     let pid = child.id();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -446,15 +609,18 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     ] {
         assert!(text.contains(said), "the report says {said:?}:\n{text}");
     }
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Runs `fixture`, DuckDB's SQL writing a history's Parquet files into `dir` (`{d}`), beside the
-/// history's schema files.
-fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    crate::history::History::open(&dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+/// history's schema files. The guard returned beside the path removes it when it drops.
+fn history_of(
+    duckdb: &std::path::Path,
+    name: &str,
+    fixture: &str,
+) -> (blaze_core::temp::TempDir, std::path::PathBuf) {
+    let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-slow-{name}-"));
+    let dir = tmp.path().to_path_buf();
+    crate::history::History::open(&dir, crate::history::CAP_MOST, crate::sampler::unsampled())
         .unwrap();
     let fixture = fixture.replace("{d}", &dir.display().to_string());
     let written = std::process::Command::new(duckdb)
@@ -463,7 +629,7 @@ fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path:
         .unwrap();
     assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
     crate::history::list_written(&dir);
-    dir
+    (tmp, dir)
 }
 
 /// Two daemons in one history, pid 7 and then pid 8, each with a build 1 (as every daemon
@@ -479,7 +645,7 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
     );
     let builds = "COPY (SELECT * FROM (VALUES (1::UBIGINT, 1000::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
         AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000002.builds.parquet';\n";
-    let mixed = history_of(
+    let (mixed_dir, mixed) = history_of(
         &duckdb,
         "mixed",
         &format!(
@@ -501,9 +667,9 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
         }
         other => panic!("two daemons' build 1 read as one build: {other:?}"),
     }
-    _ = std::fs::remove_dir_all(&mixed);
+    drop(mixed_dir);
 
-    let apart = history_of(
+    let (_apart_dir, apart) = history_of(
         &duckdb,
         "apart",
         &format!(
@@ -529,5 +695,143 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
         "another process's row of no build in the window is not the build's"
     );
     load::run(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
-    _ = std::fs::remove_dir_all(&apart);
+}
+
+/// Every query `blaze slow` asks beside the time model (`load::facts`: the build's row, threads,
+/// spans by name, misses, query counts, sampled stacks by span, threads' CPU and, with a window,
+/// memory and the recorder) is one the pinned DuckDB binds and answers, with and without a
+/// window; and the stacks are the [`STACKS`] commonest of each span name, a sample counted for
+/// its span and that span's ancestors. DuckDB 1.5.5 refused the stacks' query ("Cannot mix
+/// aggregates with non-aggregated columns"), so `blaze slow` failed on every build.
+#[test]
+#[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
+fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span() {
+    let duckdb = std::path::PathBuf::from(
+        std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+    );
+    // A root span and a leaf inside it. The leaf's samples: `a b` twice, four other stacks
+    // once each, and one blocked; the root has one sample of its own.
+    let fixture = "COPY (SELECT * FROM (VALUES (1::UBIGINT, 1000::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
+            AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000002.builds.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1::UBIGINT, NULL::UBIGINT, 0::USMALLINT, 'root', 1000::BIGINT, 100::BIGINT), \
+            (1, 8, 10, 2, 1, 1, 'leaf', 1010, 50)) \
+            AS t(build_id, process, thread, span_id, parent, depth, name, start_ns, dur_ns)) TO '{d}/1-00000001.spans.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1011::BIGINT, ['a', 'b'], 2::UBIGINT, 'on'), \
+            (1, 8, 10, 1012, ['a', 'b'], 2, 'on'), (1, 8, 10, 1013, ['a', 'c'], 2, 'on'), \
+            (1, 8, 10, 1014, ['a', 'd'], 2, 'on'), (1, 8, 10, 1015, ['a', 'e'], 2, 'on'), \
+            (1, 8, 10, 1016, ['a', 'f'], 2, 'on'), (1, 8, 10, 1017, ['w'], 2, 'off'), \
+            (1, 8, 10, 1070, ['a'], 1, 'on')) \
+            AS t(build_id, process, thread, t_ns, stack, span_id, cpu)) TO '{d}/1-00000001.samples.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (NULL::UBIGINT, 8::UINTEGER, 'live bytes', 900::BIGINT, 5::DOUBLE), \
+            (1, 8, 'live bytes', 1010, 7), (1, 8, 'live bytes', 1050, 9), \
+            (NULL, 8, 'profile spans made', 900, 1), (1, 8, 'profile spans made', 1090, 3)) \
+            AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1020::BIGINT, 'WARN', 'blaze', 'event job.rs:9', 'results were not kept: a', 1::UBIGINT), \
+            (NULL, 8, 10, 1105, 'WARN', 'blaze', 'event job.rs:9', 'results were not kept: b', 2), \
+            (1, 8, 10, 1030, 'INFO', 'blaze', 'event job.rs:1', 'fine', 3), \
+            (1, 8, 10, 1040, 'ERROR', 'blaze', 'event stop.rs:5', 'stall', 4)) \
+            AS t(build_id, process, thread, t_ns, level, target, name, message, event_id)) TO '{d}/1-00000001.events.parquet';\n";
+    let (_tmp, dir) = history_of(&duckdb, "facts", fixture);
+    let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
+    let stack = |name: &str, on_cpu, frames: &[&str], samples| SpanStack {
+        name: name.to_owned(),
+        on_cpu,
+        frames: frames.iter().map(|it| (*it).to_owned()).collect(),
+        samples,
+    };
+    let stacks = [
+        stack("leaf", true, &["a", "b"], 2),
+        stack("leaf", true, &["a", "c"], 1),
+        stack("leaf", true, &["a", "d"], 1),
+        stack("leaf", false, &["w"], 1),
+        stack("root", true, &["a", "b"], 2),
+        stack("root", true, &["a"], 1),
+        stack("root", true, &["a", "c"], 1),
+        stack("root", false, &["w"], 1),
+    ];
+    for window in [Some((1000, 1100)), None] {
+        let facts = load::facts(&source, 1, window, Some(8))
+            .unwrap_or_else(|error| panic!("window {window:?}: {error}"));
+        assert_eq!(facts.build.outcome.as_deref(), Some("ok"), "window {window:?}");
+        assert_eq!(facts.span_stacks, stacks, "window {window:?}");
+        let kinds: Vec<(&str, u64)> =
+            facts.span_kinds.iter().map(|it| (it.name.as_str(), it.runs)).collect();
+        assert_eq!(kinds, [("leaf", 1), ("root", 1)], "window {window:?}");
+        let cpu: Vec<(u32, u32, u64)> =
+            facts.thread_cpu.iter().map(|it| (it.process, it.thread, it.uncounted)).collect();
+        assert_eq!(cpu, [(8, 10, 2)], "window {window:?}");
+        assert!(facts.misses.is_empty() && facts.query_counts.is_empty(), "window {window:?}");
+        // What the daemon said was wrong, worst first, each callsite once: the line said after
+        // the build's answer (of no build) is the build's, and an INFO event is no problem.
+        let problems: Vec<(&str, &str, &str, u64)> = facts
+            .problems
+            .iter()
+            .map(|it| (it.level.as_str(), it.source.as_str(), it.what.as_str(), it.count))
+            .collect();
+        assert_eq!(
+            problems,
+            [
+                ("ERROR", "blaze event stop.rs:5", "stall", 1),
+                ("WARN", "blaze event job.rs:9", "results were not kept: b", 2),
+            ],
+            "window {window:?}"
+        );
+        if window.is_some() {
+            let memory = (facts.memory.live_before, facts.memory.live_first, facts.memory.live_peak);
+            assert_eq!(memory, (Some(5), Some(7), Some(9)), "the window's memory");
+            assert_eq!(facts.recorder.spans_made, Some(2), "the window's recorder");
+        }
+    }
+}
+
+/// The proportionality warning reaches the person who asks why: a build whose account names
+/// an alarm (here the no-op that wrote 53 inputs, 2026-11-12) says it in `blaze slow`, with
+/// the account's line and its ratios; the control is the same build with nothing written,
+/// which warns of nothing, and a history with no account, which says that it holds none.
+#[test]
+fn a_builds_account_and_its_warnings_are_said_before_the_findings() {
+    use crate::{
+        account::{Account, Seen},
+        facts::QueryCountRow,
+    };
+    let quiet = QueryCountRow {
+        build_id: 1,
+        query: "ScopeInput",
+        executed: 0,
+        verified: 0,
+        reran: 0,
+        evicted_asked: 0,
+        evicted: 0,
+        dropped: 0,
+        reads_recorded: 0,
+        reads_kept: 0,
+        reads_most: 0,
+        written: 0,
+        ran_new: 0,
+        ran_changed: 0,
+        ran_untracked: 0,
+        ran_cycle: 0,
+        validity: crate::facts::Validity::default(),
+    };
+    let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = || vec![span(1, 1, None, "job", 0, 100, 1)];
+    // The report of build 1, as the account's row is: a `Facts` left at its default says
+    // build 0, the id of no build.
+    let said = |facts: &Facts| {
+        let facts = Facts { build: BuildFacts { id: 1, ..BuildFacts::default() }, ..facts.clone() };
+        text(&report(switches(), spans(), 100, &facts), 10)
+    };
+    let wrote = Account::of(1, &[QueryCountRow { written: 53, ..quiet }], &[], Seen::default());
+    let warned = said(&Facts { account: Some(wrote.row), ..workers([1]) });
+    assert!(warned.contains("  account: 53 inputs written (0 source, 0 environment, 0 plan, 53 derived, 0 unattributed)"), "{warned}");
+    assert!(warned.contains("    warning (needless-writes): build 1 wrote 53 inputs and no row ran for a changed read"), "{warned}");
+    let calm = Account::of(1, &[quiet], &[], Seen::default());
+    let calm = said(&Facts { account: Some(calm.row), ..workers([1]) });
+    assert!(calm.contains("  account: 0 inputs written") && !calm.contains("warning ("), "{calm}");
+    let none = said(&workers([1]));
+    assert!(none.contains("  account: the history holds none for build 1"), "{none}");
 }

@@ -4,7 +4,7 @@
 //! it leaves out, those that cannot name the crate of the trait or of the type.
 
 use base_db::{Crate, Db, all_crates};
-use hir_def::TraitId;
+use hir_def::{HasModule as _, TraitId};
 use hir_expand::fixture;
 use rustc_type_ir::{IntTy, fast_reject::SimplifiedType as Simplified};
 
@@ -90,18 +90,61 @@ fn traits_and_self_tys(db: &Db) -> Vec<(TraitId, Vec<SimplifiedType<'_>>)> {
 #[test]
 fn the_walks_over_the_crates_that_name_find_what_the_walks_over_every_crate_find() {
     let db = fixture::db(FIXTURE).into_db();
+    // Attached: a failed assertion prints the ids it names (a `SolverDefId` refuses to print
+    // with no database attached).
+    blaze_memo::attach(&db, || the_walks_agree(&db));
+}
+
+fn the_walks_agree(db: &base_db::Db) {
     let (mut compared, mut found_any) = (0, false);
+    // The table of `trait_`'s impls in `dep`, for the walk over every crate. A crate that cannot
+    // name the trait's crate is not asked for it (the key `(dep, trait_)` names an arena
+    // outside `dep`'s closure, which blaze-memo's homing refuses, as no query of `dep` can hold
+    // it); it has no impl of the trait, checked on its whole table, and so adds none.
+    let of_trait = |dep: Crate, trait_: TraitId| {
+        if loaded_crates(db, dep).contains(&trait_.krate(db)) {
+            return Some(TraitImpls::for_crate_and_trait(db, dep, trait_));
+        }
+        assert!(
+            TraitImpls::for_crate(db, dep).trait_indices().all(|(it, _)| it != trait_),
+            "{dep:?}, which cannot name {trait_:?}, implements it"
+        );
+        None
+    };
     for (trait_, self_tys) in traits_and_self_tys(&db) {
         for &krate in all_crates(&db).iter() {
             let loaded = loaded_crates(&db, krate);
             let what = |of: &str| format!("{of} of {trait_:?} in {krate:?}");
+            // A crate that cannot name the trait's crate is never asked about the trait: under
+            // blaze-memo such a key (the asking crate with an id of an arena outside its
+            // closure) is refused by homing (`blaze_memo::home::mark_borrows`), as no query of
+            // that crate can hold it. What the walk over every crate finds for it is nothing:
+            // no crate it loads can name the trait, so none implements it.
+            if !loaded.contains(&trait_.krate(&db)) {
+                for &dep in loaded {
+                    assert!(of_trait(dep, trait_).is_none(), "{}", what("a table"));
+                }
+                continue;
+            }
             for self_ty in self_tys.iter().copied().chain([Simplified::Int(IntTy::I128)]) {
                 let mut expected = Vec::new();
                 for &dep in loaded {
-                    let (impls, derives) = TraitImpls::for_crate_and_trait(&db, dep, trait_)
-                        .for_trait_and_self_ty(trait_, &self_ty);
+                    let Some(table) = of_trait(dep, trait_) else { continue };
+                    let (impls, derives) = table.for_trait_and_self_ty(trait_, &self_ty);
                     expected.extend(impls.iter().map(|&it| AnyImplId::from(it)));
                     expected.extend(derives.iter().map(|&it| AnyImplId::from(it)));
+                }
+                // As above, for the self type's crate: the key would name an arena outside the
+                // asking crate's closure, and no crate it loads can name the type.
+                let self_crate = super::simplified_type_module(db, &self_ty).map(|it| it.krate(db));
+                if self_crate.is_some_and(|it| !loaded.contains(&it)) {
+                    assert_eq!(
+                        expected,
+                        Vec::<AnyImplId>::new(),
+                        "{}",
+                        what(&format!("the impls for {self_ty:?}, a type it cannot name"))
+                    );
+                    continue;
                 }
                 let found = TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
                     &db,
@@ -116,10 +159,7 @@ fn the_walks_over_the_crates_that_name_find_what_the_walks_over_every_crate_find
             let blanket: Vec<_> = loaded
                 .iter()
                 .flat_map(|&dep| {
-                    TraitImpls::for_crate_and_trait(&db, dep, trait_)
-                        .blanket_impls(trait_)
-                        .iter()
-                        .copied()
+                    of_trait(dep, trait_).map_or(&[][..], |it| it.blanket_impls(trait_)).iter().copied()
                 })
                 .collect();
             assert_eq!(
@@ -130,7 +170,11 @@ fn the_walks_over_the_crates_that_name_find_what_the_walks_over_every_crate_find
             );
             let every: Vec<_> = loaded
                 .iter()
-                .flat_map(|&dep| TraitImpls::in_crate_for_trait(&db, dep, trait_).iter().copied())
+                .flat_map(|&dep| match of_trait(dep, trait_) {
+                    Some(_) => TraitImpls::in_crate_for_trait(&db, dep, trait_),
+                    None => &[],
+                })
+                .copied()
                 .collect();
             assert_eq!(
                 TraitImpls::in_crate_and_deps_for_trait(&db, krate, trait_),

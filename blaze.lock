@@ -6,6 +6,9 @@ version = 1
 release = "0.20261105.4"
 toolchain = "nightly-2026-10-27"
 
+[index]
+newest = "2026-10-30T20:31:26Z"
+
 [native.llvm]
 pin = "crates/hir-ty-codegen/llvm.json"
 

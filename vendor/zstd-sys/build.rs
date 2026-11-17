@@ -50,6 +50,12 @@ fn compile_zstd_cmake() {
         config.define("CMAKE_VISIBILITY_INLINES_HIDDEN", "ON");
     }
 
+    // TODO(stage 0 after eb899d80c0): zstd calls its weak trace hooks (`ZSTD_trace_compress_begin`),
+    // which nothing defines. The pinned release (0.20261105.4) encodes that call as `bl 0`, which
+    // is past an AArch64 branch's reach in an image this size, so blaze's own release link fails
+    // (`A64Call26 ... ZSTD_compressBegin_internal`). No tracing, no weak call. Remove once
+    // .github/blaze-version names a release with blaze-link's undefined-weak branch.
+    config.cflag("-DZSTD_TRACE=0");
     // Feature flags the cc backend applies as plain preprocessor defines.
     if cfg!(feature = "debug") {
         config.cflag("-DDEBUGLEVEL=5");
@@ -339,6 +345,8 @@ fn compile_zstd() {
     config.warnings(false);
 
     config.define("ZSTD_LIB_DEPRECATED", Some("0"));
+    // TODO(stage 0 after eb899d80c0): as in the cmake backend above: no weak trace hooks.
+    config.define("ZSTD_TRACE", Some("0"));
 
     config
         .flag_if_supported("-ffunction-sections")

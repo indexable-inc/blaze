@@ -70,6 +70,7 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Shared, String> {
         versions: Vec::new(), // alloc: empty, allocates nothing
         more: Vec::new(),     // alloc: empty, allocates nothing
         inputs,
+        undefined: Vec::new(), // alloc: empty, allocates nothing
     })
 }
 

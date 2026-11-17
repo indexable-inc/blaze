@@ -1,0 +1,19 @@
+{
+ "id": "proved-unreachable-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane proved-unreachable",
+ "where": "cargo test -p blaze-lints -p hir-ty-pure -p blaze-lint-defs on origin/main (136432aa02), Mac, pinned nightly",
+ "what": "12 tests fail on main before any change of this lane: blaze-lints 6 (effects_tests::noalloc_refuses_a_dyn_behind_a_raw_pointer, may_tests::a_call_through_dyn_takes_the_traits_marks, opaque_tests::every_edition_lint_says_whether_its_advice_is_ready, tests::the_registry_has_blazes_lints_and_group_as_here, level::tests::edition_lints_wait_for_what_they_advise, lints::tests::the_command_line_turns_on_what_it_does_not_allow), hir-ty-pure 5 (capabilities::ambient_refuses_a_file_read_with_its_path: `UnresolvedMethod(\"is_ok\")`, minicore`s Result has no `is_ok`; two drop_effects; facts::a_repeated_call_of_a_pure_function_takes_the_firsts_result; facts::model::a_program_optimized_on_facts_behaves_as_written), blaze-lint-defs 1 (counts_are_rustcs).",
+ "cost": "about 25 minutes: an export of the base tree (git archive, 11 GiB) and a cold build of it to tell my 2 new failures from these 12",
+ "cause": "not looked into; cargo runs these suites only when a lane does, and the gate does not",
+ "whys": [
+  "my run had 14 failures",
+  "12 are on main",
+  "nothing runs these crates` unit tests with cargo before a merge",
+  "the dev-loop builder (cargo) and the gate (blaze) run different sets of tests"
+ ],
+ "class": "a suite red on main makes every lane pay to classify its own failures",
+ "prevention": "not built: the 12 fixed or marked with their issue, and `cargo test -p <crate>` of the crates a change touches in the gate while cargo is the dev-loop builder (how-to H6 names the cost, not a list)",
+ "workaround": "`git archive <base> | tar -x` into a scratch directory and run the same command there; compare the failing names",
+ "state": "open"
+}

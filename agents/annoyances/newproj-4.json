@@ -1,0 +1,11 @@
+{
+ "id": "newproj-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+ "where": "measuring scripts and `blaze stop`",
+ "what": "`blaze stop` answers before the daemon has exited, and a daemon goes on working for seconds after a build's answer (`store kept front end`, 5 cores busy): a sample started right after the last ran beside the previous sample's daemon.",
+ "cost": "one interleaved run of ten samples thrown away",
+ "cause": "the stop's answer comes before the process's end (already a row, revisions-1111); nothing says when a daemon is idle",
+ "workaround": "wait for the daemon's process to go, and for it to use no CPU, before timing (measure.py's `stop` and `quiet`)",
+ "state": "open: `blaze stop --wait`, and a `blaze status` that says idle"
+}

@@ -4,9 +4,10 @@
 //! build dependency, and on the registry package `testonly` and the checkout package `devonly`
 //! as dev-dependencies; `blaze-item-hash` depends on `front`, and `front` on `hir-def`, the
 //! required root of the front end's identity ([`crate::FRONT_END`]), and on `blaze-macro-eval`,
-//! which depends on `hir-ty`, which depends on `hir-def` and has `blaze-codegen-code` as its build
-//! dependency: each reads the files outside every package [`crate::FRONT_END_EXTRA`] names, which
-//! are there. `cli` also depends on the registry package `feat`, which depends on `reg`, and on
+//! which depends on `hir-ty` and on `blaze-usercode`; `blaze-usercode` depends on
+//! `blaze-inproc-rt` (in blaze through `blaze-inproc`); `hir-ty` depends on `hir-def` and has
+//! `blaze-codegen-code` as its build dependency: each reads the files outside every package
+//! [`crate::FRONT_END_EXTRA`] names, which are there. `cli` also depends on the registry package `feat`, which depends on `reg`, and on
 //! `outside`, a package of the checkout that is no member (under `vendor/`) and depends on
 //! `hir-def`: each can turn on a feature of a package of the closures. [`Workspace::with_llvm`] adds the
 //! checkout package `llvm-sys` as a build dependency of `hir-ty-codegen`, and its pin
@@ -51,6 +52,11 @@ impl Workspace {
         Workspace::made(what, false, false, true)
     }
 
+    #[expect(
+        blaze::tmp_path,
+        reason = "the fixture is linked into the programs' build scripts, which take no blaze-core: it \
+                  moves onto blaze_core::temp::TempDir once it is behind a test-only feature of this crate"
+    )]
     fn made(what: &str, reversed: bool, llvm: bool, solver: bool) -> Workspace {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -154,9 +160,11 @@ fn lock_of(checksum: &str, llvm: bool, solver: bool) -> String {
     [
         "version = 4\n\n".to_owned(),
         local("blaze-codegen-code", &[]),
+        local("blaze-inproc-rt", &[]),
         local("blaze-item-hash", &["front"]),
-        local("blaze-macro-eval", &["hir-ty"]),
+        local("blaze-macro-eval", &["blaze-usercode", "hir-ty"]),
         if llvm { local("blaze-stencil", &["llvm-sys"]) } else { String::new() },
+        local("blaze-usercode", &["blaze-inproc-rt"]),
         local("cli", &["blaze-item-hash", "feat", "hir-ty-codegen", "outside"]),
         local("devonly", &[]),
         registry_with("feat", FEAT_CHECKSUM, &["reg"]),
@@ -269,10 +277,26 @@ fn files(checksum: &str, llvm: bool, solver: bool) -> Vec<(&'static str, String)
         ("crates/blaze-codegen-code/src/lib.rs", "pub fn emit() {}\n".to_owned()),
         (
             "crates/blaze-macro-eval/Cargo.toml",
-            manifest("blaze-macro-eval", "[dependencies]\nhir-ty = { path = \"../hir-ty\" }\n"),
+            manifest(
+                "blaze-macro-eval",
+                "[dependencies]\nhir-ty = { path = \"../hir-ty\" }\n\
+                 blaze-usercode = { path = \"../blaze-usercode\" }\n",
+            ),
         ),
         ("crates/blaze-macro-eval/src/lib.rs", "pub fn expand() {}\n".to_owned()),
+        (
+            "crates/blaze-usercode/Cargo.toml",
+            manifest(
+                "blaze-usercode",
+                "[dependencies]\nblaze-inproc-rt = { path = \"../blaze-inproc-rt\" }\n",
+            ),
+        ),
+        ("crates/blaze-usercode/src/lib.rs", "pub fn run() {}\n".to_owned()),
+        ("crates/blaze-inproc-rt/Cargo.toml", manifest("blaze-inproc-rt", "")),
+        ("crates/blaze-inproc-rt/src/lib.rs", "pub fn serve() {}\n".to_owned()),
         // What `FRONT_END_EXTRA` names outside every package.
+        ("library/blaze_inproc_rt/src/lib.rs", "pub fn wire() {}\n".to_owned()),
+        ("library/std/src/sys/provider/derive.rs", "pub fn derive() {}\n".to_owned()),
         ("vendor/llvm-sys/pin.rs", "pub fn pin() {}\n".to_owned()),
         ("crates/blaze-stencil/pin.rs", "pub fn pin() {}\n".to_owned()),
         ("library/proc_macro/src/bridge/mod.rs", "pub mod client;\n".to_owned()),

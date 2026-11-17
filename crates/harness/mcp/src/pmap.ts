@@ -1,4 +1,5 @@
 // Ported from den (repl/src/pmap.ts) unchanged.
+import type { Docs } from "./docs.ts";
 /**
  * `items.map(fn)` run `concurrency` at a time, results in input order.
  *
@@ -55,3 +56,14 @@ export async function pmap<T, R>(
   }
   return results;
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  pmap: {
+    area: "cells",
+    for: "do many things in parallel",
+    sig: "pmap(items, (item, i, signal) => ..., { concurrency? = 16 }): Promise<R[]>",
+    about: "map in parallel, results in input order; the first error aborts the rest: `await pmap(await glob('src/**/*.ts'), async p => (await Bun.file(p).text()).split('\\n').length)`.",
+    example: "await pmap(await glob('src/**/*.ts'), async (p) => (await Bun.file(p).text()).split('\\n').length)",
+  },
+};

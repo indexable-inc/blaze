@@ -1,0 +1,21 @@
+{
+ "id": "launch3-16",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "crates/blaze-launch-host/src/tests.rs (the model launcher of the DST)",
+ "what": "The simulation's model launcher checked that a record names only declared slots with `slot < declared.max(u32::MAX)`, which is true of every slot. An edit that declared its slots before its records' references had assigned them passed the DST and failed the first real run (`names slot 8, and 8 are declared`).",
+ "cost": "a bug the DST exists to catch reached a real program; found only because the measurement checks output",
+ "cause": "an oracle condition I wrote to be permissive while the declaration rule was unsettled, and never tightened",
+ "whys": [
+  "why wrong: the oracle's bound could not fail",
+  "why possible: the model re-derived nothing from the records it was sent (it did not keep their bytes)",
+  "why not caught: no planted bug exercised that condition, so nothing showed it was vacuous",
+  "why easy: a control was written for each bug I thought of, not for each condition of the oracle",
+  "property: an oracle condition with no control that makes it fail"
+ ],
+ "class": "vacuous oracle condition: a check inside a simulation's oracle that no planted bug can trip",
+ "prevention": "every condition of a DST oracle has a planted-bug control that fails on exactly it (the invariants gate, scripts/src/bin/invariants.rs, lists conditions without a control); done here for this one (`the_oracle_catches_an_edit_that_declares_before_its_records_name`)",
+ "workaround": "the model keeps the records' bytes and checks each function place against the declared count",
+ "state": "fixed for this condition (5226c3d363); the gate's check is open",
+ "fix": "5226c3d363"
+}

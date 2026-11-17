@@ -91,6 +91,10 @@ thread_local! {
 /// own store: a [`Keep::Run`] or [`Keep::Machine`] put is under the key of every input it was
 /// made from (rule 21), so that is a value the other store lacks, never a wrong one. A
 /// [`Keep::Durable`] put is never here (see the module's docs).
+#[expect(
+    blaze::process_static,
+    reason = "the puts of ended threads, drained by the next take: the daemon whose store they go to should own them"
+)]
 static ORPHANS: SegQueue<Put> = SegQueue::new();
 static ORPHANED: AtomicBool = AtomicBool::new(false);
 
@@ -221,7 +225,7 @@ mod tests {
     fn opened(sim: &mut Sim) -> Store {
         let mut effects = Vec::new();
         let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);

@@ -106,7 +106,7 @@ fn trait_named(db: &Db, name: &str) -> TraitId {
 /// that reason alone.
 fn assert_dyn_compatible(names: &[&str]) {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for &name in names {
             let trait_ = trait_named(&db, name);
             let violation = hir_ty::dyn_compatibility::dyn_compatibility(&db, trait_);
@@ -118,7 +118,7 @@ fn assert_dyn_compatible(names: &[&str]) {
 /// Each name's result in NLL and in Polonius, with a fixture database of its own.
 fn checked(names: &[&str]) -> Vec<(String, Mode, BorrowckResult)> {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut out = Vec::new(); // alloc: test
         for &name in names {
             let function = function(&db, name);

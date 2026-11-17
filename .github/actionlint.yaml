@@ -8,8 +8,3 @@ self-hosted-runner:
     - ix-mode-cold
     - ix-cpu-*
     - blaze-*
-paths:
-  .github/workflows/release.yaml:
-    ignore:
-      # The crates.io job is off on purpose until the rename (#270); `if: false` is how.
-      - 'constant expression "false" in condition'

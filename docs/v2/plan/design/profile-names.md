@@ -115,7 +115,7 @@ module, so papaya is not banned in the recorder by path).
 
 ## Proof
 
-- **DST** (`flight/names/tests.rs`, on `blaze_core::sim::Sim`'s seeded `Rng`). Hegel draws
+- **DST** (`flight/names/tests.rs`, on `blaze_core::sim::Sim`'s seeded `Rng`). The tape draws
   threads, fibers that park and resume on other threads, texts, records, a thread that stalls
   while others fill their rings past `CAP` (rings drawn small), drain crashes (the reader's state
   dropped) and restarts. The oracle: every row the drain reads resolves to exactly the text

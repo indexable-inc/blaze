@@ -991,10 +991,50 @@ where
         if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
+        // `Described<'a, D, Args>: TypeOf` holds when `D` describes a type.
+        if item == SolverTraitLangItem::ReflectTypeOf {
+            use rustc_type_ir::reflect::TypeOfAnswer;
+            return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+                match ecx.type_of_answer(goal.param_env, goal.predicate.self_ty())? {
+                    TypeOfAnswer::Type(_) => {
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                    }
+                    TypeOfAnswer::Unknown => {
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                    }
+                    TypeOfAnswer::Refused => Err(NoSolution.into()),
+                }
+            });
+        }
         let answer = reflect_trait_holds(ecx.cx(), item, goal.predicate.self_ty());
         let base = domain_of(item).map(|_| goal.predicate.trait_ref.args.type_at(1));
         ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc)
             .enter(|ecx| ecx.reflect_candidate_response(goal.param_env, answer, base))
+    }
+
+    /// blaze: `U: UnionFrom<S>` holds when `U` is an error union and `S` one of its members or
+    /// a union of some of them ([`EvalCtxt::error_union_from`]). Any other self type fails
+    /// before any probe, whatever `S` is.
+    fn consider_builtin_error_union_from_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use crate::solve::error_union::{UnionFrom, error_union_members};
+
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
+            return Err(NoSolution.into());
+        }
+        let Some(members) = error_union_members(ecx.cx(), goal.predicate.self_ty()) else {
+            return Err(NoSolution.into());
+        };
+        let source = goal.predicate.trait_ref.args.type_at(1);
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+            let certainty = match ecx.error_union_from(goal.param_env, members, source)? {
+                UnionFrom::Holds(_) => Certainty::Yes,
+                UnionFrom::Ambiguous => Certainty::AMBIGUOUS,
+            };
+            ecx.evaluate_added_goals_and_make_canonical_response(certainty)
+        })
     }
 
     fn consider_builtin_field_candidate(

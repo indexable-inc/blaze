@@ -25,7 +25,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     match reach(words, color) {
         Ok(()) => 0,
         Err((what, code)) => {
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             code
         }
     }
@@ -97,7 +97,7 @@ fn reach(words: Vec<OsString>, color: bool) -> Result<(), (String, i32)> {
         }
         false => lines(reached.as_ref(), now),
     };
-    print!("{text}");
+    blaze_report::out!("{text}");
     Ok(())
 }
 
@@ -119,8 +119,8 @@ fn lines(reached: Option<&Reach>, now: ContentId) -> String {
     text
 }
 
-/// The root `word` names: 64 hex digits.
-fn root_of(word: &str) -> Option<ContentId> {
+/// The root `word` names: 64 hex digits (and `blaze diagnostics`'s token, written the same).
+pub(super) fn root_of(word: &str) -> Option<ContentId> {
     let bytes = word.as_bytes();
     if bytes.len() != 64 {
         return None;

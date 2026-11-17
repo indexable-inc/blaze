@@ -89,61 +89,98 @@ fn child_tokens<const N: usize>(node: ast::Node<'_>, kinds: [SyntaxKind; N]) -> 
 /// when it is lowered from its file.
 type Maps<'a> = Option<(&'a RealSpanMap, &'a AstIdMap)>;
 
-/// What a signature's (or a variant's fields') `of` keeps: the value its crate's image serves,
-/// in the `Arc` the image is read into, or the value lowered here without its source map, in
-/// the memo itself. Only `with_source_map` builds a map, lowering again.
-#[derive(Debug, PartialEq, Eq)]
-enum Kept<T> {
-    Served(Arc<T>),
-    Lowered(T),
+/// Served-else-lowered (docs/v2/plan/design/front-end-on-memo.md, A.4): what every per-item
+/// query of the front end reads its value through, the one shape of it.
+///
+/// - **Served.** The item's crate has an image ([`crate::deps::image_of`]): the value is read
+///   from it in place, and the read lists the item's fact (its stable id and the digest of its
+///   record), not the image's. A dependency the driver maps is served; so is the crate being
+///   built when the driver says its surface key hit, from its own image, written by the build
+///   before (spec F): a query of it is answered from its per-item records after its arena was
+///   dropped, and only what an edit reached is lowered again.
+/// - **Lowered.** Otherwise: the value is lowered from syntax by a query of its own, in the
+///   crate's arena, and held there for the snapshot.
+///
+/// The rule a caller keeps: `lowered` is asked only where `served` has nothing, so a crate read
+/// from its image never lowers from syntax. Memory is bounded by arena drop, not by eviction: a
+/// served value is kept in the arena of the query that read it ([`blaze_memo::keep_owned`]: a
+/// signature owns its expression store, a source map its tables) and dropped with it.
+#[derive(Debug)]
+pub enum Serve<'db, T: ?Sized> {
+    Served(&'db T),
+    Lowered(&'db T),
 }
 
-impl<T> std::ops::Deref for Kept<T> {
+impl<T: ?Sized> Clone for Serve<'_, T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Copy for Serve<'_, T> {}
+
+impl<T: ?Sized> std::ops::Deref for Serve<'_, T> {
     type Target = T;
 
     #[inline]
     fn deref(&self) -> &T {
-        match self {
-            Kept::Served(it) => it,
-            Kept::Lowered(it) => it,
+        match *self {
+            Serve::Served(it) | Serve::Lowered(it) => it,
         }
     }
 }
 
-impl<T: PartialEq + std::fmt::Debug> Kept<T> {
-    fn new(served: Option<Arc<T>>, lower: impl FnOnce() -> T) -> Kept<T> {
+impl<'db, T: ?Sized> Serve<'db, T> {
+    /// The served value where `served` has one, else `lowered`'s: a crate read from its image
+    /// never runs `lowered`, so it never lowers from syntax.
+    #[inline]
+    pub fn new(served: Option<&'db T>, lowered: impl FnOnce() -> &'db T) -> Serve<'db, T> {
         match served {
-            Some(it) => Kept::Served(it),
-            None => Kept::Lowered(lower()),
+            Some(it) => Serve::Served(it),
+            None => Serve::Lowered(lowered()),
         }
     }
 
+    /// The value, for as long as the snapshot holds it.
+    #[inline]
+    pub fn get(self) -> &'db T {
+        match self {
+            Serve::Served(it) | Serve::Lowered(it) => it,
+        }
+    }
+
+    /// Whether the value was read from an image.
+    #[inline]
+    pub fn is_served(self) -> bool {
+        matches!(self, Serve::Served(_))
+    }
+}
+
+impl<'db, T: PartialEq + std::fmt::Debug + Send + Sync + 'static> Serve<'db, T> {
     /// How to lower the value again with its source map, `store` being the kept value's: given
     /// the blocks of the value lowered here, so both lowerings agree on every id. A value an
     /// image serves has the image's blocks, not a lowering's: the map's lowering makes its own,
     /// as the reference lowering from syntax it is.
-    fn lowering<'a>(&self, store: &'a ExpressionStore) -> BodyLowering<'a> {
+    fn lowering<'s>(&self, store: &'s ExpressionStore) -> BodyLowering<'s> {
         match self {
-            Kept::Lowered(_) => BodyLowering::SourceMap { blocks: store.block_scopes() },
-            Kept::Served(_) => BodyLowering::Whole,
+            Serve::Lowered(_) => BodyLowering::SourceMap { blocks: store.block_scopes() },
+            Serve::Served(_) => BodyLowering::Whole,
         }
     }
 
-    /// `value`, lowered again with its source map as [`Kept::lowering`] says, checked equal to
-    /// the value lowered here.
-    fn with_map(&self, value: T) -> Arc<T> {
-        if let Kept::Lowered(it) = self {
-            assert_eq!(value, *it, "lowered again with its source map");
+    /// `value`, lowered again with its source map as [`Serve::lowering`] says: for a lowered
+    /// one, checked equal to the value lowered here and that one handed out (the two are
+    /// equal, so nothing more is kept); for a served one, kept in the asking query's arena.
+    fn with_map(&self, db: &'db Db, value: T) -> &'db T {
+        match *self {
+            Serve::Lowered(it) => {
+                assert_eq!(value, *it, "lowered again with its source map");
+                it
+            }
+            Serve::Served(_) => blaze_memo::keep_owned(blaze_memo::Database::memo(db), value),
         }
-        // alloc: the value with a map, one per `with_source_map`/`relative` memo
-        Arc::new(value)
     }
-}
-
-/// What dropping a `with_source_map` value frees: its map. The value's `Arc` is `relative`'s
-/// for one written in a file; one a macro writes owns its own, which goes uncounted.
-fn with_source_map_bytes<T>((_, map): &(Arc<T>, ExpressionStoreSourceMap)) -> usize {
-    map.heap_bytes()
 }
 
 /// The queries of the signature `$Sig` of an `$Id`, which `$Sig::lower` lowers and
@@ -151,46 +188,69 @@ fn with_source_map_bytes<T>((_, map): &(Arc<T>, ExpressionStoreSourceMap)) -> us
 /// without its source map; `relative` and `with_source_map` lower it again with the map.
 macro_rules! signature_queries {
     ($Sig:ident, $Id:ident, $served:ident) => {
-        #[blaze_query::tracked]
+        #[blaze_memo::tracked]
         impl $Sig {
-            /// What [`Self::of`] reads: the image's signature, or the one lowered alone.
-            #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-            fn kept(db: &Db, id: $Id) -> Kept<$Sig> {
-                Kept::new(crate::deps::signatures::$served(db, id), || Self::lower_alone(db, id))
+            /// The signature read from its crate's image, `None` for a crate served from none:
+            /// read in place and kept in this query's arena (rule outputs-are-records).
+            // `pub`: a fact boundary, which the crates that file read lists name by its kind
+            // (`hir_ty::kinds`, `blaze_items::goals`).
+            #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
+            pub fn served<'db>(db: &'db Db, id: $Id) -> Option<&'db $Sig> {
+                crate::deps::signatures::$served(db, id)
             }
 
+            /// The signature lowered alone, for a crate no image serves. `pub` as
+            /// [`Self::served`].
+            #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
+            pub fn lowered<'db>(db: &'db Db, id: $Id) -> &'db $Sig {
+                blaze_memo::keep_owned(blaze_memo::Database::memo(db), Self::lower_alone(db, id))
+            }
+        }
+
+        impl $Sig {
+            /// What [`Self::of`] reads: the image's signature, or the one lowered alone
+            /// ([`Serve`]).
+            fn kept(db: &Db, id: $Id) -> Serve<'_, $Sig> {
+                Serve::new(Self::served(db, id), || Self::lowered(db, id))
+            }
+        }
+
+        #[blaze_memo::tracked]
+        impl $Sig {
             /// The signature with where each part of it is written in its file.
-            #[blaze_query::tracked(
-                        returns(ref),
-                        lru,
-                        weigh = with_source_map_bytes,
-                        mem_tag = Nameres
-                    )]
-            pub fn with_source_map(db: &Db, id: $Id) -> (Arc<$Sig>, ExpressionStoreSourceMap) {
+            #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
+            pub fn with_source_map<'db>(
+                db: &'db Db,
+                id: $Id,
+            ) -> (&'db $Sig, &'db ExpressionStoreSourceMap) {
+                let memo = blaze_memo::Database::memo(db);
                 match Self::relative(db, id) {
                     Some((it, map)) => {
                         let map = moved_to_file(db, id.into(), id.lookup(db).id, map);
-                        (it.clone(), map) // clone: an `Arc` count, once per memo
+                        (*it, blaze_memo::keep_owned(memo, map))
                     }
                     None => {
                         let kept = Self::kept(db, id);
                         let source = id.lookup(db).source_view(db);
                         let lowering = kept.lowering(&kept.store);
                         let (it, map) = Self::lower(db, id, source, None, lowering);
-                        (kept.with_map(it), map)
+                        (kept.with_map(db, it), blaze_memo::keep_owned(memo, map))
                     }
                 }
             }
 
             /// The signature lowered again from its [`signature_syntax_of`], with the source map
             /// of that tree; `None` for one a macro writes.
-            #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-            pub fn relative(db: &Db, id: $Id) -> Option<(Arc<$Sig>, ExpressionStoreSourceMap)> {
+            #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
+            pub fn relative<'db>(
+                db: &'db Db,
+                id: $Id,
+            ) -> Option<(&'db $Sig, &'db ExpressionStoreSourceMap)> {
                 let syntax = signature_syntax_of(db, id.into())?;
                 let kept = Self::kept(db, id);
                 let lowering = kept.lowering(&kept.store);
                 let (it, map) = Self::lower(db, id, syntax.node(), Some(syntax.maps()), lowering);
-                Some((kept.with_map(it), map))
+                Some((kept.with_map(db, it), blaze_memo::keep_owned(blaze_memo::Database::memo(db), map)))
             }
         }
 
@@ -199,7 +259,7 @@ macro_rules! signature_queries {
             /// file for one a macro writes) with no source map. A read of it builds no map.
             #[inline]
             pub fn of(db: &Db, id: $Id) -> &$Sig {
-                Self::kept(db, id)
+                Self::kept(db, id).get()
             }
 
             /// The signature lowered from its syntax without its source map, outside any query
@@ -440,7 +500,7 @@ impl SignatureSyntax {
 
 /// What [`SignatureSyntax::new`] leaves out of an item that is its own anchor: the child of it
 /// that no signature reads. A value, not a function, so that it is part of a query's key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
 enum Elide {
     /// Nothing: a struct, union or type alias, and an enum with its variants.
     Nothing,
@@ -602,7 +662,7 @@ impl FileOutline {
 
 /// The [`FileOutline`] of `file_id`: one pass over the file's items, and one over what is left
 /// of the file for the copy and each map.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
     blaze_mem::frame::current(|frame| {
         let file = HirFileId::from(file_id);
@@ -612,19 +672,7 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
             unreachable!("the spans of a file, not a macro's, are a real span map")
         };
         let mut bodies = Vec::new_in(frame);
-        bodies_under(root, |body| {
-            let item = body.parent().expect("a body is under its item");
-            if item.kind() == SyntaxKind::FN && may_start_with_inner_attr(body) {
-                return;
-            }
-            let (start, anchor) = span_map.anchor_at(item.text_range().start());
-            let own = start == item.text_range().start()
-                && anchor != ROOT_ERASED_FILE_AST_ID
-                && ast_id_map.get_erased(anchor) == ast::ptr(item);
-            if own {
-                bodies.push(body);
-            }
-        });
+        cut_under(root, &span_map, &ast_id_map, |body, _| bodies.push(body));
         let outline = copy_without(root, &bodies, Some(CUT));
         let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(|&it| ast::ptr(it)));
         let ranges = frame.alloc_slice_from_iter(ptrs.iter().map(SyntaxNodePtr::text_range));
@@ -645,6 +693,58 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
             cuts,
         }
     })
+}
+
+/// The bodies [`file_outline`] cuts out of the tree `root` of a file, in order, each with the
+/// ast id of its item, the anchor its spans count from: the [`left_out`] body of each item
+/// that is its own span anchor, but a fn's whose text may start with an inner attribute.
+fn cut_under<'t>(
+    root: ast::Node<'t>,
+    span_map: &RealSpanMap,
+    ast_id_map: &AstIdMap,
+    mut each: impl FnMut(ast::Node<'t>, span::ErasedFileAstId),
+) {
+    bodies_under(root, |body| {
+        let item = body.parent().expect("a body is under its item");
+        if item.kind() == SyntaxKind::FN && may_start_with_inner_attr(body) {
+            return;
+        }
+        let (start, anchor) = span_map.anchor_at(item.text_range().start());
+        let own = start == item.text_range().start()
+            && anchor != ROOT_ERASED_FILE_AST_ID
+            && ast_id_map.get_erased(anchor) == ast::ptr(item);
+        if own {
+            each(body, anchor);
+        }
+    });
+}
+
+/// Where in `file_id`'s live tree each body its [`FileOutline`] cuts out is, in order, with the
+/// ast id of the body's item: what a by-piece check (blaze-diagnostics' `pieces`) skips of the
+/// live tree for a body it found clean. Recomputed from the live file at each call, never kept
+/// in the outline, so the outline's equality, and its backdating at a body edit, are untouched;
+/// no query of its own, as what it gives moves with every edit.
+pub fn cut_bodies(db: &Db, file_id: EditionedFileId) -> Box<[(TextRange, span::ErasedFileAstId)]> {
+    let file = HirFileId::from(file_id);
+    let root = file.root(db);
+    let ast_id_map = file.ast_id_map(db);
+    let SpanMap::RealSpanMap(span_map) = file.span_map(db) else {
+        unreachable!("the spans of a file, not a macro's, are a real span map")
+    };
+    // alloc: the result, one entry a cut body, once per file a check asks
+    let mut cut = Vec::new();
+    cut_under(root, &span_map, &ast_id_map, |body, anchor| cut.push((body.text_range(), anchor)));
+    cut.into_boxed_slice()
+}
+
+/// The body [`file_outline`] cuts out of `def`'s item ([`cut_under`]), in the tree of `def`'s
+/// own syntax ([`body_syntax`]), not the live file's: the same while the body is, whatever
+/// moves around it, so what is read off it is read by position-free syntax. `None` for a def
+/// with no syntax of its own (written by a macro) or no body there.
+pub fn cut_body_syntax(db: &Db, def: DefWithBodyId) -> Option<ast::Node<'_>> {
+    let tree = body_tree(db, def).as_ref()?;
+    let syntax = body_syntax(db, def).as_ref()?;
+    left_out(ast::to_node(syntax.item, ast::Node::root(tree)))
 }
 
 /// The [`SignatureSyntax`] of the item at `id` of `module`, `elide`'s node of it left out when
@@ -676,7 +776,7 @@ fn item_syntax<'db, N: AstIdNode>(
 ///
 /// Keyed by where the item is written, not by its def: every crate built from `file` reads
 /// this one value.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn signature_syntax(
     db: &Db,
     file: EditionedFileId,
@@ -703,7 +803,7 @@ fn signature_syntax(
 /// the body's own syntax ([`owning_body`]), so an edit elsewhere in the file leaves it the
 /// same. The outline's when the outline has the item (the body is one it keeps), and the
 /// file's when the body is not `file`'s or doesn't have it.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn body_signature_syntax(
     db: &Db,
     owner: DefWithBodyId,
@@ -744,7 +844,7 @@ fn anchor_node<'t>(
 /// The [`SignatureTree`] of `anchor` in `file`'s [`FileOutline`]: the whole anchor, less the
 /// bodies the outline leaves out of it, made once for every item anchored at it, and for every
 /// crate built from the file.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn anchor_syntax(
     db: &Db,
     file: EditionedFileId,
@@ -761,7 +861,7 @@ fn anchor_syntax(
 
 /// The [`SignatureTree`] of `anchor` in the own syntax of `owner`'s body: made once for every
 /// item of the body anchored at it.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn body_anchor_syntax(
     db: &Db,
     owner: DefWithBodyId,
@@ -791,7 +891,7 @@ fn body_source(body: &BodySyntax) -> Source<'_> {
 
 /// The tree of `owner`'s [`BodySyntax`], kept as a query's value so that what is read off it
 /// lives as long as the database: the same while the body is.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn body_tree(db: &Db, owner: DefWithBodyId) -> Option<std::sync::Arc<FlatTree>> {
     body_syntax(db, owner).as_ref().map(|it| it.tree(db))
 }
@@ -861,38 +961,58 @@ pub(crate) fn written_visibility<N: AstIdNode>(
     id: AstId<N>,
     module: ModuleId,
 ) -> RawVisibility {
+    // A visibility kept as an entry of its item, keyed by its header; one written by a macro,
+    // or with a context not its file's root, is made each time (`deps::facts`).
+    let at =
+        crate::deps::facts::At { file: id.file_id, ast: id.value.erase(), krate: module.krate(db) };
+    let header = crate::deps::facts::Part::Header;
+    crate::deps::facts::fact(db, "visibility", "", 0, Some(at), header, || {
+        (written_visibility_made(db, id, module), true)
+    })
+}
+
+/// [`written_visibility`] off the item's syntax.
+fn written_visibility_made<N: AstIdNode>(
+    db: &Db,
+    id: AstId<N>,
+    module: ModuleId,
+) -> RawVisibility {
+    // Of a crate given by its address whose file has no text here: refused, typed, naming the
+    // crate and the file, before any parse.
+    crate::nameres::frozen::pages::demand_text(db, module.krate(db), id.file_id);
     if let HirFileId::FileId(file) = id.file_id {
         let outline = file_outline(db, file);
         if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {
             let node = ast::to_node(ptr, ast::Node::root(&outline.tree));
-            return visibility_of(db, node, &mut |range| {
+            return visibility_of(db, id.file_id.context_arena(), node, &mut |range| {
                 outline.span_map.span_for_range(range).ctx
             });
         }
     }
     if let Some((body, tree, ptr)) = owning_body(db, id.file_id, id.value.erase(), module) {
         let node = ast::to_node(ptr, ast::Node::root(tree));
-        return visibility_of(db, node, &mut |range| body.span_map.span_for_range(range).ctx);
+        return visibility_of(db, id.file_id.context_arena(), node, &mut |range| body.span_map.span_for_range(range).ctx);
     }
     let node =
         ast::to_node(id.file_id.ast_id_map(db).get_erased(id.value.erase()), id.file_id.root(db));
     let span_map = id.file_id.span_map(db);
-    visibility_of(db, node, &mut |range| span_map.span_for_range(range).ctx)
+    visibility_of(db, id.file_id.context_arena(), node, &mut |range| span_map.span_for_range(range).ctx)
 }
 
 fn visibility_of(
     db: &Db,
+    table: blaze_memo::ArenaId,
     node: ast::Node<'_>,
     span_for_range: &mut impl FnMut(TextRange) -> span::SyntaxContext,
 ) -> RawVisibility {
     let item = ast::AnyHasVisibility::cast(node).unwrap_or_else(|| {
         panic!("a {:?} at {:?} has no visibility", node.kind(), node.text_range())
     });
-    visibility_from_ast(db, item.visibility(), span_for_range)
+    visibility_from_ast(db, table, item.visibility(), span_for_range)
 }
 
 /// The root of `file`'s [`FileOutline`]: the file less the bodies it leaves out.
-pub(crate) fn outline_root(db: &Db, file: EditionedFileId) -> syntax::view::SourceFile<'_> {
+pub fn outline_root(db: &Db, file: EditionedFileId) -> syntax::view::SourceFile<'_> {
     syntax::view::root(&file_outline(db, file).tree).expect("an outline's root is a file")
 }
 
@@ -1288,8 +1408,17 @@ fn has_unsafe_field(fields: Option<ast::FieldList<'_>>, cfg_options: &CfgOptions
 /// Whether a field of a variant of `id` that its crate's cfg keeps is written `unsafe`. It
 /// reads the variants, which the enum's [`signature_syntax_of`] leaves out, so it is a query of
 /// its own: a variant edit runs it again, and the signature only when the answer changes.
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
-fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
+pub(crate) fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
+    let at = crate::deps::facts::at(db, id);
+    let header = crate::deps::facts::Part::Header;
+    crate::deps::facts::fact(db, "unsafe fields", "", 3, Some(at), header, || {
+        (enum_has_unsafe_fields_made(db, id), true)
+    })
+}
+
+/// [`enum_has_unsafe_fields`] off the enum's syntax.
+fn enum_has_unsafe_fields_made(db: &Db, id: EnumId) -> bool {
     let loc = id.lookup(db);
     let source = match variants_syntax(db, id) {
         Some(syntax) => syntax.node::<ast::Enum<'_>>().value,
@@ -1618,6 +1747,11 @@ bitflags! {
         const EXPLICIT_SAFE = 1 << 12;
         const HAS_LEGACY_CONST_GENERICS = 1 << 13;
         const RUSTC_INTRINSIC = 1 << 14;
+        /// `#![blaze::views]`: the receiver is written with a view, `&self.{a, b}`
+        /// ([`written_self_view`]). In the signature's hash, so the method's borrow check and
+        /// its callers' are keyed by it; nothing that lowers the signature's types reads it, so
+        /// the method's type, ABI and code are what they are without it.
+        const SELF_VIEW = 1 << 15;
     }
 }
 
@@ -1655,6 +1789,44 @@ pub struct FunctionSignature {
 
 signature_queries!(FunctionSignature, FunctionId, served_function);
 
+/// The view a method's receiver is written with under `#![blaze::views]`, `&self.{a, b}` or
+/// `&mut self.{a}`: the fields named, as written. Whether they are fields of `Self`, once each,
+/// is the borrow check's question (`hir_ty_borrowck::views`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WrittenSelfView {
+    /// The names in the braces, in the order written.
+    pub fields: Box<[Name]>,
+    /// `&mut self.{..}`.
+    pub mutable: bool,
+}
+
+/// The view `func`'s receiver is written with, if it is ([`FnFlags::SELF_VIEW`]). Read from
+/// the source only for a function whose signature says it has one, so no other function's
+/// borrow check reads a position.
+#[blaze_memo::tracked(returns(ref), owns)]
+pub fn written_self_view(db: &Db, func: FunctionId) -> Option<WrittenSelfView> {
+    if !FunctionSignature::of(db, func).has_self_view() {
+        return None;
+    }
+    let at = crate::deps::facts::at(db, func);
+    let header = crate::deps::facts::Part::Header;
+    crate::deps::facts::fact(db, "self view", "", 4, Some(at), header, || {
+        (written_self_view_made(db, func), true)
+    })
+}
+
+/// [`written_self_view`] off the method's syntax.
+fn written_self_view_made(db: &Db, func: FunctionId) -> Option<WrittenSelfView> {
+    let source = func.lookup(db).source_view(db);
+    let param = source.value.param_list()?.self_param()?;
+    let fields = param.view_fields()?;
+    Some(WrittenSelfView {
+        // alloc: the memo's names, once per method written with a view
+        fields: fields.map(|it| it.as_name()).collect(),
+        mutable: param.mut_token().is_some(),
+    })
+}
+
 impl FunctionSignature {
     /// Lowered from its [`signature_syntax_of`], its body left out.
     fn lower(
@@ -1679,6 +1851,14 @@ impl FunctionSignature {
         flags.set(FnFlags::DEFAULT, default);
         flags.set(FnFlags::EXPLICIT_SAFE, safe);
         flags.set(FnFlags::HAS_BODY, source.value.body().is_some());
+        flags.set(
+            FnFlags::SELF_VIEW,
+            source
+                .value
+                .param_list()
+                .and_then(|it| it.self_param())
+                .is_some_and(|it| it.view_fields().is_some()),
+        );
 
         let name = as_name_opt(source.value.name());
         let abi = source
@@ -1727,6 +1907,11 @@ impl FunctionSignature {
     /// can be called as a method.
     pub fn has_self_param(&self) -> bool {
         self.flags.contains(FnFlags::HAS_SELF_PARAM)
+    }
+
+    /// Whether the receiver is written with a view, `&self.{a, b}` (`#![blaze::views]`).
+    pub fn has_self_view(&self) -> bool {
+        self.flags.contains(FnFlags::SELF_VIEW)
     }
 
     pub fn is_default(&self) -> bool {
@@ -1894,25 +2079,34 @@ fn variant_syntax(db: &Db, id: VariantId) -> Option<&SignatureSyntax> {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl VariantFields {
-    /// What [`Self::of`] reads: the image's fields, or those lowered alone.
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-    fn kept(db: &Db, id: VariantId) -> Kept<VariantFields> {
-        Kept::new(crate::deps::signatures::served_variant_fields(db, id), || {
-            Self::lower_alone(db, id)
-        })
+    /// The fields read from their crate's image, `None` for a crate served from none: read in
+    /// place, as a signature's ([`Serve`]).
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
+    pub fn served<'db>(db: &'db Db, id: VariantId) -> Option<&'db VariantFields> {
+        crate::deps::signatures::served_variant_fields(db, id)
+    }
+
+    /// The fields lowered alone, for a crate no image serves.
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
+    pub fn lowered<'db>(db: &'db Db, id: VariantId) -> &'db VariantFields {
+        blaze_memo::keep_owned(blaze_memo::Database::memo(db), Self::lower_alone(db, id))
     }
 
     /// The fields with where each part of them is written in their file.
-    #[blaze_query::tracked(returns(ref), lru, weigh = with_source_map_bytes, mem_tag = Nameres)]
-    pub fn with_source_map(db: &Db, id: VariantId) -> (Arc<Self>, ExpressionStoreSourceMap) {
+    #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
+    pub fn with_source_map<'db>(
+        db: &'db Db,
+        id: VariantId,
+    ) -> (&'db VariantFields, &'db ExpressionStoreSourceMap) {
+        let memo = blaze_memo::Database::memo(db);
         let Some((it, map)) = Self::relative(db, id) else {
             let kept = Self::kept(db, id);
             let lowering = kept.lowering(&kept.store);
             let (it, map) =
                 blaze_mem::frame::current(|frame| Self::lower(db, id, None, lowering, frame));
-            return (kept.with_map(it), map);
+            return (kept.with_map(db, it), blaze_memo::keep_owned(memo, map));
         };
         let file = match id {
             VariantId::EnumVariantId(it) => file_range(db, it.lookup(db).parent.lookup(db).id),
@@ -1920,19 +2114,22 @@ impl VariantFields {
             VariantId::UnionId(it) => file_range(db, it.lookup(db).id),
         };
         let syntax = variant_syntax(db, id).expect("fields lowered from no syntax");
-        (it.clone(), syntax.moved(file, map)) // clone: an `Arc` count, once per memo
+        (*it, blaze_memo::keep_owned(memo, syntax.moved(file, map)))
     }
 
     /// The fields lowered from their [`variant_syntax`], with the source map of that tree;
     /// `None` for a variant, struct or union a macro writes.
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-    pub fn relative(db: &Db, id: VariantId) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+    #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
+    pub fn relative<'db>(
+        db: &'db Db,
+        id: VariantId,
+    ) -> Option<(&'db VariantFields, &'db ExpressionStoreSourceMap)> {
         let syntax = variant_syntax(db, id)?;
         let kept = Self::kept(db, id);
         let lowering = kept.lowering(&kept.store);
         let (it, map) =
             blaze_mem::frame::current(|frame| Self::lower(db, id, Some(syntax), lowering, frame));
-        Some((kept.with_map(it), map))
+        Some((kept.with_map(db, it), blaze_memo::keep_owned(blaze_memo::Database::memo(db), map)))
     }
 }
 
@@ -1941,7 +2138,12 @@ impl VariantFields {
     /// file for those a macro writes) with no source map. A read of them builds no map.
     #[inline]
     pub fn of(db: &Db, id: VariantId) -> &VariantFields {
-        Self::kept(db, id)
+        Self::kept(db, id).get()
+    }
+
+    /// What [`Self::of`] reads: the image's fields, or those lowered alone ([`Serve`]).
+    fn kept(db: &Db, id: VariantId) -> Serve<'_, VariantFields> {
+        Serve::new(Self::served(db, id), || Self::lowered(db, id))
     }
 
     /// The fields lowered from their syntax without their source map, outside any query of
@@ -2057,15 +2259,17 @@ impl VariantFields {
     /// The field of these, the fields of `id`, that a name written `name` with `hygiene` names:
     /// a field access's, a record expression's or a record pattern's field name
     /// ([`ExpressionStore::member_hygiene`], [`ExpressionStore::record_field_hygiene`]). See
-    /// [`Self::name_written`].
+    /// [`Self::name_written`]; `table` is the table `hygiene`'s context is of (the store's
+    /// crate's, `Resolver::ctx_table`).
     pub fn field_written(
         &self,
         db: &Db,
+        table: blaze_memo::ArenaId,
         id: VariantId,
         name: &Name,
         hygiene: HygieneId,
     ) -> Option<LocalFieldId> {
-        self.field(&Self::name_written(db, id, *name, hygiene))
+        self.field(&Self::name_written(db, table, id, *name, hygiene))
     }
 
     /// The name, [keyed](Name::keyed), that a field name written `name` with `hygiene` looks up
@@ -2074,11 +2278,18 @@ impl VariantFields {
     /// same text its caller named (rustc's `check_field` and `check_expr_struct_fields`). Plain
     /// equality of names wherever no `macro` (2.0) marks the name; a tuple index is looked up
     /// as written, as positional fields take no key.
-    pub fn name_written(db: &Db, id: VariantId, name: Name, hygiene: HygieneId) -> Name {
+    pub fn name_written(
+        db: &Db,
+        table: blaze_memo::ArenaId,
+        id: VariantId,
+        name: Name,
+        hygiene: HygieneId,
+    ) -> Name {
         if hygiene.is_root() || name.as_tuple_index().is_some() {
             return name;
         }
-        def_site::name_in(db, name, hygiene.syntax_context(), def_site::variant_expansion(db, id))
+        let expn = def_site::variant_expansion(db, id);
+        def_site::name_in(db, table, name, hygiene.syntax_context(), expn)
     }
 }
 
@@ -2162,7 +2373,9 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
                 Some((span_map, _)) => SpanMap::RealSpanMap(span_map),
                 None => fields.file_id.span_map(db),
             };
-            visibility_from_ast(db, vis, &mut |range| span_map.span_for_range(range).ctx)
+            visibility_from_ast(db, fields.file_id.context_arena(), vis, &mut |range| {
+                span_map.span_for_range(range).ctx
+            })
         })
     });
 
@@ -2174,7 +2387,8 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
                 let type_ref = col.lower_type_ref_opt(ty, &mut ImplTraitLowering::Error);
                 let visibility = override_visibility.as_ref().map_or_else(
                     || {
-                        visibility_from_ast(db, field.visibility(), &mut |range| {
+                        let table = fields.file_id.context_arena();
+                        visibility_from_ast(db, table, field.visibility(), &mut |range| {
                             col.span_map().span_for_range(range).ctx
                         })
                     },
@@ -2185,7 +2399,7 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
                 let name = match name_at {
                     Some(range) if fields.file_id.macro_file().is_some() => {
                         let ctxt = col.span_map().span_for_range(range).ctx;
-                        match def_site::key_of_context(db, ctxt) {
+                        match def_site::key_of_context(db, fields.file_id.context_arena(), ctxt) {
                             Some(key) => name.keyed(key),
                             None => name,
                         }
@@ -2253,10 +2467,10 @@ impl PartialEq for EnumVariants {
 
 impl Eq for EnumVariants {}
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl EnumVariants {
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-    pub(crate) fn of(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+    pub fn of(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
         if let Some(it) = crate::deps::signatures::served_enum_variants(db, e) {
             return it;
         }
@@ -2376,19 +2590,49 @@ impl EnumVariants {
         self.variants.get(name).map(|&(id, _)| id)
     }
 
+    /// The variant of the enum `e` (whose variants these are) bound under `name`, a name keyed
+    /// in `table`'s contexts: the reading crate's table, which has the enum's crate in its
+    /// closure. A variant's own key is of the table of its enum's file
+    /// ([`def_site::variant_name`]), so the two keys are compared in `table`, the variant's
+    /// carried there ([`span::SyntaxContext::translate`]): context ids are per table, and the
+    /// same chain of marks is another id in another crate's table. A name with no key is
+    /// looked up as it is.
+    pub fn variant_keyed(
+        &self,
+        db: &Db,
+        e: EnumId,
+        table: blaze_memo::ArenaId,
+        name: Name,
+    ) -> Option<(EnumVariantId, FieldsShape)> {
+        let Some(key) = name.key() else { return self.variants.get(&name).copied() };
+        let names = e.lookup(db).id.file_id.context_arena();
+        if names == table {
+            return self.variants.get(&name).copied();
+        }
+        let text = name.unkeyed();
+        self.variants.iter().find_map(|(bound, &found)| {
+            let carried = bound.key().map(|it| it.translate(db, names, table));
+            (bound.unkeyed() == text && carried == Some(key)).then_some(found)
+        })
+    }
+
     /// The variant of `e` that a path segment `name`, written with `ctxt`, names (`E::V`,
     /// `<E>::V`, `Self::V`, `use E::V`): `name` looked up by [`def_site::name_in`] the scope the
     /// enum's expansion made, as rustc's `resolve_ident_in_module` of the enum's module and
     /// `hygienic_eq` of `lower_type_relative_path` and `resolve_fully_qualified_call` do. A
-    /// name with no macros 2.0 mark is looked up as written.
+    /// name with no macros 2.0 mark is looked up as written. `ctxt` is of `table`, the reading
+    /// crate's, and so is the key `name_in` gives; the variants' keys are of the table of the
+    /// enum's file, so the two are compared in `table` ([`EnumVariants::variant_keyed`]), the
+    /// one table both have a context in when the enum is a dependency's.
     pub fn variant_written(
         db: &Db,
+        table: blaze_memo::ArenaId,
         e: EnumId,
         name: &Name,
         ctxt: span::SyntaxContext,
     ) -> Option<EnumVariantId> {
-        let name = def_site::name_in(db, *name, ctxt, def_site::enum_expansion(db, e));
-        e.enum_variants(db).variant(&name)
+        let name = def_site::name_in(db, table, *name, ctxt, def_site::enum_expansion(db, e));
+        e.enum_variants(db).variant_keyed(db, e, table, name).map(|(id, _)| id)
     }
 
     /// The name `variant_id` is written with, its key dropped: what a message or a printed
@@ -2426,14 +2670,19 @@ impl EnumVariants {
     }
 }
 
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn extern_block_abi(db: &Db, extern_block: ExternBlockId) -> ExternAbi {
-    let source = extern_block.lookup(db).source_view(db);
-    source
-        .value
-        .abi()
-        .and_then(|abi| abi.abi_string()?.text_without_quotes().parse().ok())
-        .unwrap_or(ExternAbi::FALLBACK)
+    let at = crate::deps::facts::at(db, extern_block);
+    let header = crate::deps::facts::Part::Header;
+    crate::deps::facts::fact(db, "extern abi", "", 14, Some(at), header, || {
+        let source = extern_block.lookup(db).source_view(db);
+        let abi = source
+            .value
+            .abi()
+            .and_then(|abi| abi.abi_string()?.text_without_quotes().parse().ok())
+            .unwrap_or(ExternAbi::FALLBACK);
+        (abi, true)
+    })
 }
 
 #[cfg(test)]
@@ -2917,13 +3166,14 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         signatures.chain(variants).collect()
     }
 
-    /// The signature lowerings in `log`: `kept` lowers what `of` reads, `relative` lowers it
-    /// again with its source map.
+    /// The signature lowerings in `log`: `lowered` lowers what `of` reads in a crate no record
+    /// serves, `relative` lowers it again with its source map.
     fn lowerings(log: &[String]) -> Vec<&str> {
+        // `lowered` is the query that lowers alone (`kept` routes to it and is no query).
         let lowering = |it: &&String| {
-            it.contains("Signature::kept")
+            it.contains("Signature::lowered")
                 || it.contains("Signature::relative")
-                || it.contains("VariantFields::kept")
+                || it.contains("VariantFields::lowered")
                 || it.contains("VariantFields::relative")
                 || it.contains("EnumVariants::of")
         };
@@ -2943,7 +3193,13 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         (log, before, after)
     }
 
+    // PORT (round 20): false by design on blaze-memo, left failing (as are
+    // `an_edit_of_another_item_lowers_none_of_this_one` and
+    // `a_body_edit_runs_no_signature_syntax`). They claim an edit of one item lowers no
+    // signature of another item of the same crate; on the port the edit makes the crate's arena
+    // again, so every signature of it is lowered again. The signatures are still equal.
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn a_body_edit_lowers_no_signature() {
         let (log, before, after) = lowered_by(&BODY_EDITS);
         assert_eq!(lowerings(&log), Vec::<&str>::new(), "{log:#?}");
@@ -2951,6 +3207,7 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
     }
 
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn an_edit_of_another_item_lowers_none_of_this_one() {
         // `S` gets a field: its signature and fields are lowered again, and every item after
         // it moves, but none of them is lowered again.
@@ -2958,11 +3215,17 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         let mut lowerings = lowerings(&log);
         lowerings.sort_unstable();
         assert_eq!(lowerings.len(), 2, "{log:#?}");
-        assert!(lowerings[0].contains("StructSignature::kept"), "{lowerings:?}");
-        assert!(lowerings[1].contains("VariantFields::kept"), "{lowerings:?}");
+        assert!(lowerings[0].contains("StructSignature::lowered"), "{lowerings:?}");
+        assert!(lowerings[1].contains("VariantFields::lowered"), "{lowerings:?}");
     }
 
+    // PORT (round 22): false by design on blaze-memo, as the two above. It claimed an edit of
+    // a discriminant lowers the enum's variants again and not its signature. True now: the
+    // edit makes the crate's arena again, so the enum's signature is lowered again too (the
+    // signature lowered is equal); that only the variants move is the host's claim, on
+    // records.
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn a_discriminant_edit_lowers_the_variants_not_the_enum() {
         let (log, ..) = lowered_by(&[("A = 1", "A = 1 + 1")]);
         let lowerings = lowerings(&log);
@@ -3094,7 +3357,7 @@ pub const K: u8 = ;
             (format!("{:?}", before.span_map), format!("{:?}", before.ast_id_map));
         // clone: a count of the tree before
         let tree = before.tree.clone();
-        db.set_file_text(file.file_id(&db), &edited(CODE, &BODY_EDITS));
+        let file = db.set_text_of(file, &edited(CODE, &BODY_EDITS));
         let after = file_outline(&db, file);
         assert_eq!(after.text(), text, "text");
         assert_eq!(after.cuts, cuts, "cuts");
@@ -3104,6 +3367,7 @@ pub const K: u8 = ;
     }
 
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn a_body_edit_runs_no_signature_syntax() {
         let fx = fixture::db(CODE);
         let file = fx.only_file();
@@ -3317,14 +3581,16 @@ impl S {
                 let (whole, whole_map) =
                     $Signature::lower(&$db, id, source, None, BodyLowering::Whole);
                 assert_eq!(**signature, whole, "{id:?}");
-                assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
+                assert!(**map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }};
         }
         let fx = fixture::db(CODE);
         let file = fx.only_file();
         let mut db = fx.into_db();
+        // The file's id, which outlives the commits: the interned one is dropped with its text.
+        let file_id = file.file_id(&db);
         for text in [CODE.to_owned(), edited(CODE, &BODY_EDITS)] {
-            db.set_file_text(file.file_id(&db), &text);
+            _ = db.set_file_text(file_id, &text);
             let (signatures, variants) = defs(&db);
             for def in signatures {
                 assert!(
@@ -3349,7 +3615,7 @@ impl S {
                     VariantFields::lower(&db, id, None, BodyLowering::Whole, frame)
                 });
                 assert_eq!(**fields, whole, "{id:?}");
-                assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
+                assert!(**map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }
         }
     }

@@ -1,5 +1,65 @@
 {
  "targets": {
+  "naga-unknown-unknown": {
+   "cfg": [
+    "target_abi=\"\"",
+    "target_arch=\"naga\"",
+    "target_endian=\"little\"",
+    "target_env=\"\"",
+    "target_has_atomic=\"16\"",
+    "target_has_atomic=\"32\"",
+    "target_has_atomic=\"64\"",
+    "target_has_atomic=\"8\"",
+    "target_has_atomic=\"ptr\"",
+    "target_has_atomic_primitive_alignment=\"16\"",
+    "target_has_atomic_primitive_alignment=\"32\"",
+    "target_has_atomic_primitive_alignment=\"64\"",
+    "target_has_atomic_primitive_alignment=\"8\"",
+    "target_has_atomic_primitive_alignment=\"ptr\"",
+    "target_os=\"unknown\"",
+    "target_pointer_width=\"32\"",
+    "target_vendor=\"unknown\""
+   ],
+   "cpu_features": [
+    []
+   ],
+   "cpus": {
+    "generic": 0
+   },
+   "feature_cfgs": {},
+   "features": {},
+   "features_off": {},
+   "file_names": {
+    "bin": null,
+    "cdylib": null,
+    "dylib": null,
+    "lib": "lib___.rlib",
+    "proc-macro": null,
+    "rlib": "lib___.rlib",
+    "staticlib": null
+   },
+   "llvm_features": {},
+   "nightly_cfg": [
+    "fmt_debug=\"full\"",
+    "relocation_model=\"static\"",
+    "target_has_atomic",
+    "target_has_atomic_load_store",
+    "target_has_atomic_load_store=\"16\"",
+    "target_has_atomic_load_store=\"32\"",
+    "target_has_atomic_load_store=\"64\"",
+    "target_has_atomic_load_store=\"8\"",
+    "target_has_atomic_load_store=\"ptr\""
+   ],
+   "other_features": [],
+   "panic": "abort",
+   "split_debuginfo": [
+    "off"
+   ],
+   "synthetic": true,
+   "target_spec_json": {
+    "*": "{\n  \"arch\": \"naga\",\n  \"data-layout\": \"e-m:e-p:32:32-i64:64-n32-S128\",\n  \"dynamic-linking\": false,\n  \"executables\": false,\n  \"llvm-target\": \"naga-unknown-unknown\",\n  \"max-atomic-width\": 64,\n  \"metadata\": {\n    \"description\": \"A GPU device build (docs/future/gpu/shaders.md): MIR lowered to naga's IR by blaze-shader and written as MSL, SPIR-V or WGSL; nothing is linked. 32-bit usize, little endian, panic=abort, std's unsupported platform layer: blaze's own target\",\n    \"host_tools\": false,\n    \"std\": true,\n    \"tier\": null\n  },\n  \"only-cdylib\": false,\n  \"os\": \"unknown\",\n  \"panic-strategy\": \"abort\",\n  \"singlethread\": true,\n  \"target-pointer-width\": 32,\n  \"vendor\": \"unknown\"\n}\n"
+   }
+  },
   "wasm64-blaze-wasip1": {
    "cfg": [
     "target_abi=\"\"",

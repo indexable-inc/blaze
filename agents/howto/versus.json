@@ -1,0 +1,9 @@
+{
+ "id": "versus",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), track 8 of round 1112",
+ "task": "Measure blaze against makepad's Relax head to head (D21) and see which rows blaze wins",
+ "do": "On the Mac, with an installed blaze (the thin `blaze` beside its `blaze-engine`) and nothing else building: `python3 -I harness/v2/versus.py '{\"blaze\": \"<inst>/blaze\", \"relax\": \"/tmp/relax-src/relax/target/release/relax\", \"root\": \"/private/tmp/versus-<tree>\", \"tree\": \"<the blaze checkout>\"}'` with a new root per tree (it refuses a non-empty one unless \"reuse\": true, and anything under ~/.cache/blaze or ~/.blaze). Add `extra` rows for reth and tempo checkouts. Read the table, keep `<root>/versus.json` with the tree's commit; exit 0 means every row won at `factor` (3.0), 1 a lost row, 2 a failed run (named with its output). A full run on the fixtures (hello, six, bstd-hello) takes more than 20 minutes: the idle 45 s and 60 s-idle rows wait 3 times each, per tool and project.",
+ "why": "Relax's numbers move with the machine and the hour; D21 asks for both tools on one machine, every run checked (a Relax run from the wrong directory exits 1 in 10 ms and looks fast: memstrat-h3).",
+ "state": "current"
+}

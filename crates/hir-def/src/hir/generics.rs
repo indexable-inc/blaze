@@ -115,9 +115,23 @@ pub enum TypeParamProvenance {
     TypeParamList,
     TraitSelf,
     ArgumentImplTrait,
+    /// A `_` written in a function's parameter types or an impl's header with
+    /// `#![feature(blaze_anon_params)]` (docs/v2/plan/design/implied-bounds.md): a parameter as
+    /// an argument's `impl Trait` is one, unnamed and never given explicitly, its bounds those
+    /// its position implies.
+    Anonymous,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash, blaze_query::Value)]
+impl TypeParamProvenance {
+    /// Whether the parameter is one no source names, so no explicit generic argument is ever
+    /// matched with it: an argument's `impl Trait` or an anonymous `_`.
+    #[inline]
+    pub fn is_synthetic(self) -> bool {
+        matches!(self, TypeParamProvenance::ArgumentImplTrait | TypeParamProvenance::Anonymous)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub enum TypeOrConstParamData {
     TypeParamData(TypeParamData),
     ConstParamData(ConstParamData),
@@ -221,6 +235,11 @@ pub struct GenericParams {
     /// The type parameters of the where predicates' `for<..>` binders, each predicate's a run
     /// ([`WherePredicate::TypeBound`]'s `binder`).
     pub(crate) binder_params: Arena<BinderParamData>,
+    /// The `where const { COND }` conditions (`#![feature(blaze_comptime)]`,
+    /// docs/v2/plan/design/ownership.md), in the order written: each a `bool` constant over
+    /// the generic parameters, an expression of the signature's store as a const argument is.
+    /// They are no [`WherePredicate`]: a condition bounds no type. Empty without the feature.
+    pub(crate) where_consts: Box<[ConstRef]>,
 }
 
 impl ops::Index<LocalTypeOrConstParamId> for GenericParams {
@@ -268,6 +287,7 @@ static EMPTY: std::sync::LazyLock<GenericParams> = std::sync::LazyLock::new(|| G
     where_predicates: Box::default(),
     early_bound_lifetimes_len: 0,
     binder_params: Arena::default(),
+    where_consts: Box::default(),
 });
 
 impl GenericParams {
@@ -411,7 +431,13 @@ impl GenericParams {
 
     #[inline]
     pub fn has_no_predicates(&self) -> bool {
-        self.where_predicates.is_empty()
+        self.where_predicates.is_empty() && self.where_consts.is_empty()
+    }
+
+    /// The `where const { COND }` conditions, in the order written.
+    #[inline]
+    pub fn where_consts(&self) -> &[ConstRef] {
+        &self.where_consts
     }
 
     #[inline]

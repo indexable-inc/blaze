@@ -58,6 +58,10 @@ impl RunDirs {
     }
 
     /// The directory of the run of serial `n`, made empty.
+    #[expect(
+        blaze::retry,
+        reason = "the make is redone at most twice, each after a repair (a stale tree removed, the root made); making the root up front and removing stale trees at start would leave one try"
+    )]
     pub(super) fn make(&mut self, n: u64) -> io::Result<PathBuf> {
         let mut name = [0u8; 48];
         let name = name_of(std::process::id(), n, &mut name);
@@ -214,9 +218,8 @@ mod tests {
         assert_eq!(name_of(4242, 7, &mut into), "4242-7");
         assert_eq!(name_of(u32::MAX, u64::MAX, &mut into), format!("{}-{}", u32::MAX, u64::MAX));
         assert_eq!(name_of(0, 0, &mut into), "0-0");
-        let root = std::env::temp_dir().join(format!("blaze-iocp-rundirs-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
-        let mut dirs = RunDirs::new(&root).unwrap();
+        let root = crate::temp::TempDir::for_test("blaze-iocp-rundirs-");
+        let mut dirs = RunDirs::new(root.path()).unwrap();
         let made = dirs.make(3).unwrap();
         assert_eq!(made, root.join(".blaze-spawn").join(format!("{}-3", std::process::id())));
         std::fs::create_dir_all(made.join("deep/er")).unwrap();

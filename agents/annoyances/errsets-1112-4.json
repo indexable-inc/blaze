@@ -1,0 +1,19 @@
+{
+ "id": "errsets-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane errsets-1112",
+ "where": "the lane's brief and the ledger",
+ "what": "The brief asked for an error-set mechanism to be designed and built (a reflection-derived enum plus a blanket conversion was suggested). Error unions, the same thing, were already on main as ledger row E3 (commits 92ea33709b and eb4c66b4c3: the type, its canonical order, the solver's UnionFrom, widening by coercion and by `?`). Found by `grep -rn error_union crates` after reading the effects and comptime designs and sketching three designs of my own.",
+ "cost": "about 40 minutes of design that was not needed",
+ "cause": "the brief was written from the request, not from the ledger row that covers it",
+ "whys": [
+  "the brief did not name E3",
+  "a lane is started from a person's sentence, and nothing looks the outcome up in objectives.json first",
+  "the ledger is searched by id, not by what a row is about"
+ ],
+ "class": "a lane briefed on an outcome the tree already has a row and code for",
+ "prevention": "before a brief is written, search objectives.json and the tree for the outcome's nouns (ledger.rs could take a find); not built",
+ "workaround": "grep the tree for the feature's likely names before designing",
+ "fix": "",
+ "state": "open"
+}

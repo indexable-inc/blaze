@@ -113,6 +113,31 @@ impl EagerExpander {
     pub fn is_env_or_option_env(&self) -> bool {
         matches!(self, EagerExpander::Env | EagerExpander::OptionEnv)
     }
+
+    /// The variable an `env!` or `option_env!` call reads, from its argument `tt`: parsed as
+    /// the expanders parse it, and noting nothing as read. `None` for any other macro, and for
+    /// an argument that names no variable (that call is an error and reads nothing).
+    pub fn env_var_read(&self, db: &Db, arg_id: MacroCallId, tt: &tt::TopSubtree) -> Option<Symbol> {
+        match self {
+            EagerExpander::Env => {
+                let exprs = args::exprs(db, tt).ok()?;
+                let var = match exprs[..] {
+                    [var] => var,
+                    [var, message] => {
+                        args::string(&message, "expected string literal").ok()?;
+                        var
+                    }
+                    _ => return None,
+                };
+                args::string(&var, "expected string literal").ok()
+            }
+            EagerExpander::OptionEnv => {
+                let call = || call_span(db, arg_id, tt.top_subtree().delimiter.open);
+                args::single_string(db, tt, "option_env!", call).value.map(|(key, _)| key)
+            }
+            _ => None,
+        }
+    }
 }
 
 pub fn find_builtin_macro(
@@ -146,6 +171,9 @@ register_builtin! {
     (quote, Quote) => quote_expand,
     (pattern_type, PatternType) => pattern_type_expand,
     (gca, Gca) => gca_expand,
+    // `blaze::unreachable!()` (`core::blaze::unreachable`). Appended: the nameres image stores
+    // a builtin macro by its index in `ALL`.
+    (blaze_unreachable, BlazeUnreachable) => blaze_unreachable_expand,
 }
 
 register_builtin! {
@@ -237,9 +265,14 @@ fn column_expand<'f>(
     place_expand(db, frame, id, tt, span, "column!", |(_, column)| column)
 }
 
-/// `line!()` or `column!()`: the `u32` that `pick` takes of [`written_place`], as rustc's
-/// `expand_line` and `expand_column` give it. Arguments are an error, after which the value is
-/// given all the same (rustc's `check_zero_tts`).
+/// `line!()` or `column!()`: the placeholder [`PLACE_PLACEHOLDER`] as a `u32` literal, which
+/// whoever reads the literal's value resolves to where the call is written, the `u32` that
+/// `pick` takes of [`written_place`], as rustc's `expand_line` and `expand_column` give it
+/// (`hir_ty::body_store::placed_literal`). So the expansion, and the body it is in, read no
+/// line, and a line added above the body changes neither. In the input of an eager macro
+/// (`concat!("at ", line!())`), whose text the eager macro reads, the value itself, as
+/// [`in_eager_input`] tells. Arguments are an error, after which the literal is given all the
+/// same (rustc's `check_zero_tts`).
 fn place_expand<'f>(
     db: &Db,
     frame: &'f Frame,
@@ -253,7 +286,12 @@ fn place_expand<'f>(
         // alloc: an error's message, on the error path
         BuiltinError::new(format!("{name} takes no arguments")).at(call_span(db, id, span))
     });
-    let value = match written_place(db, id) {
+    let place = if in_eager_input(db, id) {
+        written_place(db, id)
+    } else {
+        Some((PLACE_PLACEHOLDER, PLACE_PLACEHOLDER))
+    };
+    let value = match place {
         Some(place) => pick(place),
         None => {
             // alloc: an error's message, on the error path
@@ -282,6 +320,30 @@ fn place_expand<'f>(
         Some(err) => ExpandResult::new(expanded, err),
         None => ExpandResult::ok(expanded),
     }
+}
+
+/// What `line!()` and `column!()` expand to outside an eager macro's input: never a line or a
+/// column, which count from 1, so a reader that took it for one reads a value no call has.
+pub const PLACE_PLACEHOLDER: u32 = 0;
+
+/// Whether the call `id` is in the input of an eager macro (`concat!`, `env!`, `include!`, ...),
+/// directly or through the calls whose expansions are in it: there its expansion is text the
+/// eager macro reads, not an expression a reader of literals sees, so it must be the value.
+/// An input file is the eager macro's call without its `EagerCallInfo`; the expansion of the
+/// eager call itself (the tokens `include!` reads in) is not one, as a call there is lowered as
+/// any other. The walk reads which macro each file is of, no position.
+fn in_eager_input(db: &Db, id: MacroCallId) -> bool {
+    let mut file = id.parent(db);
+    while let HirFileId::MacroFile(call) = file {
+        let loc = call.loc(db);
+        if matches!(loc.def.kind, crate::MacroDefKind::BuiltInEager(..))
+            && matches!(loc.kind, crate::MacroCallKind::FnLike { eager: None, .. })
+        {
+            return true;
+        }
+        file = loc.kind.file_id();
+    }
+    false
 }
 
 /// The line and column, both from 1, where the macro call `id` comes from in the end (rustc's
@@ -405,10 +467,17 @@ fn stringify_expand<'f>(
 
 /// Formats the binary operators and paths in the expression reported by a failed assertion.
 /// `stringify!` instead preserves the token spacing supplied by the caller. Appended to `out`.
-pub(crate) fn write_assert_condition(out: &mut String, tokens: &str, edition: Edition) {
+/// `tokens` is read in `edition` and under `extensions`, those of the crate that wrote the
+/// assertion, so it is shown as that crate parses it.
+pub(crate) fn write_assert_condition(
+    out: &mut String,
+    tokens: &str,
+    edition: Edition,
+    extensions: span::Extensions,
+) {
     use syntax::{SyntaxKind, T};
 
-    let parse = syntax::ast::Expr::parse(tokens, edition);
+    let parse = syntax::ast::Expr::parse_with(tokens, edition, extensions);
     let expr = parse.root();
     let start = out.len();
     let mut whitespace = false;
@@ -465,10 +534,11 @@ fn assert_expand<'f>(
         const HEAD: &str = "assertion failed: ";
         let mut message = blaze_mem::scratch::lend_string();
         message.push_str(HEAD);
-        write_assert_condition(&mut message, &tokens, span.ctx.edition(db));
+        let extensions = span.anchor.file_id.extensions();
+        write_assert_condition(&mut message, &tokens, span.ctx.edition(), extensions);
         message
     });
-    let panic_2021 = message.is_none() && use_panic_2021(db, span);
+    let panic_2021 = message.is_none() && use_panic_2021(db, id, span);
     // Written in the expansion's own builder, in the invisible group a spliced `quote!` adds.
     let mac = group(call_site_span, |b| {
         let panic_args = rest.iter();
@@ -778,7 +848,7 @@ fn panic_expand<'f>(
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
 
-    let mac = if use_panic_2021(db, span) { sym::panic_2021 } else { sym::panic_2015 };
+    let mac = if use_panic_2021(db, id, span) { sym::panic_2021 } else { sym::panic_2015 };
 
     // Pass the original arguments
     let subtree = WithDelimiter {
@@ -806,7 +876,7 @@ fn unreachable_expand<'f>(
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
 
-    let mac = if use_panic_2021(db, span) { sym::unreachable_2021 } else { sym::unreachable_2015 };
+    let mac = if use_panic_2021(db, id, span) { sym::unreachable_2021 } else { sym::unreachable_2015 };
 
     // Pass the original arguments
     let subtree = WithDelimiter {
@@ -828,20 +898,51 @@ fn unreachable_expand<'f>(
 /// written, or of the macro that wrote it. A macro of the standard library that writes one
 /// (`assert!`, `debug_assert!`) has `#[allow_internal_unstable(edition_panic)]`, which only
 /// such a macro can have, and stands for where it is called itself.
-fn use_panic_2021(db: &Db, span: Span) -> bool {
+/// `blaze::unreachable!()` (docs/v2/plan/design/proved-unreachable.md): a site blaze must
+/// prove no path reaches (`hir_ty_pure::reach`, the lint `blaze::unreachable`). What it
+/// expands to is a panic, never undefined behaviour, so a build that did not run the check is
+/// still sound: `$crate::panicking::panic("..")`, core's `#[lang = "panic"]`.
+fn blaze_unreachable_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let dollar_crate = dollar_crate(span);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
+    let message = "internal error: entered code `blaze::unreachable!()` says is never reached";
+    let call = quote_in!(frame, call_site_span =>
+        #dollar_crate::panicking::panic(#message)
+    );
+    if tt.token_trees().len() != 0 {
+        return ExpandResult::new(
+            call,
+            ExpandError::other(span, "`blaze::unreachable!()` takes no arguments"),
+        );
+    }
+    ExpandResult::ok(call)
+}
+
+/// `span` is of the call `id`: its context is of `id`'s table (the calling crate's arena).
+fn use_panic_2021(db: &Db, id: MacroCallId, span: Span) -> bool {
     // To determine the edition, we check the first span up the expansion
     // stack that does not have #[allow_internal_unstable(edition_panic)].
     // (To avoid using the edition of e.g. the assert!() or debug_assert!() definition.)
     let mut ctx = span.ctx;
+    let mut arena = span::MacroCallId::from(id).arena();
     loop {
-        let Some(expn) = ctx.outer_expn(db) else {
-            break ctx.edition(db) >= Edition::Edition2021;
+        let Some(expn) = ctx.outer_expn(db, arena) else {
+            break ctx.edition() >= Edition::Edition2021;
         };
-        let expn = crate::MacroCallId::from(expn).loc(db);
-        if expn.def.edition_panic {
-            ctx = expn.ctxt;
+        let loc = crate::MacroCallId::from(expn).loc(db);
+        if loc.def.edition_panic {
+            // The call site of `expn` is in `expn`'s calling crate, so of its table.
+            ctx = loc.ctxt;
+            arena = expn.arena();
             continue;
         }
+        let expn = loc;
         break expn.def.edition >= Edition::Edition2021;
     }
 }
@@ -1171,7 +1272,8 @@ fn relative_file(
     if res == call_site && !allow_recursion {
         Err(ExpandError::other(err_span, format!("recursive inclusion of `{path_str}`"))) // alloc: an error's message, on the error path
     } else {
-        Ok(EditionedFileId::new(db, res, lookup.krate.data(db).edition))
+        let (edition, extensions) = (lookup.krate.data(db).edition, lookup.krate.extensions(db));
+        Ok(EditionedFileId::new_with_extensions(db, res, edition, extensions))
     }
 }
 
@@ -1225,7 +1327,9 @@ fn include_path(
     tt: &tt::TopSubtree,
     name: &str,
 ) -> ExpandResult<Option<(Symbol, Span)>> {
-    let call = call_span(db, id, tt.top_subtree().delimiter.open);
+    // The call's span reads its file's syntax: asked only for an error, so a crate given by its
+    // pages resolves a well-formed `include!` from its tokens without parsing the calling file.
+    let call = || call_span(db, id, tt.top_subtree().delimiter.open);
     args::single_string(db, tt, name, call)
 }
 
@@ -1545,7 +1649,7 @@ fn option_env_expand<'f>(
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    let call = call_span(db, arg_id, call_site);
+    let call = || call_span(db, arg_id, call_site);
     let ExpandResult { value, err } = args::single_string(db, tt, "option_env!", call);
     let Some((key, span)) = value else {
         let empty =
@@ -1642,6 +1746,7 @@ mod assert_condition_tests {
             &mut out,
             r#"value<= Self :: MAX && "A :: B".is_empty()"#,
             Edition::CURRENT,
+            span::Extensions::NONE,
         );
         assert_eq!(out, r#"value <= Self::MAX && "A :: B".is_empty()"#);
     }
@@ -1651,10 +1756,10 @@ mod assert_condition_tests {
     #[test]
     fn appends_after_the_head() {
         let mut out = String::from("assertion failed: ");
-        write_assert_condition(&mut out, "!x", Edition::CURRENT);
+        write_assert_condition(&mut out, "!x", Edition::CURRENT, span::Extensions::NONE);
         assert_eq!(out, "assertion failed: !x");
         let mut out = String::from("assertion failed: ");
-        write_assert_condition(&mut out, "a ==b", Edition::CURRENT);
+        write_assert_condition(&mut out, "a ==b", Edition::CURRENT, span::Extensions::NONE);
         assert_eq!(out, "assertion failed: a == b");
     }
 }

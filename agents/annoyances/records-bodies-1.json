@@ -1,0 +1,21 @@
+{
+ "id": "records-bodies-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-bodies",
+ "where": "hir-ty item store and check_cache (crates/hir-ty/src/body_store, check_cache, mir/persist.rs)",
+ "what": "A stored result that needs the thing it replaces before it can be found or read: the item store's key is made from the lowered body (identity_parts calls Body::of), a stored MIR's decode lowered the body to look for location literals and to bound spans, and a served inference lowered the body to count its nodes. So a hit still ran body_query for every body (reth restart: 215,072 body_query spans, 55 s self CPU, measured by the main agent).",
+ "cost": "the lane's first two hours of reading, and the 55 s a restart",
+ "whys": [
+  "a hit ran body_query: the reader asked the body's store for counts and literals",
+  "the record did not keep what its reader needs to check it",
+  "each codec was written beside a database that already had the body, so its presence cost nothing there",
+  "no test counted what a hit executes in a database that has only the record",
+  "a record's reader was never held to: reads nothing but the record and its key's inputs"
+ ],
+ "cause": "a record's reader depending on a value the record exists to avoid making",
+ "class": "a cache whose lookup or decode costs the miss",
+ "prevention": "each record keeps what bounds its own read (bodies part: node counts; runtime MIR entry: store counts); count tests on a database that has only the record (hir-ty-mir tests::check_cache::runtime); the item store's key before lowering is listed in restore.md, not built",
+ "workaround": "none",
+ "fix": "check_cache part.rs BodyRoot 2, mir/persist.rs read_in, check_cache/runtime.rs (uncompiled, round 2)",
+ "state": "open"
+}

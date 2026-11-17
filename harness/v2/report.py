@@ -6,8 +6,8 @@ A script makes a `Report`, adds an `Outcome` for each thing it checked, and ends
     pass        what was checked holds
     fail        it does not: a finding about the compiler (a wrong program, a stale result,
                 a budget missed, a build that is not byte for byte the same)
-    unmeasured  the engine has no answer to it (`engine.Unmeasurable`): allowed for v1, whose
-                run sets the bar; a failure for v2, which has to measure everything
+    unmeasured  the engine has no answer to it (`engine.Unmeasurable`): a failure, as blaze
+                has to measure everything
     error       the harness could not check it (`engine.Failed`: a command that timed out,
                 an answer of the engine it could not read)
 
@@ -102,12 +102,15 @@ class Report:
         return None
 
     def failing(self) -> list[Outcome]:
-        bad: set[Verdict] = {"fail", "error"}
-        if self.engine.kind == "v2":
-            bad.add("unmeasured")
+        bad: set[Verdict] = {"fail", "error", "unmeasured"}
         return [o for o in self.outcomes if o.verdict in bad]
 
     def finish(self) -> NoReturn:
+        # A script that checked nothing has not passed (agents.json A39, vacuous success): an
+        # empty selection, a corpus that was not found or a loop over no case ends here with no
+        # outcome, which is an error of the harness and exit status 1, never a silent 0.
+        if not self.outcomes:
+            self.add("checked nothing", "error", f"{self.script} ended with no outcome: nothing it was asked to check ran")
         counts = Counter(o.verdict for o in self.outcomes)
         result = dict(script=self.script, engine=asdict(self.engine), host=host(), commit=commit(),
                       started=self.started, ended=now(), outcomes=[asdict(o) for o in self.outcomes],

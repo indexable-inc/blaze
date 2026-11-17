@@ -109,13 +109,17 @@ impl HirFileId {
 
 /// This is an implementation detail of [`HirFileId::span_map`]. Outside this crate, use
 /// `HirFileId::from(file_id).span_map(db)` instead of `real_span_map(db, file_id)`.
-#[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
 pub(crate) fn real_span_map(db: &Db, editioned_file_id: base_db::EditionedFileId) -> RealSpanMap {
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
         real_span_map_in(db, editioned_file_id, frame)
     })
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The scratch of the anchor sort, kept by the worker.
     static ANCHOR_SORT: std::cell::RefCell<blaze_mem::scratch::Scratch<(syntax::TextSize, span::ErasedFileAstId)>> =

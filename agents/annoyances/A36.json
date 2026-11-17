@@ -1,0 +1,12 @@
+{
+ "id": "A36",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "`blaze stop` of release 0.20261105.4",
+ "what": "`stop` held the terminal 60 s and then errored: `the daemon still holds the connection 60000 ms after it said it was writing the daemon image .../v2/db/image (25962 MiB)`; the daemon was at 16.5 GB resident and ended later on its own.",
+ "cost": "about two minutes",
+ "cause": "a 26 GB image written whole at stop",
+ "workaround": "waited for the pid to end",
+ "fix": "an image written incrementally, never at stop",
+ "state": "open"
+}

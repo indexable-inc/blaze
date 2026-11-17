@@ -1,0 +1,14 @@
+{
+ "id": "impl-unstable-feature-bound-not-lowered",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane typed-sql const-str (rows Q5, Q7)",
+ "where": "crates/hir-ty/src/lower.rs (an impl's predicates), crates/hir-ty/src/const_param_ty.rs",
+ "what": "`const S: &'static str` under `#![feature(adt_const_params)]` alone was accepted: core's `ConstParamTy_` impls for `str`, `[T]` and `&T` carry `#[unstable_feature_bound(unsized_const_params)]`, and hir-ty never lowers that attribute into the impl's predicates, though the solver handles `ClauseKind::UnstableFeature` and solver_errors.rs has its error kind.",
+ "cost": "a program rustc refuses was accepted; the gate had to be written a second time, by type shape, in const_param_ty.rs (`needs_unsized_const_params`), which misses an ADT whose fields hold a `&str`",
+ "cause": "the impl attribute is parsed (blaze-diagnostics stability.rs) but no lowering step turns it into a clause, so every impl core bounds on a feature is unbounded in blaze",
+ "class": "an attribute that is a predicate in rustc kept only as syntax in blaze, so each consumer re-derives what the predicate would have said",
+ "prevention": "lower `#[unstable_feature_bound(f)]` on an impl into `ClauseKind::UnstableFeature(f)` in its predicates, then delete the shape check in const_param_ty.rs; a test: `struct W(&'static str); #[derive(ConstParamTy)]` under `adt_const_params` alone is refused",
+ "workaround": "const_param_ty.rs checks references, `str` and slices at the top of the type, in arrays and in tuples",
+ "fix": "not written",
+ "state": "open"
+}

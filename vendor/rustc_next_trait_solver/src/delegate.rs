@@ -71,6 +71,17 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         ) -> Result<<Self::Interner as Interner>::Ty, E>,
     ) -> Result<Option<Const<Self::Interner>>, E>;
 
+    /// blaze: whether the constant of a `ConstEvaluatable` goal, which blaze makes only for a
+    /// `where const { COND }` condition, is `true` with the arguments it has: `Some(true)`
+    /// when it holds, `Some(false)` when it does not (it is `false`, its evaluation failed, or
+    /// it names a generic parameter and the environment does not have it), `None` while it has
+    /// an inference variable.
+    fn const_condition(
+        &self,
+        param_env: <Self::Interner as Interner>::ParamEnv,
+        ct: Const<Self::Interner>,
+    ) -> Option<bool>;
+
     // FIXME: This only is here because `wf::obligations` is in `rustc_trait_selection`!
     fn well_formed_goals(
         &self,

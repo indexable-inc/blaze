@@ -1,0 +1,21 @@
+{
+ "id": "packs-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane packs-1112",
+ "where": "crates/blaze-core/src/lib.rs (Done::Accepted, Effect::Listen on Address::Tcp)",
+ "what": "A sans-IO server on blaze-core's Listen cannot know who connected: `Done::Accepted` carries the connection alone, no peer address. An allow rule by address (what the brief asked of the peer endpoint) cannot be enforced through the driver, which is why the first round's endpoint was a thread on std sockets (a rule 44 violation).",
+ "cost": "one round: the endpoint was rewritten onto the driver with readers allowed by signed key instead of by address",
+ "cause": "Listen was built for a Unix socket reachable by its owner only and a webhook behind a proxy, where the caller's address says nothing",
+ "whys": [
+  "the endpoint could not check a caller's address on the driver",
+  "Accepted has no address",
+  "every existing listener trusts its channel (0600 socket, loopback behind SSH)",
+  "blaze-core's net effects grew from those two users",
+  "no listener before this one faced a network"
+ ],
+ "class": "an effect whose completion drops a fact the kernel gave (accept's peer address), so code that needs it leaves the driver",
+ "prevention": "`Done::Accepted { conn, from: Option<SocketAddr> }` in blaze-core, filled by every driver and the simulation; until then a network-facing listener authenticates by key (as packs do), never by address",
+ "workaround": "requests signed by a listed reader's key; no address rule",
+ "fix": "none in blaze-core",
+ "state": "open"
+}

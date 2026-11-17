@@ -1,0 +1,14 @@
+{
+ "id": "line-macro-expands-to-an-absolute-literal",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: item-relative positions (absolute_position lint, edits/shift.rs), int-1112",
+ "where": "crates/hir-expand/src/builtin/fn_macro.rs place_expand / written_place (line!() and column!() expand to an `NNNu32` literal); crates/blaze-lower/src/code.rs Surface (hashes line and column of placed regions and of tokens that read a place); crates/blaze-link/src/position.rs SpanTable (absolute Position rows per span)",
+ "what": "MIR already reads line!() from a Location slot outside const contexts, but the expansion itself is an absolute literal, so a line added above a function changes its HIR Body and reruns its front end; the crate-level narrow key hashes absolute line and column of macro calls, so the shift changes the unit key; the link's span table holds absolute rows, so every moved body's table is re-encoded (O(sites), not O(K functions))",
+ "cost": "a line added near the top of a file reruns lowering of every body below it that uses line!() or a macro, and re-encodes every moved body's span rows; the floor is one table of K item starts plus the edited item",
+ "cause": "the position is resolved to an absolute number at expansion and at link, not kept as (item, offset) until it is printed",
+ "class": "an absolute position resolved before it is printed",
+ "prevention": "line!() expands to a placeholder resolved like file!() (mir/location.rs location_macros); SpanTable holds item-relative rows plus one base per anchor; Surface hashes item-relative places; the absolute_position lint (crates/blaze-lints/src/blaze/absolute_position.rs) keeps absolute types out of kept fields",
+ "workaround": "none; MIR, code identity, template key and bytes of a moved body already stay equal (crates/hir-ty-codegen/v2/edits/shift.rs)",
+ "fix": "partly, 2026-11-13 (claude-opus-5-5, merge-1113, not yet compiled): line!()/column!() expand to PLACE_PLACEHOLDER (0u32) except inside an eager macro's input; every value reader resolves through hir_ty::body_store::placed_literal (MIR lowering, match_tree, mir persist Locations, consteval anon const, const_exprs); blaze-link SpanTable is BZSPANS2 (item-relative cells plus bases, bases last). Still open: blaze-lower Surface keeps absolute places (a dependency's constant or proc macro LineColumn can hold them; needs a positions-read log in unit keys, as env! reads have); the link still rewrites every Location record of a moved table",
+ "state": "open"
+}

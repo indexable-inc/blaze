@@ -2,16 +2,14 @@
 
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
-use hir_def::{
-    AdtId, DefWithBodyId, ModuleId, TraitId, expr_store::Body, hir::Expr, nameres::crate_def_map,
-};
+use hir_def::{AdtId, DefWithBodyId, TraitId, expr_store::Body, hir::Expr};
 use hir_expand::fixture;
 use hir_ty::{
     db::{InternedClosure, InternedClosureId},
     next_solver::SimplifiedType as HirSimplifiedType,
 };
 
-use super::{TestDB, edit, item, single};
+use super::{TestDB, edit, item, module, single};
 use crate::{
     Fact, ItemId, ItemKey, ScopeEntry, ScopeIndexKey, captures, code, const_value,
     const_value_of_static, discriminant, drop_check, hidden_types, implements, item_key, key,
@@ -41,15 +39,6 @@ fn trait_(db: &TestDB, path: &str) -> TraitId {
 
 fn implements_of(db: &TestDB, trait_path: &str, ty: &str) -> Fact {
     implements(db, trait_(db, trait_path), &HirSimplifiedType::Adt(adt(db, ty).into()))
-}
-
-#[track_caller]
-fn module(db: &TestDB, name: &str) -> ModuleId {
-    crate_def_map(db, fixture::test_crate(db))
-        .modules(db)
-        .map(|(id, _)| id)
-        .find(|id| id.name(db).is_some_and(|it| it.as_str() == name))
-        .unwrap_or_else(|| panic!("no module `{name}`"))
 }
 
 fn resolves_of(db: &TestDB, scope: &str, name: &str) -> Fact {
@@ -400,7 +389,7 @@ fn a_type_and_a_const_of_one_name_are_one_run() {
     let t = item_key(&db, ItemId::Trait(trait_(&db, "T")));
     let at = |name: &str| {
         let key = ScopeIndexKey { scope: t, name: key::name_hash(name) };
-        blaze_query::db::attach(&db, || scope(&db, key)).unwrap()
+        blaze_memo::attach(&db, || scope(&db, key)).unwrap()
     };
     let ScopeEntry::Assoc(items) = at("X") else { panic!("`X` is not an associated item") };
     assert_eq!(items.len(), 2);
@@ -513,16 +502,21 @@ fn a_field_fact_names_its_field() {
 fn a_crate_s_value_tells_apart_why_an_included_file_could_not_be_read() {
     let mut db = fixture::db("//- /lib.rs\npub fn f() {}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let dir = std::env::temp_dir().join(format!("blaze-items-unread-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let held = blaze_core::temp::TempDir::for_test("blaze-items-unread-");
+    let dir = held.join("included");
     let path = base_db::AbsPathBuf::assert_utf8(dir.clone());
-    let file = db.files().included_file(&db, krate, &path, blaze_query::db::Durability::LOW);
+    let disk = db.files().disk().expect("a test database reads the disk");
+    let file = db.files().included_file(disk, &db, krate.key(&db), &path);
     assert!(file.read(&db).is_err(), "the file is gone");
     let fact = Fact::Crate(key::crate_key(&db, krate));
     let gone = val(&db, fact);
     std::fs::create_dir_all(&dir).expect("the temporary directory");
-    assert!(db.reload_included_file(&path), "a directory is another error");
+    let mut edit = db.edit();
+    assert!(
+        edit.reload_included_file(&path, &base_db::Looks::none()),
+        "a directory is another error"
+    );
+    _ = edit.commit();
     let directory = val(&db, fact);
-    std::fs::remove_dir_all(&dir).expect("the temporary directory");
     assert_ne!(gone, directory, "two errors are two values");
 }

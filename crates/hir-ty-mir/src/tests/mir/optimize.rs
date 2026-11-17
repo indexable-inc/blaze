@@ -53,7 +53,7 @@ fn check_mir(
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
         let scope = &def_map.module(&db, module).scope(&db);
@@ -210,7 +210,7 @@ fn main() {
 /// core's `drop_in_place` is an `#[inline(always)]` call of the `drop_glue` lang item, whose body
 /// is a placeholder for the type's drop glue: inlined, it dropped nothing, and std's
 /// `Vec::retain_mut` dropped none of what it removed (cc's build scripts leaked every job token
-/// and hung, queue 01523).
+/// and hung).
 ///
 /// The crate declares `drop_glue` itself, which takes `#![feature(lang_items)]` (rustc's E0658;
 /// `crate_lang_items` collects none without it), so the root starts with it, before `out`.
@@ -439,7 +439,7 @@ fn with_box_bodies(
     let fx = fixture::db(BOX);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
         let scope = &def_map.module(&db, module).scope(&db);
@@ -902,7 +902,7 @@ fn escape_bodies_of(
     let fx = fixture::db(text);
     let file_id = *fx.files().last().unwrap();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
         let scope = &def_map.module(&db, module).scope(&db);

@@ -37,13 +37,13 @@ pub(crate) fn variances_of(db: &Db, def: GenericDefId) -> VariancesOf<'_> {
     variances_of_query(db, def).as_ref()
 }
 
-#[blaze_query::tracked(
+#[blaze_memo::tracked(
     returns(ref),
     cycle_fn = crate::variance::variances_of_cycle_fn,
     cycle_initial = crate::variance::variances_of_cycle_initial,
     mem_tag = Infer,
 )]
-fn variances_of_query(db: &Db, def: GenericDefId) -> StoredVariancesOf {
+pub fn variances_of_query(db: &Db, def: GenericDefId) -> StoredVariancesOf {
     tracing::debug!("variances_of(def={:?})", def);
     match def {
         GenericDefId::FunctionId(_) => (),
@@ -83,8 +83,8 @@ pub fn ctor_variances(db: &Db, ctor: VariantId) -> VariancesOf<'_> {
     ctor_variances_query(db, ctor).as_ref()
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
+pub fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
     let adt: GenericDefId = match ctor {
         VariantId::StructId(s) => AdtId::StructId(s).into(),
         VariantId::EnumVariantId(v) => AdtId::EnumId(v.loc(db).parent).into(),
@@ -117,7 +117,7 @@ fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
 
 pub(crate) fn variances_of_cycle_fn(
     _db: &Db,
-    _: &blaze_query::db::Cycle<'_>,
+    _: &blaze_memo::Cycle<'_>,
     _last_provisional_value: &StoredVariancesOf,
     value: StoredVariancesOf,
     _def: GenericDefId,
@@ -147,7 +147,6 @@ fn glb(v1: Variance, v2: Variance) -> Variance {
 
 pub(crate) fn variances_of_cycle_initial(
     db: &Db,
-    _: blaze_query::db::Id,
     def: GenericDefId,
 ) -> StoredVariancesOf {
     let generics = generics(db, def);
@@ -321,7 +320,7 @@ impl<'db, 'f> Context<'db, 'f> {
                 self.add_constraints_from_const(start);
                 self.add_constraints_from_const(end);
             }
-            PatternKind::NotNull => {}
+            PatternKind::NotNull | PatternKind::Variant { .. } => {}
             PatternKind::Or(patterns) => {
                 for pat in patterns {
                     self.add_constraints_from_pat(pat)

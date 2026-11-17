@@ -25,9 +25,13 @@ blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+# The kept tables of a macro thread (`wasm/thread.rs`).
+blaze-mem.workspace = true
 blaze-wasi.workspace = true
 blaze-profile.workspace = true
 blaze-usercode.workspace = true
+# `outside::Looks`: an expansion's disk looks go to its build's list.
+blaze-vfs.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
@@ -36,10 +40,9 @@ hir-ty-mir.workspace = true
 intern.workspace = true
 # Names a proc macro's machine code in CPU samples (`ix_prof::jit`).
 ix-prof.workspace = true
-blaze-lower.workspace = true
 parser.workspace = true
 proc-macro-api.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 span.workspace = true
 stdx.workspace = true
 tracing.workspace = true
@@ -51,7 +54,6 @@ libc.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-blaze-query.workspace = true
 blaze-serde.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true

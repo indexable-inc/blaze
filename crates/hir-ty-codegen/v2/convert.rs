@@ -23,8 +23,8 @@ pub(crate) enum DataTarget {
     Target(Target),
     /// The function's own, made of the request's blob.
     Own,
-    /// A `&str` of this text: `file!()`.
-    Text(String),
+    /// A `&str` of these parts, which the link writes: a `concat!` with `file!()`.
+    Text(Vec<super::TextSlot>),
     /// A `core::panic::Location` of no place the program has a span of.
     Nowhere,
 }
@@ -359,7 +359,7 @@ impl OwnData {
                     let data = self.blob(blob, writable, index, &targets, requests, resolve)?;
                     self.push(data)
                 }
-                DataTarget::Text(text) => self.text(text),
+                DataTarget::Text(slots) => self.text(&slots)?,
                 DataTarget::Nowhere => self.nowhere(),
             };
             targets.push(Some(target));
@@ -424,15 +424,20 @@ impl OwnData {
     }
 
     /// The bytes of `text`, and the `&str` of them.
-    fn text(&mut self, text: String) -> Target {
-        let Word { size: word, data: kind, .. } = self.word;
-        let len = text.len() as u64;
-        let bytes = self.push(Data::new(1, text.into_bytes(), Relocs::new()));
-        // alloc: the `&str`'s bytes, which the data owns
-        let mut fat = vec![0; 2 * word];
-        fat[word..].copy_from_slice(&len.to_le_bytes()[..word]);
-        let pointer = Relocation { at: 0, kind, target: bytes, addend: 0 };
-        self.push(Data::new(word as u32, fat, Relocs::from_iter([pointer])))
+    /// The `&str` of `slots`: its recipe as the function's own datum
+    /// (`blaze_codegen::text::recipe`) and the [`Target::Text`] of it, the address of the
+    /// `&str` record the link writes. No name of a file is read here (rule 71).
+    fn text(&mut self, slots: &[super::TextSlot]) -> Result<Target, String> {
+        use blaze_codegen::text::{TextPart, recipe};
+        let mut parts = Vec::with_capacity_in(slots.len(), std::alloc::Global);
+        parts.extend(slots.iter().map(|it| match it {
+            super::TextSlot::Bytes(text) => TextPart::Bytes(text.as_bytes()),
+            super::TextSlot::File(span) => TextPart::FileOf(*span),
+        }));
+        let data = recipe(&parts).map_err(|why| format!("a `concat!` with `file!()`: {why:?}"))?;
+        let id = data.id;
+        self.push(data);
+        Ok(Target::Text(id))
     }
 
     /// A `core::panic::Location` of no file, as v1 makes it: `<blaze>`, line 0, column 0. The

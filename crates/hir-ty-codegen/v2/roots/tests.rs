@@ -188,7 +188,7 @@ static UNNAMED: u8 = 0;
     };
     let named = test_items::static_item(db, dep("named"), "NAMED");
     assert_eq!(roots.statics, [HirStatic(named)]);
-    assert_eq!(&**hir_def::nameres::named::named_dependencies(db, main), [dep("named")]);
+    assert_eq!(hir_def::nameres::named::named_dependencies(db, main), [dep("named")]);
 }
 
 #[test]

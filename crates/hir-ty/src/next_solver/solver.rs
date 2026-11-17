@@ -387,10 +387,14 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             AliasConstKind::Anon { def_id } => {
                 let anon = def_id.0;
                 let loc = anon.loc(db);
-                if loc.allow_using_generic_params {
+                if loc.allow_using_generic_params
+                    && !crate::consteval::anon_const_is_dependent(db, anon)
+                {
                     // An array repeat count may name the owner's generic parameters without
                     // depending on them; rustc evaluates it with identity arguments in its
-                    // own environment, whatever arguments it is used with.
+                    // own environment, whatever arguments it is used with. A `where const`
+                    // condition and a generic const expression (`blaze_const_exprs`) depend on
+                    // them: each is evaluated below with the arguments of its use.
                     let owner = loc.owner.generic_def(db);
                     let args = GenericArgs::identity_for_item(interner, owner.into());
                     db.anon_const_eval(anon, args, None)
@@ -428,6 +432,17 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         // rustc's `try_evaluate_const`: a constant with no value tree is an error here; it is
         // reported for what the constant is used as.
         Ok(Some(konst.unwrap_or_else(|_| Const::new_error(interner, ErrorGuaranteed))))
+    }
+
+    /// blaze: whether a `where const { COND }` condition holds ([`crate::where_const`]): `None`
+    /// while it has an inference variable.
+    fn const_condition(&self, param_env: ParamEnv<'db>, ct: Const<'db>) -> Option<bool> {
+        let ct = self.deeply_resolve_ignoring_regions(ct);
+        match crate::where_const::condition(self.interner, param_env, ct) {
+            crate::where_const::Condition::Holds => Some(true),
+            crate::where_const::Condition::Fails(_) => Some(false),
+            crate::where_const::Condition::Undecided => None,
+        }
     }
 
     /// What `arg` needs to be well formed: the bounds of every struct, enum and union in it

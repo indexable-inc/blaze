@@ -1,0 +1,12 @@
+{
+ "id": "disk2-8",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "crates/blaze-cargo/src/serve/settle.rs, `Store::end_period`",
+ "what": "A period's end walks every row of the store on the daemon's loop: 5 ms at the median and 16.5 ms at most for hello-world's 30,000 records (`store period ends`). It grows with the rows: a store of millions would hold the loop for a second at each build's end.",
+ "cost": "not paid yet: only measured small",
+ "cause": "the plan of a period is one walk, where its moves are steps",
+ "workaround": "none",
+ "fix": "plan in steps too (scan a bounded number of rows a turn, rotate the flags when the scan ends), or on a worker through a `Reader`",
+ "state": "open"
+}

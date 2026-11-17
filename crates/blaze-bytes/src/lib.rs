@@ -17,7 +17,14 @@
 //! its deref is the slice, one load of a pointer and a length. The check is std's, after the
 //! ASCII the bytes start with is skipped 64 bytes at a time.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "bytes held without a copy: an owner's bytes lent as `&'static [u8]` beside the owner that keeps them (`Bytes::held`), checked UTF-8 viewed as `&str`, and a heap `Arc<[u8]>` of checked UTF-8 cast to `Arc<str>`"
+)]
 
 use std::{borrow::Borrow, fmt, hash, ops::Deref, str::Utf8Error, sync::Arc};
 
@@ -45,9 +52,17 @@ pub struct Bytes {
 enum Owner {
     Heap(Arc<[u8]>),
     /// Bytes kept past any request in their tag's blocks, the count beside them.
-    Kept(#[allow(dead_code)] Arc<[u8], Kept>),
+    Kept(
+        #[allow(dead_code)]
+        #[expect(blaze::unwired, reason = "wired: held only for its drop, which gives the blocks back")]
+        Arc<[u8], Kept>,
+    ),
     // dyn: the owner of an image's range, named by the crate that maps it; only ever dropped
-    Held(#[allow(dead_code)] Arc<dyn Send + Sync>),
+    Held(
+        #[allow(dead_code)]
+        #[expect(blaze::unwired, reason = "wired: held only for its drop, which lets the range go")]
+        Arc<dyn Send + Sync>,
+    ),
     Static,
 }
 

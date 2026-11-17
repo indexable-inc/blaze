@@ -1,0 +1,11 @@
+{
+ "id": "records-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+ "where": "blaze: the build after a cold build",
+ "what": "The second build after a cold one folds 1.5 million runs into the reverse index at its first view boundary, 390 to 540 ms on the edit's path (`reverse edges fold`, runs=1498483): the runs are the cold build's store of its dependencies' signatures (`store kept front end`), made after the answer and left for whoever opens the next view.",
+ "cost": "about half a second of the second edit, on every binary measured, the base included",
+ "cause": "edges are folded at a view boundary, and the last runs of a build have no boundary after them",
+ "workaround": "none; while the index is shed the fold skips durable rows (150 ms for the same runs)",
+ "state": "open: the task that stores the kept front end should fold what it ran (a fold with `&mut` at its end)"
+}

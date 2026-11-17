@@ -1,0 +1,14 @@
+{
+ "id": "given-body-closures-need-text",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: body record holds generic MIR, served in a plan's snapshot",
+ "where": "crates/hir-ty/src/db.rs (ClosureKey::new, ClosureKey::loc, closure_exprs, the Interned*Id::new debug assertions) and crates/hir-ty/src/check_cache/ids.rs (closure_expr)",
+ "what": "Serving a body's MIR from its record in a snapshot without the body's text looked like a decode of items by key and types by content, which the item store already had. But a closure's id is interned by its place among the body's closures (ClosureKey, from closure_exprs, a walk of the body's ExpressionStore), and both its interning and the id reader's check open the store, as do three debug assertions: every closure of a given body would have lowered the body from text, or been refused as a keyed file.",
+ "cost": "a second pass over the design after the first was written",
+ "cause": "a closure's identity is derived from the body's syntax at every use, not kept where its answers are",
+ "whys": "ClosureKey counts closures to stay stable across edits above them; the count is a query over the store; every reader of a closure id (interning, loc, its key in blaze-items) reaches that query; nothing kept the list beside the answers that name the closures",
+ "class": "an identity re-derived from source at each use, where a record that names the thing does not carry what derives it",
+ "prevention": "the MIR answer keeps the body's closure expressions (MirAnswerRoot.closures); under Mode::Given closure_exprs answers from the body place's record (body_store::given_closure_exprs), so ClosureKey and the closure keys are the writer's; the store-reading checks skip only in Mode::Given",
+ "workaround": "none needed",
+ "state": "fixed, not compiled"
+}

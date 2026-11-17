@@ -1,0 +1,446 @@
+{
+  "about": "S4's ban list (docs/v2/plan/design/sys.md, \"Migration\"; harness/v2/nostd.py reads it). `banned` paths may be named only under `sys`. `not_yet_moved` is every file or crate that still names one: the list only shrinks, and S4 is met when it is empty, every crate is #![no_std] and the dependency closure is blaze's crates and `no_std_packages`.",
+  "sys": [
+    "crates/blaze-sys"
+  ],
+  "banned": [
+    "libc::",
+    "std::fs",
+    "std::net",
+    "std::thread",
+    "std::process",
+    "std::time::Instant",
+    "std::time::SystemTime"
+  ],
+  "no_std_crates": [
+    "blaze-sys",
+    "blaze-std"
+  ],
+  "no_std_packages": [],
+  "not_yet_moved": [
+    {
+      "path": "crates/blaze-core/src/busy.rs",
+      "why": "a bounded busy wait on std::thread and Instant (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/cgroup.rs",
+      "why": "cgroup files by std::fs: onto the file calls (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/cores.rs",
+      "why": "core counts and thread names by std::thread and libc (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/fanotify.rs",
+      "why": "the Linux watch: fanotify is not in blaze-sys yet (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/footprint.rs",
+      "why": "the footprint read by libc and std::process (slice 2; macOS slice 3)"
+    },
+    {
+      "path": "crates/blaze-core/src/fs.rs",
+      "why": "the file effects not yet moved: Write and Rename (temporaries, directory syncs), List, Stat, Clone, Link, Seal, Times, Stamp, the mapping (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/fs/mapped.rs",
+      "why": "the file effects not yet moved: Write and Rename (temporaries, directory syncs), List, Stat, Clone, Link, Seal, Times, Stamp, the mapping (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/fs/private.rs",
+      "why": "the file effects not yet moved: Write and Rename (temporaries, directory syncs), List, Stat, Clone, Link, Seal, Times, Stamp, the mapping (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/fs/wasi.rs",
+      "why": "the file effects not yet moved: Write and Rename (temporaries, directory syncs), List, Stat, Clone, Link, Seal, Times, Stamp, the mapping (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/fsevents.rs",
+      "why": "the macOS watch (slice 3)"
+    },
+    {
+      "path": "crates/blaze-core/src/iocp.rs",
+      "why": "the IOCP driver: on ntdll and kernel32 through blaze-sys once the Windows layer is built (slice 4)"
+    },
+    {
+      "path": "crates/blaze-core/src/iocp/files.rs",
+      "why": "the IOCP driver: on ntdll and kernel32 through blaze-sys once the Windows layer is built (slice 4)"
+    },
+    {
+      "path": "crates/blaze-core/src/iocp/net.rs",
+      "why": "the IOCP driver: on ntdll and kernel32 through blaze-sys once the Windows layer is built (slice 4)"
+    },
+    {
+      "path": "crates/blaze-core/src/iocp/process.rs",
+      "why": "the IOCP driver: on ntdll and kernel32 through blaze-sys once the Windows layer is built (slice 4)"
+    },
+    {
+      "path": "crates/blaze-core/src/iocp/rundirs.rs",
+      "why": "the IOCP driver: on ntdll and kernel32 through blaze-sys once the Windows layer is built (slice 4)"
+    },
+    {
+      "path": "crates/blaze-core/src/iocp/stamp.rs",
+      "why": "the IOCP driver: on ntdll and kernel32 through blaze-sys once the Windows layer is built (slice 4)"
+    },
+    {
+      "path": "crates/blaze-core/src/iocp/watch.rs",
+      "why": "the IOCP driver: on ntdll and kernel32 through blaze-sys once the Windows layer is built (slice 4)"
+    },
+    {
+      "path": "crates/blaze-core/src/kqueue.rs",
+      "why": "the kqueue driver: on libSystem through blaze-sys once the macOS layer is built (slice 3)"
+    },
+    {
+      "path": "crates/blaze-core/src/lib.rs",
+      "why": "blaze-core: names std threads, processes or the clock; moves with bstd::rt (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/lock.rs",
+      "why": "blaze-core: names std threads, processes or the clock; moves with bstd::rt (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/locks.rs",
+      "why": "blaze-core: names std threads, processes or the clock; moves with bstd::rt (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/net.rs",
+      "why": "sockets by libc: onto blaze-sys linux/net.rs (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/process.rs",
+      "why": "spawn and reap by libc: onto clone3 and waitid (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/process/spawn.rs",
+      "why": "spawn and reap by libc: onto clone3 and waitid (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/raw.rs",
+      "why": "the libc helpers the drivers share: dissolves into blaze-sys calls as each caller moves"
+    },
+    {
+      "path": "crates/blaze-core/src/reaped.rs",
+      "why": "blaze-core: names std threads, processes or the clock; moves with bstd::rt (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/signal.rs",
+      "why": "signal handlers by libc: needs the handler form of rt_sigaction, with bstd::rt (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/threads.rs",
+      "why": "the threads driver: its threads (std::thread, with bstd::rt), sockets and the watch errand (slices 2 and 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/uring.rs",
+      "why": "the io_uring driver: its ring calls, and its file calls where it is submitted (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/uring/files.rs",
+      "why": "the io_uring driver: its ring calls, and its file calls where it is submitted (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/uring/flight.rs",
+      "why": "the io_uring driver: its ring calls, and its file calls where it is submitted (slice 2)"
+    },
+    {
+      "path": "crates/blaze-core/src/wait.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-core/src/wait/linux.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-core/src/wait/macos.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-core/src/wait/other.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-core/src/wait/ring.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-core/src/wait/unix.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-core/src/watch.rs",
+      "why": "inotify by libc: not in blaze-sys yet (slice 2)"
+    },
+    {
+      "path": "crates/blaze-std/src/rt.rs",
+      "why": "bstd's one std module: the process id and exit, until bstd::rt is on blaze-sys (slice 5)"
+    },
+    {
+      "path": "crates/base-db",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-api",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-bench",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-build-script",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-cargo",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-check",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-ci",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-codegen-code",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-diagnostics",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-doc",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-engine",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-explore",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-fetch",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-fmt",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-fuzz",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-gc",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-graph",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-http",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-ids",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-inproc",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-lazy",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-link",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-lints",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-live",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-macro-eval",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-manifest",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-mem",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-metadata",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-new",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-profile",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-protocol",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-query",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-registry",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-resolve",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-seed-run",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-spin",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-stencil",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-storemodel",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-usercode",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-v2-proof",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/harness",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/hir-def",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/hir-ty",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/hir-ty-borrowck",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/hir-ty-codegen",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/hir-ty-mir",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/hir-ty-pure",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/intern",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/ix-prof",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/parser",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/paths",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/stdx",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/syntax",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/syntax-tree",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/test-utils",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/tt",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-cas/src/pool.rs",
+      "why": "the pool's drop asks std::thread::panicking: moves with bstd::rt's unwinding (slice 5)"
+    },
+    {
+      "path": "crates/blaze-cas/src/pool/drive.rs",
+      "why": "the pool's driver thread by std::thread: moves with bstd::rt (slice 5)"
+    },
+    {
+      "path": "crates/blaze-client",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-core/src/fs/bulk.rs",
+      "why": "macOS's getattrlistbulk by libc: not in blaze-sys yet (slice 3)"
+    },
+    {
+      "path": "crates/blaze-core/src/host.rs",
+      "why": "UDP, the standard streams, the wall clock and random bytes by libc, std::thread and SystemTime: onto blaze-sys's calls (slices 2 and 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/sim/host.rs",
+      "why": "the simulated host names std::net's address types: onto bstd's own (slice 5)"
+    },
+    {
+      "path": "crates/blaze-core/src/wait/direct.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-core/src/wait/filtered.rs",
+      "why": "the deadline waits: the ring, macOS and Windows waits (slices 2 to 4); the direct driver moves by crates/blaze-core/patches/wait-direct-on-blaze-sys.patch when the branches meet"
+    },
+    {
+      "path": "crates/blaze-ext-host",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/blaze-napi",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    },
+    {
+      "path": "crates/hir-ty-lean",
+      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
+    }
+  ]
+}

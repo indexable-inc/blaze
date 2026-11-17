@@ -203,6 +203,7 @@ impl Session {
             mode: if self.chat.is_some() { "chat" } else { "tui" }.to_owned(),
             model: self.chat.as_ref().map(|c| c.model()),
             effort: self.chat.as_ref().map(|c| c.effort()).filter(|e| !e.is_empty()),
+            context: self.chat.as_ref().and_then(|c| c.context_summary()),
             past: false,
         }
     }

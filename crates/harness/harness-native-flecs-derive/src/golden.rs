@@ -1,6 +1,6 @@
 //! Compile-time layout goldens (docs/hot-reload.md, "Migrations").
 //!
-//! Every `Layout` and `Component` type is checked against its line in `layouts.lock` (repo root) while the crate compiles: size,
+//! Every `Layout` and `Component` type is checked against its line in its crate's `layouts.lock` (beside its Cargo.toml) while the crate compiles: size,
 //! alignment, every field's name, type text and offset, and every enum constant's value. A mismatch is a compile error that names
 //! the type and the crate and says what to do (bump `#[den(version = N)]`, add a migration, run `uv run tools/layouts.py`).
 //! `DEN_LAYOUTS_REGEN=1` switches the checks off, so the tool can build a binary that dumps the actual layouts (every type also
@@ -41,17 +41,12 @@ fn parse_den(attrs: &[syn::Attribute], what: &str) -> syn::Result<Option<Lit>> {
     Ok(found)
 }
 
+/// The crate's own `layouts.lock`, beside its manifest: a proc macro reads nothing outside its crate's directory (blaze
+/// runs it sandboxed to `CARGO_MANIFEST_DIR`), so the goldens are kept per crate, never in a lock above it. None there: the
+/// crate's layouts are not checked.
 fn lock_path() -> Option<std::path::PathBuf> {
-    let mut dir = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
-    loop {
-        let f = dir.join("layouts.lock");
-        if f.is_file() {
-            return Some(f);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    let f = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?).join("layouts.lock");
+    f.is_file().then_some(f)
 }
 
 fn parse_line(line: &str) -> Option<(String, Entry)> {

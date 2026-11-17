@@ -242,7 +242,7 @@ fn no_mir(what: impl std::fmt::Debug, error: impl std::fmt::Debug) -> Unshared {
 
 /// The code of a function, constant or static: its item's code hash. An enum variant's
 /// discriminant is a body of its enum's interface.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn of_item(db: &Db, def: DefWithBodyId) -> Result<ContentId, Unshared> {
     let item = ItemId::of_body(db, def);
     let code = match def {
@@ -270,7 +270,7 @@ pub fn of_item(db: &Db, def: DefWithBodyId) -> Result<ContentId, Unshared> {
     Ok(with_spans(ITEM, &[code], body))
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn of_closure<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -280,7 +280,7 @@ pub fn of_closure<'db>(
     Ok(with_spans(CLOSURE, &[code.0], body))
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn of_coroutine<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -293,7 +293,7 @@ pub fn of_coroutine<'db>(
 /// The future an `async` closure gives when called by value: the coroutine's body lowered
 /// against the closure's captures, so its code is the coroutine's with what the closure
 /// captures and how.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn of_coroutine_by_move<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,

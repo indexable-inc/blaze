@@ -200,7 +200,15 @@ impl fmt::Display for Line {
         match self.total {
             Some(total) if total > 0 => {
                 let percent = self.done.min(total) * 100 / total;
-                write!(f, "{} of {} ({percent}%)", Bytes(self.done), Bytes(total))?;
+                // Both counts in the total's unit, the unit said once.
+                let (per, unit) = Bytes(total).unit();
+                match per {
+                    1 => write!(f, "{} of {total} {unit} ({percent}%)", self.done)?,
+                    _ => {
+                        let (done, total) = (self.done as f64 / per as f64, total as f64 / per as f64);
+                        write!(f, "{done:.1} of {total:.1} {unit} ({percent}%)")?;
+                    }
+                }
             }
             _ => write!(f, "{}", Bytes(self.done))?,
         }
@@ -221,19 +229,29 @@ impl fmt::Display for Line {
 #[derive(Clone, Copy, Debug)]
 pub struct Bytes(pub u64);
 
-impl fmt::Display for Bytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Bytes {
+    /// The unit this count is said in and how many bytes one of it is: `(1, "B")` under a
+    /// kilobyte, then the largest of kB to TB the count does not round up past 999.9 of.
+    fn unit(self) -> (u64, &'static str) {
         const UNITS: [&str; 4] = ["kB", "MB", "GB", "TB"];
         if self.0 < 1000 {
-            return write!(f, "{} B", self.0);
+            return (1, "B");
         }
-        let mut value = self.0 as f64 / 1000.0;
-        let mut unit = 0;
-        while value >= 999.95 && unit + 1 < UNITS.len() {
-            value /= 1000.0;
+        let (mut per, mut unit) = (1000u64, 0);
+        while self.0 as f64 / per as f64 >= 999.95 && unit + 1 < UNITS.len() {
+            per *= 1000;
             unit += 1;
         }
-        write!(f, "{value:.1} {}", UNITS[unit])
+        (per, UNITS[unit])
+    }
+}
+
+impl fmt::Display for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.unit() {
+            (1, unit) => write!(f, "{} {unit}", self.0),
+            (per, unit) => write!(f, "{:.1} {unit}", self.0 as f64 / per as f64),
+        }
     }
 }
 

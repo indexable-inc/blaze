@@ -1,0 +1,19 @@
+{
+ "id": "errsets-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane errsets-1112",
+ "where": "cargo test on origin/main 136432aa02",
+ "what": "Suites red on the base commit 136432aa02, run in a detached worktree whose HEAD was read back, with RUST_TEST_THREADS=6: hir-ty --lib 12 failed of 566 (uniq_refs, records, budget, db kinds, intrinsic names, check_cache, body_store, fn_item_predicates, error_unions); hir-ty-mir --lib 21 failed of 1408 and 1 of its tests/mir; blaze-diagnostics --lib 63 failed of 1385; syntax --lib 2 failed (union_types_parse_only_under_the_extension, and image::tests::the_tree_version_names_the_trees_parsed: generated/runner.rs changed under TREE_VERSION 3). The generated docs were stale too: objectives.md lacked 13 rows of objectives.json, invariants.md 15 invariants and 2 refinements, and `docs check` and `invariants check` each report problems of other lanes.",
+ "cost": "an hour of baseline runs to tell my failures from the tree's (none were mine)",
+ "cause": "not known per test; nothing runs these suites on main",
+ "whys": [
+  "each lane has to rerun the base to classify failures",
+  "there is no recorded list of known failures per crate",
+  "how-to H6 tells each lane to make its own baseline"
+ ],
+ "class": "a test that is red on main and nobody is told",
+ "prevention": "a checked-in baseline of failing tests per crate that may only shrink, made by one run on main; not built",
+ "workaround": "H6: run the same suite on the base commit and compare the names",
+ "fix": "three of them on branch bstd-error-sets: 73f282a02b (the two union tests), 996e14807d (the tree version)",
+ "state": "open"
+}

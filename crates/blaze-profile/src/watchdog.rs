@@ -3,7 +3,8 @@
 //!
 //! [`Watchdog`] is sans IO: the daemon's loop tells it, each turn, the time on its driver's
 //! clock (virtual under the simulation), its counts of [`Progress`] (the worker pool's jobs
-//! ended; queries completed; the plane's tasks and units' steps ended: work on what the build
+//! ended; queries completed, memos proved current and loops' items ended; the plane's tasks
+//! and units' steps ended: work on what the build
 //! waits for, never the daemon's or the pool's housekeeping), and whether work only the daemon's own threads can finish is under way (tasks on its
 //! workers; a wait on a child process or on I/O is not the daemon's to finish). It fires on no
 //! progress, never on elapsed time: a step or a span that runs long while anything else moves
@@ -36,7 +37,14 @@ pub struct Progress {
     /// spans close on and on while a build stands still, as they did through the poolborrow
     /// stall's ten minutes (2026-11-02).
     pub jobs: u64,
-    /// Queries completed, run or verified (`blaze_query::db::completed`).
+    /// Query work ended (`blaze_memo::completed`; until the port to the session memo,
+    /// `blaze_query::db::completed`, which this describes): queries brought up to date under their
+    /// flight, run or verified; rows the claim-free verification marked current; and items of
+    /// a loop over the pool (`run_all`, `par_for_each`) that ran to their end. The last two
+    /// are what a daemon does after a restart, every worker inside one loop's items proving
+    /// restored memos: counted as queries run under a flight alone, that was no progress, and
+    /// the stop's guard ended such a daemon as stalled (2026-11-11). A worker parked on a
+    /// wait, or blocked on a lock, ends none of them.
     pub queries: u64,
     /// The plane's nodes that settled and the jobs' own effects that ended (a placement, a
     /// look, a run of user code's IO): its tasks and units' steps.
@@ -194,6 +202,7 @@ fn threads(f: &mut fmt::Formatter<'_>, threads: &[ThreadNow]) -> fmt::Result {
             unit: span.unit.as_deref(),
             awaits: span.awaits.as_deref(),
             owner: span.owner,
+            fields: span.fields.as_deref(),
             for_ns: i64::try_from(span.for_ns).unwrap_or(i64::MAX),
         });
         thread_said(f, &thread.name, thread.tid, spans)?;
@@ -214,10 +223,15 @@ pub fn open_span(f: &mut impl fmt::Write, span: &OpenSpan) -> fmt::Result {
         unit: span.unit.as_deref(),
         awaits: span.awaits.as_deref(),
         owner: span.owner,
+        fields: span.fields.as_deref(),
         for_ns: i64::try_from(span.for_ns).unwrap_or(i64::MAX),
     };
     write!(f, "{said}")
 }
+
+/// The most of a span's [`SpanSaid::fields`] a line says: enough for a loop piece's `piece` and
+/// `completion`, so one span's long text does not drown the rest of a stuck line.
+pub const FIELDS_SAID_MAX: usize = 160;
 
 /// An open span as it is said ([`open_span`]), from a live thread or from a history's
 /// reading of a daemon that died (`slow::thread_line`): one form for both.
@@ -229,6 +243,9 @@ pub struct SpanSaid<'a> {
     pub unit: Option<&'a str>,
     pub awaits: Option<&'a str>,
     pub owner: Option<u64>,
+    /// Its fields that fill no column, as `name=value` text (the loop's `piece` and
+    /// `completion`): said in brackets, cut at [`FIELDS_SAID_MAX`] bytes.
+    pub fields: Option<&'a str>,
     pub for_ns: i64,
 }
 
@@ -249,6 +266,14 @@ impl fmt::Display for SpanSaid<'_> {
         }
         if let Some(owner) = self.owner {
             write!(f, ", run by task {owner}")?;
+        }
+        if let Some(fields) = self.fields {
+            if fields.len() <= FIELDS_SAID_MAX {
+                write!(f, " [{fields}]")?;
+            } else {
+                let cut = fields.floor_char_boundary(FIELDS_SAID_MAX);
+                write!(f, " [{}...]", &fields[..cut])?;
+            }
         }
         write!(f, " ({:.1} s)", self.for_ns as f64 / 1e9)
     }
@@ -294,6 +319,9 @@ mod tests {
 
     const SEC: u64 = 1_000_000_000;
 
+    /// How long a test's stuck job waits for the test to let it go before it fails.
+    const RELEASE_WAIT: Duration = Duration::from_secs(60);
+
     /// A job of the request: inside its span, it waits for the next job, which waits for the
     /// one after, around to itself, until the test lets them go.
     fn job(k: usize, ready: &Barrier, gate: &(Lock<bool>, Signal)) {
@@ -306,9 +334,10 @@ mod tests {
         ready.wait();
         let (released, cv) = gate;
         let mut released = released.lock();
-        while !*released {
-            cv.wait(&mut released);
-        }
+        assert!(
+            !cv.wait_while_for(&mut released, |released| !*released, RELEASE_WAIT),
+            "job {k}: the test did not let the jobs go within {RELEASE_WAIT:?}"
+        );
     }
 
     #[test]
@@ -493,6 +522,75 @@ mod tests {
         );
     }
 
+    /// What a daemon's workers did by one look of the stop's guard (`serve::stop`'s
+    /// `watch_turns`), while its loop is inside one turn: a write whose maintain runs a loop's
+    /// items on every worker.
+    #[derive(Clone, Copy, Default)]
+    struct Did {
+        /// Pool jobs ended: none while the loop lasts, as each of its jobs runs many items.
+        jobs: u64,
+        /// Queries run or verified under their flight.
+        flown: u64,
+        /// Rows the claim-free verification marked current.
+        marked: u64,
+        /// The loop's items that ran to their end.
+        items: u64,
+    }
+
+    /// The daemon's completed count (`blaze_memo::completed`) of `did`, as it counts.
+    fn completed(did: Did) -> u64 {
+        did.flown + did.marked + did.items
+    }
+
+    /// The planted bug: `completed` as it counted until 2026-11-11, queries under a flight
+    /// alone.
+    fn completed_under_a_flight_alone(did: Did) -> u64 {
+        did.flown
+    }
+
+    /// The guard's looks, one each 100 ms for 300 s of a virtual clock, at a daemon restarted
+    /// on an earlier daemon's state whose loop does not turn: its 64 workers each inside a
+    /// job of one loop, proving restored memos claim-free (`moving`: each second every worker
+    /// ends an item and marks ten rows) or all parked on each other (not `moving`). The count
+    /// of queries is `count`'s; no job ends, no query runs under a flight and `working` is the
+    /// guard's constant 0. What the watchdog said, if it did.
+    fn restarted_daemon(count: fn(Did) -> u64, moving: bool) -> Option<Quiet> {
+        let mut watchdog = Watchdog::new(Watchdog::BOUND);
+        let mut did = Did { jobs: 11, flown: 7, ..Did::default() };
+        let mut said = None;
+        for look in 0..3000u64 {
+            if moving && look % 10 == 0 {
+                did.items += 64;
+                did.marked += 640;
+            }
+            let progress = Progress { jobs: did.jobs, queries: count(did), steps: 3, working: 0 };
+            // The loop has not turned since the first look: work is under way throughout.
+            said = said.or(watchdog.tick(look * (SEC / 10), progress, true));
+        }
+        said
+    }
+
+    /// The invariant: a daemon whose workers end a loop's items or prove memos current is
+    /// never said to be stalled, however long no pool job ends and no query runs under a
+    /// flight; one whose workers are all parked is said to be, at the bound.
+    #[test]
+    fn workers_ending_loop_items_or_proving_memos_are_progress_and_parked_ones_stall() {
+        assert_eq!(restarted_daemon(completed, true), None, "items ended and rows marked");
+        let quiet = restarted_daemon(completed, false).expect("every worker parked: a stall");
+        let bound = Watchdog::BOUND.as_nanos() as u64;
+        assert_eq!((quiet.since_ns, quiet.for_ns, quiet.bound_ns), (0, bound, bound), "{quiet:?}");
+        assert_eq!(quiet.at, Progress { jobs: 11, queries: 7, steps: 3, working: 0 });
+    }
+
+    /// Counted as queries under a flight alone, the same working daemon is ended as stalled:
+    /// the stall of 2026-11-11, `0 looks found work running` with every worker in `run_all`.
+    #[test]
+    fn the_oracle_catches_a_count_of_queries_under_a_flight_alone() {
+        let quiet = restarted_daemon(completed_under_a_flight_alone, true)
+            .expect("items ended and rows marked are not counted: said stalled");
+        assert_eq!(quiet.for_ns, Watchdog::BOUND.as_nanos() as u64, "{quiet:?}");
+    }
+
     #[test]
     fn a_stall_is_said_once_a_quiet_stretch_and_again_after_progress() {
         let at = |jobs| Progress { jobs, queries: 0, steps: 0, working: 0 };
@@ -534,13 +632,21 @@ mod tests {
                     let awaits = crate::span::Name::of("trait_solve `T: Sized`");
                     let on = blaze_graph::wait::WaitKind::Key;
                     let _wait =
-                        crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
+                        crate::span::Wait {
+                            awaits,
+                            function: awaits,
+                            owner: Some(7),
+                            on,
+                            by: blaze_graph::wait::OwnedBy::Job,
+                        }
+                        .open();
                     ready.wait();
                     let (released, cv) = &gate;
                     let mut released = released.lock();
-                    while !*released {
-                        cv.wait(&mut released);
-                    }
+                    assert!(
+                        !cv.wait_while_for(&mut released, |released| !*released, RELEASE_WAIT),
+                        "the test did not let the worker go within {RELEASE_WAIT:?}"
+                    );
                 })
                 .unwrap();
             ready.wait();

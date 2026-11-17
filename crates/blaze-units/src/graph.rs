@@ -77,13 +77,16 @@ impl Mode {
 /// or `Target`, the one triple a build names (`--target`'s, or the host's own when no
 /// `--target` is given, until the graph is shared). `MacroWasm` is blaze's own: a proc macro
 /// and what it depends on, built for [`Request::macro_wasm`] to run as a wasm module. No unit
-/// has it in a build that does not ask for it, so such a graph is cargo's.
+/// has it in a build that does not ask for it, so such a graph is cargo's. `Gpu` is blaze's
+/// too: a dependency asked for with `artifact = "gpu"` and what it depends on, built for
+/// [`Request::gpu`] ([`crate::GPU_DEVICE`]) by the front end alone, its entries lowered to MSL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 enum Kind {
     Host,
     Target,
     MacroWasm,
+    Gpu,
 }
 
 impl Kind {
@@ -127,6 +130,8 @@ struct Dep {
     unit_for: UnitFor,
     public: bool,
     dev: bool,
+    /// [`schema::UnitDep::gpu`].
+    gpu: bool,
 }
 
 const _: () = assert!(size_of::<Key>() == 20);
@@ -651,9 +656,9 @@ struct Proposal {
 struct State<'r, 'a> {
     request: &'r Request<'a>,
     /// The platform of each kind, whose `cfg` decides a `[target.'cfg(..)'.dependencies]`.
-    platforms: [&'a Platformed; 3],
+    platforms: [&'a Platformed; 4],
     /// Each kind as a profile reads it.
-    profile_kinds: [ProfileKind; 3],
+    profile_kinds: [ProfileKind; 4],
     pkgs: Vec<Pkg<'a>>,
     pkg_index: HashMap<PackageId, u32, Global>,
     pkg_deps: Vec<PkgDep<'a>>,
@@ -790,9 +795,12 @@ impl<'r, 'a> State<'r, 'a> {
         let units = n * 4;
         // Without `macro_wasm` no unit is `MacroWasm`, so its slot is read by none.
         let macro_wasm = request.macro_wasm.unwrap_or(request.host);
+        // Without `gpu` no unit is `Gpu` (an `artifact = "gpu"` edge is refused), so its slot is
+        // read by none.
+        let gpu = request.gpu.unwrap_or(request.host);
         State {
             request,
-            platforms: [request.host, explicit, macro_wasm],
+            platforms: [request.host, explicit, macro_wasm, gpu],
             profile_kinds: [
                 ProfileKind::Host,
                 // alloc: the triple, once per build.
@@ -800,6 +808,9 @@ impl<'r, 'a> State<'r, 'a> {
                 // A wasm macro is built for another platform than the host's, as a target is.
                 // alloc: the triple, once per build.
                 ProfileKind::Target(macro_wasm.triple.clone()),
+                // The device is another platform than the host's, as a target is.
+                // alloc: the triple, once per build.
+                ProfileKind::Target(gpu.triple.clone()),
             ],
             pkgs,
             pkg_index,
@@ -841,6 +852,38 @@ impl<'r, 'a> State<'r, 'a> {
         match proc_macro && !mode.is_any_test() && self.request.macro_wasm.is_some() {
             true => Kind::MacroWasm,
             false => of.for_target(for_host),
+        }
+    }
+
+    /// Of the package's manifest, whether its dependency `d` (the resolve's of it) is asked for
+    /// with blaze's `artifact = "gpu"`, and then whether `lib = true` also links its library.
+    fn gpu_artifact(&self, pkg: u32, d: &Dependency) -> Option<bool> {
+        use blaze_manifest::dependency::DepKind as Manifest;
+        let manifest = &self.pkgs[pkg as usize].package.manifest;
+        let kind = match d.kind() {
+            DepKind::Normal => Manifest::Normal,
+            DepKind::Development => Manifest::Development,
+            DepKind::Build => Manifest::Build,
+        };
+        manifest
+            .dependencies
+            .iter()
+            .find(|it| {
+                it.name_in_toml() == d.name_in_toml().as_str()
+                    && it.kind == kind
+                    && it.platform.as_ref() == d.platform()
+            })
+            .and_then(|it| it.artifact.as_ref())
+            .filter(|it| it.is_gpu())
+            .map(|it| it.lib)
+    }
+
+    /// The kind a gpu artifact's unit is: [`Kind::Gpu`], or the target's own when the build is
+    /// for the device already (`--target naga-unknown-unknown`), so it is one unit and one std.
+    fn gpu_kind(&self) -> Kind {
+        match self.platforms[Kind::Target as usize].triple == crate::GPU_DEVICE {
+            true => Kind::Target,
+            false => Kind::Gpu,
         }
     }
 
@@ -1399,11 +1442,20 @@ impl<'r, 'a> State<'r, 'a> {
         };
         for at in deps_start..deps_start + deps_len {
             let dep = self.pkg_deps[at as usize];
-            let (mut used, mut transitive) = (false, false);
+            // `linked`: some use of it is a library's (a plain dependency, or `artifact = "gpu"`
+            // with `lib = true`); `gpu`: some use of it asks for its device build.
+            let (mut used, mut transitive, mut linked, mut gpu) = (false, false, false, false);
             for d in dep.deps {
                 if self.dep_used(d, &filter) {
                     used = true;
                     transitive |= d.is_transitive();
+                    match self.gpu_artifact(pkg, d) {
+                        Some(lib) => {
+                            gpu = true;
+                            linked |= lib;
+                        }
+                        None => linked = true,
+                    }
                 }
             }
             if !used {
@@ -1411,6 +1463,32 @@ impl<'r, 'a> State<'r, 'a> {
             }
             let dep_pkg = self.known(pkg, dep)?;
             let Some(lib) = self.pkgs[dep_pkg as usize].lib else { continue };
+            if gpu {
+                // The device build: always `Build`, even of a check, since the dependent's front
+                // end reads the MSL it writes (`BLAZE_GPU_MSL_<CRATE>`, the plan's env).
+                let device = self.request.gpu.map(|it| it.triple.as_str());
+                if lib.for_host || device != Some(crate::GPU_DEVICE) {
+                    bail!(
+                        "`{}` depends on `{}` with `artifact = \"gpu\"`, but {}",
+                        self.pkgs[pkg as usize].id.name(),
+                        dep.id.name(),
+                        match lib.for_host {
+                            true => "it is a proc macro, which runs on the host, not the GPU",
+                            false => "this build loads no device platform (`naga-unknown-unknown`)",
+                        }
+                    );
+                }
+                let dep_for = unit_for.with_dependency(custom_build, false, false);
+                let kind = self.gpu_kind();
+                let mut edge =
+                    self.new_unit_dep(id, dep_pkg, lib.at, dep_for, kind, Mode::Build, None, false)?;
+                edge.dev = !transitive;
+                edge.gpu = true;
+                self.built.push(edge);
+            }
+            if !linked {
+                continue;
+            }
             let mode = check_or_build_mode(row.key.mode, lib.for_host);
             let dep_for = unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
             let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro, mode);
@@ -1533,7 +1611,7 @@ impl<'r, 'a> State<'r, 'a> {
         let features = self.features_of(pkg, features_for(unit_for))?;
         let class = self.profiles.class_of[profile as usize];
         let unit = self.intern(Key { pkg, target, features, class, kind, mode }, profile);
-        Ok(Dep { unit, extern_crate_name, dep_name, unit_for, public, dev: false })
+        Ok(Dep { unit, extern_crate_name, dep_name, unit_for, public, dev: false, gpu: false })
     }
 
     /// cargo's `connect_run_custom_build_deps` (the run of a build script waits for the runs of
@@ -1834,6 +1912,8 @@ impl<'r, 'a> State<'r, 'a> {
                         Kind::MacroWasm => {
                             Some(self.platforms[Kind::MacroWasm as usize].triple.clone())
                         }
+                        // alloc: the output owns its strings.
+                        Kind::Gpu => Some(self.platforms[Kind::Gpu as usize].triple.clone()),
                     },
                     // Its triple may be the target's too (`--target wasm32-wasip1`): this tells
                     // the two units apart downstream, as `kind` does here.
@@ -1859,6 +1939,7 @@ impl<'r, 'a> State<'r, 'a> {
                             noprelude: Some(false),
                             nounused: Some(false),
                             dev: dep.dev,
+                            gpu: dep.gpu,
                         })
                         // alloc: the output.
                         .collect(),

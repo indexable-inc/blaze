@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-12",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: a build script that reads the clock and runs git (reth-node-core, vergen)",
+ "what": "In every edit's build of reth the span `build script run reth-node-core` took 14.7 s (its process lived 1.4 s): its kept run is looked up by hashing the 2,916 files and 590 listings of the checkout it read through `git status`, the edited file is one of them, so it ran again, and its new build time stamp made its crate and the six above it again (14 units a leaf body edit against 8).",
+ "cost": "13 to 15 s and 6 units of every edit; reth's own source says debug builds must not run it again",
+ "cause": "cargo's rule was added to the trace of an untraceable run, never put in its place",
+ "whys": [
+  "why slow: 2,916 files hashed, a script run, 6 units",
+  "why: the run's key holds everything it read",
+  "why: blaze keys a run by its trace",
+  "why wrong here: the run read the clock, so it is no function of its trace, and the script said what reruns it",
+  "property: exactness of inputs claimed for a run that has none"
+ ],
+ "class": "a key that is exact about inputs a value does not depend on functionally: cost with no correctness bought",
+ "prevention": "built (4787b9a562, decision reth-1112-D2): an untraceable run whose script said its reruns is kept by cargo's rule and its own package's reads; invariant and control in blaze-usercode/src/rule.rs. Not built: a traceable run's checkout reads valued from the view instead of hashed from the disk",
+ "fix": "4787b9a562; reth being measured",
+ "state": "open: fix written, reth pending"
+}

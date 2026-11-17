@@ -59,6 +59,11 @@ impl Command {
     ) -> io::Result<(Process, StdioPipes)> {
         const CLOEXEC_MSG_FOOTER: [u8; 4] = *b"NOEX";
 
+        // blaze: under a given provider the child inherits a seed of its own; the guard keeps
+        // another spawn from replacing it before this child has its environment
+        // (`sys::provider::spawning`). `None`, and nothing done, for every other process.
+        let _provider = crate::sys::provider::spawning();
+
         // blaze: a child given `environ` whole is not a walk of it by this process: blaze's
         // interposer sees the spawn and hands the child what it was lent, and the child's reads
         // are its own (`crates/blaze-cargo/src/sandbox/linux_interpose.c`, `macos_interpose.c`).
@@ -230,6 +235,9 @@ impl Command {
     }
 
     pub fn exec(&mut self, default: Stdio) -> io::Error {
+        // blaze: as in `spawn`, the program that replaces this one has a seed of its own.
+        let _provider = crate::sys::provider::spawning();
+
         // blaze: as in `spawn`, the program given `environ` whole reads it itself.
         let envp = self.capture_env();
 

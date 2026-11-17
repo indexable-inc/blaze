@@ -1,0 +1,14 @@
+{
+ "id": "skill-forbids-mmap-target-maps",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), the fresh core's page and interface crate, fix-hello-1113",
+ "where": ".agents/skills/memory-and-data/SKILL.md (\"no mmap\"); docs/v2/plan/design/target.md (segments and plain arrays mapped)",
+ "what": "The memory-and-data skill says outputs are read through the store's own buffer pool and never by an mmap of a store file for the hot tier; the accepted target (the audit and the owner's decisions of 2026-11-13) maps segments once per process and reads plain arrays in place.",
+ "cost": "a lane that loads the skill before touching the store builds the buffer pool the target deletes",
+ "cause": "the skill was written for the daemon's design and was not updated when the target replaced it",
+ "class": "a skill that states a design rule which a newer accepted design reverses",
+ "prevention": "a design page that reverses a skill's rule changes the skill in the same change, and the docs check lists skills that name a superseded page",
+ "workaround": "target.md holds; the skill is to change",
+ "fix": "not yet",
+ "state": "open"
+}

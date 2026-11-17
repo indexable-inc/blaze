@@ -147,6 +147,11 @@ impl SyntaxMapping {
         }
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "mapping entries index their parents by u32, and an editor's parents are not \
+                  bounded below 2^32: making MappingEntry's parent a usize would remove it"
+    )]
     pub fn merge(&mut self, mut other: SyntaxMapping) {
         // Remap other's entry parents to be after the current list of entry parents
         let remap_base: u32 = self.entry_parents.len().try_into().unwrap();
@@ -171,6 +176,11 @@ impl SyntaxMapping {
         Some(output)
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "mapping entries index their parents by u32, and an editor's parents are not \
+                  bounded below 2^32: making MappingEntry's parent a usize would remove it"
+    )]
     pub fn add_mapping(&mut self, syntax_mapping: SyntaxMappingBuilder) {
         let SyntaxMappingBuilder { parent_node, node_mappings } = syntax_mapping;
 

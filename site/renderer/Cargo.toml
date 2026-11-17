@@ -20,7 +20,6 @@ flecs-snapshot = { git = "https://github.com/indexable-inc/flecs-opinionated", r
 ipld-core = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_ipld_dagcbor = "0.7"
-ciborium = "0.2"
 serde_json = { version = "1", features = ["preserve_order"] }
 regex-lite = "0.1"
 

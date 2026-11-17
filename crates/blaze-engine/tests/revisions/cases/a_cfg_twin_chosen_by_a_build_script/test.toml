@@ -1,0 +1,16 @@
+about = "Two functions of one name under two cfgs, the cfg set by the build script from a file (the form of rustc tests/incremental: one source, a `--cfg` a revision): the file changed, the other twin is built and the program prints its value, as a clean build does."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "1 5\n"
+
+[[revision]]
+action = "run"
+prints = "2 5\n"
+reused = ["app::g"]
+known = { outcome = "the splice refuses: `linking: the function app::main is removed with nothing put in its slot, and the GOT cell of the function app::main in the image app still calls it`; a clean build of the second cfg links" }
+
+[[revision]]
+action = "run"
+prints = "1 5\n"

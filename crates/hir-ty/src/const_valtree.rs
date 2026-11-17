@@ -13,6 +13,25 @@ use crate::{
     next_solver::{Const, ConstExt as _, DbInterner, GenericArgs, StoredTy, ValTreeCreationError},
 };
 
+/// How many bytes of a string constant (a `&'static str` const argument) a diagnostic or a
+/// debug name shows; past it, the rest is cut and its length said. `type_name`, which a
+/// program can read, and source code always show all of it.
+pub const STR_SHOWN: usize = 64;
+
+/// What a diagnostic shows of the string constant `s`: all of it when it is at most
+/// [`STR_SHOWN`] bytes, else its longest prefix of at most that many bytes that ends on a
+/// `char` boundary, and `true` for cut.
+pub fn shown_str(s: &str) -> (&str, bool) {
+    if s.len() <= STR_SHOWN {
+        return (s, false);
+    }
+    let mut end = STR_SHOWN;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
 /// [`ValTreeCreationError`] with its types stored, but for the error already reported.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValTreeError {
@@ -28,20 +47,23 @@ pub enum ValTreeError {
 /// The value-tree error of `def`'s value, `None` when it has a value tree, when its
 /// evaluation fails (an error of its own), and when it depends on its owner's generic
 /// parameters, as the solver only evaluates such a constant at a use with concrete arguments.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
 pub fn anon_const_valtree_error<'db>(db: &'db Db, def: AnonConstId<'db>) -> Option<ValTreeError> {
     let loc = def.loc(db);
     let owner = loc.owner.generic_def(db);
     let krate = def.module(db).krate(db);
     let interner = DbInterner::new_with(db, krate);
     let args = GenericArgs::identity_for_item(interner, owner.into());
-    if !loc.allow_using_generic_params
+    // A constant that depends on its owner's parameters has a value only at a use with
+    // concrete arguments, as one that may not name them at all.
+    if (!loc.allow_using_generic_params || crate::consteval::anon_const_is_dependent(db, def))
         && (args.has_non_region_param() || args.has_non_region_placeholders())
     {
         return None;
     }
     let allocation = db.anon_const_eval(def, args, None).ok()?;
-    let env = ParamEnvAndCrate { param_env: db.trait_environment(owner), krate };
+    // The constant's own environment, as it was evaluated in (`InferBodyId::param_env`).
+    let env = ParamEnvAndCrate { param_env: crate::InferBodyId::AnonConstId(def).param_env(db), krate };
     match Const::new_from_allocation(interner, &allocation, env) {
         Ok(_) | Err(ValTreeCreationError::ErrorGuaranteed(_)) => None,
         Err(ValTreeCreationError::NodesOverflow) => Some(ValTreeError::NodesOverflow),

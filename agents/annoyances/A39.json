@@ -1,0 +1,21 @@
+{
+ "id": "A39",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "my own test reruns (cargo test with a name filter); harness/v2/integrate.py's terminal-width check",
+ "what": "I reported an intermittent revision test as `main: pass 6 fail 0` and `main+edit3: pass 12 fail 0`: the test did not exist on those trees, the filter matched nothing, and `test result: ok. 0 passed` was counted as a pass. The same night the combined run's terminal-width row used `script` to make a terminal, which fails when stdin is a socket, so blaze never ran and the row said `recomputed-note=False`.",
+ "cost": "two false statements to the owner, both retracted; a wrong suspect (the handshake lane) held for an hour",
+ "cause": "my scripts grepped for a success phrase instead of checking that the named check ran",
+ "whys": [
+  "why wrong: zero tests ran and the run said ok",
+  "why possible: a filter that matches nothing is success for libtest, and my loop looked only for `test result: ok`",
+  "why not caught: nothing compares the tests run with the tests asked for",
+  "why easy: every tool here reports absence of failure, not presence of the check",
+  "property: a check that executes nothing reports success"
+ ],
+ "class": "vacuous success: any check, test run, measurement row or gate step that passes when it ran nothing (a filter matching no test, a skipped step, a command that failed before the thing measured, an empty input set)",
+ "prevention": "Built on vacuous-1112, strongest first. (1) Unrepresentable in blaze: `blaze test`/`bench` count every run into one record (blaze_screen::Tally) and one rule (cli::test::refusal) refuses a run that ran no test with exit 4 (NO_TESTS), naming the selection and the nearest tests that exist; `--no-tests pass` is cargo's behaviour; every run's end says selected/ran/passed/failed/ignored/filtered out on the terminal, in a `blaze: tests` line and as JSON (544345eec3). (2) Impossible to miss in the harness: harness/v2/ran.py is the one helper a timing row or a test run goes through (fixed environment, exit status, the caller's proof that the thing ran; a row without all three is `INVALID: why`, never a number; a test run is held to `at least N`, named tests, or an exact count); integrate.py is ported to it and exits 1 on a row that is no result; unittests.py has `at_least`; report.py refuses a script with no outcome; failures.py refuses logs with no test (f714b267c5, 83f6882263). (3) Mechanically caught in the gate: blaze.yaml's ci job holds each job its tier runs to `success` (a skip is no pass), runs ran.py's selftest (29 checks, each beside its planted bug) and library.py check (83f6882263). The rule: claims-from-evidence now says a pass counts only with proof the check ran. Not compiled and not run by the lane (write-only): the main agent's combined build and tests are the proof.",
+ "workaround": "count `1 passed`, not `ok`",
+ "fix": "see prevention",
+ "state": "prevention written on vacuous-1112 (544345eec3, f714b267c5, 83f6882263), not yet compiled or run; open until the combined tree's tests pass. Still open in this class, found by a sweep and not fixed: see vac-2"
+}

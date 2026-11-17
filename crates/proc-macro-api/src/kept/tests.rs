@@ -319,6 +319,8 @@ fn daemon(
         dir: blaze_core::FileName::new(dir).unwrap(),
         layers: Vec::new(),
         tags: 1 << 48,
+        load_tags: (1 << 48) + (1 << 32),
+        loader: blaze_cas::Loader::Pumped,
     };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {

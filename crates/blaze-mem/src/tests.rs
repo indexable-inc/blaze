@@ -427,8 +427,8 @@ fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
     assert_eq!(region.committed(), 2 * HUGE_PAGE);
     region.ensure(3 * HUGE_PAGE).expect("take it again");
     assert!(filled(&region, 0, 2 * HUGE_PAGE), "the kept pages kept their bytes");
-    // SAFETY: committed again just now.
     assert_eq!(
+        // SAFETY: committed again just now.
         unsafe { region.at(2 * HUGE_PAGE + 5).as_ptr().read() },
         0,
         "a page made again is zeroed"
@@ -456,8 +456,8 @@ fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
     for thread in threads {
         thread.join().expect("grower");
     }
-    // SAFETY: committed by the growers, who wrote it.
     assert_eq!(
+        // SAFETY: committed by the growers, who wrote it.
         unsafe { region.at(3 * HUGE_PAGE - 1).as_ptr().read() },
         1,
         "no grower mapped over another's"
@@ -1285,6 +1285,189 @@ fn frame_span_grows_in_place_and_comes_back_warm() {
     assert_eq!(frame::spare_frames(), 0, "trimming to nothing gives every warm block back");
 }
 
+/// A task's frame holds no memory once the task ends, past what its thread keeps warm
+/// ([`frame::WARM`]), however much the task held: its span's pages go back to the kernel as it
+/// ends. On a thread of its own, whose shelf starts empty. The cause, tested by removing it:
+/// without the decommit in `Shelf::give_span` the shelf keeps the span's 64 MiB and the first
+/// bound fails.
+#[test]
+fn frame_task_leaves_at_most_the_warm_shelf_however_much_it_held() {
+    const HELD: usize = 64 << 20;
+    const { assert!(HELD > frame::WARM) };
+    thread::spawn(|| {
+        assert_eq!(frame::spare_bytes(), 0, "a new thread keeps nothing warm");
+        for round in 0..3 {
+            frame::task(Tag::Codegen, |frame| {
+                // Small allocations first, in chunks, as a task's other scratch is; then one
+                // past a chunk, in a span.
+                for _ in 0..64 {
+                    frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
+                }
+                let big = frame.alloc_slice_fill_with(HELD, |i| i as u8);
+                assert!(frame.committed() >= HELD);
+                assert_eq!(big[HELD - 1], (HELD - 1) as u8);
+            });
+            let spare = frame::spare_bytes();
+            assert!(
+                spare <= frame::WARM,
+                "round {round}: the thread keeps {spare} bytes warm after a task of {HELD}, past {}",
+                frame::WARM
+            );
+            assert!(spare > 0, "round {round}: the next task starts warm");
+        }
+        frame::trim_spare(0);
+        assert_eq!(frame::spare_bytes(), 0, "trimming to nothing gives every warm page back");
+    })
+    .join()
+    .expect("the task's thread");
+}
+
+/// An idle daemon's ask reaches each thread once: a thread that kept frames warm gives them
+/// back as it next settles ([`frame::settle_spare`], what a pool worker does as it parks) and
+/// not again until asked again, and what it warms after is kept until the next ask. On threads
+/// of their own; the ask is the process's, so each thread is held only to what it does after an
+/// ask it saw. The cause, tested by removing it: without the ask, `settle_spare` trims nothing
+/// and the shelf stays warm (the first assertion after `warm`).
+#[test]
+fn a_thread_gives_its_warm_frames_back_once_an_idle_daemon_asked() {
+    fn warm() -> usize {
+        frame::task(Tag::Codegen, |frame| {
+            for _ in 0..64 {
+                frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
+            }
+        });
+        frame::spare_bytes()
+    }
+    thread::spawn(|| {
+        // Whatever was asked before this thread began is answered with nothing warm.
+        frame::settle_spare();
+        assert!(warm() > 0, "a task leaves its thread's shelf warm");
+        // Another test's ask may land between any two lines here: settle until this thread
+        // has answered every ask so far, then warm again and see no trim without an ask.
+        while frame::settle_spare() {}
+        let kept = warm();
+        assert!(kept > 0);
+        if !frame::settle_spare() {
+            assert_eq!(frame::spare_bytes(), kept, "nobody asked: the shelf stays warm");
+        }
+        frame::ask_spare_trim();
+        assert!(frame::settle_spare(), "an ask this thread has not answered");
+        assert_eq!(frame::spare_bytes(), 0, "the asked thread keeps nothing warm");
+    })
+    .join()
+    .expect("the thread");
+}
+
+/// A task of a build-shaped run: scratch of a drawn size (a few KB, a few MB or tens of MB),
+/// read back, with up to `depth` tasks inside it that run while it still holds its own.
+/// Returns the most one task of it asked for.
+fn build_task(rng: &mut SplitMix64, depth: u32) -> usize {
+    let bytes = match rng.below(8) {
+        0 => (16 << 20) + rng.below(16 << 20) as usize,
+        1..=3 => (1 << 20) + rng.below(6 << 20) as usize,
+        _ => 1 + rng.below(64 << 10) as usize,
+    };
+    let tag = if rng.below(2) == 0 { Tag::Mir } else { Tag::Codegen };
+    frame::task(tag, |frame| {
+        let scratch = frame.alloc_slice_fill_with(bytes, |i| i as u8);
+        let mut most = bytes;
+        for _ in 0..(if depth == 0 { 0 } else { rng.below(3) }) {
+            most = most.max(build_task(rng, depth - 1));
+        }
+        assert_eq!(scratch[bytes - 1], (bytes - 1) as u8, "kept past the tasks inside it");
+        most
+    })
+}
+
+/// The invariant: once a build's tasks have all ended, the frame memory each of its worker
+/// threads still holds is at most [`frame::WARM`], whatever the tasks held, however they
+/// nested and in whatever order they ran; nothing else of the frames outlives them. What does
+/// outlive a build is a named owner's (here a [`Frame`] of the test's, standing for a cache),
+/// and its bytes are its own count, unchanged by the tasks.
+///
+/// A build-shaped run: four workers, each a seeded sequence of tasks of the sizes a build's
+/// are, nested up to three deep, then one of twice the bound. The control: the same reading sees the memory while it is
+/// held (each worker's measured peak is at least its largest task's scratch, far past the
+/// bound), so a bound that holds after is not a reading that sees nothing. The directed case:
+/// twelve tasks nested, each holding a span of 8 MiB at once, more spans than a shelf keeps
+/// and 96 MiB together; the thread still ends within the bound.
+#[test]
+fn frames_after_a_build_hold_at_most_the_warm_shelf_a_worker() {
+    const WORKERS: u64 = 4;
+    const TASKS: usize = 24;
+    let mut cache = Frame::new(Tag::Query).expect("the cache's frame");
+    cache.alloc_slice_fill_with(3 << 20, |i| i as u8);
+    let cached = cache.committed();
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|worker| {
+            thread::spawn(move || {
+                let mut rng = SplitMix64::new(0x6a09_e667_f3bc_c908 ^ worker);
+                let (most, peak) = frame::measure(|| {
+                    let drawn =
+                        (0..TASKS).map(|_| build_task(&mut rng, 2)).max().expect("some tasks");
+                    // One task past the bound whatever was drawn, so the control is of it.
+                    frame::task(Tag::Mir, |frame| {
+                        frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8);
+                    });
+                    drawn.max(2 * frame::WARM)
+                });
+                // The directed case.
+                fn nested(depth: usize) {
+                    frame::task(Tag::Codegen, |frame| {
+                        let span = frame.alloc_slice_fill_with(8 << 20, |i| i as u8);
+                        if depth > 1 {
+                            nested(depth - 1);
+                        }
+                        assert_eq!(span[4096], 4096usize as u8);
+                    });
+                }
+                let ((), nested_peak) = frame::measure(|| nested(12));
+                (most, peak, nested_peak, frame::spare_bytes())
+            })
+        })
+        .collect();
+    for (worker, done) in workers.into_iter().enumerate() {
+        let (most, peak, nested_peak, spare) = done.join().expect("a worker");
+        assert!(
+            peak >= most && most > frame::WARM,
+            "worker {worker}: the control: its frames held {peak} at once, its largest task {most}"
+        );
+        assert!(
+            nested_peak >= 12 * (8 << 20),
+            "worker {worker}: the control: twelve spans held at once, {nested_peak}"
+        );
+        assert!(
+            spare <= frame::WARM,
+            "worker {worker} keeps {spare} bytes of frames after its tasks, past {}",
+            frame::WARM
+        );
+    }
+    assert_eq!(cache.committed(), cached, "the named owner's bytes are its own, as it left them");
+    cache.reset();
+}
+
+/// The control: the bound's reading is not blind. A shelf that kept everything its tasks
+/// held is past [`frame::WARM`] by the same reading: the task's frame, read while it holds
+/// twice the bound, says so; and the shelf it leaves is seen (not zero) until it is trimmed.
+#[test]
+fn the_oracle_catches_a_shelf_that_keeps_what_its_task_held() {
+    thread::spawn(|| {
+        let ((), peak) = frame::measure(|| {
+            frame::task(Tag::Mir, |frame| {
+                frame.alloc_slice_fill_with(1024, |i| i as u8);
+                frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8);
+            });
+        });
+        assert!(peak > frame::WARM, "kept whole, the task's {peak} bytes are past the bound");
+        let spare = frame::spare_bytes();
+        assert!(spare > 0 && spare <= frame::WARM, "the shelf is seen and bounded: {spare}");
+        frame::trim_spare(0);
+        assert_eq!(frame::spare_bytes(), 0, "and seen to go");
+    })
+    .join()
+    .expect("the control's thread");
+}
+
 #[test]
 fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
     use std::{alloc::Allocator, ptr::NonNull, slice};
@@ -1501,103 +1684,6 @@ fn frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing() {
     );
     let ((), none) = frame::measure(|| ());
     assert_eq!(none, 0);
-}
-
-#[test]
-fn frame_cap_waits_past_its_limit_until_bytes_come_back() {
-    let (cap, _spills) = frame::Cap::new(100, 100);
-    let held = cap.reserve(80).expect("fits");
-    let waiter = thread::spawn(move || cap.reserve(40).map(|grant| grant.bytes()));
-    while cap.waiting() == 0 {
-        thread::yield_now();
-    }
-    assert_eq!(cap.held(), 80);
-    drop(held);
-    assert_eq!(waiter.join().expect("the waiter"), Ok(40));
-    assert_eq!(cap.held(), 0, "a grant gives its bytes back when it drops");
-}
-
-#[test]
-fn frame_cap_cancels_the_newest_wait_when_every_holder_waits() {
-    let (cap, _spills) = frame::Cap::new(100, 100);
-    let mine = cap.reserve(60).expect("fits");
-    let (go, ready) = crossbeam_channel::unbounded();
-    let older = thread::spawn(move || {
-        let first = cap.reserve(30).expect("fits");
-        go.send(()).expect("the test waits for it");
-        let more = cap.reserve(30).map(|grant| grant.bytes());
-        (first.bytes(), more)
-    });
-    ready.recv().expect("the older thread holds its bytes");
-    while cap.waiting() == 0 {
-        thread::yield_now();
-    }
-    assert_eq!(
-        cap.reserve(50).map(|grant| grant.bytes()),
-        Err(frame::Cancelled),
-        "with every holder waiting, the newest wait is cancelled"
-    );
-    drop(mine);
-    assert_eq!(older.join().expect("the older waiter"), (30, Ok(30)), "the older wait goes on");
-}
-
-#[test]
-fn frame_cancel_unwinds_its_task_and_says_so_until_the_outermost_task_ends() {
-    frame::task(Tag::Infer, |_| {
-        let unwound = std::panic::catch_unwind(|| frame::task(Tag::Mir, |_| frame::cancel()));
-        let payload = unwound.expect_err("a cancel unwinds");
-        assert!(payload.is::<frame::Cancelled>(), "its payload is `Cancelled`");
-        assert!(frame::cancelling(), "still inside the outer task");
-    });
-    assert!(!frame::cancelling(), "the outermost task has ended");
-}
-
-#[test]
-#[should_panic(expected = "frame::cancel outside any frame::task")]
-fn frame_cancel_outside_any_task_stops() {
-    frame::cancel();
-}
-
-#[test]
-fn frame_cap_says_each_pass_of_spill_at() {
-    let (cap, spills) = frame::Cap::new(1000, 500);
-    let a = cap.reserve(600).expect("fits");
-    let b = cap.reserve(100).expect("fits");
-    assert_eq!(spills.ready().collect::<Vec<_>>(), [100], "one pass, with the bytes over it");
-    drop((a, b));
-    let c = cap.reserve(700).expect("fits");
-    assert_eq!(spills.ready().collect::<Vec<_>>(), [200], "passed again after falling under it");
-    drop(c);
-}
-
-#[test]
-#[should_panic(expected = "a reserve of 200 bytes, more than the cap of 100")]
-fn frame_cap_stops_on_a_reserve_past_its_whole_limit() {
-    let (cap, _spills) = frame::Cap::new(100, 100);
-    _ = cap.reserve(200);
-}
-
-#[test]
-fn frame_task_past_the_thread_shelf_reserves_from_the_cap() {
-    // Every test's task frames reserve from it while it is set, so it never makes one wait.
-    let (cap, _spills) = frame::Cap::new(1 << 50, 1 << 50);
-    let capped = thread::spawn(move || {
-        frame::set_cap(Some(cap));
-        frame::task(Tag::Codegen, |frame| {
-            let big = frame.alloc_slice_fill_with(8 << 20, |i| i as u8);
-            assert!(frame::capped() >= 8 << 20, "a span's pages are reserved from the cap");
-            assert!(cap.held() >= 8 << 20);
-            assert_eq!(big[12_345], 12_345usize as u8);
-        });
-        let left = frame::capped();
-        frame::set_cap(None);
-        left
-    });
-    assert_eq!(
-        capped.join().expect("the capped task"),
-        0,
-        "a span on the shelf holds none of the cap"
-    );
 }
 
 #[test]
@@ -2621,14 +2707,14 @@ fn scratch_lent_buffers_return_to_the_shelf_of_the_thread_that_drops_them() {
 #[test]
 fn scratch_paths_are_lent_empty_and_kept_warm() {
     scratch::with_path(|path| {
-        path.push("/tmp");
+        path.push("/scratch");
         path.push("blaze");
         assert!(path.ends_with("blaze"));
     });
     let (_, used) = measure(|| {
         scratch::with_path(|path| {
             assert!(path.as_os_str().is_empty());
-            path.push("/tmp");
+            path.push("/scratch");
             path.push("blaze");
         })
     });
@@ -2751,16 +2837,16 @@ fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_
     let work = || {
         frame::task(Tag::Other, |frame| {
             let before = frame.used();
-            let unit = crate::format_in!(frame, "{}-{:03}", "unit", 7);
+            let unit = format_in!(frame, "{}-{:03}", "unit", 7);
             assert_eq!(unit, "unit-007");
             assert!(
                 frame.contains(unit.as_ptr()) && frame.used() > before,
                 "the text is the frame's"
             );
-            let plain = crate::format_in!(frame, "no arguments");
+            let plain = format_in!(frame, "no arguments");
             assert_eq!(plain, "no arguments");
             let name = "syn";
-            assert_eq!(crate::format_in!(frame, "{name}@{}", 2), "syn@2");
+            assert_eq!(format_in!(frame, "{name}@{}", 2), "syn@2");
             unit.len()
         })
     };

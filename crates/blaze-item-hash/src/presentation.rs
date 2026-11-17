@@ -30,7 +30,8 @@ pub const PRESENTATION_DOMAIN: &str = "blaze v2 item presentation 1";
 const END: u8 = 2;
 
 /// The presentation hash of `def`'s body.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
+#[blaze::renders_positions]
 pub fn presentation(db: &Db, def: DefWithBodyId) -> ContentId {
     let mut h = Hasher::new(PRESENTATION_DOMAIN);
     // alloc: the item's path, once per body.

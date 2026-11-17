@@ -3,7 +3,7 @@ mod atom;
 use super::*;
 
 pub(super) use atom::{EXPR_RECOVERY_SET, LITERAL_FIRST, literal, parse_asm_expr};
-pub(crate) use atom::{block_expr, match_arm_list};
+pub(crate) use atom::{block_expr, const_block, match_arm_list};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Semicolon {
@@ -12,7 +12,7 @@ pub(super) enum Semicolon {
     Forbidden,
 }
 
-const EXPR_FIRST: TokenSet = LHS_FIRST;
+pub(super) const EXPR_FIRST: TokenSet = LHS_FIRST;
 
 pub(super) fn expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     let r = Restrictions { forbid_structs: false, prefer_stmt: false, macro_ends_stmt: true };
@@ -404,8 +404,9 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
                     // &raw foo;
                     p.bump_remap(T![raw]);
                 }
-            } else {
-                p.eat(T![mut]);
+            } else if !p.eat(T![mut]) && uniq::at_expr(p) {
+                // `&uniq expr` (`#![blaze::uniq]`): the `mut` of `&mut expr`, spelled `uniq`.
+                p.bump_remap(T![mut]);
             }
             REF_EXPR
         }
@@ -705,8 +706,8 @@ fn cast_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
     let m = lhs.precede(p);
     p.bump(T![as]);
     // Use type_no_bounds(), because cast expressions are not
-    // allowed to have bounds.
-    types::type_no_bounds(p);
+    // allowed to have bounds. blaze: nor an error union, as `x as u8 | y` is an or.
+    p.with_unions(false, types::type_no_bounds);
     m.complete(p, CAST_EXPR)
 }
 
@@ -758,6 +759,31 @@ fn path_expr(p: &mut Parser<'_>, r: Restrictions) -> (CompletedMarker, BlockLike
         }
         _ => (m.complete(p, PATH_EXPR), BlockLike::NotBlock),
     }
+}
+
+/// Whether the `{` the parser is at, where an expression starts, opens a record value
+/// (`#![blaze::records]`, docs/v2/plan/design/records.md) and not a block. It does exactly when
+/// the three tokens after it are
+///
+/// - an identifier, a `:` and a token that is not a second `:` (`{ a: 1 }`), or
+/// - an identifier and a `,` (`{ a, b }`, `{ a, }`, `{ a, ..base }`).
+///
+/// No block of Rust's starts so: it has no type ascription, a label is a lifetime (`'a: {`),
+/// and a statement or tail is not followed by a comma. Every other `{` is the block it is
+/// today: `{ a }` (a one-field shorthand record is `{ a, }` or `{ a: a }`), `{}` (the unit
+/// block; the empty record has no literal), `{ ..base }` and `{ .. }` (ranges), `{ a::b }` (a
+/// path). A field whose value starts with `::` is written `{ a: (::b) }`, so that the rule
+/// reads kinds alone, never whether two colons touch. The bound is four tokens, the `{`
+/// included: what an incremental reparse checks is unchanged before it parses a block or a
+/// field list alone (`syntax`'s `LOOKAHEAD`).
+///
+/// Where the grammar requires a block (a `fn`, `if`, `while`, `loop`, `unsafe` or `const`
+/// body) it never asks, so those stay blocks under the extension too.
+pub(super) fn at_record_value(p: &Parser<'_>) -> bool {
+    p.at(T!['{'])
+        && p.records_gate()
+        && p.nth(1) == IDENT
+        && (p.nth(2) == T![,] || p.nth(2) == T![:] && p.nth(3) != T![:])
 }
 
 // test record_lit

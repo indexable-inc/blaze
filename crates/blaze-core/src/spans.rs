@@ -8,9 +8,13 @@
 //! its region is registered (a stale one, unregistered since, is refused by its generation) and
 //! that the span lies inside it.
 //!
-//! The registry is the process's: a fixed table of [`REGIONS`] slots, each a state word (its
-//! generation, and whether it is free, being filled or live) beside the region's base and length,
-//! so a lookup is two atomic loads and a compare, and no lock is taken on the IO path.
+//! The registry is the process's: a table of slots, each a state word (its generation, and
+//! whether it is free, being filled or live) beside the region's base and length, so a lookup
+//! is a few atomic loads and a compare, and no lock is taken on the IO path. The table grows:
+//! it is chunks of [`CHUNK`] slots, the first static and each later one made the first time a
+//! registration finds every slot before it taken, published with one compare-and-swap and never
+//! freed or moved, so a slot's address is good for the process's life. It holds up to
+//! [`REGIONS`] regions at once (a test binary holds a pool a store, hundreds at a time).
 //!
 //! The asker's contract, turned around from [`crate::Effect::Map`]'s: while a read into a span is
 //! in flight, nothing reads, writes or gives back the span's bytes (they are the kernel's; after it
@@ -29,13 +33,20 @@ use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     fmt,
     ptr::NonNull,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
 };
 
 use crate::{Cache, FileName, IoError};
 
-/// The most regions registered at once: the store's pool registers one, a test a few.
-pub const REGIONS: usize = 64;
+/// Slots of one chunk of the registry's table.
+const CHUNK: usize = 64;
+
+/// Chunks the table grows to.
+const CHUNKS: usize = 1024;
+
+/// The most regions registered at once: a store's pool registers one, and a test binary holds
+/// hundreds of stores. The table grows to this a chunk at a time.
+pub const REGIONS: usize = CHUNK * CHUNKS;
 
 /// What a read or write that bypasses the page cache ([`Cache::Bypassed`]) must be a whole
 /// number of: its file offset, its span's address and its span's length. 4 KiB: every NVMe
@@ -104,7 +115,51 @@ impl Slot {
     };
 }
 
-static SLOTS: [Slot; REGIONS] = [const { Slot::EMPTY }; REGIONS];
+/// The table's first chunk: enough for a daemon, with nothing allocated.
+static FIRST: [Slot; CHUNK] = [const { Slot::EMPTY }; CHUNK];
+
+/// The table's later chunks, by number (the first's place is unused): null until made.
+static LATER: [AtomicPtr<[Slot; CHUNK]>; CHUNKS] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+
+/// Chunk `n` of the table, if it is made.
+fn chunk(n: usize) -> Option<&'static [Slot; CHUNK]> {
+    if n == 0 {
+        return Some(&FIRST);
+    }
+    let made = LATER.get(n)?.load(Ordering::Acquire);
+    // SAFETY: a pointer that is not null was published by `grow` with a release
+    // compare-and-swap, of a chunk it leaked whole and that nothing frees or moves.
+    (!made.is_null()).then(|| unsafe { &*made })
+}
+
+/// Chunk `n` (not the first, and inside the table) made, or the one another thread made first.
+/// The slow path of a registration, once a chunk: one allocation, published by one
+/// compare-and-swap, so no lock is taken and a lookup never waits.
+fn grow(n: usize) -> &'static [Slot; CHUNK] {
+    // alloc: a chunk of the registry, once per `CHUNK` regions held at once, kept for the process's life
+    let fresh = Box::into_raw(Box::new([const { Slot::EMPTY }; CHUNK]));
+    let made = match LATER[n].compare_exchange(
+        std::ptr::null_mut(),
+        fresh,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => fresh,
+        Err(theirs) => {
+            // SAFETY: `fresh` is this call's own box, which no one else was given.
+            drop(unsafe { Box::from_raw(fresh) });
+            theirs
+        }
+    };
+    // SAFETY: published (by this call or another's) and never freed or moved.
+    unsafe { &*made }
+}
+
+/// The slot numbered `at`, if its chunk is made.
+fn slot_at(at: u32) -> Option<&'static Slot> {
+    chunk(at as usize / CHUNK)?.get(at as usize % CHUNK)
+}
 
 fn live(generation: u32) -> u64 {
     u64::from(generation) << 2 | LIVE
@@ -123,8 +178,8 @@ impl fmt::Display for SpansFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "registering {} for reads into and writes from it: all {REGIONS} regions of the \
-             registry are taken (blaze_core::spans::REGIONS)",
+            "registering {} for reads into and writes from it: all {REGIONS} regions the \
+             registry grows to are taken (blaze_core::spans::REGIONS)",
             self.name
         )
     }
@@ -149,34 +204,46 @@ impl Spans {
         base: NonNull<u8>,
         len: usize,
     ) -> Result<Registered, SpansFull> {
-        for (at, slot) in SLOTS.iter().enumerate() {
-            let state = slot.state.load(Ordering::Relaxed);
-            if state & PHASE != FREE {
-                continue;
+        // Bounded: each chunk of the table once, the first free slot taken; a chunk not yet
+        // made is made, so only a table grown to its last chunk with every slot taken refuses.
+        for n in 0..CHUNKS {
+            let slots = match chunk(n) {
+                Some(slots) => slots,
+                None => grow(n),
+            };
+            for (at, slot) in slots.iter().enumerate() {
+                let state = slot.state.load(Ordering::Relaxed);
+                if state & PHASE != FREE {
+                    continue;
+                }
+                let generation = (state >> 2) as u32;
+                let filling = u64::from(generation) << 2 | FILLING;
+                if slot
+                    .state
+                    .compare_exchange(state, filling, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    continue;
+                }
+                slot.base.store(base.as_ptr() as usize, Ordering::Relaxed);
+                slot.len.store(len, Ordering::Relaxed);
+                slot.name.store(name.as_ptr() as usize, Ordering::Relaxed);
+                slot.name_len.store(name.len(), Ordering::Relaxed);
+                slot.state.store(live(generation), Ordering::Release);
+                let region = SpanRegion { slot: (n * CHUNK + at) as u32, generation };
+                return Ok(Registered { region, len, name });
             }
-            let generation = (state >> 2) as u32;
-            let filling = u64::from(generation) << 2 | FILLING;
-            if slot
-                .state
-                .compare_exchange(state, filling, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                continue;
-            }
-            slot.base.store(base.as_ptr() as usize, Ordering::Relaxed);
-            slot.len.store(len, Ordering::Relaxed);
-            slot.name.store(name.as_ptr() as usize, Ordering::Relaxed);
-            slot.name_len.store(name.len(), Ordering::Relaxed);
-            slot.state.store(live(generation), Ordering::Release);
-            let region = SpanRegion { slot: at as u32, generation };
-            return Ok(Registered { region, len, name });
         }
         Err(SpansFull { name })
     }
 
     /// How many regions are registered now.
     pub fn registered() -> usize {
-        SLOTS.iter().filter(|it| it.state.load(Ordering::Relaxed) & PHASE == LIVE).count()
+        (0..CHUNKS)
+            .map_while(chunk)
+            .flatten()
+            .filter(|it| it.state.load(Ordering::Relaxed) & PHASE == LIVE)
+            .count()
     }
 }
 
@@ -215,7 +282,7 @@ impl Registered {
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        let slot = &SLOTS[self.region.slot as usize];
+        let slot = slot_at(self.region.slot).expect("a registered region's slot is in the table");
         // The next generation, free: a span of this one names nothing from now on.
         let next = u64::from(self.region.generation.wrapping_add(1)) << 2 | FREE;
         slot.state.store(next, Ordering::Release);
@@ -225,7 +292,7 @@ impl Drop for Registered {
 /// The name a region was registered under, or what it is when it is not registered now: for an
 /// error.
 fn name_of(region: SpanRegion) -> String {
-    let Some(slot) = SLOTS.get(region.slot as usize) else {
+    let Some(slot) = slot_at(region.slot) else {
         // alloc: an error path.
         return format!("region {} (no slot of the registry)", region.slot);
     };
@@ -288,6 +355,78 @@ impl Resolved {
     }
 }
 
+/// The spans of a run, at most [`crate::threads::RUN_MOST`], filled in order from `at` of
+/// `file` by one `preadv` (more only where the system cuts one short before the file's end, or
+/// `EINTR` interrupts it, at most [`crate::fs::INTERRUPTS`] times): how many bytes in all, fewer
+/// only at the file's end. Bypassing the cache, a read that ends off [`DIRECT_ALIGN`] is the
+/// file's end, as [`crate::fs::read_into`] takes it.
+#[cfg(unix)]
+pub(crate) fn read_run(
+    file: &std::fs::File,
+    at: u64,
+    spans: impl Iterator<Item = Resolved>,
+    cache: Cache,
+) -> std::io::Result<usize> {
+    use std::{io, os::fd::AsFd as _};
+    const MOST: usize = crate::threads::RUN_MOST;
+    let mut taken = [Resolved { at: NonNull::dangling(), len: 0 }; MOST];
+    let mut count = 0;
+    for span in spans {
+        assert!(count < MOST, "a run of at most {MOST} spans");
+        taken[count] = span;
+        count += 1;
+    }
+    // No two spans of the run overlap, or the slices below would alias: sorted by address, each
+    // ends at or before the next starts. 64 at most, so the sort is on the stack and short.
+    let mut sorted = taken;
+    let sorted = &mut sorted[..count];
+    sorted.sort_unstable_by_key(|span| span.addr());
+    if let Some(pair) = sorted.windows(2).find(|pair| pair[0].addr() + pair[0].len as u64 > pair[1].addr()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            // alloc: an error path.
+            format!(
+                "two spans of one batched read overlap ({} bytes at {:#x} and {:#x}): a batch's \
+                 parts read into distinct memory",
+                pair[0].len,
+                pair[0].addr(),
+                pair[1].addr()
+            ),
+        ));
+    }
+    let mut slices: [io::IoSliceMut<'_>; MOST] = std::array::from_fn(|_| io::IoSliceMut::new(&mut []));
+    let mut want = 0;
+    for (slice, span) in slices.iter_mut().zip(&taken[..count]) {
+        // SAFETY: as `Resolved::with_mut`: `Spans::register`'s contract makes the bytes the
+        // registrant's, alive while it is registered (checked as the span was resolved), and
+        // nothing else touches a read's span while it is in flight; no two spans of the run
+        // overlap (checked above), so no two slices alias. The slices live only for this call.
+        *slice = io::IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(span.at.as_ptr(), span.len) });
+        want += span.len;
+    }
+    let mut left: &mut [io::IoSliceMut<'_>] = &mut slices[..count];
+    let (mut read, mut interrupted) = (0, 0);
+    while read < want {
+        match crate::raw::preadv(file.as_fd(), left, at + read as u64) {
+            Ok(0) => break,
+            Ok(n) => {
+                read += n;
+                if cache == Cache::Bypassed && read as u64 % DIRECT_ALIGN != 0 {
+                    break;
+                }
+                io::IoSliceMut::advance_slices(&mut left, n);
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && interrupted < crate::fs::INTERRUPTS =>
+            {
+                interrupted += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(read)
+}
+
 /// `span` of the effect `what` of `file` at `at`, through `cache`, as a driver reaches it, or
 /// why it is refused: its region not registered now, the span past the region's end, or, to
 /// bypass the page cache, an offset, address or length that is not a whole number of
@@ -299,7 +438,7 @@ pub(crate) fn resolve(
     cache: Cache,
     what: &str,
 ) -> Result<Resolved, IoError> {
-    let Some(slot) = SLOTS.get(span.region.slot as usize) else {
+    let Some(slot) = slot_at(span.region.slot) else {
         return Err(refusal(span, file, at, what, format_args!("no such region")));
     };
     if slot.state.load(Ordering::Acquire) != live(span.region.generation) {
@@ -327,6 +466,39 @@ pub(crate) fn resolve(
         Some(at) => Ok(Resolved { at, len: span.len as usize }),
         None => Err(refusal(span, file, at, what, format_args!("a region at address 0"))),
     }
+}
+
+/// A read into `span` carried out by a driver outside this crate (a model's file system, which
+/// holds its files' bytes itself): `bytes`, what the file holds from `at` on, copied into the
+/// span's first bytes, as many as fit, and how many that was. The span's bytes past them are
+/// left as they were. Refused as every driver refuses a span ([`resolve`]).
+pub fn read_into(
+    span: &Span,
+    file: &FileName,
+    at: u64,
+    cache: Cache,
+    bytes: &[u8],
+) -> Result<u32, IoError> {
+    let resolved = resolve(span, file, at, cache, "reading")?;
+    Ok(resolved.with_mut(|into| {
+        let len = into.len().min(bytes.len());
+        into[..len].copy_from_slice(&bytes[..len]);
+        len as u32
+    }))
+}
+
+/// A write from `span` carried out by a driver outside this crate: the span's bytes as they
+/// are now, copied, for the driver to put at `at` of `file`. Refused as every driver refuses a
+/// span ([`resolve`]).
+pub fn written_from(
+    span: &Span,
+    file: &FileName,
+    at: u64,
+    cache: Cache,
+) -> Result<Vec<u8>, IoError> {
+    let resolved = resolve(span, file, at, cache, "writing")?;
+    // alloc: a model's driver keeps the bytes as its file's change; never a build's path.
+    Ok(resolved.with(<[u8]>::to_vec))
 }
 
 /// Why [`resolve`] refused `span` of the effect `what` of `file` at `at`.
@@ -481,10 +653,37 @@ mod tests {
     /// table has slots never fills it.
     #[test]
     fn regions_given_back_free_their_slots() {
-        for _ in 0..3 * REGIONS {
+        for _ in 0..3 * CHUNK {
             // SAFETY: no effect is asked on its spans.
             let memory = unsafe { Memory::new("churn", 16) }.unwrap();
             drop(memory);
         }
+    }
+
+    /// The table grows: 200 regions held at once (a test binary's stores, each with a pool)
+    /// all register, past the first chunk's slots, each resolves to its own memory, and one
+    /// given back is refused while the rest still resolve.
+    #[test]
+    fn two_hundred_regions_register_at_once() {
+        let file = name("pool/pack-1");
+        let block = DIRECT_ALIGN as usize;
+        // SAFETY: no effect is asked on their spans.
+        let held: Vec<Memory> =
+            (0..200).map(|_| unsafe { Memory::new("one of many", block) }.unwrap()).collect();
+        assert!(Spans::registered() >= 200);
+        assert!(held.iter().any(|it| it.region().slot as usize >= CHUNK), "none past a chunk");
+        let spans: Vec<Span> = held.iter().map(|it| it.span(0, block as u32)).collect();
+        let mut addrs: Vec<u64> = spans
+            .iter()
+            .map(|span| resolve(span, &file, 0, Cache::Kept, "read into").unwrap().addr())
+            .collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        assert_eq!(addrs.len(), 200, "each region resolves to memory of its own");
+        let mut held = held;
+        drop(held.pop());
+        let why = resolve(&spans[199], &file, 0, Cache::Kept, "read into").unwrap_err();
+        assert!(why.0.contains("not registered"), "{why}");
+        assert!(resolve(&spans[0], &file, 0, Cache::Kept, "read into").is_ok());
     }
 }

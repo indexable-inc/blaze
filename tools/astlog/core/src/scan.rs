@@ -13,10 +13,12 @@ use std::path::PathBuf;
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
+use astlog_engine::{InternalSnafu, Lint, LintNoNodeSnafu, Segment, Severity};
+
 use crate::corpus::{Corpus, Value};
-use crate::error::{Error, InternalSnafu, LintNoNodeSnafu};
-use crate::eval::{Database, Row};
-use crate::program::{Lint, Program, Segment, Severity};
+use crate::error::Error;
+use crate::program::Program;
+use crate::{Database, Row};
 
 /// One scan finding: a lint-declared relation row located at its first
 /// node-valued column.
@@ -143,7 +145,7 @@ fn for_each_candidate(
                 .iter()
                 .find_map(|value| match value {
                     Value::Node(node) => Some(*node),
-                    Value::Text(_) => None,
+                    Value::Text(_) | Value::Int(_) => None,
                 })
                 .ok_or_else(|| {
                     LintNoNodeSnafu { rule: lint.relation.clone(), line: lint.line }.build()
@@ -193,7 +195,7 @@ fn render_message(
                     }
                     .build()
                 })?;
-                message.push_str(&one_line(corpus.value_text(&row[index])));
+                message.push_str(&one_line(&corpus.value_text(&row[index])));
             }
         }
     }

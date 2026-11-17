@@ -42,7 +42,7 @@ The page reads only the first, and decodes its live stream wrongly after the fir
    the request (blaze's `sql` kills DuckDB on it). ix-prof implements `Source` over its
    `core::Recorder`; blaze-explore implements it for the daemon over blaze-profile's flight
    recorder, the plane and the history, and keeps only the `blaze` layer: the ops `builds`,
-   `sql`, `views`, `view`, `spans`, `tiles`, `world`.
+   `sql`, `views`, `view`, `spans`, `tiles`.
 4. **One log per source, a position per session.** `Recorder::take_live` drains, so two pages
    reading it each would steal each other's rows. Every source's ticks go into ix-prof's
    `live::Log` (retention budget, GAP when a position falls out of it); each session reads from

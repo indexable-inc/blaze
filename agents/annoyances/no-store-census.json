@@ -1,0 +1,14 @@
+{
+ "id": "no-store-census",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 7 task C, int-1112",
+ "where": "crates/blaze-cargo/src/serve/collect.rs Collects::report; crates/blaze-profile/src/history.rs cap_of",
+ "what": "A hello-world home held 760 MB against the competitor's 75 MB and nothing said which record kinds the store's bytes were: `blaze gc` printed one line a store. The profile alone held 37 to 92 MB of it under a fixed 256 MiB cap, whatever the home held.",
+ "cost": "every disk row of the plan was an estimate; deciding which kinds to compress or move out of a home had no measurement",
+ "cause": "the store counted bytes per pack, never per record kind, and the profile's cap was a constant with no relation to the work the home had done",
+ "class": "a size reported only in total, and a bound set as a constant where it should follow what it is a part of",
+ "prevention": "`blaze gc` prints the census from `Store::census` (kinds, whole files, dead, rest, layers) whose lines sum to the store line exactly (the_census_lines_sum_to_the_store_line); the profile's default cap is a quarter of the home's store, 8 to 256 MiB",
+ "workaround": "du of the home's directories",
+ "fix": "census_lines in serve/collect.rs, history::cap_for; controls the_oracle_catches_a_kind_left_out and the_oracle_catches_a_cap_without_its_bounds",
+ "state": "written, not yet built"
+}

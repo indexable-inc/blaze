@@ -6,6 +6,7 @@
 pub(crate) mod tests;
 
 use base_db::Db;
+use blaze_memo::Database as _;
 use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup as _};
 use std::alloc::Allocator;
 
@@ -50,11 +51,44 @@ pub(crate) type Components<'db> = SmallVec<[Component<'db>; 4]>;
 
 const _: () = assert!(size_of::<Component<'static>>() <= 16);
 
+/// The outlives components of `ty`.
+///
+/// A closure outlives a region when what it captures does, and a coroutine when its captures
+/// and its resume type do (rustc's `push_outlives_components`): the parameters of the function
+/// that writes it are arguments of its type and none of its components. `impl<F: 'static>
+/// Builder for Ext<F>` given a closure that captures nothing needs nothing of its function's
+/// type parameters (reth-node-ethereum's `launch_add_ons`: E0310 of `PVB`, `EB` and `EVB`, the
+/// parameters of the impl with no `'static` bound).
 pub(crate) fn components<'db>(ty: Ty<'db>) -> Components<'db> {
     struct Find<'db>(Components<'db>);
     impl<'db> TypeVisitor<DbInterner<'db>> for Find<'db> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
+            #[cfg(test)]
+            if CLOSURES_OUTLIVE_AS_THEIR_ARGUMENTS.get() {
+                return self.visit_structurally(ty);
+            }
+            match ty.kind() {
+                TyKind::Closure(_, args) => args.as_closure().tupled_upvars_ty().visit_with(self),
+                TyKind::CoroutineClosure(_, args) => {
+                    args.as_coroutine_closure().tupled_upvars_ty().visit_with(self)
+                }
+                TyKind::Coroutine(_, args) => {
+                    let args = args.as_coroutine();
+                    args.tupled_upvars_ty().visit_with(self);
+                    args.resume_ty().visit_with(self)
+                }
+                _ => self.visit_structurally(ty),
+            }
+        }
+        fn visit_region(&mut self, region: Region<'db>) {
+            if !matches!(region.kind(), RegionKind::ReBound(..)) {
+                self.0.push(Component::Region(region));
+            }
+        }
+    }
+    impl<'db> Find<'db> {
+        fn visit_structurally(&mut self, ty: Ty<'db>) {
             match ty.kind() {
                 TyKind::Param(_) => self.0.push(Component::Param(ty)),
                 TyKind::Alias(_, _) if !ty.has_escaping_bound_vars() => {
@@ -64,15 +98,17 @@ pub(crate) fn components<'db>(ty: Ty<'db>) -> Components<'db> {
                 _ => ty.super_visit_with(self),
             }
         }
-        fn visit_region(&mut self, region: Region<'db>) {
-            if !matches!(region.kind(), RegionKind::ReBound(..)) {
-                self.0.push(Component::Region(region));
-            }
-        }
     }
     let mut find = Find(SmallVec::new());
     ty.visit_with(&mut find);
     find.0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a closure's and a coroutine's components are those of every
+    /// argument of its type, its function's parameters among them.
+    pub(crate) static CLOSURES_OUTLIVE_AS_THEIR_ARGUMENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The `impl Trait`s in `ty`, outermost first.
@@ -752,7 +788,7 @@ pub(crate) fn prove_needs_reference<'db, A: Allocator>(
 
 /// rustc's `inferred_outlives_of` the ADTs a check comes across: what each one's fields need
 /// of its own parameters, `T: 'a` and `'b: 'a` with `'a` a lifetime parameter, never
-/// `'static`. Read in place from the query's memo: a lookup allocates nothing.
+/// `'static`. Read in place from the query's arena slice: a lookup allocates nothing.
 #[derive(Default)]
 pub struct Inferred<'db> {
     _db: std::marker::PhantomData<&'db ()>,
@@ -776,29 +812,30 @@ impl<'db> Inferred<'db> {
 
 /// One of an ADT's inferred outlives predicates as the query database keeps it: what outlives, a type or a
 /// region, and the region.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InferredArg {
     Type(StoredTy),
     Region(StoredRegion),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InferredPredicate {
     arg: InferredArg,
     region: StoredRegion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
-struct InferredOutlives(Vec<InferredPredicate>);
+/// The predicates, kept in the session memo's arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct InferredOutlives<'db>(&'db [InferredPredicate]);
 
 /// A query, so an edit checks again only the ADTs it changes. Worked out to a fixed point, as
 /// ADTs can contain each other.
-#[blaze_query::tracked(
-    returns(ref),
+#[blaze_memo::tracked(
+    returns(copy),
     cycle_fn = inferred_outlives_cycle_fn,
     cycle_initial = inferred_outlives_cycle_initial,
 )]
-fn inferred_outlives(db: &Db, adt: AdtId) -> InferredOutlives {
+fn inferred_outlives<'db>(db: &'db Db, adt: AdtId) -> InferredOutlives<'db> {
     blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
         let mut found = Vec::new_in(frame);
         let mut subtypes = Vec::new_in(frame);
@@ -825,25 +862,21 @@ fn inferred_outlives(db: &Db, adt: AdtId) -> InferredOutlives {
                 Some(InferredPredicate { arg, region: region.store() })
             }),
         );
-        InferredOutlives(mem::owned(kept.into_iter()))
+        InferredOutlives(blaze_memo::keep_slice(db.memo(), &kept))
     })
 }
 
-fn inferred_outlives_cycle_initial(
-    _db: &Db,
-    _: blaze_query::db::Id,
-    _adt: AdtId,
-) -> InferredOutlives {
+fn inferred_outlives_cycle_initial<'db>(_db: &'db Db, _adt: AdtId) -> InferredOutlives<'db> {
     InferredOutlives::default()
 }
 
-fn inferred_outlives_cycle_fn(
-    _db: &Db,
-    _: &blaze_query::db::Cycle<'_>,
-    _last_provisional_value: &InferredOutlives,
-    value: InferredOutlives,
+fn inferred_outlives_cycle_fn<'db>(
+    _db: &'db Db,
+    _: &blaze_memo::Cycle<'_>,
+    _last_provisional_value: &InferredOutlives<'db>,
+    value: InferredOutlives<'db>,
     _adt: AdtId,
-) -> InferredOutlives {
+) -> InferredOutlives<'db> {
     value
 }
 

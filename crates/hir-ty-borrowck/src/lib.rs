@@ -27,7 +27,7 @@ mod decode;
 pub mod drop_early;
 mod dropck;
 mod flow;
-mod gate;
+pub mod gate;
 mod inference;
 mod intervals;
 mod liveness;
@@ -43,21 +43,36 @@ mod relation;
 mod rows;
 mod scan;
 pub mod timings;
+pub mod views;
 
 #[cfg(test)]
 mod budget;
+#[cfg(test)]
+mod contracts_tests;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]
 mod dropck_tests;
 #[cfg(test)]
+mod early_drop_tests;
+#[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+mod handles_tests;
 #[cfg(test)]
 mod missing_body_tests;
 #[cfg(test)]
 mod rpitit_tests;
 #[cfg(test)]
+mod tainted_tests;
+#[cfg(test)]
+mod views_tests;
+#[cfg(test)]
+mod kept_tests;
+#[cfg(test)]
 mod served;
+#[cfg(test)]
+mod trace_tests;
 
 #[cfg(test)]
 #[global_allocator]
@@ -121,7 +136,7 @@ pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BorrowckDiagnostic {
     /// rustc's error code, as `E0382`, or `unused_mut` for the lint the borrow checker gives.
     pub code: &'static str,
@@ -148,7 +163,7 @@ pub struct BorrowckDiagnostic {
 /// What an E0320, "overflow while adding drop-check rules", is about: the type of the local
 /// dropped, the type the drop check went past the recursion limit at, and the limit, the
 /// crate's `#![recursion_limit]`. Regions erased.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropCheckOverflow {
     pub ty: hir_ty::next_solver::StoredTy,
     pub overflow_ty: hir_ty::next_solver::StoredTy,
@@ -278,7 +293,7 @@ impl BorrowckDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BorrowckResult {
     pub diagnostics: Vec<BorrowckDiagnostic>,
     /// Why the body, or a closure in it, was not checked: MIR lowering does not support
@@ -290,7 +305,7 @@ pub struct BorrowckResult {
 }
 
 /// Why a body was not borrow checked, by the error rustc reports before borrow checking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotChecked {
     /// `BLAZE_BORROWCK=off`.
     Off,
@@ -325,20 +340,90 @@ impl NotChecked {
 }
 
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
-#[blaze_query::tracked(returns(ref))]
+///
+/// The one place a stored verdict is looked at: with an item store installed, a kept verdict of
+/// `def` by the checker in use (one the daemon served, or one this build offered and flushed)
+/// is the answer, `BorrowckResult::default()`, with no check run. A verdict is kept only for a
+/// result equal to that ([`kept`]), so the answer is the one the check would give. Under
+/// [`hir_ty::body_store::Mode::Verify`] a kept verdict runs the check as well, and its result is
+/// the answer (and is not offered again). Under [`hir_ty::body_store::Mode::Trace`] nothing is
+/// looked up, and the verdict is offered whatever it is, its answer the encoded refusal
+/// ([`gate::encode_verdict`]), so a body with a borrow error has a trace and a read list.
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
     let mode = mode(db);
     let Some(checker) = checker(mode) else { return borrowck_in_mode(db, def, mode) };
-    let (result, reads) = hir_ty::body_store::capture(db, || borrowck_in_mode(db, def, mode));
-    if gate::verdict(def, &result).is_ok() {
-        hir_ty::body_store::offer_passed(db, def, checker, reads);
+    let mut verified = None;
+    let served = hir_ty::body_store::lookup_passed(db, def, checker, || {
+        let result = borrowck_in_mode(db, def, mode);
+        let passes = kept(def, &result);
+        verified = Some(result);
+        passes
+    });
+    if served {
+        return BorrowckResult::default();
     }
+    if let Some(result) = verified {
+        return result;
+    }
+    let (result, reads) = hir_ty::body_store::capture(db, || borrowck_in_mode(db, def, mode));
+    // A store of records keeps only a silent pass (no bytes); a trace store any verdict.
+    let keep = kept(def, &result);
+    hir_ty::body_store::offer_verdict(db, def, checker, reads, keep, |out| {
+        gate::encode_verdict(gate::verdict(def, &result).err().as_ref(), out);
+    });
     result
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of `kept_tests`: [`kept`] is the verdict alone, so a pass with a lint is
+    /// kept, and its served answer would drop the lint.
+    pub(crate) static KEEP_LOUD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `result`, `def`'s borrow check, is kept as a verdict: it passed and has nothing to
+/// say. A verdict holds no bytes, so the query answers a served one with
+/// `BorrowckResult::default()`; a pass with a lint (`unused_mut`) or one not checked
+/// (`NotChecked::Off`) is never kept, as its answer is not that.
+pub(crate) fn kept(def: DefWithBodyId, result: &BorrowckResult) -> bool {
+    if gate::verdict(def, result).is_err() {
+        return false;
+    }
+    #[cfg(test)]
+    if KEEP_LOUD.with(std::cell::Cell::get) {
+        return true;
+    }
+    if !result.diagnostics.is_empty() || result.not_checked.is_some() {
+        tracing::debug!(
+            target: "blaze",
+            ?def,
+            lints = result.diagnostics.len(),
+            not_checked = ?result.not_checked,
+            "a passing borrow check with something to say: no verdict kept"
+        );
+        return false;
+    }
+    true
+}
+
+/// The name the item store files the database's verdicts under, none when no check runs: what
+/// the driver keys a served borrow check by.
+pub fn checker_name(db: &Db) -> Option<&'static str> {
+    checker(mode(db))
+}
+
+/// The checker's name when `def`'s borrow check (the [`borrowck`] query, run or served) passed
+/// with nothing to say, so its verdict may be kept: the driver's borrow check step. None when
+/// it did not, or no check runs.
+pub fn silent_pass(db: &Db, def: DefWithBodyId) -> Option<&'static str> {
+    let checker = checker_name(db)?;
+    kept(def, borrowck(db, def)).then_some(checker)
 }
 
 /// The name the item store files `mode`'s verdicts under: each checker accepts other programs.
 /// None when no check runs, whose verdict is never stored.
-pub(crate) fn checker(mode: Mode) -> Option<&'static str> {
+pub fn checker(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Nll => Some("nll"),
         Mode::Polonius => Some("polonius"),
@@ -393,6 +478,15 @@ fn check_def<'db>(
         result.not_checked = Some(NotChecked::Off);
         return result;
     }
+    // `#![blaze::views]`: a view written on a receiver that is refused (in a crate without
+    // the attribute, on a trait method, naming what is not a field of `Self`) refuses the
+    // method, with or without a body.
+    if let DefWithBodyId::FunctionId(func) = def {
+        views::check_method(db, func, None, &mut result.diagnostics);
+        if !result.diagnostics.is_empty() {
+            return result;
+        }
+    }
     // A fn, const or static written without a body, or a variant without a discriminant: rustc
     // builds no MIR for it, so there is nothing to check and nothing to refuse (where Rust
     // requires a body, AST validation reports its absence). A body that is written but lowered
@@ -409,37 +503,53 @@ fn check_def<'db>(
             Some("a body that is written but lowered to no expression: nothing to check".into());
         return result;
     }
-    let owner = InferBodyId::DefWithBodyId(def);
-    let infer = InferenceResult::of(db, owner);
-    if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
-        result.not_checked = Some(NotChecked::TypeErrors);
+    if let Some(why) = tainted_by_errors(db, def) {
+        result.not_checked = Some(why);
         return result;
     }
-    // rustc borrow checks no body its lowering or type check found an error in, which an
-    // error of either taints: a cast that is not one, `..base` in a destructuring assignment.
-    // A query of whether there was one, which reads no position: an edit elsewhere in the
-    // file checks the body again only if it changes that.
+    let owner = InferBodyId::DefWithBodyId(def);
+    let mut result = check_owner(db, owner, Some(def), mode, root, frame);
+    // A rewritten body is checked to see whether a suggestion holds: it suggests nothing more.
+    if root.is_none() {
+        drop_early::add_notes(db, def, mode, &mut result);
+    }
+    result
+}
+
+/// Why `def`'s body has no meaningful MIR, by the first error found before MIR is built in it
+/// or in a closure, coroutine or `const { .. }` block in it; `None` when it has none.
+///
+/// The rule, rustc's `tainted_by_errors`: an error reported in a body before borrow checking
+/// (type checking, E0063's missing fields among its errors, lowering, a macro call that did not
+/// expand, match checking, `check_tail_calls`, an unsized `static`) gives it rustc's error
+/// body, which nothing borrow checks, const-checks or evaluates. The user sees that error once,
+/// and never a second one saying the body could not be checked. The one place this is asked:
+/// the borrow check ([`borrowck`]) and every other consumer of a body's MIR that may only run
+/// on a body without errors (`hir`'s evaluation of a `const` or `static`).
+pub fn tainted_by_errors(db: &Db, def: DefWithBodyId) -> Option<NotChecked> {
+    let owner = InferBodyId::DefWithBodyId(def);
+    if type_check_failed(InferenceResult::of(db, owner)) {
+        return Some(NotChecked::TypeErrors);
+    }
+    // A query of whether lowering found an error (a cast that is not one, `..base` in a
+    // destructuring assignment), which reads no position: an edit elsewhere in the file checks
+    // the body again only if it changes that.
     if hir_def::expr_store::Body::has_lowering_errors(db, def) {
-        result.not_checked = Some(NotChecked::LoweringErrors);
-        return result;
+        return Some(NotChecked::LoweringErrors);
     }
     if hir_ty_mir::mir::has_failed_expansion(db, owner) {
-        result.not_checked = Some(NotChecked::ExpansionErrors);
-        return result;
+        return Some(NotChecked::ExpansionErrors);
     }
     if hir_ty_matchck::match_check(db, def).failed {
-        result.not_checked = Some(NotChecked::MatchErrors);
-        return result;
+        return Some(NotChecked::MatchErrors);
     }
-    // rustc's `check_tail_calls` refused a `become` of the body or a closure in it, whose
-    // error MIR taints the body's borrow check. One bit of the store first, so a body without
-    // a `become` reads no more.
+    // One bit of the store first, so a body without a `become` reads no more.
+    let body = hir_def::expr_store::Body::of(db, def);
     if hir_ty_tailck::has_become(body) && hir_ty_tailck::tail_call_check(db, def).failed() {
-        result.not_checked = Some(NotChecked::TailCallErrors);
-        return result;
+        return Some(NotChecked::TailCallErrors);
     }
-    // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
-    // borrow checked; a `const` is checked all the same.
+    // A `static` of a type that is not `Sized` is rustc's E0277; a `const` is checked all the
+    // same.
     if let DefWithBodyId::StaticId(it) = def
         && let Some(ty) = db.value_ty(it.into())
         && {
@@ -451,20 +561,20 @@ fn check_def<'db>(
             )
         }
     {
-        result.not_checked = Some(NotChecked::UnsizedStatic);
-        return result;
+        return Some(NotChecked::UnsizedStatic);
     }
-    let mut result = check_owner(db, owner, Some(def), mode, root, frame);
-    // A rewritten body is checked to see whether a suggestion holds: it suggests nothing more.
-    if root.is_none() {
-        drop_early::add_notes(db, def, mode, &mut result);
-    }
-    result
+    None
+}
+
+/// Whether type checking a body (an item's or a constant of a signature's) reported an error in
+/// it, which taints it: [`tainted_by_errors`]'s first question.
+fn type_check_failed(infer: &InferenceResult<'_>) -> bool {
+    infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty()
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
 /// or a const generic argument or default, which rustc checks as a body of its own.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn borrowck_anon_const<'db>(
     db: &'db Db,
     konst: hir_ty::db::AnonConstId<'db>,
@@ -477,8 +587,7 @@ pub fn borrowck_anon_const<'db>(
     }
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         let owner = InferBodyId::AnonConstId(konst);
-        let infer = InferenceResult::of(db, owner);
-        if infer.has_type_mismatches() || infer.is_erroneous() {
+        if type_check_failed(InferenceResult::of(db, owner)) {
             return BorrowckResult {
                 not_checked: Some(NotChecked::TypeErrors),
                 ..Default::default()
@@ -515,14 +624,19 @@ fn check_owner<'db>(
     let alpha = blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         check_owner_once(db, owner, def, Mode::Polonius, root, frame)
     });
-    // A `#[blaze::linear]` error is the same in every mode, so only the borrow checker's own
-    // errors are a reason to check again.
+    // A `#[blaze::linear]` or `#[blaze::norefcount]` error is the same in every mode, so only
+    // the borrow checker's own errors are a reason to check again.
     if alpha.skipped.is_some()
         || alpha.not_checked.is_some()
         || !alpha
             .diagnostics
             .iter()
-            .any(|it| it.is_error() && it.code != hir_ty_linear::LinearDiagnostic::CODE)
+            .any(|it| {
+                it.is_error()
+                    && it.code != hir_ty_linear::LinearDiagnostic::CODE
+                    && it.code != hir_ty_mir::mir::handles::ImpliedCopy::CODE
+                    && it.code != views::CODE
+            })
     {
         return alpha;
     }
@@ -557,7 +671,7 @@ fn check_owner_once<'db>(
         Err(error) => {
             // alloc: the owned result, once, when MIR lowering refuses the body
             // Rendered with `db` attached: the error's types name themselves only through it.
-            result.skipped = Some(blaze_query::db::attach(db, || format!("{error:?}")));
+            result.skipped = Some(blaze_memo::attach(db, || format!("{error:?}")));
             return result;
         }
     };
@@ -614,7 +728,7 @@ fn check_owner_once<'db>(
                 Err(error) => {
                     // alloc: the owned result, once, when MIR lowering refuses a body
                     result.skipped.get_or_insert_with(|| {
-                        blaze_query::db::attach(db, || format!("{what}: {error:?}"))
+                        blaze_memo::attach(db, || format!("{what}: {error:?}"))
                     });
                 }
             }
@@ -729,6 +843,35 @@ fn check_owner_once<'db>(
             drop_check: None,
         }
     }));
+    // `#[blaze::norefcount]` under `#![blaze::handles]`: each copy of a handle the built MIR
+    // makes where the function, or a closure or `async` block in it, moves one that is used
+    // again is an error at that move.
+    if let Some(DefWithBodyId::FunctionId(function)) = def
+        && hir_def::attrs::AttrFlags::query(db, function.into())
+            .contains(hir_def::attrs::AttrFlags::NOREFCOUNT)
+    {
+        let mut copies = Vec::new(); // alloc: empty unless a handle is copied (error path)
+        for &(body, _, _) in bodies.iter() {
+            hir_ty_mir::mir::handles::norefcount_errors(db, body, function, &mut copies);
+        }
+        result.diagnostics.extend(copies.into_iter().map(|it| BorrowckDiagnostic {
+            code: hir_ty_mir::mir::handles::ImpliedCopy::CODE,
+            span: it.span,
+            message: it.message,
+            at_signature: false,
+            labels: Vec::new(),      // alloc: empty
+            children: Vec::new(),    // alloc: empty
+            suggestions: Vec::new(), // alloc: empty
+            dropped_at_scope_end: None,
+            drop_check: None,
+        }));
+    }
+    // `#![blaze::views]`: in a method with a view written, `self` is used only through it.
+    if let (Some(DefWithBodyId::FunctionId(func)), Some(&(body, None, None))) =
+        (def, bodies.first())
+    {
+        views::check_method(db, func, Some(body), &mut result.diagnostics);
+    }
     if debugging(db, owner) {
         if let Some(skipped) = &result.skipped {
             eprintln!("skipped {skipped}");
@@ -896,14 +1039,12 @@ pub(crate) struct Ctx<'a, 'db> {
     pub(crate) env: ParamEnv<'db>,
     pub(crate) krate: Crate,
     pub(crate) store: &'a ExpressionStore,
-    #[allow(dead_code)]
     pub(crate) infer: &'a InferenceResult<'db>,
-    #[allow(dead_code)]
     pub(crate) mode: Mode,
     /// The user variable each local is, if it is one.
     pub(crate) bindings: FMap<'a, LocalId, BindingId>,
     /// In the body of a closure, its captures, by field of the closure.
-    pub(crate) upvars: FVec<'a, Upvar>,
+    pub(crate) upvars: FVec<'a, Upvar<'a>>,
     /// In the body of a closure, how it is called.
     pub(crate) closure_kind: Option<rustc_type_ir::ClosureKind>,
     pub(crate) closure_local: Option<LocalId>,
@@ -920,12 +1061,16 @@ pub(crate) struct Ctx<'a, 'db> {
     glue: RefCell<FMap<'a, Ty<'db>, hir_ty::drop::DropGlue>>,
     /// The type of every place the checks name, each found once.
     pub(crate) places: RefCell<places::Places<'a, 'db>>,
+    /// `#![blaze::views]`: the fields of the view of the method each receiver borrow is made
+    /// for, by where it is made ([`views::call_views`]). Empty in a body that calls no method
+    /// with a view.
+    pub(crate) call_views: FMap<'a, cfg::Location, &'db [hir_ty_mir::mir::FieldIndex]>,
     /// The body's task's frame: what the checks of this body build.
     pub(crate) frame: &'a Frame,
 }
 
 /// A capture of a closure, in its body.
-pub(crate) struct Upvar {
+pub(crate) struct Upvar<'a> {
     pub(crate) binding: BindingId,
     /// The local lowering copies the capture into.
     pub(crate) local: LocalId,
@@ -933,7 +1078,9 @@ pub(crate) struct Upvar {
     pub(crate) mutable: bool,
     /// The captured place is behind a reference.
     pub(crate) behind_deref: bool,
-    pub(crate) place: CapturedPlace,
+    /// Inference's capture, read in place: a copy owns a block of its sources on the global
+    /// heap, one per capture of every closure body checked.
+    pub(crate) place: &'a CapturedPlace,
 }
 
 impl<'a, 'db> Ctx<'a, 'db> {
@@ -983,8 +1130,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
                                 hir_ty::next_solver::TyKind::Adt(def, _) if def.is_box()
                             )
                         }),
-                        // clone: hir-ty's `CapturedPlace`, once per capture per closure body
-                        place: capture.clone(),
+                        place: capture,
                     });
                 }
             }
@@ -1009,6 +1155,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             copy: RefCell::new(mem::map(frame)),
             glue: RefCell::new(mem::map(frame)),
             places: RefCell::new(places::Places::new(frame, body)),
+            call_views: views::call_views(db, krate, body, frame),
             frame,
         }
     }
@@ -1179,7 +1326,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
 /// Whether `ty`, its regions `'static`, is `Copy` in `env`: a query, as what it asks of the
 /// solver can be long (a future through every type it holds) and is the same in every body of
 /// the environment, and after an edit.
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 fn is_copy_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
@@ -1194,7 +1341,7 @@ fn is_copy_query(
 
 /// [`hir_ty::drop::has_drop_glue`] of `ty`, its regions `'static`, in `env`, as the order of
 /// its variants: a query as [`is_copy_query`] is.
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 fn drop_glue_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,

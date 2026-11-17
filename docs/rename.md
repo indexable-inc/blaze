@@ -1,14 +1,14 @@
 ---
 status: record
-summary: The rename from ra-jit and cargo blaze to blaze (#270), and what tools/rename.py changes.
+summary: The rename from ra-jit and cargo blaze to blaze (#270), and what its script, tools/rename.py (deleted 2026-11-11), changed.
 date: 2026-10-28
 ---
 # The rename from ra-jit (#270)
 
 blaze was called ra-jit until 2026-10-24, and `cargo blaze` was its command until 2026-10-28.
 Nothing of either is read or run any more: `blaze` is the only command, and the names below
-are the only ones. [tools/rename.py](../tools/rename.py) made the change, and makes it again
-on any branch from before it.
+are the only ones. `tools/rename.py` made the change; it was deleted on 2026-11-11 (no branch
+from before the rename is left), and `git show 7bda937633:tools/rename.py` has it.
 
 | before | now |
 |---|---|
@@ -47,7 +47,8 @@ neither finds what was stored under the old ones.
 
 ## A branch from before the rename
 
-    python3 tools/rename.py && git commit -qam 'rename.py'
+    git show 7bda937633:tools/rename.py > /tmp/rename.py
+    python3 /tmp/rename.py && git commit -qam 'rename.py'
     git rebase origin/main
 
 The script rewrites every tracked text file and `git mv`s every path whose name says ra-jit.

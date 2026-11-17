@@ -1,0 +1,11 @@
+{
+ "id": "edit2-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "blaze: the daemon's loop on the edit path",
+ "what": "The loop reads a plane task's end every 1 ms (`channel daemon loop: a plane task's end (read every 1 ms)`), so every step of an edit that the loop hands on waits up to a millisecond: `the build's first made unit waits behind the units found kept` is 5.1 ms for hello world's 32 kept units, and a placement's seven effects are seven turns. After this lane the front of a one-function edit (plan 3.7 ms, `plan made: collect the plan's database` 1.8, lower 2 to 6, the kept units 5, changed set and inference 5) is 20 of the daemon's 44 ms.",
+ "cost": "about 10 ms an edit, none of it work",
+ "cause": "a poll where a wake would do",
+ "workaround": "none; not this lane's code",
+ "state": "open: the loop's and the plane's"
+}

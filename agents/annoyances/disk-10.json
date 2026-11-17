@@ -1,0 +1,11 @@
+{
+ "id": "disk-10",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "the lane's own rule: annoyances.json",
+ "what": "`annoyances.json` is not on `all-1111` (it is on `film-1111`), so every lane cut from all-1111 adds the file and they will conflict add/add when merged.",
+ "cost": "a merge conflict a lane",
+ "cause": "the file was started on a branch the lanes were not cut from",
+ "workaround": "rows here have ids `disk-1` up so they can be appended",
+ "state": "open"
+}

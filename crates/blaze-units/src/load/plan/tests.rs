@@ -245,6 +245,324 @@ fn the_workspace_sets_blaze_lints_in_its_metadata() {
     assert_eq!(unknown.at.as_deref(), Some("/w/Cargo.toml"));
 }
 
+/// A line of `[workspace.metadata.blaze.lints-when-ready]` is its flag exactly when the
+/// lint's switch is on, and nothing until then. A lint with no switch has nothing to wait for.
+/// blaze's own manifest sets `blaze::std_use` in its ratchet instead, at `deny` ahead of
+/// `ready::BSTD_IN_TREE` (Andrew's decision of 2026-11-11).
+#[test]
+fn a_lint_of_the_when_ready_table_is_set_once_its_switch_is_on() {
+    use blaze_lint_defs::ready;
+    let manifest = Path::new("/w/Cargo.toml");
+    let of = |text: &str| {
+        flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest)
+    };
+    let waiting =
+        of("[blaze.lints]\nhot_alloc = \"deny\"\n[blaze.lints-when-ready]\nstd_use = \"warn\"\n")
+            .unwrap();
+    let expected: &[&str] = match ready::BSTD_IN_TREE {
+        true => &["--deny=blaze::hot_alloc", "--warn=blaze::std_use"],
+        false => &["--deny=blaze::hot_alloc"],
+    };
+    assert_eq!(waiting, expected);
+    assert_eq!(ready::switch_of("std_use"), Some(ready::BSTD_IN_TREE));
+    let alone = of("[blaze.lints-when-ready]\nstd_use = \"deny\"\n").unwrap();
+    assert_eq!(alone.len(), usize::from(ready::BSTD_IN_TREE), "with no `lints` table beside it");
+    let none = of("[blaze.lints-when-ready]\nhot_alloc = \"warn\"\n").unwrap_err();
+    assert_eq!(
+        none.what,
+        "[workspace.metadata.blaze.lints-when-ready] in /w/Cargo.toml: `hot_alloc` has no switch in blaze-lint-defs' `ready` to wait for: set its level in [workspace.metadata.blaze.lints]"
+    );
+    let unknown = of("[blaze.lints-when-ready]\nstd_uses = \"warn\"\n").unwrap_err();
+    assert_eq!(
+        unknown.what,
+        "[workspace.metadata.blaze.lints-when-ready] in /w/Cargo.toml: `std_uses` is no lint or group of blaze's (`blaze::std_uses`)"
+    );
+    let level = of("[blaze.lints-when-ready]\nstd_use = \"when-ready\"\n").unwrap_err();
+    assert!(level.what.ends_with("the level of `std_use` is `allow`, `warn`, `deny` or `forbid`"));
+    // blaze's own manifest denies it in its ratchet, whatever the switch says.
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml");
+    let text = std::fs::read_to_string(root).unwrap_or_else(|error| panic!("{root}: {error}"));
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let metadata = table.get("workspace").and_then(|it| it.get("metadata"));
+    let own = flags::workspace_lints(metadata, manifest).unwrap();
+    let std_use: Vec<&String> = own.iter().filter(|it| it.ends_with("=blaze::std_use")).collect();
+    assert_eq!(std_use.last().map(|it| it.as_str()), Some("--deny=blaze::std_use"), "{own:?}");
+}
+
+/// Whether `flags`, made from a workspace whose ratchet sets `ratchet` and whose levels table
+/// sets `levels` (each `(lint, level)`), hold the invariant below: no lint only the levels
+/// table names is flagged, and each lint the ratchet sets is last flagged at its level. The
+/// first way they do not.
+fn ratchet_held(ratchet: &[(&str, &str)], levels: &[(&str, &str)], flags: &[String]) -> Result<(), String> {
+    let last = |lint: &str| flags.iter().rev().find(|it| it.ends_with(&format!("=blaze::{lint}")));
+    for (lint, _) in levels.iter().filter(|(lint, _)| !ratchet.iter().any(|(it, _)| it == lint)) {
+        if let Some(flag) = last(lint) {
+            return Err(format!("`{flag}`: `{lint}` is set only by the levels table, read beside a ratchet"));
+        }
+    }
+    for (lint, level) in ratchet {
+        let want = format!("--{level}=blaze::{lint}");
+        if last(lint) != Some(&want) {
+            return Err(format!("the ratchet sets `{lint}` to {level}, and its last flag is {:?}", last(lint)));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: where a workspace has `[workspace.metadata.blaze.lints-ratchet]`, this blaze
+/// reads its levels in place of `[workspace.metadata.blaze.lints]` (which a released blaze reads)
+/// and after `lints-when-ready`, so the ratchet's level of a lint is the one that holds.
+#[test]
+fn the_ratchet_is_read_in_place_of_the_levels_table() {
+    let manifest = Path::new("/w/Cargo.toml");
+    let of = |text: &str| {
+        flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest)
+    };
+    let levels = "[blaze.lints]\nhot_alloc = \"warn\"\n";
+    assert_eq!(of(levels).unwrap(), ["--warn=blaze::hot_alloc"], "with no ratchet, the levels table");
+    let ratchet = "[blaze.lints-ratchet]\nbaselines = \"b\"\ninternal = \"deny\"\nhot = \"allow\"\n";
+    let read = of(&format!("{levels}{ratchet}")).unwrap();
+    ratchet_held(&[("internal", "deny"), ("hot", "allow")], &[("hot_alloc", "warn")], &read).unwrap();
+    assert_eq!(
+        read,
+        ["--deny=blaze::internal", "--allow=blaze::hot"],
+        "`lints` is not read beside a ratchet, and `baselines` is no level"
+    );
+    let both = of(&format!(
+        "{ratchet}std_use = \"deny\"\n[blaze.lints-when-ready]\nstd_use = \"warn\"\n"
+    ))
+    .unwrap();
+    ratchet_held(&[("internal", "deny"), ("hot", "allow"), ("std_use", "deny")], &[], &both).unwrap();
+    assert_eq!(both.last().map(String::as_str), Some("--deny=blaze::std_use"), "{both:?}");
+    let unknown = of("[blaze.lints-ratchet]\nhot_allocs = \"deny\"\n").unwrap_err();
+    assert_eq!(
+        unknown.what,
+        "[workspace.metadata.blaze.lints-ratchet] in /w/Cargo.toml: `hot_allocs` is no lint or group of blaze's (`blaze::hot_allocs`)"
+    );
+}
+
+#[test]
+fn the_oracle_catches_the_levels_table_read_beside_the_ratchet() {
+    // The planted bug: both tables read, the levels table first, as a blaze that merged them.
+    let read = strings(&["--warn=blaze::hot_alloc", "--deny=blaze::internal"]);
+    let why = ratchet_held(&[("internal", "deny")], &[("hot_alloc", "warn")], &read)
+        .expect_err("the oracle missed the levels table read beside a ratchet");
+    assert!(why.contains("`--warn=blaze::hot_alloc`: `hot_alloc` is set only by the levels table"), "{why}");
+}
+
+#[test]
+fn the_oracle_catches_lints_when_ready_read_after_the_ratchet() {
+    // The planted bug: `lints-when-ready` appended after the ratchet, so its level wins.
+    let read = strings(&["--deny=blaze::std_use", "--warn=blaze::std_use"]);
+    let why = ratchet_held(&[("std_use", "deny")], &[], &read)
+        .expect_err("the oracle missed `lints-when-ready` read after the ratchet");
+    assert!(why.contains("the ratchet sets `std_use` to deny, and its last flag is Some(\"--warn=blaze::std_use\")"), "{why}");
+}
+
+/// What a member's ratchet downgrades must be, from the baselines (`(file name, text)`): each
+/// crate a `blaze.<lint>.txt` lists, counted or `unmeasured`, at `--warn=blaze::<lint>`, and
+/// nothing from any other file. The reference the invariant below holds `held` to, its lists
+/// compared as sets; the first difference.
+fn downgrades_held(
+    baselines: &[(&str, &str)],
+    held: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let mut want: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (name, text) in baselines {
+        let Some(lint) = name.strip_prefix("blaze.").and_then(|it| it.strip_suffix(".txt")) else {
+            continue;
+        };
+        for line in text.lines() {
+            let krate = line.split('\t').next().unwrap_or(line);
+            want.entry(krate.to_owned()).or_default().push(format!("--warn=blaze::{lint}"));
+        }
+    }
+    let sorted = |map: &std::collections::BTreeMap<String, Vec<String>>| {
+        map.iter()
+            .map(|(krate, flags)| {
+                let mut flags = flags.clone();
+                flags.sort();
+                (krate.clone(), flags)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (want, got) = (sorted(&want), sorted(held));
+    match want.iter().zip(&got).find(|(a, b)| a != b) {
+        Some((a, b)) => Err(format!("held {b:?} where the baselines say {a:?}")),
+        None if want.len() != got.len() => Err(format!("held {got:?} where the baselines say {want:?}")),
+        None => Ok(()),
+    }
+}
+
+#[test]
+fn the_oracle_catches_an_unmeasured_crate_dropped_from_the_downgrades() {
+    let baselines = [("blaze.std_use.txt", "a\tunmeasured\nb\t3\n"), ("clippy.disallowed_types.txt", "c\t1\n")];
+    // The planted bug: `unmeasured` read as no count, so its crate is held at nothing.
+    let held = [("b".to_owned(), strings(&["--warn=blaze::std_use"]))].into_iter().collect();
+    let why = downgrades_held(&baselines, &held).expect_err("the oracle missed an unmeasured crate dropped");
+    assert!(why.contains("\"a\""), "{why}");
+}
+
+#[test]
+fn the_oracle_catches_a_crate_held_from_a_clippy_baseline() {
+    let baselines = [("blaze.std_use.txt", "b\t3\n"), ("clippy.disallowed_types.txt", "c\t1\n")];
+    // The planted bug: every baseline file read, a clippy lint's too.
+    let held = [
+        ("b".to_owned(), strings(&["--warn=blaze::std_use"])),
+        ("c".to_owned(), strings(&["--warn=blaze::disallowed_types"])),
+    ]
+    .into_iter()
+    .collect();
+    let why = downgrades_held(&baselines, &held).expect_err("the oracle missed a crate held from clippy's baseline");
+    assert!(why.contains("disallowed_types"), "{why}");
+}
+
+/// The invariant: a member is held at `warn` on exactly the blaze lints whose baseline lists
+/// it, `unmeasured` or counted; a crate no baseline lists gets no flag, so the ratchet's `deny`
+/// holds for it. A baseline that does not read is an error naming it, never a crate dropped.
+#[test]
+fn a_crate_its_baseline_lists_is_held_at_warn_and_no_other() {
+    let dir = Scratch::new("ratchet");
+    let manifest = dir.0.join("Cargo.toml");
+    let metadata = |text: &str| toml::Value::Table(toml::from_str(text).unwrap());
+    let ratchet = metadata("[blaze.lints-ratchet]\nbaselines = \"b\"\ninternal = \"deny\"\n");
+    let of = |metadata: &toml::Value| {
+        flags::ratchet_downgrades(&Disk, Some(metadata), &manifest, &dir.0)
+    };
+    dir.write("b/TARGET", "aarch64-unknown-linux-gnu\n");
+    dir.write("b/blaze.std_use.txt", "a\tunmeasured\nb\t3\n");
+    dir.write("b/blaze.wall_clock.txt", "a\t1\n");
+    dir.write("b/clippy.disallowed_types.txt", "c\t1\n");
+    let held = of(&ratchet).unwrap();
+    downgrades_held(
+        &[
+            ("blaze.std_use.txt", "a\tunmeasured\nb\t3\n"),
+            ("blaze.wall_clock.txt", "a\t1\n"),
+            ("clippy.disallowed_types.txt", "c\t1\n"),
+        ],
+        &held,
+    )
+    .unwrap();
+    let wanted: Vec<(String, Vec<String>)> = vec![
+        ("a".to_owned(), strings(&["--warn=blaze::std_use", "--warn=blaze::wall_clock"])),
+        ("b".to_owned(), strings(&["--warn=blaze::std_use"])),
+    ];
+    assert_eq!(held.into_iter().collect::<Vec<_>>(), wanted);
+    // A crate's line gone, it is held at nothing.
+    dir.write("b/blaze.wall_clock.txt", "");
+    assert_eq!(of(&ratchet).unwrap().get("a"), Some(&strings(&["--warn=blaze::std_use"])));
+    assert!(of(&metadata("[blaze.lints]\ninternal = \"warn\"\n")).unwrap().is_empty());
+    let none = of(&metadata("[blaze.lints-ratchet]\ninternal = \"deny\"\n")).unwrap_err();
+    assert!(none.what.contains("`baselines` names the directory"), "{}", none.what);
+    let gone = of(&metadata("[blaze.lints-ratchet]\nbaselines = \"nowhere\"\n")).unwrap_err();
+    assert!(gone.what.contains("its baselines' directory"), "{}", gone.what);
+    dir.write("b/blaze.wall_clock.txt", "a\t0\n");
+    let line = of(&ratchet).unwrap_err();
+    assert!(line.what.contains("blaze.wall_clock.txt:1: `a\t0`"), "{}", line.what);
+    dir.write("b/blaze.wall_clock.txt", "");
+    dir.write("b/blaze.wall_clocks.txt", "a\t1\n");
+    let lint = of(&ratchet).unwrap_err();
+    assert!(lint.what.contains("the baseline of no lint of blaze's (`blaze::wall_clocks`)"), "{}", lint.what);
+}
+
+/// blaze's own ratchet reads: its directory of baselines is there and every line of it reads.
+#[test]
+fn blazes_own_baselines_read() {
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let manifest = root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let metadata = table.get("workspace").and_then(|it| it.get("metadata"));
+    let has_ratchet = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("lints-ratchet"));
+    assert!(has_ratchet.is_some(), "{} has a ratchet", manifest.display());
+    if let Err(error) = flags::ratchet_downgrades(&Disk, metadata, &manifest, root) {
+        panic!("{}", error.what);
+    }
+}
+
+/// blaze's own workspace denies `blaze::general` in its ratchet and holds `blaze::todo`, one
+/// of its lints, at `warn`: a hole warns in a local check, and the merge gate and a release
+/// deny it with `--deny blaze::todo`. The single lint's flag is after its group's, so it wins.
+#[test]
+fn blazes_own_workspace_holds_todo_at_warn_after_general_at_deny() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml");
+    let text = std::fs::read_to_string(root).unwrap_or_else(|error| panic!("{root}: {error}"));
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let metadata = table.get("workspace").and_then(|it| it.get("metadata"));
+    let own = flags::workspace_lints(metadata, Path::new(root)).unwrap();
+    let at = |flag: &str| own.iter().position(|it| it == flag);
+    let (general, todo) = (at("--deny=blaze::general"), at("--warn=blaze::todo"));
+    assert!(general.is_some() && general < todo, "{own:?}");
+    let last = own.iter().rev().find(|it| it.ends_with("=blaze::todo"));
+    assert_eq!(last.map(String::as_str), Some("--warn=blaze::todo"), "{own:?}");
+}
+
+/// The invariant: nothing a workspace or a package writes sets `blaze::unreachable` below
+/// `deny`. `allow` or `warn` of it in any of the three workspace tables or in `[lints.blaze]`,
+/// and a ratchet baseline of it (which holds a crate at `warn`), is an error naming where and
+/// the rule; `deny` and `forbid` are taken.
+#[test]
+fn a_level_of_unreachable_below_deny_is_an_error_naming_where() {
+    use crate::lint_level::FLOOR_RULE;
+    let manifest = Path::new("/w/Cargo.toml");
+    let of = |text: &str| {
+        flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest)
+    };
+    let tables = [
+        ("[blaze.lints]\n", "[workspace.metadata.blaze.lints]"),
+        ("[blaze.lints-when-ready]\n", "[workspace.metadata.blaze.lints-when-ready]"),
+        ("[blaze.lints-ratchet]\nbaselines = \"b\"\n", "[workspace.metadata.blaze.lints-ratchet]"),
+    ];
+    for (head, name) in tables {
+        for level in ["allow", "warn"] {
+            let error = of(&format!("{head}unreachable = \"{level}\"\n")).unwrap_err();
+            assert_eq!(
+                error.what,
+                format!("{name} in /w/Cargo.toml: `unreachable = \"{level}\"`: {FLOOR_RULE}")
+            );
+            assert_eq!(error.at.as_deref(), Some("/w/Cargo.toml"));
+        }
+    }
+    assert_eq!(
+        of("[blaze.lints]\nunreachable = \"deny\"\n").unwrap(),
+        ["--deny=blaze::unreachable"]
+    );
+    assert_eq!(
+        of("[blaze.lints-ratchet]\nbaselines = \"b\"\nunreachable = \"forbid\"\n").unwrap(),
+        ["--forbid=blaze::unreachable"]
+    );
+
+    let dir = Scratch::new("unreachable-baseline");
+    let root = dir.0.join("Cargo.toml");
+    let ratchet: toml::Value =
+        toml::Value::Table(toml::from_str("[blaze.lints-ratchet]\nbaselines = \"b\"\n").unwrap());
+    let baseline = dir.write("b/blaze.unreachable.txt", "a\t1\n");
+    let error = flags::ratchet_downgrades(&Disk, Some(&ratchet), &root, &dir.0).unwrap_err();
+    assert_eq!(
+        error.what,
+        format!(
+            "[workspace.metadata.blaze.lints-ratchet] in {}: {} is a baseline, which holds each \
+             crate it lists at `warn`: {FLOOR_RULE}",
+            root.display(),
+            baseline.display()
+        )
+    );
+
+    let package = |lints: &str| -> TomlManifest {
+        toml::from_str(&format!(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[lints.blaze]\n{lints}"
+        ))
+        .unwrap()
+    };
+    let lowered = flags::lints_of("a", &package("unreachable = \"warn\"\n")).unwrap_err();
+    assert_eq!(
+        lowered.what,
+        format!("the `[lints.blaze]` of `a` set `unreachable` to `warn`: {FLOOR_RULE}")
+    );
+    let (kept, _) = flags::lints_of("a", &package("unreachable = \"deny\"\n")).unwrap();
+    assert_eq!(kept, ["--deny=blaze::unreachable"]);
+}
+
 /// A package's `[lints.blaze]` names blaze's lints as the workspace's table does.
 #[test]
 fn a_packages_unknown_blaze_lint_is_an_error_naming_it() {
@@ -648,15 +966,13 @@ fn uplifted_on_windows() {
     );
 }
 
-/// A directory of the test's own under the system's temporary one, removed after.
-struct Scratch(PathBuf);
+/// A directory of the test's own, by its canonical path, removed with all it holds after.
+struct Scratch(PathBuf, blaze_core::temp::TempDir);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!("blaze-plan-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir.canonicalize().unwrap())
+        let dir = blaze_core::temp::TempDir::for_test(&format!("blaze-plan-{name}-"));
+        Scratch(dir.path().canonicalize().unwrap(), dir)
     }
 
     fn write(&self, path: &str, contents: &str) -> PathBuf {
@@ -664,12 +980,6 @@ impl Scratch {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, contents).unwrap();
         path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -728,6 +1038,7 @@ fn unit(
                 noprelude: None,
                 nounused: None,
                 dev: false,
+                gpu: false,
             })
             .collect(),
     }
@@ -784,7 +1095,21 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
 /// [`plan_app`], under `check`'s lints when `lints`, with a `clippy.toml` at the workspace's
 /// root.
 fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, String) {
-    let named = if lints { "lints-" } else { "" };
+    plan_app_with(target, lints, &[])
+}
+
+/// [`plan_app_as`] with the command line's lint levels `lint_levels` (`--deny=blaze::todo`).
+fn plan_app_with(
+    target: Option<&str>,
+    lints: bool,
+    lint_levels: &[&str],
+) -> (PathBuf, Vec<UnitPlan>, String) {
+    let named = match (lints, lint_levels.is_empty()) {
+        (false, _) => "",
+        (true, true) => "lints-",
+        (true, false) => "levels-",
+    };
+    let lint_levels = strings(lint_levels);
     let dir = Scratch::new(&format!("app-{named}{}", target.unwrap_or("host")));
     let ws = dir.0.join("w");
     if lints {
@@ -875,6 +1200,7 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         config: &config,
         intent: if lints { Intent::Check { test: false } } else { Intent::Build },
         lints,
+        lint_levels: &lint_levels,
         build_std: false,
         ws_root: &ws,
         ws_manifest: &app_path,
@@ -885,6 +1211,7 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         host: HOST,
         target,
         macro_wasm: None,
+        gpu: None,
         requested_profile: "dev",
         profile_dir: "debug",
         base_profile: &base_profile,
@@ -917,6 +1244,28 @@ fn check_lints_the_workspaces_crates_with_their_configuration() {
     let script = &plans[2];
     assert!(script.outputs[0].ends_with("/out/build_script_build"), "{:?}", script.outputs);
     assert!(script.outputs.iter().all(|it| !it.ends_with(".rmeta")), "{:?}", script.outputs);
+}
+
+/// The invariant: a level of `blaze check`'s command line is the last flag of every workspace
+/// member's lints, after the workspace's tables and the package's own `[lints]`, in the order
+/// given, so it is the level that holds; a package outside the workspace gets none.
+#[test]
+fn the_command_lines_levels_come_after_the_packages_own_lints() {
+    let (_, plans, _) = plan_app_with(None, true, &["--deny=blaze::todo", "--allow=unsafe_code"]);
+    for member in [&plans[2], &plans[4], &plans[5], &plans[6]] {
+        assert_eq!(
+            member.lints,
+            [
+                "--warn=blaze::hot_alloc",
+                "--forbid=unsafe_code",
+                "--warn=unexpected_cfgs",
+                "--deny=blaze::todo",
+                "--allow=unsafe_code",
+            ]
+        );
+    }
+    assert!(plans[0].lints.is_empty(), "a registry package takes no level of the command line");
+    assert!(plans[1].lints.is_empty(), "nor a path package outside the workspace");
 }
 
 /// The hex of a plan's `-C extra-filename`.

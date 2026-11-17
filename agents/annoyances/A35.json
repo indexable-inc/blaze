@@ -1,0 +1,12 @@
+{
+ "id": "A35",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "installing a new blaze over an old one",
+ "what": "The new daemon refused the existing home: `the store cannot go on: .../v2/store/head: it is of store format 3, not 4: remove the directory to start a new store there`; the client only said the daemon ended with exit code 1 `USAGE: its command line was refused`.",
+ "cost": "three failed runs; a 209 GB state directory moved aside by hand",
+ "cause": "the store format was bumped with no migration, and the client's message names the wrong reason",
+ "workaround": "renamed ~/.cache/blaze/v2 aside",
+ "fix": "the client prints the daemon's own last error; a format bump says in one line what to run, and old stores are collected",
+ "state": "open"
+}

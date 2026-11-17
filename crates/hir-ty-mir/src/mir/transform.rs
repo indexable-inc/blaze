@@ -73,7 +73,7 @@ pub(super) struct Ctx<'f, 'db> {
 impl<'f, 'db> Ctx<'f, 'db> {
     pub(super) fn new(db: &'db Db, owner: InferBodyId<'db>, frame: &'f Frame) -> Self {
         let krate = owner.krate(db);
-        let env = db.trait_environment(owner.generic_def(db));
+        let env = owner.param_env(db);
         let interner = DbInterner::new_with(db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         // `for const` binders (`#![feature(blaze_comptime)]`): the passes solve what inference
@@ -270,7 +270,7 @@ pub(super) fn run_one<'db>(
 
 /// The constant behind a promoted `&expr` of `def` after the passes: what the code generator
 /// evaluates for it with the interpreter.
-#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
+#[blaze_memo::tracked(returns(as_ref), owns, mem_tag = Mir)]
 pub fn runtime_promoted_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,

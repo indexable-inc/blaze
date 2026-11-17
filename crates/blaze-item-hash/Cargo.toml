@@ -19,7 +19,7 @@ blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 
 la-arena.workspace = true
 smallvec.workspace = true
@@ -33,12 +33,11 @@ hir-ty.workspace = true
 hir-ty-borrowck.workspace = true
 hir-ty-matchck.workspace = true
 span.workspace = true
-syntax.workspace = true
 
 [dev-dependencies]
 blaze-core.workspace = true
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

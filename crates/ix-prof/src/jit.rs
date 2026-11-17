@@ -40,6 +40,10 @@ pub struct CodeMap {
 
 /// The maps registered, by start, each with what keeps its code alive.
 // alloc: once a process
+#[expect(
+    blaze::process_static,
+    reason = "one row per JIT code map registered and never removed: the profiler session that registers them should own the list"
+)]
 static MAPS: ReadLock<Vec<(CodeMap, Box<dyn Any + Send + Sync>)>> =
     ReadLock::new("ixprof.jit.maps", Vec::new());
 

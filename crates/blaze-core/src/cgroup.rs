@@ -262,31 +262,33 @@ impl Drop for Cgroup {
 /// How the daemon's own cgroup holds it to its ceiling ([`hold_own`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnHeld {
-    /// Its cgroup's `memory.max` is the ceiling and `memory.high` 15/16 of it (with
-    /// `memory.swap.max` 0 where swap is accounted): the cgroup's directory.
+    /// Its cgroup's `memory.max` is the ceiling and `memory.high` what [`hold_own`] was given
+    /// (with `memory.swap.max` 0 where swap is accounted): the cgroup's directory.
     Held { dir: PathBuf },
     /// No cgroup v2 is delegated to it, or its own is the root's, which has no `memory.max`:
     /// why. Nothing of the kernel's holds it; the daemon's own watch does.
     NotDelegated(String),
 }
 
-/// `memory.high`'s share of the ceiling: the kernel reclaims and throttles the daemon from
-/// there, before `memory.max` has it killed (docs/memory-budget.md section 7, Hard).
-const HIGH_SIXTEENTHS: u64 = 15;
-
 /// Holds this process (the daemon) to `ceiling` bytes with its own cgroup v2, where one is
 /// delegated to it: the cgroup each process's cgroup is made beside ([`parent`], which moves
 /// the daemon into its leaf `daemon`, as the first spawn with a limit does) is readied, and the
-/// cgroup the daemon is then in gets `memory.max` = `ceiling`, `memory.high` = 15/16 of it and
+/// cgroup the daemon is then in gets `memory.max` = `ceiling`, `memory.high` = `throttle` and
 /// `memory.swap.max` = 0, so it can't pass the ceiling by swapping. Its spawns' cgroups are that
 /// leaf's siblings, each held to its own limit, so they are not counted against this one.
+///
+/// `throttle` is where the kernel slows every thread of the cgroup that allocates; `None`
+/// writes `max`, no throttle, and is written every time, so a cgroup that an earlier daemon
+/// left a `memory.high` in loses it. This module is the mechanism: which line the kernel is
+/// told, and why it is under no typed failure of the daemon's, is `blaze_graph::lines`, the
+/// one caller's source for both numbers.
 ///
 /// Delegation is what [`parent`] decides: where it can't ready a cgroup (no cgroup v2, the
 /// memory controller not delegated, others' processes in it), or the daemon's cgroup is the
 /// root (no `memory.max`), [`OwnHeld::NotDelegated`] says why. Once one is readied a write that
 /// fails is an error naming the file: a cgroup the daemon may write that does not take its
 /// limit is no limit. Call it again with a new ceiling to move the limit.
-pub fn hold_own(ceiling: u64) -> io::Result<OwnHeld> {
+pub fn hold_own(ceiling: u64, throttle: Option<u64>) -> io::Result<OwnHeld> {
     if let Err(why) = parent() {
         // alloc: once a ceiling is set
         return Ok(OwnHeld::NotDelegated(why.to_string()));
@@ -308,11 +310,14 @@ pub fn hold_own(ceiling: u64) -> io::Result<OwnHeld> {
         ));
     }
     let mut digits = [0u8; 20];
-    // High first: a lowered ceiling never has `memory.high` above `memory.max`, even for a
+    // High first: a lowered ceiling never has a `memory.high` above `memory.max`, even for a
     // moment.
-    let high = ceiling / 16 * HIGH_SIXTEENTHS;
+    let high = match throttle {
+        Some(high) => decimal(high, &mut digits)?,
+        None => &b"max"[..],
+    };
     // alloc: once a ceiling is set
-    write(&own.join("memory.high"), decimal(high, &mut digits)?)?;
+    write(&own.join("memory.high"), high)?;
     write(&max, decimal(ceiling, &mut digits)?)?;
     // alloc: once a ceiling is set
     match write(&own.join("memory.swap.max"), b"0") {

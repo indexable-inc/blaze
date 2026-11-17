@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 
 use base_db::{Crate, Db};
 use blaze_mem::Frame;
+use blaze_memo::ArenaId;
 use span::{Edition, Span, SyntaxContext};
 use syntax::{
     ast,
@@ -19,12 +20,17 @@ use crate::{
     tt,
 };
 
+pub mod stored;
+
 /// Old-style `macro_rules` or the new macros 2.0
 #[derive(Debug, Eq, PartialEq)]
 pub struct DeclarativeMacroExpander {
     pub mac: mbe::DeclarativeMacro,
     pub transparency: Transparency,
     edition: Edition,
+    /// The table the definition's token contexts are of ([`HirFileId::context_arena`] of the
+    /// file it is written in): a call's marker carries them into the calling crate's table.
+    pub(crate) table: ArenaId,
 }
 
 impl DeclarativeMacroExpander {
@@ -43,9 +49,9 @@ impl DeclarativeMacroExpander {
             ),
             None => {
                 let marks = MarkCache::new();
-                let call_style = call_id.loc(db).kind.call_style();
+                let call = call_id.loc(db).kind.mbe_call();
                 self.mac
-                    .expand(db, tt, self.marker(db, call_id, &marks), call_style, span)
+                    .expand(db, tt, self.marker(db, call_id, &marks), call, span)
                     .map_err(Into::into)
             }
         }
@@ -71,50 +77,78 @@ impl DeclarativeMacroExpander {
             ),
             None => {
                 let marks = MarkCache::new();
-                let call_style = call_id.loc(db).kind.call_style();
+                let call = call_id.loc(db).kind.mbe_call();
                 self.mac
-                    .expand_making_in(
-                        frame,
-                        db,
-                        tt,
-                        self.marker(db, call_id, &marks),
-                        call_style,
-                        span,
-                    )
+                    .expand_making_in(frame, db, tt, self.marker(db, call_id, &marks), call, span)
                     .map_err(Into::into)
             }
         }
     }
 
     /// The hygiene `call_id`'s expansion marks each span with, `marks` keeping the contexts made.
+    /// Every span it marks is a definition token's (mbe marks only what the rules wrote), so
+    /// its context is of [`Self::table`], carried into the call's table before the mark: the
+    /// one place a context crosses crates (a macro of a dependency expanded here).
     fn marker<'a>(
         &'a self,
         db: &'a Db,
         call_id: MacroCallId,
         marks: &'a MarkCache<SyntaxContext, SyntaxContext>,
     ) -> impl Fn(&mut Span) + Copy + 'a {
+        let call: span::MacroCallId = call_id.into();
         move |s| {
             s.ctx = marks.get_or_insert_with(s.ctx, |ctx| {
-                apply_mark(db, ctx, call_id.into(), self.transparency, self.edition)
+                let ctx = ctx.translate(db, self.table, call.arena());
+                apply_mark(db, call.arena(), ctx, call, self.transparency, self.edition)
             })
         }
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl AstId<ast::Macro> {
     /// Fetches (and compiles) the expander of this decl macro.
-    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
     pub fn decl_macro_expander(self, db: &Db, def_crate: Crate) -> DeclarativeMacroExpander {
+        let id = self;
+        // A definition written in a file, of a database that keeps definitions: found by what
+        // it is (`stored`), with no syntax made when its file is as it was, and with its
+        // tokens not made again when the file changed around it; made below and kept when it
+        // is not found.
+        let kept = match id.file_id {
+            HirFileId::FileId(file) => stored::of(db).map(|kept| {
+                (kept, file, stored::def_hash(db, id, def_crate))
+            }),
+            HirFileId::MacroFile(_) => None,
+        };
+        if let Some((kept, file, hash)) = kept
+            && let Some(def) = stored::find(db, kept, file, id.value.erase(), def_crate, hash)
+        {
+            return def.compile(def_crate.data(db).edition, id.file_id.context_arena());
+        }
+        // Made from its file's syntax below, kept or not: a file of a crate given by its
+        // address with no text here is refused first, typed and naming it (`stored::demand_text`).
+        if let HirFileId::FileId(file) = id.file_id {
+            stored::demand_text(db, def_crate, file);
+        }
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-            let id = self;
             let map = id.file_id.span_map(db);
+            // What is kept of the definition, written as its trees are made: none of one with
+            // no row, whose text its spans could not be read back to (`stored::Place::of`).
+            let mut written = kept.and_then(|(kept, file, _)| {
+                stored::Place::of(db, kept, file, id.value.erase(), def_crate)
+                    .map(|place| stored::Writer::new(place, frame))
+            });
+            let read_cfg = std::cell::Cell::new(false);
 
             let transparency = |node: view::AnyHasAttrs<'_>| {
                 let mut cfg_options = None;
                 expand_cfg_attr_view(
                     node.attrs(),
-                    || cfg_options.get_or_insert_with(|| def_crate.cfg_options(db)),
+                    || {
+                        read_cfg.set(true);
+                        cfg_options.get_or_insert_with(|| def_crate.cfg_options(db))
+                    },
                     |attr, _| {
                         if let view::Meta::KeyValueMeta(attr) = attr
                             && attr.path().is1("rustc_macro_transparency")
@@ -135,13 +169,17 @@ impl AstId<ast::Macro> {
                     },
                 )
             };
+            // The definition's contexts, and its file's call site, are of this table.
+            let table = id.file_id.context_arena();
             let ctx_edition = |ctx: SyntaxContext| {
                 if ctx.is_root() {
                     def_crate.data(db).edition
                 } else {
                     // UNWRAP-SAFETY: Only the root context has no outer expansion
-                    let krate =
-                        crate::MacroCallId::from(ctx.outer_expn(db).unwrap()).loc(db).def.krate;
+                    let krate = crate::MacroCallId::from(ctx.outer_expn(db, table).unwrap())
+                        .loc(db)
+                        .def
+                        .krate;
                     krate.data(db).edition
                 }
             };
@@ -162,12 +200,20 @@ impl AstId<ast::Macro> {
                                 DocCommentDesugarMode::Mbe,
                                 frame,
                             );
+                            if let Some(written) = &mut written {
+                                written.rules(Some(&tt));
+                            }
 
                             mbe::DeclarativeMacro::parse_macro_rules(&tt, ctx_edition)
                         }
-                        None => mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
-                            "expected a token tree".into(),
-                        )),
+                        None => {
+                            if let Some(written) = &mut written {
+                                written.rules(None::<&tt::TopSubtree>);
+                            }
+                            mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
+                                "expected a token tree".into(),
+                            ))
+                        }
                     },
                     transparency(view::AnyHasAttrs::new(macro_rules))
                         .unwrap_or(Transparency::SemiOpaque),
@@ -193,17 +239,36 @@ impl AstId<ast::Macro> {
                                 DocCommentDesugarMode::Mbe,
                                 frame,
                             );
+                            if let Some(written) = &mut written {
+                                written.macro2(args.as_ref(), &body);
+                            }
 
                             mbe::DeclarativeMacro::parse_macro2(args.as_ref(), &body, ctx_edition)
                         }
-                        None => mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
-                            "expected a token tree".into(),
-                        )),
+                        None => {
+                            if let Some(written) = &mut written {
+                                written.macro_without_body();
+                            }
+                            mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
+                                "expected a token tree".into(),
+                            ))
+                        }
                     },
                     transparency(view::AnyHasAttrs::new(macro_def)).unwrap_or(Transparency::Opaque),
                 ),
             };
-            DeclarativeMacroExpander { mac, transparency, edition }
+            if let (Some((kept, file, hash)), Some(mut written)) = (kept, written) {
+                written.transparency(transparency);
+                // The transparency read the crate's cfg (a `cfg_attr` on the definition): the
+                // tokens' key takes the cfg wherever the definition's text names `cfg`
+                // (`stored::cfg_part`). A read the key does not cover is not kept.
+                if read_cfg.get() && stored::cfg_part(db, file, id.value.erase(), def_crate).is_none()
+                {
+                    written.disown();
+                }
+                stored::keep(db, kept, file, id.value.erase(), def_crate, hash, written);
+            }
+            DeclarativeMacroExpander { mac, transparency, edition, table }
         })
     }
 }

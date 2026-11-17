@@ -183,7 +183,8 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
         }
     };
     // alloc: empty `Vec`s, which don't allocate
-    Ok(Shared { name, symbols, names, versions: Vec::new(), more: Vec::new(), inputs })
+    let (versions, more, undefined) = (Vec::new(), Vec::new(), Vec::new());
+    Ok(Shared { name, symbols, names, versions, more, inputs, undefined })
 }
 
 fn set_trie(

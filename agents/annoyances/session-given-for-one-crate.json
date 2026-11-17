@@ -1,0 +1,14 @@
+{
+ "id": "session-given-for-one-crate",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane S, port round 27",
+ "where": "crates/base-db/src/world.rs (commit, marked, the crate list), crates/hir-ty/src/consteval/deps.rs (kept_fact), crates/blaze-cargo/src/serve/unit/deps.rs (serve)",
+ "what": "A commit after the cold build dropped every arena (dropped=32, fresh=a sealed arena marked): the constants' session maker had a fact over every kept crate's key, so std's key stored moved the session arena, which every arena borrows; and any write to a sealed crate (a build script's env, a surface, an image, a check-cache gift) started a new session because Memo::next refused a sealed arena. The crate list's digest was of each crate's content ID, so a build script's env write moved the session too.",
+ "cost": "every edit after a cold build re-made the whole front end; the span said only `fresh`",
+ "cause": "values that move for one crate were inputs of the arena every crate reads, and sealing was treated as 'never dropped' instead of 'pinned sources'",
+ "whys": "the session arena was a convenient home for a driver's per-database holder; its fact grew to cover per-crate data; the list digest reused the content ID; Memo::next asserted sealed arenas were never named",
+ "class": "a coarse input that many readers share and whose value moves for a few of them",
+ "prevention": "Memo::next takes a sealed arena like any other; the list digest is of item keys and root paths; the constants' per-crate key is a gift of that crate (give_base); the db commit span names each marked arena and its cause (causes, marked, fresh); tests a_write_to_a_sealed_crate_drops_it_and_its_dependents_alone and a_given_for_one_crate_keeps_every_other_crates_arena",
+ "workaround": "none needed after the change; read the db commit span's causes to find the next coarse input",
+ "state": "fixed in the tree, not yet run"
+}

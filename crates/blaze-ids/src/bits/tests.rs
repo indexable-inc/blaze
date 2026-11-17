@@ -1,7 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, thread};
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Config;
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
@@ -441,139 +440,148 @@ fn reads_and_writes_allocate_nothing() {
 }
 
 /// The shared set against the reference copy, op by op.
-#[hegel::test]
-fn the_set_is_the_reference(tc: TestCase) {
-    let len: usize = tc.draw(gs::integers().min_value(1).max_value(399));
-    let ops: Vec<(u8, usize)> = tc.draw(
-        gs::vecs(gs::tuples!(gs::integers().max_value(3), gs::integers().max_value(len - 1)))
-            .max_size(199),
-    );
-    let mut set = BitSet::<usize>::new(len);
-    let mut reference = reference::Bits::new(len);
-    for (op, at) in ops {
-        match op {
-            0 | 1 => assert_eq!(set.insert(at), reference.insert(at)),
-            2 => {
-                let had = reference.contains(at);
-                reference.remove(at);
-                assert_eq!(set.remove(at), had);
+#[test]
+fn the_set_is_the_reference() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let len: usize = tape.int_in(1..=399, "len");
+        let ops: Vec<(u8, usize)> = tape.vec(0..=199, "ops", |tape| {
+            (tape.int_in(0..=3, "op"), tape.int_in(0..=len - 1, "at"))
+        });
+        let mut set = BitSet::<usize>::new(len);
+        let mut reference = reference::Bits::new(len);
+        for (op, at) in ops {
+            match op {
+                0 | 1 => assert_eq!(set.insert(at), reference.insert(at)),
+                2 => {
+                    let had = reference.contains(at);
+                    reference.remove(at);
+                    assert_eq!(set.remove(at), had);
+                }
+                _ => assert_eq!(set.contains(at), reference.contains(at)),
             }
-            _ => assert_eq!(set.contains(at), reference.contains(at)),
         }
-    }
-    let want: Vec<usize> = (0..len).filter(|&at| reference.contains(at)).collect();
-    assert_eq!(set.iter().collect::<Vec<_>>(), want.clone());
-    assert_eq!(
-        set.iter().rev().collect::<Vec<_>>(),
-        want.iter().rev().copied().collect::<Vec<_>>()
-    );
-    assert_eq!(set.count(), want.len());
-    assert_eq!(set.iter().count(), want.len());
-    assert_eq!(set.is_empty(), want.is_empty());
+        let want: Vec<usize> = (0..len).filter(|&at| reference.contains(at)).collect();
+        assert_eq!(set.iter().collect::<Vec<_>>(), want.clone());
+        assert_eq!(
+            set.iter().rev().collect::<Vec<_>>(),
+            want.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(set.count(), want.len());
+        assert_eq!(set.iter().count(), want.len());
+        assert_eq!(set.is_empty(), want.is_empty());
+    });
 }
 
 /// Union, intersection and difference against the reference copy, a bit at a time, with
 /// the changed flag a dataflow iterates on.
-#[hegel::test]
-fn set_operations_are_the_references(tc: TestCase) {
-    let len: usize = tc.draw(gs::integers().min_value(1).max_value(299));
-    let a: Vec<usize> = tc.draw(gs::vecs(gs::integers().max_value(len - 1)).max_size(99));
-    let b: Vec<usize> = tc.draw(gs::vecs(gs::integers().max_value(len - 1)).max_size(99));
-    let op: u8 = tc.draw(gs::integers().max_value(2));
-    let (mut x, mut y) = (BitSet::<usize>::new(len), BitSet::<usize>::new(len));
-    let (mut rx, mut ry) = (reference::Bits::new(len), reference::Bits::new(len));
-    for &at in &a {
-        x.insert(at);
-        rx.insert(at);
-    }
-    for &at in &b {
-        y.insert(at);
-        ry.insert(at);
-    }
-    let mut changed = false;
-    for at in 0..len {
-        let (had, other) = (rx.contains(at), ry.contains(at));
-        let now = match op {
-            0 => had || other,
-            1 => had && other,
-            _ => had && !other,
-        };
-        changed |= now != had;
-        if now {
+#[test]
+fn set_operations_are_the_references() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let len: usize = tape.int_in(1..=299, "len");
+        let a: Vec<usize> = tape.vec(0..=99, "a", |tape| tape.int_in(0..=len - 1, "member"));
+        let b: Vec<usize> = tape.vec(0..=99, "b", |tape| tape.int_in(0..=len - 1, "member"));
+        let op: u8 = tape.int_in(0..=2, "op");
+        let (mut x, mut y) = (BitSet::<usize>::new(len), BitSet::<usize>::new(len));
+        let (mut rx, mut ry) = (reference::Bits::new(len), reference::Bits::new(len));
+        for &at in &a {
+            x.insert(at);
             rx.insert(at);
-        } else {
-            rx.remove(at);
         }
-    }
-    let said = match op {
-        0 => x.union_with(&y),
-        1 => x.intersect_with(&y),
-        _ => x.subtract(&y),
-    };
-    assert_eq!(said, changed);
-    assert_eq!(
-        x.iter().collect::<Vec<_>>(),
-        (0..len).filter(|&at| rx.contains(at)).collect::<Vec<_>>()
-    );
-    let subset = (0..len).all(|at| !rx.contains(at) || ry.contains(at));
-    assert_eq!(x.is_subset(&y), subset);
+        for &at in &b {
+            y.insert(at);
+            ry.insert(at);
+        }
+        let mut changed = false;
+        for at in 0..len {
+            let (had, other) = (rx.contains(at), ry.contains(at));
+            let now = match op {
+                0 => had || other,
+                1 => had && other,
+                _ => had && !other,
+            };
+            changed |= now != had;
+            if now {
+                rx.insert(at);
+            } else {
+                rx.remove(at);
+            }
+        }
+        let said = match op {
+            0 => x.union_with(&y),
+            1 => x.intersect_with(&y),
+            _ => x.subtract(&y),
+        };
+        assert_eq!(said, changed);
+        assert_eq!(
+            x.iter().collect::<Vec<_>>(),
+            (0..len).filter(|&at| rx.contains(at)).collect::<Vec<_>>()
+        );
+        let subset = (0..len).all(|at| !rx.contains(at) || ry.contains(at));
+        assert_eq!(x.is_subset(&y), subset);
+    });
 }
 
 /// Iteration from both ends at once meets in the middle with every member once.
-#[hegel::test]
-fn both_ends_meet(tc: TestCase) {
-    let words: Vec<u64> = tc.draw(gs::vecs(gs::integers()).max_size(5));
-    let backs: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).max_size(399));
-    let set = BitSlice::<usize>::from_words(&words[..]);
-    let mut it = set.iter();
-    let (mut front, mut back) = (Vec::new(), Vec::new());
-    for from_back in backs.iter().copied().chain(std::iter::repeat(false)) {
-        let next = if from_back { it.next_back() } else { it.next() };
-        match next {
-            Some(at) if from_back => back.push(at),
-            Some(at) => front.push(at),
-            None => break,
+#[test]
+fn both_ends_meet() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let words: Vec<u64> = tape.vec(0..=5, "words", |tape| tape.int("word"));
+        let backs: Vec<bool> = tape.vec(0..=399, "backs", |tape| tape.bool("from the back"));
+        let set = BitSlice::<usize>::from_words(&words[..]);
+        let mut it = set.iter();
+        let (mut front, mut back) = (Vec::new(), Vec::new());
+        for from_back in backs.iter().copied().chain(std::iter::repeat(false)) {
+            let next = if from_back { it.next_back() } else { it.next() };
+            match next {
+                Some(at) if from_back => back.push(at),
+                Some(at) => front.push(at),
+                None => break,
+            }
         }
-    }
-    front.extend(back.into_iter().rev());
-    let want: Vec<usize> =
-        (0..words.len() * 64).filter(|&at| words[at / 64] >> (at % 64) & 1 == 1).collect();
-    assert_eq!(front, want);
+        front.extend(back.into_iter().rev());
+        let want: Vec<usize> =
+            (0..words.len() * 64).filter(|&at| words[at / 64] >> (at % 64) & 1 == 1).collect();
+        assert_eq!(front, want);
+    });
 }
 
 /// A splice of a range of one set into another at an offset, against a bit at a time.
-#[hegel::test]
-fn a_range_ors_in_at_an_offset(tc: TestCase) {
-    let words: Vec<u64> = tc.draw(gs::vecs(gs::integers()).min_size(1).max_size(4));
-    let into: Vec<u64> = tc.draw(gs::vecs(gs::integers()).min_size(1).max_size(4));
-    let x: usize = tc.draw(gs::integers().max_value(words.len() * 64));
-    let y: usize = tc.draw(gs::integers().max_value(words.len() * 64));
-    let from = BitSlice::<usize>::from_words(&words[..]);
-    let range = x.min(y)..x.max(y);
-    let capacity = into.len() * 64;
-    tc.assume(range.len() <= capacity);
-    let at: usize = tc.draw(gs::integers().max_value(capacity - range.len()));
-    let mut set = BitSet::<usize>::from_words(into.clone());
-    set.or_range_at(at, &from, range.clone());
-    let mut want = BitSet::<usize>::from_words(into);
-    for (offset, bit) in range.enumerate() {
-        if from.contains(bit) {
-            want.insert(at + offset);
+#[test]
+fn a_range_ors_in_at_an_offset() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let words: Vec<u64> = tape.vec(1..=4, "words", |tape| tape.int("word"));
+        let into: Vec<u64> = tape.vec(1..=4, "into", |tape| tape.int("word"));
+        let x: usize = tape.int_in(0..=words.len() * 64, "x");
+        let y: usize = tape.int_in(0..=words.len() * 64, "y");
+        let from = BitSlice::<usize>::from_words(&words[..]);
+        let range = x.min(y)..x.max(y);
+        let capacity = into.len() * 64;
+        tape.assume(range.len() <= capacity);
+        let at: usize = tape.int_in(0..=capacity - range.len(), "at");
+        let mut set = BitSet::<usize>::from_words(into.clone());
+        set.or_range_at(at, &from, range.clone());
+        let mut want = BitSet::<usize>::from_words(into);
+        for (offset, bit) in range.enumerate() {
+            if from.contains(bit) {
+                want.insert(at + offset);
+            }
         }
-    }
-    assert_eq!(set, want);
+        assert_eq!(set, want);
+    });
 }
 
 /// A rank against a count of the reference's members below it.
-#[hegel::test]
-fn a_rank_counts_the_members_below(tc: TestCase) {
-    let bools: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(1).max_size(499));
-    let ranked = Ranked::from_bools(bools.iter().copied());
-    let mut below = 0;
-    for (at, &bit) in bools.iter().enumerate() {
-        assert_eq!(ranked.rank(at), below);
-        assert_eq!(ranked.contains(at), bit);
-        below += usize::from(bit);
-    }
-    assert_eq!(ranked.count(), below);
+#[test]
+fn a_rank_counts_the_members_below() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let bools: Vec<bool> = tape.vec(1..=499, "bools", |tape| tape.bool("member"));
+        let ranked = Ranked::from_bools(bools.iter().copied());
+        let mut below = 0;
+        for (at, &bit) in bools.iter().enumerate() {
+            assert_eq!(ranked.rank(at), below);
+            assert_eq!(ranked.contains(at), bit);
+            below += usize::from(bit);
+        }
+        assert_eq!(ranked.count(), below);
+    });
 }

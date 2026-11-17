@@ -1208,7 +1208,7 @@ mod tests {
     /// [`stored`] in `sim`, kept for the test to commit puts in.
     fn opened(mut sim: Sim, values: &[(&str, Kind, &[u8])]) -> (Sim, Store) {
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0, load_tags: 1 << 32, loader: crate::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         drive(&mut sim, &mut store, &mut effects);
         assert!(store.ready());
@@ -2212,12 +2212,16 @@ mod tests {
 
     /// The model: whatever batches the server's store puts, however its deltas and full filters
     /// fall, the client's filters never hide a key the epoch they cover holds.
-    #[hegel::test]
-    fn a_filter_never_hides_a_key_it_covers(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let first: Vec<u16> = tc.draw(gs::vecs(gs::integers()).max_size(60));
-        let batches: Vec<Vec<u16>> =
-            tc.draw(gs::vecs(gs::vecs(gs::integers()).max_size(30)).max_size(24));
+    #[test]
+    fn a_filter_never_hides_a_key_it_covers() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, a_filter_never_hides_a_key_it_covers_case);
+    }
+
+    fn a_filter_never_hides_a_key_it_covers_case(tape: &blaze_sim::Tape) {
+        let first: Vec<u16> = tape.vec(0..=60, "first keys", |tape| tape.int::<u16>("key"));
+        let batches: Vec<Vec<u16>> = tape.vec(0..=24, "batches", |tape| {
+            tape.vec(0..=30, "batch keys", |tape| tape.int::<u16>("key"))
+        });
         let name = |n: u16| format!("model {n}");
         let put = |store: &mut Store, n: u16| {
             store.put(key(&name(n)), Kind::Code, &n.to_le_bytes()).unwrap();
@@ -2255,7 +2259,7 @@ mod tests {
     fn a_server_of_a_store_that_does_not_watch_its_keys_stops_and_says_why() {
         let mut sim = Sim::new(7, Faults::default());
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0, load_tags: 1 << 32, loader: crate::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         drive(&mut sim, &mut store, &mut effects);
         assert!(!store.watching_keys());
@@ -2340,10 +2344,16 @@ mod tests {
     /// fetches interleave, a key the server's store could give when it last refreshed is never
     /// ruled out, packed or not, and a fetch of it is answered with its value. A key never put
     /// is answered `Missing`, by the filter or the server.
-    #[hegel::test]
-    fn no_key_the_server_could_give_at_its_last_refresh_is_ruled_out(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let ops: Vec<u16> = tc.draw(gs::vecs(gs::integers()).max_size(160));
+    #[test]
+    fn no_key_the_server_could_give_at_its_last_refresh_is_ruled_out() {
+        blaze_sim::check(
+            blaze_sim::Config::DEFAULT,
+            no_key_the_server_could_give_at_its_last_refresh_is_ruled_out_case,
+        );
+    }
+
+    fn no_key_the_server_could_give_at_its_last_refresh_is_ruled_out_case(tape: &blaze_sim::Tape) {
+        let ops: Vec<u16> = tape.vec(0..=160, "ops", |tape| tape.int::<u16>("op"));
         let name = |n: u16| format!("interleaved {n}");
         let (mut sim, mut store) = opened(Sim::new(12, Faults::default()), &[]);
         let mut net = Net::new(usize::MAX);
@@ -2422,11 +2432,14 @@ mod tests {
 
     /// A filter frame rules in about one key in 256 it was not built of, at any size, and
     /// every key it was.
-    #[hegel::test]
-    fn a_filter_frame_rules_in_about_one_absent_key_in_256(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let built: usize = tc.draw(gs::integers().max_value(3000));
-        let salt: u64 = tc.draw(gs::integers());
+    #[test]
+    fn a_filter_frame_rules_in_about_one_absent_key_in_256() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, a_filter_frame_rules_in_about_one_absent_key_in_256_case);
+    }
+
+    fn a_filter_frame_rules_in_about_one_absent_key_in_256_case(tape: &blaze_sim::Tape) {
+        let built: usize = tape.int_in(0..=3000usize, "keys built");
+        let salt: u64 = tape.int::<u64>("salt");
         let keys: Vec<Key> = (0..built).map(|n| key(&format!("in {salt} {n}"))).collect();
         let frame = filter_of(true, 0, &keys);
         let (_, _, filter) = parse_filter(&frame[8..]).unwrap();

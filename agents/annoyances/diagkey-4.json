@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "this lane's own measuring",
+ "what": "The first reproduction ran under `timeout 900` with Python's output buffered, while two cargo builds ran on the same VM: the pinned toolchain's download (9 minutes) and a cold build under load used the 900 s, the script was killed, and nothing it had measured was written.",
+ "cost": "fifteen minutes and one run",
+ "cause": "a buffered script under a timeout, and one VM for building and measuring (the same as edit2-12)",
+ "workaround": "`python3 -u`, no timeout, started detached; timings taken again once no build ran",
+ "state": "open"
+}

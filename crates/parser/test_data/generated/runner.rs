@@ -69,6 +69,10 @@ mod ok {
         );
     }
     #[test]
+    fn bare_pattern_type() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/bare_pattern_type.rs");
+    }
+    #[test]
     fn become_expr() { run_and_expect_no_errors("test_data/parser/inline/ok/become_expr.rs"); }
     #[test]
     fn bind_pat() { run_and_expect_no_errors("test_data/parser/inline/ok/bind_pat.rs"); }
@@ -555,6 +559,10 @@ mod ok {
     }
     #[test]
     fn pattern_type() { run_and_expect_no_errors("test_data/parser/inline/ok/pattern_type.rs"); }
+    #[test]
+    fn pattern_type_base() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/pattern_type_base.rs");
+    }
     #[test]
     fn placeholder_pat() {
         run_and_expect_no_errors("test_data/parser/inline/ok/placeholder_pat.rs");

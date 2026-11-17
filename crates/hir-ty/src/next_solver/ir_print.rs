@@ -256,6 +256,7 @@ impl<'db> IrPrint<rustc_type_ir::PatternKind<DbInterner<'db>>> for DbInterner<'d
             ty::PatternKind::Range { start, end } => write!(fmt, "{:?}..={:?}", start, end),
             ty::PatternKind::Or(list) => write!(fmt, "or({:?})", list),
             ty::PatternKind::NotNull => fmt.write_str("!null"),
+            ty::PatternKind::Variant { index } => write!(fmt, "variant#{index}"),
         }
     }
 }

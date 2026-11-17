@@ -132,6 +132,29 @@ pub trait Probe: Sync {
     /// Takes one wait. Called while the waiter holds the lock it waited for, so it must not
     /// take that lock: a lock on the recording path itself is [`Lock::unrecorded`].
     fn record(&self, wait: &LockWait);
+    /// Opens the span of a file call that may wait for a device, made on a driver's thread
+    /// off its loop ([`io_wait`]): `op` is what the call does (`clone`, `write back`) and
+    /// `file` the file it is made on. Its token is given back to [`Probe::wait_end`]; `None`
+    /// from a probe that names no such call (a test's), which is the default.
+    fn io_begin(&self, op: &'static str, file: &str) -> Option<u64> {
+        let _ = (op, file);
+        None
+    }
+}
+
+/// Runs `call`, a file call that may wait for a device (a clone, a write-back, a listing),
+/// under a span of the process's probe that names `op` and `file` (rule
+/// every-wait-says-what): where a driver's thread off its loop spends its time is then in the
+/// profile by file, where before the loop's own wait was all that showed. With no probe
+/// installed the call runs as it is.
+pub fn io_wait<R>(op: &'static str, file: &str, call: impl FnOnce() -> R) -> R {
+    let probe = installed();
+    let token = probe.and_then(|it| it.io_begin(op, file));
+    let result = call();
+    if let (Some(probe), Some(token)) = (probe, token) {
+        probe.wait_end(token);
+    }
+    result
 }
 
 /// The process's probe; null for none.
@@ -305,8 +328,9 @@ struct Waiting<'a> {
     start_ns: u64,
     span: u64,
     token: u64,
-    /// Its row in the wait-for graph, while it waits.
-    registered: Option<graph::Registered>,
+    /// Its row in the wait-for graph, while it waits: held for its drop, which takes the row
+    /// out, and never read.
+    _registered: Option<graph::Registered>,
     ended: bool,
 }
 
@@ -335,16 +359,17 @@ impl<'a> Waiting<'a> {
             graph::lock(meta.name, mode, ptr::from_ref(meta).addr()),
             span,
             start_ns,
+            None,
             Some(site),
             Some(&meta.owner),
         ));
-        Waiting { meta, probe, site, mode, value_type, start_ns, span, token, registered, ended: false }
+        Waiting { meta, probe, site, mode, value_type, start_ns, span, token, _registered: registered, ended: false }
     }
 
     /// The lock taken: ends the span, records the wait, and gives the guard's acquire time.
     fn taken(mut self) -> u64 {
         self.ended = true;
-        self.registered = None;
+        self._registered = None;
         let Some(probe) = self.probe else { return 0 };
         probe.wait_end(self.token);
         self.meta.waiting.fetch_sub(1, Ordering::Relaxed);
@@ -760,14 +785,21 @@ impl Signal {
         self.name
     }
 
-    fn span<R>(&self, wait: impl FnOnce() -> R) -> R {
+    /// Runs `wait` inside the signal's span and wait-graph row; `left` is the time from now to
+    /// its deadline (`None`: it has none), which the row says on the probe's clock.
+    fn span<R>(&self, left: Option<Duration>, wait: impl FnOnce() -> R) -> R {
         let probe = installed();
         let token = probe.map(|it| it.wait_begin(Awaits::Signal(self.name)));
         let registered = probe.map(|probe| {
+            let now_ns = probe.now_ns();
+            let deadline_ns = left.map(|it| {
+                now_ns.saturating_add(u64::try_from(it.as_nanos()).unwrap_or(u64::MAX))
+            });
             graph::register(
                 stall::Blocked::Signal(self.name),
                 probe.span(),
-                probe.now_ns(),
+                now_ns,
+                deadline_ns,
                 None,
                 None,
             )
@@ -782,7 +814,7 @@ impl Signal {
 
     /// Waits for a notify, letting `guard`'s lock go meanwhile.
     pub fn wait<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>) {
-        self.span(|| self.raw.wait(&mut guard.inner));
+        self.span(None, || self.raw.wait(&mut guard.inner));
     }
 
     /// Waits while `condition` holds.
@@ -791,17 +823,18 @@ impl Signal {
         guard: &mut LockGuard<'_, T>,
         condition: impl FnMut(&mut T) -> bool,
     ) {
-        self.span(|| self.raw.wait_while(&mut guard.inner, condition));
+        self.span(None, || self.raw.wait_while(&mut guard.inner, condition));
     }
 
     /// Waits for a notify by `deadline`: whether the deadline passed first.
     pub fn wait_until<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, deadline: Instant) -> bool {
-        self.span(|| self.raw.wait_until(&mut guard.inner, deadline).timed_out())
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.span(Some(left), || self.raw.wait_until(&mut guard.inner, deadline).timed_out())
     }
 
     /// Waits for a notify for at most `most`: whether it passed first.
     pub fn wait_for<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, most: Duration) -> bool {
-        self.span(|| self.raw.wait_for(&mut guard.inner, most).timed_out())
+        self.span(Some(most), || self.raw.wait_for(&mut guard.inner, most).timed_out())
     }
 
     /// Waits while `condition` holds, by `deadline`: whether the deadline passed first.
@@ -811,7 +844,10 @@ impl Signal {
         condition: impl FnMut(&mut T) -> bool,
         deadline: Instant,
     ) -> bool {
-        self.span(|| self.raw.wait_while_until(&mut guard.inner, condition, deadline).timed_out())
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.span(Some(left), || {
+            self.raw.wait_while_until(&mut guard.inner, condition, deadline).timed_out()
+        })
     }
 
     /// Waits while `condition` holds, for at most `most`: whether it passed first.
@@ -821,7 +857,9 @@ impl Signal {
         condition: impl FnMut(&mut T) -> bool,
         most: Duration,
     ) -> bool {
-        self.span(|| self.raw.wait_while_for(&mut guard.inner, condition, most).timed_out())
+        self.span(Some(most), || {
+            self.raw.wait_while_for(&mut guard.inner, condition, most).timed_out()
+        })
     }
 
     pub fn notify_one(&self) -> bool {

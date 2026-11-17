@@ -5,10 +5,16 @@
 //! that holds a linear value ([`Types::reaches`]) is refused for a parameter that is not marked
 //! `#[blaze::linear]`: its code may drop a value of it. A trait method is checked as the impl's
 //! method it resolves to, whose own parameters are the ones that matter; a call of a closure,
-//! a function item or a function pointer through `Fn*` goes into a body checked itself; a
-//! constructor of a type with no `Drop` impl only builds the value, which is checked where it is
-//! dropped. An impl that binds an associated type to a linear type is refused when the trait's
-//! associated type is not marked: code generic over the trait drops values of it.
+//! a function item, a function pointer or a type parameter through `Fn*` goes into a body
+//! checked itself; a constructor of a type with no `Drop` impl only builds the value, which is
+//! checked where it is dropped. An impl that binds an associated type to a linear type is
+//! refused when the trait's associated type is not marked: code generic over the trait drops
+//! values of it. The one binding admitted without the mark is to the impl's own marked
+//! parameter that its self type holds (`type Output = T` of `Try for Option<T>`).
+//!
+//! `Option` and `Result` admit a linear payload this way and no other: library/core marks the
+//! type parameters of the impls whose every method hands the payload on or panics, and the
+//! methods that may drop one stay in impls with no mark, so a call of one is refused here.
 
 use hir_def::{
     AssocItemId, CallableDefId, DefWithBodyId, GenericDefId, GenericParamId, ItemContainerId,
@@ -64,6 +70,14 @@ fn check_operand<'db>(
     };
     let span = operand.span.unwrap_or(at);
     let db = types.db;
+    if let CallableDefId::FunctionId(func) = callable
+        && let Some(verb) = mem_drop(db, func)
+    {
+        for ty in args.types().filter(|&it| types.reaches(it)) {
+            out.push(given_to_drop(types, body, span, ty, func, verb));
+        }
+        return;
+    }
     let (def, args) = match callable {
         CallableDefId::FunctionId(func) => match resolve(types, func, args) {
             Some(it) => it,
@@ -123,10 +137,62 @@ fn check_operand<'db>(
     }
 }
 
+/// What `func` does to the value it is given, when it is core's `mem::drop` (`"drops"`) or
+/// `mem::forget` (`"leaks"`): a call of either with a linear value gives it up on purpose,
+/// which is refused with its own message rather than as a parameter that admits no linear
+/// type. std's `mem::drop` and `mem::forget` are core's, re-exported.
+fn mem_drop(db: &base_db::Db, func: hir_def::FunctionId) -> Option<&'static str> {
+    use hir_def::{HasModule, signatures::FunctionSignature};
+    let module = func.module(db);
+    let in_mem = module.krate(db).data(db).origin.is_lang()
+        && module.name(db).is_some_and(|it| it.as_str() == "mem");
+    if !in_mem {
+        return None;
+    }
+    match FunctionSignature::of(db, func).name.as_str() {
+        "drop" => Some("drops"),
+        "forget" => Some("leaks"),
+        _ => None,
+    }
+}
+
+/// The error of a linear value of `ty` given to `mem::drop` or `mem::forget` (`func`), which
+/// `verb` it: neither consumes it, so the obligation it stands for is never met.
+fn given_to_drop<'db>(
+    types: &Types<'_, 'db>,
+    body: &MirBody<'db>,
+    span: MirSpan,
+    ty: Ty<'db>,
+    func: hir_def::FunctionId,
+    verb: &str,
+) -> LinearDiagnostic {
+    let db = types.db;
+    let shown = names::ty(db, body, ty);
+    let name = hir_def::signatures::FunctionSignature::of(db, func).name.as_str().to_owned(); // alloc: error path
+    let mut notes = Vec::new(); // alloc: error path
+    notes.extend(names::consumed_by(types, ty));
+    notes.push(crate::drops::CONSUME.to_owned()); // alloc: error path
+    LinearDiagnostic {
+        span,
+        message: format!(
+            "`{shown}` holds a `#[blaze::linear]` value and is given to `mem::{name}`, which \
+             {verb} it without consuming it: a linear value stands for something still owed, \
+             and giving it up on purpose is refused as dropping it is"
+        ),
+        labels: Vec::new(), // alloc: error path, empty
+        notes,
+    }
+}
+
 /// What a call of `func` with `args` runs, as the item whose parameters are checked: the impl's
 /// method a trait method resolves to, or `func`. `None` when the call goes into a body checked
 /// on its own: a closure's, a function item's or a function pointer's through `Fn*`, or a
-/// method a derive writes (which takes `&self` and drops no value of `Self`).
+/// method a derive writes (which takes `&self` and drops no value of `Self`). A call through
+/// `Fn*` of a type parameter is one of those too: whatever the parameter is given, the body
+/// that runs takes the arguments by value and is checked itself (std's own `Fn*` impls for
+/// `&F`, `&mut F` and `Box<F>` only hand them on), and what it gives back is linear in the
+/// caller unless the parameter was given a callable that gives a linear value, which
+/// [`Types::reaches`] refuses where it is given.
 fn resolve<'db>(
     types: &Types<'_, 'db>,
     func: hir_def::FunctionId,
@@ -146,6 +212,7 @@ fn resolve<'db>(
                 | TyKind::CoroutineClosure(..)
                 | TyKind::FnDef(..)
                 | TyKind::FnPtr(..)
+                | TyKind::Param(..)
         )
     {
         return None;
@@ -177,10 +244,18 @@ pub(crate) fn check_impl_bindings<'db>(
     }
     let Some(trait_ref) = db.impl_trait(impl_) else { return };
     let trait_ = trait_ref.skip_binder().def_id.0;
+    let self_ty: Ty<'db> = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
     for (name, item) in items.iter() {
         let &AssocItemId::TypeAliasId(alias) = item else { continue };
         let ty: Ty<'db> = db.ty(TyDefId::TypeAliasId(alias)).instantiate_identity().skip_norm_wip();
         if !types.holds(ty) {
+            continue;
+        }
+        // The impl's own marked parameter, which its self type holds: the self type is
+        // linear wherever the binding is, so code generic over the trait is given it only
+        // for a marked parameter of its own, and a projection of that parameter's
+        // associated types is linear there (`ty::is_marked`).
+        if matches!(ty.kind(), TyKind::Param(_)) && types.holds_a(self_ty, ty) {
             continue;
         }
         let admits = trait_

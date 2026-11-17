@@ -3,17 +3,14 @@ use std::{
         fd::AsRawFd as _,
         unix::net::{UnixListener, UnixStream},
     },
-    path::PathBuf,
 };
 
 use super::{Socket, listen};
-use crate::{Address, FileName};
+use crate::{Address, FileName, temp::TempDir};
 
-fn root(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("bz-inherited-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    root
+/// A directory for the test's sockets, removed when the guard drops.
+fn root(name: &str) -> TempDir {
+    TempDir::for_test_socket(&format!("bz-inherited-{name}-"))
 }
 
 fn inherited(fd: i32) -> Address {

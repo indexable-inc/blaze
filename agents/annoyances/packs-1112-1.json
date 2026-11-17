@@ -1,0 +1,21 @@
+{
+ "id": "packs-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane packs-1112",
+ "where": "crates/blaze-cas (Store::pins, Store::pin), crates/blaze-cargo/src/serve/collect.rs (build_ended)",
+ "what": "A pin can only be written safely after the store's first scan since it opened: before it `Store::pins()` is empty, so writing a pin of a name replaces the keys an earlier run pinned. Every writer of a pin has to know this (the daemon requeues the keys for the next build's end; the import has to flush and end periods until a scan ran, before its first put).",
+ "cost": "about an hour reading collect.rs to find it; an import must force a scan first",
+ "cause": "a pin is a whole record per name, newest wins, and the name's current keys are known only from a scan",
+ "whys": [
+  "the import wrote a pin and could have dropped earlier keys",
+  "`pins()` is empty until a scan",
+  "pins are found by scanning packs, not through an index by name",
+  "a pin's key is a hash of its contents, so the name's newest cannot be looked up",
+  "the pin form was designed for one writer that always runs after a scan"
+ ],
+ "class": "an API that is only correct after a hidden precondition (read-modify-write of a record whose current value may not be loaded)",
+ "prevention": "`Store::pin_add(name, why, when, keys)` in blaze-cas that merges with the name's pin itself and refuses, or waits, until the pins are read; asked of lane storegc. Until then `serve::packs::stored::pins_read` holds the rule for imports.",
+ "workaround": "pins_read: flush and end periods (bounded) before the first put",
+ "fix": "lane storegc wrote `Store::pin_add` / `Store::pins_read` (crates/blaze-cas/src/collect.rs, not compiled); packs call it through `serve::packs::stored::pin_grown` and their own merge is deleted",
+ "state": "fixed in the tree, unverified until the round builds"
+}

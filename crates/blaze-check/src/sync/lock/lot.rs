@@ -152,6 +152,7 @@ impl Condvar {
         }
         let inner = guard.guard.take().expect("a live guard holds the lock");
         let (inner, timed_out) = match dur {
+            // wakes: the caller's notifier: this is `Condvar::wait` handed through when no model runs and no time was given
             None => (self.0.condvar.wait(inner).unwrap_or_else(PoisonError::into_inner), false),
             Some(dur) => {
                 let (inner, out) =

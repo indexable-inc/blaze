@@ -61,6 +61,8 @@ pub(crate) struct Resolved<'a> {
     pub lock: Option<LockWrite>,
     /// What cargo warns of while selecting the packages.
     pub warnings: Vec<String>,
+    /// What `blaze.lock` pins git trees by: every git package of the resolve has its pin here.
+    pub pins: blaze_audit::pins::SourcePins,
 }
 
 /// Resolves the workspace `ws` as `spec` asks and hands the result to `then`. Every file is
@@ -125,7 +127,16 @@ pub(crate) fn resolved<'r, 'db, R>(
         Ok(net) => spec.offline.or(net.offline.unwrap_or(false).then_some("--offline")),
         Err(error) => return Ok(fail(error)),
     };
-    let sources = match Sources::new(&ctx.config, &spec.sources, offline) {
+    // A workspace of blaze's own (the standard library's) has no `blaze.lock`, and no git
+    // package: any it named would be refused unpinned.
+    let pins = match spec.foreign.is_some() {
+        true => blaze_audit::pins::SourcePins::default(),
+        false => match lock::source_pins(&files, &root) {
+            Ok(it) => it,
+            Err(error) => return Ok(Staged::Failed(error)),
+        },
+    };
+    let sources = match Sources::new(&ctx.config, &spec.workspace.config, &spec.sources, offline, pins) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
@@ -335,6 +346,7 @@ pub(crate) fn resolved<'r, 'db, R>(
         manifests,
         lock: lock_write,
         warnings,
+        pins: sources.pins().clone(),
     })
 }
 
@@ -436,7 +448,13 @@ fn locate_all(
         let checksum = checksums.get(&id).and_then(Option::as_deref);
         match files.with_cx(|cx| sources.locate(cx, id, checksum))? {
             Located::Here { manifest } => here.push((id, manifest)),
-            Located::Needs(fetch) => needs.push(fetch),
+            // Once per place: a git repository's packages share its checkout.
+            Located::Needs(fetch) => {
+                if let Err(error) = fetch.ask_once(&mut needs) {
+                    let at = format!("{} v{}", id.name(), id.version()); // alloc: an error, once
+                    failed.push((load_error(&error, Some(at)), false));
+                }
+            }
             Located::Failed(error) => failed.push((error, false)),
             Located::Unfetched(error) => failed.push((error, true)),
         }

@@ -266,48 +266,43 @@ pub fn heap_committed_by(committed: fn() -> u64) {
     _ = HEAP_COMMITTED.set(committed);
 }
 
-/// How many heap give-backs were asked ([`give_back_heap`]): each thread of the global allocator
-/// gives back the free pages its own heaps keep once it sees this past the count it last did.
-static HEAP_GIVE_BACKS: AtomicU64 = AtomicU64::new(0);
-
-/// The global allocator's give-back on the calling thread ([`heap_gives_back_by`]): set once,
-/// by an allocator that keeps free pages per thread (mimalloc's theaps).
-static HEAP_GIVE_BACK: OnceLock<fn()> = OnceLock::new();
-
-/// The global allocator gives back, with `here`, what the calling thread's heaps keep free, once
-/// [`heap_give_backs`] passed what it last did on that thread. The first call wins; it allocates
-/// nothing and takes no lock, so an allocator may call it as it makes its first heap.
-pub fn heap_gives_back_by(here: fn()) {
-    _ = HEAP_GIVE_BACK.set(here);
+/// What the global allocator's pages hold for one tag's heap, read from the allocator's own
+/// page headers ([`heap_pages`]): the gap between `committed` and `used` is memory freed and
+/// kept, by whom. `empty` and `sparse` say what kind of gap: whole free pages the allocator
+/// has not given back, or pages a few live blocks pin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct HeapPages {
+    /// The allocator's pages (mimalloc's: 64 KiB, 512 KiB or 4 MiB, each of one block size).
+    pub pages: u64,
+    /// The bytes of the blocks its pages have ever handed out or made ready (a page's capacity
+    /// times its block size): what the pages hold resident, at most.
+    pub committed: u64,
+    /// The bytes of its live blocks, each at its size class's size.
+    pub used: u64,
+    /// Of `committed`, what pages with no live block hold.
+    pub empty: u64,
+    /// Of `committed`, what pages under a quarter in use hold, `empty` ones aside.
+    pub sparse: u64,
 }
 
-/// How many heap give-backs were asked: what a thread of the global allocator holds its own
-/// count to, on its allocation path. One relaxed load.
-#[inline]
-pub fn heap_give_backs() -> u64 {
-    HEAP_GIVE_BACKS.load(Ordering::Relaxed)
+/// The global allocator's walk of its pages, by tag then the pages of no tag: set once
+/// ([`heap_pages_by`]).
+static HEAP_PAGES: OnceLock<fn(&mut [HeapPages; Tag::COUNT + 1])> = OnceLock::new();
+
+/// The global allocator says what its pages hold, heap by heap, with `walk`: it fills one
+/// [`HeapPages`] a tag and a last one for the pages of no tag. The first call wins.
+pub fn heap_pages_by(walk: fn(&mut [HeapPages; Tag::COUNT + 1])) {
+    _ = HEAP_PAGES.set(walk);
 }
 
-/// Asks every thread of the global allocator to give the system back the free pages its heaps
-/// keep, and gives back this thread's now: a release let go of what the front end kept (B5).
-/// mimalloc purges a freed page only `purge_delay` after the free, and then only as some thread
-/// next takes a page; this purges every freed page at once. The pages a thread's heaps still
-/// allocate from, and those they retire empty, are that thread's alone to collect, and a block
-/// another thread frees there is not even seen as free until it looks: each other thread does
-/// its part as it next allocates for a task, or as a pool worker goes idle ([`settle_heap`])
-/// (memcap5, coord-111).
-pub fn give_back_heap() {
-    HEAP_GIVE_BACKS.fetch_add(1, Ordering::Relaxed);
-    settle_heap();
-}
-
-/// Gives back what this thread's heaps keep free if a give-back was asked since it last did
-/// ([`give_back_heap`]); nothing otherwise, or where the allocator keeps no pages per thread.
-/// What a pool worker does as it goes idle, outside any task.
-pub fn settle_heap() {
-    if let Some(here) = HEAP_GIVE_BACK.get() {
-        here();
-    }
+/// What the global allocator's pages hold now, a tag's heap each and last the heap of no tag;
+/// `None` where the allocator does not say (std's). A diagnostic read while other threads
+/// allocate: each number is one page header's at some moment, so the sums are near, not exact.
+pub fn heap_pages() -> Option<[HeapPages; Tag::COUNT + 1]> {
+    let walk = HEAP_PAGES.get()?;
+    let mut pages = [HeapPages::default(); Tag::COUNT + 1];
+    walk(&mut pages);
+    Some(pages)
 }
 
 /// The process's footprint as the system counts it, where the daemon says how to read it

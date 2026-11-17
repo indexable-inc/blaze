@@ -51,6 +51,7 @@ const LINUX: Target = Target {
     probe_stack: true,
     probe_log2: 12,
     counts: true,
+    slots: false,
 };
 const MACOS: Target = Target { os: Os::MacOs, tls: TlsModel::MachO, ..LINUX };
 const WINDOWS: Target = Target { os: Os::Windows, pic: false, tls: TlsModel::Coff, ..LINUX };
@@ -573,6 +574,45 @@ fn calls_relocate_as_cranelift() {
     let code = ours(&callers(CallConv::SystemV), &LINUX);
     let near = code.relocs.iter().find(|it| it.kind == Reloc::X86CallPCRel4).expect("a near call");
     assert_eq!((code.bytes[near.at as usize - 1], near.addend), (0xe8, -4));
+}
+
+/// The code's shape (docs/v2/plan/design/launcher.md, "Step 3"): under `Target::slots` a call
+/// of a named function is `call qword ptr [rip + word]` against the callee's GOT entry (its
+/// slot word), colocated or not, so no register holds a body's address; a return call is
+/// `jmp qword ptr [rip + word]`; and a colocated function's address is `lea reg, [rip + thunk]`,
+/// never a GOT load. A GOT relocation against a function is therefore always a call, and any
+/// other is its address: the launcher tells them apart by kind.
+#[test]
+fn under_slots_a_call_loads_the_slot_word_and_an_address_is_the_thunk() {
+    let target = Target { slots: true, ..LINUX };
+    let code = ours(&callers(CallConv::SystemV), &target);
+    let (near, far) = (Name::User { namespace: 1, index: 0 }, Name::User { namespace: 1, index: 1 });
+    let of = |name: Name| -> Vec<(Reloc, [u8; 2])> {
+        code.relocs
+            .iter()
+            .filter(|it| it.name == name)
+            .map(|it| (it.kind, [code.bytes[it.at as usize - 2], code.bytes[it.at as usize - 1]]))
+            .collect()
+    };
+    // The colocated callee: `ff 15` (the call), then `8d 05` (`lea rax`, its address).
+    assert_eq!(of(near), [(Reloc::X86GOTPCRel4, [0xff, 0x15]), (Reloc::X86PCRel4, [0x8d, 0x05])]);
+    // The outside one: the call the same, and its address from the GOT (`mov rax, [rip + got]`).
+    assert_eq!(of(far), [(Reloc::X86GOTPCRel4, [0xff, 0x15]), (Reloc::X86GOTPCRel4, [0x8b, 0x05])]);
+    assert!(code.relocs.iter().all(|it| it.kind != Reloc::X86CallPCRel4), "a direct call");
+    assert_eq!(code.calls.len(), 4);
+
+    let tail = build(sig(CallConv::Tail, &[I64], &[I64]), |b, p| {
+        let f = import(b, 0, sig(CallConv::Tail, &[I64], &[I64]), true);
+        b.ins().return_call(f, &[p[0]]);
+    });
+    let code = ours(&tail, &target);
+    let jump = code.relocs.iter().find(|it| it.name == near).expect("the callee's relocation");
+    let at = jump.at as usize;
+    assert_eq!((jump.kind, &code.bytes[at - 2..at]), (Reloc::X86GOTPCRel4, &[0xff, 0x25][..]));
+
+    // The control: without `slots` the colocated call is direct.
+    let plain = ours(&callers(CallConv::SystemV), &LINUX);
+    assert!(plain.relocs.iter().any(|it| it.kind == Reloc::X86CallPCRel4));
 }
 
 #[test]

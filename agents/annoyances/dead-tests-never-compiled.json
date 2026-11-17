@@ -1,0 +1,14 @@
+{
+ "id": "dead-tests-never-compiled",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only executor, plan 12 piece E2c steps 2-4",
+ "where": "crates/blaze-diagnostics/src/lints/names/dead.rs (no `mod tests;`), crates/blaze-diagnostics/src/lints/names/dead/tests.rs",
+ "what": "dead/tests.rs, with its allocation budgets and step 1's refinement `the_numbering_equals_the_syntax_walk`, was never declared as a module (also at b744ff28c8), so none of its tests ever compiled or ran. Step 1's handover counted its refinement as written and expected to pass; nothing had checked it. Found only while adding this round's hooks to it.",
+ "cost": "a refinement taken as evidence for a round that was never evidence; this round adds `#[cfg(test)] mod tests;` and the four old tests compile for the first time alongside the two new ones, so their first build may show old errors",
+ "cause": "a test file is a test only once a `mod` names it, and nothing reports a `.rs` file no module names",
+ "class": "an orphaned source file: written, reviewed and counted, but outside the module tree",
+ "prevention": "a gate check that every .rs under a crate's src/ is reached from its lib.rs or main.rs through `mod` items (or is a bin, a test target or an include!), naming each orphan",
+ "workaround": "declare it: dead.rs now has `#[cfg(test)] mod tests;`",
+ "fix": "the declaration; the orphan check is not built",
+ "state": "open"
+}

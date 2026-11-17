@@ -52,7 +52,15 @@ pub fn token_tree_to_syntax_node<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
 
 /// Whether two inputs are the same tokens, each the same to the parser.
 pub fn same_input(a: &parser::Input, b: &parser::Input) -> bool {
-    a.len() == b.len() && (0..a.len()).all(|i| a.token(i) == b.token(i))
+    a.len() == b.len()
+        && a.tokens().marked() == b.tokens().marked()
+        && (0..a.len()).all(|i| a.token(i) == b.token(i))
+}
+
+/// Marks the token just pushed with the syntax extensions of the crate that wrote it: its
+/// span's anchor file's.
+fn mark_last(res: &mut parser::Input, span: Span) {
+    res.mark_extensions(res.len() - 1, span.anchor.file_id.extensions());
 }
 
 fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
@@ -96,6 +104,7 @@ fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
             match current.token_tree() {
                 Some(tt::TokenTree::Leaf(tt::Leaf::Ident(ident))) => {
                     res.push(LIFETIME_IDENT, ctx_edition(ident.span.ctx));
+                    mark_last(&mut res, ident.span);
                     current.bump();
                     continue;
                 }
@@ -120,6 +129,7 @@ fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                             tt::LitKind::Err(_) => SyntaxKind::ERROR,
                         };
                         res.push(kind, ctx_edition(lit.span.ctx));
+                        mark_last(&mut res, lit.span);
 
                         if kind == FLOAT_NUMBER && !lit.text().ends_with('.') {
                             res.was_joint();
@@ -141,11 +151,13 @@ fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                                 }
                             },
                         }
+                        mark_last(&mut res, ident.span);
                     }
                     tt::Leaf::Punct(punct) => {
                         let kind = SyntaxKind::from_char(punct.char)
                             .unwrap_or_else(|| panic!("{punct:#?} is not a valid punct"));
                         res.push(kind, ctx_edition(punct.span.ctx));
+                        mark_last(&mut res, punct.span);
                         if punct.spacing == tt::Spacing::Joint {
                             res.was_joint();
                         }
@@ -161,6 +173,7 @@ fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                     tt::DelimiterKind::Invisible => None,
                 } {
                     res.push(kind, ctx_edition(subtree.delimiter.open.ctx));
+                    mark_last(&mut res, subtree.delimiter.open);
                 } else if fragments && fragment_at.is_none() {
                     fragment_at = Some(res.len());
                 }
@@ -175,6 +188,7 @@ fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                     tt::DelimiterKind::Invisible => None,
                 } {
                     res.push(kind, ctx_edition(subtree.delimiter.close.ctx));
+                    mark_last(&mut res, subtree.delimiter.close);
                 }
             }
         };

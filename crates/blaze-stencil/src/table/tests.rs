@@ -367,6 +367,7 @@ fn target(arch: blaze_codegen::Arch, cpu: Cpu) -> Target {
         probe_stack: true,
         probe_log2: 12,
         counts: true,
+        slots: false,
     }
 }
 

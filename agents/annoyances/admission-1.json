@@ -1,0 +1,14 @@
+{
+ "id": "admission-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane admission",
+ "where": "crates/blaze-cargo/src/serve/plane.rs (admit) and crates/blaze-graph/src/plane_tests.rs (Model)",
+ "what": "The rule for what a task is granted lived in three places (serve plane's PER_SOURCE_KIB/SIZED_FLOOR/UNKNOWN_MOST guesses, the graph plane's over-budget clamp, and the simulation's Model, which still counted spec.memory), so a change to one (93fb38ff5c's clamp) failed four simulations with '9 against 43' and no one place said what a grant is.",
+ "cost": "a lane's diagnosis, read not run",
+ "cause": "no single home for the forecast; the test model restated the plane's rule by hand",
+ "class": "one concept in several homes (rule 30)",
+ "prevention": "blaze_graph::forecast is the one rule (Basis, forecast, learn, Check); serve plane calls it, spans name its basis",
+ "workaround": "none",
+ "fix": "this lane's change (uncommitted at writing)",
+ "state": "open"
+}

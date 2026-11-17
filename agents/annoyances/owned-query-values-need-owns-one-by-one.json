@@ -1,0 +1,14 @@
+{
+ "id": "owned-query-values-need-owns-one-by-one",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L5 ty-lower of the front-end-on-memo port, port-memo-1113",
+ "where": "crates/hir-ty/src (lower.rs, lower/batch.rs, infer.rs, consteval*, layout*, providers.rs, opaques.rs, ...)",
+ "what": "Porting hir-ty's queries to blaze-memo meant deciding, query by query, whether its value owns heap memory (ThinVec, Box<[..]>, SmallVec, ArenaMap, Box<str> in an error) and then either rewriting it to a kept slice or marking it `owns`. Nothing listed which values drop: it was read off each type and the types it holds, with no compiler to ask, since the lane runs nothing.",
+ "cost": "the larger part of the lane's reading; the list of `owns` (about 60 queries) is a best reading that the first compile's no-drop asserts will correct",
+ "cause": "query values were designed as owned trees (rust-analyzer's salsa heritage) and the engine never had to know whether a value drops",
+ "class": "a property of a type (needs_drop) that a port has to know at every site but no tool reports before compiling",
+ "prevention": "a reflection-derived report (`needs_drop` per tracked value type, by query name) the port can read before writing, and value types built as kept slices and records from the start so `owns` stays rare",
+ "workaround": "read each value type and every field type it holds; mark `owns` where any field drops, convert the flat `Box<[Copy]>` ones to `keep_iter`/`keep_slice`",
+ "fix": "not yet",
+ "state": "open"
+}

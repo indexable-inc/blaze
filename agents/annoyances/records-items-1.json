@@ -1,0 +1,21 @@
+{
+  "id": "records-items-1",
+  "date": "2026-11-12",
+  "who": "records-items (claude-fable-5-2)",
+  "what": "A second paged record (a crate's items, `nameres/frozen/items.rs`) needed the def-map pages' slot table, window read, segment reader and FNV hash, and the signatures' portable item key. All were private to `pages.rs` and `deps/signatures/key.rs`, files of another lane, so the new module could not compile without eleven visibility edits and a constructor in files it does not own, sent as a message and then handed back to be made by the asking lane when the owner ran out of context.",
+  "whys": [
+    "The page discipline (header, slots, segments, `PageSource`) was written inside the first record that used it, not as a module records share.",
+    "Each records lane models its record on `pages.rs` by reading it, so the shared part is copied or widened one visibility at a time.",
+    "The item key lived inside the signatures part as its private detail, though it is what every per-item record is found by.",
+    "A write-only lane cannot build, so a visibility it forgot to ask for is found a round later.",
+    "File ownership is per lane and the shared piece had no owner of its own."
+  ],
+  "class": "A shared mechanism left private inside its first user, so every later user edits another lane's file to reach it.",
+  "prevention": "One module for records read in pages (`frozen::segments`, which records-impls is adding: the slot table, the window lookup, `write_segment`, `segment`, `PageSource`) and one for the portable item key (`deps::signatures::key::Key`, now `pub(crate)`); `pages.rs`, `items.rs` and the impl tables use both. A lane brief for a new record names those two modules, not `pages.rs` as a model to read.",
+  "where": "crates/hir-def/src/nameres/frozen/pages.rs, crates/hir-def/src/nameres/frozen/items.rs, crates/hir-def/src/deps/signatures/key.rs",
+  "state": "open",
+  "cause": "The paging helpers and the item key were private to the first record that needed them.",
+  "cost": "one message round with the owning lane and edits in six of its files",
+  "workaround": "`pub(super)` on the helpers of `pages.rs`; `pub(crate)` on `Key` with `Key::new` and `Key::bytes`.",
+  "fix": ""
+}

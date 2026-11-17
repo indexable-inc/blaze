@@ -25,13 +25,12 @@ use hir_ty_mir::mir::{
     MirBody, MirOptLevel, MirOptions, TerminatorKind,
     devirt::{self, ABSENT, Held, Object, ObjectKey, Target, World},
     interpret_mir,
-    location::name_sources,
     print_mir_body,
 };
 use blaze_core::lock::Lock;
 use rustc_type_ir::inherent::IntoKind as _;
 
-use crate::db::TestDB;
+use crate::db::{TestDB, name_sources};
 
 const SHAPES: &str = r#"
 //- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn
@@ -208,6 +207,7 @@ fn against(held: &Held) -> MirOptions {
         inline: true,
         heap_to_stack: false,
         world: Some(held.world().id),
+        tier: MirOptions::at(MirOptLevel::Release).tier,
     }
 }
 
@@ -231,7 +231,7 @@ fn devirtualized_in<T>(
     check: impl FnOnce(&TestDB, &MirBody<'_>, &Object, &[String]) -> T,
 ) -> T {
     let db = fixture::db(text).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let held = world(&db, text, objects);
         let options = against(&held);
         let func = function(&db, name);
@@ -433,7 +433,7 @@ fn a_track_caller_method_behind_a_plain_declaration_stays_virtual() {
 fn a_dyn_call_of_a_track_caller_method_reports_its_definition() {
     let mut db = fixture::db(TRACKED).into_db();
     name_sources(&mut db, "fixture", |_, _, _| Some("main.rs".to_owned()));
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let held = world(&db, TRACKED, &[("Lines", &["Mine"], Made::Closed)]);
         let run = function(&db, "run");
         let env =

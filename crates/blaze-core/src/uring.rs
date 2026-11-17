@@ -7,9 +7,10 @@
 //! timers are a [`Wheel`] whose next deadline ends the ring's wait. A file is opened once,
 //! kept open and registered in the ring's table of files, so requests name its slot. A whole
 //! file's write is one linked chain (written, synced, renamed over the old, its directory
-//! synced), and a rename is linked to its directories' syncs. A large aligned write at an
-//! offset bypasses the page cache from a registered buffer. A truncation is an open of its name
-//! and a call made where it is submitted, never through a kept descriptor.
+//! synced), and a rename is linked to its directories' syncs. A write at an offset goes through
+//! the page cache whatever its size (only a read into or a write from the asker's own memory
+//! that asks to goes around it). A truncation is an open of its name and a call made where it
+//! is submitted, never through a kept descriptor.
 //!
 //! A spawned process is watched through the ring too: a poll of its pidfd for its exit, its
 //! output pipes read and its input written by the ring. A listen's accepts (one multishot
@@ -45,7 +46,7 @@ mod flight;
 mod ops;
 
 use std::{
-    cell::{RefCell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
     collections::VecDeque,
     ffi::CStr,
     fmt::Write as _,
@@ -60,7 +61,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
     },
     time::{Duration, Instant},
 };
@@ -71,6 +72,9 @@ use blaze_radix as radix;
 use std::alloc::Global;
 
 use self::ops::{Cold, Hot, Id, Kind};
+/// What the process's fanotify watches have read and dropped: the cost of one group per watch
+/// (`crate::fanotify`'s floor), readable from a running daemon.
+pub use crate::fanotify::{WatchCounts, watch_counts};
 use crate::{
     Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names,
     PSI_TRIGGER, RECV_MOST, Stamp, Tag,
@@ -79,8 +83,12 @@ use crate::{
     wheel::{self, Wheel},
 };
 
+/// `IORING_OP_NOP`: completes with 0 and does nothing, where a chain's sync is left out.
+const OP_NOP: u8 = 0;
 const OP_FSYNC: u8 = 3;
-const OP_WRITE_FIXED: u8 = 5;
+/// `fsync_flags` of an `IORING_OP_FSYNC`: the file's data and what a read of it needs (its
+/// length), as `fdatasync` ([`crate::Effect::Barrier`]).
+const IORING_FSYNC_DATASYNC: u32 = 1;
 const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
@@ -146,7 +154,6 @@ const ASYNC_CANCEL_ANY: u32 = 1 << 2;
 
 const REGISTER_FILES2: libc::c_uint = 13;
 const REGISTER_FILES_UPDATE2: libc::c_uint = 14;
-const REGISTER_BUFFERS2: libc::c_uint = 15;
 const REGISTER_PBUF_RING: libc::c_uint = 22;
 const UNREGISTER_PBUF_RING: libc::c_uint = 23;
 const REGISTER_FILE_ALLOC_RANGE: libc::c_uint = 25;
@@ -155,12 +162,6 @@ const RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 /// The most slots of the table of registered files; fewer where `RLIMIT_NOFILE` is lower,
 /// which the kernel holds the table to.
 const TABLE: u32 = 1 << 16;
-/// Registered buffers for writes that bypass the page cache, each a piece of such a write.
-const DIRECT_BUFFERS: u16 = 4;
-const DIRECT_PIECE: usize = 1 << 20;
-/// A `WriteAt` of at least this many bytes, its offset and length aligned to its file
-/// system's blocks, bypasses the page cache (`O_DIRECT`).
-const DIRECT_LEAST: usize = 1 << 20;
 /// The provided buffers a connection's receives take from, and the size of each.
 const RECV_BUFFERS: u16 = 64;
 const RECV_BUFFER: usize = 16 << 10;
@@ -174,8 +175,6 @@ const INBOX: usize = 4 << 20;
 /// notification, of ~1 µs together; below ~10 KiB the copy is the cheaper (the kernel's
 /// `msg_zerocopy.rst`). A Unix socket has no zero-copy sends, so its sends always copy.
 const ZERO_COPY_LEAST: usize = 32 << 10;
-/// `statx`'s mask bit of the alignment a write that bypasses the cache needs (Linux 6.1).
-const STATX_DIOALIGN: u32 = 0x2000;
 /// What a [`Stamp`] is made of, as `statx`'s mask asks for it (`linux/stat.h`; `libc` has these
 /// only for some C libraries).
 const STATX_STAMP: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
@@ -344,6 +343,7 @@ const _: () = assert!(size_of::<ProvidedBuf>() == 16);
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code, reason = "made by the kernel, read through a pointer")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
 struct StatxTime {
     sec: i64,
     nsec: u32,
@@ -355,6 +355,7 @@ struct StatxTime {
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code, reason = "made by the kernel, read through a pointer")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
 struct Statx {
     mask: u32,
     /// `stx_blksize`, `stx_attributes`, `stx_nlink`, `stx_uid` and `stx_gid`.
@@ -609,54 +610,6 @@ impl Drop for Fixed {
     }
 }
 
-/// Registered buffers (`IORING_REGISTER_BUFFERS2`), page-aligned, for the pieces of writes
-/// that bypass the page cache (`WRITE_FIXED`), which need memory aligned to the device's
-/// blocks. Pinned once, so no request pins pages of its own; lent one per write by
-/// [`ops::Lent`].
-struct Registered {
-    map: Map,
-}
-
-impl Registered {
-    fn new(ring: RawFd) -> io::Result<Registered> {
-        let map = anonymous(DIRECT_BUFFERS as usize * DIRECT_PIECE)?;
-        let iovecs: Vec<libc::iovec> = (0..DIRECT_BUFFERS as usize)
-            .map(|n| libc::iovec {
-                iov_base: map.at.wrapping_add(n * DIRECT_PIECE).cast(),
-                iov_len: DIRECT_PIECE,
-            })
-            .collect(); // alloc: setup, once per driver.
-        let buffers = RsrcRegister {
-            nr: DIRECT_BUFFERS.into(),
-            flags: 0,
-            resv2: 0,
-            data: iovecs.as_ptr() as u64,
-            tags: 0,
-        };
-        let nr = size_of::<RsrcRegister>() as libc::c_uint;
-        register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers", "5.13").map_err(|error| {
-            match error.raw_os_error() {
-                Some(libc::ENOMEM) => io::Error::new(
-                    error.kind(),
-                    // alloc: the error of a setup that failed.
-                    format!(
-                        "{error}: pinning {} MiB of buffers needs RLIMIT_MEMLOCK of that much (ulimit -l) or CAP_IPC_LOCK",
-                        DIRECT_BUFFERS as usize * DIRECT_PIECE >> 20
-                    ),
-                ),
-                _ => error,
-            }
-        })?;
-        Ok(Registered { map })
-    }
-
-    /// The start of buffer `index`, checked to be one of the [`DIRECT_BUFFERS`] in every build.
-    fn at(&self, index: u16) -> *mut u8 {
-        assert!(index < DIRECT_BUFFERS, "registered buffer {index} of {DIRECT_BUFFERS}");
-        self.map.at.wrapping_add(index as usize * DIRECT_PIECE)
-    }
-}
-
 /// The buffers a connection's multishot receive takes from (`IORING_REGISTER_PBUF_RING`): the
 /// kernel picks one per completion, and each is given back once its bytes are copied out. The
 /// buffers given back during a reap are published to the kernel together, one store of the
@@ -877,38 +830,6 @@ fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Er
             reg.ring_entries, reg.ring_addr, reg.bgid, reg.flags, reg.resv[0], reg.resv[1], reg.resv[2],
         ),
     )
-}
-
-/// What `statx` says of a descriptor's file: its device, and the alignment of offset and
-/// length a write bypassing the page cache needs (0 where its file system has none).
-#[cfg(test)]
-fn direct_alignment(fd: RawFd) -> io::Result<(u64, u32)> {
-    #[repr(C, align(8))]
-    struct Statx([u8; 256]);
-    let mut statx = Statx([0; 256]);
-    // SAFETY: an open descriptor, an empty path with `AT_EMPTY_PATH`, and a buffer of the
-    // size of `struct statx` to write.
-    let got = unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            fd,
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            STATX_DIOALIGN,
-            statx.0.as_mut_ptr(),
-        )
-    };
-    if got != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let word = |at: usize| u32::from_ne_bytes(statx.0[at..at + 4].try_into().expect("four bytes"));
-    let device = (u64::from(word(136)) << 32) | u64::from(word(140));
-    // `stx_dio_offset_align`, where the mask says it is filled in.
-    let align = match word(0) & STATX_DIOALIGN {
-        0 => 0,
-        _ => word(156),
-    };
-    Ok((device, align))
 }
 
 /// A mapping of the ring's memory, unmapped when dropped.
@@ -1273,6 +1194,13 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
     out
 }
 
+/// An [`Effect::ReadMany`] in flight: the asker's parts, handed back with each `got` set, and
+/// how many of its requests have not ended.
+struct Batch {
+    parts: Vec<crate::ReadPart>,
+    left: usize,
+}
+
 /// A watch's read and what it reads for, in [`Uring::watchings`], which is not freed while the
 /// kernel may still write into `buffer` (see `Drop`).
 struct Watching {
@@ -1288,10 +1216,10 @@ struct Watching {
     journal: Option<FileName>,
 }
 
-/// A file opened for reading and appending, kept open: under its name in [`Uring::names`]
-/// while `named`, and kept while any request in flight uses it (its open among them). Opened
-/// through the ring into its slot of the table, by which every request on it names it; until
-/// `open`, they wait.
+/// A file opened for reading and appending (for a sync alone, reading: `read_only`), kept
+/// open: under its name in [`Uring::names`] while `named`, and kept while any request in
+/// flight uses it (its open among them). Opened through the ring into its slot of the table,
+/// by which every request on it names it; until `open`, they wait.
 struct Kept {
     fixed: Fixed,
     users: u32,
@@ -1304,6 +1232,31 @@ struct Kept {
     positional: bool,
     /// A positional file opened `O_DIRECT`, around the page cache.
     direct: bool,
+    /// Opened `O_RDONLY`: kept by a sync or a barrier of a name no request kept
+    /// ([`Wants::Flush`]), of a file that is there. A sync needs no write access, and a file
+    /// sealed read-only (a placed output, mode 0444) refuses an open for writing with `EACCES`.
+    /// Cleared where its open found the file missing and made it, as an append's open does
+    /// (`O_RDWR | O_APPEND | O_CREAT`).
+    ///
+    /// The invariant: nothing is written through a kept file while it is `read_only`.
+    /// Upheld by [`Uring::file`], the one way a request reaches a kept file by name: one that
+    /// writes ([`Wants::Append`]) and finds the name kept read-only lets that file go (its
+    /// requests in flight keep it until they end) and keeps the name opened to append; reads
+    /// and syncs take it as it is. A positional file is kept apart ([`Uring::positional`])
+    /// and is never read-only.
+    read_only: bool,
+}
+
+/// What a request asks of the file kept under its name ([`Uring::file`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wants {
+    /// Reads of a file already kept: never made.
+    Read,
+    /// Appends: opened to read and append, made with its directories where missing.
+    Append,
+    /// A sync or a barrier ([`crate::Effect::Sync`], [`crate::Effect::Barrier`]): opened
+    /// read-only where it is there; made, as for an append, only where it is missing.
+    Flush,
 }
 
 /// The bits of a `user_data` that are its link.
@@ -1343,7 +1296,7 @@ struct Offload {
     receiver: crossbeam_channel::Receiver<Completion>,
     /// Shared with the threads, so a write of one that ends after the driver is dropped
     /// still reaches an open descriptor.
-    wake: Arc<OwnedFd>,
+    wake: Arc<Wake>,
     /// Work handed to threads whose completion has not been received.
     out: usize,
     /// The request reading `wake`, while there is one.
@@ -1363,10 +1316,96 @@ impl Offload {
         }
         let (sender, receiver) = crossbeam_channel::unbounded();
         // SAFETY: the call returned a descriptor of its own.
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }); // alloc: setup, once per driver.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false), asked: AtomicBool::new(false) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
         let count = ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8])));
         Ok(Offload { sender, receiver, wake, out: 0, reading: None, count })
+    }
+}
+
+/// The most walks out on the [`Walker`] at once, starts and grows together: what its channels
+/// hold, so a send on either never waits and allocates nothing. A start past it is refused,
+/// naming its directory; a grow past it waits in [`Uring::ungrown`] for a walk to end.
+const STARTS: usize = 64;
+
+/// A watch whose start is a walk off the ring (inotify's, [`crate::watch::Walk`]), until the
+/// walk is done: in [`Uring::starting`] by its tag.
+struct Starting {
+    dir: FileName,
+    /// An [`Effect::Journal`]'s first batch, told once the watch is in place.
+    first: Option<Done>,
+    /// The list of flushes of the watch it will be, kept from one that ended.
+    flushes: Vec<Tag>,
+    /// Unwatched meanwhile: ended (with [`Done::Unwatched`]) as its walk is done, never put in
+    /// place.
+    stop: bool,
+}
+
+/// A watch's start the [`Walker`] is done with.
+struct Started {
+    tag: Tag,
+    tree: io::Result<crate::watch::Tree>,
+}
+
+/// A walk for the [`Walker`]: a watch's start, or a grow of a watch in place, by the
+/// [`Watching`] it is of (its handle's bits).
+enum Walking {
+    Start(Tag, crate::watch::Walk),
+    Grow(Tag, u64, crate::watch::Grow),
+}
+
+/// What the [`Walker`] is done with.
+enum Walked {
+    Started(Started),
+    Grown(Grown),
+}
+
+/// A grow the [`Walker`] is done with, to merge into its watch ([`Uring::merge`]).
+struct Grown {
+    tag: Tag,
+    watching: u64,
+    grown: crate::watch::Grown,
+}
+
+/// The thread that runs inotify's walks, each of a tree that may take seconds, so the ring's
+/// thread never does (one took 128 s on 2026-11-14 and ended the daemon): a watch's start
+/// ([`crate::watch::Walk`]) and the watches of a directory made under one
+/// ([`crate::watch::Grow`]). Made for the first. Its channels are bounded by [`STARTS`] and it
+/// wakes the ring as work off the ring does ([`Offload`]).
+struct Walker {
+    inbox: crossbeam_channel::Sender<Walking>,
+    done: crossbeam_channel::Receiver<Walked>,
+}
+
+impl Walker {
+    fn new(root: Arc<Path>, wake: Arc<Wake>, gate: crate::watch::Gate) -> io::Result<Walker> {
+        let (inbox, jobs) = crossbeam_channel::bounded::<Walking>(STARTS);
+        let (told, done) = crossbeam_channel::bounded(STARTS);
+        std::thread::Builder::new().name("blaze-watch-walk".into()).spawn(move || {
+            // The buffers of every grow's walk, kept for the next.
+            let mut walker = crate::watch::Walker::default();
+            let bytes = root.as_os_str().as_bytes();
+            // Ends as the driver drops its end of the inbox.
+            while let Ok(job) = jobs.recv() {
+                crate::watch::pass(&gate);
+                // Each walk's span is its own (`crate::watch`), naming the directory and the
+                // count of directories it watched.
+                let walked = match job {
+                    Walking::Start(tag, walk) => {
+                        Walked::Started(Started { tag, tree: walk.run(&root) })
+                    }
+                    Walking::Grow(tag, watching, grow) => {
+                        Walked::Grown(Grown { tag, watching, grown: grow.run(bytes, &mut walker) })
+                    }
+                };
+                if told.send(walked).is_err() {
+                    return;
+                }
+                wake_ring(&wake);
+            }
+        })?;
+        Ok(Walker { inbox, done })
     }
 }
 
@@ -1466,7 +1505,7 @@ struct Job {
     out: UnsafeCell<Vec<Stamp>>,
     base: *mut Stamp,
     sender: crossbeam_channel::Sender<Completion>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<Wake>,
 }
 
 // SAFETY: `out` is written through `base` at disjoint chunks, each only by the one thread whose
@@ -1567,7 +1606,7 @@ struct List {
     root: Arc<Path>,
     dir: FileName,
     sender: crossbeam_channel::Sender<Completion>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<Wake>,
 }
 
 impl List {
@@ -1732,11 +1771,45 @@ fn statx_at(dir: RawFd, leaf: &[u8]) -> Stamp {
     unsafe { statx.assume_init_ref() }.stamp()
 }
 
-/// Tells the ring's wait that work off the ring has sent its completion.
-fn wake_ring(wake: &OwnedFd) {
+/// The ring's wake for work done off it: the eventfd its thread reads while it waits, and
+/// whether it is waiting.
+///
+/// The eventfd is written only when the ring's thread is parked in its wait (wake
+/// coalescing): a completion sent while the thread is running is taken at its next poll
+/// ([`Uring::take_offloaded`], every reap) with no system call from the sender. The order
+/// that loses no wake: the sender puts its completion in the channel, then swaps `parked` to
+/// false and writes only if it was true; the ring's thread sets `parked`, then looks at the
+/// channel once more, and only then enters the kernel. Whichever comes second sees the
+/// other's write (both sequentially consistent), so either the thread finds the completion
+/// before it sleeps or the sender finds `parked` and writes.
+struct Wake {
+    fd: OwnedFd,
+    /// Set by the ring's thread before it waits in the kernel, cleared by it after, and by
+    /// the first sender that wakes it.
+    parked: AtomicBool,
+    /// A [`crate::Waker`] asked the wait to end ([`Driver::waker`]) with no completion of the
+    /// ring's own: set before `parked` is swapped, read by the ring's thread after it set
+    /// `parked`, so, both sequentially consistent, either the thread reads it before it sleeps
+    /// or the waker finds `parked` and writes the eventfd.
+    asked: AtomicBool,
+}
+
+impl crate::Wake for Wake {
+    fn wake(&self) {
+        self.asked.store(true, Ordering::SeqCst);
+        wake_ring(self);
+    }
+}
+
+/// Tells the ring's wait that work off the ring has sent its completion: a write of the
+/// eventfd where the ring's thread is parked, nothing where it is running ([`Wake`]).
+fn wake_ring(wake: &Wake) {
+    if !wake.parked.swap(false, Ordering::SeqCst) {
+        return;
+    }
     let one = 1u64.to_ne_bytes();
     // SAFETY: eight bytes, which an eventfd write takes, of an open eventfd.
-    unsafe { libc::write(wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+    unsafe { libc::write(wake.fd.as_raw_fd(), one.as_ptr().cast(), one.len()) };
 }
 
 pub struct Uring {
@@ -1745,17 +1818,21 @@ pub struct Uring {
     root: Arc<Path>,
     ring: Ring,
     table: Rc<Table>,
-    registered: Registered,
     /// Not freed while the kernel may still write into it (see `Drop`).
     provided: ManuallyDrop<Provided>,
-    /// The registered buffers' lending to writes that bypass the page cache.
-    lent: ops::Lent,
     /// Each file opened, for reading and appending, and the name each is kept under.
     kept: Slab<Kept>,
     names: HashMap<FileName, Handle<Kept>, Global>,
     /// Each file opened for reads into and writes from memory ([`Effect::ReadInto`],
     /// [`Effect::WriteFrom`]), by its name: the store's pool's packs, opened once and kept.
     positional: HashMap<FileName, Handle<Kept>, Global>,
+    /// Each [`Effect::ReadMany`] in flight, by its tag: its parts, each read by a request of
+    /// its own on the ring (`ops::PART`), and how many of them are not in yet.
+    batches: HashMap<Tag, Batch, Global>,
+    /// The table [`crate::threads::run`] is handed for the work done off the ring, which reads
+    /// nothing into memory (this driver's reads are on the ring, `positional`'s): it stays
+    /// empty, allocating nothing.
+    descriptors: Arc<crate::descriptors::Descriptors>,
     /// Every request in flight or waiting, by the handle its `user_data` carries ([`data`]).
     /// Not freed while the kernel may still read or write what a request holds (see `Drop`).
     ops: ManuallyDrop<ops::Ops>,
@@ -1776,8 +1853,6 @@ pub struct Uring {
     closes: usize,
     /// Slots of the table requests on paths hold.
     slots_held: usize,
-    /// Writes that bypassed the page cache, ended.
-    direct_writes: u64,
     /// Sends that went from the asker's pages (`IORING_OP_SEND_ZC`), ended.
     zero_copy_sends: u64,
     /// Completions to hand out at the next poll, in order.
@@ -1810,12 +1885,57 @@ pub struct Uring {
     buffers: Vec<Vec<u8>>,
     /// The tables of watches that ended, with their lists of flushes, for the next watch.
     trees: Vec<(crate::watch::Spare, Vec<Tag>)>,
+    /// Watches whose start is out on the [`Walker`], by tag.
+    starting: HashMap<Tag, Starting, Global>,
+    /// Effects that wait for a start ([`Uring::holds`]), in the order they were submitted:
+    /// counted in flight, and submitted as a start is put in place.
+    held: Vec<Effect>,
+    /// Starts the walker told, to be put in place ([`Uring::put_in_place`]).
+    started: Vec<Started>,
+    /// Grows the walker told, to be merged ([`Uring::put_in_place`]).
+    grown: Vec<Grown>,
+    /// How many grows are out on the walker: with `starting`, at most [`STARTS`].
+    grows_out: usize,
+    /// Watches with directories to grow and no room on the walker for them yet, by tag and
+    /// [`Watching`] handle's bits: each handed over as a walk ends.
+    ungrown: Vec<(Tag, u64)>,
+    /// Made for the first inotify walk.
+    walker: Option<Walker>,
+    /// A test's hold on the walker, given it as it is made ([`crate::watch::Gate`]).
+    #[cfg(test)]
+    walk_gate: crate::watch::Gate,
+    /// A test's: a walk of an inotify start runs on the ring's thread, as before 2026-11-14,
+    /// for tests of what follows a start (a slot's reuse, a warm watch's allocations).
+    #[cfg(test)]
+    walks_here: bool,
     /// Made for the first [`Effect::Stamp`].
     stampers: Option<Stampers>,
     offload: Offload,
+    /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]), told
+    /// as work off the ring is ([`HostSink`]).
+    host: crate::host::Host,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
     in_flight: usize,
+    /// Whether a [`crate::Waker`] was handed out ([`Driver::waker`]): a poll with nothing in
+    /// flight then waits for its wake, to its deadline, rather than returning at once (which
+    /// turned a caller's loop into a spin).
+    waker_given: Cell<bool>,
+}
+
+/// Where the host's effects are told: the channel of the work off the ring, and its wake.
+struct HostSink {
+    done: crossbeam_channel::Sender<Completion>,
+    wake: Arc<Wake>,
+}
+
+impl crate::host::Sink for HostSink {
+    fn tell(&self, completion: Completion) {
+        // A driver dropped meanwhile takes nothing; the descriptor is kept open by `wake`.
+        if self.done.send(completion).is_ok() {
+            wake_ring(&self.wake);
+        }
+    }
 }
 
 /// A temporary's number, counted from the top half so that it never meets one of
@@ -1826,8 +1946,8 @@ impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
+        let offload = Offload::new()?;
         let table = Table::new(&ring.fd)?;
-        let registered = Registered::new(ring.fd.as_raw_fd())?;
         let provided = ManuallyDrop::new(Provided::new(ring.fd.as_raw_fd())?);
         fn slab<T>(max: u32) -> io::Result<Slab<T>> {
             Slab::new(max, MemTag::Io).map_err(io::Error::other)
@@ -1839,12 +1959,13 @@ impl Uring {
             root,
             ring,
             table,
-            registered,
             provided,
-            lent: ops::Lent::new(DIRECT_BUFFERS),
             kept: slab(KEPT)?,
             names: HashMap::new_in(Global),
             positional: HashMap::new_in(Global),
+            batches: HashMap::new_in(Global),
+            // alloc: setup, once per driver: an empty table, which nothing reads through.
+            descriptors: Arc::new(crate::descriptors::Descriptors::new()),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
             paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
@@ -1857,7 +1978,6 @@ impl Uring {
             load_waiting: VecDeque::with_capacity(ENTRIES as usize), // alloc: setup, as above.
             closes: 0,
             slots_held: 0,
-            direct_writes: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
             watches: HashMap::new_in(Global),
@@ -1873,10 +1993,27 @@ impl Uring {
             spawn_dirs,
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
+            starting: HashMap::with_capacity_in(STARTS, Global),
+            held: Vec::new_in(Global),
+            started: Vec::with_capacity_in(STARTS, Global),
+            grown: Vec::with_capacity_in(STARTS, Global),
+            grows_out: 0,
+            ungrown: Vec::with_capacity_in(STARTS, Global),
+            walker: None,
+            #[cfg(test)]
+            walk_gate: None,
+            #[cfg(test)]
+            walks_here: false,
             stampers: None,
-            offload: Offload::new()?,
+            host: crate::host::Host::new(Arc::new(HostSink {
+                // clone: setup, a channel's handle and a count of the wake, for the host.
+                done: offload.sender.clone(),
+                wake: Arc::clone(&offload.wake),
+            })), // alloc: setup, once per driver.
+            offload,
             locks: crate::locks::Locks::new(),
             in_flight: 0,
+            waker_given: Cell::new(false),
         })
     }
 
@@ -1910,15 +2047,22 @@ impl Uring {
         forget(&mut self.positional, &mut self.kept, name);
     }
 
-    /// The file kept under `name`, its open through the ring started where none is; `make`
-    /// makes it if missing, with its directories. Requests on it wait for the open
-    /// ([`Uring::prepared`]); where the driver's half of the table is full, the files kept
-    /// are let go (each request in flight holds its own until it ends) to make room.
-    fn file(&mut self, name: &FileName, make: bool) -> io::Result<Handle<Kept>> {
+    /// The file kept under `name` for what a request `wants`, its open through the ring
+    /// started where none is: an append's makes it if missing, with its directories; a
+    /// sync's opens it read-only, and makes it only where its open finds it missing.
+    /// Requests on it wait for the open ([`Uring::prepared`]); where the driver's half of the
+    /// table is full, the files kept are let go (each request in flight holds its own until
+    /// it ends) to make room.
+    fn file(&mut self, name: &FileName, wants: Wants) -> io::Result<Handle<Kept>> {
+        let make = wants != Wants::Read;
         if let Some(&file) = self.names.get(name) {
             let kept = self.kept.get_mut(file).expect("named files are kept");
-            kept.make |= make && !kept.open;
-            return Ok(file);
+            // `Kept::read_only`'s invariant: a write never goes through a read-only file.
+            if !(wants == Wants::Append && kept.read_only) {
+                kept.make |= make && !kept.open;
+                return Ok(file);
+            }
+            forget(&mut self.names, &mut self.kept, name);
         }
         let fixed = Fixed::unopened(&self.table);
         // Held by its open until it ends.
@@ -1930,6 +2074,7 @@ impl Uring {
             make,
             positional: false,
             direct: false,
+            read_only: wants != Wants::Append,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.names.insert(name.clone(), file);
@@ -1962,6 +2107,7 @@ impl Uring {
             make: false,
             positional: true,
             direct,
+            read_only: false,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.positional.insert(name.clone(), file);
@@ -1988,9 +2134,11 @@ impl Uring {
         span: &crate::Span,
         cache: crate::Cache,
         idle: bool,
+        part: Option<u32>,
     ) -> io::Result<()> {
-        let what = match kind {
-            Kind::ReadInto => "a read into memory of",
+        let what = match (kind, part) {
+            (Kind::ReadInto, None) => "a read into memory of",
+            (Kind::ReadInto, Some(_)) => "a batched read into memory of",
             _ => "a write from memory to",
         };
         let span = crate::spans::resolve(span, name, at, cache, what)
@@ -2006,11 +2154,84 @@ impl Uring {
         if idle {
             hot.flags |= ops::IDLE;
         }
+        if part.is_some() {
+            hot.flags |= ops::PART;
+        }
         let addr = span.addr();
-        let len = u32::try_from(span.len()).expect("a span's length is a u32");
-        let cold = Cold { at, names: [addr as u32, (addr >> 32) as u32, len, 0, 0], ..Cold::EMPTY };
+        let len = u32::try_from(span.len()).map_err(|_| {
+            // alloc: an error path.
+            io::Error::other(format!(
+                "{what} {name}: a span of {} bytes, past the u32 length one io_uring op carries",
+                span.len()
+            ))
+        })?;
+        let index = part.unwrap_or(0);
+        let cold =
+            Cold { at, names: [addr as u32, (addr >> 32) as u32, len, index, 0], ..Cold::EMPTY };
         self.start(hot, ops::NO_BYTES, cold);
         Ok(())
+    }
+
+    /// Starts [`Effect::ReadMany`] `tag`: each part a [`Kind::ReadInto`] of its own on its
+    /// file's kept positional descriptor, all written to the ring before the next submit, so
+    /// the batch is one `io_uring_enter` where the ring has room. A part refused before it is
+    /// asked (its span, its file's open) fails alone, at once; the batch is told when its last
+    /// part is in ([`Uring::read_part_ended`]).
+    fn read_many(
+        &mut self,
+        tag: Tag,
+        parts: Vec<crate::ReadPart>,
+        cache: crate::Cache,
+        idle: bool,
+    ) -> io::Result<()> {
+        let count = parts.len();
+        if count == 0 {
+            self.ready.push(Completion { tag, done: Done::ReadMany(parts) });
+            return Ok(());
+        }
+        if self.batches.contains_key(&tag) {
+            // alloc: an error path.
+            return Err(io::Error::other(format!("a batched read is in flight as {tag:?} already")));
+        }
+        // alloc: a slot of the table of batches, grown once to the most at once.
+        self.batches.insert(tag, Batch { parts, left: count });
+        for index in 0..count {
+            let (file, at, into) = {
+                let part = &self.batches[&tag].parts[index];
+                (part.file.clone(), part.at, part.into) // clone: a refcount
+            };
+            let index32 = u32::try_from(index).expect("a batch of at most u32::MAX parts");
+            if let Err(error) =
+                self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle, Some(index32))
+            {
+                // alloc: an error path.
+                let why = IoError(format!("{file} at {at} ({} bytes): {error}", into.len));
+                self.read_part_ended(tag, index32, Done::Failed(why));
+            }
+        }
+        Ok(())
+    }
+
+    /// The part `index` of the batch `tag` ended as `done`; the batch is told once its last
+    /// part has.
+    pub(super) fn read_part_ended(&mut self, tag: Tag, index: u32, done: Done) {
+        let batch = self.batches.get_mut(&tag).expect("a part's batch in flight");
+        let part = &mut batch.parts[index as usize];
+        part.got = match done {
+            Done::ReadInto { len } => crate::Got::Read(len),
+            // alloc: an error path, its file and offset named.
+            Done::Failed(why) if why.0.starts_with(part.file.as_str()) => crate::Got::Failed(why),
+            Done::Failed(why) => crate::Got::Failed(IoError(format!(
+                "{} at {} ({} bytes): {}",
+                part.file, part.at, part.into.len, why.0
+            ))),
+            other => unreachable!("a part of a batched read ends as a read: {other:?}"),
+        };
+        batch.left -= 1;
+        if batch.left == 0 {
+            let batch = self.batches.remove(&tag).expect("just seen");
+            self.ready.push(Completion { tag, done: Done::ReadMany(batch.parts) });
+        }
     }
 
     /// A kept file's sync, done: [`Done::Synced`], unless the file kept under its name has no
@@ -2067,7 +2288,22 @@ impl Uring {
     /// in at a poll once the thread wakes the ring.
     fn off_ring(&mut self, effect: Effect) -> io::Result<()> {
         let tag = effect.tag();
-        self.off_ring_with(tag, move |root| crate::threads::run(root, effect))
+        let descriptors = Arc::clone(&self.descriptors); // clone: a count, for the thread.
+        self.off_ring_with(tag, move |root| {
+            // What the thread waits in is said by file (every-wait-says-what): a write-back
+            // of 162 MB is a second of this thread, and was in no span.
+            let (op, file) = match &effect {
+                Effect::WriteBack { file, .. } => ("write back", file.as_str()),
+                Effect::Prewarm { file, .. } => ("prewarm", file.as_str()),
+                Effect::CopyData { from, .. } => ("copy the data of", from.as_str()),
+                Effect::List { dir, .. } => ("list", dir.as_str()),
+                Effect::Private { dir, .. } => ("make private", dir.as_str()),
+                _ => ("carry out", ""),
+            };
+            // alloc: clone: the file's name for the span, once a call off the ring
+            let file = file.to_owned();
+            crate::lock::io_wait(op, &file, move || crate::threads::run(root, &descriptors, effect))
+        })
     }
 
     /// `work`, given the root, done on a thread of its own for the effect `tag`, as
@@ -2130,11 +2366,112 @@ impl Uring {
         Ok(())
     }
 
-    /// The completions the threads off the ring have sent.
+    /// Puts the read of the wake's eventfd in flight unless it is: asked before every wait in
+    /// the kernel, so a write of [`wake_ring`] (a [`crate::Waker`]'s, or a thread's off the
+    /// ring) completes it and ends the wait. Before, it was asked only while work off the ring
+    /// was out ([`Uring::offloaded`]), and a waker's write with none out ended nothing: the
+    /// thread slept to its next deadline, and the turn it was woken for waited with it. Its
+    /// completion is nobody's ([`Kind::Wake`] ends with no effect's completion); the eventfd's
+    /// count is level, so a write made before the read is asked completes it as it is asked.
+    fn read_wakes(&mut self) {
+        if self.offload.reading.is_none() {
+            let id = self.start(Hot::new(NOBODYS, Kind::Wake, 0), ops::NO_BYTES, Cold::EMPTY);
+            self.offload.reading = Some(id);
+        }
+    }
+
+    /// The completions the threads off the ring have sent, and the starts the walker is done
+    /// with (put in place by [`Uring::put_in_place`]).
     fn take_offloaded(&mut self) {
         while let Ok(completion) = self.offload.receiver.try_recv() {
             self.offload.out -= 1;
             self.ready.push(completion);
+        }
+        if let Some(walker) = &self.walker {
+            while let Ok(walked) = walker.done.try_recv() {
+                self.offload.out -= 1;
+                match walked {
+                    Walked::Started(started) => self.started.push(started),
+                    Walked::Grown(grown) => {
+                        self.grows_out -= 1;
+                        self.grown.push(grown);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `effect` waits for a watch's start: a look at the disk at or under the directory
+    /// of a watch whose walk is out, or a flush of such a watch.
+    ///
+    /// The invariant: a look under a watched directory asked after its watch is answered only
+    /// once the watch is in place, so a change made after the look was answered is heard
+    /// (what a watcher's start relies on: blaze-vfs's `Watcher::start` sweeps its stamps right
+    /// after its journal, and a watch is confirmed by a stat asked after it). A flush of it
+    /// waits too, so it is answered by the watch it asked of. Tested by
+    /// `a_look_under_a_starting_watch_waits_for_its_walk`, whose control holds nothing.
+    fn holds(&self, effect: &Effect) -> bool {
+        if self.starting.is_empty() {
+            return false;
+        }
+        if let Effect::Flush { watch, .. } = effect {
+            #[cfg(test)]
+            if crate::watch::HOLDS_NOTHING.get() {
+                return false;
+            }
+            return self.starting.contains_key(watch);
+        }
+        crate::watch::looks_under(effect, |name| {
+            self.starting.values().any(|it| crate::watch::is_under(name, it.dir.as_str()))
+        })
+    }
+
+    /// Each start the walker is done with: put in place (its read in flight, a journal's first
+    /// batch told), ended where it was unwatched meanwhile, or failed naming why. Then what was
+    /// held for a start goes, in the order it was asked; what waits for a start still out is
+    /// held again. Then each grow the walker is done with is merged ([`Uring::merge`]).
+    fn put_in_place(&mut self) {
+        if !self.grown.is_empty() {
+            let mut grown = std::mem::take(&mut self.grown);
+            for it in grown.drain(..) {
+                self.merge(it);
+            }
+            self.grown = grown;
+        }
+        if self.started.is_empty() {
+            return;
+        }
+        let mut started = std::mem::take(&mut self.started);
+        for Started { tag, tree } in started.drain(..) {
+            let Some(mut start) = self.starting.remove(&tag) else {
+                unreachable!("the start of {tag:?}, which no watch is starting")
+            };
+            match tree {
+                Ok(tree) if start.stop => {
+                    let spare = tree.end();
+                    if self.trees.len() < SPARES {
+                        start.flushes.clear();
+                        self.trees.push((spare, start.flushes));
+                    }
+                    self.ready.push(Completion { tag, done: Done::Unwatched });
+                }
+                Ok(tree) => self.in_place(tag, tree, start),
+                Err(error) => {
+                    let why = IoError(format!("watching {}: {error}", start.dir));
+                    self.ready.push(Completion { tag, done: Done::Failed(why) });
+                }
+            }
+        }
+        self.started = started;
+        if self.held.is_empty() {
+            return;
+        }
+        let mut held = std::mem::take(&mut self.held);
+        // Counted in flight as they were held; `submit` counts each again.
+        self.in_flight -= held.len();
+        self.submit(&mut held);
+        if self.held.is_empty() {
+            self.held = held;
         }
     }
 
@@ -2202,11 +2539,6 @@ impl Uring {
         connection.recvs.push_back((tag, most, into));
         self.deliver(conn);
     }
-
-    /// Writes that bypassed the page cache (`O_DIRECT`) and ended, since the driver was made.
-    pub fn direct_writes(&self) -> u64 {
-        self.direct_writes
-    }
 }
 
 /// SIGKILL to the process of `pidfd`; one that has exited already is left as it is.
@@ -2240,20 +2572,26 @@ fn gone(conn: Conn) -> io::Error {
 }
 
 /// Answers the flushes of the watch `watch`, whose read has completed and is not yet asked
-/// again, so nothing else reads its descriptor: what is still queued on it is told first.
-fn flushed(
-    ready: &mut Vec<Completion>,
+/// again, so nothing else reads its descriptor: what is still queued on it is told first. While
+/// a grow of the watch is out or directories wait for one ([`crate::watch::Tree::pending`]),
+/// what it will find came before the flushes, so they wait for its merge ([`Uring::merge`]).
+fn flushed<A: std::alloc::Allocator + std::alloc::AllocatorNightly, B: std::alloc::Allocator>(
+    ready: &mut Vec<Completion, B>,
     watch: Tag,
     tree: &mut crate::watch::Tree,
     buffer: &mut [u8],
-    flushes: &mut Vec<Tag>,
+    flushes: &mut Vec<Tag, A>,
     journal: Option<&FileName>,
 ) {
-    if flushes.is_empty() {
+    if flushes.is_empty() || tree.pending() {
         return;
     }
     let drained =
         tree.drain(buffer, |done| ready.push(Completion { tag: watch, done: told(journal, done) }));
+    // The drain heard directories made: answered once they are grown.
+    if drained.is_ok() && tree.pending() {
+        return;
+    }
     for tag in flushes.drain(..) {
         let done = match &drained {
             Ok(()) => Done::Flushed,
@@ -2410,13 +2748,29 @@ fn connect_socket(table: &Rc<Table>, domain: libc::c_int) -> io::Result<Fixed> {
 
 impl Driver for Uring {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
+        // The one now of every timer in this submit: each one's `after` counts from when it was
+        // asked, which is this call, so timers asked together fire in the order of their
+        // `after`s whatever the thread is kept from running between two of them. With a clock
+        // read per timer, a preemption longer than the gap between two `after`s orders them by
+        // when each was read instead (`more_than_the_ring_holds` fired 2, 0, 1 under a load of
+        // about 55 on 2026-11-14).
+        let now = wheel::ticks(self.start.elapsed());
         for effect in effects.drain(..) {
+            if self.holds(&effect) {
+                self.in_flight += 1;
+                self.held.push(effect);
+                continue;
+            }
             let tag = effect.tag();
             match effect {
                 Effect::Unwatch { .. } => {
                     match self.watches.get(&tag).copied() {
                         Some(id) => self.stop(id),
-                        None => self.refuse(tag, format!("nothing is watched as {tag:?}")), // alloc: an error.
+                        None => match self.starting.get_mut(&tag) {
+                            // Ended once its walk is done: the walker holds its tables till then.
+                            Some(starting) => starting.stop = true,
+                            None => self.refuse(tag, format!("nothing is watched as {tag:?}")),
+                        },
                     }
                     continue;
                 }
@@ -2431,11 +2785,24 @@ impl Driver for Uring {
                     self.kill(tag);
                     continue;
                 }
+                // The host's, told as work off the ring is: the ring reads its wake until the
+                // completion is in.
+                effect if crate::host::Host::takes(&effect) => {
+                    self.in_flight += 1;
+                    self.offloaded(tag);
+                    self.host.submit(effect);
+                    continue;
+                }
                 _ => {}
             }
             self.in_flight += 1;
             let started = match effect {
-                Effect::Write { file, bytes, .. } => self.write(tag, file, bytes).map(|()| None),
+                Effect::Write { file, bytes, .. } => {
+                    self.write(tag, file, bytes, 0).map(|()| None)
+                }
+                Effect::WriteUnsynced { file, bytes, .. } => {
+                    self.write(tag, file, bytes, ops::UNSYNCED).map(|()| None)
+                }
                 Effect::Clone { from, to, .. } => {
                     self.copy(tag, Kind::Clone, &from, &to).map(|()| None)
                 }
@@ -2446,12 +2813,27 @@ impl Driver for Uring {
                 Effect::Lstat { file, .. } => {
                     self.look(tag, Kind::Stat, false, &file).map(|()| None)
                 }
+                // On a thread of its own (`sync_file_range`, waited for there): the ring's
+                // submitter never waits for a device, and the asker waits for nothing.
+                back @ Effect::WriteBack { .. } => self.off_ring(back).map(|()| None),
+                // `mincore` of a mapping and a read-ahead call a run: on a thread of its own,
+                // as a write-back is.
+                warm @ Effect::Prewarm { .. } => self.off_ring(warm).map(|()| None),
+                // `lseek` and `copy_file_range` an extent: on a thread of its own, as the
+                // `FICLONE` of a clone is (`uring/files.rs`), since a copy of tens of MB of
+                // data is milliseconds the submitter must not wait in.
+                copy @ Effect::CopyData { .. } => self.off_ring(copy).map(|()| None),
+                // A directory's `fsync`, waited for on a thread of its own as a list is.
+                names @ Effect::SyncDir { .. } => self.off_ring(names).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
                 Effect::WriteAt { file, at, bytes, .. } => {
                     self.write_at(tag, &file, at, bytes).map(|()| None)
                 }
-                Effect::Rename { from, to, .. } => self.rename(tag, &from, &to).map(|()| None),
+                Effect::Rename { from, to, .. } => self.rename(tag, &from, &to, 0).map(|()| None),
+                Effect::RenameUnsynced { from, to, .. } => {
+                    self.rename(tag, &from, &to, ops::UNSYNCED).map(|()| None)
+                }
                 Effect::Mode { file, mode, .. } => {
                     under(&self.root, &file, |path| crate::fs::set_mode(path, mode))
                         .map(|()| Some(Done::Moded))
@@ -2473,22 +2855,25 @@ impl Driver for Uring {
                     crate::threads::read_link(&self.root, &file).map(Some)
                 }
                 Effect::Remove { file, .. } => self.remove(tag, &file).map(|()| None),
+                // One `mkdir` or `rmdir` here on the driver's thread, as a mode is set: the
+                // ring's `IORING_OP_MKDIRAT` and `IORING_OP_UNLINKAT` are not used for them yet.
+                effect @ (Effect::MakeDir { .. } | Effect::RemoveDir { .. }) => {
+                    crate::threads::run(&self.root, &self.descriptors, effect).map(Some)
+                }
                 // No io_uring op takes a lock, and `flock` without waiting is one call: here on
                 // the driver's thread, as a mode is set.
                 Effect::Lock { file, mode, .. } => {
                     self.locks.lock(&self.root, &file, mode, tag).map(Some)
                 }
                 Effect::Unlock { lock, .. } => self.locks.unlock(lock).map(Some),
-                Effect::Watch { dir, .. } => self.watch(tag, dir, false).map(|()| None),
+                Effect::Watch { dir, .. } => self.watch(tag, dir, None).map(|()| None),
                 Effect::Pressure { .. } => self.pressure(tag).map(|()| None),
                 // Linux keeps no journal across a restart: the first batch says what of the
-                // cursor is lost, and the watch is live from its start.
+                // cursor is lost, told once the watch is in place, and the watch is live from
+                // then.
                 Effect::Journal { dir, since, .. } => {
                     let first = crate::journal::first_on_linux(&dir, &since);
-                    self.watch(tag, dir, true).map(|()| {
-                        self.ready.push(Completion { tag, done: first });
-                        None
-                    })
+                    self.watch(tag, dir, Some(first)).map(|()| None)
                 }
                 // No name to stamp: answered here, with no stamper woken for it.
                 Effect::Stamp { files, .. } if files.is_empty() => {
@@ -2497,15 +2882,24 @@ impl Driver for Uring {
                 Effect::Stamp { files, .. } => self.sweep(tag, files).map(|()| None),
                 Effect::Entries { dir, .. } => self.list(tag, dir).map(|()| None),
                 Effect::Flush { watch, .. } => self.flush(watch, tag).map(|()| None),
-                Effect::Unwatch { .. } | Effect::Unlisten { .. } | Effect::Kill { .. } => {
-                    unreachable!("taken above")
-                }
+                Effect::Unwatch { .. }
+                | Effect::Unlisten { .. }
+                | Effect::Kill { .. }
+                | Effect::Bind { .. }
+                | Effect::SendTo { .. }
+                | Effect::RecvFrom { .. }
+                | Effect::Unbind { .. }
+                | Effect::Resolve { .. }
+                | Effect::ReadStdin { .. }
+                | Effect::WriteOut { .. }
+                | Effect::Now { .. }
+                | Effect::Random { .. } => unreachable!("taken above"),
                 // Of a file kept for appending, through its descriptor, after what was asked
                 // of it before; of any other, the file at its name now, opened for the read
                 // alone. Its buffer is the file's size, once it is open (a missing file's,
                 // empty).
                 Effect::ReadAll { file, .. } => match self.names.contains_key(&file) {
-                    true => self.file(&file, false).map(|file| {
+                    true => self.file(&file, Wants::Read).map(|file| {
                         let file = self.hold(file);
                         let mut hot = Hot::new(tag, Kind::Read, file.to_bits());
                         hot.flags |= ops::WHOLE;
@@ -2515,7 +2909,7 @@ impl Driver for Uring {
                     false => self.load(tag, &file, 0, None).map(|()| None),
                 },
                 Effect::Read { file, at, len, .. } => match self.names.contains_key(&file) {
-                    true => self.file(&file, false).map(|file| {
+                    true => self.file(&file, Wants::Read).map(|file| {
                         let file = self.hold(file);
                         let hot = Hot::new(tag, Kind::Read, file.to_bits());
                         // alloc: the read's result, handed to its asker.
@@ -2526,25 +2920,37 @@ impl Driver for Uring {
                 },
                 Effect::ReadInto { file, at, into, cache, priority, .. } => {
                     let idle = priority == crate::Priority::Idle;
-                    self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle)
+                    self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle, None)
                         .map(|()| None)
                 }
+                Effect::ReadMany { parts, cache, priority, .. } => {
+                    let idle = priority == crate::Priority::Idle;
+                    self.read_many(tag, parts, cache, idle).map(|()| None)
+                }
                 Effect::WriteFrom { file, at, from, cache, .. } => self
-                    .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false)
+                    .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false, None)
                     .map(|()| None),
                 // An empty one too, so it answers once the file it makes is there.
-                Effect::Append { file, bytes, .. } => self.file(&file, true).map(|file| {
+                Effect::Append { file, bytes, .. } => self.file(&file, Wants::Append).map(|file| {
                     let file = self.hold(file);
                     self.start(Hot::new(tag, Kind::Append, file.to_bits()), bytes, Cold::EMPTY);
                     None
                 }),
-                Effect::Sync { file, .. } => self.file(&file, true).map(|file| {
+                Effect::Sync { file, .. } => self.file(&file, Wants::Flush).map(|file| {
                     let file = self.hold(file);
                     self.start(
                         Hot::new(tag, Kind::Sync, file.to_bits()),
                         ops::NO_BYTES,
                         Cold::EMPTY,
                     );
+                    None
+                }),
+                // The same request with `IORING_FSYNC_DATASYNC`: Linux's cheapest ordering.
+                Effect::Barrier { file, .. } => self.file(&file, Wants::Flush).map(|file| {
+                    let file = self.hold(file);
+                    let mut hot = Hot::new(tag, Kind::Sync, file.to_bits());
+                    hot.flags |= ops::DATA;
+                    self.start(hot, ops::NO_BYTES, Cold::EMPTY);
                     None
                 }),
                 // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one open
@@ -2559,12 +2965,10 @@ impl Driver for Uring {
                         .map(|()| Some(Done::Truncated))
                 }
                 Effect::Timer { after, .. } => {
-                    let due =
-                        wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
-                    self.timers.insert(due, tag);
+                    self.timers.insert(now.saturating_add(wheel::ticks(after)), tag);
                     Ok(None)
                 }
-                Effect::Map { file, .. } => self.look(tag, Kind::Map, true, &file).map(|()| None),
+                Effect::Map { file, extent, .. } => self.map(tag, &file, extent).map(|()| None),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, .. } => crate::net::listen(&self.root, &address)
                     .and_then(|listener| {
@@ -2633,8 +3037,12 @@ impl Driver for Uring {
         let before = out.len();
         self.reap();
         self.fire_timers();
+        self.put_in_place();
         out.append(&mut self.ready);
-        if out.len() == before && self.in_flight > 0 {
+        // With nothing in flight only a waker can end the wait, so it is waited for once one
+        // has been handed out; with neither, nothing can come and the poll only looks (the
+        // rule on `Driver::waker`).
+        if out.len() == before && (self.in_flight > 0 || self.waker_given.get()) {
             let clock = Monotonic::since(self.start);
             while out.len() == before {
                 // The caller's deadline or the next timer's, whichever is sooner.
@@ -2642,13 +3050,35 @@ impl Driver for Uring {
                     .timers
                     .next_deadline()
                     .map_or(until, |due| until.min(Deadline::at(Duration::from_nanos(due))));
-                if let Err(error) = self.ring.enter(Some(wait), &clock) {
+                // The eventfd's read, in flight before the thread parks: the write of a waker or
+                // of a thread off the ring ends the kernel's wait only by completing it.
+                self.read_wakes();
+                // Parked from here ([`Wake`]): a thread off the ring that sends its completion
+                // after this writes the eventfd; one that sent before it is found by the look
+                // below, and the kernel is not entered to wait.
+                self.offload.wake.parked.store(true, Ordering::SeqCst);
+                self.take_offloaded();
+                // A start the walker finished is put in place before the kernel is entered:
+                // its eventfd's count was read, so nothing else would end the wait for it.
+                self.put_in_place();
+                // A waker's ask ends the poll with what there is, which may be nothing: what
+                // it woke the loop for is in a queue of the caller's own.
+                let asked = self.offload.wake.asked.swap(false, Ordering::SeqCst);
+                if !self.ready.is_empty() || asked {
+                    self.offload.wake.parked.store(false, Ordering::SeqCst);
+                    out.append(&mut self.ready);
+                    break;
+                }
+                let entered = self.ring.enter(Some(wait), &clock);
+                self.offload.wake.parked.store(false, Ordering::SeqCst);
+                if let Err(error) = entered {
                     self.fail_unsubmitted(&error);
                     out.append(&mut self.ready);
                     break;
                 }
                 self.reap();
                 self.fire_timers();
+                self.put_in_place();
                 out.append(&mut self.ready);
                 if until.passed(clock.now()) {
                     break;
@@ -2680,6 +3110,16 @@ impl Driver for Uring {
     fn now(&self) -> Duration {
         self.start.elapsed()
     }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
+    }
+
+    fn waker(&self) -> Option<crate::Waker> {
+        self.waker_given.set(true);
+        // clone: a handle to the ring's wake, once per waker asked for
+        Some(crate::Waker::new(Arc::clone(&self.offload.wake) as Arc<dyn crate::Wake>))
+    }
 }
 
 #[cfg(test)]
@@ -2692,6 +3132,12 @@ mod tests {
         run_until_idle, threads::Threads,
     };
 
+    #[expect(
+        blaze::tmp_path,
+        reason = "the ring's tests take a root not made yet (one sweeps a root that is not there) and clone it as a \
+                  PathBuf; moving them onto TempDir means each of some fifty callers holds a guard and a child path \
+                  under it, to be done and run on Linux, where these tests compile"
+    )]
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3226,12 +3672,40 @@ mod tests {
         assert_ne!(at.port(), 0);
         assert_eq!(round_trip(&mut ring, &Address::Tcp(at)), round_tripped());
         assert_eq!(ring.local_addr(Tag(1)), None);
-        // Nothing listens there now.
-        let mut effects = vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(1) }];
+        // A connect to a port held and refusing, not to the port just let go of, which another
+        // test or process may bind before the connect (it failed 2 runs in 24 that way, told
+        // `[Connected { .. }]`).
+        let (refusing, _held) = held_refusing_port();
+        let mut effects = vec![Effect::Connect { at: Address::Tcp(refusing), tag: Tag(1) }];
         let mut seen = Vec::new();
         run_until_idle(&mut ring, &mut effects, |done, _| seen.push(done.done))
         .expect("the effects end");
         assert!(matches!(&seen[..], [Done::Failed(_)]), "{seen:?}");
+    }
+
+    /// A loopback address that refuses every connect for as long as the second value lives,
+    /// and that no other socket is handed meanwhile: the local port of a connection held open
+    /// (its client end, its listener). Closing a listener and connecting to its port instead
+    /// races whoever binds next; a port held this way cannot be taken by a bind to port 0.
+    ///
+    /// Why it refuses and is held, as each kernel's source reads:
+    /// - Linux: a SYN is matched against established sockets by their four-tuple, then against
+    ///   listening ones (`__inet_lookup_listener`); none listens on the port, so the kernel
+    ///   answers with a reset (`ECONNREFUSED`). The port is in the bind table with a socket that
+    ///   has no `SO_REUSEADDR`, so every other bind of it conflicts (`inet_csk_bind_conflict`),
+    ///   and port 0's search skips it.
+    /// - macOS (xnu, `tcp_input`): the wildcard lookup (`in_pcblookup_hash`) walks only sockets
+    ///   with no foreign address, so a connected one is not found, and a segment to no socket
+    ///   is dropped with a reset (`dropwithresetnosock`). A bind to port 0 searches with the
+    ///   wildcard (`in_pcbbind`, `wild = 1`), which counts the connected socket, so its port is
+    ///   never handed out. A socket bound and never listening would not do here: xnu finds it,
+    ///   sees `TCPS_CLOSED` and drops the SYN with no reset, so the connect hangs to its timeout.
+    fn held_refusing_port() -> (std::net::SocketAddr, (std::net::TcpListener, std::net::TcpStream)) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = listener.local_addr().unwrap();
+        // A loopback connect to a listener completes in the kernel at once; the bound says so.
+        let client = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(10)).unwrap();
+        (client.local_addr().unwrap(), (listener, client))
     }
 
     fn maps(driver: &mut impl Driver, root: &Path) -> BTreeMap<u64, String> {
@@ -3239,10 +3713,22 @@ mod tests {
         std::fs::write(root.join("store/pack"), b"packed").unwrap();
         std::fs::write(root.join("store/empty"), b"").unwrap();
         let name = |it: &str| FileName::new(it).unwrap();
+        let whole = crate::Extent::Whole;
         let mut effects = vec![
-            Effect::Map { file: name("store/pack"), tag: Tag(1) },
-            Effect::Map { file: name("store/empty"), tag: Tag(2) },
-            Effect::Map { file: name("store/missing"), tag: Tag(3) },
+            Effect::Map { file: name("store/pack"), extent: whole, tag: Tag(1) },
+            Effect::Map { file: name("store/empty"), extent: whole, tag: Tag(2) },
+            Effect::Map { file: name("store/missing"), extent: whole, tag: Tag(3) },
+            // A range sees its bytes and nothing past its length; one past the end fails.
+            Effect::Map {
+                file: name("store/pack"),
+                extent: crate::Extent::Range { at: 2, len: 3 },
+                tag: Tag(4),
+            },
+            Effect::Map {
+                file: name("store/pack"),
+                extent: crate::Extent::Range { at: 4, len: 3 },
+                tag: Tag(5),
+            },
         ];
         let mut seen = BTreeMap::new();
         run_until_idle(driver, &mut effects, |done, _| {
@@ -3261,6 +3747,8 @@ mod tests {
                 (1, "mapped \"packed\"".to_owned()),
                 (2, "mapped \"\"".to_owned()),
                 (3, "failed".to_owned()),
+                (4, "mapped \"cke\"".to_owned()),
+                (5, "failed".to_owned()),
             ])
         );
         let root = dir("uring-map-threads");
@@ -3416,57 +3904,148 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// Aligned writes of a MiB or more, more at once than there are registered buffers, each
-    /// read back as written; where the file system takes `O_DIRECT` they bypassed the cache.
-    /// A write that is not aligned goes through the cache.
+    /// The invariant: a [`crate::Waker`]'s wake ends the poll under way while the ring's thread
+    /// is parked in the kernel with no work off the ring, first with nothing in flight (a poll
+    /// then waits for the wake, to its deadline, rather than returning at once and spinning its
+    /// caller), then with a timer far past the deadline in flight. Each wake comes once the
+    /// thread has parked and had time to enter the kernel, so it is the eventfd's write, not the
+    /// `asked` look before the enter, that ends the wait.
+    ///
+    /// Its control is the driver before the fix, where the eventfd was read only while work off
+    /// the ring was out (`Uring::offloaded`): the first poll returned at once and never parked
+    /// (the waking thread times out waiting for it), and with that skipped the second slept to
+    /// its deadline. That lost wake is why blaze-http's driver thread on Linux slept to an old
+    /// deadline with a request in its inbox (the registry client's
+    /// `requests_reuse_a_pooled_connection_and_a_refused_one_says_where`, "no answer ... in 10s").
     #[test]
-    fn aligned_writes_read_back_equal() {
-        let root = dir("uring-direct");
+    fn a_wake_ends_a_wait_parked_in_the_kernel() {
+        const BOUND: Duration = Duration::from_secs(20);
+        /// How long the waking thread lets the parked thread get into `io_uring_enter`.
+        const SETTLE: Duration = Duration::from_millis(100);
+        let root = dir("uring-wake");
         std::fs::create_dir_all(&root).unwrap();
         let mut driver = Uring::new(&root).unwrap();
-        let pack = FileName::new("store/pack").unwrap();
-        let piece = 3 * DIRECT_PIECE / 2;
-        let count = 2 * DIRECT_BUFFERS as usize;
-        let bytes =
-            |n: usize| -> Vec<u8> { (0..piece).map(|at| (at * 31 + n * 7) as u8).collect() };
-        std::fs::create_dir_all(root.join("store")).unwrap();
-        std::fs::write(root.join("store/pack"), b"").unwrap();
+        let waker = driver.waker().expect("the ring driver has a waker");
+        for timer_in_flight in [false, true] {
+            if timer_in_flight {
+                let mut effects = vec![Effect::Timer { after: BOUND * 2, tag: Tag(1) }];
+                driver.submit(&mut effects);
+            }
+            assert_eq!(driver.in_flight(), usize::from(timer_in_flight));
+            // clone: the wake's count and the waker, for the waking thread.
+            let (parked, waker) = (Arc::clone(&driver.offload.wake), waker.clone());
+            let waking = std::thread::spawn(move || {
+                blaze_spin::SpinWait::within("the ring's thread to park", BOUND, || {
+                    parked.parked.load(Ordering::SeqCst)
+                });
+                let clock = Monotonic::new();
+                wait::sleep_until(
+                    "the parked ring's thread to enter the kernel",
+                    Deadline::after(clock.now(), SETTLE),
+                    &clock,
+                )
+                .unwrap();
+                waker.wake();
+            });
+            let began = Instant::now();
+            let mut out = Vec::new();
+            driver.poll(&mut out, Deadline::after(driver.now(), BOUND));
+            let waited = began.elapsed();
+            waking.join().expect("the waking thread saw the ring's thread park, and woke it");
+            assert!(out.is_empty(), "a wake completes nothing: {out:?}");
+            assert!(
+                waited >= SETTLE && waited < BOUND / 2,
+                "with a timer in flight: {timer_in_flight}, the poll waited {waited:?}: the wake did not end it"
+            );
+        }
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The invariant: a write at an offset goes through the page cache whatever its size and
+    /// alignment, so it completes without waiting for a device. Writes of 8 MiB at multiples
+    /// of 8 MiB (a linked image's runs, as an edit's output is placed) and one unaligned: the
+    /// open of each asks for no `O_DIRECT`, each is one buffered write on its slot, and each
+    /// reads back as written. Its control is
+    /// `the_oracle_catches_a_write_at_an_offset_opened_around_the_cache`.
+    #[test]
+    fn a_write_at_an_offset_goes_through_the_page_cache() {
+        const RUN: usize = 8 << 20;
+        let root = dir("uring-buffered-runs");
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let image = FileName::new("build/image").unwrap();
+        let count = 3;
+        let bytes = |n: usize| -> Vec<u8> { (0..RUN).map(|at| (at * 31 + n * 7) as u8).collect() };
+        std::fs::write(root.join("build/image"), b"").unwrap();
         let mut effects: Vec<Effect> = (0..count)
             .map(|n| Effect::WriteAt {
-                file: pack.clone(),
-                at: (n * piece) as u64,
+                file: image.clone(),
+                at: (n * RUN) as u64,
                 bytes: bytes(n),
                 tag: Tag(n as u64),
             })
             .collect();
-        let odd = (count * piece) as u64 + 7;
+        let odd = (count * RUN) as u64 + 7;
         effects.push(Effect::WriteAt {
-            file: pack.clone(),
+            file: image.clone(),
             at: odd,
-            bytes: vec![9; DIRECT_PIECE + 1],
+            bytes: vec![9; RUN + 1],
             tag: Tag(99),
         });
+        driver.submit(&mut effects);
+        let writes: Vec<Id> = (driver.ops.iter())
+            .filter(|(_, hot)| hot.kind == Kind::WriteAt)
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(writes.len(), count + 1);
+        for id in writes {
+            let mut sqes = [Sqe::default(); ops::LINKS];
+            let n = driver.path_sqes(id, &mut sqes);
+            assert_eq!(around_the_cache(&sqes[..n]), None);
+        }
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
         .expect("the effects end");
         assert_eq!(seen, vec![Done::Written; count + 1]);
-        let file = std::fs::read(root.join("store/pack")).unwrap();
+        let file = std::fs::read(root.join("build/image")).unwrap();
         for n in 0..count {
-            assert!(file[n * piece..(n + 1) * piece] == bytes(n), "piece {n}");
+            assert!(file[n * RUN..(n + 1) * RUN] == bytes(n), "run {n}");
         }
         assert!(file[odd as usize..].iter().all(|&it| it == 9));
-        let fd = std::fs::File::open(root.join("store/pack")).unwrap();
-        let (_, align) = direct_alignment(fd.as_raw_fd()).unwrap();
-        let aligned =
-            align != 0 && piece % align as usize == 0 && DIRECT_PIECE % align as usize == 0;
-        let direct = if aligned { count as u64 } else { 0 };
-        assert_eq!(driver.direct_writes(), direct, "alignment {align}");
-        assert_eq!(
-            (driver.lent.free(), driver.lent.waiters().count()),
-            (DIRECT_BUFFERS as usize, 0)
-        );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Which of a request's `sqes` goes around the page cache, and how: an open with
+    /// `O_DIRECT`, or a write from a registered buffer (`IORING_OP_WRITE_FIXED`, 5). The oracle
+    /// of `a_write_at_an_offset_goes_through_the_page_cache`.
+    fn around_the_cache(sqes: &[Sqe]) -> Option<String> {
+        sqes.iter().find_map(|sqe| match sqe.opcode {
+            OP_OPENAT if sqe.op_flags & libc::O_DIRECT as u32 != 0 => {
+                Some("an open asks for O_DIRECT".to_owned())
+            }
+            5 => Some("a write is from a registered buffer (WRITE_FIXED)".to_owned()),
+            _ => None,
+        })
+    }
+
+    /// The planted bug: the chain the driver made until 2026-11-11 for a write of a MiB or
+    /// more at a sector's offset, its open `O_DIRECT`. The oracle names it.
+    #[test]
+    fn the_oracle_catches_a_write_at_an_offset_opened_around_the_cache() {
+        let planted = Sqe {
+            opcode: OP_OPENAT,
+            op_flags: (libc::O_WRONLY | libc::O_DIRECT) as u32,
+            ..Sqe::default()
+        };
+        let write = Sqe { opcode: OP_WRITE, ..Sqe::default() };
+        let said = around_the_cache(&[planted, write]);
+        assert_eq!(said.as_deref(), Some("an open asks for O_DIRECT"));
+        let fixed = Sqe { opcode: 5, ..Sqe::default() };
+        assert!(around_the_cache(&[fixed]).is_some_and(|it| it.contains("WRITE_FIXED")));
+        let buffered = Sqe { opcode: OP_OPENAT, op_flags: libc::O_WRONLY as u32, ..Sqe::default() };
+        assert_eq!(around_the_cache(&[buffered, write]), None);
     }
 
     /// Many sends, one after another, received by one multishot receive through a ring of
@@ -3854,6 +4433,161 @@ mod tests {
         unsweep(&root);
     }
 
+    /// The invariant (`Uring::holds`): with inotify, whose start is a walk of the tree, the
+    /// submit that starts a watch walks nothing (the start is out on the walker as it returns),
+    /// and a stat of the watched directory asked right after the watch, as a watcher confirms
+    /// one, is answered only once the watch is in place. The walker waits at a gate the test
+    /// holds, so the stat is asked while the watch is provably not in place: the driver holds
+    /// it until the test lets the walk through, and the control, nothing held, answers it
+    /// before.
+    #[test]
+    fn a_look_under_a_starting_watch_waits_for_its_walk() {
+        fn in_place_at_stat(holds_nothing: bool) -> bool {
+            let root = dir(&format!("uring-starting-{holds_nothing}"));
+            std::fs::create_dir_all(root.join("src/deep")).unwrap();
+            let src = FileName::new("src").unwrap();
+            let mut driver = Uring::new(&root).unwrap();
+            let (open, gate) = crossbeam_channel::unbounded();
+            driver.walk_gate = Some(gate);
+            crate::watch::FANOTIFY_REFUSED.set(true);
+            crate::watch::HOLDS_NOTHING.set(holds_nothing);
+            driver.submit(&mut vec![
+                Effect::Watch { dir: src.clone(), tag: Tag(1) },
+                Effect::Stat { file: src.clone(), tag: Tag(2) },
+            ]);
+            crate::watch::FANOTIFY_REFUSED.set(false);
+            assert!(
+                driver.starting.contains_key(&Tag(1)) && !driver.watches.contains_key(&Tag(1)),
+                "the submit walked the tree"
+            );
+            // A held stat is answered only after the walk, which waits at the gate: let it
+            // through. A stat not held is answered with the gate shut, so before the walk.
+            let held = driver.held.iter().any(|it| it.tag() == Tag(2));
+            if held {
+                open.send(()).unwrap();
+            }
+            let (mut out, mut at_stat) = (Vec::new(), None);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while at_stat.is_none() {
+                assert!(Instant::now() < deadline, "the stat never came (held: {held})");
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+                for it in out.drain(..) {
+                    match (it.tag.0, it.done) {
+                        (2, Done::Stat(Some(_))) => {
+                            at_stat = Some(driver.watches.contains_key(&Tag(1)));
+                        }
+                        (1, Done::Changed { .. }) => {}
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+            // Every walk through from here, the start's among them where it waits still.
+            drop(open);
+            crate::watch::HOLDS_NOTHING.set(false);
+            let mut ended = false;
+            run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(1) }], |it, _| {
+                match (it.tag.0, it.done) {
+                    (1, Done::Unwatched) => ended = true,
+                    (1, Done::Changed { .. }) => {}
+                    other => panic!("{other:?}"),
+                }
+            })
+            .expect("the effects end");
+            assert!(ended && driver.in_flight() == 0);
+            drop(driver);
+            std::fs::remove_dir_all(root).unwrap();
+            at_stat.expect("polled until the stat came")
+        }
+        assert!(in_place_at_stat(false), "the stat was answered before the watch was in place");
+        assert!(!in_place_at_stat(true), "the control was not caught");
+    }
+
+    /// The invariant (`crate::watch`, "A directory made in"): under inotify a directory made
+    /// under a watched one is watched off the loop, and a file made in it before its watch is
+    /// in place is told, by the grow's own listing, before a flush asked after it is answered.
+    /// The walker waits at a gate the test holds, so the file is made while the new directory
+    /// provably has no watch. The control (`GROW_DROPS_FOUND`) drops what the walk finds: the
+    /// file is then never told.
+    #[test]
+    fn a_file_made_in_a_new_directory_before_its_watch_is_heard() {
+        /// Asks a flush of the watch 1 as `tag` and polls until it is answered, each name a
+        /// change of the watch told into `heard`.
+        fn flush(driver: &mut Uring, tag: Tag, heard: &mut Vec<FileName>) {
+            driver.submit(&mut vec![Effect::Flush { watch: Tag(1), tag }]);
+            poll_heard(driver, heard, |it, _| it == Some(tag));
+        }
+        /// Polls until `enough` says yes, asked of each flush answered and of what was heard
+        /// so far, or thirty seconds pass.
+        fn poll_heard(
+            driver: &mut Uring,
+            heard: &mut Vec<FileName>,
+            mut enough: impl FnMut(Option<Tag>, &[FileName]) -> bool,
+        ) {
+            let (mut out, deadline) = (Vec::new(), Instant::now() + Duration::from_secs(30));
+            loop {
+                assert!(Instant::now() < deadline, "never came; heard {heard:?}");
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+                let mut done = false;
+                for it in out.drain(..) {
+                    match it.done {
+                        Done::Changed { files, .. } => heard.extend(files),
+                        Done::Flushed => done |= enough(Some(it.tag), heard),
+                        other => panic!("{:?}: {other:?}", it.tag),
+                    }
+                }
+                if done || enough(None, heard) {
+                    return;
+                }
+            }
+        }
+        fn heard_it(drops_found: bool) -> bool {
+            let root = dir(&format!("uring-grow-{drops_found}"));
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            let file = FileName::new("src/new/deeper/lib.rs").unwrap();
+            let mut driver = Uring::new(&root).unwrap();
+            let (open, gate) = crossbeam_channel::unbounded();
+            driver.walk_gate = Some(gate);
+            crate::watch::FANOTIFY_REFUSED.set(true);
+            crate::watch::GROW_DROPS_FOUND.set(drops_found);
+            driver.submit(&mut vec![Effect::Watch { dir: FileName::new("src").unwrap(), tag: Tag(1) }]);
+            crate::watch::FANOTIFY_REFUSED.set(false);
+            // The start's walk through; the watch is in place once a flush after it is answered.
+            open.send(()).unwrap();
+            let mut heard = Vec::new();
+            flush(&mut driver, Tag(2), &mut heard);
+            std::fs::create_dir(root.join("src/new")).unwrap();
+            let new = FileName::new("src/new").unwrap();
+            poll_heard(&mut driver, &mut heard, |_, heard| heard.contains(&new));
+            assert_eq!(driver.grows_out, 1, "the new directory's grow is out, at the gate");
+            // Made while `src/new` has no watch: the grow waits at the gate.
+            std::fs::create_dir(root.join("src/new/deeper")).unwrap();
+            std::fs::write(root.join(file.as_str()), b"fn f() {}").unwrap();
+            open.send(()).unwrap();
+            flush(&mut driver, Tag(3), &mut heard);
+            let told = heard.contains(&file);
+            crate::watch::GROW_DROPS_FOUND.set(false);
+            drop(open);
+            let mut ended = false;
+            run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(1) }], |it, _| {
+                match (it.tag.0, it.done) {
+                    (1, Done::Unwatched) => ended = true,
+                    (1, Done::Changed { .. }) => {}
+                    other => panic!("{other:?}"),
+                }
+            })
+            .expect("the effects end");
+            assert!(ended && driver.in_flight() == 0);
+            drop(driver);
+            std::fs::remove_dir_all(root).unwrap();
+            told
+        }
+        assert!(
+            heard_it(false),
+            "a file made in a new directory before its watch was in place was never told"
+        );
+        assert!(!heard_it(true), "the control was not caught");
+    }
+
     /// A journal on Linux first says the changes since a saved cursor are lost (and nothing is
     /// for no cursor), then tells a file written as a live batch, before a flush asked after
     /// it; it ends at an unwatch, as a watch does.
@@ -3991,8 +4725,32 @@ mod tests {
     }
 
     /// Each request in flight, by its handle.
+    /// The effects' requests in flight. The read of the wake's eventfd is the driver's own,
+    /// in flight across every wait once a waker is given, and no effect's: it is left out.
     fn requests(driver: &Uring) -> Vec<Id> {
-        driver.ops.iter().map(|(id, _)| id).collect()
+        driver.ops.iter().filter(|(_, hot)| hot.kind != Kind::Wake).map(|(id, _)| id).collect()
+    }
+
+    /// The invariant: a sync and a barrier of a file sealed read-only succeed through the
+    /// ring and through the threads driver, and of a missing file make it
+    /// ([`crate::fs::assert_syncs_a_sealed_file`], with its control); on the ring a file a
+    /// sync kept read-only (`Kept::read_only`) is let go by the append after it, which writes
+    /// through a descriptor of its own.
+    #[test]
+    fn a_sync_of_a_sealed_file_succeeds_on_each_driver() {
+        let root = dir("uring-sync-sealed");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        crate::fs::assert_syncs_a_sealed_file(&mut driver, &root);
+        let plain = FileName::new("sealed/plain").unwrap();
+        let kept = driver.names.get(&plain).copied().expect("the append's file is named");
+        assert!(!driver.kept.get(kept).expect("kept").read_only, "the append's file is kept");
+        drop(driver);
+        let threads = dir("uring-sync-sealed-threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        crate::fs::assert_syncs_a_sealed_file(&mut Threads::new(&threads, 2), &threads);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(threads).unwrap();
     }
 
     /// A completion that comes after its request ended, once the request's slot holds another
@@ -4004,6 +4762,8 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("file"), b"bytes").unwrap();
         let mut driver = Uring::new(&root).unwrap();
+        // A watch's read in flight as it is submitted, whatever watches it.
+        driver.walks_here = true;
         let file = FileName::new("file").unwrap();
         // Kept open from here, so each request on it is its own alone.
         run_until_idle(
@@ -4158,6 +4918,8 @@ mod tests {
         let root = dir("uring-warm-watch");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let mut driver = Uring::new(&root).unwrap();
+        // In place as it is submitted, so the file written right after is heard.
+        driver.walks_here = true;
         let src = FileName::new("src").unwrap();
         let mut out = Vec::with_capacity(64);
         for round in 0..2 * WARM {

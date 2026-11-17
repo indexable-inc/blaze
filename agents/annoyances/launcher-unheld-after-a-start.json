@@ -1,0 +1,14 @@
+{
+ "id": "launcher-unheld-after-a-start",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of 7c task C parts 1-3, int-1112",
+ "where": "crates/blaze-cargo/src/serve/unit/run/launch.rs Launches, Held, read_launcher, wanted; crates/blaze-cargo/src/serve/unit/run/needs.rs Front; crates/blaze-cargo/src/serve/daemon/launch.rs; crates/blaze-cargo/src/serve/local.rs LaunchMark; crates/blaze-cargo/src/serve/work.rs LaunchKept, LaunchMarked",
+ "what": "After `blaze stop` a launcher's `Hello` found no held program (`Unheld`) and the next `blaze run` relinked it whole (2,685 ms against Relax's 27.8 ms). A program the daemon built lived only in memory; a first call no record answered was refused with NO_FRONT whenever no task held the front end, including the first run after every start and the run after a serving task ended `Detached`.",
+ "cost": "the restart row of harness/v2/versus.py lost to the competitor by about 100x",
+ "cause": "the launched program's state (`Program`, its bind records' statics, who makes a first call) had no durable form and no owner outside one build's task",
+ "class": "state made by a task kept only in the task's memory, with no image and no owner across a process restart",
+ "prevention": "the loop keeps every program's start image in the store and marks `launch\\0<path>` once the put is durable; the reader restores from the mark and checks the image's record; the Front core owns who makes a need when no task holds the front end, bounded by BUILD",
+ "workaround": "none: run `blaze run` again and wait for the relink",
+ "fix": "task C of /tmp/plan/7c-launched-restart.md: launch.rs ported, serve/daemon/launch.rs and serve/tests/launched_restart.rs written. A program is named two ways: the path its link was asked for (deps/<name>-<hash>, what program_id hashes) and the path it runs from (cargo's executable, what a build's Built names); Held keeps runs_as, the launch mark stores it (1+32+32+(4+path)), a restore takes it, and wants and built_by_daemon go by it, so the daemon's self-sent build is found where the two differ. The sim's fake gives the two different values and a want by the link's path is its control. Open: the second control of the plan (a fake answering the certificate's record for any mark), /tmp/plan/7c-C3-next.md",
+ "state": "written, not yet built or run"
+}

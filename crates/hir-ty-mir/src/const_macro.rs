@@ -3,10 +3,16 @@
 //! evaluator, in this process.
 //!
 //! The function's parameters are its inputs, the attribute's first for an attribute: each is
-//! `&str`, the tokens as text (stage 0), or `&const_ast::Item`, the item as a flat syntax tree
-//! read through `const-ast`'s views (stage 2), which the macro crate depends on as blaze's own
-//! copy ([`CONST_AST`]). It returns its output as text, and every output token gets the call
-//! site's span.
+//! `&const_ast::Item`, the input parsed to an item, or `&const_ast::TokenTree`, its tokens as
+//! one token tree, both flat syntax trees read through `const-ast`'s views, which the macro
+//! crate depends on as blaze's own copy ([`CONST_AST`]). It returns a `const_ast::Output`, the
+//! tree a `const_ast::Builder` wrote, never text: the host reads it back ([`output`]), gives
+//! each token the span the call's table holds for it, and refuses a tree that is not the
+//! parser's tree of its own tokens, naming the macro and the element.
+//!
+//! A call has one span table, shared by its inputs: `def_site` 0, `call_site` 1, `mixed_site`
+//! 2, then each distinct span of the inputs in the order it first appears ([`SpanTable`]). A
+//! macro's span is an index into it, which it cannot make, join or look into.
 
 use std::{any::Any, sync::Arc};
 
@@ -15,7 +21,6 @@ use blaze_hash::HashMap;
 use hir_def::{AdtId, FunctionId, MacroId, ModuleDefId, StructId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
-    parse_to_token_tree_static_span,
     proc_macro::{
         Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
         ProcMacroKind,
@@ -34,18 +39,22 @@ use syntax::{
 
 use crate::{
     display::{DisplayTarget, HirDisplay},
-    mir::{FlatInput, MacroArg, call_const_macro},
+    mir::{FlatInput, call_const_macro},
     mir_pretty::MirEvalErrorPretty,
     next_solver::TyKind,
 };
+
+mod output;
+pub mod quote;
 
 /// The name the macro crate depends on blaze's copy of `const-ast` by.
 pub const CONST_AST_NAME: &str = "const_ast";
 
 /// The files of blaze's copy of `const-ast`, by their path from its root, which every macro
-/// crate depends on: the views a macro reads its input with are the code the expander writes
-/// the input for, with the same layout and kinds.
-pub const CONST_AST: [(&str, &str); 3] = const_ast::SOURCE;
+/// crate depends on: the views a macro reads its input with and the builder it writes its
+/// output with are the code the expander writes the input for and reads the output of, with
+/// the same layout and kinds.
+pub const CONST_AST: [(&str, &str); 4] = const_ast::SOURCE;
 
 /// The expander of the const macro `name`, a function of the macro crate whose root is `root`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,26 +123,37 @@ impl ConstMacroExpander {
             .ok_or_else(|| format!("the proc macro `{}` is not a function", self.name))
     }
 
-    /// What each parameter of `func`, of the macro crate `krate`, takes.
+    /// What each parameter of `func`, of the macro crate `krate`, takes, its return type
+    /// checked to be `const_ast::Output`.
     fn params(&self, db: &Db, krate: Crate, func: FunctionId) -> Result<Vec<Param>, String> {
-        let item = const_ast_item(db, krate)?;
+        let views = const_ast(db, krate)?;
         let sig = db.callable_item_signature(func.into()).skip_binder().skip_binder();
         let target = DisplayTarget::from_crate(db, krate);
+        let output = sig.output();
+        if !matches!(output.kind(), TyKind::Adt(adt, _) if adt.def_id() == AdtId::StructId(views.built))
+        {
+            return Err(format!(
+                "the const macro `{}` returns `{}`; it returns `{CONST_AST_NAME}::Output`",
+                self.name,
+                output.display(db, target)
+            ));
+        }
         sig.inputs()
             .iter()
             .map(|ty| {
-                if let TyKind::Ref(_, pointee, rustc_ast_ir::Mutability::Not) = ty.kind() {
-                    match pointee.kind() {
-                        TyKind::Str => return Ok(Param::Str),
-                        TyKind::Adt(adt, _) if Some(adt.def_id()) == item.map(AdtId::StructId) => {
-                            return Ok(Param::Item);
-                        }
-                        _ => {}
+                if let TyKind::Ref(_, pointee, rustc_ast_ir::Mutability::Not) = ty.kind()
+                    && let TyKind::Adt(adt, _) = pointee.kind()
+                {
+                    if adt.def_id() == AdtId::StructId(views.item) {
+                        return Ok(Param::Item);
+                    }
+                    if adt.def_id() == AdtId::StructId(views.token_tree) {
+                        return Ok(Param::Tokens);
                     }
                 }
                 Err(format!(
-                    "a parameter of the const macro `{}` is `{}`; it takes `&str` or \
-                     `&{CONST_AST_NAME}::Item`",
+                    "a parameter of the const macro `{}` is `{}`; it takes \
+                     `&{CONST_AST_NAME}::Item` or `&{CONST_AST_NAME}::TokenTree`",
                     self.name,
                     ty.display(db, target)
                 ))
@@ -145,19 +165,32 @@ impl ConstMacroExpander {
 /// What a parameter of a const macro takes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Param {
-    /// `&str`: the tokens as text.
-    Str,
     /// `&const_ast::Item`: the tokens parsed to an item, as a flat tree.
     Item,
+    /// `&const_ast::TokenTree`: the tokens as one token tree, `{ .. }`, as a flat tree.
+    Tokens,
 }
 
-/// The `Item` view of the `const_ast` the macro crate `krate` depends on, if it does, which is
-/// blaze's own copy.
-fn const_ast_item(db: &Db, krate: Crate) -> Result<Option<StructId>, String> {
+/// The types of the `const_ast` a macro crate depends on that a const macro's signature names.
+struct ConstAst {
+    /// `Item`, a parameter.
+    item: StructId,
+    /// `TokenTree`, a parameter.
+    token_tree: StructId,
+    /// `Built`, which the return type `Output` is (`Built<'static>`).
+    built: StructId,
+}
+
+/// The views of the `const_ast` the macro crate `krate` depends on, which must be blaze's own
+/// copy: a macro crate without it has no const macro.
+fn const_ast(db: &Db, krate: Crate) -> Result<ConstAst, String> {
     let Some(dep) =
         krate.data(db).dependencies.iter().find(|it| it.name.as_str() == CONST_AST_NAME)
     else {
-        return Ok(None);
+        return Err(format!(
+            "the macro crate does not depend on `{CONST_AST_NAME}`: a const macro takes and \
+             returns its trees"
+        ));
     };
     let root = dep.crate_id.data(db).root_file_id;
     if **db.file_text(root).text(db) != *CONST_AST[0].1 {
@@ -168,59 +201,127 @@ fn const_ast_item(db: &Db, krate: Crate) -> Result<Option<StructId>, String> {
     }
     let def_map = crate_def_map(db, dep.crate_id);
     let scope = def_map.module(db, def_map.root_module_id()).scope(db);
-    match scope.get(&Name::new_symbol_root(Symbol::intern("Item"))).take_types() {
-        Some(ModuleDefId::AdtId(AdtId::StructId(id))) => Ok(Some(id)),
-        _ => Err(format!("`{CONST_AST_NAME}` has no struct `Item`")),
+    let named = |name: &str| match scope.get(&Name::new_symbol_root(Symbol::intern(name))).take_types()
+    {
+        Some(ModuleDefId::AdtId(AdtId::StructId(id))) => Ok(id),
+        _ => Err(format!("`{CONST_AST_NAME}` has no struct `{name}`")),
+    };
+    Ok(ConstAst { item: named("Item")?, token_tree: named("TokenTree")?, built: named("Built")? })
+}
+
+/// One call's span table: the three sites, then every other span of its inputs once, in the
+/// order it first appears. A token's span in a `const_ast::Tree` is its index here, and a
+/// written token's span is read back through it.
+struct SpanTable {
+    index: HashMap<Span, u32, Global>,
+    spans: Vec<Span>,
+}
+
+impl SpanTable {
+    /// The table of `sites` (`def_site`, `call_site`, `mixed_site`): each at its own index,
+    /// 0, 1 and 2, even when two are the same span.
+    fn new(sites: [Span; 3]) -> SpanTable {
+        let mut index = HashMap::new_in(Global); // alloc: one call's table, dropped with it
+        for (at, site) in (0..).zip(sites) {
+            index.entry(site).or_insert(at);
+        }
+        SpanTable { index, spans: sites.to_vec() } // alloc: as `index`
+    }
+
+    /// `span`'s index, given the next one if it has none yet.
+    fn intern(&mut self, span: Span) -> u32 {
+        let next = self.spans.len() as u32;
+        let at = *self.index.entry(span).or_insert(next);
+        if at == next {
+            self.spans.push(span);
+        }
+        at
     }
 }
 
-/// `subtree` parsed to an item, as a flat tree: each token's span is its index in the call's
-/// span table, which is `sites` (`def_site`, `call_site`, `mixed_site`) and then each distinct
-/// span of the input in the order it first appears.
-fn flat_input(
+/// `subtree` parsed as items, as a flat tree whose token spans are `table`'s indices; the
+/// element the view starts at is left 0 for the caller to set.
+fn flat_tree(
     subtree: &tt::TopSubtree,
     edition: Edition,
-    sites: [Span; 3],
-) -> Result<FlatInput, String> {
+    table: &mut SpanTable,
+) -> Result<(FlatInput, syntax::Parse<syntax::view::Untyped>), String> {
     let (parse, span_map) = syntax_bridge::token_tree_to_syntax_node(
         subtree.view(),
         parser::TopEntryPoint::MacroItems,
         &mut |_| edition,
     );
     if let Some(error) = parse.errors().first() {
-        return Err(format!("the input is not an item: {error}"));
+        return Err(format!("it is not items: {error}"));
     }
-    let root = parse.syntax_node().to_flat();
-    let (tree, _) = root.flat().ok_or("the input has no flat tree")?;
-    let mut table: HashMap<Span, u32, Global> = HashMap::new_in(Global);
-    for (index, site) in (0..).zip(sites) {
-        table.entry(site).or_insert(index);
-    }
-    let mut next = sites.len() as u32;
+    let (tree, root) = parse.root().flat();
     let mut input = FlatInput::default();
-    for at in 0..tree.len() {
+    for at in root..tree.end(root) {
         let token = tree.is_token(at);
         input.kinds.push(tree.kind(at).0 | if token { const_ast::TOKEN } else { 0 });
-        input.ends.push(tree.end(at));
+        input.ends.push(tree.end(at) - root);
         if token {
-            let span = span_map.span_at(tree.range(at).start());
-            let index = *table.entry(span).or_insert_with(|| {
-                next += 1;
-                next - 1
-            });
-            input.spans.push(index);
+            input.spans.push(table.intern(span_map.span_at(tree.range(at).start())));
             input.text.push_str(tree.token_text(at));
         } else {
             input.spans.push(const_ast::NO_SPAN);
         }
         input.text_ends.push(input.text.len() as u32);
     }
-    let mut items = root.children().filter(|it| ast::Item::can_cast(it.kind()));
+    Ok((input, parse))
+}
+
+/// `subtree` parsed to an item, as a flat tree: each token's span is its index in `table`.
+fn flat_input(
+    subtree: &tt::TopSubtree,
+    edition: Edition,
+    table: &mut SpanTable,
+) -> Result<FlatInput, String> {
+    let (mut input, parse) = flat_tree(subtree, edition, table)?;
+    let (tree, root) = parse.root().flat();
+    let mut items = (root + 1..tree.end(root))
+        .filter(|&at| !tree.is_token(at) && tree.parent(at) == Some(root))
+        .filter(|&at| ast::Item::can_cast(SyntaxKind::from(tree.kind(at).0)));
     let item = items.next().ok_or("the input has no item")?;
-    input.item = item.flat().ok_or("the input has no flat tree")?.1;
     if items.next().is_some() {
         return Err("the input is more than one item".to_owned());
     }
+    input.item = item - root;
+    Ok(input)
+}
+
+/// `subtree`'s tokens as one token tree, a flat tree: wrapped as `m!{ .. }` (the three tokens
+/// added at `call_site`) and parsed as items, so the token tree and the token trees in it are
+/// the parser's own nodes; the view starts at the call's `TOKEN_TREE`. Each token's span is
+/// its index in `table`.
+fn flat_tokens(
+    subtree: &tt::TopSubtree,
+    edition: Edition,
+    table: &mut SpanTable,
+    call_site: Span,
+) -> Result<FlatInput, String> {
+    let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(call_site));
+    builder.push(tt::Leaf::Ident(tt::Ident {
+        sym: Symbol::intern("m"),
+        span: call_site,
+        is_raw: tt::IdentIsRaw::No,
+    }));
+    builder.push(tt::Leaf::Punct(tt::Punct {
+        char: '!',
+        spacing: tt::Spacing::Alone,
+        span: call_site,
+    }));
+    builder.open(tt::DelimiterKind::Brace, call_site);
+    builder.extend_with_tt(subtree.view().token_trees());
+    builder.close(call_site);
+    let wrapped = builder.build();
+    let (mut input, _) = flat_tree(&wrapped, edition, table)?;
+    let tree = input
+        .kinds
+        .iter()
+        .position(|&kind| kind == SyntaxKind::TOKEN_TREE as u16)
+        .ok_or("its tokens wrapped in a macro call have no token tree")?;
+    input.item = tree as u32;
     Ok(input)
 }
 
@@ -253,32 +354,25 @@ impl ProcMacroExpander for ConstMacroExpander {
                 params.len(),
             )));
         }
-        let mut texts = Vec::new();
-        let mut flats = Vec::new();
-        for (param, input) in params.iter().zip(&inputs) {
-            match param {
-                Param::Str => texts.push(input.to_string()),
-                Param::Item => flats.push(
-                    flat_input(input, edition, [def_site, call_site, mixed_site]).map_err(
-                        |why| {
-                            ProcMacroExpansionError::Panic(format!(
-                                "the const macro `{}` takes `&{CONST_AST_NAME}::Item`: {why}",
-                                self.name
-                            ))
-                        },
-                    )?,
-                ),
-            }
+        let mut table = SpanTable::new([def_site, call_site, mixed_site]);
+        let mut flats = Vec::with_capacity(inputs.len()); // alloc: one call's inputs
+        for (at, (param, input)) in params.iter().zip(&inputs).enumerate() {
+            let (flat, takes) = match param {
+                Param::Item => (flat_input(input, edition, &mut table), "Item"),
+                Param::Tokens => {
+                    (flat_tokens(input, edition, &mut table, call_site), "TokenTree")
+                }
+            };
+            flats.push(flat.map_err(|why| {
+                ProcMacroExpansionError::Panic(format!(
+                    "the const macro `{}` takes `&{CONST_AST_NAME}::{takes}` as parameter {at}, \
+                     and its input is refused: {why}",
+                    self.name
+                ))
+            })?);
         }
-        let (mut texts, mut flats) = (texts.iter(), flats.iter());
-        let args: Vec<MacroArg<'_>> = params
-            .iter()
-            .filter_map(|param| match param {
-                Param::Str => texts.next().map(|it| MacroArg::Str(it)),
-                Param::Item => flats.next().map(MacroArg::Item),
-            })
-            .collect();
-        let output = call_const_macro(hir, func, &args).map_err(|error| {
+        let inputs: Vec<&FlatInput> = flats.iter().collect(); // alloc: as `flats`
+        let output = call_const_macro(hir, func, &inputs).map_err(|error| {
             let mut text = format!("the const macro `{}` failed: ", self.name);
             let display_target = DisplayTarget::from_crate(hir, krate);
             let printed = error.pretty_print(
@@ -293,12 +387,8 @@ impl ProcMacroExpander for ConstMacroExpander {
             }
         })?;
         let tree =
-            parse_to_token_tree_static_span(edition, call_site, &output).ok_or_else(|| {
-                ProcMacroExpansionError::Panic(format!(
-                    "the const macro `{}` returned text that is not tokens: {output:?}",
-                    self.name
-                ))
-            })?;
+            output::expansion(&self.name, &output, &inputs, &table.spans, edition, call_site)
+                .map_err(ProcMacroExpansionError::Panic)?;
         // It runs on the database's evaluator, whose reads are the database's own, tracked;
         // none is traced as a server traces what it read, so its calling crate gets no image.
         Ok(Expanded::untraced(tree, CONST_MACRO_READS))

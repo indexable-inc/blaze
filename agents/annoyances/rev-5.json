@@ -1,0 +1,11 @@
+{
+ "id": "rev-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+ "where": "blaze: rustc attributes",
+ "what": "`#[rustc_clean(..)]` is refused with rustc's own text (`attribute requires -Z query-dep-graph to be enabled`) and `-Z query-dep-graph` in rustflags is refused too (`blaze does not know which cfgs -Z query-dep-graph decides`), so 88 files of rustc's `tests/incremental` cannot build unchanged under blaze by any setting.",
+ "cost": "an hour: the importer had to write the attributes over with spaces",
+ "cause": "blaze ports the gate of an attribute whose flag it has no meaning for",
+ "workaround": "the importer blanks the six assertion attributes, columns kept",
+ "state": "open: accept the attributes as inert (they assert on rustc's queries), or accept the flag"
+}

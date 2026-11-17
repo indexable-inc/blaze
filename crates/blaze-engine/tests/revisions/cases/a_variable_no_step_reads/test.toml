@@ -1,0 +1,41 @@
+about = "Variables no step of the build reads (another pane's TERM and COLUMNS, a service manager's INVOCATION_ID, a LIBCLANG_PATH no script of this build asks for), set in the command's environment of a workspace whose build script walks its environment: no unit is made again, no unit's record misses and no build script runs again. A walk sees the walk set (store.md, What a step reads), never the shell."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "52 none\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "52 none\n"
+redone = []
+max_units = 0
+max_records = 0
+max_runs = 0
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { UNRELATED_TO_THE_BUILD = "1", TERM = "dumb", COLUMNS = "80", INVOCATION_ID = "0123456789abcdef", LIBCLANG_PATH = "/nowhere/lib" }
+prints = "52 none\n"
+redone = []
+max_units = 0
+max_records = 0
+max_runs = 0
+link = "none"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { TERM = "xterm-256color", COLUMNS = "200" }
+prints = "52 none\n"
+redone = []
+max_units = 0
+max_records = 0
+max_runs = 0
+link = "none"

@@ -1,0 +1,11 @@
+{
+ "id": "newproj-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+ "where": "the brief's measurement and the lane's VM",
+ "what": "The brief's numbers were a Mac's (first run 6.9 s, 68 describes); the lane's VM is Linux arm64, where a dev program is walked and linked whole (14,202 describes, 12,043 functions, first run 13 to 34 s). The two platforms' first builds are different work, and nothing on the VM says what the Mac's does.",
+ "cost": "an hour reading the VM's profile against the brief's spans before seeing they are not the same build",
+ "cause": "a dev executable takes the dependency image on macOS and not on this VM (not looked into further)",
+ "workaround": "attribute and measure on the platform at hand, and say so",
+ "state": "open: a brief should name the platform its numbers are of"
+}

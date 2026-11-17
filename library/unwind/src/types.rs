@@ -38,6 +38,8 @@ pub const unwinder_private_data_size: usize =
         any(target_arch = "sparc", target_arch = "sparc64") => 2,
         any(target_arch = "riscv64", target_arch = "riscv32") => 2,
         target_family = "wasm" => 2,
+        // blaze: the GPU device target (naga-unknown-unknown), which never unwinds.
+        target_arch = "naga" => 2,
         target_arch = "hexagon" => 5,
         any(target_arch = "loongarch32", target_arch = "loongarch64") => 2,
     };

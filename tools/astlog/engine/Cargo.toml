@@ -1,0 +1,22 @@
+[package]
+name = "astlog-engine"
+description = "astlog's language and evaluator, generic over a fact source: the reader, the checked program, semi-naive Datalog with stratified negation and count, and rewrite planning"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+blaze-hash.workspace = true
+regex.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

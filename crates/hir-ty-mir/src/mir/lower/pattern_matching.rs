@@ -2,6 +2,7 @@
 
 use blaze_mem::Frame;
 use hir_def::{
+    AdtId, EnumVariantId, LocalFieldId,
     hir::{ExprId, Literal, RecordFieldPat},
     signatures::VariantFields,
 };
@@ -334,6 +335,18 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                     current = next;
                     place
                 }
+                PatAdjust::UnionMember => {
+                    let (place, next) = self.union_member_place(
+                        current,
+                        &mut current_else,
+                        cond_place,
+                        adjustment.source.as_ref(),
+                        pattern,
+                        mode,
+                    )?;
+                    current = next;
+                    place
+                }
             };
         }
         Ok(match self.store.pat(pattern) {
@@ -418,6 +431,21 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                     }
                 }
                 (then_target, current_else)
+            }
+            // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`) matches each field
+            // named at its place in the tuple core's `Record` holds; it tests nothing itself.
+            Pat::Record { args, .. }
+                if let Some(of) =
+                    crate::record::record_fields(self.lang_items(), self.place_ty(&cond_place)) =>
+            {
+                let inner = cond_place.project(PlaceElem::Field(FieldIndex(0)));
+                let mut named = Vec::with_capacity_in(args.len(), self.frame);
+                for field in args.iter() {
+                    let at =
+                        of.index_of(field.name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+                    named.push((PlaceElem::Field(FieldIndex(at as u32)), field.pat));
+                }
+                self.pattern_match_adt(current, current_else, named.into_iter(), &inner, mode)?
             }
             Pat::Record { args, .. } => {
                 let Some(variant) = self.infer.variant_resolution_for_pat(pattern) else {
@@ -688,7 +716,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                     (next, Some(else_target))
                 }
             },
-            Pat::Lit(l) => match self.store.expr(l) {
+            Pat::Lit(lit) => match self.store.expr(lit) {
                 Expr::Literal(l) => {
                     if mode == MatchingMode::Check {
                         let mut ty = self.infer.pat_ty(pattern);
@@ -716,7 +744,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                             cond_place = reference.into();
                             ty = ref_ty;
                         }
-                        let c = self.lower_literal_to_operand(ty, l)?;
+                        let c = self.lower_store_literal(ty, lit, l)?;
                         self.pattern_match_const(current_else, current, c, cond_place, pattern)?
                     } else {
                         (current, current_else)
@@ -921,12 +949,85 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
     }
 
     /// The type of a place, normalized: the local of a `?` has the type `<R as Try>::Residual`.
-    fn place_ty(&self, place: &Place<'db>) -> Ty<'db> {
+    pub(super) fn place_ty(&self, place: &Place<'db>) -> Ty<'db> {
         let local = self.local(place.local).ty.as_ref();
         let ty = PlaceTy::from_ty(local)
             .multi_projection_ty(&self.infcx, self.env, place.projection.as_slice())
             .ty;
         normalize_or_keep(&self.infcx, self.env, ty)
+    }
+
+    /// blaze: the variant of the `Repr` enum of the error union `union` that holds the member
+    /// a pattern of type `member` matches (`PatAdjust::UnionMember`, `hir_ty::error_union`).
+    pub(super) fn union_member_variant(
+        &self,
+        union: Ty<'db>,
+        member: Ty<'db>,
+    ) -> Option<EnumVariantId> {
+        let interner = self.interner();
+        let members = crate::error_union::members(interner, union)?;
+        let at = crate::error_union::member_index(members, member)?;
+        let repr = crate::error_union::repr_field(self.db, interner, union)?;
+        let repr = normalize_or_keep(&self.infcx, self.env, repr);
+        crate::error_union::repr_variant(self.db, repr, at)
+    }
+
+    /// blaze: the pattern whose type is the member that `pattern`, one with
+    /// `PatAdjust::UnionMember`, matches: `pattern` itself, a constructor pattern, or the
+    /// constructor pattern after its `x @`s (a binding by reference has the reference's type,
+    /// not the member's).
+    pub(super) fn union_member_pat(&self, mut pattern: PatId) -> PatId {
+        while let Pat::Bind { subpat: Some(inner), .. } = self.store.pat(pattern) {
+            pattern = inner;
+        }
+        pattern
+    }
+
+    /// blaze: the place of the member that `pattern`, a pattern of a member of the error
+    /// union `union` at `union_place`, matches: the one field of the variant of the union's
+    /// `Repr` enum that holds that member. When `mode` checks, control goes on (the block
+    /// returned) only where the union holds that member, and to `current_else` otherwise:
+    /// the test a variant's pattern makes of its enum.
+    fn union_member_place(
+        &mut self,
+        mut current: BasicBlockId,
+        current_else: &mut Option<BasicBlockId>,
+        union_place: Place<'db>,
+        union: Ty<'db>,
+        pattern: PatId,
+        mode: MatchingMode,
+    ) -> Result<'db, (Place<'db>, BasicBlockId)> {
+        const NOT_A_MEMBER: MirLowerError<'static> =
+            MirLowerError::TypeError("a pattern of no member of the error union it matches");
+        let member = self.infer.pat_ty(self.union_member_pat(pattern));
+        let variant = self.union_member_variant(union, member).ok_or(NOT_A_MEMBER)?;
+        if !matches!(union.as_adt(), Some((AdtId::StructId(_), _))) {
+            return Err(NOT_A_MEMBER);
+        }
+        let first = LocalFieldId::from_raw(0u32.into());
+        let held = union_place.project(PlaceElem::Field(first.into()));
+        let span: MirSpan = pattern.into();
+        if mode == MatchingMode::Check {
+            let e = self.const_eval_discriminant(variant)? as u128;
+            let tmp = self.discr_temp_place(current);
+            self.push_assignment(current, tmp, Rvalue::Discriminant(held.store()), span);
+            let next = self.new_basic_block();
+            let else_target = current_else.get_or_insert_with(|| self.new_basic_block());
+            self.set_terminator(
+                current,
+                TerminatorKind::SwitchInt {
+                    discr: Operand { kind: OperandKind::Move(tmp.store()), span: None },
+                    targets: SwitchTargets::static_if(e, next, *else_target),
+                },
+                span,
+            );
+            current = next;
+        }
+        let of_variant = VariantId::EnumVariantId(variant);
+        let place = held
+            .project(ProjectionElem::Downcast(of_variant))
+            .project(PlaceElem::Field(first.into()));
+        Ok((place, current))
     }
 
     fn pattern_matching_variant(
@@ -1027,10 +1128,11 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
         Ok(match shape {
             AdtPatternShape::Record { args } => {
                 let mut it = Vec::with_capacity_in(args.len(), self.frame);
+                let table = self.resolver.ctx_table();
                 for x in args {
                     let hygiene = self.store.record_field_hygiene(x.pat);
                     let field_id = variant_data
-                        .field_written(self.db, v, &x.name, hygiene)
+                        .field_written(self.db, table, v, &x.name, hygiene)
                         .ok_or(MirLowerError::UnresolvedField)?;
                     it.push((PlaceElem::Field(field_id.into()), x.pat));
                 }

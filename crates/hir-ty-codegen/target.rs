@@ -12,15 +12,57 @@ use cranelift_codegen::{
     isa::{self, CallConv, OwnedTargetIsa},
     settings::{self, Configurable, OptLevel},
 };
+use blaze_codegen::slot::Slot;
 use blaze_core::lock::Lock;
 
-/// Each target a unit has named ([`Target::of`]), parsed once and kept for the process. A
-/// process builds for a handful (the host, wasm32 for proc macros), so a scan finds one.
-static NAMED: Lock<Vec<&'static Target>> = Lock::new("codegen.target.named", Vec::new());
+/// Each target a unit has named ([`Target::of`]), parsed once and kept for the process.
+static NAMED: Named = Named::new();
 
 /// The most targets one process lowers units for. A code generator is kept per target and
 /// set of features (`crate::target_of`), by the target's place in [`NAMED`].
 pub(crate) const MOST_TARGETS: usize = 8;
+
+/// The targets named, one a triple, each in a slot written once ([`Slot`]) and numbered by its
+/// place: filled in order, so a slot not written yet ends them. Every function compiled asks
+/// for its unit's target, on every core at once, so a look takes no lock: a scan of the slots
+/// written, a handful (the host, wasm32 for proc macros), each one acquire load.
+struct Named([Slot<Target>; MOST_TARGETS]);
+
+impl Named {
+    const fn new() -> Named {
+        Named([const { Slot::new() }; MOST_TARGETS])
+    }
+
+    /// The target `triple` names: the one of the slot that holds it, else parsed into the
+    /// first slot not written. Two threads that name one triple first at once write one slot
+    /// and both get the one kept; two that name two triples get two slots, the one whose
+    /// write was refused going on to the next. A triple is never in two slots: each writer
+    /// looks at every slot before the one it writes, and a slot once written keeps its
+    /// target.
+    ///
+    /// # Errors
+    ///
+    /// A triple blaze emits no code for ([`Target::parse`]), and one past [`MOST_TARGETS`],
+    /// each naming it.
+    fn of(&self, triple: &str) -> Result<&Target, String> {
+        for (index, slot) in self.0.iter().enumerate() {
+            let target = match slot.get() {
+                Some(target) => target,
+                // A write refused is another thread's target, named into this slot first:
+                // looked at as any other.
+                None => match slot.set(Target::parse(triple, index as u8)?) {
+                    Ok(target) => target,
+                    Err(refused) => refused.kept,
+                },
+            };
+            if target.triple == triple {
+                return Ok(target);
+            }
+        }
+        // alloc: an error
+        Err(format!("{triple} is past the {MOST_TARGETS} targets one process lowers for"))
+    }
+}
 
 /// The most sets of target features one process compiles with: each toolchain's
 /// (`Toolchain::features`: a dev job's host features, a release job's baseline) and each
@@ -264,35 +306,12 @@ pub enum UnwindFormat {
     None,
 }
 
-/// How wasm code calls a function it names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Calls {
-    /// `call`, as rustc's code does.
-    Direct,
-    /// `call_indirect` through the slot the linker gives the function in the function
-    /// table, so that a module loaded later replaces the function by writing its slot.
-    Table,
-}
 
 impl Target {
     /// The target `triple` names, for one unit: each unit's codegen and layout ask its own,
     /// so units of two targets lower side by side in one process with nothing shared.
     pub fn of(triple: &str) -> Result<&'static Target, String> {
-        let mut named = NAMED.lock();
-        if let Some(target) = named.iter().find(|it| it.triple == triple) {
-            return Ok(target);
-        }
-        if named.len() >= MOST_TARGETS {
-            // alloc: an error
-            return Err(format!(
-                "{triple} is past the {MOST_TARGETS} targets one process lowers for"
-            ));
-        }
-        let index = named.len() as u8;
-        // alloc: leaked once per target named, for the process (setup)
-        let target: &'static Target = Box::leak(Box::new(Target::parse(triple, index)?));
-        named.push(target);
-        Ok(target)
+        NAMED.of(triple)
     }
 
     /// Its place among the targets the process has named, below [`MOST_TARGETS`].
@@ -410,11 +429,6 @@ impl Target {
     /// The triple of what the daemon itself runs on: of the program blaze is, never of a unit
     /// it compiles, which names its own ([`Target::of`]).
     pub fn host() -> &'static str {
-        // The wasm backend writes its own code from Cranelift's IR and only borrows the
-        // settings of an ISA Cranelift has, whatever the compiler itself runs on.
-        if cfg!(feature = "wasm") {
-            return "wasm32-unknown-unknown";
-        }
         // FIXME: the triples of the hosts that have no code emitted for them yet are missing,
         // and `parse` turns those down by name.
         match (std::env::consts::ARCH, std::env::consts::OS) {
@@ -496,21 +510,10 @@ impl Target {
         self.arch == Arch::Wasm64
     }
 
-    /// Whether an object is written as a relocatable wasm object, for a linker. A page links
-    /// what the compiler emits itself, and reads the object Cranelift's writer made.
+    /// Whether an object is written as a relocatable wasm object, for a linker: every wasm
+    /// target's is.
     pub fn writes_wasm_objects(&self) -> bool {
-        self.is_wasm() && self.calls() == Calls::Direct
-    }
-
-    /// How wasm code calls: through the table where functions are replaced in a page. This
-    /// is how the program blaze is links what it compiles, not a property of the code's
-    /// target: the playground (`crates/blaze-wasm`, the `wasm` feature) links every function
-    /// into the page's table itself, and every other blaze hands relocatable objects to a
-    /// linker. The calling convention, the ABI and the addresses are the same either way, and
-    /// the toolchain's id has the feature (`v2::toolchain`), so no code of one is taken for
-    /// the other's.
-    pub fn calls(&self) -> Calls {
-        if cfg!(feature = "wasm") { Calls::Table } else { Calls::Direct }
+        self.is_wasm()
     }
 
     /// The integer an address is.
@@ -607,8 +610,15 @@ impl Target {
     /// a function that calls and keeps no frame record leaves its return address where only
     /// its DWARF rows say. `-C force-frame-pointers=no` cannot take it away, as in rustc
     /// (`FramePointer::ratchet`).
+    ///
+    /// And `aarch64-unknown-linux-gnu`'s, whose rustc target spec has `frame_pointer: NonLeaf`
+    /// too (AAPCS64 expects a frame record in every function that calls): without it x29 is
+    /// any register, and a walk by the frame chain of a blaze-built program finds nothing.
+    /// blaze's own daemon is such a program: its heap and CPU samples' stacks were one frame,
+    /// an address in no function (2026-11-11, lane mem-1111: every `alloc_samples` site of a
+    /// self-built daemon read `[blaze1]`).
     pub(crate) fn requires_frame_pointers(&self) -> bool {
-        self.triple().contains("-apple-")
+        self.triple().contains("-apple-") || self.triple() == "aarch64-unknown-linux-gnu"
     }
 
     /// LLVM's `"frame-pointer"` attribute of a function of this target: `all` when its unit
@@ -771,6 +781,7 @@ impl Target {
             probe_stack: true,
             probe_log2: 12,
             counts: false,
+            slots: false,
         })
     }
 
@@ -829,7 +840,78 @@ pub(crate) fn renamed_for_llvm(
 mod tests {
     use cranelift_codegen::settings::OptLevel;
 
-    use super::{AARCH64_FEATURES, Arch, Features, MOST_FEATURE_SETS, Target, X86_FEATURES};
+    use super::{
+        AARCH64_FEATURES, Arch, Features, MOST_FEATURE_SETS, MOST_TARGETS, Named, Target,
+        X86_FEATURES,
+    };
+
+    /// The oracle of [`many_threads_name_each_target_once`]: many threads look each of
+    /// `triples` up through `of` at once; every look of a triple must give one `Target` (one
+    /// address), of that triple, at a place below [`MOST_TARGETS`] that no other triple has.
+    fn one_target_a_triple<'t>(
+        triples: &[String],
+        of: impl Fn(&str) -> &'t Target + Sync,
+    ) -> Result<(), String> {
+        const THREADS: usize = 16;
+        let seen: Vec<Vec<&Target>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..THREADS)
+                .map(|thread| {
+                    let of = &of;
+                    scope.spawn(move || {
+                        // Each thread from another triple, so the first to name one varies.
+                        (0..triples.len() * 4)
+                            .map(|step| of(&triples[(step + thread * 3) % triples.len()]))
+                            .collect::<Vec<&Target>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|it| it.join().expect("a thread of the test")).collect()
+        });
+        let mut places = [None; MOST_TARGETS];
+        for triple in triples {
+            let one = of(triple);
+            if one.triple != *triple {
+                return Err(format!("{triple} named the target of {}", one.triple));
+            }
+            if seen.iter().flatten().any(|it| it.triple == *triple && !std::ptr::eq(*it, one)) {
+                return Err(format!("{triple} named two targets"));
+            }
+            let Some(place) = places.get_mut(one.index()) else {
+                return Err(format!("{triple} is at place {}, past the table", one.index()));
+            };
+            if let Some(other) = place.replace(triple) {
+                return Err(format!("{triple} and {other} are at one place, {}", one.index()));
+            }
+        }
+        Ok(())
+    }
+
+    fn triples() -> Vec<String> {
+        (0..MOST_TARGETS).map(|at| format!("x86_64-vendor{at}-linux-gnu")).collect()
+    }
+
+    /// The invariant: a triple names one target for good, whichever threads name it first and
+    /// whatever else is named beside it ([`one_target_a_triple`]); one triple more than the
+    /// table holds is refused by name, and a triple blaze emits no code for takes no slot.
+    #[test]
+    fn many_threads_name_each_target_once() {
+        let named = Named::new();
+        assert!(named.of("riscv64gc-unknown-linux-gnu").is_err(), "no code for RISC-V");
+        assert_eq!(one_target_a_triple(&triples(), |it| named.of(it).expect("a target")), Ok(()));
+        let refused = named.of("aarch64-unknown-linux-gnu").expect_err("one target too many");
+        assert!(refused.contains("aarch64-unknown-linux-gnu"), "{refused}");
+        assert!(refused.contains("past the 8 targets"), "{refused}");
+    }
+
+    /// The planted bug: a table that parses a target at each look and keeps none, so a triple
+    /// has as many targets as looks, all at one place.
+    #[test]
+    fn the_oracle_catches_a_target_made_at_each_look() {
+        let found = one_target_a_triple(&triples(), |it| {
+            Box::leak(Box::new(Target::parse(it, 0).expect("a target")))
+        });
+        assert_eq!(found, Err("x86_64-vendor0-linux-gnu named two targets".to_owned()));
+    }
 
     fn setting(target: &Target, name: &str) -> Option<bool> {
         setting_with(target, Features::BASELINE, name)
@@ -858,17 +940,20 @@ mod tests {
         assert!(Features::BASELINE.names().is_empty());
     }
 
-    /// rustc's frame pointers: `all` when forced, Apple's `non-leaf` whatever the flags, else
+    /// rustc's frame pointers: `all` when forced, Apple's and aarch64 Linux's `non-leaf` whatever the flags, else
     /// LLVM's default.
     #[test]
     fn frame_pointers_are_forced_or_the_abis() {
-        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        // x86-64 Mach-O is no target blaze emits code for (`Target::parse`), so its rule is
+        // not asked here.
+        assert!(Target::of("x86_64-apple-darwin").is_err());
+        for apple in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu"] {
             let apple = Target::of(apple).expect("a target");
             assert!(apple.requires_frame_pointers());
             assert_eq!(apple.llvm_frame_pointer(false), Some("non-leaf"), "{}", apple.triple());
             assert_eq!(apple.llvm_frame_pointer(true), Some("all"));
         }
-        for other in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+        for other in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
             let other = Target::of(other).expect("a target");
             assert!(!other.requires_frame_pointers(), "{}", other.triple());
             assert_eq!(other.llvm_frame_pointer(false), None);
@@ -1033,43 +1118,6 @@ mod tests {
         assert_eq!(Target::of("wasm32-wasip1").expect("a target").stencil(), None);
     }
 
-    /// blaze's own `wasm` feature (the playground's build, `crates/blaze-wasm`) decides only
-    /// what is about the program blaze is: where it runs ([`Target::host`]) and how it links
-    /// what it compiles ([`Target::calls`]), both in the toolchain's id. A target's ABI,
-    /// address width or anything else of its code is the [`Target`]'s, decided by the unit's
-    /// triple: a `cfg!` of the feature that decided the address width of wasm32's IR
-    /// (dfgalias) and how a pair is returned (wasmabi) made a normal blaze's wasm32 code
-    /// differ from the playground's. Every use of the feature is counted here, by file.
-    #[test]
-    fn blazes_wasm_feature_decides_nothing_of_a_targets_code() {
-        fn walk(dir: &std::path::Path, root: &std::path::Path, uses: &mut Vec<(String, usize)>) {
-            let mut entries: Vec<_> =
-                std::fs::read_dir(dir).unwrap().map(|it| it.unwrap().path()).collect();
-            entries.sort();
-            for path in entries {
-                if path.is_dir() {
-                    walk(&path, root, uses);
-                } else if path.extension().is_some_and(|it| it == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    let count = text.matches(concat!("feature = ", "\"wasm\"")).count();
-                    if count != 0 {
-                        let name =
-                            path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-                        uses.push((name, count));
-                    }
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut uses = Vec::new();
-        walk(root, root, &mut uses);
-        let expected = [("target.rs".to_owned(), 2), ("v2/toolchain.rs".to_owned(), 1)];
-        assert_eq!(
-            uses, expected,
-            "where hir-ty-codegen reads its `wasm` feature: `host`, `calls` and the toolchain's id"
-        );
-    }
-
     #[test]
     fn cranelift_checks_nothing_blazes_verifier_checked() {
         let target = Target::of("x86_64-unknown-linux-gnu").expect("a target");
@@ -1153,11 +1201,14 @@ mod tests {
 
     /// A target is what its triple says whichever targets the process named before: its word,
     /// its pointer type and its ISA are its own, and naming it again gives the same one.
-    #[hegel::test]
-    fn a_target_is_its_triple_whatever_was_named_before(tc: hegel::TestCase) {
-        use hegel::generators as gs;
+    #[test]
+    fn a_target_is_its_triple_whatever_was_named_before() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| a_target_is_its_triple(tape))
+    }
+
+    fn a_target_is_its_triple(tape: &blaze_sim::Tape) {
         let triples = vec![Target::host(), "wasm32-wasip1", "wasm64-blaze-wasip1"];
-        let order: Vec<&str> = tc.draw(gs::vecs(gs::sampled_from(triples)).min_size(1).max_size(8));
+        let order: Vec<&str> = tape.vec(1..=8, "order", |tape| *tape.one_of(&triples, "triple"));
         for triple in order {
             let target = Target::of(triple).expect("a target");
             assert_eq!(target.triple(), triple);

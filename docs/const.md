@@ -70,7 +70,8 @@ would build with blaze only, each opt-in by name in the root manifest:
 experimental = ["const-hash", "const-fn-pointers"]
 ```
 
-Today v2 knows only the experiments `sandboxed-tests` and `const-macros`
+Today v2 knows only the experiments `sandboxed-tests` (the opt-in on macOS; on Linux, where
+tests are sandboxed by default, noted as doing nothing) and `const-macros`
 (`crates/blaze-units/src/load/sandbox.rs`, `KNOWN`) and stops at any other name, so this table
 is refused.
 

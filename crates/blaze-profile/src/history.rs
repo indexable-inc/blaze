@@ -35,9 +35,17 @@
 //! encoded in memory here and handed to the core, which writes it to a hidden name, syncs it to
 //! stable storage, then renames it, so DuckDB never reads half a file and a power loss never
 //! leaves the manifest listing bytes the disk lost (every file and the manifest, with the
-//! directory synced around the manifest's rename). Past [`CAP_BYTES`] (or the cap the history
-//! is opened with), the oldest builds are retired first, each whole: every table and flush of a
-//! build at once, so a reader of a build reads all of it or none.
+//! directory synced around the manifest's rename). The last [`KEEP_BUILDS`] finished builds
+//! and every build still running ([`History::build_started`] to [`History::build_ended`]) are
+//! kept whole whatever the cap and whatever flushes come after them. Past the cap the history
+//! is opened with ([`cap_for`] of the home's store, or [`CAP_VAR`]), the other builds are
+//! retired oldest first, each whole: every table and flush of a build at once, with every file
+//! that holds a row of it and so every build those files hold rows of too, so a reader of a
+//! build reads all of it or none. Only the Parquet files count against the cap. What goes is
+//! said as a WARN event ([`said_capped`]), and the manifest keeps the highest build the cap
+//! retired ([`manifest::CappedBuilds`]), so a reader that finds no build says why; rows the
+//! rings wrote over before a flush read them are said too: the history never loses rows with
+//! nothing said.
 //!
 //! A flush every [`EVERY`] would leave thousands of files a long build (a 52-minute self-build
 //! left 3,250), and every reader reads each one's footer. So after each flush the
@@ -118,6 +126,7 @@ use parquet::{
 };
 
 use crate::{
+    account::{self, AccountRow},
     batches::{self, Process},
     clock, crash,
     errors::{self, ErrorRow},
@@ -129,6 +138,7 @@ use crate::{
     identity, logs, panics,
     sampler::{self, Sample},
     schema::{self, Column, Table, Type},
+    supervise::{self, Dropped},
     symbols,
 };
 
@@ -150,13 +160,78 @@ pub use manifest::Manifest;
 pub use pin::Pin;
 pub use retire::PINS;
 
-/// What the history keeps by default: 4 GiB, about 400 million rows at the ~10 bytes a row
-/// takes compressed. A self-build's `check` and `build` wrote about 1 GiB together with every
-/// span a row, which a 1 GiB cap trimmed from under the build it was asked about (profrows).
-pub const CAP_BYTES: u64 = 4 << 30;
+/// The most the history keeps by default, whatever the store holds: 256 MiB, about 25
+/// million rows at the ~10 bytes a row takes compressed. Measured 2026-11-11: hello-world's
+/// cold build (std's front end and code, 400,000 spans) is 18 MiB and each edit after it
+/// 0.3 MiB; a day's work under the 4 GiB cap of before left 1.3 GiB. The last
+/// [`KEEP_BUILDS`] finished builds and every build still running are never retired
+/// ([`files`]), so the build being asked about is whole whatever the cap. What goes is said
+/// each time ([`said_capped`]).
+pub const CAP_MOST: u64 = 256 << 20;
+
+/// How many finished builds the history keeps whole whatever its cap: the highest-numbered
+/// builds any listed file holds rows of that are not running, beside every running build.
+///
+/// Why a count and not only bytes: until 2026-11-14 the cap kept only the newest flush's
+/// builds, and every reader asks for a flush before it reads, so a flush of rows of no build
+/// (the daemon's own heartbeat) became the newest and the cap retired the build just asked
+/// about; a hello-world home lost every build by its third query (`blaze debug sql` answered
+/// "0 rows" from then on). A count says what a reader may rely on in builds, the unit it asks
+/// about, and no flush can move it.
+///
+/// Why 8: `blaze explain` compares a build with the one before it, and an edit loop asks about
+/// the last few; 8 covers that with room. Its floor is those builds' own bytes: 8 edits of
+/// hello-world are about 2.4 MiB (0.3 MiB each, measured 2026-11-11, see [`CAP_MOST`]), under
+/// [`CAP_LEAST`]; a cold build of a large project can alone be past the cap, and stays, said
+/// once ([`files::Capped::over`]).
+pub const KEEP_BUILDS: usize = 8;
+
+/// The least the history keeps by default: 8 MiB, a few dozen edits' rows, so a new home's
+/// profile is not a tenth of the home (2026-11-12: a hello-world home held 92 MB of profile
+/// beside 760 MB in all, against the 75 MB of the competitor's whole home).
+pub const CAP_LEAST: u64 = 8 << 20;
+
+/// The cap the history keeps by default when the home's store holds `store_bytes`: a quarter
+/// of the store, between [`CAP_LEAST`] and [`CAP_MOST`], so a profile is never the most of
+/// what a home holds and grows only with the work the home has done.
+pub fn cap_for(store_bytes: u64) -> u64 {
+    (store_bytes / 4).clamp(CAP_LEAST, CAP_MOST)
+}
+
+/// The daemon's setting for the history's cap, in MiB: `BLAZE_PROFILE_CAP_MB=4096` keeps what
+/// the default was until 2026-11-11, whatever the store holds.
+pub const CAP_VAR: &str = "BLAZE_PROFILE_CAP_MB";
+
+/// The cap a daemon started with [`CAP_VAR`] set to `value` keeps, its home's store holding
+/// `store_bytes` (layers left out) as it started: [`cap_for`] of that unset, that many MiB
+/// set; a value that is no whole number of MiB from 1 up is refused, naming it.
+pub fn cap_of(value: Option<&str>, store_bytes: u64) -> Result<u64, String> {
+    let Some(value) = value else { return Ok(cap_for(store_bytes)) };
+    match value.trim().parse::<u64>() {
+        Ok(mib) if mib >= 1 && mib <= u64::MAX >> 20 => Ok(mib << 20),
+        // alloc: an error, once a daemon
+        _ => Err(format!(
+            "{CAP_VAR}={value:?} is not a number of MiB from 1 up for the profile history to keep \
+             (unset, it keeps a quarter of the home's store, {} to {} MiB)",
+            CAP_LEAST >> 20,
+            CAP_MOST >> 20,
+        )),
+    }
+}
 
 /// How often the daemon flushes while a session runs.
 pub const EVERY: Duration = Duration::from_secs(5);
+
+/// How often the daemon's timer flushes a quiet history ([`History::quiet`]: no build
+/// running, none whose row waits): a flush is a file a table with rows, each several KiB
+/// of Parquet footer whatever it holds, so an idle daemon's flush every [`EVERY`] wrote 48 KiB
+/// for a few hundred rows of its own heartbeat, 0.6 MB a minute (2026-11-11, samples aside).
+/// Nothing is lost by the wait and no reader sees it: a reader asks for a flush before it
+/// reads, a build's start and answer each ask for a flush (made once the builds are quiet, the
+/// daemon's `serve::observe::Held`), [`FLUSH_ROWS`] drained flush at once, and the
+/// rows of a daemon that dies meanwhile are in its rings (an idle thread writes far fewer
+/// than a ring holds in this time), which the next history reads back.
+pub const IDLE_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the history's drain thread reads the rings into the next flush, on a thread of its
 /// own so a flush that takes seconds stops no drain. A thread's ring holds [`flight::CAP`]
@@ -165,6 +240,11 @@ pub const EVERY: Duration = Duration::from_secs(5);
 /// the writer's thread every 250 ms, a 102 s self-build step lost 42 M rows while flushes of
 /// seconds stopped it (profrows).
 pub const DRAIN: Duration = Duration::from_millis(50);
+
+/// How often a flush reads the sampled blocks still held into `held_samples`
+/// ([`crate::heap::held`]): each reading is a row a held sample, one per 4 MiB held, so a
+/// minute keeps an hour's build of 60 GiB to about a million rows.
+pub const HELD_EVERY: Duration = Duration::from_secs(60);
 
 /// Rows drained that make the history flush before [`EVERY`] is up ([`History::full`]): about
 /// four row groups, so a busy build's rows are written as they come, not held for seconds.
@@ -342,15 +422,42 @@ pub struct BuildRow {
 
 /// What a client sent of a build it asked for, as it ended (`blaze_api::Request::ClientRows`):
 /// its own `spans`, `events` and `folded` rows, each an Arrow IPC stream of that table's
-/// schema with every row's `build_id` the build's, and when it started and ended.
+/// schema with every row's `build_id` the build's, and, from the client that asked for the
+/// build, when it started and ended (`times`). A launched program's rows (`program:` spans,
+/// sent by the daemon as its launcher ends) carry no times: they never write the build's row
+/// again, so the client's times stand.
 #[derive(Debug, Default)]
 pub struct ClientRows {
     pub build: u64,
-    pub started_ns: i64,
-    pub ended_ns: i64,
+    pub times: Option<(i64, i64)>,
     pub spans: Vec<u8>,
     pub events: Vec<u8>,
     pub folded: Vec<u8>,
+}
+
+/// A solo answer, as the daemon that took its kept rows gives it ([`History::solo_build`]):
+/// a command its client answered by its own check with no daemon asked, numbered by that
+/// daemon as a build of its own (`blaze_certify::kept::Kept`).
+#[derive(Debug)]
+pub struct Solo {
+    pub build: u64,
+    /// The client's start and end, on the schema's clock.
+    pub started_ns: i64,
+    pub ended_ns: i64,
+    pub workspace: String,
+    pub command: String,
+    /// The request slot's key (`builds.solo_slot`).
+    pub slot: String,
+    /// The build whose answer the slot held (`builds.solo_certified_by`).
+    pub certified_by: Option<u64>,
+}
+
+/// A solo build's own columns, beside its [`BuildRow`] until the flush that writes it.
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: a test's rows
+pub struct SoloOf {
+    pub build: u64,
+    pub slot: String,
+    pub certified_by: Option<u64>,
 }
 
 /// What a client's rows name their process (`process_name`): told from its daemon's by it
@@ -360,6 +467,47 @@ pub const CLIENT_PROCESS: &str = "blaze client";
 /// The ended builds' rows kept for their clients' times: past this many, a client that sends
 /// its rows later than this many builds ended after its own has its times dropped, named.
 const RECENT_BUILDS: usize = 64;
+
+/// Says what the cap retired, as one WARN event with the counts as its fields, so `blaze
+/// explain problems` names it and the builds whose rows are gone. Until 2026-11-11 the cap
+/// said nothing: a long build's history held its last five minutes and no row said why.
+///
+/// And says once, as the kept builds first hold more than the cap, that they do: the cap keeps
+/// the last [`KEEP_BUILDS`] finished builds and every running one whole, so a cold build of a
+/// large project can alone be past it; that is the promise kept, not a fault, so it is said
+/// once each time the history goes past the cap (`said_over`, cleared as it fits again), not
+/// at every flush.
+fn said_capped(capped: &files::Capped, said_over: &mut bool) {
+    match (capped.over, *said_over) {
+        (0, _) => *said_over = false,
+        (over, false) => {
+            *said_over = true;
+            tracing::warn!(
+                target: "blaze",
+                over,
+                keep = KEEP_BUILDS,
+                "the profile history's kept builds (every running build and the last {KEEP_BUILDS} \
+                 finished) hold {over} bytes more than its cap: they stay whole, and the cap \
+                 retires the other builds as they come"
+            );
+        }
+        (_, true) => {}
+    }
+    if capped.files == 0 {
+        return;
+    }
+    let [first_build, last_build] = capped.builds.unwrap_or([0, 0]);
+    tracing::warn!(
+        target: "blaze",
+        files = capped.files,
+        rows = capped.rows,
+        bytes = capped.bytes,
+        first_build,
+        last_build,
+        "the profile history passed its cap and retired its oldest builds' rows, each build \
+         whole: `blaze debug sql` and `blaze slow` no longer read them"
+    );
+}
 
 /// What a flush wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -375,6 +523,8 @@ pub struct Flushed {
     pub samples: usize,
     /// Heap samples ([`crate::heap`]): `alloc_samples` rows.
     pub alloc_samples: usize,
+    /// Samples still held at this flush's reading, if it made one: `held_samples` rows.
+    pub held_samples: usize,
     pub switches: usize,
     pub events: usize,
     /// Rows of `event_fields`: the fields of the events written.
@@ -397,6 +547,12 @@ pub struct Flushed {
     pub client: usize,
     pub key_parts: usize,
     pub provenance: usize,
+    /// Builds' accounts ([`History::accounted`]): `accounts` rows.
+    pub accounts: usize,
+    /// Rows this flush read and could not write, of every table: each could not be made into
+    /// a batch even alone ([`supervise::split`]). Never silent: said as a WARN event and
+    /// through [`History::take_failed`], and counted by table in [`History::dropped`].
+    pub unwritten: usize,
     /// Spans the threads were inside as the flush read them.
     pub open: usize,
     pub folded: usize,
@@ -404,8 +560,12 @@ pub struct Flushed {
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
     pub skipped: u64,
-    /// Old files retired to stay under the cap (deleted once no reader pins them).
+    /// Old files retired to stay under the cap (deleted once no reader pins them), the rows
+    /// they held and their bytes. Never silent: the flush says them as a WARN event
+    /// ([`said_capped`]).
     pub deleted: u32,
+    pub deleted_rows: u64,
+    pub deleted_bytes: u64,
     /// Files merged into others, and retired, after the flush (deleted once no reader pins
     /// them).
     pub merged: u32,
@@ -415,6 +575,23 @@ pub struct Flushed {
 
 #[derive(Debug)]
 pub enum HistoryError {
+    /// A flush panicked, saying `what`: the rows it had read are dropped, and the history
+    /// goes on with the next flush ([`History::flush_contained`]).
+    Panicked {
+        what: String,
+        rows: usize,
+        /// The rows by table, `spans 120, events 3`.
+        tables: String,
+    },
+    /// A flush wrote, and `rows` rows of `table` it had read are in no file: each could not be
+    /// made into a batch even alone (`why`: what making it panicked with), or was past the
+    /// bound of [`supervise::split`]'s halvings. `splits`: how often a batch was halved.
+    Dropped {
+        table: &'static str,
+        rows: usize,
+        splits: u32,
+        why: String,
+    },
     Io {
         path: PathBuf,
         doing: &'static str,
@@ -506,6 +683,14 @@ impl fmt::Display for CompactError {
 impl fmt::Display for HistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HistoryError::Panicked { what, rows, tables } => write!(
+                f,
+                "the profile history: a flush panicked ({what}): the {rows} rows it had read are not written ({tables}), and the history goes on from the next flush"
+            ),
+            HistoryError::Dropped { table, rows, splits, why } => write!(
+                f,
+                "the profile history: {rows} rows of the {table} table are not written: making their batch panicked ({why}) even after {splits} halvings; the other rows of the flush are written"
+            ),
             HistoryError::Io { path, doing, error } => {
                 write!(f, "the profile history: {doing} {}: {error}", path.display())
             }
@@ -577,7 +762,9 @@ impl std::error::Error for HistoryError {
             | HistoryError::Unclassified { .. }
             | HistoryError::Unplaced { .. } => None,
             HistoryError::Postmortem(error) => Some(error),
-            HistoryError::Client { .. } => None,
+            HistoryError::Client { .. }
+            | HistoryError::Panicked { .. }
+            | HistoryError::Dropped { .. } => None,
         }
     }
 }
@@ -707,8 +894,10 @@ fn column(array: impl Array + 'static) -> ArrayRef {
     Arc::new(array)
 }
 
-/// The `builds` rows of `rows`, all of the process `pid`.
-pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
+/// The `builds` rows of `rows`, all of the process `pid`; a row whose build is in `solo` has
+/// its solo columns from it.
+pub fn builds(rows: &[BuildRow], solo: &[SoloOf], pid: u32) -> Result<RecordBatch, ArrowError> {
+    let solo_of = |row: &BuildRow| solo.iter().find(|it| it.build == row.build_id);
     let outcomes = column(StringArray::from_iter_values(Outcome::ALL.iter().map(|it| it.name())));
     let outcome = UInt32Array::from_iter_values(rows.iter().map(|it| it.outcome as u32));
     // alloc: a batch's columns, once a flush
@@ -731,6 +920,8 @@ pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
         column(Int64Array::from_iter(rows.iter().map(|it| it.client_ns.map(|it| it.1)))),
         column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.0)))),
         column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.1)))),
+        column(StringArray::from_iter(rows.iter().map(|it| solo_of(it).map(|it| it.slot.as_str())))),
+        column(UInt64Array::from_iter(rows.iter().map(|it| solo_of(it).and_then(|it| it.certified_by)))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
@@ -766,6 +957,8 @@ pub struct History {
     seq: u64,
     /// Builds that started (outcome running) or ended since the last flush: written by the next.
     ended: Vec<BuildRow>,
+    /// The solo columns of the solo builds among [`History::ended`]'s rows, cleared with them.
+    solo: Vec<SoloOf>,
     /// Errors builds said since the last flush: written by the next.
     errors: Vec<ErrorRow>,
     /// Images builds linked, and the crate graphs they built, since the last flush.
@@ -794,6 +987,13 @@ pub struct History {
     key_parts: Vec<KeyedMiss>,
     /// The query engine's run log at each build's end, since the last flush.
     provenance: Vec<ProvenanceRow>,
+    /// Builds' accounts ([`crate::account`]), since the last flush.
+    accounts: Vec<AccountRow>,
+    /// The rows this history could not write, by table, since it opened.
+    dropped: Dropped,
+    /// Whether the flush before this one panicked ([`History::flush_contained`]): a second
+    /// in a row lets go of the rows kept from flush to flush too.
+    panicked_before: bool,
     /// The ring a flush reads CPU samples from ([`History::open`]), the samples of it read so
     /// far, and a flush's new ones.
     sampler: &'static sampler::Ring,
@@ -802,6 +1002,10 @@ pub struct History {
     /// The heap samples read so far ([`crate::heap::since`]), and a flush's new ones.
     heap_sampled: u64,
     heap_samples: Vec<crate::heap::HeapSample>,
+    /// A reading's samples still held ([`crate::heap::held`]), and when the last was written:
+    /// one reading every [`HELD_EVERY`].
+    held_samples: Vec<crate::heap::HeapSample>,
+    held_read: Option<Instant>,
     /// The code images the samples' addresses are in that this history wrote rows of.
     images: symbols::ImagesWritten,
     /// [`identity::binary`], once a history: every build of this process ran it.
@@ -836,6 +1040,9 @@ pub struct History {
     /// and the last flush wrote: a history that drops so deletes the mapping.
     persisted: bool,
     clean: bool,
+    /// Whether the history said its kept builds are past the cap since it last fit
+    /// ([`said_capped`]).
+    said_over: bool,
 }
 
 impl History {
@@ -874,6 +1081,8 @@ impl History {
         for refused in &opened.crashes.refused {
             tracing::warn!(target: "blaze", "{refused}");
         }
+        let mut said_over = false;
+        said_capped(&opened.capped, &mut said_over);
         let blaze = identity::binary().map_err(|error| HistoryError::Identity {
             what: "hashing blaze's own executable",
             path: std::env::current_exe().unwrap_or_default(),
@@ -906,6 +1115,8 @@ impl History {
             seq: opened.seq,
             // alloc: once a history
             ended: Vec::new(),
+            // alloc: none until a solo answer is taken
+            solo: Vec::new(),
             // alloc: once a history
             errors: Vec::new(),
             // alloc: once a history
@@ -935,6 +1146,9 @@ impl History {
             key_parts: Vec::new(),
             // alloc: once a history
             provenance: Vec::new(),
+            accounts: Vec::new(),
+            dropped: Dropped::default(),
+            panicked_before: false,
             sampler,
             sampled: 0,
             // alloc: once a history
@@ -942,6 +1156,9 @@ impl History {
             heap_sampled: 0,
             // alloc: once a history
             heap_samples: Vec::new(),
+            // alloc: once a history
+            held_samples: Vec::new(),
+            held_read: None,
             images: symbols::ImagesWritten::new(),
             blaze,
             unidentified: None,
@@ -959,6 +1176,7 @@ impl History {
             postmortem: opened.postmortem,
             persisted: false,
             clean: false,
+            said_over,
         };
         Ok(history)
     }
@@ -989,11 +1207,23 @@ impl History {
         flight::persist(self.core.dir(), &self.blaze, self.process.name)
             .map_err(HistoryError::Postmortem)?;
         self.persisted = true;
-        // The mapping is reserved whole as it is made: the cap counts it from now on, and the
-        // crash record armed beside it.
-        match self.core.job(files::Files::recount)? {
-            files::Outcome::Recounted(retired) => retired.map(|_| ()),
-            other => Err(mismatch(self.core.dir(), "counting the files beside", &other)),
+        // The mapping does not count against the cap: until 2026-11-14 it did, and on a new
+        // home (an 8 MiB cap) a mapping of 3 rings or more left the Parquet files no room at
+        // all. It is a fixed reservation the process makes whatever the history holds, so the
+        // cap, a budget for rows, is the wrong place to account it.
+        Ok(())
+    }
+
+    /// Holds the history to `cap` bytes from now on, retiring what is past it at once (the
+    /// last [`KEEP_BUILDS`] finished builds and every running one stay whole). For a daemon
+    /// whose store grew: the cap it opened with is [`cap_for`] of the store as it started.
+    pub fn set_cap(&mut self, cap: u64) -> Result<(), HistoryError> {
+        let said_over = &mut self.said_over;
+        match self.core.job(|it| it.set_cap(cap))? {
+            files::Outcome::Recounted(retired) => {
+                retired.map(|capped| said_capped(&capped, said_over))
+            }
+            other => Err(mismatch(self.core.dir(), "setting the cap of", &other)),
         }
     }
 
@@ -1004,6 +1234,12 @@ impl History {
         u32::try_from(self.core.files().last_build() + 1).unwrap_or(u32::MAX)
     }
 
+    /// Whether the timer has nothing to write for now ([`IDLE_EVERY`]): no build is running
+    /// and no build's row waits for the next flush.
+    pub fn quiet(&mut self) -> bool {
+        self.ended.is_empty() && !self.core.files_mut().any_running()
+    }
+
     /// Notes a build that started, `row` its row with outcome running and no duration, for the
     /// next flush to write: a build its daemon never ends (a kill, a crash) is then one row in
     /// the history, which a reader tells from one still running by its process ([`writes`]).
@@ -1012,6 +1248,10 @@ impl History {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
         }
+        // While it runs, the cap retires no file that holds a row of it, and blocked threads
+        // are sampled whatever span they block in.
+        self.core.files_mut().running(row.build_id, true);
+        sampler::build_running(true);
         flight::postmortem::build_started(&flight::postmortem::RunningBuild {
             build_id: row.build_id,
             started_ns: row.started_ns,
@@ -1029,6 +1269,9 @@ impl History {
     /// the build's. A tree that can't be digested leaves `tree` null, and the next flush answers
     /// why.
     pub fn build_ended(&mut self, mut row: BuildRow) {
+        if self.core.files_mut().running(row.build_id, false) {
+            sampler::build_running(false);
+        }
         flight::postmortem::build_ended(row.build_id);
         if row.blaze.is_none() {
             // clone: a hash, once a build
@@ -1097,7 +1340,7 @@ impl History {
         self.client_events.extend(events);
         self.client_folded.extend(folded);
         self.client_build = self.client_build.max(build);
-        let times = (client.started_ns, client.ended_ns);
+        let Some(times) = client.times else { return Ok(()) };
         match self.recent.iter_mut().rev().find(|it| it.build_id == build) {
             Some(row) => {
                 row.client_ns = Some(times);
@@ -1111,6 +1354,40 @@ impl History {
                 self.pending_clients.push_back((build, times));
             }
         }
+        Ok(())
+    }
+
+    /// Notes a solo answer as a build of its own, for the next flush to write: its `builds` row
+    /// (outcome ok, `misses` 0, the client's times as its own, its solo columns) and its
+    /// client's rows (`client`, of the same build, with no times: the row has them). A batch
+    /// that does not fit is the error, naming the build and table; nothing of it is noted
+    /// then. Its row is never written again: no client sends rows of it later.
+    pub fn solo_build(&mut self, solo: Solo, client: &ClientRows) -> Result<(), HistoryError> {
+        let Solo { build, started_ns, ended_ns, workspace, command, slot, certified_by } = solo;
+        debug_assert_eq!(client.build, build, "a solo build's client rows are its own");
+        debug_assert!(client.times.is_none(), "a solo build's row has its client's times");
+        self.client_rows(client)?;
+        self.solo.push(SoloOf { build, slot, certified_by });
+        self.ended.push(BuildRow {
+            build_id: build,
+            commit: None,
+            workspace,
+            command,
+            started_ns,
+            dur_ns: Some(ended_ns.saturating_sub(started_ns)),
+            started_unix_ns: None,
+            outcome: Outcome::Ok,
+            hits: None,
+            misses: Some(0),
+            joined: None,
+            // No tree is digested for a command that read nothing but stamps: its slot's
+            // certified build has the tree, which the check found unchanged.
+            tree: None,
+            // The thin `blaze` answered it, which no hash of this daemon's executable names.
+            blaze: None,
+            client_ns: Some((started_ns, ended_ns)),
+            daemon_cpu_ns: None,
+        });
         Ok(())
     }
 
@@ -1164,6 +1441,18 @@ impl History {
         self.provenance.extend(rows);
     }
 
+    /// Notes a build's account ([`crate::account::Account`]), for the next flush to write.
+    pub fn accounted(&mut self, rows: impl IntoIterator<Item = AccountRow>) {
+        self.accounts.extend(rows);
+    }
+
+    /// The rows this history read and could not write, by table, since it opened: a flush that
+    /// panicked ([`History::flush_contained`]) and rows no batch could hold
+    /// ([`supervise::split`]). What `blaze daemon status` and each build's account show.
+    pub fn dropped(&self) -> &Dropped {
+        &self.dropped
+    }
+
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
     /// since, one file a table with rows, named for the highest build any of its rows is of and
     /// never below `build` (`None`: the timer's flush, named 0 when it holds no build's rows).
@@ -1175,6 +1464,79 @@ impl History {
     /// file that could not be written, whose rows of the rings are lost and whose other rows
     /// the next flush writes; a merge; the cap; a reap; a dead daemon's rows) is said through
     /// [`History::take_failed`].
+    /// [`History::flush`], a panic of it contained (rule panics-fail-one-job): the rows it
+    /// had read are dropped, so the next flush does not meet them again, the panic is the
+    /// error, and the history's thread goes on. Until 2026-11-12 one flush's panic (arrow's
+    /// `byte array offset overflow`, twice on a machine short of memory: reth's and tempo's
+    /// cold builds) ended the thread: no build after it was written, and every `blaze why`
+    /// and `blaze debug sql` of that daemon read a history that stopped there.
+    pub fn flush_contained(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
+        let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.flush(build)));
+        match flushed {
+            Ok(flushed) => {
+                self.panicked_before = false;
+                flushed
+            }
+            Err(panic) => {
+                let what = supervise::panic_text(&*panic);
+                let read = self.read.rows();
+                // By table, so what is missing is said where a reader looks for it.
+                let mut lost = Dropped::default();
+                for (table, rows) in [
+                    (schema::SPANS.name, self.read.spans.len()),
+                    (schema::COUNTERS.name, self.read.counters.len()),
+                    (schema::SWITCHES.name, self.read.switches.len()),
+                    (schema::EVENTS.name, self.read.events.len()),
+                    (schema::EVENT_FIELDS.name, self.read.fields.len()),
+                    (schema::FOLDED.name, self.read.folds.len()),
+                ] {
+                    lost.add(table, rows as u64);
+                    self.dropped.add(table, rows as u64);
+                }
+                // The rows a flush keeps for the next when it fails (the builds' own: their
+                // misses, counts, accounts) are let go once two flushes in a row panicked:
+                // one of them may be what no batch holds, and kept it would panic every flush
+                // from here on, each dropping what the rings gave it (rule 18). Counted too.
+                if self.panicked_before {
+                    for (table, rows) in [
+                        (schema::BUILDS.name, self.ended.len()),
+                        (schema::ERRORS.name, self.errors.len()),
+                        (schema::LINKS.name, self.links.len()),
+                        (schema::CRATE_DEPS.name, self.crate_deps.len()),
+                        (schema::QUERY_COUNTS.name, self.query_counts.len()),
+                        (schema::MISSES.name, self.misses.len()),
+                        (schema::PROCESSES.name, self.processes.len()),
+                        (schema::TEST_RUNS.name, self.test_runs.len()),
+                        (schema::KEY_PARTS.name, self.key_parts.len()),
+                        (schema::PROVENANCE.name, self.provenance.len()),
+                        (schema::ACCOUNTS.name, self.accounts.len()),
+                    ] {
+                        lost.add(table, rows as u64);
+                        self.dropped.add(table, rows as u64);
+                    }
+                    self.ended.clear();
+                    self.solo.clear();
+                    self.errors.clear();
+                    self.links.clear();
+                    self.crate_deps.clear();
+                    self.query_counts.clear();
+                    self.misses.clear();
+                    self.processes.clear();
+                    self.test_runs.clear();
+                    self.key_parts.clear();
+                    self.provenance.clear();
+                    self.accounts.clear();
+                }
+                self.panicked_before = true;
+                let tables = lost.line().unwrap_or_else(|| "none of the rings'".to_owned()); // alloc: error path
+                self.read.clear();
+                self.clean = false;
+                let rows = (read as u64).max(lost.total()) as usize;
+                Err(HistoryError::Panicked { what, rows, tables })
+            }
+        }
+    }
+
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         // The record cost of the history itself: encoding and writing a flush's Parquet had no
         // span, so a slow flush read as uncovered time on the history's thread.
@@ -1187,6 +1549,18 @@ impl History {
         // they grew, so an idle daemon's timer writes no file for them.
         // Counted since the process began; the row of a build's flush carries the build.
         let (t_ns, now) = (self.read.at_ns, (self.read.lost, late + behind, behind));
+        // And said, each flush they grew in: a profile never loses rows with nothing said.
+        let (lost, skipped) =
+            (now.0.saturating_sub(self.told.0), now.1.saturating_sub(self.told.1));
+        if lost != 0 || skipped != 0 {
+            tracing::warn!(
+                target: "blaze",
+                spans_lost = lost,
+                rows_skipped = skipped,
+                "the flight recorder lost rows before the profile history read them: a total \
+                 over this stretch is short by what they held"
+            );
+        }
         if build.is_some() || now != self.told {
             self.told = now;
             let build = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
@@ -1359,14 +1733,27 @@ impl History {
         let client = client_rows(&self.client_spans)
             + client_rows(&self.client_events)
             + client_rows(&self.client_folded);
-        let mut spans = vec![
-            batches::spans(&self.read.spans, of_build).map_err(arrow_error(&schema::SPANS))?,
-            batches::spans(&self.others, self.process).map_err(arrow_error(&schema::SPANS))?,
-        ]; // alloc: a flush's parts, once a flush
+        // In batches of at most `BATCH_ROWS` rows: a text column of one batch holds at most
+        // 2 GiB (`i32` offsets), and a flush that fell behind holds up to `BACKLOG_ROWS`
+        // rows, each span with its query's key as text.
+        // A batch whose making panics all the same is halved until it fits, and a row that
+        // fits no batch alone is dropped, counted and said (`supervise::split`).
+        // alloc: once a flush, none unless a row was dropped
+        let mut unwritten: Vec<HistoryError> = Vec::new();
+        let mut spans = in_row_batches(&schema::SPANS, &self.read.spans, &mut unwritten, |rows| {
+            batches::spans(rows, of_build)
+        })
+        .map_err(arrow_error(&schema::SPANS))?;
+        spans.extend(
+            in_row_batches(&schema::SPANS, &self.others, &mut unwritten, |rows| {
+                batches::spans(rows, self.process)
+            })
+            .map_err(arrow_error(&schema::SPANS))?,
+        );
         spans.append(&mut self.client_spans);
         let counters = [batches::counters(&self.read.counters, self.process)
             .map_err(arrow_error(&schema::COUNTERS))?];
-        let builds = [builds(&self.ended, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
+        let builds = [builds(&self.ended, &self.solo, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
         let errors = [errors::batch(&self.errors).map_err(arrow_error(&schema::ERRORS))?];
         let links = [facts::links(&self.links).map_err(arrow_error(&schema::LINKS))?];
         let crate_deps =
@@ -1394,13 +1781,29 @@ impl History {
         .map_err(arrow_error(&schema::PROVENANCE))?;
         let switches = [batches::switches(&self.read.switches, self.process)
             .map_err(arrow_error(&schema::SWITCHES))?];
-        let mut events = vec![
-            batches::events(&self.read.events, self.process)
-                .map_err(arrow_error(&schema::EVENTS))?,
-        ]; // alloc: as `spans`
+        let mut events = in_row_batches(&schema::EVENTS, &self.read.events, &mut unwritten, |rows| {
+            batches::events(rows, self.process)
+        })
+        .map_err(arrow_error(&schema::EVENTS))?;
         events.append(&mut self.client_events);
-        let event_fields = [batches::event_fields(&self.read.fields, self.process)
-            .map_err(arrow_error(&schema::EVENT_FIELDS))?];
+        let event_fields =
+            in_row_batches(&schema::EVENT_FIELDS, &self.read.fields, &mut unwritten, |rows| {
+                batches::event_fields(rows, self.process)
+            })
+            .map_err(arrow_error(&schema::EVENT_FIELDS))?;
+        let accounts =
+            [account::accounts(&self.accounts).map_err(arrow_error(&schema::ACCOUNTS))?];
+        let mut unwritten_rows = 0usize;
+        for error in &unwritten {
+            if let HistoryError::Dropped { table, rows, .. } = error {
+                self.dropped.add(*table, *rows as u64);
+                unwritten_rows += *rows;
+            }
+            // Never silent (rule 3): in the build's problems, and told to the daemon
+            // (`History::take_failed`).
+            tracing::warn!(target: "blaze", "{error}");
+        }
+        self.deferred.append(&mut unwritten);
         let mut folded = vec![
             batches::folded(&self.read.folds, self.process)
                 .map_err(arrow_error(&schema::FOLDED))?,
@@ -1417,12 +1820,23 @@ impl History {
         let heap_skipped = crate::heap::since(&mut self.heap_sampled, &mut self.heap_samples);
         let alloc_samples =
             [self.alloc_samples_batch().map_err(arrow_error(&schema::ALLOC_SAMPLES))?];
+        // What the heap holds, by call site: a reading of the sampled blocks nobody freed,
+        // once every `HELD_EVERY` (each reading is every held sample again, so not each flush).
+        self.held_samples.clear();
+        if self.held_read.is_none_or(|read| read.elapsed() >= HELD_EVERY) {
+            self.held_read = Some(Instant::now());
+            crate::heap::held(&mut self.held_samples);
+        }
+        let held_samples =
+            [self.held_samples_batch().map_err(arrow_error(&schema::HELD_SAMPLES))?];
         // The images the samples' and this process's panics' addresses are in, and each
         // recovered crash's executable, of its own process.
         let seen_ns = clock::mono_ns();
         let stacks = self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]);
         let stacks =
             stacks.chain(self.heap_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        let stacks =
+            stacks.chain(self.held_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
         let stacks = stacks.chain(self.raised.iter().map(panics::Raised::pcs));
         let mut images = vec![
             self.images
@@ -1459,6 +1873,7 @@ impl History {
             builds: rows(&builds),
             samples: rows(&samples),
             alloc_samples: rows(&alloc_samples),
+            held_samples: rows(&held_samples),
             switches: rows(&switches),
             events: rows(&events),
             event_fields: rows(&event_fields),
@@ -1471,6 +1886,8 @@ impl History {
             misses: rows(&misses),
             key_parts: rows(&key_parts),
             provenance: rows(&provenance),
+            accounts: rows(&accounts),
+            unwritten: unwritten_rows,
             open: rows(&open),
             folded: rows(&folded),
             panics: rows(&panics),
@@ -1482,18 +1899,21 @@ impl History {
             files: 0,
             bytes: 0,
             deleted: 0,
+            deleted_rows: 0,
+            deleted_bytes: 0,
             merged: 0,
             compacted: 0,
         };
         let build = named;
         flushed.build = build;
         self.core.files_mut().named(build);
-        let tables: [(&'static Table, &[RecordBatch]); 21] = [
+        let tables: [(&'static Table, &[RecordBatch]); 23] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
             (&schema::SAMPLES, &samples),
             (&schema::ALLOC_SAMPLES, &alloc_samples),
+            (&schema::HELD_SAMPLES, &held_samples),
             (&schema::SWITCHES, &switches),
             (&schema::EVENTS, &events),
             (&schema::ERRORS, &errors),
@@ -1510,6 +1930,7 @@ impl History {
             (&schema::PROCESSES, &processes),
             (&schema::TEST_RUNS, &test_runs),
             (&schema::IMAGES, &images),
+            (&schema::ACCOUNTS, &accounts),
         ];
         // Each table's file is encoded here and placed by the core, then all are listed in one
         // commit: a reader sees all of the flush or none of it. A table whose file can't be
@@ -1589,7 +2010,7 @@ impl History {
             bytes,
             merged,
             compacted,
-            deleted,
+            capped,
             deferred,
             undeleted,
         } = out;
@@ -1607,6 +2028,7 @@ impl History {
         let done = |table: &Table| wrote[table_at(table)];
         if done(&schema::BUILDS) {
             self.ended.clear();
+            self.solo.clear();
         }
         if done(&schema::ERRORS) {
             self.errors.clear();
@@ -1635,6 +2057,9 @@ impl History {
         if done(&schema::PROVENANCE) {
             self.provenance.clear();
         }
+        if done(&schema::ACCOUNTS) {
+            self.accounts.clear();
+        }
         // The clients' batches went into this flush's parts.
         self.client_build = 0;
         // Placed: the core lists the records for its commit to consume, then deletes them.
@@ -1658,7 +2083,10 @@ impl History {
         flushed.bytes = bytes;
         flushed.merged = merged;
         flushed.compacted = compacted;
-        flushed.deleted = deleted;
+        flushed.deleted = capped.files;
+        flushed.deleted_rows = capped.rows;
+        flushed.deleted_bytes = capped.bytes;
+        said_capped(&capped, &mut self.said_over);
         // Committed: what fails from here on is said apart, and the flush's number stands.
         self.deferred.extend(failed);
         self.deferred.extend(deferred);
@@ -1730,6 +2158,20 @@ impl History {
             (Instant::now(), clock::mono_ns()),
             self.process,
         )
+    }
+}
+
+impl History {
+    /// The `held_samples` rows of this flush's reading of the samples still held, none where
+    /// it made no reading.
+    fn held_samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+        if self.held_samples.is_empty() {
+            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::HELD_SAMPLES)));
+        }
+        let frames =
+            symbols::frames(self.held_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        let now = clock::mono_ns();
+        batches::held_samples(&self.held_samples, &frames, (Instant::now(), now), now, self.process)
     }
 }
 
@@ -1834,6 +2276,54 @@ fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
     }
 }
 
+/// The most rows of one batch of a table whose rows hold text of any length (`spans`, `events`,
+/// `event_fields`): a batch's text column addresses its bytes with `i32` offsets, so at this
+/// many rows one overflows only past 32 KiB of text a row in one column. Until 2026-11-12 a
+/// flush made one batch of everything it had read, up to [`BACKLOG_ROWS`] rows when it fell
+/// behind (a machine short of memory): arrow panicked (`byte array offset overflow`) and the
+/// history's thread ended, on reth's and on tempo's cold build.
+pub const BATCH_ROWS: usize = 1 << 16;
+
+/// `rows` of `table` as batches of at most [`BATCH_ROWS`] rows each, in order, made by `make`;
+/// no rows is one empty batch, so every table still has its part. A batch whose making panics
+/// (a text column past 2 GiB all the same: [`BATCH_ROWS`] bounds rows, not bytes) is halved
+/// until its rows fit ([`supervise::split`]), and rows that fit no batch are left out and
+/// pushed to `unwritten` as a [`HistoryError::Dropped`] naming the table: the bound is by what
+/// arrow holds, found by trying, so no size has to be guessed.
+fn in_row_batches<T>(
+    table: &'static Table,
+    rows: &[T],
+    unwritten: &mut Vec<HistoryError>,
+    make: impl Fn(&[T]) -> Result<RecordBatch, ArrowError>,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let split = supervise::split(rows, BATCH_ROWS, make)?;
+    if split.splits > 0 || split.dropped > 0 {
+        let why = split.why.unwrap_or_default();
+        tracing::warn!(
+            target: "blaze",
+            table = table.name,
+            rows = rows.len(),
+            splits = split.splits,
+            dropped = split.dropped,
+            "the profile history halved a batch whose making panicked ({why}): the table whose text passed what one batch holds"
+        );
+        if split.dropped > 0 {
+            // alloc: error path
+            unwritten.push(HistoryError::Dropped {
+                table: table.name,
+                rows: split.dropped,
+                splits: split.splits,
+                why,
+            });
+        }
+    }
+    if split.batches.is_empty() {
+        // Every row was dropped: the table still has its part.
+        return Ok(vec![RecordBatch::new_empty(batches::schema_of(table))]); // alloc: a flush's parts
+    }
+    Ok(split.batches)
+}
+
 /// The batches of `table` in `bytes`, an Arrow IPC stream build `build`'s client sent (none for
 /// no bytes), each made again under the table's own schema so it writes beside the daemon's,
 /// and refused, naming why, when a column does not fit or a row is of another build.
@@ -1893,30 +2383,12 @@ mod tests {
         Ok(merged.len() as u64)
     }
 
-    /// `history` held to `cap` bytes from now on: its core opened again with that cap (the core
-    /// takes its cap at its open), which retires past it at once.
-    fn recap(history: &mut History, cap: u64) {
-        let dir = history.dir().to_owned();
-        let writer = Writer::new();
-        let schemas: Vec<(String, Vec<u8>)> = schema::TABLES
-            .iter()
-            .map(|table| {
-                let file = schema_file(table);
-                let bytes = writer.encode(&dir.join(&file), table, &[]).unwrap();
-                (file, bytes)
-            })
-            .collect();
-        match history.core.job(|it| it.open(cap, schemas)).unwrap() {
-            files::Outcome::Opened(opened) => history.seq = history.seq.max(opened.unwrap().seq),
-            other => panic!("{}", mismatch(&dir, "opening again", &other)),
-        }
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-history-{}-{name}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh directory for `name`: the guard, which removes it with all it holds when it
+    /// drops, and its path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-history-{name}-"));
+        let dir = tmp.path().to_path_buf();
+        (tmp, dir)
     }
 
     fn read_back(path: &Path) -> Vec<RecordBatch> {
@@ -1970,8 +2442,8 @@ mod tests {
     #[test]
     fn a_child_process_row_and_a_test_run_row_read_back_column_for_column() {
         use crate::facts::{ProcessRow, TestOutcome, TestRunRow};
-        let dir = scratch("processes-test-runs");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("processes-test-runs");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let child = ProcessRow {
             build_id: 71,
             pid: 4242,
@@ -2028,9 +2500,7 @@ mod tests {
         assert!(!builds.is_null(0) && builds.is_null(1), "a child of no build has a null build_id");
 
         let again = history.flush(Some(72)).unwrap();
-        assert_eq!((again.processes, again.test_runs), (0, 0), "a flush writes each row once");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!((again.processes, again.test_runs), (0, 0), "a flush writes each row once");    }
 
     /// A client's span of `build`, its columns otherwise none.
     fn client_span(build: u32) -> SpanRow {
@@ -2058,8 +2528,8 @@ mod tests {
 
     #[test]
     fn a_clients_rows_are_written_with_its_builds_row_given_its_times() {
-        let dir = scratch("client-rows");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("client-rows");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(BuildRow { daemon_cpu_ns: Some((7, 3)), ..row(81, Outcome::Ok) });
         history.flush(Some(81)).unwrap();
         let span = client_span(81);
@@ -2070,8 +2540,7 @@ mod tests {
         history
             .client_rows(&ClientRows {
                 build: 81,
-                started_ns: 500,
-                ended_ns: 90_000,
+                times: Some((500, 90_000)),
                 spans: bytes,
                 ..ClientRows::default()
             })
@@ -2105,13 +2574,61 @@ mod tests {
         assert!(
             matches!(refused, Err(HistoryError::Client { build: 81, table: "spans", .. })),
             "{refused:?}"
-        );
-        _ = fs::remove_dir_all(&dir);
-    }
+        );    }
+
+    /// The invariant: a solo answer is one `builds` row of its own number, outcome ok, with
+    /// the client's times as its start, length and client columns, `misses` 0 and its solo
+    /// columns set, and its client's spans under it; a daemon's build in the same flush has
+    /// null solo columns. Control: a solo build's spans of another build are refused naming
+    /// it, and nothing of it is noted.
+    #[test]
+    fn a_solo_answer_is_one_build_row_with_its_slot_and_its_clients_spans() {
+        let (_tmp, dir) = scratch("solo-build");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
+        history.build_ended(row(90, Outcome::Ok));
+        let mut bytes = Vec::new();
+        let spans = batches::spans(&[client_span(91)], Process { pid: 9, name: "client", commit: None });
+        crate::live::encode(&spans.unwrap(), &mut bytes).unwrap();
+        let solo = |build: u64| Solo {
+            build,
+            started_ns: 500,
+            ended_ns: 2_500,
+            workspace: "/w".into(),
+            command: "run".into(),
+            slot: "ab12".into(),
+            certified_by: Some(90),
+        };
+        let client = ClientRows { build: 91, spans: bytes, ..ClientRows::default() };
+        history.solo_build(solo(91), &client).unwrap();
+        let flushed = history.flush(None).unwrap();
+        assert_eq!((flushed.builds, flushed.client), (2, 1));
+        let read = read_back(&dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
+        let column = |name: &str| read[0].column(schema::BUILDS.column(name).unwrap()).clone();
+        let ids = column("build_id");
+        let ids = ids.as_primitive::<arrow_array::types::UInt64Type>();
+        let at = (0..ids.len()).find(|&it| ids.value(it) == 91).expect("the solo build's row");
+        let daemon = 1 - at;
+        let slot = column("solo_slot");
+        let slot = slot.as_string::<i32>();
+        assert_eq!((slot.value(at), slot.is_null(daemon)), ("ab12", true));
+        let by = column("solo_certified_by");
+        let by = by.as_primitive::<arrow_array::types::UInt64Type>();
+        assert_eq!((by.value(at), by.is_null(daemon)), (90, true));
+        let int = |name: &str| column(name).as_primitive::<arrow_array::types::Int64Type>().value(at);
+        assert_eq!((int("started_ns"), int("dur_ns")), (500, 2_000));
+        assert_eq!((int("client_started_ns"), int("client_ended_ns")), (500, 2_500));
+        assert_eq!(column("misses").as_primitive::<arrow_array::types::UInt64Type>().value(at), 0);
+
+        let mut other = Vec::new();
+        let spans = batches::spans(&[client_span(93)], Process { pid: 9, name: "client", commit: None });
+        crate::live::encode(&spans.unwrap(), &mut other).unwrap();
+        let refused = history.solo_build(solo(92), &ClientRows { build: 92, spans: other, ..ClientRows::default() });
+        assert!(matches!(refused, Err(HistoryError::Client { build: 92, table: "spans", .. })), "{refused:?}");
+        assert!(history.ended.is_empty() && history.solo.is_empty(), "nothing of a refused solo build is noted");    }
 
     #[test]
     fn a_flushed_table_reads_back_as_the_same_rows() {
-        let dir = scratch("round-trip");
+        let (_tmp, dir) = scratch("round-trip");
         let span = |i: u64| SpanRow {
             build: (i % 3) as u32,
             thread: 7,
@@ -2153,7 +2670,8 @@ mod tests {
             })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
-        let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)], 7).unwrap();
+        let solo = [SoloOf { build: 2, slot: "ab12".into(), certified_by: Some(1) }];
+        let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)], &solo, 7).unwrap();
 
         let mut writer = Writer::new();
         for (table, batch) in
@@ -2188,7 +2706,7 @@ mod tests {
     /// naming the value kind, the site and how many more times.
     #[test]
     fn a_merge_says_the_rows_its_inputs_held_and_holds_them() {
-        let dir = scratch("merged-rows");
+        let (_tmp, dir) = scratch("merged-rows");
         let process = Process { pid: 9, name: "blaze test", commit: None };
         let counters = |n: u64| {
             let rows: Vec<CounterRow> = (0..n)
@@ -2229,15 +2747,13 @@ mod tests {
         // A merge of a merged file says its own count, once.
         let again = dir.join("1-00000001-00000002-2.counters.parquet");
         concat(&again, &[merged, a], writer.properties(table)).unwrap();
-        assert_eq!(footer(&again), (10, vec![Some("10".to_owned())]));
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(footer(&again), (10, vec![Some("10".to_owned())]));    }
 
     #[test]
     fn a_flush_says_each_site_that_reported_a_bug_since_the_last() {
         use stdx::assert::reported::Site;
-        let dir = scratch("bugs");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("bugs");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let at = std::panic::Location::caller();
         let site = |count| Site {
             kind: "AdtDef",
@@ -2299,12 +2815,12 @@ mod tests {
 
     #[test]
     fn a_builds_row_names_the_tree_it_built_and_the_blaze_that_ran_it() {
-        let dir = scratch("identity");
+        let (_tmp, dir) = scratch("identity");
         let workspace = dir.join("work");
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
         let mut history =
-            History::open(&dir.join("profile"), CAP_BYTES, sampler::unsampled()).unwrap();
+            History::open(&dir.join("profile"), CAP_MOST, sampler::unsampled()).unwrap();
         let built = |history: &mut History, build_id| {
             let row = BuildRow {
                 workspace: workspace.to_str().unwrap().into(),
@@ -2333,15 +2849,13 @@ mod tests {
         fs::write(workspace.join("src/main.rs"), "fn main() { }\n").unwrap();
         let (edited, same_blaze) = built(&mut history, 52);
         assert_ne!(edited, tree, "a build of an edited tree names another tree");
-        assert_eq!(same_blaze, blaze);
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(same_blaze, blaze);    }
 
     #[test]
     fn the_images_a_build_linked_and_its_crate_graph_are_written_at_the_next_flush() {
         use crate::facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow};
-        let dir = scratch("facts");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("facts");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.linked([LinkRow {
             build_id: 61,
             image: "app (bin)".into(),
@@ -2376,17 +2890,54 @@ mod tests {
         assert_eq!(deps.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
         let again = history.flush(Some(62)).unwrap();
-        assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");    }
+
+    /// A build's account is written by the next flush, once, each count in its
+    /// own column, and a history with no account yet (one from before the table) reads as no
+    /// rows through the table's schema file.
+    #[test]
+    fn a_builds_account_is_written_at_the_next_flush_once() {
+        use arrow_array::types::UInt64Type;
+
+        use crate::account::{Account, End, Origin, STEP_UNIT, Seen, Step};
+        let (_tmp, dir) = scratch("accounts");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
+        let steps = [Step {
+            step: STEP_UNIT.to_owned(),
+            ends: vec![End::Changed { origin: Origin::Workspace, input: "/w/src/lib.rs".to_owned() }],
+        }];
+        let account = Account::of(71, &[], &steps, Seen { links: 2, ..Seen::default() });
+        history.accounted([account.row]);
+        let flushed = history.flush(Some(71)).unwrap();
+        assert_eq!((flushed.accounts, flushed.unwritten), (1, 0));
+        assert_eq!(history.dropped().total(), 0);
+        let read = read_back(
+            &dir.join(format!("{}-{:08}.accounts.parquet", flushed.build, flushed.seq)),
+        );
+        let batch = &read[0];
+        let count = |name: &str| {
+            batch
+                .column(schema::ACCOUNTS.column(name).unwrap())
+                .as_primitive::<UInt64Type>()
+                .value(0)
+        };
+        assert_eq!(
+            ["build_id", "steps", "units", "by_workspace_file", "changes", "links", "by_unexplained"].map(count),
+            [71, 1, 1, 1, 1, 2, 0]
+        );
+        let first = batch.column(schema::ACCOUNTS.column("first_change").unwrap()).as_string::<i32>();
+        assert_eq!(first.value(0), "/w/src/lib.rs");
+        assert!(batch.column(schema::ACCOUNTS.column("alarms").unwrap()).is_null(0));
+        let again = history.flush(Some(72)).unwrap();
+        assert_eq!(again.accounts, 0, "a flush writes each account once");    }
 
     #[test]
     fn a_builds_query_counts_are_written_at_the_next_flush_column_for_column() {
         use arrow_array::types::{UInt32Type, UInt64Type};
 
         use crate::facts::QueryCountRow;
-        let dir = scratch("query-counts");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("query-counts");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let mir = QueryCountRow {
             build_id: 63,
             query: "mir_body_query",
@@ -2404,6 +2955,11 @@ mod tests {
             ran_changed: 11,
             ran_untracked: 12,
             ran_cycle: 13,
+            validity: crate::facts::Validity {
+                proved_seal: 14,
+                edges_compared: 15,
+                ..Default::default()
+            },
         };
         history.query_counted([
             mir,
@@ -2442,18 +2998,18 @@ mod tests {
                 "ran_new",
                 "ran_changed",
                 "ran_untracked",
-                "ran_cycle"
+                "ran_cycle",
+                "proved_seal",
+                "edges_compared"
             ]
             .map(|it| count(it, 0)),
-            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             "each count in its own column"
         );
         assert_eq!(count("executed", 1), 7566);
 
         let again = history.flush(Some(64)).unwrap();
-        assert_eq!(again.query_counts, 0, "a flush writes each row once");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(again.query_counts, 0, "a flush writes each row once");    }
 
     #[test]
     fn a_flush_writes_the_recorders_new_rows_and_the_builds_that_ended() {
@@ -2464,8 +3020,8 @@ mod tests {
         })
         .join()
         .unwrap();
-        let dir = scratch("flush");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("flush");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         for table in schema::TABLES {
             let path = dir.join(format!("schema.{}.parquet", table.name));
             let read = read_back(&path);
@@ -2507,8 +3063,8 @@ mod tests {
     #[test]
     fn rows_written_between_flushes_past_a_rings_size_are_all_flushed() {
         crate::install();
-        let dir = scratch("drained");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("drained");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let bursts = 24;
         let burst = flight::CAP / 8;
         let tid = std::thread::spawn(move || {
@@ -2559,13 +3115,13 @@ mod tests {
 
     #[test]
     fn a_history_opened_again_numbers_on_from_its_files() {
-        let dir = scratch("reopen");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("reopen");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(row(1, Outcome::Failed));
         let first = history.flush(Some(1)).unwrap();
         drop(history);
         fs::write(dir.join(".1-00000099.spans.parquet.tmp"), b"half").unwrap();
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         assert!(
             !dir.join(".1-00000099.spans.parquet.tmp").exists(),
             "a half-written file is deleted"
@@ -2595,8 +3151,8 @@ mod tests {
         crate::install();
         // Past any build another test of this process writes rows of.
         const KILLED: u32 = 7_000_001;
-        let dir = scratch("killed-mid-build");
-        let mut first = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("killed-mid-build");
+        let mut first = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         std::thread::spawn(|| {
             let _build = flight::building(KILLED);
             let _span = tracing::info_span!(target: "blaze", "history killed mid-build").entered();
@@ -2610,14 +3166,12 @@ mod tests {
             "the timer's flush is named for the build its rows are of: {timer:?}"
         );
         drop(first);
-        let second = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let second = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         assert!(
             second.next_build() > KILLED,
             "the next daemon's first build is {}, a number the stopped daemon's rows already hold",
             second.next_build()
-        );
-        _ = fs::remove_dir_all(&dir);
-    }
+        );    }
 
     /// A flush with no new CPU samples asks the symbolizer nothing. The history reads a ring of
     /// the test's own: until 2026-11-03 it read the process's ring, and a run of this test saw
@@ -2626,8 +3180,8 @@ mod tests {
     #[test]
     fn a_flush_with_no_new_samples_names_nothing() {
         static OWN: sampler::Ring = sampler::Ring::new();
-        let dir = scratch("idle");
-        let mut history = History::open(&dir, CAP_BYTES, &OWN).unwrap();
+        let (_tmp, dir) = scratch("idle");
+        let mut history = History::open(&dir, CAP_MOST, &OWN).unwrap();
         let asked = symbols::ASKED.with(std::cell::Cell::get);
         let first = history.flush(None).unwrap();
         let idle = history.flush(None).unwrap();
@@ -2653,34 +3207,60 @@ mod tests {
             history.flush(None).unwrap().samples,
             1,
             "the sample kept into the history's ring"
-        );
-        _ = fs::remove_dir_all(&dir);
+        );    }
+
+    /// The oracle of the default cap `cap` (a store's bytes to the bytes kept): for stores of
+    /// `small` and `large` bytes, `small <= large`, it never falls as the store grows and
+    /// stays within [`CAP_LEAST`] and [`CAP_MOST`].
+    fn cap_follows(cap: impl Fn(u64) -> u64, small: u64, large: u64) -> Result<(), String> {
+        let (at_small, at_large) = (cap(small), cap(large));
+        if at_small > at_large {
+            return Err(format!("{small} bytes keep {at_small}, more ({large}) keep {at_large}"));
+        }
+        for (store, kept) in [(small, at_small), (large, at_large)] {
+            if !(CAP_LEAST..=CAP_MOST).contains(&kept) {
+                return Err(format!("{store} bytes keep {kept}, out of {CAP_LEAST}..={CAP_MOST}"));
+            }
+        }
+        Ok(())
     }
 
+    /// The invariant: unset, the cap never falls as the home's store grows and stays within
+    /// [`CAP_LEAST`] and [`CAP_MOST`]; a [`CAP_VAR`] that reads is the cap whatever the store
+    /// holds; one that does not is refused, naming it.
     #[test]
-    fn past_the_cap_the_oldest_files_go_first() {
-        let dir = scratch("cap");
-        let mut history = History::open(&dir, 1, sampler::unsampled()).unwrap();
-        let mut flushes = Vec::new();
-        for build in 1..=3 {
-            history.build_ended(row(build, Outcome::Ok));
-            flushes.push(history.flush(Some(build)).unwrap());
-        }
-        let name = |it: &Flushed| dir.join(format!("{}-{:08}.builds.parquet", it.build, it.seq));
-        assert!(
-            !name(&flushes[0]).exists() && !name(&flushes[1]).exists(),
-            "the older builds' files are deleted"
-        );
-        assert!(
-            name(&flushes[2]).exists(),
-            "the newest flush's files stay, though they are past the cap alone"
-        );
-        assert!(dir.join("schema.spans.parquet").exists(), "the schema files are not the cap's");
-        assert!(
-            history.core.files().kept().all(|it| it.name.last == flushes[2].seq),
-            "only the newest flush is kept"
-        );
+    fn the_cap_follows_the_store_between_its_bounds() {
+        blaze_sim::check(blaze_sim::Config::cases(300), |tape| {
+            let small = tape.int::<u64>("small");
+            let large = tape.int_in(small..=u64::MAX, "large");
+            cap_follows(|store| cap_of(None, store).unwrap(), small, large).unwrap();
+            let mib = tape.int_in(1..=u64::MAX >> 20, "mib");
+            assert_eq!(cap_of(Some(&mib.to_string()), small), Ok(mib << 20), "the variable wins");
+            assert_eq!(cap_of(Some(" 1 "), large), Ok(1 << 20));
+            for bad in ["0", "", "64MB", "-1", "1.5", "18446744073709551615"] {
+                let said = cap_of(Some(bad), small).expect_err(bad);
+                assert!(said.contains(CAP_VAR) && said.contains(&format!("{bad:?}")), "{said}");
+            }
+            assert_eq!(cap_for(64 << 20), 16 << 20, "a quarter of the store between the bounds");
+        });
     }
+
+    /// The control: the oracle refuses a cap that is a quarter of the store with the clamp
+    /// left out, and one that falls as the store grows.
+    #[test]
+    fn the_oracle_catches_a_cap_without_its_bounds() {
+        assert!(cap_follows(|store| store / 4, 0, 1 << 30).is_err(), "under the least");
+        assert!(cap_follows(|store| store / 4, 1 << 30, u64::MAX).is_err(), "over the most");
+        assert!(cap_follows(|store| CAP_MOST - (store / 4).min(CAP_MOST - CAP_LEAST), 0, 1 << 30).is_err());
+        cap_follows(cap_for, 0, u64::MAX).unwrap();
+    }
+
+    // What the cap retires, and when a pinned file goes, is tested on the core under the
+    // simulation (files/tests.rs: `the_last_builds_stay_whole_through_any_flushes_pins_and_restarts`).
+    // Three tests here did it through a `History` until 2026-11-14 and failed one run in a few:
+    // the flight recorder's rings are the process's, so every history of the test process
+    // drains every other test's rows, and their build ids named this test's flushes and tied
+    // its files into units with foreign builds. A core test is handed exactly its rows.
 
     /// The listable files in `dir`, by name: what is on disk beside the manifest.
     fn on_disk(dir: &Path) -> BTreeSet<String> {
@@ -2704,16 +3284,21 @@ mod tests {
     /// byte for byte, and lists exactly the files on disk.
     #[test]
     fn the_manifest_round_trips_through_flushes_a_merge_and_a_reopen() {
-        let dir = scratch("manifest-round-trip");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        // Past any build another test of this process writes rows of: a flush is named for
+        // the highest build its rows are of, and the rings are the process's, so a flush here
+        // that took a row of a higher build would be named for it and left out of this
+        // build's merge (with build 5, a run beside the other tests read 3 rows merged of 4).
+        const BUILD: u64 = 8_000_005;
+        let (_tmp, dir) = scratch("manifest-round-trip");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         history.flush(None).unwrap();
         for _ in 0..3 {
-            history.build_ended(row(5, Outcome::Ok));
+            history.build_ended(row(BUILD, Outcome::Ok));
             history.flush(None).unwrap();
         }
-        history.build_ended(row(5, Outcome::Ok));
-        let ended = history.flush(Some(5)).unwrap();
+        history.build_ended(row(BUILD, Outcome::Ok));
+        let ended = history.flush(Some(BUILD)).unwrap();
         assert!(ended.compacted >= 1, "the build's end merges its files: {ended:?}");
         drop(history);
         let bytes = fs::read(dir.join(manifest::FILE)).unwrap();
@@ -2723,10 +3308,10 @@ mod tests {
         assert_eq!(written.flushed(), ended.seq);
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 4, "each build row once");
         let entry = written.entries(schema::BUILDS.name).next().unwrap().1;
-        assert_eq!((entry.version, entry.rows, entry.builds), (schema::VERSION, 4, Some([5, 5])));
+        assert_eq!((entry.version, entry.rows, entry.builds), (schema::VERSION, 4, Some([BUILD, BUILD])));
         assert_eq!(entry.boot.as_deref(), clock::boot());
 
-        let history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         assert_eq!(
             fs::read(dir.join(manifest::FILE)).unwrap(),
             bytes,
@@ -2741,8 +3326,8 @@ mod tests {
     /// reopen that deletes the inputs, which no pin holds.
     #[test]
     fn a_merge_committed_and_not_deleted_reads_each_row_once() {
-        let dir = scratch("merged-not-deleted");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("merged-not-deleted");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.flush(None).unwrap();
         history.build_ended(row(7, Outcome::Ok));
         let one = history.flush(None).unwrap();
@@ -2781,7 +3366,7 @@ mod tests {
         assert!(inputs.iter().all(|it| it.exists()), "the crash left the inputs");
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 2, "the inputs are unlisted, so read once");
 
-        drop(History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap());
+        drop(History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap());
         assert!(
             inputs.iter().all(|it| !it.exists()),
             "the open deletes the retired files no pin holds"
@@ -2791,47 +3376,12 @@ mod tests {
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 2);
     }
 
-    /// A reader's pin keeps the files the manifest it read lists on disk while the cap (or a
-    /// merge) retires them; they go at the first flush after the pin drops.
-    #[test]
-    fn a_pinned_reader_keeps_retired_files_until_it_lets_go() {
-        let dir = scratch("pinned-merge");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
-        history.flush(None).unwrap();
-        history.build_ended(row(5, Outcome::Running));
-        history.flush(None).unwrap();
-        let pin = Pin::take(&dir).unwrap();
-        let read: Vec<String> =
-            pin.manifest().files(schema::BUILDS.name).map(str::to_owned).collect();
-        assert!(!read.is_empty());
-        let next = u64::from(history.next_build());
-        history.build_ended(row(next, Outcome::Ok));
-        // Past the cap, the older builds' files the pin read are retired, not deleted.
-        recap(&mut history, 1);
-        history.flush(Some(next)).unwrap();
-        let now = read_manifest(&dir).unwrap();
-        assert!(
-            read.iter().any(|it| now.retired().holds(it)),
-            "the cap retired a file the pin read"
-        );
-        for name in &read {
-            assert!(dir.join(name).exists(), "{name} was deleted under a pinned reader");
-        }
-        drop(pin);
-        history.flush(None).unwrap();
-        let after = read_manifest(&dir).unwrap();
-        for (name, _) in &now.retired().files {
-            assert!(!dir.join(name).exists(), "{name} stayed after the last pin let go");
-        }
-        assert!(after.retired().files.is_empty());
-    }
-
     /// A history from before manifests gets one made of its files, written once by its next
     /// writer, listing the same files with entries read from their footers.
     #[test]
     fn a_history_with_no_manifest_is_adopted_from_its_files() {
-        let dir = scratch("adopted");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let (_tmp, dir) = scratch("adopted");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(row(3, Outcome::Ok));
         history.flush(Some(3)).unwrap();
         drop(history);
@@ -2849,7 +3399,7 @@ mod tests {
             (was.version, was.rows, was.builds, was.t_ns)
         );
 
-        drop(History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap());
+        drop(History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap());
         assert!(dir.join(manifest::FILE).exists(), "the next writer writes it");
         assert_eq!(read_manifest(&dir).unwrap(), adopted);
     }
@@ -2858,10 +3408,10 @@ mod tests {
     /// or deleted.
     #[test]
     fn a_parquet_file_blaze_did_not_write_stops_the_open_naming_it() {
-        let dir = scratch("unclassified");
-        drop(History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap());
+        let (_tmp, dir) = scratch("unclassified");
+        drop(History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap());
         fs::write(dir.join("notes.parquet"), b"not ours").unwrap();
-        let Err(error) = History::open(&dir, CAP_BYTES, sampler::unsampled()) else {
+        let Err(error) = History::open(&dir, CAP_MOST, sampler::unsampled()) else {
             panic!("the open went on")
         };
         assert!(
@@ -2869,37 +3419,6 @@ mod tests {
             "{error}"
         );
         assert!(dir.join("notes.parquet").exists(), "left where it was");
-    }
-
-    /// The cap deletes a build whole: every table of it, every flush of it, at once.
-    #[test]
-    fn past_the_cap_a_build_goes_whole() {
-        let dir = scratch("cap-whole");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
-        // The first flush takes what the rings hold, other tests' builds' rows among them.
-        history.flush(None).unwrap();
-        history.build_ended(row(1, Outcome::Ok));
-        let one = history.flush(None).unwrap();
-        history.build_ended(row(1, Outcome::Failed));
-        history.flush(None).unwrap();
-        let old = one.build;
-        assert!(
-            history.core.files().kept().filter(|it| it.name.build == old).count() >= 2,
-            "two flushes of build {old}"
-        );
-        recap(&mut history, 1);
-        let next = u64::from(history.next_build());
-        history.build_ended(row(next, Outcome::Ok));
-        history.flush(Some(next)).unwrap();
-        assert!(
-            history.core.files().kept().all(|it| it.name.build != old),
-            "every file of build {old} is gone"
-        );
-        let manifest = read_manifest(&dir).unwrap();
-        assert!(
-            manifest.all().all(|it| Name::parse(it).is_none_or(|it| it.build != old)),
-            "and unlisted"
-        );
     }
 
     /// The flush's cost a span, in release: what docs/v2/plan/design/profile-history.md bounds.
@@ -2930,7 +3449,7 @@ mod tests {
                 folded_ns: 0,
             })
             .collect();
-        let dir = scratch("cost");
+        let (_tmp, dir) = scratch("cost");
         let mut writer = Writer::new();
         let start = std::time::Instant::now();
         let batch = batches::spans(&rows, Process::this()).unwrap();

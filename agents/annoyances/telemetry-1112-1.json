@@ -1,0 +1,18 @@
+{
+ "id": "telemetry-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane telemetry-1112",
+ "where": "blaze-profile: adding a table to the history (crates/blaze-profile/src/history.rs, schema.rs)",
+ "what": "Adding the one table `accounts` took eleven hand edits that nothing ties together: `schema::TABLES`' length (`[&Table; 30]`), a field of `History`, its initialiser in `open`, a method, the batch in `write`, the fixed-size `tables: [(..); 22]`, a `done(..)` clear, a field of `Flushed` and its line in the one literal that names every field, a view in views.sql and a section in docs/profiling.md.",
+ "cost": "about twenty minutes of reading to find the sites, written without a compiler (write-only lane), so a missed one is a round trip through the runner",
+ "cause": "each fact table is spelled out by hand at every stage of a flush",
+ "whys": [
+  "why eleven edits: a flush names each table's rows, batch, count and clear separately",
+  "why separately: the fact tables are plain Vec fields of History, not values of one trait the flush iterates",
+  "property: a table is a convention across a file, not a type"
+ ],
+ "class": "one concept spelled at many sites by hand (one-concept-one-home)",
+ "prevention": "not built: a `Fact` trait (rows -> batches by bytes, its table, its count) and one list of fact buffers the flush iterates, so a new table is one impl and one schema const",
+ "workaround": "grep history.rs for `schema::MISSES` and `misses` and mirror every hit",
+ "state": "open"
+}

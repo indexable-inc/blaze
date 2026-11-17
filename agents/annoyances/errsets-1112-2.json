@@ -1,0 +1,19 @@
+{
+ "id": "errsets-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane errsets-1112",
+ "where": "git on the Mac",
+ "what": "To test the base without my change I ran `git diff > fix.patch; git checkout <files>; ...; git apply fix.patch`. The patch file held difftastic's side-by-side text, `git apply` said \"No valid patches in input\", and the edit was gone (rewritten from the script that made it). Same class as records-2.",
+ "cost": "10 minutes; it would have been the whole change had it been larger",
+ "cause": "diff.external is difftastic, so `git diff` does not print a patch",
+ "whys": [
+  "a patch was taken with plain git diff",
+  "the default output of git diff here is for reading, and nothing says so at the point of use",
+  "records-2 recorded it as a row, and a row is read only when searched for"
+ ],
+ "class": "a command whose output looks like its usual format and is not",
+ "prevention": "a how-to row: take a patch with `git diff --no-ext-diff`, and test a base in a detached worktree instead of reverting files; the stronger form is GIT_EXTERNAL_DIFF unset for agents' shells",
+ "workaround": "git diff --no-ext-diff; a base worktree (git worktree add --detach) for baselines",
+ "fix": "",
+ "state": "open"
+}

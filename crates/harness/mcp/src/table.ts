@@ -11,6 +11,7 @@
 //
 // Both check column names: a column the table lacks is a type error, and at run time an error naming its columns.
 // One set of row functions below runs both, so the two never disagree.
+import type { Docs } from "./docs.ts";
 import { nuon } from "./nuon.ts";
 
 export type Scalar = string | number | boolean | null;
@@ -901,9 +902,33 @@ function lazy<R extends object>(source: LazySource<R>, options: { describe?: str
 /** Wrap rows as a Table (copies the array, not the rows); `table.from` is the same, `table.lazy(source)` a LazyTable. */
 export const table = Object.assign(fromRows, { from: fromRows, lazy });
 
-/** One line each for the function list (src/functions/index.ts). */
-export const tableDocs = {
-  table: "table(rows) / table.from(rows): Table<Row> — a real array (r[0], .map, .length; slice(a, b), sort(fn) and join(',') stay Array's) plus polars verbs returning new Tables: filter(col('a').gt(1) | r => bool), select('a', col('b').alias('c')), withColumns(expr, ...), sort(by | [by], true | { descending, nullsLast }), head(n = 10), tail(n), groupBy(...keys).agg(col('x').sum().alias('s'), ...) or .agg(a => ({ n: a.count(), s: a.sum(c), m: a.mean(c), lo: a.min(c), hi: a.max(c), f: a.first(c), l: a.list(c), d: a.distinct(c), sub: a.rows() })) or .len(), join(other, { on, how: inner|left|semi|anti, suffix = '_right' }), unique(subset?, { keep: first|last }), explode(listCols), unnest(recordCol), rename({ from: 'to' }), drop(...cols), count(), toArray(col), lazy(); old names work: where(fn), derive({ c: r => v }), sortBy(col, { desc }), joinOn(other, on, how), column(col), rows(). table.lazy(rows | promise | () => promise): LazyTable<Row> — the same verbs plus polars' slice(offset, length), recorded as a plan (explain()) and run by await (an eager Table; a returned one prints its rows), collect(), toRecords(), toArray(col) or height(). A column the table lacks is a type error and a runtime error naming its columns.",
-  col: "col(name), lit(value): Expr — polars expressions for filter, select, withColumns and agg: eq neq gt gtEq lt ltEq and or not add sub mul div isNull isNotNull isIn([...]) alias(name); aggregates sum mean min max count first last nUnique implode (a select of only aggregates is one row); .str.contains(re, literal?) startsWith endsWith extract(re, group = 1) toLowerCase toUpperCase lengths; .list.len() contains(v) join(sep); .struct.field(name).",
-  gitLog: "gitLog({ cwd?, ref?, path?: string | string[], since?: '1 month ago', until?, author?, merges? = false, limit? }): LazyTable<{ hash; author; email; date: ms; subject; files: string[]; added; deleted }> — commits newest first, chainable before await (a head right after becomes --max-count): gitLog({ since: '1 month ago' }).explode('files').groupBy('author').agg(col('files').nUnique().alias('files')).",
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  table: {
+    area: "tables",
+    for: "group, sort, filter, join rows",
+    sig: "table(rows) / table.from(rows): Table<Row>",
+    about: "a real array (r[0], .map, .length; slice(a, b), sort(fn) and join(',') stay Array's) plus polars verbs returning new Tables: filter(col('a').gt(1) | r => bool), select('a', col('b').alias('c')), withColumns(expr, ...), sort(by | [by], true | { descending, nullsLast }), head(n = 10), tail(n), groupBy(...keys).agg(col('x').sum().alias('s'), ...) or .agg(a => ({ n: a.count(), s: a.sum(c), m: a.mean(c), lo: a.min(c), hi: a.max(c), f: a.first(c), l: a.list(c), d: a.distinct(c), sub: a.rows() })) or .len(), join(other, { on, how: inner|left|semi|anti, suffix = '_right' }), unique(subset?, { keep: first|last }), explode(listCols), unnest(recordCol), rename({ from: 'to' }), drop(...cols), count(), toArray(col), lazy(); old names work: where(fn), derive({ c: r => v }), sortBy(col, { desc }), joinOn(other, on, how), column(col), rows(). table.lazy(rows | promise | () => promise): LazyTable<Row> — the same verbs plus polars' slice(offset, length), recorded as a plan (explain()) and run by await (an eager Table; a returned one prints its rows), collect(), toRecords(), toArray(col) or height(). A column the table lacks is a type error and a runtime error naming its columns.",
+    example: "table(rows).filter(col('size').gt(1e6)).sort('size', true).head(5)",
+  },
+  col: {
+    area: "tables",
+    sig: "col(name), lit(value): Expr",
+    about: "polars expressions for filter, select, withColumns and agg: eq neq gt gtEq lt ltEq and or not add sub mul div isNull isNotNull isIn([...]) alias(name); aggregates sum mean min max count first last nUnique implode (a select of only aggregates is one row); .str.contains(re, literal?) startsWith endsWith extract(re, group = 1) toLowerCase toUpperCase lengths; .list.len() contains(v) join(sep); .struct.field(name).",
+  },
+  lit: {
+    area: "tables",
+    sig: "lit(value)",
+    about: "see col.",
+  },
+  LazyTable: {
+    area: "tables",
+    sig: "LazyTable",
+    about: "the class behind table.lazy() and gitLog().",
+  },
+  Table: {
+    area: "tables",
+    sig: "Table",
+    about: "the class behind table(); use for instanceof checks.",
+  },
 };

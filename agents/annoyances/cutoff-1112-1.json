@@ -1,0 +1,18 @@
+{
+ "id": "cutoff-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cutoff-1112",
+ "where": "the lane's brief; crates/blaze-lower/src/code.rs",
+ "what": "The brief named `positions_stamp` and `crates/hir-def/src/deps/**` as where narrow keys and position-independent keys are. No `positions_stamp` is in any crate (one doc, patch-in-place.md, has the word), and the narrow keys of a unit are made in `blaze_lower::narrow_of` from the texts of `crates/blaze-lower/src/code.rs`; `hir_def::deps` keys dependency images, which no workspace crate has.",
+ "cost": "about a fifth of the lane's reading, spent in hir-def's image code before the texts were found",
+ "cause": "names in a brief written from memory of several lanes' reports",
+ "whys": [
+  "the brief was not checked against the tree with a search",
+  "the tree has four things called an interface (the interface text, `blaze_items::InterfaceHash`, the image, `Described::abi`) and no one place that says which key holds which"
+ ],
+ "class": "a name from memory (claims-from-evidence)",
+ "prevention": "store.md, \"Early cutoff between crates\", now says which digest a unit's key holds and where it is made; a brief that names a symbol should carry the `rg` line that found it",
+ "workaround": "searched for the miss cause's text (`what its narrow key holds of the crate`) and read from there",
+ "fix": "none",
+ "state": "open"
+}

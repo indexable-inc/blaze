@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build (incrementally) and run the harness binary from this checkout.
+# Build (incrementally) and run the harness binary from this checkout, with blaze: the workspace has a blaze-only
+# dependency (harness-native-render's `artifact = "gpu"`), so cargo can't read it, and blaze builds outside the
+# checkout (docs/cargo.md, where a build writes), so `blaze run` finds the binary.
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
-cargo build -q --release --manifest-path "$root/Cargo.toml" >&2
-exec "$root/target/release/harness" "$@"
+exec blaze run -q --release --manifest-path "$root/Cargo.toml" -p harness --bin harness -- "$@"

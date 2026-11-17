@@ -1,20 +1,26 @@
 //! The front end of a v2 build over the database: what each instance and static is by
 //! content, whose code it is, and what it refers to.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_codegen::{
     CodegenError, InstanceKey, Owner,
     backend::{
-        Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit,
+        Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates,
+        Limit,
     },
+    driver::Kept,
     plan::{Mode, Origin, Package, PlanError, Policy},
 };
+use blaze_core::lock::Lock;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
-use blaze_query::db::FromId;
+use blaze_memo::Id as _;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId,
     GenericParamId, HasModule, Lookup, signatures::FunctionSignature,
@@ -26,6 +32,7 @@ use hir_ty::{
 };
 use hir_ty_identity::{Compiled, OptionsSet, Shim, Subject, instance_identity};
 use hir_ty_mir::mir::MirOptions;
+use hir_ty_mir::mir::devirt::DevirtWorld;
 use hir_ty_mir::mir::dispatch;
 use hir_ty_share::Unshared;
 use rustc_type_ir::inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind};
@@ -36,7 +43,12 @@ use super::{
     Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs,
     undescribed,
 };
-use crate::{Instance, InstanceDef, exported_static, exported_symbol, fncache, linked_symbol};
+use crate::{
+    Instance, InstanceDef, exported_linkage, exported_static, exported_symbol, fncache, linked_symbol,
+};
+
+mod abi;
+pub(crate) mod described;
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
 pub struct Databases<'db> {
@@ -51,7 +63,7 @@ impl<'db> Databases<'db> {
     /// Runs `work` with the database attached to its thread, which any formatted type or
     /// constant (an error's message, a panic's) needs, on whichever worker the task is.
     pub(crate) fn with<T>(&self, work: impl FnOnce(&Db) -> T) -> T {
-        blaze_query::db::attach(self.db, || work(self.db))
+        blaze_memo::attach(self.db, || work(self.db))
     }
 }
 
@@ -77,18 +89,36 @@ pub struct HirFrontend<'db> {
     /// one place a build decides it (blaze-cargo's `links_image`); `false` until then.
     image: bool,
     /// How each origin's units build bodies: what a function's references are walked for and
-    /// what a generic is shared under.
-    units: Option<Units>,
-    // dyn: `reached` once a level of the walk, `stopped` once a function compiled (2 ns
+    /// what a generic is shared under. Shared with every front end made with the same
+    /// ([`give_units`]), and named in a describe's key by `units_id`.
+    units: Option<Arc<Units>>,
+    /// Which of the units given in this process `units` is ([`give_units`]).
+    units_id: Option<u32>,
+    /// What a describe's store record is keyed by of the build ([`described::Stage`]): the
+    /// toolchain and `units` by content. `None` for a front end made with no policy, whose
+    /// describes are no records.
+    stage: Option<described::Stage>,
+    /// What this database read from describe records ([`described::Found`]), set with
+    /// `stage`.
+    found: Option<Arc<described::Found>>,
+    /// What the builds over the database keep between them ([`Walks`]), given by its owner
+    /// ([`Self::with_walks`]); `None` for a front end whose builds keep nothing: its kept
+    /// walk, records found and link inputs are its own and go with it.
+    pub(super) walks: Option<&'db Walks>,
+    // dyn: `reached` once a batch of the walk, `stopped` once a function compiled (2 ns
     // against its 50 to 200 µs), never per instruction
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
     /// Set when the build's job is cancelled or gives way to another task.
     stop: Option<&'db AtomicBool>,
+    /// Set while the daemon stops the build's tasks to give memory back
+    /// ([`Self::with_give_way`]): read with `stop`, before each function.
+    give_way: Option<&'db AtomicBool>,
     /// What the walk of a final binary found of its trait objects ([`super::devirt`]).
     pub(crate) devirt: super::devirt::State,
 }
 
 /// One value for each origin of the build's [`Policy`], told apart as the plan tells them.
+#[derive(PartialEq)]
 struct ByOrigin<T> {
     /// A member's, a dependency's, build-time code's, of a package the profile names no
     /// override for.
@@ -154,6 +184,7 @@ impl<T> ByOrigin<T> {
 
 /// How the units of each origin of the build's [`Policy`] build bodies. Made once a build,
 /// choosing for each origin as the plan does.
+#[derive(PartialEq)]
 struct Units {
     /// Whether some unit of the origin MIR-inlines (`Spec::mir_inline`), at the first spec or
     /// one a build tiers it up to.
@@ -298,6 +329,212 @@ fn options_set(options: &[MirOptions]) -> Result<OptionsSet, String> {
     }
 }
 
+/// Every [`Units`] a front end of this process was made with, each content once, in the
+/// order given: a handful (one a profile and target a daemon builds), so a list. A describe's
+/// key names its units by their place here ([`Facing::units`]), which is of their content:
+/// two builds with the same units share what a key holds, and a build with others never
+/// reads it.
+/// Nothing is taken out, so a place names one content for the process's life.
+#[expect(
+    blaze::process_static,
+    reason = "a handful of units contents, never taken out so a place names one content for the process's life: the daemon should own the table"
+)]
+static UNITS: Lock<Vec<Arc<Units>>> = Lock::new("codegen.frontend.units", Vec::new());
+
+/// [`UNITS`] by place, as a describe that runs reads it ([`Facing::front`]): a lock-free look.
+/// Written only under [`UNITS`]' lock, by the one [`give_units`] that gives a content its
+/// place, before that place is handed out, so a place a `Facing` holds is always here.
+/// Until 2026-11-12 the read took the lock: once per describe on every worker, which a cold
+/// build of tempo (bd63ea64fc, 5,597,946 describes) waited 1,559 s for in all.
+static UNITS_BY_PLACE: std::sync::LazyLock<blaze_hash::SharedMap<u32, Arc<Units>>> =
+    std::sync::LazyLock::new(blaze_hash::SharedMap::default);
+
+/// `units` among those given, by content: its place and the one held there.
+fn give_units(units: Units) -> (u32, Arc<Units>) {
+    let mut given = UNITS.lock();
+    if let Some(at) = given.iter().position(|it| **it == units) {
+        // clone: a reference count, once a build
+        return (at as u32, given[at].clone());
+    }
+    // alloc: once per content of units a process builds with, kept for its life
+    let held = Arc::new(units);
+    given.push(held.clone()); // clone: a reference count, once per content
+    let place = given.len() as u32 - 1;
+    // Under the lock, before the place leaves this call: a fresh place, so nothing is there.
+    _ = UNITS_BY_PLACE.pin().try_insert(place, held.clone()); // clone: a reference count, once per content
+    (place, held)
+}
+
+/// What describing an instance reads of a front end beside the database: a describe's key
+/// with the instance and who asks, and with the static a static's describe's ([`described_static_memo`]). Equal ones describe alike over one
+/// database, whichever build's front end they are of (rule 21). Flags and a content id only,
+/// so it names no arena.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
+pub(crate) struct Facing {
+    /// Which units ([`give_units`]); `None` for a front end made with no policy.
+    units: Option<u32>,
+    build_time: bool,
+    image: bool,
+    /// The tests' hashes ([`HashSource`]'s `ById`), not the items lane's.
+    by_id: bool,
+    /// The program's dyn facts the instance's body is walked against: `None` for an instance
+    /// that takes none ([`super::devirt::takes_world`]), so its describe is one for every
+    /// program and a change of the facts leaves it as it was.
+    world: Option<DevirtWorld>,
+}
+
+impl Facing {
+    /// A front end of these facts over `db`: it describes as the one they were read from
+    /// does. Its hashes are asked what the build calls no file: no describe reads one.
+    fn front<'db>(self, db: &'db Db) -> Result<HirFrontend<'db>, String> {
+        let hashes = match self.by_id {
+            true => by_id_hashes()?,
+            false => HashSource::Items(super::hashes::ItemHashes::new(Box::new(unnamed))),
+        };
+        let units = match self.units {
+            // clone: a reference count, once per describe that runs
+            Some(id) => Some(UNITS_BY_PLACE.pin().get(&id).cloned().ok_or_else(|| {
+                // alloc: an error
+                format!("the units {id} of a describe's key were never given in this process")
+            })?),
+            None => None,
+        };
+        let mut front = HirFrontend::new(Databases::new(db), hashes, BuildTime(self.build_time));
+        (front.image, front.units, front.units_id) = (self.image, units, self.units);
+        Ok(front)
+    }
+}
+
+#[cfg(test)]
+fn by_id_hashes() -> Result<HashSource, String> {
+    Ok(HashSource::ById(super::by_id::ById))
+}
+
+#[cfg(not(test))]
+fn by_id_hashes() -> Result<HashSource, String> {
+    // alloc: an error
+    Err("a describe keyed by the tests' hashes, which no build has".to_owned())
+}
+
+/// What the hashes of [`Facing::front`] call a file: asked of none, as no describe reads a
+/// file's name (a `file!()` is a span the link names, alone as a `Location`, in a `concat!` as
+/// a `blaze_codegen::Target::Text`). Were one asked, the describe would be keyed without the
+/// name the build gives the file, so it stops.
+fn unnamed(file: base_db::FileId) -> Option<String> {
+    panic!("a describe asked what the build calls {file:?}, and no describe reads a file's name")
+}
+
+/// The describe of the static `value` by a front end of `facing`
+/// ([`HirFrontend::described_static`]), kept by the database: the next build verifies it,
+/// and evaluates and shapes the value again only where something it read changed. One row a
+/// static item, against a function's describe, which is no row. `facing`
+/// holds no world: a static's value is built against none.
+#[blaze_memo::tracked(returns(ref), owns)]
+fn described_static_memo(
+    db: &Db,
+    value: HirStatic,
+    facing: Facing,
+) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
+    let front = match facing.front(db) {
+        Ok(front) => front,
+        Err(what) => {
+            let named = super::StaticNamed(db, value.0);
+            return Err(undescribed(db, &named, None, what));
+        }
+    };
+    front.described_static(db, &value)
+}
+
+/// How many [`Walks`] are alive in the process: each names its database's interned ids, so a
+/// release of the process tables (`hir::evict::release_process_tables`) waits for none to be.
+static WALKS: AtomicUsize = AtomicUsize::new(0);
+
+/// What the builds over one database keep between them for the next build's walk, and
+/// nothing else does: each configuration's kept walks ([`HirFrontend::kept`]) and what it read
+/// from describe records ([`described::Found`]). Each names the database's interned ids, so it is
+/// owned beside the database (blaze-cargo's kept front end) and dropped with it.
+///
+/// The database's link inputs ([`super::linked::Links`]) are kept here too.
+///
+/// Until 2026-11-13 these were four process statics (`KEPT`, `WITNESSES`, `FOUND`, and
+/// linked.rs's `KEPT` of link inputs), each by
+/// the database's nonce: the kept walks of the last eight databases and configurations stayed
+/// past their databases, the records read of a database were never let go at all, and a
+/// release could only empty all of them at once (lane F6 of the memory wave, read from code).
+/// Owned here, they leave exactly when the database does, and no build asks a static.
+pub struct Walks {
+    /// The database they are of: a front end of another is refused ([`HirFrontend::with_walks`]).
+    database: base_db::Nonce,
+    /// Each configuration's kept walk: a database is built in a few (a program's, its
+    /// build-time code's, a test's), each one entry.
+    kept: Lock<Vec<(Facing, Arc<Kept<HirInstance, HirStatic>>)>>,
+    found: Lock<described::FoundSlot>,
+    /// The link inputs of the last few programs linked of the database
+    /// ([`super::linked::Links`]): what the next link of each brings forward.
+    links: super::linked::Links,
+}
+
+impl Walks {
+    /// Nothing kept yet, for `db`.
+    pub fn new(db: &Db) -> Walks {
+        WALKS.fetch_add(1, Ordering::Relaxed);
+        Walks {
+            database: db.nonce(),
+            // alloc: none until a walk is kept
+            kept: Lock::new("codegen.frontend.walks.kept", Vec::new()),
+            found: Lock::new("codegen.frontend.walks.found", None),
+            links: super::linked::Links::new(),
+        }
+    }
+
+    /// What the database's links keep for the next ([`HirFrontend::link_inputs`]).
+    pub(super) fn links(&self) -> &super::linked::Links {
+        &self.links
+    }
+
+    /// Whether these are of `db`: a database made again in its place (another nonce) needs a
+    /// [`Walks`] of its own, as [`HirFrontend::with_walks`] refuses these for it.
+    pub fn is_of(&self, db: &Db) -> bool {
+        self.database == db.nonce()
+    }
+
+    /// Lets go of everything kept, as a drop would, and keeps the owner: the next build over
+    /// the database walks whole and describes or finds everything again. How many functions
+    /// the kept walks held. A walk in flight keeps its own until it ends.
+    pub fn let_go(&self) -> usize {
+        let kept = std::mem::take(&mut *self.kept.lock());
+        let functions = kept.iter().map(|(_, walks)| walks.functions()).sum();
+        self.found.lock().take();
+        let programs = self.links.let_go();
+        // Freed outside the locks.
+        drop(kept);
+        tracing::info!(
+            target: "blaze",
+            functions,
+            programs,
+            "codegen: a database's kept walks, records found and link inputs were let go"
+        );
+        functions
+    }
+
+    /// What `db` read from describe records in its snapshot.
+    fn found(&self, db: &Db) -> Arc<described::Found> {
+        described::found_in(&mut self.found.lock(), db)
+    }
+}
+
+impl Drop for Walks {
+    fn drop(&mut self) {
+        WALKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How many [`Walks`] are alive, each of which names interned ids: what a release of the
+/// process tables waits to be 0. No process static holds a walk, a witness or a record read.
+pub fn kept_walks() -> usize {
+    WALKS.load(Ordering::Relaxed)
+}
+
 const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::with_policy`), so \
                          it can't tell how the instance's units build its MIR";
 
@@ -310,10 +547,38 @@ impl<'db> HirFrontend<'db> {
             build_time,
             image: false,
             units: None,
+            units_id: None,
+            stage: None,
+            found: None,
+            walks: None,
             checks: None,
             stop: None,
+            give_way: None,
             devirt: Default::default(),
         }
+    }
+
+    /// The front end of a build whose database's owner keeps `walks` for the builds over it:
+    /// the build's walk is kept there for the next ([`Self::kept`]), and what its describes
+    /// read and found is noted there. In any order with [`Self::with_policy`].
+    ///
+    /// # Panics
+    ///
+    /// When `walks` is of another database: its ids would name other things in this one
+    /// (rule keys-cover-every-input). A caller's bug, never a build's input.
+    pub fn with_walks(mut self, walks: &'db Walks) -> Self {
+        let database = self.databases.db.nonce();
+        assert!(
+            walks.database == database,
+            "the kept walks of database {:?} were given to a front end of database {database:?} \
+             (rule keys-cover-every-input: a kept walk names its own database's ids)",
+            walks.database
+        );
+        self.walks = Some(walks);
+        if self.stage.is_some() {
+            self.found = Some(walks.found(self.databases.db));
+        }
+        self
     }
 
     /// The front end of a build that stops before its next function once `stop` is set: its
@@ -323,8 +588,17 @@ impl<'db> HirFrontend<'db> {
         self
     }
 
+    /// The front end of a build that also stops before its next function while `give_way` is
+    /// set: the daemon is stopping the build's tasks to give memory back, and the task is
+    /// posted again once it has. Apart from [`Self::with_stop`]'s flag, which is the job's
+    /// cancel and is never cleared.
+    pub fn with_give_way(mut self, give_way: &'db AtomicBool) -> Self {
+        self.give_way = Some(give_way);
+        self
+    }
+
     /// The front end of a build whose unit's bodies `checks` checks beside it.
-    // dyn: called once a level of the walk, never per instance
+    // dyn: called once a batch of what the walk reaches, never per instance
     pub fn with_checks(mut self, checks: &'db dyn BodyChecks) -> Self {
         self.checks = Some(checks);
         self
@@ -334,7 +608,16 @@ impl<'db> HirFrontend<'db> {
     /// function need, which list what its code calls as the units of its origin inline it.
     /// It leaves whether the build links a dependency image to [`Self::with_image`].
     pub fn with_policy(mut self, policy: &Policy) -> Self {
-        self.units = Some(Units::of(self.databases.db, policy));
+        let (id, units) = give_units(Units::of(self.databases.db, policy));
+        self.stage = Some(described::Stage::of(policy, &units));
+        let db = self.databases.db;
+        // Kept by the database's owner where it gave them ([`Self::with_walks`]); else this
+        // front end's own, which go with it.
+        self.found = Some(match self.walks {
+            Some(walks) => walks.found(db),
+            None => described::found_in(&mut None, db),
+        });
+        (self.units, self.units_id) = (Some(units), Some(id));
         self
     }
 
@@ -473,12 +756,93 @@ impl<'db> HirFrontend<'db> {
         self.databases.with(work)
     }
 
-    fn described(
+    /// What describing reads of this front end beside the database, for an instance whose
+    /// body is walked against `world`.
+    fn facing(&self, world: Option<DevirtWorld>) -> Facing {
+        let by_id = match &self.hashes {
+            HashSource::Items(_) => false,
+            #[cfg(test)]
+            HashSource::ById(_) => true,
+        };
+        Facing {
+            units: self.units_id,
+            build_time: self.build_time.0,
+            image: self.image,
+            by_id,
+            world,
+        }
+    }
+
+    /// The world a describe of `instance` is keyed by: the program's dyn facts only where the
+    /// instance takes them, as its walk does ([`Self::walking`]), so a program's world rekeys
+    /// the bodies built against it and no other. One whose walk can't say is keyed by the
+    /// world, and its describe gives the error.
+    fn key_world(&self, db: &Db, instance: &HirInstance) -> Option<DevirtWorld> {
+        self.devirt.world().and_then(|world| match self.walking(db, instance) {
+            Ok(walking) => walking.world,
+            Err(_) => Some(world),
+        })
+    }
+
+    /// The describe of `instance` for `requester`, run now by the task that asks, as a value
+    /// read once (docs/v2/plan/design/end-state/memory.md): no row of the database holds it.
+    /// What it reads hits the session memo wherever the arena holding it was carried.
+    fn described_now(
         &self,
         db: &Db,
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
+        let world = self.key_world(db, instance);
+        self.described(db, instance, requester, world)
+    }
+
+    /// What the walks over this front end's database and configuration kept
+    /// (`blaze_codegen::driver::Kept`), for a build to patch and keep its own in
+    /// (`Build::keeping`): in the database owner's [`Walks`], as its instances are the
+    /// database's ids. A database made again (a restart, a checkout loaded anew) has a new
+    /// owner and so none kept: its first walk is whole, which the walk's span says (`fresh`).
+    /// A front end given no [`Walks`] keeps nothing past its build: its kept walk is a new,
+    /// empty one, its own. Every function a kept walk holds is checked against what its last
+    /// run read first ([`Frontend::redescribe`]), so which walk it is given decides only how
+    /// much is asked, never what is built.
+    pub fn kept(&self) -> Arc<Kept<HirInstance, HirStatic>> {
+        let Some(walks) = self.walks else {
+            // alloc: once a build, an empty walk this build alone holds
+            return Arc::new(Kept::new());
+        };
+        let facing = self.facing(None);
+        let mut kept = walks.kept.lock();
+        if let Some((_, walk)) = kept.iter().find(|(as_, _)| *as_ == facing) {
+            return walk.clone(); // clone: a reference count, once a build
+        }
+        // alloc: once per configuration the database is built in, a kept walk
+        let walk = Arc::new(Kept::new());
+        kept.push((facing, walk.clone())); // clone: a reference count
+        walk
+    }
+
+    /// What `instance` is for `requester`, its body walked against `world` where it takes
+    /// the program's dyn facts. It reads the database and, of the front end, what
+    /// [`Facing`] holds, never what the build calls a file. So two front ends of one
+    /// [`Facing`] describe alike.
+    fn described(
+        &self,
+        db: &Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        world: Option<DevirtWorld>,
+    ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
+        // One span a describe, named for its function once described, opened where the work
+        // is: a describe a kept walk or a record answers opens none, so the spans of a walk
+        // are the functions whose describe ran. A walk's describes run as a few long pool jobs
+        // (its worklist's), and a job of 149 s in a self-build said only `par::map` (spans37).
+        let span = tracing::info_span!(
+            target: "blaze",
+            "codegen describe",
+            function = tracing::field::Empty,
+        );
+        let _entered = span.enter();
         let hashes = &self.hashes;
         let item = match &instance.0 {
             Kind::Asm(text, _) => Ok(ItemKey(ContentId::of(ASM_ITEM_DOMAIN, text.as_bytes()))),
@@ -492,25 +856,33 @@ impl<'db> HirFrontend<'db> {
         let origin = self.compiled_for(db, instance, requester);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
         let owner = self.owner(db, &instance.0);
-        let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner)
-            .map_err(fail)?;
-        let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
+        let walking =
+            super::devirt::walking(db, world, instance, inlined, || owner).map_err(fail)?;
         // A body built against the program's dyn facts is keyed by those it read (rule 21). A
         // copy of it built into a caller is built against none: `built_in_code`.
         let read = refs::read(db, instance, walking).map_err(fail)?;
         let told =
             self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
-        // What its compiled function reads of names beside its code (the files its `file!()`
-        // names, its told locals' types) is in every key of it (rule 21), its link code's as
-        // its template code's: read once, folded into both ([`with_names`]).
+        // What its compiled function reads of names beside its code (its told locals' types)
+        // is in every key of it (rule 21), its link code's as
+        // its template code's: read once, folded into both ([`with_names`]). Folded into its
+        // body's own code once: `built_in_code` holds the untold names already, so the code is
+        // made from `code_of`, not from it, and equals it where nothing is told and no dyn fact
+        // is read, as a caller's `inlined` names it.
         let body = kind_body(&instance.0);
         let names = body.map(|body| hashes.names_read(db, body, told)).transpose().map_err(fail)?;
-        let code = with_names(super::devirt::code(built_in_code, read), names.map(|it| it.0));
+        let own = code_of(db, hashes, &instance.0).map_err(fail)?;
+        let built_in_code = match told {
+            false => with_names(own, names.map(|it| it.0)),
+            true => built_in_code(db, hashes, &instance.0).map_err(fail)?,
+        };
+        let code = with_names(super::devirt::code(own, read), names.map(|it| it.0));
         // Its template is kept under its template code, which holds no name and no place, when
         // all its positions are its own tables' and its code is its body's alone: none inlined
         // from another body (`inlined`, a unit's inliner; `lang`, the library's bodies, which
-        // `Build::options` always inlines as shipped), no report rows or PGO record naming it
-        // (`Units::names`), and a body of its own (no shim's declaration, no `main`'s start).
+        // `Build::options` inlines as shipped under a unit that inlines, and are kept under
+        // their code under every unit so one key serves all), no report rows or PGO record
+        // naming it (`Units::names`), and a body of its own (no shim's declaration, no `main`'s start).
         // The template then holds its positions by table and the instance fills its own
         // anchors (docs/v2/plan/design/name-free-identity.md).
         let lang = crate_of(db, &instance.0).is_some_and(|it| it.data(db).origin.is_lang());
@@ -538,6 +910,7 @@ impl<'db> HirFrontend<'db> {
             false => plain,
         };
         let identity = identity(db, &instance.0, item, plain);
+        let abi = abi::abi_of(db, hashes, &instance.0, plain).map_err(fail)?;
         let bound = bound(db, &instance.0, code, plain);
         let cold = cold_of(db, &instance.0);
         // Always the origin's profile, which keys it (rule 21). Pinning the setting of one
@@ -547,14 +920,23 @@ impl<'db> HirFrontend<'db> {
         // only, the origin's profile is already that crate's setting.
         let overflow_checks = None;
         let symbol = symbol_of(db, &instance.0).map_err(fail)?;
+        let linkage = match symbol {
+            Some(_) => linkage_of(db, &instance.0).map_err(fail)?,
+            None => blaze_codegen::Linkage::Strong,
+        };
         let mut refs = refs::walk(db, instance, walking).map_err(fail)?;
         asked_by(owner, &mut refs);
-        // alloc: `Described::built_in` owns its list, which the memo's is borrowed from
+        // alloc: `Described::built_in` owns its list, which the query's is borrowed from
         let built_in = refs::built_in(db, instance, walking).map_err(fail)?.to_vec();
         // Written in a workspace crate: the complement of what a caller may build in
         // (`always_inlinable_callee`), so nothing patchable is ever built in.
         let editable =
             crate_of(db, &instance.0).is_some_and(|krate| krate.data(db).origin.is_local());
+        // Written elsewhere, over a type, closure or item written in a workspace crate: an
+        // edit there can change what its references resolve to under its own key.
+        let over_editable = !editable && over_local(db, &instance.0);
+        let name = super::linked::debug_name(db, &instance.0);
+        span.record("function", name.as_str());
         Ok(Described {
             item,
             code,
@@ -564,14 +946,17 @@ impl<'db> HirFrontend<'db> {
             args,
             origin,
             editable,
+            over_editable,
             overflow_checks,
             address: if symbol.is_some() { Address::Significant } else { Address::Free },
             symbol,
-            name: super::linked::debug_name(db, &instance.0),
+            linkage,
+            name,
             refs,
             built_in,
             owner,
             identity,
+            abi,
             bound,
             cold,
         })
@@ -644,7 +1029,7 @@ impl<'db> HirFrontend<'db> {
             Ok(identity) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&identity.0).finish()),
             Err(why) if per_instance(why) => args_of(db, &self.hashes, kind),
             // alloc: the error's message
-            Err(why) => Err(blaze_query::db::attach(db, || {
+            Err(why) => Err(blaze_memo::attach(db, || {
                 format!("no compile identity for {instance:?}: {why}")
             })),
         }
@@ -660,8 +1045,9 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// Whose code a crate's is, for its settings: build-time code's in a build-time build
-    /// ([`BuildTime`]), never the standard library.
-    pub(crate) fn origin(&self, db: &Db, krate: Crate) -> Origin {
+    /// ([`BuildTime`]), never the standard library. Public for a program's roots, which are
+    /// asked for by their crate's origin (blaze-command's `program::roots`).
+    pub fn origin(&self, db: &Db, krate: Crate) -> Origin {
         let data = krate.data(db);
         let name = match &data.origin {
             CrateOrigin::Lang(_) => return Origin::Std,
@@ -744,6 +1130,14 @@ impl<'db> HirFrontend<'db> {
             .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), Some(item), what))?;
         let owner = self.static_owner(db, value);
         asked_by(owner, &mut held.refs);
+        // alloc: only an exported static, whose `DescribedStatic::symbol` owns its name
+        let symbol = exported_static(db, value.0).map(|it| it.as_str().to_owned());
+        let linkage = match symbol {
+            Some(_) => exported_linkage(db, value.0.into()).map_err(|what| {
+                undescribed(db, &super::StaticNamed(db, value.0), Some(item), what)
+            })?,
+            None => blaze_codegen::Linkage::Strong,
+        };
         Ok(DescribedStatic {
             item,
             instance: ContentId::default(),
@@ -753,8 +1147,8 @@ impl<'db> HirFrontend<'db> {
             section: held.section,
             origin: self.origin(db, value.0.krate(db)),
             owner,
-            // alloc: only an exported static, whose `DescribedStatic::symbol` owns its name
-            symbol: exported_static(db, value.0).map(|it| it.as_str().to_owned()),
+            symbol,
+            linkage,
             // alloc: per static described, its path, which errors name it by
             name: crate::fncache::static_name(db, value.0),
             refs: held.refs,
@@ -771,23 +1165,65 @@ impl Frontend for HirFrontend<'_> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
-        self.with(|db| self.described(db, instance, requester))
+        self.with(|db| self.described_now(db, instance, requester))
+    }
+
+    /// `was` holds when the describe was read from a record that still holds
+    /// ([`Self::found_holds`]); else the describe runs again (its reads hit the session memo
+    /// where their arenas were carried) and is compared.
+    fn redescribe(
+        &self,
+        instance: &HirInstance,
+        requester: &Origin,
+        was: &Described<HirInstance, HirStatic>,
+    ) -> Result<Option<Described<HirInstance, HirStatic>>, CodegenError> {
+        self.with(|db| {
+            // Read from its record in this database, under a key that is still its key: the
+            // record is the describe, and no describe ran for it.
+            if self.found_holds(db, instance, requester) {
+                return Ok(None);
+            }
+            let now = self.described_now(db, instance, requester)?;
+            Ok((now != *was).then_some(now))
+        })
+    }
+
+    fn record_key(&self, instance: &HirInstance, requester: &Origin) -> Option<blaze_cas::Key> {
+        self.with(|db| self.record_key_in(db, instance, requester))
+    }
+
+    fn from_record(
+        &self,
+        instance: &HirInstance,
+        requester: &Origin,
+        bytes: &[u8],
+    ) -> Result<Described<HirInstance, HirStatic>, String> {
+        self.with(|db| self.from_record_in(db, instance, requester, bytes))
+    }
+
+    fn to_record(
+        &self,
+        instance: &HirInstance,
+        requester: &Origin,
+        described: &Described<HirInstance, HirStatic>,
+    ) -> Option<Vec<u8>> {
+        self.with(|db| self.to_record_in(db, instance, requester, described))
     }
 
     fn describe_static(
         &self,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
-        self.with(|db| self.described_static(db, value))
+        // clone: copied out of the database's memo, once per static described
+        self.with(|db| described_static_memo(db, *value, self.facing(None)).clone())
     }
 
     fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
-        self.devirt.reached(functions, statics);
         let Some(checks) = self.checks else { return };
         let bodies: Vec<DefWithBodyId> = self.with(|db| {
             (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
                 .chain(statics.iter().map(|it| DefWithBodyId::StaticId(it.0)))
-                // alloc: once a level of the walk, sized by it
+                // alloc: once a batch of what the walk reaches, sized by it
                 .collect()
         });
         checks.reached(&bodies);
@@ -795,12 +1231,52 @@ impl Frontend for HirFrontend<'_> {
 
     fn stopped(&self) -> bool {
         self.stop.is_some_and(|it| it.load(Ordering::Relaxed))
+            || self.give_way.is_some_and(|it| it.load(Ordering::Relaxed))
             || self.checks.is_some_and(|it| it.stopped())
     }
 
+    /// Each count is what a record read in this database says of it, where one does (working
+    /// it out reads the function's optimized body, `compiled_by_user`); else counted now, its
+    /// reads hitting the session memo where their arenas were carried.
     fn counted(&self, functions: &[(HirInstance, Origin)]) -> Vec<Counted> {
-        // alloc: once a level of the walk, sized by it
-        self.with(|db| functions.iter().map(|(instance, _)| counted(db, &instance.0)).collect())
+        self.with(|db| {
+            let counted_now = |(instance, _): &(HirInstance, Origin)| {
+                match self.found_counted(instance) {
+                    Some(counted) => counted,
+                    None => counted(db, &instance.0),
+                }
+            };
+            // alloc: once per describe that reaches new functions, sized by them
+            functions.iter().map(counted_now).collect()
+        })
+    }
+
+    // No `changed_since`, `view` or `durable_view` (the trait's defaults, `None`): the session
+    // memo names no changed set (docs/v2/plan/design/front-end-on-memo.md, rule 1), so the walk
+    // is never patched and asks every function and static again each build, each describe's
+    // reads hitting the memo where their arenas were carried.
+
+    /// Every describe is the build's each time, but one read from a record that holds: no
+    /// changed set says which describe may be other.
+    fn each_build(&self, instance: &HirInstance, requester: &Origin) -> bool {
+        // One read from its record holds while its key does.
+        self.with(|db| !self.found_holds(db, instance, requester))
+    }
+
+    /// None: a static's describe is the database's memo, which verifies it, and no value
+    /// reads what the build calls a file (a `file!()` in it is a span the link names).
+    fn static_each_build(&self, _: &HirStatic) -> bool {
+        false
+    }
+
+    /// A walk closes dyn facts only where some body takes the program's world
+    /// ([`super::devirt::takes_world`]), which needs a unit that MIR-inlines: with none of
+    /// any origin (a dev build), or an origin whose plan fails, it closes none.
+    fn closes(&self) -> bool {
+        match &self.units {
+            Some(units) => units.inlines.values().any(|it| *it != Ok(false)),
+            None => true,
+        }
     }
 
     fn spell(&self, instance: &HirInstance) -> String {
@@ -817,8 +1293,12 @@ impl Frontend for HirFrontend<'_> {
     ) -> CodegenError {
         self.with(|db| past_recursion_limit(db, instance, depth, limit, head, limit_of))
     }
-    fn closed(&self) -> Result<bool, CodegenError> {
-        self.devirt.closed(self)
+    fn closed(
+        &self,
+        functions: &[(HirInstance, Origin)],
+        statics: &[HirStatic],
+    ) -> Result<bool, CodegenError> {
+        self.devirt.closed(self, functions, statics)
     }
 }
 
@@ -859,14 +1339,14 @@ fn instantiates(db: &Db, kind: &Kind) -> Option<Instantiates> {
     let body = match instance.def {
         InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => function(func),
         InstanceDef::Closure(id) => {
-            blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0
+            blaze_items::key::closure_key(db, InternedClosureId::from_gid(id)).0
         }
         InstanceDef::Coroutine(id) => {
-            blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0
+            blaze_items::key::coroutine_key(db, InternedCoroutineId::from_gid(id)).0
         }
         // rustc's by-move body of a coroutine is a `DefId` of its own.
         InstanceDef::CoroutineByMove(id) => {
-            let coroutine = blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0;
+            let coroutine = blaze_items::key::coroutine_key(db, InternedCoroutineId::from_gid(id)).0;
             Hasher::new(SHIM_BODY_DOMAIN).part(b"by move").id(&coroutine).finish()
         }
         InstanceDef::DropGlue => shim("drop glue"),
@@ -1146,8 +1626,8 @@ fn rooted<'db>(db: &'db Db, func: FunctionId, args: GenericArgs<'db>) -> HirInst
 /// compare (`blaze-codegen` `driver`'s `unkept_inline`); its own unit's code may hash the dyn
 /// facts it read beside it ([`super::devirt::code`]).
 ///
-/// A copy bakes in the names of the files its `file!()` reads as its own unit's does, so they
-/// are folded in ([`with_names`], untold: a copy's locals are its caller's to tell).
+/// What a copy reads of names is folded in as its own unit's is ([`with_names`], untold: a
+/// copy's locals are its caller's to tell).
 pub(crate) fn built_in_code(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
     let names = kind_body(kind).map(|body| hashes.names_read(db, body, false)).transpose()?;
     Ok(with_names(code_of(db, hashes, kind)?, names.map(|it| it.0)))
@@ -1202,9 +1682,9 @@ pub(crate) fn inlined(
 /// The body of a closure or coroutine, by its interned id.
 fn closure_loc<'db>(db: &'db Db, def: InstanceDef) -> Option<InternedClosure<'db>> {
     match def {
-        InstanceDef::Closure(id) => Some(InternedClosureId::from_id(id).loc(db)),
+        InstanceDef::Closure(id) => Some(InternedClosureId::from_gid(id).loc(db)),
         InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
-            Some(InternedCoroutineId::from_id(id).loc(db))
+            Some(InternedCoroutineId::from_gid(id).loc(db))
         }
         _ => None,
     }
@@ -1379,7 +1859,7 @@ fn cached(
     instance: &Instance,
     env: &hir_ty::traits::StoredParamEnvAndCrate,
 ) -> Result<CodeHash, String> {
-    let written = blaze_query::db::attach(db, || fncache::written_code(db, func, instance, env));
+    let written = blaze_memo::attach(db, || fncache::written_code(db, func, instance, env));
     let Some(written) = written else {
         return Ok(code);
     };
@@ -1413,7 +1893,7 @@ fn template_code_of(
 ) -> Result<Option<(CodeHash, DefWithBodyId)>, String> {
     let Kind::Code(instance, env) = kind else { return Ok(None) };
     let Some(body) = kind_body(kind) else { return Ok(None) };
-    let Some(owner) = blaze_query::db::attach(db, || super::hashes::span_owner(db, body)) else {
+    let Some(owner) = blaze_memo::attach(db, || super::hashes::span_owner(db, body)) else {
         return Ok(None);
     };
     let code = with_names(hashes.template_code(db, body)?, Some(names));
@@ -1441,7 +1921,7 @@ fn kind_body(kind: &Kind) -> Option<Body> {
 }
 
 /// `code` with what its compiled body reads of names beside it ([`Hashes::names_read`]):
-/// the files its `file!()` names and its told locals' types. A body with none of its own (a
+/// its told locals' types. A body with none of its own (a
 /// shim, `main`'s start, the allocator's, `asm!`) keeps `code`.
 fn with_names(code: CodeHash, names: Option<ContentId>) -> CodeHash {
     let Some(names) = names else { return code };
@@ -1502,7 +1982,7 @@ pub(super) fn crate_of(db: &Db, kind: &Kind) -> Option<Crate> {
 /// image it would refer to code an edit changes. A proc-macro dependency is not followed: its
 /// code never runs in the program, so nothing of the image refers to it, and an edit of a
 /// local proc macro changes the code hashes of what it expands into, which rekeys the image.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn reaches_local(db: &Db, krate: Crate) -> bool {
     let data = krate.data(db);
     match data.origin {
@@ -1512,6 +1992,19 @@ fn reaches_local(db: &Db, krate: Crate) -> bool {
             .filter(|dep| !dep.crate_id.data(db).target_kind.is_proc_macro())
             .any(|dep| reaches_local(db, dep.crate_id)),
     }
+}
+
+/// Whether one of an instance's type arguments, at any depth, names a type, closure,
+/// coroutine or function item of a crate whose source an edit reaches
+/// ([`Described::over_editable`]): [`HirFrontend::owner`]'s walk, over the crates
+/// [`Described::editable`] is decided by. Only a function with a body of its own has any.
+fn over_local(db: &Db, kind: &Kind) -> bool {
+    let Kind::Code(instance, _) = kind else { return false };
+    let local = |krate: Crate| krate.data(db).origin.is_local();
+    (instance.args.as_ref().iter())
+        .flat_map(|arg| arg.walk())
+        .filter_map(|arg| arg.ty())
+        .any(|ty| names_workspace(db, ty, &local))
 }
 
 /// Whether a type, not looking into its arguments (the walk does), is a workspace crate's.
@@ -1547,15 +2040,15 @@ fn identity(db: &Db, kind: &Kind, item: ItemKey, args: ContentId) -> ContentId {
                 InstanceDef::Fn(_) => hasher.update(&[0]).id(&item.0),
                 InstanceDef::Closure(id) => hasher.update(&[1]).id(&blaze_items::key::closure_key(
                     db,
-                    InternedClosureId::from_id(id),
+                    InternedClosureId::from_gid(id),
                 )
                 .0),
                 InstanceDef::Coroutine(id) => hasher
                     .update(&[2])
-                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_gid(id)).0),
                 InstanceDef::CoroutineByMove(id) => hasher
                     .update(&[3])
-                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_gid(id)).0),
                 InstanceDef::DropGlue => hasher.update(&[4]).id(&item.0),
                 InstanceDef::CallOnceShim => hasher.update(&[5]).id(&item.0),
                 InstanceDef::VtableShim(_) => hasher.update(&[6]).id(&item.0),
@@ -1621,6 +2114,18 @@ pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Result<Option<String>, String> 
         Kind::Allocator(forward) => Some(forward.symbol.to_owned()),
         Kind::Asm(..) => None,
     })
+}
+
+/// How the instance [`symbol_of`] names is defined ([`exported_linkage`]): a function's own
+/// `#[linkage]`; the C `main` and the allocator shim's entries are strong.
+pub(super) fn linkage_of(db: &Db, kind: &Kind) -> Result<blaze_codegen::Linkage, String> {
+    match kind {
+        Kind::Code(instance, _) => match instance.def {
+            InstanceDef::Fn(func) if !instance.is_generic() => exported_linkage(db, func.into()),
+            _ => Ok(blaze_codegen::Linkage::Strong),
+        },
+        Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(..) => Ok(blaze_codegen::Linkage::Strong),
+    }
 }
 
 #[cfg(test)]

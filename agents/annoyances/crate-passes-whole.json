@@ -1,0 +1,14 @@
+{
+ "id": "crate-passes-whole",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executors of plan 12 E1, E1b and E1c, int-1112",
+ "where": "crates/blaze-diagnostics/src/check.rs run, checks.rs check and syntax_clean, checks/settings.rs, pieces.rs, lints.rs early, lints/syntax.rs Walk",
+ "what": "Every crate-wide lint pass (the syntax lints, the item checks, the use checks) walked the whole crate on every check, so a one-statement body edit re-ran each pass over every file: the edit loop paid for the crate, not the edit.",
+ "cost": "a body edit's diagnostics in proportion to the crate's size, not the edit's",
+ "cause": "the passes were keyed by crate: one memo per crate pass, whose inputs are every file's live tree",
+ "class": "a cache keyed at crate level where its value is a union of per-item values (granular-caching)",
+ "prevention": "each pass's per-item work is a tracked memo keyed by a piece (a file's outline or one body) that reads only the piece's own syntax; a probe unwinds at a read beyond its key, so the piece counts as changed and runs, counted by why in the span `crate pieces sweep`",
+ "workaround": "none",
+ "fix": "pieces.rs: Piece, piece_clean, the sweep and Cx::scoped; the syntax lints' Walk skips clean pieces. E1c: the six syntax-group passes of checks::check (macros, feature expansion, ast validation, feature gates, attributes, checked attributes) walk the scoped context too (checks::check(cx, syntax_cx)) and run in the probe (checks::syntax_clean), given the crate's settings (checks/settings.rs crate_settings: enabled features, channel, registered tools, root, read off the root's outline); the check refuses (panics naming both) when the settings its walk reads differ from those. A staged_api crate's probes are beyond (crate-wide stability checks); a module file with a non-doc inner attribute is beyond and its declaring file's outline is walked with it (owners merge them); a const's or static's body is probed from its item (the outline holds an empty block where the value was, which unused_braces/unused_parens at the item read). Needs /tmp/plan/handoff-12-E1c.md (Krate::of from the settings, in lints/syntax/attrs/parse.rs) or no probe is ever clean: Krate::of names the root file, a place. Still whole and counted: the item group (asks vsema in every pass; needs HIR reads) and the use group (E2's folds).",
+ "state": "open"
+}

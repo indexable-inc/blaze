@@ -73,7 +73,7 @@ pub struct DropckError<'db> {
 /// rustc's `DropckConstraint` of an ADT, generic in the ADT's own parameters: what its
 /// destructor and fields need live (`outlives`), the types left to take apart where it is
 /// dropped (`dtorck_types`), and what its own fields overflowed at.
-#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DtorckConstraint {
     pub outlives: Vec<StoredGenericArg>,
     pub dtorck_types: Vec<StoredTy>,
@@ -321,7 +321,7 @@ impl<'db> Walk<'_, 'db> {
 /// rustc's `adt_dtorck_constraint` of `adt`, walked with `recursion_limit`: its fields, each
 /// from depth 0, then what its `Drop` impl needs live ([`destructor_constraints`]), each list
 /// without repeats.
-#[blaze_query::tracked(returns(ref), cycle_result = adt_dtorck_constraint_cycle, mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), cycle_result = adt_dtorck_constraint_cycle, owns, mem_tag = Infer)]
 pub fn adt_dtorck_constraint(db: &Db, adt: AdtId, recursion_limit: u32) -> DtorckConstraint {
     let krate = adt.module(db).krate(db);
     let interner = DbInterner::new_with(db, krate);
@@ -380,7 +380,6 @@ pub fn adt_dtorck_constraint(db: &Db, adt: AdtId, recursion_limit: u32) -> Dtorc
 /// asked for; its drop check has nothing to add.
 fn adt_dtorck_constraint_cycle(
     _db: &Db,
-    _: blaze_query::db::Id,
     _adt: AdtId,
     _recursion_limit: u32,
 ) -> DtorckConstraint {

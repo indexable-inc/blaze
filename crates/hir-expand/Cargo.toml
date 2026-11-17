@@ -20,7 +20,7 @@ either.workspace = true
 itertools.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 thin-vec.workspace = true
 
 # local deps

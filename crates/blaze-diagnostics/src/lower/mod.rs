@@ -19,6 +19,7 @@ pub(crate) mod bad_rtn;
 pub(crate) mod conflicting_assoc_type_bindings;
 pub(crate) mod const_param_ty_not_allowed;
 pub(crate) mod elided_lifetimes_in_path;
+pub(crate) mod error_union_refused;
 pub(crate) mod fn_trait_args_not_tuple;
 pub(crate) mod generic_args_prohibited;
 pub(crate) mod generic_default_refers_to_self;
@@ -33,10 +34,12 @@ pub(crate) mod invalid_const_arg;
 pub(crate) mod invalid_derive_target;
 pub(crate) mod invalid_visibility;
 pub(crate) mod late_bound_lifetime_args;
+pub(crate) mod loop_match;
 pub(crate) mod macro_def_error;
 pub(crate) mod macro_error;
 pub(crate) mod macro_expansion_parse_error;
 pub(crate) mod malformed_derive;
+pub(crate) mod method_on_ambiguous_numeric;
 pub(crate) mod method_on_unknown_raw_pointee;
 pub(crate) mod missing_body;
 pub(crate) mod missing_lifetime;
@@ -48,6 +51,8 @@ pub(crate) mod object_without_trait;
 pub(crate) mod parenthesized_generic_args_without_fn_trait;
 pub(crate) mod pattern_arg_in_extern_fn;
 pub(crate) mod pattern_type_not_lowered;
+pub(crate) mod record_refused;
+pub(crate) mod record_use_refused;
 pub(crate) mod query_cycle;
 pub(crate) mod self_ctor_not_tuple_or_unit;
 pub(crate) mod trait_impl_incorrect_safety;
@@ -55,6 +60,7 @@ pub(crate) mod trait_impl_missing_assoc_items;
 pub(crate) mod trait_impl_orphan;
 pub(crate) mod trait_impl_redundant_assoc_items;
 pub(crate) mod trait_impl_unstable_default_body;
+pub(crate) mod method_call_on_diverging_infer_var;
 pub(crate) mod tyvar_behind_raw_pointer;
 pub(crate) mod unimplemented_builtin_macro;
 pub(crate) mod unresolved_extern_crate;
@@ -117,6 +123,7 @@ pub(crate) mod borrowck_error;
 pub(crate) mod borrowck_skipped;
 pub(crate) mod break_outside_of_loop;
 pub(crate) mod comptime;
+pub(crate) mod comptime_call;
 pub(crate) mod const_check_error;
 pub(crate) mod const_eval_failed;
 pub(crate) mod const_impure;
@@ -139,6 +146,7 @@ pub(crate) mod unreachable_label;
 pub(crate) mod unused_must_use;
 pub(crate) mod val_tree_error;
 pub(crate) mod verify_refused;
+pub(crate) mod whole_value_write_through_refinement;
 pub(crate) mod yield_outside_coroutine;
 
 /// When rustc gives a diagnostic, by the pass that gives it: the driver writes them in this
@@ -186,16 +194,26 @@ pub struct Found {
     /// For a lint of rustc's pre-expansion lint pass: its level is of `lint_at`'s file alone
     /// ([`hir_lint_levels::Levels::set_of_in_file`]).
     pub pre_expansion: bool,
+    /// Never written: it only fulfills the `#[expect]` its lint has at `lint_at`, if any
+    /// (rustc's `struct_expect` of a dummy diagnostic).
+    pub fulfills_only: bool,
 }
 
 impl Found {
     pub fn new(diag: Diag, phase: Phase) -> Found {
-        Found { diag, phase, lint_at: None, pre_expansion: false }
+        Found { diag, phase, lint_at: None, pre_expansion: false, fulfills_only: false }
     }
 
     /// A lint's diagnostic, its level decided at `at`.
     pub fn lint(diag: Diag, phase: Phase, at: InFile<SyntaxNodePtr>) -> Found {
-        Found { diag, phase, lint_at: Some(at), pre_expansion: false }
+        Found { diag, phase, lint_at: Some(at), pre_expansion: false, fulfills_only: false }
+    }
+
+    /// What a lint would say at `at` and does not, because what it says there is already said
+    /// of something around it: `diag` is never written, and an `#[expect]` of the lint at `at`
+    /// is fulfilled as if it were.
+    pub fn fulfilling(diag: Diag, phase: Phase, at: InFile<SyntaxNodePtr>) -> Found {
+        Found { diag, phase, lint_at: Some(at), pre_expansion: false, fulfills_only: true }
     }
 }
 
@@ -225,6 +243,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::MissingSelfDefaultParams(d) => missing_self_default_params::lower(cx, &d),
         AnyDiagnostic::ObjectWithoutTrait(d) => object_without_trait::lower(cx, &d),
         AnyDiagnostic::PatternTypeNotLowered(d) => pattern_type_not_lowered::lower(cx, &d),
+        AnyDiagnostic::ErrorUnionRefused(d) => error_union_refused::lower(cx, &d),
+        AnyDiagnostic::RecordRefused(d) => record_refused::lower(cx, &d),
+        AnyDiagnostic::RecordUseRefused(d) => record_use_refused::lower(cx, &d),
         AnyDiagnostic::QueryCycle(d) => query_cycle::lower(cx, &d),
         AnyDiagnostic::NotAStructPath(d) => not_a_struct_path::lower(cx, &d),
         AnyDiagnostic::AutoderefRecursionLimit(d) => autoderef_recursion_limit::lower(cx, &d),
@@ -232,7 +253,13 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::InheritedRefMutabilityMismatch(d) => inherited_ref_mutability_mismatch::lower(cx, &d),
         AnyDiagnostic::MethodOnUnknownRawPointee(d) => method_on_unknown_raw_pointee::lower(cx, &d),
         AnyDiagnostic::SelfCtorNotTupleOrUnit(d) => self_ctor_not_tuple_or_unit::lower(cx, &d),
+        AnyDiagnostic::WholeValueWriteThroughRefinement(d) => {
+            whole_value_write_through_refinement::lower(cx, &d)
+        }
         AnyDiagnostic::TyvarBehindRawPointer(d) => tyvar_behind_raw_pointer::lower(cx, &d),
+        AnyDiagnostic::MethodCallOnDivergingInferVar(d) => {
+            method_call_on_diverging_infer_var::lower(cx, &d)
+        }
         AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),
         AnyDiagnostic::MacroError(d) => macro_error::lower(cx, &d),
@@ -337,6 +364,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::BreakOutsideOfLoop(d) => break_outside_of_loop::lower(cx, &d),
         AnyDiagnostic::ConstCheckError(d) => const_check_error::lower(cx, &d),
         AnyDiagnostic::ConstEvalFailed(d) => const_eval_failed::lower(cx, &d),
+        AnyDiagnostic::ComptimeCall(d) => comptime_call::lower(cx, &d),
         AnyDiagnostic::ConstImpure(d) => const_impure::lower(cx, &d),
         AnyDiagnostic::ConstPatternRefused(d) => const_pattern_refused::lower(cx, &d),
         AnyDiagnostic::EmptyRangePattern(d) => empty_range_pattern::lower(cx, &d),
@@ -348,6 +376,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::ReturnOutsideFunction(d) => return_outside_function::lower(cx, &d),
         AnyDiagnostic::TailCallRefused(d) => tail_call::lower(cx, &d),
         AnyDiagnostic::TailCallTrackCaller(d) => tail_call::lower_track_caller(cx, &d),
+        AnyDiagnostic::LoopMatchRefused(d) => loop_match::lower(cx, &d),
         AnyDiagnostic::UnsafeBinderCastOfNonBinder(d) => unsafe_binder_cast_of_non_binder::lower(cx, &d),
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
         AnyDiagnostic::UnlabeledJumpInLabeledBlock(d) => unlabeled_jump_in_labeled_block::lower(cx, &d),

@@ -19,7 +19,7 @@
 //! and their ast ids, a module's and a block's identity, the item tree, an impl's or a trait's
 //! item list and the crate's inputs, each already made for the body being named; never a
 //! signature (so an impl has no type in its name). And it is read in
-//! [`blaze_query::db::for_span_text`], so the span's query records none of those reads.
+//! [`blaze_memo::unrecorded`], so the span's query lists none of those reads.
 
 use std::fmt::Write as _;
 
@@ -150,13 +150,11 @@ fn name(db: &Db, krate: Crate, span: &tracing::Span, path: impl FnOnce(&mut Stri
     span.record("function", &text[krate_len..]);
 }
 
-/// Appends what `write` writes to `out`, its reads kept off the running query.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a span's name is tracing text that never reaches a query's value; its reads would put edges on the named query only while a profiler is on"
-)]
+/// Appends what `write` writes to `out`, its reads kept off the running query's read list: a
+/// span's name is tracing text that never reaches a query's value, and its reads would be in
+/// the named query's list only while a profiler is on.
 fn span_text(db: &Db, out: &mut String, write: impl FnOnce(&Db, &mut String)) {
-    blaze_query::db::for_span_text(db, out, write);
+    blaze_memo::unrecorded(blaze_memo::Database::memo(db), || write(db, out));
 }
 
 /// `span`, a span that declares `krate`, with `krate`'s label written in it

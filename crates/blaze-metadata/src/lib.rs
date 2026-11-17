@@ -407,6 +407,9 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
             target: units.target,
             // Metadata answers as cargo's graph does: proc macros for the host.
             macro_wasm: None,
+            // Nor a device build: `--unit-graph` refuses a dependency asked for with
+            // `artifact = "gpu"` (blaze's extension, which cargo's graph has no unit of), naming it.
+            gpu: None,
             has_dev_units,
         })
     })

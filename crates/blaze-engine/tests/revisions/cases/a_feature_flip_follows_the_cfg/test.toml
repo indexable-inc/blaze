@@ -1,0 +1,22 @@
+about = "A feature turned on by the command line, off again, and then on by the manifest's default: each build is the one the cfg selects, as a clean build of that state, and the function under no cfg is not made again by the manifest's edit."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "quiet 4\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["--features", "loud"]
+prints = "LOUD 4\n"
+
+[[revision]]
+steps = []
+action = "run"
+prints = "quiet 4\n"
+
+[[revision]]
+action = "run"
+prints = "LOUD 4\n"
+reused = ["app::unrelated"]

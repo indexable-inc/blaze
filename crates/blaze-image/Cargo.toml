@@ -21,6 +21,7 @@ blaze-ids.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

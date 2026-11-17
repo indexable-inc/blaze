@@ -70,6 +70,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    // blaze: a prefix with a link manifest (blaze-llvm.json, written when the archive was
+    // built) answers as data and its `llvm-config` is never run, so the archive for another
+    // platform than the host's is linked too (pin.rs, `pin_answer`). Only a prefix built before
+    // the manifest runs it, on the host it was built for; that path goes with the next archives.
+    let args: Vec<std::ffi::OsString> = args.into_iter().map(|it| it.as_ref().to_owned()).collect();
+    if let Some(prefix) = binary.parent().and_then(Path::parent) {
+        let query: Vec<&str> = args.iter().filter_map(|it| it.to_str()).collect();
+        let marker = std::fs::read_to_string(prefix.join(PIN_MARKER)).unwrap_or_default();
+        if let Some(answer) = pin_answer(&marker, prefix, target_env_is("msvc"), &query) {
+            return answer.map_err(|why| anyhow::anyhow!("{}: {why}", prefix.display()));
+        }
+    }
     let mut cmd = Command::new(binary);
     (|| {
         let Output {

@@ -13,6 +13,7 @@ use blaze_usercode::{
     inputs::{self, Files, Now},
     trace::{Entry, Inputs, Names},
 };
+use blaze_vfs::outside::Looks;
 
 /// The inputs of an expansion for the calling crate's `env`, as they are now. A variable is
 /// looked up where it is, so a hit allocates nothing; the whole environment is made only for
@@ -21,6 +22,9 @@ pub(crate) struct Calling<'a> {
     env: &'a Env,
     made: Option<inputs::Env>,
     /// What file, directory and listing reads are asked through: no variable is read there.
+    /// Their looks at the disk are kept by no build ([`Looks::none`]): an expansion's lookup
+    /// is the front end's, shared by every job, and what it read is in the reads of the
+    /// unit's record, which each build that uses the unit takes.
     none: inputs::Env,
 }
 
@@ -34,15 +38,15 @@ impl Inputs for Calling<'_> {
     type Error = inputs::Unreadable;
 
     fn entry(&mut self, path: &Path) -> Result<Entry, Self::Error> {
-        Now { files: Files::shared(), env: &self.none }.entry(path)
+        Now { files: Files::shared(), env: &self.none, looks: &Looks::none() }.entry(path)
     }
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        Now { files: Files::shared(), env: &self.none }.file(path)
+        Now { files: Files::shared(), env: &self.none, looks: &Looks::none() }.file(path)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        Now { files: Files::shared(), env: &self.none }.dir(path)
+        Now { files: Files::shared(), env: &self.none, looks: &Looks::none() }.dir(path)
     }
 
     fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
@@ -65,6 +69,6 @@ impl Inputs for Calling<'_> {
     }
 
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Self::Error> {
-        Now { files: Files::shared(), env: &self.none }.names(path, out)
+        Now { files: Files::shared(), env: &self.none, looks: &Looks::none() }.names(path, out)
     }
 }

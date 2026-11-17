@@ -6,8 +6,8 @@ date: 2026-11-02
 # Borrow-checker workarounds
 
 `crates/blaze-lints/src/blaze/borrow_workaround.rs`; the user's docs are
-[docs/lints.md#borrow_workaround](../../../lints.md#borrow_workaround) and
-[#nll_workaround](../../../lints.md#nll_workaround).
+`docs/lints.md#borrow_workaround` and
+`#nll_workaround`.
 
 blaze's default borrow checker is the Polonius alpha (`BLAZE_BORROWCK`, `hir_ty_borrowck::mode`),
 which accepts NLL problem case #3: a loan whose region flows to the return on one branch and is
@@ -111,4 +111,4 @@ aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines --new-baselin
 blaze::borrow_workaround,blaze::nll_workaround` writes
 `crates/blaze-lints/baselines/blaze.borrow_workaround.txt` and `blaze.nll_workaround.txt`
 (`crate<TAB>count`), which may only shrink. Neither is made yet, as no baseline is
-([lints.md](../../../lints.md) says why).
+(the lints doc, deleted 2026-11-15, said why).

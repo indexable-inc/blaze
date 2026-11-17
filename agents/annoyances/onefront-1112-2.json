@@ -1,0 +1,18 @@
+{
+ "id": "onefront-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onefront-1112",
+ "where": "crates/blaze-lower/src/doctests.rs (`doctest_writes`)",
+ "what": "Doctest examples took their source root ids by arithmetic on `Crates::sets` (`sets + 1` and up), so nothing else could ever add a source root after the first plan without colliding with them; found only by grepping for `.sets`.",
+ "cost": "one redesign of the id allocation mid-change",
+ "cause": "two allocators of one id space, the second derived from the first's count",
+ "whys": [
+  "the first plan's roots were `0..sets` and `other`, fixed for the database's life",
+  "doctests needed roots later and took the numbers after"
+ ],
+ "class": "one concept, two homes",
+ "prevention": "`Graph::root` is the one allocator of source root ids in blaze-lower; doctests call it (`RootOf::Example`)",
+ "workaround": "none",
+ "fix": "written in this lane (not yet built)",
+ "state": "open until the round's build and tests pass"
+}

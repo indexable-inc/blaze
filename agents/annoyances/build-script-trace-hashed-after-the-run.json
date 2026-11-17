@@ -1,0 +1,14 @@
+{
+ "id": "build-script-trace-hashed-after-the-run",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), test selection lane, fix-hello-1113",
+ "where": "crates/blaze-cargo/src/sandbox/v2.rs finish; crates/blaze-usercode/src/run.rs Run::complete; crates/blaze-cargo/src/serve/unit/script.rs ScriptRun::completed",
+ "what": "A build script's reads are hashed when the sandbox's trace is assembled, after the run ends. A file written between the script's read and that hash was kept under bytes the run never read, so the next build with those bytes reused a result made from the old ones: a stale reuse. Test passes already guarded this with Began::moved; build scripts did not.",
+ "cost": "found by reading, not by a failure; a stale build script output is silent until it miscompiles",
+ "cause": "the trace records which paths were read, not what they held when read; the hash is taken later, and nothing compared the change time of what was read with the run's start",
+ "class": "a result keyed by inputs hashed after the computation that read them, with no check that they did not change in between (the racy-git problem)",
+ "prevention": "Run::complete takes a `moved` check (the caller's Began::moved of Run::began, read before the spawn): a run whose reads can have changed is kept under no key, compared with nothing, its reads noted by no certificate (NotKept::Moved); tested by a_run_whose_reads_moved_after_it_began_is_kept_under_no_key with its control. The end state is a trace that records each read's identity (inode, size, change time) at the read, so no post-run stat is needed",
+ "workaround": "none",
+ "fix": "in the working tree of fix-hello-1113, not yet compiled; cargo's rerun-if-changed paths widened in after the check are not covered",
+ "state": "open"
+}

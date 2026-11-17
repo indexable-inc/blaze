@@ -51,6 +51,12 @@ class Slot:
     budget_zero: bool = False
     # What the edit is to section 6.3's table, for the report.
     about: str = ""
+    # The variants an edit between which moves no token and no position (a comment at a line's
+    # end or after the last line, spaces before a line's end, a variable nothing reads): such an
+    # edit recomputes no step of any unit, in the edited crate and above it, where one that
+    # moves a line still makes again what holds positions (docs/v2/plan/design/item-hash.md
+    # section 15).
+    still: tuple[int, ...] = ()
 
 
 def v(label: str, rejects: bool = False, **values: str) -> Variant:
@@ -189,14 +195,18 @@ SLOTS: tuple[Slot, ...] = (
                                v("beta", ORACLE_SOURCE_ENV="beta")),
          about="an environment variable option_env! reads"),
     Slot("path", "env", (v("plain", PATH_EXTRA=""), v("extra directory", PATH_EXTRA="1")),
-         budget_zero=True, about="PATH with another directory in front, read by nothing (#805)"),
+         budget_zero=True, about="PATH with another directory in front, read by nothing (#805)", still=(0, 1)),
     *(Slot(f"format:{name}", "format", (v("4, one blank"), v("2, two blanks"), v("4, none, braces below")),
            budget_zero=True, about="the file laid out otherwise: indentation, blank lines, braces")
       for name in SOURCES),
-    *(Slot(f"comments:{name}", "comments", (v("none"), v("a line before each item"), v("one after each line")),
-           budget_zero=True, about="comments added or taken away; the first kind moves every line")
+    *(Slot(f"comments:{name}", "comments", (v("none"), v("a line before each item"), v("one after each line"),
+                                            v("one after the last line"), v("spaces at lines' ends")),
+           budget_zero=True, about="comments and spaces added or taken away; the first kind moves every line",
+           still=(0, 2, 3, 4))
       for name in SOURCES),
 )
+# The kinds of edit that change no token: what they move is positions, or nothing (`Slot.still`).
+LAYOUT = ("format", "comments")
 BY_NAME = {slot.name: slot for slot in SLOTS}
 KINDS = tuple(dict.fromkeys(slot.kind for slot in SLOTS))
 ENV_SLOTS = ("script-env", "source-env", "path")
@@ -766,7 +776,9 @@ def layout(items: list[str], style: int, comments: int) -> str:
     """The items of a file laid out: `style` 0 is four spaces and a blank line between items, 1
     is two spaces and two blank lines, 2 is four spaces, no blank lines and every function's
     brace on a line of its own; `comments` 0 is none, 1 a comment line before each item, 2 a
-    comment at the end of every line that ends a statement or opens a block."""
+    comment at the end of every line that ends a statement or opens a block, 3 a comment line
+    and a blank line after the file's last line, 4 spaces and a tab at the end of every line that
+    ends a statement or opens a block. Only 1 moves a line."""
     unit = "  " if style == 1 else "    "
     laid: list[str] = []
     for at, item in enumerate(i for i in items if i.strip()):
@@ -781,11 +793,13 @@ def layout(items: list[str], style: int, comments: int) -> str:
                 lines.append(line)
         if comments == 2:
             lines = [line + " // noted" if line.rstrip().endswith(("{", ";")) else line for line in lines]
+        if comments == 4:
+            lines = [line + "  \t" if line.rstrip().endswith(("{", ";")) else line for line in lines]
         if comments == 1:
             lines.insert(0, f"// item {at}")
         laid.append("\n".join(lines))
     gap = {0: "\n\n", 1: "\n\n\n", 2: "\n"}[style]
-    return gap.join(laid).rstrip("\n") + "\n"
+    return gap.join(laid).rstrip("\n") + "\n" + ("// the end\n\n" if comments == 3 else "")
 
 
 def render(state: State) -> dict[str, str | None]:
@@ -852,6 +866,15 @@ class Edit:
         slot = BY_NAME[self.slot]
         return f"{self.kind} {self.slot}: {slot.variants[self.old].label} -> {slot.variants[self.new].label}"
 
+    def still(self) -> bool:
+        """Whether the edit moves no token and no position (`Slot.still`)."""
+        return {self.old, self.new} <= set(BY_NAME[self.slot].still)
+
+    def moves(self) -> bool:
+        """Whether the edit moves positions and no token: a layout edit (`LAYOUT`) that is not
+        `still`."""
+        return self.kind in LAYOUT and not self.still()
+
 
 # How often each kind of edit is drawn. A kind of rejecting edits is drawn rarely; its next
 # edit is as likely as any to make the program build again.
@@ -904,6 +927,24 @@ REGRESSIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "positions": (("comments:app/src/main.rs", "a line before each item"), ("format:base/src/lib.rs", "2, two blanks"),
                   ("comments:base/src/lib.rs", "one after each line"), ("format:app/src/main.rs", "4, none, braces below"),
                   ("comments:app/src/main.rs", "none"), ("format:base/src/lib.rs", "4, one blank")),
+    # What moves no token: nothing (a comment after the last line, spaces at lines' ends, a
+    # comment at each line's end), in the program's own crate and in a library below it, then
+    # lines alone (a comment on a line of its own, blank lines), each there and back.
+    "still": (("comments:app/src/main.rs", "one after the last line"), ("comments:app/src/main.rs", "spaces at lines' ends"),
+              ("comments:base/src/lib.rs", "one after each line"), ("comments:base/src/lib.rs", "one after the last line"),
+              ("comments:app/src/main.rs", "none"), ("comments:base/src/lib.rs", "none")),
+    "moves": (("comments:app/src/main.rs", "a line before each item"), ("comments:app/src/main.rs", "none"),
+              ("format:app/src/main.rs", "2, two blanks"), ("format:app/src/main.rs", "4, one blank"),
+              ("comments:base/src/lib.rs", "a line before each item"), ("format:base/src/lib.rs", "2, two blanks"),
+              ("comments:base/src/lib.rs", "none"), ("format:base/src/lib.rs", "4, one blank")),
+    # Whether a dev template missed for the comment or for the build before it (its code's
+    # "its code changed" on a one-line program): two edits that move lines and no token, one
+    # after the other, in one file. The first follows the first build, which made std's
+    # dependency images; if only the first compiles functions (`over/`) and the second none,
+    # what moved is what a body's code hash reads of a crate served from its image, not the
+    # comment. If both compile, a position is in the code.
+    "template-miss": (("comments:app/src/main.rs", "a line before each item"), ("format:app/src/main.rs", "2, two blanks"),
+                      ("comments:app/src/main.rs", "none"), ("format:app/src/main.rs", "4, one blank")),
     "resolution": (("specific", "present"), ("inference", "and i32"), ("shadow", "local"), ("vtable", "three methods"),
                    ("specific", "absent"), ("vtable", "two methods"), ("combine", "u32,u32,u8->u64"),
                    ("combine", "u32,u32->u128"), ("leak", "rc"), ("leak", "arc")),

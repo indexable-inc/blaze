@@ -1,0 +1,20 @@
+{
+ "id": "A-certificate5-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane certificate5",
+ "where": "crates/blaze-cargo/src/serve/job.rs (Jobs::started_unit, Jobs::compiled, Jobs::worked), crates/blaze-cargo/src/serve/job/said.rs, crates/blaze-cargo/src/serve/unit.rs (Writer::read_outside, Writer::env_named)",
+ "what": "Making a certificate's `said` from a build that compiled met three facts: (1) what a build says is in its scheduler's order (a package's line at its first unit's begin, a unit's diagnostics at its end) and its `Work` counts that build's own effort, so two builds of the same reads say different bytes and the second is refused as two answers under one key; (2) `Writer::read_outside` names only the paths under the build's directories of outputs (the kept answer left the rest to the watches as a whole, which a certificate does not have), so a build script's read of a file elsewhere outside the views is in no read-list; (3) `Writer::env_named` and `read_outside` are `Err` for a build in which a build script ran, so a first build with build scripts still writes no certificate.",
+ "cost": "`said` had to be given an order of its own (the plan's) and a `Work` of no work, which is not byte for byte what a walk says (a walk's order is its scheduler's); (2) is a wrong hit waiting to happen and (3) keeps reth's first build from writing; both are open",
+ "cause": "a build's words are a stream in the order things happened, with one build's counters in it, and were the only form of its answer; the steps' reads were collected for the watches' lane, which needed only those under the outputs",
+ "whys": [
+  "why two answers: the answer is filed under its reads' digests and `said` held the scheduler's order and the build's counts",
+  "why was the order the scheduler's: units say their words as they begin and end, for a live client",
+  "why is there no plan-ordered form: nothing but the live client read a build's words before the certificate",
+  "why are reads elsewhere unnamed: the kept answer asked the watches whether anything at all changed outside, and named only what it had to set aside"
+ ],
+ "class": "a value filed under a content key that holds something of the run that made it (its order, its counts, its clock)",
+ "prevention": "what is filed is made by one pure function of the request and the reads (`said::Saying`), with an oracle that two runs leave the same bytes and a planted bug for each thing of the run that could leak in",
+ "workaround": "none for (2) and (3): certificate.md, \"State\", item 3",
+ "fix": "(1) `serve/job/said.rs`, int-1112; (2) and (3) open",
+ "state": "open"
+}

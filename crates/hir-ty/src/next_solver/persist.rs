@@ -16,6 +16,7 @@ use blaze_format::{
     ALIGN, FormatError, Part, Record, SchemaHash, Slice, Writer, record_at, schema_of,
 };
 use blaze_hash::HashMap;
+use blaze_memo::{ArenaId, Gid};
 use hir_def::{
     AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId,
 };
@@ -47,7 +48,8 @@ use super::{
     ProjectionClause, Region, RegionKind, ScalarInt, SolverDefId, SubtypePredicate, Term, TermKind,
     TraitAssocConstId, TraitAssocTermId, TraitAssocTyId, TraitClause, TraitIdWrapper, TraitRef, Ty,
     TyKind, TypeAliasIdWrapper, Tys, ValTree, ValTreeKind, ValueConst, abi::Safety,
-    ensure_sufficient_stack, interner::Symbol,
+    ensure_sufficient_stack,
+    interner::{Symbol, table},
 };
 
 /// Where a value's words go.
@@ -57,13 +59,12 @@ pub(crate) trait Sink<'db> {
     fn node<N: Node<'db>>(&mut self, node: N);
     /// An ADT: in memory with its flags, persisted as its id alone.
     fn adt(&mut self, adt: AdtDef);
-    /// An id as [`put_id`] writes it, unless the sink names ids otherwise.
+    /// An id. Every sink says how it names one (a row in memory as the id itself, a persisted
+    /// table as a stable id): an id's bits mean nothing past its snapshot, so no sink writes
+    /// them by default.
     fn id<T: crate::check_cache::Relocate>(&mut self, id: T)
     where
-        Self: Sized,
-    {
-        put_id(self, id.as_id());
-    }
+        Self: Sized;
     /// A definition: its variant and id, unless the sink names definitions otherwise.
     fn def(&mut self, def: SolverDefId<'db>)
     where
@@ -79,13 +80,10 @@ pub(crate) trait Source<'db> {
     fn word(&mut self) -> Result<u32, Self::Error>;
     fn node<N: Node<'db>>(&mut self) -> Result<N, Self::Error>;
     fn adt(&mut self) -> Result<AdtDef, Self::Error>;
-    /// An id, as [`Sink::id`] wrote it.
+    /// An id, as the sink it reads back named it ([`Sink::id`]).
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, Self::Error>
     where
-        Self: Sized,
-    {
-        get_id(self).map(T::from_id)
-    }
+        Self: Sized;
     /// How many of something follow, each of at least one word.
     fn count(&mut self) -> Result<usize, Self::Error>;
     fn invalid(&self, what: &'static str) -> Self::Error;
@@ -151,47 +149,184 @@ pub(crate) trait Node<'db>: Copy {
     fn put_node(self, sink: &mut impl Sink<'db>);
     /// The value of the words [`Node::put_node`] wrote, interned.
     fn get_node<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error>;
+    /// Its row's home: the greatest arena of what it names, `None` for none
+    /// ([`table::Homed`]).
+    fn home(self) -> Option<ArenaId>;
 }
 
-/// A value's words, its children as their rows: on the stack for any value but a long one.
-type Words = SmallVec<[u32; 16]>;
+/// A value's words, its children as their rows and its ids as their places in `ids`: on the
+/// stack for any value but a long one. With the greatest arena its children and ids name.
+struct Words {
+    words: SmallVec<[u32; 16]>,
+    ids: SmallVec<[Gid; 4]>,
+    home: Option<ArenaId>,
+}
 
 impl<'db> Sink<'db> for Words {
     #[inline]
     fn word(&mut self, word: u32) {
-        self.push(word);
+        self.words.push(word);
     }
 
     #[inline]
     fn node<N: Node<'db>>(&mut self, node: N) {
-        self.push(node.row().get());
+        self.home = self.home.max(node.home());
+        self.words.push(node.row().get());
     }
 
     fn adt(&mut self, adt: AdtDef) {
         SolverDefId::from(adt.def_id()).put(self);
-        self.push(adt.flag_bits().into());
+        self.words.push(adt.flag_bits().into());
+    }
+
+    #[inline]
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+        let gid = blaze_memo::Id::gid(id);
+        self.home = self.home.max(Some(gid.arena()));
+        self.words.push(u32::try_from(self.ids.len()).expect("a row names fewer than 2^32 ids"));
+        self.ids.push(gid);
     }
 }
 
-/// The tag of `value`, a row being added: its codec's first word. In debug builds, also checks
-/// that the codec reads back what it writes for `value`.
-pub(crate) fn tag<'db, T: Code<'db> + PartialEq>(value: &T) -> u8 {
-    let mut words = Words::new();
+/// The tag of `value`, a row being added (its codec's first word), and its home (the greatest
+/// arena of the ids and rows it names), from one pass of the codec. In debug builds, also
+/// checks that the codec reads back what it writes for `value`.
+pub(crate) fn tag_and_home<'db, T: Code<'db> + PartialEq>(value: &T) -> (u8, Option<ArenaId>) {
+    let mut words = Words { words: SmallVec::new(), ids: SmallVec::new(), home: None };
     value.put(&mut words);
     if cfg!(debug_assertions) {
-        let read = match T::get(&mut Row { words: &words }) {
+        let read = match T::get(&mut Row { words: &words.words, ids: &words.ids }) {
             Ok(read) => read,
             Err(never) => match never {},
         };
         assert!(read == *value, "the codec reads back a value other than it wrote");
     }
-    let tag = words[0];
-    u8::try_from(tag).unwrap_or_else(|_| panic!("a tag of {tag}"))
+    let tag = words.words[0];
+    (u8::try_from(tag).unwrap_or_else(|_| panic!("a tag of {tag}")), words.home)
 }
 
-/// The words of a value, read back: what its `put` gave, so none is invalid.
+/// The home of `value`: the greatest arena of the ids and rows it names, as the codec lists
+/// them ([`Sink::id`], [`Sink::node`]), `None` for none (plain data, homed nowhere: never a
+/// constant arena standing for the session). A row's own home is read from its table, never
+/// walked again.
+pub(crate) fn home<'db, T: Code<'db>>(value: &T) -> Option<ArenaId> {
+    let mut sink = HomeSink { home: None };
+    value.put(&mut sink);
+    sink.home
+}
+
+/// A sink that keeps only the greatest arena named: [`home`]'s.
+struct HomeSink {
+    home: Option<ArenaId>,
+}
+
+impl<'db> Sink<'db> for HomeSink {
+    #[inline]
+    fn word(&mut self, _: u32) {}
+
+    #[inline]
+    fn node<N: Node<'db>>(&mut self, node: N) {
+        self.home = self.home.max(node.home());
+    }
+
+    fn adt(&mut self, adt: AdtDef) {
+        SolverDefId::from(adt.def_id()).put(self);
+    }
+
+    #[inline]
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+        self.home = self.home.max(Some(blaze_memo::Id::gid(id).arena()));
+    }
+}
+
+/// [`table::Homed`] for values the codec writes that are no row of a table of their own: their
+/// [`home`].
+macro_rules! homed_by_code {
+    ($($ty:ty),* $(,)?) => {$(
+        impl<'db> table::Homed for $ty {
+            #[inline]
+            fn home(&self) -> Option<ArenaId> {
+                home(self)
+            }
+        }
+    )*};
+}
+
+/// [`blaze_memo::Home`] for the solver's own id types: the arena of the id they hold, as the
+/// codec lists it ([`home`]), so a key holding one is homed with it. One that names none
+/// names none here too, and a key of nothing else is homed at the asking snapshot's session.
+macro_rules! memo_home_by_code {
+    ($($ty:ty),* $(,)?) => {$(
+        impl<'db> blaze_memo::Home for $ty {
+            #[inline]
+            fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
+                if let Some(arena) = home(self) {
+                    homes.arena(arena);
+                }
+            }
+        }
+    )*};
+}
+
+memo_home_by_code!(
+    SolverDefId<'db>,
+    TraitIdWrapper,
+    TypeAliasIdWrapper,
+    CallableIdWrapper,
+    ClosureIdWrapper<'db>,
+    CoroutineIdWrapper<'db>,
+    CoroutineClosureIdWrapper<'db>,
+    OpaqueTyIdWrapper<'db>,
+    AnonConstIdWrapper<'db>,
+    TraitAssocTyId,
+    TraitAssocConstId,
+    TraitAssocTermId,
+    ImplOrTraitAssocTyId,
+    ImplOrTraitAssocConstId,
+    ImplOrTraitAssocTermId,
+    FreeTyAliasId,
+    FreeConstAliasId,
+    FreeTermAliasId,
+    InherentAssocTyId,
+    InherentAssocConstId,
+    InherentAssocTermId,
+);
+
+homed_by_code!(
+    SolverDefId<'db>,
+    GenericDefId,
+    TraitIdWrapper,
+    TypeAliasIdWrapper,
+    CallableIdWrapper,
+    ClosureIdWrapper<'db>,
+    CoroutineIdWrapper<'db>,
+    CoroutineClosureIdWrapper<'db>,
+    OpaqueTyIdWrapper<'db>,
+    AnonConstIdWrapper<'db>,
+    TraitAssocTyId,
+    TraitAssocConstId,
+    TraitAssocTermId,
+    ImplOrTraitAssocTyId,
+    ImplOrTraitAssocConstId,
+    ImplOrTraitAssocTermId,
+    FreeTyAliasId,
+    FreeConstAliasId,
+    FreeTermAliasId,
+    InherentAssocTyId,
+    InherentAssocConstId,
+    InherentAssocTermId,
+    BoundExistentialPredicate<'db>,
+    BoundVariableKind<'db>,
+    PlaceholderType<'db>,
+    PlaceholderRegion<'db>,
+    PlaceholderConst<'db>,
+);
+
+/// The words of a value, read back: what its `put` gave, so none is invalid; its ids by their
+/// places in `ids`.
 struct Row<'r> {
     words: &'r [u32],
+    ids: &'r [Gid],
 }
 
 impl<'db> Source<'db> for Row<'_> {
@@ -208,6 +343,13 @@ impl<'db> Source<'db> for Row<'_> {
     fn node<N: Node<'db>>(&mut self) -> Result<N, Infallible> {
         let row = self.word()?;
         Ok(N::at(NonZeroU32::new(row).expect("a row's child is a row")))
+    }
+
+    #[inline]
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, Infallible> {
+        let at = self.word()? as usize;
+        let gid = *self.ids.get(at).expect("a row's id is one its `put` listed");
+        Ok(T::from_gid(gid))
     }
 
     fn adt(&mut self) -> Result<AdtDef, Infallible> {
@@ -288,6 +430,12 @@ unit_code!(ErrorGuaranteed, ExprConst);
 /// word zero-padded. The text, not a declared symbol's index, which another build may number
 /// otherwise.
 impl<'db> Code<'db> for Symbol {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the type table's format holds a name's length as a u32 word, and a name comes \
+                  from source text that nothing checks is under 4 GiB: a larger name needs a \
+                  typed refusal"
+    )]
     fn put(&self, sink: &mut impl Sink<'db>) {
         let bytes = self.0.as_str().as_bytes();
         sink.word(u32::try_from(bytes.len()).expect("a name shorter than 4 GiB"));
@@ -420,33 +568,10 @@ struct_code! {
     rustc_type_ir::FnSigTys<DbInterner<'db>> { inputs_and_output },
 }
 
-/// An id: its bits (never 0) and a generation word, always 0, which the format keeps.
-fn put_id<'db>(sink: &mut impl Sink<'db>, id: blaze_query::db::Id) {
-    sink.word(id.as_u32());
-    sink.word(0);
-}
-
-/// What a nonzero generation word after an id's index is refused as: query IDs have none.
-const GENERATION: &str =
-    "an id's generation word, which is always 0 (query ids have no generation)";
-
-fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<blaze_query::db::Id, S::Error> {
-    let index = source.word()?;
-    let generation = source.word()?;
-    if index == 0 {
-        return Err(source.invalid("an id of index 0"));
-    }
-    if generation != 0 {
-        return Err(source.past(GENERATION, u64::from(generation), 0));
-    }
-    blaze_query::db::Id::new(index).ok_or_else(|| {
-        source.past(
-            "an id's index (past `Id::MAX_U32`, which no query storage gives)",
-            u64::from(index),
-            u64::from(blaze_query::db::Id::MAX_U32),
-        )
-    })
-}
+/// What a nonzero high word after a persisted id's table index is refused as, inside a
+/// relocating scope: the format keeps the word, always 0 there (outside a scope the two words
+/// are this process's own word of the id, never persisted).
+const GENERATION: &str = "a persisted id's high word, which is always 0";
 
 impl<'db> Code<'db> for SolverDefId<'db> {
     #[inline]
@@ -1473,6 +1598,10 @@ impl<'db> Code<'db> for PatternKind<'db> {
                 pats.put(sink);
             }
             PatternKind::NotNull => sink.word(2),
+            PatternKind::Variant { index } => {
+                sink.word(3);
+                sink.word(index);
+            }
         }
     }
 
@@ -1481,6 +1610,7 @@ impl<'db> Code<'db> for PatternKind<'db> {
             0 => PatternKind::Range { start: Code::get(source)?, end: Code::get(source)? },
             1 => PatternKind::Or(Code::get(source)?),
             2 => PatternKind::NotNull,
+            3 => PatternKind::Variant { index: source.word()? },
             _ => return Err(source.invalid("a pattern")),
         })
     }
@@ -1642,6 +1772,10 @@ macro_rules! row_node {
             fn get_node<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
                 Ok($ty::intern(<$kind>::get(source)?))
             }
+            #[inline]
+            fn home(self) -> Option<ArenaId> {
+                table::Homed::home(&self)
+            }
         }
     )*};
 }
@@ -1671,6 +1805,10 @@ macro_rules! handle_node {
             }
             fn get_node<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
                 Ok(rustc_type_ir::$ty($handle::intern(<$kind>::get(source)?)))
+            }
+            #[inline]
+            fn home(self) -> Option<ArenaId> {
+                table::Homed::home(&self)
             }
         }
     )*};
@@ -1708,6 +1846,10 @@ impl<'db> Node<'db> for ValTree<'db> {
         };
         Ok(ValTree::new(kind))
     }
+    #[inline]
+    fn home(self) -> Option<ArenaId> {
+        table::Homed::home(&self)
+    }
 }
 
 /// The interned lists: a persisted node is their length and their items.
@@ -1733,6 +1875,10 @@ macro_rules! list_node {
                     .map(|_| <$item>::get(source))
                     .collect::<Result<SmallVec<[$item; 8]>, _>>()?;
                 Ok($ty::new_from_slice(&items))
+            }
+            #[inline]
+            fn home(self) -> Option<ArenaId> {
+                table::Homed::home(&self)
             }
         }
     )*};
@@ -1784,6 +1930,10 @@ impl<'db> Node<'db> for BoundExistentialPredicates<'db> {
         }
         Ok(BoundExistentialPredicates::new_from_slice(&items))
     }
+    #[inline]
+    fn home(self) -> Option<ArenaId> {
+        table::Homed::home(&self)
+    }
 }
 
 blaze_format::record! {
@@ -1809,7 +1959,8 @@ blaze_format::record! {
 /// kinds of the pinned `rustc_type_ir`. Changes with any change to a `Code` impl.
 /// 3: `BoundVariableKind::Reflected` (tag 3), blaze's field binders.
 /// 4: `SolverDefId::RpititId` (tag 18), a trait method's `impl Trait` item.
-pub const FORMAT_VERSION: u64 = 4;
+/// 5: `PatternKind::Variant` (tag 3), blaze's refinements by enum variants.
+pub const FORMAT_VERSION: u64 = 5;
 
 /// The schema of a persisted type table, for the schema of a buffer that holds one: a table
 /// written by another codec reads as a schema mismatch, never as other values.
@@ -1914,6 +2065,11 @@ impl<'db> TyTableWriter<'db> {
     }
 
     #[cold]
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the type table's format places nodes and words by u32, and nothing bounds a \
+                  table below 2^32 before this: a larger table needs a typed refusal from the writer"
+    )]
     fn add<N: Node<'db>>(&mut self, key: (Kind, NonZeroU32), node: N) -> u32 {
         let start = self.pending.len();
         ensure_sufficient_stack(|| node.put_node(&mut Children { writer: self }));
@@ -2114,14 +2270,19 @@ impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A> {
     }
 
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
-        let index = self.word()?;
-        let generation = self.word()?;
-        // The generation word is refused on its own (as `get_id` does), so a corrupt one is not
-        // folded into the id's bits and reported as a huge table index or id.
-        if generation != 0 {
-            return Err(self.past(GENERATION, u64::from(generation), 0));
+        let low = self.word()?;
+        let high = self.word()?;
+        // As [`TyTableWriter`]'s sink wrote it (`check_cache::id_bits`): inside a relocating
+        // scope, the id's index in the scope's table plus one, whose high word is 0 (refused
+        // on its own, so a corrupt one is not folded into the bits and reported as a huge
+        // table index); outside one, this process's own word of the id (`gid_bits`: its
+        // arena in the high word), which a record outside a scope holds and is never
+        // persisted (port decision 4).
+        if crate::check_cache::ids::in_scope() && high != 0 {
+            return Err(self.past(GENERATION, u64::from(high), 0));
         }
-        crate::check_cache::id_of(u64::from(index)).map_err(|refused| refused.at(self.at))
+        let bits = (u64::from(high) << 32) | u64::from(low);
+        crate::check_cache::id_of(bits).map_err(|refused| refused.at(self.at))
     }
 
     fn count(&mut self) -> Result<usize, FormatError> {
@@ -2146,7 +2307,6 @@ mod tests {
     use std::{collections::HashSet, sync::Barrier};
 
     use blaze_format::{Aligned, HEADER_LEN, Writer};
-    use blaze_query::db::FromId;
     use hir_def::{CallableDefId, FunctionId, TypeAliasId};
     use rustc_type_ir::{FlagComputation, Flags, INNERMOST, TypeFlags};
 
@@ -2172,8 +2332,8 @@ mod tests {
         assert!(record_at::<u64>(&buffer, u64::MAX).is_err(), "past any buffer");
     }
 
-    fn id<T: FromId>(index: u32) -> T {
-        T::from_id(blaze_query::db::Id::from_u32(index))
+    fn id<T: blaze_memo::Id>(index: u32) -> T {
+        T::from_gid(blaze_memo::Gid::for_test(index))
     }
 
     fn local<T>(index: u32) -> Idx<T> {
@@ -2426,6 +2586,11 @@ mod tests {
                 Pattern::intern(PatternKind::NotNull),
             ])),
             PatternKind::NotNull,
+            PatternKind::Variant { index: 2 },
+            PatternKind::Or(PatList::new_from_slice(&[
+                Pattern::intern(PatternKind::Variant { index: 0 }),
+                Pattern::intern(PatternKind::Variant { index: 3 }),
+            ])),
         ];
 
         let clause = |kind| Binder::dummy(PredicateKind::Clause(kind));
@@ -2615,7 +2780,9 @@ mod tests {
                     pats.iter().fold(TypeFlags::empty(), |flags, pat| flags | pat.flags()),
                     pats.iter().map(|pat| pat.outer_exclusive_binder()).max().unwrap_or(INNERMOST),
                 ),
-                PatternKind::NotNull => (TypeFlags::empty(), INNERMOST),
+                PatternKind::NotNull | PatternKind::Variant { .. } => {
+                    (TypeFlags::empty(), INNERMOST)
+                }
             };
             assert_eq!(pattern.flags(), flags);
             assert_eq!(pattern.outer_exclusive_binder(), binder);

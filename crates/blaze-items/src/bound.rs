@@ -52,13 +52,13 @@ pub fn bound_hash(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> 
     bound_of(db, id)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn bound_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
     let Some(code) = hash::code_hash(db, id)? else { return Ok(None) };
     let (Some(body), Some(def)) = (id.body(), id.generic_def()) else {
         unreachable!("{id:?} has a code hash and no body")
     };
-    let form = hash::body_form(db, id).as_ref().expect("an item with a code hash has a body form");
+    let form = hash::body_form(db, id).expect("an item with a code hash has a body form");
     let mut h = Hasher::new(BOUND_DOMAIN);
     h.id(&code.0).update(&(form.refs.len() as u64).to_le_bytes());
     for &to in form.refs.iter() {
@@ -99,7 +99,7 @@ fn reached<'db, 'f>(
     env: ParamEnvAndCrate<'db>,
     frame: &'f Frame,
 ) -> Result<Reached<'f>, Unhashable> {
-    let no_mir = |_| Unhashable::of(id, "its MIR failed to lower");
+    let no_mir = |_| Unhashable::of(db, id, "its MIR failed to lower");
     // alloc: std's set takes no allocator; one per bound hash.
     let mut seen: HashSet<Either<InternedClosureId<'db>, InternedCoroutineId<'db>>, Global> =
         HashSet::new_in(Global);

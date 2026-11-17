@@ -20,10 +20,46 @@ pub enum Edition {
     Edition2018,
     Edition2021,
     Edition2024,
+    /// A blaze edition (`edition = "blaze-2026.11"`; docs/v2/plan/design/std.md, "The blaze
+    /// edition: opting in"): cargo's 2024 edition for everything a manifest's edition decides
+    /// (the resolver, the keys refused from 2024 on, target discovery), which is why it
+    /// orders after it, and [`Edition::blaze`] for what blaze adds. No cargo reads it: a
+    /// package of it is built by blaze alone, and that is said at the key cargo stops at.
+    Blaze2026_11,
     EditionFuture,
 }
 
 impl Edition {
+    /// The blaze edition this is, if it is one: its one conversion to the front end's
+    /// [`edition::BlazeEdition`], whose spellings it shares.
+    pub fn blaze(&self) -> Option<edition::BlazeEdition> {
+        match self {
+            Edition::Blaze2026_11 => Some(edition::BlazeEdition::Blaze2026_11),
+            Edition::Edition2015
+            | Edition::Edition2018
+            | Edition::Edition2021
+            | Edition::Edition2024
+            | Edition::EditionFuture => None,
+        }
+    }
+
+    /// The Rust edition its sources are written in, as rustc's and rustfmt's `--edition`
+    /// take it: itself, or for a blaze edition the Rust edition it fixes
+    /// ([`edition::BlazeEdition::rust`]). What a formatter of Rust's syntax is handed.
+    pub fn rust_syntax(&self) -> String {
+        match self.blaze() {
+            Some(blaze) => blaze.rust().to_string(),
+            None => self.to_string(),
+        }
+    }
+
+    /// The manifest's edition of a blaze edition.
+    pub fn of_blaze(blaze: edition::BlazeEdition) -> Edition {
+        match blaze {
+            edition::BlazeEdition::Blaze2026_11 => Edition::Blaze2026_11,
+        }
+    }
+
     pub const LATEST_STABLE: Edition = Edition::Edition2024;
     pub const ALL: &'static [Edition] = &[
         Edition::Edition2015,
@@ -40,6 +76,8 @@ impl Edition {
             Edition::Edition2018 => Some(Version::new(1, 31, 0)),
             Edition::Edition2021 => Some(Version::new(1, 56, 0)),
             Edition::Edition2024 => Some(Version::new(1, 85, 0)),
+            // No release of Rust has it: `rust-version` says nothing about a blaze edition.
+            Edition::Blaze2026_11 => None,
             Edition::EditionFuture => None,
         }
     }
@@ -66,6 +104,7 @@ impl fmt::Display for Edition {
             Edition::Edition2018 => "2018",
             Edition::Edition2021 => "2021",
             Edition::Edition2024 => "2024",
+            Edition::Blaze2026_11 => edition::BlazeEdition::Blaze2026_11.manifest(),
             Edition::EditionFuture => "future",
         })
     }
@@ -80,6 +119,13 @@ impl FromStr for Edition {
             "2021" => Ok(Edition::Edition2021),
             "2024" => Ok(Edition::Edition2024),
             "future" => Ok(Edition::EditionFuture),
+            s if s.starts_with(edition::BlazeEdition::MANIFEST_PREFIX) => {
+                match edition::BlazeEdition::from_manifest(s) {
+                    Ok(Some(blaze)) => Ok(Edition::of_blaze(blaze)),
+                    Ok(None) => bail!("`{s}` is no blaze edition"),
+                    Err(unknown) => bail!("{unknown}"),
+                }
+            }
             s if s.parse().is_ok_and(|y: u16| y > 2024 && y < 2050) => bail!(
                 "this version of Cargo is older than the `{s}` edition, \
                  and only supports `2015`, `2018`, `2021`, and `2024` editions."
@@ -366,4 +412,56 @@ fn status(name: &str) -> Option<&'static Feature> {
 
 fn cargo_docs_link(path: &str) -> String {
     format!("https://doc.rust-lang.org/cargo/{path}")
+}
+
+#[cfg(test)]
+mod blaze_edition_tests {
+    use super::Edition;
+
+    /// The opt-in is the manifest's `edition`: `blaze-2026.11` parses to the blaze edition,
+    /// prints as it was written, and is cargo's 2024 for every `>=` a manifest rule asks.
+    #[test]
+    fn a_blaze_edition_parses_prints_and_orders_as_2024_or_later() {
+        let edition: Edition = "blaze-2026.11".parse().unwrap();
+        assert_eq!(edition, Edition::Blaze2026_11);
+        assert_eq!(edition.to_string(), "blaze-2026.11");
+        assert_eq!(edition.blaze(), Some(edition::BlazeEdition::Blaze2026_11));
+        assert_eq!(Edition::of_blaze(edition::BlazeEdition::LATEST), Edition::Blaze2026_11);
+        assert!(edition >= Edition::Edition2024, "the rules of 2024 hold in it");
+        assert!(edition.is_stable(), "it needs no `cargo-features`");
+        assert_eq!(edition.first_version(), None);
+        assert_eq!(edition.rust_syntax(), "2024", "a formatter is handed the Rust edition");
+        assert_eq!(Edition::Edition2021.rust_syntax(), "2021");
+        assert_eq!(edition.default_resolve_behavior(), Edition::Edition2024.default_resolve_behavior());
+    }
+
+    /// A Rust edition is no blaze edition (the control: were `blaze` to say yes for one,
+    /// every old package would be compiled as the blaze edition), and its text is unchanged.
+    #[test]
+    fn a_rust_edition_is_no_blaze_edition() {
+        for (written, edition) in [
+            ("2015", Edition::Edition2015),
+            ("2018", Edition::Edition2018),
+            ("2021", Edition::Edition2021),
+            ("2024", Edition::Edition2024),
+            ("future", Edition::EditionFuture),
+        ] {
+            assert_eq!(written.parse::<Edition>().unwrap(), edition);
+            assert_eq!(edition.blaze(), None, "{written}");
+            assert_eq!(edition.to_string(), written);
+        }
+        assert!(!Edition::ALL.contains(&Edition::Blaze2026_11), "cargo's editions are cargo's");
+    }
+
+    /// A `blaze-` value this blaze does not know is refused naming it and what is known,
+    /// never read as some Rust edition.
+    #[test]
+    fn an_unknown_blaze_edition_is_refused_by_name() {
+        for written in ["blaze-2026.12", "blaze-", "blaze-2024"] {
+            let refused = written.parse::<Edition>().unwrap_err().to_string();
+            assert!(refused.contains(written) && refused.contains("blaze-2026.11"), "{refused}");
+        }
+        let cargo = "2019".parse::<Edition>().unwrap_err().to_string();
+        assert!(cargo.contains("supported edition values"), "cargo's message for cargo's values: {cargo}");
+    }
 }

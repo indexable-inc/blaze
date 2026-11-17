@@ -1,0 +1,45 @@
+[package]
+name = "blaze-memo"
+description = "The session memo the front end's queries run on (docs/v2/plan/design/target.md, design 4): a table per crate arena, inputs fixed for a snapshot, single flight, declared cycles and an opt-in read recorder; no revisions, no edges, no durability"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Lock`: the `Alone` flight's table and an arena's input destructors, both off the hit path.
+blaze-core.workspace = true
+# `pump::Flights`: the scheduler's single flight behind `Scheduled`; `sched::carry` for the
+# task's stack of runs.
+blaze-graph.workspace = true
+# `SegQueue`: the image records an imaged run files, drained by the driver between commands.
+crossbeam-queue.workspace = true
+# `Record`: an imaged query's value is a plain record, its bytes the value.
+blaze-format.workspace = true
+# `FixedState`: the one deterministic hasher of keys.
+blaze-hash.workspace = true
+# `ContentId`: a record's key in `Resident`.
+blaze-ids.workspace = true
+# `record::Fact`: the (fact id, digest) pair the recorder lists, the read list's own type.
+blaze-keyed.workspace = true
+# `Arena`, `ArenaLocal`, `Tag`: every entry, node and slice lives in its arena.
+blaze-mem.workspace = true
+blaze-memo-macros.workspace = true
+# `Home` for `la_arena::Idx` (a body's expression, pattern and field ids) and
+# `intern::Symbol`: they name no arena, and the orphan rule puts the impl here.
+la-arena.workspace = true
+intern.workspace = true
+
+[dev-dependencies]
+# Every test's choices, the simulation's schedule among them, drawn from one tape.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

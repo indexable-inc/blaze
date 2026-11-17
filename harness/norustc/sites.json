@@ -1,7 +1,4 @@
 {
  "crates/blaze-build-script/src/elide/tests.rs": 1,
- "crates/blaze-cargo/src/answers/own.rs": 2,
- "crates/blaze-codegen-code/src/lib.rs": 2,
- "crates/blaze-engine/tests/repro.rs": 2,
- "crates/hir-ty-pure/src/tests/scripts.rs": 1
+ "crates/blaze-cargo/src/answers/own.rs": 2
 }

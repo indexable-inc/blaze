@@ -369,11 +369,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         expected: &Expectation<'db>,
         is_read: ExprIsRead,
     ) -> Ty<'db> {
-        // Every expression is inferred and ids are dense, so one in 64 bounds how long a
-        // cancelled revision runs on, without two dependent loads per expression.
-        if tgt_expr.into_raw().into_u32() % 64 == 0 {
-            blaze_query::db::unwind_if_cancelled(self.db);
-        }
         // An expression is inferred within the one it is in: rustc's 5,204-arm `else if`.
         crate::next_solver::ensure_sufficient_stack(|| {
             self.infer_expr_inner_here(tgt_expr, expected, is_read)
@@ -407,7 +402,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
                 let condition_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
 
+                // blaze: the condition's `let`s narrow their locals in the success branch
+                // (`#![blaze::pattern_types]`, `infer::narrow`).
+                let narrowed = self.narrowed_mark();
+                self.narrow_by_condition(condition);
                 let then_ty = self.infer_expr_inner(then_branch, expected, ExprIsRead::Yes);
+                self.unnarrow(narrowed);
                 let then_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
                 let mut coercion_sites = [then_branch, tgt_expr];
                 if let Some(else_branch) = else_branch {
@@ -573,6 +573,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
                     for arm in arms.iter() {
                         self.diverges = Diverges::Maybe;
+                        // blaze: the arm's pattern narrows a plain-local scrutinee in its guard
+                        // and body (`#![blaze::pattern_types]`, `infer::narrow`).
+                        let narrowed = self.narrowed_mark();
+                        self.narrow_by_pattern(expr, arm.pat);
                         if let Some(guard_expr) = arm.guard {
                             self.infer_expr_coerce_never(
                                 guard_expr,
@@ -584,6 +588,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         // body unreachable, and the arm diverge.
 
                         let arm_ty = self.infer_expr_inner(arm.expr, &expected, ExprIsRead::Yes);
+                        self.unnarrow(narrowed);
                         all_arms_diverge &= self.diverges;
                         // An arm of type `!` does not count as a prior arm: it does not shape
                         // the type later arms must agree with.
@@ -799,6 +804,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     self.infer_expr_coerce(value, &Expectation::has_type(lhs_ty), ExprIsRead::Yes);
                     if let Pat::Expr(lhs) = self.store.pat(target) {
                         self.check_lhs_assignable(lhs, tgt_expr, None);
+                        // blaze: rule pattern-types-unique-ref (`infer::narrow`).
+                        self.check_refinement_write(lhs);
                     }
                 } else {
                     // Let the target pattern constrain the RHS coercion target. In particular,
@@ -1176,6 +1183,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         fields: &[RecordLitField],
         base_expr: RecordSpread,
     ) -> Ty<'db> {
+        // blaze: a record value `{ a: 1, b }` (`#![blaze::records]`), which has no path.
+        if let Some(record) = self.record_path(path) {
+            let ty = self.infer_record_value(expr, record, expected, fields, base_expr);
+            self.require_type_is_sized(ty, expr.into(), ObligationCauseCode::Misc);
+            return ty;
+        }
         // Find the relevant variant
         let (adt_ty, Some(variant)) = self.resolve_variant(expr.into(), path, false) else {
             if let Some(segment) = self.first_unresolved_segment(path, expr.into()) {
@@ -1264,7 +1277,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // `check_expr_struct_fields`).
         for field in hir_fields {
             let hygiene = self.store.record_field_hygiene(field.expr);
-            let name = &VariantFields::name_written(self.db, variant, field.name, hygiene);
+            let name = &VariantFields::name_written(
+                self.db,
+                self.resolver.ctx_table(),
+                variant,
+                field.name,
+                hygiene,
+            );
             let field_type = if let Some(i) = remaining_fields.remove(name) {
                 seen_fields.insert(*name, i);
 
@@ -1416,7 +1435,20 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 {
                     debug!(?remaining_fields);
 
-                    // FIXME: Emit an error: missing fields.
+                    // rustc's `report_missing_fields`: E0063 is a type check error, so it taints
+                    // the body (and the item a closure with it is in) as every other one here
+                    // does, and nothing builds MIR of it. In the order of the variant's fields.
+                    let missed_fields: Vec<hir_def::LocalFieldId> = variant_fields
+                        .fields()
+                        .iter()
+                        .filter(|(_, field)| remaining_fields.contains_key(&field.name))
+                        .map(|(id, _)| id)
+                        .collect(); // alloc: the diagnostic's own list, only when fields are missing
+                    self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
+                        record: expr.into(),
+                        variant,
+                        missed_fields,
+                    });
                 }
             }
         }
@@ -1777,6 +1809,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
         let (ctxt, tail_expr_ty) =
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
+                // blaze: what a `let else` narrows holds to the end of the block.
+                let narrowed = this.narrowed_mark();
                 for (index, stmt) in statements.iter().enumerate() {
                     if matches!(stmt, Statement::Item(_)) {
                         continue;
@@ -1824,6 +1858,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                                     else_ty,
                                 );
                                 this.diverges = previous_diverges;
+                                // blaze: after a `let else`, its pattern narrows a plain-local
+                                // initializer (`#![blaze::pattern_types]`, `infer::narrow`).
+                                if let Some(initializer) = initializer {
+                                    this.narrow_by_pattern(initializer, pat);
+                                }
                             }
                         }
                         Statement::Expr { expr, has_semi } => {
@@ -1844,7 +1883,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
                 // check the tail expression **without** holding the
                 // `enclosing_breakables` lock below.
-                tail.map(|expr| (expr, this.infer_expr_inner(expr, expected, ExprIsRead::Yes)))
+                let tail =
+                    tail.map(|expr| (expr, this.infer_expr_inner(expr, expected, ExprIsRead::Yes)));
+                this.unnarrow(narrowed);
+                tail
             });
 
         let mut coerce = ctxt.coerce.unwrap();
@@ -1946,7 +1988,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     (_, Some(variant)) => (VariantId::EnumVariantId(variant), args),
                     (AdtId::EnumId(it), None) => {
                         let ctxt = offset.field_hygiene(index).syntax_context();
-                        let Some(it) = EnumVariants::variant_written(self.db, it, name, ctxt)
+                        let table = self.resolver.ctx_table();
+                        let Some(it) = EnumVariants::variant_written(self.db, table, it, name, ctxt)
                         else {
                             return;
                         };
@@ -1959,7 +2002,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 _ => return,
             };
             let hygiene = offset.field_hygiene(index);
-            let Some(local_id) = of.fields(self.db).field_written(self.db, of, name, hygiene)
+            let table = self.resolver.ctx_table();
+            let Some(local_id) = of.fields(self.db).field_written(self.db, table, of, name, hygiene)
             else {
                 return;
             };
@@ -1988,6 +2032,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let frame = self.frame;
         // The name is looked up hygienically among each ADT's fields (rustc's `check_field`).
         let hygiene = self.store.member_hygiene(field_expr);
+        let table = self.resolver.ctx_table();
         let mut autoderef = self.table.autoderef_with_tracking(receiver_ty, field_expr.into());
         let mut private_field = None;
         let res = autoderef.by_ref().find_map(|(derefed_ty, _)| {
@@ -2006,20 +2051,49 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     });
                 }
                 TyKind::Adt(adt, parameters) => match adt.def_id() {
+                    // blaze: `r.a` on a record (`#![blaze::records]`) is the field `a` of the
+                    // tuple core's `Record` holds; it resolves to the struct's one field, and
+                    // MIR building and the capture walk add the tuple's (`crate::record`).
+                    hir_def::AdtId::StructId(s)
+                        if let Some(record) =
+                            crate::record::record_fields(self.lang_items, derefed_ty) =>
+                    {
+                        let at = record.index_of(name.as_str())?;
+                        let (local_id, _) = s.fields(self.db).fields().iter().next()?;
+                        let field = FieldId { parent: s.into(), local_id };
+                        return Some((Either::Left(field), record.ty(at)?));
+                    }
                     hir_def::AdtId::StructId(s) => {
-                        let local_id =
-                            s.fields(self.db).field_written(self.db, s.into(), name, hygiene)?;
+                        let local_id = s
+                            .fields(self.db)
+                            .field_written(self.db, table, s.into(), name, hygiene)?;
                         let field = FieldId { parent: s.into(), local_id };
                         (field, parameters)
                     }
                     hir_def::AdtId::UnionId(u) => {
-                        let local_id =
-                            u.fields(self.db).field_written(self.db, u.into(), name, hygiene)?;
+                        let local_id = u
+                            .fields(self.db)
+                            .field_written(self.db, table, u.into(), name, hygiene)?;
                         let field = FieldId { parent: u.into(), local_id };
                         (field, parameters)
                     }
                     hir_def::AdtId::EnumId(_) => return None,
                 },
+                // blaze: a refinement by one variant (`conn.socket` on a `Conn is Conn::Open
+                // { .. }`, `#![blaze::pattern_types]`) reads that variant's field directly; MIR
+                // projects it through a downcast to the variant.
+                TyKind::Pat(base, _) => {
+                    let variant = crate::pattern_types::single_variant(self.db, derefed_ty)?;
+                    let TyKind::Adt(_, parameters) = base.kind() else { return None };
+                    let local_id = variant.fields(self.db).field_written(
+                        self.db,
+                        table,
+                        variant.into(),
+                        name,
+                        hygiene,
+                    )?;
+                    (FieldId { parent: variant.into(), local_id }, parameters)
+                }
                 _ => return None,
             };
             // Its privacy is checked from the def site of the name (rustc's `check_field`).
@@ -2270,6 +2344,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         item: func.def_id.into(),
                     })
                 }
+                // A record argument takes the defaults of this method's parameter after the
+                // receiver.
+                self.note_record_arguments(func.def_id, 1, args);
                 self.check_method_call(tgt_expr, args, func.sig, expected)
             }
             // Failed to resolve, report diagnostic and try to resolve as call to field access or
@@ -2311,12 +2388,20 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     _ => None,
                 };
 
+                // rustc's `report_failed_method_call_on_numerical_infer_var`: the receiver is
+                // an integer or float variable here, whatever a later use decides it to be.
+                let numeric_var = match receiver_ty.kind() {
+                    TyKind::Infer(InferTy::IntVar(_)) => Some(super::NumericVar::Integer),
+                    TyKind::Infer(InferTy::FloatVar(_)) => Some(super::NumericVar::Float),
+                    _ => None,
+                };
                 self.push_diagnostic(InferenceDiagnostic::UnresolvedMethodCall {
                     expr: tgt_expr,
                     receiver: receiver_ty.store(),
                     name: *method_name,
                     field_with_same_name: field_with_same_name_exists.map(|it| it.store()),
                     assoc_func_with_same_name: assoc_func_with_same_name.map(|it| it.def_id),
+                    numeric_var,
                 });
 
                 let recovered = match assoc_func_with_same_name {

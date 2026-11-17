@@ -7,7 +7,7 @@
 //!   its asks.
 //! - [`live`]: the descriptor and jump table of an image blaze-link linked live, and their run
 //!   side every dev executable carries: the execution log a test binary's recording fork server
-//!   arms (`__blaze_exec_slots`, `__blaze_exec_arm`) and the tier counters
+//!   arms (`__blaze_exec_table`, `__blaze_exec_arm`) and the tier counters
 //!   (`blaze_live_counters`). blaze-live builds the switch, which takes patches, on them.
 //! - The channel's frames ([`frame`], [`channel`]), the handshake and its checks
 //!   ([`handshake`], [`bind`]), the image's headers ([`image`]), the asks ([`ask`]), the fence's

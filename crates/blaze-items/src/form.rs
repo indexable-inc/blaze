@@ -27,6 +27,7 @@ use blaze_ids::{
     radix,
 };
 use blaze_mem::{Frame, Tag, frame};
+use blaze_memo::Database as _;
 use hir_def::{
     AdtId, AssocItemId, AttrDefId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId,
     FunctionId, GenericDefId, GenericParamId, HasModule, ItemContainerId, LocalFieldId, Lookup,
@@ -122,18 +123,20 @@ impl Missed {
 /// of its [`Crate::transitive_loaded_deps`] meets them: a dependency of `krate`, or of a crate
 /// it sees, that dependents load only for its macros. The one walk both
 /// [`pending_proc_macro`] and [`Cx::error_type_site`] read.
-#[blaze_query::tracked(returns(deref))]
-fn macro_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
-    let mut found: Vec<Crate> = Vec::new(); // alloc: the memo's value, a few crates, once per crate.
-    for &seen in krate.transitive_loaded_deps(db) {
-        for dep in seen.data(db).dependencies.iter() {
-            let dep = dep.crate_id;
-            if dep.loads_only_macros(db) && !found.contains(&dep) {
-                found.push(dep);
+#[blaze_memo::tracked(returns(copy))]
+fn macro_crates<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
+    frame::task(Tag::Other, |frame| {
+        let mut found: Vec<Crate, &Frame> = Vec::new_in(frame);
+        for &seen in krate.transitive_loaded_deps(db) {
+            for dep in seen.data(db).dependencies.iter() {
+                let dep = dep.crate_id;
+                if dep.loads_only_macros(db) && !found.contains(&dep) {
+                    found.push(dep);
+                }
             }
         }
-    }
-    found.into_boxed_slice()
+        blaze_memo::keep_slice(db.memo(), &found)
+    })
 }
 
 /// The first proc-macro crate `krate`'s items can expand a macro of ([`macro_crates`]) whose
@@ -153,7 +156,7 @@ fn macro_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
 /// dependency image) holds an answer read off a half-expanded program. A build reads `krate`
 /// only once those are built, so this is a refusal a misordered read hits, never a state a
 /// correct build sees.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn pending_proc_macro(db: &Db, krate: Crate) -> Option<Crate> {
     macro_crates(db, krate).iter().copied().find(|&dep| {
         hir_expand::proc_macro::ProcMacros::get_for_crate(db, dep).is_some_and(|macros| {
@@ -188,6 +191,40 @@ pub(crate) struct Code {
 }
 
 const _: () = assert!(size_of::<Code>() == size_of::<Sub>() + 32);
+
+impl Sub {
+    /// The form as a borrow: what a hash of it reads.
+    pub(crate) fn view(&self) -> SubRef<'_> {
+        SubRef { digest: self.digest, refs: &self.refs, missed: self.missed }
+    }
+
+    /// The form as a query's value: its refs kept in the run's arena.
+    pub(crate) fn kept<'db>(&self, db: &'db Db) -> SubRef<'db> {
+        SubRef {
+            digest: self.digest,
+            refs: blaze_memo::keep_slice(blaze_memo::Database::memo(db), &self.refs),
+            missed: self.missed,
+        }
+    }
+}
+
+/// A [`Sub`] by borrow: a query's value (its refs kept in the run's arena, owning nothing) or
+/// a view of a `Sub` a [`Cx`] wrote outside one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SubRef<'a> {
+    pub(crate) digest: ContentId,
+    /// Distinct, in slot order: slot 0 is `refs[0]`.
+    pub(crate) refs: &'a [ItemId],
+    /// Set only when the program is not one rustc accepts.
+    pub(crate) missed: Option<Missed>,
+}
+
+/// A [`Code`] as [`ty_form`] keeps it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CodeRef<'a> {
+    pub(crate) sub: SubRef<'a>,
+    pub(crate) spans: ContentId,
+}
 
 #[cfg(test)]
 impl Code {
@@ -440,6 +477,17 @@ impl Form {
         let spans = self.spans_id();
         Code { sub: self.sub(), spans }
     }
+
+    /// The code as a query's value, its refs kept in the run's arena straight from the form's
+    /// buffer.
+    fn kept_code<'db>(self, db: &'db Db) -> CodeRef<'db> {
+        let sub = SubRef {
+            digest: self.digest_id(),
+            refs: blaze_memo::keep_slice(blaze_memo::Database::memo(db), &self.refs),
+            missed: self.missed,
+        };
+        CodeRef { sub, spans: self.spans_id() }
+    }
 }
 
 impl Drop for Form {
@@ -508,13 +556,14 @@ const SEEN: usize = 64;
 
 /// Two words an entry (a 4-byte `Ty` padded to the reference's alignment): 16 bytes, 1 KiB a
 /// [`Cx`], on a 64-bit target.
-const _: () = assert!(size_of::<Option<(Ty<'static>, &'static Code)>>() == 2 * size_of::<usize>());
+const _: () =
+    assert!(size_of::<Option<(Ty<'static>, &'static CodeRef<'static>)>>() == 2 * size_of::<usize>());
 
 pub(crate) struct Cx<'db> {
     db: &'db Db,
     /// The type forms asked of [`ty_form`] lately, direct-mapped by the type's hash: one probe
     /// and no allocation, against the engine's interning of the key and its memo lookup. A `Cx` lives inside one query, so a hit skips only a read that query recorded.
-    seen: [Cell<Option<(Ty<'db>, &'db Code)>>; SEEN],
+    seen: [Cell<Option<(Ty<'db>, &'db CodeRef<'db>)>>; SEEN],
     /// Writing signature forms ([`Cx::leak_free`]): [`LEAK`] in place of each leak.
     leak_free: bool,
     #[cfg(test)]
@@ -523,7 +572,7 @@ pub(crate) struct Cx<'db> {
 
 /// A type as [`ty_form`] and [`signature_ty_form`] keep it, interned: a tracked function's one
 /// argument is an ID.
-#[blaze_query::interned(debug)]
+#[blaze_memo::interned(debug)]
 pub(crate) struct FormTy<'db> {
     #[returns(copy)]
     pub(crate) ty: StoredTy,
@@ -532,29 +581,29 @@ pub(crate) struct FormTy<'db> {
 /// A type's form, spelled once per revision for every item that writes it and kept across
 /// revisions while what it reads is unchanged: rustc's stable hash cached in each interned
 /// type, with the query engine's backdating on top.
-#[blaze_query::tracked(returns(ref), cycle_result = ty_form_cycle)]
-pub(crate) fn ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
+#[blaze_memo::tracked(returns(ref), cycle_result = ty_form_cycle)]
+pub(crate) fn ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> CodeRef<'db> {
     let mut form = Form::new("ty");
     Cx::new(db).spell(&mut form, ty.ty(db).as_ref());
-    form.code()
+    form.kept_code(db)
 }
 
 /// A type met again while it is spelled contains itself, which only a program rustc rejects
 /// has: every type of the cycle gets this, whichever of them was asked for first.
-fn ty_form_cycle<'db>(_: &'db Db, _: blaze_query::db::Id, _: FormTy<'db>) -> Code {
+fn ty_form_cycle<'db>(db: &'db Db, _: FormTy<'db>) -> CodeRef<'db> {
     let mut form = Form::new("ty");
     form.error(Missed::ErrorType);
-    form.code()
+    form.kept_code(db)
 }
 
 /// A type's form as a signature form writes it: [`ty_form`]'s, with [`LEAK`] in place of a
 /// closure's captures and a coroutine's held locals, which are of the inference and MIR of
 /// the body the closure is written in.
-#[blaze_query::tracked(returns(ref), cycle_result = ty_form_cycle)]
-pub(crate) fn signature_ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
+#[blaze_memo::tracked(returns(ref), cycle_result = ty_form_cycle)]
+pub(crate) fn signature_ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> CodeRef<'db> {
     let mut form = Form::new("ty");
     Cx::leak_free(db).spell(&mut form, ty.ty(db).as_ref());
-    form.code()
+    form.kept_code(db)
 }
 
 /// What a signature form writes in place of what a body leaks into an interface.
@@ -601,25 +650,26 @@ fn unobserved() -> AttrFlags {
 }
 
 /// The auto traits a crate declares, by key.
-#[blaze_query::tracked(returns(ref))]
-fn crate_auto_traits(db: &Db, krate: Crate) -> Box<[(ItemKey, TraitId)]> {
-    // alloc: the memo's own list, its length known once the crate is walked.
-    let mut traits = Vec::new();
-    for (_, module) in crate_def_map(db, krate).modules(db) {
-        for def in module.scope(db).declarations() {
-            if let ModuleDefId::TraitId(it) = def
-                && TraitSignature::of(db, it).flags.contains(TraitFlags::AUTO)
-            {
-                traits.push((item_key(db, ItemId::Trait(it)), it));
+#[blaze_memo::tracked(returns(copy))]
+fn crate_auto_traits<'db>(db: &'db Db, krate: Crate) -> &'db [(ItemKey, TraitId)] {
+    frame::task(Tag::Other, |frame| {
+        let mut traits: Vec<(ItemKey, TraitId), &Frame> = Vec::new_in(frame);
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            for def in module.scope(db).declarations() {
+                if let ModuleDefId::TraitId(it) = def
+                    && TraitSignature::of(db, it).flags.contains(TraitFlags::AUTO)
+                {
+                    traits.push((item_key(db, ItemId::Trait(it)), it));
+                }
             }
         }
-    }
-    traits.into_boxed_slice()
+        blaze_memo::keep_slice(db.memo(), &traits)
+    })
 }
 
 /// The auto traits of the crates `krate` loads, in the order of their keys.
-#[blaze_query::tracked(returns(ref))]
-fn loaded_auto_traits(db: &Db, krate: Crate) -> Box<[TraitId]> {
+#[blaze_memo::tracked(returns(copy))]
+fn loaded_auto_traits<'db>(db: &'db Db, krate: Crate) -> &'db [TraitId] {
     frame::task(Tag::Other, |frame| {
         let mut traits: Vec<(ItemKey, TraitId), &Frame> = Vec::new_in(frame);
         for &it in loaded_crates(db, krate).iter() {
@@ -627,12 +677,12 @@ fn loaded_auto_traits(db: &Db, krate: Crate) -> Box<[TraitId]> {
         }
         traits.sort_unstable();
         traits.dedup();
-        crate::table::column(traits.iter().map(|&(_, it)| it))
+        blaze_memo::keep_iter(db.memo(), traits.iter().map(|&(_, it)| it))
     })
 }
 
 /// What an item's visibility is resolved to, once per item.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn item_visibility(db: &Db, id: ItemId) -> Visibility {
     item_visibility_uncached(db, id)
 }
@@ -823,6 +873,7 @@ impl<'db> Cx<'db> {
     /// a closure or coroutine written in it, in the order `body` meets them. For the error a
     /// build stops with at [`Missed::NoMir`]; `None` when each lowers (the MIR that failed is
     /// elsewhere in the item, an anonymous constant of a type).
+    #[blaze::renders_positions]
     pub(crate) fn mir_error(&self, id: ItemId) -> Option<String> {
         let (within, error) = self.mir_lowering_error(id)?;
         // alloc: the error a build stops with, once
@@ -1222,11 +1273,11 @@ impl<'db> Cx<'db> {
     }
 
     /// A type: its digest and slots are the same wherever it is written.
-    pub(crate) fn ty(&self, ty: Ty<'db>) -> &'db Sub {
-        &self.ty_code(ty).sub
+    pub(crate) fn ty(&self, ty: Ty<'db>) -> SubRef<'db> {
+        self.ty_code(ty).sub
     }
 
-    fn ty_code(&self, ty: Ty<'db>) -> &'db Code {
+    fn ty_code(&self, ty: Ty<'db>) -> &'db CodeRef<'db> {
         let entry = &self.seen[FixedState.hash_one(ty) as usize % SEEN];
         if let Some((seen, code)) = entry.get()
             && seen == ty
@@ -1253,7 +1304,7 @@ impl<'db> Cx<'db> {
             return f.merge(&code.sub.digest, &code.spans, &code.sub.refs, code.sub.missed);
         }
         let code = self.ty_code(ty);
-        f.merge(&code.sub.digest, &code.spans, &code.sub.refs, code.sub.missed);
+        f.merge(&code.sub.digest, &code.spans, code.sub.refs, code.sub.missed);
     }
 
     fn function(&self, f: &mut Form, func: FunctionId) {
@@ -1634,6 +1685,11 @@ impl<'db> Cx<'db> {
 
     /// A macro by its rules: tokens with their text and whether each is joint with the next,
     /// without trivia and without its name.
+    #[expect(
+        blaze::reads_positions,
+        reason = "the rules' token trees are read off the live tree (`AstId::to_view`), so the form reruns on \
+                  any edit of the file: read them off the outline (`signatures::outline_item`)"
+    )]
     fn macro_(&self, f: &mut Form, id: MacroId) {
         let db = self.db;
         self.visibility(f, id.module(db), item_visibility(db, ItemId::Macro(id)));
@@ -2080,6 +2136,11 @@ impl<'db> Cx<'db> {
                 }
             }
             PatternKind::NotNull => f.u8(2),
+            // blaze: a variant refinement (`#![blaze::pattern_types]`), by the variant's index.
+            PatternKind::Variant { index } => {
+                f.u8(3);
+                f.u32(index);
+            }
         }
     }
 

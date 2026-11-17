@@ -1,0 +1,11 @@
+{
+ "id": "mem2-9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze: the edit loop's rows",
+ "what": "`body edit + run` run back to back is bimodal on every binary, the base included: 100 to 120 ms or 280 to 340 ms, with one of forty past a second. Each edit's build is followed by about 0.7 s of work after the answer (`store kept front end`, the release), and an edit that arrives inside it waits. Medians of 15 runs swing between 125 and 300 ms for the same binary.",
+ "cost": "three rounds of measurement before any row could be compared; the lane compares the 25th percentile and a row with a pause before each edit",
+ "cause": "the next request waits for the work the last one left; not looked into further by this lane",
+ "workaround": "read p25 and min, and the rows with a pause",
+ "state": "open"
+}

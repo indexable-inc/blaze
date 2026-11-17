@@ -20,13 +20,15 @@
 use blaze_cas::Key;
 use blaze_ids::ContentId;
 
-use crate::{Entry, Get, Identity, Seen, World, shape_slot};
+use blaze_record::{Slot, list_key};
+
+use crate::{Entry, Get, Identity, Kernel, Read, Seen, World};
 
 /// Why a lookup of a step the kernel computes found no entry.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Missed {
     /// Nothing is kept under its identity: no entry kept last was handed in, and no shape of
-    /// reads is kept under it.
+    /// reads (a read-list) is kept under it.
     New,
     /// The entry kept last under its identity saw `read` as `was`, and it is `now` now: the
     /// first of the entry's reads, in its order (kind, then key), whose hash changed. `changed`
@@ -61,21 +63,56 @@ pub enum Missed {
     Failed(String),
 }
 
+/// What a part of a key is (docs/v2/plan/design/why.md, "The model"): where a chain of
+/// reasons ends, or what it follows.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum PartKind {
+    /// Something the build is given: a variable, a flag, a setting, the toolchain, the target.
+    /// A chain ends at one that changed.
+    #[default]
+    Input,
+    /// The bytes of a file, the part's name its absolute path. A chain ends at one that
+    /// changed.
+    File,
+    /// The value of another step: the one [`Part::names`], or with none the step that
+    /// computed this one ([`Miss::via`]). A chain follows it.
+    Result,
+}
+
 /// One part of a key, by name: what a miss of a key with parts is told apart by.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Part {
-    /// What it is, as a person reads it: `toolchain`, `settings`, `env CC`. One name a part:
-    /// a key with two parts of one name is refused ([`Miss::of_parts`]).
+    /// What it is, as a person reads it: `toolchain`, `settings`, `env CC`; a
+    /// [`PartKind::File`]'s absolute path. One name a part: a key with two parts of one name
+    /// is refused ([`Miss::of_parts`]).
     pub name: String,
     /// Its hash: none when the key has no such part this time (no `-C profile-use` profile).
     pub hash: Option<ContentId>,
     /// The item it is of, when it is another's (a dependency's unit): what a chain follows.
     pub names: Option<String>,
+    pub kind: PartKind,
+    /// For a file of Rust source, the hash of what of it code can observe (its text with each
+    /// comment no macro sees as its shape): a file whose `hash` changed and whose `code` did
+    /// not changed no item.
+    pub code: Option<ContentId>,
 }
 
 impl Part {
+    /// An [`PartKind::Input`] part.
     pub fn new(name: impl Into<String>, hash: Option<ContentId>) -> Part {
-        Part { name: name.into(), hash, names: None }
+        Part { name: name.into(), hash, names: None, kind: PartKind::Input, code: None }
+    }
+
+    /// A [`PartKind::Result`] part: the value of the step of `names`, or with none of a step
+    /// that is not recorded, which the miss's [`Miss::via`] stands in for.
+    pub fn result(name: impl Into<String>, hash: Option<ContentId>, names: Option<String>) -> Part {
+        Part { name: name.into(), hash, names, kind: PartKind::Result, code: None }
+    }
+
+    /// A [`PartKind::File`] part: the file at the absolute `path`, its bytes' `hash` and its
+    /// code text's ([`Part::code`]).
+    pub fn file(path: impl Into<String>, hash: Option<ContentId>, code: Option<ContentId>) -> Part {
+        Part { name: path.into(), hash, names: None, kind: PartKind::File, code }
     }
 }
 
@@ -105,6 +142,10 @@ pub struct Miss {
     /// What the value is filed under past `key` that is not explained yet (a unit's process
     /// variables, a build script's traced reads): what a miss whose key is as it was is down to.
     pub beyond: Option<&'static str>,
+    /// The item of the step that computed this one (a function's unit): what a chain follows
+    /// from a [`PartKind::Result`] part that names no step, since that step's key covers what
+    /// such a part is made from.
+    pub via: Option<String>,
 }
 
 impl Miss {
@@ -128,7 +169,7 @@ impl Miss {
             Some(why) => Missed::Failed(why),
             None => Missed::New,
         };
-        Miss { step, subject, item, missed, key, kept: None, parts, beyond: None }
+        Miss { step, subject, item, missed, key, kept: None, parts, beyond: None, via: None }
     }
 }
 
@@ -136,13 +177,17 @@ impl Miss {
 /// entry kept last (`last`, as the caller remembers it) that hashes differently in `world` now.
 /// Called on a miss only, by someone who wants the reason. A store or world that fails here is
 /// [`Missed::Failed`], never the miss's error.
+///
+/// `now` values a read: the world's, or for a step's value the kernel's lookup of that step.
 pub(crate) fn explain<W: World + ?Sized, G: Get + ?Sized>(
     store: &G,
+    kernel: &Kernel<W>,
     world: &W,
     identity: &Identity,
     last: Option<Key>,
+    now: &mut dyn FnMut(Read<'_>) -> Result<Seen, String>,
 ) -> Missed {
-    match explained(store, world, identity, last) {
+    match explained(store, kernel, world, identity, last, now) {
         Ok(missed) => missed,
         Err(why) => Missed::Failed(why),
     }
@@ -150,14 +195,16 @@ pub(crate) fn explain<W: World + ?Sized, G: Get + ?Sized>(
 
 fn explained<W: World + ?Sized, G: Get + ?Sized>(
     store: &G,
+    kernel: &Kernel<W>,
     world: &W,
     identity: &Identity,
     last: Option<Key>,
+    value: &mut dyn FnMut(Read<'_>) -> Result<Seen, String>,
 ) -> Result<Missed, String> {
     // alloc: an error
     let at = |key: Key, why: String| format!("the store at {:x}: {why}", key.0);
     let Some(key) = last else {
-        let first = shape_slot(&identity.id(), 0);
+        let first = Key(list_key(&identity.id(), Slot { generation: 0, n: 0 }));
         return Ok(match store.has(&first).map_err(|why| at(first, why))? {
             true => Missed::Unrecorded,
             false => Missed::New,
@@ -170,8 +217,7 @@ fn explained<W: World + ?Sized, G: Get + ?Sized>(
     let (mut first, mut changed) = (None, 0u32);
     for (read, was) in entry.reads() {
         // alloc: an error
-        let now =
-            world.hash(read).map_err(|error| format!("{}: {}", world.describe(read), error.why))?;
+        let now = value(read).map_err(|why| format!("{}: {why}", kernel.describe(world, read)))?;
         if now == was {
             continue;
         }
@@ -183,8 +229,8 @@ fn explained<W: World + ?Sized, G: Get + ?Sized>(
     let reads = u32::try_from(entry.reads().len()).unwrap_or(u32::MAX);
     Ok(match first {
         Some((read, was, now)) => Missed::Read {
-            read: world.describe(read),
-            names: world.names(read),
+            read: kernel.describe(world, read),
+            names: kernel.names(world, read),
             was,
             now,
             changed,

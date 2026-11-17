@@ -3,7 +3,8 @@ name: release
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
 # Linux (x86_64, aarch64) and macOS (aarch64), puts every asset into the R2 bucket blaze-releases (where blaze fetches
 # it from, .github/scripts/r2.py) and makes a GitHub release of that name: a `.tar.xz` and a `.tar.gz` per target (`blaze` a hard link to `blaze-engine`), a `.sha256` of each, SHA256SUMS and B3SUMS (a pin's fetch checks every list a release has, crates/blaze-engine/src/versions.rs),
-# the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
+# the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), bstd's
+# `bstd-<digest>.tar.xz` (harness/library.py `archive`), and the
 # notes (what docs/CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
 # until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
 # is on a commit of main as it is: no release commits a version to main, whose Cargo.toml stays
@@ -38,6 +39,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.notes.outputs.version }}
+      bstd: ${{ steps.bstd.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,7 +60,7 @@ jobs:
       # library/, which a blaze with no checkout of its commit downloads once and checks
       # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs). The digest is
       # BLAKE3, by the uv workspace's `blake3` (the Rust crate through PyO3): no system package.
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
@@ -69,6 +71,18 @@ jobs:
         with:
           name: library
           path: ${{ runner.temp }}/library/library-*.tar.xz
+          if-no-files-found: error
+      # bstd's tree, which a release ships beside the library as `bstd-<digest>.tar.xz`
+      # (crates/blaze-std, the crates it depends on by path and a workspace of just them;
+      # harness/library.py `archive`): its digest is the build's BLAZE_BSTD_DIGEST below, so
+      # every target's blaze names the one archive made here (crates/blaze-new's BSTD_DIGEST).
+      - id: bstd
+        run: |
+          uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/bstd\", \"tree\": \"bstd\"}" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bstd
+          path: ${{ runner.temp }}/bstd/bstd-*.tar.xz
           if-no-files-found: error
 
   build:
@@ -108,7 +122,7 @@ jobs:
           job: release
           llvm: true
       # build_release.py runs in the repository's Python workspace (typed_input).
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           enable-cache: false
@@ -122,26 +136,30 @@ jobs:
       # library from the release's assets (the step `Standard library` below; shipped.rs).
       - if: github.ref_type == 'tag'
         run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+      # The bstd this release ships (the notes job's archive), which its blaze places and reads
+      # sealed (crates/blaze-cargo/src/cli/store.rs `shipped`): on a tag only, since a build of a
+      # branch is no release and has no assets to fetch it from.
+      - if: github.ref_type == 'tag'
+        env:
+          BSTD: ${{ needs.notes.outputs.bstd }}
+        run: |
+          [ ${#BSTD} -eq 64 ] || { echo "::error::the notes job gave no bstd digest (got '$BSTD')"; exit 1; }
+          echo "BLAZE_BSTD_DIGEST=$BSTD" >> "$GITHUB_ENV"
       # The `dist` profile, with LLVM, as every native blaze has (blaze-engine's default
       # `native`): build_release.py refuses a binary that loads libLLVM or a C++ runtime, or on
       # Linux asks for a glibc newer than RHEL 9's. PGO is off: blaze applies only a profile
       # trained on its own build (tools/pgo/pgo.py), which it cannot make while it refuses
       # `-C profile-generate`; `"pgo": "pinned"` stops with that error (build_release.py).
+      # TODO(stage 0 with --deny): a release is to deny `blaze::todo` (docs/v2/plan/design/
+      # proved-unreachable.md), and a build runs no lints. No step here denies it yet: run
+      # `blaze check --workspace --deny blaze::todo` before this build once
+      # .github/blaze-version's release takes the option (docs/cargo.md#lints).
       - name: blaze build -p blaze-engine --profile dist
         run: |
           uv run --frozen --no-dev python .github/scripts/build_release.py \
             '{"target": "${{ matrix.target }}", "out": "shipped", "pgo": "off"}'
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
-      # The explorer core (docs/v2/plan/design/explore-core.md, decision 3): the page's state
-      # and views as wasm, built by the same stage 0 and shipped beside the binary as
-      # `explore-core.wasm`, where the daemon reads it to serve the page (`hello`'s `core`, the
-      # `core` op). One module for every target: it is wasm.
-      - name: blaze build -p blaze-explore-core --target wasm32-unknown-unknown
-        run: |
-          blaze build --release --locked -p blaze-explore-core --target wasm32-unknown-unknown
-          cp target/wasm32-unknown-unknown/release/blaze_explore_core.wasm shipped/explore-core.wasm
-          blaze stop
       - name: Archive
         run: |
           mkdir "$NAME"
@@ -174,38 +192,6 @@ jobs:
       - if: failure()
         uses: ./.github/actions/daemon-log
 
-  # blaze's crate and the forks it depends on (`blaze-hir`, `blaze-rustc_abi`, ...) on crates.io, as
-  # its own job so it can be rerun alone: versions already published are skipped. Each crate is
-  # built first; crates.io's limit on new crates is waited out (a first release takes hours).
-  crates:
-    name: crates.io
-    needs: [notes, build]
-    # Off: it would publish 60 permanent `blaze-*` names and `blaze`, both retired (#270);
-    # whether and under which names blaze goes to crates.io is decided after the rename.
-    if: false
-    runs-on: [ix, arm64, ix-mode-cold]
-    timeout-minutes: 340
-    steps:
-      - uses: actions/checkout@v7
-      # cargo here is crates.io's client alone (`cargo package --no-verify`, `cargo publish
-      # --no-verify`); what the crates build to is checked by the stage 0's `blaze build`
-      # (publish_crates.py, `verify`).
-      - uses: ./.github/actions/blaze
-        with:
-          job: crates
-          llvm: true
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      # crates.io needs the manifests to say the release's version: written into this job's
-      # checkout only, never committed (main's stays `0.0.0`).
-      - run: |
-          python3 -I .github/scripts/canary.py stamp "{\"tag\": \"$GITHUB_REF_NAME\"}"
-      - run: python3 -I .github/scripts/publish_crates.py --publish --max-hours 5
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
-        uses: ./.github/actions/daemon-log
-
   # ix.dev/explore reads this release's profile schema (.github/scripts/explore_page.py): the
   # page deploys from indexable-inc/ix and refuses a daemon whose schema it does not read, so a
   # release ahead of it would show users only that refusal (0.20261105.1, schema 5, page 1).
@@ -215,7 +201,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
@@ -237,7 +223,7 @@ jobs:
         with:
           path: out
           merge-multiple: true
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
@@ -286,7 +272,7 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
+            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz out/bstd-*.tar.xz
       # A canary: promote.yaml tests the archives just published and makes this same release
       # stable when they pass (docs/release.md). By dispatch, since a release this token
       # publishes starts no `release:` workflow. The canary pointer moves in `metadata`.

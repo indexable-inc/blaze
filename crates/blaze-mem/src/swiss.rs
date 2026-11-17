@@ -349,8 +349,7 @@ fn put(groups: &[Group], hash: u64, value: u32, publish: Ordering) {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -445,31 +444,35 @@ mod tests {
         assert_eq!(word.full().collect::<Vec<_>>(), full);
     }
 
-    #[hegel::test]
-    fn words_agree_with_the_copies(tc: TestCase) {
-        let bytes: [u8; 8] = tc.draw(gs::arrays(gs::integers()));
-        let tag: u8 = tc.draw(gs::integers().min_value(0x80));
-        agrees::<7>(bytes, tag);
-        agrees::<8>(bytes, tag);
-        agrees::<4>(bytes, tag);
+    #[test]
+    fn words_agree_with_the_copies() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let bytes: [u8; 8] = tape.array("bytes", |tape| tape.int::<u8>("byte"));
+            let tag: u8 = tape.int_in(0x80..=u8::MAX, "tag");
+            agrees::<7>(bytes, tag);
+            agrees::<8>(bytes, tag);
+            agrees::<4>(bytes, tag);
+        })
     }
 
     /// `find` against the copies' loop, over tables a third to seven eighths full whose
     /// keys share few hashes, and `vacant` against the group `find` stops at.
-    #[hegel::test]
-    fn probes_agree_with_the_copies(tc: TestCase) {
-        let seed: u64 = tc.draw(gs::integers());
-        let log_groups: u32 = tc.draw(gs::integers().max_value(5));
-        let fill: u64 = tc.draw(gs::integers().min_value(3).max_value(7));
-        let hash: u64 = tc.draw(gs::integers());
+    #[test]
+    fn probes_agree_with_the_copies() {
+        blaze_sim::check(Config::DEFAULT, |tape| probes_agree(tape))
+    }
+
+    fn probes_agree(tape: &Tape) {
+        let log_groups: u32 = tape.int_in(0..=5u32, "log groups");
+        let fill: u64 = tape.int_in(3..=7u64, "fill eighths");
+        let hash: u64 = tape.int("hash");
         const SLOTS: usize = 7;
         let groups = 1usize << log_groups;
-        let mut rng = blaze_rng::SplitMix64::new(seed);
         let mut words = vec![0u64; groups];
         let mut keys = vec![u64::MAX; groups * SLOTS];
         let total = (groups * SLOTS) as u64 * fill / 8;
         for _ in 0..total {
-            let key = rng.next_u64() >> 60;
+            let key = tape.next_u64("key") >> 60;
             let key_hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key << 57);
             let at = vacant::<SLOTS>(key_hash, groups, |g| Ctrl(words[g]));
             words[at.group] = at.tagged(tag(key_hash)).0;

@@ -351,7 +351,6 @@ fn id_of(code: &CodegenCode, target_data: &TargetData) -> ContentId {
     hasher.update(&[
         u8::from(cfg!(feature = "llvm")),
         u8::from(cfg!(feature = "llvm-wasm")),
-        u8::from(cfg!(feature = "wasm")),
         u8::from(cfg!(debug_assertions)),
     ]);
     hasher.finish()

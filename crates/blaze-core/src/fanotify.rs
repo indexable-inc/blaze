@@ -2,7 +2,9 @@
 //! (`FAN_MARK_FILESYSTEM`), so nothing is added as directories appear, and events that name
 //! the directory a change was in by a file handle and the file by its name
 //! (`FAN_REPORT_DFID_NAME`, Linux 5.9). A handle is opened again (`open_by_handle_at`) to
-//! learn where its directory is now; a directory gone since is named where it was last seen.
+//! learn where its directory is now; a directory gone since is named where it was when the
+//! watch began if it is the watched one or above it, and dropped otherwise (the invariant
+//! below).
 //!
 //! Needs `CAP_SYS_ADMIN` (the mark) and `CAP_DAC_READ_SEARCH` (opening handles):
 //! [`Fanotify::new`] fails with a bare `EPERM` where the process lacks either, and
@@ -11,6 +13,36 @@
 //! What a watch keeps (where each directory is, by its handle) is in [`Dirs`] tables whose keys
 //! and names are spans of a [`Strings`] column, reused by the next watch once this one ends
 //! ([`Room`]): a watch, its events and its end allocate their completions' payload alone.
+//!
+//! Starting a watch walks nothing. It marks the file system of the watched directory, reads
+//! `/proc/self/mountinfo` once to mark each other file system mounted at or under it, and
+//! learns the handles of the watched directory and of each directory above it up to the root
+//! (`Fanotify::start`). Every other directory's place is learned when an event first names it
+//! (`Fanotify::place`): its handle opened then, and kept in a bounded cache after.
+//!
+//! The invariant (what an event in a directory gone and never learned may be dropped for): a
+//! path whose state the watcher believes differs from the disk's has a shortest prefix whose
+//! directory entry was unlinked (removed, or moved away) from a directory still at its place,
+//! and that unlink is an event (`DELETE` or `MOVED_FROM`, with `ONDIR` for a directory) in that
+//! live directory, whose handle opens. So the change is told by name at the top of what went,
+//! and what was under it is gone with it: the watcher takes a directory named gone as
+//! everything under it gone (blaze-vfs's `Batch::went`). What is dropped is only events inside
+//! directories that no longer exist, which name nothing that is still there. Tested by
+//! `an_rm_rf_of_a_subtree_never_seen_is_heard`, whose control drops the top deletion.
+//!
+//! The floor, and what this costs against it:
+//! - Starting a watch: O(mount points on the machine) to read and parse mountinfo (bytes, in a
+//!   kept buffer), plus a constant per file system mounted under the watched directory and per
+//!   directory above it (an open, a `statfs`, a `name_to_handle_at`, a mark). Nothing per
+//!   directory under it: the floor, since a watch must at least mark each file system it spans.
+//! - An event: one hash lookup once its directory's place is known; the first time, one
+//!   `open_by_handle_at`, one `readlink` of `/proc/self/fd` and one `close`. The floor of a
+//!   watch told directories by handle.
+//! - The cost not at the floor: one fanotify group per watch, each marking whole file systems,
+//!   so each write anywhere on a marked file system is read and placed once per watch on it
+//!   (N watches, N times), most of it dropped as outside ([`watch_counts`] says how many). The
+//!   fix is one group per file system per driver, its events sorted to watches by path: a
+//!   change of the drivers' watch tables, not made yet.
 //!
 //! Why unsafe: std has no fanotify, `name_to_handle_at`, `open_by_handle_at` or `fstatfs`, so
 //! each is one system call here. The rest has std versions that cost per event: `fs::read_link`
@@ -29,17 +61,77 @@ use std::{
         unix::ffi::OsStrExt as _,
     },
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use blaze_hash::HashMap;
 use blaze_mem::{RegionVec, Tag as MemTag};
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use crate::{
     Done, FileName,
     utf8::push_lossy,
-    watch::{Batch, Span, Strings, Visit, Walker, is_under, valid},
+    watch::{Batch, Span, Strings, is_under, join, valid},
 };
+
+/// Events read by every fanotify watch of the process, since it began.
+static EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Of those, events dropped as outside the watch's directory (beside it, or on another part
+/// of a marked file system), the gone ones among them.
+static OUTSIDE: AtomicU64 = AtomicU64::new(0);
+/// Directories an event named that were gone and never learned, each counted once (its place
+/// is cached as outside after): what the module's invariant drops.
+static GONE: AtomicU64 = AtomicU64::new(0);
+
+/// What the process's fanotify watches have read: with one group per watch, each write on a
+/// marked file system is read once per watch on it, so `outside` against `events` is what that
+/// costs (the module's floor).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WatchCounts {
+    /// Events read, by every watch.
+    pub events: u64,
+    /// Events dropped as outside their watch's directory.
+    pub outside: u64,
+    /// Directories named by an event that were gone and never learned.
+    pub gone: u64,
+}
+
+/// The process's fanotify counts so far.
+pub fn watch_counts() -> WatchCounts {
+    WatchCounts {
+        events: EVENTS.load(Ordering::Relaxed),
+        outside: OUTSIDE.load(Ordering::Relaxed),
+        gone: GONE.load(Ordering::Relaxed),
+    }
+}
+
+/// The most bytes of `/proc/self/mountinfo` a watch's start reads: about 16 000 mounts. Past
+/// it the start fails, naming the file, rather than mark the file systems of part of it.
+const MOUNTINFO: usize = 4 << 20;
+
+/// A bug planted for a test's control, each undoing one piece of the start without a walk.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Plant {
+    None,
+    /// An event that a directory was deleted is dropped: the top of an `rm -rf` is not told.
+    TopDeletionDropped,
+    /// The start does not read mountinfo: a file system mounted under the watched directory
+    /// is never marked.
+    MountinfoUnread,
+    /// The start walks every directory under the watched one, as before 2026-11-14.
+    WalksAtStart,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PLANT: std::cell::Cell<Plant> = const { std::cell::Cell::new(Plant::None) };
+}
+
+#[cfg(test)]
+fn planted(plant: Plant) -> bool {
+    PLANT.get() == plant
+}
 
 const CLASS_NOTIF: u32 = 0x0;
 const CLOEXEC: u32 = 0x1;
@@ -273,7 +365,10 @@ pub(crate) struct Room {
     /// The watched directory, relative to the root.
     dir: String,
     mounts: Vec<Mount>,
-    /// Where each directory under `dir` was last seen, relative to the root.
+    /// Where the watched directory and each directory above it up to the root were when the
+    /// watch began, relative to the root: so an event in one gone since is still placed (the
+    /// end of the watched directory, told where a directory above it went with it). Learned at
+    /// the start, a handful; no directory under the watched one is (the module's invariant).
     known: Dirs<()>,
     /// The place of each directory an event named, so a batch of events opens each
     /// directory's handle once and none again until a directory moves: the mark covers the
@@ -285,21 +380,34 @@ pub(crate) struct Room {
     /// Where an opened handle's file is, as `/proc/self/fd` says.
     link: Vec<u8>,
     batch: Batch,
-    walker: Walker,
+    /// `/proc/self/mountinfo` as the start read it, at most [`MOUNTINFO`] bytes.
+    mountinfo: Vec<u8>,
+    /// The watched directory with its links resolved, as mountinfo names mount points.
+    top: PathBuf,
+    /// A path being opened, NUL-terminated; and a mount point, its escapes decoded.
+    path: Vec<u8>,
+    point: Vec<u8>,
+    /// The system calls the last start made (a libc call that makes several, `realpath`'s,
+    /// counted once): what `a_start_makes_a_constant_number_of_system_calls` bounds.
+    calls: u32,
 }
 
 impl Room {
     fn new() -> io::Result<Room> {
         Ok(Room {
-            root: PathBuf::new(), // alloc: none, filled once and reused.
-            dir: String::new(),   // alloc: none, filled once and reused.
-            mounts: Vec::new(),   // alloc: none, an empty vector, grown once and reused.
-            known: Dirs::new(1 << 10)?,
+            root: PathBuf::new(),
+            dir: String::new(),
+            mounts: Vec::new_in(Global),
+            known: Dirs::new(1 << 6)?,
             seen: Dirs::new(SEEN)?,
-            rel: String::new(), // alloc: none, filled once and reused.
-            link: Vec::new(),   // alloc: none, an empty vector, grown once and reused.
+            rel: String::new(),
+            link: Vec::new_in(Global),
             batch: Batch::default(),
-            walker: Walker::default(),
+            mountinfo: Vec::new_in(Global),
+            top: PathBuf::new(),
+            path: Vec::new_in(Global),
+            point: Vec::new_in(Global),
+            calls: 0,
         })
     }
 }
@@ -342,14 +450,101 @@ impl Fanotify {
             Some(room) => room,
             None => Room::new()?,
         };
-        // alloc: the error of a watch that failed.
+        room.calls = 1;
         canonical(root, &mut room.root)
             .map_err(|error| named(&error, &format!("resolving {}", root.display())))?;
+        room.calls += 1;
         room.dir.clear();
         room.dir.push_str(dir.as_str());
         let mut watch = Fanotify { fd, room };
-        watch.learn(dir.as_str(), true, false)?;
+        watch.start()?;
         Ok(watch)
+    }
+
+    /// Marks the file system of the watched directory and of each one mounted at or under it,
+    /// and learns where the watched directory and each directory above it are: a constant
+    /// number of system calls per file system and per directory above, and one read of
+    /// mountinfo, whatever is under the watched directory (the module's floor).
+    fn start(&mut self) -> io::Result<()> {
+        let fanotify = self.fd.as_raw_fd();
+        let Room { root, dir, mounts, known, mountinfo, top, path, point, calls, .. } =
+            &mut self.room;
+        // The watched directory, its file system marked first: a failure of its is the watch's.
+        path.clear();
+        join(path, root.as_os_str().as_bytes(), dir.as_bytes());
+        canonical(Path::new(OsStr::from_bytes(path)), top).map_err(|error| {
+            named(&error, &format!("resolving {}", String::from_utf8_lossy(path)))
+        })?;
+        *calls += 1;
+        let c = c_path(path, top.as_os_str().as_bytes())?;
+        let opened = crate::raw::open_dir(c)
+            .map_err(|error| keep_eperm(error, &format!("opening {}", c.to_string_lossy())))?;
+        *calls += 1;
+        let (fsid, handle) = mark(fanotify, mounts, c, opened, calls)?;
+        known.insert(Key::of(&fsid, handle.kind, handle.bytes()).bytes(), (), dir);
+        // Each directory above it, to the root, by path: no descriptor, two calls each.
+        let mut above = dir.as_str();
+        while !above.is_empty() {
+            above = above.rfind('/').map_or("", |at| &above[..at]);
+            point.clear();
+            join(point, root.as_os_str().as_bytes(), above.as_bytes());
+            let c = c_path(path, point)?;
+            let fsid = fsid_at(c).map_err(|error| {
+                named(&error, &format!("statfs of {}", c.to_string_lossy()))
+            })?;
+            let handle = handle_at(c).map_err(|error| {
+                keep_eperm(error, &format!("name_to_handle_at of {}", c.to_string_lossy()))
+            })?;
+            *calls += 2;
+            // One on a file system not marked sends nothing to place.
+            if mounts.iter().any(|it| it.fsid == fsid) {
+                known.insert(Key::of(&fsid, handle.kind, handle.bytes()).bytes(), (), above);
+            }
+        }
+        #[cfg(test)]
+        if planted(Plant::WalksAtStart) {
+            let mut walker = crate::watch::Walker::default();
+            walker.walk(
+                root.as_os_str().as_bytes(),
+                dir,
+                |_, _, _| {
+                    // An open, a listing and a close at the least, counted as one.
+                    *calls += 1;
+                    Ok(crate::watch::Visit::List(None))
+                },
+                |_| {},
+            )?;
+        }
+        #[cfg(test)]
+        if planted(Plant::MountinfoUnread) {
+            return Ok(());
+        }
+        // Each other file system mounted at or under it: an unmarked one sends no event, so
+        // no event could ever lead to it.
+        *calls += read_mountinfo(mountinfo)?;
+        let top = top.as_os_str().as_bytes();
+        mount_points(mountinfo, point, |point| {
+            if point == top || !is_under_bytes(point, top) {
+                return Ok(());
+            }
+            let c = c_path(path, point)?;
+            let opened = match crate::raw::open_dir(c) {
+                Ok(opened) => opened,
+                // Unmounted, or not ours to open, since mountinfo was read: what is not there
+                // (or cannot be read by anyone this process could watch for) sends nothing a
+                // watch of this tree could name. Any other failure is the watch's.
+                Err(error) if gone(&error) => return Ok(()),
+                Err(error) => {
+                    let what = format!(
+                        "opening {}, mounted under the watched directory",
+                        c.to_string_lossy()
+                    );
+                    return Err(keep_eperm(error, &what));
+                }
+            };
+            *calls += 1;
+            mark(fanotify, mounts, c, opened, calls).map(drop)
+        })
     }
 
     /// Stops watching, its descriptor closed; its tables are the next watch's.
@@ -366,18 +561,25 @@ impl Fanotify {
         self.fd.as_raw_fd()
     }
 
-    /// What the events in `bytes` say, learning each directory they say was made or moved in.
-    /// An event in a directory whose place is known costs one hash lookup, and one beside the
-    /// watched directory nothing more.
+    /// What the events in `bytes` say. An event in a directory whose place is known costs one
+    /// hash lookup, and one beside the watched directory nothing more. A directory made or
+    /// moved in is told by its own name, never walked: a directory moved in has no events of
+    /// what was in it already, and its watcher lists a directory it is told appeared
+    /// (blaze-vfs's `Watcher`, an [`crate::Effect::Entries`] off the loop).
     pub(crate) fn take(&mut self, bytes: &[u8]) -> Done {
         let mut lost = parse(bytes, |_, _| {});
         if lost {
             self.room.seen.clear();
         }
+        let (mut events, mut outside) = (0u64, 0u64);
         let mut rel = std::mem::take(&mut self.room.rel);
         parse(bytes, |mask, record| {
+            events += 1;
             let kind = match self.place(&record, &mut rel) {
-                Ok(Kind::Outside) => return,
+                Ok(Kind::Outside) => {
+                    outside += 1;
+                    return;
+                }
                 Ok(kind) => kind,
                 Err(_) => {
                     lost = true;
@@ -394,18 +596,31 @@ impl Fanotify {
                 }
                 push_lossy(&mut rel, record.name);
             }
-            if !valid(&rel) || (kind == Kind::Above && !is_under(&rel, &self.room.dir)) {
+            #[cfg(test)]
+            if planted(Plant::TopDeletionDropped) && mask & (DELETE | ONDIR) == DELETE | ONDIR {
                 return;
             }
-            if mask & ONDIR != 0
-                && mask & (CREATE | MOVED_TO) != 0
-                && self.learn(&rel, false, true).is_err()
+            // A directory above the watched one removed, moved away or replaced: the watched
+            // directory went with it, or is another one now. Told as a change of the watched
+            // directory itself, which says so (`Effect::Watch`).
+            if kind == Kind::Above
+                && mask & ONDIR != 0
+                && mask & (DELETE | MOVED_FROM | MOVED_TO) != 0
+                && !rel.is_empty()
+                && is_under(&self.room.dir, &rel)
+                && rel != self.room.dir
             {
-                lost = true;
+                self.room.batch.push(&self.room.dir);
+                return;
+            }
+            if !valid(&rel) || (kind == Kind::Above && !is_under(&rel, &self.room.dir)) {
+                return;
             }
             self.room.batch.push(&rel);
         });
         self.room.rel = rel;
+        EVENTS.fetch_add(events, Ordering::Relaxed);
+        OUTSIDE.fetch_add(outside, Ordering::Relaxed);
         self.room.batch.changed(lost)
     }
 
@@ -428,37 +643,9 @@ impl Fanotify {
         Ok(kind)
     }
 
-    /// Learns the handle of `rel` and of every directory under it, marking each file system
-    /// met, and adds each file found to the batch with `found`: a directory moved in has no
-    /// events of what was in it already. Every error of the watched directory itself (`top`)
-    /// is the watch's; below it, a directory gone or unreadable is passed over.
-    fn learn(&mut self, rel: &str, top: bool, found: bool) -> io::Result<()> {
-        let fanotify = self.fd.as_raw_fd();
-        let Room { root, dir, mounts, known, seen, batch, walker, .. } = &mut self.room;
-        walker.walk(
-            root.as_os_str().as_bytes(),
-            rel,
-            |path, rel, first| match learn_one(fanotify, mounts, dir, known, seen, path, rel) {
-                Ok(listed) => Ok(Visit::List(listed)),
-                Err(error) if top && first => Err(match gone(&error) {
-                    // alloc: the error of a watch that failed.
-                    true => named(&error, &format!("opening {}", path.to_string_lossy())),
-                    false => error,
-                }),
-                Err(error) if gone(&error) => Ok(Visit::Skip),
-                Err(error) => Err(error),
-            },
-            |file| {
-                if found {
-                    batch.push(file);
-                }
-            },
-        )
-    }
-
     /// Where the directory of `handle` (whose [`Key`] is `key`) is now, its name relative to the
-    /// root written to `rel`: outside the root, or a directory gone that was never under the
-    /// watched one, is [`Kind::Outside`]. An error where it cannot be said.
+    /// root written to `rel`: outside the root, or a directory gone that was not learned at the
+    /// start, is [`Kind::Outside`]. An error where it cannot be said.
     fn resolve(
         &mut self,
         fsid: &[u8],
@@ -477,19 +664,23 @@ impl Fanotify {
             Ok(len) => {
                 let Ok(under) = Path::new(OsStr::from_bytes(&link[..len])).strip_prefix(&*root)
                 else {
-                    known.remove(key);
                     return Ok(Kind::Outside);
                 };
                 push_lossy(rel, under.as_os_str().as_bytes());
-                let place = classify(dir, rel);
-                match place {
-                    Kind::Under => known.insert(key, (), rel),
-                    _ => known.remove(key),
-                }
-                Ok(place)
+                Ok(classify(dir, rel))
             }
+            // The invariant (the module's): an event in a directory gone since it was made
+            // names nothing still there. Whatever of the watched tree went with that directory
+            // went at the unlink of the topmost directory removed or moved away, and that is
+            // an event in its parent, which is still at its place and so opens; the watched
+            // directory and those above it are learned at the start, so the end of the watched
+            // directory is placed even where its parent went too. So a directory gone that was
+            // never learned is dropped as outside, and its place is cached so (`place`).
             Err(error) if matches!(error.raw_os_error(), Some(libc::ESTALE | libc::ENOENT)) => {
-                let Some(((), name)) = known.get(key) else { return Ok(Kind::Outside) };
+                let Some(((), name)) = known.get(key) else {
+                    GONE.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Kind::Outside);
+                };
                 rel.push_str(name);
                 Ok(classify(dir, rel))
             }
@@ -498,91 +689,175 @@ impl Fanotify {
     }
 }
 
-/// The directory at `path` (`rel` under the root) known by its handle, its file system marked
-/// if it was not: the descriptor opened for it, to list it, unless its mount keeps it.
-fn learn_one(
+/// The directory open as `opened` (at `path`): its file system marked unless it is already,
+/// with `opened` kept as the mount's descriptor then (dropped otherwise); its file system's id
+/// and handle. Each system call made is counted in `calls`.
+fn mark<A: Allocator>(
     fanotify: RawFd,
-    mounts: &mut Vec<Mount>,
-    dir: &str,
-    known: &mut Dirs<()>,
-    seen: &mut Dirs<Kind>,
+    mounts: &mut Vec<Mount, A>,
     path: &CStr,
-    rel: &str,
-) -> io::Result<Option<OwnedFd>> {
-    let opened = match crate::raw::open_dir(path) {
-        Ok(opened) => opened,
-        // Kept bare so `learn` can pass over a directory gone below the watched one.
-        Err(error) => {
-            return Err(match gone(&error) {
-                true => error,
-                // alloc: the error of a watch that failed.
-                false => keep_eperm(error, &format!("opening {}", path.to_string_lossy())),
-            });
-        }
-    };
+    opened: OwnedFd,
+    calls: &mut u32,
+) -> io::Result<([u8; 8], Handle)> {
     let raw = opened.as_raw_fd();
-    // alloc: the error of a watch that failed.
     let fsid = fsid(raw)
         .map_err(|error| named(&error, &format!("statfs of {}", path.to_string_lossy())))?;
-    let handle = handle_of(raw).map_err(|error| match error.raw_os_error() {
+    let handle = handle_of(raw).map_err(|error| no_handles(error, path))?;
+    *calls += 2;
+    if mounts.iter().any(|it| it.fsid == fsid) {
+        return Ok((fsid, handle));
+    }
+    // SAFETY: a fanotify descriptor and a NUL-terminated path.
+    let marked = unsafe {
+        libc::syscall(
+            libc::SYS_fanotify_mark,
+            fanotify,
+            MARK_ADD | MARK_FILESYSTEM,
+            MASK,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+        )
+    };
+    *calls += 1;
+    if marked != 0 {
+        let error = io::Error::last_os_error();
+        return Err(match error.raw_os_error() {
+            Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENODEV) => io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "fanotify cannot watch the file system of {} by file handles: {error}",
+                    path.to_string_lossy()
+                ),
+            ),
+            _ => keep_eperm(error, &format!("fanotify_mark of {}", path.to_string_lossy())),
+        });
+    }
+    // Opening a handle needs CAP_DAC_READ_SEARCH, which marking did not: asked here, once per
+    // file system, so a process without it fails the start (and watches with inotify) rather
+    // than fail each event.
+    open_by_handle(raw, handle.kind, handle.bytes()).map_err(|error| {
+        keep_eperm(error, &format!("open_by_handle_at in {}", path.to_string_lossy()))
+    })?;
+    *calls += 2;
+    mounts.push(Mount { fsid, fd: opened });
+    Ok((fsid, handle))
+}
+
+/// A failure of `name_to_handle_at` of `path`, named: a file system that gives no handles
+/// says that fanotify cannot watch it; a bare `EPERM` is kept, which says a privilege is
+/// missing.
+fn no_handles(error: io::Error, path: &CStr) -> io::Error {
+    match error.raw_os_error() {
         Some(libc::EOPNOTSUPP) => io::Error::new(
             io::ErrorKind::Unsupported,
-            // alloc: the error of a watch that failed.
             format!(
-                "the file system of {} gives no file handles, which watching it with \
-                 fanotify needs: {error}",
+                "the file system of {} gives no file handles, which watching it with fanotify \
+                 needs: {error}",
                 path.to_string_lossy()
             ),
         ),
-        // alloc: the error of a watch that failed.
         _ => keep_eperm(error, &format!("name_to_handle_at of {}", path.to_string_lossy())),
-    })?;
-    let mut listed = Some(opened);
-    if !mounts.iter().any(|it| it.fsid == fsid) {
-        // SAFETY: a fanotify descriptor and a NUL-terminated path.
-        let marked = unsafe {
-            libc::syscall(
-                libc::SYS_fanotify_mark,
-                fanotify,
-                MARK_ADD | MARK_FILESYSTEM,
-                MASK,
-                libc::AT_FDCWD,
-                path.as_ptr(),
-            )
-        };
-        if marked != 0 {
-            let error = io::Error::last_os_error();
-            return Err(match error.raw_os_error() {
-                Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENODEV) => io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    // alloc: the error of a watch that failed.
-                    format!(
-                        "fanotify cannot watch the file system of {} by file handles: {error}",
-                        path.to_string_lossy()
-                    ),
-                ),
-                // alloc: the error of a watch that failed.
-                _ => keep_eperm(error, &format!("fanotify_mark of {}", path.to_string_lossy())),
-            });
+    }
+}
+
+/// `bytes` NUL-terminated in `into`, as a C string.
+fn c_path<'a, A: Allocator>(into: &'a mut Vec<u8, A>, bytes: &[u8]) -> io::Result<&'a CStr> {
+    into.clear();
+    into.extend_from_slice(bytes);
+    into.push(0);
+    CStr::from_bytes_with_nul(&into[..]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: a path with a NUL in it", String::from_utf8_lossy(bytes)),
+        )
+    })
+}
+
+/// Reads `/proc/self/mountinfo` whole into `into`, at most [`MOUNTINFO`] bytes: how many
+/// system calls that took.
+fn read_mountinfo<A: Allocator>(into: &mut Vec<u8, A>) -> io::Result<u32> {
+    use std::io::Read as _;
+    const FILE: &str = "/proc/self/mountinfo";
+    let mut file = std::fs::File::open(FILE).map_err(|error| named(&error, FILE))?;
+    let mut calls = 1;
+    let mut len = 0;
+    into.clear();
+    loop {
+        if len == into.len() {
+            if into.len() >= MOUNTINFO {
+                return Err(io::Error::other(format!(
+                    "{FILE} is over {MOUNTINFO} bytes, the most a watch's start reads to find \
+                     the file systems mounted under the watched directory"
+                )));
+            }
+            into.resize((2 * into.len()).clamp(16 << 10, MOUNTINFO), 0);
         }
-        // Opening a handle needs CAP_DAC_READ_SEARCH, which marking did not.
-        open_by_handle(raw, handle.kind, handle.bytes())
-            // alloc: the error of a watch that failed.
-            .map_err(|error| {
-                keep_eperm(error, &format!("open_by_handle_at in {}", path.to_string_lossy()))
-            })?;
-        // The mount keeps this descriptor; the walk lists the directory through one of its own.
-        mounts.push(Mount { fsid, fd: listed.take().expect("opened above") });
+        calls += 1;
+        match file.read(&mut into[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            // A signal before any byte was read: the read is asked again, as `read(2)` says.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(named(&error, FILE)),
+        }
     }
-    let key = Key::of(&fsid, handle.kind, handle.bytes());
-    let place = classify(dir, rel);
-    if place == Kind::Under {
-        known.insert(key.bytes(), (), rel);
+    into.truncate(len);
+    // The close.
+    Ok(calls + 1)
+}
+
+/// Hands `each` the mount point of every line of `mountinfo` (`/proc/self/mountinfo`'s
+/// bytes, proc(5)): the fifth field, its octal escapes (`\040` a space, `\011` a tab, `\012` a
+/// newline, `\134` a backslash) decoded into `point`. A line with no fifth field is an error
+/// naming it.
+fn mount_points<A: Allocator>(
+    mountinfo: &[u8],
+    point: &mut Vec<u8, A>,
+    mut each: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    for line in mountinfo.split(|&it| it == b'\n').filter(|it| !it.is_empty()) {
+        let Some(field) = line.split(|&it| it == b' ').nth(4) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "a line of /proc/self/mountinfo with no mount point: {}",
+                    String::from_utf8_lossy(line)
+                ),
+            ));
+        };
+        point.clear();
+        let mut at = 0;
+        while at < field.len() {
+            let octal = |it: u8| (b'0'..=b'7').contains(&it).then(|| it - b'0');
+            let escape = match field.get(at..at + 4) {
+                Some(&[b'\\', a, b, c]) => match (octal(a), octal(b), octal(c)) {
+                    (Some(a), Some(b), Some(c)) if a <= 3 => Some(a << 6 | b << 3 | c),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match escape {
+                Some(byte) => {
+                    point.push(byte);
+                    at += 4;
+                }
+                None => {
+                    point.push(field[at]);
+                    at += 1;
+                }
+            }
+        }
+        each(&point[..])?;
     }
-    if seen.len() < SEEN {
-        seen.insert(key.bytes(), place, if place == Kind::Outside { "" } else { rel });
+    Ok(())
+}
+
+/// Whether `path` is under `dir` (both absolute, as bytes): `dir` then a `/` and more.
+fn is_under_bytes(path: &[u8], dir: &[u8]) -> bool {
+    match dir {
+        b"/" => path.len() > 1 && path[0] == b'/',
+        _ => path.strip_prefix(dir).is_some_and(|rest| rest.first() == Some(&b'/')),
     }
-    Ok(listed)
 }
 
 /// The kind of place of the directory `rel` (relative to the root, "" for the root) for a
@@ -689,6 +964,11 @@ struct Key {
 }
 
 impl Key {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "`handle` is at most MAX_HANDLE (128) bytes: `Handle::bytes` slices to it and the \
+                  copy into the fixed KEY-byte array below would refuse more"
+    )]
     fn of(fsid: &[u8], kind: i32, handle: &[u8]) -> Key {
         let mut key = Key { bytes: [0; KEY], len: 0 };
         let size = u32::try_from(handle.len()).expect("a handle of at most MAX_HANDLE bytes");
@@ -712,6 +992,15 @@ fn fsid(fd: RawFd) -> io::Result<[u8; 8]> {
     if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(fsid_of(&stat))
+}
+
+/// The id of the file system that holds `path`, as fanotify's events carry it.
+fn fsid_at(path: &CStr) -> io::Result<[u8; 8]> {
+    crate::raw::statfs(path).map(|stat| fsid_of(&stat))
+}
+
+fn fsid_of(stat: &libc::statfs) -> [u8; 8] {
     // SAFETY: `fsid_t` is two `int`s (`__kernel_fsid_t`), whose field libc keeps private, so no
     // safe read of it exists; `transmute` checks the sizes match, and every bit pattern is an
     // `[i32; 2]`.
@@ -719,23 +1008,33 @@ fn fsid(fd: RawFd) -> io::Result<[u8; 8]> {
     let mut fsid = [0; 8];
     fsid[..4].copy_from_slice(&words[0].to_ne_bytes());
     fsid[4..].copy_from_slice(&words[1].to_ne_bytes());
-    Ok(fsid)
+    fsid
 }
 
 /// The handle of the directory open as `fd`, on the stack.
 fn handle_of(fd: RawFd) -> io::Result<Handle> {
+    name_to_handle(fd, c"", libc::AT_EMPTY_PATH)
+}
+
+/// The handle of the directory at `path`, links followed, on the stack: no descriptor opened,
+/// so a directory this process may only pass through is had too.
+fn handle_at(path: &CStr) -> io::Result<Handle> {
+    name_to_handle(libc::AT_FDCWD, path, libc::AT_SYMLINK_FOLLOW)
+}
+
+fn name_to_handle(fd: RawFd, path: &CStr, flags: libc::c_int) -> io::Result<Handle> {
     let mut handle = Handle { bytes: MAX_HANDLE as u32, kind: 0, handle: [0; MAX_HANDLE] };
     let mut mount_id: libc::c_int = 0;
-    // SAFETY: an open descriptor with an empty path, a handle with room for `bytes` bytes,
-    // and an int for the mount's id.
+    // SAFETY: a descriptor (open, or `AT_FDCWD`) with a NUL-terminated path (empty with
+    // `AT_EMPTY_PATH`), a handle with room for `bytes` bytes, and an int for the mount's id.
     let got = unsafe {
         libc::syscall(
             libc::SYS_name_to_handle_at,
             fd,
-            c"".as_ptr(),
+            path.as_ptr(),
             &raw mut handle,
             &raw mut mount_id,
-            libc::AT_EMPTY_PATH,
+            flags,
         )
     };
     if got != 0 {
@@ -965,12 +1264,10 @@ mod tests {
     /// with no file system marked, as outside).
     #[test]
     fn known_places_answer_until_a_directory_moves() {
-        let root = std::env::temp_dir().join(format!("blaze-fanotify-seen-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let fd = OwnedFd::from(std::fs::File::open(&root).unwrap());
+        let root = crate::temp::TempDir::for_test("blaze-fanotify-seen-");
+        let fd = OwnedFd::from(std::fs::File::open(root.path()).unwrap());
         let mut room = Room::new().unwrap();
-        room.root = root.clone();
+        room.root = root.path().to_path_buf();
         room.dir.push_str("src");
         let mut watch = Fanotify { fd, room };
         let fsid = [3; 8];
@@ -1013,13 +1310,208 @@ mod tests {
         assert_eq!(parsed(&event(MODIFY, &[])), (Vec::new(), true));
     }
 
+    /// Mount points are the fifth field of each line, their escapes decoded (a space is
+    /// `\040`), and only those strictly under the watched directory are its submounts.
+    #[test]
+    fn mountinfo_mount_points_are_read_with_their_escapes() {
+        let fixture = b"22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+            36 22 0:31 / /root/my\\040tree rw - tmpfs tmpfs rw\n\
+            37 36 0:32 / /root/my\\040tree/sub\\011tab\\134x rw - tmpfs tmpfs rw\n\
+            38 22 0:33 /mnt1 /root/my\\040treeish rw,noatime master:1 - ext3 /dev/root rw\n\
+            39 22 0:34 / /root/odd\\9 rw - tmpfs tmpfs rw\n";
+        let mut point = Vec::new_in(Global);
+        let mut points = Vec::new_in(Global);
+        mount_points(fixture, &mut point, |it| {
+            points.push(String::from_utf8(it.to_vec()).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            points,
+            ["/", "/root/my tree", "/root/my tree/sub\ttab\\x", "/root/my treeish", "/root/odd\\9"]
+        );
+        let top = b"/root/my tree";
+        let under: Vec<&String> =
+            points.iter().filter(|it| is_under_bytes(it.as_bytes(), top)).collect();
+        assert_eq!(under, ["/root/my tree/sub\ttab\\x"]);
+        assert!(is_under_bytes(b"/root", b"/") && !is_under_bytes(b"/", b"/"));
+        let broken = mount_points(b"22 1 8:1 /\n", &mut point, |_| Ok(()));
+        assert!(broken.unwrap_err().to_string().contains("no mount point"));
+    }
+
+    /// A watch of `dir` under `root`, or `None`, said, where the process may not use fanotify
+    /// (the inotify path is tested by the drivers' tests then).
+    fn privileged(root: &Path, dir: &FileName) -> Option<Fanotify> {
+        match Fanotify::new(root, dir, true, None) {
+            Ok(it) => Some(it),
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                eprintln!("skipped: fanotify needs CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH: {error}");
+                None
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// What `watch` hears until it hears `until`, which the caller changes last, or ten
+    /// seconds pass: a watch hears changes in the order they were made, so what it has not
+    /// heard by then it never will.
+    fn listen(watch: &mut Fanotify, until: &FileName) -> BTreeSet<FileName> {
+        let mut heard = BTreeSet::new();
+        let mut buffer = vec![0u8; crate::watch::BUFFER];
+        let clock = crate::wait::Monotonic::new();
+        let deadline = crate::wait::Deadline::after(clock.now(), Duration::from_secs(10));
+        while !heard.contains(until) {
+            let mut fds = [libc::pollfd { fd: watch.raw(), events: libc::POLLIN, revents: 0 }];
+            let waited =
+                crate::wait::readable("a test's fanotify events", &mut fds, Some(deadline), &clock)
+                    .unwrap();
+            if matches!(waited, crate::wait::Waited::Deadline) {
+                break;
+            }
+            // SAFETY: the buffer has room for what is read.
+            let n = unsafe { libc::read(watch.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n > 0 {
+                let Done::Changed { files, .. } = watch.take(&buffer[..n as usize]) else {
+                    unreachable!()
+                };
+                heard.extend(files);
+            }
+        }
+        assert!(heard.contains(until), "{until} never heard: {heard:?}");
+        heard
+    }
+
+    /// The invariant (the module's): an `rm -rf` of a subtree the watch never saw an event in
+    /// is heard as its top directory's name, though every directory it removed is gone and
+    /// was never learned. The control, the top deletion dropped, hears nothing of it.
+    #[test]
+    fn an_rm_rf_of_a_subtree_never_seen_is_heard() {
+        fn heard(plant: Plant) -> Option<bool> {
+            let root = crate::temp::TempDir::for_test("blaze-fanotify-rm-");
+            for file in ["src/a/b/c/one.rs", "src/a/b/d/two.rs", "src/a/e/three.rs"] {
+                std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+                std::fs::write(root.join(file), b"fn f() {}").unwrap();
+            }
+            let src = FileName::new("src").unwrap();
+            let mut watch = privileged(&root, &src)?;
+            assert_eq!(watch.room.seen.len(), 0, "the start learned a place under the watch");
+            std::fs::remove_dir_all(root.join("src/a")).unwrap();
+            let marker = FileName::new("src/marker.rs").unwrap();
+            std::fs::write(root.join(marker.as_str()), b"").unwrap();
+            PLANT.set(plant);
+            let heard = listen(&mut watch, &marker);
+            PLANT.set(Plant::None);
+            assert!(heard.iter().all(|it| it.is_under(&src)), "{heard:?}");
+            drop(watch);
+            std::fs::remove_dir_all(root).unwrap();
+            Some(heard.contains(&FileName::new("src/a").unwrap()))
+        }
+        let Some(told) = heard(Plant::None) else { return };
+        assert!(told, "the removal of src/a was not told");
+        assert_eq!(heard(Plant::TopDeletionDropped), Some(false), "the control was not caught");
+    }
+
+    /// Where the process may mount: a change on a file system mounted below the watched
+    /// directory before the watch began is heard, the mount found in mountinfo; the control,
+    /// mountinfo not read, never hears it.
+    #[test]
+    fn a_change_on_a_submount_below_the_watched_directory_is_heard() {
+        fn heard(plant: Plant) -> Option<bool> {
+            let root = crate::temp::TempDir::for_test("blaze-fanotify-mount-");
+            std::fs::create_dir_all(root.join("src/sub")).unwrap();
+            let sub = std::ffi::CString::new(root.join("src/sub").as_os_str().as_bytes()).unwrap();
+            // SAFETY: NUL-terminated strings and no data.
+            let mounted = unsafe {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    sub.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if mounted != 0 {
+                eprintln!("skipped: mounting a tmpfs: {}", io::Error::last_os_error());
+                return None;
+            }
+            let src = FileName::new("src").unwrap();
+            PLANT.set(plant);
+            let watch = Fanotify::new(&root, &src, true, None);
+            PLANT.set(Plant::None);
+            let unmount = || {
+                // SAFETY: a NUL-terminated path.
+                assert_eq!(unsafe { libc::umount2(sub.as_ptr(), libc::MNT_DETACH) }, 0);
+            };
+            let mut watch = match watch {
+                Ok(it) => it,
+                Err(error) => {
+                    unmount();
+                    match error.raw_os_error() == Some(libc::EPERM)
+                        || error.kind() == io::ErrorKind::Unsupported
+                    {
+                        // A kernel whose tmpfs has no fsid fanotify takes (before 6.7) cannot
+                        // be marked, which fails the watch; said, and passed over here.
+                        true => {
+                            eprintln!("skipped: fanotify of a tmpfs: {error}");
+                            return None;
+                        }
+                        false => panic!("{error}"),
+                    }
+                }
+            };
+            std::fs::write(root.join("src/sub/lib.rs"), b"fn f() {}").unwrap();
+            let marker = FileName::new("src/marker.rs").unwrap();
+            std::fs::write(root.join(marker.as_str()), b"").unwrap();
+            let heard = listen(&mut watch, &marker);
+            drop(watch);
+            unmount();
+            std::fs::remove_dir_all(root).unwrap();
+            Some(heard.contains(&FileName::new("src/sub/lib.rs").unwrap()))
+        }
+        let Some(told) = heard(Plant::None) else { return };
+        assert!(told, "the change on the submount was not heard");
+        assert_eq!(heard(Plant::MountinfoUnread), Some(false), "the control was not caught");
+    }
+
+    /// The outcome: starting a watch of a tree of 100 000 directories makes a constant number
+    /// of system calls (counted by the start itself) and learns no place under the watched
+    /// directory, so the thread that starts it never waits on the tree. The control, the walk
+    /// put back, makes one per directory.
+    #[test]
+    fn a_start_makes_a_constant_number_of_system_calls() {
+        /// What a start may make, whatever is under the watched directory: fanotify_init, two
+        /// realpaths, the open and mark of the watched directory's file system (five), two per
+        /// directory above it (one here), and mountinfo's open, reads and close.
+        const MOST: u32 = 32;
+        let root = crate::temp::TempDir::for_test("blaze-fanotify-big-");
+        for a in 0..100 {
+            for b in 0..1000 {
+                std::fs::create_dir_all(root.join(format!("src/d{a}/e{b}"))).unwrap();
+            }
+        }
+        let src = FileName::new("src").unwrap();
+        let begun = std::time::Instant::now();
+        let Some(watch) = privileged(&root, &src) else { return };
+        let took = begun.elapsed();
+        let calls = watch.room.calls;
+        eprintln!("a start of a watch of 100 100 directories: {calls} system calls, {took:?}");
+        assert!(calls <= MOST, "{calls} system calls");
+        assert!(watch.room.known.len() <= 2 && watch.room.seen.len() == 0);
+        let room = watch.end();
+        PLANT.set(Plant::WalksAtStart);
+        let walked = Fanotify::new(&root, &src, true, Some(room)).unwrap();
+        PLANT.set(Plant::None);
+        assert!(walked.room.calls > MOST, "the control was not caught: {}", walked.room.calls);
+        drop(walked);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Where the process may: a file made under the watched directory, in a directory made
     /// after the watch began, is heard of, and one outside it is not; a watch made again from
     /// the first's room hears the same.
     #[test]
     fn hears_what_is_under_the_watched_directory_only() {
-        let root = std::env::temp_dir().join(format!("blaze-fanotify-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
+        let root = crate::temp::TempDir::for_test("blaze-fanotify-");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let src = FileName::new("src").unwrap();
         let mut room = None;

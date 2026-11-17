@@ -1,0 +1,14 @@
+{
+ "id": "primitive2-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane primitive2",
+ "where": "crates/blaze-record (lookup), crates/hir-def/src/deps/filed.rs, crates/blaze-usercode/src/index.rs, crates/blaze-kernel/src/entry.rs, crates/blaze-cargo/src/serve/unit/reads.rs",
+ "what": "blaze-record's first `lookup` asked its caller for one digest per read name and fetched the answer itself, which fitted two of the copies it was written to replace (goal store, item store) and none of the others: hir-def's reads are valued a list at a time and their answer is a key several records are under; blaze-usercode vetoes a hit and wants the hit's list back. And the copies keep turning up: blaze-kernel's `kernel shape slot` is a sixth, blaze-cargo's `serve/unit/reads.rs` probably a seventh.",
+ "cost": "one more piece in the primitive (`walk`, a visitor over the lists a lookup searches) before the third port could be written; two copies still unported",
+ "cause": "the primitive's interface was drawn from the two simplest copies before the others were read",
+ "class": "an interface designed from a sample of its users (rule 28, rule 30)",
+ "prevention": "read every copy before fixing a shared interface; `scripts/src/bin/domains.rs` should fail a domain ending in `slot` or `shape` outside blaze-record once the kernel and unit-reads copies are ported",
+ "workaround": "none",
+ "fix": "`blaze_record::walk` written with `lookup` on top of it; hir-def's slots ported with `Bounds::new(16, 1)`; kernel and unit reads left for a successor (/tmp/primitive/next.md)",
+ "state": "open"
+}

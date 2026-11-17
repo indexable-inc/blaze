@@ -31,7 +31,49 @@ use crate::{
 
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
     // alloc: empty, allocates nothing, unless there is an error
-    entry(cx).into_iter().map(|diag| Found::new(diag, PASSES)).collect()
+    edition(cx).into_iter().chain(entry(cx)).map(|diag| Found::new(diag, PASSES)).collect()
+}
+
+/// blaze: the crate's blaze edition, where its attribute cannot be taken as one
+/// (docs/v2/plan/design/std.md, "The blaze edition: opting in"): a version that is no
+/// edition's, two attributes naming two, or an edition whose `std` the crate was not given.
+/// None of these is quietly a Rust crate or quietly the edition.
+fn edition(cx: &Cx<'_, '_>) -> Vec<Diag> {
+    use base_db::SaidBlazeEdition;
+    let krate = cx.krate.base();
+    let latest = span::BlazeEdition::LATEST;
+    // alloc: the error's message, each below
+    let message = match krate.said_blaze_edition(cx.db) {
+        SaidBlazeEdition::None => return Vec::new(),
+        SaidBlazeEdition::Unknown(written) => format!(
+            "`#![{} = {written}]` names no blaze edition: this blaze knows \"{}\" (rule \
+             blaze-edition; a package says it as `edition = \"{}\"` in Cargo.toml)",
+            span::BlazeEdition::ATTR,
+            latest.version(),
+            latest.manifest(),
+        ),
+        SaidBlazeEdition::Two(first, second) => format!(
+            "the crate is given two blaze editions, `{first}` and `{second}`: its manifest's \
+             `edition` says one, so the root file's own `#![{}]` goes (rule blaze-edition)",
+            span::BlazeEdition::ATTR,
+        ),
+        SaidBlazeEdition::Is(edition) => {
+            let std = span::BlazeEdition::STD;
+            let has_std =
+                krate.data(cx.db).dependencies.iter().any(|dep| dep.name.as_str() == std);
+            if has_std {
+                return Vec::new();
+            }
+            format!(
+                "crate `{}` is of the blaze edition `{edition}`, whose `std` is {std}, and has no \
+                 dependency named `{std}`: until blaze ships {std} with itself \
+                 (docs/v2/plan/design/std.md, row S5d) the package names it, `{std} = {{ package = \
+                 \"blaze-std\", path = \"..\" }}` under `[dependencies]` (rule blaze-edition)",
+                cx.crate_name(cx.krate),
+            )
+        }
+    };
+    vec![Diag::new(Level::Error, None, message)]
 }
 
 /// rustc's `CrateType::Executable`: a binary, an example, a build script. A test or bench
@@ -90,6 +132,20 @@ fn entry(cx: &Cx<'_, '_>) -> Vec<Diag> {
                 "the `main` function cannot be declared in an `extern` block",
                 span,
             );
+            diag.fact(cx.resolves_fact(root, "main"), "what `main` is in the crate root");
+            diags.push(diag);
+        }
+        // blaze: what `main` may take (`hir_ty::entry`, rule entry-takes-roots): the roots
+        // the runtime makes, in a crate of a blaze edition; nothing, in Rust, where a `main`
+        // with parameters is rustc's E0580 and is refused here naming the edition that
+        // allows them.
+        if local
+            && let Some(Err(refused)) = hir_ty::entry::checked(cx.db, cx.krate.base())
+            && let Some(node) = cx.vsema.source(*function)
+        {
+            let span = cx.span(node.map(|it| def_range(it.syntax())));
+            // alloc: the error's message
+            let mut diag = Diag::error(None, refused.to_string(), span);
             diag.fact(cx.resolves_fact(root, "main"), "what `main` is in the crate root");
             diags.push(diag);
         }

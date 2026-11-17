@@ -69,7 +69,7 @@ pub(crate) fn fetch_for(version: &str, why: &str) -> anyhow::Result<PathBuf> {
         return Ok(exe);
     }
     let host = hir_ty_codegen::Target::host();
-    eprintln!("blaze: fetching blaze {version} for {host}, {why}");
+    blaze_report::errln!("blaze: fetching blaze {version} for {host}, {why}");
     fetched(version, host, &exe, |name| read_at(&format!("v{version}"), name))?;
     Ok(exe)
 }
@@ -206,9 +206,9 @@ pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
     pinned_in(&mut doc, ours).with_context(|| format!("pinning blaze in {shown}"))?;
     std::fs::write(&manifest, doc.to_string()).with_context(|| format!("writing {shown}"))?;
     match was {
-        Some(was) if was == ours => eprintln!("{shown} pins blaze {ours} already"),
-        Some(was) => eprintln!("{shown} pins blaze {ours}, in place of {was}"),
-        None => eprintln!("{shown} pins blaze {ours}"),
+        Some(was) if was == ours => blaze_report::errln!("{shown} pins blaze {ours} already"),
+        Some(was) => blaze_report::errln!("{shown} pins blaze {ours}, in place of {was}"),
+        None => blaze_report::errln!("{shown} pins blaze {ours}"),
     }
     Ok(0)
 }
@@ -264,19 +264,19 @@ pub(crate) fn why_this_one(given: bool) -> String {
         .and_then(|it| pin::root_manifest(&it));
     let manifest = match found {
         Ok(Some(manifest)) => manifest,
-        Ok(None) => return format!("{this}, as no workspace is here to pin one"),
+        Ok(None) => return blaze_thin::pin::says_no_workspace(&this),
         Err(why) => return format!("{this}: {why}"),
     };
     let shown = manifest.display();
     if pin::names(std::env::var_os(pin::PINNED_BY).as_deref(), &manifest) {
-        return format!("{this}, as {shown} pins it");
+        return blaze_thin::pin::says_pinned(&this, &manifest);
     }
     let ignore = pin::ignores(given, &manifest);
     match pin::pinned(&manifest) {
         Ok(Some(wanted)) => {
             let pinned = pin::pinned_text(&wanted);
             match pin::choose(ours, &manifest, &wanted, ignore) {
-                Ok(pin::Choice::Pinned) => format!("{this}, as {shown} pins it"),
+                Ok(pin::Choice::Pinned) => blaze_thin::pin::says_pinned(&this, &manifest),
                 Ok(pin::Choice::Ignored) => format!(
                     "{this}, as `{}` says, in place of {pinned}, which {shown} pins",
                     pin::IGNORE_PIN
@@ -291,10 +291,7 @@ pub(crate) fn why_this_one(given: bool) -> String {
                 Err(why) => format!("{this}: {why}"),
             }
         }
-        Ok(None) => format!(
-            "{this}, as {shown} pins none (`[workspace.metadata.blaze] version`, which \
-             `blaze pin` writes)"
-        ),
+        Ok(None) => blaze_thin::pin::says_pins_none(&this, &manifest),
         Err(why) => format!("{this}: {why}"),
     }
 }
@@ -443,7 +440,7 @@ const POINTERS: &str = "channels";
 /// its [`pin::channel_file`] for the launcher, which runs that release for a pin to the channel.
 pub(crate) fn resolve_command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let channel = args.next().context("`version-resolve` is told the channel")?;
-    println!("{}", resolve(&channel)?);
+    blaze_report::outln!("{}", resolve(&channel)?);
     Ok(())
 }
 
@@ -591,8 +588,8 @@ mod tests {
     /// leaves the archive out, or no list at all is refused and nothing is unpacked.
     #[test]
     fn a_pinned_release_is_checked_by_every_sum_it_publishes() {
-        let root = std::env::temp_dir().join(format!("blaze-versions-sums-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-versions-sums-");
+        let root = tmp.path();
         let host = "x86_64-unknown-linux-gnu";
         let top = format!("blaze-v0.1.0-{host}");
         let archive = format!("{top}.tar.gz");
@@ -675,7 +672,6 @@ mod tests {
             })
         });
         assert!(format!("{:#}", got.unwrap_err()).contains("SHA256SUMS names no"));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A release dated after `B3SUMS` began that lacks it is refused, naming it, rather than
@@ -685,9 +681,8 @@ mod tests {
         assert!(
             !has_b3sums("0.20261030.1") && has_b3sums("0.20261031.0") && has_b3sums("0.20270101.3")
         );
-        let exe = std::env::temp_dir()
-            .join(format!("blaze-versions-b3-{}", std::process::id()))
-            .join("versions/0.20261102.0/blaze");
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-versions-b3-");
+        let exe = tmp.join("versions/0.20261102.0/blaze");
         let got = fetched("0.20261102.0", "x86_64-unknown-linux-gnu", &exe, |name| {
             Ok((name == "SHA256SUMS")
                 .then(|| b"00  blaze-v0.20261102.0-x86_64-unknown-linux-gnu.tar.gz\n".to_vec()))
@@ -702,8 +697,8 @@ mod tests {
 
     #[test]
     fn a_release_from_a_directory_is_checked_and_unpacked() {
-        let root = std::env::temp_dir().join(format!("blaze-versions-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-versions-");
+        let root = tmp.path();
         let top = format!("blaze-v0.1.0-{}", hir_ty_codegen::Target::host());
         let mut archive = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -730,6 +725,5 @@ mod tests {
             "{error:#}"
         );
         assert!(!elsewhere.exists());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

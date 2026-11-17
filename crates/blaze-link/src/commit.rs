@@ -1,6 +1,9 @@
 //! The commit: the one serial step. A stage's writes go to a copy of the image (a clone that
-//! shares its blocks, or a new file for a full link), which is synced and renamed over the
-//! image, so a reader or a crash sees the old image or the new. Running programs are told
+//! shares its blocks, or a new file for a full link), which is renamed over the image, so a
+//! reader sees the old image or the new. A file written whole is synced before the rename, so
+//! a crash sees one or the other too; a patched clone is not (the edit path syncs nothing:
+//! docs/v2/plan/design/patch-in-place.md), so after a power loss its file may be torn, which
+//! [`Image::verify`] finds by the file's digest. Running programs are told
 //! only by a commit into their code memory ([`Image::commit_into`]), never by a file commit.
 //! Effects complete in any order: each step waits for all of its own.
 //!
@@ -134,6 +137,8 @@ impl Image {
     /// of its file the commit overwrites: what a failed file commit puts back.
     pub(crate) fn take(&mut self, state: State, full: bool, undo: Vec<(u64, u64)>) -> Revert {
         self.generations = self.generations.max(state.generation);
+        // The first commit's file is written whole, whatever the stage said of it.
+        self.filed.wrote(full || !self.state.laid_out, &undo);
         let before = std::mem::replace(&mut self.state, state);
         if before.laid_out {
             let len = before.file_len;
@@ -178,6 +183,7 @@ impl Image {
     pub(crate) fn take_undo(&mut self) -> Revert {
         let Undo { state, full, len, writes } =
             self.history.pop_back().expect("a rollback's writes were made of it");
+        self.filed.wrote(full, &writes);
         let current = std::mem::replace(&mut self.state, state);
         Revert::Push { state: current, full, len, writes }
     }
@@ -185,7 +191,9 @@ impl Image {
     /// Writes a commit's or rollback's file into `memory`'s image part, as the file's effects
     /// leave it: a full write's file starts as zeros, so the gaps between its writes, and what
     /// the last file had past it, are zeroed; a shorter file zeroes what it no longer has.
-    /// Each range written is published. Nothing is written when the file doesn't fit.
+    /// Zeroing writes only where the memory was written before (`CodeMemory::zero`), so the
+    /// patch room of an image, a gap of 64 MiB or more, costs a first link nothing. Each
+    /// range written is published. Nothing is written when the file doesn't fit.
     pub(crate) fn write_into(
         &self,
         writes: &Writes,
@@ -217,12 +225,13 @@ impl Image {
             what: format!("writing {to} into its code memory: {error}"),
             refusal: None,
         };
+        // Zeros where the memory holds anything: a page of it never written (an image's
+        // patch room, most of the file) is zeros already and is not touched.
         let zero = |memory: &mut CodeMemory, offset: u64, len: u64| -> Result<(), LinkError> {
             if len == 0 {
                 return Ok(());
             }
-            memory.fill(offset, len, 0).map_err(fail)?;
-            memory.publish(CodeRange { offset, len }).map_err(fail)
+            memory.zero(offset, len).map(|_| ()).map_err(fail)
         };
         let mut at = 0;
         for (offset, bytes) in &writes.writes {
@@ -277,14 +286,24 @@ impl Image {
                 }]);
             }
         }
+        let full = writes.full;
         steps.step(writes.writes.into_iter().map(|(at, bytes)| Effect::WriteAt {
             file: owned(next),
             at,
             bytes,
             tag: tags.next(),
         }));
-        steps.step([Effect::Sync { file: owned(next), tag: tags.next() }]);
+        // Only a file written whole is synced. A link placed into the room the image kept is
+        // the edit path, and its file is derived data: after a power loss the rename may have
+        // survived writes that did not, and whoever patches a file it did not just write
+        // checks it first ([`Image::verify`]) and links from scratch when it is not the
+        // last link's.
+        if full {
+            // durable: review: the linked file is derived, and synced when written whole so the name never outlives its bytes after a power loss; a patched file is not synced and its next patcher verifies it
+            steps.step([Effect::Sync { file: owned(next), tag: tags.next() }]);
+        }
         steps.step([Effect::Mode { file: owned(next), mode: 0o755, tag: tags.next() }]);
+        // durable: review: the linked file is derived data a build places again; its rename still waits for the directory's sync and can take `RenameUnsynced` once the tests of a link's steps follow
         steps.step([Effect::Rename { from: owned(next), to: owned(to), tag: tags.next() }]);
         Ok(steps)
     }
@@ -374,6 +393,8 @@ impl Image {
         }
         if let Some(failed) = pending.failed.take() {
             let pending = self.pending.take().expect("in flight");
+            // The state put back is another than the file's digest was last told of.
+            self.filed.wrote_any();
             match pending.revert {
                 Some(Revert::Pop) => {
                     let undo = self.history.pop_back().expect("the commit pushed its undo");

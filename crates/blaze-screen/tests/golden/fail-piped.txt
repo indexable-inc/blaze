@@ -1,0 +1,14 @@
+error[E0425]: cannot find value `c` in this scope
+ --> src/main.rs:1:37
+  |
+1 | fn add(a: u32, b: u32) -> u32 { a + c }
+  |                                     ^
+  |
+help: a local variable with a similar name exists
+  |
+1 - fn add(a: u32, b: u32) -> u32 { a + c }
+1 + fn add(a: u32, b: u32) -> u32 { a + a }
+  |
+
+For more information about this error, try `rustc --explain E0425`.
+blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=6304 unit="hello (bin)" next="blaze explain hello"

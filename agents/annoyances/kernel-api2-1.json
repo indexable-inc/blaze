@@ -1,0 +1,19 @@
+{
+ "id": "kernel-api2-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-api2",
+ "where": "crates/blaze-kernel/src/nest.rs (`Engine::entered`), crates/blaze-kernel/src/lib.rs (`Kernel::get`)",
+ "what": "Nesting made every hit read its entry twice: the engine read it to hash the value for a parent that might have asked, and `Kernel::get` read it again because the engine's borrow of the store cannot be returned. The one test that pins a hit's cost (`a_step_with_no_reads_is_one_probe`) caught it only because it existed for the shape with no reads; no test pinned the cost of a hit with reads or of a child.",
+ "cost": "one extra store get and one hash of the whole value on every hit of every entry, found a piece later",
+ "whys": [
+  "why two gets: the engine did not know how much of the entry its caller would use, so it took all of it for every caller",
+  "why not caught for the other shapes: a hit's cost was a number in one test, not a stated property per shape",
+  "why the top still probes then gets: `Kernel::get` returns an entry borrowed from `&mut` store, and NLL refuses to return the engine's own read conditionally"
+ ],
+ "cause": "the cost of a lookup was not part of its interface: nothing said what a caller needs of a hit, and nothing pinned what each shape pays",
+ "class": "a hot path whose cost is implied by the code that happens to be there, so a change of structure moves it silently",
+ "prevention": "`nest::Need` (a lookup is asked for the key, the hash or the value, and reads the store accordingly) and `tests/cost.rs`, which pins (probes, gets, reads valued) per shape; a new shape adds its row there",
+ "workaround": "",
+ "fix": "done in piece 0 of lane kernel-api2; open: the top's answer probe (needs `get` to hand the entry to a closure, or a store whose put takes `&self`), and `take_lookups()` being one tally a process, which parallel tests cannot assert on",
+ "state": "open"
+}

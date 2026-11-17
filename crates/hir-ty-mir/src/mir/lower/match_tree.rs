@@ -439,12 +439,41 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         // test of its own that is not followed here.
         let adjustments = self.infer.pat_adjustments.get(&pattern).unwrap_or_default();
         for adjustment in adjustments {
-            if adjustment.kind == PatAdjust::OverloadedDeref && !adjustment.source.as_ref().is_box()
-            {
-                return None;
+            match adjustment.kind {
+                PatAdjust::OverloadedDeref if !adjustment.source.as_ref().is_box() => return None,
+                PatAdjust::BuiltinDeref | PatAdjust::OverloadedDeref => place.push(Step::Deref),
+                // blaze: a pattern of a member of an error union asks which variant of the
+                // union's `Repr` enum (its one field) the union holds, and the rest of the
+                // member in it. The member is the pattern's own type, so this is the last
+                // adjustment.
+                PatAdjust::UnionMember => {
+                    let member = self.infer.pat_ty(self.union_member_pat(pattern));
+                    let variant = self.union_member_variant(adjustment.source.as_ref(), member)?;
+                    let variant = VariantId::EnumVariantId(variant);
+                    place.push(Step::Field(0));
+                    let mut within = variant_place(variant, &place, frame);
+                    within.push(Step::Field(0));
+                    let mut inside = Vec::new_in(frame);
+                    self.pairs_of_unadjusted(pattern, within, &mut inside)?;
+                    self.pairs_of_variant(variant, inside, place, pairs);
+                    return Some(());
+                }
             }
-            place.push(Step::Deref);
         }
+        self.pairs_of_unadjusted(pattern, place, pairs)
+    }
+
+    /// [`Self::pairs_of`] of `pattern` itself, at the place its adjustments came to.
+    fn pairs_of_unadjusted<'t>(
+        &self,
+        pattern: PatId,
+        mut place: Vec<Step, &'t Frame>,
+        pairs: &mut Vec<Pair<'t>, &'t Frame>,
+    ) -> Option<()>
+    where
+        'a: 't,
+    {
+        let frame = *place.allocator();
         let ty = self.infer.pat_ty(pattern);
         match self.store.pat(pattern) {
             Pat::Wild | Pat::Bind { subpat: None, .. } => (),
@@ -558,10 +587,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     VariantId::UnionId(_) => return None,
                 };
                 let mut inside = Vec::new_in(frame);
+                let table = self.resolver.ctx_table();
                 for field in args.iter() {
                     let mut within = variant_place(variant, &place, frame);
                     let hygiene = self.store.record_field_hygiene(field.pat);
-                    let id = fields.field_written(self.db, variant, &field.name, hygiene)?;
+                    let id = fields.field_written(self.db, table, variant, &field.name, hygiene)?;
                     within.push(Step::Field(u32::from(id.into_raw())));
                     self.pairs_of(field.pat, within, &mut inside)?;
                 }
@@ -627,11 +657,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     }
 
     /// What a literal in a pattern of type `ty` asks.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a `line!()` or `column!()` pattern asks the line or column it is written at"
+    )]
     fn constant_ask<'t>(&self, ty: Ty<'db>, literal: hir_def::hir::ExprId) -> Option<Ask<'t>>
     where
         'a: 't,
     {
         let store = self.store;
+        let expr = literal;
         // A negated literal is one `Literal::negate` takes: an integer or a float.
         let (literal, negated) = match store.expr(literal) {
             Expr::Literal(it) => (it, false),
@@ -643,6 +678,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let signed = matches!(ty.kind(), TyKind::Int(_));
         let ordered = |value: u128| if signed { value ^ (1 << 127) } else { value };
+        // A `line!()` or `column!()` pattern asks the line or column its call is written at,
+        // not the placeholder the store holds. One written nowhere asks nothing this can
+        // follow (every arm is reached); lowering the pattern refuses it by name.
+        if !negated && let Literal::Uint(..) = literal {
+            match hir_ty::body_store::placed_literal(self.db, self.store_owner, expr) {
+                Ok(Some(Literal::Uint(it, _))) => return Some(Ask::Int(ordered(it))),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
         Some(match *literal {
             Literal::Bool(it) => Ask::Bool(it),
             Literal::Char(it) => Ask::Int(u128::from(it)),

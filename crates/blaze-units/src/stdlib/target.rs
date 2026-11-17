@@ -12,7 +12,12 @@
 //! `wasm64-blaze-wasip1`, the target of the bootstrap seed (`docs/future/bootstrap.md`): wasm64
 //! (memory64) with WASI preview 1 over 64-bit pointers and sizes, whose calls import from the
 //! module `wasi_snapshot_preview1_64` (blaze's `library/`), so a stock wasip1 host refuses it at
-//! instantiation, naming them. A triple in both files is an error.
+//! instantiation, naming them. And `naga-unknown-unknown`, the device build of a shader crate
+//! (docs/future/gpu/shaders.md, "Phase 2 as built"): `target_arch = "naga"`, 32-bit `usize`,
+//! little endian, `panic = "abort"`, no family and `target_os = "unknown"`, so std takes its
+//! unsupported platform layer (blaze's `library/` names `naga` where std's lists have no default
+//! arm). Nothing is linked for it: blaze-shader lowers what a crate's `GPU_ENTRIES` reach to
+//! naga's IR. A triple in both files is an error.
 //!
 //! The JSON is read once per process and compiled per target into columns: feature names
 //! interned to bits of a [`Features`] in their sorted order, what each turns on and off as a set,
@@ -87,6 +92,12 @@ struct RawTarget {
     /// of these turns no cfg on or off, and rustc warns of it.
     #[serde(default)]
     other_features: Vec<String>,
+    /// blaze's own targets only: std's build script runs with `RUSTC_BOOTSTRAP_SYNTHETIC_TARGET`
+    /// set, as rustc's bootstrap runs it for a target it defines outside rustc's list
+    /// (`src/bootstrap/src/core/build_steps/synthetic_targets.rs`), so std is not
+    /// `restricted_std` there: a shader crate names std as any crate does.
+    #[serde(default)]
+    synthetic: bool,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +177,8 @@ struct Compiled {
     /// one blaze has no data of.
     other_features: Box<[Box<str>]>,
     panic: Box<str>,
+    /// [`RawTarget::synthetic`].
+    synthetic: bool,
     split_debuginfo: Box<[Box<str>]>,
     /// By crate type, sorted.
     file_names: Box<[(Box<str>, Option<Box<str>>)]>,
@@ -205,6 +218,7 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
         features_off,
         feature_cfgs,
         other_features,
+        synthetic,
     } = raw;
     let stable_lines = cfg.len();
     let recorded: Vec<String> = cfg.into_iter().chain(nightly_cfg).collect();
@@ -341,6 +355,7 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
         feature_cfgs,
         other_features: other_features.into_boxed_slice(),
         panic: panic.into_boxed_str(),
+        synthetic,
         split_debuginfo: boxed(split_debuginfo),
         file_names: file_names
             .into_iter()
@@ -1100,6 +1115,12 @@ pub fn file_name(triple: &str, crate_type: &str, name: &str) -> Result<Option<St
             )
         })?;
     Ok(target.file_names[at].1.as_deref().map(|it| it.replace("___", name)))
+}
+
+/// Whether `triple` is one of blaze's own targets that rustc's bootstrap would call synthetic
+/// ([`RawTarget::synthetic`]): a build script run for it gets `RUSTC_BOOTSTRAP_SYNTHETIC_TARGET`.
+pub fn is_synthetic(triple: &str) -> Result<bool, String> {
+    Ok(target(triple)?.synthetic)
 }
 
 /// Whether blaze has data of `triple`: an error naming it where it has none.

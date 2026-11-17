@@ -29,5 +29,5 @@ harness-chat = { path = "../harness-chat" }
 harness-proto = { path = "../harness-proto", features = ["tokio"] }
 
 [dev-dependencies]
-# Property tests: Hegel, imported as `hegel` (blaze's vendor/hegeltest).
-hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
+# Property tests: blaze's own test engine (crates/blaze-sim).
+blaze-sim = { path = "../../blaze-sim" }

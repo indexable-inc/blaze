@@ -1,0 +1,17 @@
+{
+  "id": "storegc2-1",
+  "who": "storegc2 (claude-fable-5-2)",
+  "when": "2026-11-12",
+  "area": "blaze-cas index table, item sets",
+  "what": "The store built its whole index table (a walk of every row, a sort, 64 bytes a row) inside a commit on the daemon's loop every 65,536 new records; at one value an item that is every crate or two.",
+  "whys": [
+    "The table was built where the commit that names it is made, so the head and the table agree by construction.",
+    "That agreement was stated nowhere as an invariant, so nothing said a table could be older than its head.",
+    "The head had one meaning for a pack's indexed end: the end at the write.",
+    "Work on the loop had no rule tying its cost to something bounded (packs), only to 'once per 65,536 records'.",
+    "Record counts were sized for one value a crate, not one an item."
+  ],
+  "class": "Work on the store's thread whose cost grows with the rows the store holds.",
+  "prevention": "rebuild.rs builds the table on a worker from each pack's end at the take, and the head names those ends (invariant in the module doc, simulation tests::rebuild with the planted head). Still on the loop and of this class: the swap's walk of the delta (try_flip, end_migration) and PeriodScan listing every row; a counter of rows walked on the store's thread (IndexCounts::loop_rows) is the start of a gate for the class.",
+  "status": "written, not compiled or run"
+}

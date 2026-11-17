@@ -1,0 +1,11 @@
+{
+ "id": "disk-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "the shell",
+ "what": "`stat -f %z` failed inside a script because GNU `stat` from nix is first on PATH; `/usr/bin/stat` had to be spelled out. The same cause as A1.",
+ "cost": "minutes",
+ "cause": "two toolchains on one PATH",
+ "workaround": "spell `/usr/bin/stat`",
+ "state": "open"
+}

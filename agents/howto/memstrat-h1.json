@@ -1,0 +1,9 @@
+{
+ "id": "memstrat-h1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "task": "Time blaze's edit loop on an ix VM",
+ "do": "Put BLAZE_HOME and the project on tmpfs (/dev/shm), and before the first measurement fill the VM's memory once so its hot-add is over (a script that holds about 116 GiB of bytes for a moment on a 128 GiB VM; MemTotal in /proc/meminfo stops growing). Alternate the binaries compared, at least two pairs, and compare pairs, not single runs; nothing else may run (no cargo, no second daemon). Memory numbers do not need any of this: they repeated within 2% from the first run. Check MemTotal again before each run: the host takes memory back from a VM that stops using it, and the rows are noisy while it does.",
+ "why": "On the VM's root disk a no-op run was 83 to 144 ms where tmpfs gives 17, and while virtio-mem was still adding memory (dmesg: `virtio_mem ... add_memory`, about 50 ms each, in bursts) the same binary's no-op build was 13.9 ms in one run and 81.4 in the next.",
+ "state": "current"
+}

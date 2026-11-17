@@ -1,0 +1,14 @@
+{
+ "id": "suggest-lints-already-existed-as-unmarked",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-findings",
+ "where": "crates/blaze-lints/src/blaze.rs `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`; the lane brief's `could_be_pure`, `could_be_nopanic`, `could_be_noalloc`",
+ "what": "The brief asked for three suggestion lints that already exist under other names (with the machine-applicable fix); building them again would have been two lints for one concept.",
+ "cost": "a reading pass to find them; the new `blaze::suggest` group lists the existing ones instead",
+ "cause": "a lint is found by its name, and the names of one concept differ (`unmarked_*` vs `could_be_*`); nothing maps a concept to its lint",
+ "class": "duplicate work from a concept known by two names",
+ "prevention": "a lane brief names lints by what they find, and the lane greps docs/lints.md for the finding's shape before writing one; or one renamed alias (`blaze::RENAMED`) so either name finds it",
+ "workaround": "grep docs/lints.md for the attribute a lint would suggest before writing it",
+ "fix": "the group `blaze::suggest` includes the `unmarked_*` lints",
+ "state": "fixed"
+}

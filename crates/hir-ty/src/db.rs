@@ -949,14 +949,13 @@ impl HirDatabase for Db {
     }
 }
 
-#[blaze_query::interned(debug)]
-#[derive(PartialOrd, Ord)]
+#[blaze_memo::interned(debug)]
 pub struct InternedOpaqueTyId {
     #[returns(copy)]
     pub loc: ImplTraitId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InternedClosure<'db> {
     pub owner: InferBodyId<'db>,
     pub expr: ExprId,
@@ -966,16 +965,18 @@ pub struct InternedClosure<'db> {
 /// What a closure is interned by: its place among the closures of its body. Its expression
 /// moves with every edit of the body before it, and a closure that moved would be another
 /// type, with everything generic over it instantiated again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct ClosureKey<'db> {
     owner: InferBodyId<'db>,
     nth: u32,
+    // A closure's kind is syntax of its body and names no arena.
+    #[home(skip)]
     kind: ClosureKind,
 }
 
 impl<'db> ClosureKey<'db> {
     fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
-        let closures = closure_exprs(db, loc.owner.expression_store_owner(db), ());
+        let closures = closure_exprs(db, loc.owner.expression_store_owner(db));
         let nth = closures.partition_point(|&it| it < loc.expr) as u32;
         ClosureKey { owner: loc.owner, nth, kind: loc.kind }
     }
@@ -986,7 +987,7 @@ impl<'db> ClosureKey<'db> {
     }
 
     fn loc(self, db: &'db Db) -> InternedClosure<'db> {
-        let closures = closure_exprs(db, self.owner.expression_store_owner(db), ());
+        let closures = closure_exprs(db, self.owner.expression_store_owner(db));
         // A key from before an edit that took closures out of the body names none of them.
         // Whatever asks about it is not asked for its answer.
         let expr = closures.get(self.nth as usize).or(closures.last()).copied();
@@ -996,19 +997,25 @@ impl<'db> ClosureKey<'db> {
 }
 
 /// The closures, `async` blocks and coroutines of a body, in the order of their expressions.
-// The unit makes this a function of several arguments, whose key `closure_exprs::arguments`
-// gives back (blaze-item-hash reads it).
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-pub fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {
-    ExpressionStore::of(db, owner)
-        .exprs()
-        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Closure { .. }))
-        .map(|(id, _)| id)
-        .collect() // alloc: the memo's stored list, once per body
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn closure_exprs<'db>(db: &'db Db, owner: ExpressionStoreOwnerId) -> &'db [ExprId] {
+    // A body given from its record (`body_store::given`) has no store here: its closures are
+    // the list its record keeps, so a closure's key is the one its writer gave it.
+    if let ExpressionStoreOwnerId::Body(def) = owner
+        && crate::body_store::given(db)
+    {
+        return crate::body_store::given_closure_exprs(db, def);
+    }
+    blaze_memo::keep_iter(
+        blaze_memo::Database::memo(db),
+        ExpressionStore::of(db, owner)
+            .exprs()
+            .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Closure { .. }))
+            .map(|(id, _)| id),
+    )
 }
 
-#[blaze_query::interned(constructor = new_impl, debug)]
-#[derive(PartialOrd, Ord)]
+#[blaze_memo::interned(constructor = new_impl, debug)]
 pub struct InternedClosureId<'db> {
     #[returns(copy)]
     key: ClosureKey<'db>,
@@ -1021,7 +1028,9 @@ impl<'db> InternedClosureId<'db> {
 
     #[inline]
     pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
-        if cfg!(debug_assertions) {
+        // Not where the body is given from its record (`body_store::given`): its text, which
+        // the store is lowered from, is not there; the record's kind code is the check.
+        if cfg!(debug_assertions) && !crate::body_store::given(db) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
             assert!(
@@ -1041,8 +1050,7 @@ impl<'db> InternedClosureId<'db> {
     }
 }
 
-#[blaze_query::interned(constructor = new_impl, debug)]
-#[derive(PartialOrd, Ord)]
+#[blaze_memo::interned(constructor = new_impl, debug)]
 pub struct InternedCoroutineId<'db> {
     #[returns(copy)]
     key: ClosureKey<'db>,
@@ -1055,7 +1063,8 @@ impl<'db> InternedCoroutineId<'db> {
 
     #[inline]
     pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
-        if cfg!(debug_assertions) {
+        // As `InternedClosureId::new`'s.
+        if cfg!(debug_assertions) && !crate::body_store::given(db) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
             assert!(
@@ -1075,8 +1084,7 @@ impl<'db> InternedCoroutineId<'db> {
     }
 }
 
-#[blaze_query::interned(constructor = new_impl, debug)]
-#[derive(PartialOrd, Ord)]
+#[blaze_memo::interned(constructor = new_impl, debug)]
 pub struct InternedCoroutineClosureId<'db> {
     #[returns(copy)]
     key: ClosureKey<'db>,
@@ -1089,7 +1097,8 @@ impl<'db> InternedCoroutineClosureId<'db> {
 
     #[inline]
     pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
-        if cfg!(debug_assertions) {
+        // As `InternedClosureId::new`'s.
+        if cfg!(debug_assertions) && !crate::body_store::given(db) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
             assert!(
@@ -1116,7 +1125,7 @@ impl<'db> InternedCoroutineClosureId<'db> {
 /// An anonymous const expression that appears in a type position (e.g., array lengths,
 /// const generic arguments like `{ N + 1 }`, or const param defaults). Unlike named constants,
 /// these don't have their own `Body` — their expressions live in the parent's signature `ExpressionStore`.
-#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, blaze_memo::Home)]
 pub struct AnonConstLoc {
     /// The owner store containing this expression.
     pub owner: ExpressionStoreOwnerId,
@@ -1129,8 +1138,7 @@ pub struct AnonConstLoc {
     pub allow_using_generic_params: bool,
 }
 
-#[blaze_query::interned(debug, constructor = new_)]
-#[derive(PartialOrd, Ord)]
+#[blaze_memo::interned(debug, constructor = new_)]
 pub struct AnonConstId {
     #[returns(ref)]
     pub loc: AnonConstLoc,
@@ -1231,7 +1239,7 @@ impl<'db> AnonConstId<'db> {
 
 /// A constant, which might appears as a const item, an anonymous const block in expressions
 /// or patterns, or as a constant in types with const generics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum GeneralConstId<'db> {
     ConstId(ConstId),
     StaticId(StaticId),
@@ -1281,6 +1289,8 @@ pub mod kinds {
         INFER_ANON_CONST = 0x2401, "infer_anon_const_body_query";
         CLOSURE_EXPRS = 0x2402, "closure_exprs";
         COROUTINE_OBLIGATIONS = 0x2403, "coroutine_obligation_errors";
+        // A body's lowering as the item store keeps it (`body_store::lower`).
+        BODY_LOWERING = 0x2404, "lowering";
 
         // Const eval.
         CONST_EVAL = 0x2410, "const_eval_query";
@@ -1368,7 +1378,8 @@ pub mod kinds {
         INHERENT_IMPLS_IN_BLOCK_FOR_SELF_TY = 0x246b, "InherentImpls::in_block_for_self_ty";
         TRAIT_IMPLS_FOR_CRATE = 0x246c, "TraitImpls::for_crate";
         TRAIT_IMPLS_FOR_BLOCK = 0x246d, "TraitImpls::for_block";
-        TRAIT_IMPLS_FOR_CRATE_AND_DEPS = 0x246e, "TraitImpls::for_crate_and_deps";
+        // 0x246e was `TraitImpls::for_crate_and_deps`, gone with the port onto blaze-memo; the
+        // number is not given again.
         TRAIT_IMPLS_IN_CRATE_AND_DEPS_FOR_TRAIT_AND_SELF_TY = 0x246f,
             "TraitImpls::in_crate_and_deps_for_trait_and_self_ty";
         TRAIT_IMPLS_BLANKET_IN_CRATE_AND_DEPS = 0x2470, "TraitImpls::blanket_in_crate_and_deps";
@@ -1453,30 +1464,38 @@ pub mod kinds {
         TRAIT_IMPLS_FOR_MODULE = 0x24b4, "TraitImpls::for_module";
         TRAIT_IMPLS_FOR_CRATE_AND_TRAIT = 0x24b8, "TraitImpls::for_crate_and_trait";
 
-        // Maintained impl tables and trait candidates (`method_resolution/delta`).
-        TRAIT_SLICE = 0x24d0, "trait_slice";
-        INHERENT_SLICE = 0x24d1, "inherent_slice";
-        CANDIDATE_SLICE = 0x24d2, "candidate_slice";
-        TRAIT_BODIES = 0x24d3, "trait_bodies";
-        INHERENT_BODIES = 0x24d6, "inherent_bodies";
-        BODY_IMPL_SET_HASH = 0x24da, "body_impl_set_hash";
-        IMPL_ROW_HASH = 0x24db, "impl_row_hash";
-        BLANKET_HASH = 0x24dc, "blanket_hash";
-        BODY_PART = 0x24dd, "body_part";
-        TRAIT_SLICE_HASH = 0x24de, "trait_slice_hash";
-        INHERENT_SLICE_HASH = 0x24df, "inherent_slice_hash";
-        CANDIDATE_SLICE_HASH = 0x24e0, "candidate_slice_hash";
+        // 0x24d0..=0x24e0 were the maintained impl tables and trait candidates
+        // (`method_resolution/delta`: `trait_slice`, `inherent_slice`, `candidate_slice`,
+        // `trait_bodies`, `inherent_bodies`, `body_impl_set_hash`, `impl_row_hash`,
+        // `blanket_hash`, `body_part` and the three slice hashes), gone with the port onto
+        // blaze-memo (an edit rebuilds its crate's arena; nothing is maintained in place). None
+        // of the numbers is given again.
+        // A crate's impl directory and trait candidates, not served from pages.
+        IMPL_DIRECTORY = 0x2520, "impl_directory";
+        CANDIDATES = 0x2521, "candidates";
+        TRAIT_IMPLS_IN_CRATE_FOR_SELF_TY = 0x2522, "TraitImpls::in_crate_for_self_ty";
+        TRAIT_IMPLS_IN_CRATE_AND_DEPS_FOR_SELF_TY = 0x2523,
+            "TraitImpls::in_crate_and_deps_for_self_ty";
+
+        // Impl tables read from pages (`method_resolution/frozen/pages`).
+        IMPL_PAGES_HEAD = 0x24e1, "impl_pages_head";
 
         // Imports.
         USED_IMPORTS_WITH_TRAITS = 0x24c0, "used_imports_with_traits";
         USES_FN_CACHE = 0x24c1, "uses_fn_cache";
+        BODY_TRAIT_USES = 0x24c2, "body_trait_uses";
 
         // Bodies served from the check cache.
-        SERVED_PART = 0x24f0, "served_part";
+        // 0x24f0 was `served_part`, gone with the port onto blaze-memo; not given again.
         SERVED_ITEMS = 0x24f1, "served_items";
         LOCATION_LITERALS = 0x24f2, "location_literals";
         INFERENCE_VALUE = 0x24f3, "inference_value";
         MIR_VALUE = 0x24f4, "mir_value";
+        // A body's runtime MIR entry of its crate's value (`check_cache/runtime`), by owner.
+        BODY_ENTRY = 0x24f5, "body_entry";
+        CLOSURE_ENTRY = 0x24f6, "closure_entry";
+        COROUTINE_ENTRY = 0x24f7, "coroutine_entry";
+        COROUTINE_BY_MOVE_ENTRY = 0x24f8, "coroutine_by_move_entry";
 
         // Goals answered from the crate's own impls (`next_solver/global_goals`).
         AUTO_TRAIT_DEPTH = 0x2500, "auto_trait_depth";
@@ -1486,18 +1505,26 @@ pub mod kinds {
         EXPLICIT_SUPER_CLAUSES = 0x2510, "explicit_super_clauses_of";
         EXPLICIT_IMPLIED_CLAUSES = 0x2511, "explicit_implied_clauses_of";
         IMPL_METHOD_HYBRID_PREDICATES = 0x2512, "impl_method_hybrid_predicates";
+        // A record function's parameter defaults (`lower/record`).
+        RECORD_PARAM_DEFAULTS = 0x2513, "record_param_defaults";
+        RECORD_PARAM_DEFAULT = 0x2514, "record_param_default";
+        // A dependency's variant's row of its crate's field types batch.
+        BATCHED_FIELD_TYPES = 0x2515, "batched_field_types";
+        // A dependency's impl's rows of its crate's impl batches.
+        BATCHED_IMPL_SELF_TY = 0x2516, "batched_impl_self_ty";
+        BATCHED_IMPL_TRAIT = 0x2517, "batched_impl_trait";
+        BATCHED_IMPL_PREDICATES = 0x2518, "batched_impl_predicates";
+        // A trait's predicates as declared, without the bounds its header implies.
+        DECLARED_TRAIT_PREDICATES = 0x2519, "declared_trait_predicates_of";
 
         // Inputs.
-        FROZEN_IMPLS = 0x25e0, "FrozenImpls";
-        TRAIT_IMPLS_SLICE_INPUT = 0x25e1, "TraitImplsSlice";
-        INHERENT_SLICE_INPUT = 0x25e2, "InherentSlice";
-        CANDIDATE_SLICE_INPUT = 0x25e3, "CandidateSlice";
-        SLICE_DIRECTORY = 0x25e4, "SliceDirectory";
-        IMPL_SLICES = 0x25e5, "ImplSlices";
-        IMPL_IDENTITIES = 0x25e6, "ImplIdentities";
-        SERVED_BODIES = 0x25e7, "ServedBodies";
+        // 0x25e0..=0x25e4, 0x25e6, 0x25e7 and 0x25e9 were the inputs `FrozenImpls`,
+        // `TraitImplsSlice`, `InherentSlice`, `CandidateSlice`, `SliceDirectory`,
+        // `ImplIdentities`, `ServedBodies` and `DirectorySlot`, gone with the port onto
+        // blaze-memo (what they held is made with its crate's arena); 0x25e5 was `ImplSlices`
+        // and 0x25ea `LibraryImplSlices`, both gone 2026-11-12 (`method_resolution/delta/
+        // publish`). None of the numbers is given again.
         KEPT_CONSTS = 0x25e8, "KeptConsts";
-        DIRECTORY_SLOT = 0x25e9, "DirectorySlot";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";
@@ -1559,7 +1586,7 @@ pub mod kinds {
         /// What follows each query attribute of `text`: a function, a method of a tracked
         /// `impl`, or an interned or input struct.
         fn scan(text: &str, found: &mut Vec<String>) {
-            let attribute = concat!("#[", "blaze_query::");
+            let attribute = concat!("#[", "blaze_memo::");
             let mut in_impl: Option<String> = None;
             let mut lines = text.lines();
             while let Some(line) = lines.next() {

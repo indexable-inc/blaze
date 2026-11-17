@@ -1089,8 +1089,13 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                 for (f_index, with_field) in adt_fields.iter() {
                     let is_mentioned = fields.iter().any(|f| {
                         let hygiene = self.cx.store.record_field_hygiene(f.expr);
-                        VariantFields::name_written(self.cx.db, adt.into(), f.name, hygiene)
-                            == with_field.name
+                        VariantFields::name_written(
+                            self.cx.db,
+                            self.cx.resolver.ctx_table(),
+                            adt.into(),
+                            f.name,
+                            hygiene,
+                        ) == with_field.name
                     });
                     if !is_mentioned {
                         let field_place = self.cat_projection(
@@ -1139,9 +1144,9 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
         for adjustment in &adjustments {
             debug!("walk_adjustment expr={:?} adj={:?}", expr, adjustment);
             match adjustment.kind {
-                Adjust::NeverToAny | Adjust::Pointer(_) => {
-                    // Creating a closure/fn-pointer or unsizing consumes
-                    // the input and stores it into the resulting rvalue.
+                Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::ErrorUnion => {
+                    // Creating a closure/fn-pointer, unsizing or widening to an error union
+                    // consumes the input and stores it into the resulting rvalue.
                     // clone: frame copy, the place goes on to the next adjustment
                     self.consume_or_copy(place_with_id.clone());
                 }
@@ -1247,6 +1252,12 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                 CatPatternPat::DerefPat { inner } => {
                     debug!("walk_pat: Deref {{ inner: {:?} }}", inner);
                     walk_deref_pat(this, inner, place);
+                    return Ok(());
+                }
+                // blaze: a pattern of a member of an error union reads which member the
+                // union holds, as a variant's pattern reads its enum's discriminant.
+                CatPatternPat::UnionMember => {
+                    this.delegate.borrow(place, BorrowKind::Immutable, this.cx);
                     return Ok(());
                 }
             };
@@ -1496,6 +1507,9 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
 enum CatPatternPat {
     PatId(PatId),
     DerefPat { inner: PatId },
+    /// The place is an error union a pattern of one of its members is matched against
+    /// (`PatAdjust::UnionMember`).
+    UnionMember,
 }
 impl_from!(PatId for CatPatternPat);
 
@@ -1650,7 +1664,7 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                 self.cat_deref(expr.into(), base)
             }
 
-            Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::Borrow(_) => {
+            Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::Borrow(_) | Adjust::ErrorUnion => {
                 // Result is an rvalue.
                 Ok(self.cat_rvalue(expr.into(), target))
             }
@@ -1669,9 +1683,31 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                 }
             }
 
-            Expr::Field { expr: base, .. } => {
+            Expr::Field { expr: base, name } => {
                 let base = self.cat_expr(base)?;
                 debug!(?base);
+
+                // blaze: `r.a` on a record (`#![blaze::records]`) is the one field of core's
+                // `Record`, then the field's place in the tuple it holds, as MIR building
+                // projects it.
+                if let Some(of) =
+                    crate::record::record_fields(self.cx.lang_items, base.place.ty())
+                {
+                    let at = of.index_of(name.as_str()).ok_or(ErrorGuaranteed)? as u32;
+                    let tuple = of.tuple(self.cx.interner());
+                    let inner = self.cat_projection(
+                        expr.into(),
+                        base,
+                        tuple,
+                        ProjectionKind::Field { field_idx: 0, variant_idx: 0 },
+                    );
+                    return Ok(self.cat_projection(
+                        expr.into(),
+                        inner,
+                        expr_ty,
+                        ProjectionKind::Field { field_idx: at, variant_idx: 0 },
+                    ));
+                }
 
                 let field_idx = self
                     .cx
@@ -1854,6 +1890,44 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
 
     /// Returns the variant index for an ADT used within a Struct or TupleStruct pattern
     /// Here `pat_hir_id` is the ExprId of the pattern itself.
+    /// blaze: the place of the member that `pat`, a pattern of a member of the error union
+    /// `union`, matches, in the union at `base_place`: the union's one field (its `Repr`
+    /// enum), then the one field of that enum's variant of the member
+    /// ([`crate::error_union`]).
+    fn cat_union_member(
+        &mut self,
+        pat: PatId,
+        base_place: PlaceWithOrigin<'f>,
+        union: Ty<'db>,
+    ) -> Result<PlaceWithOrigin<'f>> {
+        let interner = self.cx.interner();
+        let members = crate::error_union::members(interner, union).ok_or(ErrorGuaranteed)?;
+        // The member is the type of the constructor pattern, which under `x @` is the
+        // pattern after it: a binding by reference has the reference's type.
+        let mut of_member = pat;
+        while let Pat::Bind { subpat: Some(inner), .. } = self.cx.store.pat(of_member) {
+            of_member = inner;
+        }
+        let pat_ty = self.node_ty(of_member.into())?;
+        let pat_ty = self.cx.structurally_resolve_type(pat.into(), pat_ty);
+        let at = crate::error_union::member_index(members, pat_ty).ok_or(ErrorGuaranteed)?;
+        let repr =
+            crate::error_union::repr_field(self.cx.db, interner, union).ok_or(ErrorGuaranteed)?;
+        let repr = self.cx.structurally_resolve_type(pat.into(), repr);
+        let held = self.cat_projection(
+            pat.into(),
+            base_place,
+            repr,
+            ProjectionKind::Field { field_idx: 0, variant_idx: 0 },
+        );
+        Ok(self.cat_projection(
+            pat.into(),
+            held,
+            members.as_slice()[at],
+            ProjectionKind::Field { field_idx: 0, variant_idx: at as u32 },
+        ))
+    }
+
     fn variant_index_for_adt(&self, pat_id: PatId) -> Result<(u32, VariantId)> {
         let variant = self.cx.result.variant_resolution_for_pat(pat_id).ok_or(ErrorGuaranteed)?;
         let variant_idx = match variant {
@@ -1940,6 +2014,11 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                     };
                     self.pat_deref_place(pat.into(), place_with_id, pat, target_ty)?
                 }
+                PatAdjust::UnionMember => {
+                    // clone: frame copy, the member's place is built from the union's after
+                    op(self, place_with_id.clone(), CatPatternPat::UnionMember)?;
+                    self.cat_union_member(pat, place_with_id, adjust.source.as_ref())?
+                }
             };
         }
         let place_with_id = place_with_id; // lose mutability
@@ -2012,6 +2091,33 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                 }
             }
 
+            // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`): each field named
+            // is at its place in the tuple core's `Record` holds.
+            Pat::Record { args: field_pats, .. }
+                if let Some(of) =
+                    crate::record::record_fields(self.cx.lang_items, place_with_id.place.ty()) =>
+            {
+                let tuple = of.tuple(self.cx.interner());
+                let inner = self.cat_projection(
+                    pat.into(),
+                    place_with_id,
+                    tuple,
+                    ProjectionKind::Field { field_idx: 0, variant_idx: 0 },
+                );
+                for fp in field_pats {
+                    let field_ty = self.pat_ty_adjusted(fp.pat)?;
+                    let at = of.index_of(fp.name.as_str()).ok_or(ErrorGuaranteed)? as u32;
+                    let field_place = self.cat_projection(
+                        pat.into(),
+                        // clone: frame copy, each subpattern extends its own
+                        inner.clone(),
+                        field_ty,
+                        ProjectionKind::Field { field_idx: at, variant_idx: 0 },
+                    );
+                    self.cat_pattern(field_place, fp.pat, op)?;
+                }
+            }
+
             Pat::Record { args: field_pats, .. } => {
                 // S { f1: p1, ..., fN: pN }
 
@@ -2022,7 +2128,13 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                     let field_ty = self.pat_ty_adjusted(fp.pat)?;
                     let hygiene = self.cx.store.record_field_hygiene(fp.pat);
                     let field_index = fields
-                        .field_written(self.cx.db, variant, &fp.name, hygiene)
+                        .field_written(
+                            self.cx.db,
+                            self.cx.resolver.ctx_table(),
+                            variant,
+                            &fp.name,
+                            hygiene,
+                        )
                         .ok_or(ErrorGuaranteed)?;
 
                     let field_place = self.cat_projection(

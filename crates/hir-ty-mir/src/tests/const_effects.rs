@@ -20,7 +20,7 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: &str) {
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let target = DisplayTarget::from_crate(&db, module_id.krate(&db));
@@ -195,11 +195,14 @@ through_pointer: fn pointer call
 /// With blaze's `#![feature(blaze_comptime)]` a call through a function pointer or of a `dyn`
 /// method is checked when it is evaluated, and a `const static { .. }` block not at all: none of
 /// them is a non-const call here. The same calls of a direct callee are still refused.
+/// `dispatch_from_dyn`: without its lang items a `&self` method is not dispatchable, so `Tr`
+/// would not be dyn-compatible and `t.m()` no vtable call (as in
+/// `tests/mir/const_check.rs`'s `comptime_defers_fn_pointer_and_dyn_calls_to_evaluation`).
 #[test]
 fn comptime_defers_dispatch_and_skips_const_static_blocks() {
     check(
         r#"
-//- minicore: fn
+//- minicore: fn, dispatch_from_dyn
 #![feature(blaze_comptime)]
 trait Tr { fn m(&self) -> u8; }
 fn helper() -> u8 { 3 }

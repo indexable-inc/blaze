@@ -458,15 +458,17 @@ pub fn apply_args_to_binder<'db, T: TypeFoldable<DbInterner<'db>>>(
     b.skip_binder().fold_with(&mut instantiate)
 }
 
-#[derive(Clone, Copy, blaze_query::Supertype)]
-pub(crate) enum ItemWithBounds<'db> {
+/// What [`ItemBounds::of`] is keyed by: an associated type or type alias, or an opaque type.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
+pub enum ItemWithBounds<'db> {
     TypeAliasId(TypeAliasId),
     InternedOpaqueTyId(InternedOpaqueTyId<'db>),
 }
 impl_from!(impl<'db> TypeAliasId, InternedOpaqueTyId<'db> for ItemWithBounds<'db>);
 
-#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
-pub(crate) struct ItemBounds {
+/// The bounds of an alias: its own written ones (and an RPITIT's), the bounds on `Self` first.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ItemBounds {
     bounds: StoredEarlyBinder<StoredClauses>,
     non_self_bounds_start: u32,
 }
@@ -530,14 +532,10 @@ impl ItemBounds {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl ItemBounds {
-    #[allow(
-        clippy::drop_non_drop,
-        reason = "this happens in the tracked macro's expansion, not sure why only here"
-    )]
-    #[blaze_query::tracked]
-    fn of(db: &Db, def_id: ItemWithBounds<'_>) -> ItemBounds {
+    #[blaze_memo::tracked]
+    pub fn of(db: &Db, def_id: ItemWithBounds<'_>) -> ItemBounds {
         let (krate, explicit_bounds) = match def_id {
             ItemWithBounds::TypeAliasId(type_alias) => (
                 type_alias.krate(db),
@@ -573,7 +571,7 @@ impl ItemBounds {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 pub(crate) fn impl_super_outlives(db: &Db, impl_: ImplId) -> StoredEarlyBinder<StoredClauses> {
     let interner = DbInterner::new_with(db, impl_.krate(db));
     let trait_ref = db.impl_trait(impl_).expect("invalid impl passed to trait solver");

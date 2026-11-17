@@ -1,0 +1,11 @@
+{
+ "id": "real-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "the VM: memory",
+ "what": "Three cold builds at once (tempo, reth, a copy of reth), each with a 200 GB ceiling, drove the 251 GB VM to 225 GB used; every daemon sat `over the limit` with 0 of 62 workers busy for about 20 minutes.",
+ "cost": "about 25 minutes",
+ "cause": "each daemon sees the others only as pressure",
+ "workaround": "one big build at a time",
+ "state": "open"
+}

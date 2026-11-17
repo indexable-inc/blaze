@@ -21,16 +21,15 @@ impl Http for NoHttp {
 }
 
 struct Fixture {
-    root: PathBuf,
+    /// Removed with all it holds (the upstream and the home) when the fixture drops.
+    root: blaze_core::temp::TempDir,
     repo: PathBuf,
     home: PathBuf,
     source: SourceId,
 }
 impl Fixture {
     fn new(name: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("blaze-git-index-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
+        let root = blaze_core::temp::TempDir::for_test(&format!("blaze-git-index-{name}-"));
         let repo = root.join("upstream");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q"]);
@@ -66,11 +65,6 @@ impl Fixture {
     }
     fn cache(&self) -> PathBuf {
         self.index().join(".cache").join(dep_path("probe", false))
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

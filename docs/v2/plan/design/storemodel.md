@@ -23,9 +23,12 @@ protocol, run on the real Rust state machines rather than a separate TLA+ spec. 
   - walk the shape slots;
   - put the entry;
   - put the shape, taking a `Mismatch` as "another writer took the slot".
-- **Warm restart's rule.** The rule is "a build answers once what it leaves is durable, and a
-  build asked mid-store waits". It is modelled as each actor's wait before it answers, in one of
-  two forms (`store::Wait`):
+- **The rule after an answer** (2026-11-10; before, "a build answers once what it leaves is
+  durable"). A build answers at once, durable or not; what it left settles after the answer
+  and is kept for reuse across a crash only once it is durable, or said lost when the store
+  stopped (`store::Op::Answer`, `store::Op::Settle`). A snapshot still waits before it answers
+  (`store::Op::AwaitAndAnswer`). What is waited on before keeping is one of two forms
+  (`store::Wait`):
   - `Own`: the tickets of its own puts;
   - `Everything`: every put made before it asked, which is the hold.
 - The daemon's `Jobs` bookkeeping itself lives in `blaze-cargo`'s private `serve` module, so it
@@ -42,7 +45,18 @@ protocol, run on the real Rust state machines rather than a separate TLA+ spec. 
   - A prefix of each file's unsynced changes is kept, the last perhaps torn at its first byte,
     its middle, or one byte short. This is ALICE's model (Pillai et al., OSDI 2014).
   - Each effect in flight may have happened or not.
-  - A failed sync dooms what it covered ("fsyncgate").
+  - A failed sync dooms what it covered ("fsyncgate"), and so does a failed barrier.
+  - A barrier (`Effect::Barrier`, which a commit asks of its packs and checks in place of a
+    sync) makes nothing durable and orders: a crash that keeps anything asked after it
+    completed keeps all it covers, whole, and a sync asked after it makes that durable.
+  - A write or a rename that waits for no sync (`WriteUnsynced`, `RenameUnsynced`) is a pending
+    entry: a crash leaves the name as it was or as it is now, the new file's bytes torn by block.
+  - Two models of blocks (`Clones`), each searched by every scenario, since a store's open
+    tries one clone to decide how it places (`blaze_cas::PlaceBy`):
+    - `Made`: a clone is a second file holding its source's bytes whole, its entry pending.
+    - `Refused`: every clone fails saying the file system cannot share blocks (ext4, tmpfs).
+  - Every variant of `Effect` is named in one match with no arm for the rest (`Files::change`):
+    an effect added to `blaze_core` does not compile until it has a rule here.
   - Two models of directory entries (`Persist`):
     - `Ordered`: journaled in order, and any sync commits the journal (ext4, XFS, APFS).
     - `Posix`: an entry is durable only once its directory is synced, and a crash keeps any
@@ -105,7 +119,7 @@ lands.
 | `a_restore_never_serves_a_value_no_writer_fully_wrote` | two builds and a reader |
 | `a_restore_never_silently_starts_empty` | crash states, plus three kinds of damage after a clean stop: a pack cut short, the head's bytes changed, a pack gone |
 | `two_values_under_one_identity_are_refused_never_overwritten` | two writers on one key, one IO failure; two gets of an impure step |
-| `after_a_build_answers_its_results_survive_any_crash` | two kernel gets racing for one shape slot, one IO failure, effects in any order |
+| `what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served` | two kernel gets racing for one shape slot, one IO failure, effects in any order |
 | `the_restore_after_any_crash_equals_a_fresh_build` | the restore, built again, equals a fresh build, and so does a clean restart of it |
 | `every_wait_ends` | two flushes and two IO failures: every wait for durability ends, and so does every restore's open |
 
@@ -120,9 +134,18 @@ histories legitimately lay out the same values differently.
 Further tests:
 
 - `larger_scenarios_sampled_keep_every_property`: seeded random search over bigger scenarios.
-- `the_model_catches_an_answer_given_before_its_store_is_durable`: the model's own check (rule
-  20). A planted early answer must be caught at the crash that loses it.
-- `a_crash_keeps_what_the_file_system_model_says`: the crash model's rules.
+- `the_oracle_catches_a_kept_answer_relied_on_before_its_tickets_were_durable` and `the_oracle_catches_a_settling_failure_dropped_silently`: the model's own checks (rule
+  23). What is kept before it is durable must be caught at the crash that loses it, and a
+  settling that ends with the store stopped and says nothing must be caught.
+- `an_open_cut_short_by_a_crash_opens_again_and_leaves_nothing_of_its_try_behind`: a store that
+  stopped cleanly opened again, its open's IO in every order with a failure anywhere and a crash
+  after every step. The files of the clone the open tries, which a crash leaves, are removed by
+  the next open, which decides how it places as its file system says; the test fails unless
+  the search saw a crash leave each of them.
+- `a_crash_keeps_what_the_file_system_model_says`, `a_crash_may_undo_or_tear_a_write_that_waited_for_no_sync`,
+  `a_clone_is_made_whole_or_refused_as_the_file_system_says` and
+  `a_barrier_orders_what_it_covers_before_what_is_asked_after` (with its control: no barrier,
+  no order): the crash model's rules.
 
 ## Findings (by reading the code; the ignored tests pin them)
 
@@ -187,7 +210,7 @@ whole daemon. That lane owns those files, so the cut is proposed, not made:
 2. Run it as one more actor kind in `blaze-storemodel`, through a `pub` re-export behind
    `#[cfg(any(test, feature = "model"))]`.
 3. Until then, the daemon's sim test
-   (`what_a_build_left_for_the_store_is_durable_once_it_answers_and_survives_a_crash`) should
+   (`what_a_build_left_for_the_store_is_durable_once_it_settles_and_survives_a_crash`) should
    crash at every IO step and in every crash state, rather than once with a random seed. The
    test would put a `CrashFs` (made `Driver`) in for `Sim`, and `Sim` would gain a
    `crash_with(chooser)`.
@@ -202,6 +225,12 @@ whole daemon. That lane owns those files, so the cut is proposed, not made:
 - The daemon's `Jobs`.
 
 ## Running
+
+While cargo builds blaze (AGENTS.md, blaze-builds-blaze) the same with `cargo test`. A change to
+`crates/blaze-cas`, `crates/blaze-kernel`, `crates/blaze-record` or `blaze_core::Effect` runs
+it: on 2026-11-12 ten of its tests were found stopping at their first step, at an effect the
+store's open had begun to ask and the model had no rule for, and nothing had run them
+(`agents/annoyances/storemodel-fix-1.json`).
 
 ```
 blaze test -p blaze-storemodel

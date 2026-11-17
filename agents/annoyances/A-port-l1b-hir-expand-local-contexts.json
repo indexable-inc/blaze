@@ -1,0 +1,12 @@
+{
+ "id": "A-port-l1b-hir-expand-local-contexts",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L1b hir-expand",
+ "where": "docs/v2/plan/design/front-end-on-memo.md, crates/span/src/hygiene.rs, crates/hir-expand/src/{hygiene.rs,mod_path.rs,declarative.rs,name.rs}",
+ "what": "The port spec says nothing of crate-local `SyntaxContext` (a u32 per arena's table), which span's lane made mid-round: every context lookup now needs the arena its context is of, and nothing carries it. hir-expand had to thread an `ArenaId` through `ModPath::from_src_view`/`from_tt`/`resolve_crate_root`/`Attr::parse_path_comma_token_tree` (public, about 20 callers in hir-def, hir and blaze-diagnostics), and `ModPath` contexts and keyed `Name`s still hold a bare u32 that compares wrong across two crates' tables. The base-db world API had gaps too: no way to give a crate its proc macros in the same commit as the graph that makes it (the gift names a `CrateKey` only the commit returns), and `Edit::set_view_root`'s result is unnamed.",
+ "cost": "a public API change hir-expand's callers must follow, two commits where the old engine had one batch, and the keyed-name and ModPath context comparisons left for hir-def to decide",
+ "cause": "a value that is meaningful only with its table (the context word) was made crate-local without a type that carries the table, so every reader has to be told the arena by hand",
+ "workaround": "an explicit `arena: ArenaId` parameter at each lookup; `HirFileId::context_arena` names a file's table; the declarative marker translates definition contexts into the call's table",
+ "fix": "a context type that carries its table (or a per-file accessor that hands out (context, arena) pairs) so a lookup cannot be made against the wrong table; `CrateGraphBuilder` ids accepted by `Edit::give` so graph and gifts commit together",
+ "state": "open"
+}

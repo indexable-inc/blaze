@@ -221,6 +221,7 @@ pub fn sleep(dur: Duration) {
 #[track_caller]
 pub fn park() {
     if rt::park(Location::caller(), false).is_none() {
+        // wakes: the caller's waker: this is `std::thread::park` handed through when no model runs
         std::thread::park();
     }
 }

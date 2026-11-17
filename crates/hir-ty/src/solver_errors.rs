@@ -344,6 +344,9 @@ impl SolverDiagnostic {
         if let Some(kind) = reflected_member_unmet(infcx, error) {
             return Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind });
         }
+        if let Some(kind) = condition_of_bound(error) {
+            return Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind });
+        }
         let goal = || {
             StoredGoal::new(
                 interner,
@@ -415,6 +418,45 @@ impl SolverDiagnostic {
         };
         Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind })
     }
+}
+
+/// blaze: a `where const { COND }` condition of an impl that does not hold
+/// (`#![feature(blaze_comptime)]`, [`crate::where_const`]) is reported as the bound the impl
+/// would have met: the error is "`Node: Acyclic` is not satisfied", and what reports it adds
+/// the condition's own reason ([`crate::where_const::bound_refusal`], the message the condition
+/// panicked with). `None` when the failed goal is no condition, or is one no impl asked for (a
+/// function's own, which is reported as the goal it is).
+fn condition_of_bound<'db>(error: &FulfillmentError<'db>) -> Option<SolverDiagnosticKind> {
+    let PredicateKind::Clause(ClauseKind::ConstEvaluatable(_)) =
+        error.obligation.predicate.kind().skip_binder()
+    else {
+        return None;
+    };
+    if !error.is_true_error() {
+        return None;
+    }
+    // The parents run from the root goal to the condition's own parent, which is the bound.
+    let mut parents: Vec<_> = error
+        .parent_trait_obligations
+        .iter()
+        .zip(&error.parent_impls)
+        .filter_map(|(predicate, &parent_impl)| {
+            let trait_predicate = predicate.as_trait_clause()?.skip_binder();
+            let predicate = StoredTraitPredicate {
+                trait_ref: StoredTraitRef::new(trait_predicate.trait_ref),
+                polarity: trait_predicate.polarity,
+            };
+            Some((predicate, parent_impl))
+        })
+        .collect(); // alloc: error path, the diagnostic's own lists
+    let (trait_predicate, _) = parents.pop()?;
+    parents.reverse();
+    let (parent_trait_predicates, parent_impls) = parents.into_iter().unzip(); // alloc: error path
+    Some(SolverDiagnosticKind::TraitUnimplemented {
+        trait_predicate,
+        parent_trait_predicates,
+        parent_impls,
+    })
 }
 
 /// blaze: the error of a field binder `for<F: Field<C>> P(F)` (`#![feature(blaze_comptime)]`)

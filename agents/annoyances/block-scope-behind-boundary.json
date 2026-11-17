@@ -1,0 +1,14 @@
+{
+ "id": "block-scope-behind-boundary",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane K1 of the no-daemon command",
+ "where": "crates/hir-def/src/nameres/boundary.rs (block_def_map is a fact boundary) against crates/blaze-item-hash/src/reads.rs name_fact (NameRead::Block) and crates/blaze-front/src/facts.rs",
+ "what": "A body's read of its own block's def map was listed as one absolute BlockScope fact, while the reads the block's import resolution made stayed hidden behind block_def_map's boundary. The block's value follows the body's text, so no surface can hold it, and no body made it: as an item fact it would be answered absent forever, and neither the body nor a nested item's body would move when an imported item changed. facts.rs refused BlockScope by name.",
+ "cost": "an hour to see that neither class (surface row or made fact) is sound with the boundary as it was",
+ "cause": "the boundary made a block one row, as if a block were a module of a crate's finished def map, but its value is the holding body's",
+ "whys": "boundaries were added per name for crate def maps; a block's map was folded in as one scan; the fact layer has no row a body makes for it; a body's own text is covered by its key, so the only uncovered inputs were the hidden import reads",
+ "class": "a fact boundary that hides reads whose value no fact layer holds: a read that is answered but never moves",
+ "prevention": "resolved by the step-5 lane, more simply than a made fact: a block's def map is no longer a boundary, so a body that reads its own block lists the block's lookups as ordinary rows (Resolves, TraitsInScope, WholeScope, Modules, CrateNames). The kind is retired everywhere: blaze-item-hash 0x180e is retired, facts.rs has no BLOCK_SCOPE rule or constant, and blaze-keyed's FactKind byte 42 is unused forever (FactKind::of_byte(42) is None).",
+ "workaround": "none needed now",
+ "state": "resolved"
+}

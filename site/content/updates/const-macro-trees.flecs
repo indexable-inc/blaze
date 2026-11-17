@@ -1,0 +1,52 @@
+// Update: const macros take and return syntax trees (docs/future/const-macros.md, "The tree API in const"), behind
+// `experimental = ["const-macros"]`. Extends the const-macros update: stage 0's text interface is removed.
+site {
+  updates {
+    "const-macro-trees" : Page {
+      Narrow
+      Update: {"2026-11-12", "0.20261112.0", "Const macros take and return syntax trees, written with a quote blaze checks.", "inline"}
+      (InTheme, themes.canary)
+      (Requires, site.updates."const-macros")
+      Title: {"Const macros return trees"}
+      Description: {"Update to const macros: a macro is given the item as a syntax tree and returns one, built with `const_ast::quote!`."}
+
+      Step tree("Trees in, a tree out") {
+        P given("A const macro is now given the item as blaze's own syntax tree, `&const_ast::Item`, and returns one, `const_ast::Output`. Nothing is printed to text and lexed back.")
+        P text("The text form, `fn(&str) -> String`, is removed.")
+      }
+
+      Step quote("Write it as Rust") {
+        P what("`const_ast::quote!` writes the tree from Rust you would write by hand. `#name` splices a part of the input.")
+        Code derive("rust", `
+          #[proc_macro_derive(Named)]
+          pub const fn named(item: &const_ast::Item) -> const_ast::Output {
+              let mut built = const_ast::Builder::new(const_ast::Span::mixed_site());
+              let b = &mut built;
+              let Some(name) = (match item.as_adt() { Some(adt) => adt.name(), None => None }) else {
+                  panic!("Named derives a struct, an enum or a union")
+              };
+              const_ast::quote!(b, items =>
+                  impl crate::Named for #name { const NAME: &str = stringify!(#name); }
+              );
+              built.finish(const_ast::Entry::Items)
+          }
+        `)
+        P checked("The quoted tokens are parsed when the macro is written, so a quote that is not Rust is an error in `macros.rs`, not at every use.")
+      }
+
+      Step spans("Spans") {
+        P kept("What you splice keeps its place: an error in it points at your struct, not at the derive.")
+        P site("What you write resolves where the builder says: `Builder::new(Span::mixed_site())` gives macro_rules hygiene, `call_site()` resolves at the use.")
+      }
+
+      Step refused("Refused, by name") {
+        P parse("blaze parses the tokens of every tree a macro returns. A tree that is not that parse is refused, naming the macro and the element.")
+        Dim example("Splice a type where a name goes, `struct #ty;`, and the build says it built `PATH_TYPE` where its tokens parse to `NAME`.")
+      }
+
+      Step source("Where it comes from") {
+        Dim where("Behind `experimental = [\"const-macros\"]` in canary since v0.20261112.0. The design: [docs/future/const-macros.md](https://github.com/indexable-inc/blaze/blob/main/docs/future/const-macros.md).")
+      }
+    }
+  }
+}

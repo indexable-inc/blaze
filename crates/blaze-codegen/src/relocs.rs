@@ -154,6 +154,11 @@ impl<T: Eq + Hash> Distinct<T> {
 }
 
 /// The index of `target` among `targets`, pushed when it is new; `index` finds each by hash.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a function's distinct relocation targets are u32 indices in the reloc format; a \
+              function with 2^32 targets needs a typed refusal from codegen"
+)]
 fn index_in<T: Eq + Hash, A: Allocator>(
     targets: &mut Vec<T>,
     index: &mut HashTable<u32, A>,

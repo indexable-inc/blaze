@@ -1,0 +1,11 @@
+{
+ "id": "A21",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "my own method",
+ "what": "I piped output through `cut -c1-34` and then misread `…: 26` as a wrong program result; it was `269` cut off.",
+ "cost": "five minutes",
+ "cause": "over-eager truncation",
+ "workaround": "truncate from the left for values at the end of a line",
+ "state": "fixed in the harness script"
+}

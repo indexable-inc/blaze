@@ -1,0 +1,11 @@
+about = "A function given a second parameter is made again with its caller; a function that does not call it, and main, which calls only the caller, are not."
+drivers = ["sim", "real"]
+
+[[revision]]
+action = "run"
+prints = "6 4\n"
+
+[[revision]]
+action = "run"
+prints = "15 4\n"
+redone = ["app::caller", "app::f"]

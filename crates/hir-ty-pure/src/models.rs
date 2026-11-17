@@ -24,7 +24,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use hir_ty::{
     db::HirDatabase,
-    method_resolution::{InherentImpls, TraitImpls},
+    method_resolution::{InherentImpls, SelfTyKey, TraitImpls},
     next_solver::{SimplifiedType, SolverDefId, TyKind},
 };
 use intern::Symbol;
@@ -73,6 +73,14 @@ pub enum Leaf {
     /// calls `setlocale` and the C locale's text does not change. Windows' `FormatMessageW`
     /// follows the user's language and is not one.
     ErrorText,
+    /// Randomness std draws for the program: the keys of a `RandomState`. A build script's
+    /// are made of its run's key by blaze's provider (docs/v2/plan/design/determinism.md), so
+    /// they are no input of it.
+    Seeded,
+    /// The wall clock: `SystemTime::now`. A build script is told the build's
+    /// `SOURCE_DATE_EPOCH`, which is then a variable its key reads; where the build sets
+    /// none, a script that asks the time is not kept as pure.
+    Wall,
 }
 
 /// How a function's value follows from its arguments' (design section 6), by MIR operand index.
@@ -136,6 +144,8 @@ pub fn apply_leaf(leaf: Leaf, args: &[Abs]) -> Applied {
         Leaf::Print => done(Effects::PRINT),
         Leaf::Exit => done(Effects::EXIT),
         Leaf::Handle | Leaf::Panic | Leaf::Alloc | Leaf::ErrorText => done(Effects::NONE),
+        Leaf::Seeded => done(Effects::SEEDED),
+        Leaf::Wall => done(Effects::WALL),
         Leaf::RawHandle => {
             // alloc: a refusal's text, once per impure script
             Applied::Refused("makes a file handle of a number".to_owned())
@@ -181,6 +191,8 @@ pub fn tag(leaf: Leaf) -> u8 {
         Leaf::Alloc => 10,
         Leaf::RawHandle => 11,
         Leaf::ErrorText => 12,
+        Leaf::Seeded => 13,
+        Leaf::Wall => 14,
     }
 }
 
@@ -214,7 +226,7 @@ pub struct Models {
 
 /// The models of `krate`, a toolchain crate, built once: its table resolved through its def
 /// map, and the foreign functions it declares that are the allocator's or the panic runtime's.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn crate_models(db: &Db, krate: Crate) -> Models {
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |_| {
         let Some(home) = toolchain(&krate.data(db).origin) else {
@@ -501,6 +513,8 @@ const EXIT: Model = Model::Leaf(Leaf::Exit);
 const PANIC: Model = Model::Leaf(Leaf::Panic);
 const ALLOC_LEAF: Model = Model::Leaf(Leaf::Alloc);
 const ERROR_TEXT: Model = Model::Leaf(Leaf::ErrorText);
+const SEEDED: Model = Model::Leaf(Leaf::Seeded);
+const WALL: Model = Model::Leaf(Leaf::Wall);
 const SAME: Model = Model::Transfer(Transfer::Same { arg: 0 });
 const JOIN: Model = Model::Transfer(Transfer::Join { base: 0, rel: 1 });
 const PUSH: Model = Model::Transfer(Transfer::Push { target: 0, rel: 1 });
@@ -645,6 +659,8 @@ const STD: &[Entry] = &[
             ERROR_TEXT,
         ),
     ),
+    method("std::hash::RandomState::new", &["hash", "RandomState"], "new", SEEDED),
+    method("std::time::SystemTime::now", &["time", "SystemTime"], "now", WALL),
     func("std::process::exit", &["process", "exit"], EXIT),
     func("std::process::abort", &["process", "abort"], EXIT),
     func("std::panicking::begin_panic", &["panicking", "begin_panic"], PANIC),
@@ -976,7 +992,9 @@ impl<'db> Resolver<'db> {
                 let Some(ModuleDefId::AdtId(adt)) = self.item(self.krate, ty, true) else { return };
                 let name = Symbol::intern(name);
                 let self_ty = SimplifiedType::Adt(SolverDefId::AdtId(adt));
-                for &imp in InherentImpls::for_crate(db, self.krate).for_self_ty(&self_ty) {
+                // The type's inherent impls alone, not the crate's whole table.
+                let impls = InherentImpls::in_crate_for_self_ty(db, self.krate, SelfTyKey(self_ty));
+                for &imp in impls {
                     methods(db, imp, std::slice::from_ref(&name), found);
                 }
             }
@@ -993,7 +1011,8 @@ impl<'db> Resolver<'db> {
                 // alloc: setup, once per toolchain crate's table entry
                 let names: smallvec::SmallVec<[Symbol; 2]> =
                     names.iter().map(|it| Symbol::intern(it)).collect();
-                TraitImpls::for_crate(db, self.krate).for_trait(trait_, |impls| {
+                // The trait's table alone, not the crate's whole table.
+                TraitImpls::for_crate_and_trait(db, self.krate, trait_).for_trait(trait_, |impls| {
                     let Either::Left(impls) = impls else { return };
                     for &imp in impls {
                         if self_ty_is(db, imp, want) {
@@ -1011,9 +1030,10 @@ impl<'db> Resolver<'db> {
                     ],
                     Prim::Slice => &[SimplifiedType::Slice],
                 };
-                let inherent = InherentImpls::for_crate(db, self.krate);
                 for self_ty in self_tys {
-                    for &imp in inherent.for_self_ty(self_ty) {
+                    let impls =
+                        InherentImpls::in_crate_for_self_ty(db, self.krate, SelfTyKey(*self_ty));
+                    for &imp in impls {
                         methods(db, imp, std::slice::from_ref(&name), found);
                     }
                 }

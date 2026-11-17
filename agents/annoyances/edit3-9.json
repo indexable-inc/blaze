@@ -1,0 +1,11 @@
+{
+ "id": "edit3-9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "the thin blaze: frameworks loaded at start",
+ "what": "The cargo-built thin blaze loads CoreFoundation, CoreServices and libiconv (`otool -L`), which it uses nothing of: blaze-core's `fsevents.rs` names the frameworks on an extern block, and the linker keeps every library named. Two programs that print one line, one with those two frameworks named, start in 5.1 and 7.1 ms median (200 runs each, a loaded machine; 3.8 and 5.7 at best): about 2 ms of every command the thin blaze answers.",
+ "cost": "2 ms of each row, not removed in this lane",
+ "cause": "a `#[link(kind = \"framework\")]` in a crate links the framework into every program that depends on the crate",
+ "workaround": "none",
+ "state": "open: mark the frameworks `+as-needed` (blaze's linker drops an as-needed library nothing uses; whether a blaze-built thin blaze already loads them is not checked: `otool -L` of one says), and for a cargo build `-dead_strip_dylibs`, which blaze's link-argument rules do not take yet"
+}

@@ -1,0 +1,14 @@
+{
+ "id": "body-task-item-store-traces-private",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, host lane H3 (Body task), port-memo-1113",
+ "where": "crates/hir-ty/src/body_store.rs:539 `traced` (private), the step encoders `pub(super)`; crates/blaze-keyed/src/driver.rs:97 `TaskFailed::Refused { what: &'static str }`",
+ "what": "Writing the Body task against the item store meant reading the store's private per-step trace and encoders by hand and assuming a `Mode::Trace` and an `Installed::trace` that do not exist; a refusal also cannot name the item it is about, only a static kind string.",
+ "cost": "most of the lane's reading time; front.rs is written against four assumed APIs the main agent must add before it compiles",
+ "cause": "the item store was built as its own cache (lookup and filing inside), so a step's reads and answer never left it as values another record could hold; TaskFailed was designed for the driver's model tasks, whose refusals have no item",
+ "class": "a computation whose result is only reachable through its own cache, so a second home for the result has to reach into its internals",
+ "prevention": "a step returns (answer bytes, read rows) as a value and the item store is one consumer of it; TaskFailed::Refused carries the item's StableId (rule 19)",
+ "workaround": "assumed `Installed::trace(def, step, schema) -> Option<Traced>` and `Mode::Trace` in crates/blaze-front/src/body/front.rs, listed in the lane report",
+ "fix": "not written: owned by hir-ty (body_store) and lane H4 (driver); see the H3 report",
+ "state": "open"
+}

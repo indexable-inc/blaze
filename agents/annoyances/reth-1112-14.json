@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-14",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: the profile history's thread",
+ "what": "`blaze-history` panicked in arrow (`generic_bytes_builder.rs:94: byte array offset overflow`) two minutes into reth's cold build on a machine short of memory, and by the same symptom in tempo's: after it `builds` held one row, `running`, and every why query read a history that stopped. A flush made one batch of all it had read (up to 2 M rows when behind), each span with its key as text.",
+ "cost": "an hour of builds with no rows, twice; the coordinator's tempo run had no `misses`",
+ "cause": "an unbounded batch, and a thread with no containment",
+ "class": "a panic that ends a daemon's thread for good (rule panics-fail-one-job)",
+ "prevention": "built: History::flush_contained (f8d7610c54: the flush's rows dropped, said, the thread goes on) and batches of at most 65,536 rows for spans, events and event_fields (e28fb8bc89). Not reproduced: the overflowing table left no backtrace",
+ "fix": "f8d7610c54, e28fb8bc89",
+ "state": "fixed, unreproduced"
+}

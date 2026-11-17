@@ -50,7 +50,7 @@ pub const BOUND_DOMAIN: &str = "blaze v2 identity bound 1";
 /// The domain of an ADT's identity: its key, interface, layout and the drop impls it reaches.
 pub const ADT_DOMAIN: &str = "blaze v2 identity adt 1";
 
-/// The identity of `ty`. Call it with the database attached (`blaze_query::db::attach`).
+/// The identity of `ty`. Call it with the database attached (`blaze_memo::attach`).
 pub fn ty<'db>(db: &'db Db, ty: Ty<'db>) -> Result<ContentId, Unshared> {
     let mut spell = Spell::new(db, TY_DOMAIN);
     spell.ty(ty)?;
@@ -83,7 +83,7 @@ fn no_content(what: String) -> Unshared {
 /// An ADT as its identity says it: its key, its interface (fields, variants, `repr`), its
 /// layout, and the `Drop` impls of it and of every ADT its fields' types name, transitively,
 /// which drop glue reads.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
     let item = ItemId::Adt(adt);
     let mut h = Hasher::new(ADT_DOMAIN);
@@ -220,6 +220,12 @@ impl<'db> Spell<'db> {
                 self.u8(8);
                 self.ty(element)?;
                 self.konst(len)?;
+            }
+            // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base
+            // enum's layout, ABI and code, so its identity is its base type's: the code of
+            // `f::<Conn is Conn::Open { .. }>` is the code of `f::<Conn>`.
+            TyKind::Pat(base, pattern) if pattern.kind().is_variants() => {
+                self.ty(base)?;
             }
             TyKind::Pat(base, pattern) => {
                 self.u8(9);
@@ -445,6 +451,10 @@ impl<'db> Spell<'db> {
                 }
             }
             PatternKind::NotNull => self.u8(2),
+            PatternKind::Variant { index } => {
+                self.u8(3);
+                self.u32(index);
+            }
         }
         Ok(())
     }

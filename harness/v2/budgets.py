@@ -48,6 +48,12 @@ The input is one JSON object (inline, a file's path, or `-`):
                     line that opens a function, after which a statement is added
     self_test       the arguments of `blaze test` in the CI budget (none: the workspace's default)
     keep            keep each project's directory under `work` (false)
+    record          `smoke`: write harness/v2/guards-known.toml again from this run's guards
+                    instead of holding the run to it (guards.py; false)
+    duckdb          the DuckDB `blaze debug sql` runs (`BLAZE_DUCKDB`), as an absolute path;
+                    empty for blaze's pin, which its first query fetches
+    hold_ms         the most an edit's build may hold its answer back for what the job still
+                    does, summed over the build (200.0; "The loop thread", below)
 
 Numbers are JSON numbers; a float field takes one with a point (4.0, not 4).
 
@@ -78,7 +84,7 @@ their pinned revisions, except blaze, which is the files of this checkout as the
     cold-blaze     blaze: a cold `blaze build` (empty home, store and target directory) until
                    ready: the share of the machine's cores busy over it (/proc/stat) at least
                    0.8, and its wall time at most `critical_slack` times its critical path
-                   (engine.critical_path_s; unmeasured on v1)
+                   (engine.critical_path_s)
     ci             blaze, warm after the cold build and one `blaze test`: `self_edit`, then
                    `blaze build` and `blaze test --reached` (only the tests the edit can have
                    changed run; docs/cargo.md, "Which tests run"): under 120 s, every test
@@ -99,8 +105,7 @@ their pinned revisions, except blaze, which is the files of this checkout as the
                    (`perf stat -a`, Linux); docs/v2/plan/design/data.md asks for it and sets no budget
     bounds         every speed-of-light bound (bounds.py: the `bound` blocks of
                    docs/v2/plan/bounds.md), each program beside `blaze` run
-                   until settled: at most the bound x 1.1 (at least the bound / 1.1 for a rate);
-                   unmeasured on v1, which has none of v2's components
+                   until settled: at most the bound x 1.1 (at least the bound / 1.1 for a rate)
 
 The timed budgets (body, big-crate, noop) also count the instructions and cycles the daemon's
 processes retired over each timed build, from quiet to quiet (counters.py: Linux's counters in
@@ -121,25 +126,69 @@ wrong build passes nothing. cargo is the baseline of the speed and memory rows a
 parameter with another value, blank lines and indentation by more, comments with another text,
 another name), so no run is a store's hit for the one before it.
 
+The loop thread. After every edit's timed build (`Lane.edits`: the body, signature, formatting,
+comment, rename and move rows, and the smoke's body edit) the build's profile is read (`blaze
+debug sql`, `LOOP_SQL`: the spans that began inside the last build's window, as guards.py takes
+them) and the row fails, whatever its time, when the daemon's loop thread stalled: a span named
+`loop stalled` (the daemon's watchdog records one for each inline step of a loop turn that ran
+over 20 ms, the step in its `function`), each listed with its step and ms; or the spans named
+`the job's answer waits for what it still does` add up to more than `hold_ms`, listed with what
+each waited for (`function`, `awaits`). The finding of 2026-11-10 (Linux, XFS): a one-line body
+edit of a hello world answered 3.2 s late, held by that span, while the loop thread sat in
+`ioctl(FICLONE)` for 0.9 and 1.4 s. loop_syscalls.py holds the same from outside, with strace.
+
+Results kept. Every edit's row also fails, whatever its time, when the daemon's log gained a
+line saying `were not kept after its answer was sent` over the row's builds (`NOT_KEPT`,
+`not_kept`): what a build left for the store (its dependency images, check outcomes, goals and
+bodies' steps) was lost after its answer, and where the whole of it was, the front end with it,
+so the next build lowered anew. The finding of 2026-11-10 (ripgrep): the daemon printed that
+line after every build ("the item store: keeping the shape of the MIR of StaticId(..): two
+images were made under ..") and each body edit took 43 s in place of 2; the line was found
+after an hour of reading the profile. `blaze slow` and `blaze why` say the same first.
+
 `smoke` is what keeps this script able to run against the blaze of the tree: the merge gate
 runs it with the blaze the change built (blaze-platform.yaml, `profile-gate`). After the
 engine's preflight (engine.V2.preflight) it writes fixture.py's workspace (three small crates),
 builds it cold in a new home, and measures one no-op build and one body edit through the code
 the budgets run (`Lane.noop`, `Lane.timed_edit`, with the edited program checked against a build
-from nothing in a home of its own), once each and against no budget. It exits 0 only when both
-gave a number and the daemon's lock and store are where engine.layout says; it needs no cargo
-and no network but blaze's own toolchain. It took 64 s with the release of 2026-11-05 on 32
+from nothing in a home of its own), once each and against no budget. Then it holds the guards
+of guards.py: on that workspace and on a one-file program it times a warm no-op build, a comment
+at the end of a line and a statement added to a body, and holds each build's time, and what the
+daemon's profile and log say it did (a kept front end let go, queries run anew or for an
+untracked read, time lowering or maintaining what did not change, an answer held after the last
+task, a loop turn no span covers), to guards.py's one table of bounds, with the bounds known to
+fail listed in harness/v2/guards-known.toml (`record` writes it); and it builds and runs a
+program whose build script runs `$RUSTC` as anyhow's does, within `PROBE_SECS`, so blaze hanging
+or failing inside its own build-script sandbox is a failure naming that step. It exits 0 only when
+the two rows gave a number, the daemon's lock and store are where engine.layout says, and every
+outcome of `guards.names()` is there and passed: nothing asked for is dropped. It needs no cargo,
+and no network but for blaze's own toolchain and, with no `duckdb` given, blaze's pinned DuckDB. It took 64 s with the release of 2026-11-05 on 32
 cores, and says where (`steps_s` in the result, a line per `blaze` command): it builds the
 fixture cold twice, once in the lane's home and once from nothing for the check of the edited
 program.
 
 `selftest` checks the parts that need neither blaze nor cargo nor the network: edit generation,
 budget evaluation, /proc/stat, which rows an input selects, the daemon home's layout against the
-daemon's rule, and that the smoke's edit applies to the fixture.
+daemon's rule, that the smoke's edit applies to the fixture, and which of a build's spans fail an
+edit (`loop_failures`). The guards' own selftest is
+guards.py's.
+
+The work of an edit: each timed build of the body-edit budget is also held to what its profile
+records of the daemon's work, so a regression fails the gate with the query's name, not as a
+slower median. From the second build on, each query of `EDIT_QUERIES` (inference, the built and the
+runtime MIR, the check of a body and of a module's items) ran at most `edit_runs` times (16): an edit
+of one function's body infers, lowers and checks that body and what reads what changed of it, not
+the crate (ripgrep, 2026-11-10: 1,165 inferences for one line of `rg::main`). The first build is
+left out: it follows a build from nothing, which lets go of every body's results, and makes the
+edited crate's again once. And in every build the critical path's time under no span, the
+`unrecorded` blind spots of `blaze slow --json`, is at most `gap_ms` (20): the same edit had 650 ms
+between its lowering and its first unit task that nothing named.
 """
 
 import bisect
+import contextlib
 import dataclasses
+import io
 import json
 import math
 import os
@@ -151,7 +200,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast, get_args
@@ -166,6 +215,7 @@ import bounds
 import blaze_cli
 import counters
 import fixture
+import guards
 import memory
 import storelib
 
@@ -239,6 +289,11 @@ class Input:
     self_edit: SelfEdit = SelfEdit()
     self_test: tuple[str, ...] = ()
     keep: bool = False
+    record: bool = False
+    duckdb: str = ""
+    hold_ms: float = 200.0
+    edit_runs: int = 16
+    gap_ms: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -319,6 +374,9 @@ SMOKE_ROWS = (
 # The smoke's body edit, as bench.py writes one: a statement after the line that opens a function.
 SMOKE_FILE, SMOKE_OPENING = "base/src/a.rs", "pub fn alpha() -> u32 {"
 SMOKE_PROGRAM = "oracle_app"
+# The most the build and the run of guards.py's probe may take: a build script that runs
+# `$RUSTC` twice, on a program of one line.
+PROBE_SECS = 300
 
 
 def select(projects: Sequence[Project], budgets: Sequence[Budget]) -> list[Row]:
@@ -878,6 +936,150 @@ def count_numbers(counted: Sequence[counters.Counts]) -> dict[str, report.Number
     return out
 
 
+# The loop thread over an edit's build, from the build's profile (the docstring's "The loop
+# thread"). The names are the daemon's: its loop's watchdog and its job's hold.
+STALLED = "loop stalled"
+HELD = "the job's answer waits for what it still does"
+# A span of the build: its name, what it is of, and its ms.
+type SpanRow = tuple[str, str, float]
+# The stalls and the holds that began inside the last build's window, in order. The window is
+# guards.FACTS_SQL's: a span is taken by when it began, not by its `build_id` (the loop thread's
+# spans are of no build), and the window runs to the reply's end when that is after the build's
+# row's (an answer held back).
+LOOP_SQL = """
+WITH b AS (
+    SELECT build_id, started_ns AS t0, started_ns + coalesce(dur_ns, 0) AS t1
+    FROM builds ORDER BY build_id DESC LIMIT 1
+), reply AS (
+    SELECT max(s.start_ns + s.dur_ns) AS at
+    FROM spans s, b
+    WHERE s.name = 'request: read to reply' AND s.start_ns <= b.t1 AND s.start_ns + s.dur_ns >= b.t0
+), w AS (
+    SELECT b.t0, greatest(b.t1, coalesce(reply.at, b.t1)) AS t1 FROM b, reply
+)
+SELECT s.name AS name, s.function AS function, s.awaits AS awaits, coalesce(s.dur_ns, 0) / 1e6 AS ms
+FROM spans s, w
+WHERE s.name IN (@NAMES@) AND s.start_ns >= w.t0 AND s.start_ns <= w.t1
+ORDER BY s.start_ns
+""".replace("@NAMES@", ", ".join("'" + name.replace("'", "''") + "'" for name in (STALLED, HELD)))
+
+
+def span_rows(stdout: str, what: str) -> list[SpanRow]:
+    """`LOOP_SQL`'s rows as `blaze debug sql --json` printed them. What a hold waited for is its
+    `function` and its `awaits`. A row that is not the query's is a ValueError naming `what`."""
+    out: list[SpanRow] = []
+    for row in guards.rows(stdout, what):
+        name, ms = row.get("name"), guards.number(row, "ms", what)
+        if not isinstance(name, str) or ms is None:
+            raise ValueError(f"{what}: a row with no name or no ms: {row}")
+        of = [str(row[column]) for column in ("function", "awaits") if row.get(column) not in (None, "")]
+        out.append((name, ", awaiting ".join(of) or "nothing the span names", ms))
+    return out
+
+
+def loop_failures(rows: Sequence[SpanRow], hold_ms: float) -> list[str]:
+    """Why a build with the spans `rows` fails its edit; empty when it does not. Every `loop
+    stalled` span fails it, named by its step; and the holds of its answer when they add up to
+    more than `hold_ms`, named by what each waited for."""
+    out = [f"the loop thread stalled {ms:.4g} ms in one step, `{step}`" for name, step, ms in rows if name == STALLED]
+    holds = [(what, ms) for name, what, ms in rows if name == HELD]
+    held = sum(ms for _, ms in holds)
+    if held > hold_ms:
+        out.append(f"the answer was held {held:.4g} ms, over the bound of {hold_ms:.4g} ms, for what the job still "
+                   "did: " + ", ".join(f"`{what}` {ms:.4g} ms" for what, ms in holds))
+    return out
+
+
+# What a one-function body edit may run again of the front end, from the build's `query_counts`
+# (the docstring's "The work of an edit"). The names are the query functions': inference, the
+# built and the runtime MIR, and the check of a body and of a module's items (hir's
+# `body_check_clean`, `module_check_clean`).
+EDIT_QUERIES = ("infer_body_query", "mir_body_query", "runtime_mir_body_query", "body_check_clean",
+                "module_check_clean")
+COUNTS_SQL = """
+SELECT q.query AS query, q.executed AS executed
+FROM query_counts q
+WHERE q.build_id = (SELECT max(build_id) FROM builds) AND q.query IN (@NAMES@)
+ORDER BY q.query
+""".replace("@NAMES@", ", ".join(f"'{name}'" for name in EDIT_QUERIES))
+
+
+def count_rows(stdout: str, what: str) -> dict[str, int]:
+    """`COUNTS_SQL`'s rows as `blaze debug sql --json` printed them: each query's runs. A query
+    with no row ran nothing. A row that is not the query's is a ValueError naming `what`."""
+    out: dict[str, int] = {}
+    for row in guards.rows(stdout, what):
+        name, executed = row.get("query"), guards.number(row, "executed", what)
+        if not isinstance(name, str) or executed is None:
+            raise ValueError(f"{what}: a row with no query or no executed: {row}")
+        out[name] = int(executed)
+    return out
+
+
+def count_failures(counts: Mapping[str, int], most: int) -> list[str]:
+    """Why a body edit whose build ran `counts` fails; empty when it does not. Each query of
+    `EDIT_QUERIES` that ran more than `most` times fails it, named, with its runs."""
+    return [f"`{name}` ran {counts[name]} times for an edit of one function's body, over the bound of {most}: the "
+            "build ran again what the edit did not change (`blaze debug sql` over `provenance` says why each ran)"
+            for name in EDIT_QUERIES if counts.get(name, 0) > most]
+
+
+def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
+    """Why a build whose `blaze slow --json` report is `printed` fails its edit by the time no
+    span names; empty when it does not. The report's blind spots of kind `unrecorded` are the
+    critical path's time the record lost (between spans, or cut): over `most_ms` in all, the edit
+    fails, saying how much and where the report says it was. A report that is no report is a
+    ValueError naming `what`."""
+    try:
+        report_ = json.loads(printed)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{what}: `blaze slow --json` printed no JSON: {error}") from error
+    spots = report_.get("blind_spots") if isinstance(report_, dict) else None
+    if not isinstance(spots, list):
+        raise ValueError(f"{what}: `blaze slow --json` printed no `blind_spots`")
+    lost = [spot for spot in spots if isinstance(spot, dict) and spot.get("kind") == "unrecorded"]
+    hidden = 0.0
+    for spot in lost:
+        ns = spot.get("hidden_ns")
+        if not isinstance(ns, (int, float)) or isinstance(ns, bool):
+            raise ValueError(f"{what}: an `unrecorded` blind spot with no `hidden_ns`: {spot}")
+        hidden += ns / 1e6
+    # Where each stretch is, as the report's `gaps` say it (report version 9): its thread and the
+    # spans of its lane before and after it. A stretch its lane ran inside no span (`no_span`) is
+    # no `unrecorded` blind spot, and is held to the same bound, each on its own.
+    gaps = [gap for gap in report_.get("gaps", []) if isinstance(gap, dict)]
+    out = []
+    for gap in gaps:
+        ms = gap.get("dur_ns", 0) / 1e6
+        if gap.get("kind") == "no_span" and ms > most_ms:
+            out.append(f"{ms:.4g} ms of the critical path ran inside no span, over the bound of {most_ms:.4g} ms "
+                       f"(slow-is-p0-traced: name it with a span first): {gap_where(gap)}")
+    if hidden <= most_ms:
+        return out
+    where = "; ".join([gap_where(gap) for gap in gaps if gap.get("kind") != "no_span"]
+                      or [str(line) for spot in lost for line in spot.get("evidence", [])])
+    return out + [f"{hidden:.4g} ms of the critical path is under no span, over the bound of {most_ms:.4g} ms "
+                  f"(slow-is-p0-traced: name it with a span first): {where or 'the report names no lane'}"]
+
+
+def gap_where(gap: dict[str, Any]) -> str:
+    """One gap of `blaze slow --json`'s `gaps` in words: how long, where in the build, on which
+    thread, and between which spans of its lane."""
+    return (f"{gap.get('dur_ns', 0) / 1e6:.4g} ms at {gap.get('from_ns', 0) / 1e6:.4g} ms on "
+            f"{gap.get('thread_name') or gap.get('lane')} ({gap.get('kind')}), after "
+            f"{gap.get('before') or 'no span of its lane'}, before {gap.get('after') or 'no span of its lane'}")
+
+
+# The daemon's line for what a build left for the store and lost after its answer (blaze-cargo's
+# `Jobs::lose`; the docstring's "Results kept").
+NOT_KEPT = "were not kept after its answer was sent"
+
+
+def not_kept(log: str) -> list[str]:
+    """The lines of the daemon's log that say a build's results were not kept, as printed."""
+    return [line.strip() for line in log.splitlines() if NOT_KEPT in line]
+
+
 @dataclass(frozen=True)
 class Edits:
     seconds: tuple[float, ...]
@@ -918,6 +1120,8 @@ class Lane:
         self.top.mkdir(parents=True)
         self.spec, self.ws = checkout(name, self.top / "src") if source is None else source(self.top / "src")
         extra = project_env(self.spec)
+        if args.duckdb:
+            extra["BLAZE_DUCKDB"] = args.duckdb
         self.home = self.top / "home"
         self.env = eng.env(self.home, None, extra)
         self.ref = self.top / "cargo-target"
@@ -1014,15 +1218,26 @@ class Lane:
         return (f"{self.name}: {step}: the warm program says something else than blaze's build of it from "
                 f"nothing: {difference(ours, scratch)}")
 
-    def edits(self, step: str, apply: Apply, revert: Revert, count: bool, limit_ms: float | None = None) -> Edits:
+    def edits(self, step: str, apply: Apply, revert: Revert, count: bool, limit_ms: float | None = None,
+              body: bool = False) -> Edits:
         """The edit, a timed build (with `count`, what it compiled), and the edit taken back and
         built: `runs` times, or with `limit_ms` until the times settle it (`enough`). After the
-        first, the program is checked against blaze's build of it from nothing (`wrong`)."""
+        first, the program is checked against blaze's build of it from nothing (`wrong`). With
+        `body` (the edit changes one function's body) each build's profile is also held to the
+        work of an edit: what it ran again of the front end (`count_failures`; from the second
+        build on, the first being the one that makes what a build from nothing let go) and the
+        critical path's time under no span (`gap_failures`)."""
         seconds: list[float] = []
         compiled: list[int] = []
         counted: list[counters.Counts] = []
+        stalled: list[str] = []
+        spent: list[str] = []
         places = 0
         n = 0
+        # What a build left for the store is stored after its answer and before the next build
+        # of the checkout lowers: each timed build's loss is in the log once the build that
+        # takes its edit back has answered.
+        log_from = len(log_text(self).encode())
         while (len(seconds) < self.args.runs if limit_ms is None
                else not enough([s * 1000 for s in seconds], limit_ms, self.args)):
             places = apply(n)
@@ -1030,6 +1245,11 @@ class Lane:
                 took, work, used = self.counted_build(f"{step} {n + 1}", count)
                 seconds.append(took)
                 counted.append(used)
+                # Before any other build: the profile's last build is the one just timed.
+                stalled += [f"{step} {n + 1} ({took * 1000:.4g} ms): {why}" for why in self.loop_failures(f"{step} {n + 1}")]
+                if body:
+                    spent += [f"{step} {n + 1} ({took * 1000:.4g} ms): {why}"
+                              for why in self.work_failures(f"{step} {n + 1}", n > 0)]
                 if work is not None:
                     if work.compiled is None:
                         raise engine.Unmeasurable(f"{self.eng.kind} did not say how many functions the {step} compiled")
@@ -1040,7 +1260,37 @@ class Lane:
                 revert(n)
             self.build(f"{step} {n + 1} taken back", False)
             n += 1
+        if lost := not_kept(log_text(self, log_from)):
+            raise Wrong(f"{self.name}: {step}: the daemon did not keep what {len(lost)} of its builds left for the "
+                        f"store, so the builds after them started from less (their times: "
+                        f"{samples(s * 1000 for s in seconds)} ms); its log says:\n" + "\n".join(lost))
+        if stalled:
+            raise Wrong(f"{self.name}: {step}: the daemon's loop thread did not keep up in {len(stalled)} of "
+                        f"{len(seconds)} builds' profiles (their times: {samples(s * 1000 for s in seconds)} ms):\n"
+                        + "\n".join(stalled))
+        if spent:
+            raise Wrong(f"{self.name}: {step}: the daemon's work on an edit of one function's body was not in "
+                        f"proportion to that function in {len(spent)} findings over {len(seconds)} builds (their "
+                        f"times: {samples(s * 1000 for s in seconds)} ms):\n" + "\n".join(spent))
         return Edits(tuple(seconds), tuple(compiled), places, tuple(counted))
+
+    def work_failures(self, step: str, counts: bool) -> list[str]:
+        """Why the build just run fails a body edit by the work its profile records
+        (`gap_failures`, and with `counts` `count_failures`); empty when it does not."""
+        out: list[str] = []
+        if counts:
+            what = f"{step}: what the edit ran again of the front end"
+            ran = count_rows(sql(self.eng, self, what, COUNTS_SQL), f"{self.name}: {what}")
+            out += count_failures(ran, self.args.edit_runs)
+        what = f"{self.name}: {step}: the critical path's time under no span"
+        said = self.eng.command(what, "slow", ["--json"], self.ws, self.env, 300).checked(what).stdout
+        return out + gap_failures(said, self.args.gap_ms, what)
+
+    def loop_failures(self, step: str) -> list[str]:
+        """Why the build just run fails its edit by what its profile says of the loop thread
+        (`LOOP_SQL`, `loop_failures`); empty when it does not."""
+        what = f"{step}: the loop thread's stalls and the answer's holds"
+        return loop_failures(span_rows(sql(self.eng, self, what, LOOP_SQL), f"{self.name}: {what}"), self.args.hold_ms)
 
     def text_edit(self, file: str, make: Callable[[str, int], str]) -> tuple[Apply, Revert]:
         path = self.ws / file
@@ -1067,7 +1317,7 @@ class Lane:
         return apply, revert
 
     def timed_edit(self, step: str, limit_ms: float) -> Measured:
-        e = self.edits(step, *self.bench_edit("body"), False, limit_ms)
+        e = self.edits(step, *self.bench_edit("body"), False, limit_ms, body=True)
         return timed([s * 1000 for s in e.seconds], "ms", places=e.places, **count_numbers(e.counted))
 
     def nothing_compiled(self, step: str, make: Callable[[str, int], str]) -> Measured:
@@ -1513,8 +1763,6 @@ def bound_row(found: bounds.Found) -> Row:
 def measure_bound(eng: engine.Engine, args: Input, found: bounds.Found) -> Measured:
     """The bound's program, beside the measured `blaze`, run until its values settle the budget."""
     b = found.bound
-    if eng.kind == "v1":
-        raise engine.Unmeasurable(f"v1 has none of v2's components; {b.name} is v2's ({found.where})")
     program = Path(args.engine.blaze).resolve().parent / (b.program + engine.EXE)
     values: list[float] = []
     while not enough(values, found.budget, args):
@@ -1541,10 +1789,14 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
     began = time.monotonic()
     once = dataclasses.replace(args, runs=1, most_runs=1)
     rows = {row.key: row for row in SMOKE_ROWS}
+    # The workspace's guard steps, or why it gave none: never dropped (`smoke_guards`).
+    gathered: list[Gathered] = []
     try:
         lane = Lane(eng, once, work, "fixture", smoke_source)
     except SETUP_ERRORS as e:
         setup_failed(rep, rows.values(), e)
+        gathered += no_facts("workspace", f"setting up the workspace: {type(e).__name__}: {e}")
+        smoke_guards(eng, args, rep, work, gathered)
         return
     try:
         try:
@@ -1553,6 +1805,7 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
             lane.count_daemon()
         except SETUP_ERRORS as e:
             setup_failed(rep, rows.values(), e)
+            gathered += no_facts("workspace", f"the cold build of the workspace: {type(e).__name__}: {e}")
             return
         judge(rep, rows["noop"], lambda: lane.noop(rows["noop"].limit))
         judge(rep, rows["body"], lambda: lane.timed_edit("body edit", rows["body"].limit))
@@ -1563,8 +1816,10 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
         rep.add("smoke: the daemon's lock and store are where engine.layout says", "error" if missing else "pass",
                 f"after the builds, the home {lane.home} has no {' and no '.join(missing)}: the daemon keeps them "
                 "elsewhere than storelib.Layout says" if missing else f"{laid.lock}, {laid.store}")
+        gathered += guard_steps(eng, lane, "workspace", SMOKE_FILE, SMOKE_OPENING)
     finally:
         lane.stop(rep)
+        smoke_guards(eng, args, rep, work, gathered)
     for row in rows.values():
         got = [o.numbers.get("measured") for o in rep.outcomes if o.name == row.name and o.verdict == "pass"]
         if not (len(got) == 1 and isinstance(got[0], (int, float)) and math.isfinite(got[0])):
@@ -1578,6 +1833,175 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
     print(f"smoke: {time.monotonic() - began:.1f} s", flush=True)
 
 
+def sql(eng: engine.Engine, lane: Lane, what: str, query: str) -> str:
+    """What `blaze debug sql --json QUERY` prints on `lane`'s daemon; a failure is an engine.Failed naming `what`."""
+    step = f"{lane.name}: {what}"
+    ran = eng.command(step, "debug", ["sql", "--json", query], lane.ws, lane.env, 300)
+    return ran.checked(step).stdout
+
+
+def log_text(lane: Lane, since: int = 0) -> str:
+    """The daemon's log from byte `since` on; empty where it has none yet."""
+    try:
+        with open(engine.layout(lane.home).log, "rb") as f:
+            f.seek(since)
+            return engine.text(f.read())
+    except FileNotFoundError:
+        return ""
+
+
+type Facts = dict[str, float | None]
+# What a guard step gave: its facts, or why it gave none.
+type Gathered = tuple[guards.Fixture, guards.Step, Facts | None, str]
+
+
+def guard_facts(eng: engine.Engine, lane: Lane, step: str, took_s: float, warm_from: int, log_from: int) -> Facts:
+    """What `lane`'s last build did, as guards.py's bounds name it: the client's wait, the
+    profile's row of it (`guards.FACTS_SQL`, the view `uncovered_time`) and the log's lines."""
+    row = guards.one_row(sql(eng, lane, f"guards: {step}: the profile's facts", guards.facts_sql(warm_from)),
+                         f"{lane.name}: {step}")
+    facts: Facts = {column: guards.number(row, column, f"{lane.name}: {step}") for column in guards.PROFILE_FACTS}
+    uncovered = guards.one_row(sql(eng, lane, f"guards: {step}: uncovered_time", guards.UNCOVERED_SQL),
+                               f"{lane.name}: {step}: uncovered_time")
+    facts["uncovered_ms"] = guards.number(uncovered, "uncovered_ms", f"{lane.name}: {step}: uncovered_time")
+    facts["ms"] = took_s * 1000
+    facts["let_go_logged"] = float(guards.let_go_lines(log_text(lane, log_from)))
+    return facts
+
+
+def no_facts(fixture: guards.Fixture, why: str) -> list[Gathered]:
+    """Every step of `fixture` with no facts, and why."""
+    return [(fixture, step, None, why) for step in guards.STEPS]
+
+
+def guard_steps(eng: engine.Engine, lane: Lane, fixture: guards.Fixture, file: str, opening: str) -> list[Gathered]:
+    """guards.py's three steps on `lane`, which was built cold: a warm no-op build, a comment at
+    the end of the line `opening` is in `file`, and a statement added to the body it opens; each
+    edit taken back and built before the next. A step that could not be run or read says why."""
+    path = lane.ws / file
+    try:
+        before = read(path)
+        lane.build("guards: the build that warms up", False)
+        mark = guards.one_row(sql(eng, lane, "guards: the mark", guards.MARK_SQL), f"{lane.name}: the mark")
+        warm_from = guards.number(mark, "warm_from", f"{lane.name}: the mark")
+        if warm_from is None:
+            raise engine.Failed(f"{lane.name}: the daemon's history has no build after the cold build and a warm one")
+        log_from = len(log_text(lane).encode())
+    except SETUP_ERRORS as e:
+        return no_facts(fixture, f"setting up {fixture}: {type(e).__name__}: {e}")
+    edits: dict[guards.Step, Callable[[str, str, int], str] | None] = {
+        "noop": None, "comment": guards.eol_comment, "body": guards.body_statement}
+    out: list[Gathered] = []
+    for step in guards.STEPS:
+        make = edits[step]
+        try:
+            if make is not None:
+                write(path, make(before, opening, 1))
+            try:
+                took, _ = lane.build(f"guards: {step}", False)
+                facts = guard_facts(eng, lane, step, took, int(warm_from), log_from)
+            finally:
+                if make is not None:
+                    write(path, before)
+            if make is not None:
+                lane.build(f"guards: {step} taken back", False)
+            out.append((fixture, step, facts, ""))
+        except SETUP_ERRORS as e:
+            out.append((fixture, step, None, f"{type(e).__name__}: {e}"))
+    return out
+
+
+def guard_outcomes(rep: report.Report, gathered: Sequence[Gathered], known: Sequence[guards.Known]) -> None:
+    """An outcome for every bound of every step gathered: judged against `known`, or an error
+    saying why the step gave no facts. Every name of `guards.names()` for those steps is added."""
+    for fixture, step, facts, why in gathered:
+        if facts is None:
+            for bound in guards.BOUNDS:
+                if bound.limit(step) is not None:
+                    rep.add(guards.name(fixture, step, bound.check), "error", why)
+            continue
+        for it in guards.judge(fixture, step, facts, known):
+            rep.add(it.name, it.verdict, it.detail, measured=it.measured, budget=it.limit, unit=it.unit, known=it.known)
+
+
+def sandbox_probe(eng: engine.Engine, rep: report.Report, args: Input, work: Path) -> None:
+    """guards.py's probe built and run within `PROBE_SECS`: its build script runs `$RUSTC`, which
+    is blaze inside the build-script sandbox. A hang, a failure, or a probe that did not compile
+    is the outcome `guards.PROBE` failing, naming the step."""
+    step = "probe: `blaze run` of a program whose build script runs $RUSTC"
+    try:
+        lane = Lane(eng, args, work, "probe", guards.probe_source)
+    except SETUP_ERRORS as e:
+        rep.add(guards.PROBE, "error", f"setting up the probe: {type(e).__name__}: {e}")
+        return
+    ended = False
+    try:
+        ran = eng.build(step, lane.ws, lane.env, [], "run", PROBE_SECS)
+        ended = True
+        if ran.returncode != 0:
+            rep.add(guards.PROBE, "fail", f"{step}: exited {ran.returncode}:\n{ran.said()}", seconds=round(ran.seconds, 2))
+        elif guards.PROBE_SAYS not in ran.stdout:
+            rep.add(guards.PROBE, "fail", f"{step}: the program did not print {guards.PROBE_SAYS!r}: its build script's "
+                    f"probe was not seen to compile:\n{ran.said()}", seconds=round(ran.seconds, 2))
+        else:
+            rep.add(guards.PROBE, "pass", f"{ran.seconds:.1f} s against at most {PROBE_SECS}", seconds=round(ran.seconds, 2))
+    except engine.Failed as e:
+        rep.add(guards.PROBE, "fail", f"{e}\nblaze hung or could not be run inside its build-script sandbox "
+                "(2026-11-10: its workers' wait ring was refused there, each ended silently, and the main thread parked "
+                "with no bound)")
+    finally:
+        if ended:
+            lane.stop(rep)
+        else:
+            # A daemon that hangs on the build does not answer a stop either.
+            try:
+                kill_group(daemon_pid(lane.home))
+            except (engine.Failed, OSError):
+                pass
+            lane.meter.close()
+
+
+def smoke_guards(eng: engine.Engine, args: Input, rep: report.Report, work: Path, gathered: list[Gathered]) -> None:
+    """The guards after the workspace's (`gathered` holds its steps): the one-file program's
+    steps, the outcomes of both against the known list (written first, with `record`), the
+    sandbox's probe, and an error for any outcome of `guards.names()` that is still missing."""
+    once = dataclasses.replace(args, runs=1, most_runs=1)
+    try:
+        lane = Lane(eng, once, work, "onefile", guards.onefile_source)
+    except SETUP_ERRORS as e:
+        gathered += no_facts("onefile", f"setting up onefile: {type(e).__name__}: {e}")
+    else:
+        try:
+            try:
+                lane.build("the cold build", False)
+                eng.wait_ready(lane.ws, lane.env)
+            except SETUP_ERRORS as e:
+                gathered += no_facts("onefile", f"the cold build of onefile: {type(e).__name__}: {e}")
+            else:
+                gathered += guard_steps(eng, lane, "onefile", guards.ONEFILE_FILE, guards.ONEFILE_OPENING)
+        finally:
+            lane.stop(rep)
+    try:
+        known = guards.read_known(guards.KNOWN.read_text())
+        if args.record:
+            judged: list[tuple[guards.Fixture, guards.Step, guards.Judged]] = [
+                (fixture, step, it) for fixture, step, facts, _ in gathered if facts is not None
+                for it in guards.judge(fixture, step, facts, ())]
+            known = guards.recorded_from(judged, known)
+            guards.KNOWN.write_text(guards.render_known(known, dict(
+                commit=report.commit() or "", blaze=getattr(eng, "version", ""), date=time.strftime("%Y-%m-%d"))))
+            print(f"smoke: {guards.KNOWN} written: {len(known)} known failures", flush=True)
+    except (ValueError, OSError) as e:
+        rep.add("guard: the known list (harness/v2/guards-known.toml)", "error", f"{type(e).__name__}: {e}")
+        known = []
+    guard_outcomes(rep, gathered, known)
+    sandbox_probe(eng, rep, once, work)
+    given = {o.name for o in rep.outcomes}
+    for wanted in guards.names():
+        if wanted not in given:
+            rep.add(wanted, "error", "the smoke gave no outcome for it: nothing asked for is dropped")
+
+
 def main(args: Input) -> None:
     if args.runs < 1 or args.runtime_runs < 1:
         fail(SCRIPT, f"runs and runtime_runs: at least 1, not {args.runs} and {args.runtime_runs}")
@@ -1585,6 +2009,12 @@ def main(args: Input) -> None:
         fail(SCRIPT, f"most_runs: at least runs ({args.runs}), not {args.most_runs}")
     if args.command == "smoke" and (args.projects or args.budgets):
         fail(SCRIPT, "command `smoke`: it measures fixture.py's workspace alone and takes no `projects` or `budgets`")
+    if args.command != "smoke" and args.record:
+        fail(SCRIPT, "record: it writes the smoke's known list, and the command is not `smoke`")
+    if args.duckdb and not os.path.isabs(args.duckdb):
+        fail(SCRIPT, f"duckdb: an absolute path, not {args.duckdb!r}")
+    if not args.hold_ms >= 0:
+        fail(SCRIPT, f"hold_ms: at least 0, not {args.hold_ms}")
     if args.command == "run" and not args.out:
         fail(SCRIPT, "out: command `run` writes its result there, and was given none")
     try:
@@ -1607,7 +2037,8 @@ def main(args: Input) -> None:
     if args.command == "smoke":
         smoke(eng, args, rep, work)
         if not args.keep:
-            shutil.rmtree(work / "fixture", ignore_errors=True)
+            for name in ("fixture", "onefile", "probe"):
+                shutil.rmtree(work / name, ignore_errors=True)
             if not args.work:
                 shutil.rmtree(work, ignore_errors=True)
         rep.extra.update(work=str(work), blaze=getattr(eng, "version", ""))
@@ -1794,6 +2225,25 @@ def selftest_smoke() -> None:
         expect(f'name = "{SMOKE_PROGRAM}"' in read(ws / "app" / "Cargo.toml"), "the smoke's program is the fixture's")
     once = dataclasses.replace(given, runs=1, most_runs=1)
     expect(enough([3.0], math.inf, once) and not enough([], math.inf, once), "the smoke times each once")
+    # The guards: the workspace's edits apply to fixture.py's file, every step that gave no facts
+    # still gives each of its outcomes, and a run with every step gathered gives every name.
+    with tempfile.TemporaryDirectory(prefix="bz-budgets-selftest-") as tmp:
+        _, ws = smoke_source(Path(tmp) / "src")
+        source = read(ws / SMOKE_FILE)
+        expect(guards.eol_comment(source, SMOKE_OPENING).count("\n") == source.count("\n")
+               and guards.body_statement(source, SMOKE_OPENING) != source, "the guards' edits apply to the workspace")
+    rep = report.Report(SCRIPT, given.engine, "")
+    facts: Facts = dict(guards.FIXED["comment"])
+    some: list[Gathered] = [(fixture, step, None if step == "noop" else facts, "the daemon did not start")
+                            for fixture in guards.FIXTURES for step in guards.STEPS]
+    with contextlib.redirect_stdout(io.StringIO()):
+        guard_outcomes(rep, some, ())
+    names = [o.name for o in rep.outcomes]
+    expect(sorted(names) == sorted(set(guards.names()) - {guards.PROBE}),
+           "the guards' outcomes are every bound of every step of both fixtures, with or without facts")
+    expect({o.verdict for o in rep.outcomes if ": noop: " in o.name} == {"error"}, "a step with no facts errs, bound by bound")
+    refused("`record` without the smoke", lambda: main(parse(Input, spec.replace('"smoke"', '"run"')[:-1]
+                                                              + ', "record": true, "out": "/tmp/x"}', SCRIPT)), SystemExit)
     got = timed([3.0], "ms")
     expect(verdict(got.value, math.inf, True) == "pass" and got.interval is None, "one sample is a number, and passes no budget")
 
@@ -1839,8 +2289,99 @@ def selftest_ledger() -> None:
             chosen = select(it.projects, it.budgets)
         except (SystemExit, ValueError) as e:
             raise SystemExit(f"{SCRIPT} selftest: the ledger's {row_id} gives an input this script refuses: {e}") from None
-        expect(it.command == "run" and (bool(chosen) or "bounds" in it.budgets),
+        # The smoke's rows are its own (`SMOKE_ROWS`, `guards.names()`): it takes no `budgets`.
+        expect((it.command == "smoke" and not it.projects and not it.budgets)
+               or (it.command == "run" and (bool(chosen) or "bounds" in it.budgets)),
                f"the ledger's {row_id} selects no row: {given}")
+
+
+def selftest_not_kept() -> None:
+    """Which lines of a daemon's log fail an edit: the finding of 2026-11-10, and a log without it."""
+    line = ("blaze serve: the results of `build` in /root/m3/rg (job 0v7) were not kept after its answer was sent: "
+            "storing what the build of /root/m3/rg left for the store: the item store: keeping the shape of the MIR "
+            "of StaticId(StaticId(ae34)): two images were made under d1eed1fd3fdb")
+    log = f"blaze serve: listening\n  {line}\nblaze serve: a kept front end is let go\n{line}\n"
+    expect(not_kept(log) == [line, line], f"each line that says so, as printed: {not_kept(log)}")
+    expect(not_kept("blaze serve: listening\nblaze serve: the results of `build` were kept\n") == [] and not_kept("") == [],
+           "a log that does not say so fails nothing")
+
+
+def selftest_loop() -> None:
+    """Which of a build's spans fail its edit: the finding of 2026-11-10 in miniature, and the
+    fixed state."""
+    stall: SpanRow = (STALLED, "place outputs", 889.0)
+    hold: SpanRow = (HELD, "the store's placement, awaiting an io thread", 3200.0)
+    said = loop_failures([stall, (STALLED, "sync the store", 1400.0), hold], 200.0)
+    expect(len(said) == 3 and "`place outputs`" in said[0] and "889 ms" in said[0] and "`sync the store`" in said[1]
+           and "1400 ms" in said[1], f"every stall fails the edit, naming its step and its ms: {said}")
+    expect("held 3200 ms" in said[2] and "bound of 200 ms" in said[2]
+           and "`the store's placement, awaiting an io thread` 3200 ms" in said[2],
+           f"a hold over the bound fails the edit, naming what it waited for: {said}")
+    expect(loop_failures([stall], 1e9) == said[:1], "a stall fails whatever the hold's bound")
+    expect(loop_failures([(HELD, "a", 120.0), (HELD, "b", 80.0)], 200.0) == [], "holds that add up to the bound pass")
+    over = loop_failures([(HELD, "a", 120.0), (HELD, "b", 80.5)], 200.0)
+    expect(len(over) == 1 and "held 200.5 ms" in over[0] and "`a` 120 ms, `b` 80.5 ms" in over[0],
+           f"holds are summed over the build: {over}")
+    expect(loop_failures([], 200.0) == [] and loop_failures([("loop turn", "x", 5000.0), ("task", "y", 9000.0)], 0.0) == [],
+           "no stall and no hold passes, whatever other spans took")
+    printed = ('{"name":"loop stalled","function":"place outputs","awaits":null,"ms":889.012}\n'
+               '{"name":"the job\'s answer waits for what it still does","function":"placement","awaits":"the store","ms":3200}\n'
+               '{"name":"loop stalled","function":null,"awaits":null,"ms":21}\n')
+    expect(span_rows(printed, "rows") == [(STALLED, "place outputs", 889.012), (HELD, "placement, awaiting the store", 3200.0),
+                                          (STALLED, "nothing the span names", 21.0)], f"the rows read: {span_rows(printed, 'rows')}")
+    refused("a row with no ms", lambda: span_rows('{"name":"loop stalled","function":"x","awaits":null,"ms":null}', "rows"),
+            ValueError)
+    refused("a row without the query's columns", lambda: span_rows('{"name":"loop stalled"}', "rows"), ValueError)
+    expect(LOOP_SQL.count("'loop stalled'") == 1 and "'the job''s answer waits for what it still does'" in LOOP_SQL
+           and "@" not in LOOP_SQL, f"the query names both spans, quoted for SQL: {LOOP_SQL}")
+    spec = '{"engine": {"kind": "v2", "blaze": "blaze"}, "out": "o.json"'
+    expect(parse(Input, spec + "}", SCRIPT).hold_ms == 200.0 and parse(Input, spec + ', "hold_ms": 50.0}', SCRIPT).hold_ms == 50.0,
+           "the hold's bound is 200 ms unless given")
+    refused("a negative bound", lambda: main(parse(Input, spec + ', "hold_ms": -1.0}', SCRIPT)), SystemExit)
+
+
+def selftest_edit_work() -> None:
+    """Which of a build's counts and unnamed time fail a body edit: the finding of 2026-11-10 in
+    miniature (ripgrep, one line of `rg::main`), and the fixed state."""
+    found = {"infer_body_query": 1165, "mir_body_query": 1166, "runtime_mir_body_query": 1164, "body_check_clean": 2}
+    said = count_failures(found, 16)
+    expect(len(said) == 3 and "`infer_body_query` ran 1165 times" in said[0] and "bound of 16" in said[0]
+           and "`mir_body_query`" in said[1] and "`runtime_mir_body_query`" in said[2],
+           f"each query over the bound fails the edit by name: {said}")
+    expect(count_failures({"infer_body_query": 2, "mir_body_query": 16}, 16) == [] and count_failures({}, 0) == [],
+           "counts within the bound, and a build that ran none, pass")
+    expect(count_failures({"Body::of": 237, "ScopeInput::name": 841}, 16) == [], "a query the bound is not of fails nothing")
+    printed = '{"query":"infer_body_query","executed":1165}\n{"query":"body_check_clean","executed":2}\n'
+    expect(count_rows(printed, "rows") == {"infer_body_query": 1165, "body_check_clean": 2},
+           f"the rows read: {count_rows(printed, 'rows')}")
+    refused("a row with no executed", lambda: count_rows('{"query":"infer_body_query"}', "rows"), ValueError)
+    expect(all(f"'{name}'" in COUNTS_SQL for name in EDIT_QUERIES) and "@" not in COUNTS_SQL,
+           f"the query names every bounded query: {COUNTS_SQL}")
+    lost = {"kind": "unrecorded", "hidden_ns": 650_000_000, "evidence": ["by reason and lane: between_spans on loop 650 ms"]}
+    report_ = json.dumps({"blind_spots": [lost, {"kind": "uncovered", "hidden_ns": 9_000_000_000}]})
+    gap = gap_failures(report_, 20.0, "report")
+    expect(len(gap) == 1 and "650 ms" in gap[0] and "bound of 20 ms" in gap[0] and "between_spans on loop" in gap[0],
+           f"the critical path's unnamed time over the bound fails the edit, saying where: {gap}")
+    expect(gap_failures(json.dumps({"blind_spots": [dict(lost, hidden_ns=20_000_000)]}), 20.0, "report") == []
+           and gap_failures('{"blind_spots": []}', 0.0, "report") == [],
+           "unnamed time within the bound, and a report with none, pass")
+    where = {"kind": "between_spans", "dur_ns": 650_000_000, "from_ns": 1_200_000_000, "thread_name": "blaze-loop",
+             "lane": "thread 7", "before": "`lower` serde", "after": "`task` unit bodies"}
+    named = gap_failures(json.dumps({"blind_spots": [lost], "gaps": [where]}), 20.0, "report")
+    expect(len(named) == 1 and "on blaze-loop (between_spans), after `lower` serde, before `task` unit bodies" in named[0],
+           f"the unnamed time says its thread and the spans around it: {named}")
+    ran = dict(where, kind="no_span", dur_ns=30_000_000)
+    bare = gap_failures(json.dumps({"blind_spots": [], "gaps": [ran]}), 20.0, "report")
+    expect(len(bare) == 1 and "30 ms of the critical path ran inside no span" in bare[0] and "blaze-loop" in bare[0],
+           f"a stretch a lane ran inside no span fails the edit too: {bare}")
+    expect(gap_failures(json.dumps({"blind_spots": [], "gaps": [dict(ran, dur_ns=20_000_000)]}), 20.0, "report") == [],
+           "a stretch inside no span within the bound passes")
+    refused("a report with no blind spots", lambda: gap_failures("{}", 20.0, "report"), ValueError)
+    refused("no JSON", lambda: gap_failures("blaze slow: no build", 20.0, "report"), ValueError)
+    spec = '{"engine": {"kind": "v2", "blaze": "blaze"}, "out": "o.json"'
+    given = parse(Input, spec + ', "edit_runs": 4, "gap_ms": 5.0}', SCRIPT)
+    expect(parse(Input, spec + "}", SCRIPT).edit_runs == 16 and parse(Input, spec + "}", SCRIPT).gap_ms == 20.0
+           and given.edit_runs == 4 and given.gap_ms == 5.0, "the bounds are 16 runs and 20 ms unless given")
 
 
 def selftest() -> None:
@@ -1907,6 +2448,9 @@ def selftest() -> None:
     selftest_smoke()
     selftest_ledger()
     selftest_work()
+    selftest_loop()
+    selftest_not_kept()
+    selftest_edit_work()
     expect(verdict(30, 30, True) == "pass" and verdict(30.01, 30, True) == "fail", "at most")
     expect(verdict(0.8, 0.8, False) == "pass" and verdict(0.79, 0.8, False) == "fail", "at least")
     expect(describe(12.5, 30, True, "ms") == "12.5 ms against a budget of at most 30 ms", describe(12.5, 30, True, "ms"))

@@ -2,7 +2,8 @@
 //! rustc's notes: an associated function of that name to call with `T::f()` instead, a field
 //! of that name to call as `(x.f)()`, the other types the method is on, a method of a similar
 //! name, the traits that would give it (to import, or to implement), and where the type is
-//! defined. The parts shared with `T::f` (`unresolved_assoc_item`) are here.
+//! defined. The parts shared with `T::f` (`unresolved_assoc_item`) are here. A receiver that
+//! was a number of undecided type at the call is `method_on_ambiguous_numeric`'s (E0689).
 //!
 //! Follows rustc's `compiler/rustc_hir_typeck/src/method/suggest.rs`
 //! (`report_no_match_method_error`, `create_no_assoc_err`, `set_label_for_method_error`,
@@ -32,7 +33,7 @@ use crate::{
     cx::{Cx, def_range_view as def_range},
     lints::code_fact,
     lower::{
-        Found, Phase,
+        Found, Phase, method_on_ambiguous_numeric,
         unresolved_field::{fn_def_span, type_param_span},
     },
     model::{Applicability, Diag, Span, Suggestion, SuggestionStyle},
@@ -59,6 +60,21 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedMethodCall<'db>) -
         is_method: true,
         args: Some(args.len()),
     };
+    // A receiver that was `{integer}` or `{float}` where the method was looked up: E0689,
+    // which never names the type the number became afterwards (`d.receiver`).
+    if let Some(numeric) = d.numeric_var {
+        let mut diag = method_on_ambiguous_numeric::lower(
+            cx,
+            d,
+            numeric,
+            call,
+            node.file_id,
+            &no_match,
+        );
+        code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
+        // alloc: the error's parts, for an error hir found
+        return vec![Found::new(diag, Phase::Bodies)];
+    }
     let name = no_match.name();
     let item_kind = no_match.item_kind();
     let mut diag = no_match.error(cx, item_kind);
@@ -188,20 +204,73 @@ fn inherent_value<'db>(
     })
 }
 
-/// Every trait of every crate: rustc's `all_traits`.
-pub(crate) fn all_traits(cx: &Cx<'_, '_>) -> Vec<hir::Trait> {
-    // alloc: the error's parts, for an error hir found
-    let mut traits = Vec::new();
-    for krate in hir::Crate::all(cx.db) {
-        for module in krate.modules_iter(cx.db) {
-            for def in module.declarations_iter(cx.db) {
-                if let hir::ModuleDef::Trait(it) = def {
-                    traits.push(it);
+/// Every trait of every crate (rustc's `all_traits`), in the order of the crates and their
+/// modules, and for each name the traits with an associated item of that name.
+///
+/// An error that asks which traits could give a name (the associated functions of the name,
+/// the traits to import, the name closest to it) reads the traits of that name here. Walking
+/// every module of every crate and probing every trait for each error made an error cost the
+/// whole workspace: tempo-contracts' body check ran 12 minutes on one worker for the errors of
+/// one missing impl table, each probe 0.2 to 1.1 s.
+pub(crate) struct TraitIndex {
+    all: Vec<hir::Trait>,
+    /// Each name with the traits (as places in `all`, ascending) that have an item of it.
+    by_item: blaze_hash::HashMap<hir::Name, Vec<u32>, Global>,
+}
+
+impl TraitIndex {
+    pub(crate) fn new(cx: &Cx<'_, '_>) -> TraitIndex {
+        // alloc: the index, once a check that has such an error
+        let mut all = Vec::new();
+        for krate in hir::Crate::all(cx.db) {
+            for module in krate.modules_iter(cx.db) {
+                for def in module.declarations_iter(cx.db) {
+                    if let hir::ModuleDef::Trait(it) = def {
+                        // alloc: as above
+                        all.push(it);
+                    }
                 }
             }
         }
+        let mut by_item: blaze_hash::HashMap<hir::Name, Vec<u32>, Global> =
+            blaze_hash::HashMap::new_in(Global);
+        for (at, t) in (0u32..).zip(&all) {
+            for item in t.items_iter(cx.db) {
+                let Some(name) = item.name(cx.db) else { continue };
+                // alloc: as above
+                let traits = by_item.entry(name).or_default();
+                if traits.last() != Some(&at) {
+                    // alloc: as above
+                    traits.push(at);
+                }
+            }
+        }
+        TraitIndex { all, by_item }
     }
-    traits
+
+    /// The traits with an associated item named `name`, in the order of the crates and their
+    /// modules.
+    pub(crate) fn with_item<'a>(
+        &'a self,
+        name: &hir::Name,
+    ) -> impl Iterator<Item = hir::Trait> + 'a {
+        self.by_item.get(name).into_iter().flatten().map(|&at| self.all[at as usize])
+    }
+
+    /// The traits with an associated item whose name is within `max_dist` edits of `lookup`
+    /// and is not `lookup`: the only traits whose items [`similar_candidate`] keeps.
+    fn with_item_close_to(&self, lookup: &str, max_dist: usize) -> HashSet<hir_def::TraitId, Global> {
+        let mut close = HashSet::new_in(Global);
+        for (name, traits) in &self.by_item {
+            if edit_distance_with_substrings(lookup, name.as_str(), max_dist)
+                .is_some_and(|it| it > 0)
+            {
+                // alloc: the error's parts, for an error hir found
+                close.extend(traits.iter().map(|&at| hir_def::TraitId::from(self.all[at as usize])));
+            }
+        }
+        close
+    }
 }
 
 fn is_local_fn(cx: &Cx<'_, '_>, f: hir::Function) -> bool {
@@ -236,7 +305,8 @@ fn static_candidates(
         });
     }
     if let Some(scope) = &no_match.scope {
-        for t in all_traits(cx).into_iter().filter(|it| scope.can_use_trait_methods(*it)) {
+        let named = cx.traits().with_item(&no_match.name);
+        for t in named.filter(|it| scope.can_use_trait_methods(*it)) {
             for item in t.items_iter(cx.db) {
                 if let hir::AssocItem::Function(f) = item
                     && f.name(cx.db) == no_match.name
@@ -572,9 +642,8 @@ pub(crate) fn similar_candidate<'db>(
     let scope = no_match.scope.as_ref()?;
     let lookup = no_match.name.as_str();
     let max_dist = std::cmp::max(lookup.len(), 3) / 3;
-    // alloc: the error's parts, for an error hir found
-    let traits: HashSet<hir_def::TraitId, Global> =
-        all_traits(cx).into_iter().map(Into::into).collect();
+    // A trait with no item of a close name gives the search nothing it keeps.
+    let traits = cx.traits().with_item_close_to(lookup, max_dist);
     // alloc: the error's parts, for an error hir found
     let mut found: Vec<hir::AssocItem> = Vec::new();
     let mut close = |item: hir::AssocItem| {
@@ -719,7 +788,9 @@ pub(crate) fn traits_to_import<'db>(
     statics: &[Static],
 ) {
     let Some(scope) = &no_match.scope else { return };
-    let all = all_traits(cx);
+    // Both lists are of traits with an item of the name.
+    // alloc: the error's parts, for an error hir found
+    let all: Vec<hir::Trait> = cx.traits().with_item(&no_match.name).collect();
     let out_of_scope: Vec<hir::Trait> = all
         .iter()
         .copied()

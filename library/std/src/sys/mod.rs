@@ -22,6 +22,7 @@ pub mod paths;
 pub mod pipe;
 pub mod platform_version;
 pub mod process;
+pub mod provider;
 pub mod random;
 pub mod stdio;
 pub mod sync;

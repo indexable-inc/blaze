@@ -1,0 +1,14 @@
+{
+ "id": "implied-bounds-shorthand-reads-written-bounds-only",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of blaze_implied_bounds and blaze_anon_params, fix-hello-1113",
+ "where": "crates/hir-ty/src/lower.rs resolve_type_param_assoc_type_shorthand_in; crates/hir-ty/src/lower/implied.rs shorthand_bounds",
+ "what": "With implied bounds, `impl<A> C<A> { fn f(x: A::Item) }` where `struct C<A: Iterator>` still fails: the short form `A::Item` is resolved from the parameter's written bounds alone, and the header's types are what the implied bounds come from, so reading them there would make lowering the header read itself. The lint `blaze::implied_bound_written` has to leave such a bound alone, found by a syntax scan for `A::` paths rather than by name resolution.",
+ "cost": "a hole in the feature (an associated type reached only through an implied bound is written `<A as Iterator>::Item`) and a syntactic exception in the lint",
+ "cause": "shorthand resolution and predicate lowering are separate passes over the same written bounds, and the implied ones are derived from lowered types, which come after shorthand resolution",
+ "class": "a derived fact (implied bounds) consumed by a pass that runs before the fact can be derived",
+ "prevention": "resolve the shorthand from the header's definitions by name, before lowering: the type paths of the header resolve to their definitions without lowering their arguments, and a definition's declared bound on its own parameter is enough to pick the trait",
+ "workaround": "write the bound, or the associated type in full",
+ "fix": "shorthand resolution reads the header as written (implied::shorthand_bounds, a pre-pass by name resolution over the header's types to each definition naming the parameter, then that definition's declared trait bounds on it), lowering the header only for the other arguments a bound names; the lint's syntactic reached_by_shorthand exception is gone. Kept gap: a shorthand projection inside the header is not walked, so a bound only its trait declares is not seen by another shorthand (E0220, never a silent accept). `fn f<A>(_: C<A, A::Out>)` with `struct C<A: Tr<B>, B>` is the cycle E0391. Tests: blaze-diagnostics tests/items/implied_bounds.rs, blaze-lints implied_bound_written_tests.rs.",
+ "state": "fixed"
+}

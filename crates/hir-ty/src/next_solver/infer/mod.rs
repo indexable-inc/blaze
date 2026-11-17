@@ -812,12 +812,16 @@ impl<'db> InferCtxt<'db> {
         traits::type_known_to_meet_bound_modulo_regions(self, param_env, ty, use_cloned_def_id)
     }
 
-    /// The root of each set of type, integer and float variables that is not yet known.
-    pub fn unresolved_root_variables(&self) -> (Vec<TyVid>, Vec<IntVid>, Vec<FloatVid>) {
+    /// The root of each set of type, integer and float variables that is not yet known, in
+    /// `alloc`: the frame of the fallback that asks.
+    pub fn unresolved_root_variables<A: std::alloc::Allocator + Copy>(
+        &self,
+        alloc: A,
+    ) -> (Vec<TyVid, A>, Vec<IntVid, A>, Vec<FloatVid, A>) {
         let mut inner = self.inner.borrow_mut();
-        let ty = inner.type_variables().unresolved_root_variables();
-        let int = inner.int_unification_storage.roots_where(IntVarValue::is_unknown);
-        let float = inner.float_unification_storage.roots_where(FloatVarValue::is_unknown);
+        let ty = inner.type_variables().unresolved_root_variables(alloc);
+        let int = inner.int_unification_storage.roots_where(IntVarValue::is_unknown, alloc);
+        let float = inner.float_unification_storage.roots_where(FloatVarValue::is_unknown, alloc);
         (ty, int, float)
     }
 

@@ -127,6 +127,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             frame: self.frame,
             // A second probe of a call the first already reported for.
             errors: None,
+            diverging_type_vars: Some(self.table.diverging_type_var_words()),
         };
         ctx.probe_for_name(Mode::MethodCall, name, self_ty)
     }

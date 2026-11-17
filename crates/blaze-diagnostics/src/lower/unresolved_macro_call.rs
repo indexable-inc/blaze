@@ -12,10 +12,10 @@
 use base_db::Db;
 use either::Either;
 use hir::{InFile, ModuleDef, ScopeDef};
-use hir_expand::inert_attr_macro::INERT_ATTRIBUTES;
 use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange, TextSize,
+    builtin_attrs::INERT_ATTRIBUTES,
     view::{self as ast, AstNode as _, HasName as _},
 };
 

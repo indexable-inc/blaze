@@ -1,0 +1,14 @@
+about = "The same sources in another directory, under another home whose store starts empty and is given the first home's records as a pack (`blaze store export --all`, then `blaze store import` under the new home, before any daemon starts there; docs/remote-cache.md, \"Packs\"; lane packs-1112): every record is checked against the pack's manifest as it is imported and pinned by the import, and the build then finds each unit's record, the standard library's and the project's own, and makes no unit. The control is this driver's own first revision, which starts from an empty store with no pack and makes them all."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "42\n"
+
+[[revision]]
+steps = ["packed elsewhere", "project moved", "edit"]
+action = "run"
+prints = "42\n"
+redone = []
+max_units = 0
+max_records = 0

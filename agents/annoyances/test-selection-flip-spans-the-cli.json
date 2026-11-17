@@ -1,0 +1,14 @@
+{
+ "id": "test-selection-flip-spans-the-cli",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane test-selection-wiring, blaze-merge-1113",
+ "where": "crates/blaze-cargo/src/cli.rs in_daemon and Request::Test; crates/blaze-cargo/src/cli/json.rs test_result; crates/blaze-api/src/lib.rs TestResult; crates/blaze-screen/src/tally.rs",
+ "what": "Making selection the default of `blaze test` is one decision, but it is spelled in five crates: the flag table (args.rs), the routing of a command to the daemon (cli.rs in_daemon, three conditions), the result's wire type (blaze-api), its JSON writer (cli/json.rs) and the tally (blaze-screen). A lane allowed the runner and the test CLI could not land the flip alone: a test-result field needs blaze-api plus its seven readers, and doc tests run on the CLI's path that the flip bypasses.",
+ "cost": "a list of about twenty file:line hand-offs to the main agent, and a tree that does not compile until they are applied",
+ "cause": "which path runs a test (CLI loop vs daemon) is decided by flags in cli.rs instead of by the request, and a test result is one wire struct copied by hand into each reader",
+ "class": "a mode of a command decided at several call sites, and a wire type with hand-written readers",
+ "prevention": "one Request::Test that always goes to the daemon (doc tests included), and the JSON and tally derived from blaze-api's TestResult by reflection rather than hand-written per field",
+ "workaround": "listed each outside edit as file:line, from, to in the lane report",
+ "fix": "not yet",
+ "state": "open"
+}

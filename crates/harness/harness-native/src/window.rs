@@ -55,7 +55,6 @@ struct State {
     title: String,
     /// The traffic lights' opacity as last set (they fade with the sidebar's fold).
     lights: f32,
-    tip: String,
     /// Drawing at the calm rate: only a breath moves.
     calm: bool,
     /// The keys' load the menu bar was made from (made again when the user's keys.flecs changes).
@@ -349,6 +348,15 @@ fn arm_stats_tick() {
     });
 }
 
+/// Hover help owns one short deadline while the view is idle. A generation makes a late callback inert.
+fn arm_tooltip(generation: u64, secs: f64) {
+    let when = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(secs))
+        .expect("hover help's bounded dwell");
+    let _ = DispatchQueue::main().after(when, move || {
+        if with(|st| st.app.tooltip_woke(generation)).unwrap_or(false) { wake(); }
+    });
+}
+
 fn mods_of(flags: NSEventModifierFlags) -> KeyMods {
     KeyMods {
         cmd: flags.contains(NSEventModifierFlags::Command),
@@ -408,6 +416,7 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            with(|st| st.app.dismiss_tooltip());
             let m = mods_of(event.modifierFlags());
             let was = composing();
             // Control, Option (as Meta), Command and the function keys go straight to the encoder; typing goes
@@ -438,6 +447,7 @@ define_class!(
 
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
+            if with(|st| st.app.dismiss_tooltip()).unwrap_or(false) { wake(); }
             let m = mods_of(event.modifierFlags());
             // A Command key: the bindings (scene/20-keys.flecs) first, then AppKit's menu.
             let out = if m.cmd {
@@ -579,8 +589,8 @@ define_class!(
             if NSEvent::pressedMouseButtons() != 0 {
                 return;
             }
-            // From the view into an overlay's window or back (overlay.rs): still over the app, the hover holds (a hover
-            // card opened from the view stays open while the pointer goes onto it); the next move there places it.
+            // From the view into an interactive overlay's window or back: still over the app. Passive hover help
+            // cannot hold the pointer outside its source window (overlay.rs excludes it).
             if with(|st| st.overlays.holds(&st.window, NSEvent::mouseLocation())).unwrap_or(false) {
                 with(|st| st.inside = true);
                 return;
@@ -605,6 +615,7 @@ define_class!(
         /// the mouse selects instead, so the pointer's shape may change.
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
+            with(|st| st.app.dismiss_tooltip());
             let m = mods_of(event.modifierFlags());
             with(|st| st.app.set_mods(m));
             wake();
@@ -628,6 +639,7 @@ define_class!(
             let m = mods_of(event.modifierFlags());
             // A swipe over the chat's effort pulses at each stop it steps (chat/pick.rs): play them with the event.
             let pulses = with(|st| {
+                st.app.dismiss_tooltip();
                 st.app.scroll_wheel(ev, m);
                 st.app.take_haptics()
             });
@@ -1031,8 +1043,7 @@ impl HarnessView {
             }
             st.renderer.render_passes(&passes);
             drop(passes);
-            let tip = st.app.tooltip();
-            st.overlays.shown(&st.window, &floats, &drawn, &tip);
+            st.overlays.shown(&st.window, &floats, &drawn);
             // The Map cards the frame painted, each under its live map (maps.rs).
             let cards = st.app.take_maps();
             st.maps.sync(&st.window, &cards, st.app.zoom());
@@ -1050,12 +1061,6 @@ impl HarnessView {
             }
             apply_cursor(st);
             shift_window(st);
-            if tip != st.tip {
-                st.tip = tip;
-                self.setToolTip(
-                    (!st.tip.is_empty()).then(|| NSString::from_str(&st.tip)).as_deref(),
-                );
-            }
             let lights = st.app.lights();
             if (lights - st.lights).abs() > 1e-3 || (lights == 0.0) != (st.lights == 0.0) {
                 st.lights = lights;
@@ -1086,6 +1091,9 @@ impl HarnessView {
                     }
                     if let Some(secs) = st.app.linger_due() {
                         arm_linger(secs);
+                    }
+                    if let Some((generation, secs)) = st.app.tooltip_arm() {
+                        arm_tooltip(generation, secs);
                     }
                     // A pause in typing: the chats' drafts are kept for the next launch.
                     st.app.flush_drafts();
@@ -1455,9 +1463,6 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     let mut app = App::new(wake_from_any_thread())?;
     app.set_gpu_clock(renderer.gpu_clock());
     app.set_media(renderer.media());
-    // Tooltips come quickly (AppKit waits about a second and a half): what a step's item or a control says under the
-    // pointer is part of reading the window, not a hint for the lost.
-    objc2_foundation::NSUserDefaults::standardUserDefaults().setInteger_forKey(250, objc2_foundation::ns_string!("NSInitialToolTipDelay"));
     // The world served to agents, and the edits saved from it replayed (src/world_api.rs): the window's only.
     app.serve_world();
     // The app's sound (src/audio.rs): the window's only. A scene or a device that refuses it leaves the app silent.
@@ -1491,7 +1496,6 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             backing: 1.0,
             title: String::new(),
             lights: 1.0,
-            tip: String::new(),
             calm: false,
             menu_gen,
             cursor: None,

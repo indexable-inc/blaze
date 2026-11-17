@@ -132,6 +132,10 @@ impl<A: Allocator + Clone> SpanMap<A> {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The scratch of the radix sorts of a map's fragment offsets, kept by the worker.
     static OFFSET_SORT: RefCell<Scratch<TextSize>> = const { RefCell::new(Scratch::new()) };

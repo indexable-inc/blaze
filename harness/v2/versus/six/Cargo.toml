@@ -1,0 +1,16 @@
+[package]
+name = "six"
+version = "0.1.0"
+edition = "2024"
+
+# Each pinned exactly; the resolved graph is the Cargo.lock beside this file.
+[dependencies]
+bitflags = "=2.13.2"
+hashbrown = { version = "=0.16.1", default-features = false, features = ["default-hasher"] }
+itoa = "=1.0.18"
+memchr = "=2.8.3"
+regex = "=1.13.1"
+smallvec = "=1.16.4"
+
+# Its own workspace, wherever the harness copies it.
+[workspace]

@@ -71,7 +71,12 @@ pub struct Carets {
     /// The last frame's clock and sweep's seconds, for [`Carets::end_frame`].
     now: f32,
     span: f32,
+    blink_seen: bool,
 }
+
+/// Animation required by carets actually painted this frame, independent of which field or overlay owns them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Activity { pub gliding: bool, pub blinking: bool }
 
 /// One caret to draw: its bar at rest in its node's own points (`rest`), the node's origin (`at`), the box its sweep
 /// stays inside (`clip`, view points), its ink, opacity, when it last moved (its blink starts over from then, held solid)
@@ -89,6 +94,7 @@ pub struct Bar {
 impl Carets {
     /// The caret panel for node `node`'s caret `b` at frame time `now`: its bar, and its sweep while one runs.
     pub fn panel(&mut self, node: u64, b: &Bar, look: &CaretLook, now: f32) -> PanelInst {
+        self.blink_seen |= b.blink && b.alpha > 0.0;
         // A glide of 0 turns the sweep off (the default, 00-tokens.flecs caret_glide): the caret only ever snaps.
         let sweeps = look.glide > 0.0;
         let span = look.glide.max(1e-3);
@@ -124,18 +130,38 @@ impl Carets {
         }
     }
 
-    /// After a frame: carets not drawn in it are forgotten, and whether one is still sweeping (the host draws another
-    /// frame while one is).
-    pub fn end_frame(&mut self) -> bool {
+    /// After a frame: forget carets not drawn and report animation owned by the visible caret primitives.
+    pub fn end_frame(&mut self) -> Activity {
         self.glides.retain(|_, (_, seen)| std::mem::take(seen));
         let (now, span) = (self.now, self.span);
-        span > 0.0 && self.glides.values().any(|(g, _)| g.active(now, span))
+        Activity {
+            gliding: span > 0.0 && self.glides.values().any(|(g, _)| g.active(now, span)),
+            blinking: std::mem::take(&mut self.blink_seen),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: only a visible blinking caret keeps the frame clock alive; no owner-specific field list is needed.
+    #[test]
+    fn visible_carets_own_their_frame_activity() {
+        let mut carets = Carets::default();
+        let look = CaretLook { blink: 1.06, ..CaretLook::default() };
+        let mut bar = Bar { rest: [0.0, 0.0, 1.5, 16.0], at: (0.0, 0.0), clip: [0.0, 0.0, 100.0, 100.0], ink: [1.0; 4], alpha: 1.0, moved: 0.0, blink: true };
+        carets.panel(41, &bar, &look, 0.0);
+        assert_eq!(carets.end_frame(), Activity { gliding: false, blinking: true });
+        assert_eq!(carets.end_frame(), Activity::default(), "a field hidden by an overlay stops animating");
+        bar.blink = false;
+        carets.panel(42, &bar, &look, 1.0);
+        assert_eq!(carets.end_frame(), Activity::default(), "a steady caret respects the user's blink preference");
+        bar.blink = true;
+        bar.alpha = 0.0;
+        carets.panel(43, &bar, &look, 2.0);
+        assert_eq!(carets.end_frame(), Activity::default(), "an invisible caret does not keep drawing");
+    }
 
     /// Typing a character snaps (no sweep); a jump past the caret's height sweeps from where it was, eased into the
     /// new place, and is done after `glide`.

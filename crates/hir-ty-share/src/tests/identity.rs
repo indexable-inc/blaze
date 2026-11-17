@@ -9,8 +9,7 @@ use base_db::Db;
 use blaze_hash::HashSet;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, coroutine_code, interface_hash, item_key, key, layout_hash};
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use hir_def::{AdtId, CallableDefId, ModuleDefId};
 use hir_expand::fixture;
 use hir_ty::{
@@ -275,6 +274,12 @@ impl<'db> OldSpell<'db> {
                 self.ty(element)?;
                 self.konst(len)?;
             }
+            // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base
+            // enum's layout, ABI and code, so its identity is its base type's: the code of
+            // `f::<Conn is Conn::Open { .. }>` is the code of `f::<Conn>`.
+            TyKind::Pat(base, pattern) if pattern.kind().is_variants() => {
+                self.ty(base)?;
+            }
             TyKind::Pat(base, pattern) => {
                 self.u8(9);
                 self.ty(base)?;
@@ -512,6 +517,10 @@ impl<'db> OldSpell<'db> {
                 }
             }
             PatternKind::NotNull => self.u8(2),
+            PatternKind::Variant { index } => {
+                self.u8(3);
+                self.u32(index);
+            }
         }
         Ok(())
     }
@@ -684,7 +693,7 @@ fn all_agree<'db>(db: &'db Db, tys: &[Ty<'db>]) {
 #[test]
 fn the_identity_tells_apart_what_both_old_spellings_did() {
     let db = fixture(CORPUS);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let tys = corpus(&db);
         all_agree(&db, &tys);
         let spelled = |name: &str| {
@@ -712,7 +721,7 @@ fn a_named_or_computed_length_is_its_value() {
          pub type Computed = [u8; 1 + 1];\n\
          pub type Three = [u8; N + 1];\n",
     );
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let spelled = |name: &str| {
             identity::ty(&db, db.ty(TyDefId::TypeAliasId(alias(&db, name))).skip_binder())
                 .unwrap_or_else(|why| panic!("`{name}`: {why}"))
@@ -726,7 +735,7 @@ fn a_named_or_computed_length_is_its_value() {
 #[test]
 fn constants_and_argument_lists_agree_with_the_old_spellings() {
     let db = fixture(CORPUS);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let konsts: Vec<Const<'_>> =
             [0, 1, 1, 2, u32::MAX as u128].map(|it| usize_const(&db, Some(it), krate)).to_vec();
@@ -737,7 +746,7 @@ fn constants_and_argument_lists_agree_with_the_old_spellings() {
                 konsts.iter().map(|&it| OldSpell::konst_of(&db, old, it).ok()).collect();
             agree(&format!("{old:?}'s constants"), &names, &one, &then);
         }
-
+    
         let tys = corpus(&db);
         let lists: Vec<GenericArgs<'_>> = tys
             .iter()
@@ -785,7 +794,7 @@ fn a_coroutines_identity_holds_its_binding_names() {
     let mut db = fx.into_db();
     let file = file.file_id(&db);
     let spelled = |db: &TestDB| {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let ty = coroutine_local(db, "make");
             (
                 identity::ty(db, ty).expect("the one spelling"),
@@ -797,7 +806,11 @@ fn a_coroutines_identity_holds_its_binding_names() {
     let before = spelled(&db);
     assert_eq!(spelled(&db), before, "asked twice");
 
-    db.set_file_text(file, &ASYNC.replace("one", "uno"));
+    // `file` is the file's key and `before` content ids, so neither dies with the arena the
+    // commit drops; `spelled` takes the function and its coroutine again in the new snapshot.
+    let mut edit = db.edit();
+    edit.set_file_text(file, &ASYNC.replace("one", "uno"));
+    let _: base_db::Committed = edit.commit();
     let after = spelled(&db);
     assert_ne!(after.0, before.0, "the one spelling holds the coroutine's binding names");
     assert_ne!(after.1, before.1, "as the code generator's did");
@@ -807,7 +820,7 @@ fn a_coroutines_identity_holds_its_binding_names() {
 #[test]
 fn is_plain_data_is_the_code_generators() {
     let db = fixture(CORPUS);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let interner = DbInterner::new_with(&db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
@@ -826,19 +839,19 @@ fn is_plain_data_is_the_code_generators() {
 /// A type written in the fixture's language: scalars, `P` and `Q` (one `u32` each), and what
 /// references, pointers, arrays, tuples, `W<_>` and function pointers make of them.
 /// At most `depth` levels of nesting, half the time stopping at a scalar.
-fn ty_text(tc: &TestCase, depth: u32) -> String {
-    if depth == 0 || !tc.draw(gs::booleans()) {
+fn ty_text(tape: &Tape, depth: u32) -> String {
+    if depth == 0 || !tape.bool("nested") {
         let leaf = ["u8", "u32", "i64", "bool", "char", "P", "Q", "()", "&'static str"];
-        return tc.draw(gs::sampled_from(leaf.to_vec())).to_owned();
+        return (*tape.one_of(&leaf, "leaf")).to_owned();
     }
-    let inner = || ty_text(tc, depth - 1);
-    match tc.draw(gs::integers::<u8>().max_value(6)) {
+    let inner = || ty_text(tape, depth - 1);
+    match tape.int_in(0..=6u8, "ty") {
         0 => format!("&'static {}", inner()),
         1 => format!("&'static mut {}", inner()),
         2 => format!("*const {}", inner()),
         3 => {
             let t = inner();
-            format!("[{t}; {}]", tc.draw(gs::integers::<usize>().max_value(2)))
+            format!("[{t}; {}]", tape.int_in(0..=2usize, "array length"))
         }
         4 => format!("({}, {})", inner(), inner()),
         5 => format!("W<{}>", inner()),
@@ -847,17 +860,21 @@ fn ty_text(tc: &TestCase, depth: u32) -> String {
 }
 
 /// Random types, each written twice under two names, agree with both old spellings.
-#[hegel::test(test_cases = 32)]
-fn random_types_agree_with_both_old_spellings(tc: TestCase) {
-    let len: usize = tc.draw(gs::integers().min_value(1).max_value(9));
-    let texts: Vec<String> = (0..len).map(|_| ty_text(&tc, 3)).collect();
+#[test]
+fn random_types_agree_with_both_old_spellings() {
+    blaze_sim::check(Config::cases(32), random_types_agree);
+}
+
+fn random_types_agree(tape: &Tape) {
+    let len: usize = tape.int_in(1..=9, "types");
+    let texts: Vec<String> = (0..len).map(|_| ty_text(tape, 3)).collect();
     let mut program =
         String::from("pub struct P(pub u32);\npub struct Q(pub u32);\npub struct W<T>(pub T);\n");
     for (at, text) in texts.iter().enumerate() {
         program.push_str(&format!("pub type A{at} = {text};\npub type B{at} = {text};\n"));
     }
     let db = fixture(&program);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let tys: Vec<Ty<'_>> = (0..texts.len())
             .flat_map(|at| [format!("A{at}"), format!("B{at}")])
             .map(|name| db.ty(TyDefId::TypeAliasId(alias(&db, &name))).skip_binder())

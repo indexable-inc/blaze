@@ -1,0 +1,11 @@
+{
+ "id": "newproj-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+ "where": "blaze-lower's tests under cargo",
+ "what": "Two tests of blaze-lower fail on this lane with or without its changes to the crate's code, both in code the lane did not touch: `code::tests::what_could_read_another_file_is_not_alone` (`a path's macro a macro is given`) and `tests::readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities` (`Crate::set_extra_data` wrote the database outside a `Db::batch`). Not run on the untouched tip: that needs a second target directory.",
+ "cost": "ten minutes telling them from the lane's three new tests",
+ "cause": "not looked into",
+ "workaround": "none",
+ "state": "open"
+}

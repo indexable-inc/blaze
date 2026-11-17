@@ -1,0 +1,14 @@
+{
+ "id": "read-through-needs-a-row-fetch-by-key",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane layout-fact; claude-opus-5-5 (Claude Opus 5.5), track 4a, int-1112",
+ "where": "crates/blaze-query/src/db/function.rs refresh_by_key; crates/blaze-query/src/db/capture.rs Reads::for_each_read_through; crates/hir-ty/src/body_store.rs Store::offered; crates/blaze-item-hash/src/reads.rs RULES",
+ "what": "The item store reads through a layout row to the reads the row itself made (Classified::Through), so no type is ever keyed. for_each_read_through panics on a row that is not current in the view, and a row its reader proved by durability keeps an older view's stamp, so each row must be brought up to date first. The only way to do that from a DatabaseKeyIndex outside blaze-query was to know which query it is and call it by its arguments: hir-ty's layout::current did that for the two layout queries only, so the small tracked helpers a struct's or enum's layout reads (struct_flags, variant_field_ids, enum_variant_ids, enum_discriminants, field_ranks, bits_layout_query, ...) could not be read through and a body whose MIR read an ADT's layout was refused by the helper's name.",
+ "cost": "not measured; every MIR entry that read an ADT's layout was refused, so it ran again on every edit",
+ "cause": "the engine's untyped row verify (ingredient::Vtable::verify) was pub(crate), so 'bring this row up to date' could not be asked by key",
+ "class": "a generic engine operation reachable only through per-query typed calls, so every user keeps a list of queries in step with the queries that exist",
+ "prevention": "blaze_query::db::refresh(db, key) is the one way to bring a row up to date by key (the engine's verify, a read edge for the running query, the database type checked against the function's own); for_each_read_through calls it itself; no caller keeps a list of queries",
+ "workaround": "none",
+ "fix": "refresh_by_key over Vtable::verify with Vtable::db (the function's database type); layout::current deleted; RULES give every helper a layout reads a fact (Fields, Attrs with #[repr] and #[blaze::bits] now hashed, ConstValue, a new FieldOrder fact for the plan input) or Through. Controls: REFRESH_UNVERIFIED serves the stale value and reads after a write; REFRESH_RECORDS_NO_READ leaves a reader stale; entries tests drop the field-types fact and wrongly hit, for a struct and an enum. Written, not yet compiled (rule 35).",
+ "state": "fixed"
+}

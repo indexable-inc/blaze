@@ -30,8 +30,8 @@ one level down:
     harness/                  the test harnesses and their fixtures
     tools/                    what builds, releases and measures blaze: agents/ (the agent rules
                               AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
-                              (the pinned PGO profiles), bench/results/ (recorded results),
-                              remote-cache/ (the cache gateway Worker), typed-input/ (the Python
+                              (the pinned PGO profiles), bench/remote-cache/ (the cache gateway's
+                              measurements), remote-cache/ (the cache gateway Worker), typed-input/ (the Python
                               workspace's shared helper), v2/ (the lanes' scripts and queue)
     docs/                     these documents; docs/future/ the plans for work not started,
                               fed1eb428d:docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
@@ -40,7 +40,6 @@ one level down:
     fuzz/                     the fuzz targets and their corpora (docs/fuzzing.md)
     site/                     the website, and install.sh, the installer `curl | sh` and CI run
     licenses/                 NOTICE and the license texts of code blaze includes
-    hegel.toml                Hegel's settings for the property tests (read from the root)
     Cargo.toml, pyproject.toml, flake.nix
                               the Rust, Python (uv) and Nix workspaces, each with its lock
 
@@ -54,7 +53,6 @@ The crates to know first:
     crates/blaze-build-script/ build scripts run as cargo runs them, with no cargo (no-rustc.md, step I)
     crates/blaze-resolve/     cargo's resolver owned by blaze: the package model, Cargo.lock, versions, features
     crates/blaze-registry/    registries read and packages fetched as cargo does, with no cargo
-    crates/blaze-wasm/        experiment: the compiler running in a web page (not in the workspace)
     .github/SECURITY.md       what to know before sharing a store, and how to report a problem
     crates/hir-def/, hir-ty/, syntax/, parser/, ...
                               the front end: crates derived from rust-analyzer (below)
@@ -111,6 +109,26 @@ it: codegen does not compensate.
 There, a crate of its own is better than growing `hir-ty` or `hir-def`, which are already the
 longest builds in the workspace.
 
+A new crate allocates as little as it can and names every allocator from its first line
+(rule `bump-allocate`): it borrows or writes into the caller's buffer where that does, and a
+function that must allocate is handed the allocator (`Vec::new_in(frame)`,
+`Box::new_in(value, alloc)`, a `&Frame` or an `A: Allocator`). No comment keeps an implied
+allocator from `blaze::implicit_allocator`. The gate holds a new crate there: a crate with no row
+in `tools/ratchets/alloc-sites.txt` is held to no `// alloc:` line and no `expect`
+of the lint outside tests (and, once no `// alloc:` line is left anywhere, no line naming
+`Global`), and every other crate's row only shrinks
+(`scripts/src/bin/allocs.rs`).
+
+A function that can fail returns an error type of its module: an enum or struct naming what
+failed and the thing it failed on, with `Display` (rule `errors-name-the-thing`), never
+`Result<_, String>`, `&str`, `Box<dyn Error>` or `anyhow`, which the caller can't match on and
+which can't take an allocator. The gate holds this by crate, from the text, until blaze checks
+its own crates with `blaze::untyped_error`: each crate's signatures with such an error, and its
+type aliases of such a `Result`, equal its row in
+`tools/ratchets/untyped-errors.txt`, which only shrinks, and a crate with no row is
+held to none; a change over its row is refused with the new sites named
+(`scripts/src/bin/untyped.rs`).
+
 blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
 writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
 the sandbox, and the harnesses. A change there is one ordinary
@@ -134,8 +152,8 @@ with blaze's changes made in place. That branch and its history are kept as
 blaze supports one toolchain, the latest nightly, pinned by date in `harness/toolchain`
 (`nightly-2026-10-27`, which says `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`). Stable
 Rust is not a separate target: what a stable release builds, the nightly builds. blaze
-itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix develop`
-plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that
+itself is built with that nightly by blaze, which brings it (`blaze toolchain`): no rustup, and
+no `cargo` or `rustc` of it is run. The pin is written in that
 one file; everything else reads it or is written from it:
 
 - `crates/blaze-cargo/src/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
@@ -222,8 +240,8 @@ files are, what they hold, the DuckDB queries that answer each question and the 
 - A test that fails before and passes after: the real crate's own tests for a bug found in
   it, a unit test beside the code for one small enough to state, a step in the relevant edit
   harness for a daemon bug ([harness.md](harness.md#adding-a-test)).
-- For concurrent, durable, crash-recovering, billing or data-deleting code: a Hegel
-  deterministic simulation test whose oracle checks the invariant, with a planted bug it
+- For concurrent, durable, crash-recovering, billing or data-deleting code: a deterministic
+  simulation test (`blaze_sim::check`) whose oracle checks the invariant, with a planted bug it
   catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
   you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners), and
@@ -235,14 +253,16 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   main after the merge, and a red train opens or adds to the issue "Release train is red",
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.
-- blaze builds in the flake's dev shell, against the LLVM it pins:
-  `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
+- blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
+  stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
+  `.github/actions/blaze` installs it), `blaze build --release --locked -p blaze-engine`, against
+  the LLVM blaze pins and fetches itself ([LLVM](#llvm)).
 - `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
-  `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
-  `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).
-  A test that fails is new unless `harness/known-failures.toml` lists it with an owner:
-  `uv run --frozen harness/failures.py '{"run": {"runner": "blaze", "packages": [...]}}'` runs the
+  `blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
+  `python3 harness/unittests.py`, what CI runs: every test of the workspace, with the failures it expects).
+  A test that fails is new unless `harness/known-failures.toml` lists it:
+  `uv run --frozen harness/failures.py '{"run": {"packages": [...]}}'` runs the
   crates you touched and says which failures are new ([harness.md](harness.md#ci)).
 - For anything that changes numbers in [results.md](results.md): the command, the commit
   and the machine, so the entry can be replaced and not just appended to.
@@ -250,26 +270,67 @@ files are, what they hold, the DuckDB queries that answer each question and the 
 When you report what you did, separate what you ran from what you inferred. The reports
 under `fed1eb428d:docs/reports/` do this and it is the reason they can be used.
 
+### Checking a change fast
+
+Code is checked as it is written, a commit at a time, on the packages it touched. The
+workspace's build and check take an hour and, with the released blaze, more memory than most
+machines have; when that is the only loop, thousands of lines are written before anything
+compiles them, and the first error (2026-11-10: a shadowed binding, then a struct named like
+its crate) arrives an hour in, with the next one an hour after.
+
+`scripts/src/bin/changed.rs` names what a change touches: the packages its files are in and the
+packages that depend on them, each after what it needs, so the first error is the earliest
+cause.
+
+    blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "origin/main", "print": "args"}') --lib --tests
+
+- The session that integrates agents' work (rule fan-out-write-only) runs that in the lane's
+  VM after each commit it takes, with `"base"` the commit before, in parallel with the build:
+  the check of a few packages does not wait for the build of all of them, and an error goes
+  back to the agent that wrote the code while it still has it in mind. `"dependents": false`
+  checks the touched packages alone, for a first answer; the dependents follow.
+- A change to a file every package's check reads (the root manifest, the lock file,
+  `.clippy.toml`, the pinned toolchain) is the workspace's: the script prints `--workspace`.
+- The gate's workspace check does the same first, so a pull request's first compile error
+  comes in minutes ([harness.md](harness.md#ci)).
+
+### Scripts that run commands
+
+A harness, a lane script or an agent's loop checks the exit status of every command it runs and
+stops at the first that fails, saying which; a command whose failure is expected says so where
+it is run (`|| true` with a comment, a `check=False` whose result is read on the next line). On
+2026-11-10 a script called `blaze daemon stop`, which is no command, for hours: the command line
+said so and exited 101, the script went on, and every measurement after it ran against the
+daemon it believed stopped. In a shell script that is `set -euo pipefail` on its first line; in
+Python, `subprocess.run(..., check=True)` or the harness's own `engine.run(..., check=True)`
+and `Ran.checked`. The command line now names the command meant (`blaze daemon stop`: did you
+mean `blaze stop`), which helps a person; a script is helped only by stopping.
+
 ### Tests
 
 How blaze tests its own code is the `testing` skill
 ([.agents/skills/testing/SKILL.md](../.agents/skills/testing/SKILL.md)), the one home for it:
-which tests to write and how few, property tests with Hegel (vendor/hegeltest, imported as
-`hegel`; never proptest, quickcheck, arbitrary or bolero), deterministic simulation tests on
-`blaze_core::sim::Sim` and their oracles, and testing a causal claim. Concurrent, durable,
+which tests to write and how few, property tests and simulations on blaze's own engine
+(`crates/blaze-sim`; never proptest, quickcheck, arbitrary or bolero), deterministic simulation
+tests on `blaze_core::sim::Sim` and their oracles, and testing a causal claim. Concurrent, durable,
 crash-recovering, billing and data-deleting code is proven by a deterministic simulation test,
 not by a code review (rule `dst-not-review`).
 
+An incremental-build bug gets a revision test ([harness.md](harness.md#revision-tests)): a
+directory under `crates/blaze-engine/tests/revisions/cases/` with the project, the edit and what
+must be made again, run in process under seeds (`cargo test -p hir-ty-codegen --lib --
+edits::revisions`) and against a real daemon (`cargo test -p blaze-engine --test revisions`).
+
 ## Documents
 
-Every doc under `docs/` opens with front matter saying what it is (`tools/docs.py` has the
-fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
+Every doc under `docs/` opens with front matter saying what it is (`scripts/src/bin/docs.rs` has
+the fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
 `record` (research, a report or a measurement, true on its date and never brought up to date) or
 `superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
-generated from it; superseded docs are left out. CI's `python3 tools/docs.py check` holds every
+generated from it; superseded docs are left out. CI's `blaze run -q -p scripts --bin docs -- check` holds every
 doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
 against the tree, and every doc that code names. A change that makes a current doc
-untrue fixes it in the same change, or marks it superseded; `python3 tools/docs.py write`
+untrue fixes it in the same change, or marks it superseded; `blaze run -q -p scripts --bin docs -- write`
 regenerates the index.
 
 ## Working in parallel
@@ -280,61 +341,74 @@ main with all the others, so:
 - **Work comes from the ledger.** A lane is one task: an objective of
   [v2/plan/objectives.md](v2/plan/objectives.md), done when its check passes. How a session
   picks, briefs, integrates and lands is [the plan's loop](v2/plan.md#how-the-work-is-run).
-- **Builds, tests, benchmarks and experiments run on the Mac or in the lane's ix VM**, never
-  on an AWS dev host or any other AWS machine. Anything large (a cold build, a harness, a
-  benchmark) goes to the VM: blaze's daemons have run the Mac out of memory.
-  - Make it: `ix new --name <lane> --no-shell`. The default image is NixOS with `nix`, `git`
-    and `gh`; `nix develop -c ...` in the checkout brings up `harness/toolchain`'s nightly
-    (about 30 s the first time). `--cpus` (2 to 128, the default is the architecture's cap) and
-    `--memory` (a ceiling in GiB it grows to on demand; add `--memory-commit` for a build,
-    whose memory ramps faster than that) size it, `--arch x86_64` or `--arch arm64` picks the
-    platform, and `--ttl 8h` deletes it on its own.
-  - Use it: `ix shell <lane> -- <command>`. Its arguments go through as they are (no remote
-    shell parses them again, as ssh's does) and stdin streams, so send a checkout with
-    `git bundle create - <branch> | ix shell <lane> -- bash -c 'cat > src.bundle && git clone
-    -b <branch> src.bundle src'` (git can't clone a bundle from a pipe).
-    The VM has no GitHub or AWS credentials. For a benchmark, give it its own VM, pinned to a
-    host CPU class (`--cpu epyc-5`, `xeon-6` or `graviton-5`) with `--memory-commit`, and build
-    nothing else there.
-  - Remove it: `ix rm <lane>` when the lane is done.
-  - Where neither can do something, stop and say what is missing; never take it to AWS.
-- **One worktree per lane, named for it** (`blaze-<lane>-<date>`). Its build directory is its
-  own without a `CARGO_TARGET_DIR`: blaze builds each workspace root into a directory of its
-  own under blaze's root, never in the checkout ([cargo.md](cargo.md#where-a-build-writes)).
-  Two lanes that pass one `CARGO_TARGET_DIR` still wait on each other's lock and overwrite each
-  other's binaries.
+- **Linux work runs on the one build VM, `blaze-vm`**, through its one queue
+  (`ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>`; how-to `H12`
+  under `agents/howto/`); nobody makes a VM per lane, and nothing runs on AWS. The Mac is for
+  what only macOS can show, one build at a time. Where neither can do something, stop and say
+  what is missing (rule `work-in-ix-vms`).
+- **Every command has a timeout** sized to its expected time, and on expiry the status or
+  stall line (`blaze debug inspect`, `blaze slow`) is taken and quoted; a hang is a bug to
+  report, never waited out (rule `every-command-has-a-timeout`).
+- **Lanes write; the main agent compiles.** A lane writes in the one integration directory, in
+  new files or one area's files no other lane touches, with the edit tools or `ast-grep` and
+  never a heredoc, `sed` or a script (rule `edit-rust-by-syntax`), and runs nothing. At most
+  four lanes write in one tree at once; a rewrite gets a fresh core in new crates beside the old
+  code. The main agent compiles each piece within minutes of its report and admits it alone
+  onto the last green head; no new wave of lanes starts while the tree does not compile (rules
+  `fan-out-write-only`, `worktree-per-lane`, `agents-are-a-cost`). A worktree is the exception,
+  for two lanes that must change one file or a variant tree.
 - **Never `git stash`.** The stash is one stack for every worktree of the repository, so a pop
-  can take another lane's changes. Commit work in progress to the lane's branch.
+  can take another lane's changes.
 - **Run harnesses with `RUST_BACKTRACE=0`**, so a test that panics prints its message and
   not a backtrace into what the harness compares.
-- **Land small and often, through a pull request** ([below](#landing-a-change)). A lane that
-  waits hours for one large merge meets every other lane's changes at once. For anything the
-  fast tier does not cover, run the release train on the branch first
-  (`gh workflow run train.yaml --ref <branch>`: everything, without the release).
-- **Clean up when done:** remove the worktree's build directory (`blaze clean` in it), the
-  worktree (`git worktree remove`) and the lane's VM (`ix rm <lane>`); delete the merged branch.
+- **Land small and often, through a pull request** ([below](#landing-a-change)), each merge
+  after the smoke run of its exact merge commit. For anything the fast tier does not cover, run
+  the release train on the branch first (`gh workflow run train.yaml --ref <branch>`:
+  everything, without the release).
+- **Clean up when done:** the lane's `/root/wt/<lane>/` and homes on `blaze-vm`, any blaze
+  process it left running, any worktree (`blaze clean` in it, then `git worktree remove`) and
+  the merged branch (rule `clean-up-lane`).
 
 ## Landing a change
 
-Main moves only through pull requests: nobody pushes to it or merges into it by hand. Once the
-branch's work is committed and the local gate passed ([What a change needs](#what-a-change-needs)),
-run in the lane's worktree
+Main moves only through pull requests: nobody pushes to it or merges into it by hand. Nothing
+merges, by `land.py` or by an admin, until a release blaze built from the exact merge commit (the
+branch merged into the main it joins) has run the hello-world smoke on blaze-vm (a cold run, a
+no-op, a body edit and a comment edit, each under a timeout, each counted only with exit 0 and the
+program's own line) and the result is quoted in the pull request; a compile check is not evidence
+that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). To make the
+quote, merge origin/main into the branch, build a release blaze of that commit on blaze-vm and run
+`blaze run -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
+(`scripts/src/bin/smoke.rs`; it exits 0 only for `verdict ok`). The quote, the block in smoke.txt
+whose first line is `blaze-smoke 1`, goes in the pull request's body, and `land.py` puts it there
+from the file you give it. `land.py` refuses to open, resume or merge a pull request whose quote
+does not name its head's exact tree, clean, with verdict ok, or whose head no longer contains
+main; no flag skips this, and an admin merge needs the quote too. Once the branch's work is
+committed, the local gate passed ([What a change needs](#what-a-change-needs)) and the smoke run,
+run
 
-    python3 .github/scripts/land.py "what the branch does"
+    python3 .github/scripts/land.py '{"what": "what the branch does", "smoke": "smoke.txt"}'
 
-It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and turns
-on auto-merge. The pull request's own run is the merge gate, the build and the unit tests on
+It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") with the
+quote in its body, and starts the waiting that merges it. The pull request's own run is the merge gate, the build and the unit tests on
 Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS, with
 astlog's rules after it, and the lint baselines ([harness.md](harness.md#ci)); a failure there ends `land.py`
-with the check's link. Once it passes, GitHub merges the branch with a merge commit, as
-`git merge --no-ff` would. There is no merge queue and the branch need not be up to date with
-main: two changes that each pass but break together are caught on main by the release train.
-`land.py` waits for the merge and prints the commit, or says why the pull request did not
-merge; then fix the branch and run it again. The waiting runs in a process of
-its own that outlives `land.py`, its terminal and a tool that ends its process group, writing to
-`.git/land/pr-N.log` in the main checkout; `land.py --wait` (or `--wait N`) follows it again, as
-does running `land.py` again on the branch, so nobody polls GitHub by hand. A branch that conflicts with main
-gets `git merge origin/main` first. Once it has merged, GitHub deletes the branch on origin;
+with the check's link. The gate also holds the budget smoke's guards with the blaze the change
+built ([harness.md](harness.md#the-smokes-guards)): what a warm no-op build, a comment edit and a
+body edit of two small fixtures may cost, and that blaze runs inside its build-script sandbox. A
+merge that goes around the gate goes around them: on 2026-11-10, with 4 of the last 300 gate
+runs green and merges going around it, every build had been lowering its program anew for days.
+A red gate is fixed or its failure is listed as known with its cause, never passed by. Once it
+passes, the waiting asks `smoke` again about the body's quote and the head GitHub has, and merges
+the branch with a merge commit pinned to that head, as `git merge --no-ff` would. The branch
+must contain main, since the quote is of the tree that becomes main: when main has moved past
+the head, the waiting refuses, and the branch gets `git merge origin/main`, a new build and a new
+smoke. There is no merge queue. `land.py` waits for the merge and prints the commit, or says why
+the pull request did not merge; then fix the branch and run it again. The waiting runs in a
+process of its own that outlives `land.py`, its terminal and a tool that ends its process group,
+writing to `.git/land/pr-N.log` in the main checkout; `land.py '{"follow": true}'` (or
+`'{"follow": N}'`) follows it again, as does running `land.py` again on the branch, so nobody
+polls GitHub by hand. Once it has merged, GitHub deletes the branch on origin;
 remove the worktree and the local branch
 (`git worktree remove <dir> && git branch -D <branch>`).
 

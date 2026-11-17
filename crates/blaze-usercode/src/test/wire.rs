@@ -36,7 +36,9 @@
 //! slot, shared with the child, starting with [`header`]. The child's runtime arms it
 //! (`__blaze_exec_arm`), then each slot's first call sets its byte; once the child has ended
 //! the server reads it ([`read_region`], the rules of `blaze_testsel::record::Record::of_region`)
-//! and sends the slots set.
+//! and sends the slots set with the [`Table`] they are of, which the runtime named once
+//! (`__blaze_exec_table`). Version 4: a record carries its table's identity, not its slot
+//! count alone.
 
 /// The variable of a test binary's environment that makes its `main` a fork server: the
 /// absolute path of the socket to connect to. The server takes it out of its environment
@@ -48,7 +50,7 @@ pub const SOCKET: &str = "__BLAZE_FORK_SERVER";
 pub const MARK: &str = "/.blaze-test/";
 
 /// The protocol's version, said by [`Frame::Hello`].
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// The most bytes a frame's body may have.
 pub const LONGEST: u32 = 64 << 20;
@@ -117,11 +119,43 @@ impl<'a> EndView<'a> {
     }
 }
 
+/// The jump table a record's slots are of, as the binary's runtime names it
+/// (`__blaze_exec_table`, asked once by the server) and as blaze's link of the binary does
+/// (blaze-link's `Image::lineage`, `Image::generation` and `Image::capacity`): the image's
+/// lineage and generation, which together name one commit of one image and so one assignment
+/// of functions to slots (a generation is never reused within an image), and the table's slot
+/// count, its capacity (the linker's header count, of which the image has given out fewer).
+/// A record is read against the table of the binary it is of only when the two are equal
+/// (`blaze_testsel::Image::executed`): a count alone is no identity, as every generation of an
+/// image has one capacity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Table {
+    pub lineage: [u8; 16],
+    pub generation: u64,
+    pub slots: u32,
+}
+
+/// The bytes of a [`Table`] the runtime writes beside its slot count: the lineage, then the
+/// generation as a little-endian `u64`.
+pub const TABLE_ID: usize = 24;
+
+impl Table {
+    /// The table of `slots` slots the runtime's `id` ([`TABLE_ID`] bytes) names.
+    pub fn of_id(id: [u8; TABLE_ID], slots: u32) -> Table {
+        let mut lineage = [0u8; 16];
+        lineage.copy_from_slice(&id[..16]);
+        let g = &id[16..];
+        let generation = u64::from_le_bytes([g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]]);
+        Table { lineage, generation, slots }
+    }
+}
+
 /// What a test's child executed.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Executed {
-    /// Its whole record: the slots it called, strictly increasing, each below `slots`.
-    Hits { slots: u32, hits: Vec<u32> },
+    /// Its whole record: the table its slots are of, and the slots it called, strictly
+    /// increasing, each below `table.slots`.
+    Hits { table: Table, hits: Vec<u32> },
     /// Not whole, and why: the binary has no slots, the child was killed or did not exit, the
     /// runtime did not arm, the test did not start.
     Not(String),
@@ -131,7 +165,7 @@ pub enum Executed {
 /// holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExecView<'a> {
-    Hits { slots: u32, hits: Hits<'a> },
+    Hits { table: Table, hits: Hits<'a> },
     Not(&'a str),
 }
 
@@ -174,7 +208,7 @@ impl<'a> Hits<'a> {
 impl<'a> ExecView<'a> {
     pub fn to_executed(self) -> Executed {
         match self {
-            ExecView::Hits { slots, hits } => Executed::Hits { slots, hits: hits.to_vec() }, // alloc: the owned frame: what a result keeps
+            ExecView::Hits { table, hits } => Executed::Hits { table, hits: hits.to_vec() }, // alloc: the owned frame: what a result keeps
             ExecView::Not(why) => Executed::Not(why.to_owned()), // alloc: the owned frame: what a result keeps
         }
     }
@@ -340,6 +374,13 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// A [`Table`]: its lineage's 16 bytes, its generation, its slot count.
+fn put_table(out: &mut Vec<u8>, table: &Table) {
+    out.extend_from_slice(&table.lineage);
+    put_u64(out, table.generation);
+    put_u32(out, table.slots);
+}
+
 /// [`Frame::Hello`] of these parts, with its length, added to `out`: the bytes
 /// [`Frame::encode`] adds for it, from borrowed names, so a server says hello straight from its
 /// tests' names, with no list of its own.
@@ -393,7 +434,7 @@ pub fn encode_ended<'a>(
         EndView::Exited(_) | EndView::Signaled(_) => 4,
     };
     let record = match executed {
-        ExecView::Hits { hits, .. } => 8 + hits.bytes().len(),
+        ExecView::Hits { hits, .. } => TABLE_ID + 8 + hits.bytes().len(),
         ExecView::Not(why) => 4 + why.len(),
     };
     out.reserve(4 + 1 + 8 + 1 + why + 4 + output.len() + 1 + record);
@@ -404,9 +445,9 @@ pub fn encode_ended<'a>(
     put_end(out, end);
     put_bytes(out, output);
     match executed {
-        ExecView::Hits { slots, hits } => {
+        ExecView::Hits { table, hits } => {
             out.push(0);
-            put_u32(out, slots);
+            put_table(out, &table);
             put_u32(out, hits.len() as u32);
             out.extend_from_slice(hits.bytes());
         }
@@ -470,9 +511,9 @@ impl Frame {
                 put_end(out, end.view());
                 put_bytes(out, output);
                 match executed {
-                    Executed::Hits { slots, hits } => {
+                    Executed::Hits { table, hits } => {
                         out.push(0);
-                        put_u32(out, *slots);
+                        put_table(out, table);
                         put_u32(out, hits.len() as u32);
                         for hit in hits {
                             put_u32(out, *hit);
@@ -547,7 +588,11 @@ impl<'a> View<'a> {
                 let output = at.bytes("output")?;
                 let executed = match at.u8("execution record kind")? {
                     0 => {
+                        let mut lineage = [0u8; 16];
+                        lineage.copy_from_slice(at.take(16, "table's lineage")?);
+                        let generation = at.u64("table's generation")?;
                         let slots = at.u32("slot count")?;
+                        let table = Table { lineage, generation, slots };
                         let count = at.u32("hit count")? as usize;
                         let hits = "slots hit";
                         let len = count
@@ -566,7 +611,7 @@ impl<'a> View<'a> {
                             }
                             last = Some(hit);
                         }
-                        ExecView::Hits { slots, hits }
+                        ExecView::Hits { table, hits }
                     }
                     1 => ExecView::Not(at.string("reason it has no execution record")?),
                     other => return Err(format!("no execution record is of kind {}", other)), // alloc: error path

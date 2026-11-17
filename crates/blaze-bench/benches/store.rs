@@ -31,21 +31,21 @@ struct Filled {
     _driven: Driven,
     handle: Handle,
     keys: Vec<Key>,
+    /// The store's directory, last so it is removed after the store closes.
+    _dir: blaze_core::temp::TempDir,
 }
 
 impl Filled {
     fn new(name: &str) -> Filled {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-bench-store-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        let mut driven = Driven::open(&dir).expect("a store");
+        let dir = blaze_core::temp::TempDir::for_test(&format!("blaze-bench-store-{name}-"));
+        let mut driven = Driven::open(dir.path()).expect("a store");
         let handle = driven.handle();
         let keys: Vec<Key> = (0..COUNT as u64).map(key_of).collect();
         for (n, key) in keys.iter().enumerate() {
-            handle.put(*key, Kind::Query, vec![n as u8; LEN]).expect("a put");
+            handle.put(*key, Kind::Query, &vec![n as u8; LEN]).expect("a put");
         }
         driven.flush().expect("a commit");
-        Filled { _driven: driven, handle, keys }
+        Filled { _driven: driven, handle, keys, _dir: dir }
     }
 }
 
@@ -60,7 +60,7 @@ fn benchmarks() -> impl IntoBenchmarks {
             let store = Filled::new("put");
             let key = key_of(u64::MAX - 1);
             let value = vec![0x5a; 1024];
-            b.iter(move || store.handle.put(key, Kind::Query, black_box(value.clone())).is_ok())
+            b.iter(move || store.handle.put(key, Kind::Query, black_box(&value)).is_ok())
         }),
         benchmark_fn("store/get_hit", |b| {
             let store = Filled::new("hit");

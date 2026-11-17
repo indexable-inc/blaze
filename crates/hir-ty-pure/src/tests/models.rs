@@ -21,7 +21,7 @@ use hir_ty::{
 };
 use rustc_type_ir::inherent::IntoKind;
 
-use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate};
+use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate, with_toolchain};
 use crate::{
     Abs, Effects,
     models::{Applied, Leaf, Model, Transfer, apply_leaf, check_resolved, crate_models, model_of},
@@ -122,7 +122,7 @@ fn leaf(leaf: Leaf) -> Option<Model> {
 #[test]
 fn std_functions_have_their_models() {
     let db = db_with(SCRIPT);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let free = |path: &[&str]| model_of(&db, free(&db, std, path));
         let method = |ty, trait_, name| model_of(&db, method(&db, std, ty, trait_, name));
@@ -175,7 +175,7 @@ fn std_functions_have_their_models() {
 #[test]
 fn alloc_and_core_functions_have_their_models() {
     let db = db_with(SCRIPT);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let alloc = lang_crate(&db, LangCrateOrigin::Alloc);
         let core = lang_crate(&db, LangCrateOrigin::Core);
         let free = |krate, path: &[&str]| model_of(&db, free(&db, krate, path));
@@ -228,7 +228,7 @@ fn foreign_in(db: &Db, owner: FunctionId, name: &str) -> FunctionId {
 #[test]
 fn strerror_r_is_fixed_error_text() {
     let db = db_with(SCRIPT);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let format_error = free(&db, std, &["sys", "io", "format_error"]);
         assert_eq!(model_of(&db, format_error), None, "its body is walked");
@@ -267,7 +267,7 @@ pub mod option {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let core = lang_crate(&db, LangCrateOrigin::Core);
         for path in [
             &["result", "unwrap_failed"][..],
@@ -282,7 +282,7 @@ pub mod option {
 #[test]
 fn only_the_toolchain_has_models() {
     let db = db_with(SCRIPT);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let script = crate_named(&db, "build_script");
         assert_eq!(model_of(&db, free(&db, script, &["env", "var"])), None);
         assert_eq!(model_of(&db, free(&db, script, &["main"])), None);
@@ -301,7 +301,7 @@ pub mod io {
 ",
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let std = crate_named(&db, "std");
         assert!(matches!(std.data(&db).origin, CrateOrigin::Local { .. }));
         assert_eq!(model_of(&db, free(&db, std, &["env", "var"])), None);
@@ -316,7 +316,7 @@ pub mod io {
 #[test]
 fn check_resolved_names_what_the_toolchain_lacks() {
     let db = db_with(SCRIPT);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let missing = check_resolved(&db, std);
         for lacked in [
@@ -358,8 +358,8 @@ fn a_platform_entry_must_resolve_on_its_platform() {
         "//- /std.rs crate:std deps:alloc",
         "//- /std.rs crate:std deps:alloc cfg:target_family=windows",
     );
-    let db = fixture::db(&format!("{windows}{SCRIPT}")).into_db();
-    blaze_query::db::attach(&db, || {
+    let db = fixture::db(&with_toolchain(&windows, SCRIPT)).into_db();
+    blaze_memo::attach(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let missing = check_resolved(&db, std);
         assert!(missing.contains(&"<std::os::windows::io::OwnedHandle as Drop>"), "{missing:?}");
@@ -371,7 +371,7 @@ fn a_platform_entry_must_resolve_on_its_platform() {
 #[test]
 fn a_table_is_built_once_per_crate() {
     let db = db_with(SCRIPT);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let first: *const _ = crate_models(&db, std);
         let second: *const _ = crate_models(&db, std);
@@ -382,7 +382,7 @@ fn a_table_is_built_once_per_crate() {
 #[test]
 fn a_memoized_lookup_allocates_nothing() {
     let db = db_with(SCRIPT);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let alloc = lang_crate(&db, LangCrateOrigin::Alloc);
         let script = crate_named(&db, "build_script");

@@ -18,8 +18,7 @@ pub fn decimal(mut n: u64, digits: &mut [u8; 20]) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::decimal;
 
@@ -44,10 +43,12 @@ mod tests {
         }
     }
 
-    #[hegel::test]
-    fn writes_what_display_and_the_copies_did(tc: TestCase) {
-        let n: u64 = tc.draw(gs::integers());
-        assert_eq!(decimal(n, &mut [0; 20]), n.to_string());
-        assert_eq!(decimal(n, &mut [0; 20]).as_bytes(), reference(n, &mut [0; 20]));
+    #[test]
+    fn writes_what_display_and_the_copies_did() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let n: u64 = tape.int("n");
+            assert_eq!(decimal(n, &mut [0; 20]), n.to_string());
+            assert_eq!(decimal(n, &mut [0; 20]).as_bytes(), reference(n, &mut [0; 20]));
+        })
     }
 }

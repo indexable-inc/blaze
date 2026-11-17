@@ -229,6 +229,8 @@ impl<'a, 'db> Cx<'a, 'db> {
         ty: Ty<'db>,
     ) -> SmallVec<[(Ty<'db>, PrivateUninhabitedField); 2]> {
         let visible = |ty| (ty, PrivateUninhabitedField(false));
+        // blaze: a refinement `T is PAT` has its base's fields (`#![blaze::pattern_types]`).
+        let ty = hir_ty::pattern_types::base(ty);
         match ctor {
             Struct | Variant(_) | UnionField => match ty.kind() {
                 // alloc: a `SmallVec` of two inline, as `ctor_sub_tys` returns.
@@ -291,6 +293,8 @@ impl<'a, 'db> PatCx for Cx<'a, 'db> {
     }
 
     fn ctor_arity(&self, ctor: &Constructor<Self>, ty: &Self::Ty) -> usize {
+        // blaze: a refinement `T is PAT` has its base's fields (`#![blaze::pattern_types]`).
+        let ty = hir_ty::pattern_types::base(*ty);
         match ctor {
             Struct | Variant(_) | UnionField => match ty.kind() {
                 TyKind::Tuple(tys) => tys.len(),
@@ -316,7 +320,14 @@ impl<'a, 'db> PatCx for Cx<'a, 'db> {
     }
 
     fn ctors_for_ty(&self, ty: &Self::Ty) -> Result<ConstructorSet<Self>, Self::Error> {
-        let ty = *ty;
+        // blaze: a refinement `T is PAT` of an enum (`#![blaze::pattern_types]`) has its base's
+        // constructors with the variants outside its set excluded: a match on it is exhaustive
+        // over its set alone, and an arm for an excluded variant is unreachable. The set lists
+        // its variants exactly, so a foreign `#[non_exhaustive]` base adds no hidden one.
+        let (ty, refined) = match hir_ty::pattern_types::refinement(*ty) {
+            Some((base, pattern)) => (base, Some(pattern)),
+            None => (*ty, None),
+        };
         let uint_range = |lo: u128, hi: u128| {
             IntRange::from_range(
                 MaybeInfiniteInt::new_finite_uint(lo),
@@ -364,13 +375,20 @@ impl<'a, 'db> PatCx for Cx<'a, 'db> {
             TyKind::Adt(def, args) => match def.def_id() {
                 AdtId::EnumId(enum_) => {
                     let variants = &enum_.enum_variants(self.db).variants;
-                    let non_exhaustive = self.is_foreign_non_exhaustive_enum(ty);
+                    let non_exhaustive =
+                        refined.is_none() && self.is_foreign_non_exhaustive_enum(ty);
                     if variants.is_empty() && !non_exhaustive {
                         ConstructorSet::NoConstructors
                     } else {
                         let foreign = enum_.krate(self.db) != self.krate;
                         let mut visibilities = IndexVec::with_capacity(variants.len());
-                        for &(variant, _) in variants.values() {
+                        for (index, &(variant, _)) in variants.values().enumerate() {
+                            if refined
+                                .is_some_and(|pattern| !pattern.kind().admits_variant(index as u32))
+                            {
+                                visibilities.push(VariantVisibility::Excluded);
+                                continue;
+                            }
                             let uninhabited = is_enum_variant_uninhabited_from(
                                 self.infcx,
                                 variant,

@@ -1118,6 +1118,27 @@ where
         item: SolverTraitLangItem,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         let cx = ecx.cx();
+        // `<Described<'a, D, Args> as TypeOf>::Type` is the type `D` describes; while `D` is
+        // not known, ambiguous, so a generic `type_of!` stays an alias.
+        if item == SolverTraitLangItem::ReflectTypeOf {
+            use rustc_type_ir::reflect::TypeOfAnswer;
+            let def_id = goal.predicate.alias.expect_projection_ty_def_id();
+            if !cx.is_projection_lang_item(def_id, SolverProjectionLangItem::ReflectTypeOfType) {
+                return Err(NoSolution.into());
+            }
+            return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+                match ecx.type_of_answer(goal.param_env, goal.predicate.self_ty())? {
+                    TypeOfAnswer::Type(ty) => {
+                        ecx.instantiate_normalizes_to_term(goal, ty.into())?;
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                    }
+                    TypeOfAnswer::Unknown => {
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                    }
+                    TypeOfAnswer::Refused => Err(NoSolution.into()),
+                }
+            });
+        }
         if item != SolverTraitLangItem::ReflectVariant {
             return Err(NoSolution.into());
         }
@@ -1149,6 +1170,32 @@ where
         _marker: structural_traits::IntMarker,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         panic!("the `#[blaze::arbitrary_ints]` markers have no associated types: {:?}", goal)
+    }
+
+    /// blaze: `<U as UnionFrom<S>>::Path`, `UnionFrom`'s one associated type: where each value
+    /// of `S` goes in the error union `U` ([`EvalCtxt::error_union_from`]). Of any other self
+    /// type there is no candidate, so a generic `<U as UnionFrom<S>>::Path` stays rigid.
+    fn consider_builtin_error_union_from_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use crate::solve::error_union::{UnionFrom, error_union_members};
+
+        let Some(members) = error_union_members(ecx.cx(), goal.predicate.self_ty()) else {
+            return Err(NoSolution.into());
+        };
+        let source = goal.predicate.alias.args.type_at(1);
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+            match ecx.error_union_from(goal.param_env, members, source)? {
+                UnionFrom::Holds(path) => {
+                    ecx.instantiate_normalizes_to_term(goal, path.into())?;
+                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                }
+                UnionFrom::Ambiguous => {
+                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                }
+            }
+        })
     }
 }
 

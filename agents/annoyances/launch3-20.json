@@ -1,0 +1,19 @@
+{
+ "id": "launch3-20",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "the VM: `cargo test -p blaze-engine --test revisions`, whole",
+ "what": "The whole revisions suite on the VM fails 6 of 24 for reasons that are the machine's or main's: /tmp is tmpfs and blaze refuses to place across it without sharing blocks (an_edit_after_a_restart, an_edit_after_a_kill), the suite's daemons run at once and one stalls under memory pressure from the others (a_touch_without_a_change), two `known` rows pass now and so fail, and build_then_run_then_build_are_no_ops walked for `a path outside the checkout ... or its watch changed`.",
+ "cost": "a lane cannot tell its own regression from the suite's standing failures without a second run of main",
+ "cause": "the suite assumes a reflink file system under TMPDIR and one daemon's worth of memory a test",
+ "whys": [
+  "why failing: environment, not code",
+  "why not known: no record of what the suite is at main's tip on an ix VM",
+  "property: a gate whose baseline on the machine lanes use is not recorded"
+ ],
+ "class": "unrecorded baseline: a suite whose failures at main's tip, on the machines lanes run it on, are not written down",
+ "prevention": "the ledger keeps the suite's result at main's tip on an ix VM (and the suite sets TMPDIR to a reflink file system or says it needs one in its first line of output)",
+ "workaround": "run the one case; read each failure's reason",
+ "state": "open",
+ "fix": ""
+}

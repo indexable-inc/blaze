@@ -17,8 +17,9 @@ doctest = false
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 either.workspace = true
+inventory.workspace = true
 smallvec.workspace = true
 stdx.workspace = true
 

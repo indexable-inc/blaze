@@ -21,9 +21,12 @@
 //! it, started by the kernel, so `current_exe`, `/proc/self/exe`, dyld's image 0, the PEB,
 //! `dl_iterate_phdr` and backtraces all see the program there, as in a whole build.
 //!
-//! 1. The daemon writes the executable's bytes, as the memory object holds them, to cargo's
-//!    path once per content key ([`host::Host::write_executable`]): not again while the key
-//!    is the same, never for a patch.
+//! 1. The build places the executable at cargo's path, as any output: the bytes the memory
+//!    object holds, under the same content key. That placement is the path's one writer; the
+//!    daemon's host writes no file. A launch is asked once its job's placements have ended,
+//!    with the key the build's record holds for the path, and starts only where that is the
+//!    memory's file's key ([`host::Program::command`]); else it is refused naming the path
+//!    and both keys ([`host::StartError::NotPlaced`]).
 //! 2. It spawns that file through `blaze-core`'s `Effect::Spawn` in the run's sandbox, with
 //!    `BLAZE_INPROC` naming its host and a token ([`host::Program::command`]).
 //! 3. Before `main` and before any other code of the program, the program's runtime
@@ -43,8 +46,8 @@
 //!    object (Linux `mmap` `MAP_FIXED|MAP_SHARED`, macOS `mach_vm_map` with
 //!    `VM_FLAGS_OVERWRITE` of the entry it got through the rendezvous; on Windows the daemon
 //!    rebuilds the image's region in the process from the section and the bytes it held).
-//!    The bytes are equal at the moment of the swap: the file was written from the object,
-//!    and the daemon writes only code no thread can reach yet. The hook says STARTED and
+//!    The bytes are equal at the moment of the swap: the file placed is the object's file,
+//!    under the same content key, and the daemon writes only code no thread can reach yet. The hook says STARTED and
 //!    returns; the program starts as it would anywhere.
 //! 5. A program started otherwise (no `BLAZE_INPROC`: run by hand) runs its file as it is;
 //!    [`runtime::attach`] says so, and [`runtime::quiesce`] does nothing.
@@ -179,6 +182,10 @@ pub struct CodeMemory {
     /// Nothing changed the image part since [`CodeMemory::lay_out`]: it is still the file the
     /// linker wrote, so it may be written out as the executable.
     pristine: bool,
+    /// The pages of the image and the arena something wrote since the object was made, a bit
+    /// each: a page never written is zeros and takes no memory, and [`CodeMemory::zero`]
+    /// leaves it so.
+    written: Vec<u64>,
     processes: Vec<Process>,
     page: u64,
 }
@@ -240,6 +247,8 @@ impl CodeMemory {
             layout: None,
             placed: None,
             pristine: false,
+            // alloc: once per code memory, a bit per page of its image and arena
+            written: vec![0; ((image + arena) / page).div_ceil(64) as usize],
             processes: Vec::new(),
             page,
         })
@@ -322,6 +331,7 @@ impl CodeMemory {
     pub fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         let range = self.checked(offset, bytes.len() as u64)?;
         self.touch(offset);
+        self.mark(offset, bytes.len() as u64);
         self.view.bytes_mut(range)?.copy_from_slice(bytes);
         Ok(())
     }
@@ -330,8 +340,47 @@ impl CodeMemory {
     pub fn fill(&mut self, offset: u64, len: u64, byte: u8) -> Result<(), Error> {
         let range = self.checked(offset, len)?;
         self.touch(offset);
+        self.mark(offset, len);
         self.view.bytes_mut(range)?.fill(byte);
         Ok(())
+    }
+
+    /// Makes `len` bytes at `offset` of the image or the arena zeros, and publishes what it
+    /// wrote: how many bytes that was. Only pages something wrote since the object was made
+    /// are filled; a page never written is zeros already and stays untouched, so it takes no
+    /// memory and no time. What a file written whole asks of the gaps between its writes
+    /// (`blaze_link::Image::commit_into`): an image's patch room, 64 MiB each of code and
+    /// data at least, is such a gap, and filling it took that much memory of every dev
+    /// executable's object and an instruction-cache pass over it on each link from scratch.
+    pub fn zero(&mut self, offset: u64, len: u64) -> Result<u64, Error> {
+        let range = self.checked(offset, len)?;
+        let (start, end) = (range.start as u64, range.end as u64);
+        let page = self.page;
+        let mut filled = 0;
+        let mut at = start;
+        while at < end {
+            let nth = at / page;
+            let to = ((nth + 1) * page).min(end);
+            if self.written[(nth / 64) as usize] & (1 << (nth % 64)) != 0 {
+                // One run of written pages: filled and published together.
+                let mut run = to;
+                while run < end {
+                    let next = run / page;
+                    if self.written[(next / 64) as usize] & (1 << (next % 64)) == 0 {
+                        break;
+                    }
+                    run = ((next + 1) * page).min(end);
+                }
+                self.touch(at);
+                self.view.bytes_mut(at as usize..run as usize)?.fill(0);
+                self.view.publish(at as usize..run as usize);
+                filled += run - at;
+                at = run;
+            } else {
+                at = to;
+            }
+        }
+        Ok(filled)
     }
 
     /// The bytes at `range` of the image or the arena, as the daemon's view has them.
@@ -356,6 +405,7 @@ impl CodeMemory {
     pub fn store_word(&mut self, offset: u64, value: u64) -> Result<(), Error> {
         self.word(offset, "store")?.store(value, std::sync::atomic::Ordering::Release);
         self.touch(offset);
+        self.mark(offset, 8);
         Ok(())
     }
 
@@ -379,6 +429,19 @@ impl CodeMemory {
                 self.checked(offset, 8)?;
                 Ok(self.view.word(offset as usize))
             }
+        }
+    }
+
+    /// Marks the pages of `len` bytes at `offset` as written ([`CodeMemory::zero`]); what is
+    /// past the image and the arena (a cell) has no bit.
+    fn mark(&mut self, offset: u64, len: u64) {
+        let code = self.image + self.arena_len;
+        if len == 0 || offset >= code {
+            return;
+        }
+        let last = (offset.saturating_add(len).min(code) - 1) / self.page;
+        for nth in offset / self.page..=last {
+            self.written[(nth / 64) as usize] |= 1 << (nth % 64);
         }
     }
 
@@ -412,6 +475,7 @@ impl CodeMemory {
             )));
         }
         self.touch(offset);
+        self.mark(offset, 4);
         self.view.word32(offset as usize).store(instruction, std::sync::atomic::Ordering::Release);
         self.view.publish(range);
         Ok(())

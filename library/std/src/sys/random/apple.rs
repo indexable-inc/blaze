@@ -10,6 +10,11 @@
 //! proven to be App Store-compatible.
 
 pub fn fill_bytes(bytes: &mut [u8]) {
+    // blaze: a process given a provider takes its bytes from the seed (`sys::provider`); every
+    // other process is as the nightly's.
+    if crate::sys::provider::fill(bytes) {
+        return;
+    }
     let ret = unsafe { libc::CCRandomGenerateBytes(bytes.as_mut_ptr().cast(), bytes.len()) };
     assert_eq!(ret, libc::kCCSuccess, "failed to generate random data");
 }

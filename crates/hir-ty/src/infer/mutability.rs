@@ -30,7 +30,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             let mut adjustments = adjustments.iter_mut().rev().peekable();
             while let Some(adj) = adjustments.next() {
                 match &mut adj.kind {
-                    Adjust::NeverToAny | Adjust::Deref(None) | Adjust::Pointer(_) => (),
+                    Adjust::NeverToAny
+                    | Adjust::Deref(None)
+                    | Adjust::Pointer(_)
+                    | Adjust::ErrorUnion => (),
                     Adjust::Deref(Some(d)) => {
                         if mutability == Mutability::Mut {
                             let source_ty = match adjustments.peek() {

@@ -376,7 +376,7 @@ pub fn rpitit_value_error<'db>(
 
 /// Why an impl's item for a trait method's `impl Trait` has no value. Each names the impl's
 /// method and the trait item where it is reported (`RpititError::message`).
-#[derive(Clone, PartialEq, Eq, Hash, Debug, blaze_query::Value)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RpititError {
     /// The impl's method and the trait's differ in their own early-bound generic parameters
     /// (E0049, E0195), already an error of its own.
@@ -443,7 +443,7 @@ impl RpititError {
 /// `impl_fn` implements, by the trait's index, in the generics of the impl's item: rustc's
 /// `collect_return_position_impl_trait_in_trait_tys`. Empty for a method that implements no
 /// trait method with an `impl Trait`.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn impl_rpitit_tys(
     db: &Db,
     impl_fn: FunctionId,
@@ -1013,20 +1013,13 @@ impl<'db> rustc_type_ir::TypeFolder<DbInterner<'db>> for Remap<'db, '_> {
 
 /// The bounds of an RPITIT: for the trait's, the bounds of its opaque type with that type (and
 /// each other of its method's) the trait's item; an impl's has none of its own.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub(crate) fn rpitit_item_bounds(
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
+pub fn rpitit_item_bounds(
     db: &Db,
     function: FunctionId,
     idx: ImplTraitIdx,
 ) -> crate::next_solver::util::ItemBounds {
     crate::next_solver::util::ItemBounds::of_rpitit(db, RpititId { function, idx })
-}
-
-/// The RPITIT a read of [`rpitit_item_bounds`] with the key `key` asks the bounds of, or `None`
-/// when `key` is no key of it: for the item and goal stores, which take the read for its trait
-/// method's signature.
-pub fn rpitit_item_bounds_of_key(db: &Db, key: blaze_query::db::Id) -> Option<RpititId> {
-    rpitit_item_bounds::arguments(db, key).map(|(function, idx)| RpititId { function, idx })
 }
 
 /// rustc's `predicates_of` an impl's RPITIT item (`gather_explicit_predicates_of`'s
@@ -1038,7 +1031,7 @@ pub fn rpitit_item_bounds_of_key(db: &Db, key: blaze_query::db::Id) -> Option<Rp
 ///
 /// The impl method's own where clauses are not in it: E0276 keeps them no stronger than the
 /// trait's, and they are what the comparison checks.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
 pub fn impl_method_hybrid_predicates(db: &Db, impl_fn: FunctionId) -> GenericPredicates {
     let ItemContainerId::ImplId(impl_) = impl_fn.lookup(db).container else {
         panic!(

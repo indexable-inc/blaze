@@ -1,0 +1,11 @@
+{
+ "id": "records-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+ "where": "blaze-query's tests under cargo",
+ "what": "`db::provenance::name_tests::an_id_in_a_key_reads_with_its_name_and_keeps_its_id` fails when the suite runs whole, on the untouched tip of all-1111 (e453ac295a) too (`NamedForTheLogTest(Id(3) = serde v1.0.3` where it expects no name): another test's names are in the process-wide table it reads.",
+ "cost": "a look at each run's one failure",
+ "cause": "a test reading process-wide state another test writes; not looked into further",
+ "workaround": "none",
+ "state": "open"
+}

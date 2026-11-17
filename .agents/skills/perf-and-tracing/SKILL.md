@@ -9,12 +9,37 @@ description: "How a slow thing is found and fixed: a span names every stretch of
 
 ## slow-is-p0-traced (rule 16)
 
-Anything slow is a P0 until a span names it, and the trace comes before the speed fix. Every stretch
-of worker time sits under a `tracing::info_span!(target: "blaze", ...)` that names the work: the
-macro path for a proc-macro expansion, the package, version and target kind for a unit, the query
-and key, the creator of a scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a
-DuckDB query over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and
-whether it was busy or waiting. A sampler stack or a guess from a log is a lead. The PR that makes
-something faster quotes the before and after from those spans.
+Anything slow is a P0 until a span names it, and anything large until the profile says what held it
+(bytes by allocator tag, each task's peak, the allocation samples); the trace comes before the fix.
+Every command writes that profile, with a daemon or without, through the one allocator, the one
+schema (`crates/blaze-profile/src/schema.rs`) and the one set of readers: a new command, path or
+task kind that writes none is itself the P0, fixed before its numbers are discussed, and it gets no
+second accounting or summary line computed apart from the profile. Every stretch of worker time sits
+under a `tracing::info_span!(target: "blaze", ...)` that names the work: the macro path for a
+proc-macro expansion, the package, version and target kind for a unit, the query and key, the
+creator of a scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a DuckDB query
+over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and whether it was busy
+or waiting. A sampler stack or a guess from a log is a lead. The PR that makes something faster
+quotes the before and after from those spans.
+
+## incremental-first (rule 60)
+
+What blaze is for is the time between an edit and its result, so that is what is measured, profiled
+and fixed first. When two things trade, the order is the owner's: incremental compile time, then
+memory use, then cold compile time, then disk cleanup that never blocks a build, then disk use. The
+edit loop is these operations, each on real large workspaces (`verify-on-real-projects`:
+paradigmxyz/reth, tempoxyz/tempo and blaze itself), on a typical Mac and on the 128-core build VM,
+each reported against its floor (`within-ten-percent-of-the-floor`): a no-op; a comment edit; a
+private body edit; a signature edit with N dependents; adding an item; adding a derive; the first
+edit after a cold build; an edit in a fresh process (the normal case, since a command answers and
+exits: `no-state-between-requests`); and the memory held between edits (none outside a build's
+helper process). When incremental work and cold-build work compete for time, incremental wins, and a
+cold-build cost is accepted where it buys a faster edit (work done once at build end so an edit need
+not redo it, records written so a restart can read them). Cold builds are not ignored: every design
+keeps the door open to a fast cold build (nothing that makes cold time worse than linear in the
+work, no structure that only an edit can use), a cold build that fails or regresses badly is still a
+bug, and its numbers are still recorded; but tuning cold time is not picked ahead of an open
+incremental item until the owner says the priority has changed. Say which of the two a speed change
+is for, and quote the edit-loop numbers with it.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

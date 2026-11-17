@@ -901,11 +901,8 @@ unsafe fn registers(_context: *const libc::c_void) -> (u64, u64) {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-crash-{name}-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> blaze_core::temp::TempDir {
+        blaze_core::temp::TempDir::for_test(&format!("blaze-crash-{name}-"))
     }
 
     /// A pid no process has: past every system's largest.
@@ -1018,7 +1015,7 @@ mod tests {
         );
         let batch = crate::panics::batch(std::slice::from_ref(row)).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        _ = fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// A record whose process recorded nothing reads as no row; a second fault of the same
@@ -1036,7 +1033,7 @@ mod tests {
         let crash = read_back(&path).unwrap().expect("the first fault recorded");
         assert_eq!(crash.row().signal, Some("SIGBUS"));
         _ = page;
-        _ = fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// A record of another layout, or of another executable, is refused with a typed error naming
@@ -1064,7 +1061,7 @@ mod tests {
         assert!(matches!(refused, CrashError::OtherBlaze { pid: GONE, .. }), "{refused}");
         assert!(matches!(read(&path, &bytes[..8], &ours), Err(CrashError::NotARecord { .. })));
         _ = page;
-        _ = fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// Only a record's own name gives a pid: a refused one set aside is not read again.

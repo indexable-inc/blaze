@@ -77,7 +77,7 @@ fn sizedness<'db>(
 #[test]
 fn implicit_sizedness_bounds_are_rustcs() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let f = declarations(&db)
             .into_iter()
             .find_map(|def| match def {
@@ -94,7 +94,7 @@ fn implicit_sizedness_bounds_are_rustcs() {
             [(0, "Sized"), (1, "MetaSized"), (2, "MetaSized"), (4, "Sized")],
             "A: Sized, B: ?Sized is MetaSized, C keeps its MetaSized only, D none, E its Sized only"
         );
-
+    
         let of_trait = |name| {
             sizedness(
                 &db,
@@ -106,7 +106,7 @@ fn implicit_sizedness_bounds_are_rustcs() {
         assert_eq!(of_trait("Pointee"), [], "a `PointeeSized` supertrait relaxes `Self`");
         assert_eq!(of_trait("Bare"), [(0, "Sized")], "a `Sized` supertrait, and no `MetaSized`");
         assert_eq!(of_trait("Auto"), [], "an auto trait gets no supertrait");
-
+    
         let alias = |name| {
             let alias = trait_named(&db, "Holder")
                 .trait_items(&db)

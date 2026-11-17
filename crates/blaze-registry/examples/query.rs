@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
-    task::{Context as TaskContext, Poll, Wake, Waker},
+    task::Poll,
     time::Instant,
 };
 
@@ -55,9 +55,11 @@ fn main() -> anyhow::Result<()> {
         Box::pin(async move { registry.query(dep, QueryKind::Exact, &mut |_| *count += 1).await })
     });
     if one_at_a_time {
-        queries.into_iter().try_for_each(block_on)?;
+        for query in queries {
+            block_on(query)??;
+        }
     } else {
-        join(queries.collect()).into_iter().collect::<anyhow::Result<()>>()?;
+        block_on(join(queries.collect()))?.into_iter().collect::<anyhow::Result<()>>()?;
     }
     let versions: usize = offered.iter().sum();
     println!(
@@ -68,37 +70,28 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct Unpark(std::thread::Thread);
-
-impl Wake for Unpark {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
+/// `future` to its end on this thread through blaze-core's one `block_on`, with no bound of
+/// its own: every request ends by the HTTP client's deadlines, as the wait's name says.
+fn block_on<F: Future>(future: F) -> anyhow::Result<F::Output> {
+    let what = "crates.io's index files (bounded by the HTTP client's timeouts)";
+    Ok(blaze_core::wait::block_on(what, None, future)?)
 }
 
-fn block_on<F: Future + Unpin>(future: F) -> F::Output {
-    join(vec![future]).pop().unwrap()
-}
-
-/// Each of `futures` run to its end on this thread, as blaze-resolve's resolver runs its
-/// queries.
-fn join<F: Future + Unpin>(mut futures: Vec<F>) -> Vec<F::Output> {
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = TaskContext::from_waker(&waker);
+/// Each of `futures` polled together to its end, as blaze-resolve's resolver runs its queries.
+async fn join<F: Future + Unpin>(mut futures: Vec<F>) -> Vec<F::Output> {
     let mut done: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
-    let mut left = futures.len();
-    while left > 0 {
+    std::future::poll_fn(|cx| {
+        let mut left = 0;
         for (future, out) in futures.iter_mut().zip(&mut done) {
-            if out.is_none()
-                && let Poll::Ready(it) = Pin::new(future).poll(&mut cx)
-            {
-                *out = Some(it);
-                left -= 1;
+            if out.is_none() {
+                match Pin::new(future).poll(cx) {
+                    Poll::Ready(it) => *out = Some(it),
+                    Poll::Pending => left += 1,
+                }
             }
         }
-        if left > 0 {
-            std::thread::park();
-        }
-    }
+        if left == 0 { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
     done.into_iter().map(|it| it.expect("every future ended")).collect()
 }

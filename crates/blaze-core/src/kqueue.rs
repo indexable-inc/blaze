@@ -43,6 +43,7 @@ use std::alloc::Global;
 use crate::{
     Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
     Tag,
+    descriptors::Descriptors,
     fsevents::{self, Tell},
     handoff::Wake,
     net, process,
@@ -111,6 +112,10 @@ struct Notify {
     /// Whether a hand-back since the driver last drained the channels has fired the trigger:
     /// a batch of them costs one `kevent`, not one each.
     woke: Wake,
+    /// A [`crate::Waker`] asked the wait to end ([`Driver::waker`]): set before the trigger is
+    /// fired, read by the polling thread after it drained and before it waits, so a wake asked
+    /// while another hand-back's trigger is pending is not lost with that trigger.
+    asked: std::sync::atomic::AtomicBool,
     /// What the file threads allocated doing their effects and handing them back.
     #[cfg(test)]
     file_allocations: std::sync::atomic::AtomicU64,
@@ -155,6 +160,33 @@ impl Notify {
             #[cfg(test)]
             self.triggers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             _ = self.change(TRIGGER as usize, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, TRIGGER);
+        }
+    }
+}
+
+/// The kqueue's [`crate::Waker`]: `asked` is set first, then the trigger fired unless one is
+/// pending. The polling thread drains (clearing `woke`), then reads `asked`, then waits: a wake
+/// that found `woke` set was made before that drain, so the read after it sees `asked`; one that
+/// found it clear fired the trigger, which ends the wait, and the next turn of the poll reads
+/// `asked`.
+impl crate::Wake for Notify {
+    fn wake(&self) {
+        self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
+        Notify::wake(self);
+    }
+}
+
+/// Where the host's effects ([`crate::host`]) are told: a channel of their own, and a wake.
+struct HostSink {
+    done: Sender<Completion>,
+    notify: Arc<Notify>,
+}
+
+impl crate::host::Sink for HostSink {
+    fn tell(&self, completion: Completion) {
+        // A driver dropped takes nothing.
+        if self.done.send(completion).is_ok() {
+            self.notify.wake();
         }
     }
 }
@@ -297,6 +329,10 @@ pub struct Kqueue {
     notify: Arc<Notify>,
     files: Receiver<Completion>,
     watched: Receiver<Completion>,
+    /// What the host told ([`HostSink`]).
+    hosted: Receiver<Completion>,
+    /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]).
+    host: crate::host::Host,
     work: Option<Sender<Effect>>,
     /// File effects asked for beyond the [`FILES`] at the threads, in the order asked.
     backlog: VecDeque<Effect>,
@@ -336,12 +372,24 @@ pub struct Kqueue {
     /// kernel keys a knote by its filter and ident, and a second `EV_ADD` would take the first's.
     pressure: Option<(Tag, u64)>,
     in_flight: usize,
+    /// Whether a [`crate::Waker`] was handed out ([`Driver::waker`]): a poll with nothing in
+    /// flight then parks for its wake, to its deadline, rather than returning at once (which
+    /// turned a caller's loop into a spin). Read and written by the polling thread alone, so
+    /// relaxed; an atomic so the driver's auto traits do not change with it.
+    waker_given: std::sync::atomic::AtomicBool,
     /// What the watches' callbacks allocated beyond their payloads, as each watch stopped.
     #[cfg(test)]
     watch_overhead: u64,
+    /// The descriptors the file threads keep for reads into memory: a file opened once.
+    descriptors: Arc<Descriptors>,
 }
 
 impl Kqueue {
+    /// How many files the threads opened for reads into memory, and closed.
+    pub fn opens(&self) -> crate::Opens {
+        self.descriptors.opens()
+    }
+
     /// A driver whose files are under `root`, with `threads` threads for the file calls.
     pub fn new(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue> {
         let root: Arc<Path> = root.into().into();
@@ -362,6 +410,7 @@ impl Kqueue {
             files: files_done,
             watched: watched_done,
             woke: Wake::new(),
+            asked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             file_allocations: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -375,14 +424,23 @@ impl Kqueue {
             0,
             TRIGGER,
         )?;
+        // alloc: setup, once per driver: the host's channel, which grows with what it tells
+        // between two polls.
+        let (host_done, hosted) = crossbeam_channel::unbounded();
+        // clone: setup, a count of the kqueue for the host's wakes.
+        let sink = HostSink { done: host_done, notify: Arc::clone(&notify) };
+        let host = crate::host::Host::new(Arc::new(sink)); // alloc: setup, once per driver.
+        // alloc: setup, once per driver: the table the file threads share.
+        let descriptors = Arc::new(Descriptors::new());
         let workers = (0..threads.max(1))
             .map(|n| {
                 // clone: setup, one count of each per worker thread.
                 let (root, queue, notify) = (Arc::clone(&root), queue.clone(), Arc::clone(&notify));
+                let kept = Arc::clone(&descriptors); // clone: as above.
                 std::thread::Builder::new()
                     // alloc: setup, once per thread.
                     .name(format!("blaze-kqueue-{n}"))
-                    .spawn(move || work_on(&root, &queue, &notify))
+                    .spawn(move || work_on(&root, &kept, &queue, &notify))
             })
             // alloc: setup, once per driver.
             .collect::<io::Result<Vec<_>>>()?;
@@ -396,6 +454,8 @@ impl Kqueue {
             notify,
             files,
             watched,
+            hosted,
+            host,
             work: Some(work),
             backlog: VecDeque::with_capacity(FILES), // alloc: setup, once per driver.
             at_threads: 0,
@@ -422,8 +482,10 @@ impl Kqueue {
             locks: crate::locks::Locks::new(),
             pressure: None,
             in_flight: 0,
+            waker_given: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             watch_overhead: 0,
+            descriptors,
         })
     }
 
@@ -472,30 +534,41 @@ impl Kqueue {
     fn begin(&mut self, effect: Effect) -> io::Result<()> {
         match effect {
             // A read into memory of the asker's, or a write from it, is a `pread` or `pwrite` on
-            // a file thread (`threads::run`), `F_NOCACHE` where it bypasses the cache and at
+            // a file thread (`threads::run`), a read on the file's kept descriptor (no open
+            // after the first) and a batch one `preadv` a run, `F_NOCACHE` where it bypasses the cache and at
             // `IOPOL_THROTTLE` where it is idle; the store's pool gives its driver threads
             // enough to keep a drive's queue deep (docs/v2/plan/design/store-pool.md).
             effect @ (Effect::ReadAll { .. }
             | Effect::Read { .. }
             | Effect::ReadInto { .. }
+            | Effect::ReadMany { .. }
             | Effect::WriteFrom { .. }
             | Effect::ReadLink { .. }
             | Effect::Append { .. }
             | Effect::Sync { .. }
+            | Effect::Barrier { .. }
+            | Effect::WriteBack { .. }
+            | Effect::SyncDir { .. }
             | Effect::Truncate { .. }
             | Effect::Write { .. }
+            | Effect::WriteUnsynced { .. }
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
+            | Effect::RenameUnsynced { .. }
             | Effect::Mode { .. }
             | Effect::Seal { .. }
             | Effect::Private { .. }
             | Effect::Times { .. }
             | Effect::Clone { .. }
+            | Effect::CopyData { .. }
+            | Effect::Prewarm { .. }
             | Effect::Link { .. }
             | Effect::Stat { .. }
             | Effect::Lstat { .. }
             | Effect::List { .. }
             | Effect::Remove { .. }
+            | Effect::MakeDir { .. }
+            | Effect::RemoveDir { .. }
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
             | Effect::Map { .. }) => {
@@ -573,6 +646,19 @@ impl Kqueue {
                     NOTE_MEMORYSTATUS_PRESSURE_WARN | NOTE_MEMORYSTATUS_PRESSURE_CRITICAL,
                 );
                 self.pressure = Some((tag, id));
+                Ok(())
+            }
+            // Told through the host's channel.
+            effect @ (Effect::Bind { .. }
+            | Effect::SendTo { .. }
+            | Effect::RecvFrom { .. }
+            | Effect::Unbind { .. }
+            | Effect::Resolve { .. }
+            | Effect::ReadStdin { .. }
+            | Effect::WriteOut { .. }
+            | Effect::Now { .. }
+            | Effect::Random { .. }) => {
+                self.host.submit(effect);
                 Ok(())
             }
             Effect::Kill { .. } | Effect::Unwatch { .. } | Effect::Unlisten { .. } => {
@@ -1221,6 +1307,9 @@ impl Kqueue {
         while let Ok(completion) = self.watched.try_recv() {
             out.push(completion);
         }
+        while let Ok(completion) = self.hosted.try_recv() {
+            out.push(completion);
+        }
     }
 }
 
@@ -1310,7 +1399,15 @@ impl Driver for Kqueue {
         let clock = Monotonic::since(self.start);
         loop {
             self.take(out);
-            if out.len() > before || self.in_flight == 0 {
+            // A waker's ask ends the poll with what there is, which may be nothing: what it
+            // woke the loop for is in a queue of the caller's own.
+            let asked = self.notify.asked.swap(false, std::sync::atomic::Ordering::SeqCst);
+            // Nothing in flight and no waker: nothing can come, so the poll only looks. With a
+            // waker handed out it parks for the wake, to its deadline (the rule on
+            // `Driver::waker`).
+            let nothing_can_come = self.in_flight == 0
+                && !self.waker_given.load(std::sync::atomic::Ordering::Relaxed);
+            if out.len() > before || nothing_can_come || asked {
                 // Changes asked for are made now, not once nothing else is ready.
                 if !self.changes.is_empty() {
                     self.wait(Some(Deadline::PASSED));
@@ -1347,16 +1444,27 @@ impl Driver for Kqueue {
     fn now(&self) -> Duration {
         self.start.elapsed()
     }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
+    }
+
+    fn waker(&self) -> Option<crate::Waker> {
+        // Only the polling thread reads it, and only after this call on that same thread.
+        self.waker_given.store(true, std::sync::atomic::Ordering::Relaxed);
+        // clone: a handle to the kqueue's notify, once per waker asked for
+        Some(crate::Waker::new(Arc::clone(&self.notify) as Arc<dyn crate::Wake>))
+    }
 }
 
 /// Runs the file effects this thread takes off `queue`, which every file thread takes from
 /// with no lock, until the driver drops its end. The completions channel has room for each:
 /// the driver keeps at most [`FILES`] at the threads.
-fn work_on(root: &Path, queue: &Receiver<Effect>, notify: &Notify) {
+fn work_on(root: &Path, kept: &Descriptors, queue: &Receiver<Effect>, notify: &Notify) {
     while let Ok(effect) = queue.recv() {
         let sent = counted(notify, || {
             let tag = effect.tag();
-            let done = crate::threads::run(root, effect)
+            let done = crate::threads::run(root, kept, effect)
                 // alloc: an error path.
                 .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
             let sent = notify.files.send(Completion { tag, done }).is_ok();
@@ -1459,11 +1567,10 @@ mod tests {
         FileName::new(it).unwrap()
     }
 
-    fn dir(what: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-kq-{what}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A new empty directory for the test `what`, removed when the guard drops: hold it for as
+    /// long as a driver works in it.
+    fn dir(what: &str) -> crate::temp::TempDir {
+        crate::temp::TempDir::for_test(&format!("blaze-kq-{what}-"))
     }
 
     fn command(program: &str, args: &[&str], stdin: &[u8]) -> Box<Command> {
@@ -1501,6 +1608,95 @@ mod tests {
         match done {
             Done::Exited(exit) => exit,
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// The waker's claim ([`Driver::waker`]): a wake from another thread ends a poll that no
+    /// completion ends, long before its deadline, with nothing in `out`; a wake made before the
+    /// poll ends that poll at once; and one wake ends one poll, not the one after. The control:
+    /// with no wake the same poll runs to its deadline.
+    #[test]
+    fn a_waker_ends_a_poll_no_completion_ends() {
+        let root = dir("waker");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        // A timer far off keeps an effect in flight, so the poll waits.
+        driver.submit(&mut vec![Effect::Timer { after: Duration::from_secs(600), tag: Tag(1) }]);
+        let waker = driver.waker().expect("the kqueue driver has a waker");
+        let mut out = Vec::new();
+        let far = |driver: &Kqueue| Deadline::after(driver.now(), Duration::from_secs(20));
+        // Made before the poll: the poll does not wait.
+        waker.wake();
+        let began = Instant::now();
+        assert_eq!(driver.poll(&mut out, far(&driver)), 0);
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        // Made while it waits, from another thread.
+        let other = waker.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            other.wake();
+        });
+        let began = Instant::now();
+        assert_eq!(driver.poll(&mut out, far(&driver)), 0);
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(40) && took < Duration::from_secs(5), "{took:?}");
+        thread.join().unwrap();
+        // The control: no wake is left over, so this poll runs to its deadline.
+        let began = Instant::now();
+        let near = Deadline::after(driver.now(), Duration::from_millis(60));
+        assert_eq!(driver.poll(&mut out, near), 0);
+        assert!(began.elapsed() >= Duration::from_millis(55), "{:?}", began.elapsed());
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// The invariant ([`Driver::waker`]): a wake sent after the polling thread has parked in
+    /// `kevent` ends the poll, first with nothing in flight (the poll parks for the wake rather
+    /// than returning at once and spinning its caller), then with a timer far past the deadline
+    /// in flight; each through the trigger (`EVFILT_USER`, registered in [`Kqueue::new`]),
+    /// counted, not through the `asked` look before the wait. The Linux driver's test of the
+    /// same name holds io_uring to the same rule.
+    ///
+    /// Its control is the driver before the rule: with nothing in flight the first poll
+    /// returned at once, before the wake was sent, and the bound on `waited` fails.
+    #[test]
+    fn a_wake_ends_a_wait_parked_in_the_kernel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const BOUND: Duration = Duration::from_secs(20);
+        /// How long the waking thread lets the polling thread get into `kevent`.
+        const SETTLE: Duration = Duration::from_millis(100);
+        let root = dir("wake-parked");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        let waker = driver.waker().expect("the kqueue driver has a waker");
+        for timer_in_flight in [false, true] {
+            if timer_in_flight {
+                driver.submit(&mut vec![Effect::Timer { after: BOUND * 2, tag: Tag(1) }]);
+            }
+            assert_eq!(driver.in_flight(), usize::from(timer_in_flight));
+            let polling = Arc::new(AtomicBool::new(false));
+            // clone: the flag and the waker, for the waking thread.
+            let (seen, other) = (Arc::clone(&polling), waker.clone());
+            let waking = std::thread::spawn(move || {
+                blaze_spin::SpinWait::within("the poll to begin", BOUND, || seen.load(Ordering::SeqCst));
+                std::thread::sleep(SETTLE);
+                other.wake();
+            });
+            let triggers = driver.notify.triggers.load(Ordering::Relaxed);
+            let mut out = Vec::new();
+            let until = Deadline::after(driver.now(), BOUND);
+            polling.store(true, Ordering::SeqCst);
+            let began = Instant::now();
+            driver.poll(&mut out, until);
+            let waited = began.elapsed();
+            waking.join().unwrap();
+            assert!(out.is_empty(), "a wake completes nothing: {out:?}");
+            assert!(
+                waited >= SETTLE && waited < BOUND / 2,
+                "with a timer in flight: {timer_in_flight}, the poll waited {waited:?}"
+            );
+            assert_eq!(
+                driver.notify.triggers.load(Ordering::Relaxed),
+                triggers + 1,
+                "the wake ended the wait through one trigger"
+            );
         }
     }
 
@@ -1622,12 +1818,20 @@ mod tests {
     }
 
     /// Listens, connects, sends each way, hangs up each end and stops listening.
+    /// A TCP `at` of port 0 is listened on at a port the system picks, read back from the
+    /// listener, and connected to there.
     fn round_trip(root: &Path, at: Address) {
         let mut driver = Kqueue::new(root, 1).unwrap();
-        let mut effects = vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
-        ];
+        // The listen is made as it is submitted.
+        driver.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+        let at = match at {
+            Address::Tcp(_) => {
+                let bound = driver.listens.iter().find_map(|(_, it)| it.listener.local_addr());
+                Address::Tcp(bound.expect("the TCP listen is made and bound"))
+            }
+            other => other,
+        };
+        let mut effects = vec![Effect::Connect { at, tag: Tag(2) }];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, effects| match (done.tag.0, done.done) {
@@ -1690,11 +1894,10 @@ mod tests {
 
     #[test]
     fn a_tcp_round_trip() {
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let at = free.local_addr().unwrap();
-        drop(free);
+        // Port 0, so the listen holds the port it is given: a port found free, let go of and
+        // listened on later races whoever binds it between.
         let root = dir("tcp");
-        round_trip(&root, Address::Tcp(at));
+        round_trip(&root, Address::Tcp("127.0.0.1:0".parse().unwrap()));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1727,11 +1930,12 @@ mod tests {
     /// this macOS and taken, or this fails naming it. Then its watch ends as asked.
     #[test]
     fn the_memory_pressure_filter_is_there() {
-        let mut driver = Kqueue::new(dir("pressure"), 1).unwrap();
+        let root = dir("pressure");
+        let mut driver = Kqueue::new(root.path(), 1).unwrap();
         driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
         let mut out = Vec::new();
         // The registration is made with this wait; a refusal comes back as its event.
-        driver.poll(&mut out, Duration::from_millis(20));
+        driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(20)));
         assert!(
             out.iter().all(|it| matches!(it.done, Done::Pressed { .. })),
             "the kernel refused a knote of EVFILT_MEMORYSTATUS (-14), the filter of \
@@ -1747,7 +1951,8 @@ mod tests {
 
     #[test]
     fn timers_fire_in_their_order() {
-        let mut driver = Kqueue::new(dir("timers"), 1).unwrap();
+        let root = dir("timers");
+        let mut driver = Kqueue::new(root.path(), 1).unwrap();
         let mut effects: Vec<Effect> = (0..3)
             .map(|n| Effect::Timer { after: Duration::from_millis(10 * (3 - n)), tag: Tag(n) })
             .collect();
@@ -1762,7 +1967,8 @@ mod tests {
 
     #[test]
     fn a_wait_ends_at_its_time() {
-        let mut driver = Kqueue::new(dir("wait"), 1).unwrap();
+        let root = dir("wait");
+        let mut driver = Kqueue::new(root.path(), 1).unwrap();
         driver.submit(&mut vec![Effect::Timer { after: Duration::from_secs(60), tag: Tag(1) }]);
         let began = Instant::now();
         let mut out = Vec::new();
@@ -1789,8 +1995,8 @@ mod tests {
         let seen = run(
             &mut driver,
             vec![
-                Effect::Map { file, tag: Tag(2) },
-                Effect::Map { file: name("missing"), tag: Tag(3) },
+                Effect::Map { file, extent: crate::Extent::Whole, tag: Tag(2) },
+                Effect::Map { file: name("missing"), extent: crate::Extent::Whole, tag: Tag(3) },
             ],
         );
         match &seen[&2] {
@@ -2459,7 +2665,8 @@ mod tests {
 
     #[test]
     fn a_warm_timer_arm_and_fire_allocates_nothing() {
-        let mut driver = Kqueue::new(dir("budget-timers"), 1).unwrap();
+        let root = dir("budget-timers");
+        let mut driver = Kqueue::new(root.path(), 1).unwrap();
         let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
         for round in 0..1000u64 {
             let ((), used) = blaze_alloc_count::measure(|| {
@@ -2646,5 +2853,18 @@ mod tests {
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The invariant: a sync and a barrier of a file sealed read-only succeed through this
+    /// driver and the threads driver, and of a missing file make it
+    /// ([`crate::fs::assert_syncs_a_sealed_file`], with its control).
+    #[test]
+    fn a_sync_of_a_sealed_file_succeeds_on_each_driver() {
+        let root = dir("sync-sealed");
+        crate::fs::assert_syncs_a_sealed_file(&mut Kqueue::new(&root, 1).unwrap(), &root);
+        let threads = dir("sync-sealed-threads");
+        crate::fs::assert_syncs_a_sealed_file(&mut Threads::new(&threads, 2), &threads);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(threads).unwrap();
     }
 }

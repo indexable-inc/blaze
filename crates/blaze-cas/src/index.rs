@@ -18,7 +18,7 @@ use crate::{
 const INDEX_MAGIC: [u8; 8] = *b"BLZINDX\x03";
 pub(crate) const INDEX_HEADER: usize = 64;
 /// The bytes of one slot's row: the key, then its place.
-const ROW: usize = 64;
+pub(crate) const ROW: usize = 64;
 /// Slots matched at once.
 const GROUP: usize = 16;
 /// The control byte of an empty slot; a full one holds its key's tag, below this.
@@ -163,7 +163,7 @@ impl<'a> Table<'a> {
         if bytes.len() < INDEX_HEADER || bytes[..8] != INDEX_MAGIC {
             return Err("it does not start as an index of this store's format does");
         }
-        if u32_at(bytes, 8) != crate::FORMAT {
+        if !(crate::FORMAT_READ..=crate::FORMAT).contains(&u32_at(bytes, 8)) {
             return Err("it is of another format of the store");
         }
         if bytes[12..16].iter().chain(&bytes[32..INDEX_HEADER]).any(|&byte| byte != 0) {

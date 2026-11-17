@@ -240,6 +240,10 @@ where
             _ => {}
         }
 
+        if let Some(widened) = self.coerce_to_error_union(a, b) {
+            return widened;
+        }
+
         match a.kind() {
             // Function items are coercible to any closure type; function pointers are not
             // (that would require double indirection). Additionally, we permit coercion of

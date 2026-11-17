@@ -157,8 +157,7 @@ fn invalid(message: String) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
-    use hegel::{PrintableGenerator, TestCase};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -359,37 +358,42 @@ mod tests {
         assert_eq!(environment(&[("é", "1"), ("É", "2")]).unwrap(), "É=2\0\0");
     }
 
+    /// UTF-16 units from `alphabet`'s, `len.start` to `len.end - 1` of them.
     fn units(
+        tape: &Tape,
         alphabet: &'static str,
         len: std::ops::Range<usize>,
-    ) -> impl PrintableGenerator<Vec<u16>> {
-        gs::vecs(gs::sampled_from(alphabet.encode_utf16().collect::<Vec<_>>()))
-            .min_size(len.start)
-            .max_size(len.end - 1)
+        label: &'static str,
+    ) -> Vec<u16> {
+        let alphabet: Vec<u16> = alphabet.encode_utf16().collect();
+        tape.vec(len.start..=len.end - 1, label, |tape| *tape.one_of(&alphabet, label))
     }
 
-    #[hegel::test]
-    fn the_runtime_reads_back_the_arguments_as_the_reference_does(tc: TestCase) {
-        let args = tc.draw(gs::vecs(units("a \t\"\\\né", 0..8)).max_size(4));
-        let program = wide(r"C:\p q\a.exe");
-        let ours = wide_command_line(&program, &args).unwrap();
-        assert_eq!(&split(&ours[..ours.len() - 1]), &args);
-        assert_eq!(&split(&reference_line(&program, &args)), &args);
+    #[test]
+    fn the_runtime_reads_back_the_arguments_as_the_reference_does() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let args = tape.vec(0..=4, "args", |tape| units(tape, "a \t\"\\\né", 0..8, "arg"));
+            let program = wide(r"C:\p q\a.exe");
+            let ours = wide_command_line(&program, &args).unwrap();
+            assert_eq!(&split(&ours[..ours.len() - 1]), &args);
+            assert_eq!(&split(&reference_line(&program, &args)), &args);
+        })
     }
 
-    #[hegel::test]
-    fn ascii_names_make_the_reference_block(tc: TestCase) {
-        let env = tc.draw(
-            gs::vecs(gs::tuples!(gs::booleans(), units("aAbB_", 1..3), units("a=\\", 0..3)))
-                .max_size(5),
-        );
-        let env: Vec<(Vec<u16>, Vec<u16>)> = env
-            .into_iter()
-            .map(|(drive, name, value)| {
-                let name = if drive { [vec![EQUALS], name].concat() } else { name };
-                (name, value)
-            })
-            .collect();
-        assert_eq!(wide_environment(env.clone()).unwrap(), reference_environment(&env));
+    #[test]
+    fn ascii_names_make_the_reference_block() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let env = tape.vec(0..=5, "env", |tape| {
+                (tape.bool("drive"), units(tape, "aAbB_", 1..3, "name"), units(tape, "a=\\", 0..3, "value"))
+            });
+            let env: Vec<(Vec<u16>, Vec<u16>)> = env
+                .into_iter()
+                .map(|(drive, name, value)| {
+                    let name = if drive { [vec![EQUALS], name].concat() } else { name };
+                    (name, value)
+                })
+                .collect();
+            assert_eq!(wide_environment(env.clone()).unwrap(), reference_environment(&env));
+        })
     }
 }

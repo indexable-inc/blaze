@@ -1,0 +1,11 @@
+{
+ "id": "disk-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "the task's premise: the profile's size",
+ "what": "The brief said the profile directory's 551 MB was spans, waits, samples and per-flush files. 516 MiB of it was one file, `flight-<pid>.map`, the flight recorder's mapping with all 256 rings' stores reserved up front; the Parquet history was 17 MB and `why.ledger` 17 MB. `du` of `profile/` says one number for three different things.",
+ "cost": "the first plan (aggregate waits) aimed at 3% of the bytes",
+ "cause": "nothing reports the history's directory by what is in it (the mapping, the ledger, each table)",
+ "workaround": "listed the directory by table with a one-line awk",
+ "state": "fixed for the mapping in 31664bef18 (reserved as handed out); a `blaze debug disk` that says each part is open"
+}

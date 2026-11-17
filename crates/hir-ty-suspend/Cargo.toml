@@ -16,7 +16,7 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 blaze-mem.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 
 either.workspace = true
 smallvec.workspace = true

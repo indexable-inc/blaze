@@ -202,6 +202,7 @@ mod tests {
         let topics = crate::profiles::SYSTEM_NOTE_PARTS.len();
         assert_eq!(ids[0], "system_prompt");
         assert!(ids[1..=topics].iter().all(|i| i.starts_with("note.")));
+        assert!(p.iter().any(|p| p.id == "note.goals" && p.tokens > 0), "the always-on objective policy is visible in launch context accounting");
         assert_eq!(&ids[topics + 1..], ["mcp_tools", "messages", "messages.user", "messages.assistant"]);
         assert_eq!(p.iter().find(|p| p.id == "messages").map(|p| p.tokens), Some(22));
         assert!(p.iter().filter(|p| !p.id.starts_with("note.")).all(|p| p.estimate.is_empty()));

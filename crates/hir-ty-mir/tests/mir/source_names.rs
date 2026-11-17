@@ -3,9 +3,11 @@
 
 use hir_expand::fixture;
 use hir_ty::{db::HirDatabase, next_solver::GenericArgs};
-use hir_ty_mir::mir::location::name_sources;
 
-use crate::{constant, db::TestDB};
+use crate::{
+    constant,
+    db::{TestDB, name_sources},
+};
 
 const PROGRAM: &str = r#"
 #[rustc_builtin_macro]
@@ -17,7 +19,7 @@ const GOAL: &str = file!();
 /// `GOAL`'s value: an address and a length, the bytes behind them in the memory map.
 #[track_caller]
 fn goal(db: &TestDB) -> String {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let value = db
             .const_eval(constant(db, "GOAL"), GenericArgs::empty(), None)
             .unwrap_or_else(|error| panic!("evaluating `GOAL`: {error:?}"));
@@ -36,7 +38,7 @@ fn file_follows_the_names_the_build_gives() {
     let _ = fx.only_file();
     let mut db = fx.into_db();
     // Before the build names files, the evaluator refuses: no placeholder for a path.
-    let unnamed = blaze_query::db::attach(&db, || {
+    let unnamed = blaze_memo::attach(&db, || {
         db.const_eval(constant(&db, "GOAL"), GenericArgs::empty(), None)
             .map(|_| ())
             .map_err(|error| format!("{error:?}"))
@@ -79,10 +81,12 @@ fn file_is_named_as_the_crate_of_its_code_names_it() {
     let fx = fixture::db(PROGRAM);
     let _ = fx.only_file();
     let mut db = fx.into_db();
-    let ours = fixture::test_crate(&db);
-    name_sources(&mut db, "build", move |_, krate, _| {
+    // By key: the naming's commit makes the crates again, and the rule is asked in the
+    // snapshots after it.
+    let ours = fixture::test_crate(&db).key(&db);
+    name_sources(&mut db, "build", move |db, krate, _| {
         Some(
-            if krate == ours { "r/../library/rt/src/lib.rs" } else { "another crate's name" }
+            if krate.key(db) == ours { "r/../library/rt/src/lib.rs" } else { "another crate's name" }
                 .to_owned(),
         )
     });

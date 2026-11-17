@@ -22,7 +22,6 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
-blaze-query.workspace = true
 blaze-resolve.workspace = true
 blaze-units.workspace = true
 

@@ -1,0 +1,11 @@
+{
+ "id": "edit4-10",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze-codegen: the refinement of a patched walk, a second case",
+ "what": "After edit4-7's fix `a_walk_over_kept_describes_builds_what_a_fresh_walk_builds` failed in 1 run of 30 with another case (four functions, the third and fourth of one code, a static the second names; `Edit::Body` of `main`, which gives `main` the body byte the second function has): `build 1: functions differs`, and it is the fresh build's `main` that is odd: its relocation rows are the second function's (`0, 0, 1, 2`) over its own targets, where the build over kept describes has `0, 1, 1, 2`, which is what `main` calls.",
+ "cost": "the test is not stable yet; half an hour to read the two sides",
+ "cause": "my reading, not verified: two functions with the same body byte and as many references get one compiled template in the test's model, whose rows say which places share a target, and which of the two made it differs between the fresh build and the patched one. If so it is the model's key (rule keys-cover-every-input), not the driver",
+ "workaround": "none",
+ "state": "open: pin the case (draws 4, 0, 0, 0, 0, 0, 3, 1, 2, false x5, one edit 0, 0, 0) and decide whether the template key or the driver is wrong"
+}

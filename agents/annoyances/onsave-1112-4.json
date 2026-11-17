@@ -1,0 +1,17 @@
+{
+ "id": "onsave-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onsave-1112",
+ "where": "the thin client's route (crates/blaze-thin/src/route.rs, `refuses`): a daemon's setting on a command",
+ "what": "`BLAZE_AHEAD=1` is read by the daemon alone, as it starts. Set on a command, it (as any `BLAZE_*` variable but `BLAZE_HOME`) makes the thin client hand the whole command to `blaze-engine`, 6 to 8 ms a request (lane launch's measure, relayed by the main agent). My first measuring script and my revision case set it on every command.",
+ "cost": "a timing series 6 to 8 ms slow a row had it not been told to me; the script now sets it on the command that starts the daemon alone (harness/v2/onsave.py)",
+ "cause": "`refuses` takes every `BLAZE_` name for one the engine must read, since the thin client cannot know which are the daemon's",
+ "whys": [
+  "the thin client keeps no list of the variables the client's path reads",
+  "a new variable must not be silently ignored by the thin path, so the default is the slow path"
+ ],
+ "class": "a setting with a side effect on a path it does not name",
+ "prevention": "not built (blaze-thin is not this lane's): one table of blaze's variables with who reads each (the client, the engine, the daemon at its start), which `refuses` reads; a daemon's variable on a command then changes no route, and a name the table lacks is refused by name",
+ "workaround": "set a daemon's variable only on the command that starts the daemon",
+ "state": "open, for the lane that owns blaze-thin"
+}

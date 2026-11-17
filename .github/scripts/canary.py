@@ -21,11 +21,6 @@
         `BLAZE_RELEASE` (crates/blaze-engine/build.rs), never by a version written into the tree.
         With an empty `tag` (release.yaml by hand on a branch, which releases nothing) the
         version is the tree's, `0.0.0-dev`, and the notes say so.
-    canary.py stamp '{"tag": "v0.YYYYMMDD.N"}'
-        The tag's version written into Cargo.toml and the workspace's own entries of Cargo.lock,
-        in this checkout only, for what needs a manifest's version to be the release's
-        (publishing to crates.io). Never committed: main's workspace version stays `0.0.0`, so a
-        release changes no crate's identity and no build of main misses blaze's store.
 
 No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
 that main's gate built, as it is. train_release.py's numbering counts every tag, as `cut`'s does,
@@ -45,9 +40,9 @@ ROOT = Path(__file__).resolve().parents[2]
 REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
 DATED = re.compile(r"v0\.(\d{8})\.(0|[1-9]\d*)")
 # A change to nothing but these makes no canary: blaze is the same program.
-DOCS = re.compile(r"^(docs/|site/|tools/agents/|tools/bench/results/)|\.md$")
+DOCS = re.compile(r"^(docs/|site/|tools/agents/)|\.md$")
 # The workspace's version in Cargo.toml: `0.0.0` on main, the tree's (a build of it says
-# `0.0.0-dev`); `stamp` writes a release's into a checkout.
+# `0.0.0-dev`). No release's version is ever written into a manifest.
 TREE_VERSION = "0.0.0"
 WORKSPACE_VERSION = re.compile(r'(\[workspace\.package\]\nversion = ")([^"]+)"')
 # How many of main's newest commits `cut` looks through for a built one.
@@ -80,11 +75,6 @@ class Cut:
 class Notes:
     tag: str
     notes: str
-
-
-@dataclass(frozen=True)
-class Stamp:
-    tag: str
 
 
 def typed(cls, text):
@@ -291,32 +281,6 @@ def added(now, then):
     return "\n".join(out).strip()
 
 
-def inheriting():
-    """The names of the workspace's crates whose version is the workspace's
-    (`version.workspace = true`): the ones `stamp` moves. A path crate with its own version
-    (`0.0.0` for most of the front end's) keeps it."""
-    import tomllib
-    names = set()
-    for manifest in ROOT.glob("crates/*/Cargo.toml"):
-        package = tomllib.loads(manifest.read_text()).get("package", {})
-        if package.get("version") == {"workspace": True}:
-            names.add(package["name"])
-    if not names:
-        sys.exit("canary.py: no crate under crates/ has `version.workspace = true`")
-    return names
-
-
-def lock_stamped(text, old, new, names):
-    """Cargo.lock with the workspace's own packages (no `source`) named in `names` at `old`
-    moved to `new`."""
-    blocks = text.split("\n[[package]]\n")
-    for i, block in enumerate(blocks[1:], 1):
-        name = re.search(r'^name = "([^"]+)"$', block, re.M)
-        if not re.search(r"^source = ", block, re.M) and name and name[1] in names:
-            blocks[i] = re.sub(rf'^version = "{re.escape(old)}"$', f'version = "{new}"', block, count=1, flags=re.M)
-    return "\n[[package]]\n".join(blocks)
-
-
 def tree_version():
     """Cargo.toml's workspace version, which must be the tree's `0.0.0`."""
     found = WORKSPACE_VERSION.search((ROOT / "Cargo.toml").read_text())
@@ -355,20 +319,7 @@ def notes(args):
     output("version", args.tag[1:])
 
 
-def stamp(args):
-    if not DATED.fullmatch(args.tag):
-        sys.exit(f"canary.py: field tag is a dated release v0.YYYYMMDD.N, not {args.tag!r}")
-    new = args.tag[1:]
-    found = tree_version()
-    manifest = ROOT / "Cargo.toml"
-    text = manifest.read_text()
-    manifest.write_text(text[:found.start(2)] + new + text[found.end(2):])
-    lock = ROOT / "Cargo.lock"
-    lock.write_text(lock_stamped(lock.read_text(), TREE_VERSION, new, inheriting()))
-    print(f"stamped {new} over {TREE_VERSION} in this checkout's Cargo.toml and Cargo.lock", flush=True)
-
-
-COMMANDS = {"cut": (Cut, cut), "notes": (Notes, notes), "stamp": (Stamp, stamp)}
+COMMANDS = {"cut": (Cut, cut), "notes": (Notes, notes)}
 
 
 def main():

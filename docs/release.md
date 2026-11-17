@@ -33,8 +33,7 @@ before any command runs. It says
                                                 (it runs itself in any checkout of blaze's tree, or with --ignore-pin)
 
 The version is the second field (`.github/actions/blaze` reads it). The binary does not know its
-channel: a canary is made stable unchanged. Where a manifest's version must be the release's
-(publishing to crates.io), `canary.py stamp` writes it into that job's checkout only.
+channel: a canary is made stable unchanged.
 
 A version is one release on one tag, for good: **promotion flips that same release** from
 prerelease to stable and makes it GitHub's *Latest*. No second tag is made and no asset is
@@ -217,8 +216,7 @@ published archives, installed with `install.sh --version <v>` as a user installs
 (Apple silicon) and Linux (x86-64 and ARM64):
 
 - the install checks: `blaze --version` is the release's, `blaze new` + `blaze run` prints
-  `Hello, world!` (v2's blaze has no `new` command, so a v2 release fails this check until it
-  has one or the check makes the package itself);
+  `Hello, world!`;
 - the whole smoke corpus (below), dev and `--release`, `blaze run` and `blaze test`;
 - each application of the corpus (below), in two jobs of its own per platform: **works** (its
   dev and release builds run, its tests pass under `blaze test`) and **speed** (`harness/bench.py`

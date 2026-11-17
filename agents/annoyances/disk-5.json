@@ -1,0 +1,11 @@
+{
+ "id": "disk-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "measuring disk on APFS",
+ "what": "`du` counts a clone's blocks once a file: the store's `placed/*.derived` files read as 450 MB and hold 9.6 MB of their own, so a home's `du` total can be several times what it holds, and the script every lane was given (`/tmp/blaze-fresh.sh`) reports `du`.",
+ "cost": "one wrong conclusion nearly drawn (that the store had tripled)",
+ "cause": "`du` has no notion of shared extents",
+ "workaround": "wrote a script that asks `ATTR_CMNEXT_PRIVATESIZE` per file (`/private/tmp/blaze-disk-scripts/private.py`, gone with the lane)",
+ "state": "open: the measuring script should say private bytes beside `du`'s"
+}

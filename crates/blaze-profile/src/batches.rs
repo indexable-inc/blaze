@@ -182,15 +182,33 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
     RecordBatch::try_new(schema_of(&schema::SPANS), columns)
 }
 
+/// A text column of `texts`, its bytes allocated once at their exact size. Until 2026-11-12
+/// the column was collected with no size given, so its bytes grew by doubling: on a cold build
+/// of tempo the largest site of the `profile` tag's heap churn, 22.25 GiB of 135.31 in blocks
+/// of 6.3 MB on average (`alloc_samples`, site `GenericByteBuilder::append_value::<&str>`,
+/// under `in_row_batches::<SpanRow, ..>`; int-1112 d45e70ddc).
+fn texts_column(texts: &[Option<std::sync::Arc<str>>]) -> ArrayRef {
+    let bytes: usize = texts.iter().map(|it| it.as_deref().map_or(0, str::len)).sum();
+    // alloc: a batch's column, once a read, at its size
+    let mut column_of = arrow_array::builder::StringBuilder::with_capacity(texts.len(), bytes);
+    for text in texts {
+        match text {
+            Some(text) => column_of.append_value(&**text),
+            None => column_of.append_null(),
+        }
+    }
+    column(column_of.finish())
+}
+
 /// The column of `spans` a span kind's field fills ([`span::CELLS`]), as its schema types it.
 fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, ArrowError> {
     let words = spans.iter().map(|it| it.said().get(cells.at));
     Ok(match cells.column.ty {
         schema::Type::U64 => column(UInt64Array::from_iter(words.map(cells.number))),
         schema::Type::Utf8 => {
-            // alloc: a batch's column, once a read
+            // alloc: a batch's texts, once a read
             let texts: Vec<Option<std::sync::Arc<str>>> = words.map(cells.text).collect();
-            column(StringArray::from_iter(texts.iter().map(|it| it.as_deref())))
+            texts_column(&texts)
         }
         schema::Type::Dict => {
             let mut values = Dict::new();
@@ -353,12 +371,37 @@ pub(crate) fn alloc_samples(
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<RecordBatch, ArrowError> {
+    heap_samples(&schema::ALLOC_SAMPLES, None, samples, frames, at, process)
+}
+
+/// The `held_samples` rows of one reading, at `read_ns`, of the samples still held
+/// ([`crate::heap::held`]): [`alloc_samples`]' columns of each, then the reading's time.
+pub(crate) fn held_samples(
+    samples: &[crate::heap::HeapSample],
+    frames: &HashMap<u64, Vec<String>, Global>,
+    at: (Instant, i64),
+    read_ns: i64,
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
+    heap_samples(&schema::HELD_SAMPLES, Some(read_ns), samples, frames, at, process)
+}
+
+/// The rows of `table`, `alloc_samples` or `held_samples`, which has `read_ns` as its last
+/// column: one column list for both, so the two tables' shared columns cannot differ.
+fn heap_samples(
+    table: &'static schema::Table,
+    read_ns: Option<i64>,
+    samples: &[crate::heap::HeapSample],
+    frames: &HashMap<u64, Vec<String>, Global>,
+    at: (Instant, i64),
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
     let rows = samples.len();
-    let schema = schema_of(&schema::ALLOC_SAMPLES);
+    let schema = schema_of(table);
     let list_field = |name: &str| {
-        let at = schema::ALLOC_SAMPLES
+        let at = table
             .column(name)
-            .unwrap_or_else(|| unreachable!("alloc_samples has {name}"));
+            .unwrap_or_else(|| unreachable!("{} has {name}", table.name));
         let DataType::List(item) = schema.field(at).data_type() else {
             unreachable!("{name} is a list (arrow.rs)")
         };
@@ -390,7 +433,7 @@ pub(crate) fn alloc_samples(
     let tags: DictionaryArray<UInt32Type> =
         samples.iter().map(|it| it.tag.map(blaze_mem::Tag::name)).collect();
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(samples.iter().map(|it| build_id(it.build)))),
         column(UInt32Array::from_value(process.pid, rows)),
         column(UInt32Array::from_iter_values(samples.iter().map(|it| it.tid as u32))),
@@ -407,6 +450,9 @@ pub(crate) fn alloc_samples(
                 .map(|it| crate::heap::site_of(&it.pcs[..usize::from(it.depth)], frames)),
         )),
     ];
+    if let Some(read_ns) = read_ns {
+        columns.push(column(Int64Array::from_value(read_ns, rows))); // alloc: one column more
+    }
     RecordBatch::try_new(schema, columns)
 }
 
@@ -581,7 +627,7 @@ pub fn event_fields(fields: &[FieldRow], process: Process<'_>) -> Result<RecordB
             FieldValue::Bool(it) => Some(it),
             _ => None,
         }))),
-        column(StringArray::from_iter(texts.iter().map(|it| it.as_deref()))),
+        texts_column(&texts),
     ];
     RecordBatch::try_new(schema_of(&schema::EVENT_FIELDS), columns)
 }
@@ -789,13 +835,17 @@ mod tests {
             let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
+            // Read back as one batch however many rows it is: the window holds every row the
+            // process's rings do, the tests' beside this one included, and the reader's own
+            // batch is 1024 rows.
             let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
                 .unwrap()
+                .with_batch_size(batch.num_rows().max(1))
                 .build()
                 .unwrap();
             let mut batches = reader.map(Result::unwrap);
             let back = batches.next().unwrap();
-            assert!(batches.next().is_none(), "a test's rows are one batch");
+            assert!(batches.next().is_none(), "the rows written are read back as one batch");
             assert_eq!(back.num_rows(), batch.num_rows());
             back
         };

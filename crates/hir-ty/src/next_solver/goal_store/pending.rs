@@ -165,6 +165,16 @@ impl Entry<'_> {
     pub(super) fn values(&self) -> impl Iterator<Item = ContentId> + '_ {
         self.values.chunks_exact(32).map(|value| ContentId(value.try_into().expect("32 bytes")))
     }
+
+    /// The order a flush writes entries in: by goal key, then by shape and fact values, so
+    /// the entries of one key are together and their order is of their bytes alone.
+    pub(super) fn cmp_bytes(&self, other: &Entry<'_>) -> std::cmp::Ordering {
+        (self.goal_key.0, self.shape, self.values).cmp(&(
+            other.goal_key.0,
+            other.shape,
+            other.values,
+        ))
+    }
 }
 
 /// The entries [`Pending::push`] wrote into `bytes`.

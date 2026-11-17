@@ -1,0 +1,11 @@
+{
+ "id": "newproj-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+ "where": "an ix VM used for timing",
+ "what": "The same binary's cold hello-world build took 17 to 48 s and the same first build of a new project 13 to 34 s across an hour on one VM (`khugepaged` at 9% of a core, the guest's memory growing from 3 to 47 GiB as it was used, `the flight recorder lost rows`): medians of five moved by a factor of two between two runs of the same script.",
+ "cost": "two measuring runs thrown away; every claim made from an interleaved run and a matched pair instead of medians",
+ "cause": "unknown: the VM was made without `--memory-commit` or a CPU class, as the brief's command said",
+ "workaround": "interleave the binaries round by round (abab.py) and read CPU time and counts beside wall time",
+ "state": "open: a lane that measures should get `--memory-commit` and `--cpu` in its brief's `ix new`"
+}

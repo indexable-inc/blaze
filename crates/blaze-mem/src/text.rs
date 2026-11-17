@@ -209,7 +209,30 @@ pub fn format<A: Allocator>(alloc: A, args: fmt::Arguments<'_>) -> String<A> {
 #[macro_export]
 macro_rules! format_in {
     ($alloc:expr, $($arg:tt)*) => {
-        $crate::text::format($alloc, ::std::format_args!($($arg)*))
+        $crate::text::format($alloc, ::core::format_args!($($arg)*))
+    };
+}
+
+/// What [`format_into!`] calls: `args` appended to `out`, the caller's buffer, which keeps its
+/// allocator and its capacity across calls. Panics as `format!` does when a formatting trait
+/// implementation returns an error into a buffer that cannot fail.
+pub fn format_into<W: fmt::Write + ?Sized>(out: &mut W, args: fmt::Arguments<'_>) {
+    if out.write_fmt(args).is_err() {
+        panic!(
+            "blaze_mem::format_into!: a formatting trait implementation returned an error when writing to the caller's buffer"
+        );
+    }
+}
+
+/// `format!` appended to the caller's buffer, in place of a new string: `format_into!(&mut
+/// buf, "{name}-{n}")` writes into `buf` (a [`String<A>`](crate::String) or any
+/// `fmt::Write`), so a loop that formats reuses one buffer and allocates only when it grows.
+/// The first choice of the `implicit_allocator` lint's help where a `format!` or `to_string`
+/// is the finding: no new allocation at all.
+#[macro_export]
+macro_rules! format_into {
+    ($out:expr, $($arg:tt)*) => {
+        $crate::text::format_into($out, ::core::format_args!($($arg)*))
     };
 }
 
@@ -412,5 +435,26 @@ impl<'a, A: Allocator> Extend<&'a char> for String<A> {
 impl<'a, A: Allocator> Extend<&'a str> for String<A> {
     fn extend<I: IntoIterator<Item = &'a str>>(&mut self, iter: I) {
         iter.into_iter().for_each(|text| self.push_str(text));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::Global;
+
+    use super::String;
+
+    /// The invariant: `format_into!` appends to the caller's buffer and allocates nothing
+    /// while what it writes fits the capacity the buffer has.
+    #[test]
+    fn format_into_appends_to_the_callers_buffer_without_growing_it() {
+        let mut buf = String::with_capacity_in(64, Global);
+        let capacity = buf.capacity();
+        for n in 0..3 {
+            format_into!(&mut buf, "{n}-");
+        }
+        format_into!(&mut buf, "end");
+        assert_eq!(&*buf, "0-1-2-end");
+        assert_eq!(buf.capacity(), capacity, "it wrote into the buffer it was given");
     }
 }

@@ -1,3 +1,4 @@
+mod assertion_helpers;
 mod builtin_derives;
 mod check_cache;
 mod closure_captures;
@@ -25,6 +26,7 @@ mod simple;
 mod trait_aliases;
 mod traits;
 mod variance;
+mod where_const;
 
 use base_db::{Crate, EditionedFileId};
 use blaze_hash::HashMap;
@@ -202,7 +204,7 @@ fn check_impl(
     let files = fx.files().to_vec();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut had_annotations = false;
         let mut mismatches = HashMap::new_in(Global);
         let mut types = HashMap::new_in(Global);
@@ -225,13 +227,13 @@ fn check_impl(
             }
         }
         assert!(had_annotations || allow_none, "no `//^` annotations found");
-
+    
         let defs = infer_defs(&db, &files);
         let mut unexpected_type_mismatches = String::new();
         for (def, store, source_map, _root_expr, _self_param, krate) in defs {
             let display_target = DisplayTarget::from_crate(&db, krate);
             let inference_result = InferenceResult::of(&db, def);
-
+    
             for (pat, ty) in inference_result.type_of_pat.iter() {
                 let mut ty = ty.as_ref();
                 if let Pat::Bind { id, .. } = store.pat(pat) {
@@ -251,7 +253,7 @@ fn check_impl(
                     assert_eq!(actual, expected, "type annotation differs at {:#?}", range.range);
                 }
             }
-
+    
             for (expr, ty) in inference_result.type_of_expr.iter() {
                 let ty = ty.as_ref();
                 let node = match expr_node(source_map, expr, &db) {
@@ -279,7 +281,7 @@ fn check_impl(
                     );
                 }
             }
-
+    
             let type_mismatches =
                 inference_result.diagnostics().iter().filter_map(|diag| match diag {
                     InferenceDiagnostic::TypeMismatch { node, expected, found, .. } => {
@@ -307,7 +309,7 @@ fn check_impl(
                     }
                 }
             }
-
+    
             for (type_ref, ty) in inference_result.placeholder_types() {
                 let node = match type_node(source_map, type_ref, &db) {
                     Some(value) => value,
@@ -315,7 +317,7 @@ fn check_impl(
                 };
                 let range = node.original_file_range_rooted_view(&db);
                 if let Some(expected) = types.remove(&range) {
-                    let actual = blaze_query::db::attach(&db, || {
+                    let actual = blaze_memo::attach(&db, || {
                         if display_source {
                             ty.display_source_code(&db, def.module(&db), true).unwrap()
                         } else {
@@ -326,7 +328,7 @@ fn check_impl(
                 }
             }
         }
-
+    
         let mut buf = String::new();
         if !unexpected_type_mismatches.is_empty() {
             format_to!(buf, "Unexpected type mismatches:\n{}", unexpected_type_mismatches);
@@ -390,9 +392,9 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut buf = String::new();
-
+    
         let mut infer_def = |inference_result: &InferenceResult<'_>,
                              store: &ExpressionStore,
                              source_map: &ExpressionStoreSourceMap,
@@ -411,7 +413,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                 })
                 .collect::<HashMap<_, _, Global>>();
             let mut mismatches: Vec<(InFile<SyntaxNode>, (Ty<'_>, Ty<'_>))> = Vec::new();
-
+    
             if let Some((binding_id, syntax_ptr)) = self_param {
                 let ty = &inference_result.type_of_binding[binding_id];
                 if let Some(syntax_ptr) = syntax_ptr {
@@ -420,7 +422,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     types.push((node, ty.as_ref()));
                 }
             }
-
+    
             for (pat, mut ty) in inference_result.type_of_pat.iter() {
                 if let Pat::Bind { id, .. } = store.pat(pat) {
                     ty = &inference_result.type_of_binding[id];
@@ -439,7 +441,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     mismatches.push((node, *mismatch));
                 }
             }
-
+    
             for (expr, ty) in inference_result.type_of_expr.iter() {
                 let node = match source_map.expr_syntax(expr) {
                     Ok(sp) => {
@@ -455,7 +457,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     mismatches.push((node, *mismatch));
                 }
             }
-
+    
             // sort ranges for consistency
             types.sort_by_key(|(node, _)| {
                 let range = node.value.text_range();
@@ -497,13 +499,13 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                 }
             }
         };
-
+    
         let defs = infer_defs(&db, &[file_id]);
         for (def, store, source_map, _root_expr, self_param, krate) in defs {
             let infer = InferenceResult::of(&db, def);
             infer_def(infer, store, source_map, self_param, krate);
         }
-
+    
         buf.truncate(buf.trim_end().len());
         buf
     })
@@ -649,9 +651,11 @@ fn query_cycle_bug() {
     );
     let pos = fx.position();
     let mut db = fx.into_db();
+    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
+    let file = pos.file_id.file_id(&db);
 
-    blaze_query::db::attach(&db, || {
-        let module = db.module_for_file(pos.file_id.file_id(&db));
+    blaze_memo::attach(&db, || {
+        let module = db.module_for_file(file);
         let crate_def_map = module.def_map(&db);
         visit_module(&db, crate_def_map, module, &mut |def| {
             let body_def: DefWithBodyId = match def {
@@ -690,10 +694,10 @@ fn query_cycle_bug() {
         }
     ";
 
-    db.set_file_text(pos.file_id.file_id(&db), new_text);
+    crate::test_db::write_file(&mut db, file, new_text);
 
-    blaze_query::db::attach(&db, || {
-        let module = db.module_for_file(pos.file_id.file_id(&db));
+    blaze_memo::attach(&db, || {
+        let module = db.module_for_file(file);
         let crate_def_map = module.def_map(&db);
         visit_module(&db, crate_def_map, module, &mut |def| {
             let body_def: DefWithBodyId = match def {

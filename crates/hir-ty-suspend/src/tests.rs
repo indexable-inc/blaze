@@ -126,10 +126,10 @@ impl Drop for Plain {
 /// `test` of what the check finds in crate `x` of the engine with `x` appended, with the
 /// database attached: a failed assertion prints interned types, which read it.
 #[track_caller]
-fn check(x: &str, test: impl FnOnce(&Db, &Found)) {
+fn check(x: &str, test: impl FnOnce(&Db, &Found<'_>)) {
     // alloc: a test's fixture text
     let db = &fixture::db(&format!("{ENGINE}{x}")).into_db();
-    blaze_query::db::attach(db, || test(db, suspend_check(db, crate_named(db, "x"))));
+    blaze_memo::attach(db, || test(db, suspend_check(db, crate_named(db, "x"))));
 }
 
 #[track_caller]
@@ -149,7 +149,7 @@ fn crate_named(db: &Db, name: &str) -> Crate {
 
 /// The one value `found` says is held across a suspend.
 #[track_caller]
-fn one_held(found: &Found) -> &Held {
+fn one_held<'a>(found: &'a Found<'a>) -> &'a Held<'a> {
     assert!(found.broken.is_empty(), "no broken promise: {:?}", found.broken);
     match &*found.held {
         [held] => held,
@@ -158,16 +158,16 @@ fn one_held(found: &Found) -> &Held {
 }
 
 #[track_caller]
-fn nothing(found: &Found) {
+fn nothing(found: &Found<'_>) {
     assert_eq!(found, &Found::default(), "nothing held across a suspend, no promise broken");
 }
 
-fn binding_name(db: &Db, held: &Held) -> String {
+fn binding_name(db: &Db, held: &Held<'_>) -> String {
     let binding = held.binding.expect("the value is a binding's");
     Body::of(db, held.call.owner)[binding].name.as_str().to_owned()
 }
 
-fn owner_name(db: &Db, held: &Held) -> String {
+fn owner_name(db: &Db, held: &Held<'_>) -> String {
     match held.call.owner {
         hir_def::DefWithBodyId::FunctionId(func) => {
             FunctionSignature::of(db, func).name.as_str().to_owned()
@@ -545,7 +545,7 @@ pub fn f() -> u32 {
     )
     .into_db();
     let db = &db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = crate_named(db, "x");
         assert_eq!(
             *roots(db, krate),
@@ -575,7 +575,7 @@ pub fn f() -> u32 {
     )
     .into_db();
     let db = &db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = crate_named(db, "x");
         let found = suspend_check(db, krate);
         let Some(Unchecked::MissingRoot(missing)) = found.unchecked else {
@@ -672,7 +672,7 @@ pub fn counted(db: &Db) -> u32 {
     )
     .into_db();
     let db = &db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = crate_named(db, "x");
         let roots = roots(db, krate);
         assert_eq!(roots.missing, None, "the root is found through the re-export");
@@ -755,5 +755,87 @@ pub fn calm() -> u32 {
                 "`calm` is not said to run on a fiber: {names:?}"
             );
         },
+    );
+}
+
+/// Crate `x` whose `root` calls one generic function, `leaf`, with `instances` different type
+/// arguments (`u8`, `(u8,)`, `((u8,),)`, ...): two bodies whatever `instances` is, and each
+/// instance of `leaf` checked in `x` (a generic body instantiated there).
+fn ladder(instances: usize) -> String {
+    let mut ty = String::from("u8");
+    let mut calls = String::new();
+    for _ in 0..instances {
+        calls.push_str(&format!("    n = leaf::<{ty}>(n);\n"));
+        ty = format!("({ty},)");
+    }
+    format!(
+        "\n//- /x.rs crate:x deps:engine\n\
+         fn leaf<T>(x: u32) -> u32 {{\n    x\n}}\n\n\
+         pub fn root(mut n: u32) -> u32 {{\n{calls}    n\n}}\n"
+    )
+}
+
+/// How many MIR bodies the memo holds, over every arena: the entries of every MIR body query
+/// of `hir_ty::providers` (each stage of a function's, closure's and coroutine's), what the
+/// old engine counted as its MIR-tagged values.
+fn mir_entries(memo: &blaze_memo::Memo) -> usize {
+    const STAGES: [&str; 6] = [
+        "mir_body",
+        "monomorphized_mir_body",
+        "runtime_mir_body",
+        "monomorphized_runtime_mir_body",
+        "optimized_mir_body",
+        "monomorphized_optimized_mir_body",
+    ];
+    const OWNERS: [&str; 4] = ["", "_for_closure", "_for_coroutine", "_for_coroutine_by_move"];
+    let mut name = String::new();
+    let mut count = 0;
+    for stage in STAGES {
+        for owner in OWNERS {
+            name.clear();
+            name.push_str("hir_ty::providers::");
+            name.push_str(stage);
+            name.push_str(owner);
+            name.push_str("_query");
+            count += memo.arenas().map(|arena| memo.entries(arena, &name)).sum::<usize>();
+        }
+    }
+    count
+}
+
+/// How many MIR bodies the memo holds ([`mir_entries`]) once crate `x` of [`ladder`] is
+/// checked: every instance summarized and the instances of `x` checked, each reading its body.
+fn held_after_the_check(instances: usize, keeps_bodies: bool) -> usize {
+    use blaze_memo::Database as _;
+    // alloc: a test's fixture text
+    let db = &fixture::db(&format!("{ENGINE}{}", ladder(instances))).into_db();
+    blaze_memo::attach(db, || {
+        let check = || _ = suspend_check(db, crate_named(db, "x"));
+        match keeps_bodies {
+            true => crate::summary::plant::keeping_bodies(check),
+            false => check(),
+        }
+    });
+    mir_entries(db.memo())
+}
+
+/// The invariant: the check keeps what it worked out of each instance's body (a summary, an
+/// instance's points), never the body: checking 8 instances of one generic and 64 leaves the
+/// same number of MIR values held.
+#[test]
+fn the_check_holds_no_body_an_instance() {
+    let (few, many) = (held_after_the_check(8, false), held_after_the_check(64, false));
+    assert_eq!(few, many, "MIR values held after checking 8 instances and 64");
+}
+
+/// The planted bug: each summary and instance check reads its body from the memo that keeps
+/// one an instance, as both did until 2026-11-13: 56 more instances hold at least 56 more
+/// bodies.
+#[test]
+fn the_oracle_catches_a_check_that_keeps_each_instances_body() {
+    let (few, many) = (held_after_the_check(8, true), held_after_the_check(64, true));
+    assert!(
+        many >= few + 56,
+        "the memoized check held {few} MIR values for 8 instances and {many} for 64"
     );
 }

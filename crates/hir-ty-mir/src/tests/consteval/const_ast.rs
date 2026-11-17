@@ -12,10 +12,11 @@ mod digest;
 const LIB: &str = include_str!("../../../../const-ast/src/lib.rs");
 const KINDS: &str = include_str!("../../../../const-ast/src/kinds.rs");
 const VIEWS: &str = include_str!("../../../../const-ast/src/views.rs");
+const BUILDER: &str = include_str!("../../../../const-ast/src/builder.rs");
 const DIGEST: &str = include_str!("const_ast_digest.rs");
 
 /// Every kind of node the views read.
-const EVERY_VIEW: &str = r#"
+pub(super) const EVERY_VIEW: &str = r#"
 #![allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -68,13 +69,18 @@ fn check(text: &str) {
         it.collect::<Vec<_>>().join(", ")
     }
     let fixture = format!(
-        "//- minicore: sized, copy, clone, derive, option, result, slice, index, coerce_unsized, str, iterator, panic
-//- /const_ast/lib.rs crate:const_ast
+        "//- minicore: sized, copy, clone, derive, option, result, slice, index, coerce_unsized, str, iterator, panic, transmute, size_of
+//- /const_ast_quote/lib.rs crate:proc-macro:const_ast_quote
+#[proc_macro]
+pub fn quote(_input: ()) {{}}
+//- /const_ast/lib.rs crate:const_ast deps:const_ast_quote cfg:blaze_const_eval
 {LIB}
 //- /const_ast/kinds.rs
 {KINDS}
 //- /const_ast/views.rs
 {VIEWS}
+//- /const_ast/builder.rs
+{BUILDER}
 //- /main.rs crate:main deps:const_ast
 mod digest {{
 {DIGEST}

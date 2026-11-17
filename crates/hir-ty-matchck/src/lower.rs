@@ -230,6 +230,10 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         self.cx.has_deref_pat.set(true);
                         Constructor::DerefPattern(*lowered.ty())
                     }
+                    PatAdjust::UnionMember => {
+                        lowered = self.union_member_pat(pat, ty, lowered)?;
+                        continue;
+                    }
                 };
                 // alloc: the fields `DeconstructedPat::new` takes.
                 lowered = Self::new_pat(ctor, vec![lowered.at_index(0)], 1, ty, pat);
@@ -278,16 +282,38 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 let fields = self.lower_tuple_fields(args, arity, ellipsis)?;
                 self.variant_pat(pat, ty, variant, fields, arity)?
             }
+            // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`): core's `Record`
+            // struct around the tuple of the record's fields, each field named at its place
+            // in the tuple and the rest wildcards.
+            HirPat::Record { args, .. }
+                if let Some(of) = hir_ty::record::record_fields(
+                    self.cx.infcx.interner.lang_items(),
+                    ty,
+                ) =>
+            {
+                let record = self.cx.infcx.interner.lang_items().Record.ok_or(LowerError::Failed)?;
+                let mut fields = Vec::with_capacity(args.len());
+                for field in args {
+                    let at = of.index_of(field.name.as_str()).ok_or(LowerError::Failed)?;
+                    fields.push(self.lower(field.pat)?.at_index(at));
+                }
+                let tuple = of.tuple(self.cx.infcx.interner);
+                let inner = Self::new_pat(Constructor::Struct, fields, of.len(), tuple, pat);
+                // alloc: the one field `DeconstructedPat::new` takes.
+                self.variant_pat(pat, ty, VariantId::StructId(record), vec![inner.at_index(0)], 1)?
+            }
             HirPat::Record { args, .. } => {
                 let variant =
                     self.infer.variant_resolution_for_pat(pat).ok_or(LowerError::Failed)?;
                 let variant_fields = variant.fields(db);
                 let arity = variant_fields.fields().len();
                 let mut fields = Vec::with_capacity(args.len());
+                // The body's contexts are of its crate's table.
+                let table = hir_ty::ctx_table(self.cx.krate);
                 for field in args {
                     let hygiene = self.body.record_field_hygiene(field.pat);
                     let fid = variant_fields
-                        .field_written(db, variant, &field.name, hygiene)
+                        .field_written(db, table, variant, &field.name, hygiene)
                         .ok_or(LowerError::Failed)?;
                     let idx = u32::from(fid.into_raw()) as usize;
                     fields.push(self.lower(field.pat)?.at_index(idx));
@@ -402,6 +428,41 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         Ok(fields)
     }
 
+    /// blaze: `member`, a pattern of one member of the error union `union`
+    /// (`PatAdjust::UnionMember`), as the pattern of the union it stands for: core's
+    /// `ErrorUnion` struct around the variant of its `Repr` enum that holds the member
+    /// (`hir_ty::error_union`). So a `match` on a union is checked as the match on that enum
+    /// it is: exhaustive when every member is covered, and a missing member is a witness.
+    fn union_member_pat(
+        &self,
+        pat: PatId,
+        union: Ty<'db>,
+        member: Pat<'a, 'db>,
+    ) -> Result<Pat<'a, 'db>, LowerError> {
+        let interner = self.cx.infcx.interner;
+        let members = hir_ty::error_union::members(interner, union).ok_or(LowerError::Failed)?;
+        let at =
+            hir_ty::error_union::member_index(members, *member.ty()).ok_or(LowerError::Failed)?;
+        let TyKind::Adt(def, args) = union.kind() else { return Err(LowerError::Failed) };
+        let AdtId::StructId(of_union) = def.def_id() else { return Err(LowerError::Failed) };
+        let (_, repr) = self
+            .cx
+            .variant_fields(args, VariantId::StructId(of_union))
+            .next()
+            .ok_or(LowerError::Failed)?;
+        let variant = hir_ty::error_union::repr_variant(self.cx.db, repr, at)
+            .ok_or(LowerError::Failed)?;
+        // alloc: the one field `DeconstructedPat::new` takes, twice.
+        let held = self.variant_pat(
+            pat,
+            repr,
+            VariantId::EnumVariantId(variant),
+            vec![member.at_index(0)],
+            1,
+        )?;
+        self.variant_pat(pat, union, VariantId::StructId(of_union), vec![held.at_index(0)], 1)
+    }
+
     fn variant_pat(
         &self,
         pat: PatId,
@@ -410,7 +471,8 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         fields: Vec<IndexedPat<Cx<'a, 'db>>>,
         arity: usize,
     ) -> Result<Pat<'a, 'db>, LowerError> {
-        let ctor = match (ty.kind(), variant) {
+        // blaze: a variant of a refinement `T is PAT` is its base's.
+        let ctor = match (hir_ty::pattern_types::base(ty).kind(), variant) {
             (TyKind::Adt(..), VariantId::EnumVariantId(v)) => {
                 Constructor::Variant(VariantIdx::of(self.cx.db, v))
             }

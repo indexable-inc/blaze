@@ -533,7 +533,8 @@ project's own (helix sets `--cfg tokio_unstable` there; `RUSTFLAGS` would replac
 the flake (`BLAZE_NIGHTLY`; `rust-bin.nightly."2026-10-09"` in the runs before 2026-10-25). A setup that cannot build a project is reported as failed and not timed
 after that.
 
-Hot-patching a running program is compared on its own (`harness/hotpatch.py`): a small program
+Hot-patching a running program was compared on its own (`hotpatch.py`, deleted 2026-11-11 with
+its program; `git show 8297d08319:harness/hotpatch.py` has it): a small program
 that calls one function every millisecond through `subsecond::call`, edited 30 times by each of
 Dioxus's `dx serve --hotpatch` (subsecond, which patches the running program on Linux),
 `blaze build` and incremental `cargo build`, the last two followed by starting the program
@@ -761,7 +762,7 @@ python3 harness/benchreport.py /tmp/bench.json --check               # what woul
 `--backend cranelift` measures one tier. `--cold-runs 5` repeats the cold builds, `--setups
 all --setups-on ripgrep,nushell` adds the setups above, `--tests` the test suites, and
 `--reference DIR` puts cargo's target directories outside the work directory.
-`python3 harness/hotpatch.py --edits 30` times hot-patching (needs `dx`: the bench shell has it). Projects are cloned once into `BLAZE_PROJECTS`
+Projects are cloned once into `BLAZE_PROJECTS`
 (default `~/blaze-projects`). The whole CI set (seven projects, both tiers, five runs) took 38
 minutes on 16 Zen 5 cores, plus the build of blaze. It needs about 20 GB of memory (nushell)
 and 30 GB of disk.
@@ -843,7 +844,7 @@ measures them here.
 
 ## Earlier one-off measurements
 
-Edit, then build, on a workspace of 200 generated crates (`harness/genws.py`), Linux x86-64,
+Edit, then build, on a workspace of 200 generated crates (`genws.py`, since deleted), Linux x86-64,
 8 CPUs, both warm and incremental, same linker, median of three. Measured once by hand before
 this page existed; not updated by CI.
 

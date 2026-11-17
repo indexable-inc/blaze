@@ -1,0 +1,19 @@
+{
+ "id": "kernel-maintain-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-maintain",
+ "where": "crates/blaze-kernel/src/nest.rs, crates/blaze-kernel/src/table.rs, crates/blaze-kernel/src/exhaustive/nested.rs",
+ "what": "The exhaustive model in exhaustive/nested.rs was out of reach for a second lane in a row: the maintained step needed the engine's run, the lookup, the carry, the session's rows and the table's layout read first (about 100K tokens of a 200K context), and the model's file was never opened. Its controls (the three of part reads, and a maintainer that forgets a deletion) are in tests/cost.rs, on smaller hand-picked sequences.",
+ "cost": "pieces 1(c) and 3 and the model half of piece 2 moved to a successor lane",
+ "whys": [
+  "why the model was not reached: a change to how a step is run crosses `Engine::entered`, `run`, `lookup`, `check`, `carry` and `Reads`, all of which had to be read to place one call",
+  "why so much to read: `Engine::entered` held the lookup, the run and the keep in one body, with the session's posting between them",
+  "why the cost tests stand in: they can be written from the public API alone, the model cannot"
+ ],
+ "cause": "the model's ways are written against the kernel's internals in one 619-line file, so adding a way needs both the model and the internals in one context",
+ "class": "a check that can only be extended by someone who has read everything it checks is extended by nobody",
+ "prevention": "give the model a table of ways (a step set, its world edits, its oracle) that a new step is added to from the public API; a lane brief for the model alone, with nest.rs off its reading list",
+ "workaround": "controls in tests/cost.rs",
+ "fix": "owed: a lane whose only piece is the model (the table step, maintained, its four controls, the cover way)",
+ "state": "open"
+}

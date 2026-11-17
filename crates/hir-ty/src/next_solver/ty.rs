@@ -75,48 +75,13 @@ const _: () = assert!(size_of::<TyKind<'static>>() <= 48);
 
 impl_stored_interned!(Ty, StoredTy);
 impl_foldable_for_stored_type!(StoredTy);
+table::holds_by_visit!(TyKind<'static>);
 
-/// The ids of the closures, coroutines and opaque types `ty` names at any depth: whose
-/// a query keyed by it is (`blaze_query::db::Storage::ids_of`, read by `crates/hir-firewall`).
-fn push_named_ids(ty: Ty<'_>, out: &mut Vec<blaze_query::db::Id>) {
-    use blaze_query::db::AsId;
-    for arg in ty.walk() {
-        let Some(ty) = arg.ty() else { continue };
-        match ty.kind() {
-            TyKind::Closure(id, _) => out.push(id.0.as_id()),
-            TyKind::CoroutineClosure(id, _) => out.push(id.0.as_id()),
-            TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => out.push(id.0.as_id()),
-            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) => {
-                out.push(def_id.0.as_id())
-            }
-            _ => {}
-        }
-    }
-}
-
-impl blaze_query::db::NamesIds for Ty<'_> {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
-        push_named_ids(*self, out);
-    }
-}
-
-impl blaze_query::db::NamesIds for StoredTy {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
-        push_named_ids(self.as_ref(), out);
-    }
-}
-
-impl blaze_query::db::NamesIds for GenericArgs<'_> {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
-        for ty in self.iter().filter_map(|arg| arg.ty()) {
-            push_named_ids(ty, out);
-        }
-    }
-}
-
-impl blaze_query::db::NamesIds for super::StoredGenericArgs {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
-        self.as_ref().names_ids(out);
+impl<'db> table::Homed for Ty<'db> {
+    /// Its row's home, written when the row was added.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        TYS.home(self.index)
     }
 }
 
@@ -137,10 +102,12 @@ impl<'db> Ty<'db> {
     pub(super) fn intern(kind: TyKind<'db>) -> Self {
         Self::at(TYS.intern(kind, || {
             let computed = FlagComputation::for_kind(&kind);
+            let (tag, home) = persist::tag_and_home(&kind);
             table::RowInfo {
-                tag: persist::tag(&kind),
+                tag,
                 flags: computed.flags,
                 binder: computed.outer_exclusive_binder,
+                home,
             }
         }))
     }
@@ -1623,8 +1590,8 @@ mod tests {
     use super::*;
     use crate::next_solver::{GenericArg, TraitAssocTyId};
 
-    fn id<T: blaze_query::db::FromId>(bits: u32) -> T {
-        T::from_id(blaze_query::db::Id::from_u32(bits))
+    fn id<T: blaze_memo::Id>(bits: u32) -> T {
+        T::from_gid(blaze_memo::Gid::for_test(bits))
     }
 
     fn u8_ty<'db>() -> Ty<'db> {

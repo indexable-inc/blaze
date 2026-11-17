@@ -1,0 +1,17 @@
+{
+ "id": "onsave-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onsave-1112",
+ "where": "the one build queue (/root/loop.sh on blaze-vm): the only compiler a lane has",
+ "what": "A lane cannot compile before it pushes: the brief says to push to `int-1112` and build that, and a push that does not compile fails the build of all eight lanes until it is fixed. This lane's first commit had 34 compile errors (a wrongly placed hunk, row onsave-1112-1). It was pushed to a scratch branch (`onsave-1112`) and built with `loop.sh onsave-1112`, so nobody else saw it; each such build switches /root/blaze to another branch and back, and waited 5 to 15 minutes behind three or four other lanes' calls.",
+ "cost": "each compile error costs a queue turn: 10 to 20 minutes a round, four rounds before the first green build",
+ "cause": "one tree, one target directory and one lock for eight lanes; a check of blaze-cargo alone is part of that same build",
+ "whys": [
+  "a cold build per lane was the cost the one VM removed (H12)",
+  "no lane has a place to run `cargo check` on its own diff"
+ ],
+ "class": "a shared branch that is also the only place code is first compiled",
+ "prevention": "not built: a second, check-only tree on the VM (`cargo check -p <crate>` of a pushed scratch commit, its own target directory, outside the build lock) so a lane's compile errors cost one minute and no queue turn; until then, the how-to: push to a scratch branch first (lane_commit.py's `push`)",
+ "workaround": "a scratch branch built through the same queue",
+ "state": "open"
+}

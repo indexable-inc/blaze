@@ -1,0 +1,674 @@
+//! `SpendFacts` over fixtures (docs/v2/plan/design/facts.md): each change as the body before
+//! (the `Debug` pipeline, which spends nothing) and after (`Release`), what the body records,
+//! the calls that must stay as they are, and the evaluator giving the same outcome with and
+//! without. The refinement over random programs is `crate::facts::model`'s.
+//!
+//! No tier's pass list has `SpendFacts` for now (`hir_ty_mir::mir::passes_at` says why), so
+//! every test of the pass runs it through the one switch, `hir_ty_mir::mir::spend_facts_at`,
+//! in a database of its own ([`spending`]).
+
+use base_db::{Crate, Db};
+use hir_def::{AdtId, FunctionId, ModuleDefId, nameres::crate_def_map};
+use hir_expand::name::Name;
+use hir_ty::{
+    ParamEnvAndCrate,
+    db::HirDatabase,
+    facts::{Fact, FactItem, Proofs, Tier, facts_of, proofs_at},
+    next_solver::{GenericArgs, TyKind},
+};
+use hir_ty_mir::mir::{
+    MirBody, MirOptLevel, MirOptions, OperandKind, Reaching, TerminatorKind, interpret_mir,
+    relied_on_own_no_unwind, runs, set_interpreter_mir_opt_level, spend_facts_at,
+};
+use intern::Symbol;
+use rustc_type_ir::inherent::IntoKind as _;
+
+use super::{
+    fixture::{crate_named, db_with},
+    fns::fn_named,
+};
+use crate::program_lifetime::{self, Why};
+
+const CALLS: &str = r#"
+//- /lib.rs crate:kernel deps:std
+pub struct Guard(u32);
+
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+fn quiet(x: u32) -> u32 {
+    x ^ 1
+}
+
+fn loud(x: u32) -> u32 {
+    if x == 0 {
+        panic!()
+    }
+    x
+}
+
+pub trait Shape {
+    fn area(&self) -> u32;
+}
+
+pub struct Square;
+
+impl Shape for Square {
+    fn area(&self) -> u32 {
+        panic!()
+    }
+}
+
+fn through(shape: &dyn Shape) -> u32 {
+    shape.area()
+}
+
+extern "C-unwind" fn other_abi(x: u32) -> u32 {
+    x ^ 1
+}
+
+unsafe extern "C" {
+    fn foreign(x: u32) -> u32;
+}
+
+pub fn edge_goes(x: u32) -> u32 {
+    let _guard = Guard(x);
+    quiet(x)
+}
+
+pub fn edge_stays(x: u32) -> u32 {
+    let _guard = Guard(x);
+    loud(x)
+}
+
+pub fn dyn_stays(shape: &dyn Shape) -> u32 {
+    let _guard = Guard(0);
+    through(shape)
+}
+
+pub fn abi_stays(x: u32) -> u32 {
+    let _guard = Guard(x);
+    other_abi(x)
+}
+
+pub fn foreign_stays(x: u32) -> u32 {
+    let _guard = Guard(x);
+    unsafe { foreign(x) }
+}
+
+pub fn pointer_stays(f: fn(u32) -> u32, x: u32) -> u32 {
+    let _guard = Guard(x);
+    f(x)
+}
+
+pub fn twice(x: u32) -> u32 {
+    quiet(x) ^ quiet(x)
+}
+
+pub fn twice_loud(x: u32) -> u32 {
+    loud(x) ^ loud(x)
+}
+
+pub fn twice_differs(x: u32, y: u32) -> u32 {
+    quiet(x) ^ quiet(y)
+}
+
+pub fn run_quiet() -> u32 {
+    edge_goes(3) ^ twice(5)
+}
+
+pub fn run_loud() -> u32 {
+    edge_stays(0)
+}
+
+pub fn run_twice_loud() -> u32 {
+    twice_loud(0)
+}
+
+pub fn run_dyn() -> u32 {
+    dyn_stays(&Square)
+}
+"#;
+
+fn release() -> MirOptions {
+    MirOptions::at(MirOptLevel::Release)
+}
+
+/// `run` over a database of `text` whose bodies at [`release`]'s tier run `SpendFacts`
+/// ([`spend_facts_at`]). The switch is no input of the optimized MIR's key, so the database is
+/// made after it is switched on and dropped before it is off: every body the database holds was
+/// built with the pass, and no body built without it is served in its place, nor the other way.
+fn spending<R>(text: &str, run: impl FnOnce(&Db) -> R) -> R {
+    let switch = spend_facts_at(release().tier);
+    let db = db_with(text);
+    let ran = run(&db);
+    drop(db);
+    drop(switch);
+    ran
+}
+
+/// The calls by name of the body's blocks off the unwind path: for each, whether it has an
+/// unwind edge.
+fn call_edges(body: &MirBody<'_>) -> Vec<bool> {
+    body.basic_blocks
+        .iter()
+        .filter(|(_, block)| !block.is_cleanup)
+        .filter_map(|(_, block)| match &block.terminator.as_ref()?.kind {
+            TerminatorKind::Call { cleanup, intrinsic: None, .. } => Some(cleanup.is_some()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The calls by name of a function (not a pointer in a local) in the body: the callee is a
+/// function item, as a constant (`Operand::fn_item`, which an `Allocation` of the item's
+/// zero-sized type is too: MIR building writes a function item so) or as a whole local of the
+/// item's type that the body copied it into.
+fn named_calls(body: &MirBody<'_>) -> usize {
+    let fn_item = |func: &hir_ty_mir::mir::Operand| match &func.kind {
+        OperandKind::Copy(place) | OperandKind::Move(place) => {
+            let place = place.as_ref();
+            place.projection.as_slice().is_empty()
+                && matches!(body.locals[place.local].ty.as_ref().kind(), TyKind::FnDef(..))
+        }
+        _ => func.fn_item().is_some(),
+    };
+    body.basic_blocks
+        .iter()
+        .filter(|(_, block)| match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::Call { func, intrinsic: None, .. }) => fn_item(func),
+            _ => false,
+        })
+        .count()
+}
+
+/// `check` given the `Debug` body and the `Release` body of the function `name` of `CALLS`,
+/// the `Release` one built with `SpendFacts` switched on ([`spending`]).
+#[track_caller]
+fn bodies(name: &str, check: impl FnOnce(&Db, FunctionId, &MirBody<'_>, &MirBody<'_>)) {
+    spending(CALLS, |db| {
+        let func = fn_named(db, crate_named(db, "kernel"), name);
+        blaze_memo::attach(db, || {
+            let before = db
+                .optimized_mir_body(func.into(), MirOptions::at(MirOptLevel::Debug))
+                .unwrap_or_else(|error| panic!("`{name}` at Debug: {error:?}"));
+            let after = db
+                .optimized_mir_body(func.into(), release())
+                .unwrap_or_else(|error| panic!("`{name}` at Release: {error:?}"));
+            check(db, func, before, after);
+        });
+    });
+}
+
+fn relied(db: &Db, krate: Crate, name: &str, fact: Fact) -> [u8; 32] {
+    facts_of(db, FactItem::Fn(fn_named(db, krate, name)), Proofs::Spent).relied(fact)
+}
+
+#[test]
+fn a_call_of_a_function_that_cannot_panic_loses_its_unwind_edge() {
+    bodies("edge_goes", |db, func, before, after| {
+        assert_eq!(call_edges(before), [true], "as written, the call unwinds to the guard's drop");
+        assert_eq!(call_edges(after), [false], "proved unable to panic, it has no edge");
+        let cleanup = |body: &MirBody<'_>| body.basic_blocks.iter().filter(|it| it.1.is_cleanup).count();
+        assert!(cleanup(before) > 0);
+        assert_eq!(cleanup(after), 0, "the cleanup only that edge reached is gone");
+        let krate = crate_named(db, "kernel");
+        let quiet = relied(db, krate, "quiet", Fact::NoUnwind);
+        assert!(after.inlined.relied.contains(&quiet), "the body records what it relied on");
+        assert!(before.inlined.relied.is_empty(), "a body nothing changed records nothing");
+        // The caller cannot panic either: the fact goes up the call graph by the same walk.
+        assert!(facts_of(db, FactItem::Fn(func), Proofs::Spent).spendable(Fact::NoUnwind));
+        assert!(relied_on_own_no_unwind(db, after, proofs_at(release().tier)));
+        assert!(!relied_on_own_no_unwind(db, before, proofs_at(release().tier)));
+    });
+}
+
+/// The calls whose edge must stay, each with why, and whether the caller itself is proved
+/// unable to panic all the same (a call of a `C-unwind` function whose body cannot panic is
+/// not a panic: the edge stays because of the ABI, not because of what the callee does).
+#[test]
+fn an_unwind_edge_stays_where_nothing_proves_the_callee() {
+    for (name, why, proved) in [
+        ("edge_stays", "the callee panics", false),
+        ("dyn_stays", "the callee calls through a `dyn`, whose target nobody named", false),
+        ("abi_stays", "the callee's ABI is `C-unwind`", true),
+        ("foreign_stays", "the callee is foreign code", false),
+        ("pointer_stays", "the call is through a function pointer", false),
+    ] {
+        bodies(name, |db, func, before, after| {
+            assert_eq!(call_edges(before), call_edges(after), "`{name}`: {why}");
+            assert!(call_edges(after).contains(&true), "`{name}` has the edge: {why}");
+            let own = facts_of(db, FactItem::Fn(func), Proofs::Spent);
+            assert_eq!(own.spendable(Fact::NoUnwind), proved, "`{name}`: {why}");
+            // No callee's fact was relied on: at most the body's own.
+            let recorded: &[[u8; 32]] = if proved { &[own.relied(Fact::NoUnwind)] } else { &[] };
+            assert_eq!(after.inlined.relied, recorded, "`{name}`: {why}");
+        });
+    }
+}
+
+#[test]
+fn a_repeated_call_of_a_pure_function_takes_the_firsts_result() {
+    // The premises, each its own failure: the pass runs only where the test switch turns it on
+    // (no tier lists it), `bodies` turns it on at the tier it builds the `Release` body at, and
+    // the callee is proved pure under the proofs that tier spends.
+    let repeats = Reaching::SpendFactsRepeats;
+    assert!(
+        !runs(release().tier, repeats),
+        "`SpendFacts` runs only where the test switch turns it on"
+    );
+    {
+        let _switch = spend_facts_at(release().tier);
+        assert!(runs(release().tier, repeats), "the switch `bodies` turns on runs `SpendFacts`");
+    }
+    let pure = |db: &Db, name: &str| {
+        let func = fn_named(db, crate_named(db, "kernel"), name);
+        let facts = facts_of(db, FactItem::Fn(func), proofs_at(release().tier));
+        assert!(facts.spendable(Fact::Pure), "the premise: `{name}` is proved pure: {facts:?}");
+    };
+    bodies("twice", |db, _, before, after| {
+        pure(db, "quiet");
+        assert_eq!(named_calls(before), 2);
+        assert_eq!(named_calls(after), 1, "the second call is a copy of the first's result");
+        let quiet = relied(db, crate_named(db, "kernel"), "quiet", Fact::Pure);
+        assert!(after.inlined.relied.contains(&quiet));
+    });
+    // A pure function that may panic merges too: the first call returned, so the second
+    // would have.
+    bodies("twice_loud", |db, _, _, after| {
+        pure(db, "loud");
+        assert_eq!(named_calls(after), 1);
+    });
+    // Different arguments are different calls.
+    bodies("twice_differs", |_, _, _, after| assert_eq!(named_calls(after), 2));
+}
+
+/// How running the function `name` of `CALLS` ends at `level`: whether it returned.
+fn returns(db: &Db, name: &str, level: MirOptLevel) -> bool {
+    let krate = crate_named(db, "kernel");
+    let func = fn_named(db, krate, name);
+    blaze_memo::attach(db, || {
+        let env = ParamEnvAndCrate { param_env: db.trait_environment(func.into()), krate }.store();
+        let args = GenericArgs::new_from_slice(&[]).store();
+        let body = match level {
+            MirOptLevel::Off => db.monomorphized_runtime_mir_body(func.into(), args, env),
+            level => db.monomorphized_optimized_mir_body(
+                func.into(),
+                MirOptions::at(level),
+                args,
+                env,
+            ),
+        }
+        .unwrap_or_else(|error| panic!("`{name}` at {level:?}: {error:?}"));
+        set_interpreter_mir_opt_level(level);
+        let ran = interpret_mir(db, body, None);
+        set_interpreter_mir_opt_level(MirOptLevel::Off);
+        match ran {
+            Ok((Ok(_), _)) => true,
+            Ok((Err(error), _)) | Err(error) => {
+                let said = format!("{error:?}");
+                assert!(said.contains("Panic"), "`{name}` at {level:?} ends in no panic: {said}");
+                false
+            }
+        }
+    })
+}
+
+#[test]
+fn the_evaluator_ends_the_same_with_facts_spent() {
+    spending(CALLS, |db| {
+        for (name, want) in
+            [("run_quiet", true), ("run_loud", false), ("run_twice_loud", false), ("run_dyn", false)]
+        {
+            assert_eq!(returns(db, name, MirOptLevel::Off), want, "`{name}` as written");
+            assert_eq!(returns(db, name, MirOptLevel::Release), want, "`{name}` with facts spent");
+        }
+    });
+}
+
+const TYPES: &str = r#"
+//- /lib.rs crate:kernel deps:std
+#[blaze::program_lifetime]
+pub struct Node {
+    kind: u16,
+    parent: Option<&'static Node>,
+    text: &'static str,
+    span: (u32, u32),
+}
+
+#[blaze::program_lifetime]
+pub enum Token {
+    Word(&'static Node),
+    End,
+}
+
+pub struct Plain {
+    bits: [u8; 4],
+}
+
+#[blaze::program_lifetime]
+pub struct HoldsPlain {
+    plain: Plain,
+    token: Token,
+}
+
+#[blaze::program_lifetime]
+pub struct Generic<T> {
+    value: T,
+}
+
+#[blaze::program_lifetime]
+pub struct Dropped(u32);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {}
+}
+
+pub struct Inner {
+    name: std::string::String,
+}
+
+#[blaze::program_lifetime]
+pub struct Owns {
+    inner: Inner,
+}
+
+#[blaze::program_lifetime]
+pub struct Borrows<'a> {
+    text: &'a str,
+}
+
+#[blaze::program_lifetime]
+pub struct Opaque {
+    hook: &'static dyn Fn(),
+    run: fn(u32) -> u32,
+}
+
+pub struct Unmarked {
+    kind: u16,
+}
+"#;
+
+#[track_caller]
+fn adt_named(db: &Db, krate: Crate, name: &str) -> AdtId {
+    let root = crate_def_map(db, krate).root_module_id();
+    let data = root.to_db(db).def_map(db).module(db, root);
+    match data.name_in_scope(db, &Name::new_symbol_root(Symbol::intern(name))).take_types() {
+        Some(ModuleDefId::AdtId(adt)) => adt,
+        _ => panic!("no type `{name}` at the root of the crate"),
+    }
+}
+
+#[test]
+fn program_lifetime_is_accepted_of_plain_and_static_shapes() {
+    let db = db_with(TYPES);
+    let krate = crate_named(&db, "kernel");
+    blaze_memo::attach(&db, || {
+        for name in ["Node", "Token", "HoldsPlain", "Opaque"] {
+            let adt = adt_named(&db, krate, name);
+            let refused = program_lifetime::shape(&db, adt);
+            assert!(refused.is_none(), "{}", refused.as_ref().map_or_else(String::new, |it| it.said()));
+            let facts = facts_of(&db, FactItem::Adt(adt), Proofs::Spent);
+            assert!(facts.holds(Fact::ProgramLifetime), "`{name}` has the fact");
+            // Declared and checked, not inferred: no pass changes code on it yet.
+            assert!(!facts.spendable(Fact::ProgramLifetime));
+        }
+        // The fact is declared: a type nobody marked has none, whatever its shape.
+        let unmarked = adt_named(&db, krate, "Unmarked");
+        assert!(program_lifetime::shape(&db, unmarked).is_none());
+        assert!(
+            !facts_of(&db, FactItem::Adt(unmarked), Proofs::Spent).holds(Fact::ProgramLifetime)
+        );
+    });
+}
+
+#[test]
+fn program_lifetime_is_refused_naming_the_reason() {
+    let db = db_with(TYPES);
+    let krate = crate_named(&db, "kernel");
+    blaze_memo::attach(&db, || {
+        for (name, why, path, says) in [
+            ("Generic", Why::Generic, "", "has a generic parameter"),
+            ("Dropped", Why::Drops, "", "has a `Drop` impl"),
+            ("Owns", Why::FieldDrops, "inner.name", "holds a value with a `Drop` impl"),
+            ("Borrows", Why::Generic, "", "has a generic parameter"),
+        ] {
+            let adt = adt_named(&db, krate, name);
+            let refused = program_lifetime::shape(&db, adt)
+                .as_ref()
+                .unwrap_or_else(|| panic!("`{name}` should be refused"));
+            assert_eq!(refused.why, why, "{}", refused.said());
+            assert!(refused.path.starts_with(path), "{}", refused.said());
+            let said = refused.said();
+            assert!(said.contains(&format!("`{name}` is `#[blaze::program_lifetime]`, but")), "{said}");
+            assert!(said.contains(says), "{said}");
+            let facts = facts_of(&db, FactItem::Adt(adt), Proofs::Spent);
+            assert!(!facts.holds(Fact::ProgramLifetime), "{said}");
+        }
+    });
+}
+
+/// Functions whose signatures name their own late-bound lifetime inside an associated type's
+/// projection: behind a field (`Unit<R>` holds an `R::Offset`), and written out.
+const LATE_BOUND: &str = r#"
+//- /lib.rs crate:kernel deps:std
+pub trait Reader {
+    type Offset;
+}
+
+pub struct Slice<'a>(&'a [u8]);
+
+impl<'a> Reader for Slice<'a> {
+    type Offset = usize;
+}
+
+pub struct Unit<R: Reader> {
+    pub offset: R::Offset,
+}
+
+pub struct Summary<'a> {
+    pub unit: &'a Unit<Slice<'a>>,
+}
+
+pub fn summary<'a>(unit: &'a Unit<Slice<'a>>) -> Summary<'a> {
+    Summary { unit }
+}
+
+pub fn written<'a>(
+    reader: Slice<'a>,
+    offset: <Slice<'a> as Reader>::Offset,
+) -> <Slice<'a> as Reader>::Offset {
+    let _ = reader;
+    offset
+}
+"#;
+
+/// The facts of every function are asked (`SpendFacts` asks each body's and each callee's), and
+/// purity's scans the parameters' types, normalizing what it reaches: the signature's
+/// late-bound lifetimes are instantiated first, so `<Slice<'a> as Reader>::Offset` is a goal
+/// the solver takes. Skipped instead, the projection kept the bound lifetime and the solver
+/// panicked wrapping it in a binder ("has escaping bound vars, so it cannot be wrapped in a
+/// dummy binder"): wasmtime's `log_get_die_ref<'a, 'r>(entry: &'a ConvertUnitEntry<'a,
+/// EndianSlice<'r, LittleEndian>>)`, whose gimli types hold `<R as gimli::Reader>::Offset`,
+/// which stopped blaze building blaze at stage 2.
+#[test]
+fn a_late_bound_lifetime_in_a_parameters_projection_is_scanned() {
+    let db = db_with(LATE_BOUND);
+    let krate = crate_named(&db, "kernel");
+    blaze_memo::attach(&db, || {
+        for name in ["summary", "written"] {
+            let func = fn_named(&db, krate, name);
+            if let crate::FnPurity::Impure(refusal) = crate::fn_purity_generic(&db, func) {
+                panic!("`{name}` is pure: {}", refusal.said());
+            }
+            let facts = facts_of(&db, FactItem::Fn(func), Proofs::Spent);
+            assert!(facts.holds(Fact::Pure), "`{name}` is pure");
+        }
+    });
+}
+
+/// Branches, index checks and arithmetic, behind a guard whose drop gives every call an
+/// unwind edge, over a call tree four deep: everything `SpendFacts` asks a summary and a
+/// proof for, in the body and in its callees, and calls `Inline` would take.
+const PROVABLE: &str = r#"
+//- /lib.rs crate:kernel deps:std
+pub struct Guard(u32);
+
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+pub fn guarded(v: &[u32; 4], a: usize) -> u32 {
+    if a < 4 { v[a] } else { 0 }
+}
+
+#[inline(never)]
+fn pick(v: &[u32; 4], a: usize) -> u32 {
+    if a < 4 { v[a] / 2 + 1 } else { 0 }
+}
+
+fn deep_three(v: &[u32; 4], a: usize) -> u32 {
+    pick(v, a) + guarded(v, a / 2)
+}
+
+fn deep_two(v: &[u32; 4], a: usize) -> u32 {
+    if a > 2 { deep_three(v, a - 1) } else { deep_three(v, a) * 2 }
+}
+
+fn deep_one(v: &[u32; 4], a: usize) -> u32 {
+    deep_two(v, a) + deep_two(v, a / 3)
+}
+
+pub fn checked(v: &[u32; 4], a: usize) -> u32 {
+    let _guard = Guard(0);
+    if a % 2 == 0 { pick(v, a) } else { deep_one(v, a / 2) * 3 + guarded(v, a) }
+}
+"#;
+
+/// How many effect summaries and proofs building `checked`'s optimized MIR with `options`
+/// made, in a database of its own, with `SpendFacts` switched on at `spend_facts` if it is
+/// `Some` ([`spend_facts_at`]: at `Tier::Zero`, the planted bug of the tier 0 control). The
+/// database is made after the switch and dropped before it, as [`spending`]'s.
+fn summaries_and_proofs(options: MirOptions, spend_facts: Option<Tier>) -> (u64, u64) {
+    let switch = spend_facts.map(spend_facts_at);
+    let db = db_with(PROVABLE);
+    let func = fn_named(&db, crate_named(&db, "kernel"), "checked");
+    let counted = blaze_memo::attach(&db, || {
+        let (((), proofs), summaries) = crate::walk::plant::counting_summaries(|| {
+            crate::walk::plant::counting_proofs(|| {
+                db.optimized_mir_body(func.into(), options)
+                    .unwrap_or_else(|error| panic!("`checked` with {options:?}: {error:?}"));
+            })
+        });
+        (summaries, proofs)
+    });
+    drop(db);
+    drop(switch);
+    counted
+}
+
+/// The invariant: building a tier 0 body runs no pass whose input is a whole-program summary:
+/// `checked`'s optimized MIR at tier 0, at level 2 with the inliner asked for (as the library's
+/// bodies were under a tier 0 unit), over a call tree four deep, computes zero effect
+/// summaries and runs the prover zero times. The control is the planted bug, `SpendFacts`
+/// switched on at tier 0: the same build then makes summaries, so the zero is the list's and
+/// not the fixture's. The optimizing tier, whose list has no `SpendFacts` for now
+/// (`passes_at`), makes none either; switched on there, the pass makes them and spends proofs.
+#[test]
+fn a_tier_zero_body_computes_no_effect_summary() {
+    let zero = MirOptions { inline: true, tier: Tier::Zero, ..release() };
+    assert_eq!(proofs_at(Tier::Zero), Proofs::None, "tier 0 spends no proof");
+    assert_eq!(summaries_and_proofs(zero, None), (0, 0), "a tier 0 body asked for summaries");
+    let (planted, _) = summaries_and_proofs(zero, Some(Tier::Zero));
+    assert!(planted > 0, "the planted bug (`SpendFacts` at tier 0) is not caught");
+    let optimizing = MirOptions { tier: Tier::Optimizing, ..zero };
+    assert_eq!(
+        summaries_and_proofs(optimizing, None),
+        (0, 0),
+        "an optimizing body asked for summaries, though no tier runs `SpendFacts`"
+    );
+    let (summaries, proofs) = summaries_and_proofs(optimizing, Some(Tier::Optimizing));
+    assert!(
+        summaries > 0 && proofs > 0,
+        "`SpendFacts` switched on at the optimizing tier spends facts: {summaries}, {proofs}"
+    );
+}
+
+/// The invariant: what each tier runs is what `passes_at` declares and the design says
+/// (docs/v2/plan/design/tiers.md): nothing that reads past the body at tier 0, rustc's
+/// inliner for the library as shipped, every pass but `SpendFacts` at the optimizing tier,
+/// and `SpendFacts` at no tier for now, run only where the test switch names the tier. Only
+/// the optimizing tier spends proofs: the pass's facts, when the switch runs it there.
+#[test]
+fn each_tier_runs_the_passes_its_declaration_lists() {
+    use hir_ty_mir::mir::{Reaching::*, passes_at};
+    assert!(passes_at(Tier::Zero).is_empty(), "{:?}", passes_at(Tier::Zero));
+    assert_eq!(passes_at(Tier::Shipped), &[Inline, Specialize]);
+    assert_eq!(passes_at(Tier::Optimizing), &[Inline, Devirtualize, Specialize]);
+    let tiers = [Tier::Zero, Tier::Shipped, Tier::Optimizing];
+    for tier in tiers {
+        for &pass in passes_at(tier) {
+            assert!(runs(tier, pass), "{tier:?} lists {pass:?} and does not run it");
+        }
+        for pass in [SpendFactsUnwind, SpendFactsRepeats] {
+            assert!(!passes_at(tier).contains(&pass), "{tier:?} lists {pass:?}");
+            assert!(!runs(tier, pass), "{tier:?} runs {pass:?} with the switch off");
+            // The control: the switch at this tier runs it there and at no other tier, and
+            // dropped, it runs nowhere again.
+            let switch = spend_facts_at(tier);
+            assert!(runs(tier, pass), "the switch at {tier:?} does not run {pass:?}");
+            for other in tiers.into_iter().filter(|it| *it != tier) {
+                assert!(!runs(other, pass), "the switch at {tier:?} runs {pass:?} at {other:?}");
+            }
+            drop(switch);
+            assert!(!runs(tier, pass), "the switch at {tier:?} outlived its guard");
+        }
+        assert_eq!(
+            proofs_at(tier) == Proofs::Spent,
+            tier == Tier::Optimizing,
+            "{tier:?}'s proofs: only the optimizing tier spends them"
+        );
+    }
+}
+
+/// The invariant: the summary of one instance under `Proofs::None` and under
+/// `Proofs::Spent` are two rows, each the same whichever is asked first: `guarded`'s index
+/// check is a panic only where no proof is spent.
+#[test]
+fn a_summary_under_each_proofs_mode_is_its_own_row() {
+    use crate::{
+        effects::Rule,
+        walk::{Def, Instance, summary_at},
+    };
+    use hir_ty_mir::mir::dispatch::Body;
+
+    let both = |none_first: bool| {
+        let db = db_with(PROVABLE);
+        let func = fn_named(&db, crate_named(&db, "kernel"), "guarded");
+        blaze_memo::attach(&db, || {
+            let (env, args) = crate::function::generic(&db, func);
+            let instance = Instance { def: Def::Body(Body::Fn(func)), args };
+            // clone: a handle and a test's key
+            let of = |proofs| summary_at(&db, proofs, env.clone(), instance.clone());
+            if none_first {
+                let none = of(Proofs::None);
+                (none, of(Proofs::Spent))
+            } else {
+                let spent = of(Proofs::Spent);
+                (of(Proofs::None), spent)
+            }
+        })
+    };
+    let (none, spent) = both(true);
+    assert!(none.kinds.has(Rule::Panic), "unproved, the index check panics: {:?}", none.kinds);
+    assert!(
+        !spent.kinds.has(Rule::Panic),
+        "proved, the index check is discharged: {:?}",
+        spent.kinds
+    );
+    assert_ne!(none, spent, "one mode's row was read for the other's");
+    let (none_after, spent_after) = both(false);
+    assert_eq!(none, none_after, "the `None` row depends on which mode was asked first");
+    assert_eq!(spent, spent_after, "the `Spent` row depends on which mode was asked first");
+}

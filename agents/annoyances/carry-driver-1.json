@@ -1,0 +1,14 @@
+{
+ "id": "carry-driver-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane carry-driver",
+ "where": "crates/blaze-front-items/src/steps.rs (`Source::file`), crates/blaze-cargo/src/serve/front_carry.rs (`Tree`)",
+ "what": "`Source::file(&self, name) -> Option<&str>` lends text borrowed from the world, and the steps need `W: 'static`, so a world over the VFS cannot read a file lazily through a `Pinned` (not 'static) or a `Reader` (its bytes are held, not lent). The daemon's world therefore holds a count of every file of the pinned root (`Bytes`, no copy), loaded once at the seed and updated from the Merkle diff each build: exact and O(changes), but O(files) memory for paths and counts.",
+ "cost": "a quarter of the lane's reading, looking for an append-only arena (none in the tree) before choosing the held map",
+ "cause": "the world trait was designed against a test world that owns its strings",
+ "class": "a trait shaped by its first (test) implementation, not by the real one",
+ "prevention": "a world trait's doc names the real world it must fit (the VFS's pinned tree) and that world is written with the trait",
+ "workaround": "held map of `Bytes` per file, UTF-8 checked at each read",
+ "fix": "none: a `Source::file` that gives `Bytes`/`Text` (owned count) would let the world read lazily",
+ "state": "open"
+}

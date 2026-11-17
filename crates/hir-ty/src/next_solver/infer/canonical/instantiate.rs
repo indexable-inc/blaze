@@ -576,7 +576,7 @@ mod tests {
     /// folded without the instantiator's cache touching the heap.
     #[test]
     fn instantiating_a_small_canonical_value_allocates_nothing() {
-        let db = Db::for_tests();
+        let db = Db::for_tests(|_| {});
         let tcx = DbInterner::new_no_crate(&db);
         let bound = |var: u32| Ty::new_canonical_bound(tcx, BoundVar::from_u32(var));
         let value = Ty::new_tup(

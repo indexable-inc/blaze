@@ -1,0 +1,19 @@
+{
+ "id": "launch3-1111-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-vm: /root/loop.sh; harness/v2/integrate.py",
+ "what": "The one build builds `blaze-thin` and `blaze-engine` and not `blaze-launcher`, which a daemon started with BLAZE_LAUNCH=1 reads from beside the engine binary. Every launched run in a round fails naming the missing file unless the caller builds the launcher itself and copies it beside the engine.",
+ "cost": "the launcher lane`s revision cases and timing table cannot run in a round as built; a lane had to run cargo in the shared tree inside its command to get the binary",
+ "cause": "the launcher is a third binary added after the build line was written; nothing lists the binaries a daemon needs beside it",
+ "whys": [
+  "why missing: the build line names two packages",
+  "why not caught: the switch is off by default, so no check of a round runs a launched program",
+  "property: a binary the daemon loads at run time that the build does not name"
+ ],
+ "class": "run-time companion not in the build: a file the daemon needs beside its executable that the one build line does not produce",
+ "prevention": "the engine names its companions (blaze-launcher) in one list that loop.sh and the release build both read, and the daemon`s start checks each exists and says which is missing",
+ "workaround": "cargo build --release -p blaze-launcher in the tree, copy target/release/blaze-launcher beside blaze-engine",
+ "state": "open",
+ "fix": ""
+}

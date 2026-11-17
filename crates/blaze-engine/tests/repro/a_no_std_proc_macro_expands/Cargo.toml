@@ -1,0 +1,17 @@
+[package]
+name = "repro"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+m2015 = { path = "m2015" }
+m2018 = { path = "m2018" }
+m2021 = { path = "m2021" }
+m2024 = { path = "m2024" }
+own_std = { path = "own_std" }
+
+[workspace]
+members = ["m2015", "m2018", "m2021", "m2024", "own_std"]

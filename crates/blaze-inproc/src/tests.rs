@@ -1,8 +1,9 @@
 //! The crate's own tests: frames and the handshake's bodies fuzzed (never a panic on any
 //! bytes), the grant's checks against an image's layout, the code memory's rules, and on
 //! Linux the real thing: a running thread's code laid over by the memory object with every
-//! byte equal at the swap, a patch one word store it sees, the executable written once per
-//! key, and the host's handshake over a real socket.
+//! byte equal at the swap, a patch one word store it sees, a launch started only from the
+//! file its build placed (refused otherwise, nothing written), and the host's handshake over
+//! a real socket.
 
 use blaze_ids::rng::SplitMix64;
 
@@ -691,6 +692,30 @@ fn memory(image: u64, arena: u64) -> Option<CodeMemory> {
     }
 }
 
+/// [`CodeMemory::zero`] leaves its range zeros and fills only the pages something wrote
+/// since the object was made: a range never written (an image's patch room) costs nothing.
+#[test]
+fn zeroing_fills_only_the_pages_that_were_written() {
+    let Some(probe) = memory(1, 1) else { return };
+    let page = probe.page();
+    drop(probe);
+    let Some(mut memory) = memory(64 * page, page) else { return };
+    assert_eq!(memory.zero(0, 64 * page).unwrap(), 0, "nothing was written: nothing is filled");
+    memory.write(3 * page + 5, &[7]).unwrap();
+    memory.fill(10 * page, 2 * page + 1, 0xcc).unwrap();
+    // Part of a written run: what is before the range stays.
+    assert_eq!(memory.zero(10 * page + 100, page).unwrap(), page);
+    let held = memory.bytes(CodeRange { offset: 10 * page, len: 2 * page + 1 }).unwrap();
+    assert!(held[..100].iter().all(|it| *it == 0xcc));
+    assert!(held[100..100 + page as usize].iter().all(|it| *it == 0));
+    assert!(held[100 + page as usize..].iter().all(|it| *it == 0xcc));
+    // The whole image: the four pages ever written, of 64.
+    assert_eq!(memory.zero(0, 64 * page).unwrap(), 4 * page);
+    let all = memory.bytes(CodeRange { offset: 0, len: 64 * page }).unwrap();
+    assert!(all.iter().all(|it| *it == 0));
+    assert!(memory.zero(64 * page, 2 * page).is_err(), "past the image and the arena");
+}
+
 #[test]
 fn sizes_round_up_to_pages() {
     let Some(memory) = memory(1, 1) else { return };
@@ -861,23 +886,37 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
     memory.reserve(arena, 16).unwrap();
 }
 
+/// The invariant: a start hook in a PID namespace of its own (a sandboxed run on Linux) is
+/// known by the last ID of its `NSpid`, the one its `getpid` answers; the control is a status
+/// with no such line, which names nobody. `host` is the daemon's side, behind its feature, as
+/// the `host` tests of `linux` below are.
+#[cfg(feature = "host")]
+#[test]
+fn a_hook_in_a_pid_namespace_is_known_by_its_innermost_id() {
+    let nested = "Name:\tt\nTgid:\t4711\nPid:\t4711\nNSpid:\t4711\t2\nNSpgid:\t4711\t1\n";
+    assert_eq!(crate::host::innermost(nested), Some(2));
+    assert_eq!(crate::host::innermost("Name:\tt\nNSpid:\t4711\n"), Some(4711));
+    assert_eq!(crate::host::innermost("Name:\tt\nPid:\t4711\n"), None);
+    assert_eq!(crate::host::innermost("NSpid:\t4711\tx\n"), None);
+}
+
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
     use crate::channel::Channel;
     use crate::sys;
 
-    fn temp_dir() -> PathBuf {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        std::env::temp_dir().join(format!(
-            "bzi-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+    /// A path not yet made, in a directory of its own short enough for a socket's path
+    /// (`TempDir::for_test_socket`): the guard removes it, and all it holds, when it drops,
+    /// so the caller holds it as long as the path is used.
+    fn temp_dir() -> (blaze_core::temp::TempDir, PathBuf) {
+        let held = blaze_core::temp::TempDir::for_test_socket("bzi-");
+        let path = held.join("d");
+        (held, path)
     }
 
     /// A function returning `value`, as bytes.
@@ -1081,7 +1120,7 @@ mod linux {
     }
 
     fn connected() -> (Channel, Channel, u32) {
-        let dir = temp_dir();
+        let (_held, dir) = temp_dir();
         let (listener, address) = sys::Listener::bind(&dir).unwrap();
         let hook = sys::connect(&address).unwrap();
         let (daemon, pid) = listener.accept().unwrap();
@@ -1092,7 +1131,7 @@ mod linux {
 
     #[test]
     fn the_listener_is_this_users_alone_and_knows_its_peer() {
-        let dir = temp_dir();
+        let (_held, dir) = temp_dir();
         let (listener, address) = sys::Listener::bind(&dir).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::mode(
             &std::fs::metadata(&dir).unwrap().permissions(),
@@ -1105,7 +1144,7 @@ mod linux {
         assert!(!std::path::Path::new(&address).exists());
         let _ = std::fs::remove_dir(&dir);
 
-        let open = temp_dir();
+        let (_open, open) = temp_dir();
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
@@ -1348,68 +1387,56 @@ mod linux {
 
         use super::*;
         use crate::handshake::HOST_VAR;
-        use crate::host::{Executable, Host, Image, Launch, Program, Wrote};
+        use crate::host::{Host, Image, Launch, Program, StartError};
 
+        /// The invariant: a launch whose path the build's record says holds another key than
+        /// the program's memory, or holds nothing, is refused with
+        /// [`StartError::NotPlaced`] naming the path, the key placed and the key held, and the
+        /// file at the path is left as it was (the host writes no file): no fallback write.
         #[test]
-        fn an_executable_is_written_once_per_key_and_never_from_a_patched_memory() {
-            let Some(mut memory) = laid_out("write") else { return };
+        fn a_launch_from_a_path_not_holding_its_file_is_refused_naming_both_keys() {
+            use std::os::unix::fs::MetadataExt;
+            let Some(memory) = laid_out("refused") else { return };
             let page = memory.page();
-            let dir = temp_dir();
+            let (_held, dir) = temp_dir();
             std::fs::create_dir_all(&dir).unwrap();
-            let host = Host::new(&dir.join("host")).unwrap();
+            let host = Arc::new(Host::new(&dir.join("host")).unwrap());
+            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
+            let (sessions, _got) = crossbeam_channel::unbounded();
+            let held = [7; 32];
+            let program =
+                Program::new(host, memory.clone(), Image { key: held, len: 2 * page }, sessions);
             let path = dir.join("prog");
-            let len = 2 * page - 3;
-            let write = |memory: &CodeMemory, key: u8, store: Option<&std::path::Path>| {
-                host.write_executable(
-                    memory,
-                    &Executable { path: &path, key: [key; 32], len, store },
-                )
+            std::fs::write(&path, b"another build's file").unwrap();
+            let identity = |path: &std::path::Path| {
+                let meta = std::fs::metadata(path).unwrap();
+                (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), std::fs::read(path).unwrap())
             };
-            let want = memory.bytes(CodeRange { offset: 0, len }).unwrap().to_vec();
-
-            assert_eq!(write(&memory, 1, None), Ok(Wrote::Written));
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-            let mode = std::os::unix::fs::PermissionsExt::mode(
-                &std::fs::metadata(&path).unwrap().permissions(),
-            );
-            assert_eq!(mode & 0o777, 0o755);
-            assert_eq!(write(&memory, 1, None), Ok(Wrote::Kept));
-            assert_eq!(write(&memory, 2, None), Ok(Wrote::Written));
-            std::fs::write(&path, b"another tool's file").unwrap();
-            assert_eq!(
-                write(&memory, 2, None),
-                Ok(Wrote::Written),
-                "a file changed since is written again"
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-
-            let store = dir.join("store");
-            std::fs::write(&store, &want).unwrap();
-            let cloned = write(&memory, 3, Some(&store)).unwrap();
-            assert!(matches!(cloned, Wrote::Cloned | Wrote::Written), "{cloned:?}");
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-            std::fs::write(&store, b"not the image").unwrap();
-            match write(&memory, 4, Some(&store)) {
-                Ok(wrote) => assert_eq!(wrote, Wrote::Written, "no clones here: the bytes"),
-                Err(error) => assert!(error.what.contains("not the image"), "{error}"),
+            let before = identity(&path);
+            let command = || Command {
+                program: path.clone(),
+                args: Vec::new(),
+                env: Vec::new(),
+                dir: dir.clone(),
+                stdin: Vec::new(),
+                sandbox: Sandbox::Off,
+                memory: None,
+            };
+            for placed in [Some([8; 32]), None] {
+                let Err(error) = program.command(command(), false, placed) else {
+                    panic!("a launch from a path holding {placed:?} started");
+                };
+                assert_eq!(error, StartError::NotPlaced { path: path.clone(), placed, held });
+                let said = error.to_string();
+                assert!(said.contains(&path.display().to_string()), "{said}");
+                assert!(said.contains(&"07".repeat(32)), "{said}");
+                if placed.is_some() {
+                    assert!(said.contains(&"08".repeat(32)), "{said}");
+                }
             }
-            assert_eq!(write(&memory, 5, None), Ok(Wrote::Written));
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-
-            memory.store_word(page, 1).unwrap();
-            assert_eq!(
-                write(&memory, 5, None),
-                Ok(Wrote::Kept),
-                "the file of this key is there: nothing to write"
-            );
-            let error = write(&memory, 6, None).unwrap_err();
-            assert!(error.what.contains("no longer the file the linker wrote"), "{error}");
-            let leftovers: Vec<_> = std::fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(|it| it.ok())
-                .filter(|it| it.file_name().to_string_lossy().ends_with(".tmp"))
-                .collect();
-            assert!(leftovers.is_empty());
+            assert_eq!(identity(&path), before, "a refused launch changed the file at its path");
+            assert_eq!(program.starts_held(), 0);
+            assert!(memory.lock().processes.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1466,7 +1493,7 @@ mod linux {
         fn the_host_grants_the_code_segments_arena_and_cells_and_learns_the_slide() {
             let Some(memory) = laid_out("host") else { return };
             let page = memory.page();
-            let dir = temp_dir();
+            let (_held, dir) = temp_dir();
             let host = Host::new(&dir).unwrap();
             let program = dir.join("prog");
             let launch = Launch {
@@ -1502,7 +1529,13 @@ mod linux {
             } else {
                 assert!(services.is_empty());
             }
-            assert_eq!(write.len(), 1);
+            // The host's socket is connected to by its path, given readable: a launch adds
+            // nothing writable to the run's sandbox.
+            assert!(write.is_empty(), "{write:?}");
+            if cfg!(unix) {
+                let socket = dir.join(format!("inproc-{}.sock", std::process::id()));
+                assert!(read.contains(&socket), "{read:?}");
+            }
             assert!(!network);
 
             let slide = 0x5555_0000_0000;
@@ -1595,13 +1628,16 @@ mod linux {
             let Some(memory) = laid_out("program") else { return };
             let page = memory.page();
             let own = memory.layout().unwrap().clone();
-            let dir = temp_dir();
+            let (_held, dir) = temp_dir();
             std::fs::create_dir_all(&dir).unwrap();
             let host = Arc::new(Host::new(&dir.join("host")).unwrap());
             let memory = Arc::new(Lock::new("inproc.test.memory", memory));
             let (sessions, got) = crossbeam_channel::unbounded();
-            let image = Image { key: [9; 32], len: 2 * page, store: None };
+            let key = [9; 32];
+            let image = Image { key, len: 2 * page };
             let program = Program::new(host, memory.clone(), image, sessions);
+            // The build's placement of the program's file, under the memory's key.
+            std::fs::write(dir.join("prog"), an_executable(page)).unwrap();
             let command = || Command {
                 program: dir.join("prog"),
                 args: Vec::new(),
@@ -1613,7 +1649,7 @@ mod linux {
             };
             let pid = std::process::id();
 
-            let (spawned, started) = program.command(command(), false).unwrap();
+            let (spawned, started) = program.command(command(), false, Some(key)).unwrap();
             assert_eq!(std::fs::read(dir.join("prog")).unwrap(), an_executable(page));
             let _channel = play_hook(&spawned, &own, 0);
             let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
@@ -1623,13 +1659,151 @@ mod linux {
             assert!(memory.lock().processes.is_empty());
             program.exited(started);
 
-            let (spawned, started) = program.command(command(), true).unwrap();
+            let (spawned, started) = program.command(command(), true, Some(key)).unwrap();
             program.exited(started);
             let _channel = play_hook(&spawned, &own, 0);
             let ended = got.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(ended.is_err_and(|it| it.what.contains("ended while")));
             assert!(memory.lock().processes.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The invariant: a launch of a program whose file the build placed at its path
+        /// writes nothing there (the file is the same file, byte for byte, with the same
+        /// inode and time, so the build's placement and its outputs' watch see no change),
+        /// and once its process has attached and exited nothing of the launch is left: no
+        /// grant waiting, no start kept, no process on the memory, no thread of the host's
+        /// or the program's. So any number of `blaze run`s leave the daemon as it was.
+        #[test]
+        fn launches_of_a_placed_executable_write_nothing_and_leave_nothing_behind() {
+            let (held, moved) = launches_leave(Planted::Nothing);
+            assert_eq!(held, Held::default(), "after {LAUNCHES} launches");
+            assert!(!moved, "the placed file was written by a launch");
+        }
+
+        /// The control: a launch whose process is never said to have exited keeps its start
+        /// and its process on the memory, and the oracle counts them.
+        #[test]
+        fn the_oracle_catches_a_launch_never_said_exited() {
+            let (held, moved) = launches_leave(Planted::NeverExited);
+            assert_eq!((held.starts, held.processes), (LAUNCHES, 1), "{held:?}");
+            assert!(!moved);
+        }
+
+        /// The control: a second writer of the path (a launch that wrote the file as the host
+        /// once did, planted here as a write between launches) is seen by the oracle as the
+        /// file moved.
+        #[test]
+        fn the_oracle_catches_a_second_writer_of_the_placed_file() {
+            let (held, moved) = launches_leave(Planted::Rewritten);
+            assert_eq!(held, Held::default());
+            assert!(moved, "a file written again between launches was not seen moved");
+        }
+
+        const LAUNCHES: usize = 24;
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Planted {
+            Nothing,
+            NeverExited,
+            /// The file at the path written again, same bytes, after the first launch.
+            Rewritten,
+        }
+
+        /// What launches left behind, each a count.
+        #[derive(Default, PartialEq, Eq, Debug)]
+        struct Held {
+            waiting: usize,
+            starts: usize,
+            processes: usize,
+            handshakes: usize,
+            starting: usize,
+        }
+
+        /// [`LAUNCHES`] launches of a program whose executable is at its path already, each
+        /// attached by a start hook played here and then ended: what they left, and whether
+        /// the file at the path is another than before (its bytes, inode, length or time).
+        fn launches_leave(planted: Planted) -> (Held, bool) {
+            use std::os::unix::fs::MetadataExt;
+            let name = match planted {
+                Planted::Nothing => "placed",
+                Planted::NeverExited => "placed-kept",
+                Planted::Rewritten => "placed-written",
+            };
+            let Some(memory) = laid_out(name) else {
+                // No code memory on this platform: what the invariant's test and each
+                // control expect of one.
+                return match planted {
+                    Planted::Nothing => (Held::default(), false),
+                    Planted::NeverExited => {
+                        (Held { starts: LAUNCHES, processes: 1, ..Held::default() }, false)
+                    }
+                    Planted::Rewritten => (Held::default(), true),
+                };
+            };
+            let page = memory.page();
+            let own = memory.layout().unwrap().clone();
+            let (_held, dir) = temp_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let host = Arc::new(Host::new(&dir.join("host")).unwrap());
+            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
+            let (sessions, got) = crossbeam_channel::unbounded();
+            let key = [7; 32];
+            let image = Image { key, len: 2 * page };
+            let program = Program::new(host.clone(), memory.clone(), image, sessions);
+            // The build's placement: the same bytes, a file of the build's own making.
+            let path = dir.join("prog");
+            std::fs::write(&path, an_executable(page)).unwrap();
+            let identity = |path: &std::path::Path| {
+                let meta = std::fs::metadata(path).unwrap();
+                (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), std::fs::read(path).unwrap())
+            };
+            let before = identity(&path);
+            for at in 0..LAUNCHES {
+                let command = Command {
+                    program: path.clone(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    dir: dir.clone(),
+                    stdin: Vec::new(),
+                    sandbox: Sandbox::Off,
+                    memory: None,
+                };
+                let (spawned, started) = program.command(command, false, Some(key)).unwrap();
+                if planted == Planted::Rewritten && at == 0 {
+                    // A second writer: the same bytes, a new file renamed over the path.
+                    let again = dir.join("prog.again");
+                    std::fs::write(&again, an_executable(page)).unwrap();
+                    std::fs::rename(&again, &path).unwrap();
+                }
+                let (channel, ..) = play_hook(&spawned, &own, 0);
+                let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+                // The process ends: its channel hangs up, its session is let go, and its
+                // launcher says it exited.
+                drop(channel);
+                drop(session);
+                if planted != Planted::NeverExited {
+                    program.exited(started);
+                }
+            }
+            // The threads of the last launches end on their own, a moment after their
+            // sessions were handed over: bounded, 10 s.
+            let ended = std::time::Instant::now() + Duration::from_secs(10);
+            while (host.handshakes() != 0 || program.starting() != 0)
+                && std::time::Instant::now() < ended
+            {
+                std::thread::yield_now();
+            }
+            let held = Held {
+                waiting: host.waiting(),
+                starts: program.starts_held(),
+                processes: memory.lock().processes.len(),
+                handshakes: host.handshakes(),
+                starting: program.starting(),
+            };
+            let moved = identity(&path) != before;
+            let _ = std::fs::remove_dir_all(&dir);
+            (held, moved)
         }
     }
 }

@@ -43,8 +43,8 @@ pub enum Event {
     Unlisted { count: u64 } keys [count],
     /// What the store had of the build's compile, and when it had little, why.
     Cache { cache: Cache } keys [cache],
-    /// What blaze does not build, which fails the build (docs/architecture.md, "Never
-    /// guess; refuse visibly").
+    /// What blaze does not build, which fails the build (AGENTS.md, rule
+    /// `no-fallback`: never a guess, a refusal that names what and why).
     Refused { name: String, why: String } keys [why, name],
     /// A line that is no step: a warning, a note.
     Said { level: Level, text: String } keys [text, level],

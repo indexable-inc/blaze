@@ -21,22 +21,53 @@
 //! a [`Parker`]'s futex wait, a child's exit ([`exited`], and the wait of a reap), a poll of one
 //! descriptor ([`pollable`]) and a sleep ([`sleep_until`]). The park's protocol and the reap's
 //! are sans-IO cores (`wait/parking.rs`, `wait/reaping.rs`), proven by the DST in `wait/tests.rs`.
+//!
+//! On macOS a [`Parker`] waits on its word's address too, through the same core
+//! (`wait/macos.rs`: `os_sync_wait_on_address_with_deadline` to an absolute Mach time and
+//! `os_sync_wake_by_address_any`; docs/macos.md).
+//!
+//! A wait on a word other processes map too ([`wait_shared`], [`wake_shared`]: the shared
+//! ledger's file, [`crate::shared`]) is the same futex or address wait without its private
+//! flag, so the kernel keys it by the mapping rather than the address.
+//!
+//! A process inside blaze's sandbox, whose seccomp filter refuses io_uring, makes the same
+//! waits with direct system calls instead (`wait/direct.rs`: `futex`, `ppoll`, `pidfd_open`,
+//! `waitid`, `clock_nanosleep`), over the same cores. Which of the two a process uses is chosen
+//! once, in its `main`, from the mark the sandbox launcher leaves in its environment
+//! ([`choose_from_env`], `wait/choice.rs`); the ring is never tried to find out.
 
 use std::time::{Duration, Instant};
 
+mod choice;
 mod parking;
 mod reaping;
 mod retry;
 
-#[cfg(test)]
-pub(crate) use self::retry::Plant;
-pub use self::retry::{Clock, Deadline, Once, WaitError, Waited};
+pub use self::{
+    choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
+    retry::{Clock, Deadline, Once, WaitError, Waited},
+};
 
 #[cfg(target_os = "linux")]
-#[expect(unsafe_code, reason = "Linux's waits: io_uring_enter and clock_nanosleep, one call each")]
+#[expect(
+    unsafe_code,
+    reason = "the waits of a process where io_uring is refused: futex, ppoll, pidfd_open, waitid and clock_nanosleep, one call each"
+)]
+mod direct;
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "test support: the seccomp filter a case runs under, and io_uring_setup asked once to see it refused"
+)]
+pub mod filtered;
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "Linux's waits: io_uring_enter, one call")]
 mod linux;
 #[cfg(target_os = "macos")]
-#[expect(unsafe_code, reason = "macOS's waits: kevent and mach_wait_until, one call each")]
+#[expect(
+    unsafe_code,
+    reason = "macOS's waits: kevent, mach_wait_until and the wait on an address and its wake, one call each"
+)]
 mod macos;
 #[cfg(not(any(unix, windows)))]
 mod other;
@@ -132,36 +163,87 @@ pub fn until<T>(
     // thread is blocked on, so a convoy whose head sits in a kernel wait names it.
     let probe = crate::lock::installed();
     let registered = probe.map(|probe| {
+        let now_ns = probe.now_ns();
+        // The deadline on `clock` said on the probe's clock, by the time left to it; none for
+        // `Deadline::NEVER`, whose wait ends only when what it waits for is ready.
+        let deadline_ns = deadline.filter(|it| *it != Deadline::NEVER).map(|it| {
+            let left = it.get().saturating_sub(clock.now());
+            now_ns.saturating_add(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX))
+        });
         crate::lock::graph::register(
             crate::lock::stall::Blocked::Wait(what),
             probe.span(),
-            probe.now_ns(),
+            now_ns,
+            deadline_ns,
             None,
             None,
         )
     });
-    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once);
+    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once));
     drop(registered);
     waited
+}
+
+/// Sleeps while the low 32 bits of `word` hold `expected`, until a [`wake_shared`] of it from
+/// any process that maps the same memory (a file mapped shared, [`crate::shared`]) or
+/// `deadline` on `clock`. `Ready` when woken or when the word no longer held `expected`
+/// (the caller looks at it again either way), `Deadline` once it passed. The kernel compares
+/// the word in the same step as it blocks, so a wake between the caller's look and its wait is
+/// not lost. The word is little-endian, its low half at its address.
+///
+/// - Linux: on the thread's wait ring, `IORING_OP_FUTEX_WAIT` of `FUTEX2_SIZE_U32` without
+///   `FUTEX2_PRIVATE`; on the direct driver ([`choose`]) `futex(FUTEX_WAIT_BITSET)` to an
+///   absolute time without `FUTEX_PRIVATE_FLAG`. Either keys the wait by the mapped page.
+/// - macOS: `os_sync_wait_on_address_with_deadline` with `OS_SYNC_WAIT_ON_ADDRESS_SHARED`, to an
+///   absolute Mach time (`wait/macos.rs`): keyed by the shared mapping's object.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn wait_shared(
+    what: &'static str,
+    word: &std::sync::atomic::AtomicU64,
+    expected: u32,
+    deadline: Deadline,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    #[cfg(target_os = "linux")]
+    return match choice::chosen() {
+        Waits::Ring => ring::wait_shared(what, word, expected, deadline, clock),
+        Waits::Direct => direct::wait_shared(what, word, expected, deadline, clock),
+    };
+    #[cfg(target_os = "macos")]
+    return macos::wait_shared(what, word, expected, deadline, clock);
+}
+
+/// Wakes every thread of every process sleeping in [`wait_shared`] on `word`. One
+/// `futex(FUTEX_WAKE)` without `FUTEX_PRIVATE_FLAG` on Linux (from either driver: a wake does
+/// not block), `os_sync_wake_by_address_all` with `OS_SYNC_WAKE_BY_ADDRESS_SHARED` on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn wake_shared(word: &std::sync::atomic::AtomicU64) {
+    #[cfg(target_os = "linux")]
+    direct::wake_shared(word);
+    #[cfg(target_os = "macos")]
+    macos::wake_shared(word);
 }
 
 /// One thread's park, woken from any thread: a token, as std's `thread::park` is (an unpark
 /// before the park makes it return at once), with an absolute deadline on an injected clock.
 /// On Linux the park is `IORING_OP_FUTEX_WAIT` on the thread's wait ring and the unpark
-/// `IORING_OP_FUTEX_WAKE` on the waker's (a plain `FUTEX_WAKE` from a thread with no ring);
-/// elsewhere std's park, until those systems' address waits land. Only one thread parks on a
+/// `IORING_OP_FUTEX_WAKE` on the waker's (a plain `FUTEX_WAKE` from a thread with no ring), or,
+/// in a process that chose the direct driver ([`choose`]), `FUTEX_WAIT_BITSET` to an absolute
+/// time and `FUTEX_WAKE`. On macOS the park is `os_sync_wait_on_address_with_deadline` on the
+/// word to an absolute Mach time and the unpark `os_sync_wake_by_address_any` (`wait/macos.rs`).
+/// Elsewhere std's park, until that system's address wait lands. Only one thread parks on a
 /// `Parker`; nothing signals it.
 pub struct Parker {
-    word: std::sync::atomic::AtomicU32,
-    #[cfg(not(target_os = "linux"))]
+    word: crate::atomic::AtomicU32,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     thread: crate::lock::Lock<Option<std::thread::Thread>>,
 }
 
 impl Parker {
     pub fn new() -> Parker {
         Parker {
-            word: std::sync::atomic::AtomicU32::new(parking::EMPTY),
-            #[cfg(not(target_os = "linux"))]
+            word: crate::atomic::AtomicU32::new(parking::EMPTY),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             thread: crate::lock::Lock::unrecorded("wait.parker.thread", None),
         }
     }
@@ -174,20 +256,37 @@ impl Parker {
         deadline: Option<Deadline>,
         clock: &impl Clock,
     ) -> Result<Waited<()>, WaitError> {
-        parking::park(&self.word, &self.kernel(), what, deadline, clock, parking::ParkPlant::None)
+        let plant = parking::ParkPlant::None;
+        #[cfg(target_os = "linux")]
+        if choice::chosen() == Waits::Direct {
+            let kernel = direct::Direct(&direct::Kernel);
+            return parking::park(&self.word, &kernel, what, deadline, clock, plant);
+        }
+        parking::park(&self.word, &self.kernel(), what, deadline, clock, plant)
     }
 
     /// Wakes its thread, or makes its next park return at once.
     pub fn unpark(&self) {
+        #[cfg(target_os = "linux")]
+        if choice::chosen() == Waits::Direct {
+            return parking::unpark(&self.word, &direct::Direct(&direct::Kernel));
+        }
         parking::unpark(&self.word, &self.kernel());
     }
 
+    /// The ring's futex: the kernel of a process that did not choose the direct driver.
     #[cfg(target_os = "linux")]
     fn kernel(&self) -> ring::Futexes {
         ring::Futexes
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// macOS's wait on an address: its futex.
+    #[cfg(target_os = "macos")]
+    fn kernel(&self) -> macos::Addresses {
+        macos::Addresses
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn kernel(&self) -> ThreadPark<'_> {
         ThreadPark(&self.thread)
     }
@@ -199,21 +298,99 @@ impl Default for Parker {
     }
 }
 
+/// A future's waker that unparks the one thread parked on this [`Parker`]: what
+/// [`block_on`] polls with, and any other thread that polls futures parked on its own.
+impl std::task::Wake for Parker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.unpark();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.unpark();
+    }
+}
+
+/// How [`block_on`] ended without the future's output.
+#[derive(Debug)]
+pub enum Unfinished {
+    /// `within` passed first: the future is dropped, which cancels what it asked.
+    TimedOut { what: &'static str, within: Duration },
+    /// The wait itself failed.
+    Wait(WaitError),
+}
+
+impl std::fmt::Display for Unfinished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unfinished::TimedOut { what, within } => {
+                write!(f, "waiting for {what}: not done in {within:?} (rule bounded-progress)")
+            }
+            Unfinished::Wait(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for Unfinished {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Unfinished::TimedOut { .. } => None,
+            Unfinished::Wait(error) => Some(error),
+        }
+    }
+}
+
+/// `future` polled on this thread to its end, parked between polls on a [`Parker`] (this
+/// module's deadline wait) for `what` (rule every-wait-says-what): at most `within` when given,
+/// on a [`Monotonic`] clock begun at the call. `None` is for a future whose every wait is
+/// bounded by deadlines of its own (an HTTP request's, which its client ends by its timeout),
+/// and says so in `what`. The tree's one "poll a future on this thread": no runtime under it.
+pub fn block_on<F: std::future::Future>(
+    what: &'static str,
+    within: Option<Duration>,
+    future: F,
+) -> Result<F::Output, Unfinished> {
+    use std::{
+        alloc::Global,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+    let clock = Monotonic::new();
+    let deadline = within.map(|it| Deadline::after(Clock::now(&clock), it));
+    let parker = Arc::new_in(Parker::new(), Global);
+    let waker = std::task::Waker::from(Arc::clone(&parker));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    // Bounded by `deadline` (or by the future's own, for `None`): each turn either ends the
+    // future, or parks until a wake or the deadline, and the deadline ends the loop.
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return Ok(output);
+        }
+        match parker.park(what, deadline, &clock) {
+            Ok(Waited::Ready(())) => {}
+            Ok(Waited::Deadline) => {
+                return Err(Unfinished::TimedOut { what, within: within.unwrap_or(Duration::MAX) });
+            }
+            Err(error) => return Err(Unfinished::Wait(error)),
+        }
+    }
+}
+
 /// The park of a system with no wait of this module on an address yet: std's thread park,
 /// the thread recorded before it says it is parked.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct ThreadPark<'a>(&'a crate::lock::Lock<Option<std::thread::Thread>>);
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl parking::Futex for ThreadPark<'_> {
-    fn prepare(&self, _: &std::sync::atomic::AtomicU32) {
+    fn prepare(&self, _: &crate::atomic::AtomicU32) {
         *self.0.lock() = Some(std::thread::current());
     }
 
     fn wait<C: Clock>(
         &self,
         what: &'static str,
-        word: &std::sync::atomic::AtomicU32,
+        word: &crate::atomic::AtomicU32,
         expected: u32,
         deadline: Option<Deadline>,
         clock: &C,
@@ -230,7 +407,7 @@ impl parking::Futex for ThreadPark<'_> {
         })
     }
 
-    fn wake(&self, _: &std::sync::atomic::AtomicU32) {
+    fn wake(&self, _: &crate::atomic::AtomicU32) {
         if let Some(thread) = self.0.lock().as_ref() {
             thread.unpark();
         }
@@ -238,7 +415,8 @@ impl parking::Futex for ThreadPark<'_> {
 }
 
 /// Waits until the child `pid` has exited, by `deadline` on `clock` (forever for `None`),
-/// leaving it unreaped: `IORING_OP_WAITID` with `WEXITED | WNOWAIT` on this thread's wait ring.
+/// leaving it unreaped: `IORING_OP_WAITID` with `WEXITED | WNOWAIT` on this thread's wait ring,
+/// or, on the direct driver, a `ppoll` of its pidfd between two `waitid(WNOHANG | WNOWAIT)`.
 /// A pid that is no child of this process (or one reaped already) fails with `ECHILD`.
 #[cfg(target_os = "linux")]
 pub fn exited(
@@ -248,7 +426,10 @@ pub fn exited(
     clock: &impl Clock,
 ) -> Result<Waited<()>, WaitError> {
     use reaping::Children as _;
-    ring::Kids.exited(what, pid, true, deadline, clock)
+    match choice::chosen() {
+        Waits::Ring => ring::Kids.exited(what, pid, true, deadline, clock),
+        Waits::Direct => direct::Direct(&direct::Kernel).exited(what, pid, true, deadline, clock),
+    }
 }
 
 /// Reaps the child `pid` once it has exited, by `deadline` on `clock`: its status and what it
@@ -260,11 +441,18 @@ pub(crate) fn reap(
     deadline: Option<Deadline>,
     clock: &impl Clock,
 ) -> Result<Waited<(libc::c_int, libc::rusage)>, WaitError> {
-    reaping::reap(what, &ring::Kids, pid, deadline, clock, reaping::ReapPlant::None)
+    let plant = reaping::ReapPlant::None;
+    match choice::chosen() {
+        Waits::Ring => reaping::reap(what, &mut ring::Kids, pid, deadline, clock, plant),
+        Waits::Direct => {
+            reaping::reap(what, &mut direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
+        }
+    }
 }
 
 /// Waits until `fd` is ready for `events` (`POLLIN`, `POLLPRI`, ...), by `deadline` on `clock`
-/// (forever for `None`): its `revents`. One `IORING_OP_POLL_ADD` on this thread's wait ring.
+/// (forever for `None`): its `revents`. One `IORING_OP_POLL_ADD` on this thread's wait ring, or
+/// `ppoll` on the direct driver.
 #[cfg(target_os = "linux")]
 pub fn pollable(
     what: &'static str,
@@ -273,5 +461,8 @@ pub fn pollable(
     deadline: Option<Deadline>,
     clock: &impl Clock,
 ) -> Result<Waited<libc::c_short>, WaitError> {
-    ring::poll(what, fd, events, deadline, clock)
+    match choice::chosen() {
+        Waits::Ring => ring::poll(what, fd, events, deadline, clock),
+        Waits::Direct => direct::poll(what, fd, events, deadline, clock),
+    }
 }

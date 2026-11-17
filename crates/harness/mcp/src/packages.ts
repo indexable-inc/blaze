@@ -22,9 +22,10 @@
 // does not resolve in the installed package is an error naming the package and what the registry or bun said. The
 // kernel's own node_modules are never consulted for a cell's package.
 //
-// Types. Cells are not type-checked: stripCell (ui/compile.ts) erases TypeScript with Bun.Transpiler and runs the
-// JavaScript, so a package's types never gate a cell and a package without types works the same. The types an
-// editor would use are in the installed folder (the package's own .d.ts, named by its `types`/`exports`).
+// Types. A cell is type-checked before it runs (typecheck.ts), but a package it imports by name is installed when the
+// cell runs, after the check: such an import is `any` to the checker, so a package's types never gate a cell and a
+// package without types works the same. Its own .d.ts files are in the installed folder (named by `types`/`exports`).
+import { HOME } from "./self.ts";
 import { builtinModules } from "node:module";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -123,7 +124,7 @@ type Pins = { version: 1; pins: Record<string, string> };
 
 /** The registry the user's npm config names, else npm's. */
 export const defaultRegistry = () => (process.env.npm_config_registry ?? process.env.NPM_CONFIG_REGISTRY ?? "https://registry.npmjs.org").replace(/\/+$/, "");
-export const defaultRoot = () => join(process.env.HARNESS_HOME ?? `${process.env.HOME}/.harness`, "packages");
+export const defaultRoot = () => join(HOME(), "packages");
 
 export class Packages {
   /** Installs under way in this kernel, by folder, so two cells importing one package install it once. */

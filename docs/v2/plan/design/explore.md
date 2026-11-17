@@ -7,7 +7,7 @@ date: 2026-10-31
 
 `blaze explore` prints and opens a link to `https://ix.dev/explore`. The page connects back to
 the daemon over WebTransport on 127.0.0.1 and asks it for builds, spans, tiles, views, SQL over
-the history and Flecs's world, and receives the live feed. Nothing is served from localhost: the
+the history, and receives the live feed. Nothing is served from localhost: the
 page is ix.dev's, the daemon only answers. The design of the page and the reasons for
 WebTransport are in explore-design.md and its addenda; the byte layout is
 `/tmp/blaze-lanes/explore-wire.md` (it moves to `docs/` with the page). This document is the
@@ -32,8 +32,7 @@ every source ends in one model on the page (indexable-inc/ix,
 Files and programs need no server of blaze's: the page reads ixprof's Arrow sections in the
 browser, and the program's own endpoint answers CORS for `https://ix.dev`. So this crate stays
 the daemon's source only. `hello` says so: `source: {kind: "blaze", extensions: ["blaze"]}`. The
-`blaze` extension is the views only the daemon has (builds, SQL, the named views, the build
-world); the generic views (flame graph and icicle with a diff, top by flat or cum, source lines,
+`blaze` extension is the views only the daemon has (builds, SQL, the named views); the generic views (flame graph and icicle with a diff, top by flat or cum, source lines,
 the timeline, allocations, waits, each live too) are the page's, over any source, and the
 daemon's Profile and Live tabs feed them.
 
@@ -61,7 +60,7 @@ session refuses as `unknown_op` naming it. `hello` also says `protocol: 1` and
 `layers: [{name, version}]`.
 
 The daemon is one `Source`: `blaze_explore::start(Config)` (`crates/blaze-explore/src/source.rs`)
-builds it over the history, the build world and blaze-profile's flight recorder, its one layer
+builds it over the history and blaze-profile's flight recorder, its one layer
 `{name: "blaze", version: blaze_profile::schema::VERSION}`, and calls `serve`. blaze-explore
 keeps the `blaze` layer's ops (`ops.rs`), their requests (`wire.rs`) and `tiles`.
 
@@ -72,7 +71,7 @@ tick run on that runtime's blocking pool, so a slow query never holds up the liv
 another query. Dropping the `Explorer` closes every session (code 0) and joins the thread.
 
 blaze-explore's `Config` holds the history (the DuckDB binary from `nix run .#duckdb` and the history's
-directory, `history::dir_in(state)`), Flecs's world (`Option<Arc<blaze_web::Graphs>>`), whether
+directory, `history::dir_in(state)`), whether
 the page's development server may connect, and the daemon's version for `hello`. Wiring it into
 `blaze serve` and adding the `blaze explore` command in blaze-cargo is queued to the coordinator.
 
@@ -147,7 +146,6 @@ page resets the stream or sends STOP_SENDING.
 | `view` | `name`, `args` | the view's result; the SQL it became in the header |
 | `spans` | `build`, `t0_ns`, `t1_ns` | the build's spans overlapping the range, by process, thread and start |
 | `tiles` | `build`, `t0_ns`, `t1_ns`, `bucket_ns`, optional `lane` (`thread` or `job`) | the `tiles` table, or `job_tiles` (a lane per fiber job, from `job_spans`) for `lane: job`; `lane`, `buckets`, `spans`, `sql_ns`, `tiles_ns` |
-| `world` | `path` | Flecs's REST answer to `GET <path>` as JSON in the header's `world`; no table |
 
 `sql` and `view` run through observe-history's `blaze_profile::sql::run` (the pinned DuckDB
 process over the Parquet history), and `views` comes from `blaze_profile::views::{VIEWS, find,
@@ -158,8 +156,8 @@ is inside the range. `tiles` applies the same rule. An empty result is checked a
 so a build that doesn't exist answers `no_such_build`, not zero rows.
 
 **Error kinds:** `unknown_op`, `bad_args`, `bad_token`, `unauthenticated`, `sql`
-(DuckDB's message and the query in the detail), `no_such_build`, `no_such_view`, `no_world`,
-`world` (Flecs answered something other than 200 JSON), `overloaded`, `encode` (Arrow
+(DuckDB's message and the query in the detail), `no_such_build`, `no_such_view`,
+`overloaded`, `encode` (Arrow
 refused a result), `cancelled` (the request was stopped and DuckDB killed), and `flush` (the
 daemon could not flush the history before the query, so it was not run).
 
@@ -176,11 +174,6 @@ through `sql::run_with(&Query, &stop)`, which kills the DuckDB process once the 
 answers `SqlError::Stopped`, sent as kind `cancelled` (to a page that is no longer listening,
 unless the stop came from elsewhere). The tiles or encoding left after a killed query end with
 it.
-
-**`world`:** `blaze_web::Graphs::rest` answers Flecs's REST over the build graph, but no v2
-daemon code makes a `Graphs` or feeds it its builds. Until it does, `world` answers `no_world`,
-naming `blaze_web::Graphs` in the daemon as what is missing. The interface (make one `Graphs` in
-`blaze serve`, feed it each build's records, pass it in `Config::world`) is queued to its owner.
 
 ## The live stream
 
@@ -300,5 +293,5 @@ and read the daemon's CPU time on the `blaze-explore` thread and its blocking po
 | Request parsing: every op, unknown ops, unknown and missing fields | `wire::tests` |
 | Tiles: `busy_ns` never exceeds the bucket, counts add up, brute-force property, column types, refusals | `tiles::tests` |
 | Certificate rotation on a virtual clock, the P-256 OIDs in the DER | `cert::tests` |
-| Each op without a transport: views, view errors, no DuckDB, ranges, `no_world` | `ops::tests` |
-| An in-process session with blaze-http's h3 client (pinning the hash): path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as IPC, `unknown_op`, `no_world`, a live frame's layout, `bad_token` closing only its own session, the dev origin | `server::tests` |
+| Each op without a transport: views, view errors, no DuckDB, ranges | `ops::tests` |
+| An in-process session with blaze-http's h3 client (pinning the hash): path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as IPC, `unknown_op`, a live frame's layout, `bad_token` closing only its own session, the dev origin | `server::tests` |

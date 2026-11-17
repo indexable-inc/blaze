@@ -4,8 +4,15 @@
 //!   their own, dictionaries and encodings) with one release swap, and frees the one it
 //!   replaced at task boundaries through its limbo. A reader loads it with one acquire load.
 //! - A record not in the mapped index table is a [`Spot`] in its tier's delta table: published
-//!   by one compare-and-swap, moved (from a writer's segment to its pack once that is mapped,
-//!   or by a settle) by one swap, the old spot freed at task boundaries.
+//!   by one compare-and-swap, moved (from a writer's segment to its pack once its commit is
+//!   durable, or by a settle) by one swap, the old spot freed at task boundaries.
+//! - A pack's bytes are read through the store's buffer pool
+//!   (docs/v2/plan/design/store-pool.md): a read pins the pages of what it reads
+//!   ([`crate::hot::Side::pin`], which loads the ones not in memory), and the pins are kept in
+//!   the [`Owned`] table, by run of pages, until the store lets the table go at a task
+//!   boundary. So the bytes a read hands out stay as they are for as long as the task that
+//!   read them runs, as a value made whole does, and a second read of a page the table pins
+//!   touches no shared word. No pack is mapped.
 //! - A value made whole to be read (decompressed, or put together from chunks) is published
 //!   once into the [`Owned`] table and read in place from then on; the store swaps in a fresh
 //!   table when the old one holds too much and frees the old one at task boundaries.
@@ -21,15 +28,20 @@ use crate::sync::{
 use crate::{
     ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Origin, Ticket, Use, cold,
     disk::{
-        self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of,
+        self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, Sealed, content_of,
     },
     encodings_of,
     flags::{Flag, FlagColumns, Row},
     index, location,
     segment::{ChunkRef, Segment},
+    hot::{HeldPins, PinError, Side},
+    pool::{PAGE, Run, counts},
     table::{Held, Keyed, Table},
 };
-use blaze_core::{FileName, Mapping};
+use blaze_core::{
+    FileName, Mapping,
+    lock::{Lock, Signal},
+};
 use blaze_format::{Aligned, SchemaHash};
 use blaze_ids::ContentId;
 use blaze_reclaim::Limbo;
@@ -41,6 +53,12 @@ pub(crate) const SEGMENTS_MOST: usize = 4096;
 /// The most a chunked value reserves before its pieces are read: past it, it grows as they are.
 const LIST_RESERVE: u64 = 64 << 20;
 
+/// How long a read waits at the pinned bound at a time before it looks again, and how many
+/// times: five seconds in all, then the read fails, naming the bound (rule
+/// `bounded-progress`).
+const BOUND_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+const BOUND_TICKS: u32 = 100;
+
 /// What the store and every reader and writer of it share.
 pub(crate) struct Shared {
     view: AtomicPtr<View>,
@@ -48,11 +66,77 @@ pub(crate) struct Shared {
     segments: Box<[OnceLock<Arc<Segment>>]>,
     /// The store's limbo once the store is dropped: what readers still holding this may read.
     orphans: AtomicPtr<Limbo>,
+    /// The whole files (by content, a derived value's by its key) this run began to write and
+    /// has not seen written back: what [`crate::Reader::derivable`] refuses as a base, since
+    /// a clone of one waits for its write-back. Written by the store alone, as a file's
+    /// state changes; held for one insert, remove or lookup.
+    unflushed: blaze_core::lock::Lock<crate::ByHashSet<ContentId, Global>>,
+    /// The store's side of its buffer pool: what a read of a pack's bytes pins through.
+    /// `None` when the pool could not be made: the store is broken, and has no pack to read.
+    side: Option<Arc<Side>>,
+    /// What a read at the pinned bound waits on: notified by the store as it frees what
+    /// passed its grace, a table of pins among it ([`Shared::pins_let_go`]).
+    bound: Lock<()>,
+    unpinned: Signal,
+    /// The keys readers keep for longer than a build ([`crate::collect::Keep`]: a kept front
+    /// end that reads a record a part at a time for its whole life), each with how many keep
+    /// it: roots of the collector, whatever their flags of use. Held for one insert, remove
+    /// or copy.
+    kept: blaze_core::lock::Lock<ByHash<Key, u32, Global>>,
+    /// Counts every key kept, ever: a mark of the collector made before one is stale.
+    kept_changes: std::sync::atomic::AtomicU64,
+    /// The store's clock as it was last told ([`crate::Store::clock`]), in seconds: what a
+    /// read stamps its pack with. `std`'s atomic under the model checker too: a hint, read
+    /// and written with no ordering.
+    tick: std::sync::atomic::AtomicU64,
+    /// The shared directories the store reads as layers ([`crate::Config::layers`]): what a
+    /// live layer ([`Shared::read_live`]) must be a writer of.
+    layers: Vec<FileName>,
+    /// The machine's layer's writer in this process, read live ([`Shared::read_live`]): a
+    /// read through a task's guard ([`crate::Reader`]) that misses every tier of this store
+    /// asks it next, so what the layer's writer was given (in its segments, its packs) is
+    /// found by this store's readers before the layer commits and this store looks again.
+    /// Nothing of it is written here: keys are content, so a key it holds that a listed tier
+    /// holds too is the same bytes.
+    live: OnceLock<Arc<Shared>>,
+}
+
+/// A read found the pool's pinned bytes at their bound through every wait for the store to
+/// let pins go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AtBound {
+    pub(crate) pinned: u64,
+    pub(crate) bound: u64,
+    pub(crate) need: u64,
+}
+
+impl std::fmt::Display for AtBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the store's pool holds {} bytes pinned by readers, and its bound is {} (half of \
+             its budget, pool::counts::pinned_bound): {} more could not be pinned through {:?} \
+             of waiting for tasks to end and let their pins go",
+            self.pinned,
+            self.bound,
+            self.need,
+            BOUND_TICK * BOUND_TICKS
+        )
+    }
 }
 
 impl Shared {
-    pub(crate) fn new(view: View) -> Shared {
+    pub(crate) fn new(view: View, side: Option<Arc<Side>>, layers: Vec<FileName>) -> Shared {
         Shared {
+            side,
+            layers,
+            live: OnceLock::new(),
+            bound: Lock::new("store.pool.pinned", ()),
+            unpinned: Signal::new("store.pool.unpinned"),
+            // alloc: empty, allocates nothing until a key is kept
+            kept: blaze_core::lock::Lock::new("store.kept", ByHash::new_in(Global)),
+            kept_changes: std::sync::atomic::AtomicU64::new(0),
+            tick: std::sync::atomic::AtomicU64::new(0),
             // alloc: once per store opened, the view readers load
             view: AtomicPtr::new(Box::into_raw(Box::new(view))),
             // alloc: once per store opened, the table of values made whole
@@ -60,6 +144,165 @@ impl Shared {
             // alloc: once per store opened, a slot per writer
             segments: (0..SEGMENTS_MOST).map(|_| OnceLock::new()).collect(),
             orphans: AtomicPtr::new(ptr::null_mut()),
+            // alloc: empty, allocates nothing until a whole file is written
+            unflushed: blaze_core::lock::Lock::new("store.unflushed", crate::ByHashSet::new_in(Global)),
+        }
+    }
+
+    /// Makes `layer` (another store's, in this process: the machine's layer's writer) the
+    /// store this one reads live behind its own tiers ([`Shared::live`]). Refused, naming
+    /// both, when `layer`'s directory is in none of this store's layers, when it is this
+    /// store, and when another is read live already: one a store.
+    pub(crate) fn read_live(&self, layer: &Arc<Shared>) -> Result<(), String> {
+        let guard = blaze_reclaim::enter();
+        let held = Held::task(&guard);
+        let dir = &layer.view(held).tiers[0].dir;
+        let mine = &self.view(held).tiers[0].dir;
+        if ptr::eq(self, &**layer) || !self.layers.iter().any(|root| dir.is_under(root)) {
+            // alloc: the error of a layer the store does not read
+            return Err(format!(
+                "the store {mine} cannot read {dir} live: it reads as layers only {:?}, and a live layer is a writer of one of them",
+                self.layers.iter().map(FileName::as_str).collect::<Vec<_>>()
+            ));
+        }
+        // clone: the store holds its live layer for its life
+        let mut given = Some(layer.clone());
+        let live = self.live.get_or_init(|| given.take().expect("taken only here"));
+        match given {
+            None => Ok(()),
+            // The same layer again (the daemon as it opens its home, then its handle's
+            // install): one live layer still.
+            Some(_) if Arc::ptr_eq(live, layer) => Ok(()),
+            // alloc: the error of a second live layer
+            Some(_) => Err(format!(
+                "the store {mine} reads {} live already: one live layer a store",
+                live.view(held).tiers[0].dir
+            )),
+        }
+    }
+
+    /// The store read live behind this one's tiers, if any ([`Shared::read_live`]).
+    pub(crate) fn live(&self) -> Option<&Shared> {
+        self.live.get().map(|it| &**it)
+    }
+
+    /// `key` is kept by one more reader.
+    pub(crate) fn keep(&self, key: Key) {
+        // alloc: one entry a key kept, removed when its last keeper lets go
+        *self.kept.lock().entry(key).or_insert(0) += 1;
+        self.kept_changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// One reader fewer keeps `key`.
+    pub(crate) fn let_go_of(&self, key: &Key) {
+        let mut kept = self.kept.lock();
+        if let Some(count) = kept.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                kept.remove(key);
+            }
+        }
+    }
+
+    /// The keys kept now, and how many were ever kept.
+    pub(crate) fn kept(&self) -> (Vec<Key>, u64) {
+        let changes = self.kept_changes.load(std::sync::atomic::Ordering::SeqCst);
+        // alloc: once a scan of a period's end, the keys kept: a few
+        (self.kept.lock().keys().copied().collect(), changes)
+    }
+
+    pub(crate) fn kept_changes(&self) -> u64 {
+        self.kept_changes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The store's clock, in seconds; 0 until it is told.
+    pub(crate) fn tick(&self) -> u64 {
+        self.tick.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_tick(&self, seconds: u64) {
+        self.tick.store(seconds, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The store began to write the whole file `id`: no base until its write-back completes.
+    pub(crate) fn unflushed(&self, id: ContentId) {
+        // alloc: one entry a whole file being written, removed when it is written back or goes
+        self.unflushed.lock().insert(id);
+    }
+
+    /// The whole file `id` is written back, or is no longer there to be cloned from.
+    pub(crate) fn settled(&self, id: &ContentId) {
+        self.unflushed.lock().remove(id);
+    }
+
+    /// Whether the store wrote the whole file `id` and has not seen it written back.
+    pub(crate) fn is_unflushed(&self, id: &ContentId) -> bool {
+        self.unflushed.lock().contains(id)
+    }
+
+    /// The store's side of its buffer pool.
+    pub(crate) fn side(&self) -> Option<&Side> {
+        self.side.as_deref()
+    }
+
+    /// The store freed what passed its grace: a read waiting at the pinned bound looks again.
+    pub(crate) fn pins_let_go(&self) {
+        self.unpinned.notify_all();
+    }
+
+    /// Room under the pinned bound for `need` more bytes: at once when there is, else after
+    /// waiting, in a span naming the bound, for the store to let go of the pins of tasks
+    /// that ended.
+    ///
+    /// The bound: readers pin at most half of the pool's budget
+    /// ([`counts::pinned_bound`]), so at least half of it is always the sweep's to take. A
+    /// task's pins live until the store frees the table they are in, which it does once the
+    /// table holds a quarter of the bound and every task that could have read from it has
+    /// ended; so the bound is met only when tasks running at once read more than it between
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`AtBound`], after [`BOUND_TICKS`] waits of [`BOUND_TICK`]: the read fails, naming the
+    /// bound. It never blocks without end, and never pins past the bound.
+    fn pin_room(&self, need: u64) -> Result<(), AtBound> {
+        self.pin_room_within(need, counts::pinned_bound(counts::budget()), BOUND_TICKS)
+    }
+
+    /// [`Shared::pin_room`] under `bound`, waiting at most `ticks` times.
+    pub(crate) fn pin_room_within(&self, need: u64, bound: u64, ticks: u32) -> Result<(), AtBound> {
+        let most = ticks;
+        let over = || counts::pinned_now().saturating_add(need) > bound;
+        if !over() {
+            return Ok(());
+        }
+        counts::bound_waited();
+        let span = tracing::info_span!(
+            target: "blaze",
+            "store pool: pinned bound",
+            pinned = counts::pinned_now(),
+            bound,
+            need,
+        );
+        let _in = span.enter();
+        let waited = blaze_graph::wait::wait(
+            blaze_graph::wait::WaitOn::Io("store pool: readers' pins at their bound"),
+            None,
+            || {
+                let mut guard = self.bound.lock();
+                let mut ticks = 0;
+                // Bounded: `most` waits (`BOUND_TICKS`) of `BOUND_TICK` each.
+                while over() && ticks < most {
+                    // wakes: the store's `tidy`, as it frees what passed its grace (`Shared::pins_let_go`), notifies `unpinned`; each wait also ends at its tick
+                    self.unpinned.wait_for(&mut guard, BOUND_TICK);
+                    ticks += 1;
+                }
+                !over()
+            },
+        );
+        match waited {
+            true => Ok(()),
+            false => Err(AtBound { pinned: counts::pinned_now(), bound, need }),
         }
     }
 
@@ -157,15 +400,46 @@ pub(crate) struct TierView {
 
 pub(crate) struct PackView {
     pub(crate) file: FileName,
-    pub(crate) mapping: Option<Mapping>,
-    /// How much of `mapping` is the store's.
+    /// The byte of the store's pool its first byte lives at, while it is open there
+    /// ([`crate::hot::Hot::pack_opened`]): its byte `at` is the pool's `base + at`.
+    pub(crate) base: Option<u64>,
+    /// How much of it is committed, and so a reader's to read through the pool.
     pub(crate) usable: u64,
+    /// Its records are no key's any more: the pack was retired ([`crate::collect`]), its
+    /// rooted records copied on, and the head names it removed or the next one will. A slot
+    /// of the index table that points into it finds nothing.
+    pub(crate) gone: bool,
+    /// When a record of it was last read, in seconds on the store's clock: the pack's own
+    /// word, which a read writes at most once a second ([`Look::was_read`]).
+    pub(crate) used: Arc<std::sync::atomic::AtomicU64>,
+    /// The offsets of its records forgotten alone, in order ([`crate::forget`]).
+    pub(crate) forgotten: Arc<Vec<u64>>, // alloc: the store's pack's list, shared
+}
+
+impl TierView {
+    /// Whether `loc` is in a pack that was retired, or is a record forgotten alone
+    /// ([`crate::forget`]): its key finds nothing in this tier.
+    #[inline]
+    pub(crate) fn gone(&self, loc: Loc) -> bool {
+        self.packs.get(loc.pack as usize).is_some_and(|it| {
+            it.gone || (!it.forgotten.is_empty() && it.forgotten.binary_search(&loc.offset).is_ok())
+        })
+    }
+
+    /// Whether a spot of a delta names a record that is gone ([`TierView::gone`]): its key
+    /// finds nothing in this tier, and an older record of the key the index holds is not
+    /// found in its place.
+    #[inline]
+    pub(crate) fn spot_gone(&self, place: Place) -> bool {
+        matches!(place, Place::Pack(loc) if self.gone(loc))
+    }
 }
 
 impl PackView {
-    fn bytes(&self, at: u64, len: u64) -> Option<&[u8]> {
-        let end = at.checked_add(len).filter(|&end| end <= self.usable)?;
-        self.mapping.as_ref()?.bytes().get(usize::try_from(at).ok()?..usize::try_from(end).ok()?)
+    /// The pool's byte its `len` bytes at `at` start at, when they are committed.
+    fn place(&self, at: u64, len: u64) -> Option<u64> {
+        at.checked_add(len).filter(|&end| end <= self.usable)?;
+        Some(self.base? + at)
     }
 }
 
@@ -273,6 +547,14 @@ impl Spot {
 /// never changes a demotion: an index swap starts the periods over, demotion waits for two,
 /// and the two rotations by then have cleared every carried `Read`, `ReadBefore`, `New` and
 /// `NewBefore`. `Flag::Verified` is no delta table's: a spot keeps it itself.
+/// Whether a record's check covered every byte its value is made from, so a read needs no
+/// BLAKE3 of the value: a format-9 record ([`Sealed::Whole`]) whose value is its payload or
+/// decoded from it alone. A value in a file of its own lies outside its record, so it is
+/// hashed; a chunked value's chunks are records of their own, each checked as it is read.
+pub(crate) fn whole_by_crc(header: &RecordHeader, payload: &[u8], sealed: Sealed) -> bool {
+    sealed == Sealed::Whole && (header.form != Form::External || payload.len() as u64 == header.raw)
+}
+
 pub(crate) fn carry_flags(from: &Table<Spot>, row: u64, to: &Table<Spot>, at: u64) {
     for flag in [Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore] {
         if from.flag(row, flag as usize) {
@@ -293,10 +575,58 @@ impl Keyed for Spot {
     }
 }
 
-/// Values made whole to be read, by where their record is.
+/// Values made whole to be read, by where their record is; and the pins of the packs' pages
+/// its readers read, by run of pages. Both live until the store lets the table go.
 pub(crate) struct Owned {
     table: Table<Decoded>,
     bytes: AtomicU64,
+    pins: Table<PinnedRun>,
+    /// Bytes of the runs `pins` holds.
+    pinned: AtomicU64,
+}
+
+/// A run of the pool's pages pinned for as long as it lives, counted in the pool's pinned
+/// bytes ([`counts`]): an entry of a table of pins, or what a [`Pinned`] holds.
+pub(crate) struct PinnedRun {
+    pins: HeldPins,
+}
+
+impl PinnedRun {
+    fn new(pins: HeldPins) -> PinnedRun {
+        counts::pinned(u64::from(pins.run().pages) * PAGE);
+        PinnedRun { pins }
+    }
+
+    /// Pages `run` of the pool pinned whole, loading those not in memory.
+    fn pin(side: &Side, run: Run) -> Result<PinnedRun, PinError> {
+        side.pin(run.first * PAGE, u64::from(run.pages) * PAGE).map(PinnedRun::new)
+    }
+
+    /// The `len` bytes at the pool's byte `at`, which its run covers and its file commits.
+    /// Only those: the run is whole pages, and a commit may be writing the last one past
+    /// what is committed, so no reference is made to the rest of it.
+    fn bytes(&self, at: u64, len: u64) -> &[u8] {
+        self.pins.part(at, len)
+    }
+}
+
+impl Drop for PinnedRun {
+    fn drop(&mut self) {
+        counts::unpinned(u64::from(self.pins.run().pages) * PAGE);
+    }
+}
+
+impl Keyed for PinnedRun {
+    type Key = (u64, u64);
+
+    fn key(&self) -> (u64, u64) {
+        let run = self.pins.run();
+        (run.first, u64::from(run.pages))
+    }
+
+    fn hash(key: &(u64, u64)) -> u64 {
+        <Decoded as Keyed>::hash(key)
+    }
 }
 
 struct Decoded {
@@ -320,12 +650,52 @@ impl Keyed for Decoded {
 
 impl Owned {
     fn new() -> Owned {
-        Owned { table: Table::new(1024, 0), bytes: AtomicU64::new(0) }
+        Owned {
+            table: Table::new(1024, 0),
+            bytes: AtomicU64::new(0),
+            pins: Table::new(1024, 0),
+            pinned: AtomicU64::new(0),
+        }
     }
 
     /// How many bytes it holds.
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// How many bytes of the pool's pages it pins.
+    pub(crate) fn pinned(&self) -> u64 {
+        self.pinned.load(Ordering::Relaxed)
+    }
+
+    /// The `len` (at least one) bytes at the pool's byte `at`, their pages pinned by this
+    /// table until it is let go: found pinned already (no shared word is written), or pinned
+    /// now, loading the pages not in memory. Of two readers that pin one run at once, one
+    /// pin is kept and both read through it.
+    fn pin<'a>(
+        &'a self,
+        held: Held<'a>,
+        shared: &Shared,
+        side: &Side,
+        at: u64,
+        len: u64,
+    ) -> Result<&'a [u8], PinFailed> {
+        let run = Run::of(at, len);
+        let id = (run.first, u64::from(run.pages));
+        if let Some((_, it)) = self.pins.get(held, &id) {
+            return Ok(it.bytes(at, len));
+        }
+        let bytes = u64::from(run.pages) * PAGE;
+        shared.pin_room(bytes).map_err(PinFailed::AtBound)?;
+        let pinned = PinnedRun::pin(side, run).map_err(PinFailed::Pin)?;
+        match self.pins.insert(held, pinned) {
+            Ok((_, it)) => {
+                self.pinned.fetch_add(bytes, Ordering::Relaxed);
+                Ok(it.bytes(at, len))
+            }
+            // Another reader's pin of the run landed first: this one goes back.
+            Err((_, (_, it))) => Ok(it.bytes(at, len)),
+        }
     }
 
     fn get<'a>(&'a self, held: Held<'a>, id: (u64, u64)) -> Option<(ContentId, &'a [u8])> {
@@ -349,6 +719,25 @@ impl Owned {
                 &it.bytes
             }
             Err((_, (_, it))) => &it.bytes,
+        }
+    }
+}
+
+/// Why a pack's bytes could not be pinned.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum PinFailed {
+    /// The store has no pool.
+    NoPool,
+    AtBound(AtBound),
+    Pin(PinError),
+}
+
+impl std::fmt::Display for PinFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinFailed::NoPool => write!(f, "the store has no buffer pool to read it through"),
+            PinFailed::AtBound(at) => write!(f, "{at}"),
+            PinFailed::Pin(err) => write!(f, "{err}"),
         }
     }
 }
@@ -416,11 +805,29 @@ impl At<'_> {
 pub(crate) struct Look<'a> {
     pub(crate) shared: &'a Shared,
     pub(crate) held: Held<'a>,
+    /// The store read live behind `shared`'s tiers ([`Shared::live`]), asked by a read that
+    /// misses them all: only a look through a task's guard has one, since what another store
+    /// frees is held only by the process's epoch ([`Held::task`]), never by a borrow of this
+    /// store ([`Held::writer`]).
+    live: Option<&'a Shared>,
 }
 
 impl<'a> Look<'a> {
+    /// A look at `shared`'s tiers alone.
     pub(crate) fn new(shared: &'a Shared, held: Held<'a>) -> Look<'a> {
-        Look { shared, held }
+        Look { shared, held, live: None }
+    }
+
+    /// A look at `shared`'s tiers and, behind them, the store it reads live: a reader's,
+    /// in a task (`guard`).
+    pub(crate) fn reading(shared: &'a Shared, guard: &'a blaze_reclaim::Guard) -> Look<'a> {
+        Look { shared, held: Held::task(guard), live: shared.live() }
+    }
+
+    /// The look a read that missed every tier asks next: the live layer's own tiers, which
+    /// read no live layer of theirs.
+    fn behind(self) -> Option<Look<'a>> {
+        self.live.map(|live| Look::new(live, self.held))
     }
 
     pub(crate) fn view(self) -> &'a View {
@@ -429,9 +836,13 @@ impl<'a> Look<'a> {
 
     pub(crate) fn find(self, key: &Key) -> Option<Result<Found<'a>, Corrupt>> {
         let view = self.view();
-        for (at, tier) in view.tiers.iter().enumerate() {
+        'tiers: for (at, tier) in view.tiers.iter().enumerate() {
             for table in std::iter::once(&tier.delta).chain(&tier.prev) {
                 if let Some((row, spot)) = table.get(self.held, key) {
+                    // A record forgotten alone: nothing of the key in this tier.
+                    if tier.spot_gone(spot.place) {
+                        continue 'tiers;
+                    }
                     return Some(Ok(Found {
                         view,
                         tier: at,
@@ -442,6 +853,8 @@ impl<'a> Look<'a> {
             }
             let Some(index) = &tier.index else { continue };
             match index.table().get(key) {
+                // A key the collector forgot: its pack was retired without it.
+                Some((_, Ok(loc))) if tier.gone(loc) => {}
                 Some((slot, Ok(loc))) => {
                     return Some(Ok(Found {
                         view,
@@ -469,14 +882,27 @@ impl<'a> Look<'a> {
     /// taking one from an older tier behind it.
     pub(crate) fn kept(self, key: &Key) -> Option<(ContentId, Ticket)> {
         let view = self.view();
-        for (at, tier) in view.tiers.iter().enumerate() {
+        'tiers: for (at, tier) in view.tiers.iter().enumerate() {
             for table in std::iter::once(&tier.delta).chain(&tier.prev) {
-                if let Some((_, spot)) = table.get(self.held, key) {
+                if let Some((row, spot)) = table.get(self.held, key) {
+                    // A record forgotten alone keeps nothing: a put writes the value again.
+                    if tier.spot_gone(spot.place) {
+                        continue 'tiers;
+                    }
+                    // A put of a value the store has is a use of it, as a read is: the
+                    // collector keeps what a build was told is kept.
+                    self.was_read(Found {
+                        view,
+                        tier: at,
+                        place: spot.place,
+                        at: At::Spot(table, row, spot),
+                    });
                     return Some((spot.content, spot.ticket));
                 }
             }
             let Some(index) = &tier.index else { continue };
             match index.table().get(key) {
+                Some((_, Ok(loc))) if tier.gone(loc) => {}
                 Some((slot, Ok(loc))) => {
                     let found = Found {
                         view,
@@ -484,6 +910,7 @@ impl<'a> Look<'a> {
                         place: Place::Pack(loc),
                         at: At::Slot(index, slot),
                     };
+                    self.was_read(found);
                     return self
                         .record(found, key)
                         .ok()
@@ -503,20 +930,35 @@ impl<'a> Look<'a> {
         tier: usize,
         bad: &mut Vec<(Key, &'static str)>,
     ) -> Vec<(Key, Found<'a>)> {
+        // alloc: the listing is the output, for checks
+        let mut out = Vec::new();
+        self.each_row(tier, bad, |key, found| out.push((key, found)));
+        out
+    }
+
+    /// [`Look::rows`] given to `each` one at a time, in the same order, with no list of
+    /// them made: what a period's scan walks, twice, so that what it holds does not grow
+    /// with the rows (but for the keys of the deltas, which are bounded, while it walks).
+    pub(crate) fn each_row(
+        self,
+        tier: usize,
+        bad: &mut Vec<(Key, &'static str)>,
+        mut each: impl FnMut(Key, Found<'a>),
+    ) {
         let view = self.view();
         let it = &view.tiers[tier];
-        // alloc: the listing is the output, for collection and checks
-        let mut out = Vec::new();
-        // The keys seen live only while the listing is made: a frame's.
+        // The keys seen live only while the rows are walked: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
             let mut shadow = blaze_hash::HashSet::new_in(frame);
             for table in std::iter::once(&it.delta).chain(&it.prev) {
                 for (row, spot) in table.iter(self.held) {
-                    if shadow.insert(spot.key) {
-                        out.push((
+                    // A record forgotten alone shadows the index's older one of its key, and
+                    // is itself no row.
+                    if shadow.insert(spot.key) && !it.spot_gone(spot.place) {
+                        each(
                             spot.key,
                             Found { view, tier, place: spot.place, at: At::Spot(table, row, spot) },
-                        ));
+                        );
                     }
                 }
             }
@@ -524,7 +966,8 @@ impl<'a> Look<'a> {
                 for (slot, key, loc) in index.table().iter() {
                     match loc {
                         Ok(_) if shadow.contains(&key) => {}
-                        Ok(loc) => out.push((
+                        Ok(loc) if it.gone(loc) => {}
+                        Ok(loc) => each(
                             key,
                             Found {
                                 view,
@@ -532,13 +975,12 @@ impl<'a> Look<'a> {
                                 place: Place::Pack(loc),
                                 at: At::Slot(index, slot),
                             },
-                        )),
+                        ),
                         Err(what) => bad.push((key, what)),
                     }
                 }
             }
         });
-        out
     }
 
     pub(crate) fn columns_of(self, bytes: &[u8]) -> Option<&'a Columns> {
@@ -569,7 +1011,7 @@ impl<'a> Look<'a> {
     }
 
     /// The file a found record is named by when it is corrupt.
-    fn file_of(self, found: Found<'a>) -> FileName {
+    pub(crate) fn file_of(self, found: Found<'a>) -> FileName {
         let tier = &found.view.tiers[found.tier];
         match found.place {
             Place::Pack(loc) => match tier.packs.get(loc.pack as usize) {
@@ -584,12 +1026,78 @@ impl<'a> Look<'a> {
         }
     }
 
-    /// The bytes of a pack, in the view the record was found in or, for a record published
-    /// after it, the one published since: a view never loses a mapping a found record names.
-    fn pack_bytes(self, found: Found<'a>, loc: Loc, at: u64, len: u64) -> Option<&'a [u8]> {
-        let of =
-            |view: &'a View| view.tiers[found.tier].packs.get(loc.pack as usize)?.bytes(at, len);
-        of(found.view).or_else(|| of(self.view()))
+    /// The bytes of a pack, pinned through the store's pool until the table of pins is let
+    /// go ([`Owned::pin`]): where the view the record was found in commits them or, for a
+    /// record published after it, where the one published since does. `Err(None)` when
+    /// neither commits them.
+    fn pack_bytes(
+        self,
+        found: Found<'a>,
+        loc: Loc,
+        at: u64,
+        len: u64,
+    ) -> Result<&'a [u8], Option<PinFailed>> {
+        self.pool_bytes(found.tier, found.view, loc.pack, at, len)
+    }
+
+    /// As [`Look::pack_bytes`], of pack `pack` of tier `tier` as `view` or the view
+    /// published since has it.
+    pub(crate) fn pool_bytes(
+        self,
+        tier: usize,
+        view: &'a View,
+        pack: u32,
+        at: u64,
+        len: u64,
+    ) -> Result<&'a [u8], Option<PinFailed>> {
+        let of = |view: &'a View| view.tiers.get(tier)?.packs.get(pack as usize)?.place(at, len);
+        let Some(place) = of(view).or_else(|| of(self.view())) else { return Err(None) };
+        self.pinned_at(place, len).map_err(Some)
+    }
+
+    /// The pages of the store's pool the records of `keys` are in, as runs in address order,
+    /// those that touch or follow each other merged into one: what a prefetch of them reads,
+    /// a run of neighbours in one read. A key with no record in a pack (not kept, or still in
+    /// its writer's segment, which is memory already) has none. For a value kept in chunks
+    /// this is its list of chunks, not the chunks: they are named by the list, which is not
+    /// read here.
+    pub(crate) fn runs_of(self, keys: &[Key]) -> Vec<Run> {
+        // alloc: a prefetch's plan, once per hint, handed to the loads
+        let mut runs: Vec<Run> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(Ok(found)) = self.find(key) else { continue };
+            let Place::Pack(loc) = found.place else { continue };
+            let len = RECORD_HEADER + loc.stored;
+            let pack = found.view.tiers[found.tier].packs.get(loc.pack as usize);
+            if let Some(place) = pack.and_then(|it| it.place(loc.offset, len)) {
+                runs.push(Run::of(place, len));
+            }
+        }
+        runs.sort_unstable_by_key(|it| it.first);
+        let mut merged = 0;
+        for at in 1..runs.len() {
+            let (last, run) = (runs[merged], runs[at]);
+            let end = last.first + u64::from(last.pages);
+            if run.first <= end {
+                let end = end.max(run.first + u64::from(run.pages));
+                runs[merged].pages = (end - last.first) as u32;
+            } else {
+                merged += 1;
+                runs[merged] = run;
+            }
+        }
+        runs.truncate(if runs.is_empty() { 0 } else { merged + 1 });
+        runs
+    }
+
+    /// The `len` bytes at the pool's byte `place`, which a pack open there commits: pinned
+    /// until the table of pins is let go, loaded first where they are not in memory.
+    pub(crate) fn pinned_at(self, place: u64, len: u64) -> Result<&'a [u8], PinFailed> {
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let side = self.shared.side().ok_or(PinFailed::NoPool)?;
+        self.shared.owned(self.held).pin(self.held, self.shared, side, place, len)
     }
 
     fn external(self, found: Found<'a>, content: &ContentId) -> Result<&'a [u8], Option<FileName>> {
@@ -614,14 +1122,25 @@ impl<'a> Look<'a> {
         of(found.view).or_else(|| of(self.view()))
     }
 
-    /// The header of a found record, checked to be of `key`, and its payload.
+    /// The header of a found record, checked to be of `key`, and its payload, the two checked
+    /// whole by the record's CRC ([`RecordHeader::check`]).
     pub(crate) fn record(
         self,
         found: Found<'a>,
         key: &Key,
     ) -> Result<(RecordHeader, &'a [u8]), Corrupt> {
+        self.record_sealed(found, key).map(|(header, payload, _)| (header, payload))
+    }
+
+    /// [`Look::record`], and what its check covered: a format-8 record's payload is the value
+    /// only once its BLAKE3 matches.
+    pub(crate) fn record_sealed(
+        self,
+        found: Found<'a>,
+        key: &Key,
+    ) -> Result<(RecordHeader, &'a [u8], Sealed), Corrupt> {
         let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
-        let (at, header, payload) = match found.place {
+        let (at, header_bytes, payload) = match found.place {
             Place::Pack(loc) => {
                 let tier = &found.view.tiers[found.tier];
                 if loc.pack as usize >= tier.packs.len() {
@@ -632,17 +1151,24 @@ impl<'a> Look<'a> {
                     )));
                 }
                 let at = loc.offset;
-                let header = self
-                    .pack_bytes(found, loc, at, RECORD_HEADER)
+                let header = self.pack_bytes(found, loc, at, RECORD_HEADER).map_err(|why| {
                     // alloc: the error's message
-                    .ok_or_else(|| corrupt(format!("its record at {at} is outside the pack")))?;
-                let header =
+                    corrupt(match why {
+                        None => format!("its record at {at} is outside the pack"),
+                        Some(why) => format!("its record at {at} could not be read: {why}"),
+                    })
+                })?;
+                let stored =
                     // alloc: the error's message
-                    RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
-                let payload = self
-                    .pack_bytes(found, loc, at + RECORD_HEADER, header.stored)
-                    // alloc: the error's message
-                    .ok_or_else(|| corrupt(format!("the record at {at} runs past the pack")))?;
+                    RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?.stored;
+                let payload =
+                    self.pack_bytes(found, loc, at + RECORD_HEADER, stored).map_err(|why| {
+                        // alloc: the error's message
+                        corrupt(match why {
+                            None => format!("the record at {at} runs past the pack"),
+                            Some(why) => format!("the record at {at} could not be read: {why}"),
+                        })
+                    })?;
                 (at, header, payload)
             }
             Place::Segment(seg) => {
@@ -657,17 +1183,17 @@ impl<'a> Look<'a> {
                     // alloc: the error's message
                     .ok_or_else(|| corrupt(format!("its record at {at} is outside its segment")))?;
                 let (header, payload) = bytes.split_at(RECORD_HEADER as usize);
-                let header =
-                    // alloc: the error's message
-                    RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
                 (at, header, payload)
             }
         };
+        let (header, sealed) = RecordHeader::check(header_bytes, payload)
+            // alloc: the error's message
+            .map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
         if header.key != *key {
             // alloc: the error's message
             return Err(corrupt(format!("the record at {at} is of another key")));
         }
-        Ok((header, payload))
+        Ok((header, payload, sealed))
     }
 
     /// The bytes of a found record, checked against its content hash: once a record for reads
@@ -678,7 +1204,7 @@ impl<'a> Look<'a> {
         key: &Key,
         why: Use,
     ) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
-        let (header, payload) = self.record(found, key)?;
+        let (header, payload, sealed) = self.record_sealed(found, key)?;
         let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
         let at = match found.place {
             Place::Pack(loc) => loc.offset,
@@ -767,8 +1293,11 @@ impl<'a> Look<'a> {
                 Cow::Owned(whole)
             }
             Form::External => match found.place {
-                Place::Segment(_) => Cow::Borrowed(payload),
-                Place::Pack(_) => match self.external(found, &header.content) {
+                // A put's bytes ride in its segment until the commit writes its file.
+                Place::Segment(_) if header.stored > 0 => Cow::Borrowed(payload),
+                // A record moved to its placed file ([`crate::home`]) names the file from its
+                // segment on: the file was listed, mapped and published before the move.
+                Place::Segment(_) | Place::Pack(_) => match self.external(found, &header.content) {
                     Ok(bytes) => Cow::Borrowed(bytes),
                     Err(Some(file)) => {
                         return Err(Corrupt {
@@ -801,13 +1330,17 @@ impl<'a> Look<'a> {
         }
         let memo = !matches!(why, Use::Check);
         if !(memo && found.at.verified()) {
-            let hashed = content_of(&bytes);
-            if hashed != header.content {
-                // alloc: the error's message
-                return Err(corrupt(format!(
-                    "its bytes hash to {hashed:x}, not the {:x} recorded",
-                    header.content
-                )));
+            // A format-9 record's CRC, checked above, covered the bytes its value is made of:
+            // the BLAKE3 is the scrub's (`Use::Check`), and a format-8 record's.
+            if !(memo && whole_by_crc(&header, payload, sealed)) {
+                let hashed = content_of(&bytes);
+                if hashed != header.content {
+                    // alloc: the error's message
+                    return Err(corrupt(format!(
+                        "its bytes hash to {hashed:x}, not the {:x} recorded",
+                        header.content
+                    )));
+                }
             }
             if memo {
                 found.at.set_verified();
@@ -819,9 +1352,20 @@ impl<'a> Look<'a> {
         Ok((header, bytes))
     }
 
-    fn was_read(self, found: Found<'a>) {
+    /// A hit of the own tier: its record's flag of use, and its pack's time of use, each
+    /// written only when it changes, so reading a record again writes no shared line. The one
+    /// mark of a read: [`crate::direct`]'s reads mark through it too.
+    pub(crate) fn was_read(self, found: Found<'a>) {
         if found.tier == 0 {
             found.at.set(Flag::Read);
+            if let Place::Pack(loc) = found.place
+                && let Some(pack) = found.view.tiers[0].packs.get(loc.pack as usize)
+            {
+                let (tick, relaxed) = (self.shared.tick(), std::sync::atomic::Ordering::Relaxed);
+                if pack.used.load(relaxed) != tick {
+                    pack.used.store(tick, relaxed);
+                }
+            }
         }
     }
 
@@ -857,13 +1401,86 @@ impl<'a> Look<'a> {
     }
 
     pub(crate) fn get(self, key: &Key) -> Result<Option<Entry<'a>>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.get(key));
+        };
         self.read(found?, key).map(Some)
+    }
+
+    /// The `len` bytes at `at` of the value of `key`, read in place: for a reader of a few
+    /// bytes of a large value (`hir_def`'s def map pages: one name's entry of a crate's
+    /// record), which must not load the rest. `None` when the store has no value of `key`.
+    ///
+    /// A raw record of a pack that a [`Look::get`] verified against its content hash once
+    /// (its opener's) is read through the pool a part at a time: its header, to check the
+    /// record is of `key`, and the pages the part is on. The pool checks every block it
+    /// reads against its file's checks before a page is loaded (`pool::loads`), so the part
+    /// is the bytes that were hashed. Any other value (not verified yet, compressed, kept in
+    /// chunks or as a file of its own, still in its writer's segment) is read whole as
+    /// [`Look::get`] reads it, and the part is of that. A part past the value's end is an
+    /// error naming the key: never bytes of the record after it.
+    pub(crate) fn part(self, key: &Key, at: u64, len: u64) -> Result<Option<&'a [u8]>, Corrupt> {
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.part(key, at, len));
+        };
+        let found = found?;
+        let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
+        let end = at.checked_add(len);
+        if let Place::Pack(loc) = found.place
+            && loc.form == Form::Raw
+            && found.at.verified()
+        {
+            if end.is_none_or(|end| end > loc.raw) {
+                // alloc: the error's message
+                return Err(corrupt(format!("bytes {at}+{len} were asked of its {} bytes", loc.raw)));
+            }
+            let read = |from: u64, len: u64| {
+                self.pack_bytes(found, loc, from, len).map_err(|why| {
+                    // alloc: the error's message
+                    corrupt(match why {
+                        None => format!("its record at {} runs past the pack", loc.offset),
+                        Some(why) => {
+                            format!("its record at {} could not be read: {why}", loc.offset)
+                        }
+                    })
+                })
+            };
+            let header = RecordHeader::decode(read(loc.offset, RECORD_HEADER)?)
+                // alloc: the error's message
+                .map_err(|what| corrupt(format!("the record at {}: {what}", loc.offset)))?;
+            if header.key != *key {
+                // alloc: the error's message
+                return Err(corrupt(format!("the record at {} is of another key", loc.offset)));
+            }
+            let bytes = read(loc.offset + RECORD_HEADER + at, len)?;
+            self.was_read(found);
+            return Ok(Some(bytes));
+        }
+        let entry = self.read(found, key)?;
+        let part = end
+            .and_then(|end| Some((usize::try_from(at).ok()?, usize::try_from(end).ok()?)))
+            .and_then(|(at, end)| entry.bytes.get(at..end));
+        match part {
+            Some(part) => Ok(Some(part)),
+            // alloc: the error's message
+            None => Err(corrupt(format!(
+                "bytes {at}+{len} were asked of its {} bytes",
+                entry.bytes.len()
+            ))),
+        }
     }
 
     /// [`Look::get`] and the directory the value is in: its own tier's, or a tier behind it.
     pub(crate) fn get_from(self, key: &Key) -> Result<Option<(Origin, Entry<'a>)>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            let Some(behind) = self.behind() else { return Ok(None) };
+            // The live layer's own records are behind this store's, under its directory.
+            return Ok(behind.get_from(key)?.map(|(origin, entry)| match origin {
+                // clone: the name of the directory a reader refuses a value of
+                Origin::Own => (Origin::Behind(behind.view().tiers[0].dir.clone()), entry),
+                origin => (origin, entry),
+            }));
+        };
         let found = found?;
         let origin = match found.tier {
             0 => Origin::Own,
@@ -874,7 +1491,9 @@ impl<'a> Look<'a> {
     }
 
     pub(crate) fn get_in_place(self, key: &Key) -> Result<Option<(Heat, Entry<'a>)>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.get_in_place(key));
+        };
         let found = found?;
         if found.place.form() != Form::Warm {
             return self.read(found, key).map(|entry| Some((Heat::Hot, entry)));
@@ -896,31 +1515,84 @@ impl<'a> Look<'a> {
         )))
     }
 
+    /// A hit counts as a read: what a build found it may read or place later, so the
+    /// collector keeps it as it keeps what was read (docs/gc.md, the roots).
     pub(crate) fn has(self, key: &Key) -> bool {
-        self.find(key).is_some()
+        match self.find(key) {
+            Some(Ok(found)) => {
+                self.was_read(found);
+                true
+            }
+            Some(Err(_)) => true,
+            None => self.behind().is_some_and(|behind| behind.has(key)),
+        }
     }
 
     /// The value of `key`, verified as [`Look::get`] verifies it, held past the task: the bytes
     /// of its record in place when they are a whole raw record of a mapped pack or a file of
     /// its own at a 16-byte boundary, else one aligned copy of the value made whole.
     pub(crate) fn pinned(self, key: &Key) -> Result<Option<Pinned>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.pinned(key));
+        };
         let found = found?;
         let entry = self.read(found, key)?;
-        let bytes = match self.mapping_holding(found, &entry) {
-            Some((mapping, start, file)) => {
+        let bytes = match (self.pins_holding(found, &entry, key)?, self.mapping_holding(found, &entry)) {
+            (Some((run, at)), _) => PinnedBytes::Pool { run, at, len: entry.bytes.len() as u64 },
+            (None, Some((mapping, start, file))) => {
                 PinnedBytes::Mapped { mapping, start, len: entry.bytes.len(), file }
             }
             // alloc: a value made whole and held past the task: one aligned copy per pin
-            None => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
+            (None, None) => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
         };
         Ok(Some(Pinned { key: entry.key, kind: entry.kind, content: entry.content, bytes }))
     }
 
+    /// Pins of its own of the pages `entry`'s bytes are in, and the pool's byte they start
+    /// at, when they are a raw record of a pack at a multiple of [`disk::ALIGN`]: what holds
+    /// the value past the task, whose own pins go with the table they are in. The pages are
+    /// in memory (the read just pinned them), so this loads nothing.
+    fn pins_holding(
+        self,
+        found: Found<'a>,
+        entry: &Entry<'a>,
+        key: &Key,
+    ) -> Result<Option<(Arc<PinnedRun>, u64)>, Corrupt> {
+        let Place::Pack(loc) = found.place else { return Ok(None) };
+        if loc.form != Form::Raw
+            || entry.bytes.is_empty()
+            || !(entry.bytes.as_ptr() as usize).is_multiple_of(disk::ALIGN as usize)
+        {
+            return Ok(None);
+        }
+        let (at, len) = (loc.offset + RECORD_HEADER, entry.bytes.len() as u64);
+        let of = |view: &'a View| view.tiers.get(found.tier)?.packs.get(loc.pack as usize)?.place(at, len);
+        let (Some(place), Some(side)) = (of(found.view).or_else(|| of(self.view())), self.shared.side())
+        else {
+            return Ok(None);
+        };
+        // alloc: the error's message
+        let corrupt = |why: String| Corrupt { key: *key, pack: self.file_of(found), what: why };
+        let run = Run::of(place, len);
+        self.shared
+            .pin_room(u64::from(run.pages) * PAGE)
+            // alloc: the error's message
+            .map_err(|why| corrupt(format!("it could not be held past its task: {why}")))?;
+        let pinned = PinnedRun::pin(side, run)
+            // alloc: the error's message
+            .map_err(|why| corrupt(format!("it could not be held past its task: {why}")))?;
+        debug_assert_eq!(pinned.bytes(place, len).as_ptr(), entry.bytes.as_ptr(), "{loc:?}");
+        // alloc: a count of the pins, so a clone of the value shares them
+        Ok(Some((Arc::new(pinned), place)))
+    }
+
     /// The mapping `entry`'s bytes are a range of, and where in it they start, when they are
-    /// one and start at a multiple of [`disk::ALIGN`]: a raw record of a pack, or a file of its
-    /// own. A value made whole (decompressed, from chunks or columns) or still in a writer's
-    /// segment is in none. For a file of its own, also the file, which holds the value whole.
+    /// one and start at a multiple of [`disk::ALIGN`]: a file of its own, which holds the
+    /// value whole (the one kind of store file still mapped: a [`Kind::Machine`] module's
+    /// loader maps it, and the others wait for block checks of their own to move onto the
+    /// pool). A raw record of a pack is held by pins ([`Look::pins_holding`]); a value made
+    /// whole (decompressed, from chunks or columns) or still in a writer's segment is in
+    /// neither.
     fn mapping_holding(
         self,
         found: Found<'a>,
@@ -935,7 +1607,6 @@ impl<'a> Look<'a> {
         let of = |view: &'a View| -> Option<(&'a Mapping, Option<&'a FileName>)> {
             let tier = view.tiers.get(found.tier)?;
             match loc.form {
-                Form::Raw => Some((tier.packs.get(loc.pack as usize)?.mapping.as_ref()?, None)),
                 Form::External => {
                     let external = tier.externals.get(&entry.content)?;
                     Some((external.mapping.as_ref()?, Some(&external.file)))
@@ -958,10 +1629,13 @@ impl<'a> Look<'a> {
 
 /// A value of the store held past the task it was read in: [`crate::Reader::pinned`].
 ///
-/// Its bytes start at a multiple of 16 and stay as they are while it lives: a range of its
-/// pack's or file's mapping, which a clone of the [`Mapping`] keeps mapped (the store replaces a
-/// file only by renaming another over it), or an aligned copy of a value that had to be made
-/// whole. Verified against the content hash it was put with before it was made.
+/// Its bytes start at a multiple of 16 and stay as they are while it lives: a raw record of
+/// a pack in the pages of the store's pool, which pins of its own keep in memory (counted in
+/// the pool's pinned bytes, and never the sweep's to take, until it is dropped); a range of
+/// the mapping of a file of its own, which a clone of the [`Mapping`] keeps mapped (the
+/// store replaces a file only by renaming another over it); or an aligned copy of a value
+/// that had to be made whole. Verified against the content hash it was put with before it
+/// was made.
 #[derive(Clone)]
 pub struct Pinned {
     pub key: Key,
@@ -973,6 +1647,12 @@ pub struct Pinned {
 
 #[derive(Clone)]
 enum PinnedBytes {
+    /// `len` bytes at the pool's byte `at`, in pages `run` pins.
+    Pool {
+        run: Arc<PinnedRun>,
+        at: u64,
+        len: u64,
+    },
     /// `file` is the file of its own the value is the whole of, when it is one.
     Mapped {
         mapping: Mapping,
@@ -986,7 +1666,7 @@ enum PinnedBytes {
 impl Pinned {
     /// Whether its bytes are the store's own, in place, rather than a copy.
     pub fn in_place(&self) -> bool {
-        matches!(self.bytes, PinnedBytes::Mapped { .. })
+        matches!(self.bytes, PinnedBytes::Mapped { .. } | PinnedBytes::Pool { .. })
     }
 
     /// The file under the driver's root whose bytes are exactly the value, when the value is a
@@ -997,8 +1677,26 @@ impl Pinned {
     pub fn file(&self) -> Option<&FileName> {
         match &self.bytes {
             PinnedBytes::Mapped { file, .. } => file.as_ref(),
-            PinnedBytes::Copied(_) => None,
+            PinnedBytes::Pool { .. } | PinnedBytes::Copied(_) => None,
         }
+    }
+}
+
+impl Pinned {
+    /// The pinned value as [`blaze_bytes::Bytes`] that keep the pin alive: a VFS file's text
+    /// paged in from the store ([`Kind::Text`]) is lent on as the file's bytes, with no copy.
+    pub fn into_bytes(self) -> blaze_bytes::Bytes {
+        let bytes: *const [u8] = &*self;
+        // dyn: `Bytes::held` takes its owner so; one call per text paged in
+        // alloc: the pin's owner cell, once per text paged in, freed with the last clone
+        let owner: std::sync::Arc<dyn Send + Sync> = std::sync::Arc::new(self);
+        // SAFETY: `bytes` points into what `owner` holds: the pool's pages a `PinnedRun` pins
+        // (resident and never the sweep's to take or write while the pin lives), a range of a
+        // `Mapping` of a file the store replaces only by renaming another over it (kept mapped
+        // by the clone `owner` holds), or an `Arc<Aligned>` copy that `owner` keeps. Moving the
+        // `Pinned` into the `Arc` moves its handle, not those bytes, so the address holds for
+        // as long as `owner` lives, and none of them is written while it does.
+        unsafe { blaze_bytes::Bytes::held(bytes, owner) }
     }
 }
 
@@ -1008,6 +1706,7 @@ impl std::ops::Deref for Pinned {
     #[inline]
     fn deref(&self) -> &[u8] {
         match &self.bytes {
+            PinnedBytes::Pool { run, at, len } => run.bytes(*at, *len),
             PinnedBytes::Mapped { mapping, start, len, .. } => {
                 &mapping.bytes()[*start..*start + *len]
             }

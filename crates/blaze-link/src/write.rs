@@ -167,11 +167,24 @@ impl Resolver<'_> {
             Special::Stop(class) => {
                 Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.1)
             }
-            Special::Section { name, end } => {
-                let (start, stop) = self.bounds(
-                    |it| matches!(it, Class::Named { name: n, .. } if n == name),
-                    format_args!("section `{name}`"),
-                )?;
+            Special::Section { name, end } | Special::WeakSection { name, end } => {
+                let named = |it: &Class| matches!(it, Class::Named { name: n, .. } if n == name);
+                if !self.regions.iter().any(|it| named(&it.class)) {
+                    // No section of the name: the name is undefined, as it is to GNU ld and
+                    // lld, which define it only for an output section that exists. 0 to weak
+                    // references, as any undefined weak symbol (its GOT cell holds 0).
+                    if matches!(special, Special::WeakSection { .. }) {
+                        return Ok(Value::Absolute(0));
+                    }
+                    // alloc: error path
+                    return Err(Why::Special(format!(
+                        "undefined symbol {}: the linker defines it as the {} of section \
+                         `{name}`, and no input has a section `{name}`",
+                        self.symbols.describe(sym),
+                        if *end { "end" } else { "start" },
+                    )));
+                }
+                let (start, stop) = self.bounds(named, format_args!("section `{name}`"))?;
                 Value::Image(if *end { stop } else { start })
             }
             Special::Placed(at) => Value::Image(at(self.regions)),
@@ -577,7 +590,9 @@ impl Reloc<'_> {
                 Value::Tls(offset) => tls_base + offset,
                 Value::Import(_) | Value::TpOff(_) => 0,
             };
-            let tls_kind = reloc::is_tls(fixup.apply);
+            // A relaxed TLS descriptor is local exec to all but an import ([`reloc::known`]).
+            let apply = reloc::known(fixup.apply, matches!(value, Value::Import(_)));
+            let tls_kind = reloc::is_tls(apply);
             let tp = match (value, self.tls_at) {
                 (Value::TpOff(tp), _) if tls_kind => Some(tp),
                 (Value::TpOff(_), _) => {
@@ -714,7 +729,7 @@ impl Reloc<'_> {
                     .map_err(|it| fail(fixup, it))?;
                 continue;
             }
-            let kind = reloc::got_kind(fixup.apply);
+            let kind = reloc::got_kind(apply);
             let g = match kind {
                 Some(kind) => {
                     let target = got_target(symbols, fixup);
@@ -814,7 +829,7 @@ impl Reloc<'_> {
                 tls: self.tls,
                 tp,
             };
-            reloc::apply(fixup.apply, &ctx, place).map_err(|it| match it.reach() {
+            reloc::apply(apply, &ctx, place).map_err(|it| match it.reach() {
                 // alloc: error path
                 true => past(fixup, it.to_string()),
                 // alloc: error path
@@ -838,11 +853,11 @@ impl Reloc<'_> {
         let to = s.wrapping_add(fixup.addend as u64);
         // alloc: error path
         Err(format!(
-            "a branch to {}{} at {to:#x}, {:#x} bytes away: past its 128 MiB reach, and no thunk of it is in reach \
+            "a branch to {}{} at {to:#x}, {} away: past its 128 MiB reach, and no thunk of it is in reach \
              (the image has {} thunk islands)",
             named_in(self.symbols, &[self.state], self.writer, fixup.target),
             if plt { " through its PLT stub" } else { "" },
-            to.wrapping_sub(p) as i64,
+            thunk::away(p, to),
             self.state.islands,
         ))
     }
@@ -1603,6 +1618,66 @@ pub(crate) struct Lists {
     pub totals: Totals,
 }
 
+crate::keep::kept_struct!(Totals { absolute, image, got, functions, function_names, fdes, unwind });
+
+impl<T: crate::keep::Kept> crate::keep::Kept for Owned<T> {
+    fn put<A: std::alloc::Allocator>(&self, out: &mut crate::keep::Out<A>) {
+        use crate::keep::Kept as _;
+        self.items.put(out);
+        self.owners.put(out);
+    }
+
+    fn take(input: &mut crate::keep::In<'_>) -> Result<Owned<T>, crate::keep::Bad> {
+        let items: Arc<Vec<T>> = crate::keep::Kept::take(input)?;
+        let owners: Arc<Vec<PieceId>> = crate::keep::Kept::take(input)?;
+        if items.len() != owners.len() {
+            return Err(crate::keep::Bad::What("a writer's list whose items and owners differ in count"));
+        }
+        Ok(Owned { items, owners })
+    }
+}
+
+/// The lists as a kept state holds them ([`crate::keep`]): a debug section's name, a
+/// `&'static str`, by its text ([`crate::keep::static_name`]).
+impl Lists {
+    pub(crate) fn keep<A: std::alloc::Allocator>(
+        &self,
+        out: &mut crate::keep::Out<A>,
+    ) -> Result<(), crate::keep::Unkept> {
+        use crate::keep::Kept as _;
+        let Lists { rebase, binds, got, functions, debug, totals } = self;
+        rebase.put(out);
+        binds.put(out);
+        got.put(out);
+        functions.put(out);
+        out.len(debug.len());
+        for (name, bytes) in debug.iter() {
+            if crate::keep::static_name(name).is_none() {
+                return Err(crate::keep::Unkept::Debug(*name));
+            }
+            out.text(name);
+            out.bytes(bytes);
+        }
+        totals.put(out);
+        Ok(())
+    }
+
+    pub(crate) fn open(input: &mut crate::keep::In<'_>) -> Result<Lists, crate::keep::Bad> {
+        use crate::keep::Kept;
+        let rebase = Kept::take(input)?;
+        let binds = Kept::take(input)?;
+        let got = Kept::take(input)?;
+        let functions = Kept::take(input)?;
+        let count = input.count(16)?;
+        let mut debug = Vec::with_capacity_in(count, Global);
+        for _ in 0..count {
+            let name: &'static str = Kept::take(input)?;
+            debug.push((name, input.bytes()?.to_vec()));
+        }
+        Ok(Lists { rebase, binds, got, functions, debug: Arc::from(debug), totals: Kept::take(input)? })
+    }
+}
+
 /// Which lists to collect from pieces.
 #[derive(Clone, Copy)]
 struct Want {
@@ -1942,6 +2017,17 @@ impl<'a> Stage<'a> {
                 Arc::from(self.debug(&lists)?)
             }
             Debug::Lines => lists.debug,
+            // The image carries no debug info. An ELF image names its side file and the
+            // CRC-32 that file will have (of this generation's build id, so nothing of the
+            // side file is read or made here); the section is laid where the debug sections
+            // are, outside the address space.
+            Debug::Beside => match self.output.format {
+                Format::Elf => Arc::from(vec![(
+                    ".gnu_debuglink",
+                    crate::beside::debuglink(self.name, &self.new.image_id()),
+                )]), // alloc: once per stage, one section of a few bytes
+                Format::MachO | Format::Pe | Format::Wasm => Arc::default(),
+            },
         };
         // alloc: once per stage; the state shares the lists
         self.new.lists = Arc::new(lists);
@@ -1959,7 +2045,7 @@ impl<'a> Stage<'a> {
         };
         let exports = self.exports();
         let mut out = Vec::with_capacity(exports.len());
-        for (name, symbol, data) in exports {
+        for crate::place::Asked { name, symbol, data, weak, own } in exports {
             let Some(sym) = self.symbols.find_sym_name(symbol) else {
                 // alloc: error path
                 return Err(error(None, format!("the export `{name}` is not defined")));
@@ -1990,9 +2076,12 @@ impl<'a> Stage<'a> {
                     }
                     None => (SymbolKind::Other, 0),
                 };
+            // What its definition states of itself is its own: an object's `malloc` among
+            // other functions of one section is not the section's size.
+            let (kind, size) = own.unwrap_or((kind, size));
             let kind = if data { SymbolKind::Data } else { kind };
             // alloc: the writer's export table owns its names (model.rs `Export`), one per export
-            out.push(Export { name: name.to_owned(), addr, size, kind });
+            out.push(Export { name: name.to_owned(), addr, size, kind, weak });
         }
         let image = |name: &str| -> Option<u64> {
             match resolver.value(self.symbols.find_sym_name(name)?) {

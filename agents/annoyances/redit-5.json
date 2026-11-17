@@ -1,0 +1,11 @@
+{
+ "id": "redit-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: name resolution, `include_readers`",
+ "what": "A write of any one file read by `include_str!`, `include_bytes!` or an `include!` outside the VFS wakes every module group of every crate that expanded any such macro: `core`'s root (110 ms), `gimli` (610 ms), `std`, for a write of thiserror's `private.rs`.",
+ "cost": "0.8 s of the first edit of a small project before this lane's fix removed the write; any real edit of an included file still pays it",
+ "cause": "`Written::included` is not narrowed by which crate read the file, though `Files::included_by` holds it",
+ "workaround": "none",
+ "state": "open"
+}

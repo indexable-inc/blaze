@@ -23,8 +23,7 @@
 
 use std::{
     collections::VecDeque,
-    fs::{File, OpenOptions},
-    io::{self, Write as _},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
@@ -33,11 +32,16 @@ use std::{
 
 use crate::lock::{Lock, LockGuard, Signal};
 
+#[cfg(target_os = "linux")]
+use std::alloc::Global;
+
 #[cfg(unix)]
 use blaze_mem::{Slab, Tag as MemTag};
 
 use crate::{
-    Completion, Confine, Done, Driver, Effect, IoError, Tag, fs,
+    Completion, Confine, Done, Driver, Effect, IoError, Tag,
+    descriptors::Descriptors,
+    fs,
     wait::Deadline,
     wheel::{self, Wheel},
 };
@@ -68,6 +72,10 @@ const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive
 #[cfg_attr(
     target_os = "wasi",
     allow(dead_code, reason = "WASI keeps no spawns, watches or listens")
+)]
+#[cfg_attr(
+    target_os = "wasi",
+    expect(blaze::unwired, reason = "wired off WASI; WASI keeps no spawns, watches or listens")
 )]
 pub(crate) mod tagged {
     use blaze_hash::HashMap;
@@ -293,6 +301,10 @@ impl<T> Mailbox<T> {
         target_os = "wasi",
         allow(dead_code, reason = "WASI has no IO threads to take file effects")
     )]
+    #[cfg_attr(
+        target_os = "wasi",
+        expect(blaze::unwired, reason = "wired off WASI, which has no IO threads to take file effects")
+    )]
     fn pop(&self) -> Option<T> {
         let mut state = lock(&self.state);
         loop {
@@ -303,6 +315,7 @@ impl<T> Mailbox<T> {
                 return None;
             }
             state.waiting += 1;
+            // wakes: a push and the queue's close each notify `ready`; a worker serves until `closed`
             self.ready.wait(&mut state);
             state.waiting -= 1;
         }
@@ -339,6 +352,9 @@ enum Told {
     /// What the watch `watch` heard, or its end.
     #[cfg(target_os = "linux")]
     Watch { watch: Id<Watching>, completion: Completion },
+    /// How the watch `watch` started: in place, or failed. Told before anything it hears.
+    #[cfg(target_os = "linux")]
+    Started { watch: Id<Watching>, started: io::Result<()> },
     /// The spawn `spawn` ended.
     #[cfg(unix)]
     Exited { spawn: Id<Arc<Life>>, completion: Completion },
@@ -363,6 +379,8 @@ struct Shared {
     errand: Signal,
     #[cfg(test)]
     off: OffThread,
+    /// The descriptors the threads keep for reads into memory: a file opened once.
+    descriptors: Descriptors,
 }
 
 /// What the driver's threads allocated, for the allocation-budget tests: each file effect and
@@ -422,6 +440,18 @@ pub struct Threads {
     /// Stopped watches kept for the next.
     #[cfg(target_os = "linux")]
     spare: Vec<Arc<linux::Control>>,
+    /// Watches whose errand has not yet told how they started ([`Told::Started`]): a start
+    /// is a walk of the tree under inotify, run on the errand, never on the submitting thread.
+    #[cfg(target_os = "linux")]
+    starting: Vec<Starting>,
+    /// Effects that wait for a start ([`Threads::holds`]), in the order they were submitted:
+    /// counted in flight, and submitted again as a start is told.
+    #[cfg(target_os = "linux")]
+    held: Vec<Effect>,
+    /// A test's hold on the walks of watches' starts ([`crate::watch::Gate`]), each errand
+    /// given a handle of it.
+    #[cfg(all(test, target_os = "linux"))]
+    walk_gate: crate::watch::Gate,
     #[cfg(target_os = "macos")]
     spare: Vec<crate::fsevents::Watch<Sink>>,
     /// Flushes a watch being stopped had not told.
@@ -432,6 +462,10 @@ pub struct Threads {
     /// Where each sandboxed spawn gets a directory of its own: the root, or the directory
     /// [`Threads::scratch`] made.
     #[cfg_attr(target_os = "wasi", allow(dead_code, reason = "WASI refuses every spawn"))]
+    #[cfg_attr(
+        target_os = "wasi",
+        expect(blaze::unwired, reason = "wired off WASI, which refuses every spawn")
+    )]
     spawn_dirs: Arc<Path>,
     #[cfg(unix)]
     spawns: Tagged<Arc<Life>>,
@@ -442,7 +476,22 @@ pub struct Threads {
     conns: Slab<Connection>,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
+    /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]).
+    #[cfg(unix)]
+    host: crate::host::Host,
     in_flight: usize,
+}
+
+/// Where the host's effects are told: the driver's mailbox.
+#[cfg(unix)]
+struct HostSink(Arc<Shared>);
+
+#[cfg(unix)]
+impl crate::host::Sink for HostSink {
+    fn tell(&self, completion: Completion) {
+        // A closed mailbox is a driver dropped: nobody asks any more.
+        _ = self.0.done.push(Told::Done(completion));
+    }
 }
 
 impl Threads {
@@ -460,6 +509,7 @@ impl Threads {
             errand: Signal::new("core.threads.errand_ready"),
             #[cfg(test)]
             off: OffThread::default(),
+            descriptors: Descriptors::new(),
         });
         // alloc: once per driver, shared with each spawn's errand.
         let spawn_dirs: Arc<Path> = Arc::from(shared.root.as_path());
@@ -483,6 +533,9 @@ impl Threads {
             // alloc: none, an empty list.
             Vec::new()
         };
+        // clone: a count of the state the host's threads tell through; alloc: once per driver.
+        #[cfg(unix)]
+        let host = crate::host::Host::new(Arc::new(HostSink(Arc::clone(&shared))));
         Threads {
             start: Instant::now(),
             shared,
@@ -498,12 +551,20 @@ impl Threads {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             // alloc: once per driver.
             spare: Vec::with_capacity(SPARE),
+            #[cfg(target_os = "linux")]
+            starting: Vec::with_capacity_in(SPARE, Global),
+            #[cfg(target_os = "linux")]
+            held: Vec::new_in(Global),
+            #[cfg(all(test, target_os = "linux"))]
+            walk_gate: None,
             #[cfg(target_os = "macos")]
             // alloc: once per driver.
             untold: Vec::with_capacity(4),
             confine: None,
             spawn_dirs,
             locks: crate::locks::Locks::new(),
+            #[cfg(unix)]
+            host,
             #[cfg(unix)]
             spawns: Tagged::new(RESERVE),
             #[cfg(unix)]
@@ -516,6 +577,17 @@ impl Threads {
             },
             in_flight: 0,
         }
+    }
+
+    /// How many files the threads opened for reads into memory, and closed.
+    pub fn opens(&self) -> crate::Opens {
+        self.shared.descriptors.opens()
+    }
+
+    /// The table of kept descriptors, for the tests that count and bypass it.
+    #[cfg(test)]
+    pub(crate) fn descriptors(&self) -> &Descriptors {
+        &self.shared.descriptors
     }
 
     /// The same driver, making the sandbox of each spawn whose sandbox is on with `confine`.
@@ -606,6 +678,8 @@ impl Threads {
                 _ => self.ready.push(completion),
             },
             #[cfg(target_os = "linux")]
+            Told::Started { watch, started } => self.started(watch, started),
+            #[cfg(target_os = "linux")]
             Told::Watch { watch, completion } => {
                 // A watch replaced by another of its tag tells nothing more.
                 if self.watches.by_id(watch).is_none() {
@@ -675,8 +749,11 @@ impl Threads {
     }
 
     /// Watches `dir` as `tag`, a journal of it from `since`. A watch of `tag` already ends
-    /// first, telling nothing more. Returns once the system watches the tree, so a change made
-    /// after is heard.
+    /// first, telling nothing more. Returns at once, whatever the tree's size: the start (under
+    /// inotify a walk of the whole tree) runs on the watch's errand, which tells it
+    /// ([`Told::Started`]); until then a look under `dir` waits ([`Threads::holds`]) and so
+    /// does a flush of the watch (its errand answers flushes only once it reads), so a change
+    /// made after either is answered is heard.
     #[cfg(target_os = "linux")]
     fn watch(
         &mut self,
@@ -687,6 +764,8 @@ impl Threads {
         if let Some(old) = self.watches.remove(tag) {
             old.control.stop();
             self.in_flight -= 1;
+            // Its errand's word of its start names a watch no longer kept, and is dropped.
+            self.starting.retain(|it| it.tag != tag);
         }
         let control = match self.spare.pop() {
             Some(control) => control,
@@ -696,25 +775,82 @@ impl Threads {
         let first = since.as_ref().map(|since| crate::journal::first_on_linux(&dir, since));
         // clone: the watch's control, kept by the driver.
         let (watch, _) = self.watches.insert(tag, Watching { control: control.clone() });
-        // clone: the watch's control, for its errand.
-        let errand =
-            Errand::Watch { dir, journal: since.is_some(), control: control.clone(), tag, watch };
+        #[cfg(test)]
+        // clone: a test's gate, a handle of it for the errand.
+        let gate = self.walk_gate.clone();
+        #[cfg(not(test))]
+        let gate = ();
+        let errand = Errand::Watch {
+            // clone: the watched directory, kept while the watch starts.
+            dir: dir.clone(),
+            journal: since.is_some(),
+            control,
+            tag,
+            watch,
+            gate,
+        };
+        self.starting.push(Starting { tag, watch, dir, first });
+        self.in_flight += 1;
         self.dispatch(errand);
-        match control.started() {
+        Ok(())
+    }
+
+    /// Whether `effect` waits for a watch's start: a look at the disk at or under the directory
+    /// of a watch whose errand has not yet told its start.
+    ///
+    /// The invariant: a look under a watched directory asked after its watch is answered only
+    /// once the watch is in place, so a change made after the look was answered is heard
+    /// ([`Effect::Watch`]'s guarantee). Tested by
+    /// `the_threads_driver_holds_a_look_under_a_starting_watch`, whose control holds nothing.
+    #[cfg(target_os = "linux")]
+    fn holds(&self, effect: &Effect) -> bool {
+        !self.starting.is_empty()
+            && crate::watch::looks_under(effect, |name| {
+                self.starting.iter().any(|it| crate::watch::is_under(name, it.dir.as_str()))
+            })
+    }
+
+    /// The watch `watch` started as `started` says: in place (a journal's first batch told), or
+    /// failed naming its directory. Then what was held for a start goes, in the order it was
+    /// asked; what waits for a start still out is held again.
+    #[cfg(target_os = "linux")]
+    fn started(&mut self, watch: Id<Watching>, started: io::Result<()>) {
+        let at = self.starting.iter().position(|it| it.watch.to_bits() == watch.to_bits());
+        // Of a watch replaced by another of its tag meanwhile: nothing to tell.
+        let Some(at) = at else { return };
+        let Starting { tag, dir, first, .. } = self.starting.remove(at);
+        match started {
             Ok(()) => {
-                self.in_flight += 1;
                 if let Some(first) = first {
                     self.ready.push(Completion { tag, done: first });
                 }
-                Ok(())
             }
             Err(error) => {
-                drop(control);
                 if let Some((_, watching)) = self.watches.remove_id(watch) {
+                    let ready = &mut self.ready;
+                    let ends = &mut self.ready_ends;
+                    watching.control.unanswered(|flush| {
+                        // alloc: an error path, a flush of a watch that never started.
+                        let why = IoError(format!("watching {dir} failed before the flush"));
+                        ready.push(Completion { tag: flush, done: Done::Failed(why) });
+                        *ends += 1;
+                    });
                     self.keep(watching.control);
                 }
-                Err(error)
+                // alloc: an error path.
+                let why = IoError(format!("watching {dir}: {error}"));
+                self.end(Completion { tag, done: Done::Failed(why) });
             }
+        }
+        if self.held.is_empty() {
+            return;
+        }
+        let mut held = std::mem::take(&mut self.held);
+        // Counted in flight as they were held; `submit` counts each again.
+        self.in_flight -= held.len();
+        self.submit(&mut held);
+        if self.held.is_empty() {
+            self.held = held;
         }
     }
 
@@ -948,7 +1084,8 @@ fn work(shared: &Shared, effect: Effect) -> bool {
     let tag = effect.tag();
     let done = shared.counted(|| {
         // alloc: an error's message.
-        run(&shared.root, effect).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
+        run(&shared.root, &shared.descriptors, effect)
+            .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
     });
     shared.done.push(Told::Done(Completion { tag, done })).is_ok()
 }
@@ -967,8 +1104,161 @@ fn at<R>(
 }
 
 /// A file effect done with blocking calls, for this driver's threads and for the drivers that
-/// keep their file calls on threads. Allocates only what its completion carries.
-pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
+/// keep their file calls on threads. Allocates only what its completion carries. Reads into
+/// memory read through `kept`'s descriptors; an effect that changes what is under a name closes
+/// that name's descriptor once it is done, so the next read opens the file there then.
+pub(crate) fn run(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done> {
+    let changed = changes(&effect);
+    let done = run_kept(root, kept, effect);
+    for name in changed.iter().flatten() {
+        kept.forget(name);
+    }
+    done
+}
+
+/// The names `effect` changes what is under: whose kept descriptors no longer read what the
+/// name holds. A write in place (`WriteAt`, `WriteFrom`) changes the bytes of the inode a
+/// descriptor reads, which it then reads too, so it closes none.
+pub(crate) fn changes(effect: &Effect) -> [Option<crate::FileName>; 2] {
+    // clone: each a refcount
+    match effect {
+        Effect::Write { file, .. }
+        | Effect::WriteUnsynced { file, .. }
+        | Effect::Truncate { file, .. }
+        | Effect::Remove { file, .. }
+        | Effect::Prewarm { file, .. } => [Some(file.clone()), None],
+        Effect::RemoveDir { dir, .. } => [Some(dir.clone()), None],
+        Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
+            [Some(from.clone()), Some(to.clone())]
+        }
+        Effect::Clone { to, .. } | Effect::CopyData { to, .. } | Effect::Link { to, .. } => {
+            [Some(to.clone()), None]
+        }
+        _ => [None, None],
+    }
+}
+
+/// The most parts of one run read by one `preadv`: 1 KiB of `iovec`s on the stack, far below
+/// `IOV_MAX` (1024 on Linux and macOS). A longer run is more calls of this many.
+pub(crate) const RUN_MOST: usize = 64;
+
+/// The parts of an [`Effect::ReadMany`] read through `kept`'s descriptors, each part's `got`
+/// set: a run of parts of one file, each at where the last ended, is one `preadv` on Unix. A
+/// part fails alone: its span refused, its file missing, or the call of its run failed.
+fn read_many(root: &Path, kept: &Descriptors, parts: &mut [crate::ReadPart], cache: crate::Cache) {
+    let mut first = 0;
+    while first < parts.len() {
+        let mut end = first + 1;
+        let mut next = parts[first].at + u64::from(parts[first].into.len);
+        while end < parts.len()
+            && end - first < RUN_MOST
+            && parts[end].file == parts[first].file
+            && parts[end].at == next
+        {
+            next += u64::from(parts[end].into.len);
+            end += 1;
+        }
+        read_run(root, kept, &mut parts[first..end], cache);
+        first = end;
+    }
+}
+
+/// One run of parts of one file, adjacent in it, read: its spans resolved (one refused fails
+/// alone and splits the run), its file's kept descriptor taken once, and each stretch of
+/// resolved spans read by one call.
+fn read_run(root: &Path, kept: &Descriptors, run: &mut [crate::ReadPart], cache: crate::Cache) {
+    use crate::{Got, ReadPart};
+    let file = run[0].file.clone(); // clone: a refcount
+    let opened = match kept.file(root, &file, cache) {
+        Ok(opened) => opened,
+        Err(error) => {
+            for part in run.iter_mut() {
+                part.got = Got::Failed(part_error(part, &error));
+            }
+            return;
+        }
+    };
+    let mut resolved = [None; RUN_MOST];
+    for (slot, part) in resolved.iter_mut().zip(run.iter_mut()) {
+        match crate::spans::resolve(&part.into, &part.file, part.at, cache, "a batched read into memory of") {
+            Ok(span) => *slot = Some(span),
+            Err(why) => part.got = Got::Failed(why),
+        }
+    }
+    // Each stretch of parts whose spans resolved, read by one call.
+    let mut first = 0;
+    while first < run.len() {
+        if resolved[first].is_none() {
+            first += 1;
+            continue;
+        }
+        let mut end = first;
+        let mut spans = [None; RUN_MOST];
+        while end < run.len() && let Some(span) = resolved[end] {
+            spans[end - first] = Some(span);
+            end += 1;
+        }
+        let stretch: &mut [ReadPart] = &mut run[first..end];
+        let read = read_stretch(&opened, stretch, &spans[..end - first], cache);
+        match read {
+            Ok(mut left) => {
+                for part in stretch.iter_mut() {
+                    let got = left.min(part.into.len as usize);
+                    part.got = Got::Read(u32::try_from(got).expect("at most a span's u32 length"));
+                    left -= got;
+                }
+            }
+            Err(error) => {
+                for part in stretch.iter_mut() {
+                    part.got = Got::Failed(part_error(part, &error));
+                }
+            }
+        }
+        first = end;
+    }
+}
+
+/// The parts of a stretch read into their spans, adjacent in the file from its first part's
+/// offset: one `preadv` on Unix (more where it is cut short before the end); how many bytes in
+/// all, fewer only at the file's end.
+#[cfg(unix)]
+fn read_stretch(
+    opened: &std::fs::File,
+    stretch: &[crate::ReadPart],
+    spans: &[Option<crate::spans::Resolved>],
+    cache: crate::Cache,
+) -> io::Result<usize> {
+    let spans = spans.iter().map(|span| span.expect("a stretch is of resolved spans"));
+    crate::spans::read_run(opened, stretch[0].at, spans, cache)
+}
+
+/// Windows and WASI have no `preadv` blaze calls: each part is one read of the kept descriptor.
+#[cfg(not(unix))]
+fn read_stretch(
+    opened: &std::fs::File,
+    stretch: &[crate::ReadPart],
+    spans: &[Option<crate::spans::Resolved>],
+    cache: crate::Cache,
+) -> io::Result<usize> {
+    let mut read = 0;
+    for (part, span) in stretch.iter().zip(spans) {
+        let span = span.expect("a stretch is of resolved spans");
+        let got = span.with_mut(|bytes| fs::read_into(opened, bytes, part.at, cache))?;
+        read += got;
+        if got < span.len() {
+            break;
+        }
+    }
+    Ok(read)
+}
+
+/// `error` of `part`, naming its file and offset.
+fn part_error(part: &crate::ReadPart, error: &io::Error) -> IoError {
+    // alloc: an error path.
+    IoError(format!("{} at {} ({} bytes): {error}", part.file, part.at, part.into.len))
+}
+
+fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done> {
     match effect {
         Effect::ReadAll { file, .. } => match at(root, &file, |path| std::fs::read(path)) {
             Ok(bytes) => Ok(Done::Read(bytes)),
@@ -978,32 +1268,26 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         },
         Effect::ReadLink { file, .. } => read_link(root, &file),
         Effect::Read { file, at: from, len, .. } => {
-            let file = at(root, &file, |path| File::open(path))?;
-            // alloc: the read's payload.
-            let mut bytes = vec![0; len];
-            let mut read = 0;
-            while read < len {
-                let n = read_at(&file, &mut bytes[read..], from + read as u64)?;
-                if n == 0 {
-                    break;
-                }
-                read += n;
-            }
-            bytes.truncate(read);
-            Ok(Done::Read(bytes))
+            Ok(Done::Read(at(root, &file, |path| fs::read(path, from, len))?))
         }
         Effect::ReadInto { file, at: from, into, cache, priority, .. } => {
             let span = crate::spans::resolve(&into, &file, from, cache, "a read into memory of")
                 // alloc: an error path.
                 .map_err(|why| io::Error::other(why.0))?;
-            let read = at(root, &file, |path| {
-                let opened = fs::open_positional(path, false, cache)?;
-                at_priority(priority, || {
-                    span.with_mut(|bytes| fs::read_into(&opened, bytes, from, cache))
-                })
+            // The kept descriptor: an open only at the file's first read (`descriptors`).
+            let opened = kept.file(root, &file, cache)?;
+            let read = at_priority(priority, || {
+                span.with_mut(|bytes| fs::read_into(&opened, bytes, from, cache))
             })
             .map_err(|error| named(&file, &error))?;
             Ok(Done::ReadInto { len: u32::try_from(read).expect("at most a span's u32 length") })
+        }
+        Effect::ReadMany { mut parts, cache, priority, .. } => {
+            at_priority(priority, || {
+                read_many(root, kept, &mut parts, cache);
+                Ok(())
+            })?;
+            Ok(Done::ReadMany(parts))
         }
         Effect::WriteFrom { file, at: offset, from, cache, .. } => {
             let span = crate::spans::resolve(&from, &file, offset, cache, "a write from memory to")
@@ -1017,22 +1301,38 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Written)
         }
         Effect::Append { file, bytes, .. } => at(root, &file, |path| {
-            let open = || OpenOptions::new().create(true).append(true).open(path);
-            fs::making_parent(path, open)?.write_all(&bytes)?;
+            fs::append(path, &bytes)?;
             Ok(Done::Appended)
         }),
-        // `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves the bytes in the
-        // drive's cache.
         Effect::Sync { file, .. } => at(root, &file, |path| {
-            OpenOptions::new().append(true).create(true).open(path)?.sync_all()?;
+            fs::sync(path)?;
             Ok(Done::Synced)
+        }),
+        Effect::SyncDir { dir, .. } => at(root, &dir, |path| {
+            fs::sync_dir(path)?;
+            Ok(Done::Synced)
+        }),
+        Effect::Barrier { file, .. } => at(root, &file, |path| {
+            fs::barrier(path)?;
+            Ok(Done::Ordered)
+        }),
+        // Waited for on this thread; the asker waits for nothing, and nothing is durable.
+        Effect::WriteBack { file, .. } => at(root, &file, |path| {
+            fs::write_back(path)?;
+            Ok(Done::WrittenBack)
         }),
         Effect::Truncate { file, len, .. } => at(root, &file, |path| {
             fs::truncate(path, len)?;
             Ok(Done::Truncated)
         }),
         Effect::Write { file, bytes, .. } => at(root, &file, |path| {
+            // durable: carries out `Effect::Write`, whose asker said why
             fs::write_atomically(path, &bytes)?;
+            Ok(Done::Written)
+        }),
+        // No sync of the file or its directory: derived data, checked by its reader.
+        Effect::WriteUnsynced { file, bytes, .. } => at(root, &file, |path| {
+            fs::write_unsynced(path, &bytes)?;
             Ok(Done::Written)
         }),
         Effect::WriteAt { file, at: offset, bytes, .. } => at(root, &file, |path| {
@@ -1041,6 +1341,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         }),
         Effect::Rename { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::rename(from, to))?;
+            Ok(Done::Renamed)
+        }),
+        Effect::RenameUnsynced { from, to, .. } => at(root, &from, |from| {
+            at(root, &to, |to| fs::rename_unsynced(from, to))?;
             Ok(Done::Renamed)
         }),
         Effect::Mode { file, mode, .. } => at(root, &file, |path| {
@@ -1061,6 +1365,14 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         Effect::Clone { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::clone(from, to))?;
             Ok(Done::Cloned)
+        }),
+        Effect::CopyData { from, to, .. } => at(root, &from, |from| {
+            let bytes = at(root, &to, |to| fs::copy_data(from, to))?;
+            Ok(Done::Copied { bytes })
+        }),
+        Effect::Prewarm { like, file, .. } => at(root, &like, |like| {
+            let bytes = at(root, &file, |file| fs::prewarm(like, file, crate::PREWARM_MOST))?;
+            Ok(Done::Prewarmed { bytes })
         }),
         Effect::Link { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::link(from, to))?;
@@ -1087,7 +1399,17 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::remove(path)?;
             Ok(Done::Removed)
         }),
-        Effect::Map { file, .. } => Ok(Done::Mapped(at(root, &file, |path| fs::map(path))?)),
+        // `mkdir`: its parent must be there, and nothing at its name.
+        Effect::MakeDir { dir, .. } => at(root, &dir, |path| std::fs::create_dir(path))
+            .map(|()| Done::MadeDir)
+            .map_err(|error| named(&dir, &error)),
+        // `rmdir`: of an empty directory alone, never what is under it or a link to one.
+        Effect::RemoveDir { dir, .. } => at(root, &dir, |path| std::fs::remove_dir(path))
+            .map(|()| Done::RemovedDir)
+            .map_err(|error| named(&dir, &error)),
+        Effect::Map { file, extent, .. } => Ok(Done::Mapped(
+            at(root, &file, |path| fs::map_extent(path, extent)).map_err(|error| named(&file, &error))?,
+        )),
         Effect::Lock { .. } | Effect::Unlock { .. } => {
             unreachable!("file locks are kept by the driver, which takes each as it is asked for")
         }
@@ -1104,8 +1426,20 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Recv { .. }
         | Effect::Send { .. }
         | Effect::Hangup { .. }
-        | Effect::Pressure { .. } => {
-            unreachable!("timers, watches, processes and sockets are kept by the driver")
+        | Effect::Pressure { .. }
+        | Effect::Bind { .. }
+        | Effect::SendTo { .. }
+        | Effect::RecvFrom { .. }
+        | Effect::Unbind { .. }
+        | Effect::Resolve { .. }
+        | Effect::ReadStdin { .. }
+        | Effect::WriteOut { .. }
+        | Effect::Now { .. }
+        | Effect::Random { .. } => {
+            unreachable!(
+                "timers, watches, processes, sockets, the standard streams, the clock and \
+                 randomness are kept by the driver"
+            )
         }
     }
 }
@@ -1162,21 +1496,6 @@ fn link_bytes(file: &crate::FileName, target: std::path::PathBuf) -> io::Result<
             format!("{file}: a link's target that is not UTF-8"),
         )),
     }
-}
-
-#[cfg(unix)]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buffer, at)
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
-}
-
-#[cfg(target_os = "wasi")]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
 }
 
 /// The bytes of the symbolic link `file`'s `target`, as [`Effect::ReadLink`] gives them.
@@ -1311,6 +1630,8 @@ enum Errand {
         control: Arc<linux::Control>,
         watch: Id<Watching>,
         tag: Tag,
+        /// A test's hold on the start's walk.
+        gate: crate::watch::Gate,
     },
 }
 
@@ -1380,6 +1701,7 @@ impl Shared {
                 }
                 return None;
             }
+            // wakes: an errand queued and the pool's close each notify `errand`; an idle errand thread serves until `closed`
             self.errand.wait(&mut errands);
         }
     }
@@ -1429,9 +1751,9 @@ impl Errand {
                 Some(Told::Listened { listen, completion: Completion { tag, done } })
             }
             #[cfg(target_os = "linux")]
-            Errand::Watch { control, .. } => {
-                control.start(Err(why));
-                None
+            Errand::Watch { control, watch, .. } => {
+                control.close();
+                Some(Told::Started { watch, started: Err(why) })
             }
         }
     }
@@ -1480,7 +1802,8 @@ impl Errand {
                 Some(Told::Listened { listen, completion: Completion { tag, done } })
             }
             #[cfg(target_os = "linux")]
-            Errand::Watch { dir, journal, control, watch, tag } => {
+            Errand::Watch { dir, journal, control, watch, tag, gate } => {
+                crate::watch::pass(&gate);
                 linux::watch(shared, room, &dir, journal, control, watch, tag)
             }
         }
@@ -1577,6 +1900,35 @@ struct Watching {
     control: Arc<linux::Control>,
 }
 
+/// What the tests of a watch's start look at.
+#[cfg(all(test, target_os = "linux"))]
+impl Threads {
+    /// Each watch's start from here waits at `gate` ([`crate::watch::Gate`]).
+    pub(crate) fn gate_walks(&mut self, gate: crossbeam_channel::Receiver<()>) {
+        self.walk_gate = Some(gate);
+    }
+
+    /// Whether the watch `tag`'s errand has not yet told how it started.
+    pub(crate) fn is_starting(&self, tag: Tag) -> bool {
+        self.starting.iter().any(|it| it.tag == tag)
+    }
+
+    /// Whether the effect `tag` is held for a watch's start.
+    pub(crate) fn is_held(&self, tag: Tag) -> bool {
+        self.held.iter().any(|it| it.tag() == tag)
+    }
+}
+
+/// A watch whose errand has not yet told how it started ([`Threads::starting`]).
+#[cfg(target_os = "linux")]
+struct Starting {
+    tag: Tag,
+    watch: Id<Watching>,
+    dir: crate::FileName,
+    /// An [`Effect::Journal`]'s first batch, told once the watch is in place.
+    first: Option<Done>,
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
@@ -1585,29 +1937,28 @@ mod linux {
         sync::Arc,
     };
 
-    use crate::lock::{Lock, Signal};
+    use crate::lock::Lock;
 
     use super::{Id, Room, Shared, Told, Watching, lock};
     use crate::{Completion, Done, FileName, IoError, Tag};
 
     /// How the driver stops a watch's errand and asks it for flushes: made once, and kept
-    /// for the next watch once the errand has let go of it.
+    /// for the next watch once the errand has let go of it. How the watch started is told
+    /// through the driver's mailbox ([`Told::Started`]), never waited for.
     pub(super) struct Control {
         stop: OwnedFd,
         /// Written once flushes are added.
         wake: OwnedFd,
         state: Lock<State>,
-        started: Signal,
     }
 
     struct State {
-        /// Asked for and not yet taken by the errand.
+        /// Asked for and not yet taken by the errand: a flush asked while the watch starts
+        /// waits here until the errand reads, so it is answered by the watch in place.
         flushes: Vec<Tag>,
         /// Whether the errand takes flushes: a flush asked after it ends fails rather than
         /// waiting for nothing.
         open: bool,
-        /// How the watch started, once it has.
-        started: Option<io::Result<()>>,
         /// What the last tree watched with it left for the next.
         spare: Option<crate::watch::Spare>,
     }
@@ -1629,9 +1980,9 @@ mod linux {
             let (stop, wake) = (crate::raw::eventfd()?, crate::raw::eventfd()?);
             // alloc: once per watch at once, kept for the next: room for a few flushes at once.
             let flushes = Vec::with_capacity(4);
-            let state = State { flushes, open: false, started: None, spare: None };
+            let state = State { flushes, open: false, spare: None };
             // alloc: as above.
-            Ok(Arc::new(Control { stop, wake, state: Lock::new("core.test.threads.control", state), started: Signal::new("core.test.threads.started") }))
+            Ok(Arc::new(Control { stop, wake, state: Lock::new("core.test.threads.control", state) }))
         }
 
         /// Ready for a watch: nothing signalled, nothing asked for.
@@ -1641,7 +1992,6 @@ mod linux {
             let mut state = lock(&self.state);
             state.flushes.clear();
             state.open = true;
-            state.started = None;
         }
 
         pub(super) fn stop(&self) {
@@ -1659,31 +2009,28 @@ mod linux {
             true
         }
 
-        /// The errand says how the watch started.
-        pub(super) fn start(&self, started: io::Result<()>) {
-            let mut state = lock(&self.state);
-            if started.is_err() {
-                state.open = false;
-            }
-            state.started = Some(started);
-            self.started.notify_all();
+        /// The watch did not start: a flush asked from here fails at once. One asked before,
+        /// which no errand will answer, the driver fails as it hears the start failed
+        /// ([`Control::unanswered`]).
+        pub(super) fn close(&self) {
+            lock(&self.state).open = false;
         }
 
-        /// How the watch started, waiting until it has.
-        pub(super) fn started(&self) -> io::Result<()> {
+        /// Each flush asked and not taken by an errand, handed to `each` and forgotten.
+        pub(super) fn unanswered(&self, mut each: impl FnMut(Tag)) {
             let mut state = lock(&self.state);
-            loop {
-                if let Some(started) = state.started.take() {
-                    return started;
-                }
-                self.started.wait(&mut state);
+            state.open = false;
+            for tag in state.flushes.drain(..) {
+                each(tag);
             }
         }
     }
 
-    /// A watch's errand: watches `dir`, then reads its events until it is stopped, answering
-    /// each flush once it has read every event queued when the flush was taken. What ends the
-    /// watch, `None` when it did not start (told through `control`) or the driver is gone.
+    /// A watch's errand: watches `dir` (under inotify a walk of the whole tree, here, off the
+    /// driver's thread), tells how it started ([`Told::Started`]), then reads its events until
+    /// it is stopped, answering each flush once it has read every event queued when the flush
+    /// was taken. What ends the watch: its start's failure, its end, or `None` where the
+    /// driver is gone.
     pub(super) fn watch(
         shared: &Shared,
         room: &mut Room,
@@ -1697,11 +2044,13 @@ mod linux {
         let mut tree = match crate::watch::Tree::reusing(spare, &shared.root, dir, false) {
             Ok(tree) => tree,
             Err(error) => {
-                control.start(Err(error));
-                return None;
+                control.close();
+                return Some(Told::Started { watch, started: Err(error) });
             }
         };
-        control.start(Ok(()));
+        if shared.done.push(Told::Started { watch, started: Ok(()) }).is_err() {
+            return None;
+        }
         if room.buffer.is_empty() {
             // alloc: once per errand thread that reads a watch, kept for the next.
             room.buffer = vec![0; crate::watch::BUFFER];
@@ -1756,9 +2105,13 @@ mod linux {
                 // Drained, not taken: both lists keep their room, so a flush allocates nothing.
                 room.taken.extend(lock(&control.state).flushes.drain(..));
                 let mut gone = false;
-                // What a drain allocates is the batches it reads; `tell` allocates nothing.
-                let drained = shared
-                    .payload(|| tree.drain(&mut room.buffer, |done| gone |= !tell(heard(done))));
+                // What a drain allocates is the batches it reads; `tell` allocates nothing. The
+                // directories it heard made are watched before the flushes are answered, so what
+                // was made in them first is told before them (`crate::watch`'s invariant).
+                let drained = shared.payload(|| {
+                    tree.drain(&mut room.buffer, |done| gone |= !tell(heard(done)))?;
+                    tree.grow_here(|done| gone |= !tell(heard(done)))
+                });
                 if gone {
                     return None;
                 }
@@ -1783,6 +2136,16 @@ mod linux {
                 if let Ok(n @ 1..) = tree.read(buffer) {
                     let done = shared.payload(|| heard(tree.take(&buffer[..n])));
                     if !tell(done) {
+                        return None;
+                    }
+                    // The directories it heard made, watched here: this is the errand's thread,
+                    // not the driver's.
+                    let mut gone = false;
+                    let grown = shared.payload(|| tree.grow_here(|done| gone |= !tell(heard(done))));
+                    if gone {
+                        return None;
+                    }
+                    if grown.is_err() && !tell(heard(crate::watch::lost())) {
                         return None;
                     }
                 }
@@ -1827,13 +2190,21 @@ fn no_watch(watch: Tag) -> String {
 
 impl Driver for Threads {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
+        // The one now of every timer in this submit, as the ring driver's: timers asked
+        // together fire in the order of their `after`s however long the thread is kept from
+        // running between two of them.
+        let now = wheel::ticks(self.start.elapsed());
         for effect in effects.drain(..) {
+            #[cfg(target_os = "linux")]
+            if self.holds(&effect) {
+                self.in_flight += 1;
+                self.held.push(effect);
+                continue;
+            }
             match effect {
                 Effect::Timer { after, tag } => {
                     self.in_flight += 1;
-                    let due =
-                        wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
-                    self.timers.insert(due, tag);
+                    self.timers.insert(now.saturating_add(wheel::ticks(after)), tag);
                 }
                 Effect::Watch { dir, tag } => {
                     if let Err(error) = self.watch(dir, None, tag) {
@@ -1954,6 +2325,26 @@ impl Driver for Threads {
                     };
                     self.tell(tag, done);
                 }
+                #[cfg(unix)]
+                effect if crate::host::Host::takes(&effect) => {
+                    self.in_flight += 1;
+                    self.host.submit(effect);
+                }
+                #[cfg(not(unix))]
+                Effect::Now { tag } => self.tell(tag, crate::host::wall()),
+                #[cfg(not(unix))]
+                Effect::Random { len, tag } => self.tell(tag, crate::host::random(len)),
+                #[cfg(not(unix))]
+                effect @ (Effect::Bind { .. }
+                | Effect::SendTo { .. }
+                | Effect::RecvFrom { .. }
+                | Effect::Unbind { .. }
+                | Effect::Resolve { .. }
+                | Effect::ReadStdin { .. }
+                | Effect::WriteOut { .. }) => {
+                    let tag = effect.tag();
+                    self.tell(tag, crate::host::refused(effect));
+                }
                 #[cfg(not(unix))]
                 Effect::Kill { .. } => {}
                 #[cfg(not(unix))]
@@ -2022,5 +2413,9 @@ impl Driver for Threads {
 
     fn now(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
     }
 }

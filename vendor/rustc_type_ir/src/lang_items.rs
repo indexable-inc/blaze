@@ -13,6 +13,9 @@ pub enum SolverProjectionLangItem {
     FieldType,
     FutureOutput,
     Metadata,
+    /// blaze: `<Described<'a, D, Args> as core::reflect::TypeOf>::Type`, the type the
+    /// description `D` describes (`type_of!`).
+    ReflectTypeOfType,
     /// blaze: `<V as core::reflect::Variant<E>>::View`, the variant view `VariantOf<E, v>`.
     ReflectVariantView,
     // tidy-alphabetical-end
@@ -22,6 +25,8 @@ pub enum SolverProjectionLangItem {
 pub enum SolverAdtLangItem {
     // tidy-alphabetical-start
     DynMetadata,
+    /// blaze: `core::error_union::ErrorUnion<(members..)>`, the type of `A | B`.
+    ErrorUnion,
     Option,
     OwnedBox,
     Poll,
@@ -47,6 +52,9 @@ pub enum SolverTraitLangItem {
     Destruct,
     DiscriminantKind,
     Drop,
+    /// blaze: `U: core::error_union::UnionFrom<S>` (`#![blaze::error_unions]`): `U` is an error
+    /// union and `S` one of its members or a union of some of them, never all.
+    ErrorUnionFrom,
     Field,
     Fn,
     FnMut,
@@ -72,9 +80,13 @@ pub enum SolverTraitLangItem {
     ReflectField,
     /// blaze: `core::reflect::FnItem`: fn item and closure types.
     ReflectFnItem,
+    /// blaze: `core::reflect::MemoPoint`: the item type of a function written `#[blaze::memo]`.
+    ReflectMemoPoint,
     /// blaze: `core::reflect::Struct`: a struct whose fields reflection may read, a tuple, or
     /// a variant view.
     ReflectStruct,
+    /// blaze: `core::reflect::TypeOf`: a `Described` whose description names a type.
+    ReflectTypeOf,
     /// blaze: `V: core::reflect::Variant<E>`: `V` is the variant representing type of a variant
     /// of the enum `E`.
     ReflectVariant,

@@ -170,6 +170,10 @@ For more information about this error, try `rustc --explain E0308`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_let_type_is_why_and_a_suffix_is_changed() {
     // tests/ui/mismatched_types/float-literal-inference-restrictions.rs, its second `let`: the
     // first's `1` rustc calls an integer, of a type not yet decided.
@@ -199,6 +203,10 @@ For more information about this error, try `rustc --explain E0308`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_returned_value_of_another_type_names_both_in_full() {
     // tests/ui/mismatched_types/abridged.rs to its first function: the others suggest
     // wrapping in `Some` and `Ok` and print an integer not yet decided.
@@ -241,6 +249,10 @@ For more information about this error, try `rustc --explain E0308`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_body_with_no_tail_points_at_the_return_type() {
     // tests/ui/block-result/consider-removing-last-semi.rs to `macro_tests`, its literal
     // `1u32`: rustc decides `1`'s type from the return type only once the error is found.
@@ -272,6 +284,10 @@ For more information about this error, try `rustc --explain E0308`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_if_with_no_else_where_a_value_is_returned() {
     // tests/ui/expr/if/if-without-else-as-fn-expr.rs to its first function.
     let source = "fn foo(bar: usize) -> usize {
@@ -304,6 +320,10 @@ For more information about this error, try `rustc --explain E0317`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_return_with_no_value() {
     // tests/ui/error-codes/E0069.rs
     let source = "fn foo() -> u8 {
@@ -335,6 +355,10 @@ For more information about this error, try `rustc --explain E0069`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_bound_of_the_callee_that_does_not_hold() {
     // tests/ui/error-codes/E0277.rs without `fn f(p: Path)`, whose `Path` is std's: its lines
     // are left empty.
@@ -496,6 +520,10 @@ const ATTR: &str = r#"#[rustc_on_unimplemented(
 )]"#;
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn on_unimplemented_gives_the_message_label_and_notes() {
     // tests/ui/diagnostic_namespace/on_unimplemented/multiple_notes.rs
     let source = r#"//@ reference: attributes.diagnostic.on_unimplemented.note-repetition
@@ -568,6 +596,10 @@ For more information about this error, try `rustc --explain E0277`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_closure_that_moves_given_to_a_bound_of_fn() {
     // tests/ui/closures/closure-wrong-kind.rs
     let source = "/* Any copyright is dedicated to the Public Domain.
@@ -664,6 +696,10 @@ For more information about this error, try `rustc --explain E0525`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn match_arms_of_incompatible_types_skip_the_diverging_one() {
     // tests/ui/match/match-arm-resolving-to-never.rs, its fifth arm's call of std's macro that
     // panics as not implemented written `loop {}`, which diverges as it does.
@@ -713,6 +749,10 @@ For more information about this error, try `rustc --explain E0308`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_let_with_no_type_and_no_use() {
     // tests/ui/error-codes/E0282.rs
     let source = "fn main() {
@@ -739,6 +779,10 @@ For more information about this error, try `rustc --explain E0282`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_underscore_as_an_argument() {
     // tests/ui/suggestions/fn-or-tuple-struct-with-underscore-args.rs
     let source = "fn foo(a: usize, b: usize) -> usize { a }
@@ -966,6 +1010,10 @@ fn main() {}
 
 #[test]
 #[ignore = "needs the named type of a `let` an ambiguous goal's variable is in (`fed1eb428d:docs/v2/requests/db-ty.md`): `top_term` is the goal's variable alone, so `W` and `Z` print `_`"]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_let_of_an_ambiguous_call_erases_its_decided_parameters() {
     // tests/ui/inference/erase-type-params-in-label.rs
     let source = r#"fn main() {
@@ -1039,6 +1087,10 @@ For more information about this error, try `rustc --explain E0283`.
 
 #[test]
 #[ignore = "needs the named type of a `let` an ambiguous goal's variable is in (`fed1eb428d:docs/v2/requests/db-ty.md`): `top_term` is the goal's variable alone, so `T` and `U` print `_`"]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_let_assigned_later_names_both_parameters() {
     // tests/ui/traits/next-solver/well-formed-in-relate.rs
     let source = "fn main() {
@@ -1206,6 +1258,10 @@ fn main() {
 
 #[test]
 #[ignore = "needs the cause of a supertrait's bound checked at an impl (rustc's `WhereClause`), which the front end does not record"]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_projection_mismatch_of_an_iterator_names_what_it_yields() {
     // tests/ui/traits/assoc-type-in-superbad.rs
     let source = "// Test case where an associated type is referenced from within the
@@ -1246,6 +1302,10 @@ For more information about this error, try `rustc --explain E0271`.
 
 #[test]
 #[ignore = "needs a const call's `[const] Trait` bound to reach the solver as a HostEffect goal; a body's const calls are checked by `effects::non_const_calls` instead"]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_impl_that_is_not_const_is_suggested_const() {
     // tests/ui/traits/const-traits/const-default-method-bodies.rs
     let source = "//@ compile-flags: -Znext-solver
@@ -1325,6 +1385,10 @@ fn main() {}
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_impl_trait_arguments_bound_and_the_impls_where_clause_are_pointed_at() {
     // tests/ui/traits/next-solver/diagnostics/where-clause-doesnt-apply.rs
     let source = "trait Foo {}
@@ -1443,6 +1507,10 @@ fn main() {
 
 #[test]
 #[ignore = "needs rustc's \"consider specifying the generic arguments\" with the inferred arguments filled in (`foo::<17, M>`)"]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_undecided_const_argument_points_at_its_const_parameter() {
     // tests/ui/const-generics/infer/one-param-uninferred.rs
     let source = "// Test that we emit an error if we cannot properly infer a constant.

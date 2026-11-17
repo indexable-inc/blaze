@@ -1,13 +1,16 @@
 //! The columns: a crate's hash columns against each item's hashes, and fact sets against the
 //! facts they were made of.
 
+use std::alloc::Global;
+
 use blaze_ids::ContentId;
+use blaze_mem::{Frame, Tag};
 use hir_expand::fixture;
 
-use super::{edit, items, single};
+use super::{edit, items, ran, runs_of, single};
 use crate::{
     Fact, FactSet, HashColumns, ItemKey, NameHash, SimplifiedType, crate_hashes, hashes, item_key,
-    kinds,
+    kinds, table::Keep,
 };
 
 fn id(n: u8) -> ContentId {
@@ -15,12 +18,18 @@ fn id(n: u8) -> ContentId {
 }
 
 /// A copy of `columns` that outlives an edit of the database it came from, rebuilt from its
-/// rows.
-fn owned(columns: &HashColumns) -> HashColumns {
-    let mut rows: Vec<_> =
-        (0..columns.len()).map(|row| (columns.keys()[row], columns.row(row))).collect();
-    let mut unhashable = columns.unhashable().to_vec();
-    HashColumns::new(&mut rows, &mut unhashable)
+/// rows and kept in `frame`.
+fn owned<'a>(columns: &HashColumns<'_>, frame: &'a Frame) -> HashColumns<'a> {
+    let mut rows: Vec<_, Global> = Vec::new_in(Global);
+    rows.extend((0..columns.len()).map(|row| (columns.keys()[row], columns.row(row))));
+    let mut unhashable: Vec<_, Global> = Vec::new_in(Global);
+    unhashable.extend_from_slice(columns.unhashable());
+    HashColumns::new(Keep::Frame(frame), &mut rows, &mut unhashable)
+}
+
+/// A frame for a test's copy of a crate's columns.
+fn test_frame() -> Frame {
+    Frame::new(Tag::Other).expect("a test's frame")
 }
 
 /// A fact of each kind, two of fields.
@@ -48,6 +57,11 @@ pub(super) fn every_kind() -> Vec<Fact> {
         Fact::Crate(id(7)),
         Fact::HiddenTypes(b),
         Fact::RpititTys(a),
+        Fact::InherentImpls(SimplifiedType(id(3))),
+        Fact::TraitImpls(b),
+        Fact::TraitsNamed(NameHash(id(4))),
+        Fact::ScopeTraitsNamed { scope: a, name: NameHash(id(4)) },
+        Fact::BlockImpls(b),
     ]
 }
 
@@ -76,7 +90,11 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {
             (trait_.0, Some(self_ty.0), None)
         }
-        Fact::Resolves { scope, name } => (scope.0, Some(name.0), None),
+        Fact::Resolves { scope, name } | Fact::ScopeTraitsNamed { scope, name } => {
+            (scope.0, Some(name.0), None)
+        }
+        Fact::InherentImpls(it) => (it.0, None, None),
+        Fact::TraitsNamed(it) => (it.0, None, None),
         Fact::Signature(it)
         | Fact::Layout(it)
         | Fact::Code(it)
@@ -89,7 +107,9 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         | Fact::DropCheck(it)
         | Fact::Derive(it)
         | Fact::HiddenTypes(it)
-        | Fact::RpititTys(it) => (it.0, None, None),
+        | Fact::RpititTys(it)
+        | Fact::TraitImpls(it)
+        | Fact::BlockImpls(it) => (it.0, None, None),
         Fact::Target(it) | Fact::Crate(it) => (it, None, None),
     };
     (fact.kind().0, parts)
@@ -127,7 +147,8 @@ fn g() { fn inner() {} }
 "#,
     );
     let krate = fixture::test_crate(&db);
-    let columns = owned(crate_hashes(&db, krate));
+    let frame = test_frame();
+    let columns = owned(crate_hashes(&db, krate), &frame);
     assert_eq!(&columns, crate_hashes(&db, krate));
     assert!(columns.unhashable().is_empty(), "{:?}", columns.unhashable());
     for id in items(&db) {
@@ -150,6 +171,8 @@ pub const C: u32 = 1;
 fn g() { fn inner() {} }
 "#,
     );
+    // The crate's id is of the snapshot it was taken in: taken again after the edit.
+    let krate = fixture::test_crate(&db);
     let now = crate_hashes(&db, krate);
     let changed = now.changed_since(&columns);
     let named = |path: &str| item_key(&db, super::item(&db, path));
@@ -162,8 +185,12 @@ fn g() { fn inner() {} }
     assert!(now.changed_since(now).is_empty());
 }
 
+// Restated for blaze-memo (port decision 9). It also claimed the edit reruns `crate_hashes`
+// and not `crate_items_by_key`: false by design, since an edit of a file drops its crate's
+// arena at the commit and every query of the crate runs again; reuse across an edit is the
+// host's, on records (docs/v2/plan/design/host.md), and that claim is owed there.
 #[test]
-fn a_body_edit_rebuilds_the_columns_without_their_key_order() {
+fn a_body_edit_changes_the_hash_of_its_item_alone() {
     let (mut db, file) = single(
         r#"
 pub struct S { x: u32 }
@@ -172,7 +199,8 @@ fn g() { fn inner() {} }
 "#,
     );
     let krate = fixture::test_crate(&db);
-    let before = owned(crate_hashes(&db, krate));
+    let frame = test_frame();
+    let before = owned(crate_hashes(&db, krate), &frame);
     edit(
         &mut db,
         file,
@@ -182,10 +210,11 @@ pub fn f(s: &S) -> u32 { s.x + 1 }
 fn g() { fn inner() {} }
 "#,
     );
-    let executed = db.log_executed(|| {
+    // The crate's id is of the snapshot it was taken in: taken again after the edit.
+    let krate = fixture::test_crate(&db);
+    let executed = runs_of(&db, || {
         let now = crate_hashes(&db, krate);
         assert_eq!(now.changed_since(&before), [item_key(&db, super::item(&db, "f"))]);
     });
-    assert!(executed.iter().any(|it| it.contains("crate_hashes")), "{executed:#?}");
-    assert!(!executed.iter().any(|it| it.contains("crate_items_by_key")), "{executed:#?}");
+    assert!(ran(&executed, crate::table::crate_hashes::KIND_NAME), "{executed:#?}");
 }

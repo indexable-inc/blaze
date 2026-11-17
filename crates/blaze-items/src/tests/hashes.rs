@@ -1,10 +1,12 @@
 //! The four hashes and the keys: what an edit changes and what it keeps.
 
+use std::alloc::Global;
+
 use hir_def::{AdtId, DefWithBodyId, ItemContainerId, Lookup, expr_store::Body, hir::Expr};
 use hir_expand::fixture;
 use hir_ty::db::{InternedClosure, InternedClosureId};
 
-use super::{TestDB, edit, item, single};
+use super::{TestDB, count, edit, item, ran, runs_of, single};
 use crate::{
     ItemHashes, ItemId, Resolved,
     hash::{self, Graph, Members},
@@ -53,7 +55,7 @@ fn f(s: &S) -> u32 {
 }
 
 #[test]
-fn rename_keeps_hashes_and_changes_the_key() {
+fn a_rename_keeps_its_own_hashes_moves_every_hash_naming_it_and_changes_the_key() {
     let (mut db, file) = single(
         r#"
 struct S { x: u32 }
@@ -62,6 +64,7 @@ fn g(s: &S) -> u32 { f(s) }
 "#,
     );
     let (f, s, g) = (of(&db, "f"), of(&db, "S"), of(&db, "g"));
+    let sigs = ["f", "g"].map(|it| signature_hash(&db, item(&db, it)).unwrap());
     let f_key = item_key(&db, item(&db, "f"));
     edit(
         &mut db,
@@ -72,9 +75,17 @@ fn h(s: &T) -> u32 { s.x }
 fn g(s: &T) -> u32 { h(s) }
 "#,
     );
-    assert_eq!(of(&db, "h"), f);
+    // A renamed item keeps its own hashes, and every name-free hash naming it (interface, code,
+    // deep: what codegen keys a template by and what inlines) stays; every signature hash that
+    // names it moves (D51), as that is what a body's stored type check is checked by: `h` and
+    // `g` name `T` in place of `S`, and `g` calls `h`.
     assert_eq!(of(&db, "T"), s);
+    assert_eq!(of(&db, "h"), f);
     assert_eq!(of(&db, "g"), g);
+    for name in ["h", "g"] {
+        let signature = |db: &TestDB, path| signature_hash(db, item(db, path)).unwrap();
+        assert_ne!(signature(&db, name), sigs[usize::from(name == "g")], "{name}: its signature");
+    }
     assert_ne!(item_key(&db, item(&db, "h")), f_key);
 }
 
@@ -168,7 +179,79 @@ fn g() -> u32 { f(1) }
     assert_ne!(of(&db, "g").code, g.code);
 }
 
+/// The invariant: a signature that names another nominal type of the same shape (a newtype for
+/// another, a unit marker for another) moves its signature and interface hashes, as it changes
+/// what every caller of it type-checks against: `f(Meters(1))` is accepted with `f(_: Meters)`
+/// and rejected with `f(_: Feet)`. A body's stored inference, MIR and borrow check are checked
+/// by the callee's `Signature` fact, whose value is the signature hash
+/// (`facts::value`, `Fact::Signature`), so a signature hash that spells `Meters` and `Feet`
+/// alike serves a caller's stale result. A fact that spells a form (a field's type) names its
+/// items by key as well, for the same reason. The control: the interface hash and the two
+/// types' layouts are name-free, which is right (what a compiled body does depends on a shape,
+/// never a name; which item it calls is bound by key beside its code), so codegen shares them.
 #[test]
+fn a_signature_naming_another_type_of_the_same_shape_moves_its_signature_hash() {
+    let cases = [
+        (
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f(_x: Meters) {}\n",
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f(_x: Feet) {}\n",
+        ),
+        (
+            "pub struct A;\npub struct B;\npub fn f(_x: &A) {}\n",
+            "pub struct A;\npub struct B;\npub fn f(_x: &B) {}\n",
+        ),
+        (
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f() -> Meters { Meters(1) }\n",
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f() -> Feet { Feet(1) }\n",
+        ),
+    ];
+    for (before, after) in cases {
+        let (mut db, file) = single(before);
+        let f = item(&db, "f");
+        let (signature, interface) = (signature_hash(&db, f).unwrap(), of(&db, "f").interface);
+        edit(&mut db, file, after);
+        let f = item(&db, "f");
+        assert_ne!(
+            signature_hash(&db, f).unwrap(),
+            signature,
+            "`f`'s signature hash did not move when the type it names became another of the \
+             same shape:\n{before}---\n{after}"
+        );
+        assert_eq!(
+            of(&db, "f").interface,
+            interface,
+            "`f`'s interface hash is name-free:\n{before}---\n{after}"
+        );
+    }
+    // A field's type, by its `Field` fact's value.
+    let field_value = |db: &TestDB| {
+        let AdtId::StructId(w) = adt(db, "W") else { unreachable!("`W` is a struct") };
+        let variant = hir_def::VariantId::from(w);
+        let (local, _) = variant.fields(db).fields().iter().next().expect("`W` has a field");
+        let fact = crate::facts::field(db, variant, local);
+        crate::facts::value(db, item(db, "W").krate(db), &fact)
+            .unwrap_or_else(|err| panic!("{}", err.describe(db)))
+    };
+    let types = "pub struct Meters(pub u32);\npub struct Feet(pub u32);\n";
+    let (mut db, file) = single(&format!("{types}pub struct W(pub Meters);\n"));
+    let before = field_value(&db);
+    edit(&mut db, file, &format!("{types}pub struct W(pub Feet);\n"));
+    assert_ne!(field_value(&db), before, "`W.0`'s fact names `Feet` in place of `Meters`");
+    // The control: equal shapes, equal layouts.
+    let (db, _) = single(cases[0].0);
+    assert_eq!(
+        layout_hash(&db, adt(&db, "Meters")).unwrap(),
+        layout_hash(&db, adt(&db, "Feet")).unwrap(),
+        "two types of one shape have one layout"
+    );
+}
+
+// The port onto blaze-memo made this claim false by design, left failing for a decision: an
+// edit of a file drops its crate's arena at the commit, so every query of the crate runs again
+// (`g`'s `interface_form` too); reuse across an edit comes from the records, not the memo.
+// What this claimed: a body edit of `f` runs no `interface_form` of `g`.
+#[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_executes_no_interface_form_of_another_item() {
     let (mut db, file) = single(
         r#"
@@ -186,13 +269,10 @@ fn g() -> u32 { f() }
 "#,
     );
     let g = item(&db, "g");
-    let executed = db.log_executed(|| {
+    let executed = runs_of(&db, || {
         crate::interface_hash(&db, g).unwrap();
     });
-    assert!(
-        !executed.iter().any(|query| query.contains("interface_form")),
-        "re-ran forms: {executed:?}"
-    );
+    assert!(!ran(&executed, hash::interface_form::KIND_NAME), "re-ran forms: {executed:?}");
 }
 
 #[test]
@@ -316,16 +396,18 @@ fn f() -> impl Sized {
     let krate = fixture::test_crate(&db);
     let mut cycles = 0;
     for graph in [Graph::Interface, Graph::Layout, Graph::Deep] {
-        let table = hash::find_components(&db, graph, krate);
-        for id in key::crate_item_ids(&db, krate) {
-            if !graph.node(id) {
-                continue;
-            }
-            let from_table = match table.get(id) {
-                None => panic!("{graph:?}: {id:?} was not searched"),
-                Some([]) => vec![id],
-                Some(members) => members.to_vec(),
-            };
+        let ids: Vec<_> =
+            key::crate_item_ids(&db, krate).filter(|&id| graph.node(id)).collect();
+        let tabled: Vec<Vec<_>> = hash::find_components(&db, graph, krate, |table| {
+            ids.iter()
+                .map(|&id| match table.get(id) {
+                    None => panic!("{graph:?}: {id:?} was not searched"),
+                    Some([]) => vec![id],
+                    Some(members) => members.to_vec(),
+                })
+                .collect()
+        });
+        for (&id, from_table) in ids.iter().zip(tabled) {
             let mut alone = hash::searched(&db, graph, krate, None, id);
             alone.sort_unstable();
             assert_eq!(from_table, alone, "{graph:?}: {id:?}");
@@ -349,19 +431,22 @@ struct C { a: *const A }
 "#,
     );
     let ids = ["A", "B", "C"].map(|name| item(&db, name));
-    let executed = db.log_executed(|| {
+    let executed = runs_of(&db, || {
         for id in ids {
             crate::interface_hash(&db, id).unwrap();
         }
     });
-    let units = executed.iter().filter(|it| it.contains("interface_unit")).count();
-    assert_eq!(units, 1, "{executed:#?}");
+    assert_eq!(count(&executed, hash::interface_unit::KIND_NAME), 1, "{executed:#?}");
     let [a, b, c] = ids.map(|id| crate::interface_hash(&db, id).unwrap());
     assert!(a != b && b != c && a != c, "each member has its own position");
 }
 
+// Restated for blaze-memo (port decision 9). It also claimed the edit runs `deep_refs` and not
+// `deep_components`: false by design, since an edit of a file drops its crate's arena at the
+// commit and every query of the crate runs again; reuse across an edit is the host's, on
+// records (docs/v2/plan/design/host.md), and that claim is owed there.
 #[test]
-fn a_body_edit_that_calls_nothing_new_keeps_the_deep_components() {
+fn a_body_edit_that_calls_nothing_new_changes_the_deep_hash() {
     let (mut db, file) = single(
         r#"
 fn f() -> u32 { g() + 1 }
@@ -378,9 +463,8 @@ fn g() -> u32 { 2 }
 "#,
     );
     let f = item(&db, "f");
-    let executed = db.log_executed(|| assert_ne!(crate::deep_hash(&db, f).unwrap(), before));
-    assert!(executed.iter().any(|it| it.contains("deep_refs")), "{executed:#?}");
-    assert!(!executed.iter().any(|it| it.contains("deep_components")), "{executed:#?}");
+    let executed = runs_of(&db, || assert_ne!(crate::deep_hash(&db, f).unwrap(), before));
+    assert!(ran(&executed, hash::deep_refs::KIND_NAME), "{executed:#?}");
 }
 
 #[test]
@@ -735,7 +819,9 @@ fn two_crates_of_one_key_stop_the_build_naming_both() {
             workspace.clone(),
         );
     }
-    graph.set_in_db(&mut db);
+    let mut edit = db.edit();
+    edit.set_crate_graph(graph);
+    _ = edit.commit();
     let clash = key::check_crate_keys(&db).expect_err("two crates of one key");
     assert!(clash.same_key, "{clash}");
     let message = clash.to_string();
@@ -750,7 +836,6 @@ fn two_crates_of_one_key_stop_the_build_naming_both() {
 #[test]
 fn an_example_and_a_test_with_one_name_are_two_crates() {
     use base_db::TargetKind::{Bench, Bin, Example, Lib, Test};
-    use blaze_query::db::Durability;
     // (what the crate is built as, the manifest target's kind)
     let graph = |kinds: &[(base_db::TargetKind, base_db::TargetKind)]| {
         let fixture: String = (0..kinds.len())
@@ -758,12 +843,16 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
             .collect();
         let mut db = fixture::db(&fixture).into_db();
         let made: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
-        let (data, workspace) = (made[0].data(&db).clone(), made[0].workspace_data(&db).clone());
-        let mut krates = Vec::new();
-        for (&(target_kind, manifest_kind), it) in kinds.iter().zip(&made) {
-            let data = base_db::BuiltCrateData {
-                root_file_id: it.data(&db).root_file_id,
-                dependencies: Vec::new(),
+        let (data, workspace) =
+            (made[0].data(&db).keyed(&db), made[0].workspace_data(&db).clone());
+        let roots: Vec<_> = made.iter().map(|it| it.data(&db).root_file_id).collect();
+        // The crates made replace the fixture's in one edit; their ids are taken after it.
+        let mut edit = db.edit();
+        let mut keys = Vec::new_in(Global);
+        for (&(target_kind, manifest_kind), &root_file_id) in kinds.iter().zip(&roots) {
+            let data = base_db::WorldCrateData {
+                root_file_id,
+                dependencies: Vec::new_in(Global),
                 origin: base_db::CrateOrigin::Local {
                     repo: None,
                     name: Some(intern::Symbol::intern("blaze-registry")),
@@ -781,17 +870,11 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
             };
             let cfg = cfg::CfgOptions::default();
             let env = base_db::Env::default();
-            krates.push(base_db::Crate::create(
-                &mut db,
-                data,
-                extra,
-                workspace.clone(),
-                cfg,
-                env,
-                Durability::LOW,
-            ));
+            keys.push(edit.create_crate(data, extra, workspace.clone(), cfg, env));
         }
-        base_db::set_all_crates_with_durability(&mut db, krates.iter().copied(), Durability::LOW);
+        edit.set_all_crates(&keys);
+        _ = edit.commit();
+        let krates: Vec<_> = keys.iter().map(|&key| db.krate(key)).collect();
         (db, krates)
     };
     let kinds = [
@@ -830,7 +913,6 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
 /// key covered what a crate is built for, a `--target` build stopped on `proc_macro@0.0.0`.
 #[test]
 fn one_package_built_for_the_host_a_target_and_wasm_proc_macros_has_a_key_for_each() {
-    use blaze_query::db::Durability;
     let host = "aarch64-apple-darwin";
     let wasm = "wasm32-wasip1";
     let built_for = |platform: Option<&str>, macro_wasm: bool| base_db::BuiltFor {
@@ -843,12 +925,16 @@ fn one_package_built_for_the_host_a_target_and_wasm_proc_macros_has_a_key_for_ea
             .collect();
         let mut db = fixture::db(&fixture).into_db();
         let made: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
-        let (data, workspace) = (made[0].data(&db).clone(), made[0].workspace_data(&db).clone());
-        let mut krates = Vec::new();
-        for (built_for, it) in kinds.iter().zip(&made) {
-            let data = base_db::BuiltCrateData {
-                root_file_id: it.data(&db).root_file_id,
-                dependencies: Vec::new(),
+        let (data, workspace) =
+            (made[0].data(&db).keyed(&db), made[0].workspace_data(&db).clone());
+        let roots: Vec<_> = made.iter().map(|it| it.data(&db).root_file_id).collect();
+        // The crates made replace the fixture's in one edit; their ids are taken after it.
+        let mut edit = db.edit();
+        let mut keys = Vec::new_in(Global);
+        for (built_for, &root_file_id) in kinds.iter().zip(&roots) {
+            let data = base_db::WorldCrateData {
+                root_file_id,
+                dependencies: Vec::new_in(Global),
                 origin: base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::ProcMacro),
                 ..data.clone()
             };
@@ -860,17 +946,11 @@ fn one_package_built_for_the_host_a_target_and_wasm_proc_macros_has_a_key_for_ea
                 build_script_runs: Box::new([]),
             };
             let (cfg, env) = (cfg::CfgOptions::default(), base_db::Env::default());
-            krates.push(base_db::Crate::create(
-                &mut db,
-                data,
-                extra,
-                workspace.clone(),
-                cfg,
-                env,
-                Durability::LOW,
-            ));
+            keys.push(edit.create_crate(data, extra, workspace.clone(), cfg, env));
         }
-        base_db::set_all_crates_with_durability(&mut db, krates.iter().copied(), Durability::LOW);
+        edit.set_all_crates(&keys);
+        _ = edit.commit();
+        let krates: Vec<_> = keys.iter().map(|&key| db.krate(key)).collect();
         (db, krates)
     };
     let kinds = [
@@ -1202,7 +1282,11 @@ fn an_error_type_left_by_an_unbuilt_proc_macro_names_the_field_and_the_macro() {
     let built =
         ProcMacros::get_for_crate(&db, pm).and_then(|it| it.macros()).expect("its macros").to_vec();
 
+    // The proc-macro crate by its stable key: each `give` commits, and an id is of the snapshot
+    // it was taken in, so `pm` and `k` are taken again after each.
+    let pm_key = pm.key(&db);
     ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::NotYetBuilt))]);
+    let k = item(&db, "K");
     let pending =
         signature_hash(&db, k).expect_err("no item of `lib` hashes while `mirror!` is not built");
     let (err, said) = (pending, pending.describe(&db));
@@ -1213,7 +1297,9 @@ fn an_error_type_left_by_an_unbuilt_proc_macro_names_the_field_and_the_macro() {
         "{said}"
     );
 
+    let pm = db.krate(pm_key);
     ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::FailedToBuild))]);
+    let k = item(&db, "K");
     let err =
         signature_hash(&db, k).expect_err("`Idx` does not resolve while `mirror!` has no expander");
     let said = err.describe(&db);
@@ -1225,10 +1311,14 @@ fn an_error_type_left_by_an_unbuilt_proc_macro_names_the_field_and_the_macro() {
         "the proc macro and why: {said}"
     );
 
+    let pm = db.krate(pm_key);
     ProcMacros::give(&mut db, [(pm, Ok(built))]);
+    let k = item(&db, "K");
     signature_hash(&db, k)
         .unwrap_or_else(|err| panic!("with its proc macro given back: {}", err.describe(&db)));
     // The refusal keeps the proc macro it found pending: said once it is built, it still names it.
+    // It was made two commits ago and holds stable keys, which `describe` takes ids of again in
+    // this snapshot.
     let said = pending.describe(&db);
     assert!(
         said.contains("`lib` was read before the proc macros of `proc_macros` were built"),

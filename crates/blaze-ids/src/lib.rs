@@ -10,7 +10,7 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/design/item-hash.md
 //!   section 6.2).
 
-#![feature(allocator_api, allocator_ext, portable_simd, register_tool)]
+#![feature(allocator_ext, portable_simd, register_tool)]
 #![register_tool(blaze)]
 #![deny(unsafe_code)]
 
@@ -35,6 +35,7 @@ pub mod bits;
 #[allow(unsafe_code)]
 pub mod crc32c;
 pub mod fuse;
+pub mod keyed;
 mod many;
 pub mod names;
 pub use blaze_radix as radix;
@@ -43,7 +44,7 @@ mod std_hash;
 mod sync;
 mod wire;
 
-pub use crate::std_hash::fixed_width_writes;
+pub use blaze_hash::fixed_width_writes;
 
 /// Counts allocations so the read paths' tests hold them to a budget.
 #[cfg(all(test, not(blaze_check)))]

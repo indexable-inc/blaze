@@ -1,5 +1,5 @@
 //! Linux's waits: `io_uring_enter` for the io_uring driver, and a sleep on the thread's wait
-//! ring (`wait/ring.rs`).
+//! ring (`wait/ring.rs`) or, on the direct driver, `clock_nanosleep` (`wait/direct.rs`).
 
 use std::{io, os::fd::RawFd, ptr};
 
@@ -113,13 +113,17 @@ pub(crate) fn uring_enter(
 
 /// Sleeps until `deadline` on `clock`: a ring timeout (`IORING_OP_TIMEOUT` to an absolute
 /// `CLOCK_MONOTONIC` time) on this thread's wait ring, its deadline in the ring's registered
-/// wait region, so a signal that ends the wait early waits again for only what is left.
+/// wait region, so a signal that ends the wait early waits again for only what is left; on the
+/// direct driver, `clock_nanosleep` to an absolute time recomputed the same way.
 pub fn sleep_until(
     what: &'static str,
     deadline: Deadline,
     clock: &impl Clock,
 ) -> Result<(), WaitError> {
-    super::ring::sleep_until(what, deadline, clock)
+    match super::choice::chosen() {
+        super::Waits::Ring => super::ring::sleep_until(what, deadline, clock),
+        super::Waits::Direct => super::direct::sleep_until(what, deadline, clock),
+    }
 }
 
 #[cfg(test)]

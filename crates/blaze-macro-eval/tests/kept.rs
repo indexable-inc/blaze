@@ -55,6 +55,8 @@ fn kept_in(sim: &mut Sim) -> blaze_cas::Store {
         dir: blaze_core::FileName::new("store").expect("a plain name"),
         layers: Vec::new(),
         tags: 1 << 48,
+        load_tags: (1 << 48) + (1 << 32),
+        loader: blaze_cas::Loader::Pumped,
     };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
@@ -524,7 +526,11 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
         .find(|(_, it)| Path::new(it.as_str()) == path)
         .map(|(file, _)| *file)
         .unwrap_or_else(|| panic!("the front end has no file {}", path.display()));
-    second.lowered.served_db().set_file_text(file, &edited);
+    let mut edit = second.lowered.served_db().edit();
+    edit.set_file_text(file, &edited);
+    _ = edit.commit();
+    // The crates' ids of the snapshot before die at the commit: taken again by their units.
+    let (sessions, once, settles) = crates(&second);
     let db = second.lowered.db();
     let reads = reads_of(db, sessions, once);
     assert!(

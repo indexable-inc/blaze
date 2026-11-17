@@ -122,17 +122,21 @@ pub unsafe fn zero(to: *mut u8, len: usize) {
 
 #[cfg(all(test, not(blaze_check)))]
 mod tests {
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
     /// Bytes written with [`copy_in`] at any offset and length come back whole through
     /// [`copy_out`], the head, words and tail each where the address puts them, and nothing
     /// outside the range moves; [`zero`] clears exactly its range.
-    #[hegel::test]
-    fn copies_round_trip_at_any_alignment(tc: TestCase) {
-        let offset = tc.draw(gs::integers::<usize>().max_value(15));
-        let bytes: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>()).max_size(80));
+    #[test]
+    fn copies_round_trip_at_any_alignment() {
+        blaze_sim::check(Config::DEFAULT, |tape| copies_round_trip(tape))
+    }
+
+    fn copies_round_trip(tape: &Tape) {
+        let offset = tape.int_in(0..=15usize, "offset");
+        let bytes: Vec<u8> = tape.vec(0..=80, "bytes", |tape| tape.int::<u8>("byte"));
         let mut buffer = [0xEEu8; 112];
         let at = buffer.as_mut_ptr().wrapping_add(offset);
         // SAFETY: `[at, at + bytes.len())` is inside `buffer` (16 + 80 <= 112), which only this

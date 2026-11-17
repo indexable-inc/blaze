@@ -1,7 +1,8 @@
-"""Fetch the pinned CEF and bundle `Harness Browser.app` (crates/harness/harness-browser/README.md).
+"""Package harness's macOS apps and fetch the pinned CEF.
 
     uv run --frozen crates/harness/scripts/cef.py '{"op": "fetch"}'
     uv run --frozen crates/harness/scripts/cef.py '{"op": "bundle", "profile": "release"}'
+    uv run --frozen crates/harness/scripts/cef.py '{"op": "install"}'
 
 `fetch` downloads the macOS arm64 minimal distribution of the CEF in `PIN` from Spotify's CEF build
 server, checks its sha1 (the server's index) and sha256 (ours), and extracts it to
@@ -12,15 +13,21 @@ again. Nothing is installed on the host.
 `bundle` makes `<target>/<profile>/Harness Browser.app` from the `harness-browser` binary cargo
 built: the framework cloned (APFS clonefile) from the cache, five helper apps that are the same
 binary, Info.plists, and an ad-hoc signature on every bundle, inside out.
+
+`install` installs blaze.app from the existing release binaries, with its icon, daemon,
+kernel, Bun runtime and browser bundle. It never rebuilds or stops running sessions.
 """
 
 import asyncio
 import hashlib
+import json
 import os
 import plistlib
 import shutil
 import sys
 import tarfile
+import tempfile
+import tomllib
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -53,8 +60,23 @@ SERVER = "https://cef-builds.spotifycdn.com/"
 FRAMEWORK = "Chromium Embedded Framework.framework"
 APP = "Harness Browser"
 BUNDLE_ID = "inc.indexable.harness.browser"
+NATIVE_APP = "blaze"
 # What macOS shows when it asks the person to let the browser read where the Mac is.
 LOCATION_WHY = "Pages you open in harness, and agents you ask, can use where this Mac is."
+# Why the browser may use each privacy-protected device, in every plist that can be asked: the host's own, and
+# blaze.app's. macOS (TCC) checks the *responsible* app's plist, and once blaze.app launches the daemon that launches
+# the host, that is blaze.app, not Harness Browser.app. A request whose responsible plist lacks the key is not refused:
+# the process is killed (SIGABRT, "attempted to access privacy-sensitive data without a usage description"). Chromium
+# reaches Bluetooth when a page offers a passkey (its phone-as-passkey path, e.g. a sign-in page), the camera and the
+# microphone when a page asks for them, and Core Location for navigator.geolocation (and ts location()); without the
+# location keys that times out and macOS never asks.
+PRIVACY_WHY = {
+    "NSBluetoothAlwaysUsageDescription": "Pages you open in harness can sign you in with a passkey on your phone or a security key.",
+    "NSCameraUsageDescription": "Pages you open in harness can use the camera when you allow it.",
+    "NSMicrophoneUsageDescription": "Pages you open in harness can use the microphone when you allow it.",
+    "NSLocationUsageDescription": LOCATION_WHY,
+    "NSLocationWhenInUseUsageDescription": LOCATION_WHY,
+}
 # CEF's helper kinds on macOS: the suffix Chromium appends to the helper's name, and our bundle id's. No "(Alerts)"
 # helper: it exists only to post macOS notifications, which the host turns off (harness-browser/src/handlers.rs), and its
 # first launch makes macOS ask the person for notification permission. Anything that still asks for it fails to launch.
@@ -68,13 +90,15 @@ HELPERS = (
 
 @dataclass(frozen=True)
 class Input:
-    op: Literal["fetch", "bundle"]
+    op: Literal["fetch", "bundle", "install"]
     # bundle: the cargo profile directory under the target dir.
     profile: str = "release"
     # bundle: the cargo target dir, default crates/harness/target.
     target_dir: str | None = None
     # fetch: the cache root, default ~/Library/Caches/inc.indexable.harness/cef (CEF_PATH for cef-dll-sys).
     cache: str | None = None
+    # install: the app destination (also supports ~/Applications/blaze.app).
+    destination: str = f"/Applications/{NATIVE_APP}.app"
 
 
 class StepError(Exception):
@@ -182,10 +206,7 @@ def info_plist(name: str, ident: str) -> bytes:
             "LSMinimumSystemVersion": "13.0",
             # No Dock icon and no menu bar: the host draws nothing of its own but the manage window.
             "LSUIElement": True,
-            # Chromium reads the Mac's position through Core Location, which answers only an app whose plist says
-            # why: without these a page's navigator.geolocation (and ts location()) times out and macOS never asks.
-            "NSLocationUsageDescription": LOCATION_WHY,
-            "NSLocationWhenInUseUsageDescription": LOCATION_WHY,
+            **PRIVACY_WHY,
             "NSPrincipalClass": "NSApplication",
             "NSSupportsAutomaticGraphicsSwitching": True,
         }
@@ -242,6 +263,100 @@ async def bundle(inp: Input) -> None:
     print(f"cef: bundled {app}")
 
 
+async def install(inp: Input) -> None:
+    out = (Path(inp.target_dir) if inp.target_dir is not None else HARNESS / "target") / inp.profile
+    app = Path(inp.destination).expanduser().absolute()
+    if app.suffix != ".app":
+        raise StepError(f"install: destination {app} must end in .app")
+    ident = "inc.indexable.harness"
+    if app.exists():
+        plist = app / "Contents/Info.plist"
+        if not plist.is_file() or plistlib.loads(plist.read_bytes()).get("CFBundleIdentifier") != ident:
+            raise StepError(f"install: {app} is not a harness app; refusing to replace it")
+    bun = shutil.which("bun")
+    required = [out / "harness-native", out / "harness", out / f"{APP}.app",
+                HARNESS / "mcp/src/mcp.ts", HARNESS / "mcp/node_modules"]
+    for path in required:
+        if not path.exists():
+            raise StepError(f"install: missing {path}; build the release binaries, bundle the browser, and bun install in mcp first")
+    if bun is None:
+        raise StepError("install: bun is not on PATH; install Bun before packaging harness")
+    app.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".harness-install-", dir=app.parent) as work:
+        staging = Path(work) / app.name
+        contents = staging / "Contents"
+        macos = contents / "MacOS"
+        resources = contents / "Resources"
+        macos.mkdir(parents=True)
+        resources.mkdir()
+        version = tomllib.loads((HARNESS / "harness-native/Cargo.toml").read_text())["package"]["version"]
+        (contents / "Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleDevelopmentRegion": "en",
+            "CFBundleDisplayName": NATIVE_APP,
+            "CFBundleName": NATIVE_APP,
+            "CFBundleIdentifier": ident,
+            "CFBundleExecutable": NATIVE_APP,
+            "CFBundleIconFile": f"{NATIVE_APP}.icns",
+            "CFBundlePackageType": "APPL",
+            "CFBundleInfoDictionaryVersion": "6.0",
+            "CFBundleShortVersionString": version,
+            "CFBundleVersion": version,
+            "LSApplicationCategoryType": "public.app-category.developer-tools",
+            "LSMinimumSystemVersion": "13.0",
+            "NSHighResolutionCapable": True,
+            "NSPrincipalClass": "NSApplication",
+            "NSSupportsAutomaticGraphicsSwitching": True,
+            # The browser host runs under this app, so macOS checks its privacy requests against this plist.
+            **PRIVACY_WHY,
+        }))
+        (contents / "PkgInfo").write_bytes(b"APPL????")
+        # Only PATH is carried from the install environment: never credentials or the rest of env.
+        (resources / "tool-path").write_text(os.environ["PATH"])
+        provenance = {}
+        for name, source in (("harness-native", out / "harness-native"), ("harness", out / "harness"), ("bun", Path(bun).resolve())):
+            await run(f"copy {name}", "/bin/cp", "-c", str(source), str(macos / name), timeout=30)
+            provenance[name] = hashlib.sha256(source.read_bytes()).hexdigest()
+        (macos / "bunx").symlink_to("bun")
+        await run("copy browser", "/bin/cp", "-cR", str(out / f"{APP}.app"), str(macos / f"{APP}.app"), timeout=60)
+        kernel = resources / "mcp"
+        kernel.mkdir()
+        for name in ("src", "skills", "node_modules", "package.json", "bun.lock", "bunfig.toml"):
+            await run(f"copy kernel {name}", "/bin/cp", "-cR", str(HARNESS / "mcp" / name), str(kernel / name), timeout=60)
+        (resources / "binaries.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        await run("compile app launcher", "/usr/bin/clang", "-Os", "-Wall", "-Wextra", "-Werror",
+                  str(HARNESS / "harness-native/macos/launcher.c"), "-o", str(macos / NATIVE_APP), timeout=60)
+        iconset = Path(work) / f"{NATIVE_APP}.iconset"
+        iconset.mkdir()
+        # The canonical blaze brand asset, shared with the website; never invent a second app mark.
+        icon = HARNESS.parents[1] / "docs/brand/blaze-icon-dark-1024.png"
+        for size in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                pixels = str(size * scale)
+                suffix = "@2x" if scale == 2 else ""
+                await run("size blaze app icon", "/usr/bin/sips", "-z", pixels, pixels, str(icon), "--out",
+                          str(iconset / f"icon_{size}x{size}{suffix}.png"), timeout=10)
+        await run("package app icon", "/usr/bin/iconutil", "-c", "icns", str(iconset),
+                  "-o", str(resources / f"{NATIVE_APP}.icns"), timeout=30)
+        sign = ("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none")
+        for name in ("harness", "harness-native", "bun"):
+            await run(f"sign {name}", *sign, str(macos / name), timeout=30)
+        await run(f"sign {NATIVE_APP}.app", *sign, str(staging), timeout=60)
+        await run(f"verify {NATIVE_APP}.app", "/usr/bin/codesign", "--verify", "--deep", "--strict", str(staging), timeout=60)
+        # Keep the old installation intact until the complete replacement has passed verification.
+        backup = Path(work) / "previous.app"
+        if app.exists():
+            app.rename(backup)
+        try:
+            staging.rename(app)
+        except OSError:
+            if backup.exists():
+                backup.rename(app)
+            raise
+    await run(f"register {NATIVE_APP}.app", "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+              "-f", str(app), timeout=30)
+    print(f"harness: installed {app}")
+
+
 async def main() -> None:
     inp = parse(Input, sys.argv[1] if len(sys.argv) > 1 else "{}", SCRIPT)
     if sys.platform != "darwin" or os.uname().machine != "arm64":
@@ -252,6 +367,8 @@ async def main() -> None:
                 await fetch(inp)
             case "bundle":
                 await bundle(inp)
+            case "install":
+                await install(inp)
     except* StepError as group:
         fail(SCRIPT, "\n".join(str(e) for e in group.exceptions))
 

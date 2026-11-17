@@ -1,0 +1,28 @@
+[package]
+name = "blaze-file-items"
+description = "A Rust source file's text to the outline of the items it declares, in one parse with no tree kept: kinds, names, visibilities, item-relative ranges, disambiguators and content hashes (docs/v2/plan/design/bottom.md, `FileItems`)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `ContentId` and `Hasher`: an item's content hashes, in named domains.
+blaze-ids.workspace = true
+# `ByHash`: the count of earlier siblings of each kind and name, for the disambiguator.
+blaze-hash.workspace = true
+# The lexer and the parser's event stream; `Edition` and `SyntaxKind`.
+parser.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

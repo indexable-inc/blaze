@@ -15,8 +15,8 @@ doctest = false
 
 [dependencies]
 base-db.workspace = true
-blaze-query.workspace = true
 blaze-graph.workspace = true
+blaze-memo.workspace = true
 blaze-hash.workspace = true
 either.workspace = true
 hir.workspace = true
@@ -33,6 +33,7 @@ stdx.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

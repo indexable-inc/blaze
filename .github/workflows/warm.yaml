@@ -1,0 +1,99 @@
+# warm: a commit checked and its reached tests run on a machine whose blaze daemon is already
+# warm (docs/v2/plan/design/ci.md, "The warm path"; harness/warm_ci.py). No VM is made and no
+# snapshot restored: the machine is long-lived, its clone and its daemon stay from job to job,
+# and a job is `git fetch`, a checkout of the commit (the daemon's watcher sees the files that
+# differ), `blaze check --workspace`, `blaze test --reached`, and this job's status.
+#
+# Not part of `ci` (blaze.yaml), and required by no branch rule: it says how long the warm path
+# takes, step by step, in its summary, until its numbers and its tests' failures (not yet held
+# to harness/known-failures.toml) let it stand in for the gate's build and tests.
+#
+# The machines are the ones the repository variable BLAZE_WARM_RUNNERS names, a JSON list:
+#
+#   [{"name": "macos-arm64", "runs_on": ["self-hosted", "macOS", "ARM64", "blaze-warm"],
+#     "checkout": "/Users/ci/blaze-warm/checkout",
+#     "llvm": "/usr/local/lib/blaze-llvm/aarch64-apple-darwin"}]
+#
+# Each is a self-hosted runner that is never scrubbed or forked (on macOS the Mac itself; on
+# Linux one long-lived ix machine), with blaze on PATH, git, Python 3.12, the pinned LLVM at
+# `llvm` and a clone at `checkout` (the first run makes it: `init`). With the variable unset no
+# job runs. A runner takes one job at a time, so jobs wait their turn; no concurrency group,
+# which would cancel the pull request waiting behind another's.
+#
+# Trust: only the repository's own branches run here. A pull request from a fork is someone
+# else's code, and its tests run arbitrary code as the runner's user beside a daemon and a store
+# every later job reads; it stays on blaze.yaml's gate, whose ix runners are a fresh fork of a
+# snapshot per job. The machine holds no secret: the job has a read-only token and posts
+# nothing itself.
+name: warm
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  runners:
+    name: warm runners
+    runs-on: [ix, arm64]
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      any: ${{ steps.matrix.outputs.any }}
+    steps:
+      - id: matrix
+        env:
+          RUNNERS: ${{ vars.BLAZE_WARM_RUNNERS }}
+          # A pull request from a fork runs nothing here.
+          TRUSTED: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [ "$TRUSTED" != true ] || [ -z "$RUNNERS" ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Refused here, naming the variable, rather than as a matrix GitHub cannot read.
+          matrix=$(echo "$RUNNERS" | jq -ce 'if type == "array" and length > 0 and all(.[]; (.name | type) == "string" and (.runs_on | type) == "array" and (.checkout | type) == "string" and (.llvm | type) == "string") then {include: .} else error("not a list of {name, runs_on, checkout, llvm}") end') \
+            || { echo "::error::the repository variable BLAZE_WARM_RUNNERS is not a JSON list of {name, runs_on, checkout, llvm}"; exit 1; }
+          echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  warm:
+    name: warm (${{ matrix.name }})
+    needs: runners
+    if: needs.runners.outputs.any == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.runners.outputs.matrix) }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 120
+    steps:
+      # The script and what it imports alone, at the commit under test: the tree it checks is
+      # the machine's own clone, which stays.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            harness/warm_ci.py
+            tools/typed-input
+          sparse-checkout-cone-mode: false
+      - name: fetch, check, reached tests (harness/warm_ci.py)
+        env:
+          CHECKOUT: ${{ matrix.checkout }}
+          LLVM: ${{ matrix.llvm }}
+          REMOTE: ${{ github.server_url }}/${{ github.repository }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          PYTHONPATH: tools/typed-input/src
+          # The fetch's alone: warm_ci.py hands it to git for that step and takes it out of the
+          # environment blaze and the daemon see (`token_var`).
+          FETCH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -c 'import json, os; e = os.environ; json.dump({"checkout": e["CHECKOUT"], "remote": e["REMOTE"], "commit": e["COMMIT"], "init": True, "token_var": "FETCH_TOKEN", "env": [{"name": "LLVM_SYS_231_PREFIX", "value": e["LLVM"]}], "out": os.path.join(e["RUNNER_TEMP"], "warm-ci.json")}, open(os.path.join(e["RUNNER_TEMP"], "warm-ci-input.json"), "w"))'
+          python3 harness/warm_ci.py "$RUNNER_TEMP/warm-ci-input.json"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: warm-ci-${{ matrix.name }}
+          path: ${{ runner.temp }}/warm-ci.json
+          if-no-files-found: warn

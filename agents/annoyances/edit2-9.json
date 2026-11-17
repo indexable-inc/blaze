@@ -1,0 +1,11 @@
+{
+ "id": "edit2-9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "blaze: the profile's flush at a build's end",
+ "what": "The profile's flush and its `fsync`s start as the build's request finishes, while the build's outputs are still being renamed onto their paths; on xfs one rename then took 6.6 ms (0.15 ms otherwise), and the answer waits for it.",
+ "cost": "up to 6 ms of an edit's answer, some edits",
+ "cause": "two writers of one file system's log at the moment the answer is due",
+ "workaround": "none",
+ "state": "open: the flush could wait for the answer"
+}

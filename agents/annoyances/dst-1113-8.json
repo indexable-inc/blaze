@@ -1,0 +1,8 @@
+{
+ "id": "dst-1113-8",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane dst-1113 R1",
+ "where": "crates/blaze-sim/src/control.rs (blaze_sim::control) vs the hand-rolled controls it replaces",
+ "what": "The old seed-loop controls accepted any oracle finding; blaze_sim::control needs the words the catch says. A write-only port lane cannot run the plant to see which oracle message it trips, so it has to guess the `says` text from reading the oracle, and a wrong guess shows up only when the main agent runs the test.",
+ "state": "open"
+}

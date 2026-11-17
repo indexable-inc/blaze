@@ -14,7 +14,7 @@ repository.workspace = true
 doctest = false
 
 # A build-dependency of the programs (blaze-engine, which works out the code generator's and the
-# front end's identities, and blaze-wasm), and a dev-dependency of the coverage checks
+# front end's identities), and a dev-dependency of the coverage checks
 # (hir-ty-codegen, blaze-cargo) and hir-ty's store tests: nothing of it is linked into blaze.
 # It reads `Cargo.lock` and the manifests itself (`toml`, `glob` for `members`): a build script
 # runs no cargo, whose `$CARGO` is blaze under blaze.

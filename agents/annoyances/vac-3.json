@@ -1,0 +1,12 @@
+{
+ "id": "vac-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane vacuous-1112",
+ "where": "crates/blaze-cargo/src/cli.rs:749 (`let mut out = io::stdout().lock()`, held for the whole command)",
+ "what": "Writing a test executable's stdout on from another thread through `io::stdout()` would never return: the command's thread holds std's stdout lock for the whole command. Found by reading, before any run; the relay writes to a duplicate of the descriptor instead.",
+ "cost": "would have been a hang of every piped `blaze test`; fifteen minutes",
+ "cause": "a process-wide lock taken for a command's life, in one function, with nothing at the other writers to say so",
+ "workaround": "`own_stdout()` in cli/test.rs: the descriptor itself",
+ "fix": "the command's stdout is passed to what writes it, not locked globally",
+ "state": "open"
+}

@@ -1,5 +1,5 @@
 //! A provided item whose own where-clauses may hold through an impl is not impossible there, as
-//! rustc's `is_impossible_associated_item` answers rustdoc (queue 01225): its clauses are solved
+//! rustc's `is_impossible_associated_item` answers rustdoc: its clauses are solved
 //! in coherence mode with the impl's parameters as inference variables, and only a clause that
 //! fails for every value of them makes the item impossible.
 //!
@@ -39,7 +39,7 @@ impl<'a> Each for Borrows<'a> { type Item = Square; }
 /// Whether `method` of `Each` is impossible through the impl for the struct `self_ty`.
 fn impossible(method: &str, self_ty: &str) -> bool {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let def_map = crate_def_map(&db, krate);
         let scope = def_map.modules(&db).next().expect("the root module").1.scope(&db);

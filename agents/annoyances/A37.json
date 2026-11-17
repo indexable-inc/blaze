@@ -1,0 +1,21 @@
+{
+ "id": "A37",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "~/.cargo/bin/blaze",
+ "what": "The installed `blaze` was a version launcher (771 KB) that ran ~/.blaze/versions/<pin>/blaze; `blaze --version` of it printed the launcher's release (0.20261028.7) while the daemon running was 0.20261105.4, so I reported the wrong installed version, and the old launcher's `blaze stop` said `daemon: not running` while that daemon held the socket.",
+ "cost": "a wrong statement to the owner; ten minutes",
+ "cause": "two binaries with one name and different versions; `stop` looked at a different daemon than the one on the socket",
+ "workaround": "stopped it with its own binary",
+ "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
+ "state": "prevention for `stop`/`status` written on vacuous-1112 (2afb298252), not yet compiled; the launcher's `--version` is open",
+ "whys": [
+  "why wrong: `stop` said no daemon ran while one held the socket and the state",
+  "why possible: `stop` asked one place (the socket path it computes) and took `nothing there` for `no daemon`",
+  "why not caught: no test starts a daemon under one environment and asks under another",
+  "why easy: the socket's path follows XDG_RUNTIME_DIR and the launcher's version; the state's path follows neither, and only the socket was asked",
+  "property: `is a daemon running` has two answers, the socket's and the state's, and a command may read either"
+ ],
+ "class": "two answers to one question: here `which daemon`: the socket this build would use, and the process that holds the state (see A38 for the class)",
+ "prevention": "crates/blaze-cargo/src/serve.rs `holder(state)`: who holds `serve.lock` now, asked of the lock the kernel holds for the daemon's life (it names the pid), never of a socket. `stop` and `status` say `no daemon is running` only when nothing listens at the socket and no daemon holds the state (cli/daemon.rs `absent`); one that holds the state is an error naming pid, lock and socket. A daemon that answers in another API schema is said to be running, with schema, socket and pid and what stops it (`other_schema`; A6). Tests with a planted bug (the answer from the socket alone) (2afb298252). Not done: `--version` printing both the launcher's and the pinned version, and stopping a daemon of another schema (SIGTERM is its graceful stop per docs/cargo.md; `stop` could send it to the lock's pid). Not compiled and not run by the lane (write-only): the main agent's combined build and tests are the proof."
+}

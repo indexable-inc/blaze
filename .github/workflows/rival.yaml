@@ -3,8 +3,7 @@
 # project is one job on a hosted runner; its three arms take turns on that runner, so the ratios
 # hold while the absolute seconds are a shared runner's (docs/harness.md: a dedicated machine's
 # numbers are the ones to publish; lane astral re-runs them on an ix VM). The report job merges
-# the projects into one README, which is the run's summary and the `rival` artifact; lane astral
-# copies it to tools/bench/results/<date>-rival/.
+# the projects into one README, which is the run's summary and the `rival` artifact.
 name: rival
 on:
   schedule:

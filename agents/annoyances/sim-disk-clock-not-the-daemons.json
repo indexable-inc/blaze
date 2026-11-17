@@ -1,0 +1,14 @@
+{
+ "id": "sim-disk-clock-not-the-daemons",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), core3 executor, int-1112",
+ "where": "crates/blaze-core/src/sim/journal.rs Disk::tick; crates/blaze-cargo/src/serve/{heads.rs,job/certify.rs,job.rs} wall_ns()",
+ "what": "The daemon asked SystemTime at every racy question while the simulated disk stamped mtimes from a counter starting at 1, so in every simulation no stamp was ever racy: no column name was saved unknown and the slot writer's read of one (what Plant::SlotBeforeLook breaks) was unreachable; solo.rs's control was #[ignore]d for it.",
+ "cost": "a control that could not run; every racy-window path of the daemon untested under simulation",
+ "cause": "the daemon read a clock of its own (certify::wall_ns) instead of its driver's, so the simulation could not inject it",
+ "class": "a core reading an ambient clock beside the injected one",
+ "prevention": "Driver::wall_ns is the one wall clock of a loop; World carries it; heads' arrive/complete take it; the sim's disk stamps by it (wall start + virtual now). Real-disk stamps outside a driver (premises, the tool cache) say they use blaze_core::system_wall_ns",
+ "workaround": "none",
+ "fix": "Driver::wall_ns on every driver; certify::wall_ns deleted; solo.rs's the_oracle_catches_a_slot_written_before_its_look un-ignored",
+ "state": "fixed, uncompiled"
+}

@@ -105,6 +105,25 @@ impl<'a> View<'a> {
         self.len
     }
 
+    /// Whether page `nth` is a whole page no part and no slot is in: `PAGE` zeros, as every
+    /// page of an image's unused patch room is (two regions of 64 MiB at least, 32768 pages).
+    /// Its hash is the zero page's, known ahead ([`zero_page`]), so no such page is gathered
+    /// or hashed.
+    fn hole(&self, nth: usize) -> bool {
+        let start = nth * PAGE;
+        let end = start + PAGE;
+        if end > self.len {
+            return false;
+        }
+        let first = self.parts.partition_point(|&(at, bytes)| at as usize + bytes.len() <= start);
+        if self.parts.get(first).is_some_and(|&(at, _)| (at as usize) < end) {
+            return false;
+        }
+        let base = self.base;
+        let slot = self.slots.partition_point(|it| ((it.0 - base) as usize) < start);
+        !self.slots.get(slot).is_some_and(|it| ((it.0 - base) as usize) < end)
+    }
+
     /// Page `nth`: borrowed when one part holds all of it and no slot is in it, else gathered
     /// into `buf`.
     fn page<'b>(&'b self, nth: usize, buf: &'b mut [u8; PAGE]) -> &'b [u8] {
@@ -296,11 +315,25 @@ pub(super) fn signature(
     }
 }
 
+/// The hash of a page of zeros: what every page of [`View::hole`] hashes to.
+fn zero_page() -> [u8; HASH] {
+    sha256::digest(&[0u8; PAGE])
+}
+
+/// The hash of page `nth` of `file`: `zero` for a hole, which is not read.
+fn page_hash(file: &View<'_>, nth: usize, zero: &[u8; HASH], buf: &mut [u8; PAGE]) -> [u8; HASH] {
+    if file.hole(nth) {
+        return *zero;
+    }
+    sha256::digest(file.page(nth, buf))
+}
+
 fn hash(file: &View<'_>, slots: &mut [u8]) {
+    let zero = zero_page();
     par::for_each(par::enumerate(par::chunks_mut(slots, HASH * GROUP)), |(group, slots)| {
         let mut buf = [0u8; PAGE];
         for (nth, slot) in slots.chunks_exact_mut(HASH).enumerate() {
-            slot.copy_from_slice(&sha256::digest(file.page(group * GROUP + nth, &mut buf)));
+            slot.copy_from_slice(&page_hash(file, group * GROUP + nth, &zero, &mut buf));
         }
     });
 }
@@ -340,6 +373,7 @@ fn hash_cached(file: &View<'_>, slots: &mut [u8], cached: Cached<'_>) {
     );
 
     let kept_hashes = &cache.kept_hashes;
+    let zero = zero_page();
     par::for_each(
         par::enumerate(par::zip(
             par::chunks_mut(slots, HASH * GROUP),
@@ -354,7 +388,7 @@ fn hash_cached(file: &View<'_>, slots: &mut [u8], cached: Cached<'_>) {
                 if let Some(k) = place_of(ranges, page) {
                     *hash = kept_hashes[k];
                 } else if written.is_none_or(|written| touched(written, (page * PAGE) as u64)) {
-                    *hash = sha256::digest(file.page(page, &mut buf));
+                    *hash = page_hash(file, page, &zero, &mut buf);
                 }
                 slot.copy_from_slice(hash);
             }
@@ -401,6 +435,31 @@ mod tests {
         signature(&View::whole(&file), "x", 0, 0x4000, true, None, &mut want);
         signature(&view, "x", 0, 0x4000, true, None, &mut seen);
         assert_eq!(seen, want);
+    }
+
+    /// A view with whole pages nothing is in (an image's patch room) signs as the assembled
+    /// file does, whose pages of zeros are hashed, with and without a cache.
+    #[test]
+    fn a_view_with_room_signs_as_the_assembled_file() {
+        let (a, b) = (noise(4, 2 * PAGE), noise(5, PAGE + 9));
+        let len = 300 * PAGE + 40;
+        // Room between the parts, a slot alone in a page of it, and a last page cut short.
+        let parts: Vec<(u64, &[u8])> = vec![(0, &a[..]), (200 * PAGE as u64, &b[..])];
+        let slots = [(0x1000_0000 + 100 * PAGE as u64 + 16, 9u64)];
+        let mut file = assembled(len, &parts);
+        file[100 * PAGE + 16..100 * PAGE + 24].copy_from_slice(&9u64.to_le_bytes());
+        let view = || View { parts: parts.clone(), len, slots: &slots, base: 0x1000_0000 };
+        assert!(view().hole(50) && view().hole(299));
+        assert!(!view().hole(0) && !view().hole(100) && !view().hole(201) && !view().hole(300));
+        let (mut want, mut seen, mut cached) = (Vec::new(), Vec::new(), Vec::new());
+        signature(&View::whole(&file), "x", 0, 0x4000, true, None, &mut want);
+        signature(&view(), "x", 0, 0x4000, true, None, &mut seen);
+        assert_eq!(seen, want);
+        let mut cache = Cache::default();
+        let kept = [(0, PAGE as u64)];
+        let with = Cached { cache: &mut cache, synthesis: 1, since: None, kept: &kept };
+        signature(&view(), "x", 0, 0x4000, true, Some(with), &mut cached);
+        assert_eq!(cached, want);
     }
 
     #[test]

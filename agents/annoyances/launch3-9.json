@@ -1,0 +1,12 @@
+{
+ "id": "launch3-9",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "ix VMs",
+ "what": "A VM made with `--memory 128` shows 4 GiB in `free` (it grows on demand), which reads as the wrong machine until `ix new --help` is read.",
+ "cost": "two commands",
+ "cause": "the ceiling is a cap, not what is plugged at boot",
+ "workaround": "none",
+ "state": "open",
+ "fix": ""
+}

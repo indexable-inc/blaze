@@ -1,3 +1,0 @@
-    PID COMMAND
-  84981 /root/perf/bin/58c3e559a0/blaze daemon
-  84984 /root/perf/bin/58c3e559a0/blaze /root/perf/prof3-ws/58c3e559a0/rg/ --own-target --profile dev --asked-in /root/perf/prof3-ws/58c3e559a0/rg --crate crates/core/main.rs --out /root/perf/prof3-ws/58c3e559a0/rg/target/blaze/whole/dcbe857337981b

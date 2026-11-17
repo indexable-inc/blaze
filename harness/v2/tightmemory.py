@@ -2,7 +2,7 @@
 it needed; the kernel never kills it (docs/v2/plan.md section 4, docs/v2/plan.md, docs/memory-budget.md).
 Linux, cgroup v2.
 
-    uv run --frozen python harness/v2/tightmemory.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/tight.json"}'
+    uv run --frozen python harness/v2/tightmemory.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/tight.json"}'
     uv run --frozen python harness/v2/tightmemory.py '{"engine": {...}, "out": "...", "factors": [1.0, 0.5, 0.25], "cgroup": "/sys/fs/cgroup/blaze"}'
     uv run --frozen python harness/v2/tightmemory.py selftest
 

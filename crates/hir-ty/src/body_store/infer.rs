@@ -14,14 +14,14 @@ use blaze_format::{
 };
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id as _;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, HasModule, ImplId, StaticId,
     StructId, TraitId, TypeAliasId, UnionId, expr_store::Body,
 };
 use std::alloc::Global;
 
-use super::{BodyFacts, INSTALLED, Lookup, Step};
+use super::{BodyFacts, Lookup, REGISTRY, Reads, Step};
 use crate::{
     InferenceResult,
     check_cache::ids::{self, IdKind, ItemSink, Table},
@@ -36,7 +36,11 @@ type R<T = ()> = Result<T, String>;
 
 blaze_format::record! {
     /// An inference answer: where its constants' type table is, its inference record's buffer,
-    /// its ids, and the items they name, each by its key and its kind at the same index.
+    /// its ids, the items they name, each by its key and its kind at the same index, and how
+    /// many expressions (the low half) and patterns (the high half) the store of the body its
+    /// writer inferred has ([`Nodes`]): what a reader bounds the record's nodes by, so reading
+    /// an answer lowers no body. The answer was found under a key that fixes the body's source
+    /// and what its lowering read, so the reader's store, were it made, has the same counts.
     #[derive(Clone, Copy)]
     struct InferRoot: 1 {
         locs: u64,
@@ -44,7 +48,7 @@ blaze_format::record! {
         ids: Slice<u8>,
         items: Slice<ContentId>,
         kinds: Slice<u8>,
-        reserved: u64,
+        nodes: u64,
     }
 }
 
@@ -52,7 +56,7 @@ const _: () = assert!(size_of::<InferRoot>() == 48);
 
 /// The schema of an inference answer, and of everything its bytes are made with.
 pub(super) const SCHEMA: SchemaHash = schema_of(&[
-    Part::Str("blaze v2 item store inference 1"),
+    Part::Str("blaze v2 item store inference 2"),
     Part::Schema(<InferRoot as Record>::SCHEMA),
     Part::Schema(<InferenceRecord as Persist>::SCHEMA),
     Part::Schema(TABLE_SCHEMA),
@@ -79,7 +83,7 @@ pub(crate) fn inference<'db>(
     def: DefWithBodyId,
     run: impl FnOnce() -> InferenceResult<'db>,
 ) -> InferenceResult<'db> {
-    if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return run();
     }
     stored(db, def, run)
@@ -94,7 +98,7 @@ fn stored<'db>(
     match lookup_inference(db, def) {
         Lookup::Off => ran(run),
         Lookup::Miss => {
-            let (result, reads) = blaze_query::db::capture_reads(db, || ran(run));
+            let (result, reads) = super::capture(db, || ran(run));
             offer_inference(db, def, &result, reads);
             result
         }
@@ -127,7 +131,7 @@ pub(crate) fn offer_inference<'db>(
     db: &'db Db,
     def: DefWithBodyId,
     result: &InferenceResult<'db>,
-    reads: Option<blaze_query::db::Reads>,
+    reads: Option<Reads>,
 ) {
     super::offer(db, def, Step::Infer, SCHEMA, reads, |facts, out| {
         encode(db, facts, def, result, out)
@@ -172,6 +176,8 @@ pub(super) fn encode<'db>(
     let locs = locs.write(&mut writer);
     let at = writer.next::<InferRoot>();
     let field = |offset: usize| at + offset as u64;
+    // The writer has the body: it was just inferred.
+    let nodes = Nodes::of(Body::of(db, def));
     let root = InferRoot {
         locs,
         record: Slice::between(
@@ -182,7 +188,7 @@ pub(super) fn encode<'db>(
         ids: words.slice(field(offset_of!(InferRoot, ids))),
         items: keys.slice(field(offset_of!(InferRoot, items))),
         kinds: kinds.slice(field(offset_of!(InferRoot, kinds))),
-        reserved: 0,
+        nodes: u64::from(nodes.exprs) | u64::from(nodes.pats) << 32,
     };
     let written = writer.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
@@ -200,10 +206,6 @@ pub(super) fn decode<'db>(
     bytes: &[u8],
 ) -> R<InferenceResult<'db>> {
     let root = open_as::<InferRoot>(bytes, SCHEMA).map_err(format_error)?;
-    if root.reserved != 0 {
-        // alloc: the reason an answer does not read
-        return Err("an inference answer with reserved bytes set".to_owned());
-    }
     let words = root.ids.follow(bytes).map_err(format_error)?;
     let record = root.record.follow(bytes).map_err(format_error)?;
     let keys = root.items.follow(bytes).map_err(format_error)?;
@@ -211,7 +213,7 @@ pub(super) fn decode<'db>(
     let items = items_of(db, facts, def, keys, kinds)?;
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
-    let nodes = Nodes::of(Body::of(db, def));
+    let nodes = Nodes { exprs: root.nodes as u32, pats: (root.nodes >> 32) as u32 };
     ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner, nodes))
         .map_err(format_error)
 }
@@ -291,6 +293,12 @@ impl<'a, 'db> Keyed<'a, 'db> {
             seen: HashMap::new_in(Global),
         }
     }
+
+    /// The id bits in the writer's database of the item at `index`: for a planted bug of a
+    /// test alone (`mir::testing`), a scan of what was given.
+    pub(super) fn bits_at(&self, index: u32) -> Option<u64> {
+        self.seen.values().find(|&&(_, _, at)| at == index).map(|&(_, bits, _)| bits)
+    }
 }
 
 impl ItemSink for Keyed<'_, '_> {
@@ -322,20 +330,20 @@ impl ItemSink for Keyed<'_, '_> {
 }
 
 /// The item `bits` of `kind` name, as the solver names it; `None` for a kind that is no item
-/// or bits that are no id (0, or past `Id::MAX_U32`).
+/// or bits that are no id (0).
 fn solver_def<'db>(kind: IdKind, bits: u64) -> Option<SolverDefId<'db>> {
-    let id = u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)?;
+    let id = ids::id_at(bits)?;
     Some(match kind {
-        IdKind::Function => SolverDefId::FunctionId(FunctionId::from_id(id)),
-        IdKind::Struct => SolverDefId::AdtId(AdtId::StructId(StructId::from_id(id))),
-        IdKind::Union => SolverDefId::AdtId(AdtId::UnionId(UnionId::from_id(id))),
-        IdKind::Enum => SolverDefId::AdtId(AdtId::EnumId(EnumId::from_id(id))),
-        IdKind::Const => SolverDefId::ConstId(ConstId::from_id(id)),
-        IdKind::Static => SolverDefId::StaticId(StaticId::from_id(id)),
-        IdKind::Trait => SolverDefId::TraitId(TraitId::from_id(id)),
-        IdKind::TypeAlias => SolverDefId::TypeAliasId(TypeAliasId::from_id(id)),
-        IdKind::Impl => SolverDefId::ImplId(ImplId::from_id(id)),
-        IdKind::EnumVariant => SolverDefId::EnumVariantId(EnumVariantId::from_id(id)),
+        IdKind::Function => SolverDefId::FunctionId(FunctionId::from_gid(id)),
+        IdKind::Struct => SolverDefId::AdtId(AdtId::StructId(StructId::from_gid(id))),
+        IdKind::Union => SolverDefId::AdtId(AdtId::UnionId(UnionId::from_gid(id))),
+        IdKind::Enum => SolverDefId::AdtId(AdtId::EnumId(EnumId::from_gid(id))),
+        IdKind::Const => SolverDefId::ConstId(ConstId::from_gid(id)),
+        IdKind::Static => SolverDefId::StaticId(StaticId::from_gid(id)),
+        IdKind::Trait => SolverDefId::TraitId(TraitId::from_gid(id)),
+        IdKind::TypeAlias => SolverDefId::TypeAliasId(TypeAliasId::from_gid(id)),
+        IdKind::Impl => SolverDefId::ImplId(ImplId::from_gid(id)),
+        IdKind::EnumVariant => SolverDefId::EnumVariantId(EnumVariantId::from_gid(id)),
         IdKind::BuiltinDeriveImpl
         | IdKind::OpaqueTy
         | IdKind::Closure
@@ -348,17 +356,17 @@ fn solver_def<'db>(kind: IdKind, bits: u64) -> Option<SolverDefId<'db>> {
 /// The bits of `def` when it is an item of `kind`.
 fn bits_of(kind: IdKind, def: SolverDefId<'_>) -> Option<u64> {
     let id = match (kind, def) {
-        (IdKind::Function, SolverDefId::FunctionId(it)) => it.as_id(),
-        (IdKind::Struct, SolverDefId::AdtId(AdtId::StructId(it))) => it.as_id(),
-        (IdKind::Union, SolverDefId::AdtId(AdtId::UnionId(it))) => it.as_id(),
-        (IdKind::Enum, SolverDefId::AdtId(AdtId::EnumId(it))) => it.as_id(),
-        (IdKind::Const, SolverDefId::ConstId(it)) => it.as_id(),
-        (IdKind::Static, SolverDefId::StaticId(it)) => it.as_id(),
-        (IdKind::Trait, SolverDefId::TraitId(it)) => it.as_id(),
-        (IdKind::TypeAlias, SolverDefId::TypeAliasId(it)) => it.as_id(),
-        (IdKind::Impl, SolverDefId::ImplId(it)) => it.as_id(),
-        (IdKind::EnumVariant, SolverDefId::EnumVariantId(it)) => it.as_id(),
+        (IdKind::Function, SolverDefId::FunctionId(it)) => it.gid(),
+        (IdKind::Struct, SolverDefId::AdtId(AdtId::StructId(it))) => it.gid(),
+        (IdKind::Union, SolverDefId::AdtId(AdtId::UnionId(it))) => it.gid(),
+        (IdKind::Enum, SolverDefId::AdtId(AdtId::EnumId(it))) => it.gid(),
+        (IdKind::Const, SolverDefId::ConstId(it)) => it.gid(),
+        (IdKind::Static, SolverDefId::StaticId(it)) => it.gid(),
+        (IdKind::Trait, SolverDefId::TraitId(it)) => it.gid(),
+        (IdKind::TypeAlias, SolverDefId::TypeAliasId(it)) => it.gid(),
+        (IdKind::Impl, SolverDefId::ImplId(it)) => it.gid(),
+        (IdKind::EnumVariant, SolverDefId::EnumVariantId(it)) => it.gid(),
         _ => return None,
     };
-    Some(u64::from(id.as_u32()))
+    Some(ids::gid_bits(id))
 }

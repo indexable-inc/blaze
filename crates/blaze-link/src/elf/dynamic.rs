@@ -22,6 +22,7 @@ use super::{
     VERNEED, VERSYM, error,
 };
 use crate::cow::CowBytes;
+use crate::keep::{Bad, In, Kept, Out};
 use crate::model::{Class, Counts, Delta, Holds, Placed, Region, SymbolKind, Tls, View};
 use crate::unwind::Frame;
 use crate::{LinkError, Output, OutputKind};
@@ -415,9 +416,10 @@ impl Tables {
         numbered(placed.regions)?;
         for &at in order.items() {
             let export = &exports[at as usize];
+            let bind = if export.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
             Sym {
                 name: strings.add(&export.name),
-                info: info(elf::STB_GLOBAL, export.kind),
+                info: info(bind, export.kind),
                 shndx: shndx(placed.regions, export.addr),
                 value: value(placed, &export.name, export.addr, export.kind)?,
                 size: export.size,
@@ -646,25 +648,134 @@ fn text_relocation(
 }
 
 /// `.rela.dyn` as [`relocations`] makes it, a kept table that patches the next.
+///
+/// A table made whole is the slid addresses' `RELATIVE` entries in address order, then the
+/// binds and GOT cells. A table kept through edits holds each slid address's entry in a
+/// *slot* that stays its own for as long as the address is slid: an address no longer slid
+/// leaves its slot zeroed (`R_*_NONE` at offset 0, which every loader passes over), an
+/// address newly slid takes the lowest empty slot, or one more at the run's end. So a link
+/// writes the entries of the addresses it changed and nothing after them. Until 2026-11-11
+/// a table was patched only where every splice of the slid addresses kept its length, and a
+/// one-function edit, which takes the old body's constants out in one place and puts the new
+/// one's in at another, moved every entry between the two: 303 KB of hello world's 442 KB
+/// table written each edit.
+///
+/// What a loader needs of it holds for both: every entry is one `Elf64_Rela`, the first
+/// `DT_RELACOUNT` are `RELATIVE` ([`KeptRela::leading`]: the slots before the first empty
+/// one), and no entry's order matters (a `RELATIVE` after the counted run is applied by the
+/// general path of glibc's and musl's loaders, as `R_*_NONE` is skipped by it). Only an
+/// output a dynamic loader relocates is kept by slot ([`slotted`]).
+///
+/// The invariant: `slot_of[i]` is the slot of `rebase[i]`'s entry, for the `rebase` of the
+/// synthesis `synthesis`; the slots `0..slots` not in `slot_of` are exactly `free`, and
+/// zeroed in `bytes`; `bytes` is the `slots` slots, then the binds' and GOT cells' entries.
 #[derive(Default)]
 pub(crate) struct KeptRela {
     synthesis: u64,
-    /// The table's bytes, its first `relative` entries the `RELATIVE` run in the order of
-    /// [`Placed::rebase`] (kept only when the slid addresses came sorted, so entry `i` is
-    /// `rebase[i]`'s): what the last link's state holds too.
+    /// The table's bytes: what the last link's state holds too.
     bytes: CowBytes,
-    relative: usize,
+    /// By index of the slid addresses (kept only when they came sorted), each one's slot.
+    slot_of: Vec<u32>,
+    /// The empty slots below `slots`.
+    free: std::collections::BTreeSet<u32>,
+    /// How many slots the `RELATIVE` run has, empty ones counted.
+    slots: usize,
     /// The binds' and GOT cells' entries a patch builds, reused.
     scratch: Vec<u8>,
-    /// How many builds were patches.
+    /// The slots a patch's new addresses took and the slots it gave back, reused.
+    taken: Vec<u32>,
+    gone: Vec<u32>,
+    /// How many builds were patches, and how many entries the last patch wrote.
     #[cfg(test)]
     pub(crate) patched: u32,
+    #[cfg(test)]
+    pub(crate) entries: u32,
+    /// The planted bug of `the_oracle_catches_a_table_made_whole_for_an_address_moved`: a
+    /// splice of the slid addresses that changes their number makes the table whole.
+    #[cfg(test)]
+    pub(crate) whole: bool,
 }
 
-/// `.rela.dyn`'s bytes, how many of its entries are `RELATIVE`, and whether another is a
-/// `TPOFF64`. With `kept` (an incremental output's) of the synthesis `placed.delta` is from,
-/// and every splice of the slid addresses of equal length, the `RELATIVE` run is patched and
-/// the binds and GOT cells built; otherwise all of it is built.
+impl KeptRela {
+    /// How many of the table's first entries are `RELATIVE`: `DT_RELACOUNT`.
+    fn leading(&self) -> usize {
+        self.free.first().map_or(self.slots, |it| *it as usize)
+    }
+
+    /// Its part of a kept state (`keep.rs`, the section `rela`): which slot each slid address
+    /// holds and how long the run is, when the table is of the state kept (`of`, the state's
+    /// synthesis); else nothing. The slots are history: a table patched through edits holds an
+    /// empty slot where an address went and a new address in the first empty one, which a table
+    /// made whole in address order does not, so an opened image that made it whole would write
+    /// another file than the image that kept it. The table's bytes are not here: they are the
+    /// state's `.rela.dyn` region, kept with the state and opened in place ([`KeptRela::open`]).
+    pub(crate) fn keep<A: std::alloc::Allocator>(&self, of: u64, out: &mut Out<A>) {
+        let held = self.synthesis != 0 && self.synthesis == of;
+        out.bool(held);
+        if held {
+            out.len(self.slots);
+            self.slot_of.put(out);
+        }
+    }
+
+    /// Whether it holds no table.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.synthesis == 0
+    }
+
+    /// The table [`KeptRela::keep`] wrote, as of the opened state's synthesis `synthesis` (a
+    /// number of this process's), over `region`: the opened state's `.rela.dyn` bytes (`None`:
+    /// the state has no such region), shared with it page by page until a patch writes one.
+    /// Every slot held is below the run's end and held once, the region holds the run, and each
+    /// empty slot is zeros in it: else the state is refused.
+    pub(crate) fn open(input: &mut In<'_>, synthesis: u64, region: Option<&CowBytes>) -> Result<KeptRela, Bad> {
+        if !input.bool()? {
+            return Ok(KeptRela::default());
+        }
+        let slots = input.len()?;
+        let slot_of = Vec::<u32>::take(input)?;
+        let Some(region) = region else {
+            return Err(Bad::What("`.rela.dyn` slots kept for a state with no `.rela.dyn` region"));
+        };
+        if slot_of.len() > slots || region.len() < RELA as usize * slots {
+            return Err(Bad::What("a `.rela.dyn` run longer than its region or with more addresses than slots"));
+        }
+        let mut free = std::collections::BTreeSet::new_in(std::alloc::Global);
+        free.extend(0..slots as u32);
+        for slot in &slot_of {
+            if !free.remove(slot) {
+                return Err(Bad::What("a `.rela.dyn` slot past the run's end, or held twice"));
+            }
+        }
+        let empty = |slot: &u32| region.read(RELA as usize * *slot as usize, RELA as usize).iter().all(|it| *it == 0);
+        if !free.iter().all(empty) {
+            return Err(Bad::What("an empty `.rela.dyn` slot that is not zeros in the region"));
+        }
+        // clone: two reference counts, the table shared with the opened state's region
+        Ok(KeptRela { synthesis, bytes: region.clone(), slot_of, free, slots, ..KeptRela::default() })
+    }
+
+    /// The table made whole holds `relative` slid addresses, each in the slot of its index.
+    fn made_whole(&mut self, relative: usize) {
+        self.slot_of.clear();
+        self.slot_of.extend(0..relative as u32); // alloc: once per table made whole, a word a slid address
+        self.free.clear();
+        self.slots = relative;
+    }
+}
+
+/// Whether `output`'s `.rela.dyn` is one a dynamic loader applies (a shared library, or an
+/// executable with an interpreter), which takes its entries in any order with `R_*_NONE`
+/// among them. A static executable's start code is not asked to: its table is always made
+/// whole, in address order.
+fn slotted(output: &Output) -> bool {
+    matches!(output.kind, OutputKind::Shared { .. }) || output.interpreter.is_some()
+}
+
+/// `.rela.dyn`'s bytes, how many of its first entries are `RELATIVE`, and whether another is
+/// a `TPOFF64`. With `kept` (an incremental output's) of the synthesis `placed.delta` is
+/// from, the `RELATIVE` run is patched by slot ([`KeptRela`]) and the binds and GOT cells
+/// built; otherwise all of it is built.
 fn rela_dyn(
     writer: &Elf,
     placed: &Placed<'_>,
@@ -678,34 +789,45 @@ fn rela_dyn(
         return Ok((CowBytes::from_vec(rela_bytes(&relocations)), relative, tpoff));
     };
     let last = std::mem::replace(&mut kept.synthesis, 0);
-    let patches = placed.delta.filter(|delta| {
-        last != 0 && kept.relative == placed.rebase.len() && delta.patches(last, &[delta.rebase])
-    });
-    if let Some(delta) = patches
-        && patch_relative(writer, placed, delta, kept)
-    {
+    // An entry is of its address and the 8 bytes there: the regions' places decide it, not
+    // their sizes, which an edit that fills the patch regions changes.
+    let patches = placed
+        .delta
+        .filter(|delta| last != 0 && delta.from == last && delta.same_places)
+        // A table no dynamic loader applies stays in address order with no empty slot: it
+        // is patched only where every splice keeps its length, and so its slots.
+        .filter(|delta| slotted(&writer.output) || delta.rebase.iter().all(|it| it.same_len()));
+    #[cfg(test)]
+    let patches = patches.filter(|delta| !kept.whole || delta.rebase.iter().all(|it| it.same_len()));
+    if let Some(delta) = patches {
         // alloc: once per relink, the binds and GOT cells (a few hundred)
         let mut others = Vec::with_capacity(placed.binds.len() + 2 * placed.got.len());
         push_others(writer, placed, shared, &mut others)?;
         sort_rela(&mut others);
-        let head = RELA as usize * kept.relative;
-        let scratch = &mut kept.scratch;
-        scratch.clear();
-        scratch.resize(RELA as usize * others.len(), 0);
-        put_relas(&others, scratch);
-        kept.bytes.resize(head + scratch.len());
-        kept.bytes.update(head, scratch);
-        kept.synthesis = placed.synthesis;
-        #[cfg(test)]
+        // A run whose empty slots take it past the region's room is made whole, with none:
+        // the table in address order is never longer than the room the counts were given.
+        let room = placed.region(&Class::Synthetic(RELA_DYN)).map_or(0, |(_, it)| it.capacity);
+        if patch_relative(writer, placed, delta, kept, RELA as usize * others.len())
+            && kept.bytes.len() as u64 <= room
         {
-            kept.patched += 1;
+            let head = RELA as usize * kept.slots;
+            let scratch = &mut kept.scratch;
+            scratch.clear();
+            scratch.resize(RELA as usize * others.len(), 0);
+            put_relas(&others, scratch);
+            kept.bytes.update(head, scratch);
+            kept.synthesis = placed.synthesis;
+            #[cfg(test)]
+            {
+                kept.patched += 1;
+            }
+            // clone: two reference counts, the table shared with the state that holds it
+            return Ok((
+                kept.bytes.clone(),
+                kept.leading(),
+                others.iter().any(|it| it.r_type == tpoff64),
+            ));
         }
-        // clone: two reference counts, the table shared with the state that holds it
-        return Ok((
-            kept.bytes.clone(),
-            kept.relative,
-            others.iter().any(|it| it.r_type == tpoff64),
-        ));
     }
     let (relocations, relative, in_order) = relocations(writer, placed, shared)?;
     let tpoff = relocations[relative..].iter().any(|it| it.r_type == tpoff64);
@@ -713,42 +835,143 @@ fn rela_dyn(
     if in_order {
         // clone: two reference counts, the table shared with the state that holds it
         kept.bytes = bytes.clone();
-        kept.relative = relative;
+        kept.made_whole(relative);
         kept.synthesis = placed.synthesis;
     }
     Ok((bytes, relative, tpoff))
 }
 
-/// Rewrites the kept `RELATIVE` run for `placed`: the entries of each splice of the slid
-/// addresses, and those whose 8 bytes the core wrote (a range of `delta.written`, a local GOT
-/// cell spliced), each read as [`relocations`] reads it. False, with the run left half
-/// patched, when that is not the table a build makes: a spliced address out of order, or one
-/// a build refuses (it gives the error).
+/// Brings the kept `RELATIVE` run to `placed`, by slot: the slots of the addresses each
+/// splice took out are emptied, each address it put in takes a slot and its entry, and the
+/// entries whose 8 bytes the core wrote (a range of `delta.written`, a local GOT cell
+/// spliced) are read again, each as [`relocations`] reads it. The table is left `others`
+/// bytes longer than its slots, for the binds' and GOT cells' entries. False, with the kept
+/// run of no use (the caller makes the table whole), when the splices are not of the list
+/// kept, a spliced address is out of order, or an entry is one a build refuses (it gives the
+/// error).
 fn patch_relative(
     writer: &Elf,
     placed: &Placed<'_>,
     delta: &Delta<'_>,
     kept: &mut KeptRela,
+    others: usize,
 ) -> bool {
     let rebase = placed.rebase;
-    if kept.bytes.len() < RELA as usize * rebase.len() {
-        return false;
-    }
-    // The run was sorted and every entry outside the splices is as it was: it stays sorted
-    // (so a build sorts nothing) when each splice is with its neighbours.
+    // The splices are of the list kept: in order, apart, and the list they leave is as long
+    // as `rebase`.
+    let (mut old_end, mut len) = (0, kept.slot_of.len());
     for splice in delta.rebase {
-        let (start, end) = (splice.new.start as usize, splice.new.end as usize);
+        let (old, new) = (&splice.old, &splice.new);
+        if old.start < old_end || old.end < old.start || old.end as usize > kept.slot_of.len() {
+            return false;
+        }
+        old_end = old.end;
+        len = len - old.len() + new.len();
+        // The list was sorted and every address outside the splices is as it was: it stays
+        // sorted (so the search below finds each address) when each splice is with its
+        // neighbours.
+        let (start, end) = (new.start as usize, new.end as usize);
         if end > rebase.len()
             || !rebase[start.saturating_sub(1)..(end + 1).min(rebase.len())].is_sorted()
         {
             return false;
         }
     }
+    if len != rebase.len() {
+        return false;
+    }
+    // Each address a splice keeps keeps its slot, matched by address: the old addresses are
+    // the `r_offset`s of the slots it took out, read from the table, in order as the list
+    // was. An address it took out and did not put back gives its slot back; an address it put
+    // in that was not there takes the lowest empty slot, or one more at the run's end, once
+    // every splice has given back. Until 2026-11-15 the new addresses took the old slots by
+    // position, so the jump table's cells piece (one splice of every filled cell, a body edit
+    // emptying one cell and filling another) moved every cell after the emptied one into its
+    // neighbour's slot: 24 bytes a function for one body edit
+    // (`a_body_edits_patch_does_not_grow_with_the_image`).
+    const UNSET: u32 = u32::MAX;
+    let (taken, gone) = (&mut kept.taken, &mut kept.gone);
+    taken.clear();
+    gone.clear();
+    let table = &kept.bytes;
+    let address = |slot: u32| -> u64 {
+        let word = table.read(RELA as usize * slot as usize, 8);
+        u64::from_le_bytes([word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7]])
+    };
+    for splice in delta.rebase {
+        let old = &kept.slot_of[splice.old.start as usize..splice.old.end as usize];
+        let new = &rebase[splice.new.start as usize..splice.new.end as usize];
+        let (mut i, mut j, mut last) = (0, 0, None);
+        while i < old.len() || j < new.len() {
+            let was = old.get(i).map(|slot| address(*slot));
+            if let Some(was) = was {
+                // The kept list was sorted: an old address out of order is a table this run
+                // does not describe, made whole by the caller.
+                if last.is_some_and(|last| was <= last) {
+                    return false;
+                }
+            }
+            match (was, new.get(j)) {
+                (Some(was), Some(&is)) if was == is => {
+                    taken.push(old[i]);
+                    (last, i, j) = (Some(was), i + 1, j + 1);
+                }
+                (Some(was), Some(&is)) if is < was => {
+                    taken.push(UNSET);
+                    j += 1;
+                }
+                (Some(was), _) => {
+                    gone.push(old[i]);
+                    kept.free.insert(old[i]);
+                    (last, i) = (Some(was), i + 1);
+                }
+                (None, Some(_)) => {
+                    taken.push(UNSET);
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
+    }
+    let mut slots = kept.slots;
+    for slot in taken.iter_mut().filter(|it| **it == UNSET) {
+        *slot = kept.free.pop_first().unwrap_or_else(|| {
+            slots += 1;
+            slots as u32 - 1
+        });
+    }
+    // Back to front, so each splice's place in the kept list is still the last link's.
+    let mut end = taken.len();
+    for splice in delta.rebase.iter().rev() {
+        let start = end - splice.new.len();
+        let (from, to) = (splice.old.start as usize, splice.old.end as usize);
+        kept.slot_of.splice(from..to, taken[start..end].iter().copied());
+        end = start;
+    }
+    // The empty slots at the run's end are let go: the run ends at its last entry.
+    while slots > 0 && kept.free.last() == Some(&(slots as u32 - 1)) {
+        kept.free.pop_last();
+        slots -= 1;
+    }
+    kept.slots = slots;
     let relative = types(writer.output.arch).relative;
     let bytes = &mut kept.bytes;
+    bytes.resize(RELA as usize * slots + others);
+    for &slot in gone.iter() {
+        if (slot as usize) < slots && kept.free.contains(&slot) {
+            bytes.update(RELA as usize * slot as usize, &[0; RELA as usize]);
+        }
+    }
+    let slot_of = &kept.slot_of;
+    #[cfg(test)]
+    let mut entries = 0;
     let mut put = |at: usize| match slid(placed, rebase[at], relative) {
         Ok(rela) => {
-            bytes.update(RELA as usize * at, &rela.bytes());
+            bytes.update(RELA as usize * slot_of[at] as usize, &rela.bytes());
+            #[cfg(test)]
+            {
+                entries += 1;
+            }
             true
         }
         Err(_) => false,
@@ -776,6 +999,10 @@ fn patch_relative(
                 return false;
             }
         }
+    }
+    #[cfg(test)]
+    {
+        kept.entries = entries;
     }
     true
 }

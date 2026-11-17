@@ -740,7 +740,10 @@ define_symbols! {
     sized_hierarchy,
     forced_keywords,
     blaze_comptime,
+    blaze_const_exprs,
     blaze_verify,
+    blaze_implied_bounds,
+    blaze_anon_params,
     mut_ref,
     type_changing_struct_update,
     RangeMin,
@@ -830,7 +833,7 @@ define_symbols! {
     atomic_xchg_release, atomic_xchg_seqcst, atomic_xor_acqrel, atomic_xor_acquire,
     atomic_xor_relaxed, atomic_xor_release, atomic_xor_seqcst, atomic_xsub_acqrel,
     atomic_xsub_acquire, atomic_xsub_relaxed, atomic_xsub_release, atomic_xsub_seqcst, box_new,
-    // Builtin attributes (`hir_expand::inert_attr_macro::INERT_ATTRIBUTES`) not named above,
+    // Builtin attributes (`syntax::builtin_attrs::INERT_ATTRIBUTES`) not named above,
     // so that each is a declared symbol `find_builtin_attr_idx` finds by its index.
     should_panic, automatically_derived, macro_escape, warn, expect, forbid, deny,
     must_not_suspend, crate_name, crate_id, link, link_name, no_link, link_section, used,
@@ -864,7 +867,7 @@ define_symbols! {
     inline, cold, unsafe_unpin, global_alloc_ty, maybe_dangling,
     panic_null_reference_constructed, panic_invalid_enum_construction, mem_size_const,
     mem_align_const, rustc_diagnostic_item, try_as_dyn, arbitrary_int, arbitrary_signed, int_from,
-    int_try_from, blaze_int_cast,
+    int_try_from, blaze_int_cast, error_union, error_union_from, error_union_widen, record,
     // The most frequent identifiers of `library/` and `harness/` (comments and literals left
     // out, keywords and the names above skipped), most frequent first, so that each is a
     // fixed ID found by `COMPILED` with no probe of the table. Not here, though common: the
@@ -921,8 +924,15 @@ define_symbols! {
     blaze_variant_view, blaze_variant_representing_type, blaze_variant_of, blaze_fields,
     blaze_only_marked, blaze_only_unmarked, blaze_variants, blaze_fn_item, blaze_adt_name,
     blaze_field_index, blaze_field_attrs, blaze_variant_index, blaze_variant_discriminant,
-    blaze_fn_info,
+    blaze_fn_info, blaze_memo_point, blaze_code_id, blaze_type_name_of, blaze_described,
+    blaze_type_of, blaze_type_of_type,
     // `#[blaze::contract_test]`, the builtin attribute `core::blaze::contract_test`
     // (docs/v2/plan/design/contracts.md, part 2).
     contract_test,
+    // `blaze::unreachable!()`, the builtin macro `core::blaze::unreachable`
+    // (docs/v2/plan/design/proved-unreachable.md).
+    blaze_unreachable,
+    // `#![blaze::handles]` (docs/v2/plan/design/edition.md, change 1): the lang item nightly's
+    // `core::clone::Share` carries, by which the copy of a handle finds it.
+    blaze_handle,
 }

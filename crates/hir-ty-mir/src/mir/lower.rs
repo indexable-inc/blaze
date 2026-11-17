@@ -252,7 +252,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     inline_consts: u32,
     /// The `line!()` literals read where the code runs ([`location::slots_lines`]); `None`
     /// where each is its value.
-    line_slots: Option<&'db blaze_hash::HashSet<ExprId, Global>>,
+    line_slots: Option<&'db location::ExprSet<'db>>,
     /// How many shared borrows rustc may promote the expression being lowered is inside of: a
     /// promoted constant is a value, so a `line!()` in one stays a literal.
     promotable_borrows: u32,
@@ -341,6 +341,10 @@ struct MirLowerCtx<'a, 'f, 'db> {
     /// (`cfg::CONTRACT_CHECKS`, docs/v2/plan/design/contracts.md part 1); `None` everywhere
     /// else, which lowers as before.
     contracts: Option<contract::Contracts>,
+    /// The locals made while an `ensures` clause was lowered, as ranges of local indexes: the
+    /// clause's own, which it may move out of. A clause is lowered at each way out and binds
+    /// the same locals each time.
+    ensures_locals: Vec<(usize, usize), &'f Frame>,
     /// Set only while `unreachable_after_calls`'s probe lowers the body again
     /// (`lower/uninhabited.rs`): lowering goes on past calls of an uninhabited type.
     probe: Option<uninhabited::Probe<'f>>,
@@ -349,6 +353,8 @@ struct MirLowerCtx<'a, 'f, 'db> {
     early_drops: &'a [EarlyDrop],
     /// How many of `early_drops` were lowered.
     early_drops_placed: usize,
+    /// The `#[loop_match]` loops being lowered, innermost last ([`loop_match`]).
+    loop_matches: Vec<loop_match::LoopMatchFrame<'f>, &'f Frame>,
 }
 
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
@@ -411,9 +417,10 @@ macro_rules! implementation_error {
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
-// After `not_supported!` and `implementation_error!`, which it uses.
+// After `not_supported!` and `implementation_error!`, which these use.
 mod comptime;
 mod contract;
+mod loop_match;
 
 impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     fn new(
@@ -463,7 +470,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
-        let env = db.trait_environment(owner.generic_def(db));
+        let env = owner.param_env(db);
         let interner = DbInterner::new_with(db, resolver.krate());
         // FIXME(next-solver): Is `non_body_analysis()` correct here? Don't we want to reveal opaque types defined by this body?
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -526,9 +533,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             exit_ended_buf: Vec::new_in(frame),
             uninhabited_call: false,
             contracts: None,
+            ensures_locals: Vec::new_in(frame),
             probe: None,
             early_drops: &[],
             early_drops_placed: 0,
+            loop_matches: Vec::new_in(frame),
         }
     }
 
@@ -555,6 +564,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn alloc_local(&mut self, local: Local) -> LocalId {
         let id = LocalId::from_raw(RawIdx::from_u32(self.building.locals.len() as u32));
+        // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base's
+        // layout and code, so a local holds the base: places project through it as through
+        // the enum, and a signature naming the refinement relates to it as its base.
+        let ty = hir_ty::pattern_types::erase(self.interner(), local.ty.as_ref()).store();
+        let mut local = local;
+        local.ty = ty;
         self.building.locals.push(local);
         id
     }
@@ -664,7 +679,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             && !self.is_line_slot(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
-            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            let mut operand = self.lower_store_literal(ty, expr_id, l)?;
             operand.span = Some(expr_id.into());
             return Ok(Some((operand, current)));
         }
@@ -772,9 +787,49 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     );
                     Ok(Some(current))
                 }
+                Adjust::ErrorUnion => {
+                    let Some((p, current)) =
+                        self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
+                    else {
+                        return Ok(None);
+                    };
+                    let source = match rest.last() {
+                        Some(it) => it.target.as_ref(),
+                        None => self.expr_ty_without_adjust(expr_id),
+                    };
+                    self.lower_error_union_widen(
+                        current,
+                        Operand { kind: OperandKind::Copy(p.store()), span: None },
+                        source,
+                        last.target.as_ref(),
+                        place,
+                        expr_id.into(),
+                    )
+                }
             },
             None => self.lower_expr_to_place_without_adjust(expr_id, place, current),
         }
+    }
+
+    /// `place = core::error_union::widen::<source, target>(value)`: a member of the error
+    /// union `target`, or a union of some of its members, put in it (`Adjust::ErrorUnion`).
+    fn lower_error_union_widen(
+        &mut self,
+        current: BasicBlockId,
+        value: Operand,
+        source: Ty<'db>,
+        target: Ty<'db>,
+        place: Place<'db>,
+        span: MirSpan,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let widen = self.lang_items().ErrorUnionWiden.ok_or(MirLowerError::LangItemNotFound)?;
+        let widen = Operand::const_zst(Ty::new_fn_def(
+            self.interner(),
+            CallableDefId::FunctionId(widen).into(),
+            GenericArgs::new_from_slice(&[source.into(), target.into()]),
+        ));
+        // alloc: the call's arguments, kept in the body
+        self.lower_call(widen, Box::new([value]), place, current, false, span)
     }
 
     fn lower_expr_to_place_with_borrow_adjust(
@@ -929,7 +984,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             let operand = match self.store.expr(*value) {
                                 Expr::Literal(l) if !self.has_adjustments(*value) => {
                                     let ty = self.expr_ty_without_adjust(*value);
-                                    self.lower_literal_to_operand(ty, l)?
+                                    self.lower_store_literal(ty, *value, l)?
                                 }
                                 _ => {
                                     let Some(konst) = self.inline_const(*value) else {
@@ -976,7 +1031,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                                     Operand::const_zst(ty.as_ref())
                                 }
                                 _ => not_supported!(
-                                    "inline assembly with a `sym` that is not a static or a                                      function without parameters"
+                                    "inline assembly with a `sym` that is not a static or a \
+                                     function without parameters"
                                 ),
                             };
                             operands.push(super::AsmOperand::Sym(named));
@@ -1076,6 +1132,20 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         let name = &FunctionSignature::of(self.db, f).name;
                         // clone: error path
                         return Err(MirLowerError::TraitFunctionDefinition(t, name.clone()));
+                    }
+                    let signature = FunctionSignature::of(self.db, f);
+                    if !signature.has_body() {
+                        // A function declared without a body (a `#[rustc_intrinsic]` declaration
+                        // such as `mem::transmute`, an `extern` item): whoever asked for its MIR
+                        // should have taken the intrinsic or foreign path, so say which function.
+                        // FIXME(claude-opus-5-5): a typed `MirLowerError` variant for this, in
+                        // hir-ty's `mir.rs`, beside `TraitFunctionDefinition`.
+                        let edition = self.edition();
+                        let name = hir_ty_print::rustc_function_name(self.db, f, &[])
+                            .unwrap_or_else(|| signature.name.display(self.db, edition).to_string());
+                        return Err(MirLowerError::ImplementationError(format!(
+                            "the body of `{name}` was asked for, a function declared without one"
+                        )));
                     }
                 }
                 Err(MirLowerError::IncompleteExpr)
@@ -1341,7 +1411,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
             }
             Expr::Loop { body, label, source: _ } => {
-                self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
+                self.enter_loop_match(expr_id)?;
+                let lowered = self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
+                    this.loop_match_begins(expr_id);
                     let scope = this.push_drop_scope();
                     if let Some((_, mut current)) = this.lower_expr_as_place(begin, body, true)? {
                         current = scope.pop_and_drop(this, current, body.into());
@@ -1350,7 +1422,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         scope.pop_assume_dropped(this);
                     }
                     Ok(())
-                })
+                })?;
+                self.leave_loop_match(expr_id)?;
+                Ok(lowered)
             }
             Expr::Call { callee, args, .. } => {
                 if let Some((func_id, generic_args)) = self.infer.method_resolution(expr_id) {
@@ -1461,6 +1535,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     return Ok(None);
                 };
                 self.push_fake_read(current, cond_place, expr_id.into());
+                self.loop_match_dispatch(expr_id, cond_place);
                 let mut end = None;
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
@@ -1550,7 +1625,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         }
                         next
                     } else {
-                        then
+                        self.loop_match_arm_entry(expr_id, index, *pat, then)?
                     };
                     if let Some(block) = self.lower_expr_to_place(*expr, place, then)? {
                         let block = arm.pop_and_drop(self, block, expr_id.into());
@@ -1603,6 +1678,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 Ok(None)
             }
             Expr::Break { expr, label } => {
+                if self.store.is_const_continue(expr_id) {
+                    return self.lower_const_continue(expr_id, expr, label, current);
+                }
                 let loop_data = match label {
                     Some(l) => {
                         self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?
@@ -1672,6 +1750,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.lower_become(expr, expr_id, current)
             }
             Expr::Yield { .. } => not_supported!("yield"),
+            // blaze: a record value `{ a: 1, b }` (`#![blaze::records]`), whose path is core's
+            // `Record` and whose fields are the record's, not the struct's.
+            Expr::RecordLit { fields, spread, .. }
+                if let Some(of) = crate::record::record_fields(
+                    self.lang_items(),
+                    self.expr_ty_without_adjust(expr_id),
+                ) =>
+            {
+                self.lower_record_value(expr_id, &of, fields, spread, place, current)
+            }
             Expr::RecordLit { fields, path, spread, .. } => {
                 let variant_id =
                     self.infer.variant_resolution_for_expr(expr_id).ok_or_else(|| {
@@ -1692,10 +1780,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         let mut operands = Vec::with_capacity_in(count, self.frame);
                         operands.resize_with(count, || None);
                         let declared = self.declared_locals();
+                        let table = self.resolver.ctx_table();
                         for RecordLitField { name, expr } in fields.iter() {
                             let hygiene = self.store.record_field_hygiene(*expr);
                             let field_id = variant_fields
-                                .field_written(self.db, variant_id, name, hygiene)
+                                .field_written(self.db, table, variant_id, name, hygiene)
                                 .ok_or(MirLowerError::UnresolvedField)?;
                             let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)?
                             else {
@@ -1766,8 +1855,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             not_supported!("Union record literal with more than one field");
                         };
                         let hygiene = self.store.record_field_hygiene(*expr);
+                        let table = self.resolver.ctx_table();
                         let local_id = variant_fields
-                            .field_written(self.db, variant_id, name, hygiene)
+                            .field_written(self.db, table, variant_id, name, hygiene)
                             .ok_or(MirLowerError::UnresolvedField)?;
                         let place = place.project(PlaceElem::Field(local_id.into()));
                         self.lower_expr_to_place(*expr, place, current)
@@ -1785,7 +1875,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 Ok(Some(current))
             }
             Expr::Const(id) => {
-                // Inline const blocks (`const { .. }`) are stored with their inner expression in
+                // A block that is not a constant of its own here (`inline_const_at`: this body
+                // is the block's own constant, or another anonymous constant's). Inline const
+                // blocks (`const { .. }`) are stored with their inner expression in
                 // the same body (see inference, which infers the inner expression directly), so we
                 // lower that expression in place. Const-ness is irrelevant here: MIR evaluation
                 // already runs in a const context.
@@ -2402,12 +2494,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             }
             Expr::Literal(l) => {
                 let ty = self.expr_ty_without_adjust(expr_id);
-                let mut op = self.lower_literal_to_operand(ty, l)?;
+                let mut op = self.lower_store_literal(ty, expr_id, l)?;
                 op.span = Some(expr_id.into());
                 self.push_assignment(current, place, op.into(), expr_id.into());
                 Ok(Some(current))
             }
-            Expr::Underscore => Ok(Some(current)),
+            // `_` is an expression only where a value is asked of it (as the left of an
+            // assignment it is a wildcard pattern, `ExprCollector::collect_pat_from_expr`):
+            // a typed hole, which type checking reports and nothing can run. Lowered to
+            // nothing it ran, with whatever was in its place before.
+            Expr::Underscore => Err(MirLowerError::TypeError("a typed hole (`_`) has no value")),
             Expr::IncludeBytes => not_supported!("include_bytes!()"),
         }
     }
@@ -2496,7 +2592,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             // Looked up hygienically, as inference does (`variant_written`).
                             let ctxt = offset.field_hygiene(index).syntax_context();
                             let id = hir_def::signatures::EnumVariants::variant_written(
-                                self.db, it, name, ctxt,
+                                self.db,
+                                self.resolver.ctx_table(),
+                                it,
+                                name,
+                                ctxt,
                             )
                             .ok_or(no_field)?;
                             place = place.project(ProjectionElem::Downcast(id.into()));
@@ -2511,7 +2611,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     let hygiene = offset.field_hygiene(index);
                     let field = of
                         .fields(self.db)
-                        .field_written(self.db, of, name, hygiene)
+                        .field_written(self.db, self.resolver.ctx_table(), of, name, hygiene)
                         .ok_or(no_field)?;
                     let field_ty = self.db.field_types(of)[field]
                         .ty()
@@ -2527,12 +2627,117 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         Ok(place)
     }
 
+    /// Lowers the record value `expr_id` (`{ a: 1, b }`, blaze's `#![blaze::records]`) of the
+    /// record `of` into `place`: the tuple of its fields in canonical order, then core's
+    /// `Record` around it. The fields written are evaluated in the order written; the rest
+    /// are copied from the base (`..base`, evaluated after them) or are the callee's defaults
+    /// (`..`), which are constants, placed in the callee's declaration order.
+    fn lower_record_value(
+        &mut self,
+        expr_id: ExprId,
+        of: &crate::record::RecordFields<'db>,
+        fields: &[RecordLitField],
+        spread: RecordSpread,
+        place: Place<'db>,
+        mut current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let TyKind::Adt(_, args) = self.expr_ty_without_adjust(expr_id).kind() else {
+            return Err(MirLowerError::TypeError("a record value whose type is no record"));
+        };
+        let record = self.lang_items().Record.ok_or(MirLowerError::LangItemNotFound)?;
+        let count = of.len();
+        let mut operands = Vec::with_capacity_in(count, self.frame);
+        operands.resize_with(count, || None);
+        let declared = self.declared_locals();
+        for RecordLitField { name, expr } in fields.iter() {
+            let at = of.index_of(name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+            let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)? else {
+                return Ok(None);
+            };
+            current = c;
+            // What unwinds from the next field drops this one first.
+            self.declare_operands_last(expr_id, declared, std::iter::once(&op));
+            operands[at] = Some(op);
+        }
+        self.declare_operands_last(expr_id, declared, operands.iter().flatten());
+        match spread {
+            RecordSpread::None => {}
+            RecordSpread::Expr(base) => {
+                let Some((base, c)) = self.lower_expr_as_place(current, base, true)? else {
+                    return Ok(None);
+                };
+                current = c;
+                let inner = base.project(ProjectionElem::Field(FieldIndex(0)));
+                for (at, operand) in operands.iter_mut().enumerate() {
+                    if operand.is_none() {
+                        let field = inner.project(ProjectionElem::Field(FieldIndex(at as u32)));
+                        *operand =
+                            Some(Operand { kind: OperandKind::Copy(field.store()), span: None });
+                    }
+                }
+            }
+            RecordSpread::FieldDefaults => {
+                let (function, param) =
+                    crate::record::record_argument_callee(self.store, self.infer, expr_id).ok_or(
+                        MirLowerError::TypeError(
+                            "a record value's `..` outside a call to a function by name",
+                        ),
+                    )?;
+                for (at, name) in of.names().enumerate() {
+                    if operands[at].is_some() {
+                        continue;
+                    }
+                    let field = Name::new_root(name);
+                    let default = crate::record_param_default(self.db, function, param, field)
+                        .ok_or(MirLowerError::TypeError(
+                            "a record field left out that its callee declares no default for",
+                        ))?;
+                    // A default names no parameter of its function, so it is the same
+                    // constant at every call.
+                    let konst = default.get_with(|it| it.as_ref()).skip_binder();
+                    let ty = of.ty(at).ok_or(MirLowerError::UnresolvedField)?;
+                    operands[at] = Some(Operand {
+                        kind: OperandKind::Constant { konst: konst.store(), ty: ty.store() },
+                        span: Some(expr_id.into()),
+                    });
+                }
+            }
+        }
+        // alloc: the fields, kept in the body
+        let mut values = Vec::with_capacity(count);
+        for it in operands {
+            values.push(it.ok_or(MirLowerError::TypeError("missing field in record value"))?);
+        }
+        let tuple_ty = of.tuple(self.interner());
+        let tuple: Place<'db> = self.temp(tuple_ty, current, expr_id.into())?.into();
+        let fields = Rvalue::Aggregate(AggregateKind::Tuple(tuple_ty.store()), values.into());
+        self.push_assignment(current, tuple, fields, expr_id.into());
+        let whole = Operand { kind: OperandKind::Move(tuple.store()), span: None };
+        let rvalue = Rvalue::Aggregate(
+            AggregateKind::Adt(VariantId::StructId(record), args.store()),
+            [whole].into(),
+        );
+        self.push_assignment(current, place, rvalue, expr_id.into());
+        Ok(Some(current))
+    }
+
     fn push_field_projection(
         &mut self,
         place: &mut Place<'db>,
         expr_id: ExprId,
     ) -> Result<'db, ()> {
         if let Expr::Field { expr, name } = self.store.expr(expr_id) {
+            // blaze: `r.a` on a record (`#![blaze::records]`) is the one field of core's
+            // `Record`, then the field's place in the tuple it holds.
+            if let Some(of) =
+                crate::record::record_fields(self.lang_items(), self.expr_ty_after_adjustments(expr))
+            {
+                let at = of.index_of(name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+                *place = place
+                    .project(ProjectionElem::Field(FieldIndex(0)))
+                    .project(ProjectionElem::Field(FieldIndex(at as u32)));
+                return Ok(());
+            }
             if let TyKind::Tuple(tys) = self.expr_ty_after_adjustments(expr).kind() {
                 let index =
                     name.as_tuple_index().ok_or(MirLowerError::TypeError("named field on tuple"))?
@@ -2542,11 +2747,17 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
                 *place = place.project(ProjectionElem::Field(FieldIndex(index)));
             } else {
-                let field = self
-                    .infer
-                    .field_resolution(expr_id)
-                    .ok_or(MirLowerError::UnresolvedField)?
-                    .either(|f| f.local_id.into(), |t| FieldIndex(t.index));
+                let field =
+                    self.infer.field_resolution(expr_id).ok_or(MirLowerError::UnresolvedField)?;
+                // blaze: a field of an enum's variant, read on a refinement by that one variant
+                // (`conn.socket` on a `Conn is Conn::Open { .. }`, `#![blaze::pattern_types]`):
+                // the place is the enum, so it is downcast to the variant first.
+                if let Either::Left(it) = field
+                    && let hir_def::VariantId::EnumVariantId(variant) = it.parent
+                {
+                    *place = place.project(ProjectionElem::Downcast(variant.into()));
+                }
+                let field = field.either(|f| f.local_id.into(), |t| FieldIndex(t.index));
                 *place = place.project(ProjectionElem::Field(field));
             }
         } else {
@@ -2567,7 +2778,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn lower_literal_or_const(&mut self, ty: Ty<'db>, loc: &ExprId) -> Result<'db, Operand> {
         match self.store.expr(*loc) {
-            Expr::Literal(l) => self.lower_literal_to_operand(ty, l),
+            Expr::Literal(l) => self.lower_store_literal(ty, *loc, l),
             Expr::Path(c) => {
                 if let Some((CandidateId::ConstId(c), subst)) =
                     self.infer.assoc_resolutions_for_expr(*loc)
@@ -2599,6 +2810,37 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             _ => {
                 not_supported!("only `char` and numeric types are allowed in range patterns");
             }
+        }
+    }
+
+    /// The literal `l` that the store's `expr` is, as a constant of type `ty`: a `line!()` or
+    /// `column!()` placeholder is first given the value of where its call is written
+    /// ([`Self::placed`]). Every literal of the store is lowered through this, never through
+    /// [`Self::lower_literal_to_operand`] alone.
+    fn lower_store_literal(
+        &mut self,
+        ty: Ty<'db>,
+        expr: ExprId,
+        l: &Literal,
+    ) -> Result<'db, Operand> {
+        let placed = self.placed(expr, l)?;
+        self.lower_literal_to_operand(ty, &placed)
+    }
+
+    /// `l`, the literal the store's `expr` is, with a `line!()` or `column!()` placeholder
+    /// resolved to the line or column of its call (`hir_ty::body_store::placed_literal`); a
+    /// call written in no file's text is an error naming it, never a zero.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a `line!()` or `column!()` lowered where it is a constant is the line or column \
+                  it is written at, as rustc's is; one read where the code runs takes none \
+                  (`Self::is_line_slot`)"
+    )]
+    fn placed<'l>(&self, expr: ExprId, l: &'l Literal) -> Result<'db, Cow<'l, Literal>> {
+        match hir_ty::body_store::placed_literal(self.db, self.store_owner, expr) {
+            Ok(Some(placed)) => Ok(Cow::Owned(placed)),
+            Ok(None) => Ok(Cow::Borrowed(l)),
+            Err(message) => Err(MirLowerError::UnplacedLiteral(message.into_boxed_str())),
         }
     }
 
@@ -2648,15 +2890,23 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             hir_def::hir::Literal::Bool(b) => scalar(&[*b as u8]),
             hir_def::hir::Literal::Int(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
             hir_def::hir::Literal::Uint(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
-            hir_def::hir::Literal::Float(f, _) => match size()? {
-                16 => scalar(&f.to_f128().to_bits().to_le_bytes()),
-                8 => scalar(&f.to_f64().to_bits().to_le_bytes()),
-                4 => scalar(&f.to_f32().to_bits().to_le_bytes()),
-                2 => scalar(&u16::try_from(f.to_f16().to_bits()).unwrap().to_le_bytes()),
-                _ => {
-                    Err(MirLowerError::TypeError("float with size other than 2, 4, 8 or 16 bytes"))
-                }
-            },
+            hir_def::hir::Literal::Float(f, _) => {
+                // apfloat's `to_bits` is a `u128` at every width: the constant is its low `size`
+                // bytes, as many as the type's layout, as for an integer.
+                let size = size()?;
+                let bits = match size {
+                    16 => f.to_f128().to_bits(),
+                    8 => f.to_f64().to_bits(),
+                    4 => f.to_f32().to_bits(),
+                    2 => f.to_f16().to_bits(),
+                    _ => {
+                        return Err(MirLowerError::TypeError(
+                            "float with size other than 2, 4, 8 or 16 bytes",
+                        ));
+                    }
+                };
+                scalar(&bits.to_le_bytes()[..size])
+            }
         }
     }
 
@@ -2677,11 +2927,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         Ok(())
     }
 
-    /// A function's `const { .. }` block as the constant it is, evaluated for each instance of
-    /// the function as rustc's inline consts are: what only runs at compile time
-    /// (`#[rustc_comptime]`, `type_info`'s intrinsics) is then never code of the function. The
-    /// block of a constant's own body is lowered in place, as it is already evaluated. The
-    /// constant is the `const { .. }` expression, which owns the block's bindings.
+    /// An item's `const { .. }` block as the constant it is, evaluated for each instance of
+    /// the item as rustc's inline consts are: what only runs at compile time
+    /// (`#[rustc_comptime]`, `type_info`'s intrinsics) is then never code of a function, and a
+    /// block in a constant's or static's value has its own count of `long_running_const_eval`'s
+    /// steps ([`inline_const_at`]). The block of the constant's own body is lowered in place.
+    /// The constant is the `const { .. }` expression, which owns the block's bindings.
     fn inline_const(&self, expr: ExprId) -> Option<AnonConstId<'db>> {
         inline_const_at(self.db, self.owner, self.infer, expr)
     }
@@ -3417,6 +3668,13 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let literal = |expr: ExprId| match self.store.expr(expr) {
             Expr::Literal(&Literal::Int(it, _)) => Some(it),
+            // A `line!()` or `column!()` is a `u32` of at least 1 wherever it is written: a
+            // divisor rustc promotes by, told without reading the line (its placeholder is 0).
+            Expr::Literal(&Literal::Uint(..))
+                if hir_ty::body_store::place_call(self.db, self.store_owner, expr).is_some() =>
+            {
+                Some(1)
+            }
             Expr::Literal(&Literal::Uint(it, _)) => i128::try_from(it).ok(),
             Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Neg } => match self.store.expr(expr) {
                 Expr::Literal(&Literal::Int(it, _)) => Some(-it),
@@ -3625,7 +3883,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             && let Expr::Literal(l) = self.store.expr(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
-            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            let mut operand = self.lower_store_literal(ty, expr_id, l)?;
             operand.span = Some(expr_id.into());
             return Ok(Some((operand, current)));
         }
@@ -4865,9 +5123,17 @@ fn cast_kind<'db>(db: &'db Db, source_ty: Ty<'db>, target_ty: Ty<'db>) -> Result
     })
 }
 
-/// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own; `None`
-/// where it is lowered in place, as an inline const of a constant's or static's value is. A
-/// `const static { .. }` block (`#![feature(blaze_comptime)]`) is a constant of its own in every
+/// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own, in an
+/// item's body (a function's, and a constant's, static's or discriminant's value); `None` where
+/// it is lowered in place: in its own constant's body, in another anonymous constant's (a block
+/// inside a block, an array length), and where its type is not known.
+///
+/// A block in a constant's value is a constant of its own as it is in a function, because rustc
+/// evaluates it as one, with its own count of `long_running_const_eval`'s steps
+/// (`Evaluator::inline_const_in_heap`): `const A: &[T] = &[const { f(1) }, const { f(2) }]`
+/// may spend 2,000,000 steps in each block, where lowered in place the blocks spent the one
+/// count of `A` between them and a constant rustc takes was refused (blaze-profile's `VIEWS`).
+/// A `const static { .. }` block (`#![feature(blaze_comptime)]`) is a constant of its own in every
 /// body: it is evaluated by an evaluation of its own, in comptime mode, never in place.
 pub fn inline_const_at<'db>(
     db: &'db Db,
@@ -4879,7 +5145,7 @@ pub fn inline_const_at<'db>(
     if matches!(owner, InferBodyId::AnonConstId(it) if it.loc(db).expr == expr) {
         return None;
     }
-    if !matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
+    if !matches!(owner, InferBodyId::DefWithBodyId(_))
         && !hir_ty::effects::const_block_is_comptime(db, owner.expression_store_owner(db), expr)
     {
         return None;
@@ -4903,8 +5169,19 @@ pub fn inline_const_at<'db>(
 
 /// `owner`'s body built from its HIR. An `async` block's is the `Future::poll` of the block's
 /// type; by move, the future owns what its `async` closure captured, where the block itself
-/// borrows from the closure.
+/// borrows from the closure. Under `#![blaze::handles]`, a move of a handle that is used again
+/// is then a copy ([`super::handles`]); under `#![blaze::early_drop]` each local whose
+/// destructor only frees memory is then dropped after its last use ([`super::early_drop`], after
+/// the copies, which are uses); both before anything, the borrow checker first, reads the body.
 pub(crate) fn build_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
+    let mut body = lower_mir_body(db, owner)?;
+    super::handles::copy_handles(db, &mut body)?;
+    super::early_drop::drop_early(db, &mut body)?;
+    Ok(body)
+}
+
+/// `owner`'s body as lowering builds it, before [`super::handles`] and [`super::early_drop`].
+fn lower_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
     match owner {
         MirOwner::Body(def) => compute_mir_body(db, def),
         MirOwner::Closure(closure) => {
@@ -4960,20 +5237,21 @@ pub fn has_failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> bool {
 }
 
 /// What keeps a body's macro calls from being lowered.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
-enum UnexpandedCall {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnexpandedCall<'db> {
     /// One failed to expand, an error at the call.
     Failed,
-    /// The first whose expansion is not what rustc parses it as, and why.
-    Misparsed(String),
+    /// The first whose expansion is not what rustc parses it as, and why: kept in the query's
+    /// arena.
+    Misparsed(&'db str),
 }
 
 /// What keeps the body's macro calls from being lowered: one that failed to expand, else the
 /// first, in the order lowering met them, whose expansion is not what rustc parses it as. It
 /// reads the store's macro calls and their sites, not the source map, so lowering a body
 /// never builds its map.
-#[blaze_query::tracked(returns(ref))]
-fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<UnexpandedCall> {
+#[blaze_memo::tracked(returns(ref))]
+fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<UnexpandedCall<'db>> {
     use syntax::view::AstNode;
     let calls = ExpressionStore::of(db, owner.expression_store_owner(db)).macro_calls();
     if calls.is_empty() {
@@ -5051,7 +5329,7 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<Unexpan
              parses as one expression, whose expansion is {what}"
         ))
     });
-    misparsed.map(UnexpandedCall::Misparsed)
+    misparsed.map(|it| UnexpandedCall::Misparsed(blaze_memo::keep_str(blaze_memo::Database::memo(db), &it)))
 }
 
 /// Whether rustc parses `call` as an expression (`parse_stmt_mac`): in statement position,
@@ -5133,6 +5411,13 @@ fn lower_closure_body_in<'db>(
     if let InferBodyId::DefWithBodyId(def) = body_owner
         && hir_ty_tailck::has_become(store)
         && hir_ty_tailck::tail_call_check(db, def).fails_body(Some(expr))
+    {
+        return Err(MirLowerError::HasErrors);
+    }
+    // rustc builds no MIR for a closure whose `#[loop_match]` it refused.
+    if let InferBodyId::DefWithBodyId(def) = body_owner
+        && store.has_loop_match()
+        && super::loop_match::loop_match_check(db, def).fails_body(Some(expr))
     {
         return Err(MirLowerError::HasErrors);
     }
@@ -5515,7 +5800,7 @@ pub(crate) fn lower_body<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<'db,
 }
 
 /// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
-#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
+#[blaze_memo::tracked(returns(as_ref), owns, mem_tag = Mir)]
 pub fn promoted_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -5615,6 +5900,13 @@ fn lower_body_dropping<'db>(
     if let InferBodyId::DefWithBodyId(def) = owner
         && hir_ty_tailck::has_become(store)
         && hir_ty_tailck::tail_call_check(db, def).fails_body(None)
+    {
+        return Err(MirLowerError::HasErrors);
+    }
+    // rustc refused a `#[loop_match]` or `#[const_continue]` of the body: it builds no MIR.
+    if let InferBodyId::DefWithBodyId(def) = owner
+        && store.has_loop_match()
+        && super::loop_match::loop_match_check(db, def).fails_body(None)
     {
         return Err(MirLowerError::HasErrors);
     }

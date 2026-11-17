@@ -6,7 +6,7 @@
 //! `HasAttrs`, `HasVisibility`, `HasGenericParams`) are inherent methods here, since a const
 //! fn can't yet call a trait's method.
 
-use crate::{Children, Node, Token, Tree, kinds::*, str_eq};
+use crate::{Builder, Children, Kind, Node, Token, Tree, kinds::*, str_eq};
 
 /// `match $e { Some(it) => it, None => return None }`: `?`, which a const fn can't use on
 /// `Option` (it is a trait's call).
@@ -19,9 +19,39 @@ macro_rules! tri {
     };
 }
 
-/// A view of the nodes of one kind.
+/// A view of the nodes of one kind, which a builder splices as the node; with `, token`, as
+/// its token (a name, which a macro puts where another node kind holds the same token).
 macro_rules! node {
     ($(#[$meta:meta])* $name:ident = $kind:ident) => {
+        node!(@view $(#[$meta])* $name = $kind);
+
+        impl<'a> $name<'a> {
+            /// Splices the node into `b`'s output (`wrap` is for a token's splice; a node is
+            /// itself).
+            pub const fn splice(self, b: &mut Builder<'_>, _wrap: &[Kind]) {
+                b.node(self.0)
+            }
+        }
+    };
+    ($(#[$meta:meta])* $name:ident = $kind:ident, token) => {
+        node!(@view $(#[$meta])* $name = $kind);
+
+        impl<'a> $name<'a> {
+            /// Splices its token into `b`'s output inside the nodes `wrap` names, outer to
+            /// inner (`[PATH_TYPE, PATH, PATH_SEGMENT, NAME_REF]` to use a name as a type).
+            ///
+            /// # Panics
+            ///
+            /// When it has no token.
+            pub const fn splice(self, b: &mut Builder<'_>, wrap: &[Kind]) {
+                match self.0.first_token() {
+                    Some(token) => b.tok_in(token, wrap),
+                    None => panic!("const_ast: a name to splice has no token"),
+                }
+            }
+        }
+    };
+    (@view $(#[$meta:meta])* $name:ident = $kind:ident) => {
         $(#[$meta])*
         #[repr(transparent)]
         #[derive(Clone, Copy)]
@@ -557,11 +587,13 @@ node!(
 
 node!(
     /// A name being defined (`ast::Name`).
-    Name = NAME
+    Name = NAME,
+    token
 );
 node!(
     /// A name being used (`ast::NameRef`).
-    NameRef = NAME_REF
+    NameRef = NAME_REF,
+    token
 );
 node!(
     /// `'a` (`ast::Lifetime`).
@@ -1292,5 +1324,36 @@ impl<'a> Tree<'a> {
         } else {
             None
         }
+    }
+}
+
+// --- Splicing into a builder ---------------------------------------------------------------
+
+/// `splice` for the views that are not one `node!` kind: the node itself, spliced.
+macro_rules! splice_node {
+    ($($name:ident),*) => {$(
+        impl<'a> $name<'a> {
+            /// Splices the node into `b`'s output (`wrap` is for a token's splice; a node is
+            /// itself).
+            pub const fn splice(self, b: &mut Builder<'_>, _wrap: &[Kind]) {
+                b.node(self.syntax())
+            }
+        }
+    )*};
+}
+
+splice_node!(Item, Adt, FieldList, Meta, GenericParam, GenericArg, Type);
+
+impl<'a> Node<'a> {
+    /// Splices the node into `b`'s output (`wrap` is for a token's splice; a node is itself).
+    pub const fn splice(self, b: &mut Builder<'_>, _wrap: &[Kind]) {
+        b.node(self)
+    }
+}
+
+impl<'a> Token<'a> {
+    /// Splices the token into `b`'s output inside the nodes `wrap` names, outer to inner.
+    pub const fn splice(self, b: &mut Builder<'_>, wrap: &[Kind]) {
+        b.tok_in(self, wrap)
     }
 }

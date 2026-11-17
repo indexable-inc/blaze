@@ -47,6 +47,10 @@ pub type EagerCall =
 // dyn: one call per nested macro call, given by hir-def, which hir-expand can't name
 pub type EagerResolver<'a> = &'a dyn Fn(&ModPath, SyntaxContext) -> Option<MacroDefId>;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread spare pool of emptied span maps, one slot per eager nesting level reached"
+)]
 thread_local! {
     /// The span maps of eager inputs being expanded, one per nesting level, kept emptied.
     static ARG_MAPS: std::cell::RefCell<Vec<ExpansionSpanMap>> =
@@ -90,10 +94,15 @@ impl Drop for ArgMap {
 /// Expands the macro calls inside the input of an eager macro's call (in preorder, the eager ones
 /// eagerly and the rest lazily) and makes the call whose argument is the expanded input. Each
 /// nested call it expands is appended to `eager_calls`.
+///
+/// `expand_to` is what the call expands to by where it is written
+/// (`ExpandTo::of_call_site_view` of its node), given by the caller, which has the node: a
+/// call in a body has it off the body's own syntax, and asking it here again by `ast_id` would
+/// read the whole file's tree, a row of the file's text in the body's list.
 pub fn expand_eager_macro_input_view(
     db: &Db,
     krate: Crate,
-    macro_call: view::MacroCall<'_>,
+    expand_to: Result<ExpandTo, syntax::SyntaxKind>,
     ast_id: AstId<ast::MacroCall>,
     def: MacroDefId,
     call_site: SyntaxContext,
@@ -102,8 +111,6 @@ pub fn expand_eager_macro_input_view(
     resolver: EagerResolver<'_>,
     eager_calls: &mut Vec<EagerCall, impl Allocator>,
 ) -> ExpandResult<Option<MacroCallId>> {
-    let expand_to = ExpandTo::of_call_site_view(macro_call);
-
     // The argument's own call: its file must exist before a nested call is expanded lazily.
     let loc = MacroCallLoc {
         def,
@@ -113,8 +120,7 @@ pub fn expand_eager_macro_input_view(
         macro_depth,
     };
     let arg_id = MacroCallId::new(db, loc);
-    #[expect(deprecated, reason = "builtin eager macros are never derives")]
-    let (_, _, span, _) = arg_id.macro_arg(db);
+    let span = &arg_id.arg_span(db);
     let expand_to = match expand_to {
         Ok(it) => it,
         Err(parent) => {
@@ -272,7 +278,9 @@ fn eager_macro_recur_view<'db>(
 
         let def = match call.path().and_then(|path| {
             let ctxt = span_map.span_at(path.syntax().text_range().start()).ctx;
-            ModPath::from_src_view(db, path, &mut |range| span_map.span_at(range.start()).ctx)
+            ModPath::from_src_view(db, curr.file_id.context_arena(), path, &mut |range| {
+                span_map.span_at(range.start()).ctx
+            })
                 .map(|it| (it, ctxt))
         }) {
             Some((path, ctxt)) => match macro_resolver(&path, ctxt) {
@@ -310,7 +318,7 @@ fn eager_macro_recur_view<'db>(
                 let ExpandResult { value, err } = expand_eager_macro_input_view(
                     db,
                     krate,
-                    call,
+                    ExpandTo::of_call_site_view(call),
                     curr.with_value(ast_id),
                     def,
                     call_site,

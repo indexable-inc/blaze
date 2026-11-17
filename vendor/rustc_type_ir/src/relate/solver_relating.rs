@@ -227,6 +227,36 @@ where
                 )?;
             }
 
+            // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) is a subtype of
+            // a refinement of the same base by a larger set and of its base type itself, so it
+            // widens for free (docs/v2/plan/design/edition.md, section 8). Only under a covariant
+            // or contravariant relation: an invariant one (behind `&mut`) relates the two
+            // structurally, so `&mut (T is PAT)` is never a `&mut T`.
+            (ty::Pat(a_base, a_pat), ty::Pat(b_base, b_pat))
+                if a_pat.kind().is_variants()
+                    && b_pat.kind().is_variants()
+                    && matches!(self.ambient_variance, ty::Covariant | ty::Contravariant) =>
+            {
+                let (sub, sup) = match self.ambient_variance {
+                    ty::Covariant => (a_pat, b_pat),
+                    _ => (b_pat, a_pat),
+                };
+                if !sub.kind().variants_within(sup.kind()) {
+                    return Err(TypeError::Sorts(ExpectedFound::new(a, b)));
+                }
+                self.tys(a_base, b_base)?;
+            }
+            (ty::Pat(a_base, a_pat), _)
+                if a_pat.kind().is_variants() && self.ambient_variance == ty::Covariant =>
+            {
+                self.tys(a_base, b)?;
+            }
+            (_, ty::Pat(b_base, b_pat))
+                if b_pat.kind().is_variants() && self.ambient_variance == ty::Contravariant =>
+            {
+                self.tys(a, b_base)?;
+            }
+
             _ => {
                 super_combine_tys(self.infcx, self, a, b)?;
             }

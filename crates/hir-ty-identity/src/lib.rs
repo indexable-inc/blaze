@@ -59,11 +59,12 @@ use std::fmt;
 use base_db::Db;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, key};
-use blaze_query::db::{AsId, FromId, Id, NamesIds};
+use blaze_memo::{Home, Homes, Id as _};
 use hir_def::{DefWithBodyId, FunctionId};
 use hir_ty::{
     InferBodyId,
     db::{InternedClosureId, InternedCoroutineId},
+    facts::Tier,
     mir::{MirOptLevel, MirOptions},
     next_solver::StoredGenericArgs,
 };
@@ -71,6 +72,23 @@ use hir_ty_mir::mir::dispatch::Body;
 
 pub use instance::instance_identity;
 pub use walk::{code_id, fn_code_id};
+
+/// const eval's answer to `core::reflect::code_id_of::<F>()`, registered for every binary that
+/// links this crate (`hir_ty::providers::CodeIdentity`).
+fn provided_code_id<'db>(
+    db: &'db Db,
+    callable: hir_ty::next_solver::Ty<'db>,
+    env: &hir_ty::traits::StoredParamEnvAndCrate,
+) -> Result<[u8; 32], String> {
+    match fn_code_id(db, callable, env) {
+        Ok(id) => Ok(id.0.0),
+        Err(unidentified) => Err(unidentified.to_string()), // alloc: error path
+    }
+}
+
+inventory::submit! {
+    hir_ty::providers::CodeIdentity { fn_code_id: provided_code_id, own_tests: cfg!(test) }
+}
 
 /// The domain of a compile identity. 3: an inlined callee's promoted constants are read, so
 /// no identity made when two instances that differ only there shared one is reused. 4: a
@@ -143,7 +161,7 @@ pub const LEAF_DOMAIN: &str = "blaze v2 behaviour identity leaf 1";
 /// reads (a data object's alignment; which words it relocates).
 pub const CODE_ID_DOMAIN: &str = "blaze v2 code id 5";
 /// The domain of the bodies inlined into another.
-pub const INLINED_DOMAIN: &str = "blaze v2 code identity inlined 2";
+pub const INLINED_DOMAIN: &str = "blaze v2 code identity inlined 3";
 /// The domain of the stable name that orders the members of one component.
 pub const NAME_DOMAIN: &str = "blaze v2 code identity name 1";
 
@@ -188,12 +206,12 @@ impl Shim {
 
 /// The body it is of: whose a query keyed by it is. A shim runs none of its own but the
 /// function a vtable shim adapts.
-impl NamesIds for Subject {
-    fn names_ids(&self, out: &mut Vec<Id>) {
+impl Home for Subject {
+    fn home(&self, homes: &mut Homes<'_>) {
         match *self {
-            Subject::Body(Body::Fn(it)) | Subject::Shim(Shim::Vtable(it)) => out.push(it.as_id()),
+            Subject::Body(Body::Fn(it)) | Subject::Shim(Shim::Vtable(it)) => it.home(homes),
             Subject::Body(Body::Closure(it) | Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
-                out.push(it)
+                it.home(homes)
             }
             Subject::Shim(
                 Shim::DropGlue | Shim::CallOnce | Shim::FnPointer | Shim::Reify { .. },
@@ -204,61 +222,72 @@ impl NamesIds for Subject {
 
 /// A subject with its generic arguments, none of them a parameter: a closure's or coroutine's
 /// are its parent's, as dispatch and the code generator have them.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Instance {
     pub subject: Subject,
     pub args: StoredGenericArgs,
 }
 
 /// Its subject and what its arguments name.
-impl NamesIds for Instance {
-    fn names_ids(&self, out: &mut Vec<Id>) {
-        self.subject.names_ids(out);
-        self.args.names_ids(out);
+impl Home for Instance {
+    fn home(&self, homes: &mut Homes<'_>) {
+        self.subject.home(homes);
+        self.args.home(homes);
     }
 }
 
-/// A set of [`MirOptions`], one bit for each of the forty-eight (three levels, UB checks or
-/// not, lifetime markers or not, inlined or not, allocations moved to the stack or not).
+/// A set of [`MirOptions`], one bit for each of the 144 (three levels, UB checks or not,
+/// lifetime markers or not, inlined or not, allocations moved to the stack or not, three tiers:
+/// [`MirOptions::tier`]), in two words.
 /// Options with a program's dyn facts ([`MirOptions::world`]) are in no set: [`OptionsSet::of`]
 /// would fold them into theirs without, which the code generator's `options_set` refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OptionsSet(u64);
+pub struct OptionsSet([u128; 2]);
 
 const LEVELS: [MirOptLevel; 3] = [MirOptLevel::Off, MirOptLevel::Debug, MirOptLevel::Release];
+const TIERS: [Tier; 3] = [Tier::Zero, Tier::Shipped, Tier::Optimizing];
 
 impl OptionsSet {
-    pub const EMPTY: OptionsSet = OptionsSet(0);
+    pub const EMPTY: OptionsSet = OptionsSet([0; 2]);
 
     pub const fn of(options: &[MirOptions]) -> OptionsSet {
-        let mut bits = 0;
+        let mut bits = [0u128; 2];
         let mut at = 0;
         while at < options.len() {
-            bits |= 1 << OptionsSet::index(options[at]);
+            let index = OptionsSet::index(options[at]);
+            bits[(index / 128) as usize] |= 1 << (index % 128);
             at += 1;
         }
         OptionsSet(bits)
     }
 
+    /// The bit of `options`, below 144: what `instance.rs` hashes as one byte.
     pub(crate) const fn index(options: MirOptions) -> u32 {
         let level = match options.level {
             MirOptLevel::Off => 0,
             MirOptLevel::Debug => 1,
             MirOptLevel::Release => 2,
         };
-        level * 16
-            + (options.ub_checks as u32) * 8
-            + (options.lifetime_markers as u32) * 4
-            + (options.inline as u32) * 2
-            + options.heap_to_stack as u32
+        let tier = match options.tier {
+            Tier::Zero => 0,
+            Tier::Shipped => 1,
+            Tier::Optimizing => 2,
+        };
+        level * 48
+            + (options.ub_checks as u32) * 24
+            + (options.lifetime_markers as u32) * 12
+            + (options.inline as u32) * 6
+            + (options.heap_to_stack as u32) * 3
+            + tier
     }
 
     pub const fn contains(self, options: MirOptions) -> bool {
-        self.0 & (1 << OptionsSet::index(options)) != 0
+        let index = OptionsSet::index(options);
+        self.0[(index / 128) as usize] & (1 << (index % 128)) != 0
     }
 
     pub const fn is_empty(self) -> bool {
-        self.0 == 0
+        self.0[0] == 0 && self.0[1] == 0
     }
 
     /// The options, in [`MirOptions`]' order.
@@ -269,13 +298,16 @@ impl OptionsSet {
                 [false, true].into_iter().flat_map(move |ub_checks| {
                     [false, true].into_iter().flat_map(move |lifetime_markers| {
                         [false, true].into_iter().flat_map(move |inline| {
-                            [false, true].map(|heap_to_stack| MirOptions {
-                                level,
-                                ub_checks,
-                                lifetime_markers,
-                                inline,
-                                heap_to_stack,
-                                world: None,
+                            [false, true].into_iter().flat_map(move |heap_to_stack| {
+                                TIERS.map(|tier| MirOptions {
+                                    level,
+                                    ub_checks,
+                                    lifetime_markers,
+                                    inline,
+                                    heap_to_stack,
+                                    world: None,
+                                    tier,
+                                })
                             })
                         })
                     })
@@ -294,9 +326,11 @@ impl OptionsSet {
 /// uninlined body as one. A build whose units all compile alike gives one options each, and
 /// the identity costs one walk. The rest of a unit's settings (overflow checks, the target,
 /// the backend) are in its `Settings`, beside the identity in its instance key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct Compiled {
+    #[home(skip)]
     pub lang: OptionsSet,
+    #[home(skip)]
     pub other: OptionsSet,
 }
 
@@ -370,10 +404,10 @@ pub(crate) fn name_of(db: &Db, subject: Subject) -> String {
     match subject {
         Subject::Body(Body::Fn(it)) => item_path(db, it.into()),
         Subject::Body(Body::Closure(it)) => {
-            format!("a closure in {}", owner(InternedClosureId::from_id(it).loc(db).owner)) // alloc: an error's name
+            format!("a closure in {}", owner(InternedClosureId::from_gid(it).loc(db).owner)) // alloc: an error's name
         }
         Subject::Body(Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
-            format!("an `async` block in {}", owner(InternedCoroutineId::from_id(it).loc(db).owner)) // alloc: an error's name
+            format!("an `async` block in {}", owner(InternedCoroutineId::from_gid(it).loc(db).owner)) // alloc: an error's name
         }
         Subject::Shim(shim) => shim.what().to_owned(), // alloc: an error's name
     }

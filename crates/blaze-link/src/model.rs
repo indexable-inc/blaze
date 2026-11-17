@@ -276,6 +276,16 @@ pub(crate) enum Special {
         name: SectionName,
         end: bool,
     },
+    /// [`Special::Section`] for a name every reference to is weak, on ELF: 0 when no region
+    /// has the name. GNU ld and lld define `__start_X` and `__stop_X` only when an output
+    /// section `X` exists; without one the name is an undefined symbol like any other, 0 to a
+    /// weak reference (libFuzzer's `__start___libfuzzer_extra_counters`) and an error to a
+    /// strong one. Decided when the image is written, where the kept regions are known, so
+    /// that a section a later change adds is bounded then.
+    WeakSection {
+        name: SectionName,
+        end: bool,
+    },
     /// An address the writer computes from the placed regions (ELF's `_end`, `etext`,
     /// `__bss_start`, `_DYNAMIC`).
     Placed(fn(&[Region]) -> u64),
@@ -370,6 +380,15 @@ pub(crate) enum Apply {
     A64TlsDescLo12,
     A64TlsDescAdd12,
     A64TlsDescCall,
+    /// A TLS descriptor's sequence in an executable ([`crate::reloc::in_output`]), where no
+    /// descriptor is needed: relaxed to initial exec, `adrp x0, G; ldr x0, [x0, G]; nop;
+    /// nop` with `G` the GOT cell holding the offset from the thread pointer, when the
+    /// target is imported.
+    A64TlsDescIe(TlsDescStep),
+    /// The same relaxed to local exec, `movz x0, #hi16, lsl #16; movk x0, #lo16; nop; nop`
+    /// of the offset from the thread pointer, when the link knows it
+    /// ([`crate::reloc::known`]). No reader emits it and no fixup holds it.
+    A64TlsDescLe(TlsDescStep),
     /// Mach-O TLV (`TLVP_LOAD_*`): the page and low 12 bits (an `LDR`) of a GOT cell holding
     /// the address of `S`'s descriptor (`S` itself for a native one in `__thread_vars`, the one
     /// the core makes in [`Class::ThreadVars`] for a thread-local static).
@@ -385,6 +404,16 @@ pub(crate) enum Apply {
     TpOff64,
     /// A relocation only the format's writer applies ([`Writer::apply`]), by its own type.
     Native(u32),
+}
+
+/// Which instruction of a TLS descriptor's four (`adrp x0; ldr x1, [x0]; add x0, x0; blr x1`)
+/// a relaxed relocation is on: `TLSDESC_ADR_PAGE21`, `_LD64_LO12`, `_ADD_LO12`, `_CALL`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum TlsDescStep {
+    Page,
+    Load,
+    Add,
+    Call,
 }
 
 /// One relocation of a piece.
@@ -805,6 +834,10 @@ pub(crate) struct Shared {
     /// Objects and archives a linker script adds (`libc_nonshared.a`): the caller reads
     /// these by name as further inputs.
     pub inputs: Vec<String>,
+    /// ELF: the names it refers to and leaves undefined, global or weak, in
+    /// [`Shared::names`]: an executable that defines one exports it, as it does a name the
+    /// library defines ([`Exported`]).
+    pub undefined: Vec<Name>,
 }
 
 impl Shared {
@@ -874,14 +907,71 @@ pub(crate) struct Bind {
     pub addend: i64,
 }
 
-/// A name the image defines for the loader and other modules: `main` of a PIE that a
-/// shared library calls back, every export of a shared library, the live descriptor.
+/// A name the image defines for the loader and other modules: every export of a shared
+/// library, a name an ELF executable defines that a shared library it links also defines or
+/// refers to (`malloc`, which the loader then binds the library's own calls to), the live
+/// descriptor.
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Export {
     pub name: String,
     pub addr: u64,
     pub size: u64,
     pub kind: SymbolKind,
+    /// ELF: bound weakly (`STB_WEAK`), as its definition is.
+    pub weak: bool,
+}
+
+/// A name resolution has the image export, an [`Export`] once it is placed: a COFF
+/// `/EXPORT` directive's, or a name an ELF executable defines that a shared library on its
+/// link line defines or leaves undefined.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: per graph built, not per item: `Arc::make_mut` of a list nothing shares yet
+pub(crate) struct Exported {
+    pub name: String,
+    /// The symbol it is.
+    pub symbol: String,
+    /// Data whatever it is defined in (`/EXPORT:name=symbol,DATA`).
+    pub data: bool,
+    /// Its definition is weak.
+    pub weak: bool,
+    /// The type and size its definition states (an ELF object's symbol); without them, those
+    /// of the piece it is in.
+    pub own: Option<(SymbolKind, u64)>,
+}
+
+/// The key of [`local_order`]'s hash: fixed, so the order is the same on every machine and in
+/// every process (rule 25).
+const LOCAL_ORDER: blaze_hash::SipKey = blaze_hash::SipKey::new(0x626c_617a_652d_7379, 0x6d74_6162_2d6c_6f63);
+
+/// The indexes in `functions` of those with a name `local` takes, in the order a symbol table
+/// lists their local symbols: by [`LOCAL_ORDER`]'s hash of the name, ties by index. Never by
+/// address: a body edit puts the new body in the patch region, so in address order its
+/// function moved to the end and every local after its old place shifted by one entry and
+/// its name by one name, about 30 bytes a function written per edit
+/// (`a_body_edits_patch_does_not_grow_with_the_image`). By name, an edited function keeps
+/// its index and its name's place. The order is a function of the names alone, never of
+/// history: the canonical form of a table made whole. In it a function added or removed
+/// shifts the locals after it (half the table on average) where its floor is one entry and
+/// one name, so an incremental ELF output keeps each local's place once placed and patches by
+/// place (`elf/image.rs`'s `KeptSymtab`, kept with the state: a patched table is history and
+/// is a whole one's by name only); there this order gives only the canonical form, which any
+/// fixed order would. Mach-O's symbol table, not yet kept by place, still relies on it to keep
+/// a body edit at one entry. ELF's `.symtab` and Mach-O's `LC_SYMTAB` both list locals in any
+/// order (no loader reads them; debuggers sort them). One hash a name and one radix sort,
+/// `O(functions)`. Made in `alloc`, as are the keys it sorts.
+pub(crate) fn local_order<A: std::alloc::Allocator + Clone>(
+    functions: &[Function],
+    local: impl Fn(&str) -> bool,
+    alloc: A,
+) -> Vec<u32, A> {
+    let mut keyed: Vec<(u128, u32), A> = Vec::with_capacity_in(functions.len(), alloc.clone());
+    keyed.extend(functions.iter().enumerate().filter_map(|(at, function)| {
+        let name = function.name.as_deref().filter(|it| local(it))?;
+        Some((blaze_ids::radix::pack_64(LOCAL_ORDER.hash(name.as_bytes()), at as u64), at as u32))
+    }));
+    blaze_ids::radix::sort_copy_by_key(&mut keyed, |it| it.0);
+    let mut order = Vec::with_capacity_in(keyed.len(), alloc);
+    order.extend(keyed.iter().map(|it| it.1));
+    order
 }
 
 /// A placed function, for the unwind tables and the debug info.
@@ -1010,6 +1100,10 @@ pub(crate) struct Delta<'a> {
     /// No region moved or changed size, but for the writer's own synthetic regions, whose
     /// size it makes.
     pub same_regions: bool,
+    /// No region moved or changed its room; any may hold more or less than it did. What a
+    /// table needs whose entries are of addresses alone (`.rela.dyn`): an edit that puts new
+    /// code and data in the patch regions changes their sizes and no address.
+    pub same_places: bool,
     /// Address ranges of the regions the core wrote since the last link, by address, none
     /// overlapping. In the [`Placed`] that [`Writer::file`] sees, they include the blocks of
     /// the synthetic regions that differ from the last link's.

@@ -5,8 +5,8 @@ use blaze_ids::ContentId;
 use hir_def::{ModuleDefId, signatures::FunctionSignature};
 use hir_expand::fixture;
 
-use super::{TestDB, edit, item, single};
-use crate::{ItemId, bound_hash, code_hash};
+use super::{TestDB, count, edit, item, runs_of, single};
+use crate::{ItemId, bound_hash, code_hash, index};
 
 fn bound(db: &TestDB, path: &str) -> ContentId {
     bound_hash(db, item(db, path))
@@ -201,18 +201,15 @@ fn each_crates_impls_of_a_trait_are_hashed_once_for_all_its_loaders() {
         ));
     }
     let db = fixture::db(&text).into_db();
-    let executed = db.log_executed(|| {
+    let executed = runs_of(&db, || {
         for n in 0..4 {
             bound_hash(&db, function_of(&db, &format!("c{n}"), "f"))
                 .unwrap_or_else(|err| panic!("{}", err.describe(&db)))
                 .expect("`f` has a body");
         }
     });
-    let runs = |query: &str| {
-        executed.iter().filter(|it| it.trim_end_matches('_').ends_with(query)).count()
-    };
-    assert_eq!(runs("seen_impls_value"), 4, "{executed:#?}");
-    assert_eq!(runs("own_impls_value"), 4, "{executed:#?}");
+    assert_eq!(count(&executed, index::seen_impls_value::KIND_NAME), 4, "{executed:#?}");
+    assert_eq!(count(&executed, index::own_impls_value::KIND_NAME), 4, "{executed:#?}");
 }
 
 #[test]

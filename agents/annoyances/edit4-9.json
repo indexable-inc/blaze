@@ -1,0 +1,11 @@
+{
+ "id": "edit4-9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze: `blaze stop`",
+ "what": "`blaze stop` returned and the daemon's process was still there seconds later (seen twice, with a 5 GiB daemon); a measurement started then ran beside it.",
+ "cost": "one A/B run measured with two daemons alive",
+ "cause": "as rev-3: stop answers before the process has exited",
+ "workaround": "wait for `pgrep` to be empty",
+ "state": "open, as rev-3"
+}

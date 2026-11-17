@@ -7,8 +7,7 @@ description: "Building native UI as Flecs (the harness app in crates/harness/): 
 
 General Flecs rules, traits and script syntax are in the `flecs` skill; this one is how the harness app builds UI
 with them. Paths below are relative to `crates/harness/`. The app is copied from den's native stack: flecs v4.2.0
-(the indexable-inc/flecs fork, branch `indexable/v4.2`, pinned by rev in `crates/harness/vendor/hyperion-flecs-c/Cargo.toml`; blaze's
-`vendor/flecs-c` pins the same rev, and CI's `.github/scripts/flecs_pin.py` fails when they differ), Metal through the
+(the indexable-inc/flecs fork, branch `indexable/v4.2`, pinned by rev in `crates/harness/vendor/hyperion-flecs-c/Cargo.toml`), Metal through the
 indexable-inc/slang fork (`harness-native/build.rs`), den's text shaper plus Slug outlines, libghostty-vt for terminal
 state (`harness-vt`).
 
@@ -199,8 +198,8 @@ existing action is entities only; a new action also needs a handler under its na
 
 ## Verify (no focus-taking, ever)
 
-- First, after any `.flecs` change: `CARGO_TARGET_DIR=target cargo test -p harness-native scenes_load` (from
-  `crates/harness/`). It builds the world headless (no window, Metal or daemon), loads every scene script (tokens, prims,
+- First, after any `.flecs` change: `blaze test -p harness-native scenes_load` (from `crates/harness/`; only blaze
+  reads the workspace, since Kip's shaders are a blaze device build, `artifact = "gpu"`). It builds the world headless (no window, Metal or daemon), loads every scene script (tokens, prims,
   the harness scene and its widgets, keys, the prims gallery and every example) and fails with flecs's error and line. A
   scene that does not load (a prefab named like a component it sets, an entity named by a script keyword such as `new`,
   an unknown token) otherwise only shows at launch, as an empty window. Run it before every push.

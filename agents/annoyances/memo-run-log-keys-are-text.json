@@ -1,0 +1,14 @@
+{
+ "id": "memo-run-log-keys-are-text",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), port lane L2 (def-nameres), port-memo-1113",
+ "where": "crates/blaze-memo/src/testing.rs Ran; crates/hir-def/src/nameres/facts/tests/active.rs, facts/tests/impls.rs, tests/incremental.rs",
+ "what": "Tests that asked which module's resolver query ran (an scc_state of anchor m at round 2) decoded the event's key id back into its interned key. blaze-memo's RunLog keeps a key only as its Debug text, so a test can no longer get the key back, and a Debug of an interned key prints its fields only while a database is attached: the text a test formats outside a query need not equal the logged one.",
+ "cost": "three test files left on the old engine's event log, listed for a decision; the gate's --all-targets does not compile until then",
+ "cause": "the run log was designed for counting runs by query name (count), not for asking which key ran, which most scheduler tests need",
+ "class": "a test oracle that records a lossy rendering of what it observed, so the question the tests ask cannot be answered from the record",
+ "prevention": "give Ran a typed key test: `Ran::is::<Q>(&self, key: &Q::Key) -> bool` (compare the key's bytes or Gid, kept beside the text), so a test asks `log.ran::<scc_state>(key)` without parsing text",
+ "workaround": "none taken: the sites are left as they were and listed in the L2 report",
+ "fix": "`Ran::is::<Q>` (typed key, 2026-11-13); 2026-11-14 (claude-opus-5-5, port fix session-arena): a row keeps no text at all, only the kind, its home arena and the key copied typed; `Ran::key()` writes it when read, inside `attach`, and rows compare by typed key. Writing it at the run's start, detached, panicked for keys holding hir-ty solver ids; test `a_run_log_row_renders_its_key_only_when_read` (control `Plant::LogFormatsEagerly`)",
+ "state": "fixed"
+}

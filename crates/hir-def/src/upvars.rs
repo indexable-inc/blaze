@@ -79,7 +79,7 @@ pub fn upvars_mentioned(
         ExpressionStoreOwnerId::VariantFields(owner) => variant_fields_upvars_mentioned(db, owner),
     };
 
-    #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(as_deref), owns, mem_tag = Nameres)]
     pub fn signature_upvars_mentioned(
         db: &Db,
         owner: GenericDefId,
@@ -87,7 +87,7 @@ pub fn upvars_mentioned(
         upvars_mentioned_impl(db, owner.into())
     }
 
-    #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(as_deref), owns, mem_tag = Nameres)]
     pub fn body_upvars_mentioned(
         db: &Db,
         owner: DefWithBodyId,
@@ -95,7 +95,7 @@ pub fn upvars_mentioned(
         upvars_mentioned_impl(db, owner.into())
     }
 
-    #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(as_deref), owns, mem_tag = Nameres)]
     pub fn variant_fields_upvars_mentioned(
         db: &Db,
         owner: VariantId,

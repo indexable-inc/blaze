@@ -30,7 +30,7 @@ crossbeam-channel.workspace = true
 expect-test.workspace = true
 
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [[bench]]
 name = "lex"

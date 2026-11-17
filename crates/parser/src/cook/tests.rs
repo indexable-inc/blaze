@@ -4,8 +4,7 @@
 //! (`invalid literal: {err:?}`, `invalid raw string literal`) and are rustc's now, so against
 //! it only the token and whether it has an error are compared.
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use rustc_lexer::{Base, Cursor, FrontmatterAllowed, LiteralKind, TokenKind};
 use rustc_literal_escaper::{Mode, check_for_errors};
 
@@ -441,16 +440,51 @@ fn bare_crs_in_doc_comments() {
     assert!(errors.is_empty());
 }
 
-#[hegel::test]
-fn agrees_on_any_literal(tc: TestCase) {
-    let src = tc.draw(gs::from_regex(
-        "(b|c|r|br|cr)?#{0,2}[\"'][a-z0-9\\\\\"'#{}_\r\n\téxuU]{0,10}[\"'#]{0,3}[a-z_]{0,2}",
+/// A literal-shaped source, the language of
+/// `(b|c|r|br|cr)?#{0,2}["'][a-z0-9\\"'#{}_\r\n\téxuU]{0,10}["'#]{0,3}[a-z_]{0,2}`.
+fn any_literal(tape: &Tape) -> String {
+    let mut src = String::new();
+    src.push_str(tape.one_of(&["", "b", "c", "r", "br", "cr"], "prefix"));
+    src.push_str(&tape.text_from("#", 0..=2, "hashes"));
+    src.push(*tape.one_of(&['"', '\''], "quote"));
+    src.push_str(&tape.text_from(
+        "abcdefghijklmnopqrstuvwxyz0123456789\\\"'#{}_\r\n\téU",
+        0..=10,
+        "body",
     ));
-    agrees(&src);
+    src.push_str(&tape.text_from("\"'#", 0..=3, "close"));
+    src.push_str(&tape.text_from("abcdefghijklmnopqrstuvwxyz_", 0..=2, "suffix"));
+    src
 }
 
-#[hegel::test]
-fn agrees_on_any_number(tc: TestCase) {
-    let src = tc.draw(gs::from_regex("0[box]?[0-9a-f_.]{0,6}(e[+-]?[0-9]{0,2})?[a-z_0-9]{0,3}"));
-    agrees(&src);
+/// A number-shaped source, the language of
+/// `0[box]?[0-9a-f_.]{0,6}(e[+-]?[0-9]{0,2})?[a-z_0-9]{0,3}`.
+fn any_number(tape: &Tape) -> String {
+    let mut src = String::from("0");
+    src.push_str(tape.one_of(&["", "b", "o", "x"], "base"));
+    src.push_str(&tape.text_from("0123456789abcdef_.", 0..=6, "digits"));
+    if let Some(exponent) = tape.option("exponent", |tape| {
+        let sign = *tape.one_of(&["", "+", "-"], "exponent sign");
+        format!("e{sign}{}", tape.text_from("0123456789", 0..=2, "exponent digits"))
+    }) {
+        src.push_str(&exponent);
+    }
+    src.push_str(&tape.text_from("abcdefghijklmnopqrstuvwxyz_0123456789", 0..=3, "suffix"));
+    src
+}
+
+#[test]
+fn agrees_on_any_literal() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let src = any_literal(tape);
+        agrees(&src);
+    });
+}
+
+#[test]
+fn agrees_on_any_number() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let src = any_number(tape);
+        agrees(&src);
+    });
 }

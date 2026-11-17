@@ -68,13 +68,13 @@ fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expec
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
-
+    
         let mut defs = Vec::new();
         visit_module(&db, def_map, module, &mut |it| defs.push(it));
-
+    
         let mut captures_info = Vec::new();
         for def in defs {
             let def: DefWithBodyId = match def {
@@ -101,7 +101,7 @@ fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expec
                         let root = syntax.file_syntax(db);
                         syntax.value.to_node(&root).syntax().text_range()
                     }
-
+    
                     // FIXME: Deduplicate this with hir::Local::sources().
                     let captured_local = capture.captured_local();
                     let local_text_range = if body.is_any_self_param(captured_local)
@@ -138,7 +138,7 @@ fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expec
                         .sorted_by_key(|it| it.start())
                         .map(|it| format!("{it:?}"))
                         .join(",");
-
+    
                     (
                         closure_text_range,
                         local_text_range,
@@ -153,7 +153,7 @@ fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expec
         captures_info.sort_unstable_by_key(|(closure_text_range, local_text_range, ..)| {
             (closure_text_range.start(), local_text_range.clone())
         });
-
+    
         let rendered = captures_info
         .iter()
         .map(|(closure_text_range, local_text_range, spans, place, capture_ty, capture_kind)| {
@@ -162,7 +162,7 @@ fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expec
             )
         })
         .join("\n");
-
+    
         expect.assert_eq(&rendered);
     })
 }

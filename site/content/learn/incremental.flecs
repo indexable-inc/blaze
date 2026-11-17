@@ -9,7 +9,7 @@ site {
       (InTheme, themes.basics)
       (Requires, site.learn.builds)
       Title: {"Only what changed"}
-      Description: {"Lesson 2: how blaze rebuilds one function at a time, and patches it into your program."}
+      Description: {"How blaze rebuilds one function at a time, and patches it into your program."}
 
       Step functions("Down to functions") {
         P unit("Cargo reruns `rustc` for whole crates, and `rustc` reuses its work in groups of functions. blaze's smallest piece of work is a single **function**.")
@@ -55,8 +55,8 @@ site {
       }
 
       Step live("Even while it runs") {
-        P running("A program that links blaze's `blaze-live` crate takes changed functions while it runs, state intact: about 20 ms from your save, and under a millisecond to swap them in.")
-        Dim where("Released on macOS on Apple silicon; Linux x86-64 and Windows x86-64 support is on main, for the next release.")
+        P running("A program that links blaze's `blaze-live` crate can take changed functions while it runs, state intact: the next call lands in the new code, with one atomic switch and no thread stopped.")
+        Dim where("Live edits worked in blaze 1. Today's daemon doesn't send them to a running program yet, so an edit takes a restart; they are coming back.")
       }
 
       Step game("What can it take live?") {

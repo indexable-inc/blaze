@@ -1,7 +1,7 @@
 use super::{COUNTERS, Descriptor, log};
 
 unsafe extern "C" {
-    fn __blaze_exec_slots() -> u32;
+    fn __blaze_exec_table(out: *mut u8) -> u32;
     fn __blaze_exec_arm(region: *mut u8, len: usize) -> i32;
     fn blaze_live_counters() -> *mut u64;
 }
@@ -12,8 +12,12 @@ unsafe extern "C" {
 /// links the runtime alone; it is not linked live, so there is no log to arm.
 #[test]
 fn a_binary_with_only_the_dev_runtime_resolves_the_execution_logs_exports() {
-    // SAFETY: the runtime's export, as the fork server declares it, takes nothing.
-    let slots = unsafe { __blaze_exec_slots() };
+    // With no table nothing is written: the bytes stay as they were.
+    let mut id = [7u8; log::TABLE_ID];
+    // SAFETY: the runtime's export, as the fork server declares it, writes at most
+    // `TABLE_ID` bytes, which `id` has.
+    let slots = unsafe { __blaze_exec_table(id.as_mut_ptr()) };
+    assert_eq!(id, [7u8; log::TABLE_ID]);
     // SAFETY: as above; with no descriptor nothing is armed, so the null region is never
     // touched.
     let armed = unsafe { __blaze_exec_arm(std::ptr::null_mut(), 0) };

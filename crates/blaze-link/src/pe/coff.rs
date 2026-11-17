@@ -150,6 +150,7 @@ fn shared(dll: String) -> Shared {
         versions: Vec::default(),
         more: Vec::default(),
         inputs: Vec::default(),
+        undefined: Vec::default(),
     }
 }
 

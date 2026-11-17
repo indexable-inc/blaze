@@ -1,6 +1,8 @@
 ---
-status: current
+status: superseded
 summary: The fuzzers: generated programs and edits, each held to blaze's own build from nothing (a warm daemon, a warm store), what a finding is, and what they do not cover.
+date: 2026-11-15
+superseded_by: v2/plan/design/bottom.md
 ---
 # The fuzzers
 

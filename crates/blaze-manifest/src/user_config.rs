@@ -13,19 +13,18 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home (`HOME`, `USERPROFILE` on
-/// Windows). None when no variable names one; the caller says what needed it.
-pub fn home() -> Option<PathBuf> {
+/// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home ([`blaze_core::home::user`]:
+/// `HOME`, else the system's record of the user).
+///
+/// # Errors
+///
+/// [`blaze_core::home::NoHome`] when `BLAZE_HOME` is unset and the user has no home, saying
+/// what was tried; the caller says what needed it.
+pub fn home() -> Result<PathBuf, blaze_core::home::NoHome> {
     if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home));
+        return Ok(PathBuf::from(home));
     }
-    Some(user_home()?.join(".blaze"))
-}
-
-/// The user's home directory (`HOME`, `USERPROFILE` on Windows), none when unset or empty.
-pub fn user_home() -> Option<PathBuf> {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(home))
+    Ok(blaze_core::home::user()?.join(".blaze"))
 }
 
 /// `config.toml` under `home`.

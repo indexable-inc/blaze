@@ -1,0 +1,14 @@
+{
+ "id": "vac-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane vacuous-1112",
+ "where": "harness/, .github/scripts/, .github/workflows/ (a read-only sweep of this tree)",
+ "what": "Places that still pass having run nothing, found and not fixed: toolchain_bump_ci.py:46,285-288 (a skipped job is not red, so a bump train that ran nothing is `green` and the merge is queued; :44 leaves the strict `train` job out); promote.py:425-428,435-444 (a phase without times, or no stable baseline, records no speed check); benchhistory.py:226-228,234-235 (no comparable history: exit 0); bench-readme.yaml:160-175 and bench-counts.yaml:130-137 (a loop over zero result files leaves `regressed=false`); rival.py:472-518 (`report` never exits non-zero; zero rows print `None.`); blaze.yaml:378,382 (`blaze status | grep -qvx` without pipefail), :488-490 (the lint ratchet exits 0 with no base), and its `needs` list leaves out lint-baselines and linux-x64-cross; promote.yaml:139,143 and install.yaml:82-118 and release.yaml:154,161 (pipelines whose first command's status is dropped; these workflows set no pipefail); nix-live.yaml:85,141-142,155; blaze-platform.yaml:209,400,534,562 (`|| true` and continue-on-error); lean_gate.py:118,402 (`packages: []` builds nothing and passes); blaze_cli.py:966-967,1019-1020,1397 (checks recorded as passed where a tool is missing); smoke.py:240-245,450; guards.py:590-594 (no ratchet on the base: nothing compared); vendor.sh:9. And in blaze: `check`/`build` with a target filter that matches nothing (`--bins` with no bin, `--test NAME`) was not looked at; a doc test executable counts as one test by its exit status.",
+ "cost": "each is a pass that can be of nothing",
+ "cause": "see A39",
+ "class": "vacuous success (A39)",
+ "prevention": "each needs its typed expectation (what it expected to run) as in ran.py and the ci job; a ruff rule already in the tree's config (PLW1510, subprocess.run without `check`) guards the unchecked exit status for the files in pyproject.toml's include list, which harness/v2 is in",
+ "workaround": "none",
+ "fix": "see prevention",
+ "state": "open"
+}

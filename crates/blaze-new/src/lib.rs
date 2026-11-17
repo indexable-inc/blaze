@@ -1,7 +1,11 @@
 //! `cargo new` and `cargo init`, made by blaze with no cargo: `src/ops/cargo_new.rs` and
-//! `src/util/vcs.rs` of cargo 1.101.0 (cad07cf8e5). It writes what cargo writes, byte for byte:
-//! the manifest, the source file, the ignore file, the repository, and the workspace's
-//! `members`. cargo runs rustfmt on the source file it writes, which is formatted already;
+//! `src/util/vcs.rs` of cargo 1.101.0 (cad07cf8e5). For a package of a Rust edition it writes
+//! what cargo writes, byte for byte: the manifest, the source file, the ignore file, the
+//! repository, and the workspace's `members`. For a package of a blaze edition
+//! (docs/v2/plan/design/std.md, "The blaze edition: opting in") the manifest says
+//! `edition = "blaze-2026.11"` and the source is on bstd: a `main` that takes `&Cx` and `Io`
+//! and writes its line through `Out`. Which it writes when no edition is asked is
+//! [`default_edition`]. cargo runs rustfmt on the source file it writes, which is formatted already;
 //! blaze runs no rustfmt. A git repository is made by `git init`, where cargo has libgit2.
 
 use std::collections::BTreeMap;
@@ -16,6 +20,55 @@ use toml_edit::{Array, Value};
 
 /// The edition `cargo new` writes when none is asked.
 const LATEST_STABLE: &str = "2024";
+
+/// Whether this blaze ships bstd with itself and gives it to every crate of a blaze edition
+/// (docs/v2/plan/design/std.md, row S5d). Not yet: a package of the edition names bstd as a
+/// dependency, so `new` can write one only where it is told where bstd is
+/// ([`NewOptions::bstd`]). Turning this to `true` makes the blaze edition what `new` and
+/// `init` write when no edition is asked, with no `bstd` line.
+pub const BSTD_SHIPS: bool = false;
+
+/// The digest of the bstd source tree the release this blaze is ships beside it
+/// (`bstd-<digest>.tar.xz`: crates/blaze-std, the crates of blaze it depends on by path and a
+/// workspace manifest of just them, digested as the library is), when it ships one: given to
+/// the build of a release as `BLAZE_BSTD_DIGEST` by the step that made the archive
+/// (harness/library.py `archive` with `"tree": "bstd"`, in release.yaml's notes job), none
+/// for a build of the tree. A shipped bstd is placed at
+/// `<machine>/bstd/<digest>/bstd` and its records are a sealed layer as the library's are
+/// (`cli::store::shipped` of blaze-cargo, the one list of what ships); a package names it there
+/// with `--bstd`. A bstd that is a path into a checkout is no shipped tree: its sources can
+/// change, so it is built in its home like any path crate.
+pub const BSTD_DIGEST: Option<&str> = match option_env!("BLAZE_BSTD_DIGEST") {
+    Some(digest) if !digest.is_empty() => Some(digest),
+    _ => None,
+};
+
+/// The edition written when none is asked: the latest blaze edition where a package of it
+/// can be built (bstd ships, or `bstd` says where it is), else Rust's latest. `--rust` on the
+/// command line asks for Rust's by name, whatever this is.
+pub fn default_edition(bstd: bool) -> &'static str {
+    match BSTD_SHIPS || bstd {
+        true => edition::BlazeEdition::LATEST.manifest(),
+        false => LATEST_STABLE,
+    }
+}
+
+/// The `main.rs` of a package of a blaze edition: its world as parameters, its line through
+/// the `Out` capability, any error of either call returned to the entry.
+const BLAZE_MAIN: &str = "\
+fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    io.need_out()?.line(cx, \"Hello, world!\")?;
+    Ok(())
+}
+";
+
+/// The `lib.rs` of a package of a blaze edition. No test module: a test of the edition takes
+/// the simulation's `Io`, which is not built yet (std.md, row S5b).
+const BLAZE_LIB: &str = "\
+pub fn add(left: u64, right: u64) -> u64 {
+    left + right
+}
+";
 
 /// What a command says on its way, as cargo's shell says it.
 pub trait Shell {
@@ -61,6 +114,10 @@ pub struct NewOptions {
     pub name: Option<String>,
     pub edition: Option<String>,
     pub registry: Option<String>,
+    /// Where bstd's package (crates/blaze-std) is, as the manifest's `bstd` dependency will
+    /// say it: needed by a package of a blaze edition until blaze ships bstd
+    /// ([`BSTD_SHIPS`]), and what makes that edition the default.
+    pub bstd: Option<String>,
 }
 
 /// What cargo's configuration and environment say that `new` and `init` read.
@@ -109,6 +166,7 @@ struct MkOptions<'a> {
     source_files: Vec<SourceFileInformation>,
     edition: Option<&'a str>,
     registry: Option<&'a str>,
+    bstd: Option<&'a str>,
 }
 
 impl NewOptions {
@@ -127,7 +185,16 @@ impl NewOptions {
             (false, true) => NewProjectKind::Lib,
             (_, false) => NewProjectKind::Bin,
         };
-        Ok(NewOptions { version_control, kind, auto_detect_kind, path, name, edition, registry })
+        Ok(NewOptions {
+            version_control,
+            kind,
+            auto_detect_kind,
+            path,
+            name,
+            edition,
+            registry,
+            bstd: None,
+        })
     }
 }
 
@@ -380,6 +447,7 @@ pub fn new(
         source_files: vec![plan_new_source_file(opts.kind.is_bin())],
         edition: opts.edition.as_deref(),
         registry: opts.registry.as_deref(),
+        bstd: opts.bstd.as_deref(),
     };
     mk(settings, shell, &mkopts)
         .with_context(|| format!("failed to create package `{name}` at `{}`", path.display()))
@@ -462,6 +530,7 @@ pub fn init(
         source_files: src_paths_types,
         edition: opts.edition.as_deref(),
         registry: opts.registry.as_deref(),
+        bstd: opts.bstd.as_deref(),
     };
     mk(settings, shell, &mkopts)
         .with_context(|| format!("failed to create package `{name}` at `{}`", path.display()))?;
@@ -712,13 +781,31 @@ fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> 
     manifest["package"] = toml_edit::Item::Table(toml_edit::Table::new());
     manifest["package"]["name"] = toml_edit::value(name);
     manifest["package"]["version"] = toml_edit::value("0.1.0");
-    manifest["package"]["edition"] = toml_edit::value(opts.edition.unwrap_or(LATEST_STABLE));
+    let edition = opts.edition.unwrap_or(default_edition(opts.bstd.is_some()));
+    // A blaze edition's, when the package is of one; a value that is no edition's is the
+    // command line's to refuse, and is written as asked, as cargo writes it.
+    let blaze = edition::BlazeEdition::from_manifest(edition).ok().flatten();
+    if blaze.is_some() && !BSTD_SHIPS && opts.bstd.is_none() {
+        bail!(
+            "a package of the blaze edition `{edition}` needs bstd, which blaze does not ship with \
+             itself yet (docs/v2/plan/design/std.md, row S5d): say where its package is with \
+             `--bstd <PATH>` (crates/blaze-std of blaze's source)"
+        );
+    }
+    manifest["package"]["edition"] = toml_edit::value(edition);
     if let Some(registry) = opts.registry {
         let mut array = toml_edit::Array::default();
         array.push(registry);
         manifest["package"]["publish"] = toml_edit::value(array);
     }
     manifest["dependencies"] = toml_edit::Item::Table(toml_edit::Table::default());
+    // The crate a blaze edition calls `std`, named until blaze ships it ([`BSTD_SHIPS`]).
+    if let (Some(_), Some(bstd)) = (blaze, opts.bstd) {
+        let mut dependency = toml_edit::InlineTable::new();
+        dependency.insert("package", "blaze-std".into());
+        dependency.insert("path", bstd.into());
+        manifest["dependencies"][edition::BlazeEdition::STD] = toml_edit::value(dependency);
+    }
 
     for i in &opts.source_files {
         if i.bin {
@@ -794,7 +881,12 @@ fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> 
         if let Some(src_dir) = path_of_source_file.parent() {
             create_dir_all(src_dir)?;
         }
-        let default_file_content: &[u8] = if i.bin {
+        let default_file_content: &[u8] = if blaze.is_some() {
+            match i.bin {
+                true => BLAZE_MAIN.as_bytes(),
+                false => BLAZE_LIB.as_bytes(),
+            }
+        } else if i.bin {
             b"\
 fn main() {
     println!(\"Hello, world!\");

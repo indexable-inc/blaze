@@ -1,6 +1,6 @@
 ---
 name: docs-and-scripts
-description: "Conventions for blaze's documents, scripts and agent-facing interfaces: docs/ front matter (current, plan, record, superseded) and `tools/docs.py`, scripts that take one typed JSON value, and no MCP. Load before writing or editing a doc under docs/, writing or changing a script, or designing an interface agents call."
+description: "Conventions for blaze's documents, scripts and agent-facing interfaces: docs/ front matter (current, plan, record, superseded) and the `docs` script (`scripts/src/bin/docs.rs`), scripts that take one typed JSON value, and no MCP. Load before writing or editing a doc under docs/, writing or changing a script, or designing an interface agents call."
 ---
 
 # Docs, scripts and agent interfaces
@@ -18,8 +18,8 @@ See [docs/v2/plan.md#9-one-interface](../../../docs/v2/plan.md#9-one-interface).
 
 Every doc under `docs/` has front matter: `current` (kept true), `plan`, `record` (dated history) or
 `superseded` (naming its replacement). Trust current docs; read plans and records as of their date.
-A change that makes a current doc untrue fixes it or marks it superseded in the same change;
-`python3 tools/docs.py check` holds them to the tree.
+A change that makes a current doc untrue fixes it or marks it superseded in the same change; `blaze
+run -q -p scripts --bin docs -- check` holds them to the tree.
 
 See [docs/contributing.md#documents](../../../docs/contributing.md#documents).
 
@@ -43,6 +43,8 @@ See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-
 
 ## Checking docs
 
-`python3 tools/docs.py check` holds every doc's links, and a current doc's anchors, repository
-paths in backticks and `BLAZE_*` settings, against the tree; `python3 tools/docs.py write`
-regenerates the index, docs/README.md. The front-matter fields are in `tools/docs.py`'s docstring.
+`blaze run -q -p scripts --bin docs -- check` holds every doc's links, and a current doc's anchors,
+repository paths in backticks and `BLAZE_*` settings, against the tree, and refuses a `.py` file
+that is not on `tools/python-allowed.txt`; `blaze run -q -p scripts --bin docs -- write` regenerates the index,
+docs/README.md. It runs on the pinned release, never on the tree's blaze. The front-matter fields
+are in `scripts/src/bin/docs.rs`'s module comment.

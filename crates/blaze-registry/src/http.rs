@@ -1,6 +1,7 @@
 //! Asking a server for a file: the [`Http`] trait the index and the downloads go through, the
 //! retries of cargo's `net.retry` (`src/util/network/retry.rs`), and [`HyperHttp`], over
-//! blaze-http (blaze's sans-IO HTTP/1.1 client, rustls with ring, driven on tokio); without the
+//! blaze-http (blaze's sans-IO HTTP/1.1 client, rustls with ring, driven on blaze-core's
+//! effects); without the
 //! `net` feature (the seed profile) a [`HyperHttp`] whose every request is [`NoNet`].
 
 use std::{

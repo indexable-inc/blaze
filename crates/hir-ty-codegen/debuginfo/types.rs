@@ -59,7 +59,7 @@ pub(crate) type Key = (StoredTy, u32);
 /// (layouts, names, captures, discriminants) mostly stays as it was. It is of the type alone,
 /// with the types it is made of by their keys, so that it is kept once for every type that is
 /// made of it, and depends on nothing of theirs.
-#[blaze_query::tracked(returns(clone))]
+#[blaze_memo::tracked(returns(clone), owns)]
 pub(crate) fn told_type(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -639,10 +639,17 @@ impl<'db> Types<'db> {
             self.captures(id.0.loc(self.db), args.tupled_upvars_ty(), offset_of, pointers);
         let parent_args = GenericArgs::new_from_slice(args.parent_args());
         let owner = MirOwner::coroutine(self.db, id.0, args);
-        let body = self
-            .db
-            .monomorphized_mir(owner, MirStage::Runtime, parent_args.store(), self.env.store())
-            .ok()?;
+        // Read once, for this type, and dropped with it: what is kept is the debug type
+        // (`told_type`'s row), never the instance's body (`monomorphized_once`).
+        let body = hir_ty::providers::monomorphized_once(
+            self.db,
+            owner,
+            MirStage::Runtime,
+            &parent_args.store(),
+            &self.env.store(),
+        )
+        .ok()?;
+        let body = &body;
         let held = body.locals_held_across_yields();
         let closure = id.0.loc(self.db);
         let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));

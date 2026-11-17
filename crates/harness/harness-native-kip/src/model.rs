@@ -52,7 +52,7 @@ pub struct Model {
 
 /// One corner of a face: `pos` the corner in its part's space and the part (`w`), `info` its normal (0 +x, 1 -x, 2 +y,
 /// 3 -y, 4 +z, 5 -z), its ink, its occlusion (0 darkest to 3 open) and which corner of the face it is (0 to 3).
-/// Byte for byte `MascotVertex` in shaders/mascot.slang.
+/// Byte for byte `MascotVertex` in harness-native-shaders' `mascot`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct Vertex {

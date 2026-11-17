@@ -1,0 +1,11 @@
+{
+ "id": "disk-9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "blaze: the build directory",
+ "what": "The linked executable is in the build directory twice, each with its own blocks (`debug/hello` and `debug/build/hello/<id>/out/hello`, 23.2 MB each on disk, 158.5 MB long), and so is its `.dSYM` (8.1 MB each): 31 MB of hello-world's 63 MB build directory is a second copy.",
+ "cost": "31 MB a program",
+ "cause": "each path is placed from the store as its own file and patched on its own",
+ "workaround": "none",
+ "state": "open: one file and a hard link, or the patch room gone (launcher.md step 5)"
+}

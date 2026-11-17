@@ -615,6 +615,14 @@ pub(super) static TARGETS: &[(&str, Cpus)] = &[
             &["aes", "crc", "crt-static", "dotprod", "dpb", "fcma", "fhm", "fp16", "jsconv", "lor", "lse", "neon", "outline-atomics", "pan", "pmuv3", "ras", "rdm", "sha2", "spe", "v8.1a", "v8.2a", "vh"],
         ],
     }),
+    ("naga-unknown-unknown", Cpus {
+        names: &[
+            ("generic", 0),
+        ],
+        sets: &[
+            &[],
+        ],
+    }),
     ("wasm32-unknown-unknown", Cpus {
         names: &[
             ("bleeding-edge", 0),

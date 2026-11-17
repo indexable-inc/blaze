@@ -86,6 +86,10 @@ pub struct LinkArgs {
     pub undefined: Undefined,
     /// ELF `-z nodelete` of a shared library: `DF_1_NODELETE`, never unloaded.
     pub nodelete: bool,
+    /// ELF `--export-dynamic-symbol PATTERN` of an executable, each pattern once in the order
+    /// given: every name the image defines that one matches ([`crate::args::glob`]) is
+    /// exported, and kept for it (`Stage::export_for_libraries`).
+    pub export_dynamic: Vec<String>,
 }
 
 /// What a symbol nothing on the link line defines becomes.
@@ -144,6 +148,13 @@ pub enum Debug {
     None,
     /// Line tables and function names: backtraces and breakpoints by line.
     Lines,
+    /// Line tables and function names in a file beside the image, which carries none
+    /// (docs/v2/plan/design/debug-side-file.md): [`crate::Image::debug_file`] gives what to
+    /// write of it once a link is committed. An ELF image names it in `.gnu_debuglink`; a
+    /// Mach-O image's is found by its `LC_UUID`. The image keeps its code, data, unwind
+    /// tables, symbol table and build id. A format blaze writes no side file for (PE, wasm)
+    /// refuses it at the image's making.
+    Beside,
 }
 
 /// A live image: it has a descriptor ([`blaze_live::patch::Descriptor`]) and patch regions,
