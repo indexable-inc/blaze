@@ -62,6 +62,7 @@ pub(crate) enum Planted {
     ObjectSized,
     ObjectAnyAuto,
     ObjectProjIgnoresBinding,
+    DynUndecidedAsNo,
 }
 
 #[cfg(not(test))]
@@ -308,9 +309,20 @@ fn with_self<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, rest: Lis
     cx.mk_list(&v)
 }
 
-/// The principal trait `d` is dyn compatible (`trait_is_dyn_compatible`).
-fn dyn_compatible<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, d: Def) -> Result<bool, Stop> {
-    Ok(cx.trait_def(d)?.flags.has(TraitFlags::DYN_COMPATIBLE))
+/// The principal trait `d` is dyn compatible (`trait_is_dyn_compatible`). A trait whose verdict
+/// the world could not reach (`TraitFlags::DYN_UNDECIDED`) is neither: the goal stops with
+/// `Unsupported::DynUndecided` naming it (rule 3). Before, the missing verdict read as "not
+/// compatible" and removed every object candidate, so `dyn Future<Output = T> + Send: Send`
+/// (listed auto trait) and `dyn Transport: Send` (an auto supertrait) answered No: tempo's
+/// false "cannot be sent between threads safely" findings (2026-11-18), whose `Future` and
+/// `Stream` verdicts were gaps (the run's "the dyn compatibility of
+/// `core::future::future::Future` is not decided" notes).
+pub(crate) fn dyn_compatible<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, d: Def) -> Result<bool, Stop> {
+    let flags = cx.trait_def(d)?.flags;
+    if flags.has(TraitFlags::DYN_UNDECIDED) && !planted(Planted::DynUndecidedAsNo) {
+        return Err(Stop::Error(SolveError::Unsupported(Unsupported::DynUndecided(d))));
+    }
+    Ok(flags.has(TraitFlags::DYN_COMPATIBLE))
 }
 
 // Assembly.
@@ -479,19 +491,19 @@ pub(crate) fn callable<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty,
         TyKind::FnDef(d, args) => {
             let sig: FnSigDef<'_> = cx.fn_sig(d)?;
             // `is_fn_trait_compatible` (a safe fn of the Rust ABI) and `has_target_features`.
-            if sig.flags & (FnSigDef::UNSAFE | FnSigDef::TARGET_FEATURE | FnSigDef::RUST_CALL) != 0 {
+            if sig.flags & (FnSigDef::UNSAFE | FnSigDef::TARGET_FEATURE | FnSigDef::NOT_FN_ABI) != 0 {
                 return Ok(Callable::No);
             }
             let io = cx.import_list(sig.portable, sig.inputs_output, args)?;
             split_sig(cx, io)
         }
         // `FnSig::is_fn_trait_compatible`: "!self.c_variadic() && self.safety().is_safe() &&
-        // self.abi().is_fn_trait_compatible()"; `ExternAbi::is_fn_trait_compatible` is false
-        // for the internal "rust-call" (and uncallable ABIs, which have no `Abi` here).
+        // self.abi() == ExternAbi::Rust" in the pinned nightly's rustc_type_ir: only a safe,
+        // non-variadic fn pointer of the Rust ABI; `extern "C" fn(u8) -> u8` is not `Fn(u8)`.
         TyKind::FnPtr(_, h) if h.c_variadic => Ok(Callable::No),
         TyKind::FnPtr(io, h) => match (h.safety, h.abi) {
-            (_, crate::term::Abi::RustCall) | (Safety::Unsafe, _) => Ok(Callable::No),
-            (Safety::Safe, _) => split_sig(cx, io),
+            (Safety::Safe, crate::term::Abi::Rust) => split_sig(cx, io),
+            _ => Ok(Callable::No),
         },
         TyKind::Closure(_, args) => {
             if args.len < 3 {

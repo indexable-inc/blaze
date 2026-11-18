@@ -24,12 +24,13 @@ use crate::tys::Tys;
 pub const PRELUDE: &str = include_str!("../tests/cases/prelude.solve");
 
 /// The case files, by name.
-pub const FILES: [(&str, &str); 5] = [
+pub const FILES: [(&str, &str); 6] = [
     ("core.solve", include_str!("../tests/cases/core.solve")),
     ("builtin.solve", include_str!("../tests/cases/builtin.solve")),
     ("auto.solve", include_str!("../tests/cases/auto.solve")),
     ("alias.solve", include_str!("../tests/cases/alias.solve")),
     ("coherence.solve", include_str!("../tests/cases/coherence.solve")),
+    ("dyn_auto.solve", include_str!("../tests/cases/dyn_auto.solve")),
 ];
 
 /// What a run found.
@@ -165,7 +166,13 @@ fn run_case<T: Tys>(case: &CaseA, decls: &[(u32, &DeclA)], tys: &mut T) -> Parse
                 let snap = tys.snapshot();
                 let r = solver.evaluate(tys, &world, mode, Goal { env, pred: c.pred, bound: c.bound }, &mut reads);
                 let res = match r {
-                    Err(s) => (line, false, format!("{:?}", g.expect), format!("stop {s:?}")),
+                    Err(s) => {
+                        let undecided = matches!(
+                            s,
+                            Stop::Error(crate::error::SolveError::Unsupported(crate::error::Unsupported::DynUndecided(_)))
+                        );
+                        (line, undecided && g.expect == Expect::DynUndecided, format!("{:?}", g.expect), format!("stop {s:?}"))
+                    }
                     Ok(a) => {
                         let got = match a {
                             Answer::Yes => "yes".to_string(),
@@ -199,6 +206,7 @@ fn run_case<T: Tys>(case: &CaseA, decls: &[(u32, &DeclA)], tys: &mut T) -> Parse
                             Expect::No => (line, a == Answer::No, "no".to_string(), got),
                             Expect::Maybe => (line, matches!(a, Answer::Maybe(Certainty::Ambiguous)), "maybe".to_string(), got),
                             Expect::Overflow => (line, matches!(a, Answer::Maybe(c) if c.is_overflow()), "overflow".to_string(), got),
+                            Expect::DynUndecided => (line, false, "dyn_undecided".to_string(), got),
                             other => return Err(CaseError { line, what: format!("a goal cannot expect {other:?}") }),
                         }
                     }

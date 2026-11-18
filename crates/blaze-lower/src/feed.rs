@@ -74,6 +74,15 @@ pub(crate) fn feed_words(m: &mut Machine<'_, '_, '_>, output: &Output, ranges: &
     m.expanding = false;
 }
 
+/// Feeds `output`, the parse of a text's input words, to `m`: `ranges` is each word's range in
+/// the text (the column [`parser::LexedStr::each_input_token`] gives beside the words), `end` the
+/// text's length. A step takes its range from the column in one step, never walking the trivia
+/// between its tokens; what it takes is [`Cursor::take`]'s on the same text (a take of no token
+/// is where the next token starts, or the text's end past the last).
+pub(crate) fn feed_input<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, ranges: AVec<'a, Range>, end: u32) {
+    run(m, output, Toks::Input { ranges, pos: 0, end }, None);
+}
+
 /// Feeds `output`, the parse of `lexed`, to `m`, expanding each body macro call through
 /// `expand` and feeding its expansion's parse in place: one stack of the parses open, the
 /// item's at the bottom, never a recursion.
@@ -94,6 +103,8 @@ enum Toks<'l, 't, 'a> {
     Lexed(Cursor<'l, 't>),
     /// Each word's range in the machine's text, and the next word.
     Words { ranges: AVec<'a, Range>, pos: usize },
+    /// A text's input words' ranges ([`feed_input`]), the next word, and the text's length.
+    Input { ranges: AVec<'a, Range>, pos: usize, end: u32 },
 }
 
 impl Toks<'_, '_, '_> {
@@ -105,6 +116,16 @@ impl Toks<'_, '_, '_> {
                 assert!(*pos + n <= ranges.len(), "the parser took a word past an expansion's last");
                 let range = match n {
                     0 => ranges.get(*pos).map_or(Range::new(0, 0), |r| Range::new(r.start, r.start)),
+                    _ => Range::new(ranges[*pos].start, ranges[*pos + n - 1].end),
+                };
+                *pos += n;
+                range
+            }
+            Toks::Input { ranges, pos, end } => {
+                let n = n as usize;
+                assert!(*pos + n <= ranges.len(), "the parser took a token past the lexer's last");
+                let range = match n {
+                    0 => ranges.get(*pos).map_or(Range::new(*end, *end), |r| Range::new(r.start, r.start)),
                     _ => Range::new(ranges[*pos].start, ranges[*pos + n - 1].end),
                 };
                 *pos += n;
@@ -126,8 +147,50 @@ struct Level<'o, 'l, 't, 'a> {
     toks: Toks<'l, 't, 'a>,
 }
 
+/// What one parse's steps need of the machine's two stacks, counted from its event words before
+/// the first step, so neither grows by reallocation while the parse is fed (lane RP4, floor C3).
+/// An expansion fed later is a parse of its own, its values on top: they may grow then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Sizes {
+    /// The most values live at once: one per token, lazy node and node (a node's exit leaves
+    /// one in place of its children's), five more per float split (`x.0.1`: two names, their
+    /// two `NAME_REF`s, the dot). [`Machine::size_for`] reserves it past the stack's length, so
+    /// a nested feed (fmt.rs's arguments) adds its own on top.
+    pub(crate) vals: usize,
+    /// The deepest nesting of open nodes, a float split's own `NAME_REF` counted.
+    pub(crate) depth: usize,
+}
+
+impl Sizes {
+    /// The sizes of `output`'s steps: one pass over its words, no allocation.
+    pub(crate) fn of(output: &Output) -> Sizes {
+        let (mut at, mut sizes, mut depth) = (0, Sizes::default(), 0usize);
+        while let Some((step, next)) = output.step(at) {
+            at = next;
+            match step {
+                OutlineStep::Step(Step::Token { .. }) | OutlineStep::Lazy { .. } => sizes.vals += 1,
+                OutlineStep::Step(Step::Enter { .. }) => {
+                    depth += 1;
+                    sizes.vals += 1;
+                    sizes.depth = sizes.depth.max(depth);
+                }
+                OutlineStep::Step(Step::Exit) => depth = depth.saturating_sub(1),
+                // `apply`: a `NAME_REF` one deeper, and one exit of an open node per field.
+                OutlineStep::Step(Step::FloatSplit { ends_in_dot }) => {
+                    sizes.vals += 5;
+                    sizes.depth = sizes.depth.max(depth + 1);
+                    depth = depth.saturating_sub(if ends_in_dot { 1 } else { 2 });
+                }
+                OutlineStep::Step(Step::Error { .. }) => {}
+            }
+        }
+        sizes
+    }
+}
+
 fn run<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, toks: Toks<'_, '_, 'a>, mut expand: Option<&mut dyn Expand>) {
     let alloc = m.allocator();
+    m.size_for(Sizes::of(output));
     let mut levels: AVec<'_, Level<'_, '_, '_, '_>> = Vec::new_in(alloc);
     levels.push(Level { parse: Parse::Base(output), at: 0, toks });
     // The calls this body has run, every nesting counted: past the budget, a call is refused.

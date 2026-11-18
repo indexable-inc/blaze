@@ -666,6 +666,11 @@ pub(crate) enum Field {
     Imm19,
     /// `adr`: a 21-bit byte offset, its low 2 bits in 29..31 and the rest in 5..24, ±1 MiB.
     Adr,
+    /// The far own-data form (pass/reach.rs): `adr xD, #0; movz x10, #lo; movk x10, #hi, lsl
+    /// #16; add xD, xD, x10`, the patch at the `adr`; the offset from the `adr` to the target,
+    /// at least 0 and below 4 GiB, goes in the `movz` and the `movk` (the pass writes both words:
+    /// [`Field::patch`] answers `None` for it).
+    Far32,
 }
 
 impl Field {
@@ -691,6 +696,19 @@ impl Field {
                 let imm = bytes as u32;
                 Some((word & !((3 << 29) | (0x7_ffff << 5))) | ((imm & 3) << 29) | (((imm >> 2) & 0x7_ffff) << 5))
             }
+            // Two words, not one: the pass's `settle` writes them (pass/reach.rs `far_words`).
+            Field::Far32 => None,
         }
     }
+}
+
+/// The two words of the far own-data form's offset ([`Field::Far32`]): `movz x10, #lo` and
+/// `movk x10, #hi, lsl #16` for `bytes` from the form's `adr`, or `None` unless `0 <= bytes <
+/// 4 GiB`.
+pub(crate) const fn far32_words(bytes: i64) -> Option<(u32, u32)> {
+    if bytes < 0 || bytes >= 1 << 32 {
+        return None;
+    }
+    let off = bytes as u32;
+    Some((movz(X10, off & 0xffff, 0), movk(X10, off >> 16, 1)))
 }

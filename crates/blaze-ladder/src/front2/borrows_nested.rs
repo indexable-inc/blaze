@@ -110,6 +110,16 @@ impl Facts for NestedFacts<'_, '_> {
     }
 }
 
+/// The item-relative range of the closure or async block `of` is the flow of, when it is a
+/// nested one (`FlowOf::is_nested`); `None` for the owner's flow: where a refusal of that flow
+/// is (borrows.rs `BorrowVerdict::within`).
+pub fn nested_range(view: &tc::BodyView<'_>, of: FlowOf) -> Option<(u32, u32)> {
+    match of {
+        FlowOf::Closure(e) | FlowOf::AsyncBlock(e) if of.is_nested(view) => view.expr_ranges.get(e.ix()).map(|r| (r.start, r.end)),
+        _ => None,
+    }
+}
+
 /// The flow after `at` in the body's order: the owner's first, then each closure and async block
 /// in expression order. `None` after the last. One pass over the expressions in all.
 pub fn next_nested(view: &tc::BodyView<'_>, at: FlowOf) -> Option<FlowOf> {

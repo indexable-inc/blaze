@@ -58,6 +58,20 @@ impl fmt::Display for PublicKey {
     }
 }
 
+/// The keys a published set (published/set.rs) is believed from with nothing named: the
+/// trusted builders' (CI's, later the remote workers'), compiled into blaze (D137), never read
+/// from a file a project or a toolchain manifest could change. EMPTY until CI has its key: so
+/// today every published set is believed only through the key a command names for its origin
+/// (`--origin-key`), and with none named a set is refused `UnknownSigner`, by name.
+pub const PUBLISHED_KEYS: &[PublicKey] = &[];
+
+/// The one answer to "is `signer` trusted for this origin": one of the compiled-in
+/// [`PUBLISHED_KEYS`], or one of `named`, the keys the command granted that origin by name
+/// (`--origin-key`; none named: empty). Nothing else makes a key trusted.
+pub fn trusted_for(signer: &PublicKey, named: &[PublicKey]) -> bool {
+    PUBLISHED_KEYS.contains(signer) || named.contains(signer)
+}
+
 impl fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "PublicKey({self})")

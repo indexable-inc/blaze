@@ -94,10 +94,13 @@ mod where_projection;
 mod promote;
 mod impl_for_object;
 mod blanket_beside_own_impl;
+mod coerce_target_obligations;
+mod assoc_ty_variant;
 mod self_fn_impl_args;
 mod specialize;
 mod dyn_closure_sig;
 mod diag_node;
+mod fn_ptr_fn_traits;
 
 /// The keys of the world's items the cases name.
 struct Items {

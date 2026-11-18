@@ -178,22 +178,18 @@ impl core::fmt::Display for ConstFail {
 /// Makes the store's row of ADT `adt`, which the evaluator's layout asked for and did not find
 /// (`size_of::<S>()` in constant `item`): by `Store::ensure(Want::Adt)`, the one maker of an
 /// ADT's row (the run path's too: program.rs), so the evaluator and the code builder lay out
-/// the same row. A row that cannot be made, or that is made and still gives no layout (a
-/// narrowed valid range: [`ConstsWorld::adt`]), is the constant's refusal, naming the ADT. A
+/// the same row. A row that cannot be made, or that is made and still gives no layout, is the
+/// constant's refusal, naming the ADT. A
 /// row whose head names a constant (`struct S([u8; N])`) is refused here by that name: the
 /// evaluator is busy with `item` (owed: one work list over constants and heads).
 fn adt_row<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,item: ItemKey, adt: ItemKey) -> Result<(), ConstFail> {
     let refuse = |why: String| ConstFail::AdtRow { item, adt, why: why.into_boxed_str() };
-    let narrowed = "its valid range is narrowed (`rustc_layout_scalar_valid_range_*`), which the constant evaluator's layout does not read yet";
-    match r.store.adts.get(&adt) {
-        Some(a) if a.narrowed => return Err(refuse(String::from(narrowed))),
-        Some(_) => return Err(refuse(String::from("its row is made and the layout still does not find it"))),
-        None => {}
+    if r.store.adts.contains_key(&adt) {
+        return Err(refuse(String::from("its row is made and the layout still does not find it")));
     }
     let lib = r.keys.library_in(r.names, adt).ok_or_else(|| refuse(String::from("it has no library key")))?;
     r.store.ensure(r.names, &mut *r.keys, super::heads::Want::Adt(lib)).map_err(|e| refuse(format!("{e}")))?;
     match r.store.adts.get(&adt) {
-        Some(a) if a.narrowed => Err(refuse(String::from(narrowed))),
         Some(_) => Ok(()),
         None => Err(refuse(String::from("its head was made, but no row is filed under its key"))),
     }
@@ -375,11 +371,9 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
     /// The store's row of the ADT (heads.rs `Store::adt`: the one maker, the same row the run
     /// path hands the code builder: program.rs `FrontEnd::adt`). `None` while the row is not
     /// made: the layout refuses naming the ADT, and [`Consts::value`] makes the row and asks
-    /// again. `None` too for a row with a narrowed valid range
-    /// (`rustc_layout_scalar_valid_range_*`), which `valid_range` below does not read: its
-    /// niche would be wrong, so it has no layout here (`Consts::value` names that refusal).
+    /// again.
     fn adt(&self, key: ItemKey) -> Option<tc::Adt<'_>> {
-        let a = self.store.adts.get(&key).filter(|a| !a.narrowed)?;
+        let a = self.store.adts.get(&key)?;
         Some(tc::Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.store.tys.view() })
     }
 
@@ -396,8 +390,10 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
         Ok(self.store.adts.get(&key).and_then(|a| a.discrs.get(variant as usize)).copied())
     }
 
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
+    /// From the ADT's row (heads.rs `AdtRow::valid`), as the run path answers (program.rs
+    /// `FrontEnd::valid_range`): a constant and the code agree on every niche.
+    fn valid_range(&self, key: ItemKey) -> ValidRange {
+        self.store.adts.get(&key).map_or(ValidRange::default(), |a| a.valid)
     }
 
     /// By the checker's solver over the store (front2/const_project.rs): a field's type

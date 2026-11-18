@@ -407,16 +407,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // `associated_path_to_ty` checks the variants first; its deny-by-default lint
                 // `ambiguous_associated_items` refuses a variant and an associated item of one
                 // name through `Self` or an alias, so either order types such a program alike).
+                // Without arguments on its segment the variant is found by
+                // [`Self::assoc_value`], as through any type-relative path.
                 let seg = segs[consumed];
-                if adt.kind == crate::world::AdtKind::Enum {
+                if adt.kind == crate::world::AdtKind::Enum && seg.has_args {
                     if let Some((i, v)) = adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name) {
                         let (vkey, ctor) = (v.key, v.ctor);
                         let def = Def::Ctor { adt: k, variant: i as u32, kind: ctor };
-                        let args = match seg.has_args {
-                            // `E::A::<T>`: the arguments on the variant's segment.
-                            true => self.explicit_args(at, Some(seg), k, 0, adt.generics)?,
-                            false => args,
-                        };
+                        // `E::A::<T>`: the arguments on the variant's segment.
+                        let args = self.explicit_args(at, Some(seg), k, 0, adt.generics)?;
                         let t = self.ctor_ty(at, k, Some(vkey), ctor, args, Some(seg.name))?;
                         if !self.is_err(t) {
                             self.defs.push((at, def));
@@ -429,31 +428,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             // `A::new()`, `A::Variant` through `type A<..> = X;` (rules/alias_path.rs): `X` at
             // the alias's segment's arguments, then a variant of the enum it is, then an
             // associated item of it, as for the type written.
+            // The variant is found by [`Self::assoc_value`], as for any type-relative path.
             Def::Alias(k) => {
                 let Some(t) = self.alias_path_ty(at, cause, k, segs[consumed - 1])? else {
                     return Ok(self.common.err);
                 };
-                let seg = segs[consumed];
-                if let TyView::Adt(ak, args) = self.view(t) {
-                    if let Some(adt) = self.reads.adt(ak)? {
-                        if adt.kind == crate::world::AdtKind::Enum {
-                            if let Some((i, v)) = adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name) {
-                                if seg.has_args {
-                                    // rustc's E0109 on a variant's arguments after an alias
-                                    // that gave the enum's: refused by name.
-                                    return Err(CheckError::Unported("generic arguments on a variant named through a type alias").into());
-                                }
-                                let (vkey, ctor) = (v.key, v.ctor);
-                                let def = Def::Ctor { adt: ak, variant: i as u32, kind: ctor };
-                                let t = self.ctor_ty(at, ak, Some(vkey), ctor, args, Some(seg.name))?;
-                                if !self.is_err(t) {
-                                    self.defs.push((at, def));
-                                }
-                                return Ok(t);
-                            }
-                        }
-                    }
-                }
                 t
             }
             Def::TyParam(i) => self.mk(TyView::Param(i))?,
@@ -759,7 +738,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `T` is a parameter, and the trait of the impl the body is a member of (rustc_resolve
     /// counts the current impl's trait in scope: `Self::g()` in `impl Tr for E` needs no
     /// `use`). An item reached twice is one candidate: candidates are counted by item key.
+    ///
+    /// Before any of them: a variant of the enum `T` is (rustc_hir_typeck method/mod.rs
+    /// `resolve_fully_qualified_call`, "Check if we have an enum variant", ahead of the probe;
+    /// RFC 2338 `type_alias_enum_variants`, stable since 1.37: "the variants of an enum may be
+    /// named through any path that resolves to the enum's type": `Alias::V`, `Self::V`,
+    /// `<E>::V`, and through an associated type `Self::Error::Overflow` where `type Error =
+    /// FromUintError<u8>`). An associated item of the same name is shadowed by the variant
+    /// (rustc's deny-by-default `ambiguous_associated_items` refuses such a program anyway).
     fn assoc_value(&mut self, at: At, cause: Cause, self_ty: Ty, seg: Segment, scope: ScopeId) -> Result<Ty, Stop> {
+        let self_ty = self.try_structurally_resolve(self_ty)?;
+        if let Some(t) = self.type_relative_variant(at, self_ty, seg)? {
+            return Ok(t);
+        }
         // A type parameter has no inherent items (the Reference, "Implementations", "Inherent
         // implementations": the implementing type is a nominal type), so the world is not asked:
         // its answer for "any type" would list every inherent impl whose self type it could
@@ -840,6 +831,31 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         self.diag(DiagCode::NoMethod, at, About::found_named(self_ty, seg.name));
         Ok(self.common.err)
+    }
+
+    /// The variant `seg` of the enum `self_ty` is, as a value at the enum's own arguments
+    /// (its ctor: the enum for a unit variant, the variant's fn item for a tuple one, E0533's
+    /// class for a braced one), recorded at its node; `None` when `self_ty` is no enum or has
+    /// no variant of that name. Generic arguments on the variant's segment after a type that
+    /// already gave the enum's are rustc's E0109 ("type arguments are not allowed on this
+    /// type"), for which the checker has no code: refused by name.
+    fn type_relative_variant(&mut self, at: At, self_ty: Ty, seg: Segment) -> Result<Option<Ty>, Stop> {
+        let TyView::Adt(k, args) = self.view(self_ty) else { return Ok(None) };
+        let Some(adt) = self.reads.adt(k)? else { return Ok(None) };
+        if adt.kind != crate::world::AdtKind::Enum {
+            return Ok(None);
+        }
+        let Some((i, v)) = adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name) else { return Ok(None) };
+        if seg.has_args {
+            return Err(CheckError::Unported("generic arguments on a variant named through a type-relative path (E0109)").into());
+        }
+        let (vkey, ctor) = (v.key, v.ctor);
+        let def = Def::Ctor { adt: k, variant: i as u32, kind: ctor };
+        let t = self.ctor_ty(at, k, Some(vkey), ctor, args, Some(seg.name))?;
+        if !self.is_err(t) {
+            self.defs.push((at, def));
+        }
+        Ok(Some(t))
     }
 
     /// The traits of the body's where-clauses whose self type is parameter `i`, elaborated

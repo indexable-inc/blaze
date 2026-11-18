@@ -20,7 +20,7 @@ use blaze_typeck::{
     Predicates, ScopeId, Seal, Shape, TraitDef, TypeAttrs, World,
 };
 
-use super::buckets::Buckets;
+use super::buckets::{Buckets, Seen, Unseen};
 use super::fill::FillError;
 use super::heads::{Seeded, Store, Want};
 use super::index::Index;
@@ -39,8 +39,9 @@ pub const MOST_IMPORTS_A_QUESTION: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fill {
     Store(Want),
-    /// The headers of the impls that can answer a trait at a shape, then the answer.
-    Impls(ItemKey, Shape),
+    /// The headers of the impls that can answer a trait at a shape, then the answer: of the
+    /// impls the asker sees (buckets.rs [`Seen`]: a checked body's crate's link closure).
+    Impls(ItemKey, Shape, Seen),
     /// The headers of the inherent impls of a shape that declare an item of the name, then
     /// the shape's items of that name. The name filters first, as rustc finds an inherent item
     /// by name before it unifies self types: `impl Uint<{ <U1792>::LIMBS / 2 }> { fn concat }`
@@ -114,6 +115,8 @@ pub enum Gap {
     /// without its field defaults (every maker files both: heads.rs `Store::adt`, and a head
     /// record carries them since form 8, head_record.rs).
     FieldDefaults(ItemKey),
+    /// The crates whose impls a checked body sees were not told (buckets.rs [`Unseen`]).
+    Sight(Unseen),
 }
 
 impl core::fmt::Display for Gap {
@@ -159,6 +162,7 @@ impl core::fmt::Display for Gap {
             Gap::Site { path, why: Some(why) } => write!(f, "the body path {path}: {why}"),
             Gap::Site { path, why: None } => write!(f, "the body path {path} has no mark row in the world (made without the body's `path_marks`)"),
             Gap::FieldDefaults(k) => write!(f, "the field defaults of ADT {k:?}, read by a base-less `S {{ a: 1, .. }}`: its head row was filed without them"),
+            Gap::Sight(why) => write!(f, "{why}"),
         }
     }
 }
@@ -339,7 +343,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         // (each is a function of its own record), and the check's `BuildOrder` is the round
         // loop's, which a body answered in one round never reaches.
         let made = match fill {
-            Fill::Impls(trait_, shape) => trait_question(self.names, &mut heads, b, trait_, shape, BuildOrder::AsAsked),
+            Fill::Impls(trait_, shape, seen) => trait_question(self.names, &mut heads, b, trait_, shape, seen, BuildOrder::AsAsked),
             Fill::Inherent(shape, name) => inherent_question(self.names, &mut heads, b, shape, name, BuildOrder::AsAsked),
             Fill::Store(_) => return self.fill(fill),
         };
@@ -618,17 +622,31 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         }
     }
 
+    /// Whose impls this world's trait questions see (buckets.rs [`Seen`]): checking a body
+    /// (`Reveal::InBody`), its crate's and the crates it links; at ground arguments after
+    /// checking (`Reveal::All`), the whole program's.
+    fn seen(&self) -> Result<Seen, Unseen> {
+        match self.reveal {
+            super::opaque_auto::Reveal::All => Ok(Seen::Program),
+            super::opaque_auto::Reveal::InBody => Seen::of_checked_body(self.names, self.module),
+        }
+    }
+
     fn impls_of_once(&self, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
-        if let Some((k, why)) = self.buckets.and_then(|b| b.trait_gap(trait_, shape)) {
+        let seen = match self.seen() {
+            Ok(seen) => seen,
+            Err(why) => return self.gap(Gap::Sight(why)),
+        };
+        if let Some((k, why)) = self.buckets.and_then(|b| b.trait_gap_seen(trait_, shape, seen)) {
             let asked = match self.keys.library_in(self.names, trait_) {
                 Some(lib) => format!("the impls of the trait {lib:x} at {shape:?}"),
                 None => format!("the impls of the trait {trait_:?} at {shape:?}"),
             };
             return self.gap(self.failed_impl(k, &why, &asked));
         }
-        match self.buckets.and_then(|b| b.impls_of(trait_, shape)) {
+        match self.buckets.and_then(|b| b.impls_seen(trait_, shape, seen)) {
             Some(v) => Ok(v),
-            None => self.impl_question(Fill::Impls(trait_, shape)),
+            None => self.impl_question(Fill::Impls(trait_, shape, seen)),
         }
     }
 

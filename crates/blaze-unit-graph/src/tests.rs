@@ -18,6 +18,9 @@ use edition::{Edition, PackageEdition};
 use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, Package, Platform, Resolver, TargetDesc};
 use crate::{Pass, Plant, Resolution, UnitError, UnitGraph, UnitKind, record};
 
+/// tempo-primitives and reth-codecs in miniature: dev-dependency unification (src/tests/dev_unify.rs).
+mod dev_unify;
+
 fn a() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }

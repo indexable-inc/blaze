@@ -33,8 +33,8 @@ mod tool_attr_spaced;
 
 pub use answer::{Held, Lack, Note, Own, Records, Variant, answer, helpers_digest};
 pub use exports::publish_expanded_exports;
-pub use fill::{ExpandPart, Fill, FillEnv, FillReport, First, NamesPart, Par, Serial, Stage};
-pub use lower::{Attrs, BodySrc, CallSrc, Cfg, Files, Fragment, ImplSrc, ItemText, KNOWN_FALSE, LangSrc, Loc, LowerCx, LowerNote, LowerNoteKind, Lowered, MOST_CFG_DEPTH, MOST_MODULES, MacroBody, MacroSrc, Member, ModMade, ProcAttr, ProcDecls, ProcExport, Module, prelude_attr, PreludeImport, RootInput, RootNote, RootPlan, SplitTop, Target, Tree, UseLeaf, WalkNote, WalkRow, Walked, Where, args, crate_root, crate_tools, file_attrs, first_line, head, inline_child, inside, is_builtin_attr, item_attrs, key_of, lower, make_key, parse_path, parse_path_marked, root_key, rules_shapes, string_value, strip_attr, to_path, to_path_marked, unraw, use_leaves, walk, walk_rows};
+pub use fill::{ExpandPart, Fill, FillEnv, FillReport, First, NamesPart, Par, Scratch, Serial, Stage};
+pub use lower::{AttrOrder, Attrs, BodySrc, CallSrc, Cfg, Files, Fragment, ImplSrc, ItemText, KNOWN_FALSE, LangSrc, Loc, LowerCx, LowerNote, LowerNoteKind, Lowered, MOST_CFG_DEPTH, MOST_MODULES, MacroBody, MacroSrc, Member, ModMade, ProcAttr, ProcDecls, ProcExport, Module, prelude_attr, PreludeImport, RootInput, RootNote, RootPlan, SplitTop, Target, Tree, UseLeaf, WalkNote, WalkRow, Walked, Where, args, crate_root, crate_tools, file_attrs, first_line, head, inline_child, inside, is_builtin_attr, item_attrs, key_of, lower, make_key, parse_path, parse_path_marked, root_key, rules_shapes, string_value, strip_attr, to_path, to_path_head, to_path_marked, unraw, use_leaves, walk, walk_rows};
 // resolve.rs: a made module's paths joined as the walk joins them.
 pub(crate) use lower::{joined, pop_dir};
 pub use prefetch::{MOST_HOPS, Prefetch, prefetch};

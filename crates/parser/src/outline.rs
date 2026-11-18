@@ -36,10 +36,17 @@ const WATCHED: [bool; SyntaxKind::__LAST as usize + 1] = {
 /// doc comment right before a `}` (the statement expected after it takes the `}`), a `#` or a
 /// `<` right before a brace (the expression or generic parameter expected there takes it) and
 /// `builtin #` (whose `asm` operands' recovery takes any token).
+///
+/// A lexer's [`SyntaxKind::LAZY_BODY`] (an outline lexer's, [`crate::LexedStr::new_outline`]),
+/// which the input has as a `{` of that contextual kind, is such a block already, found and
+/// checked by the same rules from the bytes: one token.
 pub fn lazy_block_len<'t>(input: impl Into<Tokens<'t>>, start: usize) -> Option<u32> {
     let input = input.into();
     if input.kind(start) != T!['{'] {
         return None;
+    }
+    if input.contextual_kind(start) == SyntaxKind::LAZY_BODY {
+        return Some(1);
     }
     let mut depth = 0usize;
     let mut brackets = 0usize;

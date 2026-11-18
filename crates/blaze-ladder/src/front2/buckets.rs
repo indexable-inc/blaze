@@ -17,7 +17,7 @@
 //! ([`PathSelf`], [`Homes::local`]). The check loop lowers the candidates' headers ([`Buckets::trait_wants`]),
 //! then [`Buckets::answer`] keeps those whose lowered header matches, and the answer is kept.
 
-use core::cell::{Ref, RefCell, RefMut};
+use core::cell::{OnceCell, Ref, RefCell, RefMut};
 use std::alloc::Global;
 use std::boxed::Box;
 use std::format;
@@ -36,6 +36,7 @@ use blaze_typeck::{AssocItem, AssocKind, ItemKey, Mutbl, Name, PNode, PTy, PTys,
 use super::heads::{Store, lower};
 use super::index::Index;
 use super::keys::{Keys, checker_of};
+use super::linked::{Linked, RootsError};
 use super::rows::Rows;
 use super::source::NamesSource;
 use super::types::{PRIMS, children, path_texts};
@@ -57,6 +58,162 @@ pub use records::{
 pub enum Unfilled {
     Impl(LibKey),
     Fn(ItemKey),
+    /// The crates a checked body sees could not be told ([`Unseen`]): its trait questions are
+    /// not answered, never answered over the whole program.
+    Sight(Unseen),
+}
+
+/// Whose impls a trait question's answer is made from: the key's third part (rule 21: the
+/// crates seen are an input of the answer, so they are in its key).
+///
+/// The rule: a body of crate C is checked against the impls of C and of the crates C links
+/// (its dependency closure, front2 linked.rs), never of a crate that depends on C. Coherence
+/// makes that set complete for every goal C's text can write (the Reference, "Orphan rules":
+/// an impl of a crate downstream of C names one of its OWN types or traits, which C's text
+/// cannot name); seeing more only lets an inference variable of C's body meet an impl it
+/// could never mean. rustc checks core's bodies seeing core's impls alone, so `v ==
+/// (ErrorKind::NotFound as _)` in core's `from_prim!` infers `_ = u32` from `impl PartialEq for
+/// u32`, the one impl of `u32: PartialEq<?T>`; a program that also links a crate with `impl
+/// PartialEq<Mine> for u32` made that goal ambiguous in the walk and the cast E0282 (lane RF13,
+/// 2026-11-18: the entry programs refused core's `<impl ErrorKind>::from_prim`).
+///
+/// A question at ground arguments after checking (an instance's resolution, a borrow check,
+/// a test entry) sees the whole program: a downstream type may be there (`[Mine]::contains`
+/// asks `Mine: PartialEq` in core's generic body), and no inference variable is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Seen {
+    /// Every crate of the program: a question at ground arguments (`Reveal::All`).
+    Program,
+    /// The crate's and the crates it links: a body of that crate checked (`Reveal::InBody`).
+    From(usize),
+}
+
+/// Why the crates a checked body sees were not told (rule 19: the crate or module named).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unseen {
+    /// The body's module is of no crate of the names.
+    NoCrate { module: LibKey },
+    /// The names source did not answer the crate's links (records: a fact filed in its log).
+    NotAnswered { krate: usize },
+    /// The crate is no crate of the names.
+    Roots(RootsError),
+    /// A read list of a body of the crate holds an impl question's bucket rows, and no sight of
+    /// the crate was made ([`Buckets::sight_made`]): the question was answered on a path that
+    /// did not ask [`Buckets::sight`].
+    NotMade { krate: usize },
+}
+
+impl Seen {
+    /// What a body checked in `module` sees (`Reveal::InBody`, front2 world_items.rs): its
+    /// crate's, by the module key's prefix (no record is read).
+    pub fn of_checked_body<'n, S: NamesSource<'n>>(names: S, module: LibKey) -> Result<Seen, Unseen> {
+        names.crate_of(module).map(Seen::From).ok_or(Unseen::NoCrate { module })
+    }
+}
+
+impl core::fmt::Display for Unseen {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Unseen::NoCrate { module } => write!(f, "the checked body's module {module:x} is of no crate, so the impls it sees (its crate's dependency closure) are not known"),
+            Unseen::NotAnswered { krate } => write!(f, "the crates crate {krate} links were not answered by the names source, so the impls its bodies see are not known"),
+            Unseen::Roots(e) => write!(f, "the impls a checked body sees: {e}"),
+            Unseen::NotMade { krate } => write!(f, "a read list of a body of crate {krate} holds impl bucket rows, and no sight of the crate was made (front2 buckets.rs `Buckets::sight_made`)"),
+        }
+    }
+}
+
+/// The crates one trait question's answer may hold impls of ([`Seen`]): every crate, or a
+/// crate's dependency closure.
+#[derive(Clone, Copy)]
+pub struct Sight<'l> {
+    pub seen: Seen,
+    /// `None`: every crate of the source.
+    row: Option<&'l SightRow>,
+}
+
+/// One crate's sight, made once a [`Buckets`] ([`Buckets::sight`]).
+///
+/// WHERE IT COMES FROM, so that it adds no read (rule 77; lane RF13, 2026-11-18): the crates a
+/// body sees are a function of the crate list (the unit graph), never of a names record.
+/// - Over records, crate 0 is the crate whose check scope the records ARE (blaze-world
+///   check_scope.rs, the one rule of which crates a body sees: blaze-cli engine_bodies.rs
+///   `scope_of` puts the member at 0 and its scope after it; a program's records put the
+///   program at 0 and the crates it links after it): it sees every crate of them, which the
+///   crate list alone says. Before, the sight was asked of the names source's link closure
+///   (`NamesSource::linked`), which over the read-only view (front2 tables/view.rs) records
+///   every crate's names and items WHOLE: every body that asked a trait question read every
+///   crate's `CrateScope` whole, so any names edit entered it (blaze-cli
+///   engine_edit_rows_tests.rs R6, R8, R10, R11; engine_scope_reads_tests.rs, four cases).
+/// - Over the solved names, the link closure (front2 linked.rs `Linked`, the names path's
+///   reading of the same rule over the in-memory crate graph): no record, so no read.
+/// - Over records, a crate other than 0 (a dependency's body checked over a program's records:
+///   tests only; the engine checks members, each over its own scope): the link closure, which
+///   reads names whole (owed, stated: the end form is the unit graph's edges handed to the
+///   records, blaze-world crate_list.rs `CrateGraph::deps`).
+struct SightRow {
+    /// `None`: every crate of the records.
+    closure: Option<Linked<'static>>,
+    /// The first 16 bytes of each seen crate's key, sorted: what a read-list row names a crate
+    /// by (buckets/asked.rs [`BucketRead::krate`]). Empty when `closure` is `None`.
+    ids: blaze_own::AVec<'static, u128>,
+}
+
+/// The first 16 bytes of a crate's key, big-endian: [`BucketRead::krate`]'s form.
+fn crate_id(key: blaze_id::CrateItemKey) -> u128 {
+    let mut first = [0u8; 16];
+    first.copy_from_slice(&key.0.0[..16]);
+    u128::from_be_bytes(first)
+}
+
+impl SightRow {
+    /// Crate `krate`'s sight over `names` (the type's docs); the closure in `alloc`.
+    fn of<'n, S: NamesSource<'n>>(names: S, krate: usize, alloc: blaze_own::Alloc<'static>) -> Result<SightRow, Unseen> {
+        if krate >= names.crate_count() {
+            return Err(Unseen::NotAnswered { krate });
+        }
+        let mut ids = blaze_own::AVec::new_in(alloc);
+        if names.solved().is_none() && krate == 0 {
+            return Ok(SightRow { closure: None, ids });
+        }
+        let linked = match names.linked(&[krate], alloc) {
+            None => return Err(Unseen::NotAnswered { krate }),
+            Some(Err(e)) => return Err(Unseen::Roots(e)),
+            Some(Ok(linked)) => linked,
+        };
+        // The crate graph: no record is read (`NamesSource::crate_key`).
+        for c in linked.crates() {
+            let Some(key) = names.crate_key(c) else { return Err(Unseen::NotAnswered { krate: c }) };
+            ids.push(crate_id(key));
+        }
+        ids.sort_unstable();
+        Ok(SightRow { closure: Some(linked), ids })
+    }
+}
+
+impl Sight<'_> {
+    /// The whole program's.
+    pub const PROGRAM: Sight<'static> = Sight { seen: Seen::Program, row: None };
+
+    /// Whether an impl written in `krate` may answer: an impl of no known crate stays, as
+    /// [`BucketIndex::trait_candidates`]'s home keeps it (the wide side: a refusal, if any,
+    /// never a dropped impl).
+    pub fn sees(&self, krate: Option<usize>) -> bool {
+        match (self.row.and_then(|row| row.closure.as_ref()), krate) {
+            (Some(linked), Some(c)) => linked.links(c),
+            _ => true,
+        }
+    }
+
+    /// Whether a read-list row of an impl question belongs to this sight's answer: a fact of
+    /// the whole graph (`krate` 0: the incoherent crates) always; a crate's bucket only when the
+    /// crate is seen. A bucket of a crate the body does not see cannot move its answer
+    /// ([`Buckets::answer`] takes none of its impls), so it is no read of the body.
+    pub fn sees_read(&self, read: &BucketRead) -> bool {
+        match self.row {
+            Some(SightRow { closure: Some(_), ids }) => read.krate == 0 || ids.binary_search(&read.krate).is_ok(),
+            _ => true,
+        }
+    }
 }
 
 impl core::fmt::Display for Unfilled {
@@ -64,6 +221,7 @@ impl core::fmt::Display for Unfilled {
         match self {
             Unfilled::Impl(k) => write!(f, "the candidate impl {k:x} has no header in the store when its question is answered"),
             Unfilled::Fn(k) => write!(f, "the inherent impl fn {k:?} has no `self` flag in its impl's head when its question is answered"),
+            Unfilled::Sight(why) => write!(f, "{why}"),
         }
     }
 }
@@ -1062,11 +1220,19 @@ fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, Vec<V, Global>, Global>,
 /// (between rounds, `&mut Buckets`) reaches the index through [`Buckets::index_get_mut`], which
 /// takes no runtime borrow. No `unsafe`.
 pub struct Buckets {
-    answers: Rows<(ItemKey, Shape), Vec<ItemKey, Global>>,
+    /// Each trait question's answer, by the trait, the shape and whose impls it may hold
+    /// ([`Seen`]).
+    answers: Rows<(ItemKey, Shape, Seen), Vec<ItemKey, Global>>,
     /// Per answered trait question, the least-keyed candidate whose header failed: the
     /// question's gap. Only a question that HAS such a candidate is a gap of the body asking it,
     /// so a body's outcome never depends on which other bodies or rounds lowered what first.
-    answer_failed: Rows<(ItemKey, Shape), LibKey>,
+    answer_failed: Rows<(ItemKey, Shape, Seen), LibKey>,
+    /// Each crate's sight ([`SightRow`]), made once at its first checked body's first trait
+    /// question ([`Buckets::sight`]) in the store's allocator, which that question names.
+    sights: OnceCell<Rows<usize, SightRow, blaze_own::Alloc<'static>>>,
+    /// A test's removed cause ([`Buckets::plant_whole_program_sight`]): every question sees
+    /// every crate's impls, as before answers were keyed by what they see.
+    whole_program_sight: bool,
     inherent: Rows<(Shape, Name), Vec<AssocItem, Global>>,
     /// The answered inherent questions (a shape and a name), each with its least-keyed failed
     /// candidate, if any: only an impl that declares a member of the name is a candidate.
@@ -1154,6 +1320,8 @@ impl Buckets {
         Buckets {
             answers: Rows::new_in(Global),
             answer_failed: Rows::new_in(Global),
+            sights: OnceCell::new(),
+            whole_program_sight: false,
             inherent: Rows::new_in(Global),
             inherent_done: Rows::new_in(Global),
             index: RefCell::new(index),
@@ -1715,8 +1883,13 @@ impl Buckets {
     /// reads it reads the first answer, its home and its gap (rule 21: one key, one answer).
     /// Through `&self`: the answer is a new row ([`Rows`]), so a slice an earlier answer handed
     /// out stays where it is.
-    pub fn answer(&self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Homes) -> Result<(), Unfilled> {
-        if self.answers.contains_key(&(trait_, shape)) {
+    ///
+    /// Only the impls of the crates `sight` sees are candidates ([`Seen`]): the answer is
+    /// filed under its `seen`, so a body of core and a body of a crate downstream of it read
+    /// two answers of `u32: PartialEq<_>`, each its own crate's, whichever is asked first.
+    pub fn answer(&self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Homes, sight: Sight<'_>) -> Result<(), Unfilled> {
+        let asked = (trait_, shape, sight.seen);
+        if self.answers.contains_key(&asked) {
             return Ok(());
         }
         let view = store.tys.view();
@@ -1732,6 +1905,7 @@ impl Buckets {
             // impl decides an auto trait's structural rule and never meets a positive goal).
             let mut candidates = ix.trait_candidates(trait_, shape, home);
             candidates.extend_from_slice(&ix.negative_of(trait_, shape, home));
+            candidates.retain(|k| sight.sees(ix.krate(*k)));
             candidates.sort_unstable();
             candidates.dedup();
             for k in candidates {
@@ -1755,10 +1929,52 @@ impl Buckets {
         got.sort_unstable();
         // The gap first: a reader asks `trait_gap` before `impls_of`.
         if let Some(k) = first_failed {
-            self.answer_failed.insert((trait_, shape), k);
+            self.answer_failed.insert(asked, k);
         }
-        self.answers.insert((trait_, shape), got);
+        self.answers.insert(asked, got);
         Ok(())
+    }
+
+    /// A test's removed cause (rule 23): every trait question, a checked body's too, takes the
+    /// impls of every crate of the program (the answer is still filed under its [`Seen`]).
+    pub fn plant_whole_program_sight(&mut self) {
+        self.whole_program_sight = true;
+    }
+
+    /// The crates a trait question asked for `seen` may take impls of: the program's, or
+    /// crate `c`'s dependency closure ([`SightRow`]: from the crate list, no read, over the
+    /// records' crate 0 and over the solved names), made once per crate in `alloc` (the
+    /// store's: [`Store::tys`]). Not told is a typed refusal, never the whole program in its
+    /// place (rule 3).
+    pub fn sight<'n, S: NamesSource<'n>>(&self, names: S, seen: Seen, alloc: blaze_own::Alloc<'static>) -> Result<Sight<'_>, Unseen> {
+        let Seen::From(krate) = seen else { return Ok(Sight::PROGRAM) };
+        if self.whole_program_sight {
+            return Ok(Sight { seen, row: None });
+        }
+        let rows = self.sights.get_or_init(|| Rows::new_in(alloc));
+        if let Some(row) = rows.get(&krate) {
+            return Ok(Sight { seen, row: Some(row) });
+        }
+        match rows.insert_absent(krate, SightRow::of(names, krate, alloc)?) {
+            Some(row) => Ok(Sight { seen, row: Some(row) }),
+            // `insert_absent` returns the live row it just filed.
+            None => Err(Unseen::NotAnswered { krate }),
+        }
+    }
+
+    /// The sight [`Buckets::sight`] made for `seen`, asked again with no names source: what a
+    /// body's read list keeps of its impl questions' bucket rows (front2 reads.rs
+    /// `facts_with_buckets`). A crate whose bodies asked no trait question has none made:
+    /// refused by name ([`Unseen::NotMade`]), never the whole program's in its place.
+    pub fn sight_made(&self, seen: Seen) -> Result<Sight<'_>, Unseen> {
+        let Seen::From(krate) = seen else { return Ok(Sight::PROGRAM) };
+        if self.whole_program_sight {
+            return Ok(Sight { seen, row: None });
+        }
+        match self.sights.get().and_then(|rows| rows.get(&krate)) {
+            Some(row) => Ok(Sight { seen, row: Some(row) }),
+            None => Err(Unseen::NotMade { krate }),
+        }
     }
 
     /// Answers the inherent items of `shape` named `name` from the headers of `candidates`
@@ -1814,20 +2030,33 @@ impl Buckets {
     /// list naming what selection was asked and what it found).
     pub fn answered(&self) -> Vec<(ItemKey, Shape, &[ItemKey]), Global> {
         let mut out = Vec::new_in(Global);
-        out.extend(self.answers.iter().map(|(&(t, s), v)| (t, s, v.as_slice())));
-        out.sort_unstable_by(|a, b| (a.0, format!("{:?}", a.1)).cmp(&(b.0, format!("{:?}", b.1))));
+        // One row per question and sight ([`Seen`]): two rows of one question differ in their
+        // impls, which order them too (equal rows print the same, in whichever order).
+        out.extend(self.answers.iter().map(|(&(t, s, _), v)| (t, s, v.as_slice())));
+        out.sort_unstable_by(|a, b| (a.0, format!("{:?}", a.1), a.2).cmp(&(b.0, format!("{:?}", b.1), b.2)));
         out
     }
 
-    /// The answer for `trait_` at `shape`, once made.
+    /// The whole program's answer for `trait_` at `shape`, once made ([`Seen::Program`]).
     pub fn impls_of(&self, trait_: ItemKey, shape: Shape) -> Option<&[ItemKey]> {
-        self.answers.get(&(trait_, shape)).map(|v| v.as_slice())
+        self.impls_seen(trait_, shape, Seen::Program)
+    }
+
+    /// The answer for `trait_` at `shape` from the impls `seen` names, once made.
+    pub fn impls_seen(&self, trait_: ItemKey, shape: Shape, seen: Seen) -> Option<&[ItemKey]> {
+        self.answers.get(&(trait_, shape, seen)).map(|v| v.as_slice())
     }
 
     /// The failed candidate (the least key, with why) of the answered trait question, if any:
-    /// its answer may miss that impl, so asking it is a gap, never an answer.
+    /// its answer may miss that impl, so asking it is a gap, never an answer. The whole
+    /// program's question ([`Seen::Program`]).
     pub fn trait_gap(&self, trait_: ItemKey, shape: Shape) -> Option<(LibKey, Box<str>)> {
-        let k = *self.answer_failed.get(&(trait_, shape))?;
+        self.trait_gap_seen(trait_, shape, Seen::Program)
+    }
+
+    /// [`Buckets::trait_gap`] of the question asked for `seen`.
+    pub fn trait_gap_seen(&self, trait_: ItemKey, shape: Shape, seen: Seen) -> Option<(LibKey, Box<str>)> {
+        let k = *self.answer_failed.get(&(trait_, shape, seen))?;
         self.index().failed_why(k)
     }
 

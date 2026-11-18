@@ -54,7 +54,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         if !generic_origins
             && let Some(life) = facts.sig(item)
-            && self.call_by_signature(life, &vs, dest, dest_ty, e)?
+            && self.call_by_signature(life, Some((item, g)), &vs, dest, dest_ty, e)?
         {
             self.stats.calls_by_signature += 1;
             return Ok(());

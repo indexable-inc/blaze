@@ -37,7 +37,7 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
     /// `env.module`: its text expanded and lowered, then read as a type.
     pub(super) fn macro_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, r: Range) -> Result<PTy, Why> {
         let text = v.text_at(v.type_range(t)?)?;
-        let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, r, tys.alloc())?;
+        let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, self.marks, r, tys.alloc())?;
         // A fn's return type with a macro in it is expanded whole by `heads.rs` `fn_head`
         // before its opaques are numbered, so no return opaque arrives here. An `impl Trait`
         // a type macro writes anywhere else (a parameter's type, a field, an alias) is refused

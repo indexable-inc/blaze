@@ -46,6 +46,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         fresh,
         heads_from: crate::engine_seeds::HeadsFrom::Frozen,
         head_units: crate::engine_heads::HeadUnits::Each,
+        head_sources: crate::engine_heads_once::Sources::Job,
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,

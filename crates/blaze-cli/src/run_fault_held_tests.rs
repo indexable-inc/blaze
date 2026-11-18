@@ -94,7 +94,7 @@ fn regs(x9: u64) -> Regs {
 
 fn said(line: &mut Line, offset: u64, regs: Option<Regs>, bytes: &[u8]) {
     let at = Spot { placed: Placed::Code, symbol: Symbol(FUNCTION), record: RecordId([0x2d; 32]), offset };
-    let fault = Fault { signal: Signal::Trap, pc: Some(0x1000 + offset), at: Some(at), code: None, regs, address: 0x1000 + offset, touched: Some(at), write: None };
+    let fault = Fault { signal: Signal::Trap, pc: Some(0x1000 + offset), at: Some(at), code: None, regs, address: 0x1000 + offset, touched: Some(at), write: None, callers: None };
     line.len = 0;
     write!(line, "{}", report(fault, &mut World, Some(Ok(bytes)))).expect("the line fits");
 }

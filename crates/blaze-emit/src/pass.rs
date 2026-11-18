@@ -21,6 +21,8 @@ mod float;
 mod float_width;
 mod int;
 pub(crate) mod probe;
+/// Branches and PC-relative references past a short field's reach: islands and long forms.
+mod reach;
 mod runtime;
 pub(crate) mod sites;
 pub(crate) mod stack;
@@ -31,6 +33,7 @@ pub(crate) mod variadic;
 mod wide;
 
 pub(crate) use float_width::FloatWidth;
+pub(crate) use reach::Reach;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
 /// immediate, so codes from here up are refused. Their one home is blaze-code trap.rs, which
@@ -47,7 +50,7 @@ const MOST_SLOT_ALIGN: u8 = 12;
 const MOST_DATA_ALIGN: u32 = 4;
 
 /// What a patched field reaches.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Label {
     Block(u32),
     /// The literal word of `out.fixups[i]`.
@@ -56,6 +59,9 @@ enum Label {
     Data(u32),
     /// The literal word placement fills for `words[i]`.
     Word(u32),
+    /// Byte `at` of the code, already placed: a veneer or a literal word's copy in an island
+    /// (pass/reach.rs) a short field was pointed at.
+    At(u32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,6 +121,8 @@ struct Pass<'a, 'c, A: Allocator> {
     sp_fixes: Vec<u32, Global>,
     /// The block being lowered.
     block: Block,
+    /// The short fields still to be placed in reach, and the islands' rows (pass/reach.rs).
+    far: reach::Far<'c>,
 }
 
 /// Runs the pass (see [`crate::emit`]).
@@ -128,6 +136,8 @@ pub(crate) fn run<A: Allocator>(
     relocs: &mut Vec<Reloc, A>,
     positions: &mut Vec<PositionFix, A>,
     record: Option<&mut sites::Form<A>>,
+    reach: Reach,
+    scratch: blaze_own::Alloc<'_>,
 ) -> Result<(), EmitError> {
     if view.head.ptr_bits != 64 {
         return Err(EmitError::Signature { why: "a target whose pointers are not 64 bits" });
@@ -210,6 +220,7 @@ pub(crate) fn run<A: Allocator>(
         most_align,
         sp_fixes: Vec::new_in(Global),
         block: Block(0),
+        far: reach::Far::new(reach, view, scratch),
     };
 
     // The prologue; the frame's size is patched in at the end, when the staging is known.
@@ -266,12 +277,16 @@ pub(crate) fn run<A: Allocator>(
 
     pass.unwind_begin()?;
     for block in 0..view.blocks() {
+        // A safe point before each block and each instruction: an island goes here when a
+        // short field's reach would lapse before the next one (pass/reach.rs).
+        pass.reach_point()?;
         pass.block_at[block] = pass.here();
         pass.block = Block(block as u32);
         pass.block_entry(Block(block as u32));
         let next = (block + 1 < view.blocks()).then_some(block as u32 + 1);
         let range = view.block(Block(block as u32));
         for inst in view.params(Block(block as u32)).end..range.end {
+            pass.reach_point()?;
             pass.lower(inst, next)?;
         }
     }
@@ -451,7 +466,10 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// `word`, its `field` patched to reach `to` once that is placed.
     fn put_to(&mut self, word: u32, field: Field, to: Label) {
+        let index = self.patches.len() as u32;
         self.patches.push(Patch { at: self.here(), field, to });
+        // A short field whose target is not placed yet waits for its block or an island.
+        self.note_pending(index, field, to);
         self.put(word);
     }
 
@@ -1149,7 +1167,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     self.st(X9, inst);
                     return Ok(());
                 }
-                self.put_to(enc::adr(X9, 0), Field::Adr, Label::Data(index));
+                // `adr x9`, or the far form when the data after the code may pass its reach.
+                self.own_data_addr(index);
                 self.st(X9, inst);
             }
             Op::FuncAddr => {
@@ -1178,7 +1197,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 let (then, otherwise) = (o.target(), o.target());
                 self.ld(X9, cond);
                 match then.args.is_empty() {
-                    true => self.put_to(enc::cbnz(X9, 0), Field::Imm19, Label::Block(then.block.0)),
+                    // `cbz x9, +8; b then` when `then` is placed more than 1 MiB back.
+                    true => self.branch_if(enc::cbnz(X9, 0), enc::cbz(X9, 2), then.block.0),
                     false => {
                         let at = self.here();
                         self.put(enc::cbz(X9, 0));
@@ -1194,6 +1214,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 let default = o.target();
                 self.ld(X9, scrutinee);
                 for (words, to) in o.cases(scrutinee) {
+                    // A safe point between cases (pass/reach.rs): an island's fall-through
+                    // `b` leaves `x9`, the scrutinee, as it is.
+                    self.reach_point()?;
                     let value = words.iter().rev().fold(0u64, |it, &word| (it << 32) | u64::from(word));
                     match value < 4096 {
                         true => self.put(enc::cmp_imm(X9, value as u32)),
@@ -1203,7 +1226,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
                         }
                     }
                     match to.args.is_empty() {
-                        true => self.put_to(enc::b_cond(Cond::Eq, 0), Field::Imm19, Label::Block(to.block.0)),
+                        // `b.ne +8; b to` when `to` is placed more than 1 MiB back.
+                        true => self.branch_if(enc::b_cond(Cond::Eq, 0), enc::b_cond(Cond::Ne, 2), to.block.0),
                         false => {
                             let at = self.here();
                             self.put(enc::b_cond(Cond::Ne, 0));
@@ -1507,6 +1531,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
         self.place_frame(frame_at, most_align)?;
         let frame = self.frame_bytes(most_align)?;
         self.patch_restores(frame);
+        // The last island, after the last instruction and the tail: the short fields to the
+        // literal words and the data after the code, when those may lie past their reach.
+        self.reach_end()?;
         if self.in_record() {
             // The record form places no literal word (pass/sites.rs).
             return self.finish_record();
@@ -1516,6 +1543,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
         for at in 0..self.fixups.len() {
             self.fixups[at].at = self.here();
             self.code.extend_from_slice(&[0; 8]);
+        }
+        // The literal words' copies the islands placed, after the pool's (whose index is a
+        // literal's `Label::Literal`).
+        for &fixup in self.far.fixups.iter() {
+            self.fixups.push(fixup);
         }
         let words_at = self.here();
         for (i, &to) in self.words.iter().enumerate() {
@@ -1599,7 +1631,15 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 Label::Literal(index) => literals_at + 8 * index,
                 Label::Data(index) => data_at[index as usize],
                 Label::Word(index) => words_at + 8 * index,
+                Label::At(at) => at,
             };
+            if patch.field == Field::Far32 {
+                // The far own-data form: its two offset words after the `adr` (pass/reach.rs).
+                let (lo, hi) = enc::far32_words(i64::from(to) - i64::from(patch.at)).ok_or(too_far)?;
+                self.set(patch.at + 4, lo);
+                self.set(patch.at + 8, hi);
+                continue;
+            }
             let word = patch
                 .field
                 .patch(self.word_at(patch.at), i64::from(to) - i64::from(patch.at))

@@ -950,7 +950,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let usize_ty = intern(tys, PNode::Uint(tc::UintTy::Usize))?;
                 let n = match usize_literal(text, lr)? {
                     Some(bits) => intern(tys, PNode::ConstValue { ty: usize_ty, bits })?,
-                    None => self.const_term(tys, env, text, lr, &|_| Ok(usize_ty))?,
+                    None => match body_const_len(self.heads, env, v, t, text, lr)? {
+                        Some(bits) => intern(tys, PNode::ConstValue { ty: usize_ty, bits })?,
+                        None => self.const_term(tys, env, text, lr, &|_| Ok(usize_ty))?,
+                    },
                 };
                 intern(tys, PNode::Array(kids[0], n))
             }
@@ -966,8 +969,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     (None, true) => tc::Abi::C,
                     (Some(at), _) => fn_ptr_abi(v.text_at(at)?, r)?,
                 };
-                if variadic && !matches!(abi, tc::Abi::C | tc::Abi::CUnwind | tc::Abi::System | tc::Abi::SystemUnwind) {
-                    return Err(program(format!("`...` on a fn pointer type of the {abi:?} ABI: C-variadic fn pointers take \"C\", \"C-unwind\", \"system\" or \"system-unwind\" (E0045)"), r));
+                if variadic && !abi.takes_c_variadic() {
+                    return Err(program(format!("`...` on a fn pointer type of the \"{}\" ABI: that calling convention has no variadics (E0045)", abi.name()), r));
                 }
                 let safety = if unsafety { tc::Safety::Unsafe } else { tc::Safety::Safe };
                 let mut l = Vec::with_capacity_in(kids.len() + 1, Global);
@@ -986,8 +989,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             lf::TypeRef::For { .. } => Ok(kids[0]),
             lf::TypeRef::Impl(_) => match env.anon.iter().find(|(at, _)| *at == t) {
                 Some(&(_, ty)) => Ok(ty),
-                // Neither in a fn's parameter types nor in its return type (a field, a `let`,
-                // a type alias, an `impl Trait` inside a fn pointer): refused by name.
+                // Neither in a fn's parameter types nor in its return type nor in a type
+                // alias's type (super::tait: each of those is the alias's opaque): a field, a
+                // `let`, an `impl Trait` inside a fn pointer. Refused by name.
                 None => Err(Why::Unsupported("an `impl Trait` type outside a fn's parameters and return type", r)),
             },
             _ => Err(Why::Unsupported("this type", r)),
@@ -1483,19 +1487,68 @@ pub fn subst(tys: &mut PortableTys<'_>, t: PTy, args: &[PTy]) -> Result<PTy, Why
 
 /// A written ABI string (`"C"`, with its quotes): the one reading of it, for fn items
 /// (`heads::abi_of`) and fn pointer types.
+///
+/// The rule: an ABI is part of a fn pointer type's and a fn item's IDENTITY (the Reference,
+/// "Function pointer types": `extern "C" fn()` and `fn()` are two types, and no coercion relates
+/// two ABIs), and CHECKING needs nothing else of it. So every ABI the pinned nightly knows is a
+/// type here (the checker's [`tc::Abi`], one variant per string of rustc's `ExternAbi`, read by
+/// [`tc::Abi::of_name`], the one table): an interpreter's tail-call table, `type TailInstrFn<T> =
+/// extern "rust-preserve-none" fn(..)`, is a type like any other. Only the BUILDER refuses to
+/// make a call through an ABI it cannot emit, by name (program/head_abi.rs `of_head`; blaze-build
+/// walk.rs). A string the nightly does not know is the language's E0703 ("invalid ABI").
 pub(super) fn fn_ptr_abi(written: &str, r: Range) -> Result<tc::Abi, Why> {
     let name = written.trim().strip_prefix('"').and_then(|t| t.strip_suffix('"')).ok_or(Why::Unsupported("an ABI that is no plain string", r))?;
-    match name {
-        "C" => Ok(tc::Abi::C),
-        "C-unwind" => Ok(tc::Abi::CUnwind),
-        "system" => Ok(tc::Abi::System),
-        "system-unwind" => Ok(tc::Abi::SystemUnwind),
-        "Rust" => Ok(tc::Abi::Rust),
-        "rust-call" => Ok(tc::Abi::RustCall),
-        // A body's `extern "llvm-intrinsic"` block: its declarations' headers (heads.rs, a
-        // local foreign fn); the builder calls them by their `link_name` (front2/llvm_intrinsic.rs).
-        "llvm-intrinsic" => Ok(tc::Abi::LlvmIntrinsic),
-        _ => Err(Why::Unsupported("an ABI other than \"C\", \"C-unwind\", \"system\" and \"Rust\"", r)),
+    tc::Abi::of_name(name).ok_or_else(|| program(format!("invalid ABI: found `{name}` (E0703): no ABI of the pinned nightly has this name"), r))
+}
+
+/// The length of the array type `t` of a BODY, written as one name (`[u8; SIZE]`, `[u8; {
+/// SIZE }]`) that a `const` item of the body declares: that constant's value. The Reference,
+/// "Statements", "Item declarations": "Declaring an item within a statement block restricts its
+/// scope to the block containing the statement", so `const SIZE: usize = ..;` in a fn is in
+/// scope for every type written in that block and the blocks inside it, a written type's array
+/// length included (rmp's `read_data_f32`: `const SIZE: usize = size_of::<f32>(); let mut buf:
+/// [u8; SIZE] = [0u8; SIZE];`, refused E0412 "cannot find type `SIZE`" when the length was read
+/// at the fn's module, where no `SIZE` is).
+///
+/// The block is the one the type is written in: the block scope of the paths written inside
+/// the type (every path of one written type stands in one block; a body expression's length is
+/// read so too, body.rs `scope_within`), and the constant is found from that block outwards
+/// ([`super::locals::Locals::find`]), as an expression's repeat length is
+/// (super::const_open::local_const). `None`: not a body's type, not one name, no path in the
+/// type to place it, or no item of the body takes the name: the caller reads the length as
+/// before (at the module). A body item of the name that is no constant is refused by name.
+fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, text: &str, r: Range) -> Result<Option<u128>, Why> {
+    let Some(body) = env.body else { return Ok(None) };
+    let mut name = text.trim();
+    if let Some(inner) = name.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
+        name = inner.trim();
+    }
+    let ident = name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if !ident {
+        return Ok(None);
+    }
+    let at = v.type_range(t)?;
+    let mut scope = None;
+    for p in 0..v.paths.len() {
+        let p = PathIdx(p as u32);
+        if at.cover(v.path_range(p)?) != Some(at) {
+            continue;
+        }
+        if let Some(s) = v.path(p)?.scope {
+            scope = Some(s);
+            break;
+        }
+    }
+    let Some(scope) = scope else { return Ok(None) };
+    let Some(row) = body.locals.find(body.owner, Some(scope.0), name, super::locals::LocalNs::Value) else { return Ok(None) };
+    match row.kind {
+        super::locals::LocalKind::Const => match heads.const_bits(row.key) {
+            Some(bits) if bits > u128::from(u64::MAX) => Err(Why::Unsupported("an array length past `usize` (a constant declared in the body)", r)),
+            Some(bits) => Ok(Some(bits)),
+            None => Err(Why::NeedConst(row.key, r)),
+        },
+        super::locals::LocalKind::Use => Err(Why::Unsupported("an array length named through a `use` declared in the body", r)),
+        _ => Err(Why::Unsupported("an array length naming an item of the body that is not a constant", r)),
     }
 }
 
@@ -1531,7 +1584,10 @@ pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global
 /// expands `ret` first and numbers the expansion's ([`super::type_expand::Expanded::impls`];
 /// the Reference, "Impl trait": an `impl Trait` a macro writes in the return type is one of the
 /// fn's opaques like a written one).
-pub(super) fn return_impls(v: &View<'_>, ret: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<bool, Why> {
+///
+/// The same numbering is a type alias's (super::tait `alias_opaques`: each `impl` an alias's
+/// type writes is one opaque of the alias), so `out` takes the caller's allocator.
+pub(super) fn return_impls<A: core::alloc::Allocator>(v: &View<'_>, ret: lf::TypeId, out: &mut Vec<lf::TypeId, A>) -> Result<bool, Why> {
     let mut todo: Vec<lf::TypeId, Global> = Vec::new_in(Global);
     let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
     let mut macros = false;

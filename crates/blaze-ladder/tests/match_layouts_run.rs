@@ -75,6 +75,10 @@ use blaze_typeck::ItemKey;
 
 #[path = "match_layouts_run/small_main.rs"]
 mod small_main;
+#[path = "match_layouts_run/real_shape.rs"]
+mod real_shape;
+#[path = "match_layouts_run/shim_abi.rs"]
+mod shim_abi;
 
 const DIR: &str = "/ladder/";
 const ROOT: &str = "/ladder/src/main.rs";
@@ -509,7 +513,8 @@ fn alignment() {
     });
 }
 
-/// `Option<fmt::Alignment>`: `None` in the tag's niche (3). Statuses 1 (None), 2..=4.
+/// `Option<fmt::Alignment>`: `None` in the tag's niche (0xff: the one value nearer zero, as
+/// rustc's `Niche::reserve` picks it). Statuses 1 (None), 2..=4.
 #[test]
 fn option_of_alignment() {
     row(Layout {
@@ -547,7 +552,8 @@ fn ordering() {
     });
 }
 
-/// `Option<cmp::Ordering>` (what `partial_cmp` returns): `None` in the niche past -1..=1 (2).
+/// `Option<cmp::Ordering>` (what `partial_cmp` returns): `None` in the niche below -1..=1
+/// (0xfe, -2: the tie goes below).
 /// Statuses 1 (None), 2..=4.
 #[test]
 fn option_of_ordering() {
@@ -601,8 +607,8 @@ fn repr_u8_explicit() {
 /// core's `NonZero` and `NonNull` are PATTERN TYPES (`NonZeroU32Inner(u32 is 1..=u32::MAX)` in
 /// num/niche_types.rs, `NonNull { pointer: *const T is !null }`), laid out by blaze-build
 /// layout.rs `PNode::Pat`. The `rustc_layout_scalar_valid_range_*` attribute these rows used
-/// before is what front2 refuses (heads.rs `narrowed`, lazy/fill.rs `adt_rows`), and real core
-/// no longer uses it on these types: why std hello was not refused.
+/// before is read too (heads.rs `AdtRow::valid`, the seam's `valid_range`: real_shape.rs has
+/// a row with it); real core no longer writes it on these types.
 const PATTERN_TYPE: &str = "
 #[rustc_builtin_macro(pattern_type)]
 pub macro pattern_type($($arg:tt)*) {

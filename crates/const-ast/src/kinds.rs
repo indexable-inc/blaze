@@ -201,3 +201,4 @@ pub(crate) const UNSAFE_BINDER_TYPE: u16 = 337;
 pub(crate) const SPEC_CLAUSE: u16 = 343;
 pub(crate) const UNION_TYPE: u16 = 345;
 pub(crate) const RECORD_TYPE: u16 = 346;
+pub(crate) const LAZY_BODY: u16 = 347;

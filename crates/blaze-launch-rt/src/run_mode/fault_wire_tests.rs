@@ -23,7 +23,7 @@ fn a_trap_is_told_to_the_parent_as_the_place_it_struck() {
     let struck = Struck { sig: libc::SIGTRAP, pc: Some(pc), address: pc, write: None };
     let fault = fault_of(struck, &[s, f]).expect("a SIGTRAP is reported");
     let at = Spot { placed: Placed::Code, symbol: Symbol([0x66; 32]), record: RecordId([0x2d; 32]), offset: 0x3fc };
-    assert_eq!(fault, Fault { signal: Signal::Trap, pc: Some(pc), at: Some(at), code: None, regs: None, address: pc, touched: Some(at), write: None });
+    assert_eq!(fault, Fault { signal: Signal::Trap, pc: Some(pc), at: Some(at), code: None, regs: None, address: pc, touched: Some(at), write: None, callers: None });
 
     let segv = fault_of(Struck { sig: libc::SIGSEGV, pc: Some(pc), address: AREA + 0x48, write: Some(true) }, &[s, f]).expect("a SIGSEGV is reported");
     assert_eq!(segv.touched.map(|spot| (spot.placed, spot.offset)), Some((Placed::WritableDatum, 8)));

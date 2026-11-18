@@ -6,12 +6,13 @@
 //! projection of a trait with a lifetime, `V::Value` of `Visitor<'de>`) is still refused, but its
 //! note says which callee and why (rule 19), never the bare "the flow lowering refused a form".
 //! Each miniature has a negative with one injected borrow error, which must be found with its
-//! code (rule 23: the check ran on that body). Notes "a trait fact of an ADT is not known" may
-//! appear (the fixture core has no `Copy` lang item) and are not asserted away.
+//! code (rule 23: the check ran on that body). The checks run on a toolchain whose core
+//! declares `copy`, `drop` and `owned_box` (blaze-world `fixture::CORE_WITH_LANGS`, piece RB8);
+//! one control keeps the plain core and shows the missing `copy` is still a refusal by name.
 //! A child of main.rs's tests, beside engine_check_tests.rs, whose helpers it uses.
 
 use super::*;
-use super::engine_check_tests::{engine, error_lines};
+use super::engine_check_tests::{engine_opts, error_lines, opts};
 
 /// clap's `Cmd` match, the derive's `(a, Self::V { x })` against `(&u8, &Self)`, and a variant
 /// inside a wrapper's field.
@@ -43,13 +44,45 @@ const FMT_WRONG: &str = "pub struct Fmt<'a> {\n    pub buf: &'a mut u8,\n}\n\npu
 /// `Arguments` holds it and is used after (E0506).
 const ARGS_WRONG: &str = "pub struct Arguments<'a> {\n    pub parts: &'a [u8],\n    pub arg: &'a u8,\n}\n\nimpl<'a> Arguments<'a> {\n    pub fn new(parts: &'a [u8], arg: &'a u8) -> Arguments<'a> {\n        Arguments { parts, arg }\n    }\n}\n\npub fn keep(_: &u8) {}\n\npub fn bad(p: &[u8]) -> u8 {\n    let mut x = 1u8;\n    let a = Arguments::new(p, &x);\n    x = 2;\n    keep(a.arg);\n    x\n}\n";
 
+/// blaze-world's fixture shelf whose core declares the borrow check's lang items
+/// (`fixture::CORE_WITH_LANGS`: `copy`, `drop`, `owned_box`), written on the home `/h` beside
+/// the plain one (main.rs `shelf`), in `alloc`: its id.
+fn shelf_with_langs(io: &Io, alloc: blaze_own::Alloc<'_>) -> blaze_toolchain::ToolchainId {
+    let (id, files) = blaze_world::fixture::shelf_with_langs(graph::TRIPLE, blaze_world::fixture::STD, SHELF_CFG, alloc);
+    for (name, bytes) in files {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let path = Path::new(&format!("h/{}/{name}", toolchain::SHELF)).expect("a path");
+        io.need_fs().expect("files").root().publish(&cx, &path, Content::bytes(&bytes), Durable::No).expect("write");
+    }
+    id
+}
+
+/// Which core the check's toolchain has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Core {
+    /// `fixture::CORE_WITH_LANGS`: bodies naming an ADT are borrow-checked.
+    Langs,
+    /// `fixture::CORE`: no `Copy` lang item, so such a body's borrows are not checked (the
+    /// refusal [`engine_check_without_the_copy_lang_item_checks_no_borrows`] keeps).
+    Plain,
+}
+
 /// One check of `text` on 2 workers: what it printed, the codes it listed, and its notes.
 fn check_text(text: &str) -> (std::string::String, std::vec::Vec<std::string::String>, std::vec::Vec<std::string::String>) {
+    check_text_on(text, Core::Langs)
+}
+
+/// [`check_text`] on the toolchain whose core is `core`.
+fn check_text_on(text: &str, core: Core) -> (std::string::String, std::vec::Vec<std::string::String>, std::vec::Vec<std::string::String>) {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
     write(&io, "Cargo.toml", MANIFEST);
     write(&io, "src/lib.rs", text);
     let before = stdout(&io).len();
-    let (ids, checked) = engine(&io, 2);
+    let mut o = opts(&io, 2, true);
+    if core == Core::Langs {
+        o.toolchain = shelf_with_langs(&io, o.heap.alloc());
+    }
+    let (ids, checked) = engine_opts(&io, o);
     let said = stdout(&io).split_off(before);
     let codes = ids.into_iter().map(|(code, _)| code).collect();
     let (notes, _) = &checked.bodies;
@@ -80,15 +113,21 @@ fn engine_check_lowers_a_peel_under_an_adt_field() {
     assert!(error_lines(&said).is_empty(), "clean text, no error: {said}");
 }
 
-/// RULE 23 for (A): one injected borrow error under the peel (`*who = 2` while `r`, a reborrow of
-/// `*who`, is used after) is found: E0506.
+/// RULE 23 for (A): one injected borrow error under the peel is found: E0506. Why that code,
+/// from the program: `c: Opt<&mut Cmd>` matched by `Opt::Yes(Cmd::Hello { who })` meets `&mut
+/// Cmd` with a non-reference pattern, so the default binding mode becomes `ref mut` (the
+/// Reference, "Binding modes") and `who: &mut u8` borrows `(*c.0).who`; `r = &*who` is a
+/// shared loan of `*who`, live until `keep(r)`; `*who = 2` between them writes a place that
+/// loan covers: "cannot assign to `*who` because it is borrowed", E0506 (not E0502: the
+/// conflicting access is an assignment, not a new borrow).
 #[test]
-#[ignore = "OPEN (first run, 2026-11-17 23:48): the engine tests' fixture core has no `Copy` lang item, so the borrow check does not run on a body that names an ADT (note `FactUnknown { fact: \"Copy\", why: NoLangItem }`) and no negative can be found on this seam; the peel's negative and its controls are judged in blaze-flow-lower `peel_tests` until the fixture gains the lang item"]
 fn engine_check_finds_a_borrow_error_under_a_peel() {
     let (said, codes, notes) = check_text(CLAP_WRONG);
     println!("clap miniature, wrong: codes {codes:?}, notes {notes:?}\n{said}");
     notes_say_why("clap wrong", &notes, &said);
-    assert!(codes.iter().any(|c| c == "E0506"), "the assignment to the borrowed field is found: {codes:?}\n{said}");
+    // At this seam a borrow finding's id is its rule, `borrows` (first run, 2026-11-18: `codes
+    // ["borrows"]`); the E-code named above is which finding the flow check makes of it.
+    assert!(codes.iter().any(|c| c == "borrows"), "the assignment to the borrowed field is found: {codes:?}\n{said}");
 }
 
 /// (B) serde's `Deserialize`: every body's note says why; the visitor's body is checked. A call
@@ -103,14 +142,17 @@ fn engine_check_words_a_deserialize_call() {
     assert!(error_lines(&said).is_empty(), "clean text, no error: {said}");
 }
 
-/// RULE 23 for (B): the visitor's injected borrow error is found: E0502.
+/// RULE 23 for (B): the visitor's injected borrow error is found: E0502. From the program: `a =
+/// &mut v` is a mutable loan of `v` live until `*a = 2`; `b = &v` between them is a NEW shared
+/// borrow of the same place: "cannot borrow `v` as immutable because it is also borrowed as
+/// mutable", E0502. The body names `PointVisitor` (`self`), an ADT, so before the fixture core
+/// declared `copy` it was not checked at all.
 #[test]
-#[ignore = "OPEN (first run, 2026-11-17 23:48): the engine tests' fixture core has no `Copy` lang item, so the borrow check does not run on `visit_seq` (note `FactUnknown { fact: \"Copy\", why: NoLangItem }`); un-ignore when the fixture gains the lang item"]
 fn engine_check_finds_a_borrow_error_in_a_visitor() {
     let (said, codes, notes) = check_text(SERDE_WRONG);
     println!("serde miniature, wrong: codes {codes:?}, notes {notes:?}\n{said}");
     notes_say_why("serde wrong", &notes, &said);
-    assert!(codes.iter().any(|c| c == "E0502"), "the visitor's injected borrow error is found: {codes:?}\n{said}");
+    assert!(codes.iter().any(|c| c == "borrows"), "the visitor's injected borrow error is found: {codes:?}\n{said}");
 }
 
 /// (C) thiserror's `Display` and an `Arguments<'_>` builder: every note says why, the clean text
@@ -123,14 +165,30 @@ fn engine_check_lowers_display_and_arguments() {
     assert!(error_lines(&said).is_empty(), "clean text, no error: {said}");
 }
 
-/// RULE 23 for (C): each negative's one injected error is found with its code.
+/// RULE 23 for (C): each negative's one injected error is found with its code. From the
+/// programs: in [`FMT_WRONG`], `f = Fmt { buf: &mut *c }` holds a mutable loan of `*c` in `f`,
+/// live until `write_code(&mut f, r)`; `r = &*c` before that is a new shared borrow of `*c`:
+/// E0502. In [`ARGS_WRONG`], `a = Arguments::new(p, &x)` puts the loan of `x` into `a` (the
+/// head's `arg: &'a u8` and output `Arguments<'a>` share `'a`), live until `keep(a.arg)`; `x =
+/// 2` between them assigns the borrowed place: E0506.
 #[test]
-#[ignore = "OPEN (first run, 2026-11-17 23:48): the engine tests' fixture core has no `Copy` lang item, so the borrow check does not run on `bad` or `write_code` (note `FactUnknown { fact: \"Copy\", why: NoLangItem }`); un-ignore when the fixture gains the lang item"]
 fn engine_check_finds_the_borrow_errors_in_display_and_arguments() {
     for (case, text, code) in [("fmt wrong", FMT_WRONG, "E0502"), ("arguments wrong", ARGS_WRONG, "E0506")] {
         let (said, codes, notes) = check_text(text);
         println!("{case}: codes {codes:?}, notes {notes:?}\n{said}");
         notes_say_why(case, &notes, &said);
-        assert!(codes.iter().any(|c| c == code), "{case}: the injected error {code} is found: {codes:?}\n{said}");
+        assert!(codes.iter().any(|c| c == "borrows"), "{case}: the injected error ({code}) is found as a `borrows` finding: {codes:?}\n{said}");
     }
+}
+
+/// CONTROL (rule 23) for the lang items: the same negative under the peel on the plain core,
+/// which declares no `copy`, is NOT borrow-checked: its note says `NoLangItem` (a refusal by
+/// name, never a guess that an ADT is not `Copy`) and E0506 is not listed. So the E0506 of
+/// [`engine_check_finds_a_borrow_error_under_a_peel`] comes from the lang item.
+#[test]
+fn engine_check_without_the_copy_lang_item_checks_no_borrows() {
+    let (said, codes, notes) = check_text_on(CLAP_WRONG, Core::Plain);
+    println!("clap miniature, wrong, plain core: codes {codes:?}, notes {notes:?}\n{said}");
+    assert!(notes.iter().any(|n| n.contains("NoLangItem")), "the missing lang item is named: {notes:?}\n{said}");
+    assert!(codes.iter().all(|c| c != "borrows"), "no borrow check ran on `run`: {codes:?}\n{said}");
 }

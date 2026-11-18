@@ -32,6 +32,8 @@ pub mod last;
 mod last_mem;
 pub mod overlay;
 pub mod pages;
+pub mod readers;
+pub mod runs;
 
 #[cfg(test)]
 mod finish_scale_sim;
@@ -44,6 +46,8 @@ mod owed_by_generation_sim;
 #[cfg(test)]
 mod pages_sim;
 #[cfg(test)]
+mod readers_sim;
+#[cfg(test)]
 mod sim;
 
 pub use crate::engine::{
@@ -54,3 +58,5 @@ pub use crate::engine::{
 pub use crate::last::{Found, LastAnswer, LastError, LastRow, ReadOf, Touched, search};
 pub use crate::last_mem::{MemDefines, MemReads, MemSeen};
 pub use crate::overlay::{Fold, Generations, Overlay, RowFacts, Taken, Work};
+pub use crate::readers::{Edits, FLOOR_BYTES_PER_EDGE, IndexCost, Mapped, Paired, ReaderEdits, ReaderIndex};
+pub use crate::runs::{Runs, RunsCost};

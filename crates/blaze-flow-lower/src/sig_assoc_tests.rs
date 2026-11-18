@@ -25,7 +25,7 @@ use crate::{
     read_signature,
 };
 
-fn alloc() -> Alloc<'static> {
+pub(crate) fn alloc() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 

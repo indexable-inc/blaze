@@ -422,7 +422,7 @@ fn pattern_types_give_their_range_as_a_niche() {
     let s = ls.get(id).scalar.unwrap();
     assert_eq!((s.valid.start, s.valid.end), (0xff, 0xff));
     let b = range(&mut g, PNode::Bool, 1, 1);
-    assert!(lay(&w, &mut g, &mut ls, b).is_err(), "a bool base keeps its own range");
+    assert!(lay(&w, &mut g, &mut ls, b).is_ok(), "a bool base takes the pattern's range");
 }
 
 #[test]
@@ -439,13 +439,15 @@ fn niches_of_bool_and_char_and_nesting() {
     let oob = g.adt(option, &[ob]);
     let id2 = lay(&w, &mut g, &mut ls, oob).unwrap();
     assert_eq!(ls.get(id2).size, 1, "Option<Option<bool>> still fits a byte");
-    assert_eq!(ls.tag_write(id2, 0).unwrap().value, 3);
+    // rustc's `Niche::reserve` for one value: the side nearer zero as a signed number
+    // (compiler/rustc_abi, `count == 1`): below 0 is -1, nearer than 3.
+    assert_eq!(ls.tag_write(id2, 0).unwrap().value, 0xff);
     assert_eq!(ls.variant_of_tag(id2, 2), Some(1), "2 is Some(None)");
     let c = g.n(PNode::Char);
     let oc = g.adt(option, &[c]);
     let id = lay(&w, &mut g, &mut ls, oc).unwrap();
     assert_eq!(ls.get(id).size, 4);
-    assert_eq!(ls.tag_write(id, 0).unwrap().value, 0x110000, "Option<char>::None is past the last scalar value");
+    assert_eq!(ls.tag_write(id, 0).unwrap().value, 0xFFFF_FFFF, "Option<char>::None is rustc's -1 (next down is nearer zero)");
 }
 
 #[test]
@@ -554,7 +556,7 @@ fn enum_tags_follow_their_rules() {
     let o = g.adt(option, &[t]);
     let oid = lay(&w, &mut g, &mut ls, o).unwrap();
     assert_eq!(ls.get(oid).size, 1, "Option<Ordering> uses the tag's niche");
-    assert_eq!(ls.tag_write(oid, 0).unwrap().value, 2, "None is the value after 1");
+    assert_eq!(ls.tag_write(oid, 0).unwrap().value, 0xfe, "None is -2, the tie below");
     let t = g.adt(c_less, &[]);
     let id = lay(&w, &mut g, &mut ls, t).unwrap();
     assert_eq!(size_align(&ls, id), (4, 4), "a field-less repr(C) enum is C's int");

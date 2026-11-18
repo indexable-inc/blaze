@@ -149,14 +149,14 @@ pub struct Fine {
 
 static LATE_TEXTS: Texts = Texts(&[&[("/user/lib.rs", LATE_USER)], &[("/macros/lib.rs", MACROS)]]);
 
-/// Rule: a `#[derive]` written after an attribute macro that takes the item would run on the item
-/// as written (blaze sends every derive on it, for their helpers) and again on the macro's output
-/// (rustc's only run), so the attribute macro is refused by name, `DeriveAfterAttrMacro`, and the
-/// item kept (attr-bang-kind-2, rule 3); a derive's helper between two derives (`Fine`) is inert
-/// and refused nothing.
-///
-/// Expected after attr-bang-kind-2: "1 passed, 0 failed". Control: without `Cells::called`'s
-/// `derive_follows` arm the error list is empty (the macro takes `Late`; `Other` runs twice).
+/// Rule (the Reference, "Attributes": an item's attributes are taken in written order): a
+/// `#[derive]` written after an attribute macro stays on the item the macro takes, unexpanded,
+/// and runs once, in the macro's output. The lowering sends the derives written BEFORE the
+/// macro, then the macro (`AfterDerive`), never the later derive beside it (lane AD1, task
+/// lower.rs `AttrOrder::Written`); so the macro is no longer refused `DeriveAfterAttrMacro`
+/// (that refusal stood while every derive of an item was sent at once: tests/attr_order.rs
+/// `the_old_order_refuses_the_tempo_shape` is its control). A derive's helper between two
+/// derives (`Fine`) is inert and refused nothing.
 #[test]
 fn a_derive_after_an_attribute_macro_is_refused() {
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
@@ -173,17 +173,17 @@ fn a_derive_after_an_attribute_macro_is_refused() {
     assert_eq!(
         roles,
         [
-            (String::from("pin_project"), CallRole::AfterDeriveBeforeDerive),
+            (String::from("pin_project"), CallRole::AfterDerive),
             (String::from("derive"), CallRole::Keep),
-            (String::from("serde"), CallRole::AfterDeriveBeforeDerive),
+            (String::from("serde"), CallRole::AfterDerive),
             (String::from("derive"), CallRole::Keep),
         ],
-        "each name with a derive after it is marked so, each item has its keep call"
+        "each name is sent after the derives written before it, each item has its keep call"
     );
-    assert_eq!(
-        macro_errors(user),
-        [(String::from("pin_project"), Unresolved::DeriveAfterAttrMacro)],
-        "only the attribute macro with a derive after it is refused; notes {:?}",
+    let errors = macro_errors(user);
+    assert!(
+        errors.iter().all(|(_, why)| *why != Unresolved::DeriveAfterAttrMacro),
+        "no macro is refused for a derive written after it: {errors:?}; notes {:?}",
         names.notes(0)
     );
 }

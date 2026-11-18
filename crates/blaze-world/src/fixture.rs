@@ -37,6 +37,14 @@ pub fn pack(files: &[(&str, &str)], alloc: Alloc<'_>) -> StdVec<u8> {
 /// reads it must quote (the same file).
 pub const CORE: &str = "#![no_core]\n#![feature(rustc_attrs)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\npub const FIXTURE_BAD: usize = 0 - 1;\npub struct FixtureBad {\n    pub x: [u8; FIXTURE_BAD],\n}\n";
 
+/// [`CORE`] with the three lang items the borrow check's facts ask for (blaze-ladder front2
+/// borrows.rs `BorrowLangs::of`: `copy`, `drop`, `owned_box`), declared as the real core and
+/// alloc declare them (`core::marker::Copy`, `core::ops::Drop`, `alloc::boxed::Box`; the
+/// fixture's `Box` is in core so every program links it). Without `copy`, a body naming an ADT
+/// is not borrow-checked (`FactUnknown { fact: "Copy", why: NoLangItem }`); [`CORE`] keeps that
+/// state for the tests that show the refusal (blaze-cli engine_check_tests.rs).
+pub const CORE_WITH_LANGS: &str = "#![no_core]\n#![feature(rustc_attrs, lang_items)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub mod marker {\n    #[lang = \"copy\"]\n    pub trait Copy {}\n}\npub mod ops {\n    #[lang = \"drop\"]\n    pub trait Drop {\n        fn drop(&mut self);\n    }\n}\npub mod boxed {\n    #[lang = \"owned_box\"]\n    pub struct Box<T>(*mut T);\n}\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\npub const FIXTURE_BAD: usize = 0 - 1;\npub struct FixtureBad {\n    pub x: [u8; FIXTURE_BAD],\n}\n";
+
 /// The text of the fixture's std when a test does not give its own.
 pub const STD: &str = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";
 
@@ -48,7 +56,18 @@ pub fn shelf(
     cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    shelf_of(&[(triple, cfg)], std, Shape::Plain, alloc)
+    shelf_of(&[(triple, cfg)], CORE, std, Shape::Plain, alloc)
+}
+
+/// [`shelf`] whose core is [`CORE_WITH_LANGS`]: the borrow check's lang items are declared, so
+/// a body naming an ADT is borrow-checked (blaze-cli engine_borrow_forms_tests.rs).
+pub fn shelf_with_langs(
+    triple: &'static str,
+    std: &str,
+    cfg: &'static [(&'static str, Option<&'static str>)],
+    alloc: Alloc<'_>,
+) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    shelf_of(&[(triple, cfg)], CORE_WITH_LANGS, std, Shape::Plain, alloc)
 }
 
 /// [`shelf_with_std_dep`] where bstd also depends on `blaze_ids` (`Role::Blaze`), a crate that
@@ -60,7 +79,7 @@ pub fn shelf_with_bstd_naming_std(
     cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    shelf_of(&[(triple, cfg)], std, Shape::BstdNamesStd, alloc)
+    shelf_of(&[(triple, cfg)], CORE, std, Shape::BstdNamesStd, alloc)
 }
 
 /// Which units the fixture's shelf holds.
@@ -83,7 +102,7 @@ pub fn shelf_with_std_dep(
     cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    shelf_of(&[(triple, cfg)], std, Shape::StdDep, alloc)
+    shelf_of(&[(triple, cfg)], CORE, std, Shape::StdDep, alloc)
 }
 
 /// [`shelf`] cut for `triple` and for `wasm32-wasip1` (`macro_cfg` its atoms), the macro side a
@@ -95,14 +114,16 @@ pub fn shelf_with_macro_side(
     macro_cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    shelf_of(&[(triple, cfg), ("wasm32-wasip1", macro_cfg)], std, Shape::Plain, alloc)
+    shelf_of(&[(triple, cfg), ("wasm32-wasip1", macro_cfg)], CORE, std, Shape::Plain, alloc)
 }
 
 /// The fixture's shelf cut for each of `targets` (its triple and atoms), every target with the
-/// same units, as `shape` says. Each unit's sysroot is its root text's (core `#![no_core]`:
-/// none; the `#![no_std]` ones: core; `blaze_ids`: std), with the edges the cutter writes.
+/// same units, as `shape` says, `core` core's root text. Each unit's sysroot is its root
+/// text's (core `#![no_core]`: none; the `#![no_std]` ones: core; `blaze_ids`: std), with the
+/// edges the cutter writes.
 fn shelf_of(
     targets: &[(&'static str, &'static [(&'static str, Option<&'static str>)])],
+    core: &str,
     std: &str,
     shape: Shape,
     alloc: Alloc<'_>,
@@ -112,7 +133,7 @@ fn shelf_of(
         &[
             // Two items a body calls through a head, a fn and a struct with an inherent method:
             // what blaze-cli's engine tests read as toolchain heads (engine_seeds_tests.rs).
-            ("core/src/lib.rs", CORE),
+            ("core/src/lib.rs", core),
             ("alloc/src/lib.rs", "#![no_std]\npub mod vec {}"),
             ("std/src/lib.rs", std),
             ("proc_macro/src/lib.rs", "#![no_std]\npub struct TokenStream;"),

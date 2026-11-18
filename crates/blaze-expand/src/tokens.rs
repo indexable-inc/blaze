@@ -478,6 +478,17 @@ impl<'a> TokenStream<'a> {
         *self.tokens.allocator()
     }
 
+    /// The same stream in `alloc`, each table sized once to its length (no growth, so nothing
+    /// is left behind in a bump allocator): how a stream made in a call's scratch is kept
+    /// (blaze-scope resolve.rs `expand_decls`). Equal to `self` ([`PartialEq`]).
+    pub fn clone_in<'b>(&self, alloc: Alloc<'b>) -> TokenStream<'b> {
+        TokenStream {
+            tokens: Vec::from_slice_in(&self.tokens[..], alloc),
+            text: Vec::from_slice_in(&self.text[..], alloc),
+            contexts: Vec::from_slice_in(&self.contexts[..], alloc),
+        }
+    }
+
     /// Appends a token of `kind`, `text` and `ctx`, a context of this stream.
     pub fn push(&mut self, kind: TokenKind, text: &str, ctx: Ctx) -> Result<(), StreamError> {
         self.push_bytes(kind, text.as_bytes(), ctx)

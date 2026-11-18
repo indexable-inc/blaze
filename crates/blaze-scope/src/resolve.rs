@@ -62,7 +62,7 @@ use crate::task::{
 };
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
-use crate::task::{Attrs, inline_child, walk_rows};
+use crate::task::{AttrOrder, Attrs, inline_child, walk_rows};
 use crate::tree_record::{TreeEnum, TreeModule, TreeRecord};
 use crate::task::{ProcAttr, ProcDecls, ProcExport};
 use blaze_surface::ProcKind;
@@ -153,6 +153,13 @@ pub trait SourceTexts<'a> {
     /// an expansion wrote is not found. Every real source answers [`AttrPlant::None`].
     fn attr_plant(&self) -> AttrPlant {
         AttrPlant::None
+    }
+
+    /// How a derived item's derives and the attributes after them are sent (attr-order-1,
+    /// tests/attr_order.rs): every real source answers [`AttrOrder::Written`], the Reference's
+    /// order; [`AttrOrder::DerivesAtOnce`] is that test's planted bug.
+    fn attr_order(&self) -> AttrOrder {
+        AttrOrder::Written
     }
 }
 
@@ -687,6 +694,12 @@ impl<'a> Names<'a> {
 
     pub fn graph(&self) -> &CrateGraph<'a, &'a str> {
         &self.graph
+    }
+
+    /// The allocator these names were made in: a walk's held scratch is made in it, so it
+    /// lives as long as the names it reads (blaze-ladder front2/source.rs).
+    pub fn alloc(&self) -> Alloc<'a> {
+        self.alloc
     }
 
     /// Every crate, by [`CrateId`] (its index in the inputs).
@@ -1299,7 +1312,10 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         let mark = |stage: crate::task::Stage| par.stage(stage);
         let part = |part: ExpandPart, macro_name: &str, size: usize| par.expand_part(part, macro_name, size);
         let seen = |def: ItemKey, input: &str| par.expand_call(def, input);
-        let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen };
+        // Where each macro call's working memory is held (lane N5): the Par's scratch, reset
+        // after each call, or (`Scratch::Kept`) the crate's allocator.
+        let scratch = |work: &mut dyn FnMut(Alloc<'_>)| par.call_scratch(work);
+        let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen, scratch: &scratch };
         // The cell core solves and writes the scopes. The files' blocks that hold impls are
         // modules before it starts: it is told of them as of any made module.
         par.stage(crate::task::Stage::Solve);
@@ -1472,7 +1488,7 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     let root = set.files[root_file as usize];
     let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
     let tools = crate_tools(&attrs, alloc);
-    let mut low = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, notes, par, None, alloc);
+    let mut low = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, notes, par, None, sources.attr_order(), alloc);
     let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
     let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
     let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, alloc)?;
@@ -1637,7 +1653,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     };
     // The members' notes are kept only when the record holds: a tree made again notes its own.
     let mut own_notes = AVec::new_in(alloc);
-    let mut low = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, &mut own_notes, par, Some(at), alloc);
+    let mut low = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, &mut own_notes, par, Some(at), sources.attr_order(), alloc);
     let stored_view = CrateRootView::read(stored).map_err(|_| refuse(MemberRefusal::TreeCrateRoot))?;
     if members_moved(input.key, &tree, &low, &record, &stored_view, alloc) {
         return Ok(None);
@@ -1645,7 +1661,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     if !defining.is_empty() {
         // Their macro table rows alone: their scopes, notes and calls are their records'.
         let mut dropped = AVec::new_in(alloc);
-        let outside = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, &mut dropped, par, Some(defining), alloc);
+        let outside = lower_modules(input.key, input.implicit.entry, edition, cfg, &tools, &set, &tree, listed, &mut dropped, par, Some(defining), sources.attr_order(), alloc);
         let found = macros_by_module(&outside.tables.macros, alloc);
         if outside.at.iter().any(|&i| found.get(&tree.modules[i].key).copied().unwrap_or(0) != record.modules[i].macros) {
             // A module's macros moved under the record: its inputs moved.
@@ -1803,6 +1819,7 @@ fn lower_modules<'a, P: Par>(
     notes: &mut AVec<'a, NamesNote<'a>>,
     par: &P,
     only: Option<AVec<'a, usize>>,
+    order: AttrOrder,
     alloc: Alloc<'a>,
 ) -> Lowering<'a> {
     // The modules lowered, ascending: every one, or a one-group solve's members.
@@ -1828,14 +1845,14 @@ fn lower_modules<'a, P: Par>(
                 made: false,
                 members_of: None,
                 written: file.path,
-                kept: false,
+                kept: None,
             };
             // The root's fragment (the walk's first module) declares the module's list.
             let procs = match listed {
                 None => ProcDecls::Text,
                 Some(list) => ProcDecls::Module { here: if i == 0 { list } else { &[] } },
             };
-            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0 }, fragment, alloc)
+            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, order }, fragment, alloc)
         },
         &mut parts,
     );
@@ -2161,10 +2178,15 @@ struct FillCx<'r, 'a, S> {
     part: PartMark<'r>,
     /// The caller's call mark ([`crate::task::Par::expand_call`]).
     seen: &'r dyn Fn(ItemKey, &str),
+    /// The caller's call scratch ([`crate::task::Par::call_scratch`]).
+    scratch: CallScratch<'r>,
 }
 
 /// [`crate::task::Par::expand_part`] as [`expand_decls`] takes it.
 type PartMark<'r> = &'r dyn Fn(ExpandPart, &str, usize);
+
+/// [`crate::task::Par::call_scratch`] as [`expand_decls`] takes it.
+type CallScratch<'r> = &'r dyn Fn(&mut dyn FnMut(Alloc<'_>)) -> crate::task::Scratch;
 
 impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
     fn expand(&self, request: ExpandRequest) -> crate::task::Expanded {
@@ -2177,7 +2199,7 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
         // The note that refuses the call: the last the driver notes for it before it returns
         // nothing (every way it does notes why first), kept for the names record's row.
         let last = core::cell::Cell::new(None);
-        let expansion = match expand_decls(self.base, self.run, request, self.part, self.seen, &env, &last) {
+        let expansion = match expand_decls(self.base, self.run, request, self.part, self.seen, self.scratch, &env, &last) {
             Some((decls, made)) => Expansion { decls, made, refused: None, refused_by: None },
             None => {
                 let src = self.base.tables.calls.get(&request.call).copied().or_else(|| held(self.run.tables.read(), "tables").calls.get(&request.call).copied());
@@ -2601,7 +2623,36 @@ pub(crate) fn render_with<'a>(
 
 /// Expands one call the fill asked for: its declarations and text, or `None` (noted) when it
 /// adds nothing.
+///
+/// The call's working memory (its input, the matcher's expansion, the rendering, the origin
+/// column, the kept entry's bytes) is held where `scratch` says ([`crate::task::Par::
+/// call_scratch`]): in a scratch the Par resets once [`expand_call`] returns, or in the
+/// crate's allocator. What outlives the call [`expand_call`] writes in the crate's allocator
+/// itself (`base.alloc`), each piece at its exact size: so the frame's peak is what is kept
+/// plus one call's scratch, and the two answers write equal bytes.
+#[allow(clippy::too_many_arguments, reason = "the call's context, each named")]
 fn expand_decls<'a, S: SourceTexts<'a>>(
+    base: &Base<'_, 'a, S>,
+    run: &Run<'a>,
+    request: ExpandRequest,
+    part: PartMark<'_>,
+    seen: &dyn Fn(ItemKey, &str),
+    scratch: CallScratch<'_>,
+    refused_env: &crate::refused::EnvRefusal<'a>,
+    last: &core::cell::Cell<Option<ExpandNote<'a>>>,
+) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
+    let mut out = None;
+    let mut work = |s: Alloc<'_>| out = expand_call(base, run, request, part, seen, refused_env, last, s);
+    if scratch(&mut work) == crate::task::Scratch::Kept {
+        work(base.alloc);
+    }
+    out
+}
+
+/// [`expand_decls`]'s one call, its work in `alloc` (a scratch or the crate's allocator), what
+/// it keeps in `base.alloc` (`home`).
+#[allow(clippy::too_many_arguments, reason = "the call's context, each named")]
+fn expand_call<'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
     run: &Run<'a>,
     request: ExpandRequest,
@@ -2609,8 +2660,10 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     seen: &dyn Fn(ItemKey, &str),
     refused_env: &crate::refused::EnvRefusal<'a>,
     last: &core::cell::Cell<Option<ExpandNote<'a>>>,
+    alloc: Alloc<'_>,
 ) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
-    let alloc = base.alloc;
+    // `home` keeps what outlives the call; `alloc` is the call's work.
+    let home = base.alloc;
     let call = request.call;
     let src = base.tables.calls.get(&call).copied().or_else(|| held(run.tables.read(), "tables").calls.get(&call).copied());
     let Some(src) = src else {
@@ -2636,7 +2689,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         None => match base.built.of(def_key) {
             Some(other) => {
                 let mac = other.macro_of(def_key);
-                base.built.ask(|| crate::asked::Question::macro_src(def_key, mac, alloc));
+                base.built.ask(|| crate::asked::Question::macro_src(def_key, mac, home));
                 (mac, other.key(), other.edition(), other.proc_key())
             }
             None => (None, base.key, base.edition, None),
@@ -2680,7 +2733,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         call_shape: src.kind,
         module_path,
         sources: base.sources,
-        alloc,
+        // A host's answers (`file!()`'s text, a D111 finding) are kept with the crate.
+        alloc: home,
     };
     let cfg_atom = |name: &str, value: Option<&str>| base.cfg.atoms().binary_search(&(name, value)).is_ok();
     // The crate's kept expansions ([`crate::expansions`]) are keyed by the ONE key of an
@@ -2703,7 +2757,9 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let written;
     let def: Kept<'_> = match run.prepares.get(def_key).filter(|_| declarative) {
         Some(kept) => kept,
-        None => match definition_of(mac, def_krate, runner, def_edition, src.kind, alloc) {
+        // In `home`: a declarative definition is kept for every call of it (`prepares`), and
+        // its refusal is a note; a builtin's or a proc macro's is a few words.
+        None => match definition_of(mac, def_krate, runner, def_edition, src.kind, home) {
             Ok(def) if declarative => run.prepares.keep(def_key, def),
             Ok(def) => {
                 written = def;
@@ -2766,7 +2822,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         Ok::<bool, Infallible>(answer)
     };
     let item_note = |error: ItemAttrsError<Infallible>| note(ExpandNote::ItemAttrs { macro_name: mac.name, error });
-    let (args, item): (Option<TokenStream<'a>>, TokenStream<'a>);
+    let (args, item): (Option<TokenStream<'_>>, TokenStream<'_>);
     let derive_facts;
     let call_of = match src.kind {
         CallShape::FnLike => Call::fn_like(&input, site),
@@ -2828,7 +2884,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             let derives = match ItemAttrs::new(input).derives(atom) {
                 Ok(Some(derives)) => derives,
                 // The item's cfg is false: nothing of it is derived.
-                Ok(None) => return Some((DeclsBuilder::new_in(alloc), None)),
+                Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
                 Err(error) => {
                     item_note(error);
                     return None;
@@ -2864,7 +2920,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     });
     // A kept expansion is taken when its read list is answered today as it was: each cfg atom
     // the item walk asked, then each read the expansion made.
-    let mut found: Option<blaze_expand::Expansion<'a>> = None;
+    let mut found: Option<blaze_expand::Expansion<'_>> = None;
     if let Some(key) = call_key {
         let entry = kept.find(&key).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not open: {e}", mac.name));
         if let Some((index, entry)) = entry {
@@ -2899,7 +2955,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // library's own `#[rustc_builtin_macro]` definition (core's) is that builtin.
     let shadowed = |name: &str| base.tables.macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name));
     let nested_at = DefAt { site: DefSite { krate: def_krate, module: None }, edition: def_edition, export: Export::Exported, local_inner: LocalInner::No, transparency: None };
-    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, alloc };
+    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: home, alloc };
     let run_part = match mac.body {
         MacroBody::Rules(_) | MacroBody::Macro2 { .. } => ExpandPart::RunRules,
         MacroBody::BuiltinFn(_) => ExpandPart::RunBuiltin,
@@ -2941,8 +2997,10 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                 }
                 _ => None,
             };
+            // Written in the call's work, kept at its exact size: an entry grows as it is
+            // written, and its growth stays behind in the scratch, never in `home`.
             match entry {
-                Some(entry) => kept.made(key, entry.leak()),
+                Some(entry) => kept.made(key, AVec::from_slice_in(&entry[..], home).leak()),
                 None => kept.unkept(),
             }
         }
@@ -2956,7 +3014,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // rule matches, "an error is reported"): it writes nothing, and what it might have written
     // is unknown because of it, never absent (rules 19 and 54). Returning `None` stores it
     // refused (`FillCx::expand`, `crate::refused`); the note keeps the matcher's own reason.
-    if let Some(failed) = blaze_expand::Failed::of(&expansion, alloc) {
+    if let Some(failed) = blaze_expand::Failed::of(&expansion, home) {
         note(ExpandNote::Failed { path: src.name, implicit: src.implicit, failed });
         return None;
     }
@@ -3001,10 +3059,12 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // final size (at most one a token), and the `crate` written for another crate's `$crate`
     // beside it, sparse, by its place's index: no wide row per token is held or grown (the
     // frame's largest stretch in tempo's core, `scope frame by stretch`).
-    let mut placed: AVec<'a, (u32, u32, u32)> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
+    // `placed` and `words` are kept (the nested input reads them), sized once in `home`; the
+    // rendering, `roots` and the column grow in the call's work.
+    let mut placed: AVec<'a, (u32, u32, u32)> = AVec::with_capacity_in(expansion.tokens.len(), home);
     let mut roots: AVec<'_, (u32, CrateItemKey)> = AVec::new_in(alloc);
     let mut too_large = false;
-    let mut words: AVec<'a, Option<u32>> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
+    let mut words: AVec<'a, Option<u32>> = AVec::with_capacity_in(expansion.tokens.len(), home);
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
@@ -3036,7 +3096,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // How many `crate`s the text writes for another crate's `$crate`: such a text is read only
     // with its marks (crate::crate_roots).
     let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
-    let text: &'a str = Box::leak(rendered.into_boxed_str());
+    // Rendered in the call's work (the text grows as it is written), kept at its exact size.
+    let text: &'a str = keep(rendered.as_str(), home);
     let input_index = match written_input.as_deref() {
         Some(map) => blaze_expand::origin_column::InputIndex::Aligned(map),
         None => blaze_expand::origin_column::InputIndex::AsWritten,
@@ -3046,21 +3107,25 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
     let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
-    let origins = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc)
-        .and_then(|column| crate::expansion_origins::write(call, src.place, shape, src.name, src.implicit, &column, alloc));
+    // The column and its bytes are made in the call's work; the bytes are kept at their size.
+    let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
+    let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = origin_column
+        .and_then(|column| crate::expansion_origins::write(call, src.place, shape, src.name, src.implicit, &column, alloc))
+        .map(|bytes| &*AVec::from_slice_in(bytes, home).leak());
     // What a call written in this text takes its input from (crate::nested_input): the
     // expansion's tokens sealed with its key, each placed piece's bytes, each token's word. The
-    // stream is moved, never copied: nothing reads the expansion's tokens after this.
+    // stream was made in the call's work: it is kept as one exact copy in `home` (each table
+    // sized once, `TokenStream::clone_in`), sealed there.
     let expansion_tokens = {
-        let mut sealed = expansion.tokens;
+        let mut sealed = expansion.tokens.clone_in(home);
         sealed.seal(own_key.0);
-        let sealed: &'a TokenStream<'a> = Box::leak(Box::new_in(sealed, alloc));
+        let sealed: &'a TokenStream<'a> = Box::leak(Box::new_in(sealed, home));
         let placed: &'a [(u32, u32, u32)] = placed.leak();
         let words: &'a [Option<u32>] = words.leak();
         crate::nested_input::ExpansionTokens { stream: sealed, text, places: placed, words }
     };
     part(ExpandPart::Outline, mac.name, text.len());
-    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(text, outline(text, edition, alloc), origins), alloc));
+    let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(text, outline(text, edition, home), origins), home));
     part(ExpandPart::Lower, mac.name, text.len());
     // The marks a lowered path's first segment resolves by (token-mark-2): the text's column,
     // opened once in `ExpansionText::new`.
@@ -3101,35 +3166,48 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                 (text, made, column, expansion_tokens)
             } else {
                 match crate::expanded_blocks::statements_as_items(text, call, alloc) {
-                    Ok(None) => return Some((DeclsBuilder::new_in(alloc), None)),
+                    Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
                     Ok(Some((items, copies))) => {
-                        let items: &'a str = Box::leak(items.into_boxed_str());
-                        // The column moved with the slices the items text copied.
-                        let column = match column.map(|c| crate::crate_roots::remapped(c, &copies, alloc)).transpose() {
-                            Ok(column) => column,
-                            Err(lost) if roots_written > 0 => {
+                        let items: &'a str = keep(items.as_str(), home);
+                        // The column moved with the slices the items text copied, written with
+                        // the call's own part (its call, place, shape and macro, as the
+                        // rendered text's): an item of the items text walks from its place to
+                        // the call that wrote it (blaze-cli body_types/covered.rs
+                        // `written_path`), as an item of any expansion does. The rows are those
+                        // `remapped` carried before (one remap, read back in place).
+                        let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = match made.column {
+                            Ok(column) => match crate::crate_roots::remap(column, &copies, alloc) {
+                                Ok(moved) => crate::expansion_origins::write(call, src.place, shape, src.name, src.implicit, &moved, alloc)
+                                    .map(|bytes| &*AVec::from_slice_in(bytes, home).leak()),
+                                Err(error) if roots_written > 0 => {
+                                    note(ExpandNote::RootsLost { macro_name: mac.name, lost: crate::crate_roots::RootsLost::Column { error } });
+                                    return None;
+                                }
+                                Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+                            },
+                            Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+                        };
+                        let again: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText::new(items, outline(items, edition, home), origins), home));
+                        // The marks a lowered path reads: the moved column, as before; none
+                        // when the rendered text had none (refused above when it wrote
+                        // another crate's root).
+                        let column = match (column, again.column) {
+                            (Some(_), Ok(moved)) => Some(moved),
+                            (Some(_), Err(lost)) if roots_written > 0 => {
                                 note(ExpandNote::RootsLost { macro_name: mac.name, lost });
                                 return None;
                             }
-                            Err(_) => None,
+                            _ => None,
                         };
-                        let again: &'a ExpansionText<'a> = Box::leak(Box::new_in(
-                            ExpansionText::new(
-                                items,
-                                outline(items, edition, alloc),
-                                Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
-                            ),
-                            alloc,
-                        ));
                         if let Some(error) = again.outline.errors().first() {
                             note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
-                            return Some((DeclsBuilder::new_in(alloc), None));
+                            return Some((DeclsBuilder::new_in(home), None));
                         }
-                        (items, again, column, expansion_tokens.moved(items, &copies, alloc))
+                        (items, again, column, expansion_tokens.moved(items, &copies, home))
                     }
                     Err(refused) => {
                         note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
-                        return Some((DeclsBuilder::new_in(alloc), None));
+                        return Some((DeclsBuilder::new_in(home), None));
                     }
                 }
             }
@@ -3141,7 +3219,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let included: Option<&'a str> = match mac.body {
         MacroBody::BuiltinFn("include") => {
             let seen = base.sources.crate_env(base.index).map(|env| env.seen());
-            crate::included::included_read(base.shown_from, seen, calling, &expansion.reads, alloc).map(|path| keep(&path, alloc))
+            crate::included::included_read(base.shown_from, seen, calling, &expansion.reads, alloc).map(|path| keep(&path, home))
         }
         _ => None,
     };
@@ -3159,23 +3237,24 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         made: false,
         members_of: src.owner,
         written,
-        kept: false,
+        kept: None,
         marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
     };
-    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
+    // The lowering is kept (the call's declarations and modules): in `home`.
+    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, order: base.sources.attr_order() }, fragment, home);
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
     // few moves below (what the part costs is what `make_modules` does: a module's file read,
     // outlined and lowered).
     if !out.mods_made.is_empty() {
         part(ExpandPart::Modules, mac.name, out.mods_made.len());
     }
-    let mods =core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
+    let mods =core::mem::replace(&mut out.mods_made, AVec::new_in(home));
     // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
     // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
     let included_dir: Option<&'a str> = included.filter(|_| !mods.is_empty()).map(|path| {
         let mut dir = AString::from_str_in(path, alloc);
         pop_dir(&mut dir);
-        keep(&dir, alloc)
+        keep(&dir, home)
     });
     let place = Made {
         text,
@@ -3187,9 +3266,9 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
         tokens: fragment_tokens,
     };
-    let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
+    let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(home));
     make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
-    let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
+    let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(home));
     part(ExpandPart::Tables, mac.name, 0);
     add_lowered(run, call, At::Expansion(call), out);
     part(ExpandPart::Blocks, mac.name, bodies.len());
@@ -3202,8 +3281,9 @@ const KEPT_ITEM_NAME: &str = "kept item";
 
 /// The expansion of keep call `call` (`src`), its item kept after the attributes written after
 /// its derives ([`crate::cells::KEEP_ITEM`], attr-bang-kind-2): the call's input, the item as
-/// written, lowered as the call's fragment with [`Fragment::kept`], so its derives,
-/// after-derive calls and helper checks, which the calling fragment sent, are not sent again.
+/// written, lowered as the call's fragment with [`Fragment::kept`] set to the names the calls
+/// before it answered ([`CallSrc::answered`]), so what the calling fragment sent is not sent
+/// again and the item's next stage is (attr-order-1: its later derives, its later names).
 /// Its names are declared as an attribute macro's that returned the item would be; the item's
 /// key is under the call's (as any expansion's).
 fn keep_item<'a, S: SourceTexts<'a>>(
@@ -3243,7 +3323,9 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         made: false,
         members_of: src.owner,
         written: src.written,
-        kept: true,
+        // The names of the item the calls before this one answered (attr-order-1): the item's
+        // attribute walk goes on from the next.
+        kept: Some(src.answered),
         // A kept item's text: the item as written at the call; its column (expansion_origins.rs
         // `kept`) holds no marks, and its tokens are read at the module, as this says.
         marks: None,
@@ -3251,7 +3333,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         // from that expansion's tokens, placed in the same text.
         tokens: kept_tokens,
     };
-    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
+    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, order: base.sources.attr_order() }, fragment, alloc);
     // A struct, an enum or a union makes no module; moved as `expand_decls` moves them so a
     // change there stays one shape.
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
@@ -3357,11 +3439,11 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
             made: false,
             members_of: None,
             written: body.written,
-            kept: false,
+            kept: None,
             marks,
             tokens,
         };
-        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
+        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, order: base.sources.attr_order() }, fragment, alloc);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
         let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens };
         {
@@ -3390,12 +3472,16 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
 /// must name a library builtin (`concat`, `core::concat`, `std::env`, ...) that the crate does not
 /// shadow with a macro of its own: anything else is a typed refusal naming it ([`EagerRefusal`]).
 /// The nested calls' reads (`env!`'s variable) are the crate's script outputs, already in its key.
-struct EagerDriver<'s, 'a> {
+struct EagerDriver<'s, 'a, 'w> {
     macro_name: &'a str,
     /// Where the builtins the nested calls name are defined.
     def_at: DefAt,
     shadowed: &'s dyn Fn(&str) -> bool,
-    alloc: Alloc<'a>,
+    /// Where a note's text is kept: the crate's allocator (a note outlives the call).
+    keep: Alloc<'a>,
+    /// Where the work is done: the call's scratch ([`crate::task::Par::call_scratch`]), or the
+    /// crate's allocator when the Par gave none.
+    alloc: Alloc<'w>,
 }
 
 /// A nested call on the worklist: its builtin, its arguments, the calls nested in them once
@@ -3408,15 +3494,13 @@ struct EagerFrame<'a> {
     answers: AVec<'a, TokenStream<'a>>,
 }
 
-impl<'a> EagerDriver<'_, 'a> {
+impl<'a, 'w> EagerDriver<'_, 'a, 'w> {
     fn refused(&self, nested: &str, why: EagerRefusal) -> ExpandNote<'a> {
-        let mut text = AString::new_in(self.alloc);
-        text.push_str(nested);
-        ExpandNote::Eager { macro_name: self.macro_name, nested: Box::leak(text.into_boxed_str()), why }
+        ExpandNote::Eager { macro_name: self.macro_name, nested: keep(nested, self.keep), why }
     }
 
     /// `call` of `def`, its nested calls expanded first when it is eager.
-    fn expand(&self, def: Kept<'_>, call: &Call<'_>, cx: &impl ExpandCx) -> Result<blaze_expand::Expansion<'a>, ExpandNote<'a>> {
+    fn expand(&self, def: Kept<'_>, call: &Call<'_>, cx: &impl ExpandCx) -> Result<blaze_expand::Expansion<'w>, ExpandNote<'a>> {
         let failed = |error| ExpandNote::Expand { macro_name: self.macro_name, error };
         let nested = match def.expand(call, cx, self.alloc).map_err(failed)? {
             Expanded::Expansion(expansion) => return Ok(expansion),
@@ -3435,10 +3519,10 @@ impl<'a> EagerDriver<'_, 'a> {
     }
 
     /// The answers of the outer call's `nested` calls, in order.
-    fn answers(&self, outer: &TokenStream<'_>, nested: AVec<'a, NestedCall>, site: CallSite, cx: &impl ExpandCx) -> Result<AVec<'a, TokenStream<'a>>, ExpandNote<'a>> {
+    fn answers(&self, outer: &TokenStream<'_>, nested: AVec<'w, NestedCall>, site: CallSite, cx: &impl ExpandCx) -> Result<AVec<'w, TokenStream<'w>>, ExpandNote<'a>> {
         let alloc = self.alloc;
-        let mut root: AVec<'a, TokenStream<'a>> = AVec::new_in(alloc);
-        let mut stack: AVec<'a, EagerFrame<'a>> = AVec::new_in(alloc);
+        let mut root: AVec<'w, TokenStream<'w>> = AVec::new_in(alloc);
+        let mut stack: AVec<'w, EagerFrame<'w>> = AVec::new_in(alloc);
         loop {
             // The top frame, once its nested calls are answered (or before it asked): expanded.
             if let Some(top) = stack.last_mut()
@@ -3455,10 +3539,9 @@ impl<'a> EagerDriver<'_, 'a> {
                     Expanded::Expansion(expansion) => {
                         // The nested call failed (`env!` of a variable not set, ..): its own
                         // reason, as a failed call's (rustc reports the nested call's error).
-                        if let Some(failed) = blaze_expand::Failed::of(&expansion, alloc) {
-                            let mut path = AString::new_in(alloc);
-                            path.push_str(name);
-                            return Err(ExpandNote::Failed { path: Box::leak(path.into_boxed_str()), implicit: false, failed });
+                        // The note outlives the call: kept in the crate's allocator.
+                        if let Some(failed) = blaze_expand::Failed::of(&expansion, self.keep) {
+                            return Err(ExpandNote::Failed { path: keep(name, self.keep), implicit: false, failed });
                         }
                         let mut tokens = expansion.tokens;
                         tokens.seal(key);
@@ -3751,11 +3834,11 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             made: true,
             members_of: None,
             written: fragment_of.written,
-            kept: false,
+            kept: None,
             marks: fragment_of.marks,
             tokens: fragment_of.tokens,
         };
-        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
+        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, order: base.sources.attr_order() }, fragment, alloc);
         bodies.extend(out.bodies.iter().copied());
         let mut chain = AVec::with_capacity_in(parent_chain.len() + 1, alloc);
         chain.push(m.key);

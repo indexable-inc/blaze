@@ -19,7 +19,7 @@ use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::{BodyView, InferCtx, ItemKey, Name, Needs, Outcome, Question};
 
-use super::buckets::{Ask, Buckets, TablesReadError, Unfilled, inherent_home, trait_home};
+use super::buckets::{Ask, Buckets, Seen, TablesReadError, Unfilled, inherent_home, trait_home};
 use super::heads::{HeadError, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -1196,7 +1196,8 @@ pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: I
         make(r, Fill::Store(want)).ok()?;
     }
     if r.buckets.as_ref().and_then(|b| b.impls_of(trait_, shape)).is_none() {
-        make(r, Fill::Impls(trait_, shape)).ok()?;
+        // At ground arguments after checking: the whole program's impls (`Seen::Program`).
+        make(r, Fill::Impls(trait_, shape, Seen::Program)).ok()?;
     }
     let b = r.buckets.as_ref()?;
     if b.trait_gap(trait_, shape).is_some() {
@@ -1210,11 +1211,11 @@ pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: I
 fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> Result<(), MakeFail> {
     match fill {
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
-        Fill::Impls(trait_, shape) => {
+        Fill::Impls(trait_, shape, seen) => {
             let (names, index, order) = (r.names, r.index, r.order);
             let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source(names, index));
             let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
-            match trait_question(names, &mut heads, b, trait_, shape, order)? {
+            match trait_question(names, &mut heads, b, trait_, shape, seen, order)? {
                 Made::Made => Ok(()),
                 Made::Later(never) => match never {},
             }
@@ -1325,7 +1326,9 @@ impl<'n> ImplHeads<'n> for Importing<'_, 'n> {
 /// question for both paths (`make_once` between rounds, `BodyWorld::impl_question` on the
 /// spot). `Later` leaves `b` with the question unanswered (what was filed and imported stays;
 /// filing twice is a no-op), so the fill made after it answers as one call would.
-pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, trait_: ItemKey, shape: tc::Shape, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
+/// `seen` says whose impls may answer ([`Seen`]): a checked body's crate's link closure, or
+/// the whole program's; the answer is filed under it.
+pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, trait_: ItemKey, shape: tc::Shape, seen: Seen, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
     // `trait_home` reads the trait's head when one is made (whether each parameter
     // defaults to `Self`) and the text's count when none is. A head made only after a
     // question's first answer gave a later answer of the same question another home,
@@ -1348,17 +1351,21 @@ pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S,
     let home = trait_home(names, heads.keys(), heads.store(), trait_, shape);
     // Over a bucket index: this question's buckets of the crates `home` admits.
     b.admit_shared(names, heads.keys(), home, Ask::Trait(trait_, shape)).map_err(MakeFail::Tables)?;
+    // And only impls of the crates the asking body sees (`Seen`): none of a crate downstream
+    // of a checked body's, whose headers are then never made for it either.
+    let sight = b.sight(names, seen, heads.store().tys.alloc()).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
     let mut candidates = b.trait_candidates(trait_, shape, home);
     // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
     // decides an auto trait's structural rule, and the solver matches it to no positive
     // goal; its refused header is the question's gap, never a wrong `yes`.
     candidates.extend_from_slice(&b.negative_of(trait_, shape, home));
+    candidates.retain(|k| sight.sees(b.krate(*k)));
     candidates.sort_unstable();
     candidates.dedup();
     if let Made::Later(why) = lower_heads(names, heads, b, candidates, order)? {
         return Ok(Made::Later(why));
     }
-    b.answer(heads.store(), trait_, shape, home).map_err(MakeFail::Buckets)?;
+    b.answer(heads.store(), trait_, shape, home, sight).map_err(MakeFail::Buckets)?;
     Ok(Made::Made)
 }
 

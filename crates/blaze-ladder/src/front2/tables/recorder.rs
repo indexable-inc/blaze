@@ -15,7 +15,9 @@ use core::cell::{Cell, RefCell};
 
 use blaze_id::ItemKey;
 use blaze_own::{AVec, Alloc};
+use blaze_scope::cell_key::BindingKeys;
 use blaze_scope::names_cells::{CellSink, NameCell, Section};
+use blaze_surface::Namespace;
 
 /// The most reads one task keeps before it is refused (rule 18): a body that reads more is
 /// [`ReadsFull`], never a list cut short.
@@ -89,14 +91,27 @@ impl TableRead {
 /// Where the view puts each read: the recorder, or a test's sink.
 pub trait ReadSink {
     fn read(&self, read: TableRead);
+
+    /// The read of `module`'s own binding of `(ns, name)` (blaze-scope names_cells.rs
+    /// `CellSink::put_binding`): the cell `NameCell::Binding { module, name: cell_key(ns, name) }`.
+    /// This default derives the key per read; a recorder derives it once per DISTINCT read
+    /// (blaze-scope cell_key.rs `BindingKeys`), byte-equal (rule 21).
+    fn binding(&self, module: ItemKey, ns: Namespace, name: &str) {
+        self.read(TableRead::Names(NameCell::Binding { module, name: blaze_scope::cell_key::cell_key(ns, name) }));
+    }
 }
 
-/// A [`ReadSink`] as the names walk's [`CellSink`]: each cell a [`TableRead::Names`].
+/// A [`ReadSink`] as the names walk's [`CellSink`]: each cell a [`TableRead::Names`], each
+/// binding read handed on as the read itself, so the sink keys it ([`ReadSink::binding`]).
 pub struct NamesInto<'s>(pub &'s dyn ReadSink);
 
 impl CellSink for NamesInto<'_> {
     fn put(&self, cell: NameCell) {
         self.0.read(TableRead::Names(cell));
+    }
+
+    fn put_binding(&self, module: ItemKey, ns: Namespace, name: &str) {
+        self.0.binding(module, ns, name);
     }
 }
 
@@ -158,6 +173,9 @@ pub struct Recorder<'a> {
     full: Cell<bool>,
     /// A test's planted bug: reads of this cell are dropped ([`Recorder::plant_drop`]).
     dropped: Cell<Option<NameCell>>,
+    /// The binding reads' cell keys, each derived once ([`ReadSink::binding`]): a names lookup
+    /// hashes nothing here on a repeat.
+    binding_keys: RefCell<BindingKeys<'a>>,
 }
 
 impl<'a> Recorder<'a> {
@@ -169,7 +187,14 @@ impl<'a> Recorder<'a> {
             offered: Cell::new(0),
             full: Cell::new(false),
             dropped: Cell::new(None),
+            binding_keys: RefCell::new(BindingKeys::new_in(opts.alloc)),
         }
+    }
+
+    /// How many binding cell keys this recorder derived: one per distinct binding read,
+    /// whatever the number of lookups (the floor's counter).
+    pub fn binding_keys_derived(&self) -> u64 {
+        self.binding_keys.borrow().derived()
     }
 
     /// What was offered and kept so far ([`ReadTally`]; `sort_compares` is 0 before the sort).
@@ -259,11 +284,20 @@ impl ReadSink for Recorder<'_> {
         seen.insert(read);
         reads.push(read);
     }
+
+    fn binding(&self, module: ItemKey, ns: Namespace, name: &str) {
+        let key = self.binding_keys.borrow_mut().key(module, ns, name).key;
+        self.read(TableRead::Names(NameCell::Binding { module, name: key }));
+    }
 }
 
 impl CellSink for Recorder<'_> {
     fn put(&self, cell: NameCell) {
         self.read(TableRead::Names(cell));
+    }
+
+    fn put_binding(&self, module: ItemKey, ns: Namespace, name: &str) {
+        ReadSink::binding(self, module, ns, name);
     }
 }
 

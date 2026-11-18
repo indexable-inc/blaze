@@ -61,9 +61,18 @@ const MOST_SHOWN: usize = 64;
 fn def_text<'n>(names: &'n Names<'n>, keys: &Keys, d: Def) -> String {
     let k = ItemKey(d.0);
     let header = keys.library_in(names, k).and_then(|l| names.item_text(l)).and_then(|t| t.impl_header);
+    // Lane RF13, step 2: each candidate with its crate.
     match header {
-        Some(h) => format!("{} `{}`", ItemShown::of(names, keys, k), h.split_whitespace().collect::<Vec<_>>().join(" ")),
-        None => format!("{}", ItemShown::of(names, keys, k)),
+        Some(h) => format!("{} `{}` [crate {}]", ItemShown::of(names, keys, k), h.split_whitespace().collect::<Vec<_>>().join(" "), crate_name(names, keys, k)),
+        None => format!("{} [crate {}]", ItemShown::of(names, keys, k), crate_name(names, keys, k)),
+    }
+}
+
+/// The name of the crate checker key `k` is written in ("?" where it is of none).
+fn crate_name<'n>(names: &'n Names<'n>, keys: &Keys, k: ItemKey) -> &'n str {
+    match keys.library_in(names, k).and_then(|l| names.crate_of(l)).and_then(|c| names.crates().get(c)) {
+        Some(c) => c.name,
+        None => "?",
     }
 }
 
@@ -328,5 +337,121 @@ fn core_from_prim_the_walks_way() {
             "2 from_prim after its caller: {}",
             if clean { "CLEAN: the refusal needs more of the walk's state than its caller's (h3: run the walk with a cap, see the report)" } else { "REFUSED: the caller's check leaves the state that refuses it (h3, small)" }
         );
+    }
+}
+
+/// A text printed with each run of white space as one space (a header over several lines on
+/// one line), with no copy made.
+struct Words<'t>(&'t str);
+
+impl core::fmt::Display for Words<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (i, w) in self.0.split_whitespace().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            f.write_str(w)?;
+        }
+        Ok(())
+    }
+}
+
+/// The most impl headers part 3 prints (rule 18).
+const MOST_HEADERS: usize = 64;
+
+/// 3. THE WALK'S PROGRAM (lane RF13, step 2). Parts 1 and 2 resolve an edition-2024 program; the
+/// entry programs are `blaze-2026.11` ones, whose `std` is bstd (run.rs `build_new`:
+/// `library_set::toolchain_for`, `ProgramTexts`), so their names hold more crates and more
+/// impls. Over THAT program: every impl header naming `PartialEq` and `u32` with its crate; the
+/// whole program's answer of `u32: PartialEq<_>` (`answer_impls`, `Seen::Program`), each impl
+/// with its crate; then `from_prim` the walk's way with the trace on (each candidate with its
+/// crate), once as the tree checks it (its crate's impls only: buckets.rs `Seen`) and once with
+/// `Buckets::plant_whole_program_sight` (every crate's, as before the fix). The lead is proved
+/// when the planted check is REFUSED with a second held candidate of a crate downstream of core
+/// and the tree's is CLEAN.
+///
+/// Expected lines: `3 from_prim, its crate's impls: CLEAN` and, if the lead holds, `3 from_prim,
+/// every crate's impls (planted): REFUSED`.
+#[test]
+fn core_from_prim_in_the_walks_program() {
+    use blaze_ladder::front2::buckets::Buckets;
+    use blaze_ladder::front2::check::answer_impls;
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_ladder::run::{NewFront, OverflowChecks};
+
+    let frame: &'static Frame = Box::leak(Box::new(Frame::with_reserve(32 << 30, blaze_mem::tag::Tag::Infer).expect("the test's frame")));
+    let erased: &'static Erased<&'static Frame> = frame.alloc(Erased::new(frame));
+    let a = erased.handle();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
+    let new = NewFront { package: "entry", edition: "blaze-2026.11", shelf: Some(&shelf), overflow: OverflowChecks::On };
+    let panic = blaze_build::Panic::Unwind;
+    let tc = blaze_ladder::library_set::toolchain_for(&sources, "src/main.rs", new, panic, a).unwrap_or_else(|e| panic!("the walk's toolchain: {e}"));
+    let texts = ProgramTexts::new(&sources, "src/main.rs", new, &tc, panic).unwrap_or_else(|e| panic!("the walk's texts: {e}"));
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    println!("3 the walk's program: {} crates", names.crates().len());
+    let core = crates.iter().position(|c| c.name == "core").expect("the toolchain's `core`");
+    let imp = names
+        .items(core)
+        .map(|(k, _, _)| k)
+        .find(|&k| names.item_text(k).is_some_and(|t| t.impl_header.is_some_and(|h| h.contains("ErrorKind") && !h.contains(" for ")) && t.text.contains("fn from_prim")))
+        .expect("core's `impl ErrorKind` with `from_prim`");
+    let prepared = Prepares::new_in(a);
+
+    // Every impl header of the program naming both `PartialEq` and `u32`, with its crate (a
+    // header a macro wrote shows its expansion's text, `$t` replaced).
+    {
+        let front = Front2::new(&names, frame, &sources, a).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut shown = 0usize;
+        for at in front.index.impls.iter().filter(|at| at.header.contains("PartialEq") && at.header.contains("u32")) {
+            if shown == MOST_HEADERS {
+                println!("  (more headers past {MOST_HEADERS})");
+                break;
+            }
+            shown += 1;
+            let krate = names.crates().get(at.krate).map_or("?", |c| c.name);
+            println!("3 header [crate {krate}]: {}", Words(at.header));
+        }
+        println!("3 headers naming `PartialEq` and `u32`: {shown}");
+    }
+
+    // Twice over fresh state: as the tree checks it, then with every crate's impls planted.
+    for planted in [false, true] {
+        let what = if planted { "3 from_prim, every crate's impls (planted)" } else { "3 from_prim, its crate's impls" };
+        let mut front = Front2::new(&names, frame, &sources, a).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut store = Store::new(front.index.lang("sized"), front.frame, a);
+        store.pointers = Pointers::find(&front.index, front.resolver);
+        let mut buckets = Some(Buckets::for_source(&names, &front.index));
+        if planted {
+            if let Some(b) = buckets.as_mut() {
+                b.plant_whole_program_sight();
+            }
+        }
+        let mut consts = Consts::default();
+        store.ensure(&names, &mut front.keys, Want::Impl(imp)).unwrap_or_else(|e| panic!("the impl's head: {e:?}"));
+        let k = front.keys.filed_member(checker_of(imp), MemberKind::Fn, "from_prim").expect("`from_prim` filed as a member of `impl ErrorKind`");
+        let eq = front.index.lang("eq").expect("core's `eq` lang item (`PartialEq`)");
+        let eq_key = checker_of(eq);
+        store.trace = Some(TraceAsk { trait_: Def(eq_key.0), self_kind: Some(TyKind::Uint(UintTy::U32)), goals: GOALS, cands: CANDS });
+        let mut r = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+        let clean = walks_way(&mut r, prepared, LowerTarget::Member(k), what, false);
+        r.store.trace = None;
+        // The whole program's answer, after the check (a question at ground arguments asks it).
+        if !planted {
+            match answer_impls(&mut r, eq_key, tc::Shape::Uint(tc::UintTy::U32)) {
+                None => println!("3 the whole program's `u32: PartialEq<_>`: a gap (a candidate's header refused)"),
+                Some(impls) => {
+                    println!("3 the whole program's `u32: PartialEq<_>`: {} impls", impls.len());
+                    for i in impls.iter() {
+                        println!("  {} [crate {}]", ItemShown::of(&names, &*r.keys, *i), crate_name(&names, &*r.keys, *i));
+                    }
+                }
+            }
+        }
+        println!("{what}: {}", if clean { "CLEAN" } else { "REFUSED" });
     }
 }

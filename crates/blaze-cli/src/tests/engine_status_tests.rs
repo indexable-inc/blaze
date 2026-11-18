@@ -16,13 +16,13 @@ use bstd::procs::{By, Requests};
 const SEC: u64 = 1_000_000_000;
 
 /// One crate of six bodies: enough that a stop after two leaves four not begun.
-fn six_bodies(io: &Io) {
+pub(super) fn six_bodies(io: &Io) {
     write(io, "Cargo.toml", "[package]\nname = \"six\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write(io, "src/lib.rs", "pub fn a() -> u8 {\n    1\n}\n\npub fn b() -> u8 {\n    a() + 1\n}\n\npub fn c() -> u8 {\n    b() + 1\n}\n\npub fn d() -> u8 {\n    c() + 1\n}\n\npub fn e() -> u8 {\n    d() + 1\n}\n\npub fn f() -> u8 {\n    e() + 1\n}\n");
 }
 
 /// The check of `ws` on one worker with `asking`, its result as the command's edge gets it.
-fn checked(io: &Io, asking: Asking<'static>) -> Result<engine_check::Checked, CliError> {
+pub(super) fn checked(io: &Io, asking: Asking<'static>) -> Result<engine_check::Checked, CliError> {
     let mut opts = engine_check_tests::opts(io, 1, true);
     opts.status = asking;
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
@@ -36,7 +36,7 @@ fn checked(io: &Io, asking: Asking<'static>) -> Result<engine_check::Checked, Cl
 }
 
 /// `f` of the profile the check wrote, read into a frame.
-fn with_profile<R>(io: &Io, f: impl FnOnce(&str) -> R) -> R {
+pub(super) fn with_profile<R>(io: &Io, f: impl FnOnce(&str) -> R) -> R {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let mut bytes = bstd::mem::Bytes::new_in(cx.frame(), "the profile");
@@ -45,12 +45,12 @@ fn with_profile<R>(io: &Io, f: impl FnOnce(&str) -> R) -> R {
 }
 
 /// How often `needle` is on the simulated host's stderr.
-fn on_stderr(io: &Io, needle: &str) -> usize {
+pub(super) fn on_stderr(io: &Io, needle: &str) -> usize {
     io.script(|host| core::str::from_utf8(&host.err).map_or(0, |text| text.matches(needle).count())).expect("a simulated host")
 }
 
 /// A stage's row's counts (done, started, known), from `stage X: tasks D done / S started / K known`.
-fn counts(text: &str, stage: Stage) -> (u64, u64, u64) {
+pub(super) fn counts(text: &str, stage: Stage) -> (u64, u64, u64) {
     let mut head = FixedString::<32>::new();
     write!(head, "stage {stage:?}").expect("a short name");
     let row = text.lines().find(|line| line.strip_prefix(head.as_str()).is_some_and(|rest| rest.starts_with(':') || rest.starts_with(" (running):"))).unwrap_or_else(|| panic!("no row of {stage:?} in\n{text}"));

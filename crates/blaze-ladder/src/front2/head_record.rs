@@ -63,7 +63,7 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// (self_size.rs).
 /// 6: a fn's record holds its `#[rustc_legacy_const_generics]` positions after its C-variadic
 /// flag (`FnHead::legacy_const_generics`).
-/// 7: an ADT's record holds its `#[blaze::args]` mark after its narrowed-range flag
+/// 7: an ADT's record holds its `#[blaze::args]` mark after its valid range
 /// (`AdtRow::args`, rule 83).
 /// 8: an ADT's record holds its field defaults (RFC 3681) after that mark: one optional key
 /// per field (`Store::field_defaults`), each the key of an anonymous constant's fn head.
@@ -85,7 +85,9 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// (`K_FN_REFUSED`: its key and its why's text, `Store::fn_gaps`), filed back as that member's
 /// gap: a trait whose one member's type holds a constant that does not evaluate is frozen with
 /// its other members, and a body that calls that one is refused for its reason.
-pub const VERSION: u32 = 13;
+/// 14: an ADT's record holds its valid range's two optional bounds where the narrowed-range
+/// flag was (`AdtRow::valid`: layout takes its niches outside them, as rustc does).
+pub const VERSION: u32 = 14;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -708,7 +710,14 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                 o.ty(f.ty)?;
             }
             o.repr(row.repr);
-            o.flag(row.narrowed);
+            o.opt(row.valid.start, |o, s| {
+                o.body.extend_from_slice(&s.to_le_bytes());
+                Ok(())
+            })?;
+            o.opt(row.valid.end, |o, s| {
+                o.body.extend_from_slice(&s.to_le_bytes());
+                Ok(())
+            })?;
             o.flag(row.args);
             o.count(row.discrs.len(), "an enum's discriminants")?;
             for &d in &row.discrs {
@@ -1979,7 +1988,10 @@ impl<'r> In<'r, '_, '_> {
         })?;
         let fields = self.many("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
         let repr = self.repr()?;
-        let narrowed = self.flag("an ADT's narrowed range")?;
+        let valid = blaze_build::layout::ValidRange {
+            start: self.opt("an ADT's valid range start", |r| r.u128("a valid range start"))?,
+            end: self.opt("an ADT's valid range end", |r| r.u128("a valid range end"))?,
+        };
         let args = self.flag("an ADT's `#[blaze::args]` mark")?;
         let discrs = self.many("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
         let defaults = self.defaults()?;
@@ -2003,7 +2015,7 @@ impl<'r> In<'r, '_, '_> {
             Ok(AdtLife { lifetimes, variances, bounds, fields, field_ends })
         })?;
         let fieldless = self.opt("a fieldless enum's variant count", |r| r.u32("a fieldless enum's variant count"))?;
-        let row = AdtRow { kind, generics, variants, fields, repr, narrowed, discrs, args };
+        let row = AdtRow { kind, generics, variants, fields, repr, valid, discrs, args };
         for v in &row.variants {
             let end = v.fields.start.checked_add(v.fields.len);
             if end.and_then(|e| usize::try_from(e).ok()).is_none_or(|e| e > row.fields.len()) {
@@ -2302,7 +2314,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(r1.kind == r2.kind && r1.generics == r2.generics, "an ADT's kind or generics");
             need!(r1.variants[..] == r2.variants[..], "an ADT's variants");
             need!(r1.fields[..] == r2.fields[..], "an ADT's fields");
-            need!(r1.repr == r2.repr && r1.narrowed == r2.narrowed, "an ADT's repr");
+            need!(r1.repr == r2.repr && r1.valid == r2.valid, "an ADT's repr");
             need!(r1.args == r2.args, "an ADT's `#[blaze::args]` mark");
             need!(r1.discrs[..] == r2.discrs[..], "an enum's discriminants");
             need!(d1 == d2, "an ADT's parameter defaults");

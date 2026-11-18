@@ -100,6 +100,13 @@ fn negate_then_resolve(late: PNode) -> crate::Checked<'static> {
     let out = fx.alias(neg, "Output", &[p0]);
     fx.trait_fn(neg, "neg", true, &[p0], out);
     fx.imp("neg for i32", 0, i32_, Some((neg, &[])), &[("Output", i32_)], Vec::new());
+    // A second signed impl, as core has one per signed integer and float: with `Neg for i32`
+    // alone, selecting `{integer}: Neg` before the later `let` (rustc
+    // `resolve_vars_with_obligations` at each coercion, machine.rs `resolve_with_obligations`)
+    // has ONE candidate and rightly fixes `x` to `i32`, so the later `u32` is a mismatch, not
+    // the negation's refusal. With core's impls it stays ambiguous, as here.
+    let i64_ = fx.ty(PNode::Int(IntTy::I64));
+    fx.imp("neg for i64", 0, i64_, Some((neg, &[])), &[("Output", i64_)], Vec::new());
     let unit = fx.unit();
     let owner = fx.func("g", 0, &[], unit, Vec::new());
     fx.finish();

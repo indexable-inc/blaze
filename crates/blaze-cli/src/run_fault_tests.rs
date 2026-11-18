@@ -60,7 +60,7 @@ fn a_trap_is_said_by_its_reason_and_the_call_it_ends() {
     sealed.encode(&mut bytes);
 
     let at = Spot { placed: Placed::Code, symbol: Symbol(FUNCTION), record: RecordId([0x2d; 32]), offset: 0x3fc };
-    let fault = Fault { signal: Signal::Trap, pc: Some(0x70_02ae_a76c), at: Some(at), address: 0x70_02ae_a76c, touched: Some(at), write: None, code: None, regs: None };
+    let fault = Fault { signal: Signal::Trap, pc: Some(0x70_02ae_a76c), at: Some(at), address: 0x70_02ae_a76c, touched: Some(at), write: None, code: None, regs: None, callers: None };
     let said = std::format!("{}", report(fault, &mut Names, Some(Ok(bytes.as_slice()))));
     assert!(said.starts_with("blaze run: the program was killed by SIGTRAP: it struck at +0x3fc in fn of item 0x1234"), "{said}");
     assert!(said.contains("`brk #0xff02`: an `unreachable` reached"), "{said}");
@@ -73,7 +73,7 @@ fn a_trap_is_said_by_its_reason_and_the_call_it_ends() {
     let aborted = std::format!("{}", report(fault, &mut Names, Some(Ok(bytes.as_slice()))));
     assert!(aborted.contains("`brk #0xfe00`: an abort") && !aborted.contains("right after the call"), "{aborted}");
 
-    let nowhere = Fault { signal: Signal::Segv, pc: Some(0x10), at: None, address: 0x20, touched: None, write: Some(true), code: None, regs: None };
+    let nowhere = Fault { signal: Signal::Segv, pc: Some(0x10), at: None, address: 0x20, touched: None, write: Some(true), code: None, regs: None, callers: None };
     let lost = std::format!("{}", report(nowhere, &mut Names, None));
     assert_eq!(lost, "blaze run: the program was killed by SIGSEGV: its pc 0x10 is in no placed function");
     std::println!("{said}");

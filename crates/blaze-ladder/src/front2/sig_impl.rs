@@ -98,7 +98,7 @@ const TRAIT_DOMAIN: &str = "blaze-ladder front2 borrow trait closed read v1";
 /// generic_call.rs, "PROJECTIONS"): whether its header declares a lifetime parameter, and the
 /// names of its associated types with generics of their own, sorted. `None`: the trait's text
 /// is not given, or does not lex.
-fn trait_assoc<'n, 'a, S: NamesSource<'n>>(names: S, keys: &Keys, trait_: tc::ItemKey, alloc: Alloc<'a>) -> Option<(bool, AVec<'a, &'n str>)> {
+pub(crate) fn trait_assoc<'n, 'a, S: NamesSource<'n>>(names: S, keys: &Keys, trait_: tc::ItemKey, alloc: Alloc<'a>) -> Option<(bool, AVec<'a, &'n str>)> {
     let lib = keys.library_in(names, trait_)?;
     let text = names.text_of(lib)?.text;
     let lifetimes = blaze_flow_lower::sig::trait_declares_lifetime(text, alloc).ok()?;

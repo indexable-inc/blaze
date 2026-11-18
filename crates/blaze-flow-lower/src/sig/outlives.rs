@@ -135,6 +135,204 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
     }
 }
 
+/// One bound with lifetime arguments `name: .. Path<'x, ..> ..` (piece RB8): the token of the
+/// bounded name (`simple`: it is one bare name), of the trait's last segment, and the inside
+/// of its `<..>`; `binder` the inside of a `for<..>` over the piece or the bound, if any.
+#[derive(Clone, Copy)]
+struct BoundAt {
+    name: u32,
+    simple: bool,
+    trait_: u32,
+    args: (u32, u32),
+    binder: Option<(u32, u32)>,
+}
+
+/// Calls `said` for each trait bound of the list `lo..hi` (as [`scan`]'s) whose trait path
+/// ends in a `<..>`: a piece's bounds after its first top-level `:` split at top-level `+`; a
+/// bound in `Fn(..)` form, `?Sized`, a lifetime and a path with no `<..>` are skipped.
+fn scan_trait_bounds(toks: &[Tok], mate: &[u32], text: &str, lo: u32, hi: u32, said: &mut dyn FnMut(BoundAt)) -> Result<(), SigRefusal> {
+    let word = |i: u32| -> &str {
+        match toks.get(i as usize) {
+            Some(t) => text.get(t.lo as usize..t.hi as usize).unwrap_or(""),
+            None => "",
+        }
+    };
+    let kind = |i: u32| toks.get(i as usize).map(|t| t.k);
+    let is_for = |i: u32| kind(i) == Some(Tk::Ident) && word(i) == "for" && kind(i + 1) == Some(Tk::P(b'<'));
+    let inside = |i: u32| (i + 2, mate.get(i as usize + 1).copied().unwrap_or(i + 1));
+    let mut from = lo;
+    let mut steps = 0u32;
+    while from < hi {
+        let mut to = from;
+        while to < hi && kind(to) != Some(Tk::P(b',')) {
+            steps += 1;
+            if steps > MOST {
+                return Err(SigRefusal::Bound);
+            }
+            to = step(mate, to);
+        }
+        let to = to.min(hi);
+        let mut start = from;
+        let mut binder = None;
+        if is_for(start) {
+            binder = Some(inside(start));
+            start = step(mate, start + 1);
+        }
+        let skip = matches!(kind(start), Some(Tk::Life)) || (kind(start) == Some(Tk::Ident) && word(start) == "const");
+        let mut colon = start;
+        while !skip && colon < to && kind(colon) != Some(Tk::P(b':')) {
+            steps += 1;
+            if steps > MOST {
+                return Err(SigRefusal::Bound);
+            }
+            colon = step(mate, colon);
+        }
+        if !skip && colon < to {
+            let simple = colon == start + 1 && kind(start) == Some(Tk::Ident);
+            // Each bound `b..e` up to a top-level `+`, a default `=` ending them all.
+            let mut b = colon + 1;
+            while b < to && kind(b) != Some(Tk::P(b'=')) {
+                let mut e = b;
+                while e < to && !matches!(kind(e), Some(Tk::P(b'+') | Tk::P(b'='))) {
+                    steps += 1;
+                    if steps > MOST {
+                        return Err(SigRefusal::Bound);
+                    }
+                    e = step(mate, e);
+                }
+                let mut at = b;
+                let mut own_binder = binder;
+                if is_for(at) {
+                    own_binder = Some(inside(at));
+                    at = step(mate, at + 1);
+                }
+                // The path's last segment before its `<`; `(` (an `Fn(..)` bound) or `?` ends it.
+                let mut last = None;
+                while at < e {
+                    match kind(at) {
+                        Some(Tk::Ident) => last = Some(at),
+                        Some(Tk::Sep) => {}
+                        Some(Tk::P(b'<')) => {
+                            if let Some(t) = last {
+                                let close = mate.get(at as usize).copied().unwrap_or(at);
+                                said(BoundAt { name: start, simple, trait_: t, args: (at + 1, close), binder: own_binder });
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                    at += 1;
+                }
+                b = e + 1;
+            }
+        }
+        from = to + 1;
+    }
+    Ok(())
+}
+
+impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
+    /// The fn's trait bounds with lifetime arguments (piece RB8), from its generics list and
+    /// where clause, into `out` with their arguments' regions in `regions`. A lifetime the
+    /// bound's own `for<..>` binds is no region of the fn: such a bound is no row. Called after
+    /// every other part is read, so a lifetime written only here is numbered last.
+    pub(super) fn trait_bounds(
+        &mut self,
+        generics: Option<(u32, u32)>,
+        wheres: Option<(u32, u32)>,
+        out: &mut Vec<super::TextBound, A>,
+        regions: &mut Vec<Region, A>,
+    ) -> Result<(), SigRefusal> {
+        let mut found: Vec<BoundAt, A> = Vec::new_in(self.alloc.clone());
+        for (lo, hi) in [generics, wheres].into_iter().flatten() {
+            scan_trait_bounds(&self.toks, &self.mate, self.text, lo, hi, &mut |b| found.push(b))?;
+        }
+        for &b in found.iter() {
+            let lo = regions.len() as u32;
+            let mut unread = !b.simple;
+            let mut bound_by_binder = false;
+            let mut any = false;
+            let (mut i, end) = b.args;
+            let mut steps = 0u32;
+            while i < end {
+                steps += 1;
+                if steps > MOST {
+                    return Err(SigRefusal::Bound);
+                }
+                // One argument `i..j`: a lifetime is one token alone.
+                let mut j = i;
+                while j < end && self.toks[j as usize].k != Tk::P(b',') {
+                    j = step(&self.mate, j);
+                }
+                if j == i + 1 && self.toks[i as usize].k == Tk::Life {
+                    any = true;
+                    let w = self.word(i);
+                    let bound_here = b.binder.is_some_and(|(blo, bhi)| (blo..bhi).any(|x| self.toks.get(x as usize).is_some_and(|t| t.k == Tk::Life) && self.word(x) == w));
+                    if bound_here {
+                        bound_by_binder = true;
+                    } else {
+                        match self.named(i) {
+                            Some(r) => regions.push(r),
+                            None => unread = true,
+                        }
+                    }
+                }
+                i = j + 1;
+            }
+            if !any {
+                continue;
+            }
+            // A bound its own `for<..>` quantifies (`T: for<'de> Deserialize<'de>`) holds for
+            // every region, so it fixes none of the fn's: a row with no regions. One that
+            // mixes bound and free lifetimes is not taken apart: unread.
+            let binder = bound_by_binder && regions.len() as u32 == lo;
+            unread |= bound_by_binder && !binder;
+            if bound_by_binder {
+                regions.truncate(lo as usize);
+            }
+            let param = if b.simple { Name::of(self.word(b.name)) } else { Name::of("") };
+            out.push(super::TextBound { param, trait_: Name::of(self.word(b.trait_)), lo, hi: regions.len() as u32, unread, binder });
+        }
+        Ok(())
+    }
+}
+
+/// A trait's header (`text`: its item text): its name, and its lifetime parameters' names in
+/// order into `out` (`trait Conv<'a, 'b>`: `Conv`, `['a, 'b]`; piece RB8). Not a trait: refused.
+pub fn trait_header<A: Allocator + Clone>(text: &str, out: &mut Vec<Name, A>, alloc: A) -> Result<Name, SigRefusal> {
+    let (head, toks, mate) = header(text, alloc)?;
+    let end = toks.len() as u32;
+    let word = |i: u32| -> &str {
+        match toks.get(i as usize) {
+            Some(t) => head.get(t.lo as usize..t.hi as usize).unwrap_or(""),
+            None => "",
+        }
+    };
+    let mut i = 0u32;
+    while i < end && !(toks[i as usize].k == Tk::Ident && word(i) == "trait") {
+        i = step(&mate, i);
+    }
+    if i + 1 >= end || toks[i as usize + 1].k != Tk::Ident {
+        return Err(SigRefusal::NoFn);
+    }
+    let name = Name::of(word(i + 1));
+    let at = i + 2;
+    if at < end && toks[at as usize].k == Tk::P(b'<') {
+        let close = mate[at as usize];
+        let mut first = true;
+        let mut j = at + 1;
+        while j < close {
+            let t = toks[j as usize];
+            if first && t.k == Tk::Life {
+                out.push(Name::of(word(j)));
+            }
+            first = t.k == Tk::P(b',');
+            j = step(&mate, j);
+        }
+    }
+    Ok(name)
+}
+
 /// Whether an impl's or a trait's header (`text`: its item text, the header read up to its
 /// first `{`) declares a bound with a lifetime on a type: in its generics list, its where
 /// clause, or (a trait) its supertraits (`trait Tr: 'static`, a bound on `Self`). A header the

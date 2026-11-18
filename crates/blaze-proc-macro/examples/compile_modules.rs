@@ -28,7 +28,8 @@ fn main() {
             assert_eq!(String::from_utf8_lossy(&read("wasm-sha256")).trim(), wasm_sha256, "{}", dir.display());
             let key = dir.file_name().expect("a key").to_string_lossy().into_owned();
             let decls = String::from_utf8_lossy(&read("decls")).trim().to_owned();
-            ModuleRecord { name: key[..12].to_owned(), version: String::new(), key, wasm, wasm_sha256, macros: Vec::new(), decls, dir: dir.clone() }
+            // The record holds no wasm: a compile reads it from `dir` (module.rs `ModuleRecord::wasm`).
+            ModuleRecord { name: key[..12].to_owned(), version: String::new(), key, wasm_sha256, macros: Vec::new(), decls, dir: dir.clone() }
         })
         .collect();
     let all: Vec<&ModuleRecord> = modules.iter().collect();
@@ -51,7 +52,7 @@ fn main() {
             loads.push(loaded.load_time.as_secs_f64() * 1e3);
         }
         loads.sort_by(f64::total_cmp);
-        let wasm: usize = all.iter().map(|it| it.wasm.len()).sum();
+        let wasm: usize = all.iter().map(|it| std::fs::metadata(it.dir.join("module.wasm")).map_or(0, |meta| meta.len() as usize)).sum();
         println!(
             "{pass} pass: {} modules on {workers} workers in {:.1} ms; compiled {}; findings {}; compiled records {:.1} MB (wasm {:.1} MB); one load: median {:.2} ms, slowest {:.2} ms",
             all.len(),

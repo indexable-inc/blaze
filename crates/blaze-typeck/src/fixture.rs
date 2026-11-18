@@ -1541,15 +1541,8 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
         PNode::FnDef(k, l) => format!("fn {}<{}>", fx.name_of(k), list(l)),
         PNode::FnPtr(l, h) => {
             let unsafe_ = if h.safety == crate::ids::Safety::Unsafe { "unsafe " } else { "" };
-            let abi = match h.abi {
-                crate::ids::Abi::Rust => "",
-                crate::ids::Abi::C => "extern \"C\" ",
-                crate::ids::Abi::CUnwind => "extern \"C-unwind\" ",
-                crate::ids::Abi::System => "extern \"system\" ",
-                crate::ids::Abi::SystemUnwind => "extern \"system-unwind\" ",
-                crate::ids::Abi::RustCall => "extern \"rust-call\" ",
-                crate::ids::Abi::LlvmIntrinsic => "extern \"llvm-intrinsic\" ",
-            };
+            let abi_owned = format!("extern \"{}\" ", h.abi.name());
+            let abi = if h.abi == crate::ids::Abi::Rust { "" } else { abi_owned.as_str() };
             // The list is the inputs, then the output.
             let all = t.list(l).expect("a shown list in its table");
             let (ins, out) = all.split_at(all.len().saturating_sub(1));

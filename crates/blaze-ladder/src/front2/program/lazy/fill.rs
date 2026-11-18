@@ -116,7 +116,13 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     fn target_of(&mut self, key: ItemKey) -> Result<(LowerTarget, Want), LazyRefusal> {
         self.locate(key)?;
         if let Some(lib) = self.front.keys.library_in(self.front.names, key) {
-            return Ok((LowerTarget::Free(lib), self.store.need(lib)));
+            // A free body owner's head is its own key's want (a fn's, constant's or static's
+            // signature, an item declared in a body by the kind its lowering filed: fill.rs
+            // `want_of_key`, the one rule), never `Store::need`'s, which asks a type's or
+            // trait's head and refuses a fn's key by name.
+            let want = crate::front2::fill::want_of_key(self.front.names, &self.front.keys, key)
+                .map_err(|e| LazyRefusal::Head { item: self.refused_shown(key), why: format!("{e}").into_boxed_str() })?;
+            return Ok((LowerTarget::Free(lib), want));
         }
         match self.front.keys.origin(key) {
             Some(Origin::Member { container, kind: MemberKind::Fn, .. }) => {
@@ -200,6 +206,17 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let panic_entry = crate::front2::panic_entry::declares(self.front.names, &self.store, key, alloc).map_err(local).map_err(&refuse)?;
         let alloc_shim = crate::front2::alloc_shim::declares(self.front.names, &self.store, key, alloc)
             .map_err(|why| refuse(Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.detail() }))?;
+        // A call of an allocator declaration is made with the ABI of the fn it runs (front_end.rs
+        // `fn_abi`), which the builder asks at the call, before that fn is called: its head is
+        // made here, with the declaration's row (no check of the caller made it: the caller
+        // names the declaration alone).
+        if alloc_shim.is_some()
+            && let Some(default) = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, key, alloc)
+            && !self.store.fns.contains_key(&default)
+        {
+            let (_, want) = self.target_of(default)?;
+            self.make_want(want, default)?;
+        }
         // As tabled.rs `row`, less its `NoBody` arm: a fn with a body is `Free` here whether or
         // not `check_one` made the body yet (the seam's `function(i).body` is `Some` once it has).
         let (kind, symbol) = if panic_entry || alloc_shim.is_some() {
@@ -427,8 +444,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     }
 
     /// The row of every ADT `checked`'s types and the heads' table name, in rounds as a row's
-    /// fields name more (make_from's loop, over ONE body). A narrowed valid range is refused as
-    /// make_from refuses it.
+    /// fields name more (make_from's loop, over ONE body).
     fn adt_rows(&mut self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
         for round in 0.. {
             let mut missing: AVec<'_, ItemKey> = AVec::new_in(self.alloc);
@@ -454,10 +470,6 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
                 };
                 self.adt_row(lib, k)?;
             }
-        }
-        if let Some(k) = self.store.adts.iter().filter(|(_, a)| a.narrowed).map(|(k, _)| *k).min() {
-            let adt = self.refused_shown(k);
-            return Err(LazyRefusal::Row { function: adt.clone(), refusal: Box::new(Front2Refusal::Layout { adt }) });
         }
         Ok(())
     }

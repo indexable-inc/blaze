@@ -107,7 +107,9 @@ pub mod statics;
 pub mod tables;
 pub mod test_entry;
 pub mod texts;
+mod tait;
 mod type_expand;
+mod type_marks;
 pub mod types;
 pub mod world_items;
 /// The world's E0425 answer: the segment a body path stopped at.

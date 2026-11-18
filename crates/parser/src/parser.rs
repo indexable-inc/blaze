@@ -152,8 +152,15 @@ impl<'t, S: Sink> Parser<'t, S> {
     }
 
     /// In an outline, the number of tokens of the `fn` body at the current `{` when it can be
-    /// left unparsed ([`crate::outline::lazy_block_len`]).
+    /// left unparsed ([`crate::outline::lazy_block_len`]). A body the lexer made one
+    /// [`SyntaxKind::LAZY_BODY`] token ([`crate::LexedStr::new_outline`]; a `{` whose contextual
+    /// kind says so) has no tokens to parse: it is that one token, lazy in any parse.
     pub(crate) fn lazy_body(&self) -> Option<u32> {
+        if self.inp.kind(self.pos) == T!['{']
+            && self.inp.contextual_kind(self.pos) == SyntaxKind::LAZY_BODY
+        {
+            return Some(1);
+        }
         if !self.outline {
             return None;
         }
@@ -209,6 +216,10 @@ impl<'t, S: Sink> Parser<'t, S> {
             let mut unclosed = Vec::new(); // alloc: once a parse, an error path
             for at in 0..inp.len() {
                 match inp.kind(at) {
+                    // A whole body in one token ([`Parser::lazy_body`]): closed by itself.
+                    T!['{'] if inp.contextual_kind(at) == SyntaxKind::LAZY_BODY => {
+                        closed[at] = true
+                    }
                     T!['{'] => unclosed.push(at),
                     T!['}'] => {
                         if let Some(it) = unclosed.pop() {

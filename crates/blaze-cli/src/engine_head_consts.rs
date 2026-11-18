@@ -85,11 +85,13 @@ pub(crate) fn lang_index<'n>(tables: Tables<'_, 'n>, reads: &dyn ReadSink, lang:
 pub(crate) struct EvalSink<'a> {
     reads: core::cell::RefCell<blaze_own::Vec<TableRead, Alloc<'a>>>,
     full: core::cell::Cell<bool>,
+    /// The binding reads' cell keys, each derived once (front2 recorder.rs `ReadSink::binding`).
+    binding_keys: core::cell::RefCell<blaze_scope::cell_key::BindingKeys<'a>>,
 }
 
 impl<'a> EvalSink<'a> {
     pub(crate) fn new(alloc: Alloc<'a>) -> EvalSink<'a> {
-        EvalSink { reads: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)), full: core::cell::Cell::new(false) }
+        EvalSink { reads: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)), full: core::cell::Cell::new(false), binding_keys: core::cell::RefCell::new(blaze_scope::cell_key::BindingKeys::new_in(alloc)) }
     }
 
     /// How many reads it holds.
@@ -121,6 +123,11 @@ impl ReadSink for EvalSink<'_> {
             return;
         }
         reads.push(read);
+    }
+
+    fn binding(&self, module: LibKey, ns: blaze_surface::Namespace, name: &str) {
+        let key = self.binding_keys.borrow_mut().key(module, ns, name).key;
+        self.read(TableRead::Names(NameCell::Binding { module, name: key }));
     }
 }
 

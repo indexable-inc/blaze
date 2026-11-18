@@ -206,6 +206,9 @@ pub fn move_out<A: Allocator>(flow: &Flow<A>, mut p: Place) -> Option<MoveOut> {
         match row.proj {
             Some(Proj::Deref) => return Some(MoveOut::Deref),
             Some(Proj::Index) => return Some(MoveOut::Index),
+            // An element or a subslice of an unsized `[T]` (the lowering marks the row
+            // `of_slice`; an array's is moved out of freely): E0508.
+            Some(Proj::ConstantIndex { .. } | Proj::Subslice { .. }) if row.of_slice => return Some(MoveOut::Index),
             Some(Proj::Field(_)) if row.of_drop_type => return Some(MoveOut::DropField),
             _ => {}
         }

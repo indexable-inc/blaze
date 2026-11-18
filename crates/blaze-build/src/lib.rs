@@ -416,8 +416,13 @@ pub trait Adts {
     /// answers nothing would leak every value silently.
     fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, BuildError>;
 
-    /// The ABI fn item `item` is declared with, asked of every fn built or called; no answer
-    /// is refused with [`BuildError::NoAbi`].
+    /// The ABI a call of fn item `item` is made with, asked of every fn built or called; no
+    /// answer is refused with [`BuildError::NoAbi`]. For a fn with a body, its own. For a
+    /// declaration the front end binds to another fn's definition (alloc's `extern "Rust"`
+    /// `__rust_alloc` .. run std's `extern "C"` `__rdl_alloc` ..), the DEFINITION's: the walk
+    /// lowers the call from this answer and the caller's argument types, and the instance the
+    /// call resolves to is built from its own, so the two must agree (an `Alignment`, a Rust
+    /// aggregate, crosses a "Rust" call by address and a "C" call as its `usize`).
     fn abi(&self, item: ItemKey) -> Option<Abi> {
         let _ = item;
         None

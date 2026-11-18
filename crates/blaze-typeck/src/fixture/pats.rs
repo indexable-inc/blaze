@@ -27,6 +27,18 @@ impl Bb {
         self.push_pat(Pat::Tuple { elems, rest: None })
     }
 
+    /// `alts[0] | alts[1] | ..`.
+    pub fn or_pat(&mut self, alts: &[PatId]) -> PatId {
+        let alts = self.pat_list(alts);
+        self.push_pat(Pat::Or { alts })
+    }
+
+    /// `[elems..]`, the `..` (a `wild`, or `bind_sub(name, wild)`) at index `rest`.
+    pub fn slice_pat(&mut self, elems: &[PatId], rest: Option<u32>) -> PatId {
+        let elems = self.pat_list(elems);
+        self.push_pat(Pat::Slice { elems, rest })
+    }
+
     /// `segments[0]::segments[1]..(elems..)`: a tuple struct or tuple variant by its path, no
     /// `..`.
     pub fn variant_pat(&mut self, segments: &[&str], elems: &[PatId]) -> PatId {

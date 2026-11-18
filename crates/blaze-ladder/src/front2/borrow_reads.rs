@@ -35,7 +35,9 @@ use super::reads::{Fact, FactKind, Read, ReadsError};
 /// The domain of a [`FactKind::BorrowAdt`] answer.
 const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v2";
 /// The domain of a [`FactKind::BorrowHead`] answer.
-const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v1";
+/// v2 (piece RB8): a head's verdict now also reads its trait bounds' lifetime arguments
+/// (borrows_ties.rs), so a list filed under v1 never answers for one checked since.
+const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v2";
 
 /// What the borrow check took about one ADT.
 pub enum AdtAnswer<'f> {
@@ -108,6 +110,7 @@ fn refusal(h: &mut StableHasher, why: SigRefusal) {
         SigRefusal::Bound => (9, 0, 0),
         SigRefusal::Assoc { at, why } => (10, at, why as u32),
         SigRefusal::AsyncOutputNotGiven => (11, 0, 0),
+        SigRefusal::Path { at, why } => (12, at, why as u32),
     };
     h.tag(tag);
     h.u32(a);

@@ -99,6 +99,7 @@ mod engine_check;
 mod engine_bodies;
 mod engine_body_plan;
 mod engine_heads;
+mod engine_heads_once;
 mod engine_head_consts;
 mod engine_head_notes;
 mod engine_lines;
@@ -109,6 +110,7 @@ mod engine_why;
 mod engine_names;
 mod engine_times;
 mod engine_pool;
+mod engine_phase_mem;
 mod engine_records;
 mod engine_scope_reads;
 mod engine_scripts;
@@ -521,6 +523,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         Some("explain") => return explain(cx, args.get(2), out),
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
         Some("clean") => return clean::run(cx, io, &args, out),
+        Some("store") => return store::publish_command::run(cx, io, out, err, heap),
         Some(_) | None => return Err(CliError::Usage("the command is check, run, test, clean or explain")),
     };
     let flags = flags(&args)?;
@@ -1937,6 +1940,7 @@ mod tests {
     mod engine_script_reads_e2e_tests;
     mod engine_memory_tests;
     mod engine_status_tests;
+    mod engine_phase_mem_tests;
     mod engine_body_frames_tests;
     mod engine_seeds_tests;
     mod engine_answer_rows_tests;
@@ -1958,6 +1962,9 @@ mod tests {
     mod engine_scope_reads_tests;
     mod engine_scope_reads_tables_tests;
     mod engine_edit_rows_tests;
+    mod engine_heads_cover_tests;
+    mod engine_heads_once_tests;
+    mod engine_heads_stop_tests;
     mod native_image_tests;
     mod include_data_tests;
     mod include_outside_tests;

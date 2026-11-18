@@ -220,7 +220,7 @@ impl<'r> ProcMacros<'r> {
             return Ok(results);
         }
         // Opened outside the lock: another worker's calls do not wait on this crate's read.
-        let made = Arc::new(table::open(self.store, krate)?);
+        let made = Arc::new(table::open(self.store, krate, self.runtime.heap().shared())?);
         let mut tables = crate::host::lock(&self.tables);
         match held(&tables) {
             // Another worker opened it meanwhile: its table is the name's, this one is dropped.

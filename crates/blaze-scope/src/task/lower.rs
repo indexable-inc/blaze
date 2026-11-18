@@ -1127,24 +1127,32 @@ pub fn to_path<'t, 'a>(abs: bool, segments: &[&'t str], krate: CrateItemKey, all
 /// segment's token in an expansion's text (token-mark-2): a `$crate` or `crate` root is read by it
 /// through the one resolver, [`crate::crate_roots::root_by_mark`].
 pub fn to_path_marked<'t, 'a>(abs: bool, segments: &[&'t str], first_mark: Option<blaze_expand::origin_column::TextMark>, krate: CrateItemKey, alloc: Alloc<'a>) -> Path<'a, &'t str> {
+    let (kind, taken) = to_path_head(abs, segments, first_mark, krate);
+    Path { kind, segments: AVec::from_slice_in(&segments[taken..], alloc) }
+}
+
+/// The kind of the path of `segments` as written in the crate `krate`, and how many of its
+/// leading segments the kind takes (the rest are the path's own): the one rule, read by
+/// [`to_path_marked`], which copies the rest, and by a caller that keeps its segments borrowed
+/// (blaze-ladder resolve.rs: a walk's scratch copies no segment). `first_mark` as there.
+pub fn to_path_head(abs: bool, segments: &[&str], first_mark: Option<blaze_expand::origin_column::TextMark>, krate: CrateItemKey) -> (PathKind, usize) {
     use crate::crate_roots::Root;
-    let own = |it: &[&'t str]| AVec::from_slice_in(it, alloc);
     if abs {
-        return Path { kind: PathKind::Abs, segments: own(segments) };
+        return (PathKind::Abs, 0);
     }
     let first = segments.first().copied();
     let root = first.map_or(Root::NotARoot, |first| crate::crate_roots::root_by_mark(first, first_mark));
     match (first, root) {
-        (Some("crate"), Root::Here) => Path { kind: PathKind::Crate, segments: own(&segments[1..]) },
-        (Some("crate"), Root::Crate(k)) if k == krate => Path { kind: PathKind::Crate, segments: own(&segments[1..]) },
-        (_, Root::Here) => Path { kind: PathKind::DollarCrate(krate), segments: own(&segments[1..]) },
-        (_, Root::Crate(k)) => Path { kind: PathKind::DollarCrate(k), segments: own(&segments[1..]) },
-        (Some("self"), _) => Path { kind: PathKind::SelfMod, segments: own(&segments[1..]) },
+        (Some("crate"), Root::Here) => (PathKind::Crate, 1),
+        (Some("crate"), Root::Crate(k)) if k == krate => (PathKind::Crate, 1),
+        (_, Root::Here) => (PathKind::DollarCrate(krate), 1),
+        (_, Root::Crate(k)) => (PathKind::DollarCrate(k), 1),
+        (Some("self"), _) => (PathKind::SelfMod, 1),
         (Some("super"), _) => {
             let n = segments.iter().take_while(|it| **it == "super").count();
-            Path { kind: PathKind::Super(u8::try_from(n).unwrap_or(u8::MAX)), segments: own(&segments[n..]) }
+            (PathKind::Super(u8::try_from(n).unwrap_or(u8::MAX)), n)
         }
-        _ => Path { kind: PathKind::Plain, segments: own(segments) },
+        _ => (PathKind::Plain, 0),
     }
 }
 
@@ -1696,6 +1704,10 @@ pub struct CallSrc<'t> {
     /// expansion) a range of that expansion's sealed tokens, each keeping its context
     /// (crate::nested_input). `input` is then read only for its place and length.
     pub tokens: crate::nested_input::CallTokens<'t>,
+    /// A keep call's ([`CallRole::Keep`], attr-order-1): how many of its item's after-derive
+    /// names ([`Attrs::others`]) the calls before it answer; its expansion's
+    /// [`Fragment::kept`]. 0 for every other call.
+    pub answered: u32,
 }
 
 /// The attribute macro a blaze-edition binary's root `fn main` is the input of when none is
@@ -1974,6 +1986,26 @@ pub struct LowerCx<'c, 'p, W: ?Sized> {
     /// written on it or the file exports its own entry ([`exports_entry`]). False for every
     /// other module and every expansion.
     pub entry: bool,
+    /// How a derived item's derives and the names after them are sent: [`AttrOrder::Written`]
+    /// for every real source (resolve.rs `SourceTexts::attr_order`).
+    pub order: AttrOrder,
+}
+
+/// How a derived item's attributes are sent to the cells (attr-order-1). The Reference,
+/// "Attributes" and "Procedural macros" (rustc's `take_first_attr`): an item's outer attributes
+/// are taken in written order, a `cfg_attr` replaced first by what it holds; a derive runs on
+/// the item as it stands when the derive is reached; the first attribute macro after it takes
+/// the item with every attribute written after it, a later `#[derive]` among them unexpanded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttrOrder {
+    /// That order, one stage a fragment (`Lower::after_derive_takers`): the derives before the
+    /// next name, the names up to the next derive, the keep call, whose fragment goes on.
+    Written,
+    /// The planted bug, before attr-order-1 (the control of tests/attr_order.rs): every derive
+    /// of the item sent at once with all its names, so a derive written after an attribute
+    /// macro would run on the item as written; the cells refuse the macro
+    /// `DeriveAfterAttrMacro`, which blaze-cli printed as "no `name` in `path`".
+    DerivesAtOnce,
 }
 
 impl<W: ?Sized> Clone for LowerCx<'_, '_, W> {
@@ -2008,10 +2040,12 @@ pub struct Fragment<'c, 't> {
     /// `include!` read, else the calling call's [`CallSrc::written`]. Copied into every call
     /// and body it lowers.
     pub written: &'t str,
-    /// A derived item's keep call's expansion (attr-bang-kind-2): its one item is kept after the
-    /// attributes written after its derives, whose calls, with its derives and its helper
-    /// checks, the calling fragment sent (`Lower::after_derive_takers`); none is sent again.
-    pub kept: bool,
+    /// A derived item's keep call's expansion (attr-bang-kind-2, attr-order-1): `Some(n)`, the
+    /// first `n` after-derive names of its one item ([`Attrs::others`]) were answered by the
+    /// fragments before it, every one inert, and the derives written before them ran there; the
+    /// item's attribute walk goes on from the next name (`Lower::after_derive_takers`), none of
+    /// what was sent is sent again. `None`: any other fragment.
+    pub kept: Option<u32>,
     /// The marks of an expansion's text (token-mark-2, crate::crate_roots): a path's first
     /// segment's mark resolves its root. `None`: a file, or a text no column carries.
     pub marks: Option<crate::crate_roots::TextMarks<'t>>,
@@ -2043,6 +2077,7 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
         depth: fragment.depth,
         made: fragment.made,
         kept: fragment.kept,
+        order: cx.order,
         marks: fragment.marks,
         tokens: fragment.tokens,
         pos: 0,
@@ -2128,7 +2163,9 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     depth: u16,
     made: bool,
     /// [`Fragment::kept`].
-    kept: bool,
+    kept: Option<u32>,
+    /// [`LowerCx::order`].
+    order: AttrOrder,
     /// [`Fragment::marks`].
     marks: Option<crate::crate_roots::TextMarks<'t>>,
     /// [`Fragment::tokens`].
@@ -2199,7 +2236,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             // No input: a check is never `Called`, so never expanded; only its place is read
             // (an error's location, blaze-cli names.rs).
-            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text };
+            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text, answered: 0 };
             self.out.calls.push((call, src));
             self.checks_sent += 1;
         }
@@ -2327,11 +2364,15 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // keeps `#[derive_where(..)]`, reth-codecs' `add_arbitrary_tests` keeps
         // `#[reth_codecs(..)]`). Either way which name takes the item is the cells' answer, so
         // the item goes as after-derive calls (`Lower::after_derive_takers`), never one call.
+        // In an expansion a one-segment taker written before the item's derives is such a helper
+        // too (reth-codecs' `add_arbitrary_tests` writes `#[serde(..)] #[derive(Arbitrary)]`
+        // back when the `derive` stood after it, attr-order-1): the cells answer it first.
         let derive_target = matches!(item.detail, ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union);
         let after_derive = derive_target
             && attrs.attr_macro.is_some_and(|taker| {
                 let derived_first = attrs.others.iter().position(|&o| o == taker).is_some_and(|k| attrs.derives_before[k] > 0);
-                derived_first || (self.depth > 0 && attrs.derives.is_empty() && !taker.contains("::"))
+                let underived = attrs.derives.is_empty() || self.order == AttrOrder::Written;
+                derived_first || (self.depth > 0 && underived && !taker.contains("::"))
             });
         let written = attrs.attr_macro.filter(|_| !proc_fn && !after_derive);
         if let Some(path) = written.or(implicit.then_some(IMPLICIT_MAIN)) {
@@ -2346,7 +2387,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             let place = self.call_in_text(idx, item, whole);
             let tokens = self.call_tokens(whole, crate::nested_input::InputCut::Whole);
-        let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit, place, tokens };
+        let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit, place, tokens, answered: 0 };
             self.out.calls.push((call, src));
             // `#[global_allocator]` writes the static back first in its expansion, whose fragment
             // is owned by the call (resolve.rs `expand_decls`'s `Fragment::owner`), so the static's
@@ -2364,10 +2405,14 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // helper (inert) or an attribute macro that takes the item: rustc takes the derive, then
         // each later attribute with the derive's helpers innermost (`take_first_attr`). Which
         // one is the cells' answer, so the item is sent as calls and kept by its keep call when
-        // none took it (`Lower::after_derive_takers`, attr-bang-kind-2). In the keep call's own
-        // fragment (`kept`) the item is lowered here, its calls already sent.
-        if !self.kept && (after_derive || (!attrs.derives.is_empty() && !attrs.others.is_empty() && derive_target)) {
-            self.after_derive_takers(idx, item, &attrs, whole);
+        // none took it (`Lower::after_derive_takers`, attr-bang-kind-2). One stage a fragment
+        // (attr-order-1): the derives before the next name, the names up to the next derive, the
+        // keep call; the keep call's own fragment (`kept`) goes on from there, and once every
+        // name is answered the item is lowered here with the derives written after the last.
+        let answered = self.kept.map_or(0, |n| n as usize);
+        let staged = derive_target && (after_derive || (!attrs.derives.is_empty() && !attrs.others.is_empty()));
+        if staged && answered < attrs.others.len() && (self.kept.is_none() || self.order == AttrOrder::Written) {
+            self.after_derive_takers(idx, item, &attrs, whole, answered);
             return false;
         }
         // The item's own text, only now: an item an attribute macro takes is replaced by the
@@ -2377,10 +2422,14 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         let impl_header = matches!(item.detail, ItemDetail::Impl).then(|| self.impl_header(item));
         self.out.texts.push(ItemText { key, module: self.module, item: idx, name, impl_header, text: whole });
         self.attr_checks(idx, at, &attrs.checks);
-        if !self.kept {
-            self.derive_calls(idx, item, at, &attrs.derives, whole);
-            self.helper_checks(idx, item, &attrs);
-        }
+        // The derives the stages before this fragment did not send: all of them on an item no
+        // name stands after; none in a keep call's fragment under the planted order.
+        let run = match (self.kept, self.order) {
+            (Some(_), AttrOrder::DerivesAtOnce) => attrs.derives.len(),
+            _ => helper_checks::ran_before(&attrs, answered),
+        };
+        self.derive_calls(idx, item, at, &attrs.derives[run..], whole);
+        self.helper_checks(idx, item, &attrs, run);
         if let Some(lang) = attrs.lang {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
@@ -2646,6 +2695,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             written: self.written,
             depth: self.depth,
             implicit: false,
+            answered: 0,
         };
         self.out.calls.push((call, src));
     }

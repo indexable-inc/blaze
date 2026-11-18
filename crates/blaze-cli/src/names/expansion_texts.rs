@@ -218,4 +218,21 @@ impl<'s> ExpansionTexts<'s> {
         joined.extend_from_slice(record.column);
         Ok(Some(&*joined.leak()))
     }
+
+    /// The origins of the text `call` made as the two parts they lie in, read in place and
+    /// copied nowhere: the call part (the directory's) and the column (the record's), what
+    /// blaze-scope expansion_origins.rs `OriginsView::open_parts` takes. `Ok(None)`: the crate
+    /// made no text for it; `Ok(Some(None))`: its text keeps no origins. The joined form
+    /// ([`Self::joined_origins`]) copies both into an allocator held to the command's end (295
+    /// MB on tempo's 2026-11-18 heap log); this is its replacement, 0 bytes, once the ladder's
+    /// `Load::expansion_origins` hands parts (the port: this lane's report, NOT DONE 1).
+    #[expect(dead_code, reason = "the ladder's `Load::expansion_origins` port takes it (M13 NOT DONE 1)")]
+    pub(crate) fn origins_parts(&self, call: ItemKey) -> Result<Option<Option<(&'s [u8], &'s [u8])>>, ExpansionRecordsError> {
+        let Some((entry, record)) = self.row(call)? else { return Ok(None) };
+        entry.text(&record)?;
+        if entry.call_part.is_empty() {
+            return Ok(Some(None));
+        }
+        Ok(Some(Some((entry.call_part, record.column))))
+    }
 }

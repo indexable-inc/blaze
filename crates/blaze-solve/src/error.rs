@@ -127,6 +127,11 @@ pub enum Unsupported {
     /// `<E as DiscriminantKind>::Discriminant` of this enum, whose world does not read its
     /// `repr` yet ([`crate::facts::Discr::Unread`]).
     ReprNotRead(crate::term::Def),
+    /// The dyn compatibility of this trait, a `dyn` type's principal, which the world could not
+    /// decide ([`crate::facts::TraitFlags::DYN_UNDECIDED`]): an object candidate (its listed
+    /// auto traits, its supertraits) or a `DynCompatible` goal would be answered from a verdict
+    /// that does not exist, so the goal stops here instead of failing.
+    DynUndecided(crate::term::Def),
 }
 
 /// The solver's own failure: a bound passed or malformed input. Never a user's error.

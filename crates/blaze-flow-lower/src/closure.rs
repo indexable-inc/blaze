@@ -27,8 +27,13 @@
 //! capture's positions outlive every position of the return place, except the environment's own
 //! reference (`&'env self` of an `Fn`/`FnMut`: its by-value captures and, in an `FnMut`, its
 //! `&mut` captures can be returned only for `'env`, which the return type does not name). A
-//! relation the body needs beyond these is the owner's to prove (its closure requirements, not
-//! built): the caller files such an outlives result as a refusal, never as a finding.
+//! relation the body needs beyond these is the owner's to prove (its closure requirements, the
+//! NLL RFC, "Closures"): [`lower_closure_external`] says what each placeholder is in the owner
+//! ([`External`]); an outlives result between two of the closure VALUE's positions (or
+//! `'static`) becomes a [`Requirement`] the owner's flow emits at the closure expression
+//! ([`crate::Facts::closure_requirements`]); one that names the environment's reference or the
+//! closure's signature ([`requirement`] gives `None`) is still filed as a refusal, never as a
+//! finding.
 //!
 //! An `async fn` (the Reference, "Async functions": "an async fn ... returns a future"; its body
 //! runs when the future is polled, its parameters moved into it): the fn's body lowered as a fn
@@ -37,12 +42,12 @@
 //!
 //! No recursion: the walk is the lowering's task stack.
 
-use blaze_flow::{FlowBuilder, Local, Proj};
+use blaze_flow::{FlowBuilder, Local, Origin, Proj};
 use blaze_own::Vec;
-use blaze_typeck::{BodyView, CaptureKind, Checked, ClosureKind, Expr, ExprId, Mutbl, Pat, PatId};
+use blaze_typeck::{BodyView, CaptureKind, Checked, ClosureKind, Expr, ExprId, Mutbl, PNode, PTy, Pat, PatId};
 use core::alloc::Allocator;
 
-use crate::{At, Facts, Form, Lower, Lowered, MOST_POSITIONS, Refusal, Task, TyD, Val, range_of};
+use crate::{At, Facts, Form, Lower, Lowered, MOST_POSITIONS, Refusal, Region, Task, TyD, Val, range_of};
 
 /// The body of closure `closure` (an `Expr::Closure` of `body`, not `async`) as its own flow:
 /// its captures, then its parameters, as the arguments (the module doc).
@@ -53,6 +58,80 @@ pub fn lower_closure<A: Allocator + Clone, F: Facts>(
     facts: &F,
     alloc: A,
 ) -> Result<Lowered<A>, Refusal> {
+    lower_closure_external(body, ck, closure, facts, alloc).map(|c| c.lowered)
+}
+
+/// What a placeholder of a closure's flow stands for in the flow that makes the closure (its
+/// OWNER: the fn body, or the closure or async block whose body holds the expression).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum External {
+    /// Position `j` of the closure VALUE, counted as the owner lays it (`Lower::npos` of the
+    /// closure type: each capture in row order, a capture by reference its reference first,
+    /// then the captured variable's type's positions).
+    Capture(u32),
+    /// `'static`.
+    Static,
+    /// The environment's own reference (`&'env self` of an `Fn`/`FnMut`, and the reference an
+    /// `FnMut` reaches a `&mut` capture through): bound per call, no position of the value.
+    Env,
+    /// A position of a parameter or of the return place: the closure's signature, bound per
+    /// call (the closure type holds no position for it; see [`requirement`]).
+    Sig,
+}
+
+/// A closure's flow and what each of its placeholders stands for in the owner.
+pub struct ClosureFlow<A: Allocator + Clone> {
+    pub lowered: Lowered<A>,
+    /// `(placeholder, what it stands for)`, one row per placeholder the walk made.
+    pub externals: Vec<(blaze_flow::Origin, External), A>,
+}
+
+/// One end of a [`Requirement`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Need {
+    /// Position `j` of the closure value ([`External::Capture`]).
+    Capture(u32),
+    Static,
+}
+
+/// A closure requirement (the NLL RFC, "Closures": "the closure's creator ... must prove" the
+/// relations among the closure's external regions that the closure body needs and its own
+/// signature does not give): `from` outlives `into`, both regions of the closure VALUE's type
+/// (or `'static`), proven where the closure is made. The owner's lowering emits it as
+/// `subset(from, into)` at the closure expression ([`crate::Facts::closure_requirements`]): a
+/// requirement the owner cannot prove is the owner's finding, at the closure's range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Requirement {
+    pub from: Need,
+    pub into: Need,
+}
+
+/// The requirement an outlives result of the closure's flow (`UnprovenOutlives { from, into }`:
+/// `from: into` needed between two placeholders, not known) puts on its owner, or `None` when it
+/// cannot be stated there: an end is the environment's reference or the closure's signature
+/// (bound per call: a relation the body needs between a parameter and a capture is a relation
+/// of the closure's TYPE's signature regions, which the closure type does not hold as positions
+/// yet), or a placeholder this flow did not name. `None` stays `NestedOutlives`: not checked,
+/// never accepted.
+pub fn requirement(externals: &[(blaze_flow::Origin, External)], from: blaze_flow::Origin, into: blaze_flow::Origin) -> Option<Requirement> {
+    let end = |o: blaze_flow::Origin| match externals.iter().find(|(x, _)| *x == o).map(|&(_, w)| w) {
+        Some(External::Capture(j)) => Some(Need::Capture(j)),
+        Some(External::Static) => Some(Need::Static),
+        Some(External::Env | External::Sig) | None => None,
+    };
+    Some(Requirement { from: end(from)?, into: end(into)? })
+}
+
+/// [`lower_closure`], with what each placeholder of the flow stands for in the owner
+/// ([`ClosureFlow::externals`]), so the flow's outlives results among its captures become the
+/// owner's requirements ([`requirement`]).
+pub fn lower_closure_external<A: Allocator + Clone, F: Facts>(
+    body: &BodyView<'_>,
+    ck: &Checked<'_>,
+    closure: ExprId,
+    facts: &F,
+    alloc: A,
+) -> Result<ClosureFlow<A>, Refusal> {
     let range = range_of(body, closure);
     let (params, inner) = match body.exprs.get(closure.ix()) {
         Some(Expr::Closure { is_async: true, .. }) => return Err(Refusal { form: Form::AsyncClosure, range }),
@@ -68,11 +147,33 @@ pub fn lower_closure<A: Allocator + Clone, F: Facts>(
         Some(&k) => k,
         None => return Err(Refusal { form: Form::Malformed, range }),
     };
-    let mut l = Lower::new(body, ck, facts, alloc)?;
-    l.run_closure(closure, inner, params, kind)?;
+    // The closure's signature as the type check settled it (`Checked::closures`: a fn pointer
+    // type, its inputs then its output; typeck rules/closure.rs `expr_closure`): each
+    // parameter's type BEFORE its pattern's peels. `pat_ty` of a parameter pattern is the type
+    // after them (`|(it, _)|` met by `&&(K, V)` records `(K, V)`), so a flow local of that
+    // type peels nothing and every binding below it was refused `BindingMode` (census 1118).
+    let sig = match row.and_then(|i| ck.closures.column::<2>().get(i)) {
+        Some(&s) => s,
+        None => return Err(Refusal { form: Form::Malformed, range }),
+    };
+    let tys = ck.types.view();
+    let inputs: &[PTy] = match tys.node(sig) {
+        Ok(PNode::FnPtr(l, _)) => match tys.list(l) {
+            Ok(all) if all.len() == params.len() + 1 => &all[..params.len()],
+            _ => return Err(Refusal { form: Form::Malformed, range }),
+        },
+        _ => return Err(Refusal { form: Form::Malformed, range }),
+    };
+    let mut l = Lower::new(body, ck, facts, alloc.clone())?;
+    let mut externals: Vec<(Origin, External), A> = Vec::new_in(alloc);
+    l.run_closure(closure, inner, params, inputs, kind, &mut externals)?;
+    // `'static`, made when the walk first met it (`Lower::universal`).
+    if let Some(&(_, st)) = l.uni.iter().find(|(r, _)| *r == Region::Static) {
+        externals.push((st, External::Static));
+    }
     let stats = l.stats;
     let flow = l.b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
-    Ok(Lowered { flow, stats, params: l.param_origs })
+    Ok(ClosureFlow { lowered: Lowered { flow, stats, params: l.param_origs }, externals })
 }
 
 /// The body of an `async fn` (`BodyView::coroutine` is `Some`) as its own flow, its `.await`s
@@ -104,7 +205,17 @@ pub fn lower_async_fn<A: Allocator + Clone, F: Facts>(
 impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
     /// The walk of closure `closure`'s body `inner`: as `run`, with the captures then the
     /// parameters as the arguments and the body's value as the return place.
-    fn run_closure(&mut self, closure: ExprId, inner: ExprId, params: &[PatId], kind: ClosureKind) -> Result<(), Refusal> {
+    /// `inputs`: the parameters' types from the closure's signature; `externals` receives what
+    /// each capture's and parameter's placeholder stands for in the owner ([`External`]).
+    fn run_closure(
+        &mut self,
+        closure: ExprId,
+        inner: ExprId,
+        params: &[PatId],
+        inputs: &[PTy],
+        kind: ClosureKind,
+        externals: &mut Vec<(Origin, External), A>,
+    ) -> Result<(), Refusal> {
         let ck = self.ck;
         // The closure's captures, in row order: argument `1 + k` is row `k`.
         let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc.clone());
@@ -129,6 +240,8 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         // The environment's own references (by origin index in `origs`): not known to outlive
         // the return place.
         let mut env_refs: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        // The next position of the closure value (`External::Capture`).
+        let mut value_at = 0u32;
         for k in 0..rows.len() {
             let (p, cap) = rows[k];
             let t = match ck.local_ty.get(p.ix()) {
@@ -148,6 +261,9 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
                 (CaptureKind::ByMutRef, ClosureKind::FnOnce) => (Some(Mutbl::Mut), false),
                 (CaptureKind::ByMutRef, _) => (Some(Mutbl::Mut), true),
             };
+            // What this capture's placeholders are in the closure value (`External`): the
+            // value lays the capture as `npos_d` of `&T` for one by reference, of `T` by value.
+            let first = self.origs.len() as u32;
             match through {
                 None => {
                     self.new_local_with(TyD::of(t), true, Some(l), closure)?;
@@ -168,12 +284,28 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
                     self.upvar_places.push((p, place, TyD::of(t)));
                 }
             }
+            let made = self.origs.len() as u32;
+            // A by-value capture reached through `&'env self` has the environment's reference
+            // first and no position of the value for it; a `&mut` capture of an `FnMut` has its
+            // reference at the value's position, but reaches it only for `'env`: neither is a
+            // region the owner can state a requirement on.
+            let by_value_env = env && cap == CaptureKind::ByValue;
+            for o in first..made {
+                let what = if env && o == first {
+                    External::Env
+                } else {
+                    External::Capture(value_at + (o - first) - u32::from(by_value_env))
+                };
+                externals.push((self.origs[o as usize], what));
+            }
+            value_at += (made - first) - u32::from(by_value_env);
             self.vars.push(l);
         }
         let upvar_origins = self.origs.len();
-        // The parameters: their recorded types, every position a placeholder.
+        // The parameters: their types in the closure's signature (before their patterns'
+        // peels; `lower_closure_external`), every position a placeholder.
         for (i, &p) in params.iter().enumerate() {
-            let t = match ck.pat_ty.get(p.ix()) {
+            let t = match inputs.get(i) {
                 Some(&t) => TyD::of(t),
                 None => return self.refuse_pat(Form::Malformed, p),
             };
@@ -186,6 +318,9 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         let ret_from = self.origs.len();
         self.new_local_with(rt, true, Some(Local(0)), closure)?;
         let all = self.origs.len();
+        for o in upvar_origins..all {
+            externals.push((self.origs[o], External::Sig));
+        }
         if (all - ret_from) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
             return self.refuse(Form::Bound, closure);
         }

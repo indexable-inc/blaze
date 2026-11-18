@@ -31,6 +31,13 @@
 //! handler's stack (`blaze_own::Inline`) and written with `write(2)`; the socket's one other
 //! writer, the control thread's `send`, holds [`hold_channel`] for each of its writes, so the
 //! fault's frame never lands inside one of its frames.
+//!
+//! The frame carries the faulting thread's callers too ([`walk_frames`], run schema 3): every
+//! function blaze emits keeps AArch64's frame record (blaze-emit lib.rs, "The frame": `stp x29,
+//! x30, [sp, #-16]!; mov x29, sp` in every prologue, pass/unwind.rs), so from the interrupted
+//! `x29` each `[fp]` is the caller's `fp` and `[fp + 8]` its return address. Each record is read
+//! only inside the thread's stack (`stack_bounds`) and strictly above the one before it, at
+//! most 32: the walk never reads a wild address and always ends.
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
@@ -38,7 +45,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsiz
 
 use blaze_code::record::Symbol as CodeSymbol;
 use blaze_launch::wire::RecordId;
-use blaze_launch::wire::fault::{AROUND, Around, Fault, Placed, Regs, Signal, Spot};
+use blaze_launch::wire::fault::{AROUND, Around, Callers, Fault, MOST_CALLERS, NAMED_CALLERS, Placed, Regs, Signal, Spot, WalkEnd};
 #[cfg(target_arch = "aarch64")]
 use blaze_launch::wire::fault::Arm64;
 use blaze_launch::wire::run::{Symbol as WireSymbol, Up};
@@ -202,6 +209,7 @@ extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void
         Some(mut fault) => {
             fault.regs = state;
             fault.code = code_around(struck, placed);
+            fault.callers = state.and_then(|regs| callers_of(&regs, placed));
             tell_parent(&fault)
         }
         None => Err("a signal the parent's report does not carry"),
@@ -227,10 +235,12 @@ static CHANNEL: AtomicI32 = AtomicI32::new(-1);
 static CHANNEL_HELD: AtomicBool = AtomicBool::new(false);
 /// How many 1 ms waits a holder of the socket is waited for (rule 18): 2 s.
 const HOLD_WAITS: u32 = 2000;
-/// The room a fault's frame is encoded in on the handler's stack (a frame is under 900 bytes:
-/// two spots of 32-byte ids, 34 register words of at most 9 bytes each, 32 code bytes, short
-/// keys).
-const FRAME_ROOM: usize = 2048;
+/// The room a fault's frame is encoded in on the handler's stack (a frame is under 900 bytes
+/// without callers: two spots of 32-byte ids, 34 register words of at most 9 bytes each, 32
+/// code bytes, short keys; the callers add at most 32 words of 9 bytes and 8 spots of about
+/// 110, about 1.2 KiB). 4 KiB, a quarter of the smallest signal stack the launcher's std makes
+/// on the hosts run mode serves (Linux AArch64's `SIGSTKSZ`, 16 KiB; macOS's is 128 KiB).
+const FRAME_ROOM: usize = 4096;
 
 /// Names the parent's socket for the crash report's frame. Called once, by the control thread,
 /// before any program code runs.
@@ -290,7 +300,145 @@ pub fn fault_of(struck: Struck, rows: &[Row]) -> Option<Fault> {
         address: struck.address,
         touched: spot(struck.address, rows),
         write: struck.write,
+        // Walked by the handler from the delivery's registers (`on_signal`, `callers_of`).
+        callers: None,
     })
+}
+
+/// The frame-pointer walk from `fp` (AArch64's frame record: `[fp]` the caller's `fp`, `[fp +
+/// 8]` the return address into the caller), innermost first, at most [`MOST_CALLERS`]: each
+/// record read through `read` only once it is known to lie inside `bounds` (the faulting
+/// thread's stack, `lo..hi`), 16-byte aligned and strictly above the record before it, so the
+/// walk never reads outside the stack and always ends. `None` bounds: nothing is read. Pure,
+/// so it is tested over a planted stack without a signal.
+pub fn walk_frames(fp: u64, bounds: Option<(u64, u64)>, read: &mut dyn FnMut(u64) -> Option<u64>) -> (u8, [u64; MOST_CALLERS], WalkEnd) {
+    let mut rets = [0u64; MOST_CALLERS];
+    let Some((lo, hi)) = bounds else { return (0, rets, WalkEnd::NoBounds) };
+    let mut fp = fp;
+    let mut last: Option<u64> = None;
+    let mut n = 0usize;
+    let end = loop {
+        if fp == 0 {
+            break WalkEnd::Top;
+        }
+        if n == MOST_CALLERS {
+            break WalkEnd::Cap;
+        }
+        if fp & 15 != 0 {
+            break WalkEnd::Unaligned;
+        }
+        let inside = fp >= lo && fp.checked_add(16).is_some_and(|record_end| record_end <= hi);
+        if !inside {
+            break WalkEnd::OutOfStack;
+        }
+        if last.is_some_and(|before| fp <= before) {
+            break WalkEnd::NotAbove;
+        }
+        let (Some(next), Some(ret)) = (read(fp), read(fp + 8)) else { break WalkEnd::Unread };
+        if ret == 0 {
+            break WalkEnd::Top;
+        }
+        rets[n] = ret;
+        n += 1;
+        last = Some(fp);
+        fp = next;
+    };
+    (n as u8, rets, end)
+}
+
+/// The spot of return address `ret`: the placed code holding its call, the byte before it (a
+/// call that is a function's last instruction returns to the next row's first byte), with the
+/// return address's own offset.
+pub fn return_spot(ret: u64, rows: &[Row]) -> Option<Spot> {
+    let row = holding(ret.checked_sub(1)?, rows).filter(|row| row.kind == Kind::Code)?;
+    Some(Spot { placed: Placed::Code, symbol: WireSymbol(row.symbol), record: RecordId(row.record), offset: ret - row.at })
+}
+
+/// The callers of the walk `walk_frames` gave, the first [`NAMED_CALLERS`] as spots.
+pub fn callers_from(walked: (u8, [u64; MOST_CALLERS], WalkEnd), rows: &[Row]) -> Callers {
+    let (len, ret, end) = walked;
+    let mut callers = Callers { len, ret, at: [None; NAMED_CALLERS], end };
+    for (i, spot) in callers.at.iter_mut().enumerate().take(usize::from(len)) {
+        *spot = return_spot(ret[i], rows);
+    }
+    callers
+}
+
+/// The interrupted thread's callers, from its `fp` (x29) and `sp` (`None` off AArch64).
+fn callers_of(regs: &Regs, rows: &[Row]) -> Option<Callers> {
+    let Regs::Arm64(a) = regs else { return None };
+    let bounds = stack_bounds(a.sp);
+    let walked = walk_frames(a.x[29], bounds, &mut |at| read_stack_word(at));
+    Some(callers_from(walked, rows))
+}
+
+/// The faulting thread's stack, `lo..hi`: from its `sp` at the fault up to the stack's top, as
+/// the thread's own pthread says (`pthread_get_stackaddr_np` is the top, the stack grows down
+/// `pthread_get_stacksize_np` bytes from it). Both read the calling thread's `pthread_t`
+/// fields (the main thread's size from the stack's rlimit, `getrlimit`, a system call): no lock
+/// and no allocation, so they are safe in a handler although POSIX lists neither. The handler
+/// runs on the faulting thread (an alternate signal stack is the same thread), so
+/// `pthread_self` is it. `None` when `sp` is not inside the stack (an overflow into the guard).
+#[cfg(target_os = "macos")]
+fn stack_bounds(sp: u64) -> Option<(u64, u64)> {
+    // SAFETY: `pthread_self` is always a live thread, this one; the two reads take its fields.
+    let (top, size) = unsafe {
+        let me = libc::pthread_self();
+        (libc::pthread_get_stackaddr_np(me) as u64, libc::pthread_get_stacksize_np(me) as u64)
+    };
+    let bottom = top.checked_sub(size)?;
+    (sp >= bottom && sp < top).then_some((sp, top))
+}
+
+/// Linux: the range a handler may name without reading `/proc/self/maps` (not readable in a
+/// handler) or calling `pthread_getattr_np` (it allocates and, for the main thread, reads that
+/// file): `sp` up to [`LINUX_STACK_REACH`] above it. That range is not known to be mapped, so
+/// every word is read by `process_vm_readv` of this process ([`read_stack_word`]), which
+/// answers EFAULT for an unmapped word and never faults.
+#[cfg(target_os = "linux")]
+fn stack_bounds(sp: u64) -> Option<(u64, u64)> {
+    Some((sp, sp.checked_add(LINUX_STACK_REACH)?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn stack_bounds(_sp: u64) -> Option<(u64, u64)> {
+    None
+}
+
+/// How far above `sp` a Linux walk may read: 8 MiB, the default main-thread stack rlimit.
+#[cfg(target_os = "linux")]
+const LINUX_STACK_REACH: u64 = 8 << 20;
+
+/// One word of the stack at `at`, already inside [`stack_bounds`] and 16-byte aligned (or 8
+/// past such): macOS's bounds are the thread's mapped stack above its `sp`, so it is read in
+/// place.
+#[cfg(target_os = "macos")]
+fn read_stack_word(at: u64) -> Option<u64> {
+    // SAFETY: `walk_frames` reads only inside `stack_bounds`: from the faulting `sp` to the
+    // thread's stack top, every page of which is mapped readable (the stack grows down to
+    // `sp`, and pages above `sp` were touched by the frames there). The address is 8-byte
+    // aligned (a 16-byte aligned record, or 8 past it). A volatile read: the word may be
+    // changed by nothing while this thread runs the handler, but it is not this program's
+    // object.
+    Some(unsafe { ptr::read_volatile(at as *const u64) })
+}
+
+/// One word read by `process_vm_readv` of this very process: an unmapped word is EFAULT, never
+/// a fault in the handler (`process_vm_readv` is a system call, async-signal-safe).
+#[cfg(target_os = "linux")]
+fn read_stack_word(at: u64) -> Option<u64> {
+    let mut word = 0u64;
+    let local = libc::iovec { iov_base: (&mut word as *mut u64).cast(), iov_len: 8 };
+    let remote = libc::iovec { iov_base: at as *mut c_void, iov_len: 8 };
+    // SAFETY: `local` is a live 8-byte buffer on this stack; `remote` is only read, by the
+    // kernel, which checks it.
+    let n = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    (n == 8).then_some(word)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn read_stack_word(_at: u64) -> Option<u64> {
+    None
 }
 
 /// The page every window of [`code_around`] stays inside: the smallest page of the hosts run

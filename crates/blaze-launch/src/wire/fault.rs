@@ -14,6 +14,13 @@
 //! uint}}` or `{"X86_64": {"gpr": [16 uints], "rip": uint, "rflags": uint}}`: every map's keys
 //! in the order of their encodings (by length, then by bytes). Run schema 2 added `code` and
 //! `regs` (run.rs `RUN_SCHEMA`).
+//!
+//! Run schema 3 added `"callers": Callers|null` (between `address` and `touched` in the key
+//! order): the faulting thread's frame-pointer chain, `{"at": [Spot|null], "end": text, "ret":
+//! [uint]}`, its return addresses innermost first (at most [`MOST_CALLERS`]), the first
+//! [`NAMED_CALLERS`] of them as what is placed there (each spot the code holding the return
+//! address's call: its offset is the return address's own), and why the walk ended
+//! ([`WalkEnd`]). `null`: the host's handler does not walk (not AArch64).
 
 use core::alloc::Allocator;
 
@@ -148,10 +155,94 @@ impl Around {
     }
 }
 
+/// The most return addresses a fault carries (rule 18: the walk has a cap).
+pub const MOST_CALLERS: usize = 32;
+/// How many of them the child also names as what is placed there (the parent prints these).
+pub const NAMED_CALLERS: usize = 8;
+
+/// Why a frame-pointer walk stopped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WalkEnd {
+    /// A frame pointer of 0, or a return address of 0: the chain's own end.
+    Top,
+    /// [`MOST_CALLERS`] return addresses were taken.
+    Cap,
+    /// A frame record outside the thread's stack.
+    OutOfStack,
+    /// A frame record not strictly above the one before it.
+    NotAbove,
+    /// A frame pointer not on a 16-byte boundary (AArch64's `sp` always is).
+    Unaligned,
+    /// A word of a frame record that could not be read.
+    Unread,
+    /// The faulting thread's stack bounds were not known: no frame was read.
+    NoBounds,
+}
+
+impl WalkEnd {
+    pub fn name(self) -> &'static str {
+        match self {
+            WalkEnd::Top => "Top",
+            WalkEnd::Cap => "Cap",
+            WalkEnd::OutOfStack => "OutOfStack",
+            WalkEnd::NotAbove => "NotAbove",
+            WalkEnd::Unaligned => "Unaligned",
+            WalkEnd::Unread => "Unread",
+            WalkEnd::NoBounds => "NoBounds",
+        }
+    }
+
+    /// What the end means, for a report.
+    pub fn says(self) -> &'static str {
+        match self {
+            WalkEnd::Top => "the chain's end",
+            WalkEnd::Cap => "32 frames, the most a fault carries",
+            WalkEnd::OutOfStack => "a frame record outside the thread's stack",
+            WalkEnd::NotAbove => "a frame record not above the one before it",
+            WalkEnd::Unaligned => "a frame pointer off a 16-byte boundary",
+            WalkEnd::Unread => "a frame record that could not be read",
+            WalkEnd::NoBounds => "the thread's stack bounds were not known",
+        }
+    }
+
+    fn of(name: &str) -> Option<WalkEnd> {
+        [WalkEnd::Top, WalkEnd::Cap, WalkEnd::OutOfStack, WalkEnd::NotAbove, WalkEnd::Unaligned, WalkEnd::Unread, WalkEnd::NoBounds]
+            .into_iter()
+            .find(|end| end.name() == name)
+    }
+}
+
+/// The faulting thread's callers: `len` return addresses innermost first, the first
+/// [`NAMED_CALLERS`] as spots (`None`: in no placed code), and why the walk ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Callers {
+    pub len: u8,
+    pub ret: [u64; MOST_CALLERS],
+    pub at: [Option<Spot>; NAMED_CALLERS],
+    pub end: WalkEnd,
+}
+
+impl Callers {
+    /// No return address, the walk ended by `end`.
+    pub const fn none(end: WalkEnd) -> Callers {
+        Callers { len: 0, ret: [0; MOST_CALLERS], at: [None; NAMED_CALLERS], end }
+    }
+
+    /// The return addresses taken, innermost first.
+    pub fn rets(&self) -> &[u64] {
+        &self.ret[..usize::from(self.len).min(MOST_CALLERS)]
+    }
+
+    /// The spots sent: one per return address, up to [`NAMED_CALLERS`].
+    pub fn spots(&self) -> &[Option<Spot>] {
+        &self.at[..usize::from(self.len).min(NAMED_CALLERS)]
+    }
+}
+
 /// Where a program struck: the signal, the pc (`None` where it is not read) and what is placed
 /// there, the code around the pc and the thread's registers (`None` where they are not read),
-/// the faulting address (`si_addr`) and what is placed there, and whether the access was a
-/// write (`None` where it is not known).
+/// the faulting address (`si_addr`) and what is placed there, whether the access was a write
+/// (`None` where it is not known), and the thread's callers (`None` where they are not walked).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fault {
     pub signal: Signal,
@@ -162,6 +253,58 @@ pub struct Fault {
     pub address: u64,
     pub touched: Option<Spot>,
     pub write: Option<bool>,
+    pub callers: Option<Callers>,
+}
+
+fn write_callers<A: Allocator>(to: &mut Writer<'_, A>, callers: Option<Callers>) {
+    let Some(callers) = callers else {
+        to.null();
+        return;
+    };
+    to.map(3);
+    to.text("at");
+    to.array(callers.spots().len());
+    for &spot in callers.spots() {
+        write_spot(to, spot);
+    }
+    to.text("end");
+    to.text(callers.end.name());
+    to.text("ret");
+    write_words(to, callers.rets());
+}
+
+fn read_callers(from: &mut Reader<'_>) -> Result<Option<Callers>, WireError> {
+    if from.null() {
+        return Ok(None);
+    }
+    from.map(3, "the callers, a map of 3")?;
+    from.key("at")?;
+    let spots_at = from.at();
+    let spots = from.array()?;
+    if spots > NAMED_CALLERS {
+        return Err(WireError::Range { at: spots_at, what: "a fault names at most 8 callers" });
+    }
+    let mut at = [None; NAMED_CALLERS];
+    for spot in at.iter_mut().take(spots) {
+        *spot = read_spot(from)?;
+    }
+    from.key("end")?;
+    let named = from.at();
+    let end = WalkEnd::of(from.text()?).ok_or(WireError::Variant { at: named })?;
+    from.key("ret")?;
+    let rets_at = from.at();
+    let len = from.array()?;
+    if len > MOST_CALLERS {
+        return Err(WireError::Range { at: rets_at, what: "a fault carries at most 32 return addresses" });
+    }
+    if spots != len.min(NAMED_CALLERS) {
+        return Err(WireError::Range { at: spots_at, what: "one spot per return address, up to 8" });
+    }
+    let mut ret = [0u64; MOST_CALLERS];
+    for word in ret.iter_mut().take(len) {
+        *word = from.uint()?;
+    }
+    Ok(Some(Callers { len: len as u8, ret, at, end }))
 }
 
 fn write_around<A: Allocator>(to: &mut Writer<'_, A>, around: Option<Around>) {
@@ -307,7 +450,7 @@ fn read_spot(from: &mut Reader<'_>) -> Result<Option<Spot>, WireError> {
 
 /// Writes the variant's body.
 pub(super) fn write<A: Allocator>(to: &mut Writer<'_, A>, fault: &Fault) {
-    variant(to, NAME, 8);
+    variant(to, NAME, 9);
     to.text("at");
     write_spot(to, fault.at);
     to.text("pc");
@@ -328,13 +471,15 @@ pub(super) fn write<A: Allocator>(to: &mut Writer<'_, A>, fault: &Fault) {
     to.text(fault.signal.name());
     to.text("address");
     to.uint(fault.address);
+    to.text("callers");
+    write_callers(to, fault.callers);
     to.text("touched");
     write_spot(to, fault.touched);
 }
 
 /// Reads the variant's fields, the reader just past its name.
 pub(super) fn read(from: &mut Reader<'_>) -> Result<Fault, WireError> {
-    from.map(8, "Fault, a map of 8")?;
+    from.map(9, "Fault, a map of 9")?;
     from.key("at")?;
     let at = read_spot(from)?;
     from.key("pc")?;
@@ -356,7 +501,9 @@ pub(super) fn read(from: &mut Reader<'_>) -> Result<Fault, WireError> {
     let signal = Signal::of(from.text()?).ok_or(WireError::Variant { at: named })?;
     from.key("address")?;
     let address = from.uint()?;
+    from.key("callers")?;
+    let callers = read_callers(from)?;
     from.key("touched")?;
     let touched = read_spot(from)?;
-    Ok(Fault { signal, pc, at, code, regs, address, touched, write })
+    Ok(Fault { signal, pc, at, code, regs, address, touched, write, callers })
 }

@@ -1114,6 +1114,38 @@
    "recommended": "engine.md point 8 and pieces E8, E15 to E18. The lint record is keyed by the body and the hash of the selected lints' code ids; each lint's cost is counted in the profile. E16's audit runs on the 58 real bodies of the cost test first.",
    "why": "The owner asked on 2026-11-17 for a survey of the fastest compilers, checkers, linters and formatters and how to apply it. Its evidence: ast-grep measured one walk per rule against one walk for all rules at 3.6 s against 0.98 s; rustc and Clippy merged their lint passes into one statically combined pass for the same reason; on one real project Clippy's lints were 72% of CPU where type checking was 4%. The native TypeScript port keeps type caches per checker thread and its instantiations and memory grow with the thread count. Lean re-runs cache hits to check their recorded dependencies. Pyrefly cut an update from 3.6 s to under 0.2 s by tracking the lookups a module made instead of the module.",
    "state": "decided by the main agent 2026-11-17 18:05 from the survey; engine.md edited; no lints lane has started, so nothing is rebuilt. The owner may overrule."
+  },
+  {
+   "id": "D136",
+   "date": "2026-11-18",
+   "decision": "blaze-cli has a Cargo feature `publish = [\"blaze-remote/sign\"]`, off by default; only CI's blaze is built with it. Without it `blaze store publish` is refused by name: this blaze was built without publishing, only a trusted builder's is.",
+   "recommended": "The writer code (the walk, the layout, the folder write) is compiled under the feature; the reader is always compiled.",
+   "why": "Signing pulls in ring and the signer's code; a developer's blaze never writes a shared origin, so it carries neither.",
+   "state": "decided by the coordinator 2026-11-18 for lane RH5; built by RH5."
+  },
+  {
+   "id": "D137",
+   "date": "2026-11-18",
+   "decision": "The keys trusted for published sets are a list compiled into blaze-remote (`trust::PUBLISHED_KEYS`, empty until CI has a key), plus the named `--origin-key` grant for any other origin. They are NOT in the toolchain manifest: that is fetched data itself, and the binary is the root of trust. One function answers whether a signer is trusted for an origin; an unknown signer is refused `UnknownSigner`, by name.",
+   "recommended": "blaze-remote published/set.rs `trusted`; the reader's `SetCheck` takes the keys it answers.",
+   "why": "A key list carried by data the key list is meant to verify proves nothing.",
+   "state": "decided by the coordinator 2026-11-18 for lane RH5; built by RH5."
+  },
+  {
+   "id": "D138",
+   "date": "2026-11-18",
+   "decision": "A command with a named origin takes the published set whole before its first phase, on the coordinator thread: head (signature, set id, floor), prefix, segments; each record's digest verified once; put as the home's own LOCAL records under their own tags; the toolchain root named last; committed. A set that cannot be taken stops the command by name (rule 3). A second command takes nothing: the home's taken generation and the time the origin's head was last asked are a LOCAL record, and the head is asked at most once per freshness window (the command's handed clock).",
+   "recommended": "blaze-cli store/take.rs; the pool's snapshot reads find the records locally, so no worker ever fetches.",
+   "why": "Pool workers read through a lock-free Snapshot of local segments that never fetches, so a per-key fetch on a miss never happens on the engine path; and no network call belongs on the edit loop's hot path.",
+   "state": "decided by the coordinator 2026-11-18 for lane RH5; written by RH5."
+  },
+  {
+   "id": "D139",
+   "date": "2026-11-18",
+   "decision": "A blaze built with blaze-cli's `publish` feature is a trusted builder's: its store opens as a trusted writer (blaze-cas `Settings::trusted_writer`) and every command's place writes the public class (a record all of whose names are public: the toolchain's) PUBLIC, so `blaze store publish` finds them under the toolchain root. A default (developer's) blaze writes every record LOCAL and refuses the publish by name.",
+   "recommended": "blaze-cli store.rs `TRUSTED_BUILDER = cfg!(feature = \"publish\")`, read in `open_for_command` and `CommandStore::new`; one constant, one place.",
+   "why": "Only a trusted builder may make records that leave the machine (the Trust rule); the choice is the build's, not a flag or an environment variable a developer could set by accident, and a developer's home never holds a PUBLIC record.",
+   "state": "proposed by RH5 2026-11-18 for the coordinator's word; written by RH5."
   }
  ]
 }

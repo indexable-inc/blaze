@@ -383,7 +383,7 @@ fn a_file_changed_under_the_record_is_refused_as_stale() {
     blaze_sim::control(Config::cases(300), Plant::None, Plant::SkipDigest, "read through the stale record", case);
 }
 
-fn solve_one(text: &'static str, sub: Option<&'static str>) -> &'static CrateNames<'static> {
+pub(super) fn solve_one(text: &'static str, sub: Option<&'static str>) -> &'static CrateNames<'static> {
     let g = Alloc::global();
     let mut of_crate = std::vec![("/k0/lib.rs", text)];
     of_crate.extend(sub.map(|s| ("/k0/sub.rs", s)));

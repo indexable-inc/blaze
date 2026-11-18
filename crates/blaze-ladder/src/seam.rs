@@ -24,6 +24,15 @@ use blaze_typeck::{
 use crate::front::{At, FnKind, FnLang, Front, LitTexts};
 use crate::run::{Named, RunError};
 
+/// The seam's types that name the ambient heap today, each under ONE name (rule 30), so a
+/// program that forwards the seam (tests/front_equal) names no allocator of its own and the
+/// sweep that hands the seam an allocator changes these three lines.
+pub type CheckedBodies = Vec<Option<Checked<'static>>, Global>;
+/// As [`CheckedBodies`]: a constant's or static's data record as the seam hands it.
+pub type SeamData = blaze_build::data::DataRecord<Global>;
+/// As [`CheckedBodies`]: a coroutine's state recipe as the seam hands it.
+pub type SeamRecipe = blaze_flow_lower::state_recipe::StateRecipe<Global>;
+
 /// Why [`FrontEnd::source_position`] gave no line and column.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PositionGap {
@@ -411,6 +420,10 @@ pub trait FrontEnd {
         Ok(None)
     }
     fn repr(&self, key: ItemKey) -> ReprAttrs;
+    /// ADT `key`'s valid range of its one scalar (`rustc_layout_scalar_valid_range_start` and
+    /// `_end`, as its head read them): what the layout narrows the scalar to and takes niches
+    /// outside of. The default range: the whole scalar.
+    fn valid_range(&self, key: ItemKey) -> blaze_build::layout::ValidRange;
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic>;
     fn static_item(&self, key: ItemKey) -> Option<StaticItem>;
     /// Variant `variant` of enum `adt`'s discriminant value, explicit or implicit; `None` is
@@ -551,6 +564,11 @@ impl FrontEnd for Front<'_> {
 
     fn repr(&self, key: ItemKey) -> ReprAttrs {
         Front::repr(self, key)
+    }
+
+    /// The old front end never read the attribute: the whole scalar.
+    fn valid_range(&self, _: ItemKey) -> blaze_build::layout::ValidRange {
+        blaze_build::layout::ValidRange::default()
     }
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {

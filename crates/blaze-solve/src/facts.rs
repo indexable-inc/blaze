@@ -125,6 +125,11 @@ impl TraitFlags {
     pub const SEALED: u16 = 1 << 8;
     /// The trait is `#[rustc_deny_explicit_impl]` (only builtin impls exist).
     pub const DENY_EXPLICIT_IMPL: u16 = 1 << 9;
+    /// The world could not decide the trait's dyn compatibility (a member or supertrait it did
+    /// not read: blaze-typeck dyn_compat.rs `Verdict::Gap`). Neither compatible nor not: a goal
+    /// whose answer depends on it stops with [`crate::error::Unsupported::DynUndecided`], never
+    /// answers No (rule 3). Never set together with [`TraitFlags::DYN_COMPATIBLE`].
+    pub const DYN_UNDECIDED: u16 = 1 << 10;
 
     pub const fn has(self, bits: u16) -> bool {
         self.0 & bits != 0
@@ -289,8 +294,10 @@ impl FnSigDef<'_> {
     pub const CONST: u16 = 1 << 0;
     pub const UNSAFE: u16 = 1 << 1;
     pub const TARGET_FEATURE: u16 = 1 << 2;
-    /// `extern "rust-call"`: not `Fn*`-compatible (`ExternAbi::is_fn_trait_compatible`).
-    pub const RUST_CALL: u16 = 1 << 3;
+    /// An ABI other than `Rust` (`extern "C"`, `extern "rust-call"`, ..) or C-variadic: not
+    /// `Fn*`-compatible (the pinned nightly's `FnSig::is_fn_trait_compatible`: "!c_variadic &&
+    /// safe && abi == ExternAbi::Rust").
+    pub const NOT_FN_ABI: u16 = 1 << 3;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

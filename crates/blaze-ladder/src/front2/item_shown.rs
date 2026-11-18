@@ -392,6 +392,7 @@ pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super
         CheckFail::Buckets { error, .. } => match error {
             super::buckets::Unfilled::Impl(k) => format!("the candidate impl {} has no header in the store when its question is answered", lib(*k)),
             super::buckets::Unfilled::Fn(k) => format!("the inherent impl fn {} has no `self` flag in its impl's head", path(*k)),
+            super::buckets::Unfilled::Sight(why) => format!("{why}"),
         },
         CheckFail::Tables { error, .. } => format!("the impl tables could not file a question's impls: {error}"),
         CheckFail::Check { error, .. } => format!("the checker stopped: {}", check_error_class(&path, error)),

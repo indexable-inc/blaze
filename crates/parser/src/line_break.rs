@@ -50,10 +50,43 @@ pub fn is_bare_cr(rest: &[u8]) -> bool {
 
 /// Whether `text[range]` holds a bare CR, a CR at its end judged by the byte after it in `text`
 /// (a line comment's last CR is its break's when `text` has LF next).
+///
+/// A caller that asks per token asks [`has_cr`] of the whole text once first: a text with no CR
+/// (nearly every file) then never asks this again. Here the range is searched CR to CR, never
+/// byte by byte through a closure (328 self samples in a 2026-11-18 `engine-check` stack sample).
 #[inline]
 pub fn has_bare_cr(text: &[u8], range: core::ops::Range<usize>) -> bool {
-    let start = range.start;
-    text[range].iter().enumerate().any(|(at, &b)| b == b'\r' && is_bare_cr(&text[start + at..]))
+    #[cfg(test)]
+    counts::BARE_CR_ASKS.with(|n| n.set(n.get() + 1));
+    let (mut at, end) = (range.start, range.end);
+    while let Some(i) = text[at..end].iter().position(|&b| b == b'\r') {
+        if is_bare_cr(&text[at + i..]) {
+            return true;
+        }
+        at += i + 1;
+    }
+    false
+}
+
+/// Whether `text` holds a CR at all: the one scan a lexer makes of a text for its bare-CR
+/// questions ([`has_bare_cr`]), so a text with none asks no token's range.
+#[inline]
+pub fn has_cr(text: &[u8]) -> bool {
+    #[cfg(test)]
+    counts::CR_SCANS.with(|n| n.set(n.get() + 1));
+    text.contains(&b'\r')
+}
+
+/// How often each question was asked on this thread: the tests' measure of the floor (one
+/// [`has_cr`] per lexed text; no [`has_bare_cr`] for a text without a CR).
+#[cfg(test)]
+pub(crate) mod counts {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        pub(crate) static CR_SCANS: Cell<u64> = const { Cell::new(0) };
+        pub(crate) static BARE_CR_ASKS: Cell<u64> = const { Cell::new(0) };
+    }
 }
 
 /// The pieces of `text` with each CR of a CR LF left out, in order: concatenated, they are the

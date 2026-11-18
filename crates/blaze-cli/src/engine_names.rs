@@ -316,8 +316,11 @@ impl<'f> NamesStage<'f> {
 
     /// A names task's reads, each `(record, digest)` as the task saw it, as the engine's cells:
     /// sorted by cell id, each once.
-    fn cells_read<'a>(&self, outlined: &[Outlined<'_>], read: impl Iterator<Item = (Name, ContentId)>, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
-        let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
+    fn cells_read<'a>(&self, outlined: &[Outlined<'_>], read: impl ExactSizeIterator<Item = (Name, ContentId)>, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
+        // Sized once: one cell a read (the dedup below only shortens it), so the row the
+        // engine keeps for the rest of the command is one block of its own length, never a
+        // vector grown by doubling (the 2026-11-18 heap log: 98 MB in 1,200 blocks here).
+        let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(read.len(), alloc);
         for (read, digest) in read {
             reads.push(match read.kind {
                 // A file's surface is its outline's `SURFACE` cell (engine_tasks.rs), with the
@@ -410,9 +413,13 @@ const CELLS_DOMAIN: &str = "blaze v2 engine names cell table 1";
 /// cell, each once (the engine's merge walk; rule 25).
 fn cells_of<'a>(name: Name, record: &work::Made<'_>, alloc: SharedAlloc<'a>) -> Result<SVec<'a, (Cell, ContentId)>, EngineCheckError> {
     const WHAT: &str = "the cells a `CrateScope` task defines (engine_names.rs `cells_of`)";
-    let mut defines: SVec<'a, (Cell, ContentId)> = SVec::new_in(alloc);
-    EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
+    // Each list sized once, to the cells it will hold, before its first push: the engine keeps
+    // it for the rest of the command, so it is one block of its own length (rule 67's floor),
+    // never a vector grown by doubling.
+    let sized = |cells: usize| SVec::try_with_capacity_in(cells, alloc).map_err(|_| EngineCheckError::Grow { what: WHAT, had: 0 });
     if !record.reads.iter().any(|(read, _)| read.kind == Kind::Surface) {
+        let mut defines: SVec<'a, (Cell, ContentId)> = sized(1)?;
+        EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
         return Ok(defines);
     }
     let payload = record.payload_bytes().map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload released after its put" })?;
@@ -422,6 +429,9 @@ fn cells_of<'a>(name: Name, record: &work::Made<'_>, alloc: SharedAlloc<'a>) -> 
     if table.len() % row != 0 {
         return Err(EngineCheckError::CellTable { task: name, what: "is not whole rows" });
     }
+    // WHOLE, CELLS, then one cell a row of the table.
+    let mut defines: SVec<'a, (Cell, ContentId)> = sized(2 + table.len() / row)?;
+    EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
     EngineCheckError::push(&mut defines, (CELLS, ContentId::of(CELLS_DOMAIN, table)), WHAT)?;
     let mut last: Option<[u8; 16]> = None;
     for bytes in table.chunks_exact(row) {

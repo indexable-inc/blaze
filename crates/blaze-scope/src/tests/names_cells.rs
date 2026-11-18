@@ -70,7 +70,7 @@ pub mod m {
 pub use m::g;
 ";
 
-static BEFORE: Texts = Texts(&[&[("/k0/lib.rs", K0)], &[("/k1/lib.rs", K1)]]);
+pub(super) static BEFORE: Texts = Texts(&[&[("/k0/lib.rs", K0)], &[("/k1/lib.rs", K1)]]);
 static AFTER: Texts = Texts(&[&[("/k0/lib.rs", K0_ADDED)], &[("/k1/lib.rs", K1)]]);
 
 struct Loaded(Vec<&'static [u8]>);
@@ -83,16 +83,16 @@ impl<'a> LoadNames<'a> for Loaded {
 
 /// One side of the edit: each crate's names record, opened, and its cell table; and the
 /// table with the items record's cells and a `Whole(Items)` over its bytes.
-struct Side {
-    bytes: Vec<&'static [u8]>,
-    keys: Vec<CrateItemKey>,
+pub(super) struct Side {
+    pub(super) bytes: Vec<&'static [u8]>,
+    pub(super) keys: Vec<CrateItemKey>,
     tables: Vec<Vec<u8>>,
     with_items: Vec<Vec<u8>>,
     items: Vec<&'static [u8]>,
 }
 
 impl Side {
-    fn solve(texts: &'static Texts) -> Side {
+    pub(super) fn solve(texts: &'static Texts) -> Side {
         let g = blaze_own::testing::heap().alloc();
         let inputs = [input("k0", "/k0/lib.rs", &[]), input("k1", "/k1/lib.rs", &[("k0", 0)])];
         let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
@@ -119,7 +119,7 @@ impl Side {
         NamesRecord::open(Verified::check(bytes).unwrap_or_else(|e| panic!("a record does not check: {e:?}")))
     }
 
-    fn record(&self, krate: usize) -> NamesRecord<'static> {
+    pub(super) fn record(&self, krate: usize) -> NamesRecord<'static> {
         self.record_of(self.bytes[krate])
     }
 
@@ -154,7 +154,7 @@ fn moved(before: &[u8], after: &[u8]) -> Vec<[u8; 16]> {
     out
 }
 
-fn family() -> Vec<(PathKind, Vec<&'static str>)> {
+pub(super) fn family() -> Vec<(PathKind, Vec<&'static str>)> {
     let leaves = ["a", "b", "c", "m", "S", "T", "f", "g", "E", "V", "W", "k0", "added", "missing"];
     let mut all = Vec::new();
     for n in leaves {

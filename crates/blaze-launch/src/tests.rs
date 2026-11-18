@@ -2,6 +2,7 @@
 //! ([`sim`]); the wire's bytes against blaze-protocol's check of the deterministic encoding
 //! ([`wire`]); and here, what one call of the core refuses and what the area gives back.
 
+mod fault_callers_wire;
 mod fault_regs_wire;
 mod fault_wire;
 mod grants;

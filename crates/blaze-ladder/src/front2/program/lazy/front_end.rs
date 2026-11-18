@@ -186,6 +186,9 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// callee the build resolved to before its own `check_one` made its row still has its
     /// signature's ABI.
     fn fn_abi(&self, key: ItemKey) -> Option<Abi> {
+        // The ABI of the fn an allocator declaration runs, not the declaration's (program.rs
+        // `fn_abi`, blaze-build `Adts::abi`).
+        let key = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, key, self.store.tys.alloc()).unwrap_or(key);
         let tabled = self.rows.by_key.get(&key).and_then(|&i| self.rows.abi.get(i as usize).copied());
         super::seam_rules::fn_abi(tabled, self.front.names, &self.store, key)
     }
@@ -387,6 +390,10 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     fn repr(&self, key: ItemKey) -> ReprAttrs {
         self.store.adts.get(&key).map_or(ReprAttrs::RUST, |a| a.repr)
+    }
+
+    fn valid_range(&self, key: ItemKey) -> blaze_build::layout::ValidRange {
+        self.store.adts.get(&key).map_or(blaze_build::layout::ValidRange::default(), |a| a.valid)
     }
 
     fn discriminant(&self, adt: ItemKey, variant: u32) -> Option<i128> {

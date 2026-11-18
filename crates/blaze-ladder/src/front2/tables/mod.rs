@@ -11,9 +11,14 @@ pub mod goals;
 pub mod head;
 #[cfg(test)]
 mod head_tests;
+pub mod owned_reads;
+#[cfg(test)]
+mod owned_reads_tests;
 pub mod recorder;
 #[cfg(test)]
 mod recorder_tests;
+#[cfg(test)]
+mod seeded_failures_tests;
 pub mod seeds;
 pub mod task;
 pub mod view;

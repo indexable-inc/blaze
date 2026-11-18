@@ -95,14 +95,84 @@
 //! A caller's own type parameter `U` in an argument under a declared `T: 'a` is related by its
 //! placeholder `ρ_U` (param_outlives.rs: `subset(ρ_U, 'a)`), and lib.rs `call_done` sends a
 //! call that owes such a bound here even when no argument carries an origin (`owes`).
+//!
+//! OPEN PROJECTIONS (piece B7: serde's `Self::Error`, `V::Value`, thiserror's `Self::Target`,
+//! census `CallUnrelated Shape` with `OpenProjection`). `<A0 as Tr<'r1.., A1..>>::Name` where
+//! `Tr` declares lifetime parameters: by E0207 every lifetime of the type an impl gives it is
+//! `'static`, one of the impl's that appears in the self type (a position of `A0..An`'s
+//! arguments) or one that appears in the implemented trait (one of `'r1..`). So the projection's
+//! INPUTS are the joined arguments' positions (as a closed one's) and the trait reference's
+//! lifetime arguments. The latter are erased from the portable type; they are the ones of the
+//! bound the projection's self type answers (`V::Value` under `V: Visitor<'de>` is `<V as
+//! Visitor<'de>>::Value`; `Self::Error` in a trait method is the trait's own `Self:
+//! Deserializer<'de>`): the callee's [`crate::Tie`] row for `(param, trait)`, whose regions the
+//! tie (trait_ties.rs) makes the caller's at this call. Only a projection whose self type is a
+//! bare type parameter of the head is taken ([`Mark::Open`]); a generic associated type keeps
+//! [`ShapeRefusal::OpenProjection`] (its own lifetime arguments are erased and may be the
+//! method's elided `'_`: a lending iterator's).
+//!
+//! At a call the destination's type is the output as the TYPE CHECK normalized it (rule 77:
+//! its answer, never solved again). Each projection of the output is found in it by walking
+//! the head's output and the destination's type in step ([`Skel`]), so an output with several
+//! (`Result<Self::SerializeStruct, Self::Error>`) is split exactly. Where the checker
+//! normalized it (an impl answers: `V::Value = Point`), its positions are each related both
+//! ways with every input (a superset of the one true input or `'static`, as for a closed
+//! projection: rustc's NLL type check equates the normalized type's regions with the impl's,
+//! which are the inputs'). Where it is still a projection in the caller (`D::Error`, over the
+//! caller's own `D`), it is the caller's OPAQUE type: its one position `ρ` (lib.rs `npos`
+//! counts one for an alias) stands for the meet of its inputs, so each input flows into `ρ`
+//! ONE way (`input: ρ`: every lifetime it holds outlives the meet), and each caller type
+//! parameter `U` its arguments hold flows in by its placeholder `ρ_U` (`U: ρ`). NLL's
+//! constraints for `<D as Tr<'r>>::E` (dest) `== <D as Tr<'de>>::E` (callee, instantiated) are
+//! `'r == 'de`; a requirement on the destination `ρ: 'x` then reaches every input by
+//! transitivity (`'de: 'x`, `ρ_D: 'x`), which is what rustc proves for `<D as Tr<'de>>::E: 'x`
+//! (RFC 1214, projection components). What this refuses that rustc accepts: an outlives proven
+//! by a where clause on the projection itself (`where V::Value: 'static`), which is not read.
+//! The caller's own signature states the same of its own opaque positions (`input: ρ`,
+//! [`Lower::own_alias_known`]): each is a placeholder its inputs outlive.
+//!
+//! A PART WITH NO POSITION (census `CallUnrelated Unaligned(Positions { want: 0, have: 0,
+//! exact: false })`, 36 in bstd and 35 in core: `self.0.wrapping_shl(n)`, `self.why.says()`):
+//! an operand whose instantiated parameter and own type have no position carries no region, so
+//! NLL derives no constraint from it; it is related to nothing, whatever place it is read from
+//! (a field of an ADT is an inexact place, holding the whole ADT's origins).
 
 use blaze_flow::{Origin, Place};
 use blaze_own::Vec;
 use blaze_typeck::{ExprId, ItemKey, List, Name, PNode, PTy, PTys};
 use core::alloc::Allocator;
 
-use crate::sig::{Region, SigLife};
-use crate::{At, Facts, Form, Lower, Refusal, TyD, Val};
+use crate::sig::{BodyOut, Region, SigLife};
+use crate::{At, Facts, Form, Lower, MOST_POSITIONS, Plant, Refusal, TyD, Val};
+
+/// What a trait's text says of one of its associated types, as [`read_shape`] asks it: whether
+/// the trait declares a lifetime parameter, and whether the associated type has generics of
+/// its own. Whoever answers files the read of the trait's text (rule 21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssocRead {
+    pub trait_lifetimes: bool,
+    pub generic: bool,
+}
+
+/// One node of a head's OUTPUT type, in [`read_shape`]'s walk order (pre-order, children left
+/// to right): what the destination's type must hold at the same place for the projections of
+/// the output to be found in it ([`Lower::proj_counts`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Skel {
+    /// A reference: one child, the referent.
+    Ref,
+    /// A raw pointer, slice, array or pattern type: one child.
+    Under,
+    /// A tuple of this many elements.
+    Tuple(u32),
+    /// The ADT `k`: its type arguments are the children.
+    Adt(ItemKey),
+    /// A type parameter (its argument's subtree), a trait object, a scalar: no child walked.
+    Skip,
+    /// A projection ([`Mark::Hidden`] or [`Mark::Open`], the same order): its subtree is what
+    /// the type check normalized it to at the call.
+    Proj,
+}
 
 /// One origin position of a head's written type, in the lowering's order (a reference, then
 /// its referent; an ADT's lifetime, then its arguments left to right; a tuple's elements left
@@ -120,6 +190,11 @@ pub enum Mark {
     /// the head's parameters its arguments name: by E0207 every lifetime of that type is
     /// `'static` or one of their arguments' (the module doc, "PROJECTIONS").
     Hidden { lo: u32, hi: u32 },
+    /// A projection `<Param(param) as trait_<'r..>>::Name` onto an OPEN associated type (its
+    /// trait declares lifetime parameters; it has no generics of its own): as
+    /// [`Mark::Hidden`], its inputs also the trait reference's lifetime arguments, the regions
+    /// of the callee's tie row for `(param, trait_)` (the module doc, "OPEN PROJECTIONS").
+    Open { lo: u32, hi: u32, param: u32, trait_: ItemKey },
 }
 
 /// A head's generic shape: per input then the output, its [`Mark`]s.
@@ -128,8 +203,10 @@ pub struct Shape<'s> {
     pub marks: &'s [Mark],
     /// Per input, where its marks end in `marks`; the output's are the rest.
     pub ends: &'s [u32],
-    /// The parameters each [`Mark::Hidden`]'s projection names, sorted and once each per mark.
+    /// The parameters each projection mark names, sorted and once each per mark.
     pub joins: &'s [u32],
+    /// The output's nodes ([`Skel`]): empty when the output holds no projection.
+    pub skel: &'s [Skel],
 }
 
 /// The owned form [`read_shape`] fills.
@@ -137,15 +214,16 @@ pub struct ShapeBuf<A: Allocator + Clone> {
     pub marks: Vec<Mark, A>,
     pub ends: Vec<u32, A>,
     pub joins: Vec<u32, A>,
+    pub skel: Vec<Skel, A>,
 }
 
 impl<A: Allocator + Clone> ShapeBuf<A> {
     pub fn new_in(alloc: A) -> ShapeBuf<A> {
-        ShapeBuf { marks: Vec::new_in(alloc.clone()), ends: Vec::new_in(alloc.clone()), joins: Vec::new_in(alloc) }
+        ShapeBuf { marks: Vec::new_in(alloc.clone()), ends: Vec::new_in(alloc.clone()), joins: Vec::new_in(alloc.clone()), skel: Vec::new_in(alloc) }
     }
 
     pub fn shape(&self) -> Shape<'_> {
-        Shape { marks: &self.marks, ends: &self.ends, joins: &self.joins }
+        Shape { marks: &self.marks, ends: &self.ends, joins: &self.joins, skel: &self.skel }
     }
 }
 
@@ -178,15 +256,12 @@ pub enum ShapeRefusal {
     Bound { part: u32 },
     /// An ADT whose head's lifetime count is not known.
     AdtUnknown { part: u32, adt: ItemKey },
-    /// A projection `<A0 as Tr<..>>::Name` that is not CLOSED (the module doc, "PROJECTIONS"):
-    /// `Tr` declares a lifetime parameter (`Deserializer<'de>`, `Visitor<'de>`,
-    /// `AsDisplay<'a>`) or `Name` has generics of its own (`closed` said `Some(false)`), or the
-    /// trait's text was not read (`None`). Its normalized type may hold the trait's lifetime
-    /// ARGUMENT, which no type argument of the call carries (portable types hold no regions):
-    /// at a call through a caller's `D: Deserializer<'de>` that region is the caller's `'de`,
-    /// fixed by the caller's where clause, not a region the call may choose, so standing for
-    /// it with a fresh region per call could accept what rustc refuses.
-    OpenProjection { part: u32, trait_: ItemKey, name: Name, closed: Option<bool> },
+    /// A projection `<A0 as Tr<..>>::Name` that neither [`Mark::Hidden`] nor [`Mark::Open`]
+    /// takes: `Name` has generics of its own (a generic associated type, whose own lifetime
+    /// arguments are erased and may be the method's elided `'_`), the trait's text was not read
+    /// (`read` is `None`), or `Tr` declares lifetimes and `A0` is no bare type parameter of the
+    /// head (whose bound would say the trait's lifetime arguments: `<Vec<T> as Tr<'a>>::X`).
+    OpenProjection { part: u32, trait_: ItemKey, name: Name, read: Option<AssocRead> },
     /// A closed projection whose arguments hold a region of the head's own (a reference, a
     /// trait object, an ADT with a lifetime): that position is not one the mark stands for.
     ProjectionHoldsRegion { part: u32, trait_: ItemKey, name: Name },
@@ -219,12 +294,17 @@ pub enum Misfit {
     /// A projection in an input (its demand is the impl's to say: impl_call.rs), or two in one
     /// part.
     InputProjection { part: u32 },
-    /// The output's projection stands for the destination's positions, and the destination is
-    /// no exact place or has fewer positions than the output's others.
-    ProjectionUnplaced { part: u32 },
+    /// The destination's type does not have the head's output's nodes where the output holds
+    /// a projection ([`Skel`]): it is not that output instantiated and normalized, or it is a
+    /// lowering temporary (`wrap`).
+    Skeleton { part: u32 },
     /// The output projection's arguments hold lifetimes that are not positions (a trait
-    /// object, a closure's captures) or a type parameter of the body.
+    /// object, a closure's captures), or, where the type check normalized it, a type
+    /// parameter of the body.
     ProjectionLoose { part: u32 },
+    /// An open projection ([`Mark::Open`]) whose bound the callee's tie rows do not hold as
+    /// one read row: its trait lifetime arguments are not known.
+    ProjectionTraitUnread { part: u32 },
     /// The operand or destination `part` is no exact place (`exact`), or has `have` positions
     /// where the instantiated parameter has `want`.
     Positions { part: u32, want: u32, have: u32, exact: bool },
@@ -242,9 +322,23 @@ enum Slot {
     Sig(Region),
     /// Position `k` of the call's type argument for `Param(p)`.
     Arg(u32, u32),
-    /// One position of the type a [`Mark::Hidden`] projection normalizes to at the call: every
-    /// position of the type arguments of `Shape::joins[lo..hi]` flows into it.
-    Joined(u32, u32),
+    /// One position of the type the output's projection `projs[i]` ([`Proj`]) is at the call:
+    /// each of its inputs flows into it.
+    Joined(u32),
+}
+
+/// One projection of the output at a call, as the destination holds it.
+#[derive(Clone, Copy, Debug)]
+struct Proj {
+    /// Its joined parameters, `Shape::joins[lo..hi]`.
+    lo: u32,
+    hi: u32,
+    /// [`Mark::Open`]'s `(param, trait_)`: the callee's tie row whose regions are inputs too.
+    open: Option<(u32, ItemKey)>,
+    /// The destination still holds it as a projection (the caller's opaque type, one
+    /// position): its inputs flow into that position one way, and the caller's own type
+    /// parameters its arguments hold by their placeholders.
+    alias: bool,
 }
 
 /// The most nodes one walk visits: a type past it is refused.
@@ -252,27 +346,32 @@ const MOST: u32 = 4096;
 
 /// Reads the generic shape of a head whose erased inputs and output are `inputs` and `output`
 /// in `tys`, counting positions as [`crate::sig::read_signature`] does (`adt_lifetimes`: how many
-/// lifetime parameters an ADT's head declares; `closed`: whether trait `t`'s associated type
-/// `name` is closed, [`Mark::Hidden`]). Refused: a type whose positions cannot be lined up with
-/// a type argument substituted in (an opaque type; a projection that is not closed or whose
-/// arguments hold a region of the head's own), a closure or coroutine node, an unknown ADT.
+/// lifetime parameters an ADT's head declares; `assoc`: what trait `t`'s text says of its
+/// associated type `name`, [`AssocRead`]). Refused: a type whose positions cannot be lined up
+/// with a type argument substituted in (an opaque type; a projection [`Mark::Hidden`] and
+/// [`Mark::Open`] do not take, or whose arguments hold a region of the head's own), a closure
+/// or coroutine node, an unknown ADT. The output's nodes go to `out.skel` when it holds a
+/// projection.
 pub fn read_shape<A: Allocator + Clone>(
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
     adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
-    closed: &dyn Fn(ItemKey, Name) -> Option<bool>,
+    assoc: &dyn Fn(ItemKey, Name) -> Option<AssocRead>,
     out: &mut ShapeBuf<A>,
     alloc: A,
 ) -> Result<(), ShapeRefusal> {
     out.marks.clear();
     out.ends.clear();
     out.joins.clear();
+    out.skel.clear();
+    let mut projections = false;
     let mut inner: Vec<PTy, A> = Vec::new_in(alloc.clone());
     // A work list in the lowering's order: popped last first, so children go in reversed.
     let mut stack: Vec<PTy, A> = Vec::new_in(alloc);
     for (j, &top) in inputs.iter().chain(core::iter::once(&output)).enumerate() {
         let part = j as u32;
+        let output_part = j == inputs.len();
         stack.clear();
         stack.push(top);
         let mut steps = 0u32;
@@ -281,7 +380,18 @@ pub fn read_shape<A: Allocator + Clone>(
             if steps > MOST {
                 return Err(ShapeRefusal::Bound { part });
             }
-            match tys.node(t).map_err(unread(part))? {
+            let node = tys.node(t).map_err(unread(part))?;
+            if output_part {
+                out.skel.push(match node {
+                    PNode::Ref(..) => Skel::Ref,
+                    PNode::Ptr(..) | PNode::Slice(_) | PNode::Pat(..) | PNode::Array(..) => Skel::Under,
+                    PNode::Tuple(l) => Skel::Tuple(tys.list(l).map_err(unread(part))?.len() as u32),
+                    PNode::Adt(k, _) => Skel::Adt(k),
+                    PNode::Alias { .. } => Skel::Proj,
+                    _ => Skel::Skip,
+                });
+            }
+            match node {
                 PNode::Ref(_, i) => {
                     out.marks.push(Mark::Own);
                     stack.push(i);
@@ -303,10 +413,22 @@ pub fn read_shape<A: Allocator + Clone>(
                 PNode::Dynamic(_) => out.marks.push(Mark::Own),
                 PNode::Param(i) => out.marks.push(Mark::Param(i)),
                 PNode::Alias { trait_, name, args } => {
-                    let is_closed = closed(trait_, name);
-                    if is_closed != Some(true) {
-                        return Err(ShapeRefusal::OpenProjection { part, trait_, name, closed: is_closed });
-                    }
+                    let read = assoc(trait_, name);
+                    let refused = ShapeRefusal::OpenProjection { part, trait_, name, read };
+                    // `Some(param)`: open, over the head's bare `Param(param)`.
+                    let open = match read {
+                        Some(AssocRead { generic: false, trait_lifetimes: false }) => None,
+                        Some(AssocRead { generic: false, trait_lifetimes: true }) => {
+                            let first = tys.list(args).map_err(unread(part))?.first().copied();
+                            match first.map(|f| tys.node(f)) {
+                                Some(Ok(PNode::Param(p))) => Some(p),
+                                Some(Err(_)) => return Err(ShapeRefusal::Unknown { part }),
+                                _ => return Err(refused),
+                            }
+                        }
+                        _ => return Err(refused),
+                    };
+                    projections = true;
                     // The parameters its arguments name; any region of the head's own in them
                     // (a reference, a trait object, an ADT with a lifetime) is not a position
                     // this mark stands for: refused.
@@ -347,7 +469,11 @@ pub fn read_shape<A: Allocator + Clone>(
                         }
                     }
                     out.joins.truncate(kept);
-                    out.marks.push(Mark::Hidden { lo, hi: out.joins.len() as u32 });
+                    let hi = out.joins.len() as u32;
+                    out.marks.push(match open {
+                        None => Mark::Hidden { lo, hi },
+                        Some(param) => Mark::Open { lo, hi, param, trait_ },
+                    });
                 }
                 PNode::Opaque(opaque, _) => return Err(ShapeRefusal::Opaque { part, opaque }),
                 PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(ShapeRefusal::Unnameable { part }),
@@ -356,7 +482,12 @@ pub fn read_shape<A: Allocator + Clone>(
         }
         if j < inputs.len() {
             out.ends.push(out.marks.len() as u32);
+            // Only the output's projections are found in the destination by the skeleton.
+            projections = false;
         }
+    }
+    if !projections {
+        out.skel.clear();
     }
     Ok(())
 }
@@ -385,6 +516,149 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             start
         };
         arg_origs[(start + k) as usize]
+    }
+
+    /// The callee's one read tie row for `(param, trait_)`: all of its rows' regions and the
+    /// row's range in them. `None`: no row, an unread one, or two.
+    fn open_row(&self, callee: ItemKey, (param, trait_): (u32, ItemKey)) -> Option<(&'b [Region], u32, u32)> {
+        let facts: &'b F = self.facts;
+        let ties = facts.ties(callee)?;
+        let mut found = None;
+        for t in ties.rows.iter().filter(|t| t.param == param && t.trait_ == trait_) {
+            if found.is_some() || !t.read {
+                return None;
+            }
+            found = Some(*t);
+        }
+        let t = found?;
+        (t.lo <= t.hi && t.hi as usize <= ties.regions.len()).then_some((ties.regions, t.lo, t.hi))
+    }
+
+    /// Walks the head's output nodes `skel` ([`Skel`]) and the destination's type in step,
+    /// pushing to `out` per projection, in order, its subtree's position count and whether it
+    /// is still a projection there. `false`: the destination does not have those nodes.
+    fn proj_counts(&self, skel: &[Skel], dest_ty: TyD, out: &mut Vec<(u32, bool), A>, e: ExprId) -> Result<bool, Refusal> {
+        out.clear();
+        if dest_ty.wrap.is_some() {
+            return Ok(false);
+        }
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        stack.push(dest_ty.ty);
+        for &s in skel {
+            let Some(t) = stack.pop() else { return Ok(false) };
+            let node = self.node(t, e)?;
+            match (s, node) {
+                (Skel::Ref, PNode::Ref(_, i)) => stack.push(i),
+                (Skel::Under, PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _)) => stack.push(i),
+                (Skel::Tuple(n), PNode::Tuple(l)) => {
+                    let xs = self.list(l, e)?;
+                    if xs.len() as u32 != n {
+                        return Ok(false);
+                    }
+                    for &x in xs.iter().rev() {
+                        stack.push(x);
+                    }
+                }
+                (Skel::Adt(k), PNode::Adt(d, l)) if k == d => {
+                    for &x in self.list(l, e)?.iter().rev() {
+                        stack.push(x);
+                    }
+                }
+                (Skel::Skip, _) => {}
+                (Skel::Proj, _) => out.push((self.npos(t, e)?, matches!(node, PNode::Alias { .. }))),
+                _ => return Ok(false),
+            }
+        }
+        Ok(stack.is_empty())
+    }
+
+    /// The body's own signature's projections over its own type parameters (each one position,
+    /// a placeholder: lib.rs `signature`): each is the meet of its inputs ("OPEN
+    /// PROJECTIONS"), so every type parameter `U` its arguments hold outlives it (`ρ_U: ρ`),
+    /// and, for `<Param(q) as Tr<'r..>>::Name`, each lifetime `'r` of the body's one read row
+    /// for `(q, Tr)`. Known, as the signature's other implied bounds are. Call once the whole
+    /// signature is laid (`param_origin` reads every implied bound). The rest of a local whose
+    /// type holds a closure or coroutine is skipped: knowing less is never unsound.
+    pub(crate) fn own_alias_known(&mut self, nparams: u32, root: ExprId) -> Result<(), Refusal> {
+        if self.plant == Plant::NoKnown {
+            return Ok(());
+        }
+        let facts: &'b F = self.facts;
+        let Some(sig) = facts.sig(self.body.owner) else { return Ok(()) };
+        let own = facts.ties(self.body.owner);
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        for l in 0..=nparams as usize {
+            if l == 0 && !matches!(sig.body, BodyOut::Output) {
+                continue;
+            }
+            let (Some(&t), Some(&(start, n))) = (self.local_ty.get(l), self.local_origs.get(l)) else { continue };
+            let mut at = start + u32::from(t.wrap.is_some());
+            stack.clear();
+            stack.push(t.ty);
+            let mut steps = 0u32;
+            while let Some(x) = stack.pop() {
+                steps += 1;
+                if steps > MOST_POSITIONS {
+                    return self.refuse(Form::Bound, root);
+                }
+                match self.node(x, root)? {
+                    PNode::Ref(_, i) => {
+                        at += 1;
+                        stack.push(i);
+                    }
+                    PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
+                    PNode::Tuple(xs) => {
+                        for &y in self.list(xs, root)?.iter().rev() {
+                            stack.push(y);
+                        }
+                    }
+                    PNode::Adt(k, xs) => {
+                        at += self.adt_facts(k, root)?.lifetimes;
+                        for &y in self.list(xs, root)?.iter().rev() {
+                            stack.push(y);
+                        }
+                    }
+                    PNode::Opaque(..) | PNode::Dynamic(_) => at += 1,
+                    PNode::Alias { trait_, args, .. } => {
+                        if at >= start + n {
+                            break;
+                        }
+                        let o = self.origs[at as usize];
+                        at += 1;
+                        let xs = self.list(args, root)?;
+                        held.clear();
+                        for &y in xs {
+                            self.unplaced(y, root, &mut held)?;
+                        }
+                        for h in 0..held.len() {
+                            let u = self.param_origin(held[h]);
+                            self.b.known(u, o);
+                        }
+                        let PNode::Param(q) = (match xs.first() {
+                            Some(&f) => self.node(f, root)?,
+                            None => continue,
+                        }) else {
+                            continue;
+                        };
+                        let Some(own) = own else { continue };
+                        let mut rows = own.rows.iter().filter(|r| r.param == q && r.trait_ == trait_);
+                        let (Some(row), None) = (rows.next(), rows.next()) else { continue };
+                        if !row.read {
+                            continue;
+                        }
+                        let Some(mine) = own.regions.get(row.lo as usize..row.hi as usize) else { return self.refuse(Form::Malformed, root) };
+                        for &r in mine {
+                            let x = self.universal(r);
+                            self.b.known(x, o);
+                        }
+                    }
+                    PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => break,
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A call of a known head whose generic arguments `g` carry origins, or whose head writes
@@ -437,6 +711,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         // each part's count checked against its place before any origin is made.
         let mut seq: Vec<Slot, A> = Vec::new_in(self.alloc.clone());
         let mut map_ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        // The output's projections: their destination counts (`proj_counts`), what each is,
+        // and the open ones' tie rows the call must tie (trait_ties.rs `tie_bounds_open`).
+        let mut counts: Vec<(u32, bool), A> = Vec::new_in(self.alloc.clone());
+        let mut projs: Vec<Proj, A> = Vec::new_in(self.alloc.clone());
+        let mut open_rows: Vec<(u32, ItemKey), A> = Vec::new_in(self.alloc.clone());
         let (mut mlo, mut rlo) = (0usize, 0usize);
         for i in 0..=vs.len() {
             let (mhi, rhi) = if i < vs.len() { (shape.ends[i] as usize, life.ends[i] as usize) } else { (shape.marks.len(), life.regions.len()) };
@@ -444,11 +723,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             if mhi < mlo || mhi > shape.marks.len() || rhi < rlo || rhi > life.regions.len() {
                 return self.misfit(Misfit::Malformed { part });
             }
+            if i == vs.len() && !shape.skel.is_empty() && !self.proj_counts(shape.skel, dest_ty, &mut counts, e)? {
+                return self.misfit(Misfit::Skeleton { part });
+            }
             let mut r = rlo;
-            let part_lo = seq.len();
-            // Where this part's one projection stands in `seq`, its joins, and whether one of
-            // them is not wholly placed (`unplaced`, or a type parameter of the body).
-            let mut joined: Option<(usize, u32, u32, bool)> = None;
             for &m in &shape.marks[mlo..mhi] {
                 match m {
                     Mark::Own => {
@@ -463,31 +741,59 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         seq.push(Slot::Sig(life.regions[r]));
                         r += 1;
                     }
-                    Mark::Hidden { lo, hi } => {
-                        // Only the output's, one per part: an input's demand needs the impl's
-                        // text (impl_call.rs), and two in one place cannot be split.
-                        if i < vs.len() || joined.is_some() {
+                    Mark::Hidden { lo, hi } | Mark::Open { lo, hi, .. } => {
+                        // Only the output's: an input's demand needs the impl's text
+                        // (impl_call.rs).
+                        if i < vs.len() {
                             return self.misfit(Misfit::InputProjection { part });
                         }
                         if r >= rhi || !matches!(life.regions[r], Region::Hidden(_)) {
                             return self.misfit(Misfit::RegionCount { part });
                         }
+                        r += 1;
                         let Some(ps) = shape.joins.get(lo as usize..hi as usize) else { return self.misfit(Misfit::Malformed { part }) };
-                        let mut loose = false;
+                        // The destination's positions where it stands, in the marks' order.
+                        let Some(&(n, alias)) = counts.get(projs.len()) else { return self.misfit(Misfit::Skeleton { part }) };
+                        let open = match m {
+                            Mark::Open { param, trait_, .. } => Some((param, trait_)),
+                            _ => None,
+                        };
+                        projs.push(Proj { lo, hi, open, alias });
+                        // The projection's type holds no lifetime here (`Iterator::find` on a
+                        // `Map<_, F>` whose `Item = u32`): it relates nothing, so how its
+                        // inputs hold their lifetimes does not matter. Before, a closure in
+                        // `Self` sent the call to `unify_call`'s hub, which put the `&mut
+                        // self` loan into `Self`'s own origin: a false E0505 at the adapter's
+                        // drop (tempo trie-shapes lib.rs:423, `(0..).map(..).find(..)`).
+                        if n == 0 {
+                            continue;
+                        }
                         for &p in ps {
                             let Some(&t) = args.get(p as usize) else {
                                 return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: arg_at.len() as u32 }, e);
                             };
                             // An argument whose lifetimes are not all positions (a trait
-                            // object's `Item = &'a u8`, a closure's captures) or that holds a
-                            // type parameter of the body: not taken where the projection
-                            // stands for a position (below, once the destination says).
+                            // object's `Item = &'a u8`, a closure's captures): not taken. A
+                            // type parameter of the body is taken only where the projection
+                            // is still one (by its placeholder); a normalized type holding it
+                            // has positions no input names.
                             held.clear();
-                            loose |= self.unplaced(t, e, &mut held)? || !held.is_empty();
+                            if self.unplaced(t, e, &mut held)? || (!alias && !held.is_empty()) {
+                                return self.misfit(Misfit::ProjectionLoose { part });
+                            }
                         }
-                        joined = Some((seq.len(), lo, hi, loose));
-                        seq.push(Slot::Joined(lo, hi));
-                        r += 1;
+                        if let Some(row) = open {
+                            if self.open_row(callee, row).is_none() {
+                                return self.misfit(Misfit::ProjectionTraitUnread { part });
+                            }
+                            if !open_rows.contains(&row) {
+                                open_rows.push(row);
+                            }
+                        }
+                        let ix = (projs.len() - 1) as u32;
+                        for _ in 0..n {
+                            seq.push(Slot::Joined(ix));
+                        }
                     }
                     Mark::Param(p) => {
                         // `Param(p)` is index `p` in the callee's generics, parents first (a
@@ -508,33 +814,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             if r != rhi {
                 return self.misfit(Misfit::RegionCount { part });
             }
-            // The projection stands for as many positions as the destination has beyond the
-            // part's others (its normalized type's: the destination's type is the output's
-            // as the type check normalized it).
-            if let Some((at, lo, hi, loose)) = joined {
-                let d = self.info(dest);
-                let others = (seq.len() - part_lo - 1) as u32;
-                if !d.exact || d.len < others {
-                    return self.misfit(Misfit::ProjectionUnplaced { part });
-                }
-                let n = (d.len - others) as usize;
-                match n {
-                    // The projection's type holds no lifetime here (`Iterator::find` on a
-                    // `Map<_, F>` whose `Item = u32`): it relates nothing, so how its joins
-                    // hold their lifetimes does not matter. Before, a closure in `Self` sent
-                    // the call to `unify_call`'s hub, which put the `&mut self` loan into
-                    // `Self`'s own origin: a false E0505 at the adapter's drop (tempo
-                    // trie-shapes lib.rs:423, `(0..).map(..).find(..)`).
-                    0 => {
-                        seq.remove_shift(at);
-                    }
-                    _ if loose => return self.misfit(Misfit::ProjectionLoose { part }),
-                    _ => {
-                        for _ in 1..n {
-                            seq.insert_shift(at, Slot::Joined(lo, hi));
-                        }
-                    }
-                }
+            if i == vs.len() && projs.len() != counts.len() {
+                return self.misfit(Misfit::Skeleton { part });
             }
             map_ends.push(seq.len() as u32);
             mlo = mhi;
@@ -554,7 +835,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             };
             if let Some(p) = place {
                 let s = self.info(p);
-                if !s.exact || s.len != hi - lo {
+                // A PART WITH NO POSITION (the module doc): an operand whose value carries no
+                // region is related to nothing, whatever place it is read from.
+                let empty = i < vs.len() && hi == lo && self.npos_d(vs[i].ty, e)? == 0;
+                if !empty && (!s.exact || s.len != hi - lo) {
                     return self.misfit(Misfit::Positions { part: i as u32, want: hi - lo, have: s.len, exact: s.exact });
                 }
             }
@@ -565,6 +849,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         // its parameter stands.
         let mut arg_origs: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
         let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        // The trait lifetimes the call's bounds fix are the caller's, never fresh (trait_ties.rs),
+        // and those an open projection of the output takes as inputs.
+        let mut impl_ties = crate::trait_ties::ImplTies::new_in(self.alloc.clone());
+        self.tie_bounds_open(callee, life, args, &open_rows, &mut inst, &mut impl_ties, e)?;
+        // What an impl answering a bound over a concrete argument says (trait_ties.rs rule
+        // (d)): its trait lifetimes are that argument's positions, made here as the slots below
+        // make them (one set per argument per call).
+        self.tie_impl_relations(
+            &impl_ties,
+            &mut inst,
+            |me, p, k| {
+                let &(_, n) = arg_at.get(p as usize)?;
+                (k < n).then(|| me.arg_origin(&mut arg_at, &mut arg_origs, p, k))
+            },
+            e,
+        )?;
         let mut map: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
         // The destination's first position, and whether it is a reference's (then only flowed
         // into, as every other path relates a destination).
@@ -574,20 +874,44 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             let o = match seq[j] {
                 Slot::Sig(region) => self.instance(&mut inst, region),
                 Slot::Arg(p, k) => self.arg_origin(&mut arg_at, &mut arg_origs, p, k),
-                // PROJECTIONS: the true region here is one of the joined arguments' positions
-                // or `'static` (E0207). Each of them flows into it; and, unless it is the
-                // destination's top reference, it flows back into each (a superset of
-                // equality with the true one, for a place written through it).
-                Slot::Joined(lo, hi) => {
+                // PROJECTIONS: the true region here is one of the inputs (the joined arguments'
+                // positions, an open projection's trait lifetimes) or `'static` (E0207). Each
+                // of them flows into it; and, where the type check normalized it, unless it is
+                // the destination's top reference, it flows back into each (a superset of
+                // equality with the true one, for a place written through it). Where it is
+                // still a projection, the caller's opaque type, its one position is the meet
+                // of its inputs: each flows in, one way, and so does each caller type
+                // parameter its arguments hold ("OPEN PROJECTIONS").
+                Slot::Joined(ix) => {
+                    let pj = projs[ix as usize];
                     let o = self.b.origin(false);
-                    let one_way = j == dest_lo && dest_top_ref;
-                    for q in lo..hi {
+                    let one_way = pj.alias || (j == dest_lo && dest_top_ref);
+                    for q in pj.lo..pj.hi {
                         let p = shape.joins[q as usize];
                         for k in 0..arg_at[p as usize].1 {
                             let a = self.arg_origin(&mut arg_at, &mut arg_origs, p, k);
                             self.b.subset(a, o);
                             if !one_way {
                                 self.b.subset(o, a);
+                            }
+                        }
+                        if pj.alias {
+                            held.clear();
+                            self.unplaced(args[p as usize], e, &mut held)?;
+                            for h in 0..held.len() {
+                                let u = self.param_origin(held[h]);
+                                self.b.subset(u, o);
+                            }
+                        }
+                    }
+                    if let Some(row) = pj.open {
+                        // Checked in the first pass: the callee's one read row.
+                        let Some((theirs, rlo, rhi)) = self.open_row(callee, row) else { return self.refuse(Form::Malformed, e) };
+                        for at in rlo..rhi {
+                            let x = self.instance(&mut inst, theirs[at as usize]);
+                            self.b.subset(x, o);
+                            if !one_way {
+                                self.b.subset(o, x);
                             }
                         }
                     }
@@ -611,6 +935,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             } else {
                 (dest, dest_ty, false)
             };
+            if hi == lo {
+                // No position: nothing to relate (an inexact place's origins are its base's).
+                continue;
+            }
             let s = self.info(place);
             let top_ref = ty.wrap.is_some() || matches!(self.node(ty.ty, e)?, PNode::Ref(..));
             for k in 0..s.len {

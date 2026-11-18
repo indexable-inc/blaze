@@ -622,8 +622,10 @@ impl<P: FrontEnd> LayoutFacts for FrontConsts<'_, P> {
         Ok(self.program.discriminant(adt, variant))
     }
 
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
+    /// The front end's answer (the seam's `valid_range`): the same one the code builder's
+    /// layout reads ([`FrontAdts`]), so a constant and the code agree on every niche.
+    fn valid_range(&self, key: ItemKey) -> ValidRange {
+        self.program.valid_range(key)
     }
 
     fn normalize(&self, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
@@ -870,8 +872,7 @@ fn ground_of_list(ground: &mut PortableTys<'_>, types: PTys<'_>, map: &[PTy], l:
     ground.intern_list(&out).ok()
 }
 
-/// The layout's facts from the front end. Every answer but `adt` is the default because the
-/// front refuses what would change it.
+/// The layout's facts from the front end: each the seam's own answer.
 impl<P: FrontEnd> LayoutFacts for FrontAdts<'_, P> {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.0.adt(key)
@@ -887,9 +888,10 @@ impl<P: FrontEnd> LayoutFacts for FrontAdts<'_, P> {
         Ok(self.0.discriminant(adt, variant))
     }
 
-    /// The type's own range: the front reads no `rustc_layout_scalar_valid_range_*`.
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
+    /// The front end's `rustc_layout_scalar_valid_range_*` bounds (the seam's `valid_range`:
+    /// front2's heads.rs `AdtRow::valid`).
+    fn valid_range(&self, key: ItemKey) -> ValidRange {
+        self.0.valid_range(key)
     }
 
     fn normalize(&self, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {

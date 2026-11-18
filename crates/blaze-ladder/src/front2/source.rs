@@ -37,7 +37,7 @@ use blaze_scope::names_record::{Decoded, LoadNames, NamesRecord, NamesRecordErro
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::{Names, Place};
 use blaze_scope::task::{ItemText, MacroBody, MacroSrc, Variant};
-use blaze_surface::{Def, Edition, ItemDetail, ItemIndex, ItemKind, Namespace};
+use blaze_surface::{Def, Edition, ItemDetail, ItemIndex, ItemKind, Namespace, ThroughScratch};
 
 mod item_grain;
 
@@ -429,7 +429,9 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     }
 
     fn walk(self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
-        names::path(self, module, ns, written, Alloc::global())
+        // The solved names' own allocator, the one they were resolved in (rule 75): a glob walk's
+        // scratch is made in it per call, and allocates only when the walk reaches a glob.
+        names::path(self, module, ns, written, Names::alloc(self))
     }
 
     fn written_module(self, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
@@ -913,6 +915,13 @@ pub struct Records<'n> {
     marks: RefCell<HashMap<(usize, ItemKey), Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::item_site::MarksLost>, Alloc<'n>>>,
     /// Origin columns opened so far ([`Opened::origins`]).
     origins_opened: Cell<u64>,
+    /// The ONE glob walk's working memory of every path these records resolve
+    /// ([`NamesSource::walk`], [`Records::walk_logged`], [`NamesSource::binds`]): made once, in
+    /// `alloc`, cleared by each walk and grown only while the largest walk grows. Before (tempo
+    /// `engine-check`, 2026-11-18 stack sample): `names::path` made a fresh scratch per path, per
+    /// segment and per lexical layer. Records are one thread's (they hold `RefCell`s), and a walk
+    /// calls nothing that walks again, so the borrow is never contended.
+    scratch: RefCell<ThroughScratch<'n>>,
     /// The allocator the records were opened with, the caller's: a walk's and a digest's
     /// scratch too.
     alloc: Alloc<'n>,
@@ -943,8 +952,31 @@ impl<'n> Records<'n> {
             outlines: RefCell::new(HashMap::new_in(alloc)),
             marks: RefCell::new(HashMap::new_in(alloc)),
             origins_opened: Cell::new(0),
+            scratch: RefCell::new(ThroughScratch::new_in(alloc)),
             alloc,
         }
+    }
+
+    /// PLANTED BUG, for tests/front2_walk_scratch.rs only: the held glob walk's values are not
+    /// cleared between walks from now on (blaze-surface `ThroughScratch::plant_stale_values`),
+    /// so a path whose walk reads a glob may name what an earlier walk found.
+    #[doc(hidden)]
+    pub fn plant_stale_scratch(&self) {
+        self.scratch.borrow_mut().plant_stale_values();
+    }
+
+    /// [`NamesSource::walk`] with a fresh scratch for this one path (`names::path`), the held
+    /// one untouched: the oracle tests/front2_walk_scratch.rs compares the held walk with.
+    #[doc(hidden)]
+    pub fn walk_fresh(&'n self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
+        names::path(&self.paths, module, ns, written, self.alloc)
+    }
+
+    /// The held scratch's walks through globs so far, and its buffers' capacities (a warm pass
+    /// grows none).
+    pub fn scratch_use(&self) -> (u64, [usize; 5]) {
+        let scratch = self.scratch.borrow();
+        (scratch.walks(), scratch.capacities())
     }
 
     /// PLANTED BUG, for tests/front2_records.rs only: the item row of `key` is withheld from
@@ -1001,8 +1033,9 @@ impl<'n> Records<'n> {
     /// read-only view (front2 tables/view.rs) answers a path from.
     pub fn walk_logged(&'n self, sink: &dyn blaze_scope::names_cells::CellSink, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
         let logged = blaze_scope::names_cells::Logged { world: &self.paths, log: sink };
-        // The segments are read for the call alone ([`Records::walk`]'s note).
-        names::path(&logged, module, ns, written, self.alloc)
+        // The segments are read for the call alone ([`Records::walk`]'s note); the glob walk's
+        // memory is the records' one scratch.
+        names::path_in(&logged, module, ns, written, &mut self.scratch.borrow_mut())
     }
 
     /// [`NamesSource::written_module`] with every cell consulted put in `sink`.
@@ -1034,6 +1067,15 @@ impl<'n> Records<'n> {
     fn items_of(&'n self, krate: usize) -> Option<&'n ItemsRecord<'n>> {
         // No record: the loader filed `NoRecord` the one time it was asked.
         self.items.record(krate)
+    }
+
+    /// Crate `krate`'s items record as these records opened it: opened at the first question
+    /// about it and kept for the records' life, so a reader of its rows outside the records
+    /// (blaze-cli body_types/heads.rs, a head's file) opens nothing again. `None`: the loader
+    /// holds no record of it (filed `NoRecord` once). [`Records::opened`]'s `items.crates`
+    /// counts the opens: one per crate, however many reads.
+    pub fn items_record(&'n self, krate: usize) -> Option<&'n ItemsRecord<'n>> {
+        self.items_of(krate)
     }
 
     fn names_of(&'n self, krate: usize) -> Option<NamesRecord<'n>> {
@@ -1330,7 +1372,7 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     /// views compare the name's bytes in place), so the walk's `N` is the caller's `&'w str` and
     /// no segment is copied to the records' lifetime; `Resolved` and `PathError` hold none.
     fn walk(self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
-        names::path(&self.paths, module, ns, written, self.alloc)
+        names::path_in(&self.paths, module, ns, written, &mut self.scratch.borrow_mut())
     }
 
     fn written_module(self, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
@@ -1716,7 +1758,8 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         // block's own items.) `false` is the answer "no"; a refusal (the scope is not held, an
         // ambiguous or unbounded glob walk) is no answer: a typed gap naming the module, never
         // taken for "no".
-        match names::binds(&self.paths, module, ns, name, self.alloc) {
+        let bound = names::binds_in(&self.paths, module, ns, name, &mut self.scratch.borrow_mut());
+        match bound {
             Ok(bound) => bound,
             Err(PathError { why: Why::NotRead { .. }, .. }) => {
                 self.gap("whether a block's module binds a name: the names record holds no scope row (or no chain) for the module asked", Some(module));

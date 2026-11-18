@@ -12,8 +12,12 @@
 //! 128 bits: a collision among a module's cells is a refusal by the record's writer (two names
 //! under one key, rule 21), never a quiet merge.
 
+use core::hash::Hasher as _;
+
+use blaze_hash::{FixedHasher, FixedState, Map, MapOpts};
 use blaze_id::ItemKey;
 use blaze_ids::{ContentId, Domain, Hasher};
+use blaze_own::{AVec, Alloc};
 use blaze_surface::Namespace;
 
 /// The BLAKE3 domain of a cell key; its text names the schema, so a change of the recipe is a
@@ -37,6 +41,135 @@ pub fn cell_key(ns: Namespace, name: &str) -> CellKey {
     let mut out = [0u8; 16];
     out.copy_from_slice(&id.0[..16]);
     CellKey(out)
+}
+
+/// The most distinct `(module, namespace, name)` reads one [`BindingKeys`] keeps (rule 18): the
+/// recorder's own cap on a task's reads (blaze-ladder front2 tables/recorder.rs `MOST_READS`),
+/// so a task that reads more is refused there before the memo is full.
+pub const MOST_BINDING_KEYS: usize = 1 << 20;
+
+/// A binding read's cell key as [`BindingKeys::key`] answers it: the key, and whether this is
+/// the first time the memo was asked it (`fresh`). A read that is not fresh was answered
+/// before with the same key, so a sink that keeps each read once may drop it at once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BindingKey {
+    pub key: CellKey,
+    pub fresh: bool,
+}
+
+/// One distinct binding read: its module, namespace and name (bytes `at..at + len` of the
+/// memo's name bytes), the key derived for it, and the next read of the same fingerprint.
+#[derive(Clone, Copy, Debug)]
+struct BindingRow {
+    module: ItemKey,
+    ns: Namespace,
+    at: u32,
+    len: u32,
+    key: CellKey,
+    next: Option<u32>,
+}
+
+/// The cell keys of a walk's binding reads, each DERIVED ONCE (rule 77): a names lookup logs
+/// its read as the module, the namespace and the name itself ([`crate::names_cells::CellSink::put_binding`]),
+/// and the BLAKE3 of [`cell_key`] is paid the first time that read is seen, never on a repeat.
+/// Before (a stack sample of `engine-check` on a 700-crate workspace, 2026-11-18): every
+/// lookup hashed its name to log it, 721 samples in `cell_key` of 4,337 in the path walks.
+///
+/// A repeat is found by a fast fingerprint (foldhash over the module, the namespace byte and
+/// the name) and confirmed by comparing the three, so two reads that share a fingerprint stay
+/// two (chained by `next`). The key handed out is [`cell_key`]'s own, so every key, record and
+/// read list is byte-equal to what logging per lookup made (rule 25).
+pub struct BindingKeys<'a> {
+    /// Fingerprint -> the first row of that fingerprint.
+    heads: Map<u64, u32, FixedState, Alloc<'a>>,
+    rows: AVec<'a, BindingRow>,
+    /// Every distinct read's name, one after another.
+    names: AVec<'a, u8>,
+    /// How many keys were derived ([`cell_key`] calls): one per distinct read.
+    derived: u64,
+    /// How many reads were asked, repeats too.
+    asked: u64,
+}
+
+impl<'a> BindingKeys<'a> {
+    /// An empty memo in `alloc`; it allocates nothing until its first read.
+    pub fn new_in(alloc: Alloc<'a>) -> BindingKeys<'a> {
+        BindingKeys {
+            heads: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            rows: AVec::new_in(alloc),
+            names: AVec::new_in(alloc),
+            derived: 0,
+            asked: 0,
+        }
+    }
+
+    /// The cell key of `module`'s binding of `(ns, name)`: derived now if this read was not
+    /// seen before, else the key derived then. Past [`MOST_BINDING_KEYS`] distinct reads (or
+    /// 4 GiB of names) a new read is keyed and handed out `fresh` but not kept: the answer is
+    /// the same key, only a later repeat of it pays the hash again (the task is refused at its
+    /// own cap first).
+    pub fn key(&mut self, module: ItemKey, ns: Namespace, name: &str) -> BindingKey {
+        self.asked += 1;
+        let print = fingerprint(module, ns, name);
+        let mut at = self.heads.get(&print).copied();
+        let mut last: Option<u32> = None;
+        while let Some(i) = at {
+            let row = self.rows[i as usize];
+            let (s, e) = (row.at as usize, row.at as usize + row.len as usize);
+            if row.module == module && row.ns == ns && &self.names[s..e] == name.as_bytes() {
+                return BindingKey { key: row.key, fresh: false };
+            }
+            last = Some(i);
+            at = row.next;
+        }
+        let key = cell_key(ns, name);
+        self.derived += 1;
+        let (Ok(slot), Ok(start), Ok(len)) = (u32::try_from(self.rows.len()), u32::try_from(self.names.len()), u32::try_from(name.len())) else {
+            return BindingKey { key, fresh: true };
+        };
+        if self.rows.len() >= MOST_BINDING_KEYS || start.checked_add(len).is_none() {
+            return BindingKey { key, fresh: true };
+        }
+        self.names.extend_from_slice(name.as_bytes());
+        self.rows.push(BindingRow { module, ns, at: start, len, key, next: None });
+        match last {
+            Some(prev) => self.rows[prev as usize].next = Some(slot),
+            None => {
+                self.heads.insert(print, slot);
+            }
+        }
+        BindingKey { key, fresh: true }
+    }
+
+    /// How many keys were derived: one per distinct read (the floor's counter).
+    pub fn derived(&self) -> u64 {
+        self.derived
+    }
+
+    /// How many reads were asked, repeats too.
+    pub fn asked(&self) -> u64 {
+        self.asked
+    }
+
+    /// How many distinct reads are kept.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// A binding read's fingerprint for [`BindingKeys`]'s index: foldhash over the module's bytes,
+/// the namespace byte and the name (the module is fixed-width, so the three cannot run
+/// together). A lookup only; never persisted.
+fn fingerprint(module: ItemKey, ns: Namespace, name: &str) -> u64 {
+    let mut h = FixedHasher::default();
+    h.write(&module.0.0);
+    h.write_u8(ns as u8);
+    h.write(name.as_bytes());
+    h.finish()
 }
 
 /// The BLAKE3 domain of a `Textual` table's cut cell ([`textual_cut_key`]).

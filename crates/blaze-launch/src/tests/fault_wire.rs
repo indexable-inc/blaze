@@ -34,6 +34,7 @@ fn a_fault_round_trips_and_a_cut_is_refused() {
                     address: 0x70_0000_6048 + j as u64,
                     touched: (with || i % 2 == 0).then_some(spot(kind, 0x51, 8)),
                     write: if with { Some(i % 2 == 1) } else { None },
+                    callers: None,
                 };
                 let up = Up::Fault { fault };
                 let frame = encoded(&Message::Up(up), 0);
@@ -52,7 +53,7 @@ fn a_fault_round_trips_and_a_cut_is_refused() {
         }
     }
     // The signal's text changed to one of the same length the schema has not: refused.
-    let fault = Fault { signal: Signal::Trap, pc: None, at: None, code: None, regs: None, address: 0, touched: None, write: None };
+    let fault = Fault { signal: Signal::Trap, pc: None, at: None, code: None, regs: None, address: 0, touched: None, write: None, callers: None };
     let frame = encoded(&Message::Up(Up::Fault { fault }), 0);
     let (item, _) = split(&frame).expect("a frame").expect("a whole frame");
     let mut bad = item.to_vec();

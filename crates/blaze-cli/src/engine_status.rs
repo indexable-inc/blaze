@@ -161,6 +161,9 @@ pub(crate) struct Board<'r> {
     began: Duration,
     counts: [Counts; STAGES],
     at_end: Lock<[AtEnd; STAGES]>,
+    /// Each stage's phases' arenas and the heap kept past them, as of its last phase's end
+    /// (engine_phase_mem.rs).
+    phase_mem: Lock<[crate::engine_phase_mem::StageMem; STAGES]>,
     slots: [Lock<Option<Slot>>; SLOTS],
     cursor: AtomicUsize,
     unslotted: AtomicU64,
@@ -199,6 +202,7 @@ impl<'r> Board<'r> {
             began,
             counts: core::array::from_fn(|_| Counts::default()),
             at_end: Lock::new("engine.status.at_end", [AtEnd::default(); STAGES]),
+            phase_mem: Lock::new("engine.status.phase_mem", [crate::engine_phase_mem::StageMem::default(); STAGES]),
             slots: [const { Lock::new("engine.status.slot", None) }; SLOTS],
             cursor: AtomicUsize::new(0),
             unslotted: AtomicU64::new(0),
@@ -261,6 +265,12 @@ impl<'r> Board<'r> {
     /// A stage's memory at its end (engine_memory.rs `Memory::merged`'s row), for the status.
     pub(crate) fn merged(&self, stage: Stage, at: AtEnd) {
         self.at_end.lock()[stage.index()] = at;
+    }
+
+    /// A stage's phases' memory after one of its phases ended (engine_phase_mem.rs
+    /// `PhaseLedger::add`), for the status.
+    pub(crate) fn phase_mem(&self, stage: Stage, at: crate::engine_phase_mem::StageMem) {
+        self.phase_mem.lock()[stage.index()] = at;
     }
 
     /// A task of `stage` starts now, its frame at `frame` bytes: the workers' scheduling
@@ -388,6 +398,15 @@ pub(crate) fn write_status(board: &Board<'_>, heading: Heading, now: u64, into: 
             writeln!(into)?;
         }
     }
+    // A stage's phases' arenas and what the heap kept past them: one line a stage that ran a
+    // phase (engine_phase_mem.rs `row`).
+    let phase_mem = *board.phase_mem.lock();
+    for stage in Stage::ALL {
+        if phase_mem[stage.index()].phases > 0 {
+            crate::engine_phase_mem::row(stage, &phase_mem[stage.index()], into)?;
+            writeln!(into)?;
+        }
+    }
     let s = blaze_mem::tag::snapshot();
     write!(into, "memory now (bytes): regions {} frames {} heap {}", s.resident_committed(), s.get(blaze_mem::Tag::Frames).live, s.heap_outside.saturating_add(s.heap()))?;
     match blaze_core::own_footprint() {
@@ -426,6 +445,14 @@ pub(crate) fn line(board: &Board<'_>, now: u64, into: &mut impl fmt::Write) -> f
     }
     let s = blaze_mem::tag::snapshot();
     write!(into, " · frames {} GB · heap {} GB", Gb(s.get(blaze_mem::Tag::Frames).live), Gb(s.heap_outside.saturating_add(s.heap())))?;
+    // The stage whose ended phases kept the most on the heap (engine_phase_mem.rs): the debt
+    // named as it grows; the whole row a stage is the status's.
+    let phase_mem = *board.phase_mem.lock();
+    let most = Stage::ALL.into_iter().filter(|stage| phase_mem[stage.index()].phases > 0).max_by_key(|stage| phase_mem[stage.index()].kept_on_heap);
+    if let Some(stage) = most {
+        let kept = u64::try_from(phase_mem[stage.index()].kept_on_heap.max(0)).unwrap_or(0);
+        write!(into, " · kept past its phases: {stage:?} {} GB", Gb(kept))?;
+    }
     let (longest, _) = board.longest();
     if let Some(one) = longest[0] {
         write!(into, " · longest: {} {} s", one.label.as_str(), now.saturating_sub(one.from_ns) / 1_000_000_000)?;

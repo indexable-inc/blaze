@@ -57,5 +57,15 @@ fn a_bad_discriminant_is_said_by_its_value_and_the_enum() {
     assert!(line.contains("it read 0x3 (x9)"), "the value read is not said: {line}");
     assert!(line.contains("`Two` has discriminants 0x1, 0x2"), "the enum and its discriminants are not said: {line}");
     println!("run trapped enum: {line}");
+    // The callers (run schema 3, the child's frame-pointer walk): the trap is in `make` (or
+    // `pass`), two or more calls under `main` through `build` and `run`; the line names at least
+    // two callers by their paths, `run` and `main` among them, innermost first. With the walk
+    // left out of the child (fault_report.rs `on_signal`'s `fault.callers = ..`), no
+    // "called from" is said and this fails.
+    let called = line.find("; called from ").unwrap_or_else(|| panic!("no callers are said: {line}"));
+    let callers = &line[called..];
+    assert!(callers.matches("from fn `").count() >= 2, "fewer than two callers named: {callers}");
+    let (run, main) = (callers.find("run`"), callers.find("main`"));
+    assert!(matches!((run, main), (Some(r), Some(m)) if r < m), "`run` then `main` are not named, innermost first: {callers}");
     let _ = std::fs::remove_dir_all(&base);
 }

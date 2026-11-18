@@ -4,6 +4,7 @@
 pub mod plant;
 
 mod cost;
+mod dyn_undecided;
 mod head_shape;
 mod share;
 

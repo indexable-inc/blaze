@@ -54,6 +54,11 @@ pub(crate) struct CrateRecords<'n> {
     /// opens it from here, in O(1), with no check again.
     pub names_proof: Verified<'n>,
     pub items: &'n [u8],
+    /// The items section's edition, read by its one open at the load ([`checked_records`]):
+    /// what a reader that needs only the edition takes, never opening the section again (a
+    /// proc-macro caller's edition, run_names.rs; before 2026-11-18 every names-records build
+    /// opened every crate's items section for it, re-checking its strings).
+    pub edition: blaze_surface::Edition,
     /// The texts its macro calls made: its directory and the records it names, served once at
     /// the read.
     pub expansions: ExpansionTexts<'n>,
@@ -151,11 +156,15 @@ pub(crate) fn checked_records<'n, F: Fetch>(
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
     }
-    let found = ItemsRecord::open(items, alloc).map_err(|error| LoadError::Items { name, error })?.key();
+    // The section's one open this command: its key checked, its edition kept beside it. Every
+    // later reader of its rows opens it once per job, in the job's names records
+    // (front2 source.rs `Records::items_record`).
+    let opened = ItemsRecord::open(items, alloc).map_err(|error| LoadError::Items { name, error })?;
+    let (found, edition) = (opened.key(), opened.edition());
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
     }
-    Ok(CrateRecords { key, names, names_proof, items, expansions })
+    Ok(CrateRecords { key, names, names_proof, items, edition, expansions })
 }
 
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key

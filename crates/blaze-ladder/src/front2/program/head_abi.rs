@@ -105,6 +105,41 @@ pub(super) fn of_head(abi: tc::Abi) -> Option<BuildAbi> {
         // tabled.rs `row` before its ABI is asked (a target intrinsic: front2/llvm_intrinsic.rs);
         // a fn DEFINED with this ABI, or one left out whose ABI the builder asks, is refused.
         tc::Abi::LlvmIntrinsic => None,
+        // Every other ABI of the nightly is a type the checker carries; the builder emits none
+        // of them: refused by name by the caller.
+        tc::Abi::Swift
+        | tc::Abi::Aapcs
+        | tc::Abi::AapcsUnwind
+        | tc::Abi::AvrInterrupt
+        | tc::Abi::AvrNonBlockingInterrupt
+        | tc::Abi::Cdecl
+        | tc::Abi::CdeclUnwind
+        | tc::Abi::CmseNonsecureCall
+        | tc::Abi::CmseNonsecureEntry
+        | tc::Abi::Custom
+        | tc::Abi::EfiApi
+        | tc::Abi::Fastcall
+        | tc::Abi::FastcallUnwind
+        | tc::Abi::GpuKernel
+        | tc::Abi::Msp430Interrupt
+        | tc::Abi::PtxKernel
+        | tc::Abi::RiscvInterruptM
+        | tc::Abi::RiscvInterruptS
+        | tc::Abi::RustCold
+        | tc::Abi::RustInvalid
+        | tc::Abi::RustPreserveNone
+        | tc::Abi::Stdcall
+        | tc::Abi::StdcallUnwind
+        | tc::Abi::SysV64
+        | tc::Abi::SysV64Unwind
+        | tc::Abi::RustTail
+        | tc::Abi::Thiscall
+        | tc::Abi::ThiscallUnwind
+        | tc::Abi::Vectorcall
+        | tc::Abi::VectorcallUnwind
+        | tc::Abi::Win64
+        | tc::Abi::Win64Unwind
+        | tc::Abi::X86Interrupt => None,
     }
 }
 

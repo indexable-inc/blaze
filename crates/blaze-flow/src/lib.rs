@@ -27,13 +27,15 @@ pub mod record;
 pub mod suspend;
 
 #[cfg(test)]
+mod place_mark_tests;
+#[cfg(test)]
 mod suspend_tests;
 #[cfg(test)]
 mod tests;
 
 pub use flow::{
     Block, BorrowKind, Bound, Flow, FlowBuilder, FlowError, Loan, Local, Operand, Origin, Place,
-    Point, Proj, Span, Stmt, StmtKind, Value,
+    PlaceMark, Point, Proj, Span, Stmt, StmtKind, Value,
 };
 pub use loans::{BorrowFinding, TierOne};
 pub use moves::{DropKind, MoveFinding, MoveFindingKind, MoveOut};

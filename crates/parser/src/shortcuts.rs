@@ -167,10 +167,18 @@ impl LexedStr<'_> {
             if kind.is_trivia() {
                 joiner.gap();
             } else {
-                // Only an identifier's text is sliced, for its contextual keyword.
-                let contextual = match kind {
-                    SyntaxKind::IDENT => SyntaxKind::from_contextual_keyword(&text[start..end], edition).unwrap_or(SyntaxKind::IDENT),
-                    _ => SyntaxKind::EOF,
+                // Only an identifier's text is sliced, for its contextual keyword. A whole body
+                // in one token ([`LexedStr::new_outline`]) is a `{` to the parser, its
+                // contextual kind saying it is the whole body (`Parser::lazy_body`): every
+                // question the grammar asks of the token there is answered as of the `{`.
+                let (kind, contextual) = match kind {
+                    SyntaxKind::IDENT => {
+                        let word = &text[start..end];
+                        let contextual = SyntaxKind::from_contextual_keyword(word, edition);
+                        (kind, contextual.unwrap_or(SyntaxKind::IDENT))
+                    }
+                    SyntaxKind::LAZY_BODY => (SyntaxKind::L_CURLY, SyntaxKind::LAZY_BODY),
+                    _ => (kind, SyntaxKind::EOF),
                 };
                 // A float is never empty, and a UTF-8 continuation byte is never `.`.
                 let joins = joiner.token(kind, || text.as_bytes()[end - 1] == b'.');

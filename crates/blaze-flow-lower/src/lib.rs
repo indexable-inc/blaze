@@ -48,8 +48,19 @@ mod storage_end_tests;
 mod impl_call;
 #[cfg(test)]
 mod impl_call_tests;
-pub use generic_call::{CallBounds, Mark, Misfit, Shape, ShapeBuf, ShapeRefusal, read_shape};
+pub use generic_call::{AssocRead, CallBounds, Mark, Misfit, Shape, ShapeBuf, ShapeRefusal, Skel, read_shape};
 pub use impl_call::ImplSource;
+/// A callee's trait lifetimes tied to the caller's regions at a call (piece RB8).
+mod trait_ties;
+pub use trait_ties::{Tie, TieMiss, Ties};
+#[cfg(test)]
+mod trait_ties_tests;
+/// A bound over a concrete type answered by the impl the type check selected (lane B12).
+#[cfg(test)]
+mod impl_ties_tests;
+/// A projection over a bare type parameter whose trait declares lifetimes (piece open-projection).
+#[cfg(test)]
+mod open_projection_tests;
 /// A caller's own type parameters under a callee's `T: 'a` (static-param-gap-1).
 mod param_outlives;
 pub use param_outlives::ParamOrigin;
@@ -59,14 +70,27 @@ mod tests;
 /// A subpattern that peels references under an ADT field (piece RB7).
 #[cfg(test)]
 mod peel_tests;
+/// An ADT field is the positions its declared type names (lane RB10).
+#[cfg(test)]
+mod field_regions_tests;
+/// A `Copy` impl bounds only the arguments it names (lane RB10).
+#[cfg(test)]
+mod copy_args_tests;
+/// A reference argument's loan through `unify_call`'s hub (lane RB10's repro for RB8).
+#[cfg(test)]
+mod hub_call_tests;
 
 pub use sig::{
-    AssocWhy, BodyOut, BodyState, CallableRefusal, ImplText, Region, SigBuf, SigLife, SigRefusal, impl_header_end, read_async_signature,
-    read_callable_param, read_impl_signature, read_signature,
+    AliasScope, AssocWhy, BodyOut, BodyState, CallableRefusal, ImplText, ImplTrait, ImplTraitWhy, PathIs, PathWhy, Region, SigBuf, SigLife, SigRefusal, SigWorld,
+    TextBound, impl_header_end, read_async_signature, read_async_signature_with, read_callable_param, read_callable_param_with, read_impl_signature,
+    read_impl_signature_with, read_impl_trait, read_signature, read_signature_with,
 };
 /// `Self::Name` read through the impl's own text (piece sig-assoc-projection).
 #[cfg(test)]
 mod sig_assoc_tests;
+/// A written path resolved before its lifetimes are read: aliases expanded (piece sig-paths).
+#[cfg(test)]
+mod sig_alias_tests;
 
 pub mod coroutine;
 pub mod identity;
@@ -78,7 +102,20 @@ pub use coroutine::{InteriorPart, LoweredAsync, interior, interior_parts, lower_
 
 pub mod closure;
 
-pub use closure::{lower_async_fn, lower_closure};
+pub use closure::{ClosureFlow, External, Need, Requirement, lower_async_fn, lower_closure, lower_closure_external, requirement};
+
+// Guards that move, or-pattern bindings, slice patterns (lane B8).
+mod pattern_forms;
+use pattern_forms::{BindItem, BindPass};
+#[cfg(test)]
+mod pattern_forms_tests;
+
+// Calls through a value of a closure made in this body (lane B8).
+mod callee_value;
+#[cfg(test)]
+mod callee_value_tests;
+#[cfg(test)]
+mod closure_requirements_tests;
 
 /// What the lowering needs to know about an ADT (flow.md section 7, question (e)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +157,26 @@ pub enum FieldLead {
     /// Any other declared type (a projection or an opaque type that may normalize to a
     /// reference, two references over a non-parameter): its peels are not read.
     Unread,
+}
+
+/// What stands at one stretch of origin positions of a field's DECLARED type, in the order the
+/// lowering counts positions (`npos`: pre-order, a reference's own before its referent's, an
+/// ADT's lifetimes before its arguments'; one for a trait object, an opaque type or an alias),
+/// for [`Facts::field_regions`]. The field's type is its declared type at the ADT's arguments
+/// (the Reference, "Generic parameters": a generic item's fields are its declared field types
+/// with every parameter substituted), so each of its positions IS one of the value's: a
+/// field's region is no fresh region the borrow check may choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FieldRegion {
+    /// One position: the ADT's lifetime parameter `i`, in declared order.
+    Lifetime(u32),
+    /// One position: `'static` (written, or a trait object's default with no bound: the
+    /// Reference, "Default trait object lifetimes").
+    Static,
+    /// Every position of the ADT's type argument `i` (its index in the record's argument
+    /// list, as [`Facts::field_param`] counts it), in that argument's own order: a field
+    /// declared as the parameter `T`, or `T` standing anywhere in it.
+    Arg(u32),
 }
 
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
@@ -167,6 +224,16 @@ pub trait Facts {
     fn closure_bodies_checked(&self) -> bool {
         false
     }
+    /// The requirements closure `closure`'s own check put on the flow that makes it
+    /// ([`Requirement`]: relations among the closure value's regions its body needs; closure.rs
+    /// [`requirement`]): each is emitted as a constraint at the closure expression, so one the
+    /// owner cannot prove is the owner's finding at the closure's range. The caller checks a
+    /// closure's flow BEFORE the flow that holds its expression and answers with what it found;
+    /// empty: nothing required (or the closure not checked yet: then its outlives results must
+    /// still be refused, never dropped).
+    fn closure_requirements(&self, _closure: ExprId) -> &[Requirement] {
+        &[]
+    }
     /// Whether the caller checks each async block's BODY on its own ([`lower_async`]). The
     /// lowering makes an async block expression the borrows and moves of its captures (as a
     /// closure's) and does not descend into its body; while nothing checks that body, a body
@@ -205,6 +272,14 @@ pub trait Facts {
     fn call_bounds(&self, _item: ItemKey) -> Option<CallBounds<'_>> {
         None
     }
+    /// The trait bounds with lifetime arguments of fn `item` ([`Ties`]): a callee's tie its
+    /// trait lifetimes to what the call's arguments answer them with, the body's own say what
+    /// its type parameters answer them with (trait_ties.rs). Whoever answers files the read of
+    /// the fn's text and each trait's header in the body's read list (rule 21). `None`: not
+    /// known, and a callee's trait lifetimes are fresh per call as before piece RB8.
+    fn ties(&self, _item: ItemKey) -> Option<Ties<'_>> {
+        None
+    }
     /// The index of field `name` of `variant`.
     fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32>;
     /// The type parameter field `field` of `variant` is declared as, when its declared type is
@@ -221,6 +296,30 @@ pub trait Facts {
     /// other field is refused (`Form::PeelUnderAdtField`). Whoever answers files the read of
     /// the ADT's field types in the body's read list (rule 21).
     fn field_lead(&self, _adt: ItemKey, _variant: u32, _field: u32) -> Option<FieldLead> {
+        None
+    }
+    /// Where each origin position of field `field` of `variant`'s DECLARED type stands among
+    /// the ADT's own ([`FieldRegion`], in the field type's position order). With it, a field
+    /// of an ADT place is a place of exactly those positions (`Lower::field_slot`), and a
+    /// struct literal relates each field's value into its own positions only, as a tuple's
+    /// element goes into its own; without it (`None`), a field stands for all of the ADT's
+    /// positions, and a literal goes through `unify_call`'s one origin, which ties distinct
+    /// lifetime parameters together (`Buffered<'f, 'a>`'s `held: Bytes<'a>` took `'f`).
+    /// Whoever answers files the read of the ADT's field types in the body's read list
+    /// (rule 21), and gives no row for a field whose declared type holds a projection, an
+    /// opaque type or an alias (its positions after normalizing are not the declared ones).
+    fn field_regions(&self, _adt: ItemKey, _variant: u32, _field: u32) -> Option<&[FieldRegion]> {
+        None
+    }
+    /// For each type argument of `adt` (the record's argument list, as
+    /// [`Facts::field_param`] counts it), whether its `Copy` impl needs that argument to be
+    /// `Copy`: `[false]` for `impl<T: ?Sized> Copy for NonNull<T>`, every `true` for a derived
+    /// `Copy` (the derive bounds every type parameter by `Copy`). `None`: not read, and every
+    /// argument must be `Copy` (the derive's rule, [`AdtFacts::copy`]). Only an impl whose
+    /// bounds are nothing but `Copy` on parameters (or none) may be answered: a bound the
+    /// lowering does not check (`T: Tr`) gives `None`. Whoever answers files the read of the
+    /// impl's header in the body's read list (rule 21).
+    fn copy_args(&self, _adt: ItemKey) -> Option<&[bool]> {
         None
     }
     /// The number of fields of `variant`.
@@ -250,7 +349,12 @@ pub enum Form {
     Union,
     StaticMut,
     DestructuringAssign,
+    /// An or-pattern that binds, in a form not lowered (pattern_forms.rs, "Or-patterns"): in a
+    /// guarded arm whose guard sees a moving binding (the guard would run once per
+    /// alternative), or a binding whose type is not its name's first binding's.
     OrPatternBinding,
+    /// A slice pattern's binding not lowered (pattern_forms.rs, "Slice patterns"). Each
+    /// element is a constant projection now; kept for a form the walk does not place.
     SlicePatternBinding,
     /// A peeling pattern under an ADT's field binds, and the field's declared type is not
     /// known well enough to say what it peels: [`Facts::field_lead`] gave `None` or
@@ -260,7 +364,17 @@ pub enum Form {
     PeelUnderAdtField,
     /// The binding's recorded type is not the place's type or a reference to it.
     BindingMode,
-    /// A guard over a by-value binding of a non-`Copy` type.
+    /// [`Facts::field_regions`] gave a row for a field of `adt` that does not line up with
+    /// the record: a lifetime or argument index past the ADT's, or a count of positions other
+    /// than the field type's. A malformed fact, never related another way.
+    FieldRegionsUnaligned { adt: ItemKey },
+    /// [`Facts::copy_args`] gave a row for `adt` whose length is not its argument count in the
+    /// record.
+    CopyArgsUnaligned { adt: ItemKey },
+    /// A guard over a by-value binding of a non-`Copy` type that the lowering could not bind by
+    /// reference for the guard. Such guards are lowered now (pattern_forms.rs, "Match
+    /// guards": shared references for the guard, the moves after it); kept for a form that
+    /// cannot be split so.
     GuardMovesBinding,
     /// A call of `callee`, whose signature writes lifetimes, that no row of [`Facts`] let the
     /// lowering relate: `lacks` names the row that was missing, or that the rows given did not
@@ -271,7 +385,12 @@ pub enum Form {
     /// "this argument must be `'static`", so the body is not checked rather than accepted.
     CalleeUnknown,
     /// A call through a value (a fn pointer, a closure, a `dyn Fn`, an `F: Fn(..)`) whose own
-    /// signature's lifetimes are not known, with an argument or result that carries one.
+    /// signature's lifetimes are not known, with an argument or result that carries one. Known
+    /// are: a body parameter's written callable type (`call_through_value`, sig/value.rs; it
+    /// needs [`Facts::own_text`]), and a closure made in this body, whose result may hold
+    /// anything the closure holds (callee_value.rs). Not known: a field holding a closure
+    /// (`(self.f)(x)`), a callable type parameter bound in an impl's header or a `where`
+    /// clause the reader does not read.
     CalleeValueUnknown,
     /// The callee's head names its generic parameter `param` (`PNode::Param`, parents first),
     /// but the call's argument list from the type checker has only `args`: a malformed record,
@@ -284,6 +403,12 @@ pub enum Form {
     /// under a bound the reader did not resolve (the container's header declares one). Not
     /// checked rather than accepted (generic_call.rs `call_by_generic_signature`).
     CallOutlivesUnread { callee: ItemKey, param: u32 },
+    /// A call of `callee` whose signature's regions include a trait lifetime of a bound on its
+    /// parameter `param` (a trait method's `Self: Visitor<'de>`, a `V: Visitor<'de>`), which
+    /// is the region the call's argument for `param` answers that bound with, not one the call
+    /// may choose; and `why` says that answer is not known here (trait_ties.rs). Not checked
+    /// rather than accepted with a fresh region.
+    CallTieUnplaced { callee: ItemKey, param: u32, why: TieMiss },
     /// A call of `callee` whose head holds a hidden position at its input `input` (a
     /// projection over its type parameter, `x: T::Out`; `u32::MAX`: the call as a whole) whose
     /// argument carries a lifetime there, where the impl is not known at the call (a type
@@ -318,6 +443,10 @@ pub enum Form {
     BreakTarget,
     /// A type node the lowering does not place (a closure's, a future's).
     TypeNode,
+    /// The record does not line up with the body: a table entry missing, positions that do not
+    /// add up. Never a form of the program. (A closure capturing a by-reference binding once
+    /// counted its capture by the pattern's peeled type, one position short: `npos` counts the
+    /// variable's type, `Checked::local_ty`, as `closure_value` does.)
     Malformed,
     Bound,
     Builder,
@@ -434,6 +563,24 @@ pub enum Plant {
     /// no drop glue is never ended, and `fn f(s: S) { keep(&s) }` with `keep(&'static S)` is
     /// accepted (the form before storage-end-loans).
     StorageEndTiedToDrop,
+    /// A callee's trait lifetimes are instantiated afresh at each call, as every other region
+    /// (the form before piece RB8, trait_ties.rs): `t.conv(x)` through `T: Conv<'b, 'a>` with
+    /// `fn conv(self, x: &'a u8) -> &'b u8` is accepted in `fn g<'a, 'b, ..>(..) -> &'b u8`.
+    TiesFresh,
+    /// A closure's requirements ([`Facts::closure_requirements`]) are not emitted where it is
+    /// made: `|| put(v, r)` needing `'b: 'a` in `fn f<'a, 'b>(v: &mut &'a u8, r: &'b u8)` is
+    /// accepted (closure.rs `requirement`).
+    NoRequirements,
+    /// A call of a closure of this body relates nothing into its result (callee_value.rs):
+    /// `let r = c();` with `c = || &s` holds no loan of `s`.
+    ClosureCallUnrelated,
+    /// A guarded arm's by-value bindings are moved BEFORE its guard, as if it had none
+    /// (pattern_forms.rs): `Some(x) if take(x)` moves `x` in the guard unseen.
+    GuardBindsByValue,
+    /// A slice pattern's elements are projected as any index (`Proj::Index`), each overlapping
+    /// every other (pattern_forms.rs): `let [x, y] = a;` with `a: &mut [S; 2]` then holds two
+    /// conflicting mutable loans.
+    SliceElementsOverlap,
 }
 
 /// Lowers one checked body.
@@ -496,7 +643,9 @@ struct Val {
 }
 
 /// A place's origins: `len` of the local's origins from `start` (an index into `origs`); exact
-/// when they are the place's own type's positions, else the whole of an ADT's.
+/// when they are the place's own type's positions, else the whole of an ADT's. An ADT field's
+/// exact origins are a stretch of `origs` laid for it (`Lower::field_slot`): copies of the
+/// value's origins in the field type's order, not a slice of the value's own stretch.
 #[derive(Clone, Copy, Debug)]
 struct PInfo {
     start: u32,
@@ -542,6 +691,11 @@ enum Task {
     FakeBorrow(ExprId, Val),
     FakeUse(Local, ExprId),
     BindPat(PatId, Val),
+    /// A guarded arm's bindings before its guard: by-value ones as shared references to their
+    /// places (pattern_forms.rs, "Match guards").
+    GuardRefs(PatId, Val, ExprId),
+    /// The same arm's by-value bindings once its guard held: moved or copied then.
+    GuardMoves(PatId, Val),
     LoopBack(ExprId),
     BreakDone(ExprId, bool),
     ReturnDone(ExprId, bool),
@@ -834,7 +988,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         if ck.captures.column::<2>()[i] != blaze_typeck::CaptureKind::ByValue {
                             n += 1;
                         }
-                        match ck.pat_ty.get(ck.captures.column::<1>()[i].ix()) {
+                        // The captured VARIABLE's type (`local_ty`), as `closure_value` and the
+                        // closure's own flow (closure.rs) lay it: a binding by reference
+                        // (`Effect::Unlock { lock, .. } = &mut effect`, `for (name, _) in
+                        // map.iter()`) is `&T` there, while `pat_ty` is the type its pattern
+                        // met after the peels, `T`; one position short, and the closure value
+                        // was refused `Malformed` (census 1118: twelve bodies of bstd).
+                        match ck.local_ty.get(ck.captures.column::<1>()[i].ix()) {
                             Some(&t) => stack.push(t),
                             None => return self.refuse(Form::Malformed, e),
                         }
@@ -960,8 +1120,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             let (src, start, n, st) = rel[j];
             self.relate_at(src, start, n, st, e)?;
         }
+        // What the closure's body needs of its captures and does not prove itself (closure.rs
+        // `Requirement`, the NLL RFC's closure requirements): each a subset among the value's
+        // positions here, at the aggregate's statement, so one the owner cannot prove is the
+        // owner's finding at the closure's range.
+        if self.plant != Plant::NoRequirements {
+            let facts: &'b F = self.facts;
+            for r in facts.closure_requirements(e) {
+                let from = self.need_origin(r.from, ci, e)?;
+                let into = self.need_origin(r.into, ci, e)?;
+                self.b.subset(from, into);
+            }
+        }
         self.push_place(cp, ty);
         Ok(())
+    }
+
+    /// The origin a requirement's end names in the closure value laid at `ci`.
+    fn need_origin(&mut self, n: Need, ci: PInfo, e: ExprId) -> Result<Origin, Refusal> {
+        match n {
+            Need::Static => Ok(self.universal(Region::Static)),
+            Need::Capture(k) if ci.exact && k < ci.len => Ok(self.origs[(ci.start + k) as usize]),
+            Need::Capture(_) => self.refuse(Form::Malformed, e),
+        }
     }
 
     fn npos_d(&self, t: TyD, e: ExprId) -> Result<u32, Refusal> {
@@ -1001,7 +1182,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     if !self.adt_facts(k, e)?.copy {
                         return Ok(false);
                     }
-                    stack.extend_from_slice(self.list(l, e)?);
+                    // The type is `Copy` when the arguments its `Copy` impl bounds are (the
+                    // Reference, "Copy": an impl's bounds decide; `impl<T: ?Sized> Copy for
+                    // NonNull<T>` bounds none, so `NonNull<Header>` is `Copy` and
+                    // `(head.release)(job.0)` after `job.0.as_ref()` reads a copy, task/threads.rs
+                    // `run_lent`). Unread: every argument, the derive's rule.
+                    let args = self.list(l, e)?;
+                    let facts: &'b F = self.facts;
+                    match facts.copy_args(k) {
+                        None => stack.extend_from_slice(args),
+                        Some(need) if need.len() == args.len() => {
+                            for (j, &a) in args.iter().enumerate() {
+                                if need[j] {
+                                    stack.push(a);
+                                }
+                            }
+                        }
+                        Some(_) => return self.refuse(Form::CopyArgsUnaligned { adt: k }, e),
+                    }
                 }
                 PNode::Param(i) => {
                     if !self.facts.param_copy(i) {
@@ -1128,7 +1326,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
 
     /// `parent` projected by `proj`, whose type is `child`; `parent_ty` says which positions it has.
     fn project(&mut self, parent: Place, parent_ty: TyD, proj: Proj, child: TyD, drop_type: bool, e: ExprId) -> Result<Place, Refusal> {
-        let p = self.b.project_marked(parent, proj, drop_type);
+        let mark = if drop_type { blaze_flow::PlaceMark::DropField } else { blaze_flow::PlaceMark::None };
+        self.project_mark(parent, parent_ty, proj, child, mark, e)
+    }
+
+    /// As [`Self::project`], the new place marked `mark` (blaze-flow `PlaceMark`: a field of a
+    /// `Drop` type, an element of an unsized `[T]`).
+    fn project_mark(&mut self, parent: Place, parent_ty: TyD, proj: Proj, child: TyD, mark: blaze_flow::PlaceMark, e: ExprId) -> Result<Place, Refusal> {
+        let p = self.b.project_in(parent, proj, mark);
         let pi = self.info(parent);
         let mut info = PInfo { start: pi.start, len: pi.len, exact: false, deref: 0, parent: parent.0, local: pi.local };
         if pi.exact {
@@ -1158,6 +1363,26 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         let len = self.npos_d(child, e)?;
                         info = PInfo { start: pi.start + off, len, exact: true, ..info };
                     }
+                    // A variant of the value is the value: the same type, the same positions.
+                    (Proj::Downcast(_), PNode::Adt(..)) => {
+                        info = PInfo { start: pi.start, len: pi.len, exact: true, ..info };
+                    }
+                    // A field of a struct, or of an enum's variant (its parent the downcast),
+                    // is exactly the positions its declared type names (`Facts::field_regions`).
+                    // Coarse (all of the ADT's), `self.held.push(..)` with `self: &mut
+                    // Buffered<'f, 'a>` and `held: Bytes<'a>` tied the loan to `'f` too.
+                    (Proj::Field(i), PNode::Adt(k, _)) => {
+                        let variant = match self.b.proj_of(parent) {
+                            Some(Proj::Downcast(v)) => Some(v),
+                            _ if !self.adt_facts(k, e)?.is_enum => Some(0),
+                            _ => None,
+                        };
+                        if let Some(variant) = variant
+                            && let Some((start, len)) = self.field_slot(pi, parent_ty.ty, variant, i, child, e)?
+                        {
+                            info = PInfo { start, len, exact: true, ..info };
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -1175,6 +1400,67 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         self.ensure_pinfo(p, info);
         Ok(p)
+    }
+
+    /// The positions of field `field` of `variant` of a value whose positions are `of` (exact)
+    /// and whose type is the ADT `adt_ty`, laid out as the field's own type `field_ty` counts
+    /// them: a new stretch of `origs` holding, per [`FieldRegion`], the value's origin of that
+    /// lifetime parameter, the body's `'static`, or each of that type argument's origins.
+    /// `(start, len)` of the stretch; `None` when [`Facts::field_regions`] gives no row (the
+    /// caller keeps its coarse form). The field's positions ARE the value's (the field's type
+    /// is its declared type at the value's arguments), so a loan into one reaches exactly the
+    /// value's positions that type names, and a write of the field relates into them.
+    fn field_slot(&mut self, of: PInfo, adt_ty: PTy, variant: u32, field: u32, field_ty: TyD, e: ExprId) -> Result<Option<(u32, u32)>, Refusal> {
+        if !of.exact {
+            return Ok(None);
+        }
+        let PNode::Adt(k, l) = self.node(adt_ty, e)? else { return Ok(None) };
+        let facts: &'b F = self.facts;
+        let Some(regions) = facts.field_regions(k, variant, field) else { return Ok(None) };
+        let lifetimes = self.adt_facts(k, e)?.lifetimes;
+        let args = self.list(l, e)?;
+        // Where each argument's positions begin among the value's: its lifetimes, then each
+        // argument's, in order (`npos`).
+        let mut at: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut total = lifetimes;
+        for &a in args {
+            let n = self.npos(a, e)?;
+            at.push((total, n));
+            total += n;
+        }
+        let unaligned = Form::FieldRegionsUnaligned { adt: k };
+        if total != of.len {
+            return self.refuse(unaligned, e);
+        }
+        let want = self.npos_d(field_ty, e)?;
+        let start = self.origs.len() as u32;
+        for &r in regions {
+            if self.origs.len() as u32 - start > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match r {
+                FieldRegion::Lifetime(i) if i < lifetimes => {
+                    let o = self.origs[(of.start + i) as usize];
+                    self.origs.push(o);
+                }
+                FieldRegion::Static => {
+                    let o = self.universal(Region::Static);
+                    self.origs.push(o);
+                }
+                FieldRegion::Arg(i) if (i as usize) < at.len() => {
+                    let (off, n) = at[i as usize];
+                    for j in 0..n {
+                        let o = self.origs[(of.start + off + j) as usize];
+                        self.origs.push(o);
+                    }
+                }
+                FieldRegion::Lifetime(_) | FieldRegion::Arg(_) => return self.refuse(unaligned, e),
+            }
+        }
+        if self.origs.len() as u32 - start != want {
+            return self.refuse(unaligned, e);
+        }
+        Ok(Some((start, want)))
     }
 
     fn origins(&self, p: Place) -> &[Origin] {
@@ -1446,7 +1732,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         self.scope_marks.push(0);
         let facts: &'b F = self.facts;
         match facts.sig(body.owner) {
-            Some(sig) => self.signature(sig, nparams, root)?,
+            Some(sig) => {
+                self.signature(sig, nparams, root)?;
+                self.own_alias_known(nparams, root)?;
+            }
             None => {
                 for (i, &p) in body.params.iter().enumerate() {
                     let t = match self.ck.pat_ty.get(p.ix()) {
@@ -1703,7 +1992,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// bounds and the bounds implied by the parameter and output types hold among the regions.
     /// `false`, relating nothing, when the positions do not line up one for one or a region is
     /// hidden: the caller takes its older, coarser path.
-    fn call_by_signature(&mut self, life: SigLife<'_>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+    /// `tie`: the callee and its type arguments, whose trait lifetimes are tied to the caller's
+    /// regions (trait_ties.rs); `None` for a value callee.
+    fn call_by_signature(&mut self, life: SigLife<'_>, tie: Option<(ItemKey, List)>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         if life.ends.len() != vs.len() || life.regions.iter().any(|r| matches!(r, Region::Hidden(_))) {
             return Ok(false);
         }
@@ -1727,6 +2018,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         let out_at = lo;
         let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        if let Some((item, g)) = tie {
+            let args: &'c [PTy] = self.list(g, e)?;
+            let mut impl_ties = trait_ties::ImplTies::new_in(self.alloc.clone());
+            self.tie_bounds(item, life, args, &mut inst, &mut impl_ties, e)?;
+            // No type argument here holds a position (the caller's condition for this path),
+            // so an impl's answer names none: a row that does is malformed.
+            self.tie_impl_relations(&impl_ties, &mut inst, |_, _, _| None, e)?;
+        }
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
         lo = 0;
         for i in 0..=vs.len() {
@@ -1901,6 +2200,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 Ok(())
             }
             Task::BindPat(p, v) => self.bind_pattern(p, v),
+            Task::GuardRefs(p, v, g) => self.bind_walk(p, v, None, BindPass::GuardRefs(g)),
+            Task::GuardMoves(p, v) => self.bind_walk(p, v, None, BindPass::GuardMoves),
             Task::LoopBack(e) => {
                 self.vals.pop();
                 let tg = match self.targets.pop() {
@@ -2806,6 +3107,44 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 return Ok(());
             }
         }
+        // A struct expression, or a constructor call, whose fields' declared types are known
+        // (`Facts::field_regions`): each operand goes into its own field's positions only, as
+        // a tuple's element goes into its own (the Reference, "Struct expressions": each
+        // field's value is coerced to the field's type, the declared type at the struct's
+        // arguments). Through `unify_call`'s one origin, `Checking { given: self, .. }` tied
+        // `'g` of `self: &'c Granting<'g>` to `'c` and every other lifetime of the literal.
+        if !fmt
+            && elems.is_none()
+            && d.exact
+            && self.plant != Plant::TupleUnified
+            && let Some((variant, fields)) = self.literal_fields(e, ty, vs.len())?
+        {
+            let mut slots: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+            for (j, v) in vs.iter().enumerate() {
+                let held = match v.at {
+                    At::Place(p) => self.info(p).len > 0,
+                    At::Const => false,
+                };
+                if !held {
+                    slots.push((0, 0));
+                    continue;
+                }
+                match self.field_slot(d, ty.ty, variant, fields[j], v.ty, e)? {
+                    Some(s) => slots.push(s),
+                    None => break,
+                }
+            }
+            if slots.len() == vs.len() {
+                for (j, v) in vs.iter().enumerate() {
+                    if let At::Place(p) = v.at {
+                        let (s, n) = slots[j];
+                        self.relate_at(p, s, n, v.ty, e)?;
+                    }
+                }
+                self.push_place(tp, ty);
+                return Ok(());
+            }
+        }
         match elems {
             Some(tys) if !fmt && d.exact && tys.len() == vs.len() && self.plant != Plant::TupleUnified => {
                 let mut off = d.start;
@@ -2828,6 +3167,49 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         self.push_place(tp, ty);
         Ok(())
+    }
+
+    /// The variant of `ty`'s ADT that the aggregate `e` makes, and the field each of its `n`
+    /// operands fills: a constructor call's operands are its fields in order; a struct
+    /// expression's are its written fields in source order, then those its base or its
+    /// defaults give (`Checked::fru_fields`, `Checked::default_fields`), as `Expr::Struct`
+    /// pushes them. `None`: not such an aggregate, or a field the facts do not name.
+    fn literal_fields(&self, e: ExprId, ty: TyD, n: usize) -> Result<Option<(u32, Vec<u32, A>)>, Refusal> {
+        let (None, PNode::Adt(k, _)) = (ty.wrap, self.node(ty.ty, e)?) else { return Ok(None) };
+        let mut out: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let (adt, variant) = match self.expr(e)? {
+            Expr::Call { callee, .. } => {
+                let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee) else { return Ok(None) };
+                for j in 0..n {
+                    out.push(j as u32);
+                }
+                (adt, variant)
+            }
+            Expr::Struct { fields, base, .. } => {
+                let (adt, variant) = match self.expr_def(e) {
+                    Some(Def::Ctor { adt, variant, .. }) => (adt, variant),
+                    Some(Def::Adt(adt)) if !self.adt_facts(adt, e)?.is_enum => (adt, 0),
+                    _ => return Ok(None),
+                };
+                let Some(fs) = self.body.field_inits.get(fields.range()) else { return Ok(None) };
+                for f in fs {
+                    let Some(i) = self.facts.field(adt, variant, f.name) else { return Ok(None) };
+                    out.push(i);
+                }
+                let ck = self.ck;
+                match base {
+                    blaze_typeck::StructBase::Expr(_) => out.extend_from_slice(ck.fru_fields_of(e).0),
+                    blaze_typeck::StructBase::Defaults => out.extend_from_slice(ck.default_fields_of(e).0),
+                    blaze_typeck::StructBase::None => {}
+                }
+                (adt, variant)
+            }
+            _ => return Ok(None),
+        };
+        if adt != k || out.len() != n {
+            return Ok(None);
+        }
+        Ok(Some((variant, out)))
     }
 
     /// Where each operand of the constructor call `e` (of type `ty`) goes among the value's
@@ -3013,9 +3395,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         if !generic_origins
             && owes.is_none()
-            && let Some((item, _)) = callee
+            && let Some((item, g)) = callee
             && let Some(life) = facts.sig(item)
-            && self.call_by_signature(life, &vs, tp, ty, e)?
+            && self.call_by_signature(life, Some((item, g)), &vs, tp, ty, e)?
         {
             self.stats.calls_by_signature += 1;
             self.push_place(tp, ty);
@@ -3169,6 +3551,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             self.stats.calls_unified += 1;
             return Ok(());
         }
+        // A closure value of this body: its result may hold what the value holds (callee_value.rs).
+        if self.call_of_closure_value(e, vs, dest)? {
+            self.stats.calls_unified += 1;
+            return Ok(());
+        }
         let mut c = match self.expr(e)? {
             Expr::Call { callee, .. } => callee,
             _ => return self.refuse(Form::Malformed, e),
@@ -3201,7 +3588,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         if read_callable_param(text, self.tys, param as u32, &inputs, dest_ty.ty, &adt_lifetimes, &mut buf, self.alloc.clone()).is_err() {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
-        if !self.call_by_signature(buf.life(), args, dest, dest_ty, e)? {
+        if !self.call_by_signature(buf.life(), None, args, dest, dest_ty, e)? {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
         self.stats.calls_by_signature += 1;
@@ -3303,17 +3690,27 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             let next = binds.get(i + 1).copied().unwrap_or(unreachable);
             self.tasks.push(Task::ArmEnd(arm.body, dest, join, true));
             self.tasks.push(Task::Eval(arm.body, false));
+            // A guard over a by-value binding of a non-`Copy` type (pattern_forms.rs, "Match
+            // guards"): bound by shared reference for the guard, moved once it holds.
+            let moves = match arm.guard {
+                Some(_) => self.guard_moves(arm.pat)? && self.plant != Plant::GuardBindsByValue,
+                None => false,
+            };
             if let Some(g) = arm.guard {
-                if self.guard_moves(arm.pat)? {
-                    return self.refuse_pat(Form::GuardMovesBinding, arm.pat);
-                }
                 let body_b = self.b.block();
+                if moves {
+                    self.tasks.push(Task::GuardMoves(arm.pat, val));
+                }
                 self.tasks.push(Task::FakeUse(Local(0), g));
                 self.tasks.push(Task::Start(body_b));
                 self.tasks.push(Task::Branch(g, body_b, next));
                 self.tasks.push(Task::FakeBorrow(e, val));
             }
-            self.tasks.push(Task::BindPat(arm.pat, val));
+            if let (true, Some(g)) = (moves, arm.guard) {
+                self.tasks.push(Task::GuardRefs(arm.pat, val, g));
+            } else {
+                self.tasks.push(Task::BindPat(arm.pat, val));
+            }
             self.tasks.push(Task::OpenScope);
             self.tasks.push(Task::Start(binds[i]));
         }
@@ -3398,17 +3795,40 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// `a` at `a` (the Reference, "Moved and copied types"), not at `c`. A binding inside the
     /// pattern keeps its own span.
     fn bind_pattern_from(&mut self, p: PatId, v: Val, from: Option<Span>) -> Result<(), Refusal> {
+        self.bind_walk(p, v, from, BindPass::Whole)
+    }
+
+    /// [`Self::bind_pattern_from`] for one pass (pattern_forms.rs [`BindPass`]): the whole
+    /// pattern, or a guarded arm's bindings before and after its guard. Its work list also
+    /// holds an or-pattern's blocks ([`BindItem`]): each alternative binds in a block of its
+    /// own after a switch on the place, into the locals of its names' first bindings.
+    fn bind_walk(&mut self, p: PatId, v: Val, from: Option<Span>, pass: BindPass) -> Result<(), Refusal> {
         let whole = p;
         let root = self.body.root;
         let place = self.as_place(v, root)?;
-        let mut stack: Vec<(PatId, Place, TyD, u8), A> = Vec::new_in(self.alloc.clone());
-        stack.push((p, place, v.ty, 0));
+        // Each name's first binding (an or-pattern's alternatives bind one variable).
+        let mut alias: Vec<(Name, PatId), A> = Vec::new_in(self.alloc.clone());
+        self.first_binds(p, &mut alias)?;
+        let mut stack: Vec<BindItem, A> = Vec::new_in(self.alloc.clone());
+        stack.push(BindItem::Pat(p, place, v.ty, 0));
         let mut steps = 0usize;
-        while let Some((p, mut place, mut ty, mut mode)) = stack.pop() {
+        while let Some(item) = stack.pop() {
             steps += 1;
-            if steps > self.body.pats.len() + 1 {
-                return self.refuse_pat(Form::Bound, p);
+            // Each pattern once, and each or-pattern's alternatives a start and a goto more.
+            if steps > 3 * self.body.pats.len() + 1 {
+                return self.refuse_pat(Form::Bound, whole);
             }
+            let (p, mut place, mut ty, mut mode) = match item {
+                BindItem::Pat(p, pl, t, m) => (p, pl, t, m),
+                BindItem::Start(b) => {
+                    self.b.start(b);
+                    continue;
+                }
+                BindItem::Goto(b, at) => {
+                    self.b.goto(b, self.pat_span(at));
+                    continue;
+                }
+            };
             let pat = match self.body.pats.get(p.ix()) {
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, p),
@@ -3433,7 +3853,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             match pat {
                 Pat::Missing => return self.refuse_pat(Form::Missing, p),
                 Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
-                Pat::Bind { ann, sub, .. } => {
+                Pat::Bind { ann, sub, name } => {
                     let lt = match self.ck.local_ty.get(p.ix()) {
                         Some(&t) => TyD::of(t),
                         None => return self.refuse_pat(Form::Malformed, p),
@@ -3447,12 +3867,30 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                             _ => None,
                         },
                     };
-                    let l = self.new_local_with(lt, false, None, root)?;
-                    self.name_local(l, Identity::Binding(p));
-                    self.pat_local[p.ix()] = l.0;
+                    // A guarded arm (pattern_forms.rs): before the guard a by-value binding is
+                    // a shared reference to its place; after it, the by-reference bindings are
+                    // already made and only the by-value ones are bound.
+                    let skip = match (pass, by_ref) {
+                        (BindPass::GuardRefs(g), None) => {
+                            self.guard_ref_binding(p, place, ty, lt, g)?;
+                            true
+                        }
+                        (BindPass::GuardMoves, Some(_)) => true,
+                        (BindPass::GuardMoves, None) => {
+                            self.upvar_places.retain(|u| u.0 != p);
+                            false
+                        }
+                        _ => false,
+                    };
+                    if skip {
+                        if let Some(s) = sub {
+                            stack.push(BindItem::Pat(s, place, ty, mode));
+                        }
+                        continue;
+                    }
+                    let l = self.binding_local(p, name, lt, &alias)?;
                     let lp = self.place_of(l);
                     self.b.stmt(StmtKind::StorageLive(l), self.pat_span(p));
-                    self.vars.push(l);
                     match by_ref {
                         None => {
                             if ty.wrap.is_some() || ty.ty != lt.ty {
@@ -3476,7 +3914,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         }
                     }
                     if let Some(s) = sub {
-                        stack.push((s, place, ty, mode));
+                        stack.push(BindItem::Pat(s, place, ty, mode));
                     }
                 }
                 Pat::Ref { inner, .. } => {
@@ -3486,20 +3924,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         _ => return self.refuse_pat(Form::Malformed, p),
                     };
                     let q = self.project(place, ty, Proj::Deref, it, false, root)?;
-                    stack.push((inner, q, it, 0));
+                    stack.push(BindItem::Pat(inner, q, it, 0));
                 }
-                Pat::Or { alts } => {
-                    for &a in self.body.pat_lists.get(alts.range()).unwrap_or(&[]) {
-                        if self.binds(a)? {
-                            return self.refuse_pat(Form::OrPatternBinding, p);
-                        }
-                    }
-                }
-                Pat::Slice { .. } => {
-                    if self.binds(p)? {
-                        return self.refuse_pat(Form::SlicePatternBinding, p);
-                    }
-                }
+                Pat::Or { alts } => self.or_alternatives(p, alts, place, ty, mode, pass, &mut stack)?,
+                Pat::Slice { elems, rest } => self.slice_elements(p, elems, rest, place, ty, mode, &mut stack)?,
                 Pat::Tuple { elems, rest } => {
                     let tys = match self.node(ty.ty, root)? {
                         PNode::Tuple(l) => self.list(l, root)?,
@@ -3515,7 +3943,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                             continue;
                         }
                         let q = self.project(place, ty, Proj::Field(fi), TyD::of(ft), false, root)?;
-                        stack.push((sp, q, TyD::of(ft), mode));
+                        stack.push(BindItem::Pat(sp, q, TyD::of(ft), mode));
                     }
                 }
                 Pat::TupleStruct { elems, rest, .. } => {
@@ -3574,7 +4002,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         adt: ItemKey,
         variant: u32,
         subs: &[(u32, PatId)],
-        stack: &mut Vec<(PatId, Place, TyD, u8), A>,
+        stack: &mut Vec<BindItem, A>,
     ) -> Result<(), Refusal> {
         let root = self.body.root;
         let f = match self.facts.adt(adt) {
@@ -3600,7 +4028,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             };
             let ft = if peels { self.peeled_field_ty(ty, adt, variant, fi, sp, own)? } else { TyD::of(own) };
             let q = self.project(base, ty, Proj::Field(fi), ft, f.drop_impl, root)?;
-            stack.push((sp, q, ft, mode));
+            stack.push(BindItem::Pat(sp, q, ft, mode));
         }
         Ok(())
     }

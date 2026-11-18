@@ -1,5 +1,6 @@
 // A program that holds an enum value no variant has, on purpose (run_trapped_enum.rs
-// `a_bad_discriminant_is_said_by_its_value_and_the_enum`): `main` transmutes 3, computed at
+// `a_bad_discriminant_is_said_by_its_value_and_the_enum`): `make`, under `build`, `run` and
+// `main`, transmutes 3, computed at
 // run time, into `Two` (`#[repr(usize)]`, discriminants 1 and 2) inside a struct shaped like
 // core's `Layout` (a `usize`, then the enum), and passes the struct by value. The copy's switch
 // on the discriminant (blaze-build walk.rs `copy`) matches no case and reaches its
@@ -54,13 +55,26 @@ fn pass(l: L) -> L {
     l
 }
 
-// `extern "C-unwind"`, as run_trapped/abort's `main` is and for its reason: no
-// `panic_cannot_unwind` lang item here.
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn main() -> i32 {
-    let l = pass(unsafe { make(8, three()) });
+/// `make` one call below `run`, as core's `Layout::from_size_align_unchecked` is below its
+/// callers: the trap is two calls or more under `main`, so the line names its callers
+/// (run_trapped_enum.rs asserts `run` and `main` among them).
+#[inline(never)]
+fn build(size: usize, align: usize) -> L {
+    unsafe { make(size, align) }
+}
+
+#[inline(never)]
+fn run() -> i32 {
+    let l = pass(build(8, three()));
     match l.align {
         Two::One => 1,
         Two::Other => 2,
     }
+}
+
+// `extern "C-unwind"`, as run_trapped/abort's `main` is and for its reason: no
+// `panic_cannot_unwind` lang item here.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    run()
 }

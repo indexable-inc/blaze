@@ -244,7 +244,16 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
         };
         let module = checker_of(body.module);
         let written = body.typeck.view(tc::PTys::EMPTY);
-        match facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, r.buckets.as_ref(), alloc) {
+        // Kept to the crates the body sees: the decision asks in its check world (`world_at`,
+        // `Reveal::InBody`: buckets.rs `Seen`).
+        let buckets = match r.buckets.as_ref() {
+            Some(b) => match super::buckets::Seen::of_checked_body(r.names, body.module) {
+                Ok(seen) => Some((b, seen)),
+                Err(why) => return Decision::Reads(ReadsError::Unseen(why)),
+            },
+            None => None,
+        };
+        match facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, buckets, alloc) {
             Ok(rows) => reads.extend_from_slice(&rows),
             Err(why) => return Decision::Reads(why),
         }

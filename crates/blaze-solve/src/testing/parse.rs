@@ -177,6 +177,9 @@ pub struct Attrs {
     pub unsafe_: bool,
     pub const_: bool,
     pub reservation: bool,
+    /// `dyn_undecided trait T`: a trait whose dyn compatibility the world did not decide
+    /// (`TraitFlags::DYN_UNDECIDED` in place of `DYN_COMPATIBLE`).
+    pub dyn_undecided: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +220,9 @@ pub enum Expect {
     No,
     Maybe,
     Overflow,
+    /// The goal stops: a `dyn` principal's dyn compatibility is undecided
+    /// (`Unsupported::DynUndecided`), never an answer.
+    DynUndecided,
     Overlap,
     Disjoint,
     MayOverlap,
@@ -448,6 +454,7 @@ impl P<'_> {
             "no" => Expect::No,
             "maybe" => Expect::Maybe,
             "overflow" => Expect::Overflow,
+            "dyn_undecided" => Expect::DynUndecided,
             "overlap" => Expect::Overlap,
             "disjoint" => Expect::Disjoint,
             "may_overlap" => Expect::MayOverlap,
@@ -493,6 +500,7 @@ impl P<'_> {
                     "unsafe" => a.unsafe_ = true,
                     "const" => a.const_ = true,
                     "reservation" => a.reservation = true,
+                    "dyn_undecided" => a.dyn_undecided = true,
                     "lang" => {
                         self.i += 1;
                         self.expect("(")?;

@@ -169,6 +169,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if let Ok(PathRes { def: Def::Alias(alias), consumed: c }) = res {
             return self.alias_struct_path(at, alias, segs, c as usize, last);
         }
+        // `Self::Output { .. }`, `T::Out { .. }`: one segment after `Self` or a parameter that
+        // is no variant names an associated type ([`Self::assoc_struct_path`]).
+        if let Ok(PathRes { def, consumed: c }) = res {
+            let c = c as usize;
+            if c != 0 && c + 1 == segs.len() {
+                use crate::rules::self_path::AssocPrefix;
+                let by_self = c == 1 && segs[0].name == SELF_NAME;
+                let prefix = match def {
+                    Def::TyParam(i) => Some(AssocPrefix::Param(i)),
+                    Def::SelfTy => Some(AssocPrefix::ImplSelf),
+                    Def::Adt(k) if by_self && self.assoc_route_for_adt(k, segs[c].name)? => Some(AssocPrefix::ImplSelf),
+                    _ => None,
+                };
+                if let Some(prefix) = prefix {
+                    return self.assoc_struct_path(at, prefix, segs[c], last);
+                }
+            }
+        }
         let (k, variant, def) = match res {
             Ok(r) if r.consumed as usize == segs.len() => match r.def {
                 Def::Adt(k) => (k, None, r.def),
@@ -259,6 +277,73 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         self.defs.push((at, def));
         Ok(Some((k, variant, args)))
+    }
+
+    /// Whether `k` is an enum with a variant named `name` (what a type-relative struct path's
+    /// last segment is looked up as first: rustc `associated_path_to_ty` tries the variants of
+    /// an enum before its associated types).
+    fn names_variant(&mut self, k: ItemKey, name: Name) -> Result<bool, Stop> {
+        Ok(match self.reads.adt(k)? {
+            Some(adt) => adt.kind == AdtKind::Enum && adt.variants.iter().any(|v| v.name == name),
+            None => false,
+        })
+    }
+
+    /// Whether `Self::name { .. }`, `Self` the ADT `k`, takes the associated-type route. rustc
+    /// `lower_assoc_path` looks a name up as a variant of an enum first; failing that, as an
+    /// associated item, and when that fails too an enum reports "no variant named `name`"
+    /// (here E0574 naming it, [`Self::struct_variant`]). An ADT `Self` can only have an
+    /// associated type through the impl's trait, so the route is taken for an enum only in a
+    /// trait impl (an inherent impl of a struct still takes it: rustc's E0223 there).
+    fn assoc_route_for_adt(&mut self, k: ItemKey, name: Name) -> Result<bool, Stop> {
+        let enum_ = matches!(self.reads.adt(k)?, Some(adt) if adt.kind == AdtKind::Enum);
+        if !enum_ {
+            return Ok(true);
+        }
+        if self.names_variant(k, name)? {
+            return Ok(false);
+        }
+        let header = match self.reads.assoc_parent(self.body.owner)? {
+            Some(parent) => self.reads.impl_header(parent.container)?,
+            None => None,
+        };
+        Ok(header.is_some_and(|h| h.trait_.is_some()))
+    }
+
+    /// A struct path `P::Assoc { .. }` whose prefix `P` is `Self` or a generic parameter and
+    /// whose last segment names an associated type of it (ark-poly's `impl Add for &Sparse<F>
+    /// { type Output = Sparse<F>; fn add(..) -> Self::Output { Self::Output { .. } } }`, an
+    /// `impl IntoIterator` building `Self::IntoIter { .. }`). The Reference, "Struct
+    /// expressions": the path names "a struct, enum variant, or union item"; rustc resolves a
+    /// type-relative struct path as a type (`check_struct_path` through
+    /// `lower_assoc_path`), so the associated type is projected and normalized, and the
+    /// struct or union it IS is the path's ADT at the arguments the normalized type gives it.
+    /// E0574 when it normalizes to anything else (an enum named whole, a primitive, a rigid
+    /// projection); E0220/E0221/E0223 from [`Self::assoc_ty_of_prefix`] when no single trait
+    /// of the prefix declares the name.
+    fn assoc_struct_path(
+        &mut self,
+        at: At,
+        prefix: crate::rules::self_path::AssocPrefix,
+        seg: Segment,
+        last: Option<Name>,
+    ) -> Result<Option<(ItemKey, u32, TyList)>, Stop> {
+        let Some(projected) = self.assoc_ty_of_prefix(at, at.cause(), prefix, seg)? else { return Ok(None) };
+        let t = self.try_structurally_resolve(projected)?;
+        let TyView::Adt(k, args) = self.view(t) else {
+            self.diag(DiagCode::NotAStruct, at, About::path(last));
+            return Ok(None);
+        };
+        match self.reads.adt(k)? {
+            Some(adt) if matches!(adt.kind, AdtKind::Struct | AdtKind::Union) => {
+                self.defs.push((at, Def::Adt(k)));
+                Ok(Some((k, 0, args)))
+            }
+            _ => {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                Ok(None)
+            }
+        }
     }
 
     /// The variant `seg` of the enum `k` that a type-relative struct path names (`Self::A`,

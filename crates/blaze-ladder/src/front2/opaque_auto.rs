@@ -259,6 +259,9 @@ impl<'a> HiddenTable<'a> {
 pub enum HiddenFail {
     /// No fn head of the program made this opaque (`Store::opaques` holds no row).
     NoHead { opaque: ItemKey },
+    /// An auto trait of a type alias's `impl Trait` (front2/tait.rs): its hidden type is its
+    /// defining uses', which are not checked as defining yet.
+    AliasOpaque { opaque: ItemKey, alias: ItemKey },
     /// The defining body would be lowered with the build's prepared macros, and this caller
     /// has none (`Records::consts` is `None`).
     NoPrepares { opaque: ItemKey, owner: ItemKey, shown: Box<str> },
@@ -280,6 +283,7 @@ impl core::fmt::Display for HiddenFail {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             HiddenFail::NoHead { opaque } => write!(f, "the `impl Trait` type {opaque:?}: no fn head of the program made it"),
+            HiddenFail::AliasOpaque { opaque, alias } => write!(f, "the `impl Trait` type {opaque:?} of type alias {alias:?}: {}", super::tait::HIDDEN_OWED),
             HiddenFail::NoPrepares { opaque, owner, shown } => {
                 write!(f, "the hidden type of the `impl Trait` type {opaque:?} of fn `{shown}` ({owner:?}): this caller has no prepared macros to lower its defining body with")
             }
@@ -371,7 +375,10 @@ fn define<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey) -
 fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemKey, Alloc<'static>>) -> Result<(), HiddenFail> {
     for _ in 0..MOST_DEFINES {
         let Some(&opaque) = stack.last() else { return Ok(()) };
-        let Some(&(owner, _)) = r.store.opaques.get(&opaque) else { return Err(HiddenFail::NoHead { opaque }) };
+        let Some(&(owner, index)) = r.store.opaques.get(&opaque) else { return Err(HiddenFail::NoHead { opaque }) };
+        if super::tait::of_alias(index) {
+            return Err(HiddenFail::AliasOpaque { opaque, alias: owner });
+        }
         if r.store.hidden.filed(owner) {
             if !r.store.hidden.gives(owner, opaque) {
                 return Err(HiddenFail::NoneGiven { opaque, owner, shown: shown(r, owner) });

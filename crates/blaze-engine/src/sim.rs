@@ -145,7 +145,7 @@ fn growth_of(world: &World, c: usize) -> StdVec<Planned> {
 }
 
 /// The driver's half of growth: each names task merged grows its crate's expansions, whole.
-fn grow_names<L: LastAnswer>(world: &World, engine: &mut Engine<'static, impl Scope, L>) -> Result<(), EngineError> {
+pub(crate) fn grow_names<L: LastAnswer, R: crate::readers::ReaderIndex<'static>>(world: &World, engine: &mut Engine<'static, impl Scope, L, R>) -> Result<(), EngineError> {
     let merged: StdVec<Name> = engine.merged().to_vec();
     for name in merged.iter() {
         if name.kind != Kind::CrateScope {
@@ -271,7 +271,7 @@ impl<'a> Pool<'a> for Pools {
 
 /// The model's tasks, over the world's text and the view's cells. `plant` is
 /// [`Plant::HitWithoutReads`] alone when a body drops its read of the constant it hit or made.
-fn work<L: LastAnswer>(world: &World, plant: Plant, view: View<'_, 'static, L>, task: &Task, buffer: &mut Buffer<'static>) {
+pub(crate) fn work<L: LastAnswer>(world: &World, plant: Plant, view: View<'_, 'static, L>, task: &Task, buffer: &mut Buffer<'static>) {
     let name = task.planned.name;
     let a = alloc();
     let mut defines: SVec<'static, (Cell, ContentId)> = Vec::new_in(a);

@@ -14,11 +14,11 @@ use crate::kind::{AmbiguityKind, BindingState, Def, Visibility};
 use crate::module_scope::{GlobEdge, Globs};
 use crate::through::{Asker, Node, Passed, SeenFrom, Sources, Through, merge};
 
-const K1: CrateItemKey = CrateItemKey(ContentId([1; 32]));
+pub(super) const K1: CrateItemKey = CrateItemKey(ContentId([1; 32]));
 const K2: CrateItemKey = CrateItemKey(ContentId([2; 32]));
 
 /// The item numbered `n`: the crate's 8 bytes, then `n` little-endian, then zeros.
-fn item(n: u32) -> ItemKey {
+pub(super) fn item(n: u32) -> ItemKey {
     let mut bytes = [0u8; 32];
     bytes[..8].copy_from_slice(&K1.prefix());
     bytes[8..12].copy_from_slice(&n.to_le_bytes());
@@ -31,32 +31,32 @@ fn number(key: ItemKey) -> usize {
     u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize
 }
 
-fn heap() -> Alloc<'static> {
+pub(super) fn heap() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 
 /// Why a test source cannot be read: `Open` gives no value and no edge, `Closed` stops the walk.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Halt {
+pub(super) enum Halt {
     Open,
     Closed,
 }
 
 /// One source of a test graph.
-enum Spec {
+pub(super) enum Spec {
     Value(Option<Passed>),
     Halt(Halt),
     Edges { edges: AVec<'static, GlobEdge>, krate: CrateItemKey, chain: AVec<'static, ItemKey> },
 }
 
 /// The test graph's sources, read by number, every read logged in order.
-struct Reader<'g> {
+pub(super) struct Reader<'g> {
     graph: &'g [Spec],
     calls: AVec<'static, ItemKey>,
 }
 
 impl<'g> Reader<'g> {
-    fn new(graph: &'g [Spec]) -> Reader<'g> {
+    pub(super) fn new(graph: &'g [Spec]) -> Reader<'g> {
         Reader { graph, calls: Vec::new_in(heap()) }
     }
 }
@@ -83,7 +83,7 @@ impl<'g> Sources<'g> for Reader<'g> {
 
 /// A bug planted in the reference: the oracle must see that the two walks differ.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Plant {
+pub(super) enum Plant {
     None,
     /// Each node's last edge (of two or more) is left out of its merge.
     LastEdgeIgnored,
@@ -91,7 +91,7 @@ enum Plant {
 
 /// The old `through` (blaze-surface through.rs before GLOB-THROUGH-1), kept verbatim but for
 /// the plant: the reference the new walk is compared with.
-fn reference<'w, W: Sources<'w>>(
+pub(super) fn reference<'w, W: Sources<'w>>(
     sources: &mut W,
     source: Def,
     alloc: Alloc<'_>,
@@ -187,7 +187,7 @@ fn vis(tape: &Tape) -> Visibility {
 /// A random glob graph of up to 300 sources (source 0 is asked, and has edges): values,
 /// sources that cannot be read (open or not), and nodes with up to five edges to any source,
 /// so cycles and shared targets are common; visibilities of every form, two crates.
-fn draw(tape: &Tape) -> AVec<'static, Spec> {
+pub(super) fn draw(tape: &Tape) -> AVec<'static, Spec> {
     let n = 1 + tape.below(300, "sources") as u32;
     let mut graph: AVec<'static, Spec> = Vec::new_in(heap());
     for i in 0..n {

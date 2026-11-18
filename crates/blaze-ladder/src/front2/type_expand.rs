@@ -65,11 +65,20 @@ impl<'a, 't> Expanded<'a, 't> {
 /// The type written as `text` (a signature's type, read from its view) in module `module`, with
 /// every macro call in it expanded by the names of that module and its crate's cfg and edition;
 /// `r` is the written type's place in the item, for a refusal; the expansion is made in `alloc`.
-pub(super) fn expand_type_text<'n, 'a, 't, S: NamesSource<'n>>(names: S, module: LibKey, text: &'t str, r: Range, alloc: Alloc<'a>) -> Result<Expanded<'a, 't>, Why> {
+pub(super) fn expand_type_text<'n, 'a, 't, S: NamesSource<'n>>(
+    names: S,
+    module: LibKey,
+    text: &'t str,
+    marks: Option<blaze_scope::crate_roots::TextMarks<'_>>,
+    r: Range,
+    alloc: Alloc<'a>,
+) -> Result<Expanded<'a, 't>, Why> {
     let krate = names.crate_of(module).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the crate of module {module:x} is not read").into_boxed_str(), r))?;
     let atoms = names.cfg_atoms(krate).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the cfg of the crate of module {module:x} is not read").into_boxed_str(), r))?;
     let edition = names.edition_of(krate).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the edition of the crate of module {module:x} is not read").into_boxed_str(), r))?;
-    let scoped = ScopedBy { names, module, prepared: None, blocks: &[] };
+    // A path an expansion wrote is read by its token's mark (`$crate` in the defining crate):
+    // front2/type_marks.rs.
+    let scoped = super::type_marks::Marked { scoped: ScopedBy { names, module, prepared: None, blocks: &[] }, marks };
     let mut expand = ByName::with_names(&scoped, NoHost, alloc);
     let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, alloc)
         .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;

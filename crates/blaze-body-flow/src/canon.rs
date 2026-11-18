@@ -275,6 +275,10 @@ impl<A: Allocator> Printer<'_, A> {
                     Proj::Deref => out.write_str(".*")?,
                     Proj::DerefBox => out.write_str(".box")?,
                     Proj::Index => out.write_str("[]")?,
+                    Proj::ConstantIndex { offset, min_length, from_end: false } => write!(out, "[{offset} of {min_length}]")?,
+                    Proj::ConstantIndex { offset, min_length, from_end: true } => write!(out, "[-{offset} of {min_length}]")?,
+                    Proj::Subslice { from, to, from_end: false } => write!(out, "[{from}..{to}]")?,
+                    Proj::Subslice { from, to, from_end: true } => write!(out, "[{from}..-{to}]")?,
                     Proj::Downcast(v) => write!(out, "#{v}")?,
                 }
                 if row.of_drop_type {

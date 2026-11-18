@@ -40,7 +40,13 @@
 //!    and all they depend on, get a namespace of their own (the host's); a target-specific
 //!    dependency counts only where its platform matches (the host's for the host side and for
 //!    build-dependencies); dev-dependencies count only when a target that needs them (tests) is
-//!    built. The default: `workspace.resolver` (or the root package's `package.resolver`), else
+//!    built, and then for the whole build: features are resolved once per invocation, so a
+//!    dev-dependency's features unify with the normal dependency of the same package for every
+//!    target unit of that build (the library's unit as well as its test harness), and never
+//!    reach the host's namespace unless the dev-dependency is itself a proc macro. A dependency
+//!    `x` listed both as an optional normal dependency and as a dev-dependency is on in the
+//!    test units through the dev entry even when the optional entry is off, and `x?/f` then
+//!    turns `f` on (the dev entry is not optional, so nothing waits). The default: `workspace.resolver` (or the root package's `package.resolver`), else
 //!    edition 2024: 3, 2021: 2, earlier: 1; a virtual workspace without it: 1 ("Workspaces",
 //!    "The resolver setting"). Resolver 3 changes only version selection, which the lock holds.
 //! 7. **Platform-specific dependencies** ("Specifying Dependencies", "Platform specific
@@ -81,10 +87,17 @@
 //! decision diagram of what they force under the asked roots; the walk stays, and what changes
 //! is that a set grows by an implication rather than a bit.
 //!
+//! # What `blaze check` asks
+//!
+//! `blaze check` checks every workspace member, every target (library, binaries, the library's
+//! and each binary's test harness, integration tests, examples, benches) with dev-dependencies
+//! on and unified into the one build: cargo's `cargo check --workspace --all-targets`
+//! (`Ask { roots: every member, tests: true }`, blaze-cli engine_check.rs).
+//!
 //! # Not covered
 //!
 //! Profiles beyond check's dev profile; artifact dependencies; registries that need a login;
-//! `-Z` features; examples and benches.
+//! `-Z` features.
 
 #![no_std]
 #![feature(allocator_api)]
@@ -254,6 +267,10 @@ pub(crate) enum Plant {
     None,
     /// Dev-dependencies count without tests.
     DevLeaks,
+    /// Dev-dependencies never count in the feature fixpoint, tests asked or not: a test unit
+    /// still links them, with only the features the normal build gave them (the control of
+    /// tests/dev_unify.rs).
+    DevIgnored,
     /// A feature value naming an optional dependency hidden by `dep:x` turns it on anyway.
     DepMakesImplicit,
     /// `x?/f` turns `x` on.

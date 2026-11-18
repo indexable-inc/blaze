@@ -2299,7 +2299,8 @@ fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result
         }
         Rule::DynCompatible => {
             let Pred::DynCompatible(d) = cx.goal.pred else { return Err(bad()) };
-            if cx.trait_def(d)?.flags.has(TraitFlags::DYN_COMPATIBLE) { Step::Done(Certainty::Yes) } else { Step::No }
+            // An undecided verdict stops the goal (builtin.rs `dyn_compatible`), never No.
+            if crate::builtin::dyn_compatible(cx, d)? { Step::Done(Certainty::Yes) } else { Step::No }
         }
         Rule::ConstHolds => {
             let Pred::ConstHolds { cond, args } = cx.goal.pred else { return Err(bad()) };

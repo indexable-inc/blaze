@@ -12,7 +12,12 @@
 mod classify;
 #[cfg(test)]
 mod differential;
+mod members;
 mod scan;
+
+/// The outline lexer's planted bugs, for the tests' controls.
+#[cfg(test)]
+pub(crate) use scan::plant;
 
 use std::{borrow::Cow, ops};
 
@@ -91,7 +96,21 @@ impl<'a> LexedStr<'a> {
     /// each hash to `intern::Symbol::intern_hashed` and never hashes the name again. The
     /// tokens are [`LexedStr::new`]'s.
     pub fn new_hashed(edition: Edition, text: &'a str) -> LexedStr<'a> {
-        Self::lex_with::<true, true>(edition, text)
+        Self::lex_with::<true, true, false>(edition, text)
+    }
+
+    /// The tokens of an item's text for an outline ([`crate::TopEntryPoint::parse_outline`]):
+    /// [`LexedStr::new`]'s, but each `fn` body of the item, or of an `impl`'s or `trait`'s
+    /// member, is ONE token of kind [`SyntaxKind::LAZY_BODY`] over its `{ .. }`, when the
+    /// outline would leave it unparsed (`members`, [`scan::body_len`]); no token of the body is
+    /// lexed. The parser takes that token as the lazy `BLOCK_EXPR` it would have made of the
+    /// body's tokens, so the outline's steps are those of [`LexedStr::new`]'s tokens, the body
+    /// one input token instead of many. A body the outline would parse (a refusal of
+    /// [`crate::lazy_block_len`]), or that this cannot read for certain, is lexed as before.
+    /// A `fn` nested in a body is inside the body's token; one in a `mod`, a block or a macro
+    /// call is lexed as before (the parser's outline still skips it, from its tokens).
+    pub fn new_outline(edition: Edition, text: &'a str) -> LexedStr<'a> {
+        Self::lex_with::<true, false, true>(edition, text)
     }
 
     /// Whether a token of `kind` has a hash in [`LexedStr::name_hashes`]: the kinds the lexer
@@ -124,14 +143,17 @@ impl<'a> LexedStr<'a> {
     /// there and the rest by `rustc_lexer`; without, all by `rustc_lexer`. Both give the same
     /// tokens (`fast_and_rustc_lexer_lex_alike`, `every_file_of_the_corpus_lexes_alike`).
     fn lex<const FAST: bool>(edition: Edition, text: &'a str) -> LexedStr<'a> {
-        Self::lex_with::<FAST, false>(edition, text)
+        Self::lex_with::<FAST, false, false>(edition, text)
     }
 
-    /// [`LexedStr::lex`], with `HASH` each identifier's name hashed too.
-    fn lex_with<const FAST: bool, const HASH: bool>(
+    /// [`LexedStr::lex`], with `HASH` each identifier's name hashed too, and with `OUTLINE`
+    /// each `fn` body it may leave one token ([`LexedStr::new_outline`]; the byte classes find
+    /// the body's end, so `OUTLINE` needs `FAST`).
+    fn lex_with<const FAST: bool, const HASH: bool, const OUTLINE: bool>(
         edition: Edition,
         text: &'a str,
     ) -> LexedStr<'a> {
+        const { assert!(FAST || !OUTLINE, "an outline lex reads the byte classes") };
         let _p = blaze_trace::info_span!(target: "blaze", "LexedStr::new").entered();
         assert!(text.len() <= u32::MAX as usize, "a text of 4 GiB or more");
         let mut conv = Converter::new(edition, text);
@@ -156,11 +178,13 @@ impl<'a> LexedStr<'a> {
         if FAST {
             // The classes go in the worker's scratch, so a warm lex allocates nothing for them.
             blaze_mem::scratch::with_u64s(|words| {
-                let classes = classify::Classes::new(text.as_bytes(), words);
-                conv.lex_rest::<HASH>(Some(&classes));
+                let mut classes = classify::Classes::new(text.as_bytes(), words);
+                // The text's one CR scan, the converter's ([`Converter::cr`]).
+                classes.cr = conv.cr;
+                conv.lex_rest::<HASH, OUTLINE>(Some(&classes));
             });
         } else {
-            conv.lex_rest::<HASH>(None);
+            conv.lex_rest::<HASH, false>(None);
         }
         conv.finalize_with_eof()
     }
@@ -305,6 +329,9 @@ struct Converter<'a> {
     res: LexedStr<'a>,
     offset: usize,
     edition: Edition,
+    /// Whether the text holds a CR at all: its one scan ([`crate::line_break::has_cr`]), so a
+    /// token of a text with none asks no bare-CR question ([`Converter::bare_cr`]).
+    cr: bool,
 }
 
 impl<'a> Converter<'a> {
@@ -326,6 +353,7 @@ impl<'a> Converter<'a> {
             },
             offset: 0,
             edition,
+            cr: crate::line_break::has_cr(text.as_bytes()),
         }
     }
 
@@ -334,15 +362,45 @@ impl<'a> Converter<'a> {
     /// `rustc_lexer`; without, all by `rustc_lexer`. Lexes from scratch at every token
     /// `rustc_lexer` lexes, because some of its tokens are split as rustc splits them in older
     /// editions: `GuardedStrPrefix` before 2024, a C string and a raw lifetime before 2021.
-    fn lex_rest<const HASH: bool>(&mut self, classes: Option<&classify::Classes<'_>>) {
+    ///
+    /// With `OUTLINE` ([`LexedStr::new_outline`]) [`scan::simple`] stops at each `{`, and the
+    /// member machine ([`members::Members`]), having read every token before it, says whether
+    /// it opens a `fn` body; when it does and [`scan::body_len`] finds the body's end, the body
+    /// is one [`SyntaxKind::LAZY_BODY`] token.
+    fn lex_rest<const HASH: bool, const OUTLINE: bool>(
+        &mut self,
+        classes: Option<&classify::Classes<'_>>,
+    ) {
         let text = self.res.text;
+        let mut members = members::Members::new(self.edition);
         while self.offset < text.len() {
             if let Some(classes) = classes {
+                if OUTLINE && text.as_bytes()[self.offset] == b'{' {
+                    members.read(&self.res);
+                    #[cfg(test)]
+                    let skip = !scan::plant::on(scan::plant::Plant::SkipOff);
+                    #[cfg(not(test))]
+                    let skip = true;
+                    let body = (skip && members.at_body())
+                        .then(|| scan::body_len(text, self.offset, classes));
+                    match body {
+                        Some(Some(len)) => self.push(LAZY_BODY, len),
+                        _ => self.push(T!['{'], 1),
+                    }
+                    continue;
+                }
                 if classify::is_simple_first(text.as_bytes()[self.offset]) {
-                    self.offset =
-                        scan::simple::<HASH>(&mut self.res, classes, self.edition, self.offset);
+                    self.offset = scan::simple::<HASH, OUTLINE>(
+                        &mut self.res,
+                        classes,
+                        self.edition,
+                        self.offset,
+                    );
                     if self.offset == text.len() {
                         break;
+                    }
+                    if OUTLINE && text.as_bytes()[self.offset] == b'{' {
+                        continue;
                     }
                 }
                 if let Some((kind, len)) = scan::special(text, self.offset, classes) {
@@ -378,7 +436,7 @@ impl<'a> Converter<'a> {
 
     /// Whether the `len` bytes from the offset hold a bare CR (crate::line_break).
     fn bare_cr(&self, len: usize) -> bool {
-        has_bare_cr(self.res.text.as_bytes(), self.offset..self.offset + len)
+        self.cr && has_bare_cr(self.res.text.as_bytes(), self.offset..self.offset + len)
     }
 
     fn comment_kind(doc_style: Option<rustc_lexer::DocStyle>) -> SyntaxKind {

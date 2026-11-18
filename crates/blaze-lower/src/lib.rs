@@ -447,7 +447,11 @@ mod call_reads_tests;
 #[cfg(test)]
 mod expand_tests;
 #[cfg(test)]
+mod outline_sig_tests;
+#[cfg(test)]
 mod scoped_tests;
+#[cfg(test)]
+mod sizing_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -662,7 +666,11 @@ pub fn anon_const_key(item_text: &str, range: Range, edition: Edition) -> Conten
 }
 
 /// Lowers one item's signature from its text (from its first attribute to its last token).
-/// The text is parsed as an outline: a fn's body is never parsed.
+/// The text is parsed as an outline: a fn's body is never parsed, and the body of the item's
+/// `fn`, or of an `impl`'s or a `trait`'s, is never lexed either ([`parser::LexedStr::new_outline`]:
+/// one token for the whole body). The parser's words and each word's range are made in one
+/// pass over the tokens, so the feed takes each step's range from that column
+/// ([`feed::feed_input`]).
 ///
 /// # Panics
 ///
@@ -674,6 +682,47 @@ pub fn lower_signature<'a, 't>(
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
     // A text that spells `$crate` is read from its words, `$crate` one of them ([`spelled_words`]).
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        return lower_signature_words(text, w.item_words(), edition, cfg, alloc);
+    }
+    let end = u32::try_from(text.len()).expect("an item of over 4 GiB: ranges are u32 pairs");
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new_outline(pe, text);
+    let (words, ranges) = input_columns(&lexed, pe, alloc);
+    let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(&words, true));
+    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
+    feed::feed_input(&mut m, &output, ranges, end);
+    m.finish()
+}
+
+/// The parser's words of `lexed` (its tokens that are not trivia, then [`parser::Tokens::PAD`]
+/// `EOF` words: [`parser::LexedStr::to_input`]'s) and each word's range in its text, in one
+/// pass ([`parser::LexedStr::each_input_token`]).
+fn input_columns<'a>(lexed: &parser::LexedStr<'_>, pe: parser::Edition, alloc: Alloc<'a>) -> (AVec<'a, u32>, AVec<'a, Range>) {
+    let mut words: AVec<'a, u32> = AVec::with_capacity_in(lexed.len() + parser::Tokens::PAD, alloc);
+    let mut ranges: AVec<'a, Range> = AVec::with_capacity_in(lexed.len(), alloc);
+    lexed.each_input_token(pe, &mut parser::Joiner::new(), |word, bytes, joins| {
+        if joins && let Some(last) = words.last_mut() {
+            *last |= parser::JOINT;
+        }
+        words.push(word);
+        // The text is under 4 GiB ([`lower_signature`]).
+        ranges.push(Range::new(bytes.start as u32, bytes.end as u32));
+    });
+    words.extend((0..parser::Tokens::PAD).map(|_| parser::Tokens::EOF_WORD));
+    (words, ranges)
+}
+
+/// [`lower_signature`] as it was: the whole text lexed ([`parser::LexedStr::new`]), every body
+/// token in the input, and the feed walking the lexer's tokens. The reference the outline
+/// lexer's lowering is compared with, byte for byte.
+#[cfg(test)]
+pub(crate) fn lower_signature_whole_lex<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     if let Some(w) = spelled_words(text, edition, alloc) {
         return lower_signature_words(text, w.item_words(), edition, cfg, alloc);
     }

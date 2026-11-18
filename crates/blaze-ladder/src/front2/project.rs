@@ -388,18 +388,26 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         let checked = super::body_reads::check_body_filed_as(&mut r, &lowered, &scope, None, Some(&mut asked), stalls);
         drop(rounds);
         let _reads = Cost::enter(cost, Part::Reads);
-        // The buckets as the check left them: what each impl question read, per crate.
+        // The buckets as the check left them: what each impl question read, per crate, kept to
+        // the crates the body sees (its check world's, `Reveal::InBody`: buckets.rs `Seen`).
+        let seen = super::buckets::Seen::of_checked_body(r.names, lowered.module).map_err(ReadsError::Unseen);
         let buckets = r.buckets.as_ref();
         let whole = |list: &blaze_typeck::ReadList<'_>| -> Result<BodyReads<'a>, ReadsError> {
+            let buckets = match buckets {
+                Some(b) => Some((b, seen?)),
+                None => None,
+            };
             let rows = facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, buckets, alloc)?;
             Ok(BodyReads { rows, reach: Reach::Whole })
         };
         verdict.facts = match (&checked, &asked.finished) {
             (Ok((_, filed)), _) => whole(&filed.reads),
             (Err(_), Some(list)) => whole(list),
-            (Err(_), None) => {
-                facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, buckets, alloc).map(|rows| BodyReads { rows, reach: Reach::Asked })
+            (Err(_), None) => match buckets {
+                Some(b) => seen.and_then(|seen| facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, Some((b, seen)), alloc)),
+                None => facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, None, alloc),
             }
+            .map(|rows| BodyReads { rows, reach: Reach::Asked }),
         };
         if let Ok(list) = &verdict.facts
             && list.reach == Reach::Whole

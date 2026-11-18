@@ -12,7 +12,7 @@ use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::Alloc;
 use blaze_scope::names::{PathError, Unheld, Why, Written};
 use blaze_scope::resolve::Names;
-use blaze_scope::task::to_path;
+use blaze_scope::task::{to_path, to_path_head};
 use blaze_surface::{Def, DefKind, ItemDetail, ItemKind, Namespace};
 
 use crate::front2::source::NamesSource;
@@ -110,13 +110,15 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
             Some(k) => k,
             None => self.krate_key(module)?,
         };
-        let mut written = to_path(abs, segments, krate, Alloc::global());
+        // The head read in place: the written segments after it are borrowed, never copied (a
+        // copy per path in the process's heap before, 2026-11-18).
+        let (mut kind, skip) = to_path_head(abs, segments, None, krate);
         // token-mark-2: an item text writes `crate` for another crate's `$crate`; its mark's crate
         // is `dollar` (blaze-lower `site_of` via blaze-scope `crate_roots::root_by_mark`).
         if let (Some(k), false, Some(&"crate")) = (dollar, abs, segments.first()) {
-            written.kind = blaze_surface::PathKind::DollarCrate(k);
+            kind = blaze_surface::PathKind::DollarCrate(k);
         }
-        let w = Written { kind: written.kind, segments: &written.segments };
+        let w = Written { kind, segments: &segments[skip..] };
         // The segments `to_path` read as the path's head (`crate`, `self`, `super`): counted in
         // the path as WRITTEN, in a refusal's segment as in `consumed` below, so `at` indexes
         // `segments`. (The library's `at` indexes what follows the head: `crate::a::f` with no

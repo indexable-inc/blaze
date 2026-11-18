@@ -113,9 +113,8 @@ pub(crate) fn holds(func: View<'_>, isa: Isa) -> Option<(usize, usize)> {
         let word = inst(code, at);
         assert_ne!(word & 0x3b00_0000, 0x1800_0000, "a load of a literal word at {at}\n{}", text());
         if word & 0x9f00_0000 == 0x1000_0000 {
-            // `adr`: 21 signed bits, the low 2 in 29..31.
-            let imm = (((word >> 5) & 0x7_ffff) << 2) | ((word >> 29) & 3);
-            let to = at as i64 + i64::from(((imm << 11) as i32) >> 11);
+            // A near `adr`, or the far own-data form's sum (pass/reach.rs).
+            let to = crate::record_check::adr_reaches(code, insts, at, word);
             assert!(
                 to >= insts as i64 && to <= code.len() as i64,
                 "the `adr` at {at} reaches {to}, not the data after the {insts} bytes of instructions\n{}",

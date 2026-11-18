@@ -182,6 +182,9 @@ pub enum ReadsError {
     /// Two questions are one fact and got two answers (rule 21): the fact's bytes miss what
     /// tells them apart.
     TwoAnswers { fact: Fact, first: u64, second: u64 },
+    /// The crates the body sees, whose impl buckets its list keeps, were not told
+    /// (front2 buckets.rs `Seen`).
+    Unseen(super::buckets::Unseen),
 }
 
 impl core::fmt::Display for ReadsError {
@@ -189,6 +192,7 @@ impl core::fmt::Display for ReadsError {
         match self {
             ReadsError::UnnamedPath(q) => write!(f, "the read {q:?} names no path of the body's path table as it was asked"),
             ReadsError::TwoAnswers { fact, first, second } => write!(f, "the fact {fact:?} has two answers ({first:016x}, {second:016x}) in one read list (rule keys-cover-every-input)"),
+            ReadsError::Unseen(why) => write!(f, "the read list's impl buckets: {why}"),
         }
     }
 }
@@ -374,27 +378,39 @@ pub fn facts_of<'a>(questions: &[Question], answers: Option<&[u64]>, module: tc:
 /// `Buckets::inherent_reads`; a pure function of the question and the records, whichever body
 /// asked first) as [`FactKind::CrateBucket`] rows: `key` the crate, `detail` the bucket, each
 /// with its own answer digest. Over the solved names no bucket is read and no row is added.
+///
+/// `buckets` comes with what the body sees (front2 buckets.rs `Seen`, its check world's:
+/// `Seen::of_checked_body`): a trait question's rows are only the buckets of the crates it
+/// sees, so a body of crate A does not read the impl buckets of a crate downstream of A,
+/// whose impls its answer never takes (lane RF13). An inherent question's crate is the self
+/// type's, which the body names, so it is seen: its rows are kept whole.
 pub fn facts_with_buckets<'a>(
     questions: &[Question],
     answers: Option<&[u64]>,
     module: tc::ItemKey,
     paths: &[BodyPath],
     segments: &[Segment],
-    buckets: Option<&super::buckets::Buckets>,
+    buckets: Option<(&super::buckets::Buckets, super::buckets::Seen)>,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, Read>, ReadsError> {
     let mut rows: AVec<'a, Read> = AVec::new_in(alloc);
     for (i, &q) in questions.iter().enumerate() {
         let answer = answers.and_then(|all| all.get(i).copied());
         rows.push(Read { fact: fact_of(q, module, paths, segments)?, answer });
-        // A shared borrow of the buckets' index, held over this question's rows only.
-        let read = match (buckets, q) {
-            (Some(b), Question::ImplsOf(trait_, shape)) => Some(b.trait_reads(trait_, shape)),
-            (Some(b), Question::Inherent(shape, _)) => Some(b.inherent_reads(shape)),
-            _ => None,
-        };
-        for bucket in read.as_deref().unwrap_or(&[]) {
-            rows.push(Read { fact: Fact { kind: FactKind::CrateBucket, key: bucket.krate, detail: bucket.bucket }, answer: Some(bucket.answer) });
+        let Some((b, seen)) = buckets else { continue };
+        let bucket_row = |bucket: &super::buckets::BucketRead| Read { fact: Fact { kind: FactKind::CrateBucket, key: bucket.krate, detail: bucket.bucket }, answer: Some(bucket.answer) };
+        match q {
+            Question::ImplsOf(trait_, shape) => {
+                // A shared borrow of the buckets' index, held over this question's rows only.
+                let read = b.trait_reads(trait_, shape);
+                if read.is_empty() {
+                    continue;
+                }
+                let sight = b.sight_made(seen).map_err(ReadsError::Unseen)?;
+                rows.extend(read.iter().filter(|bucket| sight.sees_read(bucket)).map(bucket_row));
+            }
+            Question::Inherent(shape, _) => rows.extend(b.inherent_reads(shape).iter().map(bucket_row)),
+            _ => {}
         }
     }
     rows.sort_unstable();

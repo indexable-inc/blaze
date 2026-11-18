@@ -816,6 +816,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         }
     }
 
+    /// Sizes the value and frame stacks once for a parse about to be fed ([`crate::feed::Sizes`]),
+    /// so no event of it grows them by reallocation (they grew by doubling from empty before).
+    pub(crate) fn size_for(&mut self, sizes: crate::feed::Sizes) {
+        self.vals.reserve(sizes.vals);
+        self.frames.reserve(sizes.depth);
+    }
+
+    /// The value and frame stacks' capacities: the tests' measure of floor C3.
+    #[cfg(test)]
+    pub(crate) fn stack_capacities(&self) -> (usize, usize) {
+        (self.vals.capacity(), self.frames.capacity())
+    }
+
     // -----------------------------------------------------------------------------------------
     // Events
 
@@ -1327,6 +1340,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
 
     pub(crate) fn put_rows_of(&mut self, nodes: &[(Node, Range)]) -> List {
         let start = idx(self.out.rows.len());
+        // One growth for the list, not one per doubling the rows pass on the way.
+        self.out.rows.reserve(nodes.len());
+        self.out.row_ranges.reserve(nodes.len());
         for (n, r) in nodes {
             self.out.rows.push(*n);
             self.out.row_ranges.push(*r);

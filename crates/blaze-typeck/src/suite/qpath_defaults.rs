@@ -19,7 +19,7 @@ use super::check_body;
 use crate::Checked;
 use crate::diag::DiagCode;
 use crate::fixture::{Bb, Fx, show};
-use crate::ids::{ExprId, IntTy, LangItem, Mutbl};
+use crate::ids::{ExprId, IntTy, LangItem, Mutbl, UintTy};
 use crate::infer::InferPlant;
 use crate::machine::Plant;
 use crate::portable::PNode;
@@ -46,6 +46,12 @@ fn check(default_self: bool) -> (Fx, Checked<'static>, ExprId) {
     }
     fx.trait_fn(cmp, "eq", true, &[rp0, rp1], bool_);
     fx.imp("cmp for i32", 0, i32_, Some((cmp, &[i32_])), &[], Vec::new());
+    // A second impl, so `i32: Cmp<?Rhs>` has two candidates and selection before the
+    // argument's coercion (machine.rs `resolve_with_obligations`, rustc
+    // `resolve_vars_with_obligations`) leaves `Rhs` open: with one impl it would rightly fix
+    // `Rhs = i32` and the control would no longer tell the default from inference.
+    let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+    fx.imp("cmp u8 for i32", 0, i32_, Some((cmp, &[u8_])), &[], Vec::new());
     let owner = fx.func("f", 0, &[r_i32, rr_i32], bool_, Vec::new());
     fx.finish();
     let mut bb = Bb::new();

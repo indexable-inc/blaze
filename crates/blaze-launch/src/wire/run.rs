@@ -32,8 +32,9 @@ use crate::{Slot, Thread, Tier};
 
 /// The version of the run wire's bodies. A reader of another refuses the message by name
 /// ([`WireError::RunSchema`]). 2: `Up::Fault` carries the code around the pc and the thread's
-/// registers (wire/fault.rs).
-pub const RUN_SCHEMA: u32 = 2;
+/// registers (wire/fault.rs). 3: `Up::Fault` carries the faulting thread's callers, its
+/// frame-pointer chain (wire/fault.rs `Callers`).
+pub const RUN_SCHEMA: u32 = 3;
 
 /// A function instance as a code record names it: the bytes of blaze-code's `record::Symbol`
 /// (the item's stable id and its type arguments by content). This crate depends on no other,

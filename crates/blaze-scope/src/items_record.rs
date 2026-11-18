@@ -1169,6 +1169,9 @@ pub struct ItemsDecoded {
     pub texts: usize,
     /// Their bytes (hashed once each).
     pub text_bytes: usize,
+    /// UTF-8 checks of the records' strings: one per record opened (its whole strings section,
+    /// [`ItemsRecord::open`]), none per row read (rule 74).
+    pub string_checks: usize,
 }
 
 /// A text as a reader saw it the one time it asked: checked once, then answered from here.
@@ -1190,7 +1193,10 @@ pub struct ItemsRecord<'a> {
     root_module: ItemKey,
     counts: [usize; TABLES],
     offsets: [usize; TABLES + 1],
-    strings_len: usize,
+    /// The strings section, checked UTF-8 ONCE by [`ItemsRecord::open`] (the proof every row's
+    /// string is read under: a row's string is a slice of it, so a read checks only that the
+    /// slice lies inside it and on character boundaries, never the bytes again).
+    strings: &'a str,
     atoms: OnceCell<AVec<'a, (&'a str, Option<&'a str>)>>,
     /// Each text asked, by where it is, as its one check saw it: empty, and unallocated, until
     /// the first text is asked.
@@ -1226,6 +1232,11 @@ impl<'a> ItemsRecord<'a> {
             within(WHAT[i], offsets[i], counts[i].checked_mul(WIDTHS[i]))?;
         }
         within("strings", offsets[TABLES], Some(strings_len))?;
+        // The one UTF-8 check of the record's strings (rule 74): every string a row names is a
+        // slice of this section, which the writer made of `&str`s alone ([`Strings::put`]), so
+        // a bad byte anywhere in it is refused here, at open, whichever row's string it is in.
+        let strings = core::str::from_utf8(&bytes[offsets[TABLES]..offsets[TABLES] + strings_len])
+            .map_err(|e| ItemsRecordError::Utf8 { what: "the record's strings", at: e.valid_up_to() })?;
         Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX)).ok_or(ItemsRecordError::Byte { what: "an edition", byte: bytes[8 + 4 * F_EDITION] })?;
         std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: bytes[8 + 4 * F_STD] })?;
         Ok(ItemsRecord {
@@ -1234,10 +1245,10 @@ impl<'a> ItemsRecord<'a> {
             root_module: key_at(bytes, KEYS_AT + 32),
             counts,
             offsets,
-            strings_len,
+            strings,
             atoms: OnceCell::new(),
             seen: RefCell::new(HashMap::new_in(alloc)),
-            decoded: Cell::new(ItemsDecoded { crates: 1, bytes: bytes.len(), ..ItemsDecoded::default() }),
+            decoded: Cell::new(ItemsDecoded { crates: 1, bytes: bytes.len(), string_checks: 1, ..ItemsDecoded::default() }),
             alloc,
         })
     }
@@ -1292,12 +1303,14 @@ impl<'a> ItemsRecord<'a> {
 
     fn str_at(&self, what: &'static str, at: u32, len: u32) -> Result<&'a str, ItemsRecordError> {
         let (at, len) = (at as usize, len as usize);
-        if at.checked_add(len).is_none_or(|end| end > self.strings_len) {
+        let Some(end) = at.checked_add(len).filter(|end| *end <= self.strings.len()) else {
             return Err(ItemsRecordError::Short { what, at });
-        }
-        let start = self.offsets[TABLES] + at;
-        let bytes: &'a [u8] = &self.bytes[start..start + len];
-        core::str::from_utf8(bytes).map_err(|_| ItemsRecordError::Utf8 { what, at })
+        };
+        // No UTF-8 check here: `open` checked the whole section ([`ItemsRecord::strings`]). A
+        // range that cuts a character (a writer's bug: the writer stores whole strings) is
+        // refused by name, as a bad byte was.
+        let strings: &'a str = self.strings;
+        strings.get(at..end).ok_or(ItemsRecordError::Utf8 { what, at })
     }
 
     /// Row `i` of table `t`: its offset in the bytes. `i` is below the table's count.
@@ -1305,13 +1318,21 @@ impl<'a> ItemsRecord<'a> {
         self.offsets[t] + i * WIDTHS[t]
     }
 
-    /// Binary search of table `t`'s rows, keyed by their first 32 bytes.
+    /// Binary search of table `t`'s rows, keyed by their first 32 bytes. A step compares the
+    /// first 8 bytes as one big-endian word (the same order as the bytes'), and the 32 only
+    /// when those are equal: a key is a digest, so the word decides nearly every step with no
+    /// call to `memcmp` (285 self samples in the 2026-11-18 `engine-check` stack sample).
     fn find(&self, t: usize, key: ItemKey) -> Option<usize> {
         let (mut lo, mut hi) = (0usize, self.counts[t]);
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&key.0.0[..8]);
+        let want = u64::from_be_bytes(word);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let row = self.row(t, mid);
-            match self.bytes[row..row + 32].cmp(&key.0.0[..]) {
+            word.copy_from_slice(&self.bytes[row..row + 8]);
+            let order = u64::from_be_bytes(word).cmp(&want).then_with(|| self.bytes[row + 8..row + 32].cmp(&key.0.0[8..]));
+            match order {
                 core::cmp::Ordering::Less => lo = mid + 1,
                 core::cmp::Ordering::Greater => hi = mid,
                 core::cmp::Ordering::Equal => return Some(mid),
@@ -1746,6 +1767,7 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
             sum.bytes += d.bytes;
             sum.texts += d.texts;
             sum.text_bytes += d.text_bytes;
+            sum.string_checks += d.string_checks;
         }
         sum
     }

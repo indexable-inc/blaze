@@ -15,7 +15,7 @@ use bstd::test::{Fault, Given, Seeds, seeded};
 
 use super::super::{DirStore, FilesError, OnDir, RecordError, RecordPlant};
 use super::super::SEAL_LEN;
-use super::{CrateResults, Kept, Table, Whole, file_of, open};
+use super::{CrateResults, Kept, Table, Whole, file_of};
 
 const KEYS: u32 = 24;
 
@@ -25,6 +25,18 @@ fn krate() -> ContentId {
 
 fn key(k: u32) -> ContentId {
     ContentId::of("blaze-proc-macro table test", &k.to_le_bytes())
+}
+
+/// `bytes` as a pending row holds them: one block of their length in the test's heap.
+fn held(bytes: Vec<u8>) -> super::Bytes {
+    let mut out = super::Bytes::with_capacity_in(bytes.len(), blaze_own::testing::heap().shared());
+    out.extend_from_slice(&bytes);
+    out
+}
+
+/// The crate's results opened as a command opens them, its rows in the test's heap.
+fn open(store: &DirStore, krate: ContentId) -> Result<CrateResults, RecordError> {
+    super::open(store, krate, blaze_own::testing::heap().shared())
 }
 
 /// Key `k`'s read list: none, or one absent variable (three distinct lists over the keys).
@@ -93,14 +105,14 @@ fn program(io: &Io, plant: RecordPlant, cuts: bool) -> Result<(), RecordError> {
     let (a, b) = (opened(&store, cuts)?, opened(&store, cuts)?);
     for k in 0..KEYS {
         let into = if k % 2 == 0 { &a } else { &b };
-        into.insert_bytes(&store, key(k), list(k), answer(k))?;
+        into.insert_bytes(&store, key(k), held(list(k)), held(answer(k)))?;
     }
     let (first, second) = if a.table().len() % 2 == 0 { (&a, &b) } else { (&b, &a) };
     first.keep(&store, &[])?;
     second.keep(&store, &[])?;
     let third = opened(&store, cuts)?;
     for k in 0..KEYS {
-        third.insert_bytes(&store, key(k), list(k), answer(k))?;
+        third.insert_bytes(&store, key(k), held(list(k)), held(answer(k)))?;
     }
     third.keep(&store, &[])?;
     // Nothing more to keep: a second keep writes nothing.
@@ -197,7 +209,7 @@ fn large_table(name: &str, plant: RecordPlant) -> Result<(usize, usize), RecordE
     let run = || -> Result<(usize, usize), RecordError> {
         let first = open(&store, krate())?;
         for k in 0..LARGE_ROWS {
-            first.insert_bytes(&store, key(k), list(k), large_answer(k))?;
+            first.insert_bytes(&store, key(k), held(list(k)), held(large_answer(k)))?;
         }
         let Kept::Written { bytes, .. } = first.keep(&store, &[])? else { panic!("a command with new rows wrote nothing") };
         let again = open(&store, krate())?;

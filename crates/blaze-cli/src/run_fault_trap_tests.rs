@@ -56,7 +56,7 @@ fn record_bytes(alloc: blaze_own::Alloc<'_>) -> blaze_own::AVec<'_, u8> {
 
 fn said(offset: u64, placing: bool, bytes: &[u8]) -> std::string::String {
     let at = Spot { placed: Placed::Code, symbol: Symbol(FUNCTION), record: RecordId([0x2d; 32]), offset };
-    let fault = Fault { signal: Signal::Trap, pc: Some(0x1000 + offset), at: Some(at), address: 0x1000 + offset, touched: Some(at), write: None, code: None, regs: None };
+    let fault = Fault { signal: Signal::Trap, pc: Some(0x1000 + offset), at: Some(at), address: 0x1000 + offset, touched: Some(at), write: None, code: None, regs: None, callers: None };
     std::format!("{}", report(fault, &mut World { placing }, Some(Ok(bytes))))
 }
 

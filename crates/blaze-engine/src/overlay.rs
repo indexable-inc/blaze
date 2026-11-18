@@ -18,6 +18,10 @@
 //!    is absent.
 //! 3. A cell's readers are the last answer's, less those this request dropped, plus those it
 //!    added (`Plant::ReadersStale` drops the "less": the planted bug of last_sim.rs's control).
+//!    This request's writes to the reverse index are the engine's while it runs (readers.rs, the
+//!    strategy seam, applied in engine.rs `Engine::readers_into`): the overlay answers the last
+//!    answer's half ([`Overlay::last_readers_into`]) and holds the writes once the request ends
+//!    ([`Work::readers`], one sorted column).
 //! 4. A file's plan this request replaced or took shadows the last answer's.
 //! 5. The owed tasks and cells are this request's whole sets, started from the last answer's.
 //!
@@ -63,7 +67,7 @@
 //!   (by digest: the seen digest against today's; by generation: the cell's moved-at and
 //!   [`Overlay::moved_now`] of that cell alone), and a row changes only by [`Overlay::take_row`]
 //!   (its stale reads of counted cells leave the counts) and [`Overlay::put_row`] (its stale
-//!   reads join them), the reverse index changing with them (`read_by`, `unread_by`).
+//!   reads join them), the reverse index changing with them (the engine's index writes).
 //!
 //! So `Engine::finish` settles a cell when its count is 0 and asks no reader again: what it once
 //! asked of every reader of every owed cell, each a walk of the reader's read list, is a lookup
@@ -86,6 +90,7 @@ use blaze_own::{Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
 
 use crate::engine::{Answer, Cause, CellId, EngineError, Gen, Phase, Plant, Planned, Row, SMap, SSet, SVec};
 use crate::last::{Found, LastAnswer, LastRow, Touched};
+use crate::readers::ReaderEdits;
 
 /// A row's fixed fields as the engine asks for them, from this request's row or the last
 /// answer's: what a worker's view and the engine's walk read without the row's lists.
@@ -166,8 +171,9 @@ pub struct Work<'a> {
     pub rows: SMap<'a, Name, Option<Row<'a>>>,
     /// The cells this request moved: their digest and this request's serial, or `None`: absent.
     pub cells: SMap<'a, CellId, Option<(ContentId, Gen)>>,
-    /// Each cell's readers this request added (`true`) or dropped (`false`).
-    pub readers: SMap<'a, CellId, SMap<'a, Name, bool>>,
+    /// Each cell's readers this request added (`true`) or dropped (`false`), sorted by cell then
+    /// reader: put by the engine's finish (readers.rs `ReaderIndex::finish`), empty before.
+    pub readers: ReaderEdits<'a>,
     /// The file plans this request replaced (`Some`, sorted) or took (`None`).
     pub by_file: SMap<'a, Name, Option<SVec<'a, Name>>>,
     /// Whether each row this request touched is one with findings or failed, from now on.
@@ -282,20 +288,20 @@ impl<'a> Work<'a> {
                 }
             }
         }
-        for (id, delta) in self.readers.into_iter() {
-            let readers = answer.readers.entry(id).or_insert_with(|| BTreeSet::new_in(alloc));
-            for (reader, added) in delta.into_iter() {
-                match added {
+        for (id, delta) in self.readers.iter() {
+            let readers = answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc));
+            for (reader, added) in delta.iter() {
+                match *added {
                     true => {
-                        readers.insert(reader);
+                        readers.insert(*reader);
                     }
                     false => {
-                        readers.remove(&reader);
+                        readers.remove(reader);
                     }
                 }
             }
             if readers.is_empty() {
-                answer.readers.remove(&id);
+                answer.readers.remove(id);
             }
         }
         for (file, names) in self.by_file.into_iter() {
@@ -387,7 +393,7 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
             plant,
             rows: BTreeMap::new_in(alloc),
             cells: BTreeMap::new_in(alloc),
-            readers: BTreeMap::new_in(alloc),
+            readers: ReaderEdits::new_in(alloc),
             by_file: BTreeMap::new_in(alloc),
             findings: BTreeMap::new_in(alloc),
             owed_tasks,
@@ -724,42 +730,21 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
 
     // The reverse index (rule 3).
 
-    /// The tasks whose rows read `id`, ascending by name.
-    pub fn readers(&self, id: CellId) -> Result<SVec<'a, Name>, EngineError> {
-        let alloc = self.work.alloc;
-        let delta = self.work.readers.get(&id);
-        let mut out: SVec<'a, Name> = Vec::new_in(alloc);
+    /// The last answer's readers of `id`, pushed on `out` in the last answer's order: the first
+    /// half of shadowing rule 3, which the engine completes with this request's writes
+    /// (engine.rs `Engine::readers_into`).
+    pub fn last_readers_into(&self, id: CellId, out: &mut SVec<'a, Name>) -> Result<(), EngineError> {
         if let Some(cell) = self.last.cell(&id) {
-            for task in self.last.readers(cell, Alloc::from(alloc))?.iter() {
-                let name = self.name_of(*task, id.of)?;
-                let dropped = delta.is_some_and(|delta| delta.get(&name) == Some(&false));
-                if !dropped || self.plant == Plant::ReadersStale {
-                    out.push(name);
-                }
+            for task in self.last.readers(cell, Alloc::from(self.work.alloc))?.iter() {
+                out.push(self.name_of(*task, id.of)?);
             }
         }
-        if let Some(delta) = delta {
-            for (name, added) in delta.iter() {
-                if *added {
-                    out.push(*name);
-                }
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        Ok(())
     }
 
-    /// `reader`'s row reads `id` from now on.
-    pub fn read_by(&mut self, id: CellId, reader: Name) {
-        let alloc = self.work.alloc;
-        self.work.readers.entry(id).or_insert_with(|| BTreeMap::new_in(alloc)).insert(reader, true);
-    }
-
-    /// `reader`'s row no longer reads `id`.
-    pub fn unread_by(&mut self, id: CellId, reader: Name) {
-        let alloc = self.work.alloc;
-        self.work.readers.entry(id).or_insert_with(|| BTreeMap::new_in(alloc)).insert(reader, false);
+    /// The request's writes to the reverse index, at its end (the engine's finish).
+    pub fn put_readers(&mut self, edits: ReaderEdits<'a>) {
+        self.work.readers = edits;
     }
 
     // File plans (rule 4).

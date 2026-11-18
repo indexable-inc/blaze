@@ -22,6 +22,9 @@
 //!
 //! - The code is followed by its literal words (8-aligned) and its data rows (each at least
 //!   8-aligned, at most 16): placement puts the code's first byte at a 16-aligned address.
+//! - No function is refused for its size below `b`'s ±128 MiB of instructions: a conditional
+//!   branch, literal load or `adr` whose target may pass its ±1 MiB is reached through an
+//!   island of veneers placed in the code, or a long form (pass/reach.rs).
 //!
 //! # The record form
 //!
@@ -260,6 +263,10 @@ mod trap_codes_tests;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tier_tests;
+
+/// Branches and references past ±1 MiB, run (pass/reach.rs).
+#[cfg(all(test, target_arch = "aarch64"))]
+mod reach_tests;
 
 
 /// The most bytes a `memcpy` or `memset` of a constant length is emitted inline; past it, the
@@ -537,6 +544,20 @@ pub(crate) fn emit_inline_up_to<A: Allocator>(
     inline_most: u64,
     out: &mut Code<A>,
 ) -> Result<Called, EmitError> {
+    emit_reaching(func, via, bound, isa, inline_most, pass::Reach::Islands, out)
+}
+
+/// [`emit_inline_up_to`] with the pass's `reach` (pass/reach.rs): [`pass::Reach::ShortOnly`]
+/// is the reach tests' control, the pass with no island and no long form.
+pub(crate) fn emit_reaching<A: Allocator>(
+    func: View<'_>,
+    via: &[Via],
+    bound: &RoutinePlaces,
+    isa: Isa,
+    inline_most: u64,
+    reach: pass::Reach,
+    out: &mut Code<A>,
+) -> Result<Called, EmitError> {
     out.bytes.clear();
     out.fixups.clear();
     out.relocs.clear();
@@ -552,6 +573,7 @@ pub(crate) fn emit_inline_up_to<A: Allocator>(
         None => func,
         Some(owned) => owned.view(),
     };
-    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, &mut out.positions, None)?;
+    // The pass's own rows (the pending short fields, the islands' copies) in the same scratch.
+    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, &mut out.positions, None, reach, heap.handle())?;
     Ok(called)
 }

@@ -63,7 +63,6 @@ use blaze_ladder::front2::reads::Fact;
 use blaze_ladder::front2::project::BodyVerdict;
 use blaze_ladder::front2::project::head_digest::{HeadDigestError, WantPlace, reads_a_head, want_lib};
 use blaze_ladder::front2::source::NamesSource;
-use blaze_scope::items_record::ItemsRecord;
 use blaze_scope::resolve::At;
 use blaze_surface::{Edition, Item, ItemIndex, ItemKind};
 use std::alloc::Global;
@@ -140,7 +139,11 @@ impl<'n> Checker<'n> {
     fn read_head_file(&self, krate: usize, file: u32, _frame: &'n bstd::mem::Frame) -> Result<Option<HeadFile<'n>>, &'n str> {
         let g = self.heap;
         let reader = self.readers.get(krate).ok_or("a head's crate is not among the body's crates (body_types/heads.rs)")?;
-        let items = ItemsRecord::open(reader.records.items, g).map_err(|_| "a head's crate's items record does not open (body_types/heads.rs)")?;
+        // The job's one open of the crate's items record, the names records' (front2 source.rs
+        // `Records::items_record`, opened at its first question and kept): never opened again
+        // per head file (before 2026-11-18, each file of a head opened it and re-checked its
+        // strings).
+        let items = self.records.items_record(krate).ok_or("a head's crate's items record is not held by the job's names records (body_types/heads.rs)")?;
         let row = match items.file(file) {
             Ok(Some(row)) => row,
             _ => return Err("a head's file is not in its crate's items record (body_types/heads.rs)"),

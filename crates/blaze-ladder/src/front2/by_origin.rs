@@ -536,6 +536,14 @@ pub fn const_params_of<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, store:
     let kind = world_kind(names, keys, store,item).map_err(|e| Unmade::Refused(Refusal::Fill(e)))?;
     let refuse = |class: KeyClass| Unmade::Refused(Refusal::Kind(KindGap::Unanswered { question: Question::ConstParams(item), class, path: path(names, keys, store, item) }));
     match kind {
+        // An opaque of a type alias (front2/tait.rs): its const parameters are the alias's.
+        WorldKind::Opaque { fn_, index } if super::tait::of_alias(index) => match kind_of_key(names, keys, fn_).map_err(|e| Unmade::Refused(Refusal::Fill(e)))? {
+            KeyKind::Item(ItemKind::TypeAlias(lib)) => match store.maps.const_params.get(&lib) {
+                Some(c) => Ok(&c[..]),
+                None => Err(want_unmade(names, keys, store, fn_)),
+            },
+            other => Err(refuse(other.class())),
+        },
         WorldKind::Opaque { fn_, .. } => match store.fns.get(&fn_) {
             Some(f) => Ok(&f.consts[..]),
             None => Err(want_unmade(names, keys, store,fn_)),

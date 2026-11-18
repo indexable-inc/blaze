@@ -41,7 +41,7 @@ impl Facts for Plain {
 /// The fixtures' facts with lifetime parts: each fn's read from the text given for it by
 /// [`read_signature`], as the census does. `callees_known` false: no callee's head is known
 /// (the lowering relates such a call as one of unknown signature).
-struct Sigs {
+pub(crate) struct Sigs {
     sigs: vec::Vec<(ItemKey, SigBuf<Alloc<'static>>)>,
     callees_known: bool,
     /// The text of the body being lowered (`Facts::own_text`); empty: not known.
@@ -49,7 +49,7 @@ struct Sigs {
 }
 
 impl Sigs {
-    fn new() -> Sigs {
+    pub(crate) fn new() -> Sigs {
         Sigs { sigs: vec::Vec::new(), callees_known: true, own: String::new() }
     }
 
@@ -722,13 +722,13 @@ fn callable_parameter_types_are_read() {
 }
 
 /// [`Sigs`] with one ADT that declares lifetimes (`life`), and closures lowered.
-struct Wide {
-    sigs: Sigs,
-    life: Option<ItemKey>,
+pub(crate) struct Wide {
+    pub(crate) sigs: Sigs,
+    pub(crate) life: Option<ItemKey>,
 }
 
 impl Wide {
-    fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
+    pub(crate) fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
         let life = self.life;
         let mut buf = SigBuf::new_in(Alloc::global());
         match read_signature(text, fx.t.view(), inputs, output, &|k| Some(u32::from(Some(k) == life)), &mut buf, Alloc::global()) {

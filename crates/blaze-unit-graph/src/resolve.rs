@@ -237,7 +237,7 @@ impl<'l, 'a> Resolution<'l, 'a> {
         if dep.kind == DepKind::Dev {
             // Dev-dependencies are a workspace member's only (a published package's are not
             // in the lock), and take part when tests are built; resolver 1 always unifies them.
-            let wanted = self.ask.tests || self.resolver == Resolver::V1 || self.plant == Plant::DevLeaks;
+            let wanted = (self.ask.tests || self.resolver == Resolver::V1 || self.plant == Plant::DevLeaks) && self.plant != Plant::DevIgnored;
             if !self.members[id.index()] || !wanted {
                 return false;
             }

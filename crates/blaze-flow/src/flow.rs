@@ -85,6 +85,11 @@ pub enum Proj {
     DerefBox,
     /// Any index: two indices may overlap.
     Index,
+    /// rustc's `ConstantIndex`: the element `offset` from the start (`from_end`: from the end,
+    /// 1 the last) of a value at least `min_length` long.
+    ConstantIndex { offset: u32, min_length: u32, from_end: bool },
+    /// rustc's `Subslice`: elements `from..to` (`from_end`: `from..len - to`).
+    Subslice { from: u32, to: u32, from_end: bool },
     Downcast(u32),
 }
 
@@ -98,6 +103,22 @@ pub struct PlaceRow {
     pub depth: u32,
     /// A `Field` of a type that implements `Drop`: not movable out of (the Reference).
     pub of_drop_type: bool,
+    /// An element or subslice of an UNSIZED `[T]` (a slice pattern under a reference or a
+    /// `Box<[T]>`): not movable out of (E0508, "cannot move out of type `[T]`, a non-copy
+    /// slice"), where the same projection of an array `[T; N]` is. Its own fact, never read
+    /// from [`Self::of_drop_type`] (lane B12 item 6).
+    pub of_slice: bool,
+}
+
+/// What a place made by [`FlowBuilder::project_in`] is marked as: one fact per row, the
+/// reason a move out of it is refused (moves.rs `move_out`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlaceMark {
+    None,
+    /// [`PlaceRow::of_drop_type`].
+    DropField,
+    /// [`PlaceRow::of_slice`].
+    SliceElement,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -306,6 +327,10 @@ impl<A: Allocator> Flow<A> {
                 Some(Proj::Deref) => write!(f, ".*")?,
                 Some(Proj::DerefBox) => write!(f, ".box")?,
                 Some(Proj::Index) => write!(f, "[_]")?,
+                Some(Proj::ConstantIndex { offset, from_end: false, .. }) => write!(f, "[{offset}]")?,
+                Some(Proj::ConstantIndex { offset, from_end: true, .. }) => write!(f, "[-{offset}]")?,
+                Some(Proj::Subslice { from, to, from_end: false }) => write!(f, "[{from}..{to}]")?,
+                Some(Proj::Subslice { from, to, from_end: true }) => write!(f, "[{from}..-{to}]")?,
                 Some(Proj::Downcast(v)) => write!(f, " as {v}")?,
                 None => {}
             }
@@ -427,6 +452,7 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
                 proj: None,
                 depth: 0,
                 of_drop_type: false,
+                of_slice: false,
             });
         }
         FlowBuilder {
@@ -457,11 +483,17 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
         self.flow.local_places[l as usize]
     }
 
+    /// The projection that made `p` from its parent; `None` for a local's own place (or a
+    /// place this builder never made).
+    pub fn proj_of(&self, p: Place) -> Option<Proj> {
+        self.flow.places.get(p.index()).and_then(|row| row.proj)
+    }
+
     /// A new local (a temporary or a binding found while lowering): its place is a new row.
     pub fn add_local(&mut self) -> Local {
         let l = Local(self.flow.locals);
         self.flow.locals += 1;
-        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false });
+        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false });
         self.flow.local_places.push(Place(self.flow.places.len() as u32 - 1));
         l
     }
@@ -473,6 +505,12 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
 
     /// As [`Self::project`], marking a field of a type that implements `Drop`.
     pub fn project_marked(&mut self, parent: Place, proj: Proj, of_drop_type: bool) -> Place {
+        self.project_in(parent, proj, if of_drop_type { PlaceMark::DropField } else { PlaceMark::None })
+    }
+
+    /// As [`Self::project`], the new row marked `mark` (a place is interned by its parent and
+    /// projection: the mark is a fact of those, so a second ask finds the first row).
+    pub fn project_in(&mut self, parent: Place, proj: Proj, mark: PlaceMark) -> Place {
         for (i, row) in self.flow.places.iter().enumerate() {
             if row.parent == Some(parent) && row.proj == Some(proj) {
                 return Place(i as u32);
@@ -484,7 +522,8 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
             parent: Some(parent),
             proj: Some(proj),
             depth: up.depth + 1,
-            of_drop_type,
+            of_drop_type: mark == PlaceMark::DropField,
+            of_slice: mark == PlaceMark::SliceElement,
         });
         Place(self.flow.places.len() as u32 - 1)
     }

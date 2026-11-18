@@ -51,6 +51,7 @@
 use blaze_drive::cells::Cell;
 use blaze_drive::key::{self, ABSENT, Key, Kind, Name, Tool};
 use blaze_engine::CellId;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc};
@@ -70,6 +71,7 @@ use crate::front2::heads::{HeadError, SeedFailed, Seeded, Store, Want};
 use crate::front2::keys::{Keys, MemberKind, checker_of, member_key_of};
 use crate::front2::project::head_digest::{digest_of_heads, want_heads};
 use crate::front2::source::NamesSource;
+use crate::front2::tables::owned_reads::ReadOwners;
 
 const MAGIC: [u8; 4] = *b"BZFZ";
 /// Raised on any change of the form; head_record.rs's own version is inside each record.
@@ -447,9 +449,18 @@ pub struct Frozen<'a> {
     /// too). Read by value ([`const_value_cell`]): the record holds the value, not the
     /// constant's text, so an edit that keeps the value keeps the record.
     pub consts: AVec<'a, (LibKey, u128)>,
-    /// The wants its store made by lowering (heads.rs `Store::lowered`): over a store seeded
-    /// from frozen heads ([`freeze_seeded`]), only the item's own.
+    /// The wants its store made by lowering (heads.rs `Store::lowered`) outside a constant's
+    /// evaluation: over a store seeded from frozen heads ([`freeze_seeded`]), only the item's
+    /// own.
     pub lowered: u32,
+    /// The wants the CONSTANT EVALUATOR made by lowering in its store ([`ConstSource::eval_const`]):
+    /// its `Records` make the heads an evaluation needs by an unseeded `Store::ensure`, so a
+    /// constant ITEM an anonymous constant names (`[u8; N]`: the anon const's body reads `N`)
+    /// has its head lowered again here though `N`'s own cell froze it (owned_reads_tests.rs
+    /// `one_source_lowers_each_head_and_evaluates_each_constant_once`, lane H7: the 31st of 30).
+    /// Counted apart, so the freeze's floor is stated exactly; seeding the evaluator's store is
+    /// front2 check.rs `Records`' piece (the report's NOT DONE).
+    pub eval_lowered: u32,
 }
 
 /// The item whose whole want is `want`, frozen: a pure function of the item and the names. It
@@ -502,9 +513,16 @@ pub fn freeze_seeded<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
     let mut keys = Keys::new();
     let mut needed: AVec<'a, Want> = AVec::new_in(alloc);
     let mut asked: AVec<'a, LibKey> = AVec::new_in(alloc);
+    // What the constant evaluator lowered in this store ([`Frozen::eval_lowered`]).
+    let mut by_eval = 0u32;
     for _ in 0..=MOST_FREEZE_CONSTS {
         let c = match ensure_in(names, want, want, source, &mut store, &mut keys, &mut needed, scratch) {
-            Ok(()) => return finish(names, &keys, &mut store, want, &needed, alloc),
+            Ok(()) => {
+                let mut frozen = finish(names, &keys, &mut store, want, &needed, alloc)?;
+                frozen.lowered = frozen.lowered.saturating_sub(by_eval);
+                frozen.eval_lowered = by_eval;
+                return Ok(frozen);
+            }
             Err(Need::Fail(e)) => return Err(e),
             Err(Need::Const(c)) => c,
         };
@@ -529,7 +547,10 @@ pub fn freeze_seeded<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
                 Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
             }
         }
-        match source.eval_const(&mut store, &mut keys, c) {
+        let before = store.lowered;
+        let evaluated = source.eval_const(&mut store, &mut keys, c);
+        by_eval = by_eval.saturating_add(store.lowered.saturating_sub(before));
+        match evaluated {
             Ok(()) => {}
             // In a trait's members it is the asking member's gap, as an anonymous constant's
             // refusal is (`Maps::anon_failed`; types.rs `const_value_bits`): the member is
@@ -592,7 +613,7 @@ fn finish<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Store<'
     let mut consts: AVec<'a, (LibKey, u128)> = AVec::with_capacity_in(store.maps.const_bits.len(), alloc);
     consts.extend(store.maps.const_bits.iter().map(|(k, b)| (*k, *b)));
     consts.sort_unstable_by_key(|(k, _)| *k);
-    Ok(Frozen { bytes, reads, consts, lowered: store.lowered })
+    Ok(Frozen { bytes, reads, consts, lowered: store.lowered, eval_lowered: 0 })
 }
 
 /// The seed of a store making cell `own` (`None`: a body's store, which makes no cell): need
@@ -1052,8 +1073,14 @@ pub struct SeededHeads<'n, 'a, N> {
     pub attempts: u32,
     /// What evaluates a constant a head's type holds ([`ConstSource::eval_const`]).
     consts: Option<&'a mut (dyn ConstValues<'n> + 'a)>,
-    /// The wants all its freezes made by lowering (heads.rs `Store::lowered`).
+    /// The wants all its freezes made by lowering (heads.rs `Store::lowered`), outside constant
+    /// evaluation ([`Frozen::lowered`]).
     pub lowered: u32,
+    /// The wants its constant evaluator made by lowering ([`Frozen::eval_lowered`]).
+    pub eval_lowered: u32,
+    /// Each kept cell's own [`Frozen::lowered`], at its index in `kept` (0 for one taken from
+    /// `known`): which cell a count past its floor is (owned_reads_tests.rs prints it).
+    lowered_each: AVec<'a, u32>,
     /// The needs met of a cell up the stack ([`HeadSource::open`]), each lowered where met.
     pub reentered: u32,
     /// The frozen heads known before this source freezes a cell itself (the request's, seeds.rs
@@ -1063,6 +1090,14 @@ pub struct SeededHeads<'n, 'a, N> {
     from_known: AVec<'a, bool>,
     /// The cells copied from `known`.
     pub taken: u32,
+    /// Told each cell's freeze as it begins and ends ([`SeededHeadsOpts::owners`]).
+    owners: Option<&'a (dyn ReadOwners + 'a)>,
+    /// Each kept cell's index in `kept`, by its bytes ([`want_bytes`]): an ask is one probe, not
+    /// a walk of every cell kept so far (a job of a large member keeps tens of thousands, and
+    /// each ask walked them: quadratic in the job, lane H8).
+    at: Map<[u8; WANT_BYTES], usize, FixedState, Alloc<'a>>,
+    /// Each failed cell's [`Unmade`], by its bytes: the lookup of `failed`, which keeps the order.
+    failed_at: Map<[u8; WANT_BYTES], Unmade, FixedState, Alloc<'a>>,
     alloc: Alloc<'a>,
 }
 
@@ -1147,6 +1182,11 @@ pub struct SeededHeadsOpts<'n, 'a, N> {
     /// cell taken from it keeps no reads ([`HeadCells::cell`] answers it with none), so a head
     /// task, whose read list is its source's, takes none.
     pub known: Option<&'a (dyn KnownHeads + 'a)>,
+    /// Who the names reads made now belong to (front2 tables/owned_reads.rs): each attempt of
+    /// a cell's freeze is entered as that cell's and left after, so a recorder with owners keeps
+    /// every cell's reads apart and one source serves many head tasks. `None`: no one is told
+    /// (a source a task, whose recorder is the task's).
+    pub owners: Option<&'a (dyn ReadOwners + 'a)>,
 }
 
 impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
@@ -1165,17 +1205,33 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             attempts: 0,
             consts: o.consts,
             lowered: 0,
+            eval_lowered: 0,
+            lowered_each: AVec::new_in(o.alloc),
             reentered: 0,
             known: o.known,
             from_known: AVec::new_in(o.alloc),
             taken: 0,
+            owners: o.owners,
+            at: Map::new(MapOpts { hasher: FixedState, alloc: o.alloc, capacity: None }),
+            failed_at: Map::new(MapOpts { hasher: FixedState, alloc: o.alloc, capacity: None }),
             alloc: o.alloc,
         }
+    }
+
+    /// Cell `want` kept at the end of `kept` (its bytes pushed there just now): indexed.
+    fn index_last(&mut self, want: Want) {
+        self.at.insert(want_bytes(want), self.kept.cells.len() - 1);
     }
 
     /// The cells frozen so far, in the order they were finished.
     pub fn cells(&self) -> impl Iterator<Item = Want> + '_ {
         self.kept.cells.iter().map(|(w, _)| *w)
+    }
+
+    /// Each kept cell with the wants its freeze lowered (outside constant evaluation), in the
+    /// order finished; 0 for a cell taken from the known heads.
+    pub fn lowered_each(&self) -> impl Iterator<Item = (Want, u32)> + '_ {
+        self.kept.cells.iter().zip(self.lowered_each.iter()).map(|((w, _), n)| (*w, *n))
     }
 
     /// How many cells it keeps (frozen here or taken from its known heads).
@@ -1214,10 +1270,11 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
     /// frozen, it answers [`FreezeError::Unfrozen`] and the driver freezes that cell first: no
     /// freeze runs inside another, so the stack is `making` and not the thread's.
     fn made(&mut self, want: Want) -> Result<usize, FreezeError> {
-        if let Some(at) = self.kept.cells.iter().position(|(w, _)| *w == want) {
+        let key = want_bytes(want);
+        if let Some(&at) = self.at.get(&key) {
             return Ok(at);
         }
-        if let Some(&(_, unmade)) = self.failed.iter().find(|(w, _)| *w == want) {
+        if let Some(&unmade) = self.failed_at.get(&key) {
             return Err(unmade.again(want));
         }
         // Known already (the request's table, another worker's freeze): copied in, so its
@@ -1232,8 +1289,10 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             let mut copy = RecordBytes::with_capacity_in(bytes.len(), self.alloc);
             copy.extend_from_slice(bytes);
             self.kept.cells.push((want, copy));
+            self.index_last(want);
             self.reads.push(AVec::new_in(self.alloc));
             self.values.push(AVec::new_in(self.alloc));
+            self.lowered_each.push(0);
             self.from_known.push(true);
             self.taken += 1;
             return Ok(self.kept.cells.len() - 1);
@@ -1246,7 +1305,7 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         self.making.clear();
         driven?;
         // The driver returns once `want`, the stack's bottom, is kept.
-        self.kept.cells.iter().position(|(w, _)| *w == want).ok_or(FreezeError::Unfrozen { need: want })
+        self.at.get(&key).copied().ok_or(FreezeError::Unfrozen { need: want })
     }
 
     /// Freeze the cells on `making`, innermost first, until it is empty: a freeze that meets a
@@ -1255,16 +1314,28 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
     /// [`MOST_ATTEMPTS`]. A failure fails every cell on the stack (each needs the one above it),
     /// kept so none is frozen again, and is handed to the asker as it was.
     fn drive(&mut self, want: Want) -> Result<(), FreezeError> {
-        let (names, sized, frame, scratch, alloc) = (self.names, self.sized, self.frame, self.scratch, self.alloc);
+        let (names, sized, frame, scratch, alloc, owners) = (self.names, self.sized, self.frame, self.scratch, self.alloc, self.owners);
         for _ in 0..MOST_ATTEMPTS {
             let Some(&top) = self.making.last() else { return Ok(()) };
             self.attempts += 1;
             let reentered = self.reentered;
-            match freeze_seeded(names, sized, top, self, frame, scratch, alloc) {
+            // This attempt's reads are `top`'s (front2 tables/owned_reads.rs): its lookups, the
+            // ones that find and seed its needs, and its constants' evaluation.
+            if let Some(owners) = owners {
+                owners.enter(top);
+            }
+            let attempt = freeze_seeded(names, sized, top, self, frame, scratch, alloc);
+            if let Some(owners) = owners {
+                owners.leave();
+            }
+            match attempt {
                 Ok(f) => {
                     self.making.pop();
                     self.lowered += f.lowered;
+                    self.eval_lowered += f.eval_lowered;
+                    self.lowered_each.push(f.lowered);
                     self.kept.cells.push((top, f.bytes));
+                    self.index_last(top);
                     self.reads.push(f.reads);
                     self.values.push(f.consts);
                     self.from_known.push(false);
@@ -1283,11 +1354,21 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
                     let making = core::mem::replace(&mut self.making, AVec::new_in(alloc));
                     // A need refused as not the asker's: each cell on the stack keeps that
                     // refusal itself, so a later ask meets its words and class, not `Again`.
+                    // A need that failed BEFORE (`Again`, from a seed of it inside this freeze):
+                    // the cells on the stack failed because THAT cell did, so a later ask names
+                    // it, the cell whose reason the request was told when it first failed
+                    // (front2 tables/seeds.rs `RequestSeed::seed`). Named `top` instead, a later
+                    // ask's `Again` pointed at a cell no failure was ever handed for (lane H8:
+                    // tempo printed "the request was never told why" 718 times).
                     let unmade = match &e {
                         FreezeError::NotTheirs { want, why } => Unmade::Refused { want: *want, why: *why },
+                        FreezeError::Again { failed, .. } => Unmade::Failed(*failed),
                         _ => Unmade::Failed(top),
                     };
                     self.failed.extend(making.iter().map(|w| (*w, unmade)));
+                    for w in making.iter() {
+                        self.failed_at.insert(want_bytes(*w), unmade);
+                    }
                     return Err(e);
                 }
             }

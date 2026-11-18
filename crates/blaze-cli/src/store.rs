@@ -59,6 +59,18 @@ pub(crate) mod roots;
 /// rollback floor a home keeps for each set it reads.
 pub(crate) mod published;
 
+/// A fresh home takes a published set whole, once, before the command's first phase (D138).
+pub(crate) mod take;
+
+/// `blaze store publish <folder> --signer <key file>`: a trusted builder's (D136).
+pub(crate) mod publish_command;
+
+/// Whether this blaze is a trusted builder's (CI's: blaze-cli's `publish` feature, D136): its
+/// store is opened as a trusted writer's, so a record every name of which is public (the
+/// toolchain's, [`Sharing`]) is put `PUBLIC`, which `blaze store publish` lays out. A
+/// developer's blaze puts every record `LOCAL`, and nothing it makes is ever published.
+pub(crate) const TRUSTED_BUILDER: bool = cfg!(feature = "publish");
+
 /// The seam the request reads and writes records through. `'m` is the borrow of the command's
 /// [`Lent`]: a [`Held<'m>`] outlives every later get and put (blaze-cas plain/lent.rs).
 pub trait Store<'m> {
@@ -160,6 +172,9 @@ pub enum StoreFailure {
     Root(roots::RootError),
     /// The published set (store/published.rs): its walk, its floor, or its folder's write.
     Published(published::PublishedError),
+    /// A published set named by `--origin` could not be taken (store/take.rs): the command
+    /// stops, and nothing is made in its place (rule 3).
+    Take(take::TakeError),
 }
 
 /// A drive record's form, as [`record::open`](blaze_drive::record::open) reads it.
@@ -455,6 +470,7 @@ impl fmt::Display for StoreFailure {
             StoreFailure::Look { folder, error } => write!(f, "looking for the old store folder {folder}: {error}"),
             StoreFailure::Root(error) => write!(f, "{error}"),
             StoreFailure::Published(error) => write!(f, "{error}"),
+            StoreFailure::Take(error) => write!(f, "{error}"),
             StoreFailure::TwoValues { key, lent, clash } => {
                 write!(f, "the store under the home's .blaze/v2/store: two values under one key {key}: the record of ")?;
                 clash.write_subject(f)?;
@@ -671,7 +687,8 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
         if named > plain_place::SEGMENTS_NAMED_MOST {
             err.line(cx, format_args!("blaze: the store under the home's .blaze/{} names {named} segments, past {}: its compaction is behind", plain_place::STORE_DIR, plain_place::SEGMENTS_NAMED_MOST))?;
         }
-        Ok(CommandStore { place: PlainPlace::new(lent, public_writer), sharing: ToolchainCrates::new(), toolchain: std::vec::Vec::new_in(Global), remote, mapped_all: false, open_ns })
+        // A trusted builder's blaze writes the public class `PUBLIC` whoever calls ([`TRUSTED_BUILDER`]).
+        Ok(CommandStore { place: PlainPlace::new(lent, public_writer || TRUSTED_BUILDER), sharing: ToolchainCrates::new(), toolchain: std::vec::Vec::new_in(Global), remote, mapped_all: false, open_ns })
     }
 }
 
@@ -696,11 +713,7 @@ pub struct Opened {
 pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout_root: &Dir<ReadWrite>, checkout: &str, clock: &Clock, err: &Out, heap: &'static blaze_own::Heap) -> Result<Opened, CliError> {
     let home = Home::of(cx, &io.need_fs()?, home)?;
     let boot = match io.boot() {
-        Ok(boot) => {
-            let mut first = [0u8; 8];
-            first.copy_from_slice(&boot.0[..8]);
-            Some(u64::from_le_bytes(first))
-        }
+        Ok(boot) => Some(boot_fact(&boot)),
         Err(why) => {
             err.line(cx, format_args!("blaze: no boot fact ({why}): each segment an earlier command wrote is checked once"))?;
             None
@@ -709,10 +722,23 @@ pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout
     let nonce = nonce(&mut io.need_rng()?);
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let began = ns(clock);
-    let lent = home.open_store(&Settings::default(), Facts { boot, nonce }, heap.alloc())?;
+    // A trusted builder's store may name the public namespace ([`TRUSTED_BUILDER`]); a
+    // developer's only its own.
+    let settings = Settings { trusted_writer: TRUSTED_BUILDER, ..Settings::default() };
+    let lent = home.open_store(&settings, Facts { boot, nonce }, heap.alloc())?;
     let open_ns = ns(clock).saturating_sub(began);
     old_home(cx, &home, checkout_root, checkout, &lent, err)?;
     Ok(Opened { home, lent, open_ns })
+}
+
+/// The store's boot fact ([`Facts::boot`]) of the machine's boot: its first 8 bytes. A power
+/// cut is a new boot, so a segment written before it is checked once after it (a torn,
+/// unsynced segment is then lost by name, never trusted): a test that opens a store after a
+/// simulated crash takes its boot from here too, never a constant.
+pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&boot.0[..8]);
+    u64::from_le_bytes(first)
 }
 
 /// After the answer is printed, once every handle over `lent` is gone: the ONE commit of this
@@ -962,7 +988,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
                 if let (Some(set), Some(head), false) = (remote.named.check.set, remote.reader.head(), remote.floored)
                     && head.generation > set.seen
                 {
-                    published::keep_floor(&mut self.place, &set.id, head.generation)?;
+                    published::keep_floor(&mut self.place, &set.id, head.generation, clock.wall().as_ns())?;
                     remote.floored = true;
                 }
                 self.place.get(key)?
@@ -1094,20 +1120,33 @@ struct OneKey {
     set: Option<PublishedSet>,
 }
 
-/// A published set a named origin is read as (blaze-remote published/set.rs): its id, and the
-/// highest generation this home has taken for it (store/published.rs `floor`).
+/// A published set a named origin is read as (blaze-remote published/set.rs): its id, the
+/// highest generation this home has taken for it (store/published.rs `floor`), and whether the
+/// command named a key for the origin (`--origin-key`; else only blaze-remote's compiled-in
+/// `trust::PUBLISHED_KEYS` are believed, D137).
 #[derive(Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code, reason = "made by `NamedOrigin::published`, which main.rs names next"))]
 struct PublishedSet {
     id: ContentId,
     seen: u64,
+    named: bool,
+}
+
+impl OneKey {
+    /// The keys the command granted the origin by name: the one, or for a published set named
+    /// with no `--origin-key`, none.
+    fn named_keys(&self) -> &[PublicKey] {
+        match self.set {
+            Some(PublishedSet { named: false, .. }) => &[],
+            _ => &self.keys,
+        }
+    }
 }
 
 impl HeadCheck for OneKey {
     fn check(&self, namespace: Namespace, signer: &PublicKey, domain: &'static str, message: &[u8], signature: &[u8; 64]) -> Result<(), SignatureWhy> {
         match self.set {
             None => Ed25519Keys { namespace: Namespace::PUBLIC, keys: &self.keys }.check(namespace, signer, domain, message, signature),
-            Some(set) => SetCheck { set: set.id, keys: &self.keys, seen: set.seen }.check(namespace, signer, domain, message, signature),
+            Some(set) => SetCheck { set: set.id, keys: self.named_keys(), seen: set.seen }.check(namespace, signer, domain, message, signature),
         }
     }
 }
@@ -1134,23 +1173,38 @@ impl NamedOrigin {
         }
     }
 
-    /// The published set `set` of the folder origin `folder` (its `public/<toolchain>/<target>`),
-    /// believed when its head is `key`'s over the set's id at a generation no lower than the
-    /// floor `lent` holds for it. An `http://` origin is NOT DONE here (its base joined with the
-    /// set's folder): refused by name.
-    #[cfg_attr(not(test), allow(dead_code, reason = "named by main.rs once the toolchain manifest pins the published keys (the report's NOT DONE); the e2e test reads through it"))]
-    pub fn published<D: Driver>(cx: &Cx, fs: &Fs, folder: &str, key: &str, set: blaze_remote::published::set::SetName<'_>, lent: &Lent<D, StoreAlloc>) -> Result<NamedOrigin, CliError> {
-        if folder.starts_with("http://") || folder.starts_with("https://") {
-            return Err(CliError::Usage("a published set is read from a folder origin for now; an http:// one is not joined to the set's folder yet"));
-        }
-        let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
-        let mut dir = fs.open_dir(cx, &Path::new(folder)?)?;
-        for part in set.dir() {
-            dir = dir.subdir(&Path::new(part)?);
-        }
+    /// The published set `set` of the origin `origin`: its folder `public/<toolchain>/<target>`
+    /// beneath a folder, or that path joined to an `http://` base (each object then one ranged
+    /// GET of `<base>/public/<toolchain>/<target>/<name>`). Believed when its head is signed over
+    /// the set's id by a key trusted for the origin (blaze-remote trust.rs `trusted_for`: the
+    /// compiled-in published keys, or `key`, the `--origin-key` named for it), at a generation
+    /// no lower than the floor `lent` holds for it. `https://` is refused by name, as for any
+    /// origin (no TLS yet).
+    pub fn published<D: Driver>(cx: &Cx, fs: &Fs, net: Option<&Net>, origin: &str, key: Option<&str>, set: blaze_remote::published::set::SetName<'_>, lent: &Lent<D, StoreAlloc>) -> Result<NamedOrigin, CliError> {
+        let named = match key {
+            Some(key) => Some(PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?),
+            None => None,
+        };
+        let at = if origin.starts_with("https://") {
+            return Err(CliError::Usage("--origin https://: bstd's Http has no TLS yet (D63, stage two); name an http:// origin or a folder"));
+        } else if origin.starts_with("http://") {
+            let net = net.ok_or(CliError::Usage("--origin http://: this host offers no network"))?;
+            let [public, toolchain, target] = set.dir();
+            // Each part a checked set name (`[0-9a-z._-]`): nothing joined here leaves the base.
+            let joined = bstd::mem::format_in!(cx.frame(), "{}/{}/{}/{}", origin.trim_end_matches('/'), public, toolchain, target);
+            OriginAt::Http(HttpAt::of(joined.as_str(), net)?)
+        } else {
+            let mut dir = fs.open_dir(cx, &Path::new(origin)?)?;
+            for part in set.dir() {
+                dir = dir.subdir(&Path::new(part)?);
+            }
+            OriginAt::Folder(dir)
+        };
         let id = set.id();
         let seen = published::floor(lent, &id)?;
-        Ok(NamedOrigin { at: OriginAt::Folder(dir), check: OneKey { keys: [key], set: Some(PublishedSet { id, seen }) } })
+        // With no key named, the one slot is never consulted (`OneKey::named_keys`).
+        let keys = [named.unwrap_or(PublicKey([0; 32]))];
+        Ok(NamedOrigin { at, check: OneKey { keys, set: Some(PublishedSet { id, seen, named: named.is_some() }) } })
     }
 }
 

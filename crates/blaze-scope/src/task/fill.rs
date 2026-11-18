@@ -87,6 +87,31 @@ pub trait Par {
     fn tree_record_read(&self, bytes: usize) {
         let _ = bytes;
     }
+
+    /// Where one macro call's working memory is held while it is expanded (resolve.rs
+    /// `expand_decls`: its input, the matcher's expansion, the rendering, the origin column,
+    /// the kept entry's bytes): [`Scratch::Reset`] when this Par ran `work` itself in a
+    /// scratch allocator it resets once `work` returns (everything `work` keeps it copies into
+    /// the crate's own allocator at its exact size first); [`Scratch::Kept`] when it did not
+    /// run `work`, which the caller then runs in the crate's allocator, as before this hook.
+    ///
+    /// By default [`Scratch::Kept`]: the library holds no allocator of its own (sans-IO); a
+    /// driver hands one through this method (blaze-cli names/metered.rs). The two answers
+    /// write equal bytes (tests/call_scratch.rs); only the frame's peak differs.
+    fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        let _ = work;
+        Scratch::Kept
+    }
+}
+
+/// Where a macro call's working memory was held ([`Par::call_scratch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scratch {
+    /// In the crate's own allocator, kept until the crate's names are done: the work was not
+    /// run by the Par (the path before lane N5, and the control of its test).
+    Kept,
+    /// In a scratch the Par reset once the call's results were copied out.
+    Reset,
 }
 
 /// The stretches of one crate's solve finer than a [`Stage`] ([`Par::names_part`]), in the

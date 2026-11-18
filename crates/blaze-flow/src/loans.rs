@@ -66,6 +66,23 @@ pub fn for_each_access<A: Allocator>(flow: &Flow<A>, s: Stmt, mut f: impl FnMut(
     }
 }
 
+/// rustc's `place_projection_conflict` for two constant projections of one array or slice:
+/// whether they can never name the same element. Two indices from the same end are disjoint
+/// when they differ; one from each end, when the shortest value both match keeps them apart;
+/// an index and a subslice, when the index lies outside it. Anything else may overlap.
+fn constant_disjoint(x: Proj, y: Proj) -> bool {
+    use Proj::{ConstantIndex as Ci, Subslice as Sub};
+    match (x, y) {
+        (Ci { offset: a, from_end: fa, .. }, Ci { offset: b, from_end: fb, .. }) if fa == fb => a != b,
+        (Ci { offset: begin, min_length: m1, from_end: false }, Ci { offset: end, min_length: m2, from_end: true })
+        | (Ci { offset: end, min_length: m2, from_end: true }, Ci { offset: begin, min_length: m1, from_end: false }) => begin < m1.max(m2).saturating_sub(end),
+        (Ci { offset, from_end: false, .. }, Sub { from, to, from_end: false }) | (Sub { from, to, from_end: false }, Ci { offset, from_end: false, .. }) => offset < from || offset >= to,
+        (Ci { offset, from_end: false, .. }, Sub { from, from_end: true, .. }) | (Sub { from, from_end: true, .. }, Ci { offset, from_end: false, .. }) => offset < from,
+        (Ci { offset, from_end: true, .. }, Sub { to, from_end: true, .. }) | (Sub { to, from_end: true, .. }, Ci { offset, from_end: true, .. }) => offset <= to,
+        _ => false,
+    }
+}
+
 /// Places `a` (shallow or not) and `b` (shallow or not) overlap: one is a prefix of the other,
 /// distinct fields and variants are disjoint, a shallow side does not reach through a `Deref`.
 pub fn overlap<A: Allocator>(flow: &Flow<A>, a: Place, a_shallow: bool, b: Place, b_shallow: bool) -> bool {
@@ -81,6 +98,7 @@ pub fn overlap<A: Allocator>(flow: &Flow<A>, a: Place, a_shallow: bool, b: Place
         return match (flow.place(pa).proj, flow.place(pb).proj) {
             (Some(Proj::Field(x)), Some(Proj::Field(y))) if x != y => false,
             (Some(Proj::Downcast(x)), Some(Proj::Downcast(y))) if x != y => false,
+            (Some(x), Some(y)) if constant_disjoint(x, y) => false,
             _ => true,
         };
     }

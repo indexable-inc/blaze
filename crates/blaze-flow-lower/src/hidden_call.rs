@@ -192,10 +192,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             let at = part.iter().position(|r| matches!(r, Region::Hidden(_))).unwrap_or(0) as u32;
             unders.push(Some(Under { at, n }));
         }
+        let out_hidden = life.regions[lo..].iter().any(|r| matches!(r, Region::Hidden(_)));
+        // A hidden OUTPUT that is a projection over the head's type parameters (closed, or
+        // open over a bound the call ties: generic_call.rs, "OPEN PROJECTIONS"), with no
+        // hidden input: related per call by the generic signature, never through the coarse
+        // path's one hub, which puts a `&mut self` loan into the output (`it.next()`,
+        // `seq.next_element()` twice: a false E0499). A head it does not line up keeps the
+        // coarse path below.
+        let facts: &'b F = self.facts;
+        if out_hidden
+            && unders.iter().all(Option::is_none)
+            && let Some(shape) = facts.shape(item)
+            && let Some(bounds) = facts.call_bounds(item)
+            && self.call_by_generic_signature(item, life, shape, bounds, g, vs, dest, dest_ty, e)?
+        {
+            return Ok(HiddenCall::BySignature);
+        }
         if !known {
             return Ok(HiddenCall::Coarse);
         }
-        let out_hidden = life.regions[lo..].iter().any(|r| matches!(r, Region::Hidden(_)));
         if out_hidden {
             // Known: each hidden input's origins outlive `'static`; the output stays coarse.
             let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
@@ -217,7 +232,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let mut ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
         expand(life, &unders, &mut regions, &mut ends);
         let wide = SigLife { regions: &regions, ends: &ends, bounds: life.bounds, body: life.body };
-        if !self.call_by_signature(wide, vs, dest, dest_ty, e)? {
+        if !self.call_by_signature(wide, Some((item, g)), vs, dest, dest_ty, e)? {
             // The expansion lines up by construction; a destination that does not is named.
             return self.refuse(Form::CallHiddenInput { callee: item, input: u32::MAX }, e);
         }

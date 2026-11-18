@@ -521,10 +521,6 @@ fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
     }
 }
 
-fn stream_bytes(out: &mut Vec<u8>, stream: &TokenStream<'_>) {
-    stream_pieces(stream, |piece| out.extend_from_slice(piece));
-}
-
 /// The version of what the host gives a macro (the bridge server, the sandbox's answers, the
 /// streams a call passes): in every expansion's base key, so a change to it never reads an
 /// answer an older host made. 2: an attribute without arguments is given an empty stream (1
@@ -566,6 +562,11 @@ pub(crate) fn base_key_under(host_version: u32, module_wasm_sha256: &str, export
 }
 
 fn origin_bytes(out: &mut Vec<u8>, origin: TokenOrigin) {
+    out.extend_from_slice(&origin_piece(origin));
+}
+
+/// An origin's canonical bytes: its tag, then its value (little-endian).
+fn origin_piece(origin: TokenOrigin) -> [u8; 5] {
     let (tag, value) = match origin {
         TokenOrigin::Input(at) => (0u8, at),
         TokenOrigin::AttrArgs(at) => (1, at),
@@ -575,8 +576,8 @@ fn origin_bytes(out: &mut Vec<u8>, origin: TokenOrigin) {
         TokenOrigin::Made(Transparency::SemiOpaque) => (4, 1),
         TokenOrigin::Made(Transparency::Opaque) => (4, 2),
     };
-    out.push(tag);
-    out.extend_from_slice(&value.to_le_bytes());
+    let v = value.to_le_bytes();
+    [tag, v[0], v[1], v[2], v[3]]
 }
 
 fn origin_of(tag: u8, value: u32) -> Option<TokenOrigin> {
@@ -615,35 +616,48 @@ fn level_of(byte: u8) -> Option<ProcLevel> {
 /// diagnostics and their text. What a crate's results table keeps a call's answer as
 /// ([`table`]); the reads are the row's read list.
 fn answer_into(out: &mut Vec<u8>, produced: &Produced<'_>) {
-    stream_bytes(out, &produced.tokens);
+    answer_pieces(produced, |piece| out.extend_from_slice(piece));
+}
+
+/// [`answer_into`]'s bytes, each piece handed to `out` in order: what a buffer is filled from,
+/// and what [`answer_len`] measures, so an answer is written into ONE buffer of its own length
+/// (two passes: measure, then write), never into one grown a push at a time.
+fn answer_pieces(produced: &Produced<'_>, mut out: impl FnMut(&[u8])) {
+    stream_pieces(&produced.tokens, &mut out);
     for origin in produced.origins.iter() {
-        origin_bytes(out, *origin);
+        out(&origin_piece(*origin));
     }
-    out.extend_from_slice(&(produced.diagnostics.len() as u32).to_le_bytes());
+    out(&(produced.diagnostics.len() as u32).to_le_bytes());
     for diagnostic in produced.diagnostics.iter() {
         match *diagnostic {
             ProcDiagnostic::Emitted { level, message, at } => {
-                out.push(0);
-                out.push(level_byte(level));
-                out.extend_from_slice(&message.at.to_le_bytes());
-                out.extend_from_slice(&message.len.to_le_bytes());
+                out(&[0, level_byte(level)]);
+                out(&message.at.to_le_bytes());
+                out(&message.len.to_le_bytes());
                 match at {
                     Some(origin) => {
-                        out.push(1);
-                        origin_bytes(out, origin);
+                        out(&[1]);
+                        out(&origin_piece(origin));
                     }
-                    None => out.push(0),
+                    None => out(&[0]),
                 }
             }
             ProcDiagnostic::Panicked { message } => {
-                out.push(1);
-                out.extend_from_slice(&message.at.to_le_bytes());
-                out.extend_from_slice(&message.len.to_le_bytes());
+                out(&[1]);
+                out(&message.at.to_le_bytes());
+                out(&message.len.to_le_bytes());
             }
         }
     }
-    out.extend_from_slice(&(produced.text.len() as u32).to_le_bytes());
-    out.extend_from_slice(&produced.text);
+    out(&(produced.text.len() as u32).to_le_bytes());
+    out(produced.text.as_slice());
+}
+
+/// How many bytes [`answer_pieces`] hands out for `produced`: the first of the two passes.
+fn answer_len(produced: &Produced<'_>) -> usize {
+    let mut len = 0usize;
+    answer_pieces(produced, |piece| len += piece.len());
+    len
 }
 
 /// Why a record's bytes are not one.
@@ -762,6 +776,9 @@ pub enum RecordError {
     /// bytes of one answer or of one read list): more than the table's 32-bit word for it
     /// holds. The table's own length is not bounded: its places are 64-bit.
     TooLarge { krate: ContentId, what: &'static str, count: usize },
+    /// The allocator the results were handed refused the `bytes` of the row of `base` (its
+    /// read list or its answer, each one block of its own length).
+    NoRoom { base: ContentId, bytes: usize },
 }
 
 impl std::fmt::Display for RecordError {
@@ -779,6 +796,9 @@ impl std::fmt::Display for RecordError {
             RecordError::Table { krate, what } => write!(f, "the proc-macro results table of crate {krate:x} (crate/{krate:x}): {what} is not this layout's"),
             RecordError::TooLarge { krate, what, count } => {
                 write!(f, "the proc-macro results of crate {krate:x}: {count} {what}, more than the table's 32-bit word for it holds; not kept")
+            }
+            RecordError::NoRoom { base, bytes } => {
+                write!(f, "the expansion of base {base:x}: its allocator refused the {bytes} bytes of its row (blaze-proc-macro table.rs `CrateResults::insert`)")
             }
         }
     }

@@ -36,23 +36,25 @@ use super::published::folder::{self, Order, Plan};
 use super::published::{self, PublishedError};
 use super::{CommandLent, CommandStore, Facts, FolderOrigin, Home, NamedOrigin, Store};
 
-const TOOLCHAIN: ToolchainId = ToolchainId([0x5a; 32]);
-const TARGET: &str = "aarch64-apple-darwin";
-const SEED: [u8; 32] = [7; 32];
+// The fixture's pieces are the store's tests' (store/take_tests.rs, store/publish_command_tests.rs
+// take them too): one home made one way.
+pub(super) const TOOLCHAIN: ToolchainId = ToolchainId([0x5a; 32]);
+pub(super) const TARGET: &str = "aarch64-apple-darwin";
+pub(super) const SEED: [u8; 32] = [7; 32];
 const OTHER_SEED: [u8; 32] = [9; 32];
-const MARKER: &[u8] = b"PRIVATE-MARKER";
+pub(super) const MARKER: &[u8] = b"PRIVATE-MARKER";
 /// Publishable records, and private ones.
-const N: u32 = 24;
+pub(super) const N: u32 = 24;
 const M: u32 = 8;
 
-type Records = std::vec::Vec<(ContentId, std::vec::Vec<u8>)>;
+pub(super) type Records = std::vec::Vec<(ContentId, std::vec::Vec<u8>)>;
 
-struct Planted {
-    public: Records,
-    private: Records,
+pub(super) struct Planted {
+    pub(super) public: Records,
+    pub(super) private: Records,
 }
 
-fn planted(public: core::ops::Range<u32>, private: u32) -> Planted {
+pub(super) fn planted(public: core::ops::Range<u32>, private: u32) -> Planted {
     let record = |public: bool, n: u32| {
         let key = ContentId::of("published e2e test record", &[u8::from(public)].iter().chain(&n.to_le_bytes()).copied().collect::<std::vec::Vec<u8>>());
         let mut bytes = if public { b"public record ".to_vec() } else { MARKER.to_vec() };
@@ -63,21 +65,21 @@ fn planted(public: core::ops::Range<u32>, private: u32) -> Planted {
     Planted { public: public.map(|n| record(true, n)).collect(), private: (0..private).map(|n| record(false, n)).collect() }
 }
 
-fn path(text: &str) -> Path {
+pub(super) fn path(text: &str) -> Path {
     Path::new(text).expect("a path")
 }
 
-fn set_name(hex: &blaze_toolchain::Hex) -> SetName<'_> {
+pub(super) fn set_name(hex: &blaze_toolchain::Hex) -> SetName<'_> {
     SetName::new(hex.as_str(), TARGET).expect("a set's name")
 }
 
-fn set_path(origin: &str) -> std::string::String {
+pub(super) fn set_path(origin: &str) -> std::string::String {
     format!("{origin}/public/{}/{TARGET}", TOOLCHAIN.hex().as_str())
 }
 
 /// The home `home` (its store opened with the only test heap there is: UNSURE in the report)
 /// holding `records` under the toolchain's root, put in that order or reversed.
-fn plant(io: &Io, cx: &Cx, home: &str, records: &Planted, reversed: bool) -> (Home, CommandLent) {
+pub(super) fn plant(io: &Io, cx: &Cx, home: &str, records: &Planted, reversed: bool) -> (Home, CommandLent) {
     let fs = io.need_fs().expect("files");
     let home = Home::of(cx, &fs, Some(home)).expect("the home");
     // CI's settings: a trusted writer, whose puts may name the public namespace.
@@ -104,7 +106,7 @@ fn plant(io: &Io, cx: &Cx, home: &str, records: &Planted, reversed: bool) -> (Ho
 
 /// A's set laid out for the folder origin `origin` and written in `order`, at most `most`
 /// objects: the plan and how many were written.
-fn publish<'a>(io: &Io, cx: &Cx, lent: &CommandLent, origin: &str, signer: &Signer, order: Order, most: usize, alloc: Alloc<'a>) -> Result<(Plan<'a>, usize), PublishedError> {
+pub(super) fn publish<'a>(io: &Io, cx: &Cx, lent: &CommandLent, origin: &str, signer: &Signer, order: Order, most: usize, alloc: Alloc<'a>) -> Result<(Plan<'a>, usize), PublishedError> {
     let fs = io.need_fs().expect("files");
     let root = match fs.root().make_dir_synced(cx, &path(origin)) {
         Ok(dir) => dir,
@@ -136,8 +138,21 @@ fn read(io: &Io, cx: &Cx, dir: &Dir<ReadWrite>, check: &dyn HeadCheck, keys: &[C
     (got, reader.report())
 }
 
-fn contains(bytes: &[u8], what: &[u8]) -> bool {
+pub(super) fn contains(bytes: &[u8], what: &[u8]) -> bool {
     bytes.windows(what.len()).any(|window| window == what)
+}
+
+/// A developer's home at `home`: the default settings, so everything it writes is `LOCAL`.
+/// The boot is the simulated machine's, as a command takes it ([`super::boot_fact`]): a
+/// crash (`io.crash()`, a power cut) is a new boot, so a segment the cut tore is checked and
+/// lost by name, not trusted as this boot's (a constant boot here reported a torn segment as
+/// "changed outside blaze" on 2026-11-18, seed 4, tape `0 8`).
+pub(super) fn developer_home(io: &Io, cx: &Cx, home: &str, nonce: u64) -> (Home, CommandLent) {
+    let fs = io.need_fs().expect("files");
+    let home = Home::of(cx, &fs, Some(home)).expect("the home");
+    let boot = super::boot_fact(&io.boot().expect("the simulation's boot"));
+    let lent = home.open_store(&Settings::default(), Facts { boot: Some(boot), nonce }, blaze_own::testing::heap().alloc()).expect("the store opens");
+    (home, lent)
 }
 
 #[test]
@@ -158,12 +173,10 @@ fn only_the_published_class_leaves_and_a_second_home_reads_each_record_once() {
     }
     // 2. B reads through the command's store.
     let fs = io.need_fs().expect("files");
-    // A developer's home: the default settings, so everything it writes is `LOCAL`.
-    let home_b = Home::of(&cx, &fs, Some("/b")).expect("B's home");
-    let lent_b = home_b.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 6 }, blaze_own::testing::heap().alloc()).expect("B's store opens");
+    let (_home_b, lent_b) = developer_home(&io, &cx, "/b", 6);
     let hex = TOOLCHAIN.hex();
     let set = set_name(&hex);
-    let origin = NamedOrigin::published(&cx, &fs, "o", &signer.public().to_string(), set, &lent_b).expect("the published origin");
+    let origin = NamedOrigin::published(&cx, &fs, None, "o", Some(signer.public().to_string().as_str()), set, &lent_b).expect("the published origin");
     let (clock, err) = (io.need_clock().expect("a clock"), io.need_err().expect("err"));
     let erased_b = blaze_own::Erased::new(cx.frame());
     let mut store = CommandStore::new(&cx, &lent_b, false, 0, Some(&origin), clock, &err, erased_b.handle()).expect("B's store");

@@ -115,6 +115,7 @@ use blaze_own::{AVec, Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
 
 use crate::last::{LastAnswer, LastError, Touched};
 use crate::overlay::{Fold, Overlay, RowFacts};
+use crate::readers::{IndexCost, Paired, ReaderIndex};
 
 /// A vector over a `Sync` allocator: what a buffer holds and a view reads.
 pub type SVec<'a, T> = Vec<T, SharedAlloc<'a>>;
@@ -527,6 +528,9 @@ pub enum Plant {
     /// (overlay.rs "Stale counts"): a cell every reader now saw stays owed (finish_scale_sim.rs's
     /// control).
     StaleKeptOnTake,
+    /// The column reader index (readers.rs `Paired`) loses the last reader of a cell from each
+    /// question's answer: readers_sim.rs's differential test, against the old index, catches it.
+    LastReaderDropped,
 }
 
 /// What one request did.
@@ -553,6 +557,10 @@ pub struct Report {
     pub grown: u32,
     /// What settling the owed cells cost (plan row B1).
     pub settle: Settle,
+    /// What the request's reader index held and cost (readers.rs): read edges, bytes an edge,
+    /// allocations in all and the most one phase's merge made. Not a decision: two strategies
+    /// of the index decide alike and cost otherwise.
+    pub index: IndexCost,
 }
 
 /// What settling the owed cells cost: the profile's `finish:` line (plan row B1).
@@ -782,9 +790,18 @@ pub trait Pool<'a> {
 }
 
 /// One request's engine, over the last answer in the form `L` (the module's "The last answer
-/// and this request's writes").
-pub struct Engine<'a, S: Scope, L = Answer<'a>> {
+/// and this request's writes"), keeping its writes to the reverse index in the strategy `R`
+/// (readers.rs, rule 78: [`Paired`], columns, the engine's; `Mapped`, the old maps, for the
+/// differential test).
+pub struct Engine<'a, S: Scope, L = Answer<'a>, R = Paired<'a>> {
     alloc: SharedAlloc<'a>,
+    /// This request's writes to the reverse index (shadowing rule 3's "less" and "plus").
+    index: R,
+    /// Questions' scratch, kept across them so a question allocates nothing once warm: a cell's
+    /// readers, the index's writes of it, the readers found to enter.
+    names: SVec<'a, Name>,
+    edits: SVec<'a, (Name, bool)>,
+    found: SVec<'a, Planned>,
     tools: Tools,
     plant: Plant,
     scope: S,
@@ -817,15 +834,26 @@ pub struct Engine<'a, S: Scope, L = Answer<'a>> {
     orphans: SSet<'a, Name>,
 }
 
-impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
+impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L, Paired<'a>> {
+    /// [`Engine::with_index_in`] with the engine's reader index, the columns ([`Paired`]).
+    pub fn new_in(tools: Tools, last: L, edit: &Edit<'_>, scope: S, plant: Plant, alloc: SharedAlloc<'a>) -> Result<Engine<'a, S, L>, EngineError> {
+        Engine::with_index_in(tools, last, edit, scope, plant, alloc)
+    }
+}
+
+impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
     /// Plans a request from the last answer and the edit (invariant 1): each changed file's
     /// tasks whose key moved, its tasks gone (their cells move to absent), the owed tasks, and
-    /// the readers of the owed cells.
-    pub fn new_in(tools: Tools, last: L, edit: &Edit<'_>, scope: S, plant: Plant, alloc: SharedAlloc<'a>) -> Result<Engine<'a, S, L>, EngineError> {
+    /// the readers of the owed cells. Its writes to the reverse index are kept in `R`.
+    pub fn with_index_in(tools: Tools, last: L, edit: &Edit<'_>, scope: S, plant: Plant, alloc: SharedAlloc<'a>) -> Result<Engine<'a, S, L, R>, EngineError> {
         let serial = Gen(last.serial().0 + 1);
         let view = Overlay::new_in(last, serial, plant, alloc)?;
         let mut engine = Engine {
             alloc,
+            index: R::new_in(alloc, plant),
+            names: Vec::new_in(alloc),
+            edits: Vec::new_in(alloc),
+            found: Vec::new_in(alloc),
             tools,
             plant,
             scope,
@@ -1020,21 +1048,51 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
     /// Whether the made row `made` is still needed by the request (invariant 10): a row other
     /// than itself reads one of its cells, the scope runs that row, and the phase being opened
     /// does not enter it (`self.tasks`, sorted by name, holds the phase's other tasks).
-    fn still_needed(&self, made: Name) -> Result<bool, EngineError> {
+    fn still_needed(&mut self, made: Name) -> Result<bool, EngineError> {
         if self.view.row(made)?.is_none() {
             return Ok(false);
         }
+        let mut names = core::mem::replace(&mut self.names, Vec::new_in(self.alloc));
+        let mut needed = false;
         for cell in self.view.defines(made)?.iter() {
-            for reader in self.view.readers(CellId { of: made, cell: *cell })?.iter() {
+            self.readers_into(CellId { of: made, cell: *cell }, &mut names)?;
+            for reader in names.iter() {
                 if *reader != made
                     && self.tasks.binary_search_by_key(reader, |task| task.planned.name).is_err()
                     && self.planned_of(*reader)?.is_some_and(|planned| self.scope.runs(&planned))
                 {
-                    return Ok(true);
+                    needed = true;
+                    break;
                 }
             }
+            if needed {
+                break;
+            }
         }
-        Ok(false)
+        self.names = names;
+        Ok(needed)
+    }
+
+    /// The tasks whose rows read `id`, ascending by name, into `out` (cleared first): the last
+    /// answer's readers less those this request dropped, plus those it added (overlay.rs
+    /// shadowing rule 3; `Plant::ReadersStale` drops the "less"). The index's writes are asked
+    /// once, sorted by name, and each last reader is looked up in them by halving.
+    fn readers_into(&mut self, id: CellId, out: &mut SVec<'a, Name>) -> Result<(), EngineError> {
+        out.clear();
+        let mut edits = core::mem::replace(&mut self.edits, Vec::new_in(self.alloc));
+        self.index.edits_of(id, &mut edits);
+        let found = self.view.last_readers_into(id, out);
+        let stale = self.plant == Plant::ReadersStale;
+        out.retain(|name| stale || edits.binary_search_by_key(name, |edit| edit.0).map_or(true, |at| edits[at].1));
+        for (name, added) in edits.iter() {
+            if *added {
+                out.push(*name);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        self.edits = edits;
+        found
     }
 
     /// The open phase's tasks, sorted by name.
@@ -1132,12 +1190,15 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
                 continue;
             }
             let mut read = false;
+            let mut names = core::mem::replace(&mut self.names, Vec::new_in(self.alloc));
             for cell in self.view.defines(name)?.iter() {
-                if self.view.readers(CellId { of: name, cell: *cell })?.iter().any(|reader| *reader != name) {
+                self.readers_into(CellId { of: name, cell: *cell }, &mut names)?;
+                if names.iter().any(|reader| *reader != name) {
                     read = true;
                     break;
                 }
             }
+            self.names = names;
             if read {
                 continue;
             }
@@ -1160,6 +1221,7 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
         if self.view.refused() {
             return Err(EngineError::ViewRefused { phase: Some(phase) });
         }
+        let index_before = self.index.cost().allocations;
         let mut done: SVec<'a,Done<'a>> = Vec::new_in(self.alloc);
         let mut made: SVec<'a,Made<'a>> = Vec::new_in(self.alloc);
         for buffer in buffers.iter_mut() {
@@ -1241,6 +1303,9 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
         // Results are in task order now: both are sorted by name and matched one to one. Every
         // row goes in before any cell moves, so a reader merged in this phase is seen as it now
         // reads, whatever the order (invariant 2).
+        // The phase's reads go to the reverse index in one growth of its column (readers.rs).
+        let writes = done.iter().chain(kept.iter().map(|one| &one.done)).map(|result| result.reads.len()).sum::<usize>();
+        self.index.reserve(writes);
         let mut changes: SVec<'a, (CellId, Option<ContentId>)> = Vec::new_in(self.alloc);
         self.report.results += done.len() as u32;
         let mut done_iter = done.into_iter();
@@ -1272,6 +1337,10 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
         for (id, digest) in changes.iter() {
             self.move_cell(*id, *digest, Some(phase))?;
         }
+        // The index's allocations this merge: its writes and the one sort the first question
+        // after them made (readers.rs's floor, a constant a phase).
+        let index_made = self.index.cost().allocations.saturating_sub(index_before);
+        self.report.index.phase_allocations_max = self.report.index.phase_allocations_max.max(index_made);
         Ok(())
     }
 
@@ -1342,9 +1411,11 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
     }
 
     fn readers_of(&mut self, id: CellId, moved_in: Option<Phase>) -> Result<(), EngineError> {
-        let readers = self.view.readers(id)?;
+        let mut readers = core::mem::replace(&mut self.names, Vec::new_in(self.alloc));
+        self.readers_into(id, &mut readers)?;
         let now = self.view.digest(&id);
-        let mut found: SVec<'a,Planned> = Vec::with_capacity_in(readers.len(), self.alloc);
+        let mut found = core::mem::replace(&mut self.found, Vec::new_in(self.alloc));
+        found.clear();
         let mut stale = 0u32;
         for reader in readers.iter() {
             // A reader whose row saw today's digest of the cell is today's for it: the maker of
@@ -1365,9 +1436,11 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
         // The cell's stale count from this visit on (overlay.rs "Stale counts"): `finish` settles
         // the cell when it is 0, asking no reader again.
         self.view.count_stale(id, stale);
+        self.names = readers;
         for planned in found.iter() {
             self.candidate(*planned, moved_in.map(|phase| (phase, id)))?;
         }
+        self.found = found;
         Ok(())
     }
 
@@ -1407,7 +1480,7 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
     }
 
     fn unread(&mut self, id: CellId, reader: Name) -> Result<(), EngineError> {
-        self.view.unread_by(id, reader);
+        self.index.write(id, reader, false);
         // A made record that lost a reader may have none left (invariant 10).
         if id.of != reader && self.view.row(id.of)?.is_some_and(|row| row.inline) {
             self.orphans.insert(id.of);
@@ -1440,7 +1513,7 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
             }
         }
         for (id, _) in done.reads.iter() {
-            self.view.read_by(*id, name);
+            self.index.write(*id, name, true);
         }
         // The defined cells: each that moved is recorded and its readers made candidates. The
         // last row's digests are the answer's kept form (`CellDigest`): equal bytes compare
@@ -1500,7 +1573,7 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
     }
 }
 
-impl<'a, S: Scope, L: Fold<'a>> Engine<'a, S, L> {
+impl<'a, S: Scope, L: Fold<'a>, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
     /// Ends the request: the owed cells are this request's moved ones and the earlier ones, less
     /// each whose every reader's row saw its digest; this request's writes go to the form
     /// ([`Fold`]).
@@ -1541,6 +1614,12 @@ impl<'a, S: Scope, L: Fold<'a>> Engine<'a, S, L> {
             self.view.forget_owed_cells();
         }
         self.report.certified = self.report.entered == 0 && self.moved.is_empty();
+        // The reverse index's writes, one sorted column, to the working set the form folds.
+        let mut cost = self.index.cost();
+        cost.phase_allocations_max = self.report.index.phase_allocations_max;
+        self.report.index = cost;
+        let edits = self.index.finish(self.alloc);
+        self.view.put_readers(edits);
         let touched = self.view.touched();
         let (last, work) = self.view.into_parts();
         let answer = last.fold(work)?;
@@ -1549,8 +1628,8 @@ impl<'a, S: Scope, L: Fold<'a>> Engine<'a, S, L> {
 }
 
 /// One request's loop: each phase opened, run on the pool into the buffers, merged.
-pub fn drive<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync>(
-    engine: &mut Engine<'a, S, L>,
+pub fn drive<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync, R: ReaderIndex<'a>>(
+    engine: &mut Engine<'a, S, L, R>,
     pool: &mut P,
     buffers: &mut [Buffer<'a>],
     work: &(dyn Fn(&P::Cx, View<'_, 'a, L>, &Task, &mut Buffer<'a>) + Sync),
@@ -1560,12 +1639,12 @@ pub fn drive<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync>(
 
 /// [`drive`] with growth (invariant 11): after each phase's merge, `grow` is handed the engine to
 /// call [`Engine::grow`] for each grower among [`Engine::merged`], before the next phase opens.
-pub fn drive_growing<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync>(
-    engine: &mut Engine<'a, S, L>,
+pub fn drive_growing<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync, R: ReaderIndex<'a>>(
+    engine: &mut Engine<'a, S, L, R>,
     pool: &mut P,
     buffers: &mut [Buffer<'a>],
     work: &(dyn Fn(&P::Cx, View<'_, 'a, L>, &Task, &mut Buffer<'a>) + Sync),
-    grow: &mut dyn FnMut(&mut Engine<'a, S, L>) -> Result<(), EngineError>,
+    grow: &mut dyn FnMut(&mut Engine<'a, S, L, R>) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
     while engine.next_phase()?.is_some() {
         {

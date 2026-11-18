@@ -11,10 +11,9 @@ use core::convert::Infallible;
 use core::num::NonZeroU32;
 
 use blaze_engine::{Buffer, Pool, Stage, Task};
-use blaze_own::Vec;
+use blaze_own::{SharedAlloc, Vec};
 use bstd::clock::Clock;
 use bstd::cx::Cx;
-use std::alloc::Global;
 use bstd::mem::{Frame, TASK_FRAME};
 use bstd::task::{Class, TaskError};
 
@@ -27,7 +26,9 @@ pub(crate) struct Workers<'c> {
     workers: NonZeroU32,
     clock: &'c Clock,
     failed: Option<TaskError>,
-    times: std::vec::Vec<u64, Global>,
+    /// One a task of the last phase: in the request's arena (engine_phase_mem.rs), as the pool
+    /// lives to the request's end.
+    times: Vec<u64, SharedAlloc<'c>>,
     board: &'c crate::engine_status::Board<'c>,
 }
 
@@ -42,11 +43,14 @@ pub(crate) struct WorkersOpts<'c> {
     /// Where each task says it runs (engine_status.rs): its start is the workers' scheduling
     /// point, refused once a stop is asked. The pool runs the `Outlines` phases alone.
     pub(crate) board: &'c crate::engine_status::Board<'c>,
+    /// The request's arena's handle (engine_phase_mem.rs `RequestMem::shared`): the tasks'
+    /// times.
+    pub(crate) alloc: SharedAlloc<'c>,
 }
 
 impl<'c> Workers<'c> {
     pub(crate) fn new(opts: WorkersOpts<'c>) -> Workers<'c> {
-        Workers { cx: opts.cx, workers: opts.workers, clock: opts.clock, failed: None, times: std::vec::Vec::new_in(Global), board: opts.board }
+        Workers { cx: opts.cx, workers: opts.workers, clock: opts.clock, failed: None, times: Vec::new_in(opts.alloc), board: opts.board }
     }
 
     /// Each task's time on its worker in the last [`Pool::run`], in the order of its tasks.
@@ -88,6 +92,10 @@ impl<'a> Pool<'a> for Workers<'_> {
         for ((run, buffer), times) in tasks.chunks(per).zip(buffers.iter_mut()).zip(self.times.chunks_mut(per)) {
             let clock = self.clock.clone();
             let board = self.board;
+            // PHASE-MEM-DEBT(Outlines): a run's tasks share its frame, not reset per task (a
+            // frame resets by `&mut`, and `cx.frame()` is shared): the Outlines work writes
+            // nothing to it today (engine_tasks.rs `Tasks::work` publishes into the buffer's
+            // allocator), so it holds nothing; a task that scratches must get its own frame.
             runs.push(scope.may_overlap("engine run", TASK_FRAME, move |cx: &Cx| {
                 for (task, time) in run.iter().zip(times.iter_mut()) {
                     // Not run once a stop is asked: the driver stops before the merge.

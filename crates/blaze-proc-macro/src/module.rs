@@ -271,13 +271,20 @@ pub struct Exported {
     pub helpers: Vec<String>,
 }
 
-/// A module record, read and its bytes checked against its digest once.
+/// A module record: its key, its macros and the digest its `wasm-sha256` states. The module's
+/// wasm is NOT held: it is read only by a compile ([`ModuleRecord::wasm`]), on the one load
+/// whose compiled record is missing (host.rs `load_now`), checked against the digest there,
+/// and dropped with the compile. A load from a compiled record (every command after the
+/// first) reads no wasm at all: the record's seal names the digest it was compiled from.
+/// (Before, every command read and hashed every macro crate's wasm and kept it to the end:
+/// 114 MB in 79 blocks on tempo's 2026-11-18 heap log.)
 #[derive(Debug)]
 pub struct ModuleRecord {
     pub key: String,
     pub name: String,
     pub version: String,
-    pub wasm: Vec<u8>,
+    /// The digest of `module.wasm` as `wasm-sha256` states it; [`ModuleRecord::wasm`]
+    /// checks the bytes against it when it reads them.
     pub wasm_sha256: String,
     pub macros: Vec<Exported>,
     /// The name of the global holding the address of the harness's list.
@@ -291,6 +298,18 @@ impl ModuleRecord {
     /// The macro `name` of `kind`.
     pub fn find(&self, kind: ProcKind, name: &str) -> Option<&Exported> {
         self.macros.iter().find(|it| it.kind == kind && it.name == name)
+    }
+
+    /// The module's wasm, `module.wasm` in its folder, checked against [`Self::wasm_sha256`]:
+    /// what a compile reads, once, and drops when it is done. Not kept here (the type's docs).
+    pub fn wasm(&self) -> Result<Vec<u8>, ModuleError> {
+        let path = self.dir.join("module.wasm");
+        let wasm = std::fs::read(&path).map_err(|error| ModuleError::Io { path, error })?;
+        let found = sha256_hex(&wasm);
+        if found != self.wasm_sha256 {
+            return Err(ModuleError::Digest { key: self.key.clone(), held: self.wasm_sha256.clone(), found });
+        }
+        Ok(wasm)
     }
 }
 
@@ -326,8 +345,8 @@ impl std::fmt::Display for ModuleError {
 impl std::error::Error for ModuleError {}
 
 /// Whether `store` holds `id`'s module, by its key: the wasm's digest as the record states it,
-/// the module's bytes not read. What a command that expands nothing asks; [`read_module`]
-/// checks the bytes when a call loads them.
+/// the module's bytes not read. What a command that expands nothing asks; a compile checks
+/// the bytes when it reads them ([`ModuleRecord::wasm`]).
 pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), ModuleError> {
     let key = module_key(id);
     let path = store.join("proc-macro/modules").join(&key).join("wasm-sha256");
@@ -350,12 +369,8 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
         std::fs::read(&path).map_err(|error| ModuleError::Io { path, error })
     };
     let text = |file: &str| -> Result<String, ModuleError> { Ok(String::from_utf8_lossy(&read(file)?).into_owned()) };
-    let wasm = read("module.wasm")?;
+    // The wasm is not read here: a compile reads and checks it ([`ModuleRecord::wasm`]).
     let held = text("wasm-sha256")?.trim().to_owned();
-    let found = sha256_hex(&wasm);
-    if held != found {
-        return Err(ModuleError::Digest { key, held, found });
-    }
     let mut macros = Vec::new();
     for line in text("macros")?.lines() {
         let bad = || ModuleError::Macros { key: key.clone(), line: line.to_owned() };
@@ -372,5 +387,5 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
         macros.push(Exported { index, kind, name, helpers });
     }
     let decls = text("decls")?.trim().to_owned();
-    Ok(ModuleRecord { key, name: id.name.to_owned(), version: id.version.to_owned(), wasm, wasm_sha256: found, macros, decls, dir })
+    Ok(ModuleRecord { key, name: id.name.to_owned(), version: id.version.to_owned(), wasm_sha256: held, macros, decls, dir })
 }

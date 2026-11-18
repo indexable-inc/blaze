@@ -41,7 +41,7 @@ fn around(len: u8) -> Around {
 
 fn fault(code: Option<Around>, regs: Option<Regs>) -> Fault {
     let at = Spot { placed: Placed::Code, symbol: Symbol([0x66; 32]), record: RecordId([0xd9; 32]), offset: 0x3fc };
-    Fault { signal: Signal::Trap, pc: Some(0x70_02ae_a76c), at: Some(at), code, regs, address: 0x70_02ae_a76c, touched: Some(at), write: None }
+    Fault { signal: Signal::Trap, pc: Some(0x70_02ae_a76c), at: Some(at), code, regs, address: 0x70_02ae_a76c, touched: Some(at), write: None, callers: None }
 }
 
 /// The fault's frame (the file's one maker, `run_wire::encoded`): its item is `frame[4..]`.

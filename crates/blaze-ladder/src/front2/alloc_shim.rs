@@ -59,7 +59,8 @@
 //!   no body and NO symbol, so nothing asks the process for `__rust_alloc`;
 //! - instance resolution (program.rs `resolve`, by [`bound`]) answers the default for the
 //!   declaration, so the builder makes an ordinary direct call of a known instance, with the
-//!   default's ABI (the builder reads it from the instance the call resolves to).
+//!   default's ABI (the seam's `fn_abi` answers the bound default's for the declaration:
+//!   blaze-build `Adts::abi`).
 //!
 //! `__rust_no_alloc_shim_is_unstable_v2` is a fn rustc generates with an empty body (a
 //! marker that a program links the shim): it has no default to bind to. The table files it as

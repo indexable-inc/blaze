@@ -123,10 +123,18 @@ fn same_answer(one: &Answer, other: &Answer) -> bool {
     answer_lines(one) == answer_lines(other) && one.checked.status.0 == other.checked.status.0
 }
 
-/// The `Signature` head tasks a request entered: the Heads stage's entries less its crates'
-/// `ImplBucket` tasks (engine_check.rs `Checked::heads`).
+/// The `Signature` head tasks a request entered, counted by kind from the engine's entered list
+/// (engine_check.rs `Checked::signatures_entered`). Not the Heads stage's entries less
+/// `Checked::heads.0`: that is the Heads rows of the whole answer, standing ones too (the first
+/// run's helper said 0 where the stage line said 1 entered).
 fn head_tasks(checked: &engine_check::Checked) -> u32 {
-    checked.stages[Stage::Heads.index()].entered.saturating_sub(checked.heads.0)
+    checked.signatures_entered
+}
+
+/// Why each task was entered, with the kind of the read that moved (engine_check.rs `Because`):
+/// which read carried an edit to a head task.
+fn moved_reads(checked: &engine_check::Checked) -> std::vec::Vec<(Stage, &'static str, Option<crate::engine_scope_reads::CellKind>, u32)> {
+    checked.because.iter().map(|(group, count)| (group.stage, group.cause, group.cell, *count)).collect()
 }
 
 /// The words of a body left unchecked for a head (engine_seeds.rs `no_cell`, `other_units`) or
@@ -189,7 +197,6 @@ fn engine_expansion_heads_freeze_every_written_item() {
 /// - `make!`'s definition edited enters every call's (`make!(A)`, `make!(C)` and `outer!(D)`,
 ///   whose nested `make!` reads its record), and the definition's own entry when it has one.
 #[test]
-#[ignore = "OPEN (first run, 2026-11-18 00:29): row `a comment in an unrelated fn`: the helper `head_tasks` (Heads entered less `Checked::heads.0`) gave 0 where the floor is 1, while the stage line says `(Heads, StageCount { entered: 1, identical: 1 })`: the helper's subtraction is wrong for this request; the rows after it did not run"]
 fn engine_expansion_heads_edit_rows() {
     let io = Io::simulated(SimWorld::new(37, Limits::USUAL));
     write(&io, "Cargo.toml", MANIFEST);
@@ -212,32 +219,91 @@ fn engine_expansion_heads_edit_rows() {
         let now = request(&io, 2, false, HeadUnits::Each);
         let fresh = request(&io, 2, true, HeadUnits::Each);
         let entered = head_tasks(&now.checked);
-        println!("row {row}: head tasks entered {entered} (floor {heads:?}); {}", entries(&now.checked));
+        println!("row {row}: head tasks entered {entered} (floor {heads:?}); moved {:?}; {}", moved_reads(&now.checked), entries(&now.checked));
         written_heads_hold(row, &now);
         assert!(same_answer(&now, &fresh), "row {row}: the incremental answer is a fresh request's:\nnow {:?}\nfresh {:?}", answer_lines(&now), answer_lines(&fresh));
         assert!(heads.contains(&entered), "row {row}: {entered} head task(s) entered, the floor is {heads:?} (the edited entries' own, and every call's under an edited definition): {}", entries(&now.checked));
     }
 }
 
+/// THE CONTROL's fixture before its edit: the call `later!()` writes a `macro_rules!` and no
+/// head, so its head task froze nothing and its freeze read no cell of the call's expansion.
+const LATER_BEFORE: &str = concat!(
+    "macro_rules! later {\n    () => {\n        macro_rules! nothing {\n            () => {};\n        }\n    };\n}\n\n",
+    "later!();\n\n",
+    "pub fn read() -> u8 {\n    0\n}\n"
+);
+/// After: `later!`'s definition writes a fn `m` (the call's first head) and `read` calls it.
+/// The call's text, so its head task's source, is the same; of everything its task read before
+/// only the call's expansion record moved.
+const LATER_AFTER: &str = concat!(
+    "macro_rules! later {\n    () => {\n        pub fn m() -> u8 {\n            1\n        }\n    };\n}\n\n",
+    "later!();\n\n",
+    "pub fn read() -> u8 {\n    m()\n}\n"
+);
+
+/// One control case: (its name, the files before, after, whether the plant must go stale).
+type Case = (&'static str, &'static str, &'static str, bool);
+
 /// THE CONTROL (rule 23): THE PLANT `HeadUnits::NoExpansionReads` drops every head task's read
-/// of its calls' expansion records. `make!`'s definition edited to write a NEW fn `a` (and `read`
-/// to call it): no `Item` cell a call's head task read moves, so under the plant the call's head
-/// task is not entered, its record lacks `a`'s head, and `read`'s check differs from a fresh
-/// request's (the oracle catches the stale head). With the rule the same edit answers as fresh.
+/// of its calls' expansion records (engine_heads.rs `heads_of`).
+/// - `later!()` comes to write its first head (`LATER_*`): nothing else its head task read moves
+///   (its source is the call's text; it froze no head, so its freeze read no `Item` or
+///   `text_marks` cell of the call: front2 tables/view.rs `text_marks` reads
+///   `NameCell::Expansion` only for a head it freezes). Under the plant the task is not entered,
+///   `m`'s head is no task's, and `read` is refused where a fresh request checks it: the oracle
+///   catches the stale head. With the rule the expansion read moves and the task is entered.
+/// - `make!`'s definition writes a new fn under every call (`NEW_ITEM_*`; the first run's
+///   fixture): the calls' head tasks already read their expansion through the heads they froze
+///   (`text_marks`), so the plant goes NOT stale; printed with the kind of each moved read
+///   (`moved_reads`) as the witness of which read carried it.
 #[test]
-#[ignore = "OPEN (first run, 2026-11-18 00:29): under the plant the incremental answer EQUALS the fresh one (no staleness shown), so this fixture does not prove the expansion read is needed: `make!`'s definition edit reaches the call's head task by another read. The fixture needs an edit only the expansion record carries (the inner macro of a nested call). Both prints said `head tasks entered 0` (the helper `head_tasks`, see the edit-rows test)"]
 fn engine_expansion_heads_plant_drops_expansion_reads() {
-    for (units, stale) in [(HeadUnits::Each, false), (HeadUnits::NoExpansionReads, true)] {
-        let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
-        write(&io, "Cargo.toml", MANIFEST);
-        write(&io, "src/lib.rs", NEW_ITEM_BEFORE);
-        let cold = request(&io, 2, true, units);
-        written_heads_hold("the control, cold", &cold);
-        write(&io, "src/lib.rs", NEW_ITEM_AFTER);
-        let now = request(&io, 2, false, units);
-        let fresh = request(&io, 2, true, units);
-        println!("{units:?}: head tasks entered {}; now {:?}; fresh {:?}; {}", head_tasks(&now.checked), answer_lines(&now), answer_lines(&fresh), entries(&now.checked));
-        written_heads_hold("the control, fresh", &fresh);
-        assert_eq!(!same_answer(&now, &fresh), stale, "{units:?}: the incremental answer is stale exactly under the plant:\nnow {:?}\nfresh {:?}", answer_lines(&now), answer_lines(&fresh));
+    let cases: [Case; 2] = [("a call's first head", LATER_BEFORE, LATER_AFTER, true), ("a new fn under calls that already write heads", NEW_ITEM_BEFORE, NEW_ITEM_AFTER, false)];
+    for (case, before, after, plant_stale) in cases.iter() {
+        for (units, stale) in [(HeadUnits::Each, false), (HeadUnits::NoExpansionReads, *plant_stale)] {
+            let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+            write(&io, "Cargo.toml", MANIFEST);
+            write(&io, "src/lib.rs", before);
+            let cold = request(&io, 2, true, units);
+            written_heads_hold(case, &cold);
+            write(&io, "src/lib.rs", after);
+            let now = request(&io, 2, false, units);
+            let fresh = request(&io, 2, true, units);
+            println!("{case}, {units:?}: head tasks entered {}; moved {:?}; now {:?}; fresh {:?}; {}", head_tasks(&now.checked), moved_reads(&now.checked), answer_lines(&now), answer_lines(&fresh), entries(&now.checked));
+            written_heads_hold(case, &fresh);
+            assert_eq!(!same_answer(&now, &fresh), stale, "{case}, {units:?}: the incremental answer is stale exactly where the plant must show it:\nnow {:?}\nfresh {:?}", answer_lines(&now), answer_lines(&fresh));
+            if !stale {
+                written_heads_hold(case, &now);
+            }
+        }
     }
+}
+
+/// AN UNNAMED ENTRY IS SHOWN BY ITS HEAD (item_name.rs `shown_name`, the one home of an item's
+/// shown name): an impl, an impl with an attribute and a `where` on the next line, a macro call,
+/// `const _` and a `use` each print their head as written, and no entry prints `<unnamed>`.
+/// CONTROL: a named fn still prints its name alone.
+#[test]
+fn engine_expansion_heads_unnamed_entries_show_their_heads() {
+    const TEXT: &str = concat!(
+        "pub trait Tr {}\npub struct A<T>(T);\n",
+        "impl Tr for u8 {}\n",
+        "#[doc = \"[x]\"]\n// a comment\nimpl<T> Tr for A<T>\nwhere\n    T: Copy,\n{\n}\n",
+        "make!(A, a);\n",
+        "const _: () = ();\n",
+        "use core::fmt;\n",
+        "pub fn named() {}\n"
+    );
+    let frame = bstd::mem::Frame::with_reserve(1 << 22, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let outline = blaze_file_items::outline(TEXT, blaze_surface::Edition::E2021, erased.handle());
+    let shown: std::vec::Vec<&str> = outline.items().iter().map(|item| crate::item_name::shown_name(item, TEXT)).collect();
+    println!("shown: {shown:?}");
+    assert!(!shown.contains(&"<unnamed>"), "no entry is shown as `<unnamed>`: {shown:?}");
+    for head in ["impl Tr for u8", "impl<T> Tr for A<T>", "const _: ()", "named"] {
+        assert!(shown.contains(&head), "{head:?} is shown: {shown:?}");
+    }
+    assert!(shown.iter().any(|one| one.starts_with("make!")), "the call is shown by its macro: {shown:?}");
+    assert!(shown.iter().any(|one| one.starts_with("use core::fmt")), "the `use` is shown by its path: {shown:?}");
 }

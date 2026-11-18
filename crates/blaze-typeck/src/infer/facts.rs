@@ -110,7 +110,7 @@ struct AdtRow {
 #[derive(Clone, Copy)]
 struct SigRow {
     generics: u32,
-    /// `FnSigDef`'s flags: `UNSAFE` and `RUST_CALL` from the fn's header.
+    /// `FnSigDef`'s flags: `UNSAFE` and `NOT_FN_ABI` from the fn's header.
     flags: u16,
     io: SList,
     por: Por,
@@ -920,9 +920,14 @@ impl<'a> FactCache<'a> {
                 flags |= s;
             }
         }
-        // Set only on the rule's verdict (`crate::dyn_compat`): a refusal or a gap leaves it off.
-        if crate::dyn_compat::verdict(reads, k)? == crate::dyn_compat::Verdict::Compatible {
-            flags |= STraitFlags::DYN_COMPATIBLE;
+        // The rule's verdict (`crate::dyn_compat`), three ways: compatible, not (a refusal), or
+        // a gap the world could not decide. A gap is no "not": it sets `DYN_UNDECIDED`, and a
+        // solver goal that needs the verdict stops naming the trait (blaze-solve builtin.rs
+        // `dyn_compatible`, rule 3) instead of answering No for every `dyn Tr + Send: Send`.
+        match crate::dyn_compat::verdict(reads, k)? {
+            crate::dyn_compat::Verdict::Compatible => flags |= STraitFlags::DYN_COMPATIBLE,
+            crate::dyn_compat::Verdict::Gap { .. } => flags |= STraitFlags::DYN_UNDECIDED,
+            crate::dyn_compat::Verdict::Not { .. } => {}
         }
         let row = TraitRow {
             flags: STraitFlags(flags),
@@ -1079,8 +1084,8 @@ impl<'a> FactCache<'a> {
         if s.header.safety == crate::ids::Safety::Unsafe {
             flags |= FnSigDef::UNSAFE;
         }
-        if s.header.abi == crate::ids::Abi::RustCall {
-            flags |= FnSigDef::RUST_CALL;
+        if s.header.abi != crate::ids::Abi::Rust || s.header.c_variadic {
+            flags |= FnSigDef::NOT_FN_ABI;
         }
         let row = SigRow {
             generics: s.parent_count + s.own_count,

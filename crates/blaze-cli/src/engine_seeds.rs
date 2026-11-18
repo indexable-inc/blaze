@@ -255,6 +255,8 @@ pub(crate) struct SeedCounts {
     pub(crate) bodies: SeedTally,
     /// What the head tasks entered this request froze, by unit (engine_heads.rs `UnitCounts`).
     pub(crate) units: crate::engine_heads::UnitCounts,
+    /// The Heads stage's table of frozen heads (engine_heads_once.rs `OnceCounts`).
+    pub(crate) once: crate::engine_heads_once::OnceCounts,
 }
 
 /// The profile's line of the request's frozen heads.
@@ -278,6 +280,7 @@ pub(crate) fn profile(counts: &SeedCounts, into: &mut blaze_own::String<&Frame>)
     );
     let _ = writeln!(into);
     crate::engine_heads::unit_profile(&counts.units, into);
+    crate::engine_heads_once::profile(&counts.once, into);
 }
 
 /// Why a member's head was not in its head task's record (the profile's words, rule 19).
@@ -680,6 +683,7 @@ impl RequestTable {
             bodies,
             // The Heads stage's, set by the command after the merge (engine_check.rs).
             units: crate::engine_heads::UnitCounts::default(),
+            once: crate::engine_heads_once::OnceCounts::default(),
         })
     }
 }

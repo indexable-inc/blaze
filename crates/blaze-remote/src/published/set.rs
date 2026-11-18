@@ -120,9 +120,10 @@ impl<'s> SetName<'s> {
     }
 }
 
-/// The reader's check of a set's head: signed by one of `keys` (the keys this blaze trusts for
-/// published sets), over the set's id and the head, at a generation no lower than `seen` (the
-/// highest this home has taken for the set; 0 when none).
+/// The reader's check of a set's head: signed by a key trusted for the origin (trust.rs
+/// `trusted_for`: the compiled-in `PUBLISHED_KEYS`, or one of `keys`, those the command named
+/// for it), over the set's id and the head, at a generation no lower than `seen` (the highest
+/// this home has taken for the set; 0 when none).
 pub struct SetCheck<'k> {
     pub set: ContentId,
     pub keys: &'k [PublicKey],
@@ -131,7 +132,7 @@ pub struct SetCheck<'k> {
 
 impl HeadCheck for SetCheck<'_> {
     fn check(&self, namespace: Namespace, signer: &PublicKey, domain: &'static str, message: &[u8], signature: &[u8; 64]) -> Result<(), SignatureWhy> {
-        if namespace != Namespace::PUBLIC || !self.keys.contains(signer) {
+        if namespace != Namespace::PUBLIC || !crate::trust::trusted_for(signer, self.keys) {
             return Err(SignatureWhy::UnknownSigner);
         }
         crate::trust::verify_bound(signer, domain, &self.set.0, message, signature).map_err(SignatureWhy::Invalid)?;

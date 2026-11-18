@@ -115,9 +115,6 @@ pub enum Front2Refusal {
     Abi { function: Box<str>, abi: tc::Abi },
     /// A literal whose value front2 cannot read (an escape, a form), at its range in the fn.
     Literal { function: Box<str>, what: &'static str, range: tc::Range },
-    /// An ADT the program made narrows its valid range (`rustc_layout_scalar_valid_range_*`),
-    /// which the back half's `valid_range` does not read yet.
-    Layout { adt: Box<str> },
     /// A `#[rustc_intrinsic]` fn the build's intrinsic table does not name and that its
     /// declaration gives no fallback body to build from (front2/intrinsic_rule.rs): which of
     /// the two reasons, and where the declaration stands (`file:line`, made when refused).
@@ -208,9 +205,6 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::Abi { function, abi } => write!(f, "front2: `{function}`'s ABI {abi:?} is neither Rust nor C"),
             Front2Refusal::Literal { function, what, range } => {
                 write!(f, "front2: `{function}` at {}..{}: {what} (front2's)", range.start, range.end)
-            }
-            Front2Refusal::Layout { adt } => {
-                write!(f, "front2: `{adt}` narrows its valid range and the back half reads none (run.rs `valid_range`)")
             }
             Front2Refusal::Intrinsic { function, unbuilt, at } => write!(
                 f,
@@ -1112,11 +1106,6 @@ impl<'n> Front2Program<'n> {
         drop(scopes);
         drop(spells);
         drop(lowered);
-        // A narrowed valid range is not read by the back half yet: refused, never a wrong niche.
-        let narrowed = records.store.adts.iter().filter(|(_, a)| a.narrowed).map(|(k, _)| *k).min();
-        if let Some(k) = narrowed {
-            return Err(Front2Refusal::Layout { adt: super::item_shown::refused(&records, k) });
-        }
         // One table for the back half, which reads every body and record from one: the
         // records' table, then each body lowered again into it in the order tabled. (A checked
         // body's own table is a copy of the records' at its lowering, so two bodies' own types
@@ -1602,6 +1591,11 @@ impl FrontEnd for Front2Program<'_> {
     /// ABI the builder spreads no arguments of: the builder's `NoAbi` names the fn, and a
     /// survey's left-out cause is printed beside it (run.rs `callee_refusal`).
     fn fn_abi(&self, key: ItemKey) -> Option<Abi> {
+        // A call of an allocator declaration (`__rust_alloc`, "Rust", an `Alignment` argument)
+        // is made with the ABI of the fn it runs (std's `__rdl_alloc`, "C", a `usize`):
+        // blaze-build `Adts::abi`. Read from the declaration, the caller passed the address of
+        // its `Alignment` where the default reads the value (std hello's trap, 2026-11-17).
+        let key = super::alloc_shim::bound(self.front.names, &self.front.index, &self.store, key, self.store.tys.alloc()).unwrap_or(key);
         let tabled = self.by_key.get(&key).map(|&i| self.fns[i].abi);
         lazy::seam_rules::fn_abi(tabled, self.front.names, &self.store, key)
     }
@@ -1920,6 +1914,12 @@ impl FrontEnd for Front2Program<'_> {
 
     fn repr(&self, key: ItemKey) -> ReprAttrs {
         self.store.adts.get(&key).map_or(ReprAttrs::RUST, |a| a.repr)
+    }
+
+    /// The row's `rustc_layout_scalar_valid_range_*` bounds (heads.rs `AdtRow::valid`); an ADT
+    /// with no row has no attribute read, and layout asks only after `adt` answered the row.
+    fn valid_range(&self, key: ItemKey) -> blaze_build::layout::ValidRange {
+        self.store.adts.get(&key).map_or(blaze_build::layout::ValidRange::default(), |a| a.valid)
     }
 
     /// A `#[rustc_intrinsic]` fn's table entry, read from its name when it was tabled.

@@ -22,7 +22,7 @@ use core::alloc::Allocator;
 
 use blaze_typeck::{ItemKey, PTy, PTys};
 
-use super::{Ctx, Mode, Pair, Reader, Region, SigBuf, SigRefusal, Tk, lex};
+use super::{Ctx, Mode, NoAliases, Pair, Reader, Region, SigBuf, SigRefusal, SigWorld, Tk, lex};
 
 /// Why a callable parameter's signature was not read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -165,13 +165,28 @@ pub fn read_callable_param<A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), CallableRefusal> {
+    read_callable_param_with(text, tys, param, inputs, output, &NoAliases(adt_lifetimes), out, alloc)
+}
+
+/// [`read_callable_param`] in `world`: each written type path is read for what it resolves to
+/// (alias.rs).
+pub fn read_callable_param_with<A: Allocator + Clone>(
+    text: &str,
+    tys: PTys<'_>,
+    param: u32,
+    inputs: &[PTy],
+    output: PTy,
+    world: &dyn SigWorld,
+    out: &mut SigBuf<A>,
+    alloc: A,
+) -> Result<(), CallableRefusal> {
     out.regions.clear();
     out.ends.clear();
     out.bounds.clear();
     let mut r = Reader {
         text,
         tys,
-        adt_lifetimes,
+        world,
         toks: Vec::new_in(alloc.clone()),
         mate: Vec::new_in(alloc.clone()),
         names: Vec::new_in(alloc.clone()),
@@ -180,6 +195,10 @@ pub fn read_callable_param<A: Allocator + Clone>(
         alloc: alloc.clone(),
         imp: None,
         unwritten: Vec::new_in(alloc.clone()),
+        from: None,
+        holes: Vec::new_in(alloc.clone()),
+        found: Vec::new_in(alloc.clone()),
+        depth: 0,
     };
     lex(text, &mut r.toks)?;
     r.pair_brackets()?;

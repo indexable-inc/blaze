@@ -172,25 +172,180 @@ pub const CLOSURE_FN_ONCE: u64 = 2;
 
 /// A fn pointer's calling convention. Each is its own type: `extern "C" fn()` and
 /// `extern "C-unwind" fn()` relate to nothing but themselves (the reference, "Function pointer
-/// types"; rustc's `ExternAbi`, cut to the ABIs a fn pointer on the hosts in scope is written
-/// with).
+/// types"; every ABI of the pinned nightly's `ExternAbi`, by discriminant: a type of any ABI the
+/// nightly knows is carried, and what the builder cannot emit is refused there by name).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
 pub enum Abi {
-    Rust,
-    C,
-    CUnwind,
-    System,
-    SystemUnwind,
+    Rust = 0,
+    C = 1,
+    CUnwind = 2,
+    System = 3,
+    SystemUnwind = 4,
     /// `extern "rust-call"` (unstable `unboxed_closures`): the ABI of `FnOnce::call_once`,
     /// `FnMut::call_mut` and `Fn::call` in the pinned library (library/core/src/ops/function.rs).
     /// At the type level a fn of it takes its last parameter, a tuple, as one value; only the
     /// call's ABI spreads that tuple. Not `Fn*`-compatible (`ExternAbi::is_fn_trait_compatible`).
-    RustCall,
+    RustCall = 5,
     /// `extern "llvm-intrinsic"` (unstable `link_llvm_intrinsics`): rustc_abi's `LlvmIntrinsic`,
     /// "Unstable ABI used to call LLVM intrinsics." The pinned library's `core::arch` declares
     /// every target intrinsic in such a block; a declaration in a body carries it as its fn
     /// header's ABI (blaze-ladder front2/heads.rs, a local foreign fn).
-    LlvmIntrinsic,
+    LlvmIntrinsic = 6,
+    Swift = 7,
+    Aapcs = 8,
+    AapcsUnwind = 9,
+    AvrInterrupt = 10,
+    AvrNonBlockingInterrupt = 11,
+    Cdecl = 12,
+    CdeclUnwind = 13,
+    CmseNonsecureCall = 14,
+    CmseNonsecureEntry = 15,
+    Custom = 16,
+    EfiApi = 17,
+    Fastcall = 18,
+    FastcallUnwind = 19,
+    GpuKernel = 20,
+    Msp430Interrupt = 21,
+    PtxKernel = 22,
+    RiscvInterruptM = 23,
+    RiscvInterruptS = 24,
+    RustCold = 25,
+    RustInvalid = 26,
+    RustPreserveNone = 27,
+    Stdcall = 28,
+    StdcallUnwind = 29,
+    SysV64 = 30,
+    SysV64Unwind = 31,
+    RustTail = 32,
+    Thiscall = 33,
+    ThiscallUnwind = 34,
+    Vectorcall = 35,
+    VectorcallUnwind = 36,
+    Win64 = 37,
+    Win64Unwind = 38,
+    X86Interrupt = 39,
+}
+
+impl Abi {
+    /// Every ABI of the pinned nightly's `ExternAbi`, by discriminant.
+    pub const ALL: [Abi; 40] = [
+        Abi::Rust,
+        Abi::C,
+        Abi::CUnwind,
+        Abi::System,
+        Abi::SystemUnwind,
+        Abi::RustCall,
+        Abi::LlvmIntrinsic,
+        Abi::Swift,
+        Abi::Aapcs,
+        Abi::AapcsUnwind,
+        Abi::AvrInterrupt,
+        Abi::AvrNonBlockingInterrupt,
+        Abi::Cdecl,
+        Abi::CdeclUnwind,
+        Abi::CmseNonsecureCall,
+        Abi::CmseNonsecureEntry,
+        Abi::Custom,
+        Abi::EfiApi,
+        Abi::Fastcall,
+        Abi::FastcallUnwind,
+        Abi::GpuKernel,
+        Abi::Msp430Interrupt,
+        Abi::PtxKernel,
+        Abi::RiscvInterruptM,
+        Abi::RiscvInterruptS,
+        Abi::RustCold,
+        Abi::RustInvalid,
+        Abi::RustPreserveNone,
+        Abi::Stdcall,
+        Abi::StdcallUnwind,
+        Abi::SysV64,
+        Abi::SysV64Unwind,
+        Abi::RustTail,
+        Abi::Thiscall,
+        Abi::ThiscallUnwind,
+        Abi::Vectorcall,
+        Abi::VectorcallUnwind,
+        Abi::Win64,
+        Abi::Win64Unwind,
+        Abi::X86Interrupt,
+    ];
+
+    /// The string each ABI is written with, by discriminant.
+    const NAMES: [&'static str; 40] = [
+        "Rust",
+        "C",
+        "C-unwind",
+        "system",
+        "system-unwind",
+        "rust-call",
+        "llvm-intrinsic",
+        "Swift",
+        "aapcs",
+        "aapcs-unwind",
+        "avr-interrupt",
+        "avr-non-blocking-interrupt",
+        "cdecl",
+        "cdecl-unwind",
+        "cmse-nonsecure-call",
+        "cmse-nonsecure-entry",
+        "custom",
+        "efiapi",
+        "fastcall",
+        "fastcall-unwind",
+        "gpu-kernel",
+        "msp430-interrupt",
+        "ptx-kernel",
+        "riscv-interrupt-m",
+        "riscv-interrupt-s",
+        "rust-cold",
+        "rust-invalid",
+        "rust-preserve-none",
+        "stdcall",
+        "stdcall-unwind",
+        "sysv64",
+        "sysv64-unwind",
+        "tail",
+        "thiscall",
+        "thiscall-unwind",
+        "vectorcall",
+        "vectorcall-unwind",
+        "win64",
+        "win64-unwind",
+        "x86-interrupt",
+    ];
+
+    /// The string the ABI is written with.
+    pub const fn name(self) -> &'static str {
+        Abi::NAMES[self as usize]
+    }
+
+    /// The ABI written `s`; `None` for a string the nightly does not know (E0703).
+    pub fn of_name(s: &str) -> Option<Abi> {
+        Abi::NAMES.iter().position(|n| *n == s).map(|i| Abi::ALL[i])
+    }
+
+    /// Whether a fn of this ABI may be C-variadic (rustc_abi `supports_c_variadic`, plus
+    /// "system" as before).
+    pub const fn takes_c_variadic(self) -> bool {
+        matches!(
+            self,
+            Abi::C
+                | Abi::CUnwind
+                | Abi::System
+                | Abi::SystemUnwind
+                | Abi::Cdecl
+                | Abi::CdeclUnwind
+                | Abi::Aapcs
+                | Abi::AapcsUnwind
+                | Abi::SysV64
+                | Abi::SysV64Unwind
+                | Abi::Win64
+                | Abi::Win64Unwind
+                | Abi::EfiApi
+        )
+    }
 }
 
 /// Whether calling through a fn pointer needs `unsafe`.
@@ -221,15 +376,7 @@ impl FnPtrHeader {
     /// One byte: the ABI in the low six bits, C-variadic in bit 6, `unsafe` in bit 7 (a key's
     /// and a canonical form's; blaze-typeck's `FnSig` hash already gives bit 6 that meaning).
     pub const fn bits(self) -> u8 {
-        let abi = match self.abi {
-            Abi::Rust => 0,
-            Abi::C => 1,
-            Abi::CUnwind => 2,
-            Abi::System => 3,
-            Abi::SystemUnwind => 4,
-            Abi::RustCall => 5,
-            Abi::LlvmIntrinsic => 6,
-        };
+        let abi = self.abi as u8;
         let abi = if self.c_variadic { abi | 0x40 } else { abi };
         match self.safety {
             Safety::Safe => abi,
@@ -239,16 +386,11 @@ impl FnPtrHeader {
 
     /// The inverse of [`FnPtrHeader::bits`]; `None` for a byte it never writes.
     pub const fn from_bits(b: u8) -> Option<FnPtrHeader> {
-        let abi = match b & 0x3f {
-            0 => Abi::Rust,
-            1 => Abi::C,
-            2 => Abi::CUnwind,
-            3 => Abi::System,
-            4 => Abi::SystemUnwind,
-            5 => Abi::RustCall,
-            6 => Abi::LlvmIntrinsic,
-            _ => return None,
-        };
+        let i = (b & 0x3f) as usize;
+        if i >= Abi::ALL.len() {
+            return None;
+        }
+        let abi = Abi::ALL[i];
         let safety = if b & 0x80 != 0 { Safety::Unsafe } else { Safety::Safe };
         Some(FnPtrHeader { abi, safety, c_variadic: b & 0x40 != 0 })
     }

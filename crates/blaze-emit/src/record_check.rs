@@ -65,9 +65,31 @@ fn inst(code: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
 }
 
+/// Where an `adr` at `at` reaches: its own offset, or for the far own-data form (pass/reach.rs:
+/// `adr xD, #0; movz x10, #lo; movk x10, #hi, lsl #16; add xD, xD, x10`, the whole form inside
+/// the first `end` bytes) the `adr`'s offset plus `hi << 16 | lo`. `word` is the `adr`.
+pub(crate) fn adr_reaches(code: &[u8], end: usize, at: usize, word: u32) -> i64 {
+    // `adr`: 21 signed bits, the low 2 in 29..31.
+    let imm = (((word >> 5) & 0x7_ffff) << 2) | ((word >> 29) & 3);
+    let near = at as i64 + i64::from(((imm << 11) as i32) >> 11);
+    let rd = word & 31;
+    if imm != 0 || at + 16 > end {
+        return near;
+    }
+    let (movz, movk, add) = (inst(code, at + 4), inst(code, at + 8), inst(code, at + 12));
+    let (lo, hi) = ((movz >> 5) & 0xffff, (movk >> 5) & 0xffff);
+    let far = movz == crate::enc::movz(crate::enc::X10, lo, 0)
+        && movk == crate::enc::movk(crate::enc::X10, hi, 1)
+        && add == crate::enc::add(rd, rd, crate::enc::X10);
+    match far {
+        true => at as i64 + i64::from((hi << 16) | lo),
+        false => near,
+    }
+}
+
 /// Checks the first `insts` bytes of `view`'s code (the instructions): no load of a literal
 /// word (bits 29..27 `011`, bits 25..24 `00`); every `adr` reaches the data after the
-/// instructions; every `adrp` is the first instruction of the next site row, written with a
+/// instructions (the far form's `adr` with its offset added: [`adr_reaches`]); every `adrp` is the first instruction of the next site row, written with a
 /// zero page and followed by `ldr xN, [xN]` (a load or call site; a call's register is `x16`
 /// and `blr x16` ends it) or `add xN, xN, #0` (a relro site); and no site row is left over.
 /// The number of sites on success.
@@ -85,9 +107,7 @@ pub fn no_address_word(view: &CodeView<'_>, insts: u32) -> Result<usize, Address
             return Err(AddressWord::LiteralLoad { at: here });
         }
         if word & 0x9f00_0000 == 0x1000_0000 {
-            // `adr`: 21 signed bits, the low 2 in 29..31.
-            let imm = (((word >> 5) & 0x7_ffff) << 2) | ((word >> 29) & 3);
-            let to = at as i64 + i64::from(((imm << 11) as i32) >> 11);
+            let to = adr_reaches(code, end, at, word);
             if to < end as i64 || to > code.len() as i64 {
                 return Err(AddressWord::AdrOutside { at: here, to });
             }

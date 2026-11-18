@@ -84,6 +84,14 @@ pub enum EngineCheckError {
     Signals(bstd::procs::SignalError),
     /// The status watcher did not run (engine_status.rs `watched`).
     Watcher(crate::engine_status::StatusError),
+    /// The request's or a phase's arena could not be reserved (engine_phase_mem.rs).
+    PhaseMem(crate::engine_phase_mem::PhaseMemError),
+}
+
+impl From<crate::engine_phase_mem::PhaseMemError> for CliError {
+    fn from(error: crate::engine_phase_mem::PhaseMemError) -> CliError {
+        CliError::EngineCheck(EngineCheckError::PhaseMem(error))
+    }
 }
 
 impl EngineCheckError {
@@ -123,6 +131,7 @@ impl fmt::Display for EngineCheckError {
             },
             EngineCheckError::Signals(error) => write!(f, "its stop and status signals: {error} (engine_check.rs `serve`)"),
             EngineCheckError::Watcher(error) => write!(f, "{error}"),
+            EngineCheckError::PhaseMem(error) => write!(f, "{error}"),
         }
     }
 }
@@ -246,6 +255,7 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
         fresh: false,
         heads_from: crate::engine_seeds::HeadsFrom::Frozen,
         head_units: crate::engine_heads::HeadUnits::Each,
+        head_sources: crate::engine_heads_once::Sources::Job,
         frame,
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,
@@ -293,6 +303,9 @@ pub(crate) struct Opts<'f> {
     /// Under which units a head task freezes (engine_heads.rs `HeadUnits`): the command's is
     /// `Each`; a test plants one unit alone (rule 23).
     pub(crate) head_units: crate::engine_heads::HeadUnits,
+    /// What a head task freezes its heads over (engine_heads_once.rs `Sources`): the command's
+    /// is `Job`; a test sets `Head` for the measure before the table (rule 78).
+    pub(crate) head_sources: crate::engine_heads_once::Sources,
     /// The request's frame (its caller's, at most [`REQUEST_FRAME`]): every stage's lists and
     /// records whose size follows the project (crates, files, bodies, findings, environments,
     /// labels) are in it, never in the command's fixed frame.
@@ -350,9 +363,12 @@ pub(crate) struct Checked {
     /// has a row for, a read nothing can ever move (8 kept, all counted); then the count of
     /// such reads of a head's `Signature` cell, which no task defines yet (lane EV widens them).
     pub(crate) undefined_reads: (std::vec::Vec<(Name, CellId), std::alloc::Global>, u32, u32),
-    /// Each `ImplBucket` task's row, (entered, failed), and the crates whose tables standing
-    /// rows put on the shelf from the store (engine_heads.rs `complete`).
+    /// The Heads stage's rows in the answer (`Signature` and `ImplBucket`, entered or standing),
+    /// the head tasks refused, and the crates whose tables standing rows put on the shelf from
+    /// the store (engine_heads.rs `complete`).
     pub(crate) heads: (u32, u32, u32),
+    /// The `Signature` head tasks entered this request (lane RH4's edit rows count them).
+    pub(crate) signatures_entered: u32,
     /// The `Lint` tasks entered this request and their findings (engine_lints.rs `seen`).
     pub(crate) lints: crate::engine_lints::LintsSeen,
     /// The bodies in files no member crate's module tree reaches (engine_bodies.rs
@@ -374,6 +390,9 @@ pub(crate) struct Checked {
     /// The request's frozen heads: the table, the dependency heads read, found and frozen, and
     /// the bodies seeded and refused (engine_seeds.rs `SeedCounts`).
     pub(crate) seeds: crate::engine_seeds::SeedCounts,
+    /// Each stage's phases' arenas (their most, what their drops gave back) and the heap kept
+    /// past each phase, and the arenas made and dropped (engine_phase_mem.rs).
+    pub(crate) phase_mem: crate::engine_phase_mem::PhaseLedger,
 }
 
 /// The check of the checkout at `root`, printed through `shown` to `out`; the store's words on
@@ -391,15 +410,25 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
 /// [`check`] under its board.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out, board: &crate::engine_status::Board<'_>) -> Result<Checked, CliError> {
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _ } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _ } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
+    // The request's arena (engine_phase_mem.rs): what this call keeps to its end and no record
+    // holds, given back whole when it returns; each phase's arena is made from it. Declared
+    // first, so dropped last: every value over it is a local dropped before it.
+    let request_mem = crate::engine_phase_mem::RequestMem::new()?;
+    let request = request_mem.shared();
+    // The phases' arenas and the heap kept past each, by stage.
+    let mut phase_mem = crate::engine_phase_mem::PhaseLedger::new();
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
     // `of_root`): the level each lint finding prints at, and what the Lints stage runs.
     let linting = crate::lints::of_root(cx, root, frame)?;
     shown.lints = linting.step;
     // The one store, opened as `check` opens it (main.rs), committed after the answer.
+    // PHASE-MEM-DEBT(Request): the store's open takes the process heap (store.rs
+    // `open_for_command`, `heap: &'static Heap`): its lease tables live to the command's end.
     let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, heap)?;
+    crate::store::take::before_first_phase(cx, io, &opened, toolchain, phases, err)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     phases.mark_in("store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
@@ -423,7 +452,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     // standing row's block for a request that enters tasks. Unreadable: answered in full.
     let mut last_lines = None;
     if let Some(pointer) = &pointer {
-        match crate::engine_answer::load_lines(cx, &mut store, pointer.lines, heap.shared())? {
+        match crate::engine_answer::load_lines(cx, &mut store, pointer.lines, request)? {
             Ok(lines) => last_lines = Some(lines),
             Err(why) => unreadable = Some(why),
         }
@@ -455,6 +484,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         let facts = pointer.facts;
         if !moved && facts.printed.replayable && facts.owed == 0 {
             // The whole answer's lines through the one printer, as the request that wrote them.
+            // PHASE-MEM-DEBT(Request): the printer's lists are on the process heap
+            // (engine_lines.rs `print_all`, `heap: &'static Heap`): the request's, not named so.
             let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;
             crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
             let whole = facts.printed.bodies_whole;
@@ -478,6 +509,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             let file = root.create(cx, &Path::new(print::PROFILE)?)?;
             file.append(cx, text.as_bytes(), bstd::fs::Durable::No)?;
             file.close(cx, bstd::fs::Durable::No)?;
+            // PHASE-MEM-DEBT(CHECKED): `Checked` outlives the request (main.rs prints it, the
+            // tests read it) and has no lifetime, so its lists are on the process heap.
             return Ok(Checked {
                 status,
                 tasks: 0,
@@ -493,6 +526,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 unreadable: None,
                 undefined_reads: (std::vec::Vec::new_in(std::alloc::Global), 0, 0),
                 heads: (0, 0, 0),
+                signatures_entered: 0,
                 lints: crate::engine_lints::LintsSeen::default(),
                 ownerless: (0, std::vec::Vec::new_in(std::alloc::Global)),
                 files: Files::default(),
@@ -501,17 +535,19 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 records: crate::engine_store::Ledger::new(),
                 sweep: sweep_counts,
                 seeds: crate::engine_seeds::SeedCounts::default(),
+                phase_mem: crate::engine_phase_mem::PhaseLedger::new(),
             });
         }
     }
     // Else the answer it names, every page checked: the engine starts from it.
-    let mut start = Answer::new_in(heap.shared());
-    let mut causes: SMap<'_, Name, (blaze_engine::Gen, blaze_engine::Cause)> = SMap::new_in(heap.shared());
+    // The request's: the engine's answer grows from it and is saved as the stored answer.
+    let mut start = Answer::new_in(request);
+    let mut causes: SMap<'_, Name, (blaze_engine::Gen, blaze_engine::Cause)> = SMap::new_in(request);
     // Each row's record in the store, by its key (pages.rs `records`).
-    let mut records: SMap<'_, Name, blaze_drive::Key> = SMap::new_in(heap.shared());
+    let mut records: SMap<'_, Name, blaze_drive::Key> = SMap::new_in(request);
     let mut last_root = None;
     if let Some(pointer) = &pointer {
-        match crate::engine_answer::load_answer(cx, &mut store, pointer.root, heap.shared())? {
+        match crate::engine_answer::load_answer(cx, &mut store, pointer.root, request)? {
             Ok((kept, root_read)) => {
                 start = kept.answer;
                 causes = kept.causes;
@@ -535,12 +571,18 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         fs: io.need_fs()?,
         sdk: place.sdk,
         exe_dir: place.exe_dir,
+        // PHASE-MEM-DEBT(Units): the fetches' and every stage's `handles.env.heap` (fetch.rs
+        // `FetchEnv::heap`, `&'static Heap`): the stages put what they make on the process heap
+        // through it; each becomes the phase's handle when its stage takes one (`kept past the
+        // phase` names which).
         heap,
     };
 
     // 1. Plan: the units stage, then the files, then the crates.
     let stamps = FromMeta::now(phases.clock());
     let mut rows = Rows::new_in(frame);
+    // PHASE-MEM-DEBT(Units): the layout's manifests on the process heap (units.rs `lay`, `heap:
+    // &'static Heap`): the request's, read by every stage's plan.
     let mut laid = crate::units::lay(cx, root, &stamps, &mut rows, toolchain, heap, frame, erased.handle())?;
     let home_dir = Some(opened.home.dir());
     sweep::read_home_listing(cx, home_dir, &stamps, crate::macros::MODULE_LISTING, &mut rows, frame)?;
@@ -551,6 +593,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         let program = crate::program::dev_profile_panic(cx, root, frame)?;
         let target = crate::graph::target(cx, &env, program, &blaze_unit_graph::UnitKind::Lib, frame)?;
         let host = crate::graph::target(cx, &env, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
+        // PHASE-MEM-DEBT(Units): the unit graph on the process heap (graph.rs `Graph::new`,
+        // `heap: &'static Heap`): the request's; the graph is a record (`discover` puts it).
         laid.graph = Some(crate::graph::Graph::new(parts, lockfile, units, target, host, true, heap, frame));
     }
     // The graph and its fetches read back when nothing it is a function of moved (plan row D2),
@@ -558,7 +602,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     let back = crate::engine_units::Back { rows: &start.rows, records: &records };
     let mut discovered = crate::engine_units::discover(cx, root, &mut store, &mut laid, units, tools, &back, &env, frame)?;
     phases.mark_in(discovered.cause.phase(), frame);
-    let alloc = heap.shared();
+    // The request's handle: the plan, the engine, the buffers the workers fill (merged into the
+    // answer), the lines printed. Nothing over it outlives this call.
+    let alloc = request;
     let kept = Kept { slots: &today_slots, rows: &start.rows, records: &records };
     let (outlined, probes, file_counts) = plan(cx, root, &stamps, &laid, workers, &kept, &mut store, alloc)?;
     // Each file's row in the leaf table, so the next request's sweep proves it unchanged by its
@@ -600,6 +646,10 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     let mut bodies = crate::engine_bodies::BodiesStage::new(scope_reads);
     let mut heads = crate::engine_heads::HeadsStage::new(scope_reads);
     heads.freeze = head_units;
+    // PHASE-MEM-DEBT(Heads): the request's frozen heads on the process heap
+    // (engine_heads_once.rs `HeadsOnce::new`, `heap: &'static Heap`): they cross from the Heads
+    // phases to the Bodies phases, so the request's; to take `SharedAlloc<'r>` of the request.
+    heads.once = Some(crate::engine_heads_once::HeadsOnce::new(heap, crate::engine_heads_once::OncePlant::Rule, head_sources));
     let graph = discovered.get(Name::unit_graph()).and_then(|one| one.made.as_ref().ok().map(|record| blaze_drive::Input { name: one.name, at: tools.key(one.name, &one.source), out: record.out }));
     // Each file once in the edit, with every task it plans (its outline and its bodies): the
     // engine takes a file's entry as all its tasks, so a second entry would drop the first's.
@@ -649,7 +699,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
 
     // 2. Drive: each phase run, merged, its records put.
     let mut engine = Engine::new_in(tools, start, &Edit { files: &files }, Everything, blaze_engine::Plant::None, alloc)?;
-    let mut pool = Workers::new(WorkersOpts { cx, clock: &env.clock, workers, board });
+    let mut pool = Workers::new(WorkersOpts { cx, clock: &env.clock, workers, board, alloc });
     let mut buffers: SVec<'_, Buffer<'_>> = SVec::new_in(alloc);
     for _ in 0..pool.runs() {
         buffers.push(Buffer::new_in(alloc));
@@ -659,9 +709,13 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     let side = laid.lock.as_ref().map(|lockfile| crate::proc_runner::MacroSide {
         lock: lockfile,
         place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows },
+        // PHASE-MEM-DEBT(Names): the proc macros' expansions on the process heap
+        // (proc_runner.rs `MacroSide::heap`, `&'static Heap`): made in a Names phase, read by
+        // the Scripts and Names phases after; the record is what should cross.
         heap,
     });
     let handles = Handles { root, lock: laid.lock.as_ref().map(|lockfile| lockfile.lock), members, env: &env, side: side.as_ref(), outlined: &outlined, workers, board };
+    // PHASE-MEM-DEBT(CHECKED): returned in `Checked`, which has no lifetime.
     let mut ran = blaze_own::Vec::new_in(heap.alloc());
     let mut puts = 0u32;
     // What each stage's records cost this process (engine_store.rs `Ledger`).
@@ -676,13 +730,27 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     let mut phase_times = std::vec::Vec::new_in(std::alloc::Global);
     // The request's frozen heads, counted at the Bodies phase's merge (engine_seeds.rs).
     let mut seed_counts = crate::engine_seeds::SeedCounts::default();
+    // A test's planted heap leak (rule 23's control, engine_phase_mem.rs `with_planted_leak`):
+    // kept to the command's end, as a stage that broke the rule would keep it.
+    #[cfg(test)]
+    let mut planted_kept = blaze_own::Vec::new_in(heap.alloc());
     while let Some(phase) = engine.next_phase()? {
         // The driver's scheduling point (engine_status.rs): a stop asked during the last
         // merge or put.
         if let Some(by) = board.stopping() {
             return Err(stopped(cx, root, err, board, by, &ledger, names.as_ref(), phases, clock, frame)?);
         }
-        let mut entered: SVec<'_, Task> = SVec::new_in(alloc);
+        // The phase's arena (engine_phase_mem.rs), made before its tasks run and ended once
+        // its records are committed, below. A local of this iteration: a stop's return, an
+        // error's `?` or an unwind drops it too, its pages back to the kernel.
+        let mem = request_mem.phase(phase.stage)?;
+        let at_phase = mem.shared();
+        #[cfg(test)]
+        if let Some(leak) = crate::engine_phase_mem::planted_leak(phase.stage, heap) {
+            planted_kept.push(leak);
+        }
+        // The phase's tasks: read to its end, never after.
+        let mut entered: SVec<'_, Task> = SVec::new_in(at_phase);
         entered.extend_from_slice(engine.tasks());
         let mark = board.phase_began(phase.stage, entered.len() as u64, board.now(clock));
         let began = clock.now();
@@ -703,6 +771,12 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                     times.push(task.planned.name, clock.now().since(one).map_or(0, crate::engine_times::ns));
                 }
             }
+            // PHASE-MEM-DEBT(Names): the stage takes the request's handle (its `Done`s merge into
+            // the answer) and no phase handle, and puts its results (`NamesStage::results`: read
+            // lists, findings, expansions) on the request frame and the process heap
+            // (`handles.env.heap`), kept to the command's end for the put and the print. To take
+            // `at_phase: SharedAlloc<'p>` for all but its `Done`s, and read its findings back
+            // from the lines record.
             Stage::Names => match names.as_mut() {
                 Some(stage) => stage.run_phase(cx, &mut store, &mut read, &handles, &entered, &mut buffers[0], &mut times, alloc, frame)?,
                 None => buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
@@ -714,6 +788,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                     heads.read_back += crate::engine_heads::complete(cx, &mut store, stage, &mut bodies.shelf, &|name| records.get(&name).copied(), engine.view(), frame)?;
                 }
                 // The heads not frozen, a body that reads one quotes (engine_head_notes.rs).
+                // PHASE-MEM-DEBT(Bodies): `Failed::of` takes `Alloc<'static>` and keeps its rows
+                // on the process heap (engine_head_notes.rs), to the command's end for the
+                // print; to become the lines record's head notes, read back.
                 bodies.heads_failed = crate::engine_head_notes::Failed::of(&heads, last_lines.as_ref(), heap.alloc())?;
                 // The request's frozen heads, read only while the phase runs (engine_seeds.rs):
                 // the head tasks' cells and the dependency heads this machine froze before.
@@ -723,6 +800,10 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                     (crate::engine_seeds::HeadsFrom::Frozen, Some(stage), Some(graph)) => match bodies.kept.list(cx, &mut store, &graph, frame)? {
                         Some(list) => {
                             let crates = crate::engine_seeds::crates_of(&list, stage);
+                            // PHASE-MEM-DEBT(Bodies): the table lives to this phase's end alone
+                            // and is built on the process heap (engine_seeds.rs
+                            // `RequestTable::build`, `heap: &'static Heap`): to take `&mem`'s
+                            // `SharedAlloc<'p>`, when its growth is freed at the phase's end.
                             Some(crate::engine_seeds::RequestTable::build(cx, &mut store, &planned, engine.view(), &|name| records.get(&name).copied(), crates, &seed_root, seed_tool, heap)?)
                         }
                         // No crate list: no body is checked, each says why (engine_bodies.rs `groups`).
@@ -734,6 +815,10 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                 if let Some(table) = request_heads.as_mut() {
                     table.body_locals = body_locals;
                 }
+                // PHASE-MEM-DEBT(Bodies): the stage's packs, groups and notes on the process
+                // heap (`handles.env.heap`, engine_bodies.rs `run_phase`), and each run's frame
+                // shared by its bodies, not reset per body; its notes kept to the command's end
+                // for the print. To take `at_phase` for what lives to the phase's end.
                 bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame, request_heads.as_ref())?;
                 // The dependency heads frozen now, put sorted by key and listed by the root.
                 if let Some(table) = &request_heads {
@@ -742,6 +827,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
                     seed_counts.bodies = bodies.seeds;
                 }
             }
+            // PHASE-MEM-DEBT(Scripts): as Names': `ScriptsStage::results` on the request frame
+            // and the process heap, kept to the command's end; to take `at_phase`.
             Stage::Scripts => match names.as_mut() {
                 Some(stage) => scripts.run_phase(cx, &mut store, &handles, stage, &entered, &mut buffers[0], &mut times, alloc, frame)?,
                 None => buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
@@ -749,12 +836,19 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             Stage::Heads => {
                 let handles = crate::engine_bodies::Handles { root, env: &env, graph, names: names.as_ref(), outlined: &outlined, workers, clock: phases.clock(), board };
                 let crate::engine_bodies::BodiesStage { kept, shelf, .. } = &mut bodies;
+                // PHASE-MEM-DEBT(Heads): `HeadsStage::made` and `refused` on the process heap,
+                // kept to the command's end for the put and the notes, and the shelf's tables
+                // carried to the Bodies phases (`bodies.shelf`): to take `at_phase` for the
+                // first, and the store's records read in place for the second.
                 heads.run_phase(cx, &mut store, &mut read, &handles, kept, shelf, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
             }
+            // PHASE-MEM-DEBT(Lints): `LintsStage::made` on the process heap, kept to the
+            // command's end for the put and the print; to take `at_phase`.
             Stage::Lints => lints.run_phase(cx, root, &outlined, workers, phases.clock(), &entered, &mut buffers[0], &mut times, alloc)?,
         }
         board.phase_ended(mark, entered.len() as u64, board.now(clock));
-        // Stopped while the phase ran: its tasks not begun have no result, so no merge.
+        // Stopped while the phase ran: its tasks not begun have no result, so no merge. The
+        // phase's arena is dropped by the return (engine_phase_mem.rs `PhaseMem`'s drop).
         if let Some(by) = board.stopping() {
             return Err(stopped(cx, root, err, board, by, &ledger, names.as_ref(), phases, clock, frame)?);
         }
@@ -773,9 +867,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         ran.push((phase, planned_here, u32::try_from(entered.len()).unwrap_or(u32::MAX)));
         // The phase's records to the store, sorted by key, before the next phase reads them.
         let putting = clock.now();
-        // One a task of the phase: the project's size, so in the request's heap.
-        let mut put: Vec<Put<'_>, blaze_own::Alloc<'static>> = Vec::new_in(heap.alloc());
-        let mut marks: Vec<(Name, Option<(blaze_drive::Key, blaze_ids::ContentId)>), blaze_own::Alloc<'static>> = Vec::new_in(heap.alloc());
+        // One a task of the phase: the project's size, so in the phase's arena, gone with it.
+        let mut put: Vec<Put<'_>, blaze_own::Alloc<'_>> = Vec::new_in(mem.alloc());
+        let mut marks: Vec<(Name, Option<(blaze_drive::Key, blaze_ids::ContentId)>), blaze_own::Alloc<'_>> = Vec::new_in(mem.alloc());
         for task in entered.iter() {
             let name = task.planned.name;
             // A file's outline is put whole (its parts, paths and findings): the next request
@@ -827,7 +921,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             };
             put.push(Put { key, name, source: task.planned.source, out, reads, payload, listing, extras });
         }
-        let put_now = crate::engine_store::put_all(cx, &mut store, &mut put, phase.stage, &mut ledger, heap.alloc())?;
+        // Each record's head, made in the phase's arena and written before it ends.
+        let put_now = crate::engine_store::put_all(cx, &mut store, &mut put, phase.stage, &mut ledger, mem.alloc())?;
         puts += put_now;
         drop(put);
         // Written now, so the store's arena frees them: the next phase reads them in place from
@@ -868,7 +963,16 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             }
         }
         phase_times.push(times.fold(phase, wall, merge, clock.now().since(putting).map_or(0, crate::engine_times::ns)));
+        // The phase's records are committed: its arena ends here. A value over `at_phase` still
+        // alive at `end` is a borrow across its move, refused at compile time
+        // (engine_phase_mem.rs's doc).
+        drop(marks);
+        drop(entered);
+        let row = mem.end();
+        board.phase_mem(row.stage, phase_mem.add(row));
     }
+    // Every phase's arena made and dropped by now (each ended in its iteration).
+    phase_mem.counts = request_mem.counts();
     let finishing = clock.now();
     let mut finished = engine.finish()?;
     finished.report.settle.finish_ns = clock.now().since(finishing).map_or(0, crate::engine_times::ns);
@@ -900,6 +1004,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     for one in finished.causes.iter() {
         entered_now.insert(one.name);
     }
+    let signatures_entered = u32::try_from(finished.causes.iter().filter(|one| one.name.kind == blaze_drive::Kind::Signature).count()).unwrap_or(u32::MAX);
     let mut lines = crate::engine_lines::Lines::new_in(alloc);
     // A row with findings that stands and whose block the last record does not hold (a bug of
     // the write): counted and said, never a quiet pass (rule 3).
@@ -944,6 +1049,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         // A head task's heads not frozen, each with its reason (engine_head_notes.rs).
         if crate::engine_head_notes::is_head_task(*name) {
             if !bodies.heads_failed.ready {
+                // PHASE-MEM-DEBT(Heads): as the Bodies phase's (`Failed::of`, `Alloc<'static>`).
                 bodies.heads_failed = crate::engine_head_notes::Failed::of(&heads, last_lines.as_ref(), heap.alloc())?;
             }
             bodies.heads_failed.note(&heads, *name, &mut lines, frame);
@@ -992,6 +1098,8 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     }
     // The plan's notes (a file no unit holds), no task's: made now, or kept (engine_body_plan.rs).
     bodies.plan_lines(&outlined, last_lines.as_ref(), &mut lines);
+    // PHASE-MEM-DEBT(Request): as the certificate's print, the printer's lists on the process
+    // heap (engine_lines.rs `print_all`): to take the request's `SharedAlloc<'_>`.
     let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;
     crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
     let unchecked = tally.unchecked;
@@ -1059,6 +1167,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     crate::engine_memory::profile(&ledger, names.as_ref(), &mut text);
     // The head tasks' freezes by unit (engine_heads.rs `UnitCounts`), said beside the table's.
     seed_counts.units = heads.units;
+    seed_counts.once = crate::engine_heads_once::counts(&heads);
     crate::engine_seeds::profile(&seed_counts, &mut text);
     // A task by what it is about: a file's path, a crate's name, a script's crate, a body's item.
     let world = names.as_ref().and_then(|stage| stage.names.as_ref());
@@ -1085,11 +1194,15 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         let _ = writeln!(text, "files: {} outline(s) read back from the store (file not read), {} outlined (file read), {} probed by the planner", file_counts.read_back, file_counts.outlined, file_counts.probed);
         let _ = writeln!(text, "{sweep_counts}");
         let _ = writeln!(text, "{cleanup}");
+        let made = phase_mem.counts;
+        let _ = writeln!(text, "phase arenas: {} made, {} dropped, {} bytes given back at their drops (engine_phase_mem.rs)", made.made, made.dropped, made.returned);
     }
     // Written in place, never synced, as `check`'s profile (print.rs `profile`).
     let file = root.create(cx, &Path::new(print::PROFILE)?)?;
     file.append(cx, text.as_bytes(), bstd::fs::Durable::No)?;
     file.close(cx, bstd::fs::Durable::No)?;
+    // PHASE-MEM-DEBT(CHECKED): `Checked` has no lifetime and outlives the request, so its lists
+    // are on the process heap.
     let mut kept = blaze_own::Vec::new_in(heap.alloc());
     kept.extend(because.iter().copied());
     Ok(Checked {
@@ -1107,6 +1220,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         unreadable,
         undefined_reads,
         heads: (heads_entered, u32::try_from(heads.refused.len()).unwrap_or(u32::MAX), heads.read_back),
+        signatures_entered,
         lints: lints.seen(&outlined),
         ownerless: (bodies.ownerless, bodies.ownerless_paths(&outlined)),
         files: file_counts,
@@ -1115,6 +1229,7 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         records: ledger,
         sweep: sweep_counts,
         seeds: seed_counts,
+        phase_mem,
     })
 }
 
@@ -1214,6 +1329,19 @@ fn profile_text<'f>(ran: &[(Phase, u32, u32)], report: &blaze_engine::Report, be
     }
     let settle = report.settle;
     let _ = writeln!(text, "finish: owed cells {}, settled {}, saw calls {}, reads compared {}, {} ms", settle.owed, settle.settled, settle.saw_calls, settle.compared, settle.finish_ns / 1_000_000);
+    let index = &report.index;
+    let _ = writeln!(
+        text,
+        "index: read edges {}, {} bytes ({} an edge, floor {}), allocations {} (at most {} a phase), runs {}, sorts {}",
+        index.edges,
+        index.bytes,
+        index.bytes_per_edge(),
+        blaze_engine::FLOOR_BYTES_PER_EDGE,
+        index.allocations,
+        index.phase_allocations_max,
+        index.runs,
+        index.seals
+    );
     let _ = writeln!(text, "entered because (stage, cause, the moved cell's task and kind: tasks), top {BECAUSE_SHOWN}");
     for (group, count) in because.iter().take(BECAUSE_SHOWN) {
         let kind = group.cell.map_or("", crate::engine_scope_reads::CellKind::words);
@@ -1328,7 +1456,7 @@ fn plan<'h, 'm>(
         scope.narrow_workers(workers, Class::Foreground);
         // One a file of the wave: project-sized, so never in the command's fixed frame.
         // Each want of the wave in its order: read back on this thread, or a worker's handle.
-        let mut handles = Vec::with_capacity_in(wave.len(), std::alloc::Global);
+        let mut handles = Vec::with_capacity_in(wave.len(), alloc);
         let mut stopped = None;
         for want in wave.iter() {
             let known = kept.slot(want);

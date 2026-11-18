@@ -11,7 +11,8 @@
 //! - **Primitives** (Reference, "Type layout", "Primitive data layout"): an integer or float of
 //!   `n` bytes has size `n` and alignment `n`; `bool` is one byte whose valid values are 0 and 1;
 //!   `char` is four bytes whose valid values are `0..=0x10FFFF` (the surrogates are inside the
-//!   range: the niche used is the values above it); `!` is zero-sized and uninhabited.
+//!   range: its niche is the values above it, `Option<char>`'s `None` the last, `0xFFFF_FFFF`);
+//!   `!` is zero-sized and uninhabited.
 //! - **Pointers**: a pointer to a sized type is one word; to a slice or `str` two words, the
 //!   address at offset 0 and the length at offset 8 (Reference, "Pointers and references
 //!   layout": "pointers to unsized types are ... twice the size of `usize`"). A reference is
@@ -43,26 +44,40 @@
 //!   values). An aggregate's niche is the one of its fields' with the most invalid values (ties:
 //!   the lowest offset); an array's is its first element's. `#[rustc_layout_scalar_valid_range_*]`
 //!   ([`LayoutFacts::valid_range`]) narrows the valid range of a struct around one scalar (or the
-//!   first half of a wide pointer): this is how `core` declares `NonNull` and the `NonZero`
-//!   integers. `UnsafeCell` hides its field's niche ([`ReprAttrs::hide_niche`]): a value behind a
+//!   first half of a wide pointer), the bounds as written replacing the scalar's (each `None`
+//!   keeping its end); today's `core` writes none (its `NonNull` and `NonZero` inners are
+//!   pattern types), older code and tests do. `UnsafeCell` hides its field's niche ([`ReprAttrs::hide_niche`]): a value behind a
 //!   shared reference may be changed, so no outer type may read meaning into its bytes.
-//! - **Enums, `repr(Rust)`** (blaze's rule, which keeps every layout Rust guarantees):
-//!   - A variant is *absent* when it is uninhabited and all its fields are zero-sized: it is
-//!     never built, so it needs no bytes and no tag value of its own.
+//! - **Pattern types** (`u32 is 1..`, core's `NonZero` inners, `NonNull`'s `*const T is !null`,
+//!   `char is '\u{1}'..`): the base's layout with its scalar's valid range replaced by the
+//!   pattern's one canonical range.
+//! - **Enums, `repr(Rust)`**: rustc's `layout_of_enum` and `Niche::reserve` step for step (the
+//!   pinned toolchain's source is crates/rustc_abi/src/layout.rs and lib.rs), so a niche value
+//!   is the one rustc's code reads (`transmute::<Option<char>, u32>(None)` is `0xFFFF_FFFF`):
+//!   - A variant is *absent* when it is uninhabited and every field is a 1-ZST (size 0,
+//!     alignment 1): it is never built, so it needs no bytes and no tag value of its own.
 //!   - No variant present: zero-sized and uninhabited. One present: the layout of that
 //!     variant as a struct, no tag.
-//!   - Otherwise the smaller of two candidates (the niche one when equal):
-//!     *tagged*: the tag at offset 0, the smallest integer holding every discriminant (signed if
-//!     one is negative), then each variant's fields after it in *increasing* alignment (so small
-//!     fields fill the bytes next to the tag);
-//!     *niche*: when every present variant but one (the largest, ties the first) is zero-sized,
-//!     that variant is laid out as a struct and the others are encoded in invalid values of its
-//!     niche: variants `first..=last` (every variant but the untagged one lies in that range)
-//!     take the values `start + (v - first)`, wrapping at the niche's width, where `start` is
-//!     the value after the niche's valid range.
+//!   - Otherwise one of two candidates: the smaller; at equal sizes the one whose own niche
+//!     has more invalid values; else the tagged one.
+//!     *tagged*: the tag at offset 0, the smallest integer of at least 8 bits holding
+//!     `min(0, ..)..=max(0, ..)` of the discriminants of the variants with no uninhabited field
+//!     (signed if one is negative), widened to the smallest alignment of any variant's first
+//!     non-1-ZST field when that is a wider integer; each variant's fields after it in
+//!     *increasing* alignment; the tag's valid values the smallest wrapping range holding those
+//!     discriminants.
+//!     *niche*: the untagged variant is the last of the largest size; variants `first..=last`
+//!     (the first and last that are neither it nor absent) take the values
+//!     `start + (v - first)` of its largest niche, reserved next to the niche's valid range on
+//!     the side nearer zero (`Niche::reserve`); every other variant must fit before the niche's
+//!     bytes or after them (its fields then moved past them), else there is no niche layout.
+//!     The size is the untagged variant's, rounded to the largest alignment.
 //!   This gives the null-pointer optimisation Rust guarantees (std's `option` module doc,
 //!   "Representation"): `Option<T>` has `T`'s size and `None` is all zeros at the pointer for
 //!   `&T`, `&mut T`, `Box<T>`, `NonNull<T>`, `fn` pointers and `NonZero*`; tested by name.
+//!   Field order inside a variant (and a struct) is still blaze's own (above), not rustc's
+//!   niche-biased sort: a niche's OFFSET may differ from rustc's where a struct has two fields
+//!   of one alignment (`(u8, bool)`), its values never.
 //! - **Enums, `repr(C)` and `repr(<int>)`** (RFC 2195, the Reference's "Primitive
 //!   representation of enums with fields"): a field-less enum is its tag (`repr(C)`: C's `int`,
 //!   32 bits; refused when a discriminant does not fit); with fields, `repr(<int>)` is a union of
@@ -95,6 +110,8 @@ pub mod simd;
 mod simd_rule;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod niche_table;
 
 /// The target's pointer size in bytes.
 pub const PTR_BYTES: u64 = 8;
@@ -355,6 +372,16 @@ pub const fn mask(bits: u32) -> u128 {
     if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 }
 }
 
+/// The value of the low `bits` bits of `v` read as a two's-complement signed number.
+pub const fn sign_extend(v: u128, bits: u32) -> i128 {
+    if bits >= 128 {
+        v as i128
+    } else {
+        let shift = 128 - bits;
+        ((v << shift) as i128) >> shift
+    }
+}
+
 /// An inclusive range of a scalar's values that may wrap around (`start > end`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WrappingRange {
@@ -410,17 +437,52 @@ impl Niche {
         self.scalar.valid.invalid(self.scalar.prim.bits())
     }
 
-    /// Takes `count` invalid values just past the valid range: the first value taken, and the
-    /// scalar with them counted valid.
+    /// Takes `count` consecutive invalid values next to the valid range: the first value taken,
+    /// and the scalar with them counted valid. rustc's rule exactly (`rustc_abi` `Niche::reserve`,
+    /// the pinned nightly's): the values are taken either just BELOW the range's start (the
+    /// start moves down) or just PAST its end (the end moves up), whichever reaches zero first:
+    /// - one value (an `Option`-like enum), the scalar not `bool`'s `0..=1`: the side whose next
+    ///   value is nearer zero as a SIGNED number, below on a tie (`Option<NonZero<u8>>`'s `None`
+    ///   is 0; `Option<char>`'s is `0xFFFF_FFFF`, -1; `Option<Ordering>`'s is -2);
+    /// - else, a range that wraps (zero is inside it): past the end;
+    /// - else, when the start is nearer zero than the end's distance to the maximum: below the
+    ///   start if `count` values fit between zero and the start, else past the end;
+    /// - else past the end, unless that wraps past zero into the range's own values: below.
+    ///
+    /// `bool`'s `0..=1` is held to past the end (rustc: "this ought to work for `bool` too, but
+    /// that seems to be hitting a miscompilation"): `Option<bool>`'s `None` is 2.
     fn reserve(&self, count: u128) -> Option<(u128, Scalar)> {
         if count == 0 || count > self.available() {
             return None;
         }
-        let bits = self.scalar.prim.bits();
+        let prim = self.scalar.prim;
+        let bits = prim.bits();
         let m = mask(bits);
-        let start = self.scalar.valid.end.wrapping_add(1) & m;
-        let end = self.scalar.valid.end.wrapping_add(count) & m;
-        Some((start, Scalar { prim: self.scalar.prim, valid: WrappingRange { start: self.scalar.valid.start, end } }))
+        let v = self.scalar.valid;
+        let move_start = || {
+            let start = v.start.wrapping_sub(count) & m;
+            Some((start, Scalar { prim, valid: WrappingRange { start, end: v.end } }))
+        };
+        let move_end = || {
+            let start = v.end.wrapping_add(1) & m;
+            let end = v.end.wrapping_add(count) & m;
+            Some((start, Scalar { prim, valid: WrappingRange { start: v.start, end } }))
+        };
+        let distance_end_zero = m - v.end;
+        let is_bool = bits == 8 && v == WrappingRange { start: 0, end: 1 };
+        if count == 1 && !is_bool {
+            let next_up = sign_extend(v.end.wrapping_add(1) & m, bits).unsigned_abs();
+            let next_down = sign_extend(v.start.wrapping_sub(1) & m, bits).unsigned_abs();
+            if next_down <= next_up { move_start() } else { move_end() }
+        } else if v.start > v.end {
+            move_end()
+        } else if v.start <= distance_end_zero {
+            if count <= v.start { move_start() } else { move_end() }
+        } else {
+            let end = v.end.wrapping_add(count) & m;
+            let overshot_zero = end >= 1 && end <= v.end;
+            if overshot_zero { move_start() } else { move_end() }
+        }
     }
 }
 
@@ -628,6 +690,50 @@ struct Uni {
     pair: Option<(Scalar, Scalar)>,
 }
 
+/// One variant of a `repr(Rust)` enum laid out alone as a struct (`Layouts::enum_`): what
+/// choosing between the tagged and niche layouts reads of it.
+#[derive(Clone, Copy)]
+struct Probe {
+    size: u64,
+    align: u8,
+    niche: Option<Niche>,
+    /// A field is uninhabited: its discriminant is never held.
+    uninhabited: bool,
+    /// Uninhabited with every field a 1-ZST: never built, given neither bytes nor a tag value.
+    absent: bool,
+    scalar: Option<Scalar>,
+    pair: Option<(Scalar, Scalar)>,
+}
+
+/// The smallest wrapping range holding every one of `values` (each below `2^bits`), rustc's
+/// `WrappingRange::smallest_range_containing`: `min..=max` when it spans at most half the
+/// values, else the narrowest of it and each wrap-around range `(..=a) | (b..)` between two
+/// neighbouring sorted values, `min..=max` first on a tie. No values: `0..=0` (rustc: "we might
+/// have no inhabited variants, so pretend there's at least one"). Sorts `values`.
+fn smallest_range(values: &mut [u128], bits: u32) -> WrappingRange {
+    let m = mask(bits);
+    let (Some(&min), Some(&max)) = (values.iter().min(), values.iter().max()) else {
+        return WrappingRange { start: 0, end: 0 };
+    };
+    let obvious = WrappingRange { start: min, end: max };
+    if max - min <= 1u128 << (bits - 1) {
+        return obvious;
+    }
+    values.sort_unstable();
+    let width = |r: WrappingRange| r.end.wrapping_sub(r.start) & m;
+    let mut best = obvious;
+    for w in values.windows(2) {
+        let (end, start) = (w[0], w[1]);
+        if start != end {
+            let r = WrappingRange { start, end };
+            if width(r) < width(best) {
+                best = r;
+            }
+        }
+    }
+    best
+}
+
 /// The layouts of one program's ground types, made on demand.
 pub struct Layouts<A: Allocator + Clone> {
     rows: Vec<Layout, A>,
@@ -640,6 +746,10 @@ pub struct Layouts<A: Allocator + Clone> {
     /// tuple whose last field is itself a struct ending in a trait object, read by `dyn_chain`.
     dyn_inner: Vec<(u32, LayoutId), A>,
     alloc: A,
+    /// A planted bug for the control test (layout/niche_table.rs): every `repr(Rust)` enum of
+    /// two or more present variants takes the tagged layout, never the niche one.
+    #[cfg(test)]
+    pub(crate) niche_off: bool,
 }
 
 fn align_up(at: u64, align: u8) -> Result<u64, Refusal> {
@@ -721,6 +831,8 @@ impl<A: Allocator + Clone> Layouts<A> {
             discrs: Vec::new_in(alloc.clone()),
             dyn_inner: Vec::new_in(alloc.clone()),
             alloc,
+            #[cfg(test)]
+            niche_off: false,
         }
     }
 
@@ -1105,16 +1217,20 @@ impl<A: Allocator + Clone> Layouts<A> {
                     [start, end] => WrappingRange { start: bits(*start)?, end: bits(*end)? },
                     _ => return Err(Refusal::Unsupported("a pattern type of other than one range")),
                 };
-                // The range replaces the base's, so the base's must be full (an integer's, a raw
-                // pointer's address): a `bool`, `char` or reference base would be widened. Its
-                // ends are kept to the scalar's width (a signed bound may arrive sign-extended).
+                // The range replaces the base's (rustc's `layout_of_uncached` for `ty::Pat`), so
+                // `char is '\u{1}'..` (core's `NonZeroCharInner`) is `1..=0x10FFFF`. Its ends are
+                // kept to the scalar's width (a signed bound may arrive sign-extended). A range
+                // reaching outside the base's own valid values would call an invalid value
+                // valid: refused by name (typeck admits none).
                 let narrowed = |s: Scalar| -> Result<Scalar, Refusal> {
                     let bits = s.prim.bits();
-                    if s.valid != WrappingRange::full(bits) {
-                        return Err(Refusal::Unsupported("a pattern type over a scalar that has its own valid range"));
-                    }
                     let m = mask(bits);
-                    Ok(Scalar { prim: s.prim, valid: WrappingRange { start: valid.start & m, end: valid.end & m } })
+                    let r = WrappingRange { start: valid.start & m, end: valid.end & m };
+                    let rel = |v: u128| v.wrapping_sub(s.valid.start) & m;
+                    if s.valid != WrappingRange::full(bits) && (rel(r.start) > rel(r.end) || rel(r.end) > rel(s.valid.end)) {
+                        return Err(Refusal::Malformed("a pattern type whose range reaches outside its base's valid values"));
+                    }
+                    Ok(Scalar { prim: s.prim, valid: r })
                 };
                 match (base.scalar, base.pair) {
                     (Some(s), _) => {
@@ -1621,28 +1737,31 @@ impl<A: Allocator + Clone> Layouts<A> {
             return self.tagged(t, n, tag, 0, start, c_attrs, Order::Declaration, &fields_of, discrs);
         }
 
-        // repr(Rust).
-        let mut present: Vec<bool, A> = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut zero: Vec<bool, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        // repr(Rust): rustc's `layout_of_enum` (crates/rustc_abi/src/layout.rs, the pinned
+        // toolchain's), each step named there. Each variant alone, as a struct.
+        let mut probes: Vec<Probe, A> = Vec::with_capacity_in(n, self.alloc.clone());
         for v in 0..n {
-            let mut all_zst = true;
-            let mut uninhabited = false;
-            for &p in fields_of(v)? {
+            let fs = fields_of(v)?;
+            let mut one_zst = true;
+            for &p in fs {
                 let l = self.get(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?);
-                all_zst &= l.is_zst();
-                uninhabited |= l.uninhabited;
+                one_zst &= l.is_zst() && l.align == 0;
             }
-            present.push(!(uninhabited && all_zst));
-            zero.push(all_zst);
+            let u = self.univariant(fs, Order::Decreasing, attrs, 0, 0)?;
+            self.offsets.truncate(u.first as usize);
+            // `absent`: uninhabited and every field a 1-ZST (size 0 AND alignment 1: a variant
+            // holding `([u64; 0], !)` keeps the enum's alignment, so it is laid out).
+            let absent = u.uninhabited && one_zst;
+            probes.push(Probe { size: u.size, align: u.align, niche: u.niche, uninhabited: u.uninhabited, absent, scalar: u.scalar, pair: u.pair });
         }
-        let present_count = present.iter().filter(|&&p| p).count();
+        let present_count = probes.iter().filter(|p| !p.absent).count();
         if present_count == 0 {
             let mut l = self.zst_row(t, true);
             l.discrs = discrs;
             return self.push(l);
         }
         if present_count == 1 {
-            let v = present.iter().position(|&p| p).unwrap_or(0);
+            let v = probes.iter().position(|p| !p.absent).ok_or(Refusal::Malformed("an enum's one present variant not found"))?;
             let u = self.univariant(fields_of(v)?, Order::Decreasing, attrs, 0, 0)?;
             let mut l = self.struct_row(t, u);
             l.variants = Variants::Single { index: v as u32 };
@@ -1650,101 +1769,141 @@ impl<A: Allocator + Clone> Layouts<A> {
             return self.push(l);
         }
 
-        // The tagged candidate.
-        let tag_prim = fit_int(min, max);
-        let m = mask(tag_prim.bits());
-        let tag = Scalar { prim: tag_prim, valid: WrappingRange { start: (min as u128) & m, end: (max as u128) & m } };
-        let mark = (self.offsets.len(), self.variant_rows.len(), self.rows.len());
-        let tagged = self.tagged(t, n, tag, 0, tag_prim.size(), attrs, Order::Increasing, &fields_of, discrs)?;
-        let tagged_size = self.get(tagged).size;
-
-        // The niche candidate: every present variant but the largest is zero-sized.
-        let mut untagged = None;
-        let mut best_size = 0u64;
-        let mut others_zero = true;
-        let mut sizes: Vec<u64, A> = Vec::with_capacity_in(n, self.alloc.clone());
-        for v in 0..n {
-            let u = self.univariant(fields_of(v)?, Order::Decreasing, attrs, 0, 0)?;
-            sizes.push(u.size);
-            self.offsets.truncate(u.first as usize);
-        }
-        for v in 0..n {
-            if present[v] && (untagged.is_none() || sizes[v] > best_size) {
-                untagged = Some(v);
-                best_size = sizes[v];
+        // The tagged candidate. The tag holds the discriminants of the variants with no
+        // uninhabited field (`necessary_discriminants`; the others are never built): the
+        // smallest integer of at least 8 bits holding `min(0, ..)..=max(0, ..)` of them, signed
+        // when one is negative (`discr_range_of_repr`).
+        let mut necessary: Vec<i128, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        for (v, p) in probes.iter().enumerate() {
+            if !p.uninhabited {
+                necessary.push(self.discrs[discr_first as usize + v]);
             }
         }
-        let Some(untagged) = untagged else { return Ok(tagged) };
+        let lo = necessary.iter().copied().min().unwrap_or(0).min(0);
+        let hi = necessary.iter().copied().max().unwrap_or(0).max(0);
+        let min_prim = fit_int(lo, hi);
+        let Prim::Int { bytes: min_bytes, signed } = min_prim else {
+            return Err(Refusal::Malformed("an enum tag that is not an integer"));
+        };
+        // Tag widening: the tag grows to the smallest alignment of any variant's first field
+        // (by offset) that is not a 1-ZST, when that is a wider integer (`Integer::for_align`:
+        // 1, 2, 4, 8 or 16 bytes), so the bytes before that field are the tag's, not padding.
+        let mut start_align: Option<u8> = None;
         for v in 0..n {
-            if v != untagged && present[v] && !zero[v] {
-                others_zero = false;
-            }
-        }
-        if !others_zero {
-            return Ok(tagged);
-        }
-        let first_v = (0..n).find(|&v| v != untagged && present[v]);
-        let last_v = (0..n).rev().find(|&v| v != untagged && present[v]);
-        let (Some(first_v), Some(last_v)) = (first_v, last_v) else { return Ok(tagged) };
-        let u = self.univariant(fields_of(untagged)?, Order::Decreasing, attrs, 0, 0)?;
-        let Some(niche) = u.niche else { return Ok(tagged) };
-        let Some((start, reserved)) = niche.reserve((last_v - first_v + 1) as u128) else { return Ok(tagged) };
-        // The others' (zero-sized) fields are at offset 0; their alignment counts.
-        let mut align = u.align;
-        for v in 0..n {
-            if v != untagged {
-                for &p in fields_of(v)? {
-                    align = align.max(self.get(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?).align);
+            let fs = fields_of(v)?;
+            let u = self.univariant(fs, Order::Increasing, ReprAttrs { align: None, ..attrs }, min_prim.size(), min_prim.align())?;
+            let mut lowest: Option<(u64, u8)> = None;
+            for (i, &p) in fs.iter().enumerate() {
+                let l = *self.get(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?);
+                if l.is_zst() && l.align == 0 {
+                    continue;
+                }
+                let off = self.offsets[(u.first + i as u32) as usize];
+                if lowest.is_none_or(|(o, _)| off < o) {
+                    lowest = Some((off, l.align));
                 }
             }
+            self.offsets.truncate(u.first as usize);
+            if let Some((_, a)) = lowest {
+                start_align = Some(start_align.map_or(a, |s| s.min(a)));
+            }
         }
-        let size = align_up(u.size, align)?;
-        if size > tagged_size {
+        let tag_prim = match start_align {
+            Some(a) if a <= 4 && (1u8 << a) > min_bytes => Prim::Int { bytes: 1u8 << a, signed },
+            _ => min_prim,
+        };
+        // Its valid values: the smallest wrapping range holding every necessary discriminant at
+        // the tag's width (`WrappingRange::smallest_range_containing`).
+        let tag_bits = tag_prim.bits();
+        let mut values: Vec<u128, A> = Vec::with_capacity_in(necessary.len(), self.alloc.clone());
+        values.extend(necessary.iter().map(|&d| (d as u128) & mask(tag_bits)));
+        let tag = Scalar { prim: tag_prim, valid: smallest_range(&mut values, tag_bits) };
+        let mark = (self.offsets.len(), self.variant_rows.len(), self.rows.len());
+        let tagged = self.tagged(t, n, tag, 0, tag_prim.size(), attrs, Order::Increasing, &fields_of, discrs)?;
+        #[cfg(test)]
+        if self.niche_off {
             return Ok(tagged);
         }
-        // The niche layout wins: drop the tagged candidate's rows (the last ones made).
-        let untagged_offsets: Vec<u64, A> = {
-            let mut v = Vec::new_in(self.alloc.clone());
-            v.extend_from_slice(&self.offsets[u.first as usize..(u.first + u.len) as usize]);
-            v
-        };
+
+        // The niche candidate (`calculate_niche_filling_layout`). The untagged variant is the
+        // LAST of the largest size (`max_by_key`); the tagged ones are `first..=last`, the
+        // first and last variants that are neither it nor absent; their count of values is
+        // reserved next to its largest niche's valid range.
+        let mut align = 0u8;
+        let mut largest = 0usize;
+        for (v, p) in probes.iter().enumerate() {
+            align = align.max(p.align);
+            if p.size >= probes[largest].size {
+                largest = v;
+            }
+        }
+        let needs_tag = |v: usize| v != largest && !probes[v].absent;
+        let first_v = (0..n).find(|&v| needs_tag(v)).ok_or(Refusal::Malformed("an enum of two present variants with none to tag"))?;
+        let last_v = (0..n).rev().find(|&v| needs_tag(v)).ok_or(Refusal::Malformed("an enum of two present variants with none to tag"))?;
+        let Some(niche) = probes[largest].niche else { return Ok(tagged) };
+        let Some((start, reserved)) = niche.reserve((last_v - first_v + 1) as u128) else { return Ok(tagged) };
+        let size = align_up(probes[largest].size, align)?;
+        // Every other variant fits before the niche (it ends at or before the niche's offset) or
+        // after it (from the niche's end rounded up to its own alignment), or there is no niche
+        // layout; one placed after has all its fields moved by that offset.
+        let niche_end = niche.offset + reserved.prim.size();
+        let mut shift: Vec<u64, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        for (v, p) in probes.iter().enumerate() {
+            if v == largest || p.size <= niche.offset {
+                shift.push(0);
+                continue;
+            }
+            let at = align_up(niche_end, p.align)?;
+            if at + p.size > size {
+                return Ok(tagged);
+            }
+            shift.push(at);
+        }
+        let enum_niche = Niche::of(niche.offset, reserved);
+        // The smaller layout; at equal sizes the one with the larger niche; else the tagged one.
+        let tagged_size = self.get(tagged).size;
+        let tagged_niche = self.get(tagged).niche.map_or(0, |x| x.available());
+        let niche_wins = size < tagged_size || (size == tagged_size && tagged_niche < enum_niche.map_or(0, |x| x.available()));
+        if !niche_wins {
+            return Ok(tagged);
+        }
+        // The niche layout wins: drop the tagged candidate's rows (the last ones made), then lay
+        // each variant out again at its place.
         self.offsets.truncate(mark.0);
         self.variant_rows.truncate(mark.1);
         self.rows.truncate(mark.2);
-        let variants_first = self.variant_rows.len() as u32;
         let mut variant_ids: Vec<LayoutId, A> = Vec::with_capacity_in(n, self.alloc.clone());
-        let enum_niche = Niche::of(niche.offset, reserved);
         for v in 0..n {
-            let fs = fields_of(v)?;
-            let first = self.offsets.len() as u32;
-            if v == untagged {
-                self.offsets.extend_from_slice(&untagged_offsets);
-            } else {
-                self.offsets.resize(self.offsets.len() + fs.len(), 0);
-            }
-            let mut uninhabited = false;
-            for &p in fs {
-                uninhabited |= self.get(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?).uninhabited;
+            let u = self.univariant(fields_of(v)?, Order::Decreasing, attrs, 0, 0)?;
+            for off in &mut self.offsets[u.first as usize..(u.first + u.len) as usize] {
+                *off += shift[v];
             }
             let id = self.push(Layout {
                 ty: t,
                 size,
                 align,
                 tail: Tail::Sized,
-                uninhabited,
+                uninhabited: probes[v].uninhabited,
                 scalar: None,
                 pair: None,
-                fields: Fields::Struct { first, len: fs.len() as u32 },
+                fields: Fields::Struct { first: u.first, len: u.len },
                 variants: Variants::Single { index: v as u32 },
-                niche: if v == untagged { Niche::of(niche.offset, reserved) } else { None },
+                niche: if v == largest { enum_niche } else { None },
                 discrs: (0, 0),
             })?;
             variant_ids.push(id);
         }
+        let variants_first = self.variant_rows.len() as u32;
         self.variant_rows.extend_from_slice(&variant_ids);
-        let scalar = if size == reserved.prim.size() && niche.offset == 0 { Some(reserved) } else { None };
-        let pair = match u.pair {
-            Some((a, b)) if niche.offset == 0 && a.prim == reserved.prim => Some((reserved, b)),
+        // The untagged variant's scalar or pair, with the niche's values counted valid, when it
+        // is the whole enum: the same size and alignment, every other variant zero-sized. Only
+        // the niche's half of a pair is always initialized: the other is its full range.
+        let others_zst = probes.iter().enumerate().all(|(v, p)| v == largest || p.size == 0);
+        let whole = size == probes[largest].size && align == probes[largest].align && others_zst;
+        let scalar = probes[largest].scalar.filter(|_| whole && niche.offset == 0).map(|_| reserved);
+        let pair = match probes[largest].pair {
+            Some((a, b)) if whole && niche.offset == 0 && a.prim == reserved.prim => Some((reserved, Scalar::full(b.prim))),
+            Some((a, b)) if whole && niche.offset == PTR_BYTES && b.prim == reserved.prim => Some((Scalar::full(a.prim), reserved)),
             _ => None,
         };
         self.push(Layout {
@@ -1752,14 +1911,14 @@ impl<A: Allocator + Clone> Layouts<A> {
             size,
             align,
             tail: Tail::Sized,
-            uninhabited: false,
+            uninhabited: probes.iter().all(|p| p.uninhabited),
             scalar,
             pair,
             fields: Fields::Struct { first: 0, len: 0 },
             variants: Variants::Multiple {
                 tag: reserved,
                 tag_offset: niche.offset,
-                encoding: TagEncoding::Niche { untagged: untagged as u32, first: first_v as u32, last: last_v as u32, start },
+                encoding: TagEncoding::Niche { untagged: largest as u32, first: first_v as u32, last: last_v as u32, start },
                 first: variants_first,
                 count: n as u32,
             },

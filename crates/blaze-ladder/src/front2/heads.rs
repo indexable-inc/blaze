@@ -382,8 +382,11 @@ pub struct AdtRow {
     pub fields: Vec<tc::Field, Global>,
     /// Its `#[repr(..)]`: what layout reads.
     pub repr: blaze_build::layout::ReprAttrs,
-    /// A `rustc_layout_scalar_valid_range_*` attribute narrows its valid range.
-    pub narrowed: bool,
+    /// Its `#[rustc_layout_scalar_valid_range_start(s)]` and `..._end(e)`, as written (each
+    /// `None` when absent): the ONE fact of a narrowed valid range (rule 30) that layout's
+    /// `valid_range` answers (blaze-build layout.rs narrows the struct's one scalar by it; a
+    /// pattern type's range is its type's, `PNode::Pat`, never here). Read by [`valid_range_of`].
+    pub valid: blaze_build::layout::ValidRange,
     /// An enum's discriminant by variant, explicit or implicit, in its discriminant type
     /// ([`discr_ty`]); empty for a struct or union. Layout's `discriminant` answers from it.
     pub discrs: Vec<i128, Global>,
@@ -392,6 +395,36 @@ pub struct AdtRow {
     /// which the body check's `args-inline` reads (blaze-typeck rules/args_inline.rs); the head
     /// record keeps it, so an ADT of any crate is known.
     pub args: bool,
+}
+
+/// Reads one `#[rustc_layout_scalar_valid_range_start(n)]` or `..._end(n)` (its path `path` as
+/// written, its argument text `args`, `(n)` or `n`) of an ADT of `kind` into `out`. rustc's rule
+/// (rustc_middle `layout_scalar_valid_range`): the attribute takes one integer literal, sits on a
+/// struct, and bounds the struct's one scalar; the end is inclusive. The literal is any radix
+/// with `_`s and a suffix, never negative; a repeated bound, another suffix of the path, a union
+/// or enum, or a value past `u128` is refused by name (layout refuses a struct that is not one
+/// scalar or one wide pointer).
+pub(crate) fn valid_range_of(path: &str, args: &str, kind: tc::AdtKind, out: &mut blaze_build::layout::ValidRange) -> Result<(), &'static str> {
+    let which = path.strip_prefix("rustc_layout_scalar_valid_range_").map(str::trim);
+    if kind != tc::AdtKind::Struct {
+        return Err("a `rustc_layout_scalar_valid_range_*` attribute on an enum or union (rustc takes it on a struct only)");
+    }
+    let args = args.trim();
+    let inner = args.strip_prefix('(').and_then(|a| a.strip_suffix(')')).unwrap_or(args).trim();
+    if inner.starts_with('-') || inner.contains(',') {
+        return Err("a `rustc_layout_scalar_valid_range_*` bound that is not one non-negative integer literal");
+    }
+    let value = crate::front::int_value(inner).ok_or("a `rustc_layout_scalar_valid_range_*` bound that is not one integer literal")?;
+    let slot = match which {
+        Some("start") => &mut out.start,
+        Some("end") => &mut out.end,
+        _ => return Err("a `rustc_layout_scalar_valid_range_*` attribute other than `_start` and `_end`"),
+    };
+    if slot.is_some() {
+        return Err("a `rustc_layout_scalar_valid_range_*` bound written twice");
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 /// Whether an attribute's path, as written, is `blaze::args` (spaces around `::` allowed).
@@ -1486,7 +1519,16 @@ impl<'n> Store<'n> {
         // them, as a struct's (types.rs `with_defaults`).
         let mut defaults = Vec::new_in(Global);
         own_defaults(&b, &mut self.tys, &env, v, 0, &mut defaults)?;
+        // Each `impl Trait` the alias's type writes is one opaque of the alias (super::tait).
+        let alias_ck = checker_of(key);
+        let a = self.tys.alloc();
+        let opaques = super::tait::alias_opaques(&mut self.tys, v, lf::TypeId(t), alias_ck, generics, &cs, a)?;
+        let env = Env { anon: &opaques, ..env };
         let ty = b.ty(&mut self.tys, &env, v, lf::TypeId(t))?;
+        for o in super::tait::alias_opaque_preds(&b, &mut self.tys, &env, v, alias_ck, &opaques, self.sized, a)? {
+            self.preds.insert(o.key, o.preds);
+            self.opaques.insert(o.key, (alias_ck, o.index));
+        }
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -1921,11 +1963,10 @@ impl<'n> Store<'n> {
         }
         self.field_defaults.insert(ck, defaults);
         self.preds.insert(ck, preds);
-        // Its `#[repr(..)]`, read by the reader the old front reads with, and whether a
-        // `rustc_layout_scalar_valid_range_*` narrows its range (the program refuses to lay
-        // out such a type until the back half's `valid_range` reads it).
+        // Its `#[repr(..)]`, read by the reader the old front reads with, and its
+        // `rustc_layout_scalar_valid_range_*` bounds (layout's `valid_range`).
         let mut repr = blaze_build::layout::ReprAttrs::RUST;
-        let mut narrowed = false;
+        let mut valid = blaze_build::layout::ValidRange::default();
         let mut args = false;
         let attrs = v.list(head::ATTRS);
         for (i, &n) in v.rows(attrs)?.iter().enumerate() {
@@ -1941,11 +1982,14 @@ impl<'n> Store<'n> {
             if path == "lang" && matches!(crate::front::unquote(v.text_at(a.args)?), "unsafe_cell" | "unsafe_pinned") {
                 repr.hide_niche = true;
             }
-            narrowed |= path.starts_with("rustc_layout_scalar_valid_range");
+            if path.starts_with("rustc_layout_scalar_valid_range") {
+                let r = v.site(v.row_range(attrs.start + i as u32)?)?;
+                valid_range_of(path, v.text_at(a.args)?, kind, &mut valid).map_err(|what| Why::Unsupported(what, r))?;
+            }
             args |= is_args_attr(path);
         }
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
-        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, narrowed, discrs, args });
+        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, valid, discrs, args });
         Ok(())
     }
 
@@ -2160,7 +2204,7 @@ impl<'n> Store<'n> {
                 rets.clear();
                 let r = v.site(v.type_range(t)?)?;
                 let ret_text = v.text_at(v.type_range(t)?)?;
-                let x = super::type_expand::expand_type_text(names, outer.module, ret_text, r, self.tys.alloc())?;
+                let x = super::type_expand::expand_type_text(names, outer.module, ret_text, marks, r, self.tys.alloc())?;
                 x.impls(ret_text, r, &mut rets)?;
                 Some(x)
             }
@@ -2303,7 +2347,7 @@ impl<'n> Store<'n> {
             // pointer (E0308) and libc's variadic `open` was refused as a `...` on a Rust fn.
             None => super::foreign_head::module_foreign_header(names, lib, container.is_some(), flags, header, whole)?,
         };
-        if c_variadic && !matches!(header.abi, tc::Abi::C | tc::Abi::CUnwind | tc::Abi::System | tc::Abi::SystemUnwind) {
+        if c_variadic && !header.abi.takes_c_variadic() {
             return Err(Why::Unsupported("`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])", whole));
         }
         let has_body = flags & sig::HAS_BODY != 0;

@@ -135,6 +135,10 @@ fetch = ["dep:blaze-http"]
 # The proc-macro sandbox (Wasmtime), linked into `blaze`: no helper process, one code path. A
 # command that expands nothing does not run it; without it the binary still looks modules up.
 sandbox = ["blaze-proc-macro/runtime"]
+# A trusted builder's blaze (CI's; D136): `blaze store publish` signs and writes a published
+# set to a folder, and the command's store writes the toolchain's public records `PUBLIC`. Off by
+# default: a developer's blaze refuses `blaze store publish` by name and writes only `LOCAL`.
+publish = ["blaze-remote/sign"]
 
 [dev-dependencies]
 # `check` and `control`: the sweep's simulation and its planted-bug control.

@@ -31,13 +31,17 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use blaze_expand::atoms::{ATOM, Atoms, AtomsBuilder, AtomsError, Checked};
 use blaze_expand::{Ctx, Edition, Produced, ReadAnswer, ReadKind, Reads, TokenOrigin, TokenStream};
 use blaze_ids::ContentId;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, SharedAlloc};
 use bstd::sync::Lock;
 
 use super::{
-    Corrupt, Cursor, DirStore, FilesError, Held, RecordError, RecordName, RecordPlant, SEAL_LEN, answer_into, answer_of, origin_bytes, origin_of,
-    tail_of, token_bytes, token_of,
+    Corrupt, Cursor, DirStore, FilesError, Held, RecordError, RecordName, RecordPlant, SEAL_LEN, answer_into, answer_len, answer_of, answer_pieces,
+    origin_bytes, origin_of, tail_of, token_bytes, token_of,
 };
+
+/// A pending row's canonical bytes: one block of exactly their length in the allocator the
+/// command handed the results ([`open`]).
+type Bytes = blaze_own::Vec<u8, SharedAlloc<'static>>;
 use crate::sandbox::{Package, answer_now};
 
 /// The layout word a body starts with. 03: a kept answer's tokens are rows over the table's
@@ -241,18 +245,29 @@ impl Table {
 
 /// A read list in canonical bytes: the count, then each read's subject and the answer it had.
 fn list_into(out: &mut Vec<u8>, reads: &Reads<'_>) -> Result<(), usize> {
-    out.extend_from_slice(&(reads.list().len() as u32).to_le_bytes());
+    list_pieces(reads, |piece| out.extend_from_slice(piece))
+}
+
+/// [`list_into`]'s bytes, each piece handed to `out` in order (measured, then written:
+/// [`CrateResults::insert`]). `Err`: the index of a read whose answer a list does not hold,
+/// before any piece of that read is handed out.
+fn list_pieces(reads: &Reads<'_>, mut out: impl FnMut(&[u8])) -> Result<(), usize> {
+    out(&(reads.list().len() as u32).to_le_bytes());
     for (at, read) in reads.list().iter().enumerate() {
         let subject = reads.subject(read);
-        out.extend_from_slice(&(subject.len() as u32).to_le_bytes());
-        out.extend_from_slice(subject.as_bytes());
-        match read.answer {
-            ReadAnswer::Digest(id) => {
-                out.push(1);
-                out.extend_from_slice(&id.0);
-            }
-            ReadAnswer::Absent => out.push(0),
+        let answer = match read.answer {
+            ReadAnswer::Digest(id) => Some(id),
+            ReadAnswer::Absent => None,
             ReadAnswer::Bool(_) | ReadAnswer::Number(_) => return Err(at),
+        };
+        out(&(subject.len() as u32).to_le_bytes());
+        out(subject.as_bytes());
+        match answer {
+            Some(id) => {
+                out(&[1]);
+                out(&id.0);
+            }
+            None => out(&[0]),
         }
     }
     Ok(())
@@ -505,8 +520,8 @@ fn list_holds(list: &[u8], package: &Package, valued: &AtomicU64) -> Result<bool
 /// A row a command ran: its key, its read list and its answer, each in canonical bytes.
 struct New {
     key: ContentId,
-    list: Vec<u8>,
-    answer: Vec<u8>,
+    list: Bytes,
+    answer: Bytes,
 }
 
 /// The rows a command ran for one crate, sorted by key then list bytes.
@@ -536,6 +551,8 @@ pub struct CrateResults {
     pending_rows: AtomicU64,
     /// How many reads were valued against a package.
     valued: AtomicU64,
+    /// Where a pending row's bytes are made: the allocator the command handed ([`open`]).
+    alloc: SharedAlloc<'static>,
 }
 
 /// One package's verdict on each read list of a table: whether the list's reads are answered
@@ -702,8 +719,10 @@ fn write_whole(store: &DirStore, krate: &ContentId, file: &[u8]) -> Result<(), F
     Ok(())
 }
 
-/// The results filed for the crate named `krate`, read and proved once for this command.
-pub fn open(store: &DirStore, krate: ContentId) -> Result<CrateResults, RecordError> {
+/// The results filed for the crate named `krate`, read and proved once for this command; the
+/// rows the command runs are made in `alloc` (the hook's: its runtime's heap, handed from the
+/// program's entry).
+pub fn open(store: &DirStore, krate: ContentId, alloc: SharedAlloc<'static>) -> Result<CrateResults, RecordError> {
     let table = match read_whole(store, &krate).map_err(RecordError::Files)? {
         Some(whole) => Table::of(whole).map_err(|what| RecordError::Table { krate, what })?,
         None => Table::empty(),
@@ -714,6 +733,7 @@ pub fn open(store: &DirStore, krate: ContentId) -> Result<CrateResults, RecordEr
         pending: Lock::new("a crate's proc-macro results of this command", Pending { rows: Vec::new(), written: 0 }),
         pending_rows: AtomicU64::new(0),
         valued: AtomicU64::new(0),
+        alloc,
     })
 }
 
@@ -783,8 +803,8 @@ impl CrateResults {
         // Another package of this name may have run the row: its reads are valued here, as a
         // table row's are (a call's own package's hold; a repeat inside one command is rare).
         for row in pending.rows[first..].iter().take_while(|row| row.key == *base) {
-            if list_holds(&row.list, package, &self.valued).map_err(corrupt)? {
-                return produced_of(&row.list, &row.answer, edition, alloc).map(Some).map_err(corrupt);
+            if list_holds(row.list.as_slice(), package, &self.valued).map_err(corrupt)? {
+                return produced_of(row.list.as_slice(), row.answer.as_slice(), edition, alloc).map(Some).map_err(corrupt);
             }
         }
         Ok(None)
@@ -794,30 +814,40 @@ impl CrateResults {
     /// Another answer under the same key, reads and digests is refused
     /// ([`RecordError::TwoAnswers`], rule 21); the same one again is taken once.
     pub fn insert(&self, store: &DirStore, base: ContentId, produced: &Produced<'_>) -> Result<(), RecordError> {
-        let mut list = Vec::new();
-        list_into(&mut list, &produced.reads).map_err(|read| RecordError::Unkeepable { base, read })?;
-        let mut answer = Vec::new();
-        answer_into(&mut answer, produced);
+        // Each in ONE block of its own length: measured, then written (the 2026-11-18 heap log
+        // held 380 MB of answers grown a push at a time, up to twice their length each).
+        let mut list_len = 0usize;
+        list_pieces(&produced.reads, |piece| list_len += piece.len()).map_err(|read| RecordError::Unkeepable { base, read })?;
+        let mut list = self.sized(base, list_len)?;
+        list_pieces(&produced.reads, |piece| list.extend_from_slice(piece)).map_err(|read| RecordError::Unkeepable { base, read })?;
+        let mut answer = self.sized(base, answer_len(produced))?;
+        answer_pieces(produced, |piece| answer.extend_from_slice(piece));
         self.insert_bytes(store, base, list, answer)
     }
 
+    /// An empty buffer with room for exactly `len` bytes of `base`'s row, in the results'
+    /// allocator; refused by name when it refuses.
+    fn sized(&self, base: ContentId, len: usize) -> Result<Bytes, RecordError> {
+        Bytes::try_with_capacity_in(len, self.alloc).map_err(|_| RecordError::NoRoom { base, bytes: len })
+    }
+
     /// [`CrateResults::insert`] of a read list and an answer already in canonical bytes.
-    fn insert_bytes(&self, store: &DirStore, base: ContentId, list: Vec<u8>, answer: Vec<u8>) -> Result<(), RecordError> {
+    fn insert_bytes(&self, store: &DirStore, base: ContentId, list: Bytes, answer: Bytes) -> Result<(), RecordError> {
         for at in self.table.rows_of(&base) {
             let row = self.table.row(at);
-            if self.table.list(row.list) == list {
+            if self.table.list(row.list) == list.as_slice() {
                 // The found row is dense: compared in the loose form the run's answer is in.
                 let held = self.table.loose_answer(at).map_err(|Corrupt(what)| RecordError::Corrupt { base, what })?;
-                return if held == answer { Ok(()) } else { Err(RecordError::TwoAnswers { base }) };
+                return if held.as_slice() == answer.as_slice() { Ok(()) } else { Err(RecordError::TwoAnswers { base }) };
             }
         }
         let mut pending = self.pending(store)?;
-        let at = pending.rows.partition_point(|row| (row.key.0, &row.list[..]) < (base.0, &list[..]));
+        let at = pending.rows.partition_point(|row| (row.key.0, row.list.as_slice()) < (base.0, list.as_slice()));
         if let Some(row) = pending.rows.get(at)
             && row.key == base
-            && row.list == list
+            && row.list.as_slice() == list.as_slice()
         {
-            return if row.answer == answer { Ok(()) } else { Err(RecordError::TwoAnswers { base }) };
+            return if row.answer.as_slice() == answer.as_slice() { Ok(()) } else { Err(RecordError::TwoAnswers { base }) };
         }
         pending.rows.insert(at, New { key: base, list, answer });
         self.pending_rows.store(pending.rows.len() as u64, Ordering::Release);
@@ -840,7 +870,7 @@ impl CrateResults {
             }
         }
         for row in &pending.rows {
-            rows.push((&row.key.0, &row.list, Answer::Loose(&row.answer)));
+            rows.push((&row.key.0, row.list.as_slice(), Answer::Loose(row.answer.as_slice())));
         }
         file_of(&self.krate, Some(&self.table.atoms()), &mut rows).map(Some)
     }
@@ -860,3 +890,7 @@ impl CrateResults {
 #[cfg(test)]
 #[path = "table_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "table_once_tests.rs"]
+mod once_tests;

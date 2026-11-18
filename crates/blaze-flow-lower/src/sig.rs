@@ -23,15 +23,18 @@ use core::alloc::Allocator;
 
 use blaze_typeck::{ItemKey, PNode, PTy, PTys};
 
+/// A written path read for what it resolves to: a type alias expanded (piece sig-paths).
+mod alias;
 /// A member of an impl: `Self::Name` and the impl's lifetimes (piece sig-assoc-projection).
 mod impl_life;
 mod outlives;
 mod value;
 
-pub use impl_life::{AssocWhy, ImplText, impl_header_end, read_impl_signature};
-pub use outlives::{assoc_declares_generics, container_declares_type_outlives, trait_declares_lifetime};
+pub use alias::{AliasScope, MOST_DEPTH, NoAliases, PathIs, PathWhy, SigWorld};
+pub use impl_life::{AssocWhy, ImplText, ImplTrait, ImplTraitWhy, MOST_IMPL_REGIONS, impl_header_end, read_impl_signature, read_impl_signature_with, read_impl_trait};
+pub use outlives::{assoc_declares_generics, container_declares_type_outlives, trait_declares_lifetime, trait_header};
 
-pub use value::{CallableRefusal, read_callable_param};
+pub use value::{CallableRefusal, read_callable_param, read_callable_param_with};
 
 /// What stands at one origin position of a signature.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -103,6 +106,31 @@ pub struct SigBuf<A: Allocator + Clone> {
     pub body: BodyState,
     /// With [`BodyState::Async`]: the written return type's regions.
     pub body_regions: Vec<Region, A>,
+    /// Each trait bound the fn's own text writes with lifetime arguments (`V: Visitor<'de>`,
+    /// `where T: Conv<'a, 'b>`), in text order (outlives.rs `trait_bounds`): what ties a
+    /// callee's trait lifetimes to its caller's regions at a call (piece RB8, [`crate::Ties`]).
+    pub trait_bounds: Vec<TextBound, A>,
+    /// The lifetime arguments of every [`TextBound`], each row's `lo..hi`.
+    pub trait_bound_regions: Vec<Region, A>,
+    /// Each lifetime name the text writes (`'static` and `'_` aside), with the `Named` region
+    /// it reads as: a trait method's trait lifetimes by name (front2 borrows_ties.rs).
+    pub names: Vec<(blaze_typeck::Name, Region), A>,
+}
+
+/// One trait bound the fn's text writes with lifetime arguments (`T: Tr<'a, 'b>`): the bare
+/// name it bounds and the trait's last path segment, as written; its lifetime arguments are
+/// `SigBuf::trait_bound_regions[lo..hi]`, in order. `unread`: the left side is no bare name,
+/// or an argument is `'_`: the row says which trait, never which regions. `binder`: every
+/// lifetime argument is one the bound's `for<..>` quantifies (`T: for<'de> Deserialize<'de>`),
+/// so the bound fixes no region of the fn (no regions).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TextBound {
+    pub param: blaze_typeck::Name,
+    pub trait_: blaze_typeck::Name,
+    pub lo: u32,
+    pub hi: u32,
+    pub unread: bool,
+    pub binder: bool,
 }
 
 impl<A: Allocator + Clone> SigBuf<A> {
@@ -114,7 +142,10 @@ impl<A: Allocator + Clone> SigBuf<A> {
             type_outlives: Vec::new_in(alloc.clone()),
             type_outlives_unread: false,
             body: BodyState::Output,
-            body_regions: Vec::new_in(alloc),
+            body_regions: Vec::new_in(alloc.clone()),
+            trait_bounds: Vec::new_in(alloc.clone()),
+            trait_bound_regions: Vec::new_in(alloc.clone()),
+            names: Vec::new_in(alloc),
         }
     }
 
@@ -157,6 +188,9 @@ pub enum SigRefusal {
     /// An `async fn` read without its written return type's erased form (the `Output` of its
     /// future: [`read_async_signature`] takes it): its body's value cannot be lined up.
     AsyncOutputNotGiven,
+    /// A written type path that was not read for what it resolves to, and why (alias.rs): the
+    /// path's offset in the fn's text.
+    Path { at: u32, why: PathWhy },
 }
 
 /// The reader's bound on any one walk (tokens, types): a signature past it is refused.
@@ -380,7 +414,8 @@ struct Pair {
 struct Reader<'t, 'w, A: Allocator + Clone> {
     text: &'t str,
     tys: PTys<'w>,
-    adt_lifetimes: &'w dyn Fn(ItemKey) -> Option<u32>,
+    /// The ADTs' lifetime counts and what a written path resolves to (alias.rs).
+    world: &'w dyn SigWorld,
     toks: Vec<Tok, A>,
     /// Per token, its closing or opening bracket's index (`u32::MAX` for the rest).
     mate: Vec<u32, A>,
@@ -393,8 +428,17 @@ struct Reader<'t, 'w, A: Allocator + Clone> {
     /// by name and its associated type members.
     imp: Option<impl_life::ImplLife<'t, A>>,
     /// The positions whose regions the fn's own text did not write (a `Self`'s, a
-    /// `Self::Name`'s): elision counts only what is written.
+    /// `Self::Name`'s, an alias's own): elision counts only what is written.
     unwritten: Vec<u32, A>,
+    /// Where this text resolves its paths: `None` for the item read, an alias's scope inside
+    /// its text (alias.rs).
+    from: Option<AliasScope>,
+    /// Reading an alias's text: its type parameters' names, whose uses are holes.
+    holes: Vec<&'t str, A>,
+    /// The holes met, for the use's reader to fill (alias.rs).
+    found: Vec<alias::Hole, A>,
+    /// How many alias texts deep this reader is.
+    depth: u32,
 }
 
 impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
@@ -529,7 +573,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                 PNode::Array(i, _) => stack.push(i),
                 PNode::Tuple(l) => stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?),
                 PNode::Adt(k, l) => {
-                    n += (self.adt_lifetimes)(k).ok_or(SigRefusal::Unknown)?;
+                    n += self.world.adt_lifetimes(k).ok_or(SigRefusal::Unknown)?;
                     stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?);
                 }
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
@@ -565,6 +609,10 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                 p.lo += 1;
                 p.hi -= 1;
             }
+            // In an alias's text, a use of one of its type parameters: the use's reader fills it.
+            if self.hole(p) {
+                continue;
+            }
             if p.whole_self || (p.hi == p.lo + 1 && self.is_word(p.lo, p.hi, "Self")) {
                 for k in 0..n {
                     regions[(p.base + k) as usize] = Region::SelfTy(k);
@@ -580,6 +628,11 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             let unaligned = SigRefusal::Unaligned { at: self.at(p.lo) };
             if p.lo >= p.hi {
                 return Err(unaligned);
+            }
+            // A plain path is read for what it resolves to: the erased ADT itself, or a type
+            // alias expanded (alias.rs); never lined up with its expansion as if it were it.
+            if self.path_or_alias(p, mode, regions)? {
+                continue;
             }
             match self.node(p.ty)? {
                 PNode::Ref(_, inner) => {
@@ -664,7 +717,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                         None => parts.clear(),
                     }
                     // One position per lifetime parameter the ADT's head declares, in order.
-                    let has = (self.adt_lifetimes)(k).ok_or(SigRefusal::Unknown)?;
+                    let has = self.world.adt_lifetimes(k).ok_or(SigRefusal::Unknown)?;
                     // The written lifetime arguments' tokens: one per parameter, or none (each
                     // elided: the Reference, "Lifetime elision", "Each elided lifetime in the
                     // parameters becomes a distinct lifetime parameter").
@@ -699,14 +752,24 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                     }
                     let mut off = p.base + has;
                     let elems = self.tys.list(l).map_err(|_| SigRefusal::Unknown)?;
-                    if types.len() != elems.len() {
-                        // Defaults or const arguments: fine only when no argument has a position.
+                    // Defaulted trailing parameters (`Vec<&T>` is `Vec<&T, Global>`): the written
+                    // arguments are the first ones, and what the defaults hold has no position
+                    // (a default with one is not read). The path is the ADT's own (resolved
+                    // above), so its arguments are its parameters in order.
+                    let mut defaults_bare = types.len() < elems.len();
+                    if defaults_bare {
+                        for &t in &elems[types.len()..] {
+                            defaults_bare &= self.count(t)? == 0;
+                        }
+                    }
+                    if types.len() != elems.len() && !defaults_bare {
+                        // Const arguments or defaults: fine only when no argument has a position.
                         if n != has {
                             return Err(unaligned);
                         }
                         continue;
                     }
-                    for (j, &t) in elems.iter().enumerate() {
+                    for (j, &t) in elems.iter().take(types.len()).enumerate() {
                         let (lo, hi) = types[j];
                         work.push(Pair { ty: t, lo, hi, base: off, ctx: Ctx::Adt(has > 0), whole_self: false });
                         off += self.count(t)?;
@@ -797,6 +860,8 @@ enum Receiver {
 /// Reads the lifetime part of the fn whose text is `text` and whose erased inputs and output are
 /// `inputs` and `output` in `tys`. `adt_lifetimes` says how many lifetime parameters an ADT's
 /// head declares. On `Ok`, `out` holds one region per origin position, in the lowering's order.
+/// For a text that names no type alias ([`NoAliases`]: fixtures); real code is read with
+/// [`read_signature_with`] and a world that resolves its paths.
 pub fn read_signature<A: Allocator + Clone>(
     text: &str,
     tys: PTys<'_>,
@@ -806,7 +871,21 @@ pub fn read_signature<A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
-    read_signature_in(text, None, tys, inputs, output, None, adt_lifetimes, out, alloc)
+    read_signature_in(text, None, tys, inputs, output, None, &NoAliases(adt_lifetimes), out, alloc)
+}
+
+/// [`read_signature`] in `world`: each written type path is read for what it resolves to, a
+/// type alias expanded (alias.rs).
+pub fn read_signature_with<A: Allocator + Clone>(
+    text: &str,
+    tys: PTys<'_>,
+    inputs: &[PTy],
+    output: PTy,
+    world: &dyn SigWorld,
+    out: &mut SigBuf<A>,
+    alloc: A,
+) -> Result<(), SigRefusal> {
+    read_signature_in(text, None, tys, inputs, output, None, world, out, alloc)
 }
 
 /// [`read_signature`] (of a member of the impl `imp` when given: [`read_impl_signature`]) of an
@@ -825,11 +904,27 @@ pub fn read_async_signature<'t, A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
+    read_async_signature_with(text, imp, tys, inputs, future, written, &NoAliases(adt_lifetimes), out, alloc)
+}
+
+/// [`read_async_signature`] in `world` ([`read_signature_with`]).
+#[expect(clippy::too_many_arguments, reason = "read_signature's inputs, the impl, and the async fn's written output")]
+pub fn read_async_signature_with<'t, A: Allocator + Clone>(
+    text: &'t str,
+    imp: Option<ImplText<'t>>,
+    tys: PTys<'_>,
+    inputs: &[PTy],
+    future: PTy,
+    written: PTy,
+    world: &dyn SigWorld,
+    out: &mut SigBuf<A>,
+    alloc: A,
+) -> Result<(), SigRefusal> {
     let life = match imp {
-        Some(it) => Some(impl_life::impl_life_or_unread(text, it, tys, adt_lifetimes, alloc.clone())?),
+        Some(it) => Some(impl_life::impl_life_or_unread(text, it, tys, world, alloc.clone())?),
         None => None,
     };
-    read_signature_in(text, life, tys, inputs, future, Some(written), adt_lifetimes, out, alloc)
+    read_signature_in(text, life, tys, inputs, future, Some(written), world, out, alloc)
 }
 
 /// [`read_signature`], of a member of the impl `imp` when given (impl_life.rs
@@ -843,7 +938,7 @@ fn read_signature_in<'t, A: Allocator + Clone>(
     inputs: &[PTy],
     output: PTy,
     async_written: Option<PTy>,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
+    world: &dyn SigWorld,
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
@@ -854,10 +949,13 @@ fn read_signature_in<'t, A: Allocator + Clone>(
     out.type_outlives_unread = false;
     out.body = BodyState::Output;
     out.body_regions.clear();
+    out.trait_bounds.clear();
+    out.trait_bound_regions.clear();
+    out.names.clear();
     let mut r = Reader {
         text,
         tys,
-        adt_lifetimes,
+        world,
         toks: Vec::new_in(alloc.clone()),
         mate: Vec::new_in(alloc.clone()),
         names: Vec::new_in(alloc.clone()),
@@ -866,6 +964,10 @@ fn read_signature_in<'t, A: Allocator + Clone>(
         alloc: alloc.clone(),
         imp,
         unwritten: Vec::new_in(alloc.clone()),
+        from: None,
+        holes: Vec::new_in(alloc.clone()),
+        found: Vec::new_in(alloc.clone()),
+        depth: 0,
     };
     lex(text, &mut r.toks)?;
     r.pair_brackets()?;
@@ -1017,6 +1119,13 @@ fn read_signature_in<'t, A: Allocator + Clone>(
     }
     let wheres = if where_at < end { Some((where_at + 1, end)) } else { None };
     r.type_outlives(generics, wheres, &mut out.type_outlives, &mut out.type_outlives_unread)?;
+    // Last of all, so a lifetime written only in a trait bound is numbered after every other:
+    // the regions above are unchanged by it.
+    r.trait_bounds(generics, wheres, &mut out.trait_bounds, &mut out.trait_bound_regions)?;
+    for k in 0..r.names.len() {
+        let first = r.names[k];
+        out.names.push((blaze_typeck::Name::of(r.word(first)), Region::Named(k as u32)));
+    }
     // The impl's: its self type's equal and `'static` positions, its declared `'a: 'b`.
     if let Some(imp) = r.imp.as_ref() {
         out.bounds.extend_from_slice(&imp.bounds);

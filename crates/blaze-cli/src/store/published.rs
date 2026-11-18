@@ -5,13 +5,16 @@
 //!   each record it keeps, with the record's own tag and namespace, for blaze-remote `lay_out_bound`
 //!   (whose predicate keeps the public ones). A key a root names that the store does not hold, or
 //!   a record of the wrong tag where an index belongs, stops the walk by name: nothing is skipped.
-//! - THE FLOOR ([`floor`], [`keep_floor`]): the highest generation of a set this home has taken,
-//!   one record under the root `pubf.<set id>` (store/roots.rs `RootName::published_floor`), kept as
-//!   long as the toolchain's records. A reader's [`SetCheck`](blaze_remote::published::set::SetCheck)
-//!   refuses a head below it: an older set served again is a rollback, refused by name.
-//! - THE FOLDER WRITE ([`folder`], under test only until blaze-cli has a `publish` feature that
-//!   turns on blaze-remote's `sign`): the set laid out at the generation after its folder's head,
-//!   every object named by a digest written first, then `prefix`, then `head`, each by a rename.
+//! - THE FLOOR ([`seen`], [`floor`], [`keep_floor`]): the highest generation of a set this home
+//!   has taken, and when (the wall clock) its head was last asked, one record under the root
+//!   `pubf.<set id>` (store/roots.rs `RootName::published_floor`), kept as long as the toolchain's
+//!   records. A reader's [`SetCheck`](blaze_remote::published::set::SetCheck) refuses a head below
+//!   the generation: an older set served again is a rollback, refused by name. The time is the
+//!   freshness window's (store/take.rs `FRESH_NS`).
+//! - THE FOLDER WRITE ([`folder`], in a trusted builder's blaze: blaze-cli's `publish` feature,
+//!   which turns on blaze-remote's `sign`; D136): the set laid out at the generation after its
+//!   folder's head, every object named by a digest written first, then `prefix`, then `head`,
+//!   each by a rename.
 
 use core::fmt;
 
@@ -28,12 +31,21 @@ use super::roots::{RootName, TOOLCHAIN_LIFE_NS};
 pub(crate) const FLOOR_TAG: Tag = Tag(u16::MAX - 8);
 const FLOOR_DOMAIN: &str = "blaze-cli published floor 1";
 const FLOOR_MAGIC: [u8; 4] = *b"BLPF";
-/// A floor record: the magic, the set's id, the generation (little-endian).
-const FLOOR_LEN: usize = 4 + 32 + 8;
+/// A floor record: the magic, the set's id, the generation, the wall time its head was last
+/// asked (ns since the Unix epoch; both little-endian).
+const FLOOR_LEN: usize = 4 + 32 + 8 + 8;
+
+/// What this home holds of a published set: the highest generation it has taken (0: none), and
+/// when its head was last asked, by the command's wall clock (0: never).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Seen {
+    pub generation: u64,
+    pub asked_wall_ns: u64,
+}
 
 /// Why the published set's walk, floor or write stopped: each names the root or the object.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code, reason = "the folder write's refusals: made by `blaze store publish`, which lands with blaze-cli's `publish` feature"))]
+#[cfg_attr(not(any(test, feature = "publish")), allow(dead_code, reason = "the folder write's refusals: made by `blaze store publish` in a trusted builder's blaze (the `publish` feature)"))]
 pub enum PublishedError {
     /// The store refused a read or the root under `root`.
     Store { root: RootName, why: LentError },
@@ -56,9 +68,12 @@ pub enum PublishedError {
     HttpOrigin,
     /// The signer's key file does not hold 64 hex digits (its bytes are never shown).
     SignerKey,
-    #[cfg(test)]
+    /// `blaze store publish` in a blaze built without the `publish` feature: only a trusted
+    /// builder's (CI's) signs a set (D136).
+    NotPublisher,
+    /// The set's name (this blaze's toolchain and target) is not one a set may have.
     Set(blaze_remote::published::set::SetNameError),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "publish"))]
     Lay(blaze_remote::published::LayOutError),
 }
 
@@ -75,9 +90,9 @@ impl fmt::Display for PublishedError {
             PublishedError::Head(why) => write!(f, "the folder origin's head is refused, so nothing is laid over it: {why}"),
             PublishedError::HttpOrigin => f.write_str("an http:// or https:// origin is not written from here: only CI and the remote workers publish to a shared origin; name a folder"),
             PublishedError::SignerKey => f.write_str("the signer's key file does not hold an Ed25519 seed as 64 hex digits (its contents are not shown)"),
-            #[cfg(test)]
-            PublishedError::Set(error) => write!(f, "{error}"),
-            #[cfg(test)]
+            PublishedError::NotPublisher => f.write_str("this blaze was built without publishing: only a trusted builder's is (blaze-cli's `publish` feature, D136)"),
+            PublishedError::Set(error) => write!(f, "the published set's name: {error}"),
+            #[cfg(any(test, feature = "publish"))]
             PublishedError::Lay(error) => write!(f, "the published set's layout: {error}"),
         }
     }
@@ -93,7 +108,7 @@ impl From<PublishedError> for crate::CliError {
 
 /// One record a walk found: its key, its own tag and namespace, its bytes in place.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code, reason = "walked by `blaze store publish`, which lands with blaze-cli's `publish` feature"))]
+#[cfg_attr(not(any(test, feature = "publish")), allow(dead_code, reason = "walked by `blaze store publish`, in a trusted builder's blaze (the `publish` feature)"))]
 pub(crate) struct Walked<'l> {
     pub key: ContentId,
     pub tag: Tag,
@@ -107,7 +122,7 @@ fn key_of(bytes: &[u8]) -> CasKey {
 
 /// Every record the root `tool.<toolchain>` keeps, added to `out` in the root's order (the
 /// layout sorts): through each index it names to each key the index holds. No root: nothing.
-#[cfg_attr(not(test), allow(dead_code, reason = "called by `blaze store publish`, which lands with blaze-cli's `publish` feature"))]
+#[cfg_attr(not(any(test, feature = "publish")), allow(dead_code, reason = "called by `blaze store publish`, in a trusted builder's blaze (the `publish` feature)"))]
 pub(crate) fn walk_toolchain<'l, D: Driver>(lent: &'l Lent<D, StoreAlloc>, toolchain: ToolchainId, out: &mut std::vec::Vec<Walked<'l>, StoreAlloc>) -> Result<(), PublishedError> {
     let root = RootName::toolchain(toolchain);
     let store = |why| PublishedError::Store { root, why };
@@ -129,12 +144,26 @@ pub(crate) fn walk_toolchain<'l, D: Driver>(lent: &'l Lent<D, StoreAlloc>, toolc
     Ok(())
 }
 
+/// The origin named for a publish: a folder; an `http://` or `https://` one refused by name for
+/// every blaze (a shared origin is written by CI and the remote workers alone).
+pub(crate) fn folder_only(origin: &str) -> Result<&str, PublishedError> {
+    if origin.starts_with("http://") || origin.starts_with("https://") {
+        return Err(PublishedError::HttpOrigin);
+    }
+    Ok(origin)
+}
+
 /// The highest generation of `set` this home has taken; 0 when it has taken none.
-#[cfg_attr(not(test), allow(dead_code, reason = "read by `NamedOrigin::published`, which main.rs names next"))]
 pub(crate) fn floor<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Result<u64, PublishedError> {
+    Ok(seen(lent, set)?.generation)
+}
+
+/// What this home holds of `set`: its floor and when its head was last asked; zeros when it
+/// has taken none.
+pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Result<Seen, PublishedError> {
     let root = RootName::published_floor(set);
     let store = |why| PublishedError::Store { root, why };
-    let Some(at) = lent.root_named(root.as_str()) else { return Ok(0) };
+    let Some(at) = lent.root_named(root.as_str()) else { return Ok(Seen { generation: 0, asked_wall_ns: 0 }) };
     // A root's record is the keys it names: one, the floor record's.
     let Some(named) = lent.get(&at).map_err(store)? else { return Err(PublishedError::Gone { root, key: at }) };
     if named.bytes.len() != 32 {
@@ -146,18 +175,23 @@ pub(crate) fn floor<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> R
     if record.tag != FLOOR_TAG || bytes.len() != FLOOR_LEN || bytes[..4] != FLOOR_MAGIC || bytes[4..36] != set.0 {
         return Err(PublishedError::Floor { root, len: bytes.len() });
     }
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&bytes[36..44]);
-    Ok(u64::from_le_bytes(word))
+    let word = |at: usize| {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[at..at + 8]);
+        u64::from_le_bytes(word)
+    };
+    Ok(Seen { generation: word(36), asked_wall_ns: word(44) })
 }
 
-/// Keeps `generation` as the floor of `set` from the next commit on: a `LOCAL` record (this
-/// home's fact, never published) under the root `pubf.<set>`.
-pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &ContentId, generation: u64) -> Result<(), PublishedError> {
+/// Keeps `generation` as the floor of `set` from the next commit on, its head asked at
+/// `asked_wall_ns` (the command's wall clock): a `LOCAL` record (this home's fact, never
+/// published) under the root `pubf.<set>`.
+pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &ContentId, generation: u64, asked_wall_ns: u64) -> Result<(), PublishedError> {
     let mut bytes = [0u8; FLOOR_LEN];
     bytes[..4].copy_from_slice(&FLOOR_MAGIC);
     bytes[4..36].copy_from_slice(&set.0);
-    bytes[36..].copy_from_slice(&generation.to_le_bytes());
+    bytes[36..44].copy_from_slice(&generation.to_le_bytes());
+    bytes[44..].copy_from_slice(&asked_wall_ns.to_le_bytes());
     let key = ContentId::of(FLOOR_DOMAIN, &bytes);
     place.put_record(blaze_drive::Key(key), false, FLOOR_TAG, &bytes).map_err(PublishedError::Place)?;
     let root = RootName::published_floor(set);
@@ -165,9 +199,9 @@ pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &Content
     Ok(())
 }
 
-/// The write of a set to a folder origin. Under test until blaze-cli's `publish` feature turns
-/// on blaze-remote's `sign` for the binary (the report's QUESTIONS); the e2e test drives it.
-#[cfg(test)]
+/// The write of a set to a folder origin: in a trusted builder's blaze (blaze-cli's `publish`
+/// feature turns on blaze-remote's `sign`, D136), and under test.
+#[cfg(any(test, feature = "publish"))]
 pub(crate) mod folder {
     use blaze_own::{Alloc, Vec};
     use blaze_remote::PublicKey;
@@ -190,6 +224,7 @@ pub(crate) mod folder {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(crate) enum Order {
         HeadLast,
+        #[cfg_attr(not(test), allow(dead_code, reason = "the planted order: the publish DST's control"))]
         HeadFirst,
     }
 
@@ -201,14 +236,6 @@ pub(crate) mod folder {
         pub unchanged: bool,
         pub published: u32,
         pub left_out: u32,
-    }
-
-    /// The origin named for a publish: a folder; an `http://` or `https://` one refused.
-    pub(crate) fn folder_only(origin: &str) -> Result<&str, PublishedError> {
-        if origin.starts_with("http://") || origin.starts_with("https://") {
-            return Err(PublishedError::HttpOrigin);
-        }
-        Ok(origin)
     }
 
     /// The signer whose seed is the file at `path` (64 hex digits): read through the granted
@@ -261,13 +288,18 @@ pub(crate) mod folder {
     /// `records` laid out for the folder `dir` of `set`: at its head's generation when that lays
     /// out the same head (unchanged), else at the next one (1 for an empty folder).
     pub(crate) fn plan<'a>(cx: &Cx, dir: &Dir<ReadWrite>, set: &SetName<'_>, records: &[Walked<'_>], signer: &Signer, alloc: Alloc<'a>) -> Result<Plan<'a>, PublishedError> {
+        plan_sized(cx, dir, set, records, signer, SEGMENT_BYTES, alloc)
+    }
+
+    /// [`plan`] with segments cut at `segment_bytes` of payloads (a test cuts many).
+    pub(crate) fn plan_sized<'a>(cx: &Cx, dir: &Dir<ReadWrite>, set: &SetName<'_>, records: &[Walked<'_>], signer: &Signer, segment_bytes: u64, alloc: Alloc<'a>) -> Result<Plan<'a>, PublishedError> {
         let id = set.id();
         let mut candidates: Vec<Candidate<'_>, Alloc<'_>> = Vec::with_capacity_in(records.len(), alloc);
         for record in records {
             candidates.push(Candidate { key: record.key, tag: record.tag, namespace: record.namespace, class: Class::Toolchain, bytes: record.bytes });
         }
         let lay = |generation| {
-            let layout = Layout { segment_bytes: SEGMENT_BYTES, page_entries: PAGE_ENTRIES, generation };
+            let layout = Layout { segment_bytes, page_entries: PAGE_ENTRIES, generation };
             lay_out_bound(&candidates, layout, Some(&id), signer, alloc).map_err(PublishedError::Lay)
         };
         let current = current_head(cx, dir, set, signer)?;

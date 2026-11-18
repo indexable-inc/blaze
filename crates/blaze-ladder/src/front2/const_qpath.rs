@@ -695,7 +695,8 @@ fn eval_one<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need_lib: LibKey
     };
     // The impl candidates of (trait, type): the body check's own fill (check.rs `make_once`,
     // `Fill::Impls`), so the impls `impl_const` scans are the ones a body's goal would see.
-    make_for(r, Fill::Impls(trait_, shape), need).map_err(wrap)?;
+    // A constant's value is evaluated at ground arguments: the whole program's impls.
+    make_for(r, Fill::Impls(trait_, shape, super::buckets::Seen::Program), need).map_err(wrap)?;
     let Some((consts, prepared)) = r.consts.take() else { return Err(ConstFail::Nested { item: need, shown: super::check::key_shown(r, need) }) };
     let got = consts.trait_const_value(r, prepared, declared, self_node).map(int_of);
     r.consts = Some((consts, prepared));

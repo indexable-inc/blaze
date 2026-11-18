@@ -27,14 +27,14 @@ const EDITION: Edition = Edition::E2024;
 /// `produced` kept as `base`'s answer in `package`'s crate, as a command does it: the crate's
 /// results opened, the row taken, the table written.
 fn keep(store: &DirStore, base: blaze_ids::ContentId, package: &Package, produced: &Produced<'_>) -> Result<(), RecordError> {
-    let results = table::open(store, table::crate_name(package))?;
+    let results = table::open(store, table::crate_name(package), blaze_own::testing::heap().shared())?;
     results.insert(store, base, produced)?;
     results.keep(store, &[]).map(|_| ())
 }
 
 /// What a later command finds for `base` in `package`'s crate: its table opened again.
 fn find<'a>(store: &DirStore, base: &blaze_ids::ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
-    { let results = table::open(store, table::crate_name(package))?; results.find(store, base, package, &table::Verdicts::of(&results), edition, alloc) }
+    { let results = table::open(store, table::crate_name(package), blaze_own::testing::heap().shared())?; results.find(store, base, package, &table::Verdicts::of(&results), edition, alloc) }
 }
 
 /// The expansion records under the folder `store`, through a world over that folder.
@@ -239,16 +239,25 @@ fn when(index: i64, then: Vec<u8>) -> Vec<u8> {
 }
 
 fn module(wasm: Vec<u8>, macros: u32) -> ModuleRecord {
+    module_in(&folder("module"), wasm, macros)
+}
+
+#[path = "lazy_wasm_tests.rs"]
+mod lazy_wasm;
+
+/// A module record in `dir`: its wasm kept there as `module.wasm`, where a compile reads it
+/// (module.rs `ModuleRecord::wasm`: the record holds none).
+fn module_in(dir: &Path, wasm: Vec<u8>, macros: u32) -> ModuleRecord {
     let digest = sha256_hex(&wasm);
+    std::fs::write(dir.join("module.wasm"), &wasm).expect("the module's wasm in its folder");
     ModuleRecord {
         key: digest.clone(),
         name: "test-macros".to_owned(),
         version: "0.0.0".to_owned(),
         wasm_sha256: digest,
-        wasm,
         macros: (0..macros).map(|index| Exported { index, kind: ProcKind::FnLike, name: format!("m{index}"), helpers: Vec::new() }).collect(),
         decls: "decls".to_owned(),
-        dir: folder("module"),
+        dir: dir.to_owned(),
     }
 }
 
@@ -435,7 +444,7 @@ fn reader() -> Setup {
 
 /// The reader's module record, kept in `dir`.
 fn reader_in(dir: &Path) -> ModuleRecord {
-    ModuleRecord { dir: dir.to_owned(), ..module(wasm(&reader_body()), 4) }
+    module_in(dir, wasm(&reader_body()), 4)
 }
 
 /// Each of the reader's four macros run once, its record's bytes.

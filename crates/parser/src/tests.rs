@@ -1,5 +1,7 @@
 mod comptime;
+mod lex_once;
 mod nightly_items;
+mod outline_lex;
 mod prefix_entries;
 mod top_entries;
 mod verify;

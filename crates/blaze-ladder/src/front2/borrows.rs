@@ -30,7 +30,7 @@ use super::body::Body;
 use super::borrow_reads::{AdtAnswer, AskedAdts, HeadAnswer, adt_read, file_borrow_reads, head_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
-use super::borrows_nested::{FlowOf, NestedFacts, next_nested};
+use super::borrows_nested::{FlowOf, NestedFacts, nested_range, next_nested};
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
 use super::borrows_unmade::{AdtUnmade, HeadClass};
 use super::heads::{HeadError, Want, member_fn_want};
@@ -40,6 +40,10 @@ use super::project::{BodyRef, BodyVerdict, MOST_LENS, ProjectWorld};
 use super::project_records::BodySource;
 use super::source::NamesSource;
 use super::types::Why;
+
+/// Each head's trait bounds with lifetime arguments (piece RB8).
+#[path = "borrows_ties.rs"]
+mod ties;
 
 /// One finding of the move or borrow check: its code (rustc's error code where one names the
 /// same rule, else a word), what it says, and its item-relative range.
@@ -150,11 +154,14 @@ pub struct BorrowVerdict<'a> {
     /// The one reason the body was not checked; `None` only for a body lowered and checked to
     /// its end (its findings then whole).
     pub refused: Option<BorrowRefused>,
+    /// The item-relative range of the closure or async block whose own flow gave `refused`;
+    /// `None` for the owner's flow (the flow census names the closure a refusal is in).
+    pub within: Option<(u32, u32)>,
 }
 
 impl<'a> BorrowVerdict<'a> {
     fn new_in(alloc: Alloc<'a>) -> BorrowVerdict<'a> {
-        BorrowVerdict { findings: AVec::new_in(alloc), refused: None }
+        BorrowVerdict { findings: AVec::new_in(alloc), refused: None, within: None }
     }
 
     /// Checked to its end with no finding.
@@ -201,6 +208,9 @@ pub struct BorrowFacts<'a> {
     /// a call of a head that writes lifetimes, with lifetime-carrying generic arguments, is
     /// related through them (blaze-flow-lower generic_call.rs, pieces BR3 and BR4).
     calls: super::call_generics::CallBoundsTable<'a>,
+    /// Each head's trait bounds with lifetime arguments and their read rows (borrows_ties.rs):
+    /// a callee's trait lifetimes are the caller's at a call (blaze-flow-lower trait_ties.rs).
+    ties: ties::TiesTable<'a>,
     /// The generic shape of each callee head whose signature was read (blaze-flow-lower
     /// `read_shape`): a call whose type arguments carry origins is related through it.
     shapes: AVec<'a, (u128, blaze_flow_lower::ShapeBuf<Alloc<'a>>)>,
@@ -224,11 +234,16 @@ pub struct BorrowFacts<'a> {
     /// One read row per ADT and per head the facts were taken of (front2 borrow_reads.rs),
     /// for the body's read list (rule 21).
     reads: AVec<'a, Read>,
+    /// The text of the body's own fn (blaze-flow-lower `Facts::own_text`): a call through one
+    /// of the body's parameters reads that parameter's written type from it. Empty: not known.
+    /// No read row of its own: the owner's text is the body's own input (its key covers it).
+    own_text: AVec<'a, u8>,
 }
 
 impl<'a> BorrowFacts<'a> {
     fn new_in(alloc: Alloc<'a>) -> BorrowFacts<'a> {
         BorrowFacts {
+            own_text: AVec::new_in(alloc),
             adts: AVec::new_in(alloc),
             variants: AVec::new_in(alloc),
             fields: AVec::new_in(alloc),
@@ -238,6 +253,7 @@ impl<'a> BorrowFacts<'a> {
             sigs: AVec::new_in(alloc),
             sig_refused: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
+            ties: ties::TiesTable::new_in(alloc),
             shapes: AVec::new_in(alloc),
             shape_refused: AVec::new_in(alloc),
             object_traits: AVec::new_in(alloc),
@@ -287,8 +303,14 @@ impl<'a> BorrowFacts<'a> {
 }
 
 impl Facts for BorrowFacts<'_> {
+    fn own_text(&self) -> Option<&str> {
+        core::str::from_utf8(&self.own_text).ok().filter(|t| !t.is_empty())
+    }
     fn call_bounds(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> {
         self.calls.get(item)
+    }
+    fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
+        self.ties.get(item)
     }
     fn sig(&self, item: tc::ItemKey) -> Option<SigLife<'_>> {
         let at = self.sigs.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
@@ -596,6 +618,9 @@ pub enum ImplsUnknown {
 /// ([`ProjectWorld::check_borrows`]) and the census (tests/flow_census.rs) both call it.
 pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owner: tc::ItemKey, c: &tc::Checked<'_>, langs: BorrowLangs, alloc: Alloc<'a>) -> BorrowFacts<'a> {
     let mut g = BorrowFacts::new_in(alloc);
+    if let Some(f) = r.store.fns.get(&owner) {
+        g.own_text.extend_from_slice(f.text.as_bytes());
+    }
     let mut adts: AVec<'a, u128> = AVec::new_in(alloc);
     for n in c.types.view().nodes() {
         if let tc::PNode::Adt(k, _) = n {
@@ -785,12 +810,12 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         let tys = r.store.tys.view();
         let (keys, names) = (&*r.keys, r.names);
         let adt_lifetimes = |a: tc::ItemKey| Some(adt_head_lifetimes(keys, names, a));
-        let closed = |t: tc::ItemKey, name: tc::Name| {
+        let assoc = |t: tc::ItemKey, name: tc::Name| {
             asked_traits.borrow_mut().push(t.0);
-            super::sig_impl::trait_closed(names, keys, t, name, alloc)
+            ties::assoc_read(names, keys, t, name, alloc)
         };
         let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
-        match blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &closed, &mut shape, alloc) {
+        match blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &assoc, &mut shape, alloc) {
             Ok(()) => g.shapes.push((k, shape)),
             // Kept, never dropped (rule 3): the note of a call refused for it says why.
             Err(why) => g.shape_refused.push((k, why)),
@@ -827,6 +852,8 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
             _ => None,
         };
         g.calls.gather(k, head, sig, container, alloc);
+        let trait_text = |lib: blaze_id::ItemKey| r.names.text_of(lib).map(|t| t.text);
+        g.ties.gather(k, head, sig, &trait_text, alloc);
     }
     g.items = items;
     g
@@ -950,6 +977,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // Everything below reads these facts, a refusal included: all of them are the body's reads.
     reads.extend_from_slice(facts.reads());
     reads.extend_from_slice(facts.calls.reads());
+    reads.extend_from_slice(facts.ties.reads());
     if let (Some(&(adt, fact)), Some(&why)) = (facts.unknown().first(), facts.unknown_why().first()) {
         let item = r.keys.library_in(r.names, tc::ItemKey(adt));
         verdict.refused = Some(BorrowRefused::FactUnknown { adt: tc::ItemKey(adt), item, fact, why });
@@ -986,6 +1014,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                     },
                     _ => call_refused(r, &facts, refusal).unwrap_or(BorrowRefused::Lower(refusal)),
                 });
+                verdict.within = nested_range(&view, of);
                 break;
             }
         };
@@ -996,6 +1025,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             Ok(record) => record,
             Err(bound) => {
                 verdict.refused = Some(BorrowRefused::Bound(bound));
+                verdict.within = nested_range(&view, of);
                 break;
             }
         };
@@ -1035,6 +1065,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             verdict.findings.push(BorrowDiagnostic { start: span.lo, end: span.hi, code, text });
         }
         if verdict.refused.is_some() {
+            verdict.within = nested_range(&view, of);
             break;
         }
         next = next_nested(&view, of);
@@ -1151,7 +1182,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             Some(b) => b,
             None => {
                 let why = if verdict.diagnostics.is_empty() { Untyped::TypesNotChecked } else { Untyped::TypeErrors };
-                BorrowVerdict { findings: AVec::new_in(alloc), refused: Some(BorrowRefused::Untyped(why)) }
+                BorrowVerdict { findings: AVec::new_in(alloc), refused: Some(BorrowRefused::Untyped(why)), within: None }
             }
         };
         (verdict, borrows)

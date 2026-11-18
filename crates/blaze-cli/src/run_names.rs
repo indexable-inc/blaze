@@ -33,7 +33,7 @@ use blaze_ladder::front2::body_host::Sourced;
 use blaze_ladder::front2::source::{Log, Records};
 use blaze_ladder::run::make_one::NamesRecords;
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_scope::items_record::{ItemsRecord, ItemsRecordError};
+use blaze_scope::items_record::ItemsRecordError;
 use blaze_world::crate_list::{CrateGraph, CrateList};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
@@ -77,6 +77,10 @@ pub(crate) struct Opened<'n> {
 #[derive(Debug)]
 pub(crate) enum NamesError {
     /// A crate's items record could not be opened for its edition.
+    #[expect(
+        dead_code,
+        reason = "no longer made: the edition is the load's (front_load.rs `CrateRecords::edition`); the variant goes with the port that makes `names_records` infallible, its matches in body_types.rs and `open` with it (lane S4, NOT DONE)"
+    )]
     Items { at: usize, why: ItemsRecordError },
 }
 
@@ -89,7 +93,8 @@ pub(crate) enum NamesError {
 /// `env` is the environment of the crate at 0 (a body job's owner, body_types.rs `owner_env`):
 /// what a body's `env!` reads; every other crate's `env!` is refused by name (body_host.rs).
 /// Nothing is read of a crate here: `Records::new` opens each on the first question about it.
-/// COST: one items-record open per crate, for its edition.
+/// COST: no items-record open here (each crate's edition is its load's); the records open each
+/// crate's items record once, at its first question.
 #[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
 pub(crate) fn names_records<'n>(
     cx: &'n Cx,
@@ -113,8 +118,9 @@ pub(crate) fn names_records<'n>(
         records.push(one.records);
         crate_names.push(one.name);
         packages.push(one.package);
-        let edition = ItemsRecord::open(one.records.items, g).map_err(|why| NamesError::Items { at, why })?.edition();
-        callers.push((at, one.world_at, edition));
+        // The edition the load's one open read (front_load.rs `CrateRecords::edition`): the
+        // section is not opened again here; the records made below open it once, when asked.
+        callers.push((at, one.world_at, one.records.edition));
     }
     let (records, crate_names, packages): (&'n [CrateRecords<'n>], &'n [&'n str], &'n [&'n str]) = (records.leak(), crate_names.leak(), packages.leak());
     let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.leak();

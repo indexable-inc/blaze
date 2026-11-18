@@ -19,7 +19,8 @@ use core::fmt;
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{
-    BindingState, Def, DefKind, Edition, Namespace, Node, Passed, PathKind, RefusedWhy, Sources, Through, Visibility, through,
+    BindingState, Def, DefKind, Edition, Namespace, Node, Passed, PathKind, RefusedWhy, Sources, Through, ThroughScratch,
+    Visibility, through_in,
 };
 
 use crate::builtin::builtin_type_in;
@@ -84,7 +85,19 @@ pub fn written_module<N: Name, W: World<N>>(world: &W, module: ItemKey, n: u8) -
 /// local item's body" for every local struct, 2026-11-17). `Ok(false)`: no binding; an error:
 /// the records the answer needs are not held, or the walk was refused.
 pub fn binds<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, name: N, alloc: Alloc<'_>) -> Result<bool, PathError> {
-    match in_source(world, Def::module(module), ns, name, alloc) {
+    binds_in(world, module, ns, name, &mut ThroughScratch::new_in(alloc))
+}
+
+/// [`binds`] with the glob walk's working memory the caller's: a caller asking many names keeps
+/// one [`ThroughScratch`] for all of them, so no lookup allocates once it is warm.
+pub fn binds_in<N: Name, W: World<N>>(
+    world: &W,
+    module: ItemKey,
+    ns: Namespace,
+    name: N,
+    scratch: &mut ThroughScratch<'_>,
+) -> Result<bool, PathError> {
+    match in_source(world, Def::module(module), ns, name, scratch) {
         Ok(found) => Ok(found.is_some()),
         Err(why) => Err(PathError { module, at: 0, why }),
     }
@@ -217,19 +230,39 @@ impl Resolved {
 /// checker's lowering writes it) is the global path `x::y`; positions in the result still count
 /// the `{{root}}` segment.
 pub fn path<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: Written<'_, N>, alloc: Alloc<'_>) -> Result<Resolved, PathError> {
+    path_in(world, module, ns, path, &mut ThroughScratch::new_in(alloc))
+}
+
+/// [`path`] with the glob walk's working memory the caller's: every layer and segment of the
+/// walk reuses `scratch` (one per walk at least, where each lookup through globs made its own),
+/// and a caller resolving many paths keeps one for all of them. The answer is [`path`]'s: the
+/// scratch is cleared per lookup and holds no answer between them.
+pub fn path_in<N: Name, W: World<N>>(
+    world: &W,
+    module: ItemKey,
+    ns: Namespace,
+    path: Written<'_, N>,
+    scratch: &mut ThroughScratch<'_>,
+) -> Result<Resolved, PathError> {
     let rooted = path.kind == PathKind::Plain && path.segments.first().is_some_and(|s| s.as_ref() == "{{root}}");
     if !rooted {
-        return walk(world, module, ns, path, alloc);
+        return walk(world, module, ns, path, scratch);
     }
     let global = Written { kind: PathKind::Abs, segments: &path.segments[1..] };
-    match walk(world, module, ns, global, alloc) {
+    match walk(world, module, ns, global, scratch) {
         Ok(r) => Ok(Resolved { def: r.def, consumed: r.consumed + 1 }),
         Err(e) if e.why == Why::Empty => Err(PathError { module, at: 0, why: Why::Empty }),
         Err(e) => Err(PathError { at: e.at + 1, ..e }),
     }
 }
 
-fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: Written<'_, N>, alloc: Alloc<'_>) -> Result<Resolved, PathError> {
+fn walk<N: Name, W: World<N>>(
+    world: &W,
+    module: ItemKey,
+    ns: Namespace,
+    path: Written<'_, N>,
+    scratch: &mut ThroughScratch<'_>,
+) -> Result<Resolved, PathError> {
     let fail = |at: usize, why: Why| PathError { module, at, why };
     let last = path.segments.len().checked_sub(1).ok_or(fail(0, Why::Empty))?;
     let chain = world.chain(module).ok_or(fail(0, Why::NotRead { module, layer: Unheld::Step }))?;
@@ -265,7 +298,7 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
         let ns_here = if at == last { ns } else { Namespace::Types };
         let def = match current {
             None => {
-                let def = lexical(world, module, chain, root, ns_here, name, alloc).map_err(|why| fail(at, why))?;
+                let def = lexical(world, module, chain, root, ns_here, name, scratch).map_err(|why| fail(at, why))?;
                 // A built-in type's name in type position, bound lexically to a module (`use
                 // core::str;` then `&str`): the built-in type, since a module is never a type. Only
                 // a whole one-segment path in the type namespace is a type position; as a prefix
@@ -283,7 +316,7 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
                 }
                 "self" => Def::module(m),
                 _ => {
-                    let found = in_source(world, Def::module(m), ns_here, name, alloc).map_err(|why| fail(at, why))?;
+                    let found = in_source(world, Def::module(m), ns_here, name, scratch).map_err(|why| fail(at, why))?;
                     let p = match found {
                         Some(p) => p,
                         None => return Err(fail(at, refused_in(world, m).unwrap_or(Why::NotFound))),
@@ -376,7 +409,7 @@ fn lexical<'w, N: Name, W: World<N>>(
     root: W::Root<'w>,
     ns: Namespace,
     name: N,
-    alloc: Alloc<'_>,
+    scratch: &mut ThroughScratch<'_>,
 ) -> Result<Def, Why> {
     let head = root.head();
     match name.as_ref() {
@@ -414,7 +447,7 @@ fn lexical<'w, N: Name, W: World<N>>(
             child = Some(*m);
         }
     }
-    if let Some(p) = in_source(world, Def::module(module), ns, name, alloc.clone())? {
+    if let Some(p) = in_source(world, Def::module(module), ns, name, scratch)? {
         return Ok(p.def);
     }
     if ns == Namespace::Macros {
@@ -439,7 +472,7 @@ fn lexical<'w, N: Name, W: World<N>>(
             if world.scope(prelude).is_none() {
                 return Err(Why::NotRead { module: prelude, layer: unheld });
             }
-            let found = in_source(world, Def::module(prelude), ns, name, alloc).map_err(|why| match why {
+            let found = in_source(world, Def::module(prelude), ns, name, scratch).map_err(|why| match why {
                 // A glob of the prelude's into a module not held is still the prelude's layer.
                 Why::NotRead { module, .. } => Why::NotRead { module, layer: unheld },
                 why => why,
@@ -459,7 +492,13 @@ fn lexical<'w, N: Name, W: World<N>>(
 }
 
 /// `name` in `source` (a module, through its globs, or an enum).
-fn in_source<N: Name, W: World<N>>(world: &W, source: Def, ns: Namespace, name: N, alloc: Alloc<'_>) -> Result<Option<Passed>, Why> {
+fn in_source<N: Name, W: World<N>>(
+    world: &W,
+    source: Def,
+    ns: Namespace,
+    name: N,
+    scratch: &mut ThroughScratch<'_>,
+) -> Result<Option<Passed>, Why> {
     struct Records<'w, N, W> {
         world: &'w W,
         ns: Namespace,
@@ -484,7 +523,7 @@ fn in_source<N: Name, W: World<N>>(world: &W, source: Def, ns: Namespace, name: 
         }
     }
     let mut sources = Records { world, ns, name };
-    match through(&mut sources, source, alloc) {
+    match through_in(&mut sources, source, scratch) {
         Ok(Some(p)) if matches!(p.state, BindingState::Ambiguous(_)) => Err(Why::Ambiguous),
         Ok(found) => Ok(found),
         // `source` itself not held is the walk's own step; a module behind its globs is a glob's.

@@ -44,13 +44,13 @@
 
 use core::cell::RefCell;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::{Domain, Hasher};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{Binding, CrateRootHead, CrateRootView, DefKind, Globs, ItemKind, MacroShapes, Namespace, RefusedWhy, ScopeView};
 
-use crate::cell_key::{CellKey, cell_key};
+use crate::cell_key::{BindingKey, BindingKeys, CellKey, cell_key};
 use crate::expansion_records::{Directory, ExpansionRecordsError};
 use crate::facts::Name;
 use crate::items_record::{ItemsRecord, ItemsRecordError, TextOf, TextSpan};
@@ -796,37 +796,73 @@ pub fn seen_in(table: &[u8], key: [u8; 16]) -> Result<Option<ContentId>, CellsEr
 /// alone, never of which task asked first (reads.rs's "what is not listed").
 pub trait CellSink {
     fn put(&self, cell: NameCell);
+
+    /// The read of `module`'s own binding of `(ns, name)`, a hit or a miss (a miss is a read
+    /// too: the name added later moves it): what [`LoggedScope::get`] logs, as the module, the
+    /// namespace and the name, so a lookup derives no key itself. The cell is
+    /// `NameCell::Binding { module, name: cell_key(ns, name) }`, byte-equal however it is
+    /// derived (rule 21). This default derives the key now, per read; a sink that keeps each
+    /// read once overrides it to derive the key once per DISTINCT read ([`BindingKeys`], as
+    /// [`Log`] does).
+    fn put_binding(&self, module: ItemKey, ns: Namespace, name: &str) {
+        self.put(NameCell::Binding { module, name: cell_key(ns, name) });
+    }
 }
 
 impl CellSink for Log<'_> {
     fn put(&self, cell: NameCell) {
         Log::put(self, cell)
     }
+
+    fn put_binding(&self, module: ItemKey, ns: Namespace, name: &str) {
+        let BindingKey { key, fresh } = self.keys.borrow_mut().key(module, ns, name);
+        if fresh {
+            Log::put(self, NameCell::Binding { module, name: key });
+        }
+    }
 }
 
-/// The cells a walk consulted, each once: by key, with the cell it is.
+/// The cells a walk consulted, each once, with the cell it is; keyed ([`NameCell::key`]) once
+/// per distinct cell, when they are listed ([`Log::cells`]), never per read.
 pub struct Log<'a> {
-    cells: RefCell<HashMap<[u8; 16], NameCell, Alloc<'a>>>,
+    cells: RefCell<Set<NameCell, FixedState, Alloc<'a>>>,
+    /// The binding reads' cell keys, each derived once ([`CellSink::put_binding`]).
+    keys: RefCell<BindingKeys<'a>>,
 }
 
 impl<'a> Log<'a> {
     pub fn new(alloc: Alloc<'a>) -> Log<'a> {
-        Log { cells: RefCell::new(HashMap::new_in(alloc)) }
+        Log {
+            cells: RefCell::new(Set::new(SetOpts { hasher: FixedState, alloc: alloc, capacity: None })),
+            keys: RefCell::new(BindingKeys::new_in(alloc)),
+        }
     }
 
     /// Logs `cell`: what a reader outside the walk (an items record question) consulted.
     pub fn put(&self, cell: NameCell) {
-        self.cells.borrow_mut().insert(cell.key(), cell);
+        self.cells.borrow_mut().insert(cell);
     }
 
-    /// Every cell logged so far, by key order, into `alloc`.
+    /// Every cell logged so far, by key order, into `alloc`: each distinct cell's key derived
+    /// here, once.
     pub fn cells<'b>(&self, alloc: Alloc<'b>) -> AVec<'b, ([u8; 16], NameCell)> {
         let mut all: AVec<'b, ([u8; 16], NameCell)> = AVec::new_in(alloc);
-        for (key, cell) in self.cells.borrow().iter() {
-            all.push((*key, *cell));
+        for cell in self.cells.borrow().iter() {
+            all.push((cell.key(), *cell));
         }
         all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         all
+    }
+
+    /// How many binding cell keys ([`cell_key`]) this log derived: one per distinct binding
+    /// read, whatever the number of lookups (the floor's counter).
+    pub fn binding_keys_derived(&self) -> u64 {
+        self.keys.borrow().derived()
+    }
+
+    /// How many binding reads were logged, repeats too.
+    pub fn binding_reads(&self) -> u64 {
+        self.keys.borrow().asked()
     }
 
     pub fn len(&self) -> usize {
@@ -856,7 +892,8 @@ pub struct LoggedScope<'w, S> {
 
 impl<'w, N: Name, S: ScopeRead<'w, N>> ScopeRead<'w, N> for LoggedScope<'w, S> {
     fn get(self, ns: Namespace, name: N) -> Option<Binding> {
-        self.log.put(NameCell::Binding { module: self.module, name: cell_key(ns, name.as_ref()) });
+        // Logged as the read itself: no key is derived per lookup ([`CellSink::put_binding`]).
+        self.log.put_binding(self.module, ns, name.as_ref());
         self.scope.get(ns, name)
     }
 

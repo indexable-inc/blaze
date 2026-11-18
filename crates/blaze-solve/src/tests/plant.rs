@@ -16,6 +16,9 @@ pub enum Plant {
     ObjectAnyAuto,
     /// An object's projection is its binding's whatever the binding's term (alias.rs `step_object`).
     ObjectProjIgnoresBinding,
+    /// A trait whose dyn compatibility the world did not decide is taken as not compatible
+    /// (builtin.rs `dyn_compatible`): the state before the gap stopped the goal.
+    DynUndecidedAsNo,
 }
 
 std::thread_local! {

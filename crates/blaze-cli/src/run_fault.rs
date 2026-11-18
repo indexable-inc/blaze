@@ -19,13 +19,19 @@
 //! ([`crate::run_parent::Lazy::name_of`]). The child's own line is written only when it could
 //! not tell the parent (one report, rule 30).
 //!
+//! The line ends with the faulting thread's callers, as the child walked its frame-pointer
+//! chain (run schema 3, wire/fault.rs `Callers`), the first eight each named by its symbol's
+//! row as the pc is: `; called from fn `core::alloc::layout::Layout::array::inner` +0x54, from
+//! fn `alloc::raw_vec::..` +0x1c0, from 0x1a2b3c, in no placed code, and 3 more (the walk
+//! ended: the chain's end)`.
+//!
 //! Pure: [`report`] is given the names and the record's bytes; own_process.rs reads them.
 
 use core::fmt;
 
 use blaze_code::record::{CodeView, Held, Subject};
 use blaze_code::trap::{self, Reason, TrapAt};
-use blaze_launch::wire::fault::{Fault, Placed, Regs, Spot};
+use blaze_launch::wire::fault::{Callers, Fault, NAMED_CALLERS, Placed, Regs, Spot};
 use blaze_typeck::ItemKey;
 
 use crate::run_parent::ParentError;
@@ -81,6 +87,8 @@ pub(crate) struct Report {
     unread: Option<Unread>,
     /// The enum the trap row's subject names, when it has one.
     subject: Option<Named>,
+    /// The callers the child named, each by its symbol's row (`None`: in no placed code).
+    callers: [Option<Named>; NAMED_CALLERS],
 }
 
 /// What names a run's places for a report: the walk (run_parent.rs `Lazy`), while it is alive.
@@ -118,7 +126,36 @@ pub(crate) fn report(fault: Fault, places: &mut dyn Places, record: Option<Resul
     let callee = trap.and_then(|trap| trap.after_call).map(|symbol| places.named(symbol.0));
     let site = trap.and_then(|trap| trap.construct).and_then(|row| row.site).and_then(|(item, at)| places.site(ItemKey(item), at));
     let subject = trap.and_then(|trap| trap.construct).and_then(|row| row.subject).map(|subject| places.item(ItemKey(subject.item)));
-    Report { fault, at, touched, trap, callee, site, unread, subject }
+    let mut callers = [const { None }; NAMED_CALLERS];
+    if let Some(walked) = fault.callers {
+        for (named, spot) in callers.iter_mut().zip(walked.spots()) {
+            *named = spot.map(|spot| places.named(spot.symbol.0));
+        }
+    }
+    Report { fault, at, touched, trap, callee, site, unread, subject, callers }
+}
+
+/// `; called from <each named caller> +<offset>, .., and N more (the walk ended: <why>)`: the
+/// callers the child walked, innermost first; nothing when this host's child walks none.
+fn callers_said(f: &mut fmt::Formatter<'_>, walked: &Callers, named: &[Option<Named>; NAMED_CALLERS]) -> fmt::Result {
+    if walked.rets().is_empty() {
+        return write!(f, "; no caller was walked (the walk ended: {})", walked.end.says());
+    }
+    f.write_str("; called from ")?;
+    for (i, (&ret, spot)) in walked.rets().iter().zip(walked.spots()).enumerate() {
+        if i > 0 {
+            f.write_str(", from ")?;
+        }
+        match (spot, &named[i]) {
+            (Some(spot), Some(named)) => write!(f, "{} +{:#x}", Thing(named, "fn"), spot.offset)?,
+            _ => write!(f, "{ret:#x}, in no placed code (the launcher's own, or a stub)")?,
+        }
+    }
+    let more = walked.rets().len() - walked.spots().len();
+    if more > 0 {
+        write!(f, ", and {more} more")?;
+    }
+    write!(f, " (the walk ended: {})", walked.end.says())
 }
 
 /// What a trap row says the switched value is, read from the fault's registers (the child's,
@@ -275,6 +312,9 @@ impl fmt::Display for Report {
             write!(f, "; {access} {:#x}, ", self.fault.address)?;
             place(f, spot, named)?;
         }
+        if let Some(walked) = &self.fault.callers {
+            callers_said(f, walked, &self.callers)?;
+        }
         Ok(())
     }
 }
@@ -290,3 +330,7 @@ mod trap_tests;
 #[cfg(test)]
 #[path = "run_fault_held_tests.rs"]
 mod held_tests;
+
+#[cfg(test)]
+#[path = "run_fault_callers_tests.rs"]
+mod callers_tests;

@@ -642,6 +642,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.ret = match f.then {
             Then::Nothing => ty,
             Then::Coerce { to, two_phase } => {
+                // `demand_coerce_diag`: the target with the pending obligations selected first.
+                let to = self.resolve_with_obligations(to)?;
                 if !self.coerce(Some(e), ty, to, two_phase)? {
                     self.diag(DiagCode::Mismatch, At::Expr(e), About::types(to, ty));
                 }
@@ -1147,6 +1149,28 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             return Ok(self.ty.shallow_resolve(t));
         }
         Ok(t)
+    }
+
+    /// `resolve_vars_with_obligations` (rustc_hir_typeck fn_ctxt/_impl.rs), the one home for the
+    /// rule every `check_expr_coercible_to_type` site keeps (`demand_coerce_diag` calls it on
+    /// the expected type before `coerce`): a target that still holds a variable ANYWHERE (not
+    /// only at the top: `&?R`) has the pending obligations selected first, so a goal that one
+    /// candidate decides fixes the variable before the source is coerced to it. This is what
+    /// makes `p == &x` with `p: *const T` (the one `impl PartialEq for *const T` fixes the right
+    /// operand's variable to `*const T`, then `&T` coerces to it), `(**self).partial_cmp(other)`
+    /// with `other: &ArrayVec<T, N>` (`impl PartialOrd for [T]` fixes `Rhs = [T]`, then the
+    /// argument deref-coerces) and `Ptr::Target::lt(self, other)` under `Ptr::Target:
+    /// PartialOrd<Q::Target>` (the where-clause fixes `Rhs`) type as the pinned nightly types
+    /// them; without it the variable is unified with the source's own type and the goal fails
+    /// (E0277). A target with no variable is returned as it is and nothing is selected.
+    pub(crate) fn resolve_with_obligations(&mut self, t: Ty) -> Result<Ty, Stop> {
+        let t = self.ty.shallow_resolve(t);
+        let one = self.mk_list(&[t])?;
+        if !self.ty.list_has_infer(one) {
+            return Ok(t);
+        }
+        self.select()?;
+        Ok(self.ty.shallow_resolve(t))
     }
 
     /// `structurally_resolve_type`: as `try_structurally_resolve`, and a type variable left is

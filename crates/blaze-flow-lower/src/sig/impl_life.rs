@@ -48,7 +48,7 @@ use core::alloc::Allocator;
 
 use blaze_typeck::{ItemKey, PNode, PTy, PTys};
 
-use super::{Ctx, Mode, Pair, Reader, Region, SigBuf, SigLife, SigRefusal, Tk, Tok, lex, read_signature_in};
+use super::{Ctx, Mode, NoAliases, Pair, Reader, Region, SigBuf, SigLife, SigRefusal, SigWorld, Tk, Tok, lex, read_signature_in};
 
 /// Why a `Self::Name` of a signature, or the impl's header, was not read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,6 +119,12 @@ impl<'t, A: Allocator + Clone> ImplLife<'t, A> {
         ImplLife { names, bounds: Vec::new_in(alloc.clone()), trait_words: Vec::new_in(alloc), assoc: &[], expand: false, header: self.header }
     }
 
+    /// An alias's lifetime parameters by name, each the region its use gives it (alias.rs): no
+    /// bounds, no trait, no `Self::Name` (an alias's text has none to expand).
+    pub(super) fn of_alias(names: Vec<(&'t str, Region), A>, alloc: A) -> ImplLife<'t, A> {
+        ImplLife { names, bounds: Vec::new_in(alloc.clone()), trait_words: Vec::new_in(alloc), assoc: &[], expand: false, header: true }
+    }
+
     /// A header that was not read: no lifetime is mapped, every `Self::Name` is refused.
     fn unread(alloc: A) -> ImplLife<'t, A> {
         ImplLife { names: Vec::new_in(alloc.clone()), bounds: Vec::new_in(alloc.clone()), trait_words: Vec::new_in(alloc), assoc: &[], expand: false, header: false }
@@ -149,8 +155,24 @@ pub fn read_impl_signature<'t, A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
-    let life = impl_life_or_unread(text, imp, tys, adt_lifetimes, alloc.clone())?;
-    read_signature_in(text, Some(life), tys, inputs, output, None, adt_lifetimes, out, alloc)
+    read_impl_signature_with(text, imp, tys, inputs, output, &NoAliases(adt_lifetimes), out, alloc)
+}
+
+/// [`read_impl_signature`] in `world`: each written type path, the impl header's included, is
+/// read for what it resolves to (alias.rs).
+#[expect(clippy::too_many_arguments, reason = "read_signature's inputs and the impl's text")]
+pub fn read_impl_signature_with<'t, A: Allocator + Clone>(
+    text: &'t str,
+    imp: ImplText<'t>,
+    tys: PTys<'_>,
+    inputs: &[PTy],
+    output: PTy,
+    world: &dyn SigWorld,
+    out: &mut SigBuf<A>,
+    alloc: A,
+) -> Result<(), SigRefusal> {
+    let life = impl_life_or_unread(text, imp, tys, world, alloc.clone())?;
+    read_signature_in(text, Some(life), tys, inputs, output, None, world, out, alloc)
 }
 
 /// The impl's header as a member `text`'s reading takes it ([`read_impl_signature`]'s doc): read,
@@ -159,10 +181,10 @@ pub(super) fn impl_life_or_unread<'t, A: Allocator + Clone>(
     text: &'t str,
     imp: ImplText<'t>,
     tys: PTys<'_>,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
+    world: &dyn SigWorld,
     alloc: A,
 ) -> Result<ImplLife<'t, A>, SigRefusal> {
-    match impl_life(imp, tys, adt_lifetimes, alloc.clone()) {
+    match impl_life(imp, tys, world, alloc.clone()) {
         Ok(life) => Ok(life),
         Err(why) => {
             if writes_outer_lifetime(text, alloc.clone())? {
@@ -246,13 +268,56 @@ fn writes_outer_lifetime<A: Allocator + Clone>(text: &str, alloc: A) -> Result<b
 fn impl_life<'t, A: Allocator + Clone>(
     imp: ImplText<'t>,
     tys: PTys<'_>,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
+    world: &dyn SigWorld,
+    alloc: A,
+) -> Result<ImplLife<'t, A>, AssocWhy> {
+    impl_life_with(imp, tys, world, None, alloc)
+}
+
+/// What [`read_impl_trait`] takes of the header beyond [`ImplLife`], filled by the same one
+/// pass over its tokens ([`impl_life_with`]).
+struct HeaderPreds<'t, A: Allocator + Clone> {
+    /// The self type's origin positions.
+    positions: u32,
+    /// The trait path's lifetime arguments as written, in order (`'_` among them).
+    trait_lifes: Vec<&'t str, A>,
+    /// The trait path is in a form not read here: `Fn(..)` sugar, or generics not closing it.
+    trait_form: bool,
+    /// Declared `'a: 'b` with a side the self type does not hold (nor `'static`), by name.
+    free_bounds: Vec<(&'t str, &'t str), A>,
+    /// `T: 'a` over a type parameter the self type writes: the lifetimes, by name.
+    outlived: Vec<&'t str, A>,
+    /// A predicate names a lifetime in a form not read: a trait bound's arguments, a `for<..>`
+    /// binder, a bounded type that holds a lifetime, or `T: 'a` over a `T` the self type does
+    /// not write (one only the trait reference names).
+    unread: bool,
+}
+
+impl<'t, A: Allocator + Clone> HeaderPreds<'t, A> {
+    fn new_in(alloc: A) -> HeaderPreds<'t, A> {
+        HeaderPreds {
+            positions: 0,
+            trait_lifes: Vec::new_in(alloc.clone()),
+            trait_form: false,
+            free_bounds: Vec::new_in(alloc.clone()),
+            outlived: Vec::new_in(alloc),
+            unread: false,
+        }
+    }
+}
+
+/// [`impl_life`], also filling `preds` when given (one pass over the header either way).
+fn impl_life_with<'t, A: Allocator + Clone>(
+    imp: ImplText<'t>,
+    tys: PTys<'_>,
+    world: &dyn SigWorld,
+    mut preds: Option<&mut HeaderPreds<'t, A>>,
     alloc: A,
 ) -> Result<ImplLife<'t, A>, AssocWhy> {
     let mut r = Reader {
         text: imp.text,
         tys,
-        adt_lifetimes,
+        world,
         toks: Vec::new_in(alloc.clone()),
         mate: Vec::new_in(alloc.clone()),
         names: Vec::new_in(alloc.clone()),
@@ -261,6 +326,10 @@ fn impl_life<'t, A: Allocator + Clone>(
         alloc: alloc.clone(),
         imp: None,
         unwritten: Vec::new_in(alloc.clone()),
+        from: None,
+        holes: Vec::new_in(alloc.clone()),
+        found: Vec::new_in(alloc.clone()),
+        depth: 0,
     };
     lex(imp.text, &mut r.toks).map_err(|_| AssocWhy::Header)?;
     let cut = header_cut(&r.toks);
@@ -370,7 +439,246 @@ fn impl_life<'t, A: Allocator + Clone>(
             life.trait_words.push(r.word(t));
         }
     }
+    if let Some(preds) = preds.as_deref_mut() {
+        preds.positions = n;
+        if let Some((tlo, thi)) = trait_range {
+            r.trait_lifetimes(tlo, thi, preds);
+        }
+        if let Some((glo, ghi)) = generics {
+            r.header_preds(glo, ghi, (lo, hi), &life, preds);
+        }
+        if where_at < end {
+            r.header_preds(where_at + 1, end, (lo, hi), &life, preds);
+        }
+    }
     Ok(life)
+}
+
+impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
+    /// The lifetime arguments of the trait path `lo..hi` (`de::Visitor<'de>`, `Tr<'a, T>`): the
+    /// generics that close it, each argument that is one lifetime token. `Fn(..)` sugar, or
+    /// generics that do not close the path, is a form not read (`trait_form`).
+    fn trait_lifetimes(&self, lo: u32, hi: u32, preds: &mut HeaderPreds<'t, A>) {
+        let mut i = lo;
+        while i < hi {
+            if self.is(i, hi, Tk::P(b'(')) {
+                preds.trait_form = true;
+                return;
+            }
+            i = self.skip(i);
+        }
+        if !self.is(hi - 1, hi, Tk::P(b'>')) {
+            return;
+        }
+        let open = self.mate[(hi - 1) as usize];
+        if open == u32::MAX || open < lo || open >= hi - 1 {
+            preds.trait_form = true;
+            return;
+        }
+        let mut parts: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        self.pieces(open + 1, hi - 1, &mut parts);
+        for &(plo, phi) in parts.iter() {
+            if phi == plo + 1 && self.is(plo, phi, Tk::Life) {
+                preds.trait_lifes.push(self.word(plo));
+            }
+        }
+    }
+
+    /// The predicates of the header's generics or `where` clause in `lo..hi`, as
+    /// [`HeaderPreds`] keeps them; `self_ty` is the self type's token range, `life` what the
+    /// self type holds by name.
+    fn header_preds(&self, lo: u32, hi: u32, self_ty: (u32, u32), life: &ImplLife<'t, A>, preds: &mut HeaderPreds<'t, A>) {
+        let held = |w: &str| w == "'static" || life.region_of(w).is_some();
+        let lifes_in = |a: u32, b: u32| (a..b).any(|x| self.toks[x as usize].k == Tk::Life);
+        let mut parts: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        self.pieces(lo, hi, &mut parts);
+        for &(plo, phi) in parts.iter() {
+            if self.is(plo, phi, Tk::Life) {
+                // `'a` declared, or `'a: 'b + 'c`.
+                if !self.is(plo + 1, phi, Tk::P(b':')) {
+                    continue;
+                }
+                let a = self.word(plo);
+                for i in plo + 2..phi {
+                    if self.toks[i as usize].k != Tk::Life {
+                        continue;
+                    }
+                    let b = self.word(i);
+                    if !(held(a) && held(b)) {
+                        preds.free_bounds.push((a, b));
+                    }
+                }
+                continue;
+            }
+            // The bounded type ends at the first `:` outside brackets (`const N: usize` has no
+            // lifetime: nothing below matches it).
+            let mut colon = None;
+            let mut i = plo;
+            while i < phi {
+                if self.toks[i as usize].k == Tk::P(b':') {
+                    colon = Some(i);
+                    break;
+                }
+                i = self.skip(i);
+            }
+            let Some(c) = colon else { continue };
+            if lifes_in(plo, c) {
+                preds.unread = true;
+                continue;
+            }
+            let bounded = (c == plo + 1 && self.is(plo, phi, Tk::Ident)).then(|| self.word(plo));
+            let in_self = bounded.is_some_and(|w| (self_ty.0..self_ty.1).any(|x| self.is(x, self_ty.1, Tk::Ident) && self.word(x) == w));
+            // Its bounds, split at `+` outside brackets.
+            let mut from = c + 1;
+            let mut i = c + 1;
+            loop {
+                let at_end = i >= phi;
+                if at_end || self.toks[i as usize].k == Tk::P(b'+') {
+                    if i == from + 1 && self.is(from, phi, Tk::Life) {
+                        if in_self {
+                            preds.outlived.push(self.word(from));
+                        } else {
+                            preds.unread = true;
+                        }
+                    } else if lifes_in(from, i.min(phi)) {
+                        preds.unread = true;
+                    }
+                    if at_end {
+                        break;
+                    }
+                    from = i + 1;
+                    i += 1;
+                    continue;
+                }
+                i = self.skip(i);
+            }
+        }
+    }
+}
+
+/// What an impl's header says of the trait reference it implements, as a call whose bound
+/// `T: Tr<'x..>` the impl answers takes it (trait_ties.rs, the impl's answer). Regions:
+/// `SelfTy(k)` (a lifetime the self type holds, its position `k`), `Static`, or `Named(j)`: the
+/// impl's `j`th lifetime that its self type does not hold, FREE (the Reference,
+/// "Implementations", "Generic implementations": such a lifetime is constrained only by the
+/// trait reference, so it is what the call answers it with: existential at the call).
+pub struct ImplTrait<A: Allocator + Clone> {
+    /// The trait reference's lifetime arguments, in the trait's order.
+    pub args: Vec<Region, A>,
+    /// `(a, b)`: `a: b`, among the self type's positions (a name at two positions, a `'static`),
+    /// the header's declared lifetime bounds, free ones included.
+    pub bounds: Vec<(Region, Region), A>,
+    /// Lifetimes a type parameter of the self type must outlive (`T: 'a`).
+    pub outlived: Vec<Region, A>,
+    /// How many free lifetimes `Named(..)` numbers.
+    pub free: u32,
+    /// The self type's origin positions.
+    pub positions: u32,
+}
+
+impl<A: Allocator + Clone> ImplTrait<A> {
+    pub fn new_in(alloc: A) -> ImplTrait<A> {
+        ImplTrait { args: Vec::new_in(alloc.clone()), bounds: Vec::new_in(alloc.clone()), outlived: Vec::new_in(alloc), free: 0, positions: 0 }
+    }
+}
+
+/// Why [`read_impl_trait`] did not read a header.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImplTraitWhy {
+    /// The header or its self type was not read ([`AssocWhy`] says which).
+    Header(AssocWhy),
+    /// An inherent impl: no trait reference.
+    Inherent,
+    /// The trait path is `Fn(..)` sugar or its generics are not read.
+    TraitForm,
+    /// The path writes another count of lifetime arguments than the trait declares.
+    Count { want: u32, have: u32 },
+    /// A predicate of the header names a lifetime in a form not read ([`HeaderPreds::unread`]).
+    Predicates,
+    /// More free lifetimes or relations than [`MOST_IMPL_REGIONS`].
+    Bound,
+}
+
+/// The most regions one header's answer holds (rule 18).
+pub const MOST_IMPL_REGIONS: usize = 1024;
+
+/// Reads impl `imp`'s header for the trait reference it implements ([`ImplTrait`]), the trait
+/// declaring `lifetimes` lifetime parameters. One pass over the header's tokens; each
+/// lifetime name is looked up among the header's few (the floor is the pass).
+pub fn read_impl_trait<'t, A: Allocator + Clone>(
+    imp: ImplText<'t>,
+    tys: PTys<'_>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
+    lifetimes: u32,
+    out: &mut ImplTrait<A>,
+    alloc: A,
+) -> Result<(), ImplTraitWhy> {
+    out.args.clear();
+    out.bounds.clear();
+    out.outlived.clear();
+    out.free = 0;
+    let mut preds: HeaderPreds<'t, A> = HeaderPreds::new_in(alloc.clone());
+    let life = impl_life_with(imp, tys, &NoAliases(adt_lifetimes), Some(&mut preds), alloc.clone()).map_err(ImplTraitWhy::Header)?;
+    if life.trait_words.is_empty() {
+        return Err(ImplTraitWhy::Inherent);
+    }
+    if preds.trait_form {
+        return Err(ImplTraitWhy::TraitForm);
+    }
+    if preds.unread {
+        return Err(ImplTraitWhy::Predicates);
+    }
+    out.positions = preds.positions;
+    // The free lifetimes by name, in order of first use; `'_` (and an elided argument) is a
+    // distinct one each (the Reference, "Lifetime elision": in an impl header each elided
+    // lifetime is a fresh parameter of the impl).
+    let mut free: Vec<&'t str, A> = Vec::new_in(alloc);
+    let region = |w: &'t str, free: &mut Vec<&'t str, A>| -> Result<Region, ImplTraitWhy> {
+        if w == "'static" {
+            return Ok(Region::Static);
+        }
+        if let Some(r) = life.region_of(w) {
+            return Ok(r);
+        }
+        if w != "'_"
+            && let Some(j) = free.iter().position(|&f| f == w)
+        {
+            return Ok(Region::Named(j as u32));
+        }
+        if free.len() >= MOST_IMPL_REGIONS {
+            return Err(ImplTraitWhy::Bound);
+        }
+        free.push(w);
+        Ok(Region::Named(free.len() as u32 - 1))
+    };
+    let have = preds.trait_lifes.len() as u32;
+    if have == 0 {
+        for _ in 0..lifetimes {
+            let r = region("'_", &mut free)?;
+            out.args.push(r);
+        }
+    } else if have != lifetimes {
+        return Err(ImplTraitWhy::Count { want: lifetimes, have });
+    } else {
+        for &w in preds.trait_lifes.iter() {
+            let r = region(w, &mut free)?;
+            out.args.push(r);
+        }
+    }
+    out.bounds.extend_from_slice(&life.bounds);
+    for &(a, b) in preds.free_bounds.iter() {
+        let (ra, rb) = (region(a, &mut free)?, region(b, &mut free)?);
+        out.bounds.push((ra, rb));
+    }
+    for &w in preds.outlived.iter() {
+        let r = region(w, &mut free)?;
+        out.outlived.push(r);
+    }
+    if out.bounds.len() > MOST_IMPL_REGIONS || out.outlived.len() > MOST_IMPL_REGIONS {
+        return Err(ImplTraitWhy::Bound);
+    }
+    out.free = free.len() as u32;
+    Ok(())
 }
 
 /// How a written type names an associated type of `Self`.
@@ -455,7 +763,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
         let mut sub = Reader {
             text,
             tys: self.tys,
-            adt_lifetimes: self.adt_lifetimes,
+            world: self.world,
             toks: Vec::new_in(self.alloc.clone()),
             mate: Vec::new_in(self.alloc.clone()),
             names: Vec::new_in(self.alloc.clone()),
@@ -464,6 +772,11 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             alloc: self.alloc.clone(),
             imp: Some(nested),
             unwritten: Vec::new_in(self.alloc.clone()),
+            // The impl's member texts resolve their paths where the impl does.
+            from: self.from,
+            holes: Vec::new_in(self.alloc.clone()),
+            found: Vec::new_in(self.alloc.clone()),
+            depth: self.depth,
         };
         lex(text, &mut sub.toks).map_err(|_| refuse(AssocWhy::Form))?;
         sub.pair_brackets().map_err(|_| refuse(AssocWhy::Form))?;
@@ -474,6 +787,8 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
         sub.line_up(Pair { ty: p.ty, lo, hi, base: 0, ctx: p.ctx, whole_self: false }, Mode::Output(None), &mut got).map_err(|e| match e {
             SigRefusal::ElisionUndecided { .. } => refuse(AssocWhy::Elided),
             SigRefusal::Assoc { why, .. } => refuse(why),
+            // A path in the impl's text the world refused keeps its own name (alias.rs).
+            SigRefusal::Path { why, .. } => SigRefusal::Path { at, why },
             _ => refuse(AssocWhy::Unaligned),
         })?;
         for k in 0..n {

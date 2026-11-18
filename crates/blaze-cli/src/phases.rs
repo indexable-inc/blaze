@@ -49,6 +49,8 @@ pub struct Phases {
     /// The cleanup line's part known before the commit after the answer (store/roots.rs
     /// `CleanupLine::before_commit`), for a profile written before that commit (main.rs).
     pub(crate) cleanup: Option<crate::store::roots::BeforeCommit>,
+    /// The published set named by `--origin`, taken before the first phase (store/take.rs).
+    pub(crate) published: Option<crate::store::take::Taken>,
     /// The command's own frame, by what took its bytes ([`Phases::mark_in`], [`Phases::took`]).
     held: Held,
 }
@@ -138,6 +140,7 @@ impl Phases {
             code_records: None,
             run_names: None,
             cleanup: None,
+            published: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
         }
     }
@@ -278,6 +281,9 @@ impl fmt::Display for Phases {
         }
         if let Some(cleanup) = self.cleanup {
             writeln!(f, "{cleanup}")?;
+        }
+        if let Some(taken) = self.published {
+            writeln!(f, "{taken}")?;
         }
         let held = &self.held;
         write!(f, "frame        the command's frame: {} of {} bytes used · by phase (bytes):", held.seen.0, held.seen.1)?;

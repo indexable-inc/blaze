@@ -13,15 +13,68 @@
 
 use blaze_surface::Item;
 
-/// The name of `item` as written in `text` (the file the outline was made from): `<unnamed>`
-/// for an entry with no name (an impl, a `use`, `const _`); a name whose range does not lie in
-/// `text` (an outline of another text: a bug of the caller) is said as such, never cut.
+/// What a range outside the file's text is said as (an outline of another text: a bug of the
+/// caller), never cut.
+const OUTSIDE: &str = "<a name outside the file's text: the outline is not this text's>";
+
+/// The name of `item` as written in `text` (the file the outline was made from). An entry with
+/// no name (an impl, a `use`, an extern block, a macro call, `const _`) is shown by its head as
+/// written ([`shown_head`]: `impl Serialize for Point`, `make!`, `const _: ()`), never as a
+/// placeholder; a name whose range does not lie in `text` is said as such ([`OUTSIDE`]).
 pub(crate) fn shown_name<'t>(item: &Item, text: &'t str) -> &'t str {
-    let Some(name) = item.name else { return "<unnamed>" };
+    let Some(name) = item.name else { return shown_head(item, text) };
     match item.checked_in_file(name).and_then(|r| r.get(text)) {
         Some(shown) => shown,
-        None => "<a name outside the file's text: the outline is not this text's>",
+        None => OUTSIDE,
     }
+}
+
+/// The head of `item` as written, borrowed from `text`: its `signature` range (to its body's
+/// start) without its outer attributes and comments, up to the end of its first line, trailing
+/// space trimmed (`impl<T> Tr for A<T>` of a head whose `where` is on the next line). Each step
+/// moves forward in the head, so the scan is bounded by its length.
+fn shown_head<'t>(item: &Item, text: &'t str) -> &'t str {
+    let Some(head) = item.checked_in_file(item.signature).and_then(|r| r.get(text)) else { return OUTSIDE };
+    let mut rest = head;
+    for _ in 0..=head.len() {
+        rest = rest.trim_start();
+        let skipped = if rest.starts_with('#') {
+            attribute_len(rest)
+        } else if rest.starts_with("//") {
+            rest.find('\n').unwrap_or(rest.len())
+        } else if rest.starts_with("/*") {
+            rest.find("*/").map_or(rest.len(), |at| at + 2)
+        } else {
+            0
+        };
+        if skipped == 0 {
+            break;
+        }
+        rest = rest.get(skipped..).unwrap_or("");
+    }
+    let line = rest.split('\n').next().unwrap_or("").trim_end();
+    if line.is_empty() { head.trim() } else { line }
+}
+
+/// The length of the attribute `#[..]` or `#![..]` that `at` starts with, to its closing `]`
+/// at depth zero (brackets inside strings are not told apart: a shown head, not a parse);
+/// `at`'s whole length when it does not close, 0 when `at` is no attribute.
+fn attribute_len(at: &str) -> usize {
+    let open = if at.starts_with("#![") { 2 } else if at.starts_with("#[") { 1 } else { return 0 };
+    let mut depth = 0u32;
+    for (offset, byte) in at.bytes().enumerate().skip(open) {
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return offset + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    at.len()
 }
 
 #[cfg(test)]

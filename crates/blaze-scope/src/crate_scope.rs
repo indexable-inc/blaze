@@ -1386,6 +1386,10 @@ impl<P: Par> Par for OfMembers<'_, P> {
         self.par.stage(stage);
     }
 
+    fn call_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> crate::task::Scratch {
+        self.par.call_scratch(work)
+    }
+
     fn expand_part(&self, part: crate::task::ExpandPart, macro_name: &str, size: usize) {
         self.par.expand_part(part, macro_name, size);
     }

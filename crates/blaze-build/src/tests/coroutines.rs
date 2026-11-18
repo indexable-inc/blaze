@@ -281,8 +281,10 @@ fn option_of_a_future_takes_the_tag_niche() {
     let row = *ls.get(id);
     assert!(row.size == 16, "Option<future> must use the tag's niche: {} != 16", row.size);
     match row.variants {
-        Variants::Multiple { tag_offset: 8, encoding: TagEncoding::Niche { untagged: 1, first: 0, last: 0, start: 4 }, .. } => {}
-        other => panic!("None is not the tag value 4 at offset 8: {other:?}"),
+        // rustc's `Niche::reserve` for ONE value over tags 0..=3: the side nearer zero as a
+        // signed number: below 0 is -1 (0xff), nearer than 4 (compiler/rustc_abi, `count == 1`).
+        Variants::Multiple { tag_offset: 8, encoding: TagEncoding::Niche { untagged: 1, first: 0, last: 0, start: 255 }, .. } => {}
+        other => panic!("None is not the tag value 255 at offset 8: {other:?}"),
     }
 
     // Control 1: no answer, no niche: the tagged form.

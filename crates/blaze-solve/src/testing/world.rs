@@ -707,7 +707,7 @@ impl World {
                         self.langs.insert(l, idef);
                     }
                 }
-                let mut flags = TraitFlags::DYN_COMPATIBLE;
+                let mut flags = if attrs.dyn_undecided { TraitFlags::DYN_UNDECIDED } else { TraitFlags::DYN_COMPATIBLE };
                 for (on, bit) in [
                     (attrs.auto, TraitFlags::AUTO),
                     (attrs.marker, TraitFlags::MARKER),

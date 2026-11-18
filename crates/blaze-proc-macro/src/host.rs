@@ -139,6 +139,9 @@ pub enum RuntimeError {
     Wait { module: String, waited: Duration },
     /// A worker thread of [`Runtime::load_all`] could not be started.
     Spawn(std::io::Error),
+    /// The module's wasm, read for its compile, could not be read or is not the bytes its
+    /// `wasm-sha256` names (module.rs `ModuleRecord::wasm`).
+    Wasm(crate::module::ModuleError),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -153,6 +156,7 @@ impl std::fmt::Display for RuntimeError {
             }
             RuntimeError::Wait { module, waited } => write!(f, "the module of {module} was still being loaded by another worker after {waited:?}"),
             RuntimeError::Spawn(error) => write!(f, "a thread to load proc-macro modules could not be started: {error}"),
+            RuntimeError::Wasm(error) => write!(f, "a proc-macro module's wasm, read for its compile: {error}"),
         }
     }
 }
@@ -366,6 +370,12 @@ impl Runtime {
         &self.parts
     }
 
+    /// The heap the runtime was handed ([`Runtime::new`]): what the hook makes the rows a
+    /// command runs in (record.rs `table::open`).
+    pub fn heap(&self) -> &'static blaze_own::Heap {
+        self.heap
+    }
+
     /// What the machine code depends on besides the module: [`Settings`], Wasmtime's
     /// compatibility hash, the host's architecture and system.
     pub fn code_id(&self) -> &str {
@@ -482,7 +492,11 @@ impl Runtime {
             }
             None => {
                 self.compiles.fetch_add(1, Ordering::Relaxed);
-                let code = self.engine.precompile_module(&module.wasm).map_err(|e| compile(format!("{e:#}")))?;
+                // The wasm read and checked only here, for this compile, and dropped with it
+                // (module.rs `ModuleRecord::wasm`).
+                let wasm = module.wasm().map_err(RuntimeError::Wasm)?;
+                let code = self.engine.precompile_module(&wasm).map_err(|e| compile(format!("{e:#}")))?;
+                drop(wasm);
                 self.write_renamed(dir, &path, &code)?;
                 self.write_renamed(dir, &seal_path, seal(&key, module, &self.code_id, &code).as_bytes())?;
                 // SAFETY: the bytes this engine just made from the module, in this process's

@@ -57,6 +57,60 @@ fn a_hundred_thousand_reads_of_fifty_cells_keep_fifty() {
     assert!(list.windows(2).all(|w| w[0] < w[1]), "sorted, each once");
 }
 
+/// A NAMES LOOKUP HASHES NOTHING ON A REPEAT (recorder.rs `ReadSink::binding`): 10,000 binding
+/// lookups of 37 distinct (module, namespace, name) reads, put through the walk's sink
+/// (`NamesInto` over the recorder, as front2 tables/view.rs walks), derive 37 keys, and the list
+/// equals the per-read keying's (the trait's default, through a sink that keys each read):
+/// byte-equal cells (rule 21). The owned recorder the same. CONTROL (rule 23): the default
+/// keying derives a key per lookup, so the counter is the recorder's own.
+#[test]
+fn ten_thousand_lookups_of_thirty_seven_names_derive_thirty_seven_keys() {
+    use blaze_scope::names_cells::CellSink as _;
+    use blaze_surface::Namespace;
+
+    use super::owned_reads::{OwnedRecorder, OwnedRecorderOpts, Owning, ReadOwners as _};
+    use super::recorder::NamesInto;
+    use crate::front2::heads::Want;
+
+    const NAMES: [&str; 37] = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "Vec", "Option", "Result", "String", "Box", "Rc", "Arc", "Cell", "RefCell", "HashMap", "Iterator",
+    ];
+    let read = |i: u32| -> (ItemKey, Namespace, &'static str) {
+        let at = (i * 7 + i / 5) as usize % NAMES.len();
+        // The module and namespace are functions of the name: 37 distinct reads in all.
+        let ns = if at % 2 == 0 { Namespace::Types } else { Namespace::Values };
+        (key((at % 3) as u32), ns, NAMES[at])
+    };
+    let r = Recorder::new(RecorderOpts { alloc: a() });
+    let walk = NamesInto(&r);
+    // The per-read keying (the trait's default), the oracle.
+    let oracle = Recorder::new(RecorderOpts { alloc: a() });
+    for i in 0..10_000u32 {
+        let (module, ns, name) = read(i);
+        walk.put_binding(module, ns, name);
+        oracle.read(TableRead::Names(NameCell::Binding { module, name: blaze_scope::cell_key::cell_key(ns, name) }));
+    }
+    assert_eq!(r.binding_keys_derived(), 37, "one key a distinct read");
+    assert_eq!(oracle.binding_keys_derived(), 0, "CONTROL: keyed by the caller, the recorder derived none");
+    let (mine, theirs) = (r.finish().expect("within the cap"), oracle.finish().expect("within the cap"));
+    assert_eq!(mine.len(), 37);
+    assert_eq!(&mine[..], &theirs[..], "byte-equal cells however the key is derived");
+    // The owned recorder, through one owner.
+    let owned = OwnedRecorder::new(OwnedRecorderOpts { alloc: a(), owning: Owning::Each });
+    let owner = Want::Fn(blaze_id::ItemKey(ContentId([9; 32])));
+    owned.enter(owner);
+    let walk = NamesInto(&owned);
+    for i in 0..10_000u32 {
+        let (module, ns, name) = read(i);
+        walk.put_binding(module, ns, name);
+    }
+    owned.leave();
+    assert_eq!(owned.binding_keys_derived(), 37, "the owned recorder: one key a distinct read");
+    let mut kept: AVec<'_, TableRead> = AVec::new_in(a());
+    owned.reads_of(owner, &mut |one| kept.push(one)).expect("its reads");
+    assert_eq!(&kept[..], &mine[..], "the owned recorder's cells equal the recorder's");
+}
+
 /// A mixed tape (drawn: lengths, a pool, repeats, every kind) finishes as the old recorder's
 /// list: the whole tape sorted and deduplicated. The planted drop is offered too and must be
 /// absent from both.

@@ -1422,7 +1422,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             }
             let fa = frame.alloc(blaze_own::Erased::new(frame)).handle();
             let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, g)) as &mut (dyn ConstValues<'_> + '_));
-            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, frame, scratch: g, alloc: fa, consts, known: Some(table) });
+            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, frame, scratch: g, alloc: fa, consts, known: Some(table), owners: None });
             Some(frame.alloc(RequestSeed::new(RequestSeedOpts { names: opened.records, heads: table, freezer, body_locals: table.body_locals() })))
         }
         None => None,
