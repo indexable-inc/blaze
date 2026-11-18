@@ -7,6 +7,7 @@
 //! into inputs, asks the tutor, and keeps everything in `$HARNESS_HOME/learn.json`.
 
 use super::*;
+use super::chat::Draft;
 use harness_learn::{Course, Input, Lesson, Mark, Progress, Run, Step, tutor};
 use harness_native_ui_layout_api::{Size, SizeKind, Sizing};
 
@@ -62,8 +63,12 @@ pub struct Learn {
     saved: Saved,
     screen: Screen,
     run: Option<Run>,
-    /// The words typed into the home's field.
-    draft: String,
+    /// The start page's field: the chat input's editor (src/app/chat.rs Draft), single-line.
+    draft: Draft,
+    /// A fill-in step's field, the same editor; what it holds is the run's answer typed ([`Learn::field`]).
+    fill: Draft,
+    /// The field with the keys this frame, its text node (for copy's flash); 0 when none shows.
+    field_node: std::cell::Cell<u64>,
     /// Why the last ask of the tutor failed, shown on the home.
     note: String,
     /// What the tutor is asked for now, and its generation: an answer of an older one (cancelled) is dropped.
@@ -91,7 +96,9 @@ impl Default for Learn {
             saved: Saved::default(),
             screen: Screen::Home,
             run: None,
-            draft: String::new(),
+            draft: Draft::default(),
+            fill: Draft::default(),
+            field_node: std::cell::Cell::new(0),
             note: String::new(),
             want: None,
             ask: 0,
@@ -165,6 +172,35 @@ impl Learn {
         self.saved.courses.iter().find(|c| c.id == id)
     }
 
+    /// The field that has the keys now: the start page's, or an unanswered fill-in's (kept in step with the run's
+    /// answer: a new step's field starts from what the run holds).
+    fn field(&mut self) -> Option<&mut Draft> {
+        match (&self.screen, self.run.as_ref().and_then(Run::view)) {
+            (Screen::Home, _) => Some(&mut self.draft),
+            (Screen::Step, Some(v)) if v.mark.is_none() && matches!(v.step, Step::Fill { .. }) => {
+                if self.fill.text != v.typed {
+                    self.fill = line_draft(v.typed);
+                }
+                Some(&mut self.fill)
+            }
+            _ => None,
+        }
+    }
+
+    /// Edit the field with the keys by `f`: one line (a newline or tab is a space), and a fill-in's words handed to the
+    /// run as its answer. Whether a field took it.
+    fn edit(&mut self, f: impl FnOnce(&mut Draft)) -> bool {
+        let Some(d) = self.field() else { return false };
+        f(d);
+        if d.text.contains(['\n', '\r', '\t']) {
+            d.text = d.text.replace(['\n', '\r', '\t'], " ");
+        }
+        if let (Screen::Step, Some(run)) = (&self.screen, self.run.as_mut()) {
+            run.step(Input::Type(self.fill.text.clone()), &mut self.saved.progress, today());
+        }
+        true
+    }
+
     /// Start walking `lesson` of `course` if its steps are written; whether it did.
     fn start_lesson(&mut self, course: &str, lesson: &str) -> bool {
         let Some(c) = self.course(course) else { return false };
@@ -205,19 +241,6 @@ impl Learn {
     }
 }
 
-/// What a chat message asks to be taught, if it asks: the words after "teach me" (or "i want to learn"), without the
-/// filler around them. A message that names nothing ("teach me something") leaves the pick to the tutor.
-pub(super) fn topic_of(message: &str) -> Option<String> {
-    let lower = message.to_lowercase();
-    let at = ["teach me", "i want to learn", "help me learn"].iter().find_map(|k| lower.find(k).map(|i| i + k.len()))?;
-    // The byte offset is the same in the original: lowercasing ASCII keeps lengths, and a message with other letters
-    // before the phrase is checked for a char boundary.
-    let rest = message.get(at..).unwrap_or("").trim().trim_end_matches(['?', '.', '!']).trim();
-    let rest = ["about ", "how to ", "to "].iter().find_map(|p| rest.strip_prefix(p)).unwrap_or(rest).trim();
-    let vague = rest.len() < 3 || ["something", "somthing", "anything", "a thing", "stuff"].iter().any(|v| rest.to_lowercase().starts_with(v));
-    Some(if vague { "one genuinely useful idea from computer science that most programmers never learned properly (your pick; name it in the course title)".to_owned() } else { rest.to_owned() })
-}
-
 /// Typed text as a field takes it: no control characters, no AppKit function-key code points.
 fn typed(text: &str) -> String {
     text.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect()
@@ -252,6 +275,42 @@ impl App {
             && self.focused_pane().is_some_and(|p| model::shows(self.world.world_ref(), p).is_none())
     }
 
+    /// Whether a field on the start page or in a lesson has the keys: the chat input's edits act on it.
+    pub(in crate::app) fn learn_editing(&self) -> bool {
+        self.learn_focused() && !self.renaming() && self.learn.borrow_mut().field().is_some()
+    }
+
+    /// The chat input's edits on the field that has the keys ([`App::with_draft`]).
+    pub(in crate::app) fn learn_draft(&mut self, f: impl FnOnce(&mut Draft)) -> bool {
+        let took = self.learn.borrow_mut().edit(f);
+        self.poke();
+        took
+    }
+
+    /// An `act.Edit` on the field (a move, a selection, an erase); Return, Escape and the arrows Learn binds itself.
+    pub(in crate::app) fn learn_edit(&mut self, op: &str) {
+        self.learn_draft(|d| _ = d.edit_line(op));
+    }
+
+    /// Command-C on the field: its selection, and its node to flash.
+    pub(in crate::app) fn learn_copy(&self) -> Option<Option<(String, chat::Copied)>> {
+        if !self.learn_editing() {
+            return None;
+        }
+        let mut l = self.learn.borrow_mut();
+        let node = l.field_node.get();
+        let text = l.field().map(|d| d.selected().to_owned()).unwrap_or_default();
+        Some((!text.is_empty() && node != 0).then_some((text, chat::Copied::Field(node))))
+    }
+
+    /// The input method's marked text in the field, while one has the keys.
+    pub(in crate::app) fn learn_marked(&self) -> Option<Option<String>> {
+        if !self.learn_editing() {
+            return None;
+        }
+        Some(self.learn.borrow_mut().field().and_then(|d| d.marked.clone()))
+    }
+
     /// Take what the link's threads brought since the last frame.
     fn learn_arrivals(&self) {
         let mut l = self.learn.borrow_mut();
@@ -279,7 +338,7 @@ impl App {
                             }
                             let (cid, first) = (course.id.clone(), course.lessons[0].id.clone());
                             l.saved.courses.insert(0, course);
-                            l.draft.clear();
+                            l.draft = Draft::default();
                             l.save();
                             self.learn_open(&mut l, &cid, &first);
                         }
@@ -459,7 +518,7 @@ impl App {
     fn learn_next(&self, l: &mut Learn) {
         match &l.screen {
             Screen::Home => {
-                let topic = l.draft.trim().to_owned();
+                let topic = l.draft.text.trim().to_owned();
                 if topic.is_empty() {
                     return;
                 }
@@ -468,9 +527,16 @@ impl App {
                 l.ask += 1;
                 l.want = Some(Want::Outline { topic: topic.clone() });
                 // The first line of what was asked, kept short: a long ask (a conversation to understand) is not echoed.
-                let named: String = topic.lines().next().unwrap_or("").chars().take(72).collect();
-                let named = named.trim_start_matches(|c: char| !c.is_alphanumeric()).to_owned();
-                l.screen = Screen::Making { kicker: "New course".to_owned(), title: named, sub: "Planning five to seven short lessons".to_owned() };
+                let named: String = if topic == harness_learn::intent::SURPRISE {
+                    "Something worth knowing".to_owned()
+                } else {
+                    let first: String = topic.lines().next().unwrap_or("").chars().take(72).collect();
+                    let first = first.trim_start_matches(|c: char| !c.is_alphanumeric());
+                    // Said as a title: its first letter up.
+                    let mut cs = first.chars();
+                    cs.next().map(|c| c.to_uppercase().chain(cs).collect()).unwrap_or_default()
+                };
+                l.screen = Screen::Making { kicker: "New lesson".to_owned(), title: named, sub: "Writing your first lesson".to_owned() };
                 self.learn_ask(l);
             }
             Screen::Making { .. } => {}
@@ -555,7 +621,7 @@ not the transcript.\n\nThe conversation:\n{}",
             l.load();
             l.run = None;
             l.screen = Screen::Home;
-            l.draft = topic.to_owned();
+            l.draft = line_draft(topic);
             me.learn_next(l);
         }
         self.poke();
@@ -578,18 +644,23 @@ not the transcript.\n\nThe conversation:\n{}",
             if !matches!(l.screen, Screen::Home) {
                 return false;
             }
-            l.draft.trim().to_owned()
+            l.draft.text.trim().to_owned()
         };
         if text.is_empty() {
             return true;
         }
-        if course || topic_of(&text).is_some() {
+        let topic = match harness_learn::intent::of(&text) {
+            harness_learn::Intent::Learn { topic } => Some(topic),
+            harness_learn::Intent::Do => course.then_some(text.clone()),
+        };
+        if let Some(topic) = topic {
             let me = &*self;
             let mut l = me.learn.borrow_mut();
+            l.draft = line_draft(&topic);
             me.learn_next(&mut l);
             return true;
         }
-        self.learn.borrow_mut().draft.clear();
+        self.learn.borrow_mut().draft = Draft::default();
         self.ask_new_chat(text);
         true
     }
@@ -614,6 +685,9 @@ not the transcript.\n\nThe conversation:\n{}",
                     };
                     if free {
                         me.learn_next(l);
+                    } else {
+                        // In a field, the right arrow is the caret's.
+                        l.edit(|d| _ = d.edit_line("right"));
                     }
                 }
                 "up" | "down" | "move_up" | "move_down" => {
@@ -649,21 +723,11 @@ not the transcript.\n\nThe conversation:\n{}",
                     }
                 }
                 "back" => match l.screen {
-                    Screen::Home => l.draft.clear(),
+                    Screen::Home => l.draft = Draft::default(),
                     _ => me.learn_leave(l),
                 },
-                "erase" => match (&l.screen, l.run.as_mut()) {
-                    (Screen::Home, _) => {
-                        l.draft.pop();
-                    }
-                    (Screen::Step, Some(run)) => {
-                        if let Some(mut t) = run.view().map(|v| v.typed.to_owned()) {
-                            t.pop();
-                            run.step(Input::Type(t), &mut l.saved.progress, today());
-                        }
-                    }
-                    _ => {}
-                },
+                // Backspace under Learn's binding: the field's erase, as the chat input's.
+                "erase" => _ = l.edit(|d| _ = d.edit_line("backspace")),
                 _ => eprintln!("harness-native: learn: no key {key:?}"),
             }
         }
@@ -684,16 +748,17 @@ not the transcript.\n\nThe conversation:\n{}",
             let mut l = self.learn.borrow_mut();
             let l = &mut *l;
             match (&l.screen, l.run.as_mut()) {
-                (Screen::Home, _) => l.draft.push_str(&text),
+                (Screen::Home, _) => _ = l.edit(|d| d.insert(&text)),
                 (Screen::Step, Some(run)) => {
                     let Some(v) = run.view() else { return true };
-                    let input = match v.step {
-                        Step::Choice { options, .. } => text.parse::<usize>().ok().filter(|n| (1..=options.len()).contains(n)).map(|n| Input::Choose(n - 1)),
-                        Step::Fill { .. } => Some(Input::Type(format!("{}{text}", v.typed))),
-                        Step::Read { .. } | Step::Order { .. } => None,
-                    };
-                    if let Some(input) = input {
-                        run.step(input, &mut l.saved.progress, today());
+                    match v.step {
+                        Step::Choice { options, .. } => {
+                            if let Some(n) = text.parse::<usize>().ok().filter(|n| (1..=options.len()).contains(n)) {
+                                run.step(Input::Choose(n - 1), &mut l.saved.progress, today());
+                            }
+                        }
+                        Step::Fill { .. } => _ = l.edit(|d| d.insert(&text)),
+                        Step::Read { .. } | Step::Order { .. } => {}
                     }
                 }
                 _ => {}
@@ -825,16 +890,31 @@ not the transcript.\n\nThe conversation:\n{}",
 
 /// A field's words (hn.LearnField's `text`), its caret after the last of them: the text primitive draws the caret
 /// (TextEdit, in UTF-16 units), so it sits where the words end.
-fn field_text(field: View<'_>, s: &str) {
+/// A field's words, caret and selection from its editor (byte offsets to the text node's UTF-16 units); its text node.
+fn field_text(field: View<'_>, d: &Draft) -> u64 {
     use harness_native_ui_text_api::TextEdit;
-    let Some(t) = field.part("text") else { return };
-    t.text(s);
-    let at = s.encode_utf16().count() as u32;
+    let Some(t) = field.part("text") else { return 0 };
+    let units = |b: usize| d.text.get(..b).map_or(0, |s| s.encode_utf16().count()) as u32;
+    let marked = d.marked.as_deref().unwrap_or("");
+    let shown = if marked.is_empty() {
+        std::borrow::Cow::Borrowed(d.text.as_str())
+    } else {
+        std::borrow::Cow::Owned(format!("{}{marked}{}", &d.text[..d.caret], &d.text[d.caret..])) // alloc: one field's words while an input method composes
+    };
+    t.text(&shown);
+    let caret = units(d.caret);
+    let mark_hi = caret + marked.encode_utf16().count() as u32;
     let was = t.entity().try_cloned::<&TextEdit>().unwrap_or_default();
-    let next = TextEdit { caret: at, anchor: at, mark_lo: 0, mark_hi: 0, focused: true, ..was };
+    let next = TextEdit { caret: if marked.is_empty() { caret } else { mark_hi }, anchor: units(d.anchor), mark_lo: caret, mark_hi, focused: true, ..was };
     if next != was {
         t.set(next);
     }
+    t.id()
+}
+
+/// A one-line editor holding `s`, the caret at its end.
+fn line_draft(s: &str) -> Draft {
+    Draft { text: s.to_owned(), caret: s.len(), anchor: s.len(), ..Draft::default() }
 }
 
 fn set_text(v: View<'_>, part: &str, s: &str) {
@@ -846,10 +926,10 @@ fn set_text(v: View<'_>, part: &str, s: &str) {
 fn fill_home(v: View<'_>, l: &Learn) {
     let day = today();
     if let Some(f) = v.part("field") {
-        field_text(f, &l.draft);
-        set_text(f, "hint", if l.draft.is_empty() { "Ask anything, or name something to learn\u{2026}" } else { "" });
+        l.field_node.set(field_text(f, &l.draft));
+        set_text(f, "hint", if l.draft.text.is_empty() && l.draft.marked.is_none() { "Ask anything, or name something to learn\u{2026}" } else { "" });
         if let Some(go) = f.part("go") {
-            let (key, prefab) = if l.draft.trim().is_empty() { ("off", "hn.ChatSendOff") } else { ("on", "hn.ChatSend") };
+            let (key, prefab) = if l.draft.text.trim().is_empty() { ("off", "hn.ChatSendOff") } else { ("on", "hn.ChatSend") };
             view::for_each_of(go, [(key, prefab, ())], |b, (), _| {
                 if key == "on" {
                     b.action("learn:next");
@@ -1007,7 +1087,8 @@ fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
             }
             Step::Fill { answer, .. } => {
                 view::for_each_of(list, [("field".to_owned(), "hn.LearnField", ())], |f, (), _| {
-                    field_text(f, s.typed);
+                    let d = if l.fill.text == s.typed { l.fill.clone() } else { line_draft(s.typed) };
+                    l.field_node.set(field_text(f, &d));
                     let hint = match (s.mark, s.typed.is_empty()) {
                         (Some(Mark::Wrong), _) => format!("   \u{2192} {answer}"),
                         (None, true) => "Type the missing part".to_owned(),
@@ -1110,9 +1191,9 @@ impl App {
                 for c in ["c1", "f1", "o1"] {
                     p.record(&format!("{}/owner/{c}", course.id), true, day.saturating_sub(1));
                 }
-                l.draft = "how tcp congestion control works".to_owned();
+                l.draft = line_draft("how tcp congestion control works");
             }
-            "making" => l.screen = Screen::Making { kicker: "New course".into(), title: "How TCP congestion control works".into(), sub: "Planning five to seven short lessons".into() },
+            "making" => l.screen = Screen::Making { kicker: "New lesson".into(), title: "How TCP congestion control works".into(), sub: "Writing your first lesson".into() },
             "read" => {}
             "choice" => walk(&mut run, &mut p, &to_choice),
             "picked" => walk(&mut run, &mut p, &[Input::Next, Input::Choose(2)]),
@@ -1138,7 +1219,7 @@ impl App {
             other => return Err(format!("HARNESS_NATIVE_SHOT_LEARN {other:?}: not a screen (new, home, making, read, choice, picked, right, wrong, fill, order, done)")),
         }
         if screen == "course" {
-            l.draft.clear();
+            l.draft = Draft::default();
             l.screen = Screen::Course { course: course.id.clone() };
         }
         l.saved = Saved { courses: if screen == "new" { Vec::new() } else { vec![course] }, progress: p, tutor: None };

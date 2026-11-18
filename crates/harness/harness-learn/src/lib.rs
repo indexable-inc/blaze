@@ -18,10 +18,12 @@
 //! ways). Days are passed in as a count since any fixed epoch ([`Day`]), so nothing here reads a clock.
 
 pub mod course;
+pub mod intent;
 pub mod memory;
 pub mod run;
 pub mod tutor;
 
+pub use intent::Intent;
 pub use course::{Course, CourseError, Lesson, Step};
 pub use memory::{Day, Memory, Progress};
 pub use run::{Input, Mark, Run, Summary, View};

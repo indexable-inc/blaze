@@ -248,8 +248,9 @@ impl App {
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
         } else if self.learn_focused() && !self.renaming() {
-            // Learn, the home, has the keys: Return checks or goes on, Escape leaves, the rest is typed.
-            &[keys::LEARN]
+            // The start page or a lesson has the keys: Return asks, checks or goes on, Escape leaves. A field there
+            // (the start page's, a fill-in's) is edited as the chat's input is: the editing keys under Learn's own.
+            if self.learn_editing() { &[keys::LEARN, keys::CHAT] } else { &[keys::LEARN] }
         } else if self.renaming() {
             // A name being renamed in its row has the keys: the chat input's edits act on it (chat/rename.rs).
             &[keys::CHAT]

@@ -156,18 +156,12 @@ hn {
     ask : hn.LearnDisplay { Text: {s: "What’s on your mind?"} }
     a1 : hn.LearnAirSmall {}
     sub : hn.LearnSmall {
-      Text: {s: "Ask, make or learn anything. What you learn is kept, and what you miss comes back."}
+      Text: {s: "Ask for anything. Ask to understand something and you get a short lesson that asks you back."}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
     a2 : hn.LearnAir {}
     field : hn.LearnField {}
     a3 : hn.LearnAirSmall {}
-    // The two ways what is typed goes: asked (an agent answers and does it), or made into a course of short lessons.
-    keys : ui.Line, Faint {
-      Text: {s: "↵  ask        ⌘↵  make it a course"}
-      TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
-    }
-    a3b : hn.LearnAirSmall {}
     // Why the last course could not be made, in the error ink; empty and without room else.
     note : ui.Words {
       Fill: $tone_error
