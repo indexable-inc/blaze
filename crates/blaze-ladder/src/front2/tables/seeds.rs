@@ -343,6 +343,13 @@ impl<'k, 'n, 'a, N: NamesSource<'n>, H: RequestHeads> RequestSeed<'k, 'n, 'a, N,
         let freezer = self.freezer.borrow();
         (freezer.lowered, freezer.attempts)
     }
+
+    /// Inspect the cell's retained failure while its freezer is borrowed.
+    pub fn with_failure<R>(&self, cell: Want, inspect: impl FnOnce(CellFailure<'_>) -> R) -> Option<R> {
+        let freezer = self.freezer.borrow();
+        let (failure, _) = freezer.failure(cell)?;
+        Some(inspect(failure))
+    }
 }
 
 impl<'n, N: NamesSource<'n>, H: RequestHeads> HeadSeed<'n> for RequestSeed<'_, 'n, '_, N, H> {

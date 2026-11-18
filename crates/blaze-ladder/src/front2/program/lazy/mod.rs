@@ -277,6 +277,9 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     projection_why: RefCell<Option<Box<str>>>,
     /// What the instance questions' worlds asked and found unmade (the seam's `make_asked`).
     asked: RefCell<Vec<crate::front2::world_items::Fill, Global>>,
+    /// Each internal-symbol declaration bound to its definition once (front_end.rs
+    /// `InternalBindings`; the rule is seam_rules.rs's, shared with the whole program).
+    internal_bindings: RefCell<front_end::InternalBindings<'n>>,
     /// Each crate's members keyed as their containers' heads key them, made the first time a
     /// key of the crate is asked that the key map does not know (lazy/locate.rs).
     member_rows: HashMap<usize, locate::MemberIndex<'n>, Global>,
@@ -348,6 +351,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             entry_key: entry,
             projection_why: RefCell::new(None),
             asked: RefCell::new(Vec::new_in(Global)),
+            internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             member_rows: HashMap::new_in(Global),
             counts: LazyCounts::default(),
             alloc,

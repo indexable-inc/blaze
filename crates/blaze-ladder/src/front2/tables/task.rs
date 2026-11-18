@@ -9,6 +9,11 @@
 //! which order, on how many workers. The recorder is the task's own; its list is sorted once,
 //! when the body is done.
 //!
+//! TWO ALLOCATORS ([`check_body_split`], lane BD3): `work`, where the check works (the recorder,
+//! its `seen` set, the cells before the engine widens them, the verdict's words and bytes),
+//! which the caller frees as the body ends; and `out`, where what outlives the body goes (the
+//! records made inline). The row is the caller's, copied from the answer's cells at its length.
+//!
 //! THE BODY is found by its item's cells (`Item{key}`; a member's `Members{owner}` too), never
 //! by listing the crate: the task's name's subject is the body's item key.
 //!
@@ -42,6 +47,8 @@ use super::super::buckets::impl_tables_name;
 use super::super::index::{Index, LangTwice};
 use super::super::keys::{Keys, MemberKind};
 use super::super::project::{BodyRef, BodyVerdict, ProjectWorld};
+use super::super::project::every_body::Reached;
+use super::super::project_records::Listed;
 use super::super::reads::{FactKind, ReadsError};
 use super::super::by_origin::{FactHolder, fact_holder, kind_of_key};
 use super::super::item_shown::ItemShown;
@@ -170,9 +177,78 @@ pub struct BodyOut<'a> {
     pub read_tally: super::recorder::ReadTally,
 }
 
+/// A body task's answer by [`check_body_split`], in TWO allocators (rule 11: by lifetime): what
+/// outlives the body (the records made inline, `made`) in the caller's `out`, and every list
+/// that is only a step toward the row (the recorder's list, the cells before the engine widens
+/// them, the control's `held`, the verdict's words and bytes) in its `work`, which the caller
+/// frees as the body ends (blaze-cli engine_bodies.rs: the body's scratch frame, reset per
+/// body). The row itself is made by the caller from `cells` ([`BodyChecked::done_in`]), sized
+/// to what it keeps: before, the row's list was `cells` (in the request's arena, sized to the
+/// recorder's list) and every list beside it was in the request's arena too.
+pub struct BodyChecked<'a, 'w> {
+    /// The verdict's digest (`Done::out`).
+    pub out: ContentId,
+    /// Whether the body was refused, left a gap, or its borrows were refused (`Done::failed`).
+    pub failed: bool,
+    /// The type, lint and borrow findings (`Done::findings`).
+    pub findings: u32,
+    /// Each cell the body read with the digest [`Make`] gave, sorted by cell and each once.
+    pub cells: AVec<'w, (CellId, ContentId)>,
+    pub made: SVec<'a, Made<'a>>,
+    /// As [`BodyOut`]'s fields of the same names.
+    pub bytes: AVec<'w, u8>,
+    pub reads: AVec<'w, TableRead>,
+    pub held: AVec<'w, (TableRead, u128)>,
+    pub said: AVec<'w, Said<'w>>,
+    pub goal_hits: AVec<'w, blaze_solve::share::GoalHit>,
+    pub read_tally: super::recorder::ReadTally,
+    /// What the check's working lists took in `work` ([`WorkBytes`]).
+    pub work: WorkBytes,
+}
+
+/// The bytes a body's check took in its `work` allocator, by kind, counted from the lists'
+/// capacities as they stood (no walk; rule 16: the Bodies stage's memory line, blaze-cli
+/// engine_bodies.rs `BodyMem`). Each is freed with the body; each one's floor is said beside it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct WorkBytes {
+    /// The recorder's tables at their most, its list and its `seen` set (recorder.rs
+    /// [`Recorder::table_bytes`]); floor: its distinct reads as one list
+    /// ([`WorkBytes::recorder_floor`]).
+    pub recorder: u64,
+    /// The recorder's distinct reads as one list: `kept` reads of `size_of::<TableRead>()`.
+    pub recorder_floor: u64,
+    /// The cells before the engine widens them (`cells`); floor: the same, it is one list.
+    pub cells: u64,
+    /// The control's instrument (`held`, and the keys it is made from); floor: 0 (only tests read it).
+    pub held: u64,
+    /// The verdict's lines and their words (`said`); floor: the words.
+    pub said: u64,
+    /// The verdict's canonical bytes (`bytes`); floor: 0, its digest `out` is what is kept.
+    pub verdict: u64,
+    /// The shared goals taken (`goal_hits`).
+    pub goal_hits: u64,
+}
+
+impl<'a, 'w> BodyChecked<'a, 'w> {
+    /// The engine's row of this answer for `task` under `name`, in `alloc`: its reads `cells`
+    /// as they are (no widening), one block of their length; its one define the verdict cell
+    /// unless it failed.
+    pub fn done_in<'r>(&self, task: &Task, name: Name, alloc: SharedAlloc<'r>) -> Done<'r> {
+        let mut reads: SVec<'r, (CellId, ContentId)> = SVec::with_capacity_in(self.cells.len(), alloc);
+        reads.extend_from_slice(&self.cells);
+        let mut defines: SVec<'r, (Cell, ContentId)> = SVec::with_capacity_in(usize::from(!self.failed), alloc);
+        if !self.failed {
+            defines.push((VERDICT_CELL, self.out));
+        }
+        Done { name, key: task.key, out: self.out, defines, reads, findings: self.findings, failed: self.failed }
+    }
+}
+
 /// One line of a body's verdict ([`BodyOut::said`]): `start..end` is item-relative (rule 71).
 #[derive(Debug)]
 pub struct Said<'a> {
+    /// Path below the task's root, e.g. `mid::inner`. The root's own lines have no prefix.
+    pub within: Option<AString<'a>>,
     pub what: SaidWhat<'a>,
     pub start: u32,
     pub end: u32,
@@ -196,11 +272,40 @@ pub enum SaidWhat<'a> {
     BorrowsNotChecked,
 }
 
-/// The body `task` names, checked over `tables` (module docs).
+/// The body `task` names, checked over `tables` (module docs), every list in `shared`: the
+/// tests' form, the answer and its row in one allocator ([`check_body_split`] is the engine's).
 pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, make: &dyn Make<'a>, shared: SharedAlloc<'a>) -> Result<BodyOut<'a>, TaskError> {
+    check_body_in(tables, task, frame, make, shared, Coverage::WithLocals)
+}
+
+pub(super) enum Coverage {
+    WithLocals,
+    #[cfg(test)]
+    RootOnly,
+}
+
+/// [`check_body`] with its coverage named (local_fns_tests.rs: `RootOnly`, the control), every
+/// list in `shared`: [`check_split`] with one allocator for both, its row made from its cells.
+pub(super) fn check_body_in<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, make: &dyn Make<'a>, shared: SharedAlloc<'a>, coverage: Coverage) -> Result<BodyOut<'a>, TaskError> {
+    let checked = check_split(tables, task, frame, make, shared.local(), shared, coverage)?;
+    let done = checked.done_in(task, task.planned.name, shared);
+    let BodyChecked { made, bytes, reads, held, said, goal_hits, read_tally, .. } = checked;
+    Ok(BodyOut { done, made, bytes, reads, held, said, goal_hits, read_tally })
+}
+
+/// The body `task` names and every local fn it reaches, checked over `tables` (module docs), in
+/// two allocators ([`BodyChecked`]): `work`, where the check works and which the caller frees as
+/// the body ends, and `out`, where what outlives the body (the records made inline) goes. The
+/// row is the caller's to make from the answer's `cells` (the engine widens them first).
+pub fn check_body_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, make: &dyn Make<'a>, work: Alloc<'w>, out: SharedAlloc<'a>) -> Result<BodyChecked<'a, 'w>, TaskError> {
+    check_split(tables, task, frame, make, work, out, Coverage::WithLocals)
+}
+
+/// The one check behind [`check_body`], [`check_body_in`] and [`check_body_split`].
+fn check_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, make: &dyn Make<'a>, work: Alloc<'w>, out: SharedAlloc<'a>, coverage: Coverage) -> Result<BodyChecked<'a, 'w>, TaskError> {
     let name = task.planned.name;
     let setup = Cost::enter(frame.cost, Part::Setup);
-    let alloc = shared.local();
+    let alloc = work;
     let recorder = Recorder::new(RecorderOpts { alloc });
     if let Some(cell) = frame.plant_drop {
         recorder.plant_drop(cell);
@@ -225,19 +330,55 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
         world.set_body_sources(sources);
     }
     drop(setup);
-    let (verdict, borrows) = world.check_borrows(body, frame.alloc);
-    if let Some(error) = world.take_seed_error() {
+    let root = Listed { body, at: None, entry: None };
+    let mut goal_hits = AVec::new_in(alloc);
+    let mut seed_error = None;
+    let check = |w: &mut ProjectWorld<'n, Tables<'_, 'n>>, b| {
+        let pair = w.check_borrows(b, frame.alloc);
+        if let Some(error) = w.take_seed_error() {
+            seed_error.get_or_insert(error);
+        }
+        goal_hits.extend_from_slice(w.goal_hits());
+        pair
+    };
+    let reached = match coverage {
+        Coverage::WithLocals => world.each_from(&[root], alloc, check),
+        #[cfg(test)]
+        Coverage::RootOnly => {
+            let mut check = check;
+            let mut one = AVec::new_in(alloc);
+            one.push(Reached { listed: root, within: None, got: check(&mut world, body) });
+            one
+        }
+    };
+    if let Some(error) = seed_error {
         return Err(TaskError::Seed { body: name, error });
     }
     let reading = Cost::enter(frame.cost, Part::Reads);
-    let facts = verdict.facts.as_ref().map_err(|e| TaskError::Facts(*e))?;
-    for row in facts.rows.iter() {
-        // By the records, unrecorded: which cell holds a fact is the plan's, not the body's.
-        // An opaque type's facts are its fn's head's (the fn's head files it).
-        let key = world.opaque_fn(blaze_typeck::ItemKey(row.fact.key)).map_or(row.fact.key, |fn_| fn_.0);
-        if let Some(read) = fact_read(view.records(), &world.front.keys, row.fact.kind, key)? {
-            recorder.read(read);
+    let mut bytes = AString::new_in(alloc);
+    let mut said = AVec::new_in(alloc);
+    let mut failed = false;
+    let mut findings = 0u32;
+    for (i, one) in reached.iter().enumerate() {
+        let (verdict, borrows) = &one.got;
+        let facts = verdict.facts.as_ref().map_err(|e| TaskError::Facts(*e))?;
+        // An internal-symbol declaration the body named was bound by searching crates' items:
+        // that search is the body's read (front2 internal_symbol.rs `record_search`).
+        super::super::internal_symbol::record_search(view, &world.store, facts);
+        for row in facts.rows.iter() {
+            // By the records, unrecorded: which cell holds a fact is the plan's, not the body's.
+            // An opaque type's facts are its fn's head's (the fn's head files it).
+            let key = world.opaque_fn(blaze_typeck::ItemKey(row.fact.key)).map_or(row.fact.key, |fn_| fn_.0);
+            if let Some(read) = fact_read(view.records(), &world.front.keys, row.fact.kind, key)? {
+                recorder.read(read);
+            }
         }
+        said.extend(said_of(verdict, borrows, view.records(), &world.front.keys, || local_path(&reached[..i], one.within, alloc), alloc)?);
+        // The root has precisely its original bytes. Each local appends another complete verdict.
+        write_verdict(&mut bytes, verdict, borrows, Facts::Digest)?;
+        failed |= verdict.refused.is_some() || !verdict.gaps.is_empty() || matches!(borrows.refused, Some(ref r) if !matches!(r, BorrowRefused::Untyped(_)));
+        let count = verdict.diagnostics.len() + verdict.findings.len() + borrows.findings.len();
+        findings = findings.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
     }
     // THE BODY'S OWN HEAD (rule 21): its signature (a member's: its container's cell) is an
     // input of every check of it, also one refused before any question (a trait member's
@@ -250,25 +391,23 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     // read list (tests: every one must be in it; the store makes a head only when asked).
     let mut held_keys: AVec<'_, u128> = AVec::new_in(alloc);
     world.each_held_head(&mut |k| held_keys.push(k));
-    let mut held: AVec<'a, (TableRead, u128)> = AVec::with_capacity_in(held_keys.len(), alloc);
+    let mut held: AVec<'w, (TableRead, u128)> = AVec::with_capacity_in(held_keys.len(), alloc);
     for &k in held_keys.iter() {
         if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, k)? {
             held.push((read, k));
         }
     }
     held.sort_unstable();
-    let said = said_of(&verdict, &borrows, view.records(), &world.front.keys, alloc)?;
-    let mut goal_hits: AVec<'a, blaze_solve::share::GoalHit> = AVec::with_capacity_in(world.goal_hits().len(), alloc);
-    goal_hits.extend_from_slice(world.goal_hits());
     drop(world);
+    // Counted before the recorder is consumed: its tables at their most (they only grow).
+    let recorder_bytes = recorder.table_bytes();
     let (reads, read_tally) = recorder.finish_tallied().map_err(TaskError::Full)?;
-    let bytes = verdict_bytes(&verdict, &borrows, Facts::Digest, alloc)?;
-    let out = ContentId::of(OUT_DOMAIN, &bytes);
-
-    let failed = verdict.refused.is_some() || !verdict.gaps.is_empty() || matches!(borrows.refused, Some(ref r) if !matches!(r, BorrowRefused::Untyped(_)));
-    let findings = verdict.diagnostics.len() + verdict.findings.len() + borrows.findings.len();
-    let mut made: SVec<'a, Made<'a>> = SVec::new_in(shared);
-    let mut cells: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(reads.len(), shared);
+    // The root's verdict bytes, then each local fn's (a root with no local fn keeps its bytes).
+    let bytes: AVec<'w, u8> = bytes.into_bytes();
+    let digest = ContentId::of(OUT_DOMAIN, &bytes);
+    // Only what outlives the body in `out`; the cells are a step toward the row (`work`).
+    let mut made: SVec<'a, Made<'a>> = SVec::new_in(out);
+    let mut cells: AVec<'w, (CellId, ContentId)> = AVec::with_capacity_in(reads.len(), alloc);
     for read in reads.iter() {
         let Some(id) = cell_id(tables, *read)? else { continue };
         let saw = make.make(&id, &mut made).map_err(TaskError::Make)?;
@@ -276,38 +415,77 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     }
     cells.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     cells.dedup_by(|a, b| a.0 == b.0);
-    let mut defines: SVec<'a, (Cell, ContentId)> = SVec::new_in(shared);
-    if !failed {
-        defines.push((VERDICT_CELL, out));
-    }
-    let done = Done { name, key: task.key, out, defines, reads: cells, findings: u32::try_from(findings).unwrap_or(u32::MAX), failed };
+    let size = |n: usize, each: usize| (n as u64).saturating_mul(each as u64);
+    let work_bytes = WorkBytes {
+        recorder: recorder_bytes,
+        recorder_floor: size(reads.len(), core::mem::size_of::<TableRead>()),
+        cells: size(cells.capacity(), core::mem::size_of::<(CellId, ContentId)>()),
+        held: size(held_keys.capacity(), core::mem::size_of::<u128>()) + size(held.capacity(), core::mem::size_of::<(TableRead, u128)>()),
+        said: size(said.capacity(), core::mem::size_of::<Said<'_>>())
+            + said.iter().map(|s| s.words.capacity() as u64 + s.within.as_ref().map_or(0, |w| w.capacity() as u64) + if let SaidWhat::NotChecked { cause } = &s.what { cause.capacity() as u64 } else { 0 }).sum::<u64>(),
+        verdict: size(bytes.capacity(), 1),
+        goal_hits: size(goal_hits.capacity(), core::mem::size_of::<blaze_solve::share::GoalHit>()),
+    };
+    drop(held_keys);
     drop(reading);
-    Ok(BodyOut { done, made, bytes, reads, held, said, goal_hits, read_tally })
+    // `findings` summed over the root and its local fns (u32, saturating), as the row's.
+    Ok(BodyChecked { out: digest, failed, findings, cells, made, bytes, reads, held, said, goal_hits, read_tally, work: work_bytes })
+}
+
+/// A local fn's path below the task root. The work list puts every parent before its children.
+fn local_path<'n, 'a, T>(earlier: &[Reached<'n, T>], within: Option<(BodyRef<'n>, &'n str)>, alloc: Alloc<'a>) -> Option<AString<'a>> {
+    let (mut parent, leaf) = within?;
+    let root = earlier[0].listed.body;
+    if parent == root {
+        return Some(AString::from_str_in(leaf, alloc));
+    }
+    let mut names = AVec::new_in(alloc);
+    let mut ancestors = earlier.iter().rev();
+    while parent != root {
+        let ancestor = ancestors.find(|r| r.listed.body == parent).expect("each_from visits the parent before the local fn");
+        let (outer, name) = ancestor.within.expect("each_from marks every non-root fn with its parent");
+        names.push(name);
+        parent = outer;
+    }
+    let mut path = AString::new_in(alloc);
+    for name in names.iter().rev() {
+        path.push_str(name);
+        path.push_str("::");
+    }
+    path.push_str(leaf);
+    Some(path)
 }
 
 /// The lines `check` prints for a verdict (blaze-cli body_types.rs, today's path), in `alloc`.
-fn said_of<'n, 'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, names: &'n Records<'n>, keys: &Keys, alloc: Alloc<'a>) -> Result<AVec<'a, Said<'a>>, TaskError> {
+fn said_of<'n, 'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, names: &'n Records<'n>, keys: &Keys, local_path: impl Fn() -> Option<AString<'a>>, alloc: Alloc<'a>) -> Result<AVec<'a, Said<'a>>, TaskError> {
     let text = |s: &str| -> AString<'a> {
         let mut t = AString::new_in(alloc);
         t.push_str(s);
         t
     };
     let mut said: AVec<'a, Said<'a>> = AVec::new_in(alloc);
+    let mut push = |what, start, end, words| {
+        let within = match said.last() {
+            Some(previous) => previous.within.clone(),
+            None => local_path(),
+        };
+        said.push(Said { within, what, start, end, words });
+    };
     for d in verdict.diagnostics.iter() {
-        said.push(Said { what: SaidWhat::Type { code: d.code }, start: d.start, end: d.end, words: text(d.text.as_str()) });
+        push(SaidWhat::Type { code: d.code }, d.start, d.end, text(d.text.as_str()));
     }
     for d in verdict.findings.iter() {
-        said.push(Said { what: SaidWhat::Lint { lint: d.lint }, start: d.start, end: d.end, words: text(d.text.as_str()) });
+        push(SaidWhat::Lint { lint: d.lint }, d.start, d.end, text(d.text.as_str()));
     }
     if let Some(refused) = &verdict.refused {
         let cause = super::super::said::refused_cause(names, keys, refused);
         let words = super::super::said::refused_words(names, refused);
-        said.push(Said { what: SaidWhat::NotChecked { cause: text(&cause) }, start: 0, end: 0, words: text(&words) });
+        push(SaidWhat::NotChecked { cause: text(&cause) }, 0, 0, text(&words));
     } else if let Some(words) = super::super::said::gap_words(&verdict.gaps) {
-        said.push(Said { what: SaidWhat::NotChecked { cause: text(super::super::said::GAP_CAUSE) }, start: 0, end: 0, words: text(&words) });
+        push(SaidWhat::NotChecked { cause: text(super::super::said::GAP_CAUSE) }, 0, 0, text(&words));
     }
     for d in borrows.findings.iter() {
-        said.push(Said { what: SaidWhat::Borrow { code: d.code }, start: d.start, end: d.end, words: text(d.text) });
+        push(SaidWhat::Borrow { code: d.code }, d.start, d.end, text(d.text));
     }
     if let Some(refused) = &borrows.refused
         && !matches!(refused, BorrowRefused::Untyped(_))
@@ -315,7 +493,7 @@ fn said_of<'n, 'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, names
         let (start, end) = refused.range().unwrap_or((0, 0));
         let mut words = AString::new_in(alloc);
         write!(words, "{}: {refused:?}", refused.text()).map_err(|_| TaskError::Write)?;
-        said.push(Said { what: SaidWhat::BorrowsNotChecked, start, end, words });
+        push(SaidWhat::BorrowsNotChecked, start, end, words);
     }
     Ok(said)
 }
@@ -331,13 +509,16 @@ pub enum Facts {
 /// A body's verdict and borrow verdict as canonical bytes: what a body result's `out` digests.
 pub fn verdict_bytes<'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, facts: Facts, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, TaskError> {
     let mut text = AString::new_in(alloc);
+    write_verdict(&mut text, verdict, borrows, facts)?;
+    Ok(text.into_bytes())
+}
+
+fn write_verdict(text: &mut AString<'_>, verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, facts: Facts) -> Result<(), TaskError> {
     write!(text, "diagnostics {:?}\nfindings {:?}\ngaps {:?}\nrefused {:?}\nborrows {:?}\n", verdict.diagnostics, verdict.findings, verdict.gaps, verdict.refused, borrows).map_err(|_| TaskError::Write)?;
     if facts == Facts::Digest {
         write!(text, "reads {:?}\n", verdict.reads).map_err(|_| TaskError::Write)?;
     }
-    let mut bytes: AVec<'a, u8> = AVec::new_in(alloc);
-    bytes.extend_from_slice(text.as_bytes());
-    Ok(bytes)
+    Ok(())
 }
 
 /// The body a `BodyCheck` name's subject (an item key) is, found by its item's cells.
@@ -397,6 +578,9 @@ fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128)
             let refused = |error: FreezeError| TaskError::Cell { key: fact, shown: ItemShown::of(names, keys, fact), error };
             let class = kind_of_key(names, keys, fact).map_err(|error| refused(FreezeError::NoWant { key: fact, error }))?;
             match fact_holder(class) {
+                // A block item's head comes from the enclosing body's text. No Signature task
+                // publishes it; reads made while checking it go to this task's recorder.
+                FactHolder::Head if keys.local_kind(fact).is_some() => Ok(None),
                 FactHolder::Head => {
                     let want = fact_cell(names, keys, fact).map_err(refused)?;
                     let id = head_cell_id(want);

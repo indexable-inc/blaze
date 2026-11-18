@@ -36,13 +36,17 @@ use super::reads::{Fact, FactKind, Read, ReadsError};
 /// v3 (lane B11): an ADT's row also holds its fields' regions, its `Copy` impl's needs, and what
 /// reading its fields' written types asked (ADT lifetime counts, path answers).
 /// v4 (lane B13): and its lifetime parameters' variances (`Facts::adt_variances`).
-const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v4";
+/// v5 (lane B15): a fn-pointer field now has positions, and a lifetime its binder binds is a
+/// field region of its own (`FieldRegion::Bound`, tag 3); its variances read the pointer.
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v5";
 /// The domain of a [`FactKind::BorrowHead`] answer.
 /// v2 (piece RB8): a head's verdict now also reads its trait bounds' lifetime arguments
 /// (borrows_ties.rs), so a list filed under v1 never answers for one checked since.
 /// v3 (lane B11): the head's text is read through the front end's world (borrow_sig_world.rs):
 /// each path answer it took is in the row.
-const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v3";
+/// v4 (lane B15): a fn-pointer type in the head now has positions, and a lifetime its binder
+/// binds is read as `Region::Bound` (tag 5), so the regions of such a head changed.
+const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v4";
 
 /// What the borrow check took about one ADT.
 pub enum AdtAnswer<'f> {
@@ -112,6 +116,7 @@ fn region(h: &mut StableHasher, r: Region) {
         Region::Anon(n) => (2, n),
         Region::SelfTy(n) => (3, n),
         Region::Hidden(n) => (4, n),
+        Region::Bound(n) => (5, n),
     };
     h.tag(tag);
     h.u32(n);
@@ -193,6 +198,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
                                 FieldRegion::Lifetime(i) => (0, i),
                                 FieldRegion::Static => (1, 0),
                                 FieldRegion::Arg(i) => (2, i),
+                                FieldRegion::Bound(i) => (3, i),
                             };
                             h.tag(tag);
                             h.u32(n);

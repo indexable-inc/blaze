@@ -16,15 +16,19 @@
 //! reason ([`Failed::body_words`]), whether the head task ran this request or stood.
 //!
 //! The words of a note: `<cell>\x1F<head>\x1F<why>`, `<cell>` the head's cell in its task as 32
-//! hex digits, or `-` when the whole task failed (no head of it was frozen).
+//! hex digits, or `-` when the whole task failed. A constant or engine root prefixes that
+//! field with `const/` or `engine/`, so a body can classify a standing head's refusal.
+//! When the body's words add a head or constant path, a fourth field keeps the original
+//! reason for grouping across heads.
 
 use core::fmt;
 
 use blaze_drive::Name;
 use blaze_drive::cells::Cell;
 use blaze_ladder::front2::consts::ConstFail;
-use blaze_ladder::front2::heads::HeadError;
-use blaze_ladder::front2::tables::head::{ConstRefused, FreezeError};
+use blaze_ladder::front2::heads::{HeadError, Want};
+use blaze_ladder::front2::source::{NamesSource, Records};
+use blaze_ladder::front2::tables::head::{CellFailure, ConstRefused, FreezeError, HeadDone, MOST_MAKING, NotTheirs, SeededHeads, want_bytes};
 use blaze_ladder::front2::types::Why;
 use blaze_own::Alloc;
 use bstd::Cx;
@@ -54,8 +58,13 @@ pub(crate) struct Refused {
     pub(crate) cell: Option<Cell>,
     /// The head, as a finding shows its path (`a::m::S::f`), or what the task covers.
     pub(crate) head: &'static str,
-    /// Why, in words holding no key (equal reasons are one group).
-    pub(crate) why: &'static str,
+    pub(crate) cause: Cause,
+}
+
+impl Refused {
+    pub(crate) fn whole(name: Name, head: &'static str, why: &'static str) -> Self {
+        Self { name, cell: None, head, cause: Cause::new(RootKind::Head, why) }
+    }
 }
 
 /// Every head of this answer that could not be frozen: this request's (the Heads stage's
@@ -91,7 +100,11 @@ impl Failed {
             }
             let mut bad = None;
             head_notes(block, &mut |words| match parse(words) {
-                Some((cell, head, why)) => stood.push(Refused { name, cell, head: leak(g, format_args!("{head}")), why: leak(g, format_args!("{why}")) }),
+                Some((cell, kind, head, words, group)) => {
+                    let words = leak(g, format_args!("{words}"));
+                    let group = group.map_or(words, |why| leak(g, format_args!("{why}")));
+                    stood.push(Refused { name, cell, head: leak(g, format_args!("{head}")), cause: Cause { kind, words, group } });
+                }
                 None => {
                     bad.get_or_insert(());
                 }
@@ -130,7 +143,7 @@ impl Failed {
                 into.push_str("the head of `");
                 into.push_str(one.head);
                 into.push_str("` it reads could not be frozen: ");
-                into.push_str(one.why);
+                into.push_str(one.cause.words);
             }
             // A failed row with no reason kept is a bug of the Heads stage: said, never quiet.
             None => into.push_str("a head it reads could not be frozen, and its head task kept no reason (engine_head_notes.rs `Failed`)"),
@@ -156,7 +169,7 @@ impl Failed {
             lines.note(name, Class::Waited, b"");
             return;
         }
-        let lost = Refused { name, cell: None, head: "?", why: "its head task has findings and the Heads stage kept no reason (engine_head_notes.rs `Failed::note`)" };
+        let lost = Refused { name, cell: None, head: "?", cause: Cause::new(RootKind::Engine, "its head task has findings and the Heads stage kept no reason (engine_head_notes.rs `Failed::note`)") };
         lines.note(name, Class::Head, words(lost, frame).as_bytes());
     }
 }
@@ -179,11 +192,14 @@ pub(crate) fn seed_words<'f>(head: &'static str, why: &'static str, frame: &'f F
 /// A note's head and reason after its cell, each after the separator, kept out of them.
 fn push_parts(out: &mut blaze_own::text::String<&Frame>, head: &str, why: &str) {
     for part in [head, why] {
-        out.push(SEP);
-        // The separator kept out of a part: a space in its place.
-        for ch in part.chars() {
-            out.push(if ch == SEP { ' ' } else { ch });
-        }
+        push_part(out, part);
+    }
+}
+
+fn push_part(out: &mut blaze_own::text::String<&Frame>, part: &str) {
+    out.push(SEP);
+    for ch in part.chars() {
+        out.push(if ch == SEP { ' ' } else { ch });
     }
 }
 
@@ -196,6 +212,7 @@ fn holds_head_notes(name: Name) -> bool {
 /// A note's words (module docs), the separator kept out of its parts.
 fn words<'f>(one: Refused, frame: &'f Frame) -> blaze_own::text::String<&'f Frame> {
     let mut out = blaze_own::text::String::new_in(frame);
+    out.push_str(one.cause.kind.tag());
     match one.cell {
         Some(Cell(bytes)) => {
             for byte in bytes {
@@ -205,7 +222,10 @@ fn words<'f>(one: Refused, frame: &'f Frame) -> blaze_own::text::String<&'f Fram
         }
         None => out.push('-'),
     }
-    push_parts(&mut out, one.head, one.why);
+    push_parts(&mut out, one.head, one.cause.words);
+    if one.cause.group != one.cause.words {
+        push_part(&mut out, one.cause.group);
+    }
     out
 }
 
@@ -222,9 +242,12 @@ fn unhex(ch: u8) -> Option<u8> {
 }
 
 /// A note's words read back: its cell, head and reason.
-fn parse(words: &str) -> Option<(Option<Cell>, &str, &str)> {
-    let mut parts = words.splitn(3, SEP);
+fn parse(words: &str) -> Option<(Option<Cell>, RootKind, &str, &str, Option<&str>)> {
+    let mut parts = words.split(SEP);
     let (cell, head, why) = (parts.next()?, parts.next()?, parts.next()?);
+    let (kind, cell) = [RootKind::Constant, RootKind::Engine, RootKind::Head]
+        .into_iter()
+        .find_map(|kind| cell.strip_prefix(kind.tag()).map(|cell| (kind, cell)))?;
     let cell = match cell.as_bytes() {
         b"-" => None,
         digits if digits.len() == 32 => {
@@ -236,7 +259,8 @@ fn parse(words: &str) -> Option<(Option<Cell>, &str, &str)> {
         }
         _ => return None,
     };
-    Some((cell, head, why))
+    let group = parts.next();
+    parts.next().is_none().then_some((cell, kind, head, why, group))
 }
 
 /// The closing lines (module docs): every head note of `blocks`, grouped by reason.
@@ -249,7 +273,7 @@ pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b
         }
         let mut bad = false;
         head_notes(block, &mut |words| match parse(words) {
-            Some((_, head, why)) => all.push((why, head)),
+            Some((_, _, head, why, group)) => all.push((group.unwrap_or(why), head)),
             None => bad = true,
         })
         .map_err(|why| CliError::Text { what: why.what })?;
@@ -305,6 +329,182 @@ pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b
 /// `args` as text kept for the request (in the request's heap `g`).
 pub(crate) fn leak(g: Alloc<'static>, args: fmt::Arguments<'_>) -> &'static str {
     blaze_own::Box::leak(blaze_own::text::format(g, args).into_boxed_str())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RootKind {
+    Head,
+    Constant,
+    Engine,
+}
+
+impl RootKind {
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Head => "",
+            Self::Constant => "const/",
+            Self::Engine => "engine/",
+        }
+    }
+
+    pub(crate) fn of(error: &FreezeError) -> Self {
+        match error {
+            FreezeError::Const { .. } => Self::Constant,
+            FreezeError::NotACell { .. } | FreezeError::Read { .. } | FreezeError::Unfrozen { .. }
+            | FreezeError::NotTheirs { why: NotTheirs::NoCell { .. } | NotTheirs::OtherUnits { .. }, .. } => Self::Engine,
+            _ => Self::Head,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Cause {
+    pub(crate) words: &'static str,
+    pub(crate) kind: RootKind,
+    /// The terminal reason alone, as the closing lines group it.
+    pub(crate) group: &'static str,
+}
+
+impl Cause {
+    pub(crate) fn new(kind: RootKind, words: &'static str) -> Self {
+        Self { words, kind, group: words }
+    }
+
+    pub(crate) fn own<'n>(error: &FreezeError, records: &'n Records<'n>, g: Alloc<'static>) -> Self {
+        Self::from_reason(error, leak(g, format_args!("{}", Reason(error))), records, g)
+    }
+
+    pub(crate) fn from_reason<'n>(error: &FreezeError, why: &'static str, records: &'n Records<'n>, g: Alloc<'static>) -> Self {
+        let mut cause = Self::new(RootKind::of(error), why);
+        if let FreezeError::Const { c, .. } = error {
+            let constant = cause_label(records, Want::Head(*c), g);
+            cause.words = leak(g, format_args!("{} (constant `{constant}`)", cause.group));
+        }
+        cause
+    }
+
+    /// Each UTF-8 field has a u64 little-endian byte length. The read observes the
+    /// classification, the explanation and the terminal reason used for grouping.
+    pub(crate) fn digest(self, domain: &'static str) -> blaze_ids::ContentId {
+        blaze_ids::Hasher::new(domain).part(self.kind.tag().as_bytes()).part(self.words.as_bytes()).part(self.group.as_bytes()).finish()
+    }
+}
+
+/// A label kept in a cause. An unnamed item's identity survives edits above it in
+/// its file, so its cell digest must not include a display location.
+pub(crate) fn cause_label<'n>(records: &'n Records<'n>, want: Want, g: Alloc<'static>) -> &'static str {
+    use blaze_ladder::front2::item_shown::ItemShown;
+    use blaze_ladder::front2::keys::{MemberKind, checker_of, member_key_of};
+
+    let mut key = want.key();
+    if let Want::MemberFn(owner, member) = want {
+        let mut found = None;
+        records.each_member(owner, &mut |row| {
+            if let (blaze_surface::ItemKind::Function, Some(name)) = (row.kind, row.name)
+                && member_key_of(checker_of(owner), MemberKind::Fn, name) == member
+            {
+                found = Some(row.key);
+            }
+        });
+        let Some(item) = found else {
+            return leak(g, format_args!("unlisted member fn {:032x} of {owner:x}", member.0));
+        };
+        key = item;
+    }
+    match ItemShown::of_lib(records, key).path() {
+        Some(path) => leak(g, format_args!("{path}")),
+        None => leak(g, format_args!("unnamed item {key:x}")),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Step {
+    Needs(Want),
+    End(Want, Cause),
+}
+
+impl Step {
+    pub(crate) fn retained<'n>(cell: Want, failure: CellFailure<'_>, records: &'n Records<'n>, g: Alloc<'static>) -> Self {
+        match failure {
+            CellFailure::Needs(next) => Self::Needs(next),
+            CellFailure::Own(error) => Self::End(cell, Cause::own(error, records, g)),
+            CellFailure::Refused { want, why } => {
+                let kind = RootKind::of(&FreezeError::NotTheirs { want, why });
+                Self::End(want, Cause::new(kind, why.said()))
+            }
+        }
+    }
+}
+
+/// Publish only the cell's own error (and the constant's name in its records) or its
+/// first failed direct need. Both are fixed by the cell's demand order. The caller's
+/// chain and the order workers reach the cell do not enter the shared row.
+pub(crate) fn published<'n>(want: Want, failure: CellFailure<'_>, records: &'n Records<'n>, g: Alloc<'static>) -> Option<(Cause, Option<Want>)> {
+    match failure {
+        CellFailure::Own(error) => Some((Cause::own(error, records, g), None)),
+        CellFailure::Needs(next) => {
+            let error = FreezeError::Again { want, failed: next };
+            Some((Cause::new(RootKind::Head, leak(g, format_args!("{}", Reason(&error)))), Some(next)))
+        }
+        CellFailure::Refused { .. } => None,
+    }
+}
+
+/// Follow at most MOST_MAKING direct needs. Only a repeated cell is a cycle. A long
+/// acyclic chain and a missing entry each name the cell at which the explanation stopped.
+pub(crate) fn root_cause(
+    asked: Want,
+    mut step: impl FnMut(Want) -> Option<Step>,
+    label: impl Fn(Want) -> &'static str,
+    scratch: impl core::alloc::Allocator + Copy,
+    g: Alloc<'static>,
+) -> Cause {
+    let mut seen = blaze_hash::HashSet::new_in(scratch);
+    let mut cell = asked;
+    for _ in 0..=MOST_MAKING {
+        match step(cell) {
+            Some(Step::End(root, mut cause)) => {
+                if root != asked {
+                    cause.words = leak(g, format_args!("it needs `{}`: {}", label(root), cause.words));
+                }
+                return cause;
+            }
+            Some(Step::Needs(next)) => {
+                seen.insert(want_bytes(cell));
+                if seen.contains(&want_bytes(next)) {
+                    return Cause::new(RootKind::Engine, leak(g, format_args!("cycle in failed head needs at `{}`", label(next))));
+                }
+                cell = next;
+            }
+            None => return Cause::new(RootKind::Engine, leak(g, format_args!("no retained failure for the head of `{}`", label(cell)))),
+        }
+    }
+    Cause::new(RootKind::Engine, leak(g, format_args!("failed head chain reaches `{}` beyond the limit of {MOST_MAKING} needs", label(cell))))
+}
+
+/// Resolve a head task's failure while its names and source are still available. A need
+/// another job froze has its entry in the shared table. The resulting note can stand on a
+/// later request where neither source exists.
+pub(crate) fn head_result<'n, N: NamesSource<'n>>(
+    job: &crate::engine_heads_once::JobCx<'_, '_, 'n, '_, '_>,
+    source: &SeededHeads<'n, '_, N>,
+    asked: Want,
+    made: HeadDone<'static>,
+) -> Result<HeadDone<'static>, Cause> {
+    let Some(error) = &made.failed else { return Ok(made) };
+    if source.failure(asked).is_none() && !matches!(error, FreezeError::Again { .. } | FreezeError::NotTheirs { why: NotTheirs::Failed { .. }, .. }) {
+        return Err(Cause::own(error, job.records, job.g));
+    }
+    Err(root_cause(asked, |cell| {
+        if let Some(entry) = job.once.look_failed(cell) {
+            return Some(match entry.needs {
+                Some(need) => Step::Needs(need),
+                None => Step::End(cell, entry.cause),
+            });
+        }
+        let (failure, _) = source.failure(cell)?;
+        Some(Step::retained(cell, failure, job.records, job.g))
+    }, |cell| cause_label(job.records, cell, job.g), job.frame, job.g))
 }
 
 /// Why a freeze failed, in words that hold no key: two heads refused for one reason print one

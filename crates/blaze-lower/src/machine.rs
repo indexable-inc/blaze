@@ -3384,7 +3384,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let t1 = self.kid(f, 1, |v| v == V::Type).map(|v| v.id);
         // A fn's body is a lazy node of the outline, or a block skipped; a const's or
         // static's value follows its `=`.
-        let body = self.first(f, V::Skipped(BLOCK_EXPR)).is_some() || f.flags & F_EQ != 0;
+        let block = self.first(f, V::Skipped(BLOCK_EXPR));
+        let body = block.is_some() || f.flags & F_EQ != 0;
+        if f.kind == FN && let Some(block) = block {
+            self.out.head[head::FN_TEXT_PREFIX] = block.range.start;
+        }
         let mut flags = 0;
         for (tok, flag) in [
             (CONST_KW, sig::CONST),

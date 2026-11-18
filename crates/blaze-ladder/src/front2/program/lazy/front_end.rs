@@ -14,6 +14,40 @@
 use super::*;
 
 use crate::seam::FrontEnd;
+use crate::front2::tables::recorder::TableRead;
+
+/// All internal declarations in this program search the same graph. Keep its covering
+/// reads once, and remember each caller that read them, even on a cached binding or refusal.
+pub(super) struct InternalBindings<'n> {
+    definitions: Map<ItemKey, ItemKey, Alloc<'n>>,
+    callers: Map<ItemKey, (), Alloc<'n>>,
+    reads: AVec<'n, TableRead>,
+    /// A declaration first met at a ground instance. The seam carries Missing to make_asked,
+    /// which can return the original reach refusal with its full payload.
+    refused: Option<Front2Refusal>,
+}
+
+impl<'n> InternalBindings<'n> {
+    pub(super) fn new_in(alloc: Alloc<'n>) -> Self {
+        Self { definitions: Map::new_in(alloc), callers: Map::new_in(alloc), reads: AVec::new_in(alloc), refused: None }
+    }
+
+    fn read<S: NamesSource<'n>>(&mut self, owner: ItemKey, names: S) -> Result<(), Front2Refusal> {
+        if self.reads.is_empty() {
+            for krate in 0..names.crate_count() {
+                let Some(key) = names.crate_key(krate) else {
+                    self.reads.clear();
+                    return Err(Front2Refusal::Unlisted { krate });
+                };
+                self.reads.push(crate::front2::internal_symbol::search_read(key));
+            }
+            self.reads.sort_unstable();
+            self.reads.dedup();
+        }
+        self.callers.insert(owner, ());
+        Ok(())
+    }
+}
 
 impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// `f` over the checker's world of row `i`'s live body: as `Front2Program::in_world`. A ctor
@@ -60,6 +94,26 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
 
     fn lits_of(&self, owner: ItemKey) -> Option<&Literals> {
         self.live_by_key(owner).map(|l| &l.lits)
+    }
+
+    fn bind_internal(&self, owner: ItemKey, item: ItemKey) -> Result<Option<ItemKey>, Front2Refusal> {
+        let names = self.front.names;
+        let mut bindings = self.internal_bindings.borrow_mut();
+        if let Some(&def) = bindings.definitions.get(&item) {
+            bindings.read(owner, names)?;
+            return Ok(Some(def));
+        }
+        let target = super::seam_rules::internal_binding(names, &self.front.keys, &self.store, item, || bindings.read(owner, names))?;
+        if let Some(def) = target {
+            bindings.definitions.insert(item, def);
+        }
+        Ok(target)
+    }
+
+    /// The caller's cross-crate reads for internal symbol binding.
+    pub fn internal_binding_reads(&mut self, owner: ItemKey) -> &[TableRead] {
+        let bindings = self.internal_bindings.get_mut();
+        if bindings.callers.contains_key(&owner) { bindings.reads.as_slice() } else { &[] }
     }
 }
 
@@ -115,6 +169,14 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         if let Some(default) = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, alloc) {
             return Ok((default, List::EMPTY));
         }
+        match self.bind_internal(self.rows.key[i], item) {
+            Ok(Some(def)) => return Ok((def, List::EMPTY)),
+            Ok(None) => {}
+            Err(why) => {
+                self.internal_bindings.borrow_mut().refused = Some(why);
+                return Err(ResolveError::Missing(tc::Question::Attrs(item)));
+            }
+        }
         let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, alloc))??;
         Ok((r.item, r.args))
     }
@@ -131,6 +193,9 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// As `Front2Program::make_asked`: the fills the instance questions' worlds noted, made
     /// as the body check makes its own (check.rs `make_all`).
     fn make_asked(&mut self, i: usize) -> Result<bool, crate::run::RunError> {
+        if let Some(why) = self.internal_bindings.get_mut().refused.take() {
+            return Err(crate::run::RunError::Front2(why));
+        }
         let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));
         if fills.is_empty() {
             return Ok(false);
@@ -256,7 +321,21 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn check_one(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, crate::run::RunError> {
-        self.check_one_key(key).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
+        use crate::run::RunError;
+        let body = self.check_one_key(key).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        if let Some((_, checked)) = &body {
+            // The reach walk also visits fns used as values (including fn pointers).
+            let values = checked.expr_defs.column::<1>().iter().filter_map(|d| match *d {
+                tc::Def::Fn(k) => Some(k),
+                _ => None,
+            });
+            for callee in checked.callees.column::<1>().iter().copied().chain(values) {
+                self.bind_internal(key, callee).map_err(RunError::Front2)?;
+            }
+        } else {
+            self.bind_internal(key, key).map_err(RunError::Front2)?;
+        }
+        Ok(body)
     }
 
     fn ctor_row(&mut self, key: ItemKey) -> Result<Option<usize>, crate::run::RunError> {

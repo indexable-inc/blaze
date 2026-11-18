@@ -29,7 +29,6 @@ use core::fmt;
 
 use blaze_build::Panic;
 use blaze_manifest::layout::panic::ProfilePanic;
-use blaze_scope::resolve::Names;
 
 use crate::code_records::PanicStrategy;
 use crate::front2::source::NamesSource;
@@ -101,7 +100,7 @@ impl core::error::Error for ProgramPanicError<'_> {}
 
 /// The program's strategy, as its crate's cfg says it ([`derive_cfg`] put it there from the
 /// program's inputs): what front2 binds `__rust_start_panic` and `__rust_panic_cleanup` by.
-pub fn of_program<'n>(names: &'n Names<'n>) -> Result<Panic, ProgramPanicError<'n>> {
+pub fn of_program<'n, S: NamesSource<'n>>(names: S) -> Result<Panic, ProgramPanicError<'n>> {
     let atoms = names.cfg_atoms(0).ok_or(ProgramPanicError::NoProgramCrate)?;
     let mut found = None;
     for &(name, value) in atoms {

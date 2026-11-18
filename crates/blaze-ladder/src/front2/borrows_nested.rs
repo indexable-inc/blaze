@@ -173,6 +173,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn own_text(&self) -> Option<&str> {
         self.facts.own_text()
     }
+    fn fn_binders(&self) -> bool {
+        self.facts.fn_binders()
+    }
     fn closure_bodies_checked(&self) -> bool {
         true
     }

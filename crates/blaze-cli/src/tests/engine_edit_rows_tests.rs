@@ -446,9 +446,100 @@ fn r5_a_literal_edited_enters_its_body_alone() {
     let base = seen(&io, "R5", "a/src/lib.rs::base");
     let row = settle(&io, "R5 one fn body edited", &now, Oracle::Equal);
     assert_eq!(base, Seen::Last, "R5: the edited body `base` was entered");
-    // FLOOR (1, 0, 0, 1): row "One statement edited". Today the head task's key holds the body
-    // text's digest (engine_heads.rs `plan_items`): 1 head entered, identical.
-    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 1, 1), "R5: floor 1 outline, 0 names, 0 heads, 1 body: {PINNED}");
+    // K1 kept RX5's one head. CX17 drops it because the literal contributes only to the
+    // value of `base`. Its return type is still the declared `u32`.
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "R5: 1 outline, 0 names, 0 heads, 1 body: {FLOOR}");
+}
+
+fn head_body_world(text: &str) -> Io {
+    let io = Io::simulated(SimWorld::new(17, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    write(&io, "src/lib.rs", text);
+    io
+}
+
+fn one_fn_head_key_moved(now: &Answer) {
+    assert!(now.checked.from_last, "the edit used the stored answer");
+    assert_eq!(now.checked.signatures_entered, 1, "only the defining function's head entered");
+    let moved = now.checked.because.iter().any(|(group, n)| group.stage == Stage::Heads && group.cause == "key moved" && *n == 1);
+    assert!(moved, "the defining function entered by its source key: {}", entries(&now.checked));
+    println!("defining function head entered by its key: {}", now.checked.signatures_entered);
+}
+
+#[test]
+fn r5_a_local_fn_body_edit_enters_the_outer_head() {
+    let io = head_body_world("pub fn outer() -> u8 { fn local() -> u8 { 1 } local() }");
+    let _ = cold(&io, "R5 local fn");
+    write(&io, "src/lib.rs", "pub fn outer() -> u8 { fn local() -> u8 { 2 } local() }");
+    let now = request(&io, false);
+    settle(&io, "R5 local fn", &now, Oracle::Equal);
+    one_fn_head_key_moved(&now);
+}
+
+#[test]
+fn r5_an_opaque_return_body_edit_enters_its_head() {
+    // The fixture shelf has an empty prelude. Supply its Sized lang item in this crate.
+    const PREFIX: &str = "#![feature(lang_items)]\n#[lang = \"sized\"] pub trait Sized {}\n";
+    let io = head_body_world(&format!("{PREFIX}pub fn f() -> impl Sized {{ 1u8 }}"));
+    let _ = cold(&io, "R5 opaque return");
+    write(&io, "src/lib.rs", &format!("{PREFIX}pub fn f() -> impl Sized {{ 1u16 }}"));
+    let now = request(&io, false);
+    settle(&io, "R5 opaque return", &now, Oracle::Equal);
+    one_fn_head_key_moved(&now);
+}
+
+/// Plan the fixture's real signature parts with the body input removed from every fn.
+/// Leave the ordinary body parts, the read lists and the edited file itself intact.
+fn request_without_fn_head_bodies(io: &Io, text: &str) -> Answer {
+    use crate::engine_heads::{FnHeadBodies, PLANTED_HEAD_SOURCES, outline_head_source};
+
+    let edition = blaze_surface::Edition::E2024;
+    let outline = blaze_file_items::outline(text, edition, blaze_own::testing::heap().alloc());
+    let file = crate::signature::file_subject("src/lib.rs");
+    let sources = outline.items().iter().enumerate()
+        .filter(|(_, item)| crate::signature::is_signature_entry(&outline, item))
+        .map(|(at, item)| {
+            let name = crate::signature::signature_name(file, &outline, item, text);
+            let source = outline_head_source(&outline, blaze_surface::ItemIndex(at as u32), text, edition, FnHeadBodies::DropAll);
+            (name, source)
+        })
+        .collect();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PLANTED_HEAD_SOURCES.with_borrow_mut(|parts| parts.clear());
+        }
+    }
+    assert!(PLANTED_HEAD_SOURCES.replace(sources).is_empty());
+    let _reset = Reset;
+    request(io, false)
+}
+
+#[test]
+#[ignore = "OPEN (first compile, 2026-11-18 04:41): this control does NOT fail: with every fn body dropped from the head keys the edit still answers as a fresh world, because adding the block's impl moves the file's items, so the heads re-enter by `read moved CrateScope` whatever their keys hold. The rule it stands for (a fn whose body holds items keeps its body in its head's key) is so far shown by no planted bug: find an edit that moves no name and goes stale, or drop the rule (lane CX19)"]
+#[should_panic(expected = "row R5 dropped fn bodies: the answer after the edit is a fresh world's")]
+fn r5_dropping_every_fn_body_from_heads_leaves_a_stale_answer() {
+    // A block's impl is visible outside the block (Reference, “Items”). The existing caller
+    // needs the first head the block contributes. Before the edit the outer head read no
+    // member of an impl there. Both versions already contain a local fn.
+    const BEFORE: &str = "pub struct S;\npub fn outer() { fn local() {} local(); }\npub fn read() -> u8 { S::value() }";
+    const AFTER: &str = "pub struct S;\npub fn outer() { fn local() {} impl S { pub fn value() -> u8 { 1 } } local(); }\npub fn read() -> u8 { S::value() }";
+    for planted in [false, true] {
+        let io = head_body_world(BEFORE);
+        let run = |text| if planted { request_without_fn_head_bodies(&io, text) } else { request(&io, false) };
+        let _ = run(BEFORE);
+        write(&io, "src/lib.rs", AFTER);
+        let now = run(AFTER);
+        assert!(now.checked.from_last, "the edit used the stored answer");
+        if planted {
+            let fresh_world = head_body_world(AFTER);
+            settle(&fresh_world, "R5 dropped fn bodies", &now, Oracle::Equal);
+        } else {
+            settle(&io, "R5 first block impl", &now, Oracle::Equal);
+            assert!(findings(&now.lines).all(|line| !line.contains("error[")), "the block's impl supplies S::value: {:?}", now.lines);
+            assert_eq!(now.checked.seeds.bodies.refused, 0, "the caller can read the new method's frozen head");
+        }
+    }
 }
 
 /// R6, A PRIVATE FN ADDED TO `a` (row "A private fn added": 1 names group, 1 head, 1 body): its
@@ -532,8 +623,9 @@ fn r9_a_generic_body_edited_enters_that_body_alone() {
     let row = settle(&io, "R9 a generic fn's body edited", &now, Oracle::Equal);
     assert_eq!(pick, Seen::Last, "R9: the edited generic body was entered");
     assert_eq!((first, same), (Seen::Earlier, Seen::Earlier), "R9: no caller of the generic fn checked again: {FLOOR}");
-    // FLOOR (0, 1). Today the head task's key holds the body text's digest: 1 head, identical.
-    assert_eq!((row.heads, row.bodies), (1, 1), "R9: floor 0 heads, that 1 body: {PINNED}");
+    // K1 kept RX5's one head. CX17 drops it because the local binding leaves `pick<T>(T) -> T`
+    // and the heads visible to its callers unchanged.
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "R9: 1 outline, 0 names, 0 heads, the generic body alone: {FLOOR}");
 }
 
 /// R10, A STRUCT'S PRIVATE FIELD ADDED IN `a`, THE STRUCT ONLY NAMED IN `b` (plan row A5 "head
@@ -595,9 +687,9 @@ fn r12_switched_away_and_back_makes_no_record() {
     let (entered_back, puts_back) = (back.checked.entered, back.checked.puts);
     println!("row R12: back: entered {entered_back}, records made (put) {puts_back}, records lines {:?}", back.checked.records.lines);
     let _ = settle(&io, "R12 X1 switched away and back", &back, Oracle::Equal);
-    // FLOOR 0 made (X1). Today no entered task looks its record up by key before it runs: the
-    // outline, the head and the body are entered by "key moved" and 2 records are put.
-    assert_eq!(puts_back, 2, "R12 (X1): floor back on the original bytes, every record is found by its key: 0 made ({entered_back} entered): {PINNED}");
+    // As in R5, the outline and body enter. Only the outline contributes a put
+    // (engine_check.rs, the phase's record loop has no stored record for Stage::Bodies).
+    assert_eq!(puts_back, 1, "R12 (X1): floor back on the original bytes, every record is found by its key: 0 made ({entered_back} entered): {PINNED}");
 }
 
 /// R13, A `#[cfg(test)]` TEST FN'S BODY EDITED: that 1 body (when test bodies are tasks), 0
@@ -612,12 +704,11 @@ fn r13_a_test_body_edited_enters_that_body_alone() {
     let base = seen(&io, "R13", "a/src/lib.rs::base");
     let twice = seen(&io, "R13", "a/src/lib.rs::twice");
     let row = settle(&io, "R13 a test fn's body edited", &now, Oracle::Equal);
-    assert_ne!(test, Seen::Earlier, "R13: the edited test body, a task, was entered");
+    assert_eq!(test, Seen::Last, "R13: the outline lists the edited test as a body task");
     assert_eq!((base, twice), (Seen::Earlier, Seen::Earlier), "R13: no library body entered: {FLOOR}");
-    let want = u32::from(test == Seen::Last);
-    // FLOOR (1, 0, the test's body). Today the test's head task's key holds its body text's
-    // digest: 1 head entered, identical.
-    assert_eq!((row.outlines, row.heads, row.bodies), (1, 1, want), "R13: floor 1 outline, 0 heads, the test's body alone: {PINNED}");
+    // K1 kept RX5's one head. CX17 drops it because adding zero inside the test changes
+    // neither its signature nor the items it declares.
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "R13: 1 outline, 0 names, 0 heads, the test's body alone: {FLOOR}");
 }
 
 /// R14, A FILE MOVED: `c/src/use_b.rs` renamed `counting.rs`, its `mod` line changed to match.

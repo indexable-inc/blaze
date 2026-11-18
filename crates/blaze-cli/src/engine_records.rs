@@ -278,6 +278,23 @@ impl<'r> EngineRecords<'r> {
         Ok(Exports { payload: payload.bytes(), exports })
     }
 
+    /// The tests section of the `CrateScope` record `input` names (names/sections.rs: a test
+    /// unit's tests record; empty for a unit not compiled with `test`), where it lies in the
+    /// store's mapping, for `'r`: what `blaze test` runs (run_names.rs `test_unit`). Counted as
+    /// one record read; nothing is copied.
+    pub(crate) fn tests(&mut self, cx: &Cx, store: &mut dyn Store<'r>, input: &Input) -> Result<&'r [u8], ReadError> {
+        let cx = cx.span("engine: a unit's tests record read in place");
+        let Some(held) = store.get(&cx, input.at).map_err(LoadError::Store)? else {
+            return Err(LoadError::NotInStore { name: input.name, at: input.at }.into());
+        };
+        let record = held.place.map_err(|why| ReadError::NotInPlace { name: input.name, why })?;
+        let (_, parts) = payload_of(input.name, record)?;
+        self.counts.records += 1;
+        self.counts.bytes += record.len() as u64;
+        self.counts.sections += parts.tests.len() as u64;
+        Ok(parts.tests)
+    }
+
     /// What it read so far.
     pub(crate) fn counts(&self) -> ReadCounts {
         self.counts

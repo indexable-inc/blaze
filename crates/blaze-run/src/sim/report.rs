@@ -114,7 +114,7 @@ fn the_summary_says_each_count() {
         Some(
             "{\"event\":\"summary\",\"result\":\"failed\",\"ran\":3,\"passed\":2,\"failed\":1,\"reused\":2,\
              \"not_kept\":1,\"not_kept_by\":{\"clock\":1,\"network\":0,\"wrote_outside\":0,\"foreign\":0,\
-             \"unsandboxed\":0,\"descriptor\":0,\"threads\":0},\"ignored\":1,\"benches\":1,\"filtered_out\":2,\
+             \"unsandboxed\":0,\"descriptor\":0,\"threads\":0,\"untraced\":0},\"ignored\":1,\"benches\":1,\"filtered_out\":2,\
              \"flaky\":2}"
         )
     );

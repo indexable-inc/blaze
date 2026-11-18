@@ -22,9 +22,9 @@
 //! the order the lowering gives them: every list of a head is in written order (parameters,
 //! fields, variants, members), which is meaningful and machine-free; no map order reaches here.
 //!
-//! A fn's text (what its body is lowered from) is not copied: the record holds its length and
-//! digest, and the reader hands the text in (it has it: the item's own text, by which the record
-//! is keyed); a text that is not the one the head was made from is [`HeadRecordError::Text`].
+//! A fn record checks the length and digest of the text its head depends on. For a
+//! body-independent head this is the prefix before the body's opening brace. The reader
+//! supplies the current item's complete text for body lowering.
 //!
 //! Refused by name ([`HeadRecordError::Unencoded`]), never skipped: an inference hole, a
 //! closure type and an async block's future in a head's terms (body types, never a head's); an
@@ -90,7 +90,11 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 15: a trait's `supertraits` holds every clause its header implies (heads.rs `trait_members`,
 /// preds.rs `predicates_implying`): the bounds on its associated types too (`Curve<A: B>`),
 /// where before only clauses on `Self` were kept.
-pub const VERSION: u32 = 15;
+/// 16: an ADT's lifetime variances read its fn-pointer fields (lifetimes.rs `variances`, lane
+/// B15): a lifetime in a fn pointer's input is `Contra`, where it was `In` (not computed).
+/// 17: a fn text slot distinguishes a signature prefix from a whole item (lane CX17: a head
+/// record checks its signature's text alone unless the fn's key holds its body).
+pub const VERSION: u32 = 17;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -163,8 +167,8 @@ pub enum HeadRecordError {
     Shape { what: &'static str },
     /// A fn head is read without its text.
     NoText,
-    /// The text handed in is not the one the head was made from.
-    Text { want_len: u32, got_len: usize },
+    /// The current item does not match the fn's recorded text extent and digest.
+    Text { key: ItemKey, want_len: u32, got_len: usize },
     /// The store has no such head made.
     NotMade { at: HeadAt },
     /// The type table refused a term (its cap).
@@ -185,8 +189,8 @@ impl core::fmt::Display for HeadRecordError {
             HeadRecordError::Outside { what } => write!(f, "head record: {what} is not in the type table handed in"),
             HeadRecordError::Shape { what } => write!(f, "head record: {what}"),
             HeadRecordError::NoText => write!(f, "head record: a fn head is read without its item's text"),
-            HeadRecordError::Text { want_len, got_len } => {
-                write!(f, "head record: the text handed in ({got_len} bytes) is not the one the head was made from ({want_len} bytes, by digest)")
+            HeadRecordError::Text { key, want_len, got_len } => {
+                write!(f, "head record: fn {key:?}'s text differs from its recorded {want_len}-byte extent or digest (current item {got_len} bytes)")
             }
             HeadRecordError::NotMade { at } => write!(f, "head record: the store has no head made for {at:?}"),
             HeadRecordError::Table(e) => write!(f, "head record: the type table refused a term: {e:?}"),
@@ -626,6 +630,19 @@ enum Text {
     Zeroed,
 }
 
+/// A prefix ends immediately before the brace recorded by the parser. Checking the brace
+/// also rejects a longer signature that begins with all the bytes of the old one.
+fn fn_record_text(text: &str, prefix: Option<u32>) -> Option<&[u8]> {
+    let bytes = text.as_bytes();
+    match prefix {
+        None => Some(bytes),
+        Some(end) => {
+            let (signature, body) = bytes.split_at_checked(end as usize)?;
+            (body.first() == Some(&b'{')).then_some(signature)
+        }
+    }
+}
+
 fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot: Text) -> Result<RecordBytes<'b>, HeadRecordError> {
     let mut o = Out {
         tys,
@@ -639,14 +656,16 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
     let kind = match head {
         HeadRef::Fn { key, head, preds, static_, life } => {
             o.key(key);
-            let text = head.text.as_bytes();
-            let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
             match slot {
                 Text::Kept => {
+                    let text = fn_record_text(head.text, head.text_prefix).ok_or(E::Shape { what: "a fn text prefix must end at the body's opening brace" })?;
+                    let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
+                    o.flag(head.text_prefix.is_some());
                     o.u32(len);
                     o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
                 }
                 Text::Zeroed => {
+                    o.flag(false);
                     o.u32(0);
                     o.body.extend_from_slice(&[0; 32]);
                 }
@@ -1911,11 +1930,13 @@ impl<'r> In<'r, '_, '_> {
 
     fn fn_head<'n>(&mut self, text: Option<&'n str>) -> Result<Head<'n>, E> {
         let key = self.key("a fn's key")?;
+        let prefix = self.flag("a fn text's signature-prefix flag")?;
         let want_len = self.u32("a fn text's length")?;
         let want: [u8; 32] = self.array("a fn text's digest")?;
         let text = text.ok_or(E::NoText)?;
-        if usize::try_from(want_len).ok() != Some(text.len()) || ContentId::of(TEXT_DOMAIN, text.as_bytes()).0 != want {
-            return Err(E::Text { want_len, got_len: text.len() });
+        let text_prefix = prefix.then_some(want_len);
+        if !fn_record_text(text, text_prefix).is_some_and(|part| part.len() == want_len as usize && ContentId::of(TEXT_DOMAIN, part).0 == want) {
+            return Err(E::Text { key, want_len, got_len: text.len() });
         }
         let lib = self.lib("a fn's library key")?;
         let container = self.opt("a fn's container", |r| r.key("a fn's container"))?;
@@ -1935,6 +1956,7 @@ impl<'r> In<'r, '_, '_> {
         let head = FnHead {
             lib,
             text,
+            text_prefix,
             container,
             parent,
             own,

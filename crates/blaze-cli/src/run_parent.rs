@@ -569,7 +569,8 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
 
     fn maker(&mut self, start: &Roots<'r>) -> Result<Maker<'h>, ParentError> {
         let names = self.names()?;
-        Ok(Maker::new(names, start.maker_entry(), &self.builder, self.tables))
+        // `run_roots` start by the rule (`MakerStart::ByRule`): what `Maker::new` did.
+        Ok(Maker::of_roots(names, start.maker_entry(), start, &self.builder, self.tables))
     }
 
     /// From the names records: the checker key's library item (its first 16 bytes,

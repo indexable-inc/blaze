@@ -232,6 +232,18 @@ fn is_item(kind: SyntaxKind) -> bool {
     )
 }
 
+/// Whether a direct child supplies the outline entry's name. For `extern crate x as y;`
+/// the name is the crate reference `x`: scope lowering resolves that target, then uses
+/// the separate rename to determine the local binding.
+fn is_name_child(entry: SyntaxKind, child: SyntaxKind) -> bool {
+    matches!((entry, child), (_, NAME) | (EXTERN_CRATE, NAME_REF))
+}
+
+/// Syntax kinds the text outline classifies as errors when it makes a row for them.
+fn is_error_entry(kind: SyntaxKind) -> bool {
+    matches!(kind, ERROR | ATTR | DOC_COMMENT)
+}
+
 /// The kinds of entry told apart from their siblings by name: the rest, by their head.
 fn is_named(syntax: SyntaxKind) -> bool {
     matches!(

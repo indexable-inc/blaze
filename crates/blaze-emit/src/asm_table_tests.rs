@@ -3,20 +3,15 @@
 //! a binary literal grouped by the diagram's fields, so the expected word comes from the
 //! layout and never from the encoder. The fields are named in each group's comment.
 
-use crate::asm::{Assembler, Dialect};
+use crate::{asm::Dialect, asm_tests::assembled};
 
 /// The one word `statement` assembles to, or the refusal's reason and token.
 fn word(statement: &str) -> Result<u32, (&'static str, String)> {
-    let mut reader = Assembler::new(Dialect::Darwin);
-    let mut out = None;
-    let mut sink = |w: u32| {
-        assert!(out.is_none(), "{statement:?} made more than one word");
-        out = Some(w);
-    };
-    let done = reader.feed(statement.as_bytes(), &mut sink).and_then(|()| reader.finish(&mut sink));
-    match done {
-        Ok(1) => Ok(out.expect("one word handed out")),
-        Ok(n) => panic!("{statement:?} made {n} words"),
+    match assembled(Dialect::Darwin, statement) {
+        Ok(words) => {
+            assert_eq!(words.len(), 1, "{statement:?} must make exactly one word");
+            Ok(words[0])
+        }
         Err(e) => Err((e.why, e.token.text().to_owned())),
     }
 }
@@ -28,6 +23,25 @@ fn word(statement: &str) -> Result<u32, (&'static str, String)> {
 fn rows_match_the_a64_layouts() {
     #[rustfmt::skip]
     let rows: &[(&str, u32)] = &[
+        // PC-relative offsets are signed words, measured from the branch.
+        ("b 2f\n2:",                  0b000101_00000000000000000000000001),
+        ("b.ne 2f\n2:",               0b01010100_0000000000000000001_0_0001),
+        ("2: b.al 2b",                0b01010100_0000000000000000000_0_1110),
+        ("cbz x5, 2f\n2:",            0b1_011010_0_0000000000000000001_00101),
+        ("cbnz w4, 2f\n2:",           0b0_011010_1_0000000000000000001_00100),
+        ("tbz w3, #31, 2f\n2:",       0b0_011011_0_11111_00000000000001_00011),
+        ("tbnz x17, #32, 2f\n2:",     0b1_011011_1_00000_00000000000001_10001),
+        ("sub w4, w4, #1",           0b0_1_0_100010_0_000000000001_00100_00100),
+        ("add x2, x2, #1",           0b1_0_0_100010_0_000000000001_00010_00010),
+        // size 001000 0 L pair Rs ordered Rt2 Rn Rt.
+        ("ldxr w3, [x4]",            0b10_001000_0_1_0_11111_0_11111_00100_00011),
+        ("ldaxr x5, [sp, #0]",       0b11_001000_0_1_0_11111_1_11111_11111_00101),
+        ("stxr w7, x8, [x9]",        0b11_001000_0_0_0_00111_0_11111_01001_01000),
+        ("stlxr w9, w2, [x3]",       0b10_001000_0_0_0_01001_1_11111_00011_00010),
+        ("ldxp x3, x4, [x5]",        0b11_001000_0_1_1_11111_0_00100_00101_00011),
+        ("ldxp w3, w4, [x5]",        0b10_001000_0_1_1_11111_0_00100_00101_00011),
+        ("stxp w3, x4, x5, [x6]",    0b11_001000_0_0_1_00011_0_00101_00110_00100),
+        ("stxp w3, w4, w5, [x6]",    0b10_001000_0_0_1_00011_0_00101_00110_00100),
         // System: 1101010100 L op0 op1 CRn CRm op2 Rt. Barriers and hints: L 0, op0 00,
         // op1 011, CRn 0010 (hints) or 0011 (barriers), Rt 11111.
         ("nop",                     0b1101010100_0_00_011_0010_0000_000_11111),
@@ -134,6 +148,13 @@ fn rows_match_the_a64_layouts() {
 fn refusals_name_the_token() {
     let none = "operands no form of the mnemonic in the assembler's table takes";
     let cases: &[(&str, &str, &str)] = &[
+        ("ldxr x3, [xzr]", none, "ldxr x3, [xzr]"),
+        ("ldxr x3, [x2,#8]", none, "ldxr x3, [x2,#8]"),
+        ("stxr x1, x2, [x3]", none, "stxr x1, x2, [x3]"),
+        ("stlxr w2, x2, [x3]", "exclusive store status overlaps data or address", "w2"),
+        ("ldxp w1, x2, [x3]", none, "ldxp w1, x2, [x3]"),
+        ("ldxp w2, w2, [x3]", "exclusive pair load has overlapping destinations", "w2"),
+        ("stxp w3, x1, x2, [x3]", "exclusive store status overlaps data or address", "w3"),
         ("csel w0, x1, w2, ne", none, "csel w0, x1, w2, ne"),
         ("and x0, x1, x2", none, "and x0, x1, x2"),
         ("crc32b w0, w0, x1", none, "crc32b w0, w0, x1"),

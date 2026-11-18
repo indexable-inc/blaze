@@ -276,9 +276,9 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     }
 
     /// WHOLE: the items record's file rows have no cell.
-    fn file_shown(self, krate: usize, file: u32) -> Option<&'n str> {
+    fn file_paths(self, krate: usize, file: u32) -> Option<source::FilePaths<'n>> {
         self.whole(krate, Section::Items);
-        self.records.file_shown(krate, file)
+        self.records.file_paths(krate, file)
     }
 
     /// WHOLE: a whole file's text, read only to print a position (rule 71).

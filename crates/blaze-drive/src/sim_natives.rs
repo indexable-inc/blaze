@@ -374,6 +374,7 @@ fn request(tape: &Tape, world: &World, store: &mut BTreeMap<Key, StdVec<u8>>, la
                     running = true;
                 }
                 Effect::Stop { .. } => return Err(Broke::Oracle(String::from("a clean world's program was stopped"))),
+                Effect::StartTests { .. } => return Err(Broke::Harness(String::from("`run` started tests"))),
                 Effect::Publish(_) | Effect::Unpublish(_) | Effect::Print(_) => {}
                 Effect::WriteLast { bytes } => ended.last = Some(bytes.as_slice().to_vec()),
                 Effect::Done(answer) => ended.answer = Some(answer),

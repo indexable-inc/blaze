@@ -42,7 +42,9 @@ use super::reads::{Fact, FactKind, Read};
 pub const DETAIL: u64 = 1;
 
 /// The domain of this module's row answers.
-const DOMAIN: &str = "blaze-ladder front2 borrow call bounds read v1";
+/// v2 (lane B15): a fn pointer in a bound's types has positions and a lifetime its binder
+/// binds is `Region::Bound` (tag 5).
+const DOMAIN: &str = "blaze-ladder front2 borrow call bounds read v2";
 
 /// Why no bounds were filed for a callee: its calls through `call_by_generic_signature` are
 /// not made, and stay refused (`CallWritesLifetimes`) or on `unify_call`'s one origin.
@@ -142,6 +144,7 @@ fn region(h: &mut StableHasher, r: Region) {
         Region::Anon(n) => (2, n),
         Region::SelfTy(n) => (3, n),
         Region::Hidden(n) => (4, n),
+        Region::Bound(n) => (5, n),
     };
     h.tag(tag);
     h.u32(n);

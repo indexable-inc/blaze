@@ -83,6 +83,7 @@ struct Patch {
 
 struct Pass<'a, 'c, A: Allocator> {
     view: View<'a>,
+    scratch: blaze_own::Alloc<'c>,
     via: &'a [Via],
     isa: Isa,
     /// The most bytes a bulk operation of a constant length is inline.
@@ -206,6 +207,7 @@ pub(crate) fn run<A: Allocator>(
     data_index.resize(view.datas.len(), NONE);
     let mut pass = Pass {
         view,
+        scratch,
         via,
         isa,
         inline_most,

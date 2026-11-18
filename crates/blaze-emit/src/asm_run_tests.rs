@@ -46,6 +46,48 @@ fn calls_view(func: blaze_lir::View<'_>, cases: &[[u64; 4]]) -> Vec<u64> {
     cases.iter().map(|&args| run::call(&exec, args)).collect()
 }
 
+#[test]
+fn backward_countdown_runs() {
+    let f = block(&[Ty::I64], Ty::I64, &[AsmPiece::Text("2: sub x3, x3, #1\ncbnz x3, 2b")], &[explicit(AsmOperandKind::InOut, "x3")]);
+    assert_eq!(calls(&f, &[[5, 0, 0, 0]]), [0]);
+    println!("asm::countdown: 5 -> 0");
+}
+
+#[test]
+fn forward_branch_runs() {
+    let f = block(
+        &[Ty::I64], Ty::I64, &[AsmPiece::Text("tbz x3, #32, 2f\nsub x3, x3, #1\n2:")],
+        &[explicit(AsmOperandKind::InOut, "x3")],
+    );
+    assert_eq!(calls(&f, &[[7, 0, 0, 0], [1 << 32, 0, 0, 0]]), [7, u64::from(u32::MAX)]);
+    println!("asm::forward: bit 32 selects skip or subtract");
+}
+
+#[test]
+fn exclusive_increment_runs() {
+    let f = one(&[Ty::PTR], Ty::I64, |b, params| {
+        let id = b.asm_block(
+            &[AsmPiece::Text("2: ldaxr x2, [x1]\nadd x2, x2, #1\nstlxr w4, x2, [x1]\ncbnz w4, 2b")],
+            &[explicit(AsmOperandKind::In, "x1"), explicit(AsmOperandKind::Out, "x2"), explicit(AsmOperandKind::Out, "w4")],
+            0,
+            "",
+        );
+        let pair = b.compound(&[Ty::I64, Ty::I32]);
+        let result = b.asm(id, pair, params);
+        b.project(result, 0)
+    });
+    let code = emitted_for(f.view(), &[], ISA).expect("the exclusive increment emits");
+    let exec = run::place(&code, |fixup| panic!("unexpected relocation {fixup:?}"));
+    for initial in [0, 41, u64::MAX] {
+        let mut counter = initial;
+        let addr = (&raw mut counter).expose_provenance() as u64;
+        let result = run::call(&exec, [addr, 0, 0, 0]);
+        let expected = initial.wrapping_add(1);
+        assert_eq!((result, counter), (expected, expected));
+    }
+    println!("asm::exclusive: 0 -> 1, 41 -> 42, u64::MAX -> 0");
+}
+
 /// CRC32 as the Arm ARM's `CRC32` pseudocode defines it: the accumulator and the data
 /// bit-reflected, divided by `poly` (reflected: 0xedb88320 for CRC32, 0x82f63b78 for
 /// CRC32C), no inversion on either side.

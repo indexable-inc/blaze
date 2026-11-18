@@ -12,10 +12,13 @@
 //! over lifetimes. These bounds specify a bound that is true for all lifetimes"; "Lifetime
 //! elision": the elision rules hold "in function item, function pointer, and closure trait
 //! signatures", so `fn(&u8) -> &u8` is `for<'a> fn(&'a u8) -> &'a u8`. Every region this reader
-//! gives but `'static` is therefore bound by the callable's own binder (written `for<'a>` or
-//! elided), and each call instantiates it afresh. A lifetime the callable takes from OUTSIDE
-//! its binder (the enclosing fn's `'a`, `Self`'s, a hidden one) is fixed across calls: it is
-//! refused ([`CallableRefusal::OuterLifetime`]) until the heads carry it.
+//! gives but `'static` and a free name is therefore bound by the callable's own binder (written
+//! `for<'a>` or elided: [`Region::Bound`]), and each call instantiates it afresh. A lifetime the
+//! callable takes from OUTSIDE its binder (the enclosing fn's `'a`) is fixed across calls: read
+//! through the parameter's own value ([`read_callable_value_with`], lane B15) it is the region
+//! the parameter's type holds at a position, and the call relates through that position; where
+//! the parameter's type holds it nowhere (`F: Fn(&'a u8)`, `Self`'s, a hidden one) it is refused
+//! ([`CallableRefusal::OuterLifetime`]).
 
 use blaze_own::Vec;
 use core::alloc::Allocator;
@@ -37,7 +40,8 @@ pub enum CallableRefusal {
     /// The callable's written inputs are not as many as the call's arguments.
     ArgCount { text: u32, call: u32 },
     /// A lifetime not bound by the callable's own binder (the enclosing fn's, `Self`'s, a
-    /// hidden one): the same at every call, which a per-call instance cannot say.
+    /// hidden one) that the parameter's own type holds at no position (or the reading was not
+    /// given the parameter's type): the same at every call, which a per-call instance cannot say.
     OuterLifetime { at: u32 },
     /// A walk passed its bound.
     Bound,
@@ -180,6 +184,47 @@ pub fn read_callable_param_with<A: Allocator + Clone>(
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), CallableRefusal> {
+    read_callable(text, tys, param, None, inputs, output, world, out, alloc)
+}
+
+/// [`read_callable_param_with`] for a call through the parameter's OWN value (lib.rs
+/// `call_through_value`, lane B15): `param_ty` is the parameter's erased type, and `value` is
+/// filled with one region per origin position of it, as the fn's own signature reads them
+/// (sig.rs `read_signature`, the same numbering of names). A lifetime the callable takes from
+/// outside its binder (the fn's `'a` in `f: fn() -> &'a u8`, the Reference's FREE region of a
+/// fn-pointer type) is then no refusal when the parameter's type holds it at a position: the
+/// caller relates the call through that position of the parameter (its free positions, by
+/// variance), while every lifetime of the callable's binder is fresh at each call. A free
+/// lifetime the parameter's type does not hold (`F: Fn(&'a u8)`, whose `F` has no position)
+/// stays [`CallableRefusal::OuterLifetime`].
+#[expect(clippy::too_many_arguments, reason = "read_callable_param_with's inputs and the parameter's own type and regions")]
+pub fn read_callable_value_with<A: Allocator + Clone>(
+    text: &str,
+    tys: PTys<'_>,
+    param: u32,
+    param_ty: PTy,
+    inputs: &[PTy],
+    output: PTy,
+    world: &dyn SigWorld,
+    out: &mut SigBuf<A>,
+    value: &mut Vec<Region, A>,
+    alloc: A,
+) -> Result<(), CallableRefusal> {
+    read_callable(text, tys, param, Some((param_ty, value)), inputs, output, world, out, alloc)
+}
+
+#[expect(clippy::too_many_arguments, reason = "the two readers' inputs")]
+fn read_callable<A: Allocator + Clone>(
+    text: &str,
+    tys: PTys<'_>,
+    param: u32,
+    mut value: Option<(PTy, &mut Vec<Region, A>)>,
+    inputs: &[PTy],
+    output: PTy,
+    world: &dyn SigWorld,
+    out: &mut SigBuf<A>,
+    alloc: A,
+) -> Result<(), CallableRefusal> {
     out.regions.clear();
     out.ends.clear();
     out.bounds.clear();
@@ -199,6 +244,8 @@ pub fn read_callable_param_with<A: Allocator + Clone>(
         holes: Vec::new_in(alloc.clone()),
         found: Vec::new_in(alloc.clone()),
         depth: 0,
+        binders: Vec::new_in(alloc.clone()),
+        bound: 0,
     };
     lex(text, &mut r.toks)?;
     r.pair_brackets()?;
@@ -249,6 +296,21 @@ pub fn read_callable_param_with<A: Allocator + Clone>(
     }
     let (mut lo, mut hi) = (colon + 1, phi);
     let not_callable = CallableRefusal::NotCallable { at: r.at(lo) };
+    // The parameter's own type, read as the fn's signature reads it: its free regions are the
+    // fn's names, its fn pointer's bound ones numbered from here. The callable's inputs below
+    // are read with the same numbering (the binder opened at the same number, the elided ones
+    // met in the same order), so a region of both is one region.
+    let first_bound = r.bound;
+    if let Some((param_ty, regions)) = value.as_mut() {
+        let n = r.count(*param_ty)?;
+        regions.clear();
+        regions.resize(n as usize, Region::Hidden(u32::MAX));
+        r.line_up(Pair { ty: *param_ty, lo, hi, base: 0, ctx: Ctx::Other, whole_self: false }, Mode::Input, regions)?;
+        if regions.iter().any(|x| *x == Region::Hidden(u32::MAX)) {
+            return Err(SigRefusal::Unaligned { at: r.at(lo) }.into());
+        }
+        r.bound = first_bound;
+    }
     // Peel what stands around the callable: references, `dyn`, `impl`, a whole paren group.
     let mut steps = 0u32;
     loop {
@@ -298,6 +360,11 @@ pub fn read_callable_param_with<A: Allocator + Clone>(
     if parts.len() != inputs.len() {
         return Err(CallableRefusal::ArgCount { text: parts.len() as u32, call: inputs.len() as u32 });
     }
+    // The callable's own binder (written `for<..>`, and every lifetime elided in its inputs:
+    // the Reference, "Lifetime elision" in fn pointer and closure trait signatures), opened at
+    // the number the parameter's own reading opened it (above).
+    r.bound = first_bound;
+    r.push_binder(term.binder.0, term.binder.1)?;
     for (j, &ty) in inputs.iter().enumerate() {
         let (mut alo, ahi) = parts[j];
         // A fn pointer may name its parameters: `fn(x: &T)`.
@@ -307,7 +374,7 @@ pub fn read_callable_param_with<A: Allocator + Clone>(
         let base = out.regions.len() as u32;
         let n = r.count(ty)?;
         out.regions.resize((base + n) as usize, Region::Hidden(u32::MAX));
-        r.line_up(Pair { ty, lo: alo, hi: ahi, base, ctx: Ctx::Other, whole_self: false }, Mode::Input, &mut out.regions)?;
+        r.line_up(Pair { ty, lo: alo, hi: ahi, base, ctx: Ctx::Other, whole_self: false }, Mode::Binder, &mut out.regions)?;
         out.ends.push(out.regions.len() as u32);
     }
     // The Reference, "Lifetime elision": "If there is exactly one lifetime used in the
@@ -330,18 +397,20 @@ pub fn read_callable_param_with<A: Allocator + Clone>(
         None if n == 0 => {}
         None => return Err(SigRefusal::Unaligned { at: r.at(term.inputs.0) }.into()),
     }
-    // Only `'static` and the callable's own binder: a written name must be in its `for<..>`.
+    r.binders.pop();
+    // `'static`, the callable's own binder (fresh at each call), or a FREE lifetime the
+    // parameter's own type holds at a position (`read_callable_value_with`): any other name is
+    // the same at every call and no position says which region it is.
+    let held: &[Region] = match value.as_ref() {
+        Some((_, regions)) => &regions[..],
+        None => &[],
+    };
     for &x in out.regions.iter() {
         match x {
-            Region::Static | Region::Anon(_) => {}
+            Region::Static | Region::Anon(_) | Region::Bound(_) => {}
             Region::Named(k) => {
-                let first = r.names[k as usize];
-                let w = r.word(first);
-                let mut bound = false;
-                for b in term.binder.0..term.binder.1 {
-                    bound |= r.toks[b as usize].k == Tk::Life && r.word(b) == w;
-                }
-                if !bound {
+                if !held.contains(&x) {
+                    let first = r.names[k as usize];
                     return Err(CallableRefusal::OuterLifetime { at: r.at(first) });
                 }
             }

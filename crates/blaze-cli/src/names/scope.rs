@@ -38,7 +38,7 @@ use bstd::mem::{Frame, Tag};
 
 use blaze_drive::key::crate_scope_name;
 
-use super::{Names, OUT_DOMAIN, RULE, Resolved, UNRESOLVED, scope_record, sections, slot_of, surface, tell_public, world};
+use super::{Names, OUT_DOMAIN, RULE, Resolved, scope_record, sections, slot_of, surface, tell_public, world};
 use crate::CliError;
 use crate::engine_records::ReadError;
 use crate::fetch::FetchEnv;
@@ -58,6 +58,9 @@ pub(crate) const SCOPE_JOBS: usize = 4 << 30;
 
 /// One crate to resolve, as a pool worker is handed it: all of it read-only and `Sync`.
 pub(crate) struct ScopeJob<'j> {
+    /// Where the crate's findings are kept: they leave the worker with its result, so the
+    /// request's shared heap, named (never a conjured one).
+    kept: blaze_own::SharedAlloc<'static>,
     /// The crate's index in the world (its texts' `krate`).
     at: usize,
     /// Its input, its dependencies renumbered to `deps`' order.
@@ -397,6 +400,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b, 's>(
     // The environment is copied here into the round's frame, so the job outlives this borrow
     // of the world; the worker copies it again into its own frame ([`EnvLent`]). With a script,
     // its `OUT_DIR` and `rustc-env` pairs joined (`CrateEnv::joined`, a copy too).
+    let kept = env.heap.shared();
     let env = match (names.world.texts.crate_env(at), outputs) {
         (None, _) => None,
         (Some(env), Some(outputs)) => Some(EnvLent::new(&*blaze_own::Box::leak(blaze_own::Box::new_in(env.joined(outputs, round.alloc), round.alloc)))),
@@ -408,7 +412,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b, 's>(
             }
         },
     };
-    let job = ScopeJob { at, input: CrateInput { deps: own_deps, ..input }, deps: deps.leak(), sysroot, packs, corrected, env, procs: names.procs() };
+    let job = ScopeJob { at, input: CrateInput { deps: own_deps, ..input }, deps: deps.leak(), sysroot, packs, corrected, env, procs: names.procs(), kept };
     Ok(Prepared::Resolve(blaze_own::Box::leak(blaze_own::Box::new_in(job, round.frame))))
 }
 
@@ -416,6 +420,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b, 's>(
 /// and read lists, owned, and what its frame held by the stretch of the solve that took it
 /// ([`super::metered`]). Reads nothing but `job` and the checkout files the crate names.
 pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame) -> (Resolution, super::metered::ScopeBytes) {
+    let failed_with = |words| failed_scope(words, job.kept);
     // Each macro call's working memory, beside the crate's frame (blaze-scope task/fill.rs
     // `Par::call_scratch`): reserved here, committed as used, rolled back after each call and
     // dropped with this resolve (its blocks back to the chunk cache). A frame that cannot be
@@ -435,7 +440,7 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
 pub(crate) const CALL_SCRATCH: usize = 4 << 30;
 
 /// A crate whose resolution failed before or around its solve, `words` saying why.
-fn failed_with(words: String) -> Resolution {
+fn failed_scope(words: String, kept: blaze_own::SharedAlloc<'static>) -> Resolution {
     Resolution::Made {
         resolved: Resolved {
             out: crate::work::failed_out(),
@@ -443,7 +448,7 @@ fn failed_with(words: String) -> Resolution {
             files: std::vec::Vec::new(),
             absent: std::vec::Vec::new(),
             data: std::vec::Vec::new(),
-            findings: blaze_own::Vec::new_in(Global),
+            findings: blaze_own::Vec::new_in(kept),
             left_package: blaze_own::Vec::new_in(Global),
             failed: Some(words),
             failed_calls: blaze_own::Vec::new_in(Global),
@@ -456,6 +461,7 @@ fn failed_with(words: String) -> Resolution {
 }
 
 fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame, metered: &super::metered::Metered<'_>) -> Resolution {
+    let failed_with = |words| failed_scope(words, job.kept);
     let cx = cx.span("crate scope: resolve one crate's names");
     let erased = Erased::new(frame);
     let alloc = erased.handle();
@@ -508,7 +514,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     let mut quiet: blaze_own::Vec<&str, Global> = blaze_own::Vec::new_in(Global);
     quiet.extend(job.input.deps.iter().filter(|(_, at)| job.deps.get(*at).is_some_and(|bytes| blaze_scope::crate_scope::is_error_record(bytes))).map(|(name, _)| *name));
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
-        Ok(done) => match scope_record(&done, crate_name, &quiet, alloc) {
+        Ok(done) => match scope_record(&done, crate_name, &quiet, alloc, job.kept) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
                 // bodies read its inner names (front_load.rs), so an out over the exports alone
@@ -523,7 +529,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
             Err(unwritten) => (
                 None,
                 sections::write(0, [&[][..]; sections::SECTIONS]),
-                blaze_own::Vec::new_in(Global),
+                blaze_own::Vec::new_in(job.kept),
                 Some(std::format!("{unwritten}")),
                 true,
                 0,
@@ -538,7 +544,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         Err(error) => (
             None,
             sections::write(0, [&[][..]; sections::SECTIONS]),
-            blaze_own::Vec::new_in(Global),
+            blaze_own::Vec::new_in(job.kept),
             Some(std::format!("crate `{crate_name}`: its names could not be resolved: {error:?}")),
             false,
             0,
@@ -651,9 +657,9 @@ pub(crate) fn answer<'b>(names: &mut Names<'_>, task: &Task<'_>, held: &'b Frame
     }
     let mut made = Made::new_in(name, held);
     made.out = resolved.out;
-    for finding in resolved.findings.iter() {
+    for (rule, finding) in resolved.findings.iter() {
         let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a path's segment is not UTF-8" })?;
-        made.find(UNRESOLVED, finding.at, &[words]);
+        made.find(*rule, finding.at, &[words]);
     }
     for finding in resolved.failed_calls.iter() {
         let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a failed call's words are not UTF-8" })?;
@@ -840,7 +846,7 @@ mod tests {
             files: std::vec::Vec::new(),
             absent: std::vec::Vec::new(),
             data: std::vec::Vec::new(),
-            findings: blaze_own::Vec::new_in(Global),
+            findings: blaze_own::Vec::new_in(blaze_own::testing::heap().shared()),
             left_package: blaze_own::Vec::new_in(Global),
             failed: None,
             failed_calls: blaze_own::Vec::new_in(Global),

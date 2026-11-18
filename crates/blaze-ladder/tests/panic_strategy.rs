@@ -35,7 +35,7 @@ use std::alloc::Global;
 use blaze_build::Panic;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_ladder::crates::{Inputs, Toolchain, syntax_of};
-use blaze_ladder::front::FnKind;
+use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::program::Front2Program;
 use blaze_ladder::panic_strategy::{derive_cfg, of_profile, of_program, of_strategy, strategy};
 use blaze_manifest::layout::panic::ProfilePanic;
@@ -221,16 +221,19 @@ fn tabled_runtime(panic: Panic) -> String {
     let program = Front2Program::survey(&names, &frame, &files, &mut left_out, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("no survey: {e}"));
     let left: Vec<String> = left_out.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     assert!(left.is_empty(), "front2 tables every fn the walk reaches; left out: {left:?}");
-    let rows: Vec<(String, bool, FnKind, String)> = (0..program.fn_count())
-        .map(|i| {
-            let f = program.function(i);
-            (f.path.to_string(), f.body.is_some(), f.kind, f.symbol.to_string())
-        })
+    // The runtime entry tabled with its body, found by its KEY and its crate by the key's crate:
+    // a module-level fn's row path is its bare name (front2 row_path.rs), so the path's text
+    // never said which crate (the test read `__rust_start_panic` as a crate name: red on the
+    // green tree until 2026-11-18).
+    let defined: Vec<_> = (0..names.crates().len())
+        .flat_map(|krate| names.items(krate))
+        .map(|(lib, _, _)| lib)
+        .filter(|&lib| names.item_text(lib).is_some_and(|item| item.name == Some(START_PANIC)))
+        .filter(|&lib| program.fn_index(checker_of(lib)).is_some_and(|i| program.function(i).body.is_some()))
         .collect();
-    let defined: Vec<&str> = rows.iter().filter(|(path, body, ..)| *body && path.ends_with(START_PANIC)).map(|(path, ..)| path.as_str()).collect();
-    assert_eq!(defined.len(), 1, "one runtime entry tabled with its body: {rows:?}");
-    let krate = defined[0].split("::").next().expect("a path's crate");
-    krate.to_string()
+    assert_eq!(defined.len(), 1, "one runtime entry tabled with its body: {defined:?}");
+    let krate = names.crate_of(defined[0]).expect("the tabled runtime definition's crate");
+    names.krate(krate).name.to_string()
 }
 
 #[test]

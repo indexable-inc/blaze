@@ -998,6 +998,8 @@ fn record_words<'f>(error: &SourceError<'_>, readers: &[Reader<'_>], packs: &[Pa
 struct Checker<'n> {
     records: &'n Records<'n>,
     load: &'n StoreLoad<'n>,
+    /// The body host records checkout data reads here as it expands includes.
+    texts: &'n crate::job_texts::JobTexts<'n>,
     /// The owner's front end, OWNED here so it is dropped with the checker when the file job
     /// ends: its impl buckets and head store are maps on the global heap, which no frame reset
     /// frees. Leaked into the job's frame (`Box::leak`, as it was until 2026-11-17), every file
@@ -1117,14 +1119,14 @@ impl<'n> FileTypes<'n> {
     }
 
     /// The types of the body at `item` of `outline` (over `text`) into `made`, its record so
-    /// far (its syntax): its findings, and its read list. `handed`: the `Signature`s its task
-    /// was handed (heads.rs `handed_reads`), each head read at its out; a head whose
-    /// `Signature` was not handed is pushed to `needs`, and the task answers those instead.
+    /// far (its syntax): its findings and reads. `caller` pairs the file's real checkout path
+    /// with its drive slot. A head or data file is read at its handed out or requested in `needs`.
     pub(crate) fn check(
         &mut self,
         outline: &blaze_file_items::Outline<'_>,
         item: &blaze_surface::Item,
         text: &str,
+        caller: (&str, Name),
         made: &mut Record<Global>,
         handed: &[(Name, ContentId)],
         needs: &mut std::vec::Vec<Want, Global>,
@@ -1213,10 +1215,22 @@ impl<'n> FileTypes<'n> {
             // every_body.rs's work list): each one's types, then (when they were checked clean)
             // its moves and borrows over the same lowered body and `Checked` record (front2/
             // borrows.rs `check_borrows`).
+            let data_start = checker.texts.data.borrow().len();
             let reached = covered::each_covered(&mut checker.world, root, g, |w, body| {
                 let _checking = cx.span("body types: check a body");
                 w.check_borrows(body, g)
             });
+            // A directory module's real path can differ from the slot that lists its parts.
+            let (caller_path, caller_slot) = caller;
+            for (path, from) in checker.texts.data.borrow_mut().drain(data_start..) {
+                let name = Name::file(path.as_bytes());
+                if let Ok(at) = handed.binary_search_by_key(&name, |(read, _)| *read) {
+                    made.reads.push(handed[at]);
+                } else if !needs.iter().any(|want| want.name == name) {
+                    let home = if from == caller_path { caller_slot } else { Name::file(from.as_bytes()) };
+                    needs.push(Want { name, home });
+                }
+            }
             let new_error = checker.records.errors().get(errors).map(|error| {
                 let asked = checker.load.unserved();
                 let asked = asked.get(unserved..).unwrap_or(&[]);
@@ -1548,5 +1562,5 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
         let said = record_words(error, owner.readers, job.packs, frame, g);
         return Err(words(format_args!("the records did not answer: {said}")));
     }
-    Ok(Some(Checker { records, load, world, by_chain, file, mine, root_file: owner.root_file, readers: owner.readers, packs: job.packs, heads: heads::Heads::default(), written: None, cfg, heap: g }))
+    Ok(Some(Checker { records, load, texts: opened.sources.0, world, by_chain, file, mine, root_file: owner.root_file, readers: owner.readers, packs: job.packs, heads: heads::Heads::default(), written: None, cfg, heap: g }))
 }

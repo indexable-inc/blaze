@@ -82,8 +82,8 @@ mod hub_call_tests;
 
 pub use sig::{
     AliasScope, AssocWhy, BodyOut, BodyState, CallableRefusal, ImplText, ImplTrait, ImplTraitWhy, PathIs, PathWhy, Region, SigBuf, SigLife, SigRefusal, SigWorld,
-    TextBound, impl_header_end, read_async_signature, read_async_signature_with, read_callable_param, read_callable_param_with, read_impl_signature,
-    read_impl_signature_with, read_impl_trait, read_signature, read_signature_with,
+    TextBound, impl_header_end, read_async_signature, read_async_signature_with, read_callable_param, read_callable_param_with, read_callable_value_with,
+    read_impl_signature, read_impl_signature_with, read_impl_trait, read_signature, read_signature_with,
 };
 /// `Self::Name` read through the impl's own text (piece sig-assoc-projection).
 #[cfg(test)]
@@ -182,6 +182,10 @@ pub enum FieldRegion {
     /// list, as [`Facts::field_param`] counts it), in that argument's own order: a field
     /// declared as the parameter `T`, or `T` standing anywhere in it.
     Arg(u32),
+    /// One position: a lifetime bound by a fn-pointer type of the field's written type
+    /// (`f: fn(&u8)`, sig.rs `Region::Bound`, numbered within the field), no region of the
+    /// value's: an existential origin of the field's place, one per number (lane B15).
+    Bound(u32),
 }
 
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
@@ -228,6 +232,15 @@ pub trait Facts {
     /// whose arguments or result carry a lifetime is refused ([`Form::CalleeValueUnknown`]).
     fn own_text(&self) -> Option<&str> {
         None
+    }
+    /// Whether the regions a fn-pointer type's binder binds ([`Region::Bound`], sig.rs
+    /// `MOST_BINDERS`) are read as bound: the body's own an existential origin each, a call
+    /// through a fn-pointer parameter instantiating them afresh. `false` is the control of
+    /// lane B15 (rule 23, front2 `FactsPlant::FnBindersFree`): every one read as FREE, a
+    /// placeholder of the body's like a named lifetime, taken at a call from the parameter's
+    /// own position, as a reading that knew no binder would.
+    fn fn_binders(&self) -> bool {
+        true
     }
     /// Whether the caller checks each closure's BODY on its own (its captures as inputs of
     /// their modes). The lowering makes a closure expression the borrows and moves of its
@@ -966,7 +979,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     // ---- type facts, each a bounded work list ----
 
     /// The number of origin positions of `t`: one per reference, one per lifetime parameter of an ADT, one
-    /// per opaque, alias or trait object; in pre-order, a node's own before its children's.
+    /// per opaque, alias or trait object; in pre-order, a node's own before its children's. A fn
+    /// pointer's are its inputs' then its output's, as a tuple's: the layout is a function of the
+    /// erased type (rule 21), and which of them the pointer's binder binds is a region of the
+    /// lifetime part that wrote the type (sig.rs `Region::Bound`, `MOST_BINDERS`: the erased
+    /// table cannot hold it).
     fn npos(&self, t: PTy, e: ExprId) -> Result<u32, Refusal> {
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
         stack.push(t);
@@ -984,7 +1001,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(k, l) => {
                     n += self.adt_facts(k, e)?.lifetimes;
                     stack.extend_from_slice(self.list(l, e)?);
@@ -1060,7 +1077,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             match self.node(t, e)? {
                 PNode::Opaque(_, _) => {}
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(k, l) => {
                     if self.adt_facts(k, e)?.lifetimes > 0 {
                         return Ok(false);
@@ -1452,6 +1469,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         let want = self.npos_d(field_ty, e)?;
         let start = self.origs.len() as u32;
+        let mut bound: Vec<(u32, Origin), A> = Vec::new_in(self.alloc.clone());
         for &r in regions {
             if self.origs.len() as u32 - start > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
@@ -1471,6 +1489,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         let o = self.origs[(of.start + off + j) as usize];
                         self.origs.push(o);
                     }
+                }
+                // A fn pointer's bound lifetime: any instance of its binder (as the body's own
+                // in `universal`), one origin per binder variable of this field.
+                FieldRegion::Bound(v) => {
+                    let o = match bound.iter().find(|(x, _)| *x == v) {
+                        Some(&(_, o)) => o,
+                        None => {
+                            let o = self.b.origin(false);
+                            bound.push((v, o));
+                            o
+                        }
+                    };
+                    self.origs.push(o);
                 }
                 FieldRegion::Lifetime(_) | FieldRegion::Arg(_) => return self.refuse(unaligned, e),
             }
@@ -1859,9 +1890,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         if let Some(&(_, o)) = self.uni.iter().find(|(x, _)| *x == r) {
             return o;
         }
+        // A lifetime a fn-pointer type of the signature binds (sig.rs `Region::Bound`): no
+        // region of the fn, so no placeholder. The body may use such a parameter at any
+        // instance of its binder (`for<'r> fn(&'r u8)` is a subtype of `fn(&'a u8)`: the
+        // Reference, "Subtyping and Variance", higher-ranked fn pointers), which an existential
+        // origin says: it takes whatever region its uses ask, one per binder variable. Under the
+        // control (`Facts::fn_binders` false) it is a placeholder like a named lifetime.
+        if matches!(r, Region::Bound(_)) && self.facts.fn_binders() {
+            let o = self.b.origin(false);
+            self.uni.push((r, o));
+            return o;
+        }
         let o = self.b.origin(true);
         if r == Region::Static {
             for i in 0..self.uni.len() {
+                // An existential of a bound lifetime is not a placeholder: `'static` is known
+                // to outlive the placeholders only.
+                if matches!(self.uni[i].0, Region::Bound(_)) && self.facts.fn_binders() {
+                    continue;
+                }
                 let x = self.uni[i].1;
                 self.b.known(o, x);
             }
@@ -2023,6 +2070,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// `tie`: the callee and its type arguments, whose trait lifetimes are tied to the caller's
     /// regions (trait_ties.rs); `None` for a value callee.
     fn call_by_signature(&mut self, life: SigLife<'_>, tie: Option<(ItemKey, List)>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        self.call_by_signature_seeded(life, tie, &[], vs, dest, dest_ty, e)
+    }
+
+    /// [`Self::call_by_signature`] with some of the callee's regions already the caller's
+    /// origins (`seed`): a call through a fn-pointer parameter, whose free regions are that
+    /// parameter's own positions (`call_through_value`); every other region is fresh, as there.
+    #[expect(clippy::too_many_arguments, reason = "call_by_signature's inputs and the seed")]
+    fn call_by_signature_seeded(&mut self, life: SigLife<'_>, tie: Option<(ItemKey, List)>, seed: &[(Region, Origin)], vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         if life.ends.len() != vs.len() || life.regions.iter().any(|r| matches!(r, Region::Hidden(_))) {
             return Ok(false);
         }
@@ -2046,6 +2101,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         let out_at = lo;
         let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        inst.extend_from_slice(seed);
         if let Some((item, g)) = tie {
             let args: &'c [PTy] = self.list(g, e)?;
             let mut impl_ties = trait_ties::ImplTies::new_in(self.alloc.clone());
@@ -3637,11 +3693,37 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             inputs.push(v.ty.ty);
         }
         let adt_lifetimes = |k: ItemKey| facts.adt(k).map(|f| f.lifetimes);
+        let world = sig::NoAliases(&adt_lifetimes);
         let mut buf: SigBuf<A> = SigBuf::new_in(self.alloc.clone());
-        if read_callable_param(text, self.tys, param as u32, &inputs, dest_ty.ty, &adt_lifetimes, &mut buf, self.alloc.clone()).is_err() {
+        // The parameter's own place: its positions hold the regions its written type reads as
+        // (`signature` laid them from the same reading), so a FREE lifetime of the callable
+        // (`f: fn() -> &'a u8`: the fn's `'a`) is the origin at the position that holds it
+        // (lane B15: the Reference, "Function pointer types" and "Subtyping and Variance", the
+        // call relates the pointer's free regions; its bound ones are fresh per call).
+        let own = Local(1 + param as u32);
+        let Some(&own_ty) = self.local_ty.get(own.0 as usize) else { return self.refuse(Form::Malformed, e) };
+        let mut held: Vec<Region, A> = Vec::new_in(self.alloc.clone());
+        if own_ty.wrap.is_some()
+            || read_callable_value_with(text, self.tys, param as u32, own_ty.ty, &inputs, dest_ty.ty, &world, &mut buf, &mut held, self.alloc.clone()).is_err()
+        {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
-        if !self.call_by_signature(buf.life(), None, args, dest, dest_ty, e)? {
+        let pi = self.info(self.place_of(own));
+        if !pi.exact || pi.len as usize != held.len() {
+            return self.refuse(Form::CalleeValueUnknown, e);
+        }
+        // Each free region of the parameter's type, at its first position. Under the control
+        // (`Facts::fn_binders` false) a bound one is taken as free too: one region for every
+        // call, the parameter's own.
+        let binders = facts.fn_binders();
+        let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        for (j, &r) in held.iter().enumerate() {
+            let free = matches!(r, Region::Named(_)) || (!binders && matches!(r, Region::Bound(_)));
+            if free && !seed.iter().any(|(x, _)| *x == r) {
+                seed.push((r, self.origs[(pi.start + j as u32) as usize]));
+            }
+        }
+        if !self.call_by_signature_seeded(buf.life(), None, &seed, args, dest, dest_ty, e)? {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
         self.stats.calls_by_signature += 1;

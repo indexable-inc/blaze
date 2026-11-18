@@ -9,10 +9,14 @@
 pub mod cost;
 #[cfg(test)]
 mod failed_once_tests;
+#[cfg(test)]
+mod fn_text_tests;
 pub mod goals;
 pub mod head;
 #[cfg(test)]
 mod head_tests;
+#[cfg(test)]
+mod local_fns_tests;
 pub mod owned_reads;
 #[cfg(test)]
 mod owned_reads_tests;

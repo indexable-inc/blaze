@@ -49,6 +49,7 @@ fn table<'r>(short: &'r [u8], long: &'r [u8], refused: &'r str) -> Vec<Verdict<'
         NotKept::Unsandboxed,
         NotKept::Descriptor,
         NotKept::Threads,
+        NotKept::Untraced,
     ] {
         out.push(Verdict::Pass(pass(2, Err(why))));
     }
@@ -132,8 +133,9 @@ fn every_cut_of_a_record_is_refused() {
     bad[8] = 2;
     assert_eq!(open(&bad), Err(ResultError::Tag { at: 8, byte: 2 }));
     let mut bad = pass.as_slice().to_vec();
-    bad[56] = 8;
-    assert_eq!(open(&bad), Err(ResultError::Tag { at: 56, byte: 8 }));
+    // 9: one past the last reason (`NotKept::Untraced` is 8).
+    bad[56] = 9;
+    assert_eq!(open(&bad), Err(ResultError::Tag { at: 56, byte: 9 }));
     // A signal number on a panic is a field its ending does not use.
     let panic = failed(3, Ended::DidNotPanic, Captured::NONE).encode(Alloc::global()).expect("a failure encodes");
     let mut bad = panic.as_slice().to_vec();

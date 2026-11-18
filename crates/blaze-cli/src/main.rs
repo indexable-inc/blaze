@@ -88,6 +88,7 @@ mod journal_sweep;
 mod graph;
 mod graph_payload;
 mod test_args;
+mod test_drive;
 mod test_loop;
 mod test_run;
 mod toolchain;
@@ -230,6 +231,14 @@ pub enum CliError {
     /// `blaze run`'s names rows (run_names.rs): the program's crates, or their record at the
     /// certificate, could not be had.
     RunNames(run_names::RunNamesError),
+    /// `blaze test`'s suite stopped in blaze, not in a test (test_drive.rs): its setup, a
+    /// test's start, the loop or the output.
+    Test(test_drive::DriveError),
+    /// `blaze test`'s words after `--` were refused (test_args.rs): the refusal, which borrows
+    /// the words, was printed on the error stream the line above (main.rs's `StartTests` arm).
+    TestArgs,
+    /// `blaze test`'s words asked for a pool its plan cannot be (blaze-run zygote.rs).
+    TestPool(blaze_run::zygote::PoolError),
     /// The request stood on its certificate and the store holds no record of its program's names
     /// rows (run_names.rs): the command drops it before the program starts and asks again in
     /// full, once (`command`'s `ask`). `again`: it was already asked in full, which walks and
@@ -290,6 +299,9 @@ impl fmt::Display for CliError {
             CliError::Draw(error) => write!(f, "{error}"),
             CliError::Lints(error) => write!(f, "{error}"),
             CliError::RunNames(error) => write!(f, "{error}"),
+            CliError::Test(error) => write!(f, "{error}"),
+            CliError::TestArgs => write!(f, "`blaze test`'s words after `--` were refused (the line above, test_args.rs)"),
+            CliError::TestPool(error) => write!(f, "`blaze test`'s pool: {error}"),
             CliError::RunLine(error) => write!(f, "{error}"),
             CliError::ExtrasOwnerNotPut { owner, key } => write!(
                 f,
@@ -721,10 +733,11 @@ fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Show
     let (ran_stages, not_stages) = check_coverage(finished.names_held, shown.types_unchecked == 0, shown.borrows_unchecked == 0, frame);
     let coverage = (command == Command::Check && !not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     // How many items `check` could not check: also `run`'s when its program did not start, as
-    // its gate refuses a start over one (`Gate::Before`); 0 for `test`, and for a program that ran.
+    // its gate refuses a start over one (`Gate::Before`); 0 for `test`, and for a program or a
+    // suite that ran (its own lines are the command's last).
     let mut unchecked = 0u32;
     if ran.is_none() {
-        let tail = (command == Command::Test).then_some("tests are not run yet: this build of blaze checks them");
+        let tail = None;
         // The items `check` could not check: their lines, one a cause, were drawn with the
         // other notes (main.rs `draw`), before the findings; here only their count.
         if matches!(command, Command::Check | Command::Run) {
@@ -774,7 +787,9 @@ fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Show
         Command::Run if ran.is_none() && unchecked > 0 => Ok(Status(program::NOT_RUN)),
         // The program ran at the machine's `StartProgram`: its status is the command's.
         Command::Run => ran.map(Status).ok_or(CliError::Drive(DriveError::Finished)),
-        Command::Test => Ok(Status::FAILED),
+        // The suite ran at the machine's `StartTests`: 0 when every test passed and none was
+        // left unrun (test_loop.rs `Status::passed`), else `FAILED`.
+        Command::Test => ran.map(Status).ok_or(CliError::Drive(DriveError::Finished)),
     }
 }
 
@@ -1275,7 +1290,7 @@ fn request<'f>(
         };
         let at = phases.now();
         if answered.is_some()
-            && matches!(effect, Effect::Get { .. } | Effect::Run { .. } | Effect::Open { .. } | Effect::StartProgram { .. })
+            && matches!(effect, Effect::Get { .. } | Effect::Run { .. } | Effect::Open { .. } | Effect::StartProgram { .. } | Effect::StartTests)
         {
             continue;
         }
@@ -1286,6 +1301,7 @@ fn request<'f>(
             Effect::Publish(_) | Effect::Unpublish(_) => "effect publish (the settled table)",
             Effect::Open { .. } => "effect open (queued)",
             Effect::StartProgram { .. } => "effect start program",
+            Effect::StartTests => "effect start tests",
             Effect::Stop { .. } => "effect stop",
             Effect::Print(_) => "effect print",
             Effect::WriteLast { .. } => "effect write last",
@@ -1365,7 +1381,7 @@ fn request<'f>(
                 store.commit_puts()?;
                 let mut read = engine_records::EngineRecords::new();
                 let seen = body_types::TreesSeen::default();
-                let Some(found) = run_names::found(&cx, &req, picked.root, &mut store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)? else {
+                let Some(found) = run_names::found(&cx, &req, run_names::Owner::Root(picked.root), &mut store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)? else {
                     return Err(CliError::AnswerInFull { again: in_full });
                 };
                 // The body ids (run_ids.rs), also decided before the start: a walk builds them
@@ -1396,7 +1412,7 @@ fn request<'f>(
                 let (fetch_env, procs) = (&facts.fetch_env, facts.names.as_ref().and_then(|names| names.procs()));
                 let (bodies, codes, reads, seen) = (&mut facts.bodies, &mut store, &mut read, &seen);
                 let mut names = || {
-                    run_names::names_of(&cx, root, &found, picked.root, &mut *codes, &mut *bodies, &mut *reads, fetch_env, procs, seen, frame, heap)
+                    run_names::names_of(&cx, root, &found, run_names::Owner::Root(picked.root), &mut *codes, &mut *bodies, &mut *reads, fetch_env, procs, seen, frame, heap)
                         .map_err(|error| run_parent::ParentError::Names { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
                 };
                 let mut ids = || made.take().ok_or_else(|| run_parent::ParentError::BodyIds { shown: Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
@@ -1420,6 +1436,108 @@ fn request<'f>(
                     Err(CliError::Program(error)) => return Err(CliError::Ran { command: word, error }),
                     Err(error) => return Err(error),
                 };
+                let stepped = phases.now();
+                phases.took(kind, frame);
+                req.step(Event::Exited { ok }, &mut effects)?;
+                phases.took(STEP, frame);
+                phases.request.steps += phases.since(stepped);
+            }
+            // `test` after its clean check (request.rs `tests_verdict`): each test of the answer's
+            // test unit in a process of its own under the lazy parent, as `StartProgram` starts
+            // a program (test_drive.rs). The suite's lines are on standard output as they come;
+            // its status is the command's (`close`).
+            Effect::StartTests => {
+                started = phases.since(began);
+                // `blaze test`'s words after `--` (test_args.rs): refused by name before any
+                // test starts.
+                // The refusal borrows the words, so it is printed here and the error names it.
+                let args = match test_args::parse(launch.args, alloc) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        err.line(&cx, format_args!("blaze test: {error}")).map_err(CliError::Out)?;
+                        return Err(CliError::TestArgs);
+                    }
+                };
+                // The pool is as wide as the machine's cores, as the request's workers are.
+                let plan = args.config(workers).map_err(CliError::TestPool)?;
+                // The failure's rule is the terminal's width, 80 when not a terminal (report.rs
+                // `Style::width`: 4 to 120).
+                let width = out.size().map_or(80, |size| size.cols.clamp(4, 120));
+                let style = match args.format {
+                    blaze_run::report::Format::Text => blaze_run::report::Style::text(width, out.is_terminal()),
+                    blaze_run::report::Format::Json => blaze_run::report::Style::json(),
+                };
+                let config = test_loop::LoopConfig { plan, style, list: args.list, run: blaze_run::CheckoutKey(req.certificate().0.0), suites: 1 };
+                watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
+                // The unit's records read in place, as `StartProgram`'s (committed first).
+                store.commit_puts()?;
+                let mut read = engine_records::EngineRecords::new();
+                let seen = body_types::TreesSeen::default();
+                let Some((found, unit)) = test_drive::found_tests(&cx, &req, &mut store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)? else {
+                    return Err(CliError::AnswerInFull { again: in_full });
+                };
+                let ids_refused = |error: run_ids::RunIdsError<'static>| {
+                    CliError::OwnProcess(own_process::OwnError::Parent(run_parent::ParentError::BodyIds { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) }))
+                };
+                watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
+                let ids = match found.list() {
+                    Some(list) => {
+                        let previous = match last.map(blaze_drive::answers::read_last).transpose().map_err(|error| CliError::Drive(DriveError::LastFile(error)))? {
+                            Some(l) => run_ids::RunIds::from_record(&cx, &mut store, l.cert, toolchain, &tools, alloc).map_err(ids_refused)?,
+                            None => None,
+                        };
+                        run_ids::for_run(&cx, &req, toolchain, list, &tools, previous.as_ref(), &mut store, alloc).map_err(ids_refused)?
+                    }
+                    None => match run_ids::on_hit(&cx, &req, toolchain, &tools, &mut store, alloc).map_err(ids_refused)? {
+                        run_ids::OnHit::Ids(ids) => ids,
+                        run_ids::OnHit::AnswerInFull => return Err(CliError::AnswerInFull { again: in_full }),
+                    },
+                };
+                // The names records, made the one way `run`'s are (run_names.rs): the suite reads
+                // a test's roots and each first call from them.
+                let names = run_names::names_of(
+                    &cx,
+                    root,
+                    &found,
+                    run_names::Owner::At(unit.at),
+                    &mut store,
+                    &mut facts.bodies,
+                    &mut read,
+                    &facts.fetch_env,
+                    facts.names.as_ref().and_then(|names| names.procs()),
+                    &seen,
+                    frame,
+                    heap,
+                )
+                .map_err(CliError::RunNames)?;
+                // What the code is built for: the unit's edition, the `dev` profile's overflow
+                // checks and panic strategy, the code builder (D105), this machine.
+                let overflow = program::dev_overflow(&cx, root, frame)?;
+                let panic = program::dev_panic(&cx, root, frame)?;
+                let parent = |why| CliError::OwnProcess(own_process::OwnError::Parent(why));
+                let isa = run_parent::isa().map_err(parent)?;
+                let builder = run_parent::builder_for(unit.edition.name(), overflow, panic, producers.get::<blaze_ids::producer::CodeBuilder>(), isa).map_err(parent)?;
+                let suite = test_drive::Suite {
+                    io: launch.io,
+                    names,
+                    ids: &ids,
+                    builder,
+                    lent,
+                    tests: unit.tests,
+                    config,
+                    // `StartTests` comes only after a check with no error (request.rs
+                    // `tests_verdict`): the loop is told so, and would run nothing over one.
+                    check_errors: 0,
+                    tables: heap.alloc(),
+                    watch,
+                };
+                let status = test_drive::run_suite(&cx, suite, frame).map_err(CliError::Test)?;
+                phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen));
+                if let Some(why) = seen.refused() {
+                    return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
+                }
+                let ok = status.passed();
+                *ran = Some(if ok { Status::OK.0 } else { Status::FAILED.0 });
                 let stepped = phases.now();
                 phases.took(kind, frame);
                 req.step(Event::Exited { ok }, &mut effects)?;
@@ -1691,9 +1809,12 @@ fn draw<'f>(
     // as kinds are built. For `run` it is also what a refusal's program was run in, and only
     // then: a `run` that reports nothing says nothing, its program's output the whole output.
     let reported = !prints.is_empty() || program.is_some() || !failed.is_empty() || !notices.is_empty();
+    // (`test` as `run`: its tests' report is the command's output, printed by the test driver;
+    // first real run, 2026-11-18: a passing suite printed this note after its summary, saying
+    // this build "does not .. run tests .. yet".)
     let said = match command {
-        Command::Run => reported,
-        Command::Check | Command::Test => true,
+        Command::Run | Command::Test => reported,
+        Command::Check => true,
     };
     if let Some(words) = left_out_note(command, frame)?.filter(|_| said) {
         print::note(cx, words.as_str(), shown, frame, out)?;
@@ -1968,6 +2089,7 @@ mod tests {
     mod names_records_tests;
     mod engine_check_tests;
     mod engine_body_memory_tests;
+    mod engine_body_reads_memory_tests;
     mod engine_body_coverage_tests;
     mod engine_script_reads_tests;
     mod engine_script_reads_e2e_tests;

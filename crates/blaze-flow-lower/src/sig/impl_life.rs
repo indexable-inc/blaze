@@ -330,6 +330,8 @@ fn impl_life_with<'t, A: Allocator + Clone>(
         holes: Vec::new_in(alloc.clone()),
         found: Vec::new_in(alloc.clone()),
         depth: 0,
+        binders: Vec::new_in(alloc.clone()),
+        bound: 0,
     };
     lex(imp.text, &mut r.toks).map_err(|_| AssocWhy::Header)?;
     let cut = header_cut(&r.toks);
@@ -777,6 +779,10 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             holes: Vec::new_in(self.alloc.clone()),
             found: Vec::new_in(self.alloc.clone()),
             depth: self.depth,
+            // The member's text is its own scope: no binder of the user's reaches into it; its
+            // bound lifetimes number on from the user's (taken back below).
+            binders: Vec::new_in(self.alloc.clone()),
+            bound: self.bound,
         };
         lex(text, &mut sub.toks).map_err(|_| refuse(AssocWhy::Form))?;
         sub.pair_brackets().map_err(|_| refuse(AssocWhy::Form))?;
@@ -802,6 +808,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             self.unwritten.push(p.base + k);
         }
         self.hidden += sub.hidden;
+        self.bound = sub.bound;
         Ok(true)
     }
 

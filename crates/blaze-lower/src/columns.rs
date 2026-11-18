@@ -12,7 +12,7 @@ use blaze_surface::Range;
 use crate::form::*;
 
 /// The number of `u32` words in a [`Head`].
-pub const HEAD_WORDS: usize = 32;
+pub const HEAD_WORDS: usize = head::FN_TEXT_PREFIX + 1;
 
 /// What a lowering is about, beyond its columns: the root of a body, or the parts of a
 /// signature. Words by [`Head`]'s constants; lists are (start, len) pairs.
@@ -64,6 +64,23 @@ pub mod head {
     /// The length of the item's text the record was lowered from: a view is made only with
     /// a text of this length ([`super::open`]).
     pub const ITEM_LEN: usize = 30;
+    /// Item-relative offset of a fn body's opening brace. Absent for declarations.
+    pub const FN_TEXT_PREFIX: usize = 31;
+
+    /// Whether a fn's signature can require its body to determine a head. A type macro can
+    /// expand to `impl Trait`. An async fn returns an opaque future, and a const fn can be
+    /// called in a type. The planner and signature lowering use the same conservative rule.
+    pub fn signature_needs_fn_body(signature: &str, name_start: Option<u32>, edition: blaze_surface::Edition) -> bool {
+        use parser::SyntaxKind::{ASYNC_KW, BANG, CONST_KW, IMPL_KW, L_BRACK, L_CURLY, L_PAREN};
+
+        let tokens = parser::LexedStr::new(crate::parser_edition(edition), signature);
+        (0..tokens.len()).any(|i| match tokens.kind(i) {
+            IMPL_KW => true,
+            ASYNC_KW | CONST_KW => name_start.is_none_or(|start| tokens.text_start(i) < start as usize),
+            BANG => matches!((i + 1..tokens.len()).map(|n| tokens.kind(n)).find(|k| !k.is_trivia()), Some(L_PAREN | L_BRACK | L_CURLY)),
+            _ => false,
+        })
+    }
 }
 
 blaze_format_core::record! {
@@ -71,8 +88,9 @@ blaze_format_core::record! {
     /// Format 2: a block scope's row holds its `{` offset (`d`) and the expansion that wrote
     /// it (`e`, NONE for the item's own text) ([`crate::scope_origin`]).
     /// Format 3: the marks of the expansions' words (`mark_starts`, `mark_bytes`).
+    /// Format 4 assigns the reserved last head word to the fn text prefix.
     #[derive(Clone, Copy, Debug)]
-    pub struct LoweredRoot: 3 {
+    pub struct LoweredRoot: 4 {
         pub langs: u64,
         pub exprs: Slice<Node>,
         pub expr_ranges: Slice<Range>,
@@ -112,6 +130,9 @@ blaze_format_core::record! {
         pub mark_starts: Slice<u32>,
         /// ... and its mark, `origin_column::MARK` bytes a row (`TextMark::to_bytes`).
         pub mark_bytes: Slice<u8>,
+        // Written as the array itself: the record's compile-time field check (blaze-format-core
+        // declared.rs) refuses the alias `Head` here ("a field type that is not its struct's
+        // field's", first compile of lane CX17).
         pub head: [u32; 32],
     }
 }
@@ -510,6 +531,19 @@ impl<'b> View<'b> {
     /// The item's text the record was lowered from.
     pub fn item(&self) -> &'b str {
         self.item
+    }
+
+    /// The prefix checked by a frozen fn head, combining the parser's body boundary with
+    /// the outline's knowledge of items declared inside that body.
+    pub fn fn_text_prefix(&self, detail: blaze_surface::ItemDetail) -> Result<Option<u32>, TextAt> {
+        let (blaze_surface::ItemDetail::Fn { body_holds_items: false }, Some(end)) = (detail, self.head_opt(head::FN_TEXT_PREFIX)) else {
+            return Ok(None);
+        };
+        let edition = u8::try_from(self.head[head::EDITION]).ok().and_then(blaze_surface::Edition::from_byte)
+            .ok_or(BadRow { column: "a fn head's edition", tag: 0 })?;
+        let name_start = self.head_opt(head::NAME).map(|n| self.name_range(NameIdx(n))).transpose()?.map(|name| name.start);
+        let signature = self.text_at(self.range(Range::new(0, end)))?;
+        Ok((!head::signature_needs_fn_body(signature, name_start, edition)).then_some(end))
     }
 
     pub(crate) fn lens(&self) -> Lens {

@@ -39,7 +39,7 @@ use core::fmt;
 use blaze_drive::cells::Cell;
 use blaze_drive::key::ABSENT;
 use blaze_drive::{Kind, Locate, Name};
-use blaze_engine::{CellId, SVec, View};
+use blaze_engine::{CellId, View};
 use blaze_ids::ContentId;
 use blaze_own::Vec;
 use blaze_scope::names_cells::{NameCell, Section};
@@ -285,7 +285,7 @@ pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc
 
 /// `cells` added to a checked body's reads (each with the digest the view holds), sorted, each
 /// once: the units ranked before the one that checked it, which a fresh run would ask first.
-pub(crate) fn add_reads<'a>(reads: &mut SVec<'a, (CellId, ContentId)>, cells: &[CellId], view: View<'_, 'a>) {
+pub(crate) fn add_reads<A: core::alloc::Allocator>(reads: &mut Vec<(CellId, ContentId), A>, cells: &[CellId], view: View<'_, '_>) {
     if cells.is_empty() {
         return;
     }

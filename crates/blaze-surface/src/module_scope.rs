@@ -116,6 +116,7 @@ pub enum Unresolved {
     /// attributes before it), so it would run twice. Refused by name instead (attr-bang-kind-2,
     /// rule 3): move the `#[derive]` before the attribute macro, or into its output. The error's
     /// path is the attribute macro's, its place the item's.
+    /// Only the `AttrOrder::DerivesAtOnce` control reaches this refusal.
     DeriveAfterAttrMacro,
 }
 

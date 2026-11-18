@@ -464,6 +464,7 @@ const fn reason_byte(why: NotKept) -> u8 {
         NotKept::Unsandboxed => 4,
         NotKept::Descriptor => 5,
         NotKept::Threads => 6,
+        NotKept::Untraced => 7,
     }
 }
 
@@ -476,6 +477,7 @@ const fn reason_of(byte: u8) -> Option<NotKept> {
         4 => Some(NotKept::Unsandboxed),
         5 => Some(NotKept::Descriptor),
         6 => Some(NotKept::Threads),
+        7 => Some(NotKept::Untraced),
         _ => None,
     }
 }

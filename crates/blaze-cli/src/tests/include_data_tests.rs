@@ -1,5 +1,5 @@
-//! A file read as data by `include_str!` / `include_bytes!` (data_include.rs): a read of the
-//! crate's names record, its bytes' digest in the read list, never a module's `Surface`.
+//! A file read by `include_str!` or `include_bytes!` contributes its bytes' digest to the
+//! read lists of the crate's names and the body containing the call.
 //! tempo's first stop (2026-11-16 19:03): "the names of package `tempo-node` read
 //! `crates/node/tests/assets/test-genesis.json`, which no manifest's targets and no file's
 //! `mod` lines list". A child of main.rs's tests: its helpers are theirs.
@@ -41,6 +41,13 @@ fn package() -> Io {
     io
 }
 
+fn assert_includes_checked(io: &Io, checked: &Checked) {
+    assert!(checked.failed.is_empty(), "{:?}\n{}", checked.failed, checked.profile);
+    // A refused body is reported at exit 4 even when every task answered. The check may
+    // still report the command-wide coverage limit (exit 3).
+    assert!(matches!(checked.status, Some(0 | 3)), "status {:?}\n{}\n{}", checked.status, stdout(io), checked.profile);
+}
+
 /// (1) An `include_str!` of a non-Rust file under `tests/assets` and an `include_bytes!` of a
 /// binary file check: the request answers (no `Unlisted` stop), no task fails, and each data
 /// file is outlined as data: three `FileItems` records (`src/lib.rs` and the two data files).
@@ -48,7 +55,11 @@ fn package() -> Io {
 /// as tempo's did: "the names of package `wide` read `tests/assets/test-genesis.json`, which
 /// no manifest's targets and no file's `mod` lines list".
 ///
-/// Prints `data includes: FileItems made 3, CrateScope made 1`.
+/// The cold check includes core, alloc and std (blaze-world list.rs), the library and its
+/// test unit (drive.md, “a library's test unit (`TestLib`) is a second `CrateScope`”).
+/// Only the Rust file has a surface. Its one function has one body record across both owners.
+///
+/// Prints `data includes: FileItems made 3, CrateScope made 5`.
 #[test]
 fn a_data_include_is_a_read_of_the_names_never_a_module() {
     let io = package();
@@ -56,9 +67,10 @@ fn a_data_include_is_a_read_of_the_names_never_a_module() {
         Ok(whole) => whole,
         Err(error) => panic!("the request stops: {error}"),
     };
-    assert!(whole.failed.is_empty(), "{:?}\n{}", whole.failed, whole.profile);
+    assert_includes_checked(&io, &whole);
     let (items, scopes) = (made(&whole.profile, "FileItems"), made(&whole.profile, "CrateScope"));
-    assert_eq!((items, scopes), (3, 1), "{}\n{}", stdout(&io), whole.profile);
+    assert_eq!((items, scopes, made(&whole.profile, "Surface")), (3, 5, 1), "{}\n{}", stdout(&io), whole.profile);
+    assert_eq!(made(&whole.profile, "BodyCheck"), 1, "both includes belong to f:\n{}", whole.profile);
     println!("data includes: FileItems made {items}, CrateScope made {scopes}");
 }
 
@@ -73,13 +85,12 @@ fn a_data_include_is_a_read_of_the_names_never_a_module() {
 
 /// (3) A changed data file moves exactly the records that read it. Two members: `a` includes
 /// `a/assets/g.json`, `b` reads no data. After the first check, the JSON alone is edited: the
-/// second check makes one `FileItems` (the JSON's, its out its bytes' id) and one `CrateScope`
-/// (`a`'s: its read list held the old digest); `b`'s names stand. A third check with nothing
-/// changed makes none. Without the data file in `a`'s read list the second check makes no
-/// `CrateScope` (`a`'s names stand on an old file: rule 21); with every names record asked
-/// again it makes two.
+/// second check makes one `FileItems` (the JSON's, its out its bytes' id) and two `CrateScope`
+/// records. Both the library and its test unit in `a` read the old digest. The two scopes of
+/// `b` and the three toolchain scopes stand. Only the body containing the include reads the
+/// JSON. A third check with nothing changed reuses that body's answer as well.
 ///
-/// Prints `json edited: FileItems made 1, CrateScope made 1`.
+/// Prints `json edited: FileItems made 1, CrateScope made 2`.
 #[test]
 fn a_changed_data_file_moves_exactly_its_readers() {
     let io = Io::simulated(SimWorld::new(42, Limits::USUAL));
@@ -89,19 +100,29 @@ fn a_changed_data_file_moves_exactly_its_readers() {
     write(
         &io,
         "a/src/lib.rs",
-        "#![no_core]\n#[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\npub fn f() {\n    include_str!(\"../assets/g.json\");\n}\n",
+        "#![no_core]\n#[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\npub fn f() {\n    include_str!(\"../assets/g.json\");\n}\npub fn unrelated() {}\n",
     );
     write(&io, "a/assets/g.json", "{\"n\": 1}\n");
     write(&io, "b/src/lib.rs", "#![no_core]\npub fn h() {}\n");
     let first = check(&io, work::Sizes::USUAL);
-    assert!(first.failed.is_empty(), "{:?}\n{}", first.failed, first.profile);
-    assert_eq!(made(&first.profile, "CrateScope"), 2, "{}", first.profile);
+    assert_includes_checked(&io, &first);
+    assert_eq!(
+        (made(&first.profile, "FileItems"), made(&first.profile, "CrateScope")),
+        (3, 7),
+        "two libraries and one JSON file, four member units and three toolchain crates:\n{}",
+        first.profile,
+    );
+    assert_eq!((made(&first.profile, "BodyCheck"), made(&first.profile, "Surface")), (3, 2), "f, unrelated and h in two Rust files:\n{}", first.profile);
     write(&io, "a/assets/g.json", "{\"n\": 2}\n");
     let edited = check(&io, work::Sizes::USUAL);
-    assert!(edited.failed.is_empty(), "{:?}\n{}", edited.failed, edited.profile);
+    assert_includes_checked(&io, &edited);
     let (items, scopes) = (made(&edited.profile, "FileItems"), made(&edited.profile, "CrateScope"));
-    assert_eq!((items, scopes), (1, 1), "only the JSON and `a`'s names, never `b`'s:\n{}", edited.profile);
+    assert_eq!((items, scopes, made(&edited.profile, "Surface")), (1, 2, 0), "only the JSON and the names of its two readers:\n{}", edited.profile);
+    assert_eq!(made(&edited.profile, "BodyCheck"), 1, "only f reads the edited JSON:\n{}", edited.profile);
     let same = check(&io, work::Sizes::USUAL);
+    assert_includes_checked(&io, &same);
     assert_eq!((made(&same.profile, "FileItems"), made(&same.profile, "CrateScope")), (0, 0), "{}", same.profile);
+    assert_eq!(made(&same.profile, "BodyCheck"), 0, "the included bytes are unchanged:\n{}", same.profile);
+    assert_eq!(made(&same.profile, "Surface"), 0, "both Rust files are unchanged:\n{}", same.profile);
     println!("json edited: FileItems made {items}, CrateScope made {scopes}");
 }

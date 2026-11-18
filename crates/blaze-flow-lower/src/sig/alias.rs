@@ -294,6 +294,10 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             holes: Vec::new_in(self.alloc.clone()),
             found: Vec::new_in(self.alloc.clone()),
             depth: self.depth + 1,
+            // The alias's text is its own scope: no binder of the user's reaches into it; its
+            // bound lifetimes number on from the user's (taken back once it is read).
+            binders: Vec::new_in(self.alloc.clone()),
+            bound: self.bound,
         };
         lex(text, &mut sub.toks).map_err(|_| refuse(PathWhy::AliasForm))?;
         sub.pair_brackets().map_err(|_| refuse(PathWhy::AliasForm))?;
@@ -381,6 +385,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             }
         }
         self.hidden += sub.hidden;
+        self.bound = sub.bound;
         // Each type parameter's first use is the path's argument lined up in this text and
         // mode; a later use of the same parameter is the same type: its regions copied.
         let mut first: Vec<(u32, u32, u32), A> = Vec::new_in(self.alloc.clone());

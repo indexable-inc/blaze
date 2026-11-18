@@ -565,14 +565,13 @@ fn unread_words<'n>(why: &str, frame: &'n bstd::mem::Frame) -> &'n str {
 }
 
 /// The reads a body names by what it found, of the inputs its task was handed (`inputs`): its
-/// heads' `Signature`s and its file's `Surface`, by name, in `jobs` (the round's frame, which
-/// outlives the body's job). What [`read_heads`] reads a head at, and work.rs
-/// `bodies_syntax` the `Surface`: each at its task's out, never one the body made.
+/// heads' `Signature`s, its file's `Surface`, and included data files' `FileItems`, by name,
+/// in `jobs` (the round's frame, which outlives the body's job). Each read uses its task's out.
 pub(crate) fn handed_reads<'j>(inputs: &[blaze_drive::Input], jobs: &'j bstd::mem::Frame) -> Result<&'j [(Name, ContentId)], &'static str> {
-    let named = |input: &&blaze_drive::Input| matches!(input.name.kind, blaze_drive::Kind::Signature | blaze_drive::Kind::Surface);
+    let named = |input: &&blaze_drive::Input| matches!(input.name.kind, blaze_drive::Kind::Signature | blaze_drive::Kind::Surface | blaze_drive::Kind::FileItems);
     let count = inputs.iter().filter(named).count();
     let mut held: blaze_own::Vec<(Name, ContentId), &'j bstd::mem::Frame> = blaze_own::Vec::new_in(jobs);
-    held.try_reserve_exact(count).map_err(|_| "the frame of one round's jobs is full: a body's handed `Signature`s are more than it holds")?;
+    held.try_reserve_exact(count).map_err(|_| "the frame of one round's jobs is full: a body's handed signatures, surfaces and files are more than it holds")?;
     held.extend(inputs.iter().filter(named).map(|input| (input.name, input.out)));
     held.sort_unstable_by_key(|(name, _)| *name);
     Ok(held.leak())

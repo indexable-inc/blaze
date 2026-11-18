@@ -17,7 +17,7 @@
 //! - `include!`/`include_str!`/`include_bytes!`: a file under the build script's `OUT_DIR` from
 //!   its record (as blaze-build-script's `ScriptCx`), else the file the calling file's folder
 //!   and the written path name (core's `include_str!`: "The file is located relative to the
-//!   current file"), read from the crate's texts and bounded by its package (D60).
+//!   current file"). Data includes read bytes under the same source root as the item host.
 //! - `cfg!`: the crate's cfg atoms (a fn-like call in a body is answered by the body's own set
 //!   first: blaze-lower's `BodyCx`).
 //! - `file!()`/`module_path!()` in eager input (`concat!(file!(), ..)`): the file's STABLE name
@@ -32,6 +32,8 @@
 //! Every answer is a function of the crate, the body's file and the question: no machine path,
 //! no ambient environment (rule 75).
 
+use core::cell::LazyCell;
+
 use blaze_expand::seen::SeenRoot;
 use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced, TokenStream};
 use blaze_id::ItemKey as LibKey;
@@ -39,7 +41,7 @@ use blaze_own::{AString, Alloc};
 use blaze_scope::resolve::{At, SourceTexts};
 
 use super::heads::CrateCfg;
-use super::source::NamesSource;
+use super::source::{FilePaths, NamesSource};
 
 fn refused(ask: HostAsk) -> HostError {
     HostError { ask, why: HostWhy::Refused }
@@ -52,6 +54,8 @@ fn refused(ask: HostAsk) -> HostError {
 pub trait BodySources {
     /// The text of the file at `path` (absolute, under the crate's package folder).
     fn read(&self, krate: usize, path: &str) -> Option<&str>;
+    /// Bytes of a data include at `path`, with the calling file for the job's read list.
+    fn read_data(&self, krate: usize, from: &str, path: &str) -> Option<&[u8]>;
     /// The variable `name` of the crate's environment: `Ok(None)` when it is unset; refused
     /// when the source has no environment for the crate or cargo sets it to a value not known.
     fn env(&self, krate: usize, name: &str) -> Result<Option<&str>, HostError>;
@@ -93,6 +97,10 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
         self.0.read(krate, path)
     }
 
+    fn read_data(&self, krate: usize, from: &str, path: &str) -> Option<&[u8]> {
+        self.0.read_data(krate, from, path)
+    }
+
     fn env(&self, krate: usize, name: &str) -> Result<Option<&str>, HostError> {
         let env = self.0.crate_env(krate).ok_or(refused(HostAsk::Env))?;
         env.get(name).map_err(|_| refused(HostAsk::Env))
@@ -127,21 +135,20 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
     }
 }
 
-/// The body's file: its path (absolute, under the package) and its package-relative path,
-/// from which `file!()`'s answer is made ([`BodySources::shown_file`]).
-#[derive(Clone, Copy)]
-struct BodyFile<'h> {
-    path: &'h str,
-    shown: &'h str,
+fn body_file<'h, S: NamesSource<'h>>(names: S, krate: usize, item: LibKey) -> Option<FilePaths<'h>> {
+    let place = names.place_of(item)?;
+    match place.at {
+        At::File(file) if place.krate == krate => names.file_paths(krate, file),
+        _ => None,
+    }
 }
 
 /// The expansion host of one body: see the module's doc.
-pub struct BodyHost<'h> {
+pub struct BodyHost<'h, F = fn() -> Option<FilePaths<'h>>> {
     sources: Option<&'h dyn BodySources>,
     krate: usize,
-    /// `None`: the body's text is in a macro's expansion, or the names are records (no file
-    /// table): its includes and `file!()` are refused by name.
-    file: Option<BodyFile<'h>>,
+    /// Only includes and file-place queries depend on the items record's file row.
+    file: LazyCell<Option<FilePaths<'h>>, F>,
     /// `file!()`'s answer, made on the first ask; `None` inside: refused.
     shown_file: core::cell::OnceCell<Option<AString<'h>>>,
     module_path: Option<&'h str>,
@@ -153,19 +160,23 @@ impl<'h> BodyHost<'h> {
     /// The host of the body of `item` (a fn, or a member's container), written in `module` of
     /// the crate at `krate`; `sources` is the run's ([`super::heads::Store::sources`]): `None`
     /// refuses every env read, include and proc macro by name.
-    pub fn of<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> BodyHost<'h> {
-        let file = match (names.solved(), names.place_of(item)) {
-            (Some(solved), Some(place)) if place.krate == krate => match place.at {
-                At::File(i) => solved.krate(krate).files.get(i as usize).map(|f| BodyFile { path: f.path, shown: f.shown }),
-                At::Expansion(_) => None,
-            },
-            _ => None,
-        };
-        BodyHost { sources, krate, file, shown_file: core::cell::OnceCell::new(), module_path: names.module_path(module), atoms: names.cfg_atoms(krate).unwrap_or(&[]), alloc }
+    pub fn of<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
+        Self::from_file_lookup(names, sources, krate, module, alloc, move || body_file(names, krate, item))
+    }
+
+    fn from_file_lookup<S: NamesSource<'h>, F: FnOnce() -> Option<FilePaths<'h>>>(
+        names: S, sources: Option<&'h dyn BodySources>, krate: usize, module: LibKey, alloc: Alloc<'h>, file: F,
+    ) -> BodyHost<'h, F> {
+        BodyHost { sources, krate, file: LazyCell::new(file), shown_file: core::cell::OnceCell::new(), module_path: names.module_path(module), atoms: names.cfg_atoms(krate).unwrap_or(&[]), alloc }
+    }
+
+    #[cfg(test)]
+    pub(super) fn planted_solved_file<S: NamesSource<'h>>(names: S, sources: &'h dyn BodySources, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
+        Self::from_file_lookup(names, Some(sources), krate, module, alloc, move || body_file(names.solved()?, krate, item))
     }
 }
 
-impl ExpandCx for BodyHost<'_> {
+impl<'h, F: FnOnce() -> Option<FilePaths<'h>>> ExpandCx for BodyHost<'h, F> {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
         self.sources.ok_or(refused(HostAsk::Env))?.env(self.krate, name)
     }
@@ -175,26 +186,31 @@ impl ExpandCx for BodyHost<'_> {
         blaze_lower::cfg_outcome(predicate, &mut CrateCfg(self.atoms), self.alloc)
     }
 
-    fn include(&self, written: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+    fn include(&self, written: &str, how: IncludeAs) -> Result<Included<'_>, HostError> {
         let sources = self.sources.ok_or(refused(HostAsk::Include))?;
         if let Some(file) = sources.script_file(self.krate, written) {
             return Ok(file?.map_or(Included::Missing, Included::Bytes));
         }
-        let file = self.file.ok_or(refused(HostAsk::Include))?;
+        let file = (*self.file).ok_or(refused(HostAsk::Include))?;
         let package = sources.folder(self.krate).ok_or(refused(HostAsk::Include))?;
+        let from = file.package.in_package(package, self.alloc).ok_or(refused(HostAsk::Include))?;
         // The one place an include's path is made, the item host's too (D96 (4): an absolute
         // path under the root the crate sees is its package's).
-        let Some(path) = blaze_scope::included::included_file(package, sources.seen(self.krate), file.path, written, self.alloc) else {
+        let Some(path) = blaze_scope::included::included_file(package, sources.seen(self.krate), &from, written, self.alloc) else {
             return Ok(Included::Outside);
         };
-        Ok(sources.read(self.krate, path.as_str()).map_or(Included::Missing, |text| Included::Bytes(text.as_bytes())))
+        let bytes = match how {
+            IncludeAs::Tokens => sources.read(self.krate, &path).map(str::as_bytes),
+            IncludeAs::Str | IncludeAs::Bytes => sources.read_data(self.krate, &from, &path),
+        };
+        Ok(bytes.map_or(Included::Missing, Included::Bytes))
     }
 
     fn place(&self, what: PlaceOf) -> Result<Place<'_>, HostError> {
         match what {
             // D96 (4): the item host's answer, byte-equal (one read, one answer in both layers).
             PlaceOf::File => {
-                let file = self.file.ok_or(refused(HostAsk::Place))?;
+                let file = (*self.file).ok_or(refused(HostAsk::Place))?;
                 let shown = self.shown_file.get_or_init(|| self.sources.and_then(|s| s.shown_file(self.krate, file.shown, self.alloc)));
                 shown.as_ref().map(|text| Place::Text(text.as_str())).ok_or(refused(HostAsk::Place))
             }
@@ -214,7 +230,7 @@ mod tests {
     use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced};
     use blaze_own::Alloc;
 
-    use super::{BodyFile, BodyHost, BodySources};
+    use super::{BodyHost, BodySources, FilePaths, LazyCell};
 
     /// One crate (index 0) of package `/package/3/`: `CARGO_PKG_NAME` is `tempo-node`,
     /// `CARGO_PKG_AUTHORS` is cargo's but not known, and one file besides the body's.
@@ -223,6 +239,9 @@ mod tests {
     impl BodySources for One {
         fn read(&self, krate: usize, path: &str) -> Option<&str> {
             (krate == 0 && path == "/package/3/src/abi.json").then_some("[]")
+        }
+        fn read_data(&self, krate: usize, from: &str, path: &str) -> Option<&[u8]> {
+            (krate == 0 && from == "/package/3/src/lib.rs" && path == "/package/3/src/abi.json").then_some(b"[]")
         }
         fn env(&self, krate: usize, name: &str) -> Result<Option<&str>, HostError> {
             match (krate, name) {
@@ -259,7 +278,7 @@ mod tests {
         BodyHost {
             sources,
             krate: 0,
-            file: Some(BodyFile { path: "/package/3/src/lib.rs", shown: "src/lib.rs" }),
+            file: LazyCell::new(|| Some(FilePaths { package: blaze_scope::package_path::PackagePath::new("src/lib.rs").unwrap(), shown: "src/lib.rs" })),
             shown_file: core::cell::OnceCell::new(),
             module_path: Some("tempo_node::rpc"),
             atoms: &[("unix", None)],

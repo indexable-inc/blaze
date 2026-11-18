@@ -255,7 +255,7 @@ fn request(
                 Effect::WriteLast { bytes } => ended.last = Some(bytes.as_slice().to_vec()),
                 Effect::Done(answer) => ended.answer = Some(answer),
                 Effect::Open { name, .. } => panic!("{name} was opened: a content read is never a file part"),
-                Effect::StartProgram { .. } | Effect::Stop { .. } => panic!("`check` started or stopped a program"),
+                Effect::StartProgram { .. } | Effect::StartTests { .. } | Effect::Stop { .. } => panic!("`check` started or stopped a program"),
             }
         }
         if ended.answer.is_some() {

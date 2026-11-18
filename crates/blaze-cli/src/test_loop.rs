@@ -89,6 +89,9 @@ pub(crate) enum CannotRun {
     /// No test sandbox is built for this host (Linux), and no test runs unsandboxed (rule 9):
     /// test_run.rs `Runner` answers every run so without starting anything.
     NoSandbox,
+    /// blaze refused the test's entry (blaze-ladder run/special/test_roots.rs): its words are
+    /// printed on the line before the `NOT RUN` line (test_drive.rs `drive`).
+    EntryRefused,
 }
 
 impl CannotRun {
@@ -97,6 +100,7 @@ impl CannotRun {
             CannotRun::BodiesNotBuilt => "the code builder cannot build test bodies yet (test.md, piece 8)",
             CannotRun::NoRunner => "no zygote runs tests on this host yet (test.md, piece 9)",
             CannotRun::NoSandbox => "no test sandbox is built for Linux yet, and blaze runs no test unsandboxed (rule 9; test.md, piece 9)",
+            CannotRun::EntryRefused => "blaze refuses its entry: the line before this one says why",
         }
     }
 }

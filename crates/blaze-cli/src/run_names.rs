@@ -340,6 +340,12 @@ pub(crate) enum RunNamesError {
     NonePicked,
     /// Two crates of the list have their root at `root`.
     TwoProgramCrates { root: std::boxed::Box<str>, first: &'static str, second: &'static str },
+    /// No member crate is at place `at` of the list ([`Owner::At`]).
+    NoMemberAt { at: usize },
+    /// `test`: no member crate of the answer is a test unit (none holds a tests record).
+    NoTestUnit,
+    /// `test`: two member crates are test units; one suite a command is run yet.
+    TwoTestUnits { first: &'static str, second: &'static str },
     /// The answer holds no `CrateScope` row for a crate the program's check reads.
     NotAnswered { crate_name: &'static str },
     /// A crate's `CrateScope` record could not be read in place as its names, items and
@@ -367,6 +373,12 @@ impl fmt::Display for RunNamesError {
             RunNamesError::NonePicked => write!(f, "the request started a program, but this command picked none: only `blaze run` picks one (run_package.rs `pick`; {at})"),
             RunNamesError::NoProgramCrate { root } => write!(f, "no member crate of the crate list has its root at `{root}`, the program `blaze run` starts ({at})"),
             RunNamesError::TwoProgramCrates { root, first, second } => write!(f, "two crates of the crate list, `{first}` and `{second}`, have their root at `{root}` ({at})"),
+            RunNamesError::NoMemberAt { at: place } => write!(f, "the crate list has no member crate at place {place} ({at})"),
+            RunNamesError::NoTestUnit => write!(f, "no member crate of the answer is compiled as a test unit (none holds a tests record), so `blaze test` has no test to run ({at})"),
+            RunNamesError::TwoTestUnits { first, second } => write!(
+                f,
+                "`{first}` and `{second}` are both test units: `blaze test` runs one suite a command yet (test.md, \"The other targets\"; {at})"
+            ),
             RunNamesError::NotAnswered { crate_name } => write!(f, "the answer holds no `CrateScope` row for crate `{crate_name}`, which the program's check reads ({at})"),
             RunNamesError::Records { crate_name, error } => write!(f, "crate `{crate_name}`: {error} ({at})"),
             RunNamesError::Scope { rule } => write!(f, "the program's check scope was refused: {rule}"),
@@ -382,17 +394,85 @@ fn stored(error: CliError) -> RunNamesError {
     RunNamesError::Store(std::boxed::Box::new_in(error, Global))
 }
 
+/// Crate `crate_name`'s record not read, boxed (`RunNamesError::Records`).
+fn unread(crate_name: &'static str, error: ReadError) -> RunNamesError {
+    RunNamesError::Records { crate_name, error: std::boxed::Box::new_in(error, Global) }
+}
+
+/// Which member crate of the list is the program's.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Owner<'s> {
+    /// The one rooted at this checkout-relative path: `run`'s picked program (run_package.rs
+    /// `Program::root`).
+    Root(&'s str),
+    /// The one at this place in the list: `test`'s unit ([`test_unit`]), which shares its root
+    /// with the library it is compiled from.
+    At(usize),
+}
+
+/// One test unit of the answer: its place in the crate list, and its tests record (the
+/// `tests` section of its `CrateScope` record, names/sections.rs), in place.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestUnit<'m> {
+    pub(crate) at: usize,
+    pub(crate) tests: &'m [u8],
+    /// Its edition, as its items record says (front_load.rs `CrateRecords::edition`): what its
+    /// code is built for (run_parent.rs `builder_for`).
+    pub(crate) edition: blaze_surface::Edition,
+}
+
+/// The answer's one test unit: the member crate whose `CrateScope` record holds a tests
+/// section (a unit compiled without `test` has an empty one, names/sections.rs), read in place
+/// through `read`. A member with no row in `answered` is outside its scope: a walk answers
+/// every member, and on a hit the rows are the suite's scope alone ([`Stood`]), the test unit
+/// among them. More than one test unit is refused by name ([`RunNamesError::TwoTestUnits`]):
+/// the record of the rows at the certificate holds one scope (NOT DONE: one suite per unit,
+/// the rows keyed by the unit). COST: one in-place read of each member's record, and the test
+/// unit's records opened once (the read [`program_of`] then hits).
+pub(crate) fn test_unit<'m>(
+    cx: &Cx,
+    answered: &dyn Answered,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    heap: &'static blaze_own::Heap,
+    scratch: &Frame,
+) -> Result<TestUnit<'m>, RunNamesError> {
+    let _cx = cx.span("run names: the test unit");
+    let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
+    let list = kept.list(cx, store, &graph, scratch).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
+    let mut found: Option<TestUnit<'m>> = None;
+    for at in 0..CrateGraph::len(&list) {
+        if !list.member(at) {
+            continue;
+        }
+        let Some(input) = answered.crate_input(at, blaze_drive::key::crate_scope_name(&list.key(at))) else { continue };
+        let name = CrateGraph::name(&list, at);
+        let tests = read.tests(cx, store, &input).map_err(|error| unread(name, error))?;
+        if tests.is_empty() {
+            continue;
+        }
+        if let Some(first) = found {
+            return Err(RunNamesError::TwoTestUnits { first: CrateGraph::name(&list, first.at), second: name });
+        }
+        let edition = read.records(cx, store, &input, list.key(at), heap.alloc()).map_err(|error| unread(name, error))?.edition;
+        found = Some(TestUnit { at, tests, edition });
+    }
+    found.ok_or(RunNamesError::NoTestUnit)
+}
+
 /// The program's crates from `answered`: the crate list of its `UnitGraph` row (read once a
-/// command, `Kept::list`), the member crate rooted at `program_root` (the picked program's crate
-/// root, checkout-relative: run_package.rs `Program::root`, `bin/tempo/src/main.rs` for a member
-/// binary), its `CrateScope` record's `no_core`, and its check scope's crates, each by its row.
+/// command, `Kept::list`), the member crate `owner` names ([`Owner`]: `run`'s rooted at the
+/// picked program's crate root, checkout-relative: run_package.rs `Program::root`,
+/// `bin/tempo/src/main.rs` for a member binary; `test`'s by its place), its `CrateScope`
+/// record's `no_core`, and its check scope's crates, each by its row.
 /// COST: the list's read and the program's records once a command (in place, through `read`:
 /// engine_records.rs); the scope, O(crates + edges).
 #[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
 pub(crate) fn program_of<'m>(
     cx: &Cx,
     answered: &dyn Answered,
-    program_root: &str,
+    owner: Owner<'_>,
     store: &mut dyn Store<'m>,
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
@@ -402,19 +482,25 @@ pub(crate) fn program_of<'m>(
     let _cx = cx.span("run names: the program's crates");
     let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
     let list = kept.list(cx, store, &graph, scratch).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
-    let mut owner: Option<usize> = None;
-    for at in 0..CrateGraph::len(&list) {
-        if list.member(at) && list.root(at).strip_prefix("/0/") == Some(program_root) {
-            if let Some(first) = owner {
-                return Err(RunNamesError::TwoProgramCrates { root: std::boxed::Box::from(program_root), first: CrateGraph::name(&list, first), second: CrateGraph::name(&list, at) });
+    let owner = match owner {
+        Owner::Root(program_root) => {
+            let mut owner: Option<usize> = None;
+            for at in 0..CrateGraph::len(&list) {
+                if list.member(at) && list.root(at).strip_prefix("/0/") == Some(program_root) {
+                    if let Some(first) = owner {
+                        return Err(RunNamesError::TwoProgramCrates { root: std::boxed::Box::from(program_root), first: CrateGraph::name(&list, first), second: CrateGraph::name(&list, at) });
+                    }
+                    owner = Some(at);
+                }
             }
-            owner = Some(at);
+            owner.ok_or_else(|| RunNamesError::NoProgramCrate { root: std::boxed::Box::from(program_root) })?
         }
-    }
-    let owner = owner.ok_or_else(|| RunNamesError::NoProgramCrate { root: std::boxed::Box::from(program_root) })?;
+        Owner::At(at) if at < CrateGraph::len(&list) && list.member(at) => at,
+        Owner::At(at) => return Err(RunNamesError::NoMemberAt { at }),
+    };
     let input_of = |at: usize| answered.crate_input(at, blaze_drive::key::crate_scope_name(&list.key(at))).ok_or(RunNamesError::NotAnswered { crate_name: CrateGraph::name(&list, at) });
     let own = input_of(owner)?;
-    let records = read.records(cx, store, &own, list.key(owner), heap.alloc()).map_err(|error| RunNamesError::Records { crate_name: CrateGraph::name(&list, owner), error: std::boxed::Box::new_in(error, Global) })?;
+    let records = read.records(cx, store, &own, list.key(owner), heap.alloc()).map_err(|error| unread(CrateGraph::name(&list, owner), error))?;
     // A `#![no_core]` program links no sysroot crate (body_types.rs `prepare`, the same read).
     let no_core = blaze_scope::names_record::NamesRecord::open(records.names_proof).crate_root().head().no_core;
     let scope = blaze_world::check_scope::check_scope_in(&list, owner, no_core, heap.alloc()).map_err(|refused| RunNamesError::Scope { rule: refused.rule() })?;
@@ -468,7 +554,7 @@ impl Found<'_> {
 pub(crate) fn found<'m>(
     cx: &Cx,
     req: &blaze_drive::Request<'_>,
-    program_root: &str,
+    owner: Owner<'_>,
     store: &mut dyn Store<'m>,
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
@@ -476,7 +562,7 @@ pub(crate) fn found<'m>(
     scratch: &Frame,
 ) -> Result<Option<Found<'m>>, RunNamesError> {
     if crate::run_ids::walked(req) {
-        let program = program_of(cx, &Walked(req), program_root, store, kept, read, heap, scratch)?;
+        let program = program_of(cx, &Walked(req), owner, store, kept, read, heap, scratch)?;
         put(cx, &program, req.certificate(), store, heap)?;
         return Ok(Some(Found::Walked(program)));
     }
@@ -490,7 +576,7 @@ pub(crate) fn names_of<'n, 'm: 'n>(
     cx: &'n Cx,
     root: &'n Dir<ReadWrite>,
     found: &Found<'_>,
-    program_root: &str,
+    owner: Owner<'_>,
     store: &mut dyn Store<'m>,
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
@@ -503,7 +589,7 @@ pub(crate) fn names_of<'n, 'm: 'n>(
     match found {
         Found::Walked(program) => open(cx, root, program, store, read, env, procs, seen, frame, heap),
         Found::Stood(rows) => {
-            let program = program_of(cx, rows, program_root, store, kept, read, heap, frame)?;
+            let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
             open(cx, root, &program, store, read, env, procs, seen, frame, heap)
         }
     }

@@ -16,16 +16,21 @@
 //! Statements end at a newline (the Reference: several template strings are joined with `\n`)
 //! or, on ELF, at `;`. A statement left blank once its comments are gone assembles to nothing:
 //! a comment-only template emits no instruction, which is what an optimization barrier is.
-//! Every other statement is a mnemonic and its operands, encoded by its row of the table; a
-//! mnemonic with no row, a directive (`.arch_extension`), a label (`2:`) or an operand form no
-//! row takes is [`AsmError`], naming the template's line and the token (rule 19). Nothing is
-//! skipped or guessed (rule 3).
+//! Numeric label definitions name the next instruction address. The mnemonic table encodes
+//! instructions. An unknown mnemonic, a directive (`.arch_extension`), a named label or an
+//! unsupported operand form yields [`AsmError`] with the template line and token.
 //!
-//! Sans-IO: [`Assembler::feed`] takes bytes and hands each instruction word to a sink;
-//! [`Assembler::finish`] ends the last statement. No allocation: one statement is held in a
-//! fixed buffer of [`STATEMENT_MOST`] bytes, and a longer one is refused by name.
+//! [`Assembler::feed`] appends instruction words directly to the caller's code buffer.
+//! [`Assembler::finish`] resolves local branches within this template. Only labels and
+//! their uses need scratch space. Each statement fits in [`STATEMENT_MOST`] bytes.
 
 mod table;
+
+use core::{alloc::Allocator, ops::Range};
+
+use blaze_own::{AVec, Alloc};
+
+use crate::enc::Field;
 
 /// The most bytes one statement holds once its comments are gone.
 pub(crate) const STATEMENT_MOST: usize = 256;
@@ -111,8 +116,37 @@ enum Lex {
     BlockComment { star: bool },
 }
 
+/// An occurrence of a local number, retaining its exact spelling for diagnostics.
+struct Local {
+    token: Range<usize>,
+    at: usize,
+    line: u32,
+}
+
+impl Local {
+    fn new(spellings: &mut AVec<'_, u8>, token: &[u8], at: usize, line: u32) -> Self {
+        let start = spellings.len();
+        spellings.extend_from_slice(token);
+        Self { token: start..spellings.len(), at, line }
+    }
+
+    /// Compare decimal numbers without an integer-size limit. Zero has an empty key.
+    fn number<'a>(&self, spellings: &'a [u8]) -> &'a [u8] {
+        let digits = &spellings[self.token.start..self.token.end - 1];
+        &digits[digits.iter().position(|&d| d != b'0').unwrap_or(digits.len())..]
+    }
+
+    fn error(&self, spellings: &[u8], why: &'static str) -> AsmError {
+        AsmError { line: self.line, why, token: AsmToken::of(&spellings[self.token.clone()]) }
+    }
+}
+
 /// The template reader of one `asm!` block.
-pub(crate) struct Assembler {
+pub(crate) struct Assembler<'out, 's, A: Allocator> {
+    code: &'out mut Vec<u8, A>,
+    spellings: AVec<'s, u8>,
+    definitions: AVec<'s, Local>,
+    branches: AVec<'s, (Local, Field, u32)>,
     dialect: Dialect,
     lex: Lex,
     /// A `/` seen in code, not yet known to start a comment.
@@ -123,13 +157,15 @@ pub(crate) struct Assembler {
     /// The line the statement is on (from 1) and the line the reader is on.
     statement_line: u32,
     line: u32,
-    /// The instruction words handed out.
-    words: u32,
 }
 
-impl Assembler {
-    pub(crate) fn new(dialect: Dialect) -> Assembler {
+impl<'out, 's, A: Allocator> Assembler<'out, 's, A> {
+    pub(crate) fn new(dialect: Dialect, code: &'out mut Vec<u8, A>, scratch: Alloc<'s>) -> Self {
         Assembler {
+            code,
+            spellings: AVec::new_in(scratch),
+            definitions: AVec::new_in(scratch),
+            branches: AVec::new_in(scratch),
             dialect,
             lex: Lex::Code,
             slash: false,
@@ -137,20 +173,19 @@ impl Assembler {
             len: 0,
             statement_line: 1,
             line: 1,
-            words: 0,
         }
     }
 
-    /// Reads `text`, handing each instruction word it assembles to `out`.
-    pub(crate) fn feed(&mut self, text: &[u8], out: &mut dyn FnMut(u32)) -> Result<(), AsmError> {
+    /// Reads another rendered piece of the template.
+    pub(crate) fn feed(&mut self, text: &[u8]) -> Result<(), AsmError> {
         for &byte in text {
-            self.byte(byte, out)?;
+            self.byte(byte)?;
         }
         Ok(())
     }
 
-    /// Ends the template: its last statement assembled. Answers how many words it made.
-    pub(crate) fn finish(&mut self, out: &mut dyn FnMut(u32)) -> Result<u32, AsmError> {
+    /// Sort D definitions once, then find each branch's nearest definition in O(log D).
+    pub(crate) fn finish(mut self) -> Result<(), AsmError> {
         if self.slash {
             self.slash = false;
             self.push(b'/')?;
@@ -158,16 +193,41 @@ impl Assembler {
         if let Lex::BlockComment { .. } = self.lex {
             return Err(AsmError { line: self.line, why: "an unterminated `/*` comment", token: AsmToken::of(b"/*") });
         }
-        self.end_statement(out)?;
-        Ok(self.words)
+        self.end_statement()?;
+        let names = &self.spellings;
+        self.definitions.sort_unstable_by(|a, b| {
+            (a.number(names), a.at, a.token.start).cmp(&(b.number(names), b.at, b.token.start))
+        });
+        for pair in self.definitions.windows(2) {
+            if pair[0].at == pair[1].at && pair[0].number(names) == pair[1].number(names) {
+                return Err(pair[1].error(names, "a local label defined twice at the same instruction address"));
+            }
+        }
+        for (branch, field, word) in self.branches {
+            let number = branch.number(names);
+            // A definition immediately before a branch is at its PC and is backward.
+            let next = self.definitions.partition_point(|d| (d.number(names), d.at) <= (number, branch.at));
+            let target = if names[branch.token.end - 1] == b'f' {
+                self.definitions.get(next)
+            } else {
+                next.checked_sub(1).and_then(|i| self.definitions.get(i))
+            };
+            let target = target.filter(|d| d.number(names) == number)
+                .ok_or_else(|| branch.error(names, "no local label in the requested direction"))?;
+            let bytes = target.at as i64 - branch.at as i64;
+            let patched = field.patch(word, bytes)
+                .ok_or_else(|| branch.error(names, "local label outside this branch's displacement range"))?;
+            self.code[branch.at..branch.at + 4].copy_from_slice(&patched.to_le_bytes());
+        }
+        Ok(())
     }
 
-    fn byte(&mut self, byte: u8, out: &mut dyn FnMut(u32)) -> Result<(), AsmError> {
+    fn byte(&mut self, byte: u8) -> Result<(), AsmError> {
         match self.lex {
             Lex::LineComment => {
                 if byte == b'\n' {
                     self.lex = Lex::Code;
-                    self.newline(out)?;
+                    self.newline()?;
                 }
                 Ok(())
             }
@@ -204,13 +264,23 @@ impl Assembler {
                         self.slash = true;
                         Ok(())
                     }
-                    b'\n' => self.newline(out),
+                    b'\n' => self.newline(),
+                    b':' => {
+                        self.push(byte)?;
+                        let token = trim(&self.statement[..self.len]);
+                        let digits = &token[..token.len() - 1];
+                        if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+                            self.definitions.push(Local::new(&mut self.spellings, token, self.code.len(), self.statement_line));
+                            self.len = 0;
+                        }
+                        Ok(())
+                    }
                     b';' => match self.dialect {
                         Dialect::Darwin => {
                             self.lex = Lex::LineComment;
                             Ok(())
                         }
-                        Dialect::Elf => self.end_statement(out),
+                        Dialect::Elf => self.end_statement(),
                     },
                     b'#' if self.blank() => {
                         self.lex = Lex::LineComment;
@@ -243,14 +313,14 @@ impl Assembler {
         Ok(())
     }
 
-    fn newline(&mut self, out: &mut dyn FnMut(u32)) -> Result<(), AsmError> {
-        self.end_statement(out)?;
+    fn newline(&mut self) -> Result<(), AsmError> {
+        self.end_statement()?;
         self.line += 1;
         Ok(())
     }
 
     /// Assembles the statement held, if it is not blank, and empties the buffer.
-    fn end_statement(&mut self, out: &mut dyn FnMut(u32)) -> Result<(), AsmError> {
+    fn end_statement(&mut self) -> Result<(), AsmError> {
         let len = core::mem::replace(&mut self.len, 0);
         let line = self.statement_line;
         self.statement_line = self.line;
@@ -258,9 +328,16 @@ impl Assembler {
         if text.is_empty() {
             return Ok(());
         }
-        let word = table::assemble(text).map_err(|(why, token)| AsmError { line, why, token: AsmToken::of(token) })?;
-        out(word);
-        self.words += 1;
+        let instruction = table::assemble(text).map_err(|(why, token)| AsmError { line, why, token: AsmToken::of(token) })?;
+        let word = match instruction {
+            table::Instruction::Word(word) => word,
+            table::Instruction::Branch { word, field, target } => {
+                let local = Local::new(&mut self.spellings, target, self.code.len(), line);
+                self.branches.push((local, field, word));
+                word
+            }
+        };
+        self.code.extend_from_slice(&word.to_le_bytes());
         Ok(())
     }
 }

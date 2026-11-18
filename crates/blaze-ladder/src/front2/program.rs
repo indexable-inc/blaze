@@ -1627,9 +1627,7 @@ impl FrontEnd for Front2Program<'_> {
         // The program's strategy, read from its inputs (crate 0's cfg, derived from
         // `UserCrate::panic`: crate::panic_strategy). An unreadable one was refused by name by
         // the reach walk at the declaration, so no call of it is built to come here.
-        if let Ok(panic) = crate::panic_strategy::of_program(self.front.names)
-            && let Some(def) = super::internal_symbol::bound(self.front.names, &self.front.index, &self.store, item, panic, alloc)
-        {
+        if let Ok(Some(def)) = lazy::seam_rules::internal_binding(self.front.names, &self.front.keys, &self.store, item, || Ok(())) {
             return Ok((def, List::EMPTY));
         }
         let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, alloc))??;

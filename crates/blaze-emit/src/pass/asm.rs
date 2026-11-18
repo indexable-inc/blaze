@@ -29,6 +29,9 @@
 //! `nostack` it may push below `sp`, which is the frame's bottom. `noreturn` is the LIR
 //! `unreachable` that follows the block. A `sym` operand, a `label` (`asm_br`) and a block of
 //! more than two outputs are refused by name.
+//! A C ABI clobber needs no caller-save spills here. Live values already have frame cells,
+//! and the prologue saved the incoming link register. A literal `bl name` still needs the
+//! function reference place to which the call site will be bound.
 
 use std::alloc::Allocator;
 
@@ -273,13 +276,13 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
 
         // 4. The template.
-        let mut reader = Assembler::new(Dialect::of(self.isa.os));
+        let mut reader = Assembler::new(Dialect::of(self.isa.os), self.code, self.scratch);
         let refused = |e: crate::asm::AsmError| EmitError::Asm { inst: inst as u32, line: e.line, why: e.why, token: e.token };
         for piece in view.asm_pieces_of(id) {
             match piece.kind {
                 AsmPieceRec::TEXT => {
                     let text = view.asm_str(piece.a, piece.b);
-                    reader.feed(text, &mut |w| self.put(w)).map_err(refused)?;
+                    reader.feed(text).map_err(refused)?;
                 }
                 AsmPieceRec::OPERAND => {
                     let p = placed
@@ -291,12 +294,12 @@ impl<A: Allocator> Pass<'_, '_, A> {
                         return Err(unsupported(inst, op, "an `asm!` placeholder naming an explicit register operand"));
                     }
                     let (name, len) = render(p, piece.b).map_err(|why| unsupported(inst, op, why))?;
-                    reader.feed(&name[..len], &mut |w| self.put(w)).map_err(refused)?;
+                    reader.feed(&name[..len]).map_err(refused)?;
                 }
                 _ => return Err(unsupported(inst, op, "an `asm!` template piece of no known kind")),
             }
         }
-        reader.finish(&mut |w| self.put(w)).map_err(refused)?;
+        reader.finish().map_err(refused)?;
 
         // 5. Outputs.
         for p in placed.iter().flatten() {

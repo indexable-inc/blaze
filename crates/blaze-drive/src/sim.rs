@@ -29,6 +29,9 @@ use crate::request::{
 use crate::settled::Settled;
 use crate::worker::{self, InPlace};
 
+/// `test` runs its tests after its check (`Effect::StartTests`), over this harness.
+mod tests_start;
+
 // --- The toy checkout -------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -675,6 +678,9 @@ struct Ended {
     /// The program: started, stopped, and whether it is still running.
     started: bool,
     stopped: bool,
+    /// `test`'s tests were started (`Effect::StartTests`), and how they ended when they did.
+    tested: bool,
+    tests_ok: Option<bool>,
     /// The machine's own count at the answer ([`Request::bookkeeping`]).
     bookkeeping: u64,
 }
@@ -877,6 +883,8 @@ fn request_with(
         in_place: 0,
         started: false,
         stopped: false,
+        tested: false,
+        tests_ok: None,
         bookkeeping: 0,
     };
     let mut gets: StdVec<Key> = StdVec::new();
@@ -1001,6 +1009,17 @@ fn request_with(
                     ended.started = true;
                     running = true;
                 }
+                // The tests run to their end as the caller's suite does (blaze-cli test_drive.rs),
+                // wanting nothing of the machine; how they end is the tape's.
+                Effect::StartTests { .. } => {
+                    oracle(!ended.tested, || String::from("the tests started twice"))?;
+                    oracle(!ended.started && !running, || String::from("tests started beside a program"))?;
+                    oracle(first.is_none(), || String::from("tests started with an event still to step"))?;
+                    let ok = tape.one_in(2, "the tests pass");
+                    ended.tested = true;
+                    ended.tests_ok = Some(ok);
+                    first = Some(Event::Exited { ok });
+                }
                 Effect::Stop { .. } => {
                     ended.stopped = true;
                     if running {
@@ -1051,6 +1070,7 @@ fn request_with(
             // The answer is the last thing the machine says: a program it started has exited
             // first, or its exit would step an answered machine.
             oracle(!ended.started || exited, || String::from("answered while the program it started is running"))?;
+            oracle(!ended.tested || exited, || String::from("answered while the tests it started are running"))?;
             // Under `Reached` the program's exit is the verdict: work still out is abandoned.
             let abandons = setup.ask.gate == Gate::Reached && setup.ask.command != Command::Check;
             let unfinished = !gets.is_empty() || !batches.is_empty() || (!answer.profile.certified && ended.last.is_none());
@@ -2136,14 +2156,19 @@ fn commands(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             None => {}
         }
         let (answer, ended) = finished(ended)?;
-        // `test` is its check alone until tests run on this path: it starts no program (a
-        // package's `main` is not its tests) and never answers as a program's pass or failure.
+        // `test` starts no program (a package's `main` is not its tests): it runs its tests after
+        // its check (`Effect::StartTests`, sim/tests_start.rs), and its answer is theirs.
         if command == Command::Test {
             oracle(!ended.started, || String::from("`test` started a program: `main` is not a test"))?;
-            oracle(matches!(answer.verdict, Verdict::Checked | Verdict::Failed { started: false, .. }), || {
-                format!("`test` answered {:?}: its answer is its check's alone", answer.verdict)
-            })?;
+            match answer.verdict {
+                Verdict::Passed => oracle(ended.tests_ok == Some(true), || String::from("`test` passed and its tests did not"))?,
+                Verdict::ProgramFailed => oracle(ended.tests_ok == Some(false), || String::from("`test` failed as its tests and they passed or did not run"))?,
+                Verdict::Failed { started: false, .. } => oracle(!ended.tested, || String::from("`test` failed its check and its tests ran"))?,
+                other => return Err(Broke::Oracle(format!("`test` answered {other:?}"))),
+            }
         }
+        // Only `test` runs tests.
+        oracle(command == Command::Test || !ended.tested, || format!("`{command:?}` started tests"))?;
         if ended.last.is_some() {
             last = ended.last;
         }

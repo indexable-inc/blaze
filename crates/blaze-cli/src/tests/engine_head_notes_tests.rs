@@ -81,7 +81,7 @@ fn one_member_fails_alone_and_its_reason_is_printed() {
         // Checked: its only note may be the borrow check's (this fixture's core has no `Copy`
         // lang item, so borrows are "not checked: a trait fact of an ADT is not known"), never
         // a refusal of the body.
-        let refused = lines.iter().any(|line| line.contains("body `calls_good`") && !line.contains("body `calls_good`: borrows not checked"));
+        let refused = lines.iter().any(|line| line.contains("body `calls_good`") && !line.contains("borrows not checked: "));
         assert!(!refused, "{round}: `calls_good` is checked (`good`'s head is frozen):\n{text}");
         assert!(!text.contains("kept no reason"), "{round}: every failed head kept its reason:\n{text}");
         let grouped: std::vec::Vec<&std::string::String> = lines.iter().filter(|line| line.contains("heads: ")).collect();

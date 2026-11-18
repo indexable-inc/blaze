@@ -34,7 +34,7 @@ pub use alias::{AliasScope, MOST_DEPTH, NoAliases, PathIs, PathWhy, SigWorld};
 pub use impl_life::{AssocWhy, ImplText, ImplTrait, ImplTraitWhy, MOST_IMPL_REGIONS, impl_header_end, read_impl_signature, read_impl_signature_with, read_impl_trait};
 pub use outlives::{assoc_declares_generics, container_declares_type_outlives, trait_declares_lifetime, trait_header};
 
-pub use value::{CallableRefusal, read_callable_param, read_callable_param_with};
+pub use value::{CallableRefusal, read_callable_param, read_callable_param_with, read_callable_value_with};
 
 /// What stands at one origin position of a signature.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -50,7 +50,46 @@ pub enum Region {
     /// A position whose lifetimes the text does not say (an opaque or associated type): related
     /// to nothing in the fn's own body; a call through such a signature is not instantiated.
     Hidden(u32),
+    /// A lifetime BOUND by the binder of a fn-pointer type written in the text (lane B15): one
+    /// its `for<..>` names, or one elided inside it, numbered per text in reading order (the
+    /// rules: the note on [`MOST_BINDERS`]). It is no lifetime of the fn: elision of the fn's
+    /// own output does not count it, and a use of the pointer instantiates it afresh.
+    Bound(u32),
 }
+
+/// FN-POINTER BINDERS (lane B15). The rules, from the Reference:
+///
+/// - "Function pointer types": `for<'a> fn(&'a u8)` is a fn pointer whose `'a` is bound by its
+///   own `for<..>` ("Higher-ranked trait bounds": the type holds "for all lifetimes").
+/// - "Lifetime elision": the elision rules hold "in function item, function pointer, and
+///   closure trait signatures", so `fn(&u8) -> &u8` is `for<'a> fn(&'a u8) -> &'a u8`: every
+///   lifetime elided in a fn-pointer type is BOUND by that pointer, and an elided output takes
+///   the pointer's one input lifetime (else it is E0106: refused, never guessed).
+/// - A lifetime the pointer names from outside its binder (`fn(&'a u8)` in `impl<'a>` or in a
+///   fn's generics, `'static`) is FREE: it is the enclosing item's region.
+/// - "Subtyping and Variance": `fn(A) -> R` is contravariant in `A` and covariant in `R`; for
+///   the free regions only, as a bound one is the same at every instance of the type.
+///
+/// WHERE THE BINDER LIVES. The type checker's table is region-erased (`PNode::Ref` holds no
+/// region), so `for<'r> fn(&'r u8)` and `fn(&'a u8)` are one `PTy` there, and its equality, by
+/// which the checker unifies, must stay region-blind. A binder in `PNode::FnPtr` would make the
+/// checker tell apart types it relates by subtyping (`let g: fn(&'a u8) = f` with `f` higher
+/// ranked is a coercion rustc accepts) and would be a second home of region facts. So a fn
+/// pointer's positions are laid structurally, as the type's (its inputs' positions in order,
+/// then its output's: the layout a function of the erased type, rule 21), and which of them its
+/// binder binds is a REGION of the signature's lifetime part, read from the text that wrote the
+/// type: `Region::Bound(v)`, beside `Named` and `Anon`. The records that hold a lifetime part
+/// (the head digests of front2 borrow_reads.rs) key it by the item's text already.
+///
+/// HOW THE LOWERING USES IT (lib.rs): a callee's bound region is fresh at each call, as every
+/// callee region is; the body's own bound region is an existential origin of its own, never a
+/// placeholder (a higher-ranked parameter may be used at any instance: `h = f` with
+/// `h: fn(&'a u8)` is accepted); a call through a fn-pointer parameter instantiates its bound
+/// regions fresh and takes its free ones from the parameter's own positions (sig/value.rs).
+///
+/// The constant itself: how many fn-pointer binders one written type may nest (`fn(fn(&u8))`
+/// is two); deeper is refused [`SigRefusal::Bound`].
+pub const MOST_BINDERS: u32 = 8;
 
 /// One signature's lifetime part, borrowed from whoever holds it.
 #[derive(Clone, Copy, Debug)]
@@ -388,6 +427,9 @@ fn lex<A: Allocator + Clone>(text: &str, toks: &mut Vec<Tok, A>) -> Result<(), S
 enum Mode {
     Input,
     Output(Option<Region>),
+    /// Inside a fn-pointer type's inputs: an elided lifetime is a fresh [`Region::Bound`]
+    /// ([`MOST_BINDERS`]: the binders' rules).
+    Binder,
 }
 
 /// What encloses a type: a trait object's default lifetime reads it.
@@ -409,6 +451,15 @@ struct Pair {
     base: u32,
     ctx: Ctx,
     whole_self: bool,
+}
+
+/// A written fn-pointer type's parts ([`Reader::fn_pointer_text`]): the tokens of its
+/// `for<..>`'s names (empty when none), of its inputs inside the parentheses, and of its output.
+#[derive(Clone, Copy)]
+struct FnText {
+    binder: (u32, u32),
+    inputs: (u32, u32),
+    output: Option<(u32, u32)>,
 }
 
 struct Reader<'t, 'w, A: Allocator + Clone> {
@@ -439,6 +490,12 @@ struct Reader<'t, 'w, A: Allocator + Clone> {
     found: Vec<alias::Hole, A>,
     /// How many alias texts deep this reader is.
     depth: u32,
+    /// The fn-pointer binders in scope, innermost last: the tokens `lo..hi` of a `for<..>`'s
+    /// names (empty when none is written) and the [`Region::Bound`] number of its first name.
+    binders: Vec<(u32, u32, u32), A>,
+    /// The next [`Region::Bound`] number of this text (an alias's or an impl member's text
+    /// numbers on from its user's, so the two never meet).
+    bound: u32,
 }
 
 impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
@@ -522,6 +579,21 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
         if w == "'_" {
             return None;
         }
+        // A name of a fn-pointer binder in scope, innermost first: bound by it, never the fn's
+        // (`for<'a> fn(&'a u8)` inside `fn f<'a>` shadows the fn's `'a`).
+        for b in (0..self.binders.len()).rev() {
+            let (lo, hi, first) = self.binders[b];
+            let mut var = first;
+            for t in lo..hi {
+                if self.toks[t as usize].k != Tk::Life {
+                    continue;
+                }
+                if self.word(t) == w {
+                    return Some(Region::Bound(var));
+                }
+                var += 1;
+            }
+        }
         // A lifetime of the impl, held by its self type: that position of `Self` (impl_life.rs).
         if let Some(r) = self.imp.as_ref().and_then(|m| m.region_of(w)) {
             return Some(r);
@@ -546,7 +618,130 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             }
             Mode::Output(Some(r)) => Ok(r),
             Mode::Output(None) => Err(SigRefusal::ElisionUndecided { at: self.at(at) }),
+            Mode::Binder => {
+                self.bound += 1;
+                Ok(Region::Bound(self.bound - 1))
+            }
         }
+    }
+
+    /// Opens the binder of a fn-pointer type whose `for<..>` names are the tokens `lo..hi`
+    /// (`lo == hi`: none written): its names are numbered from the next [`Region::Bound`].
+    fn push_binder(&mut self, lo: u32, hi: u32) -> Result<(), SigRefusal> {
+        if self.binders.len() as u32 >= MOST_BINDERS {
+            return Err(SigRefusal::Bound);
+        }
+        let first = self.bound;
+        for t in lo..hi {
+            if self.toks[t as usize].k == Tk::Life {
+                self.bound += 1;
+            }
+        }
+        self.binders.push((lo, hi, first));
+        Ok(())
+    }
+
+    /// The written fn-pointer type at `lo..hi`: `[for<..>] [unsafe] [extern ["abi"]] fn ( .. )
+    /// [-> T]`, as the tokens of its binder's names, of its inputs and of its output (when one
+    /// is written). `None`: not that form.
+    fn fn_pointer_text(&self, lo: u32, hi: u32) -> Option<FnText> {
+        let mut i = lo;
+        let mut binder = (lo, lo);
+        if self.is_word(i, hi, "for") && self.is(i + 1, hi, Tk::P(b'<')) {
+            let close = self.mate[(i + 1) as usize];
+            if close == u32::MAX || close >= hi {
+                return None;
+            }
+            binder = (i + 2, close);
+            i = close + 1;
+        }
+        if self.is_word(i, hi, "unsafe") {
+            i += 1;
+        }
+        if self.is_word(i, hi, "extern") {
+            i += 1;
+            if self.is(i, hi, Tk::Lit) {
+                i += 1;
+            }
+        }
+        if !self.is_word(i, hi, "fn") || !self.is(i + 1, hi, Tk::P(b'(')) {
+            return None;
+        }
+        let open = i + 1;
+        let close = self.mate[open as usize];
+        if close == u32::MAX || close >= hi {
+            return None;
+        }
+        let output = if self.is(close + 1, hi, Tk::Arrow) {
+            if close + 2 >= hi {
+                return None;
+            }
+            Some((close + 2, hi))
+        } else if close + 1 == hi {
+            None
+        } else {
+            return None;
+        };
+        Some(FnText { binder, inputs: (open + 1, close), output })
+    }
+
+    /// Lines up a written fn-pointer type `fx` with the erased `FnPtr` list `list` (its inputs,
+    /// then its output last), filling `regions[base..]` (the rules: [`MOST_BINDERS`]). Its
+    /// binder is opened for the walk and closed after: a name it binds and every lifetime
+    /// elided in its inputs is a fresh [`Region::Bound`]; an elided output takes the one
+    /// lifetime its inputs use, else it is refused; a name from outside stays the fn's.
+    fn line_up_fn_pointer(&mut self, fx: FnText, list: &[PTy], base: u32, regions: &mut Vec<Region, A>) -> Result<(), SigRefusal> {
+        let unaligned = SigRefusal::Unaligned { at: self.at(fx.inputs.0) };
+        let Some((&out_ty, ins)) = list.split_last() else { return Err(unaligned) };
+        let mut parts: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        self.pieces(fx.inputs.0, fx.inputs.1, &mut parts);
+        // A C-variadic pointer's `...` is no input of the list.
+        if let Some(&(lo, hi)) = parts.last()
+            && hi == lo + 3
+            && (lo..hi).all(|t| self.toks[t as usize].k == Tk::P(b'.'))
+        {
+            parts.pop();
+        }
+        if parts.len() != ins.len() {
+            return Err(unaligned);
+        }
+        self.push_binder(fx.binder.0, fx.binder.1)?;
+        let mut off = base;
+        for (j, &t) in ins.iter().enumerate() {
+            let (mut lo, hi) = parts[j];
+            // A fn pointer may name its parameters: `fn(x: &T)`, `fn(_: &T)`.
+            if (self.is(lo, hi, Tk::Ident) || self.is(lo, hi, Tk::P(b'_'))) && self.is(lo + 1, hi, Tk::P(b':')) && !self.is(lo + 2, hi, Tk::P(b':')) {
+                lo += 2;
+            }
+            let n = self.count(t)?;
+            self.line_up(Pair { ty: t, lo, hi, base: off, ctx: Ctx::Other, whole_self: false }, Mode::Binder, regions)?;
+            off += n;
+        }
+        // The Reference, "Lifetime elision", in a fn-pointer type as in a fn: "If there is
+        // exactly one lifetime used in the parameters (elided or not), that lifetime is assigned
+        // to all elided output lifetimes."
+        let mut one: Option<Region> = None;
+        let mut many = false;
+        for k in base..off {
+            let x = regions[k as usize];
+            if matches!(x, Region::Hidden(_)) || self.unwritten.contains(&k) {
+                continue;
+            }
+            match one {
+                None => one = Some(x),
+                Some(y) if y != x => many = true,
+                Some(_) => {}
+            }
+        }
+        let decided = if many { None } else { one };
+        let n = self.count(out_ty)?;
+        match fx.output {
+            Some((lo, hi)) => self.line_up(Pair { ty: out_ty, lo, hi, base: off, ctx: Ctx::Other, whole_self: false }, Mode::Output(decided), regions)?,
+            None if n == 0 => {}
+            None => return Err(unaligned),
+        }
+        self.binders.pop();
+        Ok(())
     }
 
     fn node(&self, t: PTy) -> Result<PNode, SigRefusal> {
@@ -554,7 +749,8 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
     }
 
     /// The number of origin positions of `t`, as the lowering counts them: one per reference,
-    /// one per lifetime parameter of an ADT, one per opaque, alias or trait object.
+    /// one per lifetime parameter of an ADT, one per opaque, alias or trait object; a fn
+    /// pointer's are its inputs' then its output's, bound and free alike ([`MOST_BINDERS`]).
     fn count(&self, t: PTy) -> Result<u32, SigRefusal> {
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
         stack.push(t);
@@ -571,7 +767,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) => stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?),
+                PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?),
                 PNode::Adt(k, l) => {
                     n += self.world.adt_lifetimes(k).ok_or(SigRefusal::Unknown)?;
                     stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?);
@@ -628,6 +824,15 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
             let unaligned = SigRefusal::Unaligned { at: self.at(p.lo) };
             if p.lo >= p.hi {
                 return Err(unaligned);
+            }
+            // A fn-pointer type written as one: its binder's own reading. Written through an
+            // alias (`type Cb = fn(&u8);`), the path below expands it and meets this form there.
+            if let PNode::FnPtr(l, _) = self.node(p.ty)?
+                && let Some(fx) = self.fn_pointer_text(p.lo, p.hi)
+            {
+                let list = self.tys.list(l).map_err(|_| SigRefusal::Unknown)?;
+                self.line_up_fn_pointer(fx, list, p.base, regions)?;
+                continue;
             }
             // A plain path is read for what it resolves to: the erased ADT itself, or a type
             // alias expanded (alias.rs); never lined up with its expansion as if it were it.
@@ -968,6 +1173,8 @@ fn read_signature_in<'t, A: Allocator + Clone>(
         holes: Vec::new_in(alloc.clone()),
         found: Vec::new_in(alloc.clone()),
         depth: 0,
+        binders: Vec::new_in(alloc.clone()),
+        bound: 0,
     };
     lex(text, &mut r.toks)?;
     r.pair_brackets()?;
@@ -1064,7 +1271,9 @@ fn read_signature_in<'t, A: Allocator + Clone>(
         let mut one: Option<Region> = None;
         let mut many = false;
         for (j, &x) in out.regions.iter().enumerate() {
-            if matches!(x, Region::Hidden(_)) || r.unwritten.contains(&(j as u32)) {
+            // A fn pointer's bound lifetime is the pointer's, not one the fn's parameters use
+            // (`fn call(f: fn(&u8) -> &u8, x: &u8) -> &u8` takes `x`'s: MOST_BINDERS).
+            if matches!(x, Region::Hidden(_) | Region::Bound(_)) || r.unwritten.contains(&(j as u32)) {
                 continue;
             }
             match one {

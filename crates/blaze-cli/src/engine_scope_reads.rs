@@ -24,6 +24,27 @@
 //! crate's record (its impl rows: whole; under `Whole` its other names reads and every header's
 //! head read are widened to records whole too, [`ScopeReads::TABLES_AT_CELLS`]), and the script
 //! run (whole).
+//!
+//! A DEPENDENCY'S BUCKETS (lane BD3, under both strategies): a body's read of a bucket of a
+//! crate that defines no cell table (`CELLS` ABSENT: engine_names.rs `cells_of` defines one only
+//! for a crate whose names read a checkout file, a member's or a path dependency's) is its impl
+//! tables task's `WHOLE` (engine_bodies.rs `widen`, `dependency_tables`), one cell a crate,
+//! where it was one cell a bucket probed: on a 700-crate workspace a body's lookups probe a
+//! bucket in most of its scope's crates, and each cell is a read in the row, in the engine's
+//! cell index and in its reverse index for the request's whole life.
+//! - SOUND: `WHOLE` is the digest of the tables' records (front2 buckets/records.rs: the
+//!   directory, which names every bucket's content id, and `NoImplsOf`), so it moves whenever
+//!   any bucket cell of that crate moves, a bucket going from absent to filed included: the
+//!   coarse read never misses an edit its fine reads would have seen (a superset; rule 21).
+//! - WHAT IT COSTS: precision only where a crate's tables move, and a dependency's move only
+//!   with its text, which is keyed by the lock and the shelf (registry sources are never
+//!   statted): a new graph, which re-enters every body of its readers anyway.
+//! - WHERE IT WOULD BE WRONG: an edited PATH dependency (or any crate whose text the checkout
+//!   holds). It is not unsound (the digest still moves) but every body that probed any of its
+//!   buckets would re-enter on any impl added to it, which is why such a crate keeps its
+//!   bucket cells: it defines `CELLS`, and `dependency_tables` reads it as fine. Reading it whole
+//!   would be UNSOUND only if `WHOLE` were a key of the tables' inputs that an edit can leave
+//!   unmoved (a lock digest, say), not their content's digest; it is the content's.
 
 use blaze_drive::Name;
 use blaze_drive::cells::Cell;

@@ -17,6 +17,7 @@ use std::vec::Vec;
 use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::machine::sig;
+pub use blaze_lower::head::signature_needs_fn_body;
 use blaze_lower::{CfgAnswer, Lowered, View, form as lf, head};
 use blaze_own::Alloc;
 use blaze_scope::crate_roots::TextMarks;
@@ -550,6 +551,8 @@ fn legacy_positions(args: &str, r: Range, out: &mut Vec<u32, Global>) -> Result<
 pub struct FnHead<'n> {
     pub lib: LibKey,
     pub text: &'n str,
+    /// Bytes before the body's opening brace, or `None` when the head checks the whole item.
+    pub text_prefix: Option<u32>,
     pub container: Option<ItemKey>,
     pub parent: u32,
     pub own: u32,
@@ -1270,14 +1273,14 @@ impl<'n> Store<'n> {
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, marks)
+                self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, detail, marks)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                let made = self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, marks);
+                let made = self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, detail, marks);
                 if made.is_ok() {
                     let m = if v.head[head::FLAGS] & sig::MUT != 0 { tc::Mutbl::Mut } else { tc::Mutbl::Not };
                     self.statics.insert(ck, m);
@@ -1710,7 +1713,7 @@ impl<'n> Store<'n> {
                     // of the trait's members is met before the trait is made again, so a trait
                     // of n members is made at most a few times, not once per need (Iterator's
                     // members: 62 restarts and 126 ms of 149 a body, front2_tables_cost.rs).
-                    match self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m.text, marks) {
+                    match self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m, marks) {
                         Ok(()) => {}
                         Err(Why::Need(k)) if self.needs == NeedsMet::All => needs.push(k),
                         Err(why) => return Err(why),
@@ -1810,7 +1813,12 @@ impl<'n> Store<'n> {
                     self.preds.insert(mk, cp);
                     let header = tc::FnPtrHeader::RUST;
                     let has_body = mv.head[head::FLAGS] & sig::HAS_BODY != 0;
-                    let row = FnHead { lib: key, text: m.text, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false, header, c_variadic: false, legacy_const_generics: Vec::new_in(Global), inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(Global) };
+                    let alloc = *ps.allocator();
+                    let row = FnHead {
+                        lib: key, text: m.text, text_prefix: None, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false,
+                        header, c_variadic: false, legacy_const_generics: Vec::new_in(alloc), inputs: Vec::new_in(alloc), output, has_body,
+                        module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(alloc),
+                    };
                     self.fns.insert(mk, row);
                 }
                 _ => {}
@@ -1936,6 +1944,7 @@ impl<'n> Store<'n> {
             let row = FnHead {
                 lib: key,
                 text,
+                text_prefix: None,
                 container: None,
                 parent: 0,
                 own: generics,
@@ -2114,7 +2123,12 @@ impl<'n> Store<'n> {
             // is what the constant evaluator reads when another constant names it
             // (`usize::MAX >> 1`). Read from the text, never assumed.
             let has_body = cv.head[head::FLAGS] & sig::HAS_BODY != 0;
-            let row = FnHead { lib: key, text, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false, header, c_variadic: false, legacy_const_generics: Vec::new_in(Global), inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc };
+            let alloc = *ps.allocator();
+            let row = FnHead {
+                lib: key, text, text_prefix: None, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false,
+                header, c_variadic: false, legacy_const_generics: Vec::new_in(alloc), inputs: Vec::new_in(alloc), output, has_body,
+                module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc,
+            };
             self.fns.insert(mk, row);
             consts.push((name, mk));
         }
@@ -2132,8 +2146,8 @@ impl<'n> Store<'n> {
     /// `fn_gaps` and the container's head goes on (a need is passed up: the store makes the
     /// head it names and makes the container again).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
-        match self.fn_head(names, lib, key, container, outer, parent, inherited, v, text, marks) {
+    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+        match self.fn_head(names, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
                 self.fn_gaps.insert(key, why);
@@ -2150,7 +2164,7 @@ impl<'n> Store<'n> {
     /// `inherited` its container's clauses, `v` its own text's, `marks` its text's tokens'
     /// (front2 item_site.rs).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         ps.extend_from_slice(outer.params);
         let mut cs = Vec::new_in(Global);
@@ -2377,7 +2391,8 @@ impl<'n> Store<'n> {
                 legacy_positions(v.text_at(a.args)?, r, &mut legacy_const_generics)?;
             }
         }
-        self.fns.insert(key, FnHead { lib, text, container, parent, own, declared, self_param, header, c_variadic, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
+        let text_prefix = v.fn_text_prefix(detail)?;
+        self.fns.insert(key, FnHead { lib, text, text_prefix, container, parent, own, declared, self_param, header, c_variadic, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }
 }

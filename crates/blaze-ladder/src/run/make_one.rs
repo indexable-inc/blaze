@@ -891,6 +891,8 @@ pub struct InstanceShown {
 pub struct Maker<'n> {
     names: NamesRecords<'n>,
     entry: Option<ItemKey>,
+    /// Where its program starts: the front's roots' say (run/special.rs `MakerStart`).
+    start: crate::run::special::MakerStart,
     made: Option<(RecordsProgram<'n>, MakerState)>,
     isa: Isa,
     overflow: OverflowChecks,
@@ -906,10 +908,25 @@ impl<'n> Maker<'n> {
     /// the records' builder; its ISA, overflow setting and panic strategy are the makes' (rule
     /// 21: one source, nothing to compare). `alloc`: the `'static` heap the lazy program's
     /// tables live in (`Store::new`, `MakerState`). Cheap: reads, resolves and checks nothing.
+    ///
+    /// Its program starts by THE start rule (`MakerStart::ByRule`): a program's run. A parent
+    /// whose roots name another start takes [`Maker::of_roots`].
     pub fn new(names: NamesRecords<'n>, entry: Option<ItemKey>, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
+        Self::starting(names, entry, crate::run::special::MakerStart::ByRule, builder, alloc)
+    }
+
+    /// The maker for the roots a front handed (run/special.rs `Roots`): `entry` as [`Maker::new`]
+    /// takes it, and the program's start the roots' own (`Roots::maker_start`): `blaze run`'s
+    /// roots start by the rule, a test's at its fn. The one way the lazy parent makes a maker.
+    pub fn of_roots(names: NamesRecords<'n>, entry: Option<ItemKey>, roots: &crate::run::special::Roots<'_>, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
+        Self::starting(names, entry, roots.maker_start, builder, alloc)
+    }
+
+    fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
         Maker {
             names,
             entry,
+            start,
             made: None,
             isa: builder.isa,
             overflow: builder.settings.overflow_checks,
@@ -1019,9 +1036,10 @@ impl<'n> Maker<'n> {
             if let Some(sources) = body_sources {
                 program.set_body_sources(sources);
             }
-            // The start, by the one rule run/special.rs `roots` takes (the seam's `rust_start`):
-            // a refusal here is the parent's own roots refusal, met again, never passed over.
-            program.decide_start().map_err(RunError::Roots)?;
+            // The start the front's roots named (run/special.rs `MakerStart`): by the one rule
+            // run/special.rs `roots` takes (the seam's `rust_start`), a refusal here the parent's
+            // own roots refusal met again, never passed over; or a test fn, called directly.
+            program.decide_start(self.start).map_err(RunError::Roots)?;
             self.checks.constructed += 1;
             // A lazy program holds no checked body when made: 0, counted as the claim reads it.
             self.checks.by_construction += (0..program.fn_count()).filter(|&c| program.function(c).body.is_some()).count();

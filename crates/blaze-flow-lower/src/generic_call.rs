@@ -165,6 +165,8 @@ pub enum Skel {
     Under,
     /// A tuple of this many elements.
     Tuple(u32),
+    /// A fn pointer of this many inputs and output (its list's length): they are the children.
+    FnPtr(u32),
     /// The ADT `k`: its type arguments are the children.
     Adt(ItemKey),
     /// A type parameter (its argument's subtree), a trait object, a scalar: no child walked.
@@ -386,6 +388,7 @@ pub fn read_shape<A: Allocator + Clone>(
                     PNode::Ref(..) => Skel::Ref,
                     PNode::Ptr(..) | PNode::Slice(_) | PNode::Pat(..) | PNode::Array(..) => Skel::Under,
                     PNode::Tuple(l) => Skel::Tuple(tys.list(l).map_err(unread(part))?.len() as u32),
+                    PNode::FnPtr(l, _) => Skel::FnPtr(tys.list(l).map_err(unread(part))?.len() as u32),
                     PNode::Adt(k, _) => Skel::Adt(k),
                     PNode::Alias { .. } => Skel::Proj,
                     _ => Skel::Skip,
@@ -397,7 +400,9 @@ pub fn read_shape<A: Allocator + Clone>(
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) => {
+                // A fn pointer's positions are its inputs' then its output's (lib.rs `npos`), each
+                // the next region of the lifetime part (sig.rs reads a bound one as `Bound`).
+                PNode::Tuple(l) | PNode::FnPtr(l, _) => {
                     for &x in tys.list(l).map_err(unread(part))?.iter().rev() {
                         stack.push(x);
                     }
@@ -550,7 +555,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             match (s, node) {
                 (Skel::Ref, PNode::Ref(_, i)) => stack.push(i),
                 (Skel::Under, PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _)) => stack.push(i),
-                (Skel::Tuple(n), PNode::Tuple(l)) => {
+                (Skel::Tuple(n), PNode::Tuple(l)) | (Skel::FnPtr(n), PNode::FnPtr(l, _)) => {
                     let xs = self.list(l, e)?;
                     if xs.len() as u32 != n {
                         return Ok(false);
@@ -620,6 +625,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         }
                     }
                     PNode::Opaque(..) | PNode::Dynamic(_) => at += 1,
+                    // A fn pointer's positions (lane B15: lib.rs `npos`) are skipped whole: a
+                    // projection in its inputs or output is no implied fact of the signature
+                    // (a fn pointer's well-formedness does not hold its parameters'), and
+                    // knowing less is never unsound.
+                    PNode::FnPtr(..) => at += self.npos(x, root)?,
                     PNode::Alias { trait_, args, .. } => {
                         if at >= start + n {
                             break;

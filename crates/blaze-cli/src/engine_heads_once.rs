@@ -22,7 +22,8 @@
 //!   at once write equal bytes (rule 25): the first is kept, the second counted (`twice`), other
 //!   bytes a typed refusal (rule 21), as engine_seeds.rs `RequestTable::publish`.
 //!
-//! A TASK'S READ LIST ([`task_reads`]), for each cell the task defines: that cell's own names
+//! A TASK'S READ LIST includes the asking job's receiver-pointer reads (including its lang
+//! rows). For each cell the task defines, [`task_reads`] adds that cell's own names
 //! reads (its freeze's, and its task's own lookups), what its constants' evaluation read and the
 //! text cells of the constants it holds, and the CELL of each head it read, placed as before
 //! (engine_heads.rs `Owners::place`). A head read at its head task's cell (a head of the same
@@ -104,7 +105,7 @@ use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::index::Index;
 use blaze_ladder::front2::keys::Keys;
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, HeadCells, HeadDone, Known, KnownHeads, NotTheirs, SeededHeads, SeededHeadsOpts, WANT_BYTES, cell_id as head_cell_id, head_task, want_bytes};
+use blaze_ladder::front2::tables::head::{ConstValues, HeadCells, HeadDone, Known, KnownHeads, NotTheirs, SeededHeads, SeededHeadsOpts, WANT_BYTES, cell_id as head_cell_id, head_task, want_bytes};
 use blaze_ladder::front2::tables::owned_reads::{OwnedRecorder, ReadOwners as _};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::seeds::MOST_CELLS;
@@ -118,7 +119,7 @@ use bstd::mem::Frame;
 use crate::CliError;
 use crate::engine_seeds::{DependencyFinder, HeadRecords, KEY_BYTES, Keyed};
 use crate::engine_head_consts::{HeadConsts, UnplacedIn, eval_reads, text_cell};
-use crate::engine_head_notes::{Reason, leak};
+use crate::engine_head_notes::{Cause, head_result, leak, published};
 use crate::engine_heads::{HeadAt, MOST_HEAD_READS, Owners, Subjects, names_read};
 use crate::engine_tasks::{HEADS, WHOLE};
 
@@ -152,9 +153,8 @@ pub(crate) struct Entry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FailedEntry {
     pub(crate) want: Want,
-    /// Its failure's words, key-free (engine_head_notes.rs `Reason`): its cell's digest is made
-    /// of them (engine_heads.rs `HEAD_FAILED_DOMAIN`), and a later ask is answered them.
-    pub(crate) said: &'static str,
+    /// Its own failure, or the reason it stopped at its direct need.
+    pub(crate) cause: Cause,
     /// Its DIRECT need when it failed for a need (front2 tables/head.rs `CellFailure::Needs`);
     /// `None`: it failed by itself.
     pub(crate) needs: Option<Want>,
@@ -486,10 +486,9 @@ impl<R: HeadRecords> HeadsOnce<R> {
         }
     }
 
-    /// One head task's read list kept, of `cells` cells (each once: engine_heads.rs
-    /// `once_each` ran).
-    pub(crate) fn read_list(&self, cells: usize) {
-        let cells = u32::try_from(cells).unwrap_or(u32::MAX);
+    /// One task under one unit. Both strategies hand the merge this same sorted, distinct list.
+    pub(crate) fn read_list(&self, reads: &[CellId]) {
+        let cells = u32::try_from(reads.len()).unwrap_or(u32::MAX);
         self.read_lists.fetch_add(1, Ordering::Relaxed);
         self.read_cells.fetch_add(u64::from(cells), Ordering::Relaxed);
         self.read_most.fetch_max(cells, Ordering::Relaxed);
@@ -581,7 +580,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
 
     /// One more failure of a cell the table holds failed as `held`.
     fn failed_again(&self, held: &FailedEntry, entry: FailedEntry) -> Result<Put, OnceError> {
-        if held.said != entry.said || held.needs != entry.needs {
+        if held.cause != entry.cause || held.needs != entry.needs {
             return Err(OnceError::UnequalFailure { cell: entry.want });
         }
         if held.reads != entry.reads || held.heads != entry.heads {
@@ -793,7 +792,7 @@ impl<R: HeadRecords> KnownHeads for HeadsOnce<R> {
         // A cell some worker failed (lane HF1): refused by its own words, never frozen again; a
         // cell that needs it fails naming it (front2 tables/head.rs `CellFailure::Needs`).
         if let Some(failed) = self.look_failed(cell) {
-            return Known::Refused(NotTheirs::Failed { said: failed.said });
+            return Known::Refused(NotTheirs::Failed { said: failed.cause.words });
         }
         match self.look(cell) {
             Some(_) if self.plant == OncePlant::ForgetAtPut && self.forgot.pin().contains(&want_bytes(cell)) => Known::Freeze,
@@ -953,27 +952,32 @@ pub(crate) fn one_head<'n, 's: 'n>(
     name: Name,
     push: &mut dyn FnMut(CellId),
     failed: &mut Option<&'static str>,
-) -> HeadDone<'static> {
+) -> Result<HeadDone<'static>, Cause> {
     if job.once.sources == Sources::Head {
         return alone(job, owners, want, name, push, failed);
+    }
+    // The asking job supplies the receiver pointers, including on a table hit or failure.
+    // Their reads include this job's lang-index rows (engine_heads.rs `crate_setup`).
+    for &id in job.pointer_reads {
+        push(id);
     }
     let mark = source.kept_len();
     let fail_mark = source.failed_len();
     // The task's own lookups (its item's text, `cell_of`) are its cell's.
     job.names.enter(want);
     job.evals.enter(want);
-    let mut made = head_task(job.shared, source, want, job.tool, job.g);
+    let made = head_task(job.shared, source, want, job.tool, job.g);
     job.names.leave();
     job.evals.leave();
     if let Err(why) = publish_since(job, source, mark, fail_mark) {
         failed.get_or_insert(why);
     }
-    if made.failed.is_some() {
+    let result = head_result(job, source, want, made);
+    if result.is_err() {
         // A head that did not freeze (lane HF1): its failure the table's entry, put by this job
         // or another, never frozen again (module docs).
         match job.once.look_failed(want) {
             Some(entry) => {
-                made.failed = Some(FreezeError::NotTheirs { want, why: NotTheirs::Failed { said: entry.said } });
                 if let Err(why) = reads_from(job, owners, want, name, entry.reads, entry.heads, push) {
                     failed.get_or_insert(why);
                 }
@@ -981,31 +985,17 @@ pub(crate) fn one_head<'n, 's: 'n>(
             // A failure no cell keeps (no text, a chain too deep, too many attempts; a need
             // refused for an engine's lack): the task's own, with its own lookups.
             None => {
-                for id in job.pointer_reads.iter() {
-                    push(*id);
-                }
                 if let Err(why) = reads_from(job, owners, want, name, &[], &[], push) {
                     failed.get_or_insert(why);
                 }
             }
         }
-        return made;
+        return result;
     }
     if let Err(why) = task_reads(job, owners, want, name, push) {
         failed.get_or_insert(why);
     }
-    made
-}
-
-/// The words cell `want`'s kept `failure` is answered and its cell's digest made of (lane HF1):
-/// its own reason's, or the `Again` naming its need's, both key-free (engine_head_notes.rs
-/// `Reason`); `None` for a need refused for an engine's lack, which stays the asker's.
-fn failure_words(g: Alloc<'static>, want: Want, failure: CellFailure<'_>) -> Option<&'static str> {
-    match failure {
-        CellFailure::Own(error) => Some(leak(g, format_args!("{}", Reason(error)))),
-        CellFailure::Needs(need) => Some(leak(g, format_args!("{}", Reason(&FreezeError::Again { want, failed: need })))),
-        CellFailure::Refused { .. } => None,
-    }
+    result
 }
 
 /// Every cell `source` froze itself from its kept index `mark` on, and every cell that failed in
@@ -1015,12 +1005,8 @@ fn publish_since<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, source: &mut SeededHeads<'
     let g = job.g;
     let mut gave_up: Vec<FailedEntry, Alloc<'static>> = Vec::new_in(g);
     for (w, failure, heads) in source.failures_from(fail_mark) {
-        let Some(said) = failure_words(g, w, failure) else { continue };
-        let needs = match failure {
-            CellFailure::Needs(need) => Some(need),
-            CellFailure::Own(_) | CellFailure::Refused { .. } => None,
-        };
-        gave_up.push(FailedEntry { want: w, said, needs, reads: &[], heads: job.once.lend(heads) });
+        let Some((cause, needs)) = published(w, failure, job.records, g) else { continue };
+        gave_up.push(FailedEntry { want: w, cause, needs, reads: &[], heads: job.once.lend(heads) });
     }
     for entry in gave_up.iter_mut() {
         let reads = cell_reads(job, entry.want, &[])?;
@@ -1059,13 +1045,9 @@ fn publish_since<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, source: &mut SeededHeads<'
 fn cell_reads(job: &JobCx<'_, '_, '_, '_, '_>, w: Want, consts: &[(LibKey, u128)]) -> Result<Vec<CellId, Alloc<'static>>, &'static str> {
     let g = job.g;
     let mut out: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
-    out.extend_from_slice(job.pointer_reads);
     names_of(job, job.names, w, &mut out, "a names read of its head names a crate its scope does not hold (front2 tables/task.rs `cell_id`)")?;
     let mut raw: Vec<TableRead, Alloc<'static>> = Vec::new_in(g);
     job.evals.reads_of(w, &mut |one| raw.push(one)).map_err(|e| leak(g, format_args!("its constants' evaluation: {e}")))?;
-    if !raw.is_empty() || !consts.is_empty() {
-        out.extend_from_slice(job.lang_reads);
-    }
     names_of(job, job.evals, w, &mut out, "a names read of its constants' evaluation names a crate its scope does not hold (front2 tables/task.rs `cell_id`)")?;
     eval_reads(job.records, job.subjects, &raw, &mut |id| out.push(id)).map_err(|unplaced| {
         let shown = UnplacedIn { unplaced: &unplaced, crates: job.crates };
@@ -1254,7 +1236,7 @@ fn cover<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
 /// the job's one source: the [`Sources::Head`] strategy only (rule 78; lane HF1: never called by
 /// [`Sources::Job`], module docs "A HEAD THAT DOES NOT FREEZE"): its result and its reads,
 /// every names cell its freeze consulted and the cell of each head it read, transitively.
-fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, want: Want, name: Name, push: &mut dyn FnMut(CellId), failed: &mut Option<&'static str>) -> HeadDone<'static> {
+fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, want: Want, name: Name, push: &mut dyn FnMut(CellId), failed: &mut Option<&'static str>) -> Result<HeadDone<'static>, Cause> {
     let g = job.g;
     let recorder = Recorder::new(RecorderOpts { alloc: g });
     let names = job.base.reading_into(&recorder);
@@ -1263,15 +1245,8 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
     let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, g);
     job.once.alone.fetch_add(1, Ordering::Relaxed);
     let mut source = SeededHeads::new(SeededHeadsOpts { names, sized: job.sized, pointers: job.pointers, frame: job.frame, scratch: g, alloc: g, consts: Some(&mut consts as &mut dyn ConstValues<'_>), known: None, owners: None });
-    let mut made = head_task(names, &mut source, want, job.tool, g);
-    // Its words from its own source's kept failure (lane HF1), as the job sources' table says
-    // them (`failure_words`), so the two strategies' rows are equal.
-    if made.failed.is_some()
-        && let Some((failure, _)) = source.failure(want)
-        && let Some(said) = failure_words(g, want, failure)
-    {
-        made.failed = Some(FreezeError::NotTheirs { want, why: NotTheirs::Failed { said } });
-    }
+    let made = head_task(names, &mut source, want, job.tool, g);
+    let result = head_result(job, &source, want, made);
     for id in job.pointer_reads.iter() {
         push(*id);
     }
@@ -1363,7 +1338,7 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
             failed.get_or_insert("its head read more names cells than the recorder holds (front2 tables/recorder.rs)");
         }
     }
-    made
+    result
 }
 
 /// Whether reads were offered to `recorder` with no owner, or past its caps (a job's whole

@@ -179,7 +179,7 @@ impl BodyVerdict<'_> {
 /// by [`ProjectWorld::from_records`]). Every method is one function over both.
 pub struct ProjectWorld<'n, S = &'n Names<'n>> {
     pub front: Front2<'n, S>,
-    store: Store<'n>,
+    pub(super) store: Store<'n>,
     buckets: Option<Buckets>,
     consts: Consts<'n>,
     prepared: &'n Prepares<'n>,
@@ -346,6 +346,10 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     where
         F: FnOnce(&mut Records<'_, 'n, S>, &Body<'n>, &blaze_typeck::Checked<'static>),
     {
+        // One body's shared-goal hits at a time: a task that checks several bodies (a body and
+        // its local fns, tables/task.rs) sums them itself; an early return below must not
+        // leave the body before's to be counted again.
+        self.store.goal_hits.clear();
         let mut verdict =
             BodyVerdict { diagnostics: AVec::new_in(alloc), findings: AVec::new_in(alloc), undecided: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
         let prepared = self.prepared;

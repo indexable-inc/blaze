@@ -2065,7 +2065,7 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 if crate::signature::is_signature_entry(&outline, item) {
                     let at = blaze_surface::ItemIndex(index as u32);
                     let name = crate::signature::signature_name(subject, &outline, item, text);
-                    parts.push(Part { name, locate: Locate::Source(crate::signature::signature_source(&outline, at, text)), place: item.range.start });
+                    parts.push(Part { name, locate: Locate::Source(crate::engine_heads::outline_head_source(&outline, at, text, edition, crate::engine_heads::FnHeadBodies::Rule)), place: item.range.start });
                 }
             }
             // Each lint unit its own part (lints.rs), when the step runs a rule: keyed by its
@@ -2388,7 +2388,8 @@ fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &
     // its task was handed, the `Surface` task's: never this text's source, which is the
     // part's key, not its out (the drive's `ReadNotHanded` refused it, 2026-11-17); a body not
     // handed it needs it of its file's `FileItems`, which lists it.
-    let surface = Name::new(Kind::Surface, Name::file(job.file.slot.as_bytes()).subject);
+    let caller = Name::file(job.file.slot.as_bytes());
+    let surface = Name::new(Kind::Surface, caller.subject);
     let set_up = clock.now();
     let mut types = crate::body_types::FileTypes::new(cx, root, job.types, text, scratch, job.heap.alloc());
     if job.file.plant == Plant::HeadReadLeftOut {
@@ -2434,10 +2435,10 @@ fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &
             if let Some(item) = found
                 && done.findings.is_empty()
             {
-                types.check(&outline, item, text, &mut done, handed, &mut wants);
+                types.check(&outline, item, text, (path, caller), &mut done, handed, &mut wants);
                 match handed.binary_search_by_key(&surface, |(name, _)| *name) {
                     Ok(at) => done.reads.push(handed[at]),
-                    Err(_) => wants.push(Want { name: surface, home: Name::file(job.file.slot.as_bytes()) }),
+                    Err(_) => wants.push(Want { name: surface, home: caller }),
                 }
                 // One read a name, in name order: two owners name the same heads.
                 done.reads.sort_unstable_by_key(|(name, _)| *name);
@@ -2446,7 +2447,7 @@ fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &
             // Every body's record says its file, its text and the fns its check covered (none
             // when its syntax stopped it): run_ids.rs names each covered fn's `BodyCheck` by it.
             if let Some(item) = found {
-                seal_body_payload(&mut done, Name::file(job.file.slot.as_bytes()), item.hash)?;
+                seal_body_payload(&mut done, caller, item.hash)?;
             }
             Ok(done)
         });

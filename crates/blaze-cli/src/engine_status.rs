@@ -164,6 +164,9 @@ pub(crate) struct Board<'r> {
     /// Each stage's phases' arenas and the heap kept past them, as of its last phase's end
     /// (engine_phase_mem.rs).
     phase_mem: Lock<[crate::engine_phase_mem::StageMem; STAGES]>,
+    /// What each checked body left past its task and what it took in its scratch, summed and
+    /// at its most (engine_bodies.rs `BodyMemLive`, lane BD3): the `bodies memory:` line.
+    pub(crate) bodies_mem: crate::engine_bodies::BodyMemLive,
     slots: [Lock<Option<Slot>>; SLOTS],
     cursor: AtomicUsize,
     unslotted: AtomicU64,
@@ -203,6 +206,7 @@ impl<'r> Board<'r> {
             counts: core::array::from_fn(|_| Counts::default()),
             at_end: Lock::new("engine.status.at_end", [AtEnd::default(); STAGES]),
             phase_mem: Lock::new("engine.status.phase_mem", [crate::engine_phase_mem::StageMem::default(); STAGES]),
+            bodies_mem: crate::engine_bodies::BodyMemLive::new(),
             slots: [const { Lock::new("engine.status.slot", None) }; SLOTS],
             cursor: AtomicUsize::new(0),
             unslotted: AtomicU64::new(0),
@@ -407,6 +411,9 @@ pub(crate) fn write_status(board: &Board<'_>, heading: Heading, now: u64, into: 
             writeln!(into)?;
         }
     }
+    // What a checked body leaves past its task, by part, and its scratch (engine_bodies.rs
+    // `BodyMemLive`): nothing when no body was checked.
+    board.bodies_mem.line(into)?;
     let s = blaze_mem::tag::snapshot();
     write!(into, "memory now (bytes): regions {} frames {} heap {}", s.resident_committed(), s.get(blaze_mem::Tag::Frames).live, s.heap_outside.saturating_add(s.heap()))?;
     match blaze_core::own_footprint() {

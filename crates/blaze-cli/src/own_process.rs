@@ -157,7 +157,7 @@ fn beside(cx: &Cx, fs: &bstd::fs::Fs, launcher: &str, frame: &Frame) -> Beside {
 }
 
 /// The launcher's path: [`LAUNCHER`] in the folder of `exe`, this binary's own path.
-fn launcher_beside<'f>(exe: &str, frame: &'f Frame) -> Result<bstd::mem::String<&'f Frame>, OwnError> {
+pub(crate) fn launcher_beside<'f>(exe: &str, frame: &'f Frame) -> Result<bstd::mem::String<&'f Frame>, OwnError> {
     let Some((folder, _)) = exe.rsplit_once('/') else {
         return Err(OwnError::NoLauncherFolder { exe: std::boxed::Box::from(exe) });
     };

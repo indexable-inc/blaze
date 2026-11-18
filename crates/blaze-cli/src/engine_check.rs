@@ -174,7 +174,7 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
     let flags = crate::flags(&args)?;
     // The request's frame, never the command's fixed 64 MiB one (tempo panicked at 95.7 s,
     // g114729, with that one full): see [`REQUEST_FRAME`].
-    let request = Frame::with_reserve(REQUEST_FRAME, bstd::mem::Tag::Other).map_err(|_| CliError::Text { what: "the request's frame could not be reserved (engine_check.rs `REQUEST_FRAME`)" })?;
+    let request = Frame::with_reserve(REQUEST_FRAME, bstd::mem::Tag::Plane).map_err(|_| CliError::Text { what: "the request's frame could not be reserved (engine_check.rs `REQUEST_FRAME`)" })?;
     let frame: &Frame = &request;
     // `why`'s first word is its target, never a checkout: it stands where blaze was started.
     let checkout = crate::checkout::checkout(if why.is_some() { None } else { flags.dir }, frame)?;

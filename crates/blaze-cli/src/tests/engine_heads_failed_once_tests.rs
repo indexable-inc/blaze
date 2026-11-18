@@ -117,7 +117,8 @@ fn need() -> Want {
 }
 
 fn failed(said: &'static str, needs: Option<Want>) -> FailedEntry {
-    FailedEntry { want: cell(), said, needs, reads: &[], heads: &[] }
+    let cause = crate::engine_head_notes::Cause::new(crate::engine_head_notes::RootKind::Head, said);
+    FailedEntry { want: cell(), cause, needs, reads: &[], heads: &[] }
 }
 
 /// The request's heap, by the helpers' own form (engine_check_tests.rs `opts`).
@@ -139,7 +140,7 @@ fn two_failures_of_one_cell_leave_one_entry() {
     assert_eq!(table.put(frozen), Err(OnceError::FrozenAndFailed { cell: cell() }));
     let counts = table.counts();
     assert_eq!((counts.failed_cells, counts.failed, counts.failed_twice, counts.cells), (1, 4, 1, 0), "{counts:?}");
-    assert_eq!(table.look_failed(cell()).map(|e| e.said), Some("its own reason"));
+    assert_eq!(table.look_failed(cell()).map(|e| e.cause.words), Some("its own reason"));
     assert!(matches!(table.known(cell()), Known::Refused(NotTheirs::Failed { said: "its own reason" })), "a failed cell is not answered by its words");
     // And the other way: a frozen cell is never put failed.
     let other: HeadsOnce = HeadsOnce::new(heap(), OncePlant::Rule, Sources::Job);

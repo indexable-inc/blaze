@@ -69,6 +69,9 @@ pub enum NotKept {
     Descriptor,
     /// It started a second thread and no reach set was given for it.
     Threads,
+    /// Nothing traced it: the run gave no report of what it entered and read (blaze-cli
+    /// test_drive.rs until the zygote's descriptor-3 report, test.md pieces 9 and 10).
+    Untraced,
 }
 
 /// A test's row in the suite's head: its last outcome and how long its last run took.

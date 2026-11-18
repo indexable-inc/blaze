@@ -55,6 +55,8 @@ pub(crate) enum Cond {
     Lt = 11,
     Gt = 12,
     Le = 13,
+    Al = 14,
+    Nv = 15,
 }
 
 impl Cond {
@@ -345,6 +347,11 @@ pub(crate) const fn cbnz(rt: Reg, words: i32) -> u32 {
     0xb500_0000 | (((words as u32) & 0x7_ffff) << 5) | rt
 }
 
+/// Test bit and branch: b5 011011 op b40 imm14 Rt. The displacement starts at zero.
+pub(crate) const fn test_branch(nonzero: bool, rt: Reg, bit: u32) -> u32 {
+    0x3600_0000 | ((bit >> 5) << 31) | ((nonzero as u32) << 24) | ((bit & 31) << 19) | rt
+}
+
 #[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn br(rn: Reg) -> u32 {
     0xd61f_0000 | (rn << 5)
@@ -615,6 +622,11 @@ pub(crate) const fn stxp(rel: bool, rs: Reg, rt: Reg, rt2: Reg, rn: Reg) -> u32 
     0xc820_0000 | (rs << 16) | ((rel as u32) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
+/// Select the element width of an LDXP/STXP word: sz (bit 30) is 1 for X, 0 for W.
+pub(crate) const fn exclusive_pair_width(wide: bool, word64: u32) -> u32 {
+    if wide { word64 } else { word64 & !(1 << 30) }
+}
+
 /// `casp{a,l,al} xs, x(s+1), xt, x(t+1), [rn]` (C6.2, CASP, FEAT_LSE, 64-bit: `0 sz=1 001000 0
 /// L 1 Rs o0 Rt2=11111 Rn Rt`): if the 16 bytes at `rn` equal `xs:x(s+1)` (low word first),
 /// they become `xt:x(t+1)`; `xs:x(s+1)` get the old pair either way. `rs` and `rt` are even.
@@ -763,6 +775,8 @@ pub(crate) enum Field {
     Imm26,
     /// `b.cond`, `cbz`, `cbnz`, `ldr` (literal): a 19-bit word offset in bits 5..24, ±1 MiB.
     Imm19,
+    /// `tbz`, `tbnz`: a 14-bit word offset in bits 5..19.
+    Imm14,
     /// `adr`: a 21-bit byte offset, its low 2 bits in 29..31 and the rest in 5..24, ±1 MiB.
     Adr,
     /// The far own-data form (pass/reach.rs): `adr xD, #0; movz x10, #lo; movk x10, #hi, lsl
@@ -776,6 +790,12 @@ impl Field {
     /// `word` with its field set to reach `bytes` from it, or `None` past the field's reach.
     pub(crate) const fn patch(self, word: u32, bytes: i64) -> Option<u32> {
         match self {
+            Field::Imm14 => {
+                if bytes % 4 != 0 || bytes < -(1 << 15) || bytes >= 1 << 15 {
+                    return None;
+                }
+                Some((word & !(0x3fff << 5)) | ((((bytes / 4) as u32) & 0x3fff) << 5))
+            }
             Field::Imm26 => {
                 if bytes % 4 != 0 || bytes < -(1 << 27) || bytes >= 1 << 27 {
                     return None;

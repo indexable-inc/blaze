@@ -687,10 +687,7 @@ impl Rows<'_, '_, '_> {
             }
             o.head_start = o.head_start.or(head);
             match (syntax, c.kind) {
-                (_, NAME) => {
-                    o.name.get_or_insert(range);
-                }
-                (EXTERN_CRATE, NAME_REF) => {
+                (_, child) if is_name_child(syntax, child) && c.start < c.end => {
                     o.name.get_or_insert(range);
                 }
                 (USE, USE_TREE) => o.tree = Some(range),
@@ -749,7 +746,7 @@ impl Rows<'_, '_, '_> {
             MACRO_CALL => ItemDetail::MacroCall { path: o.path.map(rel), input: o.input.map(rel) },
             VARIANT => ItemDetail::Variant { discriminant: o.value.map(rel) },
             RECORD_FIELD | TUPLE_FIELD => ItemDetail::Field { ty: o.ty.map(rel), default: o.value.map(rel) },
-            ERROR | ATTR | DOC_COMMENT => ItemDetail::Error,
+            kind if is_error_entry(kind) => ItemDetail::Error,
             syntax => ItemDetail::Unhandled { syntax: u16::from(syntax) },
         };
         let by = match syntax {

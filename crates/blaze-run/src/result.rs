@@ -243,6 +243,7 @@ pub(crate) const fn not_kept_number(why: NotKept) -> u8 {
         NotKept::Unsandboxed => 5,
         NotKept::Descriptor => 6,
         NotKept::Threads => 7,
+        NotKept::Untraced => 8,
     }
 }
 
@@ -256,6 +257,7 @@ pub(crate) const fn not_kept_of(byte: u8) -> Option<Result<(), NotKept>> {
         5 => Some(Err(NotKept::Unsandboxed)),
         6 => Some(Err(NotKept::Descriptor)),
         7 => Some(Err(NotKept::Threads)),
+        8 => Some(Err(NotKept::Untraced)),
         _ => None,
     }
 }
@@ -673,6 +675,7 @@ impl fmt::Display for NotKeptWords {
             NotKept::Unsandboxed => "ran outside the sandbox",
             NotKept::Descriptor => "read through a descriptor it did not open",
             NotKept::Threads => "started a thread with no reach set",
+            NotKept::Untraced => "was not traced",
         })
     }
 }

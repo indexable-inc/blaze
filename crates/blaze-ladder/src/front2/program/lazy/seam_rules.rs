@@ -57,11 +57,30 @@ pub(in crate::front2::program) fn llvm_row(foreign: Option<&str>, link_name: Opt
 /// A panic entry, allocator shim or std-internal declaration supplies the call's ABI.
 /// Its row has no outside symbol to link.
 pub(in crate::front2::program) fn bound_decl_row<'n, S: NamesSource<'n>>(
-    names: S, store: &Store<'_>, key: ItemKey, panic_entry: bool, alloc_shim: Option<crate::front2::alloc_shim::Shim>, path: &str,
+    names: S, store: &Store<'n>, key: ItemKey, panic_entry: bool, alloc_shim: Option<crate::front2::alloc_shim::Shim>, path: &str,
 ) -> Result<Option<(FnKind, &'static str)>, Front2Refusal> {
     let internal = crate::front2::internal_symbol::declares(names, store, key, store.tys.alloc())
         .map_err(|why| Front2Refusal::Attrs { function: path.into(), why: why.detail() })?;
     Ok((panic_entry || alloc_shim.is_some() || internal.is_some()).then_some((FnKind::Free, "")))
+}
+
+/// Bind a declaration in the program that will run the call. A failed lookup has the
+/// reach walk's refusal, including the declaration's displayed key and the full detail.
+pub(in crate::front2::program) fn internal_binding<'n, S: NamesSource<'n>>(
+    names: S, keys: &Keys, store: &Store<'n>, item: ItemKey, on_lookup: impl FnOnce() -> Result<(), Front2Refusal>,
+) -> Result<Option<ItemKey>, Front2Refusal> {
+    use crate::front2::internal_symbol::{self, InternalRefused};
+    let alloc = store.tys.alloc();
+    let unchecked = |class: &'static str, first| Front2Refusal::Unchecked {
+        function: crate::front2::item_shown::ItemShown::of(names, keys, item).boxed(),
+        class: class.into(),
+        first,
+    };
+    let refused = |why: InternalRefused| unchecked(why.class(), why.detail());
+    let Some(decl) = internal_symbol::declares(names, store, item, alloc).map_err(refused)? else { return Ok(None) };
+    on_lookup()?;
+    let panic = crate::panic_strategy::of_program(names).map_err(|why| unchecked(why.class(), why.to_string().into_boxed_str()))?;
+    internal_symbol::bound(names, keys, decl, panic, alloc).map(Some).map_err(refused)
 }
 
 /// A trait declaration supplies the call signature until dispatch selects an implementation.

@@ -5,8 +5,8 @@
 //! This first piece is the bridge every answer needs: a call's [`Writes`] from blaze-expand's
 //! [`MacroWrites`] (what a definition can write, crate `blaze_expand::writes`), and the [`Texts`]
 //! a driver reads files through. Its tests hold the soundness property of the summaries against
-//! real expansions (tests/writes_sound.rs). The `Source` impl itself (`outline`, `expansion`,
-//! `root`) is the next piece.
+//! real expansions (tests/writes_sound.rs). The `Source` impl itself is [`CrateSource`]
+//! (src/source.rs), judged against blaze-scope's whole-crate names (tests/demand_fixture.rs).
 //!
 //! # The soundness rule, as this crate keeps it
 //!
@@ -21,6 +21,17 @@ use blaze_expand::{CallWrites, MacroWrites, TokenStream, Written};
 use blaze_id::CrateItemKey;
 use blaze_names_demand::types::Writes;
 use blaze_own::{AVec, Alloc, Vec};
+
+mod error;
+mod source;
+
+pub use error::SourceError;
+pub use source::{CrateFacts, CrateSource, CrateSourceOpts, MOST_FILES, MOST_HELD, SourceCounts, Summaries};
+
+/// How many resolvers deep a callee may be asked (rule 18): a call's macro found by an ask
+/// whose modules have calls whose macros are found by an ask ... Each layer is a fresh
+/// `Resolver` over the same source, so the chain is bounded here, not by the machine.
+pub const MOST_CALLEE_DEPTH: usize = 4;
 
 /// The texts of a crate's files, as the driver holds them (read from disk, a VCS, a test's
 /// table). `None` for a file that does not exist; the caller says what that means.

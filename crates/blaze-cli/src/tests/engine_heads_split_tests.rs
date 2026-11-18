@@ -1,11 +1,13 @@
 //! A CRATE'S HEAD TASKS SPLIT OVER THE WORKERS (engine_heads.rs `split_count`, `heads_of`,
 //! `in_split_order`, lane OW1). A child of main.rs's tests, over engine_check_tests.rs's helpers.
 //!
-//! THE FLOOR: busy jobs = min(workers, tasks with work). One crate of four files, on eight
+//! THE FLOOR: busy jobs = min(workers, tasks with work). One crate of eight files, on eight
 //! workers: under the rule its tasks are cut into more than one job and more than one ran a task.
 //! EQUAL ANSWERS: the crate's tasks in one job against eight jobs, each on a fresh world of one
 //! seed: equal findings, equal head rows (each `Signature` row's out, defines and read list, as
 //! the stored answer holds them) and equal table counts (cells, frozen, bytes held).
+//! WHOLE FILES: six files with 1, 1, 40, 3, 3 and 2 tasks. The large file stays in its own
+//! job. The old evenly spaced cuts cross that file three times, counted as one shared file.
 //! THE MERGE (rule 43, `blaze_sim`): the split jobs' results put in split order whatever order
 //! they finished in, every order the tape draws. CONTROL (rule 23): the planted arrival order
 //! (`MergePlant::Arrival`) is caught by the same oracle.
@@ -13,7 +15,7 @@
 use super::engine_check_tests::{engine_opts, opts};
 use super::*;
 
-use crate::engine_heads::{HeadJobs, HeadSplit, MergePlant, in_split_order};
+use crate::engine_heads::{HeadJobs, HeadSplit, MergePlant, file_splits, in_split_order};
 use blaze_sim::{Broke, Config, Tape, check as sim_check, control};
 
 const WORKSPACE: &str = "[workspace]\nmembers = [\"four\"]\nresolver = \"2\"\n";
@@ -23,14 +25,35 @@ const A: &str = "pub struct A {\n    pub x: u32,\n}\n\npub struct A2 {\n    pub 
 const B: &str = "use crate::a::A;\n\npub struct B {\n    pub a: A,\n    pub y: u32,\n}\n\npub trait Get {\n    fn get(&self) -> u32;\n}\n\nimpl Get for B {\n    fn get(&self) -> u32 {\n        self.a.x + self.y\n    }\n}\n\npub fn b(a: A, y: u32) -> B {\n    B { a, y }\n}\n\npub const TWO: u32 = 2;\n";
 const C: &str = "use crate::a::A;\nuse crate::b::{B, Get, TWO};\n\npub struct C {\n    pub b: B,\n}\n\npub fn sum(a: &A, b: &B) -> u32 {\n    a.x + b.get() * TWO\n}\n\npub fn c(b: B) -> C {\n    C { b }\n}\n\npub fn cx(c: &C) -> u32 {\n    c.b.get()\n}\n";
 
-fn four_files(seed: u64) -> Io {
+fn eight_files(seed: u64) -> Io {
     let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
     write(&io, "Cargo.toml", WORKSPACE);
     write(&io, "four/Cargo.toml", MANIFEST);
-    write(&io, "four/src/lib.rs", LIB);
+    write(&io, "four/src/lib.rs", &format!("{LIB}pub mod d;\npub mod e;\npub mod f;\npub mod g;\n"));
     write(&io, "four/src/a.rs", A);
     write(&io, "four/src/b.rs", B);
     write(&io, "four/src/c.rs", C);
+    for module in ["d", "e", "f", "g"] {
+        write(&io, &format!("four/src/{module}.rs"), &functions(5));
+    }
+    io
+}
+
+const UNEVEN: [usize; 6] = [1, 1, 40, 3, 3, 2];
+
+fn uneven_files() -> Io {
+    let io = Io::simulated(SimWorld::new(43, Limits::USUAL));
+    write(&io, "Cargo.toml", WORKSPACE);
+    write(&io, "four/Cargo.toml", MANIFEST);
+    let mut paths = ["four/src/lib.rs", "four/src/a.rs", "four/src/b.rs", "four/src/c.rs", "four/src/d.rs", "four/src/e.rs"];
+    paths.sort_unstable_by_key(|path| blaze_drive::Name::file(path.as_bytes()));
+    for (path, tasks) in paths.into_iter().zip(UNEVEN) {
+        let mut source = functions(tasks);
+        if path == "four/src/lib.rs" {
+            source.push_str("pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\n");
+        }
+        write(&io, path, &source);
+    }
     io
 }
 
@@ -87,8 +110,8 @@ fn head_rows(io: &Io, g: blaze_own::Alloc<'static>) -> (blaze_ids::ContentId, u3
 /// with S > 1 and B > 1.
 #[test]
 fn split_head_jobs_answer_as_one_job_and_fill_the_workers() {
-    let one = request(&four_files(41), HeadSplit::Jobs(core::num::NonZeroU32::MIN));
-    let eight = request(&four_files(41), HeadSplit::Jobs(core::num::NonZeroU32::new(8).expect("eight")));
+    let one = request(&eight_files(41), HeadSplit::Jobs(core::num::NonZeroU32::MIN));
+    let eight = request(&eight_files(41), HeadSplit::Jobs(core::num::NonZeroU32::new(8).expect("eight")));
     for (label, said) in [("1", &one), ("8", &eight)] {
         let u = said.checked.seeds.units;
         println!("heads split {label}: {} rows, digest {:?}; jobs {} for {} tasks, {} busy; cells {}, frozen {}, bytes held {}", said.rows.1, said.rows.0, u.split_jobs, u.tasks, u.busy, said.checked.seeds.once.cells, said.checked.seeds.once.frozen, said.checked.seeds.once.bytes_held);
@@ -104,13 +127,57 @@ fn split_head_jobs_answer_as_one_job_and_fill_the_workers() {
     assert_eq!((a.cells, a.bytes_held), (b.cells, b.bytes_held), "EQUAL TABLES: the request's frozen heads, one job against eight: cells {} and {}, bytes {} and {}", a.cells, b.cells, a.bytes_held, b.bytes_held);
 
     // THE FLOOR under the rule: one crate on eight workers is cut, and more than one job works.
-    let rule = request(&four_files(41), HeadSplit::Rule);
+    let rule = request(&eight_files(41), HeadSplit::Rule);
     let u = rule.checked.seeds.units;
     println!("heads split rule: {} split jobs over {} crate jobs, {} busy, floor {}, most {} in one crate", u.split_jobs, u.crate_jobs, u.busy, u.busy_floor, u.most_splits);
     assert!(u.most_splits > 1, "a one-crate unit is cut into more than one job: {u:?}");
     assert!(u.busy > 1, "more than one split job ran a task: {u:?}");
     assert!(u.busy * 100 >= u.busy_floor * 90, "busy jobs within 10% of the floor min(workers, tasks): {u:?}");
+    assert_eq!(u.split_files, 0, "the command schedules each file in one split");
     assert_eq!(rule.rows, one.rows, "EQUAL ROWS: the rule's split against one job");
+}
+
+#[test]
+fn uneven_head_files_stay_whole_and_answer_as_one_job() {
+    let jobs = core::num::NonZeroU32::new(4).expect("four");
+    let tasks = UNEVEN.iter().sum::<usize>();
+    let target = tasks.div_ceil(jobs.get() as usize);
+    let largest = *UNEVEN.iter().max().expect("six files");
+    let runs: std::vec::Vec<_> = file_splits(&UNEVEN, tasks, jobs.get() as usize).collect();
+    assert_eq!(runs, [0..2, 2..42, 42..50], "greedy whole files with the oversized file alone");
+    let sizes: std::vec::Vec<_> = runs.iter().map(|run| run.len()).collect();
+    assert!(sizes.iter().all(|&size| size <= target + largest));
+
+    let one = request(&uneven_files(), HeadSplit::Jobs(core::num::NonZeroU32::MIN));
+    let whole = request(&uneven_files(), HeadSplit::Jobs(jobs));
+    let u = whole.checked.seeds.units;
+    assert_eq!(u.split_files, 0, "files in multiple dispatched splits");
+    assert_eq!(u.most_splits as usize, runs.len(), "actual jobs dispatched for the crate");
+    assert_eq!(one.rows.1, tasks as u32, "one stored Signature per function");
+    assert_eq!(whole.rows, one.rows, "all Signature rows equal the one-job answer");
+    println!("uneven head files: sizes {sizes:?}, bound {}, {} files in more than one split, {} equal rows", target + largest, u.split_files, whole.rows.1);
+}
+
+#[test]
+fn the_file_split_count_catches_even_task_cuts() {
+    let jobs = core::num::NonZeroU32::new(4).expect("four");
+    let even = request(&uneven_files(), HeadSplit::Even(jobs));
+    let u = even.checked.seeds.units;
+    assert_eq!(u.most_splits, jobs.get(), "the control dispatches all four even cuts");
+    assert!(u.crate_jobs > 0, "the fixture ran head tasks");
+    assert_eq!(u.split_files, u.crate_jobs, "cuts at 12, 25 and 37 all cross the same file in each crate job");
+    println!("uneven head files control: 1 file in more than one split per crate job, {} total", u.split_files);
+}
+
+#[test]
+fn whole_file_cuts_fit_the_job_budget_when_possible() {
+    // Target 9. Admitting the next whole file raises the limit to 12 and fits two jobs.
+    let sizes: std::vec::Vec<_> = file_splits(&[6, 6, 6], 18, 2).map(|run| run.len()).collect();
+    assert_eq!(sizes, [12, 6]);
+    // Target 5. Both boundaries of the eight-task file are compulsory.
+    let isolated: std::vec::Vec<_> = file_splits(&[1, 8, 1], 10, 2).map(|run| run.len()).collect();
+    assert_eq!(isolated, [1, 8, 1]);
+    println!("two requested jobs: {sizes:?}; isolated oversized file: {isolated:?}");
 }
 
 /// The request's heap, by the helpers' own form (engine_check_tests.rs `opts`).

@@ -153,7 +153,7 @@ const RED: &str = "1;31";
 const GREEN: &str = "32";
 const YELLOW: &str = "33";
 
-const NOT_KEPT: [NotKept; 7] = [
+const NOT_KEPT: [NotKept; 8] = [
     NotKept::Clock,
     NotKept::Network,
     NotKept::WroteOutside,
@@ -161,6 +161,7 @@ const NOT_KEPT: [NotKept; 7] = [
     NotKept::Unsandboxed,
     NotKept::Descriptor,
     NotKept::Threads,
+    NotKept::Untraced,
 ];
 
 const fn not_kept_key(why: NotKept) -> &'static str {
@@ -172,6 +173,7 @@ const fn not_kept_key(why: NotKept) -> &'static str {
         NotKept::Unsandboxed => "unsandboxed",
         NotKept::Descriptor => "descriptor",
         NotKept::Threads => "threads",
+        NotKept::Untraced => "untraced",
     }
 }
 
@@ -184,6 +186,7 @@ const fn not_kept_index(why: NotKept) -> usize {
         NotKept::Unsandboxed => 4,
         NotKept::Descriptor => 5,
         NotKept::Threads => 6,
+        NotKept::Untraced => 7,
     }
 }
 
@@ -379,7 +382,7 @@ struct Counts {
     passed: u32,
     failed: u32,
     reused: u32,
-    not_kept: [u32; 7],
+    not_kept: [u32; NOT_KEPT.len()],
     ignored: u32,
     benches: u32,
     /// Tests the plan wanted run that could not be ([`NotRun`]); set by [`summary_with`].

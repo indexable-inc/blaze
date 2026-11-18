@@ -86,10 +86,18 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// store's table, the one the back half reads); else `main` called directly. What the seam's
     /// `rust_start` answers. Reads crate 0's fn rows and their attributes, the linked crates'
     /// lang rows, and for a Rust start `main`'s head; no body.
-    pub fn decide_start(&mut self) -> Result<(), crate::run::special::RootsError> {
+    ///
+    /// `start` is what the front's roots say (run/special.rs `MakerStart`): `ByRule` is the
+    /// above, a program's run; `Direct(f)` is a test's run, `f` called directly, and the rule
+    /// (and so the crate's `fn main`) is not asked at all.
+    pub fn decide_start(&mut self, start: crate::run::special::MakerStart) -> Result<(), crate::run::special::RootsError> {
         use crate::front2::start::{Entry2, rust_start};
-        use crate::run::special::RootsError;
+        use crate::run::special::{MakerStart, RootsError};
         let names = self.front.names;
+        if let MakerStart::Direct(entry) = start {
+            self.start = Some(Entry2::Direct(entry));
+            return Ok(());
+        }
         let entry = match start_of(names, self.alloc).map_err(RootsError::Start)? {
             StartOf::Exported(e) => e,
             StartOf::LangStart(lang_start) => {

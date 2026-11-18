@@ -46,6 +46,13 @@ use super::index::ImplAt;
 /// The names as this command solved them: the first [`NamesSource`].
 pub type Solved<'n> = &'n Names<'n>;
 
+/// The path a reader resolves against its package directory and the name used in diagnostics.
+#[derive(Clone, Copy, Debug)]
+pub struct FilePaths<'n> {
+    pub package: PackagePath<'n>,
+    pub shown: &'n str,
+}
+
 /// A member of a trait or an impl, as either source lists it (question 13).
 #[derive(Clone, Copy, Debug)]
 pub struct MemberOf<'n> {
@@ -194,7 +201,12 @@ pub trait NamesSource<'n>: Copy {
     /// Question 10f: file `file` of crate `krate` as a message shows it (its shown path, as a
     /// `#[track_caller]` `Location`'s file is written: [`crate::seam::FrontEnd::caller_site`]).
     /// `None`: no such file (over records the error is in the log).
-    fn file_shown(self, krate: usize, file: u32) -> Option<&'n str>;
+    fn file_shown(self, krate: usize, file: u32) -> Option<&'n str> {
+        self.file_paths(krate, file).map(|paths| paths.shown)
+    }
+
+    /// Both paths from the same file row. The package path is portable across checkouts.
+    fn file_paths(self, krate: usize, file: u32) -> Option<FilePaths<'n>>;
 
     /// Question 10g: today's whole text of file `file` of crate `krate`, what an item's
     /// [`NamesSource::item_start`] is an offset into: where a position is turned into a line and
@@ -478,8 +490,9 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         Some((at, outline.item(item).range.start))
     }
 
-    fn file_shown(self, krate: usize, file: u32) -> Option<&'n str> {
-        self.crates().get(krate)?.files.get(file as usize).map(|f| f.shown)
+    fn file_paths(self, krate: usize, file: u32) -> Option<FilePaths<'n>> {
+        let row = self.crates().get(krate)?.files.get(file as usize)?;
+        Some(FilePaths { package: row.package, shown: row.shown })
     }
 
     fn file_text(self, krate: usize, file: u32) -> Option<&'n str> {
@@ -1465,11 +1478,11 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         Some((span.at, span.start))
     }
 
-    /// From the items record's file row (its `shown` column): no text is read.
-    fn file_shown(self, krate: usize, file: u32) -> Option<&'n str> {
+    /// Both columns of the items record's file row, without reading its text.
+    fn file_paths(self, krate: usize, file: u32) -> Option<FilePaths<'n>> {
         let record = self.items_of(krate)?;
         match self.read(krate, record.file(file))? {
-            Some(row) => Some(row.shown),
+            Some(row) => Some(FilePaths { package: row.path, shown: row.shown }),
             None => {
                 self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::Short { what: "a file row", at: file as usize } });
                 None

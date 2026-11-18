@@ -330,6 +330,7 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
             FnHead {
                 lib: a.module,
                 text,
+                text_prefix: None,
                 container: None,
                 parent: 0,
                 own: 0,

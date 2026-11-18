@@ -63,7 +63,7 @@ fn engine_check_puts_an_equal_expansion_once() {
     let (was, now) = (baseline.records.extras[at], checked.records.extras[at]);
     let (names_was, names_now) = (baseline.records.lines[at], checked.records.lines[at]);
     println!("expansions, baseline: {was:?}; 30 calls: {now:?}\nrecords (Names), baseline: {names_was}; 30 calls: {names_now}\n{}", profile_lines(&io));
-    assert!(ids.iter().all(|(code, _)| code != "unresolved"), "the chain resolves: {ids:?}");
+    assert!(ids.iter().all(|(code, _)| code != "unresolved" && !code.starts_with("unresolved-")), "the chain resolves: {ids:?}");
     // `check` names each member twice, its lib and its test harness (blaze-unit-graph
     // resolve.rs `Kind::TestLib`): six `CrateScope` tasks, each crate's ten calls a row of each
     // of its two, 60 rows. A token's mark holds its macro's DEFINING crate key (blaze-expand

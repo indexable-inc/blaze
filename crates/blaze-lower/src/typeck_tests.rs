@@ -1428,18 +1428,50 @@ fn an_impls_const_parameter_is_bound_by_selection() {
     assert!(lines.contains("pick([1u16, 2, 3, 4]) => [u8; 4]"), "{lines}");
 }
 
-/// Both uses of one const parameter take one value (the Reference, "Const generics"): the
-/// impl above does not give `[u16; 3]: Tr<[u8; 4]>` (E0277), and does give
-/// `[u16; 3]: Tr<[u8; 3]>`. A unifier that took any const for any other fails the first.
+/// Both uses of the impl's `N` take one value. The first argument fixes `T = [u16; 3]`,
+/// so the sole impl fixes `U = [u8; 3]`. The second argument must coerce to that formal
+/// (the Reference, "Type coercions", "Coercion sites"). Its written length is four.
 #[test]
 fn an_impls_const_parameter_takes_one_value() {
     let (fx, [_, main]) = const_impl_world();
     let wrong = "fn main() {\n    need([1u16, 2, 3], [1u8, 2, 3, 4])\n}";
     let (c, _, _) = lower_and_check(&fx, main, wrong);
-    assert_eq!(c.diags.iter().map(|d| d.code).collect::<std::vec::Vec<_>>(), [blaze_typeck::DiagCode::Unsatisfied]);
+    assert_eq!(findings(wrong, &c), [(blaze_typeck::DiagCode::Mismatch, "[1u8, 2, 3, 4]")]);
+    let diag = &c.diags[0];
+    assert_eq!(show(&fx, c.types.view(), diag.expected.expect("the second formal")), "[u8; 3]");
+    assert_eq!(show(&fx, c.types.view(), diag.found.expect("the second argument")), "[u8; 4]");
     let right = "fn main() {\n    need([1u16, 2, 3], [1u8, 2, 3])\n}";
     let (c, _, _) = lower_and_check(&fx, main, right);
     assert!(c.diags.is_empty(), "diagnostics {:?}", c.diags);
+}
+
+/// `impl<X> Tr<X> for (X,)` uses one type in both places. Checking the tuple first
+/// determines the other formal. Checking the trait argument first leaves Self unknown.
+#[test]
+fn an_impls_type_parameter_takes_one_type() {
+    use blaze_typeck::DiagCode::{Mismatch, Unsatisfied};
+    use std::vec::Vec;
+
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let tr = fx.tr("Tr", 2, Vec::new(), &[]);
+    let (a, b, unit) = (fx.param(0), fx.param(1), fx.unit());
+    let tuple = fx.tuple(&[a]);
+    fx.imp("impl<X> Tr<X> for (X,)", 1, tuple, Some((tr, &[a])), &[], Vec::new());
+    let bound = fx.bound(tr, &[a, b]);
+    fx.func("need", 2, &[a, b], unit, std::vec![bound]);
+    fx.func("rhs_first", 2, &[b, a], unit, std::vec![bound]);
+    let main = fx.func("main", 0, &[], unit, Vec::new());
+    fx.finish();
+
+    let text = "fn main() { need((1u8,), false) }";
+    let (c, _, _) = lower_and_check(&fx, main, text);
+    assert_eq!(findings(text, &c), [(Mismatch, "false")]);
+
+    // Committing the impl while Self is unknown would demand a (bool,) argument here.
+    // Both formals instead take their arguments' types, leaving (u8,): Tr<bool> unmet.
+    let text = "fn main() { rhs_first(false, (1u8,)) }";
+    let (c, _, _) = lower_and_check(&fx, main, text);
+    assert_eq!(c.diags.iter().map(|d| d.code).collect::<Vec<_>>(), [Unsatisfied]);
 }
 
 /// `pattern_type!(T is PAT)`, the pinned library's built-in (core/src/pat.rs), read from its

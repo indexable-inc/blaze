@@ -60,6 +60,9 @@ use crate::front2::start::{Entry2, rust_start};
 use crate::symbols::{SymbolError, encode_instance, fn_symbol_of_name, tls_getter_symbol};
 use crate::tls_index::{ENDER_NAME, ender_parts, make_ender_entry, tls_ender_symbol};
 
+/// One test's roots (`blaze test`: the test fn as a `fn()` entry, under the same lazy parent).
+pub mod test_roots;
+
 /// The domain of the shim's symbol: one shim a (lang_start, main) pair.
 const SHIM_SYMBOL_DOMAIN: &str = "blaze-ladder C entry shim symbol 1";
 
@@ -157,6 +160,8 @@ pub enum RootsError {
     /// The program unwinds and its lang crates name no one personality routine
     /// (personality.rs `personality_of`).
     Personality(crate::personality::PersonalityError),
+    /// A test fn's entry was refused (test_roots.rs).
+    Test(test_roots::TestRefusal),
 }
 
 impl fmt::Display for RootsError {
@@ -167,6 +172,7 @@ impl fmt::Display for RootsError {
             RootsError::Symbol { what, error } => write!(f, "the run's roots: {what}'s instance name: {error}"),
             RootsError::Types(error) => write!(f, "the run's roots: `lang_start`'s argument list `[T]`: {error:?}"),
             RootsError::Personality(error) => write!(f, "the run's roots: {error}"),
+            RootsError::Test(refusal) => write!(f, "the run's roots: {refusal}"),
         }
     }
 }
@@ -189,10 +195,26 @@ pub struct Shim<'r> {
     pub main: RootRow<'r>,
 }
 
+/// Where the maker's program starts (make_one.rs `Maker`, lazy/fill.rs `decide_start`), as the
+/// roots that front handed say: a property of the roots, so the parent that entered a test fn
+/// builds its instances for that entry, never for the crate's `fn main` (one seam: the front's
+/// roots; one builder).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MakerStart {
+    /// THE start rule, decided again in the maker's own store (program.rs `start_of`, as
+    /// [`roots`] decided it): a program's run.
+    ByRule,
+    /// The fn `0` called directly, through no `#[lang = "start"]` (front2 start.rs
+    /// `Entry2::Direct`): a test's run ([`test_roots::test_roots`]).
+    Direct(blaze_id::ItemKey),
+}
+
 /// The run's roots ([`roots`]; the module doc's table).
 pub struct Roots<'a> {
     /// What the start rule answered.
     pub start: StartOf,
+    /// Where the maker over these roots starts its program ([`MakerStart`]).
+    pub maker_start: MakerStart,
     /// How the launcher starts [`Roots::entry`].
     pub form: EntryForm,
     /// The symbol the launcher is told: the shim's for a Rust program with std, else the root
@@ -313,7 +335,7 @@ fn roots_with<'n, 'a, S: NamesSource<'n>>(
             Some(routine) => Some(table.push("the personality routine", checker_of(routine), List::EMPTY, store.tys.view())?),
         },
     };
-    Ok(Roots { start, form, entry, rows: table.rows, symbols: table.symbols, shim, personality })
+    Ok(Roots { start, maker_start: MakerStart::ByRule, form, entry, rows: table.rows, symbols: table.symbols, shim, personality })
 }
 
 /// The root rows as [`roots`] fills them.

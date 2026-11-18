@@ -48,8 +48,10 @@ pub const DETAIL: u64 = 4;
 /// The `detail` of a trait's header row read for a tie.
 pub const TRAIT_DETAIL: u64 = 5;
 
-const DOMAIN: &str = "blaze-ladder front2 borrow trait ties read v1";
-const TRAIT_DOMAIN: &str = "blaze-ladder front2 borrow tie trait header read v1";
+/// v2 (lane B15): a fn pointer in a bound's types has positions and a lifetime its binder
+/// binds is `Region::Bound` (tag 5).
+const DOMAIN: &str = "blaze-ladder front2 borrow trait ties read v2";
+const TRAIT_DOMAIN: &str = "blaze-ladder front2 borrow tie trait header read v2";
 
 /// Every fn's rows, sorted by checker key, and the rows read for them.
 pub struct TiesTable<'a> {
@@ -204,6 +206,7 @@ fn region(h: &mut StableHasher, r: Region) {
         Region::Anon(n) => (2, n),
         Region::SelfTy(n) => (3, n),
         Region::Hidden(n) => (4, n),
+        Region::Bound(n) => (5, n),
     };
     h.tag(tag);
     h.u32(n);

@@ -343,7 +343,7 @@ fn compare_one(w: &World, program: &str, files: &[SourceFile<'_>], edition: &str
             return out;
         }
     };
-    if let Err(e) = lazy.decide_start() {
+    if let Err(e) = lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule) {
         println!("{program}: GAP: the lazy program's start: {}", first_line(a, &e).as_str());
         out.gap = true;
         return out;

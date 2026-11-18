@@ -101,12 +101,24 @@ impl core::fmt::Display for TestEntryRefusal {
     }
 }
 
-/// The entry of the test fn `test` (library key; `key` its checker key), whose body was just
-/// lowered (so its head is in the store): read from its head alone, the `report` fn resolved
-/// through the checker's own impl index.
-pub fn entry_shape(r: &mut Records<'_, '_>, test: LibKey, key: ItemKey) -> Result<EntryShape, TestEntryRefusal> {
+/// What a test fn's HEAD alone says of its entry ([`head_shape`]): the half of the rule that
+/// needs no impl index, which every caller shares (rule 30): [`entry_shape`] for the suite, and
+/// blaze-ladder run/special/test_roots.rs for one test's roots under the lazy parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadShape {
+    /// It returns `()`: the fn is its own entry ([`EntryShape::Direct`]).
+    Unit,
+    /// It returns `output`, a non-opaque type: its entry is the report shim, whose `report` fn
+    /// [`entry_shape`] selects.
+    Returns(PTy),
+}
+
+/// The head-only half of the entry rule of the test fn `test` (library key; `key` its checker
+/// key), whose head is in `store`: a free, monomorphic fn taking no arguments, returning `()`
+/// or a type that is not opaque. Each refusal by name.
+pub fn head_shape(store: &super::heads::Store<'_>, test: LibKey, key: ItemKey) -> Result<HeadShape, TestEntryRefusal> {
     let (output, params, inputs, member) = {
-        let head = r.store.fns.get(&key).ok_or(TestEntryRefusal::NoHead { test })?;
+        let head = store.fns.get(&key).ok_or(TestEntryRefusal::NoHead { test })?;
         (head.output, head.parent + head.own, u32::try_from(head.inputs.len()).unwrap_or(u32::MAX), head.container.is_some())
     };
     if member {
@@ -118,12 +130,12 @@ pub fn entry_shape(r: &mut Records<'_, '_>, test: LibKey, key: ItemKey) -> Resul
     if inputs != 0 {
         return Err(TestEntryRefusal::TakesArguments { test, count: inputs });
     }
-    let node = r.store.tys.view().node(output).map_err(|_| TestEntryRefusal::Malformed { test })?;
+    let node = store.tys.view().node(output).map_err(|_| TestEntryRefusal::Malformed { test })?;
     match node {
         PNode::Tuple(list) => {
-            let unit = r.store.tys.view().list(list).map_err(|_| TestEntryRefusal::Malformed { test })?.is_empty();
+            let unit = store.tys.view().list(list).map_err(|_| TestEntryRefusal::Malformed { test })?.is_empty();
             if unit {
-                return Ok(EntryShape::Direct);
+                return Ok(HeadShape::Unit);
             }
         }
         // An `async fn`'s own future is its opaque type number 0 (keys.rs `opaque_key`).
@@ -131,6 +143,17 @@ pub fn entry_shape(r: &mut Records<'_, '_>, test: LibKey, key: ItemKey) -> Resul
         PNode::Opaque(..) => return Err(TestEntryRefusal::OpaqueReturn { test }),
         _ => {}
     }
+    Ok(HeadShape::Returns(output))
+}
+
+/// The entry of the test fn `test` (library key; `key` its checker key), whose body was just
+/// lowered (so its head is in the store): read from its head alone ([`head_shape`]), the
+/// `report` fn resolved through the checker's own impl index.
+pub fn entry_shape(r: &mut Records<'_, '_>, test: LibKey, key: ItemKey) -> Result<EntryShape, TestEntryRefusal> {
+    let output = match head_shape(&*r.store, test, key)? {
+        HeadShape::Unit => return Ok(EntryShape::Direct),
+        HeadShape::Returns(output) => output,
+    };
     let lib = r.index.lang(TERMINATION_LANG).ok_or(TestEntryRefusal::NoTermination)?;
     let termination = r.keys.item(lib).map_err(|_| TestEntryRefusal::NoTermination)?;
     let shape = super::buckets::shape_of(r.store.tys.view(), output).ok_or(TestEntryRefusal::Malformed { test })?;

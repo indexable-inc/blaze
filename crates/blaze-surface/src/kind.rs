@@ -190,6 +190,8 @@ byte_enum! {
         /// An `AfterDerive` call with a `#[derive]` written after it on the same item: when it
         /// names an attribute macro the call is refused (`Unresolved::DeriveAfterAttrMacro`),
         /// since that derive would run on the item here and again on the macro's output.
+        /// Lowering takes the item's attributes in written order (`AttrOrder::Written`), so only
+        /// the planted old order (`AttrOrder::DerivesAtOnce`) reaches this refusal, kept as that control's oracle.
         AfterDeriveBeforeDerive = 3 => "after derive, before a derive",
     }
 }

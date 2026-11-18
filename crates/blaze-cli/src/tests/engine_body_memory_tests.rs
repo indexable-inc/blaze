@@ -16,17 +16,15 @@ use super::*;
 const BODIES: usize = 300;
 const EVERY: usize = 3;
 
-/// The most the stage may hold a body past its task on this fixture: its row (`Ran`, under
-/// 200 bytes), a short label, and for a third of them one finding with its message (about
-/// 100 bytes). Ten times the floor would be about 450 bytes; this bound is the row's size plus
-/// a finding at every body, so a list a body on the heap, or a copy of the body's output, fails.
+/// On a 64-bit host the row is 96 bytes. The labels f0 through f299 total 1090 bytes.
+/// Every third body has a 40-byte finding and a 32-byte message (E0308, separator,
+/// "found `u8`, expected `u16`"). There are no notes. The integer mean is
+/// 96 + (1090 + 100 * (40 + 32)) / 300 = 123 bytes per body.
 ///
 /// PINNED (first run, 2026-11-18, the cut of BD1 on c1ebcac4a3): the stage holds 843 bytes a
 /// body here, not the 512 this lane wrote without a run (it took `Ran` for under 200 bytes).
-/// The bound is today's number rounded up; it is about 13 times `HELD_FLOOR`, which misses the
-/// floor (rule 67). OWED: say `size_of::<Ran>()` on the profile's line and shrink the row; when
-/// the number goes down, tighten this toward the floor.
-const HELD_MOST: u64 = 900;
+/// That measurement was about 13 times `HELD_FLOOR` and the bound was raised to 900.
+const HELD_MOST: u64 = 123;
 
 /// A lib of [`BODIES`] fns, every [`EVERY`]th one returning a `u8` as a `u16`.
 fn many_bodies(io: &Io) {
@@ -42,14 +40,32 @@ fn many_bodies(io: &Io) {
     write(io, "src/lib.rs", lib.as_str());
 }
 
-/// The profile's `bodies: held per body` line: (bytes a body, floor, scratch most).
-fn held_line(profile: &str) -> (u64, u64, u64) {
+struct HeldLine {
+    per_body: u64,
+    floor: u64,
+    row: u64,
+    label: u64,
+    findings: u64,
+    words: u64,
+    scratch: u64,
+}
+
+/// Read the numbers the stage actually printed, including the independently rounded means.
+fn held_line(profile: &str) -> HeldLine {
     let line = profile.lines().find(|line| line.starts_with("bodies: held per body ")).unwrap_or_else(|| panic!("no `bodies: held per body` line in the profile:\n{profile}"));
     let number_after = |key: &str| -> u64 {
         let at = line.find(key).unwrap_or_else(|| panic!("`{key}` not in {line:?}")) + key.len();
         line[at..].split(|c: char| !c.is_ascii_digit()).next().and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("no number after `{key}` in {line:?}"))
     };
-    (number_after("held per body "), number_after("(floor "), number_after("scratch at most "))
+    HeldLine {
+        per_body: number_after("held per body "),
+        floor: number_after("(floor "),
+        row: number_after("row "),
+        label: number_after("label "),
+        findings: number_after("findings "),
+        words: number_after("words "),
+        scratch: number_after("scratch at most "),
+    }
 }
 
 /// THE STAGE HOLDS A BODY ITS ROW AND FINDINGS ALONE: on [`BODIES`] bodies with a finding in
@@ -63,9 +79,22 @@ fn the_bodies_stage_holds_a_body_its_row_and_findings_alone() {
     let (_, lines, _) = said(&io, true);
     let errors = lines.iter().filter(|line| line.contains("error[")).count();
     assert_eq!(errors, BODIES.div_ceil(EVERY), "every planted E0308 printed:\n{}", lines.join("\n"));
+    for i in (0..BODIES).step_by(EVERY) {
+        let path = format!("src/lib.rs:{}:", i + 1);
+        assert!(lines.iter().any(|line| line.contains(&path) && line.contains("error[types]") && line.contains("found `u8`, expected `u16`")),
+            "missing the tail type mismatch for f{i} at {path}");
+    }
     let profile = profile(&io);
-    let (per_body, floor, scratch) = held_line(&profile);
+    let HeldLine { per_body, floor, row, label, findings, words, scratch } = held_line(&profile);
     assert_eq!(floor, crate::engine_bodies::HELD_FLOOR as u64, "the line's floor is the stage's");
+    assert_eq!(row, core::mem::size_of::<crate::engine_bodies::Ran<'_>>() as u64);
+    assert_eq!(label, 1090 / BODIES as u64, "the labels are f0 through f299");
+    assert!(findings > 0, "the stage must account for the planted findings");
+    assert_eq!(words, 0, "the type mismatches have findings and every body was checked");
+    // Only label and findings have a fractional part here. Their two discarded fractions
+    // can contribute at most one byte to the independently rounded total.
+    let parts = row + label + findings + words;
+    assert!((parts..=parts + 1).contains(&per_body), "parts and total disagree:\n{profile}");
     assert!(per_body >= floor, "a body held under its floor ({per_body} < {floor}): the count misses its row");
     assert!(per_body <= HELD_MOST, "the stage holds {per_body} bytes a body, over {HELD_MOST}:\n{profile}");
     println!("BODIES HELD: {per_body} bytes a body (floor {floor}, {:.1}x) over {BODIES} bodies, {errors} findings; scratch at most {scratch} bytes", per_body as f64 / floor as f64);
@@ -80,11 +109,11 @@ fn the_per_body_scratch_reset_changes_no_answer() {
     let io = Io::simulated(SimWorld::new(43, Limits::USUAL));
     many_bodies(&io);
     let (ids, lines, _) = said(&io, true);
-    let (_, _, reset) = held_line(&profile(&io));
+    let reset = held_line(&profile(&io)).scratch;
     crate::engine_bodies::PLANT_KEEP_SCRATCH.with(|plant| plant.set(true));
     let (planted_ids, planted_lines, _) = said(&io, true);
     crate::engine_bodies::PLANT_KEEP_SCRATCH.with(|plant| plant.set(false));
-    let (_, _, kept) = held_line(&profile(&io));
+    let kept = held_line(&profile(&io)).scratch;
     assert_eq!(planted_ids, ids, "the plant changed the findings listed");
     assert_eq!(planted_lines, lines, "the plant changed what was printed");
     assert!(kept > reset, "the scratch kept across bodies held no more ({kept} <= {reset}): the reset is not what bounds it");

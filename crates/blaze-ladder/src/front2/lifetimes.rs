@@ -19,8 +19,11 @@
 //! one per reference, one per ADT that declares any lifetime parameter ([`GRAIN`]: the lowering
 //! counts ONE per such ADT today; `Grain::PerParam` is the end state and one constant away),
 //! one per trait object (its bound), one per opaque or associated type ([`Region::Hidden`]).
-//! A fn pointer has none. This is the count of crates/blaze-flow-lower/src/sig.rs, whose
-//! `read_signature` reads the same answer from the fn's text: the census compares the two.
+//! A fn pointer has none HERE (the head record's lifetime part). The borrow lowering's count
+//! (crates/blaze-flow-lower/src/sig.rs, lib.rs `npos`) gives a fn pointer its inputs' and
+//! output's positions since lane B15, and reads which its binder binds (`Region::Bound` there);
+//! this record does not say a fn pointer's lifetimes, so the two counts differ exactly at fn
+//! pointers holding a reference, an ADT with lifetimes, an opaque or a trait object.
 //!
 //! REGIONS. `Named(i)` is a lifetime parameter: the container's first (an impl's declared ones,
 //! then one per lifetime elided in its header), then the fn's own, in declaration order.
@@ -48,8 +51,10 @@
 //! `std::marker::PhantomData<T>` covariant; `dyn Trait<T> + 'a` covariant, invariant. A
 //! struct's, enum's or union's own variance comes from its fields, and a parameter used in
 //! positions of different variances is invariant. This first version computes it only for an
-//! ADT whose every field is made of references, raw pointers, tuples, slices, arrays, built-in
-//! types and its own type parameters: there the table alone decides. For every other ADT each
+//! ADT whose every field is made of references, raw pointers, tuples, slices, arrays, fn
+//! pointers (lane B15: inputs contravariant, output covariant, a lifetime of the pointer's own
+//! `for<..>` binder no parameter's), built-in types and its own type parameters: there the
+//! table alone decides. For every other ADT each
 //! lifetime parameter is answered INVARIANT with `computed: false`. Invariant is the sound
 //! over-approximation for the check: it demands that two lifetimes be equal where the true
 //! variance would let one outlive the other, so it can only add findings, never accept a
@@ -1027,17 +1032,30 @@ fn read_container<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>,v: &View<'_>
 /// module's "VARIANCE": the Reference's table decides where every field is plain).
 fn variances<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>,v: &View<'_>, fields: &[lf::TypeId], n: u32) -> Result<List<LifeVariance>, LifeRefusal> {
     let alloc = r.alloc;
-    // Per parameter: used in a covariant position, used in an invariant one.
-    let mut seen: List<(bool, bool)> = Vec::new_in(alloc);
-    seen.resize(n as usize, (false, false));
+    // Per parameter: used in a covariant position, in a contravariant one, in an invariant one.
+    let mut seen: List<(bool, bool, bool)> = Vec::new_in(alloc);
+    seen.resize(n as usize, (false, false, false));
     let mut plain = true;
-    // Each type with whether it stands under `&mut` or `*mut` (invariant there).
-    let mut todo: List<(lf::TypeId, bool)> = Vec::new_in(alloc);
+    // The names a `for<..>` binder of a field's fn pointer binds (lane B15): a lifetime bound
+    // there is the pointer's, no parameter of the ADT (the Reference, "Function pointer types",
+    // "Higher-ranked trait bounds"). Shadowing a parameter's name in a binder is E0496, so one
+    // list for the whole walk says the same as a scoped one for every program rustc accepts.
+    let mut bound: List<u64> = Vec::new_in(alloc);
+    // Each type with the variance it stands at (the Reference's table, composed: `&mut T` and
+    // `*mut T` invariant in `T`, `fn(A) -> R` contravariant in `A`).
+    let mut todo: List<(lf::TypeId, Variance)> = Vec::new_in(alloc);
     for &f in fields {
-        todo.push((f, false));
+        todo.push((f, Variance::Co));
     }
+    let under = |at: Variance, inner: Variance| match (at, inner) {
+        (Variance::In, _) | (_, Variance::In) => Variance::In,
+        (Variance::Co, x) => x,
+        (Variance::Contra, Variance::Co) => Variance::Contra,
+        (Variance::Contra, Variance::Contra) => Variance::Co,
+    };
+    let of_mut = |m: tc::Mutbl| if m == tc::Mutbl::Mut { Variance::In } else { Variance::Co };
     let mut steps = 0u32;
-    while let Some((t, inv)) = todo.pop() {
+    while let Some((t, at)) = todo.pop() {
         steps += 1;
         if steps > MOST {
             return Err(LifeRefusal::Bound);
@@ -1046,24 +1064,51 @@ fn variances<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>,v: &View<'_>, fie
             lf::TypeRef::Never => {}
             lf::TypeRef::Ref { mutbl, lifetime, inner } => {
                 if let Some(name) = lifetime
+                    && !bound.contains(&v.name(name)?)
                     && let Some(Region::Named(i)) = r.written(v, name)?
                     && let Some(s) = seen.get_mut(i as usize)
                 {
-                    if inv {
-                        s.1 = true;
-                    } else {
-                        s.0 = true;
+                    match at {
+                        Variance::Co => s.0 = true,
+                        Variance::Contra => s.1 = true,
+                        Variance::In => s.2 = true,
                     }
                 }
-                todo.push((inner, inv || mutbl == tc::Mutbl::Mut));
+                todo.push((inner, under(at, of_mut(mutbl))));
             }
-            lf::TypeRef::Ptr { mutbl, inner } => todo.push((inner, inv || mutbl == tc::Mutbl::Mut)),
-            lf::TypeRef::Slice(inner) => todo.push((inner, inv)),
-            lf::TypeRef::Array { elem, .. } => todo.push((elem, inv)),
+            lf::TypeRef::Ptr { mutbl, inner } => todo.push((inner, under(at, of_mut(mutbl)))),
+            lf::TypeRef::Slice(inner) => todo.push((inner, at)),
+            lf::TypeRef::Array { elem, .. } => todo.push((elem, at)),
             lf::TypeRef::Tuple(l) => {
                 for &i in v.ids(l)? {
-                    todo.push((lf::TypeId(i), inv));
+                    todo.push((lf::TypeId(i), at));
                 }
+            }
+            // `fn(A) -> R` (lane B15): its inputs contravariant, its output covariant. A
+            // lifetime its binder binds is no parameter's (`bound`); an elided one neither.
+            lf::TypeRef::FnPtr { params, ret, .. } => {
+                for &row in v.rows(params)? {
+                    let p = lf::Param::decode(row)?;
+                    if p.variadic {
+                        continue;
+                    }
+                    match p.ty {
+                        Some(ty) => todo.push((ty, under(at, Variance::Contra))),
+                        None => plain = false,
+                    }
+                }
+                if let Some(ret) = ret {
+                    todo.push((ret, at));
+                }
+            }
+            lf::TypeRef::For { binder, inner } => {
+                for &row in v.rows(binder)? {
+                    match lf::GenericParam::decode(row)? {
+                        lf::GenericParam::Lifetime { name, .. } => bound.push(v.name(name)?),
+                        _ => plain = false,
+                    }
+                }
+                todo.push((inner, at));
             }
             lf::TypeRef::Path(p) => {
                 // One name with no arguments that is a type parameter or a built-in type.
@@ -1080,10 +1125,12 @@ fn variances<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>,v: &View<'_>, fie
         }
     }
     let mut out: List<LifeVariance> = Vec::new_in(alloc);
-    for &(co, inv) in seen.iter() {
-        out.push(match (plain, co, inv) {
-            (true, true, false) => LifeVariance { variance: Variance::Co, computed: true },
-            (true, _, true) => LifeVariance { variance: Variance::In, computed: true },
+    for &(co, contra, inv) in seen.iter() {
+        out.push(match (plain, co, contra, inv) {
+            (true, true, false, false) => LifeVariance { variance: Variance::Co, computed: true },
+            (true, false, true, false) => LifeVariance { variance: Variance::Contra, computed: true },
+            // Used at two variances, or at an invariant one: invariant.
+            (true, true, true, _) | (true, _, _, true) => LifeVariance { variance: Variance::In, computed: true },
             // Not plain, or a parameter no field uses (an error of the Reference's "Generic
             // parameters"; nothing to compute from): the sound over-approximation.
             _ => LifeVariance { variance: Variance::In, computed: false },

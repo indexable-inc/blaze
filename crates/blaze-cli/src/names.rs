@@ -75,12 +75,12 @@ pub(crate) mod sections;
 // itself); "13": a cell table whose `Module` cell still held the module's textual macro list and
 // marks, with no `Textual` or `Incoherent` cell (lane BH1: blaze-scope names_cells.rs, cell
 // digest domain 2), whose readers would read those cells absent) are under other names, never
-// found, made again.
+// found, made again. Source 14 reported every unresolved path as a missing name.
 // The subject's domain is blaze-drive key.rs `CRATE_SCOPE_DOMAIN` (the name's one home,
 // `crate_scope_name`): it names the crate's task, not its record's form, so a form change
 // moves this source domain alone (every key moves; the name a reader reads by stays). Bump it
 // there only when what a name stands for changes.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 14";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 15";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -222,8 +222,8 @@ pub(crate) struct Resolved {
     /// without repeats: read as the file's own `FileItems` record, whose out is its bytes' id
     /// (data_include.rs), never as a `Surface`.
     data: std::vec::Vec<(String, String), Global>,
-    /// Each unresolved path of the crate's own code, as its record's finding ([`unresolved`]).
-    findings: blaze_own::Vec<Unresolved, Global>,
+    /// Each unresolved path of the crate's own code with its rule ([`rule_of`]).
+    findings: PathFindings,
     /// Each include of the crate's own code read outside its package, inside the workspace
     /// (D111): its record's warning finding ([`include_outside::findings`]).
     left_package: blaze_own::Vec<Unresolved, Global>,
@@ -245,7 +245,7 @@ pub(crate) struct Resolved {
 /// A resolved crate's payload ([`sections::write`]) with its unresolved paths as findings.
 struct ScopeRecord {
     payload: blaze_own::Vec<u8, Global>,
-    findings: blaze_own::Vec<Unresolved, Global>,
+    findings: PathFindings,
     unresolved: u32,
     /// Why the tests section is empty though the unit is a test unit.
     tests_refused: Option<std::string::String>,
@@ -272,12 +272,12 @@ impl core::fmt::Display for Unwritten {
 
 /// The record of the crate `crate_name` resolved as `done`; `alloc` is the allocator `done` was
 /// made in (its task's frame), which the link table is written into before its copy into the
-/// payload.
+/// payload. `kept` holds findings that leave the worker with the crate's record.
 /// `quiet`: the names the crate calls its failed dependencies by (names/scope.rs
 /// `resolve_metered`), whose paths are counted, not found (plan row A8).
-fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, quiet: &[&str], alloc: Alloc<'a>) -> Result<ScopeRecord, Unwritten> {
+fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, quiet: &[&str], alloc: Alloc<'a>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
-    let mut findings = blaze_own::Vec::new_in(Global);
+    let mut findings = PathFindings::new_in(kept);
     let unresolved = done.names.notes.len() as u32 + unresolved(done.names, quiet, &mut findings);
     // The names and items records, filed in the same record (drive.md, "End state", piece
     // 3): a body is checked by reading them, never by solving the crate graph again.
@@ -344,13 +344,39 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
     Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras })
 }
 
-/// The rule of a `use` or macro path in a project's own crate that names nothing.
+/// No binding was found for this segment of a `use` or macro path.
 pub(crate) const UNRESOLVED: u16 = 14;
+pub(crate) const UNRESOLVED_PRIVATE: u16 = 28;
+pub(crate) const UNRESOLVED_AMBIGUOUS: u16 = 29;
+pub(crate) const UNRESOLVED_NOT_A_MODULE: u16 = 30;
+pub(crate) const UNRESOLVED_SUPER_ABOVE_ROOT: u16 = 31;
+pub(crate) const UNRESOLVED_DOLLAR_CRATE: u16 = 32;
+pub(crate) const UNRESOLVED_WRONG_MACRO_KIND: u16 = 33;
+pub(crate) const UNRESOLVED_DERIVE_AFTER_ATTRIBUTE: u16 = 34;
+
+fn rule_of(why: blaze_surface::Unresolved) -> u16 {
+    use blaze_surface::Unresolved as Reason;
+    match why {
+        Reason::NotFound => UNRESOLVED,
+        Reason::Private => UNRESOLVED_PRIVATE,
+        Reason::Ambiguous(_) => UNRESOLVED_AMBIGUOUS,
+        Reason::NotAModule => UNRESOLVED_NOT_A_MODULE,
+        Reason::NoParent => UNRESOLVED_SUPER_ABOVE_ROOT,
+        Reason::NoCrate => UNRESOLVED_DOLLAR_CRATE,
+        Reason::WrongMacroKind => UNRESOLVED_WRONG_MACRO_KIND,
+        Reason::DeriveAfterAttrMacro => UNRESOLVED_DERIVE_AFTER_ATTRIBUTE,
+    }
+}
 
 /// Whether a finding of `rule` (blaze-cli's area) is placed by [`place_pieces`]: its message
 /// starts with the file, the item chain and the edition. The one list of them.
 pub(crate) fn placed(rule: u16) -> bool {
-    matches!(rule, UNRESOLVED | include_outside::INCLUDE_OUTSIDE_PACKAGE | failed_call::FAILED_CALL | test_marks::TEST_REFUSED | test_marks::TEST_DUPLICATED)
+    matches!(rule,
+        UNRESOLVED | UNRESOLVED_PRIVATE | UNRESOLVED_AMBIGUOUS | UNRESOLVED_NOT_A_MODULE |
+        UNRESOLVED_SUPER_ABOVE_ROOT | UNRESOLVED_DOLLAR_CRATE | UNRESOLVED_WRONG_MACRO_KIND |
+        UNRESOLVED_DERIVE_AFTER_ATTRIBUTE | include_outside::INCLUDE_OUTSIDE_PACKAGE |
+        failed_call::FAILED_CALL | test_marks::TEST_REFUSED | test_marks::TEST_DUPLICATED
+    )
 }
 
 /// Whether a names finding of `rule` (blaze-cli's area) is a warning: drawn after the answer,
@@ -359,17 +385,23 @@ pub(crate) fn warning(rule: u16) -> bool {
     matches!(rule, include_outside::INCLUDE_OUTSIDE_PACKAGE | test_marks::TEST_DUPLICATED)
 }
 
-/// One unresolved path of a project crate, placed item-relative (rule 71): the range of the
-/// failing segment from its item's start, and the message: the file, the item's chain digest
-/// ([`crate::work::item_chain`]; 16 hex digits, or empty for a path with no place), the
-/// file's edition byte, then the words' two pieces, all split by 0x1F. A body edit moves no
-/// byte of it; the printer finds the item's start in the file as it is ([`placed`]).
+/// A placed include, failed call or test mark. Its message starts with [`place_pieces`].
 struct Unresolved {
     at: (u32, u32),
     message: blaze_own::Vec<u8, Global>,
 }
 
-/// The pieces before the words in an [`UNRESOLVED`] finding's message.
+/// Each path's report rule and its item-relative finding, kept until the crate's record is written.
+type PathFindings = blaze_own::Vec<(u16, PathFinding), blaze_own::SharedAlloc<'static>>;
+
+/// The failing segment's range from the item's start. The message holds the file, item chain,
+/// edition and [`unresolved_args`], separated by 0x1F for [`place_pieces`].
+struct PathFinding {
+    at: (u32, u32),
+    message: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+}
+
+/// The pieces before the arguments in a [`placed`] finding's message.
 const PLACE_PIECES: usize = 3;
 
 /// The byte offset of `word` in `text` at or after `from`, as a whole identifier.
@@ -390,24 +422,24 @@ fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// Every `use` and macro path of crate `c` that resolved to nothing. The project's own (a
+/// Every `use` and macro path of crate `c` that the resolver refused. The project's own (a
 /// checkout file, `/0/`) are findings in `own`, sorted; the number of the others (a fetched or
 /// toolchain crate's: not the project's to fix) is returned, counted in one note. A path into a
 /// failed dependency (its first segment one of `quiet`, the names the crate calls such crates
 /// by, failing past it) is counted too, never a finding: that crate's failure is reported once,
 /// at it (plan row A8, rule 19).
-fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, quiet: &[&str], own: &mut blaze_own::Vec<Unresolved, Global>) -> u32 {
+fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, quiet: &[&str], own: &mut PathFindings) -> u32 {
     use blaze_surface::{PathKind, ScopeError};
     let project = c.files.iter().any(|file| file.path.starts_with("/0/"));
     let mut elsewhere = 0u32;
     for r in c.done.values() {
         for error in r.scope.errors.iter() {
-            let (loc, path, segment) = match error {
-                ScopeError::Import { site, path, segment, .. } => {
+            let (loc, path, segment, why) = match error {
+                ScopeError::Import { site, path, segment, why } => {
                     let fragment = site.expansion.unwrap_or(r.scope.module);
-                    (c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(site.index as usize).copied()), path, *segment as usize)
+                    (c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(site.index as usize).copied()), path, *segment as usize, *why)
                 }
-                ScopeError::Macro { call, path, segment, .. } => (c.tables.calls.get(call).map(|src| src.loc), path, *segment as usize),
+                ScopeError::Macro { call, path, segment, why } => (c.tables.calls.get(call).map(|src| src.loc), path, *segment as usize, *why),
                 _ => continue,
             };
             let into_failed = segment > 0 && matches!(path.kind, PathKind::Plain | PathKind::Abs) && path.segments.first().is_some_and(|first| quiet.contains(first));
@@ -415,7 +447,7 @@ fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, quiet: &[&str], own: &mu
                 elsewhere += 1;
                 continue;
             }
-            let mut message = blaze_own::Vec::new_in(Global);
+            let mut message = blaze_own::Vec::new_in(*own.allocator());
             let mut at = (0u32, 0u32);
             let file = loc.and_then(|loc| c.files.get(loc.file as usize).map(|file| (loc, *file)));
             match file.and_then(|(loc, file)| Some((loc, file, crate::work::item_holding(&file.outline, loc.offset)?))) {
@@ -442,40 +474,71 @@ fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, quiet: &[&str], own: &mu
             message.push(0x1F);
             message.push(b'0' + c.edition.byte());
             message.push(0x1F);
-            message.push(b'`');
-            message.extend_from_slice(path.segments.get(segment).copied().unwrap_or("").as_bytes());
-            message.extend_from_slice(b"`\x1F");
-            let before = &path.segments[..segment.min(path.segments.len())];
-            let head: &[u8] = match path.kind {
-                PathKind::Plain | PathKind::DollarCrate(_) => b"",
-                PathKind::Crate => b"crate",
-                PathKind::SelfMod => b"self",
-                PathKind::Super(_) => b"super",
-                PathKind::Abs => b"::",
-            };
-            match (head.is_empty(), before.is_empty()) {
-                (true, true) => message.extend_from_slice(b"this scope"),
-                _ => {
-                    message.push(b'`');
-                    message.extend_from_slice(head);
-                    for (i, seg) in before.iter().enumerate() {
-                        if i > 0 || (!head.is_empty() && head != b"::") {
-                            message.extend_from_slice(b"::");
-                        }
-                        message.extend_from_slice(seg.as_bytes());
-                    }
-                    message.push(b'`');
-                }
-            }
-            own.push(Unresolved { at, message });
+            unresolved_args(&mut message, why, path.kind, &path.segments, segment);
+            own.push((rule_of(why), PathFinding { at, message }));
         }
     }
     // The scopes are a map: its order reaches the record only sorted (rule 25).
-    own.sort_unstable_by(|a, b| (&a.message[..], a.at).cmp(&(&b.message[..], b.at)));
+    own.sort_unstable_by(|(ra, a), (rb, b)| (ra, &a.message[..], a.at).cmp(&(rb, &b.message[..], b.at)));
     elsewhere
 }
 
-/// Where an [`UNRESOLVED`] finding is to be drawn, read from its message alone (no file is
+/// Append the arguments of the reason's wording row, separated by the record's 0x1F.
+fn unresolved_args(message: &mut blaze_own::Vec<u8, impl core::alloc::Allocator>, why: blaze_surface::Unresolved, kind: blaze_surface::PathKind, segments: &[&str], segment: usize) {
+    use blaze_surface::{PathKind, Unresolved as Reason};
+    let through = &segments[..segment.saturating_add(1).min(segments.len())];
+    match why {
+        Reason::NotFound => {
+            message.push(b'`');
+            message.extend_from_slice(segments.get(segment).copied().unwrap_or("").as_bytes());
+            message.extend_from_slice(b"`\x1F");
+            // The missing-name wording omits the hygiene root and spells any super prefix once.
+            let scope_kind = match kind {
+                PathKind::DollarCrate(_) => PathKind::Plain,
+                PathKind::Super(_) => PathKind::Super(1),
+                other => other,
+            };
+            let before = &segments[..segment.min(segments.len())];
+            if scope_kind == PathKind::Plain && before.is_empty() {
+                message.extend_from_slice(b"this scope");
+            } else {
+                message.push(b'`');
+                path_arg(message, scope_kind, before);
+                message.push(b'`');
+            }
+        }
+        Reason::Private | Reason::NotAModule => path_arg(message, kind, through),
+        Reason::Ambiguous(ambiguity) => {
+            path_arg(message, kind, through);
+            message.push(0x1F);
+            message.extend_from_slice(ambiguity.name().as_bytes());
+        }
+        Reason::NoParent | Reason::NoCrate | Reason::WrongMacroKind | Reason::DeriveAfterAttrMacro => path_arg(message, kind, segments),
+    }
+}
+
+fn path_arg(message: &mut blaze_own::Vec<u8, impl core::alloc::Allocator>, kind: blaze_surface::PathKind, segments: &[&str]) {
+    use blaze_surface::PathKind;
+    let (root, count) = match kind {
+        PathKind::Plain => ("", 0),
+        PathKind::Abs => {
+            message.extend_from_slice(b"::");
+            ("", 0)
+        }
+        PathKind::Crate => ("crate", 1),
+        PathKind::SelfMod => ("self", 1),
+        PathKind::Super(depth) => ("super", usize::from(depth)),
+        PathKind::DollarCrate(_) => ("$crate", 1),
+    };
+    for (i, name) in core::iter::repeat_n(root, count).chain(segments.iter().copied()).enumerate() {
+        if i > 0 {
+            message.extend_from_slice(b"::");
+        }
+        message.extend_from_slice(name.as_bytes());
+    }
+}
+
+/// Where a finding recognized by [`placed`] is to be drawn, read from its message alone (no file is
 /// read here): its file, its item's chain and the edition the chain was made in, and the
 /// words. `None` for one with no file: drawn at its crate's name. The item's start in the file
 /// as it is today is found where the file is read, once for all its findings (print.rs
@@ -627,16 +690,14 @@ impl Names<'_> {
             let paths: usize = resolved.files.iter().chain(resolved.absent.iter()).map(|path| path.capacity()).sum();
             let data: usize = resolved.data.iter().map(|(path, from)| path.capacity() + from.capacity()).sum();
             let slots = (resolved.files.capacity() + resolved.absent.capacity()) * core::mem::size_of::<String>() + resolved.data.capacity() * core::mem::size_of::<(String, String)>();
-            let findings: usize = resolved
-                .findings
-                .iter()
-                .chain(resolved.left_package.iter())
+            let placed_bytes: usize = resolved.left_package.iter()
                 .chain(resolved.failed_calls.iter())
-                .chain(resolved.test_marks.iter().map(|(_, one)| one))
                 .map(|one| core::mem::size_of::<Unresolved>() + one.message.len())
                 .sum();
+            let path_bytes: usize = resolved.findings.iter().map(|entry| core::mem::size_of_val(entry) + entry.1.message.len()).sum();
+            let mark_bytes: usize = resolved.test_marks.iter().map(|entry| core::mem::size_of_val(entry) + entry.1.message.len()).sum();
             let failed = resolved.failed.as_ref().map_or(0, |words| words.capacity());
-            lists += paths + data + slots + findings + failed;
+            lists += paths + data + slots + placed_bytes + path_bytes + mark_bytes + failed;
             payloads += resolved.payload.len();
         }
         (self.made.len() as u64, lists as u64, payloads as u64)
@@ -947,6 +1008,99 @@ fn surface(path: &str) -> Name {
 
 #[cfg(test)]
 mod script_units_tests;
+
+#[cfg(test)]
+mod unresolved_tests {
+    use blaze_report::frame::words::{Area, say, wording};
+    use blaze_surface::{AmbiguityKind, PathKind, Unresolved};
+
+    fn expect(why: Unresolved, kind: PathKind, segments: &[&str], segment: usize, expected_code: &str, expected: &str) {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut message = blaze_own::Vec::new_in(alloc);
+        super::unresolved_args(&mut message, why, kind, segments, segment);
+        let args: std::vec::Vec<_> = core::str::from_utf8(&message).expect("diagnostic text").split('\x1f').collect();
+        let mut headline = blaze_own::AString::new_in(alloc);
+        let mut label = blaze_own::AString::new_in(alloc);
+        let code = say(Area::Cli, super::rule_of(why), &args, &mut headline, &mut label).expect("unresolved wording");
+        assert_eq!(code, expected_code);
+        assert_eq!(headline.as_str(), expected);
+    }
+
+    #[test]
+    fn missing_binding() {
+        expect(Unresolved::NotFound, PathKind::Plain, &["gone"], 0, "unresolved", "no `gone` in this scope");
+        expect(Unresolved::NotFound, PathKind::Crate, &["m", "gone"], 1, "unresolved", "no `gone` in `crate::m`");
+    }
+
+    #[test]
+    fn private_binding() {
+        expect(Unresolved::Private, PathKind::Crate, &["hidden", "f"], 0, "unresolved-private", "`crate::hidden` is private in this scope");
+    }
+
+    #[test]
+    fn non_module_segment() {
+        expect(Unresolved::NotAModule, PathKind::Plain, &["m", "f", "item"], 1, "unresolved-not-a-module", "`m::f` is neither a module nor an enum");
+    }
+
+    #[test]
+    fn super_above_root() {
+        expect(Unresolved::NoParent, PathKind::Super(2), &["f"], 0, "unresolved-super-above-root", "`super` goes above the crate root in `super::super::f`");
+    }
+
+    #[test]
+    fn dollar_crate_without_dependency() {
+        let kind = PathKind::DollarCrate(super::CrateItemKey(super::ContentId([1; 32])));
+        expect(Unresolved::NoCrate, kind, &["f"], 0, "unresolved-dollar-crate", "the crate named by `$crate` in `$crate::f` is not a dependency");
+    }
+
+    #[test]
+    fn ambiguous_binding() {
+        expect(Unresolved::Ambiguous(AmbiguityKind::GlobVsGlob), PathKind::SelfMod, &["f"], 0, "unresolved-ambiguous", "`self::f` is ambiguous (glob vs glob)");
+    }
+
+    #[test]
+    fn wrong_macro_kind() {
+        expect(Unresolved::WrongMacroKind, PathKind::Abs, &["macros", "make"], 1, "unresolved-wrong-macro-kind", "`::macros::make` names a different kind of macro than this call requires");
+    }
+
+    #[test]
+    fn derive_after_attribute_macro() {
+        expect(
+            Unresolved::DeriveAfterAttrMacro,
+            PathKind::Plain,
+            &["reth_codecs", "add_arbitrary_tests"],
+            1,
+            "unresolved-derive-after-attribute",
+            "attribute macro `reth_codecs::add_arbitrary_tests` was refused because a `#[derive]` is written after it on the same item",
+        );
+    }
+
+    #[test]
+    fn each_reason_has_a_distinct_rule_with_its_argument_count() {
+        // A new variant breaks the exhaustive match in rule_of. Add its case here with its rule.
+        const REASONS: [Unresolved; 8] = [
+            Unresolved::NotFound,
+            Unresolved::Private,
+            Unresolved::Ambiguous(AmbiguityKind::GlobVsGlob),
+            Unresolved::NotAModule,
+            Unresolved::NoParent,
+            Unresolved::NoCrate,
+            Unresolved::WrongMacroKind,
+            Unresolved::DeriveAfterAttrMacro,
+        ];
+        let rules = REASONS.map(super::rule_of);
+        let mut message = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
+        for (i, why) in REASONS.into_iter().enumerate() {
+            let rule = rules[i];
+            assert!(!rules[..i].contains(&rule), "{why:?} repeats rule {rule}");
+            assert!(super::placed(rule), "{why:?} must be placed at its item");
+            let row = wording(Area::Cli, rule).expect("each unresolved reason has a wording row");
+            message.clear();
+            super::unresolved_args(&mut message, why, PathKind::Plain, &["f"], 0);
+            assert_eq!(message.split(|b| *b == 0x1F).count(), usize::from(row.args), "{why:?}");
+        }
+    }
+}
 
 #[cfg(test)]
 pub(crate) use scope::scope_made;

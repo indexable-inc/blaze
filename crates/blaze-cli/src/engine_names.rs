@@ -128,7 +128,7 @@ impl<'f> NamesStage<'f> {
         // The wave's frame: its jobs and what they share, dropped (given back) when the phase
         // returns. The dependencies' exports are NOT in it: each is a borrow of the store's
         // mapping, read in place through the request's one reader (engine_records.rs).
-        let own = Frame::with_reserve(crate::names::SCOPE_JOBS, Tag::Other).map_err(|_| CliError::Text { what: "a names phase's frame could not be reserved" })?;
+        let own = Frame::with_reserve(crate::names::SCOPE_JOBS, Tag::Nameres).map_err(|_| CliError::Text { what: "a names phase's frame could not be reserved" })?;
         let mut round = ScopeRound::new(&own, false);
         let mut exports = ReadExports { read, route: crate::engine_memory::route_now() };
         // What lives only for this phase goes in its frame, never in the command's (`frame`

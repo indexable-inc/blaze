@@ -199,6 +199,8 @@ fn field_region<A: core::alloc::Allocator + Clone>(r: Region, buf: &SigBuf<A>, l
             let &(name, _) = buf.names.iter().find(|&&(_, x)| x == r)?;
             lifetimes.iter().position(|&l| l == name).map(|i| FieldRegion::Lifetime(i as u32))
         }
+        // A lifetime a fn pointer's `for<..>` binds (lane B15): no parameter of the ADT's.
+        Region::Bound(v) => Some(FieldRegion::Bound(v)),
         Region::Anon(_) | Region::SelfTy(_) | Region::Hidden(_) => None,
     }
 }
@@ -231,7 +233,8 @@ fn walk<'a>(tys: tc::PTys<'_>, root: tc::PTy, world: &dyn SigWorld, regions: Opt
                 stack.push(inner);
             }
             tc::PNode::Ptr(_, inner) | tc::PNode::Slice(inner) | tc::PNode::Pat(inner, _) | tc::PNode::Array(inner, _) => stack.push(inner),
-            tc::PNode::Tuple(l) => {
+            // A fn pointer's positions are its inputs' then its output's (lane B15), as a tuple's.
+            tc::PNode::Tuple(l) | tc::PNode::FnPtr(l, _) => {
                 for &a in tys.list(l).ok()?.iter().rev() {
                     stack.push(a);
                 }
@@ -257,7 +260,6 @@ fn walk<'a>(tys: tc::PTys<'_>, root: tc::PTy, world: &dyn SigWorld, regions: Opt
             | tc::PNode::Float(_)
             | tc::PNode::Str
             | tc::PNode::Never
-            | tc::PNode::FnPtr(..)
             | tc::PNode::FnDef(..)
             | tc::PNode::ConstValue { .. }
             | tc::PNode::ConstParam(_) => {}

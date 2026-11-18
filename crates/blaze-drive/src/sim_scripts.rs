@@ -321,7 +321,7 @@ fn request(tape: &Tape, world: &World, store: &mut BTreeMap<Key, StdVec<u8>>, la
                 Effect::WriteLast { bytes } => ended.last = Some(bytes.as_slice().to_vec()),
                 Effect::Done(answer) => ended.answer = Some(answer),
                 Effect::Open { name, .. } => return Err(Broke::Harness(format!("{name} was opened, and the sim has no files"))),
-                Effect::StartProgram { .. } | Effect::Stop { .. } => {
+                Effect::StartProgram { .. } | Effect::StartTests { .. } | Effect::Stop { .. } => {
                     return Err(Broke::Harness(String::from("`check` started or stopped a program")));
                 }
             }

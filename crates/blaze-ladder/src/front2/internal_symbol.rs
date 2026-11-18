@@ -108,13 +108,11 @@ use blaze_own::Alloc;
 use blaze_scope::resolve::Names;
 use blaze_typeck::ItemKey;
 use std::boxed::Box;
-use std::format;
 
 use super::alloc_shim::Shim;
 use super::check::Records;
 use super::heads::{CrateCfg, Store};
-use super::index::Index;
-use super::keys::checker_of;
+use super::keys::Keys;
 use super::reach::Reached;
 use super::source::NamesSource;
 use blaze_id::ItemKey as LibKey;
@@ -147,8 +145,9 @@ pub fn runtime_crate(panic: Panic) -> &'static str {
 
 /// A declaration this file binds: the fn `lib`, declared `extern "Rust"` with [`ATTR`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Declared {
+pub struct Declared<'n> {
     pub lib: LibKey,
+    pub name: &'n str,
 }
 
 /// Why a std-internal declaration is not bound.
@@ -170,6 +169,8 @@ pub enum InternalRefused {
     /// The declaration's place (and so its block's ABI) is not in the names library
     /// (program.rs `placed`'s `Unplaced`, D106 piece Z).
     Unplaced { name: Box<str> },
+    /// The records could not supply one of the crates searched for the definition.
+    Unread { name: Box<str>, krate: usize },
 }
 
 impl InternalRefused {
@@ -190,33 +191,39 @@ impl InternalRefused {
             InternalRefused::Attrs { .. } => "a `#[rustc_std_internal_symbol]` fn whose attributes do not read",
             InternalRefused::KeyClash { .. } => "the `#[rustc_std_internal_symbol]` definition's key is another item's in the key map",
             InternalRefused::Unplaced { .. } => "a declaration the names library does not place (its block's ABI is unknown)",
+            InternalRefused::Unread { .. } => "the names source could not answer the internal symbol lookup",
         }
     }
 
     /// The whole refusal: the class and what it names.
     pub fn detail(&self) -> Box<str> {
-        match self {
-            InternalRefused::NoDefinition { name }
-            | InternalRefused::NotInRustBlock { name }
-            | InternalRefused::Attrs { name }
-            | InternalRefused::KeyClash { name }
-            | InternalRefused::Unplaced { name } => format!("`{name}`: {}", self.class()).into_boxed_str(),
-            InternalRefused::DefinedTwice { name, first, second } => format!("`{name}`: {} (`{first}` and `{second}`)", self.class()).into_boxed_str(),
-            InternalRefused::NoPanicRuntime { .. } => Box::from(self.class()),
-        }
+        self.to_string().into_boxed_str()
     }
 }
 
 impl core::fmt::Display for InternalRefused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.detail())
+        match self {
+            InternalRefused::NoDefinition { name }
+            | InternalRefused::NotInRustBlock { name }
+            | InternalRefused::Attrs { name }
+            | InternalRefused::KeyClash { name }
+            | InternalRefused::Unplaced { name } => write!(f, "`{name}`: {}", self.class()),
+            InternalRefused::DefinedTwice { name, first, second } => write!(f, "`{name}`: {} (`{first}` and `{second}`)", self.class()),
+            InternalRefused::NoPanicRuntime { .. } => f.write_str(self.class()),
+            InternalRefused::Unread { name, krate } => write!(f, "`{name}` in crate {krate}: {}", self.class()),
+        }
     }
 }
 
-/// Whether the item whose text (from its first attribute) is `text`, of crate `krate`, carries
-/// [`ATTR`]: its lowered signature's attributes, `cfg_attr` evaluated under the crate's cfg.
-/// `Err(())` when the text does not lower. `alloc` holds the lowering, dropped on return.
-fn carries<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, alloc: Alloc<'_>) -> Result<bool, ()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Declaration,
+    Definition,
+}
+
+/// The body flag and cfg-expanded attributes come from the same signature lowering.
+fn carries<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, role: Role, alloc: Alloc<'_>) -> Result<bool, ()> {
     // The attribute is a word of the item's own text wherever it is written (an expansion's
     // text included): a text without it carries none, and nothing is lowered for it.
     if !text.contains(ATTR) {
@@ -225,6 +232,9 @@ fn carries<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, alloc: Al
     let atoms = names.cfg_atoms(krate).ok_or(())?;
     let sig = blaze_lower::lower_signature(text, names.edition_of(krate).ok_or(())?, &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
     let v = sig.view();
+    if role == Role::Definition && v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY == 0 {
+        return Ok(false);
+    }
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| ())? {
         let a = v.attr(n).map_err(|_| ())?;
         if v.text_at(a.path).map_err(|_| ())?.trim() == ATTR {
@@ -258,30 +268,49 @@ pub fn is_panic_runtime(names: &Names<'_>, krate: usize) -> bool {
     // The root file is the first a crate's resolution reads (blaze-scope resolve.rs: the
     // root's file is added to the empty set first, index 0).
     let Some(root) = names.krate(krate).files.first() else { return false };
-    root.outline.file_attrs().iter().any(|a| {
+    runtime_attr(root.text, &root.outline)
+}
+
+fn runtime_attr(text: &str, outline: &blaze_file_items::Outline<'_>) -> bool {
+    outline.file_attrs().iter().any(|a| {
         if !a.inner {
             return false;
         }
-        let Some(written) = root.text.get(a.range.start as usize..a.range.end as usize) else { return false };
+        let Some(written) = text.get(a.range.start as usize..a.range.end as usize) else { return false };
         let inside = written.trim().strip_prefix("#!").map(str::trim_start).and_then(|s| s.strip_prefix('[')).and_then(|s| s.strip_suffix(']'));
         inside.is_some_and(|s| s.trim() == PANIC_RUNTIME)
     })
 }
 
-/// Whether the outline entry at `lib` is a fn with a body (not a declaration in an `extern`
-/// block, which has none).
-fn is_defined_fn(names: &Names<'_>, lib: LibKey) -> bool {
-    use blaze_surface::ItemDetail;
-    let Some(p) = names.place(lib) else { return false };
-    let Some((_, outline)) = names.outline_at(p.krate, p.at) else { return false };
-    let item = outline.item(p.item);
-    matches!(item.detail, ItemDetail::Fn { .. }) && item.body.is_some()
+fn marked_runtime<'n, S: NamesSource<'n>>(names: S, krate: usize, alloc: Alloc<'_>) -> Option<bool> {
+    if let Some(solved) = names.solved() {
+        return Some(is_panic_runtime(solved, krate));
+    }
+    let text = names.file_text(krate, 0)?;
+    let edition = names.edition_of(krate)?;
+    Some(runtime_attr(text, &blaze_file_items::outline(text, edition, alloc)))
 }
 
-/// The item for a refusal: front2 item_shown.rs `ItemShown` (its whole path and its key; never
-/// a `_` in place of a name).
-fn path_of(names: &Names<'_>, lib: LibKey) -> Box<str> {
-    super::item_shown::ItemShown::of_lib(names, lib).boxed()
+/// The module segment of a panic runtime entry's row. Use the definition's own
+/// module so the path and key identify the same provider in either front end.
+pub(crate) fn runtime_definition_module<'n, S: NamesSource<'n>>(
+    names: S, lib: LibKey, name: &str, alloc: Alloc<'_>,
+) -> Result<Option<&'n str>, InternalRefused> {
+    if !is_runtime_name(name) {
+        return Ok(None);
+    }
+    let krate = names.crate_of(lib).ok_or_else(|| InternalRefused::Unplaced { name: name.into() })?;
+    let unread = || InternalRefused::Unread { name: name.into(), krate };
+    let root = names.root_module(krate).and_then(|module| names.module_path(module)).ok_or_else(unread)?;
+    if !matches!(root, PANIC_ABORT_CRATE | PANIC_UNWIND_CRATE)
+        || names.proc_macro(krate).ok_or_else(unread)?
+        || !marked_runtime(names, krate, alloc).ok_or_else(unread)?
+        || !candidate(names, krate, lib, name, alloc)?
+    {
+        return Ok(None);
+    }
+    let module = names.home_of(lib).and_then(|home| names.module_path(home)).ok_or_else(unread)?;
+    Ok(Some(module))
 }
 
 /// The definition a call of the std-internal declaration named `name` runs, under the
@@ -291,29 +320,39 @@ fn path_of(names: &Names<'_>, lib: LibKey) -> Box<str> {
 /// linked into the program and are skipped, as the index skips them. Two candidates are
 /// [`InternalRefused::DefinedTwice`] naming the two smallest keys, so the answer is the same
 /// in any order the graph is walked.
-pub fn definition(names: &Names<'_>, name: &str, panic: Panic, alloc: Alloc<'_>) -> Result<LibKey, InternalRefused> {
+pub fn definition<'n, S: NamesSource<'n>>(names: S, name: &str, panic: Panic, alloc: Alloc<'_>) -> Result<LibKey, InternalRefused> {
     let runtime = is_runtime_name(name);
     let wanted = runtime_crate(panic);
     let mut found: Option<LibKey> = None;
     let mut second: Option<LibKey> = None;
     let mut runtime_seen = false;
-    for (krate, c) in names.crates().iter().enumerate() {
-        if c.implicit.proc_macro {
+    for krate in 0..names.crate_count() {
+        let unread = || InternalRefused::Unread { name: name.into(), krate };
+        if names.proc_macro(krate).ok_or_else(unread)? {
             continue;
         }
         if runtime {
-            if c.name != wanted || !is_panic_runtime(names, krate) {
+            let root = names.root_module(krate).ok_or_else(unread)?;
+            if names.module_path(root).ok_or_else(unread)? != wanted {
+                continue;
+            }
+            if !marked_runtime(names, krate, alloc).ok_or_else(unread)? {
                 continue;
             }
             runtime_seen = true;
         }
-        for (key, _, _) in names.items(krate) {
-            let Some(t) = names.item_text(key) else { continue };
-            if t.name != Some(name) || !is_defined_fn(names, key) {
-                continue;
+        let mut failure = None;
+        let listed = names.each_item(krate, &mut |key, _| {
+            if failure.is_some() || names.name_of(key) != Some(name) {
+                return;
             }
-            if !carries(names, krate, t.text, alloc).map_err(|()| InternalRefused::Attrs { name: Box::from(name) })? {
-                continue;
+            match candidate(names, krate, key, name, alloc) {
+                Ok(false) => return,
+                Err(why) => {
+                    failure = Some(why);
+                    return;
+                }
+                Ok(true) => {}
             }
             // Keep the two smallest keys: the refusal names the same pair in any walk order.
             match found {
@@ -329,10 +368,17 @@ pub fn definition(names: &Names<'_>, name: &str, panic: Panic, alloc: Alloc<'_>)
                     }
                 }
             }
+        });
+        if !listed {
+            return Err(unread());
+        }
+        if let Some(why) = failure {
+            return Err(why);
         }
     }
     if let (Some(first), Some(second)) = (found, second) {
-        return Err(InternalRefused::DefinedTwice { name: Box::from(name), first: path_of(names, first), second: path_of(names, second) });
+        let path = |k| super::item_shown::ItemShown::of_lib(names, k).boxed();
+        return Err(InternalRefused::DefinedTwice { name: Box::from(name), first: path(first), second: path(second) });
     }
     match found {
         Some(key) => Ok(key),
@@ -341,14 +387,59 @@ pub fn definition(names: &Names<'_>, name: &str, panic: Panic, alloc: Alloc<'_>)
     }
 }
 
+fn candidate<'n, S: NamesSource<'n>>(names: S, krate: usize, key: LibKey, name: &str, alloc: Alloc<'_>) -> Result<bool, InternalRefused> {
+    let unread = || InternalRefused::Unread { name: name.into(), krate };
+    if names.kind_of_item(key).ok_or_else(unread)? != blaze_surface::ItemKind::Function {
+        return Ok(false);
+    }
+    let text = names.text_of(key).ok_or_else(unread)?.text;
+    carries(names, krate, text, Role::Definition, alloc).map_err(|()| InternalRefused::Attrs { name: name.into() })
+}
+
+/// A code-cache hit can reuse the caller before instance resolution runs. File the search
+/// domain in the caller's BodyCheck reads whenever it used a potentially internal fn head.
+/// The items section covers crate metadata, file digests and the complete set of item rows,
+/// including the absence of a competing definition in an otherwise unrelated crate.
+pub(crate) fn record_search<'n>(
+    tables: super::tables::view::Tables<'_, 'n>, store: &Store<'n>, facts: &super::reads::BodyReads<'_>,
+) {
+    use super::reads::FactKind;
+    let searches = facts.rows.iter().filter(|r| r.fact.kind == FactKind::Head).any(|r| {
+        // A type check can finish before linkage is decided. An unread declaration keeps
+        // the covering reads too. Linkage reports its own typed refusal at the call.
+        !matches!(declares(tables, store, ItemKey(r.fact.key), store.tys.alloc()), Ok(None))
+    });
+    if searches {
+        for k in 0..tables.crate_count() {
+            // Tables indexes the records' crate-key slice. Its length is crate_count().
+            let Some(key) = tables.crate_key(k) else {
+                tables.gap("a crate in the internal symbol search has no crate key", None);
+                return;
+            };
+            tables.reads().read(search_read(key));
+        }
+    }
+}
+
+/// One covering read for all the facts the search can ask of this crate. Keeping it even
+/// for an empty or currently ineligible crate covers a new definition or runtime there.
+pub(crate) fn search_read(key: blaze_id::CrateItemKey) -> super::tables::recorder::TableRead {
+    use blaze_scope::names_cells::{NameCell, Section};
+    super::tables::recorder::TableRead::Names(NameCell::Whole { krate: key.prefix(), section: Section::Items })
+}
+
+fn may_declare(head: &super::heads::FnHead<'_>) -> bool {
+    !head.has_body && head.container.is_none() && head.text.contains(ATTR)
+}
+
 /// Which std-internal declaration the fn `key` is: a fn with no body, declared in an `extern`
 /// block, whose attributes carry [`ATTR`], named none of alloc_shim's names, with no
 /// `#[link_name]` naming another symbol. `Ok(None)` for every other item;
 /// [`InternalRefused::NotInRustBlock`] when the block's ABI is not `"Rust"`. `alloc` holds the
 /// signature's lowering, dropped on return.
-pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKey, alloc: Alloc<'_>) -> Result<Option<Declared>, InternalRefused> {
+pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'n>, key: ItemKey, alloc: Alloc<'_>) -> Result<Option<Declared<'n>>, InternalRefused> {
     let Some(h) = store.fns.get(&key) else { return Ok(None) };
-    if h.has_body || h.container.is_some() || !h.text.contains(ATTR) {
+    if !may_declare(h) {
         return Ok(None);
     }
     // A module-level declaration is named and placed by the names library; one an `extern`
@@ -370,7 +461,7 @@ pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKe
     let Some(abi) = abi else { return Ok(None) };
     let attrs = || InternalRefused::Attrs { name: Box::from(name) };
     let krate = names.crate_of(h.lib).ok_or_else(attrs)?;
-    if !carries(names, krate, h.text, alloc).map_err(|()| attrs())? {
+    if !carries(names, krate, h.text, Role::Declaration, alloc).map_err(|()| attrs())? {
         return Ok(None);
     }
     if abi != "Rust" {
@@ -379,26 +470,14 @@ pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKe
     if renamed(names, krate, h.text, name, alloc).map_err(|()| attrs())? {
         return Ok(None);
     }
-    Ok(Some(Declared { lib: h.lib }))
+    Ok(Some(Declared { lib: h.lib, name }))
 }
 
-/// The declared name of `d`, as [`declares`] read it.
-fn declared_name<'s>(names: &'s Names<'_>, store: &'s Store<'_>, key: ItemKey, d: Declared) -> Option<&'s str> {
-    match names.item_text(d.lib).and_then(|t| t.name) {
-        Some(name) => Some(name),
-        None => super::panic_entry::local_name(store, key).ok().flatten(),
-    }
-}
-
-/// The definition a call of `item` runs, when `item` is a std-internal declaration (not
-/// generic: no arguments), under the program's strategy `panic`. `None` for every other item
-/// and a declaration [`reached`] refused (it is then in no table, and its caller is refused
-/// with that cause). `index` is the seam's, as alloc_shim's: nothing here asks it.
-pub fn bound(names: &Names<'_>, index: &Index<'_>, store: &Store<'_>, item: ItemKey, panic: Panic, alloc: Alloc<'_>) -> Option<ItemKey> {
-    let _ = index;
-    let d = declares(names, store, item, alloc).ok().flatten()?;
-    let name = declared_name(names, store, item, d)?;
-    definition(names, name, panic, alloc).ok().map(checker_of)
+/// The definition a call of this declaration runs. Filing the library key checks the same
+/// collision in the reach walk and when the records supply a definition for the first time.
+pub fn bound<'n, S: NamesSource<'n>>(names: S, keys: &Keys, d: Declared<'_>, panic: Panic, alloc: Alloc<'_>) -> Result<ItemKey, InternalRefused> {
+    let lib = definition(names, d.name, panic, alloc)?;
+    keys.item(lib).map_err(|_| InternalRefused::KeyClash { name: d.name.into() })
 }
 
 fn failed(why: &InternalRefused) -> Reached {
@@ -415,13 +494,9 @@ pub fn reached(r: &mut Records<'_, '_>, k: ItemKey, panic: Panic, alloc: Alloc<'
         Err(why) => return Some((failed(&why), None)),
         Ok(Some(d)) => d,
     };
-    let name = declared_name(r.names, r.store, k, d)?;
-    Some(match definition(r.names, name, panic, alloc) {
+    Some(match bound(r.names, r.keys, d, panic, alloc) {
         Err(why) => (failed(&why), None),
-        Ok(lib) => match r.keys.item(lib) {
-            Ok(def) => (Reached::NoBody, Some(def)),
-            Err(_) => (failed(&InternalRefused::KeyClash { name: Box::from(name) }), None),
-        },
+        Ok(def) => (Reached::NoBody, Some(def)),
     })
 }
 

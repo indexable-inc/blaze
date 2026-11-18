@@ -143,7 +143,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     Region::SelfTy(_) => {}
                     // An impl's `type` text elides nothing (E0106) and names only its own
                     // lifetimes: anything else was not read as this file assumes.
-                    Region::Named(_) | Region::Anon(_) | Region::Hidden(_) => return self.refuse(refused, e),
+                    Region::Named(_) | Region::Anon(_) | Region::Hidden(_) | Region::Bound(_) => return self.refuse(refused, e),
                 }
             }
         }

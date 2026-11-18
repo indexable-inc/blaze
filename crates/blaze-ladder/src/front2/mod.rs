@@ -20,6 +20,8 @@ pub mod block_traits;
 pub mod block_type_uses;
 pub mod body;
 pub mod body_host;
+#[cfg(test)]
+mod body_host_include_tests;
 pub mod body_left;
 pub mod body_reads;
 pub mod borrow_reads;

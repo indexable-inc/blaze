@@ -15,7 +15,7 @@
 //! timer reads), `pacib`, `tst`/`csel`/`eor`/`cmp` (cmov's), scalar `fmadd`/`frintn`/`fsqrt`/
 //! `fcvt`, CRC32, and NEON `cmeq`/`and`/`shrn` (constant_time_eq's).
 
-use crate::enc::{self, Cond, Fp1, Ftype, Pstate, Reg, SysReg, ZR};
+use crate::enc::{self, Cond, Field, Fp1, Ftype, Pstate, Reg, Size, SysReg, ZR};
 
 /// The most operands one statement has here (`fmadd` has four).
 const ARGS_MOST: usize = 5;
@@ -25,6 +25,8 @@ const ARGS_MOST: usize = 5;
 enum Arg {
     /// A general register; 31 is `xzr`/`wzr`, or `sp`/`wsp` when `sp`.
     Gpr { reg: Reg, wide: bool, sp: bool },
+    /// An exclusive access address, [Xn|SP] with optional zero offset.
+    Base(Reg),
     /// A scalar SIMD&FP register.
     Fp { reg: Reg, width: FpWidth },
     /// A vector register with its arrangement.
@@ -32,7 +34,7 @@ enum Arg {
     Imm(i128),
     /// A word (a system register, a condition, a barrier option): its text is the operand's.
     Name,
-    /// Anything else (a shifted register, an address, a bare `v0`): no row takes it.
+    /// Anything else (a shifted register, an indexed address, a bare `v0`): no row takes it.
     Other,
 }
 
@@ -65,18 +67,31 @@ struct Arr {
 
 /// A statement's operands, each with its text.
 struct Ops<'t> {
+    mnemonic: &'t [u8],
     args: [Arg; ARGS_MOST],
     texts: [&'t [u8]; ARGS_MOST],
     n: usize,
 }
 
 impl<'t> Ops<'t> {
-    fn parse(rest: &'t [u8]) -> Result<Ops<'t>, (&'static str, &'t [u8])> {
-        let mut ops = Ops { args: [Arg::Other; ARGS_MOST], texts: [&[]; ARGS_MOST], n: 0 };
+    fn parse(mnemonic: &'t [u8], rest: &'t [u8]) -> Result<Ops<'t>, (&'static str, &'t [u8])> {
+        let mut ops = Ops { mnemonic, args: [Arg::Other; ARGS_MOST], texts: [&[]; ARGS_MOST], n: 0 };
         if rest.is_empty() {
             return Ok(ops);
         }
-        for piece in rest.split(|&b| b == b',') {
+        let mut in_address = false;
+        for piece in rest.split(|&b| match b {
+            b'[' => {
+                in_address = true;
+                false
+            }
+            b']' => {
+                in_address = false;
+                false
+            }
+            b',' => !in_address,
+            _ => false,
+        }) {
             if ops.n == ARGS_MOST {
                 return Err(("a statement of more than five operands", rest));
             }
@@ -100,6 +115,7 @@ impl<'t> Ops<'t> {
 /// What a row makes of a statement's operands.
 enum Fit {
     Word(u32),
+    Branch { word: u32, field: Field, target: usize },
     /// Not this row's shape.
     No,
     /// This row's shape, but operand `at` cannot be encoded, for `why`.
@@ -114,6 +130,21 @@ struct Row {
 
 /// Every form the assembler has, by mnemonic.
 const ROWS: &[Row] = &[
+    Row { mnemonic: "b", encode: branch },                 // 000101 imm26
+    Row { mnemonic: "b.cond", encode: branch_cond },       // 01010100 imm19 0 cond
+    Row { mnemonic: "cbz", encode: |o| compare_branch(o, false) },  // sf 011010 0 imm19 Rt
+    Row { mnemonic: "cbnz", encode: |o| compare_branch(o, true) },  // sf 011010 1 imm19 Rt
+    Row { mnemonic: "tbz", encode: |o| test_branch(o, false) },     // b5 011011 0 b40 imm14 Rt
+    Row { mnemonic: "tbnz", encode: |o| test_branch(o, true) },     // b5 011011 1 b40 imm14 Rt
+    Row { mnemonic: "sub", encode: |o| arithmetic_imm(o, enc::sub_imm) }, // sf 1 0 100010 0 imm12 Rn Rd
+    Row { mnemonic: "add", encode: |o| arithmetic_imm(o, enc::add_imm) }, // sf 0 0 100010 0 imm12 Rn Rd
+    // Exclusive accesses: size 001000 0 L pair Rs ordered Rt2 Rn Rt.
+    Row { mnemonic: "ldxr", encode: |o| load_exclusive(o, false) },  // L=1 pair=0 Rs=31 ordered=0 Rt2=31
+    Row { mnemonic: "ldaxr", encode: |o| load_exclusive(o, true) },  // L=1 pair=0 Rs=31 ordered=1 Rt2=31
+    Row { mnemonic: "stxr", encode: |o| store_exclusive(o, false) }, // L=0 pair=0 ordered=0 Rt2=31
+    Row { mnemonic: "stlxr", encode: |o| store_exclusive(o, true) }, // L=0 pair=0 ordered=1 Rt2=31
+    Row { mnemonic: "ldxp", encode: load_pair },                    // L=1 pair=1 Rs=31 ordered=0
+    Row { mnemonic: "stxp", encode: store_pair },                   // L=0 pair=1 ordered=0
     Row { mnemonic: "nop", encode: nop },
     Row { mnemonic: "isb", encode: isb },
     Row { mnemonic: "dsb", encode: dsb },
@@ -146,25 +177,40 @@ const ROWS: &[Row] = &[
     Row { mnemonic: "shrn", encode: shrn },
 ];
 
-/// The word of statement `text` (not blank, its comments gone), or why not and the token.
-pub(crate) fn assemble(text: &[u8]) -> Result<u32, (&'static str, &[u8])> {
+pub(super) enum Instruction<'t> {
+    Word(u32),
+    Branch { word: u32, field: Field, target: &'t [u8] },
+}
+
+/// The instruction of a statement, retaining the target token until its offset is known.
+pub(super) fn assemble(text: &[u8]) -> Result<Instruction<'_>, (&'static str, &[u8])> {
     let end = text.iter().position(|it| it.is_ascii_whitespace()).unwrap_or(text.len());
     let mnemonic = &text[..end];
     if mnemonic.first() == Some(&b'.') {
         return Err(("an assembler directive (the baseline tier's assembler takes instructions only)", mnemonic));
     }
     if let Some(colon) = mnemonic.iter().position(|&it| it == b':') {
-        return Err(("a label (local labels are not assembled yet)", &mnemonic[..=colon]));
+        return Err(("a label other than a decimal local label", &mnemonic[..=colon]));
     }
-    let ops = Ops::parse(super::trim(&text[end..]))?;
+    let ops = Ops::parse(mnemonic, super::trim(&text[end..]))?;
+    let row_name = if mnemonic.get(..2).is_some_and(|s| s.eq_ignore_ascii_case(b"b.")) { b"b.cond" } else { mnemonic };
     let (mut known, mut bad) = (false, None);
     for row in ROWS {
-        if !row.mnemonic.as_bytes().eq_ignore_ascii_case(mnemonic) {
+        if !row.mnemonic.as_bytes().eq_ignore_ascii_case(row_name) {
             continue;
         }
         known = true;
         match (row.encode)(&ops) {
-            Fit::Word(word) => return Ok(word),
+            Fit::Word(word) => return Ok(Instruction::Word(word)),
+            Fit::Branch { word, field, target } => {
+                let token = ops.text(target);
+                match token.split_last() {
+                    Some((b'b' | b'f', digits)) if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+                        return Ok(Instruction::Branch { word, field, target: token });
+                    }
+                    _ => return Err(("expected a decimal local label followed by `b` or `f`", token)),
+                }
+            }
             Fit::No => {}
             Fit::Bad { why, at } => {
                 bad = bad.or(Some((why, ops.text(at))));
@@ -182,6 +228,20 @@ pub(crate) fn assemble(text: &[u8]) -> Result<u32, (&'static str, &[u8])> {
 
 /// The shape of operand text `t` (trimmed).
 fn arg(t: &[u8]) -> Arg {
+    if let Some(address) = t.strip_prefix(b"[").and_then(|s| s.strip_suffix(b"]")) {
+        let mut parts = address.split(|&b| b == b',');
+        let base = parts.next().and_then(|s| gpr(super::trim(s)));
+        if let Some(offset) = parts.next() {
+            let offset = super::trim(offset);
+            if number(super::trim(offset.strip_prefix(b"#").unwrap_or(offset))) != Some(0) || parts.next().is_some() {
+                return Arg::Other;
+            }
+        }
+        return match base {
+            Some(Arg::Gpr { reg, wide: true, sp }) if reg != ZR || sp => Arg::Base(reg),
+            _ => Arg::Other,
+        };
+    }
     if let Some(rest) = t.strip_prefix(b"#") {
         return number(super::trim(rest)).map_or(Arg::Other, Arg::Imm);
     }
@@ -408,6 +468,93 @@ fn imm_bits(v: i128, wide: bool) -> Option<u64> {
 }
 
 // The rows' encoders: each takes its shape or answers `No`.
+
+fn branch(ops: &Ops<'_>) -> Fit {
+    match ops.args() {
+        [_] => Fit::Branch { word: enc::b(0), field: Field::Imm26, target: 0 },
+        _ => Fit::No,
+    }
+}
+
+fn branch_cond(ops: &Ops<'_>) -> Fit {
+    let [_] = ops.args() else { return Fit::No };
+    let suffix = &ops.mnemonic[2..];
+    let cond = named(CONDS, suffix).or_else(|| named(&[("al", Cond::Al), ("nv", Cond::Nv)], suffix));
+    match cond {
+        Some(cond) => Fit::Branch { word: enc::b_cond(cond, 0), field: Field::Imm19, target: 0 },
+        None => Fit::No,
+    }
+}
+
+fn compare_branch(ops: &Ops<'_>, nonzero: bool) -> Fit {
+    let [Arg::Gpr { reg, wide, sp: false }, _] = *ops.args() else { return Fit::No };
+    let word = if nonzero { enc::cbnz(reg, 0) } else { enc::cbz(reg, 0) };
+    Fit::Branch { word: enc::sf(wide, word), field: Field::Imm19, target: 1 }
+}
+
+fn test_branch(ops: &Ops<'_>, nonzero: bool) -> Fit {
+    let [Arg::Gpr { reg, wide, sp: false }, Arg::Imm(bit), _] = *ops.args() else { return Fit::No };
+    let width = if wide { 64 } else { 32 };
+    if !(0..width).contains(&bit) {
+        return Fit::Bad { why: "a tested bit outside the register width", at: 1 };
+    }
+    Fit::Branch { word: enc::test_branch(nonzero, reg, bit as u32), field: Field::Imm14, target: 2 }
+}
+
+fn arithmetic_imm(ops: &Ops<'_>, encode: fn(Reg, Reg, u32, bool) -> u32) -> Fit {
+    let [Arg::Gpr { reg: rd, wide, sp: sd }, Arg::Gpr { reg: rn, wide: w, sp: sn }, Arg::Imm(imm)] = *ops.args() else {
+        return Fit::No;
+    };
+    if w != wide || (rd == ZR && !sd) || (rn == ZR && !sn) {
+        return Fit::No;
+    }
+    if !(0..=4095).contains(&imm) {
+        return Fit::Bad { why: "an unshifted arithmetic immediate outside 0..=4095", at: 2 };
+    }
+    Fit::Word(enc::sf(wide, encode(rd, rn, imm as u32, false)))
+}
+
+fn load_exclusive(ops: &Ops<'_>, acquire: bool) -> Fit {
+    let [Arg::Gpr { reg, wide, sp: false }, Arg::Base(base)] = *ops.args() else { return Fit::No };
+    Fit::Word(enc::ldxr(if wide { Size::X } else { Size::W }, acquire, reg, base))
+}
+
+fn store_exclusive(ops: &Ops<'_>, release: bool) -> Fit {
+    let [Arg::Gpr { reg: status, wide: false, sp: false }, Arg::Gpr { reg, wide, sp: false }, Arg::Base(base)] = *ops.args() else {
+        return Fit::No;
+    };
+    if status == reg || (base != enc::SP && status == base) {
+        return Fit::Bad { why: "exclusive store status overlaps data or address", at: 0 };
+    }
+    Fit::Word(enc::stxr(if wide { Size::X } else { Size::W }, release, status, reg, base))
+}
+
+fn load_pair(ops: &Ops<'_>) -> Fit {
+    let [Arg::Gpr { reg, wide, sp: false }, Arg::Gpr { reg: other, wide: w, sp: false }, Arg::Base(base)] = *ops.args() else {
+        return Fit::No;
+    };
+    if w != wide {
+        return Fit::No;
+    }
+    if reg == other {
+        return Fit::Bad { why: "exclusive pair load has overlapping destinations", at: 1 };
+    }
+    Fit::Word(enc::exclusive_pair_width(wide, enc::ldxp(false, reg, other, base)))
+}
+
+fn store_pair(ops: &Ops<'_>) -> Fit {
+    let [
+        Arg::Gpr { reg: status, wide: false, sp: false }, Arg::Gpr { reg, wide, sp: false },
+        Arg::Gpr { reg: other, wide: w, sp: false }, Arg::Base(base),
+    ] = *ops.args() else { return Fit::No };
+    if w != wide {
+        return Fit::No;
+    }
+    if status == reg || status == other || (base != enc::SP && status == base) {
+        return Fit::Bad { why: "exclusive store status overlaps data or address", at: 0 };
+    }
+    Fit::Word(enc::exclusive_pair_width(wide, enc::stxp(false, status, reg, other, base)))
+}
 
 fn nop(ops: &Ops<'_>) -> Fit {
     match ops.args() {

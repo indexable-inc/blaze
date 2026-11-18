@@ -17,14 +17,19 @@ use crate::{
     tests::{ISA, emitted_for, one},
 };
 
-/// Every word `text` assembles to under `dialect`, or the refusal.
-fn words(dialect: Dialect, text: &str) -> Result<u32, crate::asm::AsmError> {
-    let mut reader = Assembler::new(dialect);
-    let mut count = 0u32;
-    reader.feed(text.as_bytes(), &mut |_| count += 1)?;
-    let made = reader.finish(&mut |_| count += 1)?;
-    assert_eq!(made, count, "`finish` answers the words it handed out");
-    Ok(count)
+/// The resolved words of one template, or its source diagnostic.
+pub(crate) fn assembled(dialect: Dialect, text: &str) -> Result<Vec<u32>, crate::asm::AsmError> {
+    let heap = blaze_own::testing::heap();
+    let mut code = Vec::new();
+    let mut reader = Assembler::new(dialect, &mut code, heap.alloc());
+    reader.feed(text.as_bytes())?;
+    reader.finish()?;
+    assert_eq!(code.len() % 4, 0, "A64 instructions are whole words");
+    Ok(code.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect())
+}
+
+fn words(dialect: Dialect, text: &str) -> Result<usize, crate::asm::AsmError> {
+    Ok(assembled(dialect, text)?.len())
 }
 
 /// Comments as LLVM's AArch64 assembler reads them make no instruction: `/* */` (across lines
@@ -58,8 +63,10 @@ fn unknown_mnemonic_refused_by_name() {
     assert_eq!((e.line, e.token.text()), (2, "frob"));
     let e = words(Dialect::Darwin, ".arch_extension crc").expect_err("a directive");
     assert_eq!(e.token.text(), ".arch_extension");
-    let e = words(Dialect::Darwin, "2: frob").expect_err("a label");
-    assert_eq!(e.token.text(), "2:");
+    let e = words(Dialect::Darwin, "2: frob").expect_err("a numeric label followed by an unknown instruction");
+    assert_eq!((e.line, e.token.text(), e.why), (1, "frob", "a mnemonic the baseline tier's assembler has no row for"));
+    let e = words(Dialect::Darwin, "named: frob").expect_err("only decimal local labels are supported");
+    assert_eq!((e.line, e.token.text(), e.why), (1, "named:", "a label other than a decimal local label"));
     let e = words(Dialect::Darwin, "/* open").expect_err("an unterminated comment");
     assert_eq!(e.token.text(), "/*");
     let e = words(Dialect::Darwin, "/* a\n\n */ frob").expect_err("a comment across lines leaves its statement open");
@@ -77,6 +84,46 @@ fn barrier(ty: Ty, class: &str, template: &[AsmPiece<'_>]) -> Func<Global> {
 }
 
 const OPERAND_0: AsmPiece<'static> = AsmPiece::Operand { index: 0, modifier: None };
+
+#[test]
+fn numeric_labels_choose_the_nearest_definition() {
+    let text = "23: nop; b 23f; b 23b; 023:b 23b; b 23f; nop; 23:";
+    let got = assembled(Dialect::Elf, text).expect("repeated numbers at distinct PCs are legal");
+    assert_eq!(got, [0xd503201f, 0x14000002, 0x17fffffe, 0x14000000, 0x14000002, 0xd503201f]);
+    println!("asm::labels: nearest forward, backward and same-PC targets");
+}
+
+#[test]
+fn local_label_refusals_name_line_and_token() {
+    let far = format!("\ntbz x3, #63, 8f\n{}8:", "nop\n".repeat(8191));
+    let cases = [
+        ("2:\nb 2f", 2, "2f", "no local label in the requested direction"),
+        ("\nb 2b\n2:", 2, "2b", "no local label in the requested direction"),
+        ("2:\n/* empty */\n02: nop", 3, "02:", "a local label defined twice at the same instruction address"),
+        (far.as_str(), 2, "8f", "local label outside this branch's displacement range"),
+        ("nop\nb name", 2, "name", "expected a decimal local label followed by `b` or `f`"),
+        ("nop\ntbnz w2, #32, 2f\n2:", 2, "#32", "a tested bit outside the register width"),
+    ];
+    for (text, expected_line, expected_token, expected_why) in cases {
+        let f = barrier(Ty::I64, "reg", &[AsmPiece::Text(text)]);
+        let error = emitted_for(f.view(), &[], ISA).map(|_| ()).expect_err(expected_why);
+        let EmitError::Asm { line, token, why, .. } = error else { panic!("expected a template diagnostic, got {error}") };
+        assert_eq!((line, token.text(), why), (expected_line, expected_token, expected_why));
+    }
+    println!("asm::labels: all six refusals name their line and token");
+}
+
+#[test]
+fn test_branch_displacement_limits() {
+    let forward = format!("tbz x7, #63, 2f\n{}2:", "nop\n".repeat(8190));
+    assert_eq!(assembled(Dialect::Darwin, &forward).unwrap()[0], 0xb6fbffe7);
+    let back = format!("2:\n{}tbnz w1, #0, 2b", "nop\n".repeat(8192));
+    assert_eq!(assembled(Dialect::Darwin, &back).unwrap()[8192], 0x37040001);
+    let outside = format!("2:\n{}tbnz w1, #0, 2b", "nop\n".repeat(8193));
+    let err = assembled(Dialect::Darwin, &outside).expect_err("one word below the signed 14-bit minimum");
+    assert_eq!((err.line, err.token.text(), err.why), (8195, "2b", "local label outside this branch's displacement range"));
+    println!("asm::tb: reaches -8192 and +8191 words");
+}
 
 /// The refusal reaches the emitter's caller as `EmitError::Asm`, naming the instruction, the
 /// line and the mnemonic, with the placeholder rendered (`frob x9`'s token is `frob`).

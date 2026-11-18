@@ -704,14 +704,15 @@ fn callable_parameter_types_are_read() {
     };
     let got = read("fn a(f: fn(&'static S), s: S) { f(&s); }", &[rs], unit);
     assert_eq!(got, Ok((vec![Region::Static], vec![1])));
+    // Lane B15: a lifetime of the callable's binder, written or elided, is `Bound`.
     let got = read("fn b(f: fn(&S) -> &S, s: &S) -> &S { f(s) }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Region::Anon(0), Region::Anon(0)], vec![1])));
+    assert_eq!(got, Ok((vec![Region::Bound(0), Region::Bound(0)], vec![1])));
     let got = read("fn c<F: for<'a> Fn(&'a S) -> &'a S>(f: F, s: &S) -> &S { f(s) }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Region::Named(0), Region::Named(0)], vec![1])));
+    assert_eq!(got, Ok((vec![Region::Bound(0), Region::Bound(0)], vec![1])));
     let got = read("fn d<F>(f: F, s: S) where F: Fn(&'static S) + Send { f(&s); }", &[rs], unit);
     assert_eq!(got, Ok((vec![Region::Static], vec![1])));
     let got = read("fn e(f: &mut dyn FnMut(&S, &S), s: &S) { f(s, s); }", &[rs, rs], unit);
-    assert_eq!(got, Ok((vec![Region::Anon(0), Region::Anon(1)], vec![1, 2])));
+    assert_eq!(got, Ok((vec![Region::Bound(0), Region::Bound(1)], vec![1, 2])));
     let got = read("fn g<'a>(f: impl Fn(&'a S), s: &'a S) { f(s); }", &[rs], unit);
     assert!(matches!(got, Err(CallableRefusal::OuterLifetime { .. })), "{got:?}");
     let got = read("fn h(f: Callback, s: &S) { f(s); }", &[rs], unit);

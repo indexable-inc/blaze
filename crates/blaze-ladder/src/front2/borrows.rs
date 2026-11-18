@@ -258,6 +258,9 @@ pub struct BorrowFacts<'a> {
     /// How many impls' texts the gathering read from the source (sig_impl.rs `ImplTextsMemo`:
     /// one an impl a body).
     impl_text_reads: u32,
+    /// Whether a fn-pointer type's bound lifetimes are read as bound (`Facts::fn_binders`);
+    /// `false` only under the control `FactsPlant::FnBindersFree`.
+    fn_binders: bool,
     /// The variance of each ADT's lifetime and type parameters, in head order, from its head
     /// record (lifetimes.rs `AdtLife.variances`), for blaze-flow-lower `Facts::adt_variances`:
     /// per ADT where its run is in `variance_list`. An ADT with no row is taken invariant in
@@ -306,6 +309,7 @@ impl<'a> BorrowFacts<'a> {
             object_traits: AVec::new_in(alloc),
             impl_sources: AVec::new_in(alloc),
             impl_text_reads: 0,
+            fn_binders: true,
             variance_at: AVec::new_in(alloc),
             variance_list: AVec::new_in(alloc),
             items: AVec::new_in(alloc),
@@ -362,6 +366,9 @@ impl<'a> BorrowFacts<'a> {
 impl Facts for BorrowFacts<'_> {
     fn own_text(&self) -> Option<&str> {
         core::str::from_utf8(&self.own_text).ok().filter(|t| !t.is_empty())
+    }
+    fn fn_binders(&self) -> bool {
+        self.fn_binders
     }
     fn call_bounds(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> {
         self.calls.get(item)
@@ -744,6 +751,11 @@ pub enum FactsPlant {
     /// No impl's texts given at a selected call (`Facts::impl_source` answers nothing): a
     /// bound over a concrete type is refused `ImplUnread`, as before piece B13.
     NoImplSources,
+    /// Every lifetime a fn-pointer type's binder binds read as FREE (`Facts::fn_binders`
+    /// false): the body's own a placeholder like a named lifetime, a call through a fn-pointer
+    /// parameter relating it to the parameter's own position, as before lane B15 a reading that
+    /// knew no binder would.
+    FnBindersFree,
 }
 
 /// [`gather_facts`] with one provider turned off ([`FactsPlant`]).
@@ -757,6 +769,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     alloc: Alloc<'a>,
 ) -> BorrowFacts<'a> {
     let mut g = BorrowFacts::new_in(alloc);
+    g.fn_binders = plant != FactsPlant::FnBindersFree;
     if let Some(f) = r.store.fns.get(&owner) {
         g.own_text.extend_from_slice(f.text.as_bytes());
     }

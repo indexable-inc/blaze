@@ -202,6 +202,18 @@ impl<'a> Recorder<'a> {
         ReadTally { offered: self.offered.get(), kept: self.reads.borrow().len() as u64, sort_compares: 0 }
     }
 
+    /// The bytes the recorder's two tables hold now, from their capacities (adds only, no walk):
+    /// the list (`size_of::<TableRead>()` a slot) and `seen` (a slot and its control byte). Its
+    /// floor is the distinct reads as one list, `tally().kept` slots. The binding-key memo is
+    /// not counted (blaze-scope cell_key.rs `BindingKeys` says no size; its rows are a names
+    /// lookup's, one per distinct binding read: [`Recorder::binding_keys_derived`]).
+    pub fn table_bytes(&self) -> u64 {
+        let slot = core::mem::size_of::<TableRead>() as u64;
+        let list = self.reads.borrow().capacity() as u64 * slot;
+        let seen = self.seen.borrow().capacity() as u64 * (slot + 1);
+        list + seen
+    }
+
     /// PLANTED BUG, for tests only: every read of `cell` is dropped from now on, as a view
     /// that forgot to record one question would leave it out.
     #[doc(hidden)]

@@ -449,6 +449,15 @@ pub enum Effect<'a> {
     /// the `Native` record at `native` holds (blaze-run's Parent). Both keys are the effect's
     /// own, so the runner never asks the request for either. Answered by [`Event::Exited`].
     StartProgram { units: Key, native: Key },
+    /// `test`: run the answer's tests (blaze-cli test_drive.rs). Pushed once the check is done
+    /// and found no error and no failed task, never beside it (docs/v2/plan/design/test.md
+    /// piece 3: a suite whose check failed runs nothing), and only over an answer with a units
+    /// record. It carries no key: the test unit is found by the caller in the answer's crate
+    /// list (blaze-cli run_names.rs `test_unit`: a library and its test unit share a root, and
+    /// the unit is the member whose `CrateScope` record holds a tests section), which this
+    /// machine does not read. Answered by [`Event::Exited`]: `ok` when every test passed and
+    /// none was left unrun.
+    StartTests,
     /// Stop the running program: the gate found `errors` error-level findings.
     Stop { errors: u32 },
     Print(Print<'a>),
@@ -1277,11 +1286,15 @@ impl<'a> Request<'a> {
     }
 
     /// `run`: a program is part of the answer. `test` starts none: a package's `main` is not
-    /// its tests, and until tests run on this path (docs/v2/plan/design/test.md) `test` is the
-    /// check of all it reaches, answered [`Verdict::Checked`] or failed, never passed (decision
-    /// D61 item 5: no pass over a stage that did not run).
+    /// its tests ([`Request::runs_tests`]).
     fn runs_program(&self) -> bool {
         starts_program(self.command, self.plant)
+    }
+
+    /// `test`: its tests are part of the answer ([`Effect::StartTests`]), started after the
+    /// check, never a program.
+    fn runs_tests(&self) -> bool {
+        starts_tests(self.command, self.plant)
     }
 
     /// The units or the program's image settled: once both are known, under `Beside` and
@@ -1344,6 +1357,11 @@ impl<'a> Request<'a> {
         let Some(mut answer) = self.held else { return };
         let started = self.program != Program::Unstarted;
         let verdict = match (self.runs_program(), self.program) {
+            // `test`: its tests' verdict, or `None` while they are to start or running.
+            (false, _) if self.runs_tests() => match self.tests_verdict(answer.units, started, out) {
+                Some(verdict) => verdict,
+                None => return,
+            },
             (false, _) => Verdict::Checked,
             // A started program is waited for, stopped or not: its `Exited` is the last event,
             // and the answer comes after it. Answering first left the caller holding a start it
@@ -1381,6 +1399,35 @@ impl<'a> Request<'a> {
         self.held = None;
         self.phase = Phase::Answered;
         out.push(Effect::Done(answer));
+    }
+
+    /// `test`'s verdict once its check is done (`conclude`): the tests start over a check with
+    /// no error and no failed task (an unchecked item holds no start: `Gate::Beside`, and each
+    /// test's own refusal is the runner's), and their `Exited` is the verdict. `None` while they
+    /// are started now or still running: their `Exited` is the last event, the answer after it.
+    fn tests_verdict(&mut self, units: Option<Key>, started: bool, out: &mut AVec<'_, Effect<'a>>) -> Option<Verdict> {
+        let start = |request: &mut Self, out: &mut AVec<'_, Effect<'a>>| {
+            request.program = Program::Running;
+            out.push(Effect::StartTests);
+            None
+        };
+        match self.program {
+            Program::Running | Program::Stopped => None,
+            // A check error or a failed task: no test runs over it (the plant starts them).
+            Program::Unstarted if self.plant == Plant::TestsOverErrors && units.is_some() => start(self, out),
+            _ if self.errors > 0 || !self.failures.is_empty() => Some(Verdict::Failed { errors: self.errors, started }),
+            Program::Unstarted => match units {
+                Some(_) => start(self, out),
+                // The walk is done and the units have no record: refused by name, never started
+                // on a default key.
+                None => {
+                    self.failures.push(TaskFailure { name: Name::units(), why: Why::Refused { what: "tests to start whose units have no record", rule: "test" } });
+                    Some(Verdict::Failed { errors: self.errors, started: false })
+                }
+            },
+            Program::Ended { ok: true } => Some(Verdict::Passed),
+            Program::Ended { ok: false } => Some(Verdict::ProgramFailed),
+        }
     }
 
     /// An `Open` answered: the file joins the table (new to this answer, so `changed`) or is
@@ -4954,6 +5001,12 @@ fn starts_program(command: Command, plant: Plant) -> bool {
         Command::Test => plant == Plant::TestStartsProgram,
         Command::Check => false,
     }
+}
+
+/// Whether `command` runs tests ([`Effect::StartTests`]): `test` alone, and never beside a
+/// program (under [`Plant::TestStartsProgram`] the planted `test` starts a program instead).
+fn starts_tests(command: Command, plant: Plant) -> bool {
+    command == Command::Test && !starts_program(command, plant)
 }
 
 fn file_of(name: Name, home: Name) -> Name {

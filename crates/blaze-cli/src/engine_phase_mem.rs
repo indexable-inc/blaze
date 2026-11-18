@@ -88,8 +88,12 @@ pub(crate) const REQUEST_RESERVE: usize = crate::engine_check::REQUEST_FRAME;
 /// The most one phase's arena takes: a cap of address space, as [`REQUEST_RESERVE`].
 pub(crate) const PHASE_RESERVE: usize = 64 << 30;
 
-/// The tag the arenas' pages count to: the request's frame's.
-const TAG: Tag = Tag::Other;
+/// The tags the arenas' pages count to, each its own so the status's `memory by tag` line names
+/// which holds the memory (tempo, 2026-11-18, tree b45a62c58e: `Other` held 15.8 GB over two
+/// 64 GiB reservations, the request's frame and these arenas together, and the line could not
+/// say which; rule 16): the request's arena, and a phase's.
+const REQUEST_TAG: Tag = Tag::Api;
+const PHASE_TAG: Tag = Tag::Query;
 
 /// Why an arena could not be made: the kernel refused its reservation (rule 3: the command
 /// stops, naming which).
@@ -141,7 +145,7 @@ impl RequestMem {
     /// What it holds at its drop is its to free ([`LiveAtDrop::Freed`]): the stages handed its
     /// handle keep values to its end by design (`Vec::leak` into the handed allocator).
     pub(crate) fn new() -> Result<RequestMem, PhaseMemError> {
-        let root = Root::new(RootOpts { reserve: REQUEST_RESERVE, tag: TAG, live_at_drop: LiveAtDrop::Freed }).map_err(|error| PhaseMemError::Request { error })?;
+        let root = Root::new(RootOpts { reserve: REQUEST_RESERVE, tag: REQUEST_TAG, live_at_drop: LiveAtDrop::Freed }).map_err(|error| PhaseMemError::Request { error })?;
         Ok(RequestMem { root, made: AtomicU32::new(0), dropped: AtomicU32::new(0), returned: AtomicU64::new(0) })
     }
 
@@ -152,7 +156,7 @@ impl RequestMem {
 
     /// The arena of a phase of `stage` beginning now, the process heap read as it begins.
     pub(crate) fn phase(&self, stage: Stage) -> Result<PhaseMem<'_>, PhaseMemError> {
-        let root = Root::new(RootOpts { reserve: PHASE_RESERVE, tag: TAG, live_at_drop: LiveAtDrop::Refused }).map_err(|error| PhaseMemError::Phase { stage, error })?;
+        let root = Root::new(RootOpts { reserve: PHASE_RESERVE, tag: PHASE_TAG, live_at_drop: LiveAtDrop::Refused }).map_err(|error| PhaseMemError::Phase { stage, error })?;
         self.made.fetch_add(1, Ordering::AcqRel);
         Ok(PhaseMem { request: self, stage, root, heap_at_start: heap_now() })
     }

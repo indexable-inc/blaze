@@ -4,9 +4,9 @@
 //! The record's words go to the item grammar as they are ([`Tokens::parser_tokens`]: the
 //! parser's words with their pad, each with the `JOINT` bit its writer set, so which tokens are
 //! joined is the record's own fact and nothing is re-joined from where tokens stand in a text).
-//! The parse is walked with a stack of the nodes open at each step, as [`crate::outline`]'s is,
-//! and an entry is what it is there: a node of an item's kind (or a variant or field) directly
-//! in the file or in an entry's list ([`is_item`], [`is_list`]), never inside a body.
+//! As in [`crate::outline`], a stack tracks the nodes open at each step. Every grammar node
+//! directly in the file or in an entry's list ([`is_list`]) gets an entry, including item
+//! forms the text outline marks unhandled, except for attributes and error nodes.
 //!
 //! Every position is a [`TokenRange`] of the record: an entry's extent from its first token
 //! (an attribute's, a doc comment's `#`) to its last, each outer attribute's, its name as one
@@ -27,7 +27,7 @@ use parser::{
     TopEntryPoint,
 };
 
-use super::{is_item, is_list};
+use super::{is_error_entry, is_list, is_name_child};
 
 /// One entry of a token outline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,7 +130,7 @@ pub fn outline_token_record<'a>(
         match step {
             Step::Enter { kind } => {
                 let parent = open.last().copied();
-                let entry = match parent.is_some_and(|p| p.list) && is_entry(kind) {
+                let entry = match parent.is_some_and(|p| p.list) && !is_error_entry(kind) {
                     true => {
                         let index = u32::try_from(out.entries.len()).expect("entries counted in u32");
                         let attrs = u32::try_from(out.attrs.len()).expect("attributes counted in u32");
@@ -161,14 +161,15 @@ pub fn outline_token_record<'a>(
                 }
                 // A node directly in an entry: its outer attribute, or its name.
                 if let Some(owner) = open.last().and_then(|o| o.entry) {
+                    let entry = &mut out.entries[owner as usize];
                     match node.kind {
                         ATTR => {
                             out.attrs.push(range);
                             let attrs = u32::try_from(out.attrs.len()).expect("attributes counted in u32");
-                            out.entries[owner as usize].attrs.end = attrs;
+                            entry.attrs.end = attrs;
                         }
-                        NAME if !range.is_empty() => {
-                            out.entries[owner as usize].name.get_or_insert(range.start);
+                        child if is_name_child(entry.kind, child) && !range.is_empty() => {
+                            entry.name.get_or_insert(range.start);
                         }
                         _ => {}
                     }
@@ -187,9 +188,4 @@ pub fn outline_token_record<'a>(
         entry.digest = tokens.digest(entry.extent);
     }
     Ok(out)
-}
-
-/// The kinds a list holds as entries: items, variants and fields.
-fn is_entry(kind: SyntaxKind) -> bool {
-    is_item(kind) || matches!(kind, VARIANT | RECORD_FIELD | TUPLE_FIELD)
 }

@@ -24,6 +24,15 @@ blaze-file-items.workspace = true
 blaze-own.workspace = true
 # `CrateItemKey`: the crate a text is read from; `ContentId` in the tests' sites.
 blaze-id.workspace = true
+# The one home of the module walk (the `mod x;` path rule), lowering (keys, cfg, attributes,
+# use trees) and a macro's definition: this source's keys equal the whole-crate names' by it.
+blaze-scope.workspace = true
+# `DeclsBuilder` and its kinds: what lowering hands back.
+blaze-surface.workspace = true
+# `Implicit` and `Sysroot`: a crate's extern prelude and its prelude's module.
+blaze-unit-graph.workspace = true
+# `Hasher`: a crate root's digest.
+blaze-ids.workspace = true
 
 [dev-dependencies]
 # The soundness property: generated definitions expanded for real, against their summaries.
@@ -34,6 +43,8 @@ blaze-mem.workspace = true
 blaze-tokens.workspace = true
 # `bytes_of_slice`: the record copied to a 16-byte aligned column.
 blaze-format.workspace = true
+# `Edition2021` of the fixture's `Implicit` preludes.
+edition.workspace = true
 
 [lints]
 workspace = true

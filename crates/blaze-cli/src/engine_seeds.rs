@@ -1025,7 +1025,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
         // so the read alone would call it "no such cell", or another unit's when every head of
         // this unit failed.
         if let Some(refused) = self.failed.find(id.of, id.cell) {
-            return NotTheirs::Failed { said: self.could_not_freeze(cell, refused.why) };
+            return NotTheirs::Failed { said: self.could_not_freeze(cell, refused.cause.words) };
         }
         let read = self.table.members.pin().get(&id).copied();
         match read {

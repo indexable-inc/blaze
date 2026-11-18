@@ -23,10 +23,14 @@
 //! `fn ok<'de: 'x, 'x, D: De<'de>>(d: D) -> (&'x S, D::Error) { d.take() }` with a false
 //! `'x: 'de`, the tuple's `&'x S` tied both ways to the callee's `&'de S`.
 //!
-//! WHAT IS NOT HERE: a fn pointer's lifetimes have no position in this lowering (`npos` counts
-//! none for `FnPtr`), so the table's fn row is not expressed: a relation through a fn pointer
-//! of non-higher-ranked lifetimes relates nothing (lib.rs `npos`; NOT DONE in lane B13's
-//! report). The table's contravariant row is kept in [`Variance`] for when it has positions.
+//! FN POINTERS (lane B15): a fn pointer's positions are its inputs' then its output's (lib.rs
+//! `npos`), the inputs at `Contra`, the output at `Co`. Which of them its binder binds is a
+//! region of the lifetime part (sig.rs `Region::Bound`): a bound one is an existential origin,
+//! so relating it by the table asks nothing of the fn's regions, while a free one (`fn(&'a u8)`
+//! with the fn's `'a`) relates by the table exactly. NOT HERE: a higher-ranked pointer type
+//! as the EXPECTED type (`fn(&'a u8)` given where `for<'r> fn(&'r u8)` is wanted, which rustc
+//! refuses as "one type is more general") would need its bound regions as placeholders of the
+//! relation; they are existentials, so that refusal is not made (as before this piece).
 //!
 //! SOUNDNESS: every unknown is invariant (more relations refuse more, never less). The control
 //! (`Plant::NoVariance`, rule 23) gives every position below the top reference `In`, the form
@@ -117,6 +121,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 PNode::Tuple(l) => {
                     for &x in self.list(l, e)?.iter().rev() {
                         todo.push(Step::Ty(x, v));
+                    }
+                }
+                // `fn(A) -> R`: contravariant in `A`, covariant in `R` (the table's row). A
+                // position the pointer's binder binds takes the same answer: its origin is an
+                // existential of its own (lib.rs `universal`, `field_slot`), so the relation
+                // asks nothing of a region of the fn's.
+                PNode::FnPtr(l, _) => {
+                    let xs = self.list(l, e)?;
+                    if let Some((&out, ins)) = xs.split_last() {
+                        todo.push(Step::Ty(out, v));
+                        for &x in ins.iter().rev() {
+                            todo.push(Step::Ty(x, v.then(Variance::Contra)));
+                        }
                     }
                 }
                 PNode::Adt(k, l) => {

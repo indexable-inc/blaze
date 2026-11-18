@@ -141,10 +141,9 @@ fn moved_reads(checked: &engine_check::Checked) -> std::vec::Vec<(Stage, &'stati
 /// of a head task refused for two heads under one cell (engine_heads.rs `heads_of`).
 const REFUSALS: [&str; 4] = ["a body never freezes a member's head", "and not under this body's unit", "fall under one cell", "holds no text"];
 
-/// The notes of `answer` that are not this fixture's own borrow note (its core has no `Copy`
-/// lang item: "borrows not checked", engine_body_locals_tests.rs): a body left unchecked.
+/// Exclude borrow-check notes because the fixture's core has no `Copy` lang item.
 fn unchecked(answer: &Answer) -> std::vec::Vec<&std::string::String> {
-    answer.checked.bodies.0.iter().filter(|note| !note.contains(": borrows not checked: ")).collect()
+    answer.checked.bodies.0.iter().filter(|note| !note.contains("borrows not checked: ")).collect()
 }
 
 /// THE RULE on one fresh answer of a clean fixture: no body refused or left unchecked, no member
@@ -190,8 +189,8 @@ fn engine_expansion_heads_freeze_every_written_item() {
 
 /// THE EDIT ROWS of written heads, each from the stored answer of the row before and checked
 /// against a fresh request on the same files (THE ORACLE):
-/// - a comment in `unrelated`'s body enters 1 head task (its own entry's: a fn's head task holds
-///   its text) and no call's;
+/// - a comment in `unrelated`'s body enters no head task (a comment is no token of its entry's
+///   key) and no call's;
 /// - `make!(A, a)` to `make!(B, a)` enters that call's head task alone (no head reads `A`);
 /// - `make!(C, c)` to `make!(E, c)` enters that call's alone: the file's other call's is not;
 /// - `make!`'s definition edited enters every call's (`make!(A)`, `make!(C)` and `outer!(D)`,
@@ -206,8 +205,11 @@ fn engine_expansion_heads_edit_rows() {
     // Each row's edit is one entry's from the row before (the definition's: its own entry, if
     // it has a head task, and the three calls it writes for).
     let rows: [(&str, &str, core::ops::RangeInclusive<u32>); 7] = [
-        ("a comment in an unrelated fn", COMMENTED, 1..=1),
-        ("the comment taken out", BASE, 1..=1),
+        // A comment is no token: since item keys are from tokens (lane K1, 2026-11-18) the edit
+        // moves no head task's key (first run: 0 entered, the answer a fresh request's). It was
+        // 1 while a fn's head task held its text's bytes.
+        ("a comment in an unrelated fn", COMMENTED, 0..=0),
+        ("the comment taken out", BASE, 0..=0),
         ("`make!(A, a)` is `make!(B, a)`", A_RENAMED, 1..=1),
         ("`make!(B, a)` back", BASE, 1..=1),
         ("`make!(C, c)` is `make!(E, c)`, the other call of the file", C_RENAMED, 1..=1),
