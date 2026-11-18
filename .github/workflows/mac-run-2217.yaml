@@ -1,0 +1,438 @@
+# One question, on a GitHub-hosted macos-15 runner (arm64): does `blaze run` of the owner's hello
+# world (crates/blaze-cli/tests/e2e/hello-blaze, as tests/command_rungs.rs runs it) print the same
+# at a06c29bee (#2217, branch promote-nested-borrow-rebuild-1117: a shared borrow of a promotable
+# Freeze value is promotable) as at its base c2723984c (rebuild-1115)? blaze-build's
+# walk/promote.rs `promoted_fns` has no arm for a borrow inside a promoted operand, so a body on
+# hello's run path with a nested promoted borrow could now be refused. Linux cannot answer it: its
+# `blaze run` stops at the native image (`Write(NotMac)`).
+#
+# Push this file ALONE on an orphan branch `mac-run-2217` (recipe.md says how): a branch made from
+# rebuild-1115 also carries llvm.yaml, whose `push` trigger has no branch filter.
+#
+# Per commit: a release build (blaze, blaze-launcher beside it, toolchain_cut), the toolchain cut
+# onto a fresh scratch home's shelf with PINNED rewritten as `write_pin` does and blaze rebuilt when
+# the id moved, then `blaze run` in a fresh copy of each program with exactly HOME, PATH, TERM and
+# LANG (as command_rungs.rs gives its child). The second commit is checked out in the same
+# workspace, so its build is incremental. A failing run never stops the job: every status is
+# recorded and the summary table is written whatever happened.
+name: mac-run-2217
+
+on:
+  push:
+    branches: [mac-run-2217]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-run-2217
+  cancel-in-progress: false
+
+env:
+  HEAD_SHA: c2723984cd1eb927824375f54b5aa6223a13825b
+  FIX_SHA: a06c29beed280f323ff19804039f00f467884763
+  # The owner's last commit (1bcb1084a, "hello world prints"): built and run only when hello does
+  # not print at HEAD_SHA, to tell a runner problem from a regression of the ten commits after it.
+  OWNER_SHA: 1bcb1084ab7239fb2894669484df42851e4bb062
+  # "true" also runs tests/command_rungs.rs (hello-blaze and all 241 front2 rungs through the
+  # release binary) on both commits: up to 241 x 120 s each, so off unless asked for.
+  COMMAND_RUNGS: "false"
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: blaze run hello, c2723984c vs a06c29bee
+    runs-on: macos-15
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 1
+          path: blaze
+
+      - name: machine, helpers, probe programs
+        run: |
+          M="$RUNNER_TEMP/m"
+          mkdir -p "$M/logs" "$M/probes"
+          {
+            sw_vers; uname -m; sysctl -n hw.ncpu hw.memsize machdep.cpu.brand_string
+            df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+            xcode-select -p; xcrun --show-sdk-path; xcrun --show-sdk-version
+            command -v perl bash; bash --version | head -n 1
+          } 2>&1 | tee "$M/logs/machine.txt" || true
+
+          # capped.pl SECS RCFILE SECSFILE CMD...: CMD in a process group of its own, killed whole
+          # at SECS; RCFILE gets its status (124 when killed at the deadline, 128+n for signal n),
+          # SECSFILE its wall time. Whatever of the group outlives CMD is killed too.
+          cat > "$M/capped.pl" <<'PERL'
+          use strict; use warnings; use Time::HiRes qw(time);
+          my ($secs, $rcfile, $timefile) = splice(@ARGV, 0, 3);
+          my $t0 = time;
+          my $pid = fork();
+          die "fork: $!" unless defined $pid;
+          if ($pid == 0) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; }
+          my $late = 0;
+          $SIG{ALRM} = sub { $late = 1; kill 'KILL', -$pid; };
+          alarm $secs;
+          waitpid($pid, 0);
+          my $st = $?;
+          alarm 0;
+          my $wall = time - $t0;
+          kill 'KILL', -$pid;
+          my $rc = $late ? 124 : (($st & 127) ? 128 + ($st & 127) : ($st >> 8));
+          open(my $f, '>', $rcfile) or die; print $f "$rc\n"; close $f;
+          open($f, '>', $timefile) or die; printf $f "%.2f\n", $wall; close $f;
+          PERL
+
+          cat > "$M/lib.sh" <<'SH'
+          M="$RUNNER_TEMP/m"
+          B="$GITHUB_WORKSPACE/blaze"
+          LOGS="$M/logs"
+          TC=$(cat "$B/harness/toolchain")
+          CARGO_HOME0="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTUP_HOME0="${RUSTUP_HOME:-$HOME/.rustup}"
+
+          # One summary row, tab-separated; each field made safe for a markdown cell.
+          clean() { printf '%s' "$1" | tr '|`\t\r\n' "/'   " | cut -c1-400; }
+          row() {
+            local fields=() f
+            for f in "$@"; do fields+=("$(clean "$f")"); done
+            (IFS=$'\t'; printf '%s\n' "${fields[*]}") >> "$M/summary.tsv"
+          }
+
+          # build_bins LABEL N: the release binaries of the tree as it is; status 0 or the build's.
+          build_bins() {
+            local label=$1 n=$2 log="$LOGS/$1-build-$2.log" t0 rc
+            t0=$(date +%s)
+            if (cd "$B" && cargo +"$TC" build --locked --release -p blaze-cli -p blaze-launcher -p scripts \
+                  --bin blaze --bin blaze-fact-shim --bin blaze-launcher --bin toolchain_cut) > "$log" 2>&1; then rc=0; else rc=$?; fi
+            row step "$label" "build $n" "$rc" "$(( $(date +%s) - t0 )) s; $(grep -E '^(error|warning: unused)' "$log" | head -n 1)"
+            [ "$rc" = 0 ] || { echo "::error::$label: build $n failed (exit $rc)"; tail -n 60 "$log"; }
+            return "$rc"
+          }
+
+          # cut_shelf LABEL: the toolchain cut of the tree (aarch64-apple-darwin, with the macro side
+          # wasm32-wasip1; without it if that cut fails) onto LABEL's fresh shelf
+          # (<home>/.blaze/v2/toolchain); PINNED rewritten as `write_pin` writes it when the cut's id
+          # is not the one the binary was built with, then rebuilt; the binaries copied to LABEL/bin.
+          cut_shelf() {
+            local label=$1 home="$M/$1/home" shelf reg side json ok=no log id pinned t0
+            shelf="$home/.blaze/v2/toolchain"
+            rm -rf "$home"; mkdir -p "$shelf"
+            reg=$(ls -d "$CARGO_HOME0"/registry/cache/index.crates.io-* 2>/dev/null | head -n 1 || true)
+            t0=$(date +%s)
+            for side in true false; do
+              log="$LOGS/$label-cut-macro_side-$side.log"
+              json=$(printf '{"tree": "%s", "targets": ["aarch64-apple-darwin"], "registry": "%s", "shelf": "%s", "macro_side": %s}' "$B" "$reg" "$shelf" "$side")
+              echo "toolchain_cut $json" > "$log"
+              if "$B/target/release/toolchain_cut" "$json" >> "$log" 2>&1; then ok=yes; break; fi
+            done
+            cat "$log"
+            id=$(awk '$1 == "toolchain" { print $2; exit }' "$log")
+            pinned=$(tr -d '[:space:]' < "$B/crates/blaze-toolchain/PINNED")
+            row step "$label" "cut (macro_side $side)" "$ok" "$(( $(date +%s) - t0 )) s; id $id; PINNED was $pinned; registry $reg"
+            [ "$ok" = yes ] && [ -n "$id" ] || { echo "::error::$label: the toolchain cut failed"; return 1; }
+            if [ "$id" != "$pinned" ]; then
+              printf '%s\n' "$id" > "$B/crates/blaze-toolchain/PINNED"
+              build_bins "$label" 2 || return 1
+            fi
+            mkdir -p "$M/$label/bin"
+            cp "$B/target/release/blaze" "$B/target/release/blaze-launcher" "$B/target/release/blaze-fact-shim" "$M/$label/bin/"
+            row step "$label" "binary" 0 "blaze $(shasum -a 256 "$M/$label/bin/blaze" | cut -c1-16); PINNED $(cat "$B/crates/blaze-toolchain/PINNED"); tree $(git -C "$B" rev-parse --short=9 HEAD)"
+            touch "$M/$label/ready"
+          }
+
+          # judge LABEL NAME EXPECTED PREFIX: the verdict as command_rungs.rs gives it (125 is
+          # blaze's refusal; any other status is the program's, compared with `expected`).
+          judge() {
+            local label=$1 name=$2 expected=$3 p=$4 rc secs want printed verdict first promo out1
+            rc=$(cat "$p.rc"); secs=$(cat "$p.secs")
+            want=$(sed -n '1s/^status //p' "$expected")
+            tail -n +3 "$expected" > "$p.want"
+            if cmp -s "$p.out" "$p.want"; then printed=yes; else printed=no; fi
+            case "$rc" in
+              124) verdict=HUNG ;;
+              125) verdict=REFUSED ;;
+              *) if [ "$rc" = "$want" ] && [ "$printed" = yes ]; then verdict=PASS
+                 elif [ "$rc" -gt 128 ]; then verdict="CRASHED (signal $(( rc - 128 )))"
+                 else verdict=WRONG; fi ;;
+            esac
+            out1=$(head -n 1 "$p.out")
+            first=$( (grep -m 1 -E '^error' "$p.err" || head -n 1 "$p.err") )
+            promo=$(grep -c -i 'promot' "$p.err" || true)
+            row run "$label" "$name" "$rc" "$secs" "$verdict" "$printed" "$out1" "$first" "$promo"
+            echo "== $label $name: status $rc, ${secs}s, $verdict (stdout as expected: $printed)"
+            echo "-- stdout:"; head -c 2000 "$p.out"; echo; echo "-- stderr:"; head -c 6000 "$p.err"; echo
+          }
+
+          # run_prog LABEL NAME SRC SECS: `blaze run` in a fresh copy of SRC with exactly HOME (the
+          # label's scratch home), PATH, TERM and LANG, as tests/command_rungs.rs runs a child.
+          run_prog() {
+            local label=$1 name=$2 src=$3 secs=$4 dir p
+            dir="$M/$label/proj/$name"; p="$LOGS/$label-$name"
+            rm -rf "$dir"; mkdir -p "$M/$label/proj"; cp -R "$src" "$dir"
+            (cd "$dir" && perl "$M/capped.pl" "$secs" "$p.rc" "$p.secs" \
+              env -i HOME="$M/$label/home" PATH="$PATH" TERM=dumb LANG=C.UTF-8 "$M/$label/bin/blaze" run \
+              > "$p.out" 2> "$p.err" < /dev/null) || true
+            judge "$label" "$name" "$src/expected" "$p"
+          }
+
+          # repeat_run LABEL NAME SECS: a second `blaze run` in the same copy (the warm path).
+          repeat_run() {
+            local label=$1 name=$2 secs=$3 dir p
+            dir="$M/$label/proj/$name"; p="$LOGS/$label-$name-repeat"
+            (cd "$dir" && perl "$M/capped.pl" "$secs" "$p.rc" "$p.secs" \
+              env -i HOME="$M/$label/home" PATH="$PATH" TERM=dumb LANG=C.UTF-8 "$M/$label/bin/blaze" run \
+              > "$p.out" 2> "$p.err" < /dev/null) || true
+            judge "$label" "$name (repeat)" "$B/crates/blaze-cli/tests/e2e/hello-blaze/expected" "$p"
+          }
+
+          # run_all LABEL: hello cold, hello again, then the probes, each in the label's home.
+          run_all() {
+            local label=$1 probe
+            run_prog "$label" hello-blaze "$B/crates/blaze-cli/tests/e2e/hello-blaze" 300
+            if [ "$(cat "$LOGS/$label-hello-blaze.rc")" != 124 ]; then repeat_run "$label" hello-blaze 120; fi
+            for probe in p-const p-fn p-fntable p-local; do
+              run_prog "$label" "$probe" "$M/probes/$probe" 180
+            done
+          }
+
+          # checkout_sha SHA: the commit in the same workspace (target/ and PINNED's rewrite kept:
+          # PINNED's blob is the same in all three commits, so git carries the change over).
+          checkout_sha() {
+            git -C "$B" fetch --no-tags --depth=1 origin "$1"
+            git -C "$B" checkout --detach "$1"
+            git -C "$B" log -1 --format='%H %s'
+            git -C "$B" status --short
+          }
+
+          # run_tests LABEL: the existing tests next to the change, on the tree as it is (release
+          # profile, so the release build's dependencies are reused).
+          run_tests() {
+            local label=$1 t name log rc counts names
+            for t in "blaze-typeck --lib -- promote" "blaze-build --lib -- promote" \
+                     "blaze-ladder --test front2_promoted_value --test front2_promote_member"; do
+              name=${t%% *}; log="$LOGS/$label-test-$name.log"
+              # shellcheck disable=SC2086
+              if (cd "$B" && cargo +"$TC" test --locked --release --no-fail-fast -p $t) > "$log" 2>&1; then rc=0; else rc=$?; fi
+              counts=$(grep -E '^test result:' "$log" | awk '{ p += $4; f += $6 } END { printf "%d passed, %d failed", p, f }')
+              names=$(grep -E '^test [^ ]+ \.\.\. ' "$log" | sed -E 's/^test //; s/ \.\.\. /: /' | tr '\n' ';')
+              row test "$label" "$name" "$rc" "$counts" "$names"
+              grep -E '^(test |test result:|error)' "$log" | head -n 40 || true
+            done
+          }
+          SH
+
+          # The probes: nested promoted borrows on the run path, written with only what the
+          # owner's hello uses (`main(cx, out)`, `out.line(cx, <&str>)?`, `Ok(())`) plus `match`
+          # on integers and indexing; each value read shows in the output, so a wrong value is a
+          # WRONG line and not a pass.
+          probe() { mkdir -p "$M/probes/$1/src"; printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "blaze-2026.11"\n' "$1" > "$M/probes/$1/Cargo.toml"; cat > "$M/probes/$1/src/main.rs"; printf 'status 0\nstdout\n%s' "$2" > "$M/probes/$1/expected"; }
+          probe p-const $'ada\n*.lagda\n' <<'RS'
+          // A constant table of borrowed slices (ripgrep's `ignore` DEFAULT_TYPES shape).
+          const T: &[(&[&str], &[&str])] = &[(&["ada"], &["*.adb", "*.ads"]), (&["agda"], &["*.agda", "*.lagda"])];
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              out.line(cx, T[0].0[0])?;
+              out.line(cx, T[1].1[1])?;
+              Ok(())
+          }
+          RS
+          probe p-fn $'f 7\n' <<'RS'
+          // A borrow of a promoted borrow returned from a fn: rustc promotes both.
+          fn f() -> &'static &'static i32 {
+              &&7
+          }
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              match **f() {
+                  7 => out.line(cx, "f 7")?,
+                  _ => out.line(cx, "f other")?,
+              }
+              Ok(())
+          }
+          RS
+          probe p-fntable $'*.ads\n' <<'RS'
+          // The table as a fn's promoted return value (the Linux trace's `dtfn` form).
+          fn table() -> &'static [(&'static [&'static str], &'static [&'static str])] {
+              &[(&["ada"], &["*.adb", "*.ads"])]
+          }
+
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              out.line(cx, table()[0].1[1])?;
+              Ok(())
+          }
+          RS
+          probe p-local $'x01 2\nx10 3\n' <<'RS'
+          // A local slice of borrowed slices.
+          fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+              let x: &[&[u8]] = &[&[1u8, 2], &[3]];
+              match x[0][1] {
+                  2 => out.line(cx, "x01 2")?,
+                  _ => out.line(cx, "x01 other")?,
+              }
+              match x[1][0] {
+                  3 => out.line(cx, "x10 3")?,
+                  _ => out.line(cx, "x10 other")?,
+              }
+              Ok(())
+          }
+          RS
+          head -n 50 "$M"/probes/*/src/main.rs
+
+      - name: Rust (the nightly in harness/toolchain) and the lock's sources
+        timeout-minutes: 20
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install "$TC" --profile minimal
+          rustc +"$TC" -vV | tee "$LOGS/rustc.txt"
+          (cd "$B" && cargo +"$TC" fetch --locked)
+          ls -d "$CARGO_HOME0"/registry/cache/index.crates.io-*
+
+      - name: c2723984c (head) - build, toolchain cut
+        id: head-build
+        continue-on-error: true
+        timeout-minutes: 120
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          build_bins head 1
+          cut_shelf head
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: c2723984c (head) - blaze run
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          [ -f "$M/head/ready" ] || { echo "head did not build: nothing to run"; row run head hello-blaze - - "NOT BUILT" - - - -; exit 0; }
+          run_all head
+
+      - name: a06c29bee (#2217) - checkout, build, toolchain cut
+        continue-on-error: true
+        timeout-minutes: 90
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          checkout_sha "$FIX_SHA"
+          build_bins fix 1
+          cut_shelf fix
+          diff -rq "$M/head/home/.blaze/v2/toolchain" "$M/fix/home/.blaze/v2/toolchain" > "$LOGS/shelf-diff.txt" 2>&1 && echo "the two shelves are equal" || { echo "the shelves differ:"; head -n 20 "$LOGS/shelf-diff.txt"; }
+
+      - name: a06c29bee (#2217) - blaze run
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          [ -f "$M/fix/ready" ] || { echo "the fix did not build: nothing to run"; row run fix hello-blaze - - "NOT BUILT" - - - -; exit 0; }
+          run_all fix
+
+      - name: 1bcb1084a (the owner's) - only when hello did not print at head
+        continue-on-error: true
+        timeout-minutes: 90
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          if [ -f "$LOGS/head-hello-blaze.out" ] && grep -qxF 'Hello, world!' "$LOGS/head-hello-blaze.out"; then
+            echo "hello printed at head: no control run"; exit 0
+          fi
+          checkout_sha "$OWNER_SHA"
+          build_bins owner 1
+          cut_shelf owner
+          run_prog owner hello-blaze "$B/crates/blaze-cli/tests/e2e/hello-blaze" 300
+
+      - name: tests next to the change, on both commits
+        continue-on-error: true
+        timeout-minutes: 90
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          checkout_sha "$FIX_SHA"
+          run_tests fix
+          checkout_sha "$HEAD_SHA"
+          run_tests head
+
+      - name: tests/command_rungs.rs on both commits (COMMAND_RUNGS=true only)
+        if: env.COMMAND_RUNGS == 'true'
+        continue-on-error: true
+        timeout-minutes: 150
+        run: |
+          . "$RUNNER_TEMP/m/lib.sh"
+          for label in fix head; do
+            [ -f "$M/$label/ready" ] || continue
+            if [ "$label" = fix ]; then checkout_sha "$FIX_SHA"; else checkout_sha "$HEAD_SHA"; fi
+            if (cd "$B" && HOME="$M/$label/home" CARGO_HOME="$CARGO_HOME0" RUSTUP_HOME="$RUSTUP_HOME0" \
+                BLAZE_RUNGS_BIN="$M/$label/bin/blaze" COMMAND_RUNGS_LIST="$LOGS/$label-command-rungs.txt" \
+                cargo +"$TC" test --locked --release -p blaze-cli --test command_rungs -- --nocapture) > "$LOGS/$label-command-rungs.log" 2>&1; then rc=0; else rc=$?; fi
+            row test "$label" command_rungs "$rc" "$(grep -E '^command rungs:' "$LOGS/$label-command-rungs.log" | tail -n 1)" "$(grep -E '^hello-blaze' "$LOGS/$label-command-rungs.log" | tr '\n' ';')"
+          done
+          if [ -f "$LOGS/fix-command-rungs.txt" ] && [ -f "$LOGS/head-command-rungs.txt" ]; then
+            diff "$LOGS/head-command-rungs.txt" "$LOGS/fix-command-rungs.txt" > "$LOGS/command-rungs.diff" || true
+            head -n 80 "$LOGS/command-rungs.diff"
+          fi
+
+      - name: summary
+        if: always()
+        run: |
+          M="$RUNNER_TEMP/m"; LOGS="$M/logs"; S="$GITHUB_STEP_SUMMARY"
+          touch "$M/summary.tsv"
+          get() { awk -F'\t' -v l="$1" -v n="$2" -v c="$3" '$1 == "run" && $2 == l && $3 == n { print $c; exit }' "$M/summary.tsv"; }
+          hs=$(get head hello-blaze 4); fs=$(get fix hello-blaze 4)
+          hp=no; fp=no
+          grep -qxF 'Hello, world!' "$LOGS/head-hello-blaze.out" 2>/dev/null && hp=yes
+          grep -qxF 'Hello, world!' "$LOGS/fix-hello-blaze.out" 2>/dev/null && fp=yes
+          # blaze's own `error` lines only: its closing line holds timings, which differ every run.
+          he=$(grep -m 1 -E '^error' "$LOGS/head-hello-blaze.err" 2>/dev/null || true)
+          fe=$(grep -m 1 -E '^error' "$LOGS/fix-hello-blaze.err" 2>/dev/null || true)
+          if [ -z "$hs" ] || [ -z "$fs" ] || [ "$hs" = - ] || [ "$fs" = - ]; then
+            answer="NOT ANSWERED: a commit did not build or run (head status '${hs}', fix status '${fs}')."
+          elif [ "$hp" = no ]; then
+            answer="NOT ANSWERED: hello world does not print at c2723984c on this runner (status $hs); see the 1bcb1084a row."
+          elif [ "$fp" = yes ] && [ "$hs" = "$fs" ] && cmp -s "$LOGS/head-hello-blaze.out" "$LOGS/fix-hello-blaze.out"; then
+            answer="#2217 keeps hello world printing: the same stdout and the same status ($hs) at c2723984c and a06c29bee."
+            [ "$he" = "$fe" ] || answer="$answer The first error line differs: head '$he', fix '$fe'."
+          else
+            answer="#2217 CHANGES hello world: head printed it (status $hs), the fix's stdout as expected: $fp, status $fs, first error line '$fe'."
+          fi
+          {
+            echo "## blaze run of the owner's hello world: c2723984c (head) against a06c29bee (#2217)"
+            echo
+            echo "**$answer**"
+            echo
+            echo "| commit | program | status | wall s | verdict | stdout as expected | stdout, first line | stderr, first error line | lines naming promotion |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            awk -F'\t' '$1 == "run" { printf "| %s | %s | %s | %s | %s | %s | `%s` | %s | %s |\n", $2, $3, $4, $5, $6, $7, $8, $9, $10 }' "$M/summary.tsv"
+            echo
+            echo "| commit | step | status | detail |"
+            echo "|---|---|---|---|"
+            awk -F'\t' '$1 == "step" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $5 }' "$M/summary.tsv"
+            echo
+            echo "| commit | tests | cargo status | counts | each test |"
+            echo "|---|---|---|---|---|"
+            awk -F'\t' '$1 == "test" { printf "| %s | %s | %s | %s | %s |\n", $2, $3, $4, $5, $6 }' "$M/summary.tsv"
+            echo
+            echo "Logs: the artifact \`mac-run-2217-logs\` (each run's .out, .err, .rc, .secs; builds, cuts, tests; each copy's .blaze/)."
+          } >> "$S"
+          cat "$S"
+          # Each copy's own .blaze folder (the profile) beside the logs; the homes' stores are not kept.
+          for d in "$M"/*/proj/*; do
+            [ -d "$d/.blaze" ] || continue
+            mkdir -p "$LOGS/projects/${d#"$M"/}"
+            cp -R "$d/.blaze" "$LOGS/projects/${d#"$M"/}/" || true
+          done
+
+      - name: logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac-run-2217-logs
+          path: ${{ runner.temp }}/m/logs
+          retention-days: 14
+          if-no-files-found: warn
