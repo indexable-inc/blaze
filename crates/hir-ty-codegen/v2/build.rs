@@ -177,6 +177,10 @@ impl Build {
     /// decided.
     pub(crate) fn tier_of(self, lang: bool) -> Tier {
         match (self.tier(), lang) {
+            // A proc macro's wasm module is never optimized (its backend is the stencil one),
+            // yet each expansion runs it: the library's bodies in it are as shipped, as rustc
+            // links a proc macro against its optimized standard library at every level.
+            (Tier::Zero, true) if self.bridged => Tier::Shipped,
             (Tier::Zero, _) => Tier::Zero,
             (_, true) => Tier::Shipped,
             (tier, false) => tier,
@@ -207,5 +211,19 @@ mod tests {
         assert_eq!((world, Build::WALK.world), (None, None));
         assert!(optimized && inlines);
         assert!(!Build::WALK.optimized && !Build::WALK.inlines);
+    }
+
+    /// A proc macro's wasm module is never optimized, as its backend is the stencil one, yet
+    /// it builds the library's bodies as shipped, where rustc's inliner runs; its own crate's
+    /// bodies stay at tier 0, as every other unit that does not optimize builds both.
+    #[test]
+    fn a_proc_macros_module_builds_the_librarys_bodies_as_shipped() {
+        let module = Build { bridged: true, inlines: true, ..Build::WALK };
+        assert!(!module.optimized);
+        assert_eq!(module.tier_of(true), Tier::Shipped);
+        assert_eq!(module.tier_of(false), Tier::Zero);
+        let unit = Build { inlines: true, ..Build::WALK };
+        assert_eq!((unit.tier_of(true), unit.tier_of(false)), (Tier::Zero, Tier::Zero));
+        assert_eq!(Build::WALK_INLINED.tier_of(true), Tier::Shipped);
     }
 }
