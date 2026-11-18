@@ -89,8 +89,11 @@ impl Began {
     /// it was assembled with need not be what the run read; `None` when nothing can have.
     /// Each path is asked of by every name its answer rests on ([`names`]): the name and
     /// every directory above it are `lstat`ed, and one whose last change can share a tick
-    /// with the run's start or come after it ([`blaze_vfs::racy`]) has moved. A path whose names
-    /// can't be told has moved: it is never taken as still. Conservative: a change beside the
+    /// with the run's start or come after it ([`blaze_vfs::racy`]) has moved. A look that
+    /// showed a directory (a file read answered [`DIRECTORY`], not a listing) rests on the
+    /// directories above it alone: its answer is that a directory is there, which a name made
+    /// or removed in it leaves as it was. A path whose names can't be told has moved: it is
+    /// never taken as still. Conservative: a change beside the
     /// name in its directory, or the run's own write of what it read, counts as a move, and
     /// the pass is not kept, never a stale one kept.
     pub fn moved(&self, traced: &blaze_core::Traced) -> Option<Moved> {
@@ -103,12 +106,12 @@ impl Began {
             dirs = traced.dirs.len() as u64,
         )
         .entered();
-        let files = traced.files.iter().map(|(path, answer)| (path, *answer));
-        let dirs = traced.dirs.iter().map(|(path, _)| (path, Some(DIRECTORY)));
-        files.chain(dirs).find_map(|(path, answer)| self.path_moved(path, answer))
+        let files = traced.files.iter().map(|(path, answer)| (path, *answer, false));
+        let dirs = traced.dirs.iter().map(|(path, _)| (path, Some(DIRECTORY), true));
+        files.chain(dirs).find_map(|(path, answer, listed)| self.path_moved(path, answer, listed))
     }
 
-    fn path_moved(&self, path: &Path, answer: Option<[u8; 32]>) -> Option<Moved> {
+    fn path_moved(&self, path: &Path, answer: Option<[u8; 32]>, listed: bool) -> Option<Moved> {
         let Some(names) = names(path, answer) else {
             tracing::info!(
                 target: "blaze",
@@ -119,8 +122,16 @@ impl Began {
             return Some(Moved { read: path.to_path_buf(), at: path.to_path_buf(), why: MovedWhy::Untold });
         };
         let last = names.len() - 1; // `names` ends with the name the path leads to
+        // A look that showed a directory is answered by its being one: its own stamp, which a
+        // name made or removed in it moves, is not asked, and its parent's, which says whether
+        // a directory is there, is. A listing's answer is what is in the directory: its own
+        // stamp is asked.
+        let looked = !listed && answer == Some(DIRECTORY);
         names.iter().enumerate().find_map(|(n, name)| {
-            let at = stamped_since(name, self.wall_ns)?;
+            let at = match looked && n == last {
+                true => stamped_since(name.parent()?, self.wall_ns)?,
+                false => stamped_since(name, self.wall_ns)?,
+            };
             let why = MovedWhy::of(path, name, n == last, at);
             tracing::info!(
                 target: "blaze",
@@ -1034,6 +1045,31 @@ mod tests {
         let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
         assert_eq!(later.moved(&read(&file, Some([1; 32]))), None, "the control");
         assert_eq!(later.moved(&read(&below, None)), None, "the control");
+        drop(dir);
+    }
+
+    /// The invariant: a look that showed a directory (a file read answered [`DIRECTORY`])
+    /// does not rest on the directory's own stamp, which a name made in it after the run began
+    /// moves: what is asked is the directory above it, whose stamp says whether a directory is
+    /// there. A listing of the same directory rests on its own stamp. Both directories here
+    /// changed within the racy window of the run's start, so the look is said to have moved by
+    /// the directory above it, and the listing by the directory itself.
+    #[test]
+    fn a_directory_looked_at_rests_on_the_directory_above_it_not_its_own_stamp() {
+        let dir = TempDir::for_test("blaze-usercode-moved-dir-");
+        // Canonical, so a link above the temporary directory (macOS's `/var`) is none of these.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let looked = root.join("looked");
+        std::fs::create_dir(&looked).unwrap();
+        let began = Began::now();
+        std::fs::write(looked.join("made"), b"after").unwrap();
+        let moved = |at: &Path, why: MovedWhy| Some(Moved { read: looked.clone(), at: at.to_path_buf(), why });
+        let look = blaze_core::Traced { files: vec![(looked.clone(), Some(DIRECTORY))], ..Default::default() };
+        assert_eq!(began.moved(&look), moved(&root, MovedWhy::Above));
+        let listing = blaze_core::Traced { dirs: vec![(looked.clone(), [1; 32])], ..Default::default() };
+        assert_eq!(began.moved(&listing), moved(&looked, MovedWhy::Itself));
+        let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
+        assert_eq!(later.moved(&look), None, "the control: nothing changed after it began");
         drop(dir);
     }
 
