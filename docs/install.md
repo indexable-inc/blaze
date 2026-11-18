@@ -8,6 +8,21 @@ summary: Installing blaze: the install script, the release channels and what get
 curl -fsSL https://ix.dev/blaze | sh
 ```
 
+On Windows (x86-64), in PowerShell:
+
+```powershell
+irm https://ix.dev/blaze/install.ps1 | iex
+```
+
+`site/install.ps1` does what install.sh does, in Windows PowerShell 5.1 and PowerShell 7, and
+takes the same choices: `$env:BLAZE_CHANNEL`, `$env:BLAZE_VERSION`, `$env:BLAZE_NO_TOOLCHAIN=1`,
+`$env:BLAZE_RELEASES`, `$env:BLAZE_ARCHIVE`; or, to pass them as parameters,
+`& ([scriptblock]::Create((irm https://ix.dev/blaze/install.ps1))) -Channel canary`
+(`-Version V`, `-NoToolchain`, `-Detail`). It puts the programs in `%CARGO_HOME%\bin`
+(`%USERPROFILE%\.cargo\bin`); a program that runs, such as the daemon, is moved aside, not
+overwritten, which Windows refuses. **No release has a Windows build yet** (#1389), so for now
+it stops with `blaze release vX has no build for Windows on x86-64`.
+
 Then, in a project of yours:
 
 ```sh
@@ -20,9 +35,12 @@ changed. What to do next: [usage.md](usage.md).
 
 ## What you need
 
-- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows has no release build and
-  the installer refuses it; v2 has not been run there (v1's port:
-  [platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not supported.
+- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows (x86-64) has install.ps1
+  above, and no release build for it to install yet; install.sh refuses Windows; v2 has not been
+  run there (v1's port: [platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not
+  supported.
+- **On Windows, the Visual C++ build tools** (`link.exe` and the Windows SDK), which the
+  installer says how to get when `vswhere` finds none.
 - **On Linux, glibc 2.34 or newer**: RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Each
   is checked by installing there in a container with no Rust. Alpine and other musl systems are
   not supported; the installer says so.
