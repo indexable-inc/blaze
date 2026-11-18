@@ -185,6 +185,8 @@ const HOVER_DEPTH: usize = 16;
 /// The view's fixed nodes, by entity id.
 struct Ids {
     tree: u64,
+    /// The sidebar's head (hn.SideNew): New, and the courses as rows (src/app/learn.rs fill_side_courses).
+    side_new: u64,
     device: u64,
     /// `hn.LinkNote` over the Archive row: the link's refusal, when it is refused.
     link_note: u64,
@@ -329,6 +331,8 @@ pub struct App {
     /// At home: nothing is selected on purpose, so the main card shows Learn and no session is selected in its place.
     /// True at launch and after the sidebar's Learn row; false once anything is selected.
     home: bool,
+    /// What the start page asked, sent as the first message of the chat it started once that chat is up.
+    first_message: Option<String>,
     /// The scroll of a lesson's step (app/learn.rs learn_wheel): the text areas' physics and overlay scroller.
     learn_scroll: std::cell::RefCell<view::field::FieldScroll>,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
@@ -546,8 +550,8 @@ impl App {
         if let Some(w) = side_w {
             set_side_width(side.entity(), w);
         }
-        // The sidebar's first row: start a chat (scene/widgets/learn.flecs hn.SideNew).
-        side.child("hn.SideNew");
+        // The sidebar's head: New, then the courses (scene/widgets/learn.flecs hn.SideNew).
+        let side_new = side.child("hn.SideNew").id();
         let tree = side.child("hn.Tree");
         let foot = side.child("hn.SideFoot");
         let link_note = foot.child("hn.LinkNote");
@@ -572,6 +576,7 @@ impl App {
         row_menu.set(Laid::default());
         let ids = Ids {
             tree: tree.id(),
+            side_new,
             device: device.id(),
             link_note: link_note.id(),
             main: main.id(),
@@ -654,6 +659,7 @@ impl App {
             learn: std::cell::RefCell::new(learn::Learn::default()),
             home: true,
             learn_scroll: std::cell::RefCell::new(view::field::FieldScroll::default()),
+            first_message: None,
             fold: fold::TreeFold::default(),
             tree_focus: false,
             press: (0, KeyMods::default()),
@@ -950,6 +956,10 @@ impl App {
                 self.chat_started_on(p.sid, p.model.as_deref(), p.effort.as_deref());
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
+                if let Some(text) = self.first_message.take() {
+                    crate::audio::cue("send");
+                    self.link.chat_send(p.sid, &text, Vec::new());
+                }
                 if let Some(why) = self.refuse_spawned.take() {
                     refused = Some((p.sid, why));
                 }
@@ -1025,11 +1035,20 @@ impl App {
         if note.entity().try_cloned::<&Size>().is_none_or(|s| s.h != h) {
             note.set(Size { w: Sizing::GROW, h });
         }
+        self.fill_side_courses(self.ids.side_new);
         let tree = View::of(w.entity_from_id(self.ids.tree));
         let hint: HashMap<u64, usize> =
             rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
         let info: Vec<(String, &str, model::Row)> = model::rows(w)
             .into_iter()
+            // A chat nothing was ever asked in is no row: it says nothing a person would come back to (only the one in
+            // front shows).
+            .filter(|r| {
+                let o = w.entity_from_id(r.e);
+                sel == Some(r.e)
+                    || !o.has(model::ChatMode::id())
+                    || o.try_cloned::<&model::Name>().is_some_and(|n| n.s.as_str() != model::UNTITLED_CHAT)
+            })
             .map(|r| {
                 let prefab = if self.run_of(r.e).is_some() { "hn.RunRow" } else { "hn.ObjRow" };
                 (format!("o{}", r.e), prefab, r)
@@ -1948,27 +1967,30 @@ impl App {
             .unwrap_or_else(|| "claude".to_owned())
     }
 
-    /// cmd+N: a chat of the last agent kind on its last model and effort ([`Self::remember_choice`]). A remembered model
-    /// (or effort) its kind no longer lists is not started on: the chat starts as its agent does by default, its models'
-    /// menu open with an error naming what is gone.
     /// Whether the chat `sid` has had a message sent in it: a chat with none is still the new chat Cmd-N would make.
     pub(in crate::app) fn sent(&self, sid: u64) -> bool {
         self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().any(|i| matches!(i, model::chat::Item::User { .. })))
     }
 
+    /// cmd+N and the sidebar's New row: the start page, its field taking the keys. One place where everything starts:
+    /// what is typed there is asked of an agent (Return) or made into a course (cmd+Return), src/app/learn.rs.
     pub(in crate::app) fn new_chat(&mut self) {
-        self.relit = self.world.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
-        // Cmd-N on a chat nothing has been sent in yet does nothing: that chat already is the new one.
-        if let Some(sid) = self.selected().and_then(|e| self.session_of(e))
-            && self.chats.borrow().contains_key(&sid)
-            && !self.sent(sid)
-        {
-            // It says so: the lantern is struck again and the cue plays.
-            crate::audio::cue("fresh");
-            self.poke();
-            return;
-        }
         crate::audio::cue("fresh");
+        self.learn_start_page();
+        self.home = true;
+        self.tree_focus = false;
+        self.select(None);
+        self.poke();
+    }
+
+    /// A chat that opens with `text` asked, of the last agent kind on its last model and effort
+    /// ([`Self::remember_choice`]), the text sent once it is up. A remembered model (or effort) its kind no longer lists
+    /// is not started on: the chat starts as its agent does by default, its models' menu open with an error naming what
+    /// is gone.
+    pub(in crate::app) fn ask_new_chat(&mut self, text: String) {
+        self.relit = self.world.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+        self.first_message = Some(text);
+        self.home = false;
         let kind = self.chat_kind();
         let c = self.choice_of(&kind);
         let kept = self.link.agent_models();

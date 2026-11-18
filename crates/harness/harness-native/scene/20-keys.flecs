@@ -47,7 +47,7 @@ act {
 
   // cmd+N: a chat at once, no picker, of the agent kind a chat was last started with (native.json `chat_kind`, else
   // `new_kind` when that is an agent, else Claude); its model is changed afterwards from the chat's own model control.
-  NewChat { MenuItem: {bar: "File", title: "New Chat"} }
+  NewChat { MenuItem: {bar: "File", title: "New"} }
   OpenChat { MenuItem: {bar: "File", title: "Open Chat…"} }
   // The picker (File > New…, unbound): a row for each act.Spawn below with a `title`, in this order (the one picked last
   // is highlighted when it opens, native.json `new_kind`). A titled Spawn added in keys.flecs joins it.
@@ -136,6 +136,8 @@ act {
   ArchiveOpenFirst {}
   // Learn (src/app/learn.rs): start the course typed, check the answer in hand or go on; leave; erase a character.
   LearnNext {}
+  // Cmd+Return on the start page: what is typed becomes a course, not a question.
+  LearnCourse {}
   // The right arrow: on to the next screen, only where nothing is left to answer.
   LearnForward {}
   // Up and down: the option picked (a choice), the item highlighted (an order); with shift, that item moves.
@@ -410,6 +412,9 @@ key {
 
   learn_return { Keybind: {key: "return"}
     (Does, act.LearnNext)
+    (When, ctx.Learn) }
+  learn_course { Keybind: {key: "return", cmd: 1}
+    (Does, act.LearnCourse)
     (When, ctx.Learn) }
   learn_enter { Keybind: {key: "enter"}
     (Does, act.LearnNext)

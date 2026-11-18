@@ -405,6 +405,16 @@ impl App {
         if let Some(sid) = what.strip_prefix("from:").and_then(|s| s.parse::<u64>().ok()) {
             return self.learn_from_chat(sid);
         }
+        // A course's row in the sidebar: its path in front, whatever was selected put down.
+        if what.starts_with("course:") {
+            self.home = true;
+            self.select(None);
+            self.poke();
+        }
+        // The start page's send button: what Return does there.
+        if what == "next" && self.learn_start_ask(false) {
+            return;
+        }
         {
             let me = &*self;
             let mut l = me.learn.borrow_mut();
@@ -552,7 +562,42 @@ not the transcript.\n\nThe conversation:\n{}",
     }
 
     /// A key of ctx.Learn (scene/20-keys.flecs).
+    /// The start page in front, as cmd+N leaves it: its field ready, whatever lesson was open kept where it was.
+    pub(super) fn learn_start_page(&mut self) {
+        let mut l = self.learn.borrow_mut();
+        l.load();
+        l.note.clear();
+        l.screen = Screen::Home;
+    }
+
+    /// Return (or cmd+Return, `course`) on the start page: what is typed is asked of an agent in a new chat, or, asked
+    /// for (cmd+Return, or "teach me ..."), made into a course. False when the start page is not in front.
+    fn learn_start_ask(&mut self, course: bool) -> bool {
+        let text = {
+            let l = self.learn.borrow();
+            if !matches!(l.screen, Screen::Home) {
+                return false;
+            }
+            l.draft.trim().to_owned()
+        };
+        if text.is_empty() {
+            return true;
+        }
+        if course || topic_of(&text).is_some() {
+            let me = &*self;
+            let mut l = me.learn.borrow_mut();
+            me.learn_next(&mut l);
+            return true;
+        }
+        self.learn.borrow_mut().draft.clear();
+        self.ask_new_chat(text);
+        true
+    }
+
     pub(super) fn learn_key(&mut self, key: &str) {
+        if matches!(key, "next" | "course") && self.learn_start_ask(key == "course") {
+            return;
+        }
         {
             let me = &*self;
             let mut l = me.learn.borrow_mut();
@@ -697,6 +742,35 @@ not the transcript.\n\nThe conversation:\n{}",
     }
 
     /// Draw Learn into `pane` (hn.LearnPane): the one screen the state says.
+    /// The sidebar's courses (hn.SideNew `courses`): one row each, like a chat's, the course in front on the selection's
+    /// plate; what is due today trails it.
+    pub(super) fn fill_side_courses(&self, head: u64) {
+        self.learn.borrow_mut().load();
+        let w = self.world.world_ref();
+        let Some(list) = View::of(w.entity_from_id(head)).part("courses") else { return };
+        let l = self.learn.borrow();
+        let day = today();
+        let front = if self.home && self.selected().is_none() {
+            match &l.screen {
+                Screen::Course { course } | Screen::Done { course, .. } => Some(course.as_str()),
+                Screen::Step => l.run.as_ref().map(Run::course_id),
+                Screen::Home | Screen::Making { .. } => None,
+            }
+        } else {
+            None
+        };
+        let rows = l.saved.courses.iter().map(|c| {
+            let prefab = if front == Some(c.id.as_str()) { "hn.SideCourseOn" } else { "hn.SideCourse" };
+            (format!("{}:{prefab}", c.id), prefab, c)
+        });
+        view::for_each_of(list, rows, |row, c, _| {
+            row.action(&format!("learn:course:{}", c.id));
+            set_text(row, "title", &c.title);
+            let due = l.saved.progress.due(c, day).len();
+            set_text(row, "due", &if due == 0 { String::new() } else { due.to_string() });
+        });
+    }
+
     pub(super) fn fill_learn_pane(&self, pane: u64) {
         self.learn.borrow_mut().load();
         self.learn_arrivals();
@@ -773,7 +847,7 @@ fn fill_home(v: View<'_>, l: &Learn) {
     let day = today();
     if let Some(f) = v.part("field") {
         field_text(f, &l.draft);
-        set_text(f, "hint", if l.draft.is_empty() { "A topic, a tool, a paper, a codebase\u{2026}" } else { "" });
+        set_text(f, "hint", if l.draft.is_empty() { "Ask anything, or name something to learn\u{2026}" } else { "" });
         if let Some(go) = f.part("go") {
             let (key, prefab) = if l.draft.trim().is_empty() { ("off", "hn.ChatSendOff") } else { ("on", "hn.ChatSend") };
             view::for_each_of(go, [(key, prefab, ())], |b, (), _| {
@@ -784,9 +858,9 @@ fn fill_home(v: View<'_>, l: &Learn) {
         }
     }
     set_text(v, "note", &l.note);
-    set_text(v, "label", if l.saved.courses.is_empty() { "" } else { "Your courses" });
+    set_text(v, "label", if l.saved.courses.is_empty() { "" } else { "Continue" });
     if let Some(list) = v.part("courses") {
-        let rows = l.saved.courses.iter().take(5).map(|c| (c.id.as_str(), "hn.LearnCourse", c));
+        let rows = l.saved.courses.iter().take(3).map(|c| (c.id.as_str(), "hn.LearnCourse", c));
         view::for_each_of(list, rows, |row, c, _| {
             row.action(&format!("learn:course:{}", c.id));
             if let Some(head) = row.part("head") {

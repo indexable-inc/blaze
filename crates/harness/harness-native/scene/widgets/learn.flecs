@@ -153,15 +153,21 @@ hn {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     top : hn.LearnTop {}
-    ask : hn.LearnDisplay { Text: {s: "What do you want to learn?"} }
+    ask : hn.LearnDisplay { Text: {s: "What’s on your mind?"} }
     a1 : hn.LearnAirSmall {}
     sub : hn.LearnSmall {
-      Text: {s: "Short lessons. You answer, it remembers, and what you miss comes back."}
+      Text: {s: "Ask, make or learn anything. What you learn is kept, and what you miss comes back."}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
     a2 : hn.LearnAir {}
     field : hn.LearnField {}
     a3 : hn.LearnAirSmall {}
+    // The two ways what is typed goes: asked (an agent answers and does it), or made into a course of short lessons.
+    keys : ui.Line, Faint {
+      Text: {s: "↵  ask        ⌘↵  make it a course"}
+      TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+    }
+    a3b : hn.LearnAirSmall {}
     // Why the last course could not be made, in the error ink; empty and without room else.
     note : ui.Words {
       Fill: $tone_error
@@ -509,7 +515,7 @@ hn {
       go : ui.Row {}
       home : hn.LearnQuiet {
         Action: {name: "learn:home"}
-        label { Text: {s: "Home"} }
+        label { Text: {s: "Back"} }
       }
     }
   }
@@ -521,7 +527,7 @@ hn {
 hn {
   prefab LearnHomeButton : ui.IconButton {
     Action: {name: "learn:show"}
-    Tooltip: {text: "Learn"}
+    Tooltip: {text: "Start"}
     icon : ui.Node {
       Fill: $tone_clear
       Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
@@ -532,37 +538,13 @@ hn {
   }
 }
 
-// The sidebar's first row: start a chat. A plain row on the tree's grid (a plus, the words, its key on hover), so the
-// one thing a person does most is always in the same place and never behind a menu.
+// The sidebar's head: New (cmd+N, the start page), then what the person is learning, as plain rows on the tree's grid
+// (src/app/learn.rs fill_side_courses). One list: courses and chats read alike, no section, no header.
 @tree ChildOf
 hn {
   prefab SideNew : ui.Column {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: $side_inset, r: $side_inset, t: 0, b: 6}
-    // Home: Learn. The first row, so the way back to it is always in the same place.
-    learn : ui.Row {
-      Pressable
-      Action: {name: "learn:show"}
-      Cursor: {shape: Arrow}
-      Fill: $tone_clear
-      Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
-      HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
-      PressLook: {dark: $tone_press.dark, light: $tone_press.light}
-      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
-      Padding: {l: $label_inset - $side_inset, r: $tree_pad_r, t: 0, b: 0}
-      house : ui.Node {
-        Fill: $tone_clear
-        Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
-        Size: {w: {kind: Fixed, value: $tree_kind, min: 0, max: 0}, h: {kind: Fixed, value: $tree_kind, min: 0, max: 0}}
-        Vector: {d: "M2.5 7.5 L8 2.5 L13.5 7.5 M4 6.5 V13 H12 V6.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
-          inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.4}
-      }
-      label : ui.Lead, Ink {
-        Text: {s: "Learn"}
-        TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
-      }
-    }
+    Padding: {l: $side_inset, r: 0, t: 0, b: 0}
     row : ui.Row {
       Pressable
       Action: {name: "chat:new"}
@@ -571,18 +553,19 @@ hn {
       Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
       HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
       PressLook: {dark: $tone_press.dark, light: $tone_press.light}
-      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
       Padding: {l: $label_inset - $side_inset, r: $tree_pad_r, t: 0, b: 0}
-      plus : ui.Node {
+      // A pencil on a page: write something new.
+      mark : ui.Node {
         Fill: $tone_clear
-        Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
+        Stroke: {dark: $tone_ink.dark, light: $tone_ink.light}
         Size: {w: {kind: Fixed, value: $tree_kind, min: 0, max: 0}, h: {kind: Fixed, value: $tree_kind, min: 0, max: 0}}
-        Vector: {d: "M8 3 V13 M3 8 H13", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
-          inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.4}
+        Vector: {d: "M7 3 H4 A1.5 1.5 0 0 0 2.5 4.5 V12 A1.5 1.5 0 0 0 4 13.5 H11.5 A1.5 1.5 0 0 0 13 12 V9 M6.5 9.5 L7 7.5 L12.5 2 L14 3.5 L8.5 9 Z",
+          view_x: 0, view_y: 0, view_w: 16, view_h: 16, inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.3}
       }
-      label : ui.Lead, Ink {
-        Text: {s: "New chat"}
+      label : ui.Lead, Strong {
+        Text: {s: "New"}
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
       }
       spacer : ui.Spacer {}
@@ -593,6 +576,38 @@ hn {
         HoverShow: {row: 0, keep: false}
       }
     }
+    gap : ui.Node {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 10, min: 0, max: 0}}
+    }
+    courses : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+
+  // A course in the sidebar: a row like a chat's, its title and, trailing, what is due today. Pressed: its path.
+  prefab SideCourse : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
+    Padding: {l: $label_inset - $side_inset + $tree_kind + 6, r: $tree_pad_r, t: 0, b: 0}
+    title : ui.Lead, Ink {
+      TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+    }
+    due : ui.Line, Faint {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  // The course in front: the selection's plate under it, as a selected chat's row.
+  prefab SideCourseOn : hn.SideCourse {
+    Fill: $tone_selection
   }
 }
 
@@ -612,7 +627,7 @@ hn {
       back : ui.IconButton {
         Action: {name: "learn:back"}
         AlignSelf: {align: Center}
-        Tooltip: {text: "Home  esc"}
+        Tooltip: {text: "Back  esc"}
         icon : ui.Node {
           Fill: $tone_clear
           Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}

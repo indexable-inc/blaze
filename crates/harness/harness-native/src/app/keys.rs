@@ -118,6 +118,7 @@ const HANDLERS: &[(&str, Handler)] = &[
     ("SearchErase", |a, _, _| a.archive_search(SearchEdit::Erase)),
     ("ArchiveOpenFirst", |a, _, _| a.archive_open_first()),
     ("LearnNext", |a, _, _| a.learn_key("next")),
+    ("LearnCourse", |a, _, _| a.learn_key("course")),
     ("LearnForward", |a, _, _| a.learn_key("forward")),
     ("LearnBack", |a, _, _| a.learn_key("back")),
     ("LearnUp", |a, _, _| a.learn_key("up")),

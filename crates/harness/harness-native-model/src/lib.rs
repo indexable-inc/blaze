@@ -998,6 +998,9 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
     }
 }
 
+/// What a chat nothing was asked in yet is called: such a chat is no row in the sidebar (only the one in front shows).
+pub const UNTITLED_CHAT: &str = "New chat";
+
 /// What a session is called ([`Name`]), from the daemon's record of it: what the person renamed it to (`label`); a
 /// sub-agent (one with a parent) the name it was spawned with; a chat the title of its first message (harness-chat's
 /// `title_of`); else its spawn name, else the title its program gave its terminal; else what it is ("New chat",
@@ -1017,7 +1020,7 @@ pub fn session_name(s: &serde_json::Value) -> String {
     }
     let kind = s["kind"].as_str().unwrap_or("");
     match kind {
-        _ if chat => "New chat",
+        _ if chat => UNTITLED_CHAT,
         "claude" => "Claude",
         "codex" => "Codex",
         "cursor" => "Cursor",
