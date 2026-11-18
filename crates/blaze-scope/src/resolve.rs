@@ -146,6 +146,24 @@ pub trait SourceTexts<'a> {
         let _ = krate;
         None
     }
+
+    /// The planted bug of the attribute-path tests (rule 23,
+    /// tests/attr_path_from_expansion.rs): [`AttrPlant::Spelling`] finds an attribute or derive
+    /// call on its item by the path's text with the spaces taken out, as before, so a `$crate`
+    /// an expansion wrote is not found. Every real source answers [`AttrPlant::None`].
+    fn attr_plant(&self) -> AttrPlant {
+        AttrPlant::None
+    }
+}
+
+/// How an attribute or derive call is found among its item's attributes
+/// ([`SourceTexts::attr_plant`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttrPlant {
+    /// By the path's words (blaze-expand `same_path`): the one way.
+    None,
+    /// The planted bug: by the path's text, spaces taken out.
+    Spelling,
 }
 
 /// One crate to resolve. Its index in the slice given to [`resolve_crates`] is its
@@ -362,6 +380,9 @@ pub enum Lexed {
     Body,
     Parameters,
     Input,
+    /// The path of the attribute or derive the lowering read for an item call: what the call
+    /// is found among the item's attributes by.
+    Path,
 }
 
 /// Why a call's expansion adds nothing, or adds with a fault.
@@ -2751,10 +2772,23 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             Call::attr(args.as_ref(), &item, site)
         }
         CallShape::Attr => {
+            // The attribute the lowering read is found by its path's words (blaze-expand
+            // `same_path`), never by its text: an item an expansion wrote holds `$crate` where
+            // the lowering's rendered text says `crate`, and spaces every token (tempo's
+            // `#[$crate::linkme::distributed_slice(..)]` statics, 2026-11-17).
+            let plant = base.sources.attr_plant();
+            let named = lexed(src.name, Lexed::Path)?;
             let mut walk = ItemAttrs::new(input);
             let attr = loop {
                 match walk.next(atom) {
-                    Ok(NextAttr::Call { path, attr }) if same_path(&path, src.name) => break attr,
+                    Ok(NextAttr::Call { path, attr })
+                        if match plant {
+                            AttrPlant::None => walk.attr_is(attr.clone(), &named),
+                            AttrPlant::Spelling => same_spelling(&path, src.name),
+                        } =>
+                    {
+                        break attr;
+                    }
                     Ok(NextAttr::Call { .. }) => {}
                     // The lowering kept the item, so its cfg was true: no attribute left is
                     // the lowering and this walk disagreeing.
@@ -2788,7 +2822,13 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                     return None;
                 }
             };
-            let Some(used) = derives.uses.iter().find(|u| same_path(&u.path, src.name)) else {
+            // Found by the path's words, as an attribute call is (the arm above).
+            let plant = base.sources.attr_plant();
+            let named = lexed(src.name, Lexed::Path)?;
+            let Some(used) = derives.uses.iter().find(|u| match plant {
+                AttrPlant::None => blaze_expand::same_path(&u.tokens, 0..u.tokens.len(), &named, 0..named.len()),
+                AttrPlant::Spelling => same_spelling(&u.path, src.name),
+            }) else {
                 note(ExpandNote::AttrNotFound { name: src.name });
                 return None;
             };
@@ -3545,8 +3585,10 @@ pub enum MacroDefError<'a> {
     Refused(ExpandNote<'a>),
 }
 
-/// Whether two paths as written are one (`a :: b` and `a::b`): spaces are not part of a path.
-fn same_path(a: &str, b: &str) -> bool {
+/// The planted bug's match ([`AttrPlant::Spelling`]): two paths' texts, spaces taken out. A
+/// `$crate` an expansion wrote is `$crate` on the item and `crate` in the lowering's text, so
+/// this never finds it.
+fn same_spelling(a: &str, b: &str) -> bool {
     a.chars().filter(|c| !c.is_whitespace()).eq(b.chars().filter(|c| !c.is_whitespace()))
 }
 

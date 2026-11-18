@@ -14,9 +14,11 @@
 //! ITS SOURCE ([`signature_source`]), its key's text: the entry's head bytes (a fn's, `const`'s or
 //! `static`'s signature; a struct's, enum's, union's or alias's whole text, whose fields are its
 //! head), for a trait or impl each member's (kind, name, disambiguator) and, for a trait's fn and
-//! any non-fn member, that member's bytes; each enclosing impl's or trait's signature; and the
-//! file's `Surface` (what the head's paths resolve through: its `use`s and declarations). A body
-//! edit leaves it equal; any edit to the head moves it.
+//! any non-fn member, that member's bytes; and each enclosing impl's or trait's signature.
+//! Nothing of its siblings: what its paths resolve through (the file's `use`s and declarations)
+//! is read by its task, never keyed. Two entries of one name are told apart by their names
+//! ([`signature_name`]: each step's disambiguator counts the earlier siblings of the same kind
+//! and name), never by their keys. A body edit leaves it equal; any edit to the head moves it.
 //!
 //! ITS OUT ([`signature_out`]): the digest of the head records the want makes
 //! (`ProjectWorld::want_digest`) with [`unencoded`], the head's tokens without whitespace or
@@ -70,7 +72,7 @@ use blaze_surface::{Edition, Item, ItemIndex, ItemKind};
 /// The domain of a `Signature`'s subject ([`signature_name`]).
 const NAME_DOMAIN: &str = "blaze-cli signature name 1";
 /// The domain of a `Signature` part's source ([`signature_source`]).
-const SOURCE_DOMAIN: &str = "blaze-cli signature source 1";
+const SOURCE_DOMAIN: &str = "blaze-cli signature source 2";
 /// The domain of a head's tokens ([`unencoded`]). 2: each piece is its `token_digest`
 /// (kinds, joints, doc comments and the edition in), no longer its bare lexemes.
 const TOKENS_DOMAIN: &str = "blaze-cli signature tokens 2";
@@ -222,12 +224,16 @@ fn head_bytes(item: &Item) -> ContentId {
     if whole_is_head(item.kind()) { item.hash } else { item.signature_hash }
 }
 
-/// The source of the `Signature` part of entry `at` of `outline` (see the module docs);
-/// `surface` is its file's (`Outline::surface`).
-pub(crate) fn signature_source(outline: &Outline<'_>, at: ItemIndex, text: &str, surface: ContentId) -> ContentId {
+/// The source of the `Signature` part of entry `at` of `outline` (see the module docs). It
+/// holds nothing of the entry's siblings (lane BH1): before, the file's surface was in it, so
+/// an item added to the file moved every head of the file (the tiny fixture, g200823: 14 head
+/// keys for one private fn added to `m3.rs`). What the head's paths resolve to is read, not
+/// keyed: the names cells its task records (engine_heads.rs), and on the drive's path its
+/// owners' `CrateScope` records whole, which every surface of the crate moves.
+pub(crate) fn signature_source(outline: &Outline<'_>, at: ItemIndex, text: &str) -> ContentId {
     let item = outline.item(at);
     let mut h = Hasher::new(SOURCE_DOMAIN);
-    h.update(&surface.0).update(&[item.kind() as u8]).update(&head_bytes(item).0);
+    h.update(&[item.kind() as u8]).update(&head_bytes(item).0);
     if matches!(item.kind(), ItemKind::Trait | ItemKind::Impl) {
         let trait_ = item.kind() == ItemKind::Trait;
         let mut count = 0u32;

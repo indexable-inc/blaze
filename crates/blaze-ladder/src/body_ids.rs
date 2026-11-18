@@ -66,7 +66,7 @@ pub use blaze_run::parent::Read;
 use blaze_typeck::ItemKey;
 
 use crate::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView};
-use crate::code_records::{Builder, CodeKey, CodeStore, ENTRY_FORM, EntryError, EntryView, PanicStrategy, StoreError, triple};
+use crate::code_records::{Builder, CodeClass, CodeKey, CodeStore, ENTRY_FORM, EntryError, EntryView, PanicStrategy, StoreError, triple};
 use crate::symbols::{fn_symbol_of_name, static_symbol, tls_symbol};
 
 const KEY_DOMAIN: &str = "blaze-ladder code record key 2";
@@ -89,6 +89,15 @@ pub trait BodyIds {
     fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]>;
     /// The crate-grain fact of the crate that defines `item`, with today's digest.
     fn crate_fact(&self, item: ItemKey) -> Option<Read>;
+    /// The class of the crate that defines `item` (code_records.rs [`CodeClass`]): an
+    /// instance is the toolchain's when every item of its name is. A seam that tells no
+    /// toolchain crate from another answers `Program` for all: its code is then kept by the
+    /// program's root alone, which only shortens its life (the command's seam, blaze-cli
+    /// run_ids.rs, tells them).
+    fn class(&self, item: ItemKey) -> CodeClass {
+        let _ = item;
+        CodeClass::Program
+    }
 }
 
 /// The key of the code record of the instance `symbol` (the module doc, "The key"). `body.reads`
@@ -738,7 +747,11 @@ impl<'a> Walk<'a> {
             .map_err(|why| WalkError::Make { tabled, why })?;
             form.declared(made.as_slice(), declared).map_err(|why| WalkError::Entry { tabled, found: false, why })?;
             if unkeyed.is_none() {
-                store.put(key, made.as_slice()).map_err(WalkError::Store)?;
+                // The toolchain's when every item of its name is (`items` is the name's, filled
+                // when it was keyed above), else the program's.
+                let toolchain = !items.is_empty() && items.iter().all(|&item| ids.class(item) == CodeClass::Toolchain);
+                let class = if toolchain { CodeClass::Toolchain } else { CodeClass::Program };
+                store.put(class, key, made.as_slice()).map_err(WalkError::Store)?;
             }
         }
         // The declared rows, reached in the entry's order; on a refusal the row's edges so far

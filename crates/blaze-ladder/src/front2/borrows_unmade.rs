@@ -89,7 +89,7 @@ impl HeadClass {
             HeadError::Item(_, why) => {
                 let (why, at) = match why {
                     Why::Need(_) => (WhyClass::Need, None),
-                    Why::Unsupported(what, r) => (WhyClass::Unsupported(what), range_of(r)),
+                    Why::Unsupported(what, r) | Why::UnsupportedIn(what, _, r) => (WhyClass::Unsupported(what), range_of(r)),
                     Why::Program(_, r) => (WhyClass::Program, range_of(r)),
                     Why::Resolve(_, r) => (WhyClass::Resolve, range_of(r)),
                     Why::NoCheckerType(_, r) => (WhyClass::NoCheckerType, range_of(r)),

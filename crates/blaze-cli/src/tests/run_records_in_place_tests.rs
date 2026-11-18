@@ -151,6 +151,11 @@ impl<'m> Store<'m> for Placed<'m> {
         Ok(())
     }
     fn public_crates(&mut self, _subjects: &[ContentId]) {}
+    fn toolchain_crates(&mut self, _subjects: &[ContentId]) {}
+    fn index_beside(&mut self, _cx: &Cx, owner: Key, keys: &[Key]) -> Result<(), CliError> {
+        self.place.index_beside(owner, keys)?;
+        Ok(())
+    }
     fn kept(&self) -> StoreKept {
         StoreKept::default()
     }

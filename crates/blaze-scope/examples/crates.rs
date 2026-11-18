@@ -846,6 +846,7 @@ fn note_text(c: &CrateNames<'static>, note: &NamesNote<'static>) -> (String, Str
                         Lexed::Body => "macro body",
                         Lexed::Parameters => "macro parameters",
                         Lexed::Input => "call's input",
+                        Lexed::Path => "attribute's path",
                     };
                     (format!("lex refused the {what}"), format!("{at}: {macro_name}!: {error}"))
                 }

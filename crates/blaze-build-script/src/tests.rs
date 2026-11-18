@@ -406,7 +406,12 @@ fn a_stored_file_is_read_through_the_area_only_when_asked() {
 
 fn given_env<'a>(features: &'a [blaze_unit_graph::Text<'a>], cfg: &'a [CfgAtom<'a>], deps: &'a [DepMetadata<'a>]) -> Given<'a, 'a> {
     Given {
-        package: PackageFacts { name: "zstd-sys", version: "2.1.2+zstd.1.5.7", authors: "a:b", links: Some("zstd"), ..PackageFacts::default() },
+        package: PackageFacts {
+            name: "zstd-sys",
+            version: "2.1.2+zstd.1.5.7",
+            meta: Some(blaze_unit_graph::PackageMetaVars { authors: "a:b", ..blaze_unit_graph::PackageMetaVars::default() }),
+            links: Some("zstd"),
+        },
         seen: SeenRoot::Package,
         features,
         target_cfg: cfg,

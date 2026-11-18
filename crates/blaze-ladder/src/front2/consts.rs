@@ -646,6 +646,25 @@ impl<'n> Consts<'n> {
         self.value_at(r, prepared, key, Root::Args(list), build)
     }
 
+    /// The fn instance that key `key` names in a record this evaluator made (each record names
+    /// the instance every fn word of its value was made from: blaze-consteval
+    /// `ConstRecord::fns`), its arguments copied from this evaluator's own type table, where
+    /// they were made, into `ground` (the build's): the seam's `FrontEnd::const_fn_instance`.
+    /// Read from the record, never searched for among the program's fns, so a generic fn's
+    /// instance (`const G: fn(u8) -> u8 = id::<u8>;`), a fn declared inside the constant's own
+    /// block (std's `thread_local!` expansion) and a closure's `call_once` are answered alike.
+    /// Equal keys name equal instances (the key is a hash of the fn's code identity and its
+    /// arguments as trees), so the first record naming it answers. `None`: no record names the
+    /// key, or its arguments do not copy (a full table): the builder refuses by name.
+    pub fn fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::Instance> {
+        let named = self.records.iter().find_map(|r| r.fn_named(key))?;
+        let (unit, _, _) = self.unit.as_ref()?;
+        let from = unit.view();
+        let args = from.list(named.instance.args).ok()?;
+        let args = super::const_at::copy_ground(from, args, ground, scratch).ok()?;
+        Some(blaze_build::Instance { item: named.instance.item, args })
+    }
+
     /// `args` (types of `from`, all ground) copied into this evaluator's own type table, as
     /// one list of it.
     /// `alloc` is the store's: the unit's tables are kept with the evaluator.

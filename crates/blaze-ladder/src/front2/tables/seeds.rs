@@ -47,6 +47,11 @@ pub enum SeedError {
     Unequal { cell: Want },
     /// The request's heads frozen now hold `most` cells: cell `cell` is not taken (rule 18).
     Full { cell: Want, most: usize },
+    /// Member cell `cell`'s head was frozen by its head task under other units than the
+    /// reader's only (blaze-cli engine_heads.rs `head_cell`: one cell a unit): another unit's
+    /// bytes name that unit's keys, so none is taken. `said`: the head by path, the units that
+    /// froze it and the reader's (rule 19).
+    NotInItsUnit { cell: Want, said: &'static str },
 }
 
 impl core::fmt::Display for SeedError {
@@ -56,6 +61,7 @@ impl core::fmt::Display for SeedError {
             SeedError::NotFrozen { need, cell } => write!(f, "{need:?} needs cell {cell:?}, which the request's frozen heads do not hold (front2 tables/seeds.rs)"),
             SeedError::Unequal { cell } => write!(f, "cell {cell:?} was frozen twice in one request to other bytes: its freeze is not a function of its cell (front2 tables/seeds.rs `RequestHeads::publish`)"),
             SeedError::Full { cell, most } => write!(f, "cell {cell:?}: the request's heads frozen now already hold {most} cells (front2 tables/seeds.rs `RequestHeads::publish`)"),
+            SeedError::NotInItsUnit { said, .. } => write!(f, "{said}"),
         }
     }
 }
@@ -218,10 +224,11 @@ impl<'n, N: NamesSource<'n>> HeadSeed<'n> for Freezing<'n, '_, N> {
     }
 }
 
-/// The request's frozen heads as every worker sees them ([`RequestSeed`]): what it knows
-/// ([`KnownHeads::known`]: read only, or inserted once with equal bytes), and where a worker
-/// publishes a head it froze. Shared by every worker of the request (`Sync`).
-pub trait RequestHeads: KnownHeads + Sync {
+/// The request's frozen heads as one worker's stretch sees them ([`RequestSeed`]): what it
+/// knows ([`KnownHeads::known`]: read only, or inserted once with equal bytes), and where a
+/// worker publishes a head it froze. Not `Sync` itself: blaze-cli's is a stretch's view
+/// (engine_seeds.rs `StretchHeads`: its names place a want), over the one shared `Sync` table.
+pub trait RequestHeads: KnownHeads {
     /// `bytes`, frozen now for `cell` by one worker, handed to every other. A cell published
     /// before keeps the first bytes; equal bytes again are counted, other bytes refused
     /// ([`SeedError::Unequal`]); past the table's cap, [`SeedError::Full`]. `krate`: the crate

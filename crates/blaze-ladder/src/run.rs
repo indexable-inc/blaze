@@ -1163,30 +1163,19 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     }
 
     /// The fn instance a constant's record names by key (`DataTarget::Fn(key)`: `const F: fn()
-    /// -> i32 = seven;`). The evaluator keyed it over the fn's code identity (consts.rs
-    /// `item_code_id`, which `FrontEnd::code_of` gives too) at its ground arguments, a hash
-    /// with no inverse here: the candidates are the program's non-generic fns with a checked
-    /// body, each keyed exactly as [`Adts::promoted_fn_key`] and the build loop key it, in the
-    /// program's order (as [`build_from`] finds a static's fn targets); the first equal key is
-    /// the answer. The walk files it in `Built::refs`, which the loop reaches like any callee.
-    /// A fn whose key cannot be made is no record's target (the evaluator made a key for each
-    /// target). Not found here, and refused by the walk naming the key
-    /// (`BuildError::NoConstFnInstance`): a generic instance (`const F: fn() = f::<u8>;`) and a
-    /// closure's `call_once` (the evaluator would have to say which instance it keyed).
+    /// -> i32 = seven;`, `const G: fn(u8) -> u8 = id::<u8>;`, a closure coerced in a constant,
+    /// a fn declared in the constant's own block). The evaluator that made the record named the
+    /// instance it made each fn word from (blaze-consteval `ConstRecord::fns`), so the front end
+    /// that kept the record answers it, its arguments copied into `ground`
+    /// ([`FrontEnd::const_fn_instance`]); nothing is searched for and no fn's body needs to be
+    /// checked first. One answer for both paths (rule 30): the whole-program build here and the
+    /// record walk's maker (run/make_one.rs) read the same records. The walk files the instance
+    /// in `Built::refs`, which the build loop reaches like any callee and the maker declares in
+    /// the made entry (its row, made on its first call through the pointer), so a later process
+    /// that finds the record by key never asks again. `None` (refused by the walk as
+    /// `BuildError::NoConstFnInstance`): no record of the front end names the key.
     fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {
-        for c in 0..self.0.fn_count() {
-            let function = self.0.function(c);
-            let sig = self.0.sig(c);
-            if function.body.is_none() || sig.parent_count != 0 || sig.own_count != 0 {
-                continue;
-            }
-            let Some(done) = self.4.checked.get(c).and_then(Option::as_ref) else { continue };
-            let made = blaze_build::instance_key_normalized(self.0.code_of(c), List::EMPTY, done.types.view(), ground, self, self.4.alloc);
-            if made.ok() == Some(key) {
-                return Some(Instance { item: function.key, args: List::EMPTY });
-            }
-        }
-        None
+        self.0.const_fn_instance(key, ground, self.4.alloc)
     }
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
@@ -2599,7 +2588,8 @@ fn build_from<P: FrontEnd>(
             let range = match error {
                 BuildError::Unsupported { expr, .. }
                 | BuildError::UnsupportedType { expr, .. }
-                | BuildError::NoConstBlockValue { expr, .. } => {
+                | BuildError::NoConstBlockValue { expr, .. }
+                | BuildError::NoConstFnInstance { expr, .. } => {
                     body.and_then(|body| ranges(&body.expr_ranges, expr.0))
                 }
                 BuildError::UnsupportedPat { pat, .. } => body.and_then(|body| ranges(&body.pat_ranges, pat.0)),
@@ -3005,8 +2995,11 @@ fn build_from<P: FrontEnd>(
             // Put under its content key, and its code key pointed at it: an entry built again
             // after a stale one replaces the pointer, never the bytes under a key.
             let content = crate::code_records::content_key(&entry);
-            run.store.put(content, &entry).map_err(|e| fail(CodeRecordError::Store(e)))?;
-            run.store.point(key, content).map_err(|e| fail(CodeRecordError::Store(e)))?;
+            // The whole-program record walk keys an instance by its parts, not by the crates of
+            // its items: kept under the program's root (the lazy walk, body_ids.rs, classes it).
+            let class = crate::code_records::CodeClass::Program;
+            run.store.put(class, content, &entry).map_err(|e| fail(CodeRecordError::Store(e)))?;
+            run.store.point(class, key, content).map_err(|e| fail(CodeRecordError::Store(e)))?;
             run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: format!("{}", name()).into_boxed_str(), found: false });
             continue;
         }

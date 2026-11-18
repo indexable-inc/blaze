@@ -43,6 +43,8 @@ mod macros;
 mod proc_callers;
 mod proc_env;
 #[cfg(test)]
+mod proc_env_pkg_meta_tests;
+#[cfg(test)]
 mod proc_env_unknown_tests;
 mod proc_runner;
 mod names;
@@ -93,17 +95,21 @@ mod engine_answer;
 mod engine_answer_rows;
 mod engine_check;
 mod engine_bodies;
+mod engine_body_plan;
 mod engine_heads;
 mod engine_head_consts;
 mod engine_head_notes;
 mod engine_lines;
 mod engine_lints;
+mod engine_memory;
 mod engine_why;
 mod engine_names;
 mod engine_times;
 mod engine_pool;
 mod engine_records;
+mod engine_scope_reads;
 mod engine_scripts;
+mod engine_script_reads;
 mod engine_seeds;
 mod engine_store;
 mod engine_tasks;
@@ -656,7 +662,9 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
     }
     let status = close(cx, command, &finished, &shown, ran, phases.in_main(), frame, out);
     phases.mark_in("answer printed", frame);
-    // The answer is printed: the profile is written after it, in place, never synced.
+    // The answer is printed: the profile is written after it, in place, never synced; the
+    // cleanup it can name is what is known before the commit.
+    phases.cleanup = Some(store::roots::CleanupLine::before_commit(&opened.lent));
     print::profile(cx, &root, &finished.answer, phases, frame)?;
     // Then the store's one commit: this command's records and its roots in one flip.
     store::after_answer_printed(cx, opened.lent, flags.stats, phases.clock(), err)?;
@@ -891,6 +899,9 @@ fn kept<'f>(req: &Request<'_>, followed: &sweep::Followed<'_>, rows: &Rows<'_>, 
             let keep = match leaf.kind {
                 LeafKind::Slot => leaf.absent() || req.holds(path.as_bytes()),
                 LeafKind::Manifest | LeafKind::Listing | LeafKind::HomeListing | LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder => !slots_only,
+                // This path keeps no build script's outputs (scripts.rs `CheckoutReads::Hole`),
+                // so no read of one: the engine's request makes them again.
+                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat => false,
             };
             if keep {
                 kept.push(leaf.kind, leaf.flags, path, leaf.stamp, leaf.id);
@@ -1039,7 +1050,7 @@ fn request<'f>(
         // source, so a module the bootstrap builder adds or replaces asks again (scripts.rs).
         sweep::read_home_listing(&cx, home_dir, &stamps, scripts::MODULE_LISTING, &mut facts.rows, frame)?;
     } else {
-        for leaf in followed.now.rows.iter().filter(|leaf| leaf.kind != LeafKind::Slot) {
+        for leaf in followed.now.rows.iter().filter(|leaf| leaf.kind != LeafKind::Slot && !leaf.kind.by_script()) {
             facts.rows.push(leaf.kind, leaf.flags, followed.now.path(leaf), leaf.stamp, leaf.id);
         }
     }
@@ -1089,7 +1100,7 @@ fn request<'f>(
     let mut gone: Vec<&[u8], &Frame> = Vec::new_in(frame);
     for (i, leaf) in followed.now.rows.iter().enumerate() {
         let path = followed.now.path(leaf);
-        if !matches!(leaf.kind, LeafKind::Listing | LeafKind::HomeListing | LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder) && leaf.absent() && followed.was[i].0 & sweep::ABSENT == 0 {
+        if !matches!(leaf.kind, LeafKind::Listing | LeafKind::HomeListing | LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder) && !leaf.kind.by_script() && leaf.absent() && followed.was[i].0 & sweep::ABSENT == 0 {
             gone.push(path.as_bytes());
         }
         if leaf.kind != LeafKind::Slot || leaf.absent() {
@@ -1289,7 +1300,12 @@ fn request<'f>(
                 // Its files are its package's `src/`, listed alone: never the checkout.
                 // The start list's certificate and name: today's request certificate, and this
                 // request shape's list (start_list.rs; run.md stage 7).
-                let today = start_list::Today { certificate: start_list::Certificate(req.certificate().0.0), name: start_list::ListName::of(&shape) };
+                let cert = req.certificate();
+                let today = start_list::Today {
+                    certificate: start_list::Certificate(cert.0.0),
+                    name: start_list::ListName::of(&shape),
+                    tables: [blaze_cas::Key(run_ids::table_key(cert, toolchain, &tools).0), blaze_cas::Key(run_names::inputs_key(cert).0)],
+                };
                 // Where the program's names rows are, decided before it starts (run_names.rs): a
                 // walk finds its crates now and writes them at the certificate; a hit reads that
                 // record. A hit with none is dropped here, before the start, and asked in full.
@@ -1906,12 +1922,19 @@ mod tests {
     mod members_tests;
     mod names_records_tests;
     mod engine_check_tests;
+    mod engine_script_reads_tests;
+    mod engine_script_reads_e2e_tests;
+    mod engine_memory_tests;
     mod engine_seeds_tests;
     mod engine_answer_rows_tests;
     mod engine_module_facts_tests;
     mod engine_unnamed_calls_tests;
     mod engine_expansion_tests;
     mod engine_head_notes_tests;
+    mod engine_unit_heads_tests;
+    mod engine_unit_files_tests;
+    mod engine_scope_reads_tests;
+    mod engine_scope_reads_tables_tests;
     mod native_image_tests;
     mod include_data_tests;
     mod include_outside_tests;

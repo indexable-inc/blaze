@@ -15,7 +15,25 @@
 //!   list's pointer and record ([`keep_program`]), named through ONE index record by the root
 //!   [`ProgramRoot`] (made from the list's name), so a program that reached 100,000 code
 //!   records costs a root of one key; renewed by a run of that program from any checkout, let
-//!   go of when no checkout runs it for blaze-cas `ROOT_LIFE_NS`.
+//!   go of when no checkout runs it for blaze-cas `ROOT_LIFE_NS`. It names the certificate's
+//!   run tables too (`run_ids`, `run_names`: [`start_list::Today::tables`]).
+//! - [`Toolchain`]: the toolchain's records for every project on it, by the root `tool.<id>`
+//!   ([`keep_toolchain`]): std's compiled code (`CodeClass::Toolchain` writes), and from the
+//!   engine's answer std's names records with the expansion records beside them; renewed by
+//!   every command that reaches them, let go of after [`TOOLCHAIN_LIFE_NS`] unrenewed.
+//!
+//! The ENGINE path's records, each with the root that reaches it (the census):
+//! - each standing row's task record (names, tree, outlines, heads, body results, lint
+//!   findings, the unit graph), the answer's pages and the printed lines: the answer's
+//!   `.pages` root, through one index (engine_answer.rs `save`, `CommandStore::pin_through`);
+//! - a names record's expansion records (`EXPANSION_TAG`): the index filed beside the names
+//!   record (engine_store.rs `put_all`, blaze-cas `Plain::index_beside`), named by the same
+//!   root; std's also by the toolchain root;
+//! - the sealed pointer: the answer's root itself (`store.pin(name, ..)`);
+//! - dependency heads: `engine-dependency-heads.<hex>`, one per tool set (so per toolchain),
+//!   renewed by every request that lists heads (engine_seeds.rs);
+//! - the rows-form answer's segments and roots: its checkout and tree roots
+//!   (engine_answer_rows.rs `write_effects`).
 //!
 //! What a POINTER is to the sweep (blaze-cas core.rs `POINTER_TAG`, `live_of`, `copy_live`): a
 //! record under its NAME's key, live only when a root reaches that name, and then only its
@@ -36,8 +54,9 @@ use core::marker::PhantomData;
 use std::alloc::Global;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{Lent, LentError, ROOT_LIFE_NS, Sliced};
+use blaze_cas::plain::{INDEX_TAG, INDEXED_ROOT_TAG, Lent, LentError, ROOT_LIFE_NS, Sliced};
 use blaze_core::Driver;
+use blaze_toolchain::ToolchainId;
 
 use crate::start_list;
 
@@ -63,8 +82,17 @@ impl Class for Program {
     const WHAT: &'static str = "a program's code";
 }
 
+/// Code and records settled per toolchain: std's compiled code, the getter and ender (class
+/// (c)), kept by the toolchain's root ([`keep_toolchain`]).
+#[derive(Debug)]
+pub(crate) enum Toolchain {}
+
+impl Class for Toolchain {
+    const WHAT: &'static str = "the toolchain's code";
+}
+
 /// The proof that a root of class `C` names some keys from the next commit on: only the
-/// functions of this module and `PlainPlace::pin` make one (rule 76).
+/// functions of this module and `PlainPlace::pin`/`pin_through` make one (rule 76).
 #[derive(Debug)]
 pub(crate) struct Rooted<C: Class> {
     /// The root's record key.
@@ -79,43 +107,55 @@ impl<C: Class> Rooted<C> {
     }
 }
 
-/// A program's root for one request shape: `code.<64 hex of the start list's name>`.
+/// A root's name: a five-byte class word and the 64 hex of the 32-byte id it is kept by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct ProgramRoot([u8; PROGRAM_ROOT_LEN]);
+pub struct RootName([u8; ROOT_NAME_LEN]);
 
-const PROGRAM_WORD: &[u8; 5] = b"code.";
-const PROGRAM_ROOT_LEN: usize = 5 + 64;
+const ROOT_NAME_LEN: usize = 5 + 64;
 
-impl ProgramRoot {
+impl RootName {
     /// The program root of the start list `list`: `code.` and the 64 hex of the list name's key,
     /// so made from the same parts as [`start_list::ListName`] (the request shape, which holds
     /// the command and the program), per user and NOT per checkout (rule 30: the root and the
     /// list it names are one fact with one lifetime). Any run of that program from any checkout
     /// renews it; code records are keyed from text and shared across checkouts anyway.
-    pub(crate) fn of(list: &start_list::ListName) -> ProgramRoot {
+    pub(crate) fn program(list: &start_list::ListName) -> RootName {
+        RootName::of(b"code.", &list.id().0)
+    }
+
+    /// The toolchain root of `toolchain`: `tool.` and the 64 hex of its id. Every project on one
+    /// toolchain shares it, so std's compiled code made for one is found by the next.
+    pub(crate) fn toolchain(toolchain: ToolchainId) -> RootName {
+        RootName::of(b"tool.", &toolchain.0)
+    }
+
+    fn of(word: &[u8; 5], id: &[u8; 32]) -> RootName {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut name = [0u8; PROGRAM_ROOT_LEN];
-        name[..5].copy_from_slice(PROGRAM_WORD);
-        for (i, byte) in list.id().0.iter().enumerate() {
+        let mut name = [0u8; ROOT_NAME_LEN];
+        name[..5].copy_from_slice(word);
+        for (i, byte) in id.iter().enumerate() {
             name[5 + 2 * i] = HEX[usize::from(byte >> 4)];
             name[5 + 2 * i + 1] = HEX[usize::from(byte & 15)];
         }
-        ProgramRoot(name)
+        RootName(name)
     }
 
     /// The root's name: ASCII by construction.
     pub(crate) fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.0).expect("a program root's name is ASCII hex by construction")
+        core::str::from_utf8(&self.0).expect("a root's name is ASCII by construction")
     }
 }
 
 /// Why a root could not be set, by class and name (rule 19).
 #[derive(Debug)]
-pub(crate) enum RootError {
+pub enum RootError {
     /// The store refused the index or the root.
-    Store { class: &'static str, root: ProgramRoot, why: LentError },
+    Store { class: &'static str, root: RootName, why: LentError },
     /// The start list's keys could not be read back.
     List(start_list::ListError),
+    /// The root named `root` holds a record that is not an indexed root's, or names an index
+    /// record of another tag: its keys cannot be carried into the renewed root.
+    NotIndexed { class: &'static str, root: RootName, key: CasKey },
 }
 
 impl fmt::Display for RootError {
@@ -123,6 +163,9 @@ impl fmt::Display for RootError {
         match self {
             RootError::Store { class, root, why } => write!(f, "the root `{}` of {class} was not set: {why}", root.as_str()),
             RootError::List(why) => write!(f, "the program's root: {why}"),
+            RootError::NotIndexed { class, root, key } => {
+                write!(f, "the root `{}` of {class} names {:?}, which is not an indexed root or an index record (blaze-cas `INDEXED_ROOT_TAG`, `INDEX_TAG`)", root.as_str(), key.0)
+            }
         }
     }
 }
@@ -138,24 +181,84 @@ pub(crate) struct ProgramKept {
 }
 
 /// The program's code kept for the next command of this program and request shape: one index
-/// of every key the walk served or made (`walked`, the code store's record of this run) and
-/// every key the start list just written names (`list`: its bytes, `None` when the run kept no
-/// list), named by the program root of `name` ([`ProgramRoot::of`]) for blaze-cas `ROOT_LIFE_NS` (renewed by each run that
+/// of every key the walk served or made (`walked`, the code store's record of this run), every
+/// key the start list just written names (`list`: its bytes, `None` when the run kept no list)
+/// and the certificate's run tables (`today.tables`), named by the program root of
+/// `today.name` ([`RootName::program`]) for blaze-cas `ROOT_LIFE_NS` (renewed by each run that
 /// names it again). Called once a run, after the list is written and before the commit after
 /// the answer: the index, the root and the run's records ride that one flip.
-pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, Global>, name: &start_list::ListName, list: Option<&[u8]>, walked: &[CasKey]) -> Result<(Rooted<Program>, ProgramKept), RootError> {
-    let root = ProgramRoot::of(name);
+pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, Global>, today: &start_list::Today, list: Option<&[u8]>, walked: &[CasKey]) -> Result<(Rooted<Program>, ProgramKept), RootError> {
+    let root = RootName::program(&today.name);
     let mut keys: std::vec::Vec<CasKey, Global> = std::vec::Vec::with_capacity_in(walked.len() + 64, Global);
     keys.extend_from_slice(walked);
+    keys.extend_from_slice(&today.tables);
     let mut kept = ProgramKept::default();
     if let Some(bytes) = list {
-        kept.stale_rows = start_list::rooted_keys(lent, name, bytes, &mut keys).map_err(RootError::List)?;
+        kept.stale_rows = start_list::rooted_keys(lent, &today.name, bytes, &mut keys).map_err(RootError::List)?;
     }
     // The index sorts and dedups (blaze-cas `Plain::index`); its cap is the store's refusal.
     let store = |why| RootError::Store { class: Program::WHAT, root, why };
     let index = lent.index(&keys).map_err(store)?;
     let at = lent.root_through(root.as_str(), &[index], ROOT_LIFE_NS).map_err(store)?;
     Ok((Rooted::new(at), kept))
+}
+
+/// A toolchain root's life: twice a program's, and renewed by every command that reaches a
+/// record of its class (decided 2026-11-17).
+pub(crate) const TOOLCHAIN_LIFE_NS: u64 = 2 * ROOT_LIFE_NS;
+
+/// The most index records a toolchain root names before they are folded into one: each command
+/// that makes toolchain code adds one, so the root stays one record of at most this many keys.
+pub(crate) const TOOLCHAIN_INDEXES_FOLD: usize = 64;
+
+/// The toolchain's code kept for every later command on `toolchain`, whichever program or
+/// project: the root `tool.<id>` ([`RootName::toolchain`]) names the index records it named
+/// before (an expired root names nothing: its records are gone or going) and, when this
+/// command made toolchain code (`made`, the code store's toolchain-class writes), one more
+/// index of those keys; past [`TOOLCHAIN_INDEXES_FOLD`] indexes they are folded into one.
+/// Set again for [`TOOLCHAIN_LIFE_NS`] by every command that calls it (every `blaze run`: a run
+/// reaches the toolchain's getter and ender at the least): equal bytes within a day of
+/// the last renewal write nothing (blaze-cas `set_root`). Answers `None` when there is nothing
+/// to name: no earlier root and nothing made. `beside`: index records made with records of
+/// `made` (blaze-cas `Plain::index_beside`: a names record's expansion records), named by the
+/// root as they are, so reach keeps what they hold too (one level).
+pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, Global>, toolchain: ToolchainId, made: &[CasKey], beside: &[CasKey]) -> Result<Option<Rooted<Toolchain>>, RootError> {
+    let root = RootName::toolchain(toolchain);
+    let store = |why| RootError::Store { class: Toolchain::WHAT, root, why };
+    let not_indexed = |key| RootError::NotIndexed { class: Toolchain::WHAT, root, key };
+    let mut indexes: std::vec::Vec<CasKey, Global> = std::vec::Vec::new_in(Global);
+    if let Some(key) = lent.root_named(root.as_str()) {
+        let Some(held) = lent.get(&key).map_err(store)? else { return Err(not_indexed(key)) };
+        if held.tag != INDEXED_ROOT_TAG {
+            return Err(not_indexed(key));
+        }
+        indexes.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
+    }
+    if !made.is_empty() {
+        indexes.push(lent.index(made).map_err(store)?);
+    }
+    indexes.extend_from_slice(beside);
+    // An equal index made again (the same keys, the same key) is one index (rule 25).
+    indexes.sort_unstable();
+    indexes.dedup();
+    if indexes.is_empty() {
+        return Ok(None);
+    }
+    if indexes.len() > TOOLCHAIN_INDEXES_FOLD {
+        // One index of every key the indexes hold: its cap is the store's refusal.
+        let mut keys: std::vec::Vec<CasKey, Global> = std::vec::Vec::new_in(Global);
+        for index in &indexes {
+            let Some(held) = lent.get(index).map_err(store)? else { return Err(not_indexed(*index)) };
+            if held.tag != INDEX_TAG {
+                return Err(not_indexed(*index));
+            }
+            keys.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
+        }
+        indexes.clear();
+        indexes.push(lent.index(&keys).map_err(store)?);
+    }
+    let at = lent.root_through(root.as_str(), &indexes, TOOLCHAIN_LIFE_NS).map_err(store)?;
+    Ok(Some(Rooted::new(at)))
 }
 
 /// The command's cleanup line (the closing profile's, phases.rs, and `--stats`): the roots the
@@ -210,5 +313,29 @@ impl CleanupLine {
             carried: lent.carried(),
             leases: u32::try_from(lent.leases().len()).unwrap_or(u32::MAX),
         }
+    }
+
+    /// The part of the line known BEFORE the commit after the answer, for a profile written
+    /// before it (`check` and `run` on the old path, main.rs): the roots this command set and
+    /// the keys they name, and the leases. The slice and what the commit carries are known only
+    /// after it: on `--stats` after the commit, and whole in a profile written after it (the
+    /// engine's, engine_check.rs).
+    pub(crate) fn before_commit<D: Driver>(lent: &Lent<D, Global>) -> BeforeCommit {
+        BeforeCommit(CleanupLine::of(lent, None))
+    }
+}
+
+/// [`CleanupLine::before_commit`]: printed so it never says a slice ran or swept nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeforeCommit(pub CleanupLine);
+
+impl fmt::Display for BeforeCommit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let it = &self.0;
+        write!(
+            f,
+            "cleanup      before the commit: roots: {} named {} keys ({} through index records); leases {}; the slice and what the commit carried come after this profile (`--stats`)",
+            it.roots, it.keys, it.indexed, it.leases,
+        )
     }
 }

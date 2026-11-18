@@ -149,6 +149,24 @@ pub enum LeafKind {
     /// the files digest walks (`macro_files::walked`); followed as a listing is, so a file made
     /// or removed beneath the crate moves a row.
     MacroFolder = 6,
+    /// A checkout file a member's build script read (`file:`): its id the answer the run saw,
+    /// the file's bytes as the sandbox digests them (engine_script_reads.rs). The script reads
+    /// its `Given` cell; nothing of the layout does, so it moves no layout.
+    ScriptFile = 7,
+    /// A checkout folder a member's build script listed (`dir:`): its id the sandbox's listing
+    /// answer, every entry one level (engine_script_reads.rs).
+    ScriptListing = 8,
+    /// A checkout path a member's build script stat'd (`stat:`): its id its kind, and a file's
+    /// size; a folder's does not depend on what is in it (engine_script_reads.rs).
+    ScriptStat = 9,
+}
+
+impl LeafKind {
+    /// A row a build script's read made: followed by engine_script_reads.rs `now`, read by a
+    /// `Given` cell and never by the layout.
+    pub fn by_script(self) -> bool {
+        matches!(self, LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat)
+    }
 }
 
 /// A slot of `mod x;`: `x.rs` and `x/mod.rs` are both probed; the row's stamp and id are the one
@@ -226,7 +244,8 @@ impl<'f> Rows<'f> {
 /// What the layout read: equal sources, equal layouts.
 pub fn units_source<'r>(rows: impl Iterator<Item = (&'r str, &'r Leaf)>, frame: &Frame) -> ContentId {
     let mut sorted: Vec<(&str, &Leaf), &Frame> = Vec::new_in(frame);
-    sorted.extend(rows.filter(|(_, leaf)| leaf.kind != LeafKind::Slot));
+    // A build script's read is a cell its script reads, never the layout's source.
+    sorted.extend(rows.filter(|(_, leaf)| leaf.kind != LeafKind::Slot && !leaf.kind.by_script()));
     sorted.sort_unstable_by(|a, b| (a.1.kind, a.0).cmp(&(b.1.kind, b.0)));
     let mut h = blaze_ids::Hasher::new(UNITS_SOURCE_DOMAIN);
     for (path, leaf) in sorted.iter() {
@@ -650,10 +669,14 @@ impl<S: Stamps> Follow<S> {
                     (old.flags, None, old.id)
                 }
                 LeafKind::MacroFolder => crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, Some(&old), frame)?,
+                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat => {
+                    let kind = crate::engine_script_reads::ReadKind::of_leaf(old.kind).ok_or(CliError::Text { what: "a script read's leaf row has no read kind (sweep.rs `follow_marked`)" })?;
+                    crate::engine_script_reads::now(&cx, root, &self.stamps, self.plant, kind, path, Some((old.stamp, old.id)), frame)?
+                }
             };
             now.push(old.kind, flags, path, stamp, id);
             was.push(old_state);
-            if old.kind != LeafKind::Slot && now.rows[i].state() != old_state {
+            if old.kind != LeafKind::Slot && !old.kind.by_script() && now.rows[i].state() != old_state {
                 layout_moved = true;
             }
         }
@@ -683,13 +706,15 @@ const LEAVES: &str = "a pointer in .blaze/v2/at (its leaf table)";
 /// rows:  rows x (kind u8, flags u8, 0 u16, stamp [40], digest [32])   sorted by (kind, path)
 /// ```
 ///
-/// A stamp of zeros is none (an inode of 0 proves nothing). BCL5 had no `MacroFile` and
+/// A stamp of zeros is none (an inode of 0 proves nothing). BCL6 had no `ScriptFile`,
+/// `ScriptListing` and `ScriptStat` kinds (a member build script's reads of the checkout,
+/// engine_script_reads.rs). BCL5 had no `MacroFile` and
 /// `MacroFolder` kinds (member-macro-stamp-1: a member proc-macro crate's files and folders, each
 /// with its stamp). BCL4 had no `MacroFiles` kind
 /// (member-macro-module-2: a member proc-macro crate's files, whole). BCL3 was the whole checkout's tree
 /// (directories and files), the walk this replaces; BCL2 a row a file with its whole path; BCL1
 /// had no stamp: each an older form, reported and rebuilt.
-pub(crate) const LEAVES_MAGIC: &[u8; 4] = b"BCL6";
+pub(crate) const LEAVES_MAGIC: &[u8; 4] = b"BCL7";
 
 const HEADER: usize = 16;
 const ROW: usize = 4 + Stamp::BYTES + 32;
@@ -750,7 +775,7 @@ impl<'f> Leaves<'f> {
             }
             start = end;
             let at = row_at + ROW * k;
-            if bytes[at] > LeafKind::MacroFolder as u8 {
+            if bytes[at] > LeafKind::ScriptStat as u8 {
                 return Err(refuse(at, WireWhy::Tag(bytes[at])));
             }
             if bytes[at + 1] & !FLAGS != 0 {
@@ -790,7 +815,10 @@ impl<'f> Leaves<'f> {
             3 => LeafKind::HomeListing,
             4 => LeafKind::MacroFiles,
             5 => LeafKind::MacroFile,
-            _ => LeafKind::MacroFolder,
+            6 => LeafKind::MacroFolder,
+            7 => LeafKind::ScriptFile,
+            8 => LeafKind::ScriptListing,
+            _ => LeafKind::ScriptStat,
         };
         let stamp = Stamp::get(&row[4..4 + Stamp::BYTES]);
         let mut id = [0; 32];
@@ -979,6 +1007,8 @@ mod tests {
                 LeafKind::HomeListing => (ABSENT, ContentId([0; 32])),
                 // No member proc-macro crate in this sweep's workspace: no such row is made.
                 LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder => (ABSENT, ContentId([0; 32])),
+                // No build script in this sweep's workspace: no such row is made.
+                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat => (ABSENT, ContentId([0; 32])),
             }
         };
         let sweep = |round: &str| -> Result<(std::vec::Vec<(LeafKind, String)>, u64), Broke> {

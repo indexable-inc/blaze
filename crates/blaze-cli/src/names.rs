@@ -72,12 +72,15 @@ pub(crate) mod sections;
 // readers would read those cells absent; "11": an items record of version 8, whose item rows
 // hold no `extern` block ABI, and `Item` cells that do not cover it; "12": the expansion texts
 // section (form 3) in place of the expansions directory, the texts and columns in the record
-// itself) are under other names, never found, made again.
+// itself); "13": a cell table whose `Module` cell still held the module's textual macro list and
+// marks, with no `Textual` or `Incoherent` cell (lane BH1: blaze-scope names_cells.rs, cell
+// digest domain 2), whose readers would read those cells absent) are under other names, never
+// found, made again.
 // The subject's domain is blaze-drive key.rs `CRATE_SCOPE_DOMAIN` (the name's one home,
 // `crate_scope_name`): it names the crate's task, not its record's form, so a form change
 // moves this source domain alone (every key moves; the name a reader reads by stays). Bump it
 // there only when what a name stands for changes.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 13";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 14";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -526,6 +529,9 @@ pub struct Names<'f> {
     /// Where the world placed each locked package (proc_callers.rs): what a proc macro called
     /// in a crate of that package is shown.
     placed: crate::proc_callers::Placed<'f>,
+    /// The names step's own frame ([`NAMES_FRAME`], held to the command's end): what the world
+    /// read into it, for the profile's memory line ([`Names::held`]).
+    frame: &'static Frame,
     /// Crates whose names were resolved this command, and the unresolved paths among them.
     pub resolved: u32,
     pub unresolved: u64,
@@ -595,6 +601,45 @@ impl Names<'_> {
     pub(crate) fn read_files(&self, subject: ContentId) -> Option<(&[String], &[(String, String)])> {
         let at = self.made.binary_search_by_key(&subject, |(subject, _)| *subject).ok()?;
         Some((&self.made[at].1.files, &self.made[at].1.data))
+    }
+
+    /// What this world keeps of the crates resolved this command, to the command's end, for the
+    /// profile's memory lines (engine_memory.rs): how many crates, the bytes of their read lists
+    /// and findings (a later step reads the lists, [`Names::read_files`]), and the payload bytes
+    /// not yet handed to a record (an answered crate hands its payload over, names/scope.rs
+    /// `hand_payload`, so this is 0 once every crate resolved was answered). A walk made once,
+    /// when the profile is written: profile-only, never in a record (rule 25).
+    pub(crate) fn held(&self) -> (u64, u64, u64) {
+        self.held_by_crates()
+    }
+
+    /// The names step's own frame ([`NAMES_FRAME`]): its bytes in use and committed now. It
+    /// takes the world's reads (the sources store, the shelf, the members' places, whatever is
+    /// read through the world's checkout reader), held to the command's end.
+    pub(crate) fn frame_held(&self) -> (u64, u64) {
+        (self.frame.used() as u64, self.frame.committed() as u64)
+    }
+
+    fn held_by_crates(&self) -> (u64, u64, u64) {
+        let mut lists = 0usize;
+        let mut payloads = 0usize;
+        for (_, resolved) in self.made.iter() {
+            let paths: usize = resolved.files.iter().chain(resolved.absent.iter()).map(|path| path.capacity()).sum();
+            let data: usize = resolved.data.iter().map(|(path, from)| path.capacity() + from.capacity()).sum();
+            let slots = (resolved.files.capacity() + resolved.absent.capacity()) * core::mem::size_of::<String>() + resolved.data.capacity() * core::mem::size_of::<(String, String)>();
+            let findings: usize = resolved
+                .findings
+                .iter()
+                .chain(resolved.left_package.iter())
+                .chain(resolved.failed_calls.iter())
+                .chain(resolved.test_marks.iter().map(|(_, one)| one))
+                .map(|one| core::mem::size_of::<Unresolved>() + one.message.len())
+                .sum();
+            let failed = resolved.failed.as_ref().map_or(0, |words| words.capacity());
+            lists += paths + data + slots + findings + failed;
+            payloads += resolved.payload.len();
+        }
+        (self.made.len() as u64, lists as u64, payloads as u64)
     }
 
     /// The `Script` name the crate at world index `at` reads, if its package has a build script.
@@ -824,7 +869,7 @@ pub(crate) fn world<'f>(
             public.push(name.subject);
         }
     }
-    Ok(Names { world, by_subject, by_key, made: std::vec::Vec::new(), public, scripts, script_placed, script_roots, script_modules, prepares: Prepares::new_in(alloc), graph, procs: None, placed, resolved: 0, unresolved: 0 })
+    Ok(Names { world, by_subject, by_key, made: std::vec::Vec::new(), public, scripts, script_placed, script_roots, script_modules, prepares: Prepares::new_in(alloc), graph, procs: None, placed, frame, resolved: 0, unresolved: 0 })
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that
@@ -851,6 +896,12 @@ pub(crate) fn script_units<'a>(
 /// a world is made.
 pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
     store.public_crates(&names.public);
+    // The toolchain's of them: their records are kept under the toolchain's root.
+    let mut toolchain = std::vec::Vec::with_capacity_in(names.world.crates.len(), Global);
+    toolchain.extend(
+        names.world.crates.iter().filter(|krate| matches!(krate.origin, blaze_world::Origin::Toolchain(_))).map(|krate| blaze_drive::key::crate_scope_name(&krate.input.key).subject),
+    );
+    store.toolchain_crates(&toolchain);
 }
 
 /// The `CrateScope` parts the graph's record names: one per crate of the world, by subject,
@@ -899,4 +950,4 @@ mod script_units_tests;
 
 #[cfg(test)]
 pub(crate) use scope::scope_made;
-pub(crate) use scope::{Prepared, Resolution, SCOPE_FRAME, SCOPE_JOBS, ScopeJob, ScopeRound, answer, prepare, resolve, run, settle};
+pub(crate) use scope::{CopiedExports, DepExports, Prepared, Resolution, SCOPE_FRAME, SCOPE_JOBS, ScopeJob, ScopeRound, answer, prepare, resolve, run, settle};

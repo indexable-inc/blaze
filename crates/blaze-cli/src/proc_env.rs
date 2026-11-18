@@ -163,6 +163,7 @@ mod tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            meta: None,
         };
         CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of {crate_name}: {e}"))
     }

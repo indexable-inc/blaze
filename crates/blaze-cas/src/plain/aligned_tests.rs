@@ -124,6 +124,34 @@ fn an_own_put_is_refused_in_place_until_its_commit() {
     assert_eq!((read(&lent, 1), read(&lent, 2)), (Read::InPlace, Read::InPlace));
 }
 
+/// Asking whether a put is held (`Lent::holds`) lends nothing: after the commit, in the SAME
+/// process, the key asked about and the key put beside it read from the segment's mapping. The
+/// control (rule 23): the same question asked by a get keeps the chunk, and the key beside it,
+/// never read before, is refused in place for the rest of the command. That was blaze-cli
+/// `put_record`'s equal-bytes check on a real project: an expansion record two units put kept
+/// the names records beside it in the arena, and every reader of them was refused.
+#[test]
+fn asking_whether_a_put_is_held_keeps_no_chunk_past_its_commit() {
+    let lent = process(Sim::new(61, Faults::default()), 1, Plant::None);
+    lent.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("a put");
+    lent.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
+    assert!(lent.holds(&key(1), &value(1)).expect("asked"), "an own put is held with its bytes");
+    assert!(!lent.holds(&key(1), &value(2)).expect("asked"), "and not with other bytes");
+    assert!(!lent.holds(&key(3), &value(3)).expect("asked"), "a key never put is not held");
+    lent.commit().expect("the commit");
+    assert_eq!((read(&lent, 1), read(&lent, 2)), (Read::InPlace, Read::InPlace), "asked by `holds`: both in place after the commit");
+    assert!(lent.holds(&key(1), &value(1)).expect("asked"), "a committed record is held with its bytes");
+    assert!(!lent.holds(&key(1), &value(2)).expect("asked"), "and not with other bytes");
+
+    let control = process(Sim::new(63, Faults::default()), 1, Plant::None);
+    control.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("a put");
+    control.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
+    assert!(control.get(&key(1)).expect("a get").is_some_and(|lend| lend.bytes == &value(1)[..]), "the same question, asked by a get");
+    control.commit().expect("the commit");
+    assert_eq!(read(&control, 2), Read::NotInPlace(NotInPlace::Arena { len: value(2).len() }), "the control: a get kept the chunk, so the key beside it is not in place");
+    println!("holds: asked by comparison, both keys in place after the commit; asked by a get, the key beside it stayed in the arena");
+}
+
 /// Commits of records of every length mod 16, a compaction after every eighth (more segments
 /// than one slice keeps, so merges run): every record reads in place and aligned after each, and
 /// after a reopen.

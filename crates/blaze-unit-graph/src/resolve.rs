@@ -661,7 +661,18 @@ impl<'l, 'a> Resolution<'l, 'a> {
         }
         unavailable.sort_unstable();
         unavailable.dedup();
-        Ok(Pass::Done(UnitGraph { units, unavailable, resolver: self.resolver }))
+        // Each package of a unit with its metadata, once, by id (`UnitGraph::meta`).
+        let mut ids: AVec<'a, LockId> = Vec::with_capacity_in(units.len(), alloc);
+        ids.extend(units.iter().map(|unit: &Unit<'a>| unit.package));
+        ids.sort_unstable();
+        ids.dedup();
+        let mut meta = Vec::with_capacity_in(ids.len(), alloc);
+        for id in ids.iter().copied() {
+            if let Answer::Read(package) = &self.answers[id.index()] {
+                meta.push((id, package.meta.clone()));
+            }
+        }
+        Ok(Pass::Done(UnitGraph { units, unavailable, resolver: self.resolver, meta }))
     }
 
     fn unit(&self, st: &State<'_, 'a>, key: Key, package: &Package<'a>, t: &Tmp<'a>, new_id: &[u32]) -> Unit<'a> {

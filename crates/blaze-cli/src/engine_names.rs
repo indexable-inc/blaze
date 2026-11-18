@@ -29,6 +29,7 @@ use bstd::mem::{Frame, Tag};
 use bstd::task::Class;
 
 use crate::engine_check::EngineCheckError;
+use crate::engine_records::{EngineRecords, InPlace, ReadError};
 use crate::engine_tasks::{CELLS, Outlined, WHOLE};
 use crate::engine_units::{Failure, Published, drive_task, published};
 use crate::fetch::FetchEnv;
@@ -46,6 +47,8 @@ pub(crate) struct NamesStage<'f> {
     made: Vec<(Name, Option<(Key, ContentId)>), &'f Frame>,
     /// Each crate's result, in the order entered.
     pub(crate) results: Vec<Published<'f>, &'f Frame>,
+    /// What the phases' frames held, for the profile's memory lines (engine_memory.rs).
+    pub(crate) memory: crate::engine_memory::NamesMemory,
 }
 
 /// The phase-independent handles a names phase reads.
@@ -61,7 +64,7 @@ pub(crate) struct Handles<'h, 'f> {
 
 impl<'f> NamesStage<'f> {
     pub(crate) fn new(names: Names<'f>, frame: &'f Frame) -> NamesStage<'f> {
-        NamesStage { names: Some(names), made: Vec::new_in(frame), results: Vec::new_in(frame) }
+        NamesStage { names: Some(names), made: Vec::new_in(frame), results: Vec::new_in(frame), memory: crate::engine_memory::NamesMemory::new() }
     }
 
     /// One `CrateScope` task a crate of the world, at its depth (sorted by name).
@@ -106,10 +109,11 @@ impl<'f> NamesStage<'f> {
     /// One names phase: every task entered once, its result in `buffer`, each resolution's
     /// time on its worker in `times`.
     #[expect(clippy::too_many_arguments, reason = "the phase loop's handles, each named")]
-    pub(crate) fn run_phase<'a>(
+    pub(crate) fn run_phase<'a, 'r>(
         &mut self,
         cx: &Cx,
-        store: &mut dyn crate::store::Store<'_>,
+        store: &mut dyn crate::store::Store<'r>,
+        read: &mut EngineRecords<'r>,
         handles: &Handles<'_, 'f>,
         tasks: &[EngineTask],
         buffer: &mut Buffer<'a>,
@@ -119,15 +123,22 @@ impl<'f> NamesStage<'f> {
     ) -> Result<(), CliError> {
         let cx = cx.span("engine: one names phase");
         let heap = handles.env.heap.alloc();
+        // The wave's frame: its jobs and what they share, dropped (given back) when the phase
+        // returns. The dependencies' exports are NOT in it: each is a borrow of the store's
+        // mapping, read in place through the request's one reader (engine_records.rs).
         let own = Frame::with_reserve(crate::names::SCOPE_JOBS, Tag::Other).map_err(|_| CliError::Text { what: "a names phase's frame could not be reserved" })?;
         let mut round = ScopeRound::new(&own, false);
+        let mut exports = ReadExports { read, route: crate::engine_memory::route_now() };
+        // What lives only for this phase goes in its frame, never in the command's (`frame`
+        // holds what the stage keeps: each crate's result).
+        let wave_frame: &Frame = &own;
         // 1. Each task's job, on this thread.
-        let mut jobs: Vec<(usize, blaze_drive::Task<'_>, &crate::names::ScopeJob<'_>), &Frame> = Vec::new_in(frame);
-        let mut answered: Vec<(usize, Result<work::Made<'f>, Failure<'f>>), &Frame> = Vec::new_in(frame);
-        let mut closure: Vec<usize, &Frame> = Vec::new_in(frame);
+        let mut jobs: Vec<(usize, blaze_drive::Task<'_>, &crate::names::ScopeJob<'_>), &Frame> = Vec::new_in(wave_frame);
+        let mut answered: Vec<(usize, Result<work::Made<'f>, Failure<'f>>), &Frame> = Vec::new_in(wave_frame);
+        let mut closure: Vec<usize, &Frame> = Vec::new_in(wave_frame);
         // What each answered task was handed (its dependencies, script and surfaces), by task
         // index: a failure's read list (plan row A8).
-        let mut saw: Vec<(usize, Vec<(Name, ContentId), &Frame>), &Frame> = Vec::new_in(frame);
+        let mut saw: Vec<(usize, Vec<(Name, ContentId), &Frame>), &Frame> = Vec::new_in(wave_frame);
         for (i, task) in tasks.iter().enumerate() {
             let name = task.planned.name;
             let names = self.names.as_ref().ok_or(CliError::Text { what: "the names world is gone (engine_names.rs `run_phase`)" })?;
@@ -144,7 +155,7 @@ impl<'f> NamesStage<'f> {
                     Err(_) => return Err(EngineCheckError::Unseen { task: name, read: script }.into()),
                 },
             };
-            closure_of(names, at, &mut closure, frame);
+            closure_of(names, at, &mut closure, wave_frame);
             let mut inputs = blaze_own::Vec::new_in(heap);
             let mut failed = blaze_own::Vec::new_in(heap);
             for g in closure.iter() {
@@ -170,22 +181,26 @@ impl<'f> NamesStage<'f> {
             }
             failed.sort_unstable();
             let drive = drive_task(name, task.key, task.planned.source, inputs, failed, heap);
-            let prepared = crate::names::prepare(&cx, handles.root, store, &mut self.names, handles.lock, handles.members, handles.env, handles.side, &drive, &mut round, frame)?;
+            let prepared = crate::names::prepare(&cx, handles.root, store, &mut exports, &mut self.names, handles.lock, handles.members, handles.env, handles.side, &drive, &mut round, frame)?;
             match prepared {
                 Prepared::Resolve(job) => jobs.push((i, drive, job)),
                 Prepared::Answer(did) => {
-                    saw.push((i, handed(&drive, frame)));
+                    saw.push((i, handed(&drive, wave_frame)));
                     answered.push((i, published(name, did)?));
                 }
                 Prepared::Made => return Err(EngineCheckError::Twice { task: name }.into()),
             }
         }
         // 2. The wave's resolutions at once, on the workers.
-        let mut resolutions: Vec<Result<crate::names::Resolution, work::Panicked>, &Frame> = Vec::new_in(frame);
+        let mut resolutions: Vec<Result<crate::names::Resolution, work::Panicked>, &Frame> = Vec::new_in(wave_frame);
+        // Each resolved task's scratch, as its frame committed it at the task's end: (bytes,
+        // task). The frame is the task's own (`may_overlap`), dropped when it ends, its blocks
+        // back to the chunk cache and its spans to the kernel (blaze-mem frame.rs `Drop`).
+        let mut scratch: Vec<(u64, Name), &Frame> = Vec::new_in(wave_frame);
         {
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
-            let mut running = Vec::new_in(frame);
+            let mut running = Vec::new_in(wave_frame);
             let root = handles.root;
             let clock = &handles.env.clock;
             for (_, drive, job) in jobs.iter() {
@@ -194,14 +209,18 @@ impl<'f> NamesStage<'f> {
                 running.push(scope.may_overlap("crate scope", crate::names::SCOPE_FRAME, move |cx: &Cx| {
                     let began = clock.now();
                     let resolution = work::unwinding(|| crate::names::resolve(cx, root, job, cx.frame()).0);
-                    Ok::<_, Infallible>((resolution, name, clock.now().since(began).map_or(0, crate::engine_times::ns)))
+                    // Read before the task ends and its frame goes: what it committed at most
+                    // (a frame gives nothing back before its reset or drop).
+                    let committed = cx.frame().committed() as u64;
+                    Ok::<_, Infallible>((resolution, name, clock.now().since(began).map_or(0, crate::engine_times::ns), committed))
                 }));
             }
             let mut stopped = None;
             for handle in running.into_iter() {
                 match handle.join(&cx) {
-                    Ok((resolution, name, ns)) => {
+                    Ok((resolution, name, ns, committed)) => {
                         times.push(name, ns);
+                        scratch.push((committed, name));
                         resolutions.push(resolution);
                     }
                     Err(error) => {
@@ -217,7 +236,7 @@ impl<'f> NamesStage<'f> {
         // 3. Each answered, on this thread, with the surfaces and data files it read.
         for ((i, mut drive, _), resolution) in jobs.into_iter().zip(resolutions) {
             let name = drive.name;
-            saw.push((i, handed(&drive, frame)));
+            saw.push((i, handed(&drive, wave_frame)));
             let names = self.names.as_mut().ok_or(CliError::Text { what: "the names world is gone (engine_names.rs `run_phase`)" })?;
             let resolution = match resolution {
                 Ok(resolution) => resolution,
@@ -276,6 +295,10 @@ impl<'f> NamesStage<'f> {
             buffer.done.push(done);
             self.results.push(Published { name, source: task.planned.source, wave: task.planned.phase.wave, made });
         }
+        // What this phase's frames held (rules 16, 50): the wave's own as it is now, before it
+        // is dropped on return, and each task's scratch.
+        let wave = tasks.first().map_or(0, |task| task.planned.phase.wave);
+        self.memory.wave(wave, own.committed() as u64, &mut scratch, handles.workers.get());
         Ok(())
     }
 
@@ -332,6 +355,31 @@ impl<'f> NamesStage<'f> {
             Ok(at) => self.made[at].1 = made,
             Err(at) => self.made.insert(at, (name, made)),
         }
+    }
+}
+
+/// The names stage's route to its dependencies' exports sections (names/scope.rs
+/// [`crate::names::DepExports`]): the request's one reader of records (engine_records.rs
+/// `EngineRecords::exports`), by route [`InPlace`] in every command; the tests' control
+/// ([`crate::engine_memory::with_copying_route`]) takes the counted copying route instead, so
+/// the "copied" count of the in-place route is seen to be a count (rule 78).
+struct ReadExports<'e, 'r> {
+    read: &'e mut EngineRecords<'r>,
+    route: crate::engine_memory::ExportsRoute,
+}
+
+impl<'j, 'r: 'j> crate::names::DepExports<'j, 'r> for ReadExports<'_, 'r> {
+    fn exports(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, input: &Input, krate: &str, _frame: &'j Frame, alloc: blaze_own::Alloc<'j>) -> Result<&'j [u8], ReadError> {
+        let read = match self.route {
+            crate::engine_memory::ExportsRoute::InPlace => self.read.exports::<InPlace>(cx, store, input, alloc)?,
+            #[cfg(test)]
+            crate::engine_memory::ExportsRoute::Copying => self.read.exports::<crate::engine_records::Copying>(cx, store, input, alloc)?,
+        };
+        #[cfg(test)]
+        crate::names::sections::watch(krate, read.payload);
+        #[cfg(not(test))]
+        let _ = krate;
+        Ok(read.exports)
     }
 }
 

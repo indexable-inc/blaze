@@ -40,7 +40,9 @@ use blaze_drive::key::crate_scope_name;
 
 use super::{Names, OUT_DOMAIN, RULE, Resolved, UNRESOLVED, scope_record, sections, slot_of, surface, tell_public, world};
 use crate::CliError;
+use crate::engine_records::ReadError;
 use crate::fetch::FetchEnv;
+use crate::front_load::LoadError;
 use crate::job_texts::JobTexts;
 use crate::store::Store;
 use crate::work::{Did, Made, held_str};
@@ -93,6 +95,32 @@ impl<'j> ScopeRound<'j> {
     /// The round's frame, held until the round's scope has joined.
     pub(crate) fn frame(&self) -> &'j Frame {
         self.frame
+    }
+}
+
+/// How a `CrateScope` job reads each dependency's exports section (rule 78: one seam). The
+/// engine's names stage reads them in place through the request's one reader
+/// (engine_records.rs `EngineRecords::exports`, engine_names.rs), so a wave's frame holds no
+/// dependency's bytes; the old machine ([`CopiedExports`]: work.rs, [`run`]), whose puts are
+/// read back from the store's arena before its commit, copies each into the round's frame.
+/// `krate` names the dependency for the names tests' watch (sections.rs `watch`).
+pub(crate) trait DepExports<'j, 's> {
+    fn exports(&mut self, cx: &Cx, store: &mut dyn Store<'s>, input: &Input, krate: &str, frame: &'j Frame, alloc: Alloc<'j>) -> Result<&'j [u8], ReadError>;
+}
+
+/// The old machine's route: the dependency's record read out of the store into `frame`, its
+/// exports section copied 16-aligned into `alloc` (two copies, held to the round's end).
+pub(crate) struct CopiedExports;
+
+impl<'j, 's> DepExports<'j, 's> for CopiedExports {
+    fn exports(&mut self, cx: &Cx, store: &mut dyn Store<'s>, input: &Input, krate: &str, frame: &'j Frame, alloc: Alloc<'j>) -> Result<&'j [u8], ReadError> {
+        let read = crate::work::payload(cx, store, input, frame).map_err(|error| ReadError::Load(LoadError::Store(error)))?;
+        let parts = sections::sections(read.payload()).map_err(|error| ReadError::Load(LoadError::Sections { name: input.name, error }))?;
+        #[cfg(test)]
+        sections::watch(krate, read.payload());
+        #[cfg(not(test))]
+        let _ = krate;
+        Ok(blaze_scope::resolve::aligned(parts.exports, alloc))
     }
 }
 
@@ -184,12 +212,14 @@ fn have<'t>(names: &Names<'_>, task: &'t Task<'_>, g: usize) -> Option<&'t Input
 
 /// The task's first step, on the main thread: the world made if this command has none yet, the
 /// crate found, its needs checked; a crate not resolved this command gets its job, made in
-/// `round` (its dependencies' exports records read from `store`).
+/// `round` (its dependencies' exports sections read from `store` by `exports`: in place on the
+/// engine's path, [`DepExports`]).
 #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
-pub(crate) fn prepare<'f: 'j, 'j, 'b>(
+pub(crate) fn prepare<'f: 'j, 'j, 'b, 's>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
-    store: &mut dyn Store<'_>,
+    store: &mut dyn Store<'s>,
+    exports: &mut dyn DepExports<'j, 's>,
     names: &mut Option<Names<'f>>,
     lock: Option<&'f Lock<'static>>,
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
@@ -322,17 +352,19 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
             deps.push(bytes);
             continue;
         }
-        let read = crate::work::payload(&cx, store, handed, round.frame)?;
-        let record = match sections::sections(read.payload()) {
-            Ok(parts) => parts.exports,
+        // In place on the engine's path: a borrow of the store's mapping, nothing of it in the
+        // round's frame (engine_records.rs `EngineRecords::exports`); a store that cannot be
+        // read stops the request, as before; a record that does not open fails this crate,
+        // naming the dependency (rule 19).
+        let krate = crates[*g].input.name;
+        let bytes = match exports.exports(&cx, store, handed, krate, round.frame, round.alloc) {
+            Ok(bytes) => bytes,
+            Err(ReadError::Load(LoadError::Store(error))) => return Err(error),
             Err(error) => {
-                let words = bstd::mem::format_in!(held, "crate `{}`: the record of its dependency `{}`: {error}", input.name, crates[*g].input.name);
+                let words = bstd::mem::format_in!(held, "crate `{}`: the record of its dependency `{krate}`: {error}", input.name);
                 return Ok(Prepared::Answer(Did::FailedSaying(refused("a dependency's record"), held_str(words.as_str(), held))));
             }
         };
-        #[cfg(test)]
-        sections::watch(crates[*g].input.name, read.payload());
-        let bytes = blaze_scope::resolve::aligned(record, round.alloc);
         round.exports.push((handed.at, place, bytes));
         deps.push(bytes);
     }
@@ -712,7 +744,7 @@ pub(crate) fn run<'f, 'b>(
     let own = Frame::with_reserve(SCOPE_JOBS, Tag::Other).map_err(|_| CliError::Text { what: "a crate scope's frame could not be reserved" })?;
     let resolution = {
         let mut round = ScopeRound::new(&own, false);
-        match prepare(cx, root, store, names, lock, members, env, macros, task, &mut round, held)? {
+        match prepare(cx, root, store, &mut CopiedExports, names, lock, members, env, macros, task, &mut round, held)? {
             Prepared::Answer(did) => return Ok(did),
             Prepared::Made => None,
             Prepared::Resolve(job) => {

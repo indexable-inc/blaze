@@ -45,7 +45,9 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         },
         fresh,
         heads_from: crate::engine_seeds::HeadsFrom::Frozen,
+        head_units: crate::engine_heads::HeadUnits::Each,
         frame,
+        scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
     }
 }
 
@@ -303,7 +305,7 @@ fn engine_check_rechecks_the_callers_of_an_edited_signature() {
 /// The head reads of every body of the stored answer (engine_heads.rs `Owners::place`): each must
 /// name a cell its head task defines, at the digest it defines, or it is a read no edit moves
 /// (rule 21), returned in the list. The count: head reads judged good.
-fn head_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::String>, u32) {
+pub(super) fn head_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::String>, u32) {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
@@ -349,10 +351,9 @@ fn every_head_read_of_a_body_is_a_head_task_cell() {
 /// `P`, read by `make` and `get`; `area`, called by `top` and `helper`; `other`, called by
 /// `top`. Each edit enters, exactly:
 /// - a fn's parameter type changed: that fn's body (its key moved) and its two callers (their
-///   read of its head moved); three head tasks: `area`'s, whose heads moved, and two identical
-///   (`make`'s and `get`'s, which read a head of the file: see the edits below);
+///   read of its head moved); one head task: `area`'s, whose heads moved (see the edits below);
 /// - a struct gains a field: the two bodies that read its head (and three more by a names cell,
-///   OPEN, below); every head task of the file, `P`'s alone moving;
+///   OPEN, below); `P`'s head task, moving, and its readers', identical;
 /// - a body edit, and a comment inside a body: that body by its key, and the floor of the head
 ///   tasks: one, its item's (keyed by the item's whole text, engine_heads.rs `plan_items`),
 ///   which makes the heads it made (identical), so nothing reads a moved head.
@@ -383,27 +384,37 @@ fn a_moved_head_enters_exactly_its_readers() {
         (s.entered, s.identical)
     };
     let sig = Some(blaze_drive::Kind::Signature);
-    let edit = |what: &str, text: std::string::String, want_bodies: &[(&'static str, Option<blaze_drive::Kind>, u32)], want_heads: (u32, u32)| {
+    // `want_heads` `None`: the caller asserts the head tasks from the answer handed back.
+    let edit = |what: &str, text: std::string::String, want_bodies: &[(&'static str, Option<blaze_drive::Kind>, u32)], want_heads: Option<(u32, u32)>| {
         write(&io, "src/lib.rs", &text);
         let (_, checked) = engine_from(&io, 2, false);
         println!("{what}: {}", entries(&checked));
         assert_eq!(bodies(&checked), want_bodies, "{what}: the bodies entered, by cause: {}", entries(&checked));
-        assert_eq!(heads(&checked), want_heads, "{what}: the head tasks (entered, identical): {}", entries(&checked));
+        if let Some(want_heads) = want_heads {
+            assert_eq!(heads(&checked), want_heads, "{what}: the head tasks (entered, identical): {}", entries(&checked));
+        }
+        checked
     };
     let area_u64 = "pub fn area(_w: u64, h: u32) -> u32 {\n    h\n}";
-    // The head tasks: the edited item's, and the two whose heads read another head of the file
-    // (`make`'s and `get`'s read `P`): a head task reads a head as its file's `HEADS` cell (one
-    // phase earlier; engine_heads.rs `heads_of`), which any signature edit of the file moves;
-    // they make equal heads (identical), so no body is entered for them.
-    edit("a parameter's type changed", lib(p, area_u64, other), &[("key moved", None, 1), ("read moved", sig, 2)], (3, 2));
+    // The head tasks: the edited item's alone. It was (3, 2) before lane BH1, when every head's
+    // key held its file's surface and a head task read another head of the file as the file's
+    // `HEADS` cell, which any signature edit of the file moves (`make`'s and `get`'s read `P`,
+    // entered and identical); a head task now reads a head of its own file by that head's
+    // `Signature` cell (engine_heads.rs `heads_of`), and `area`'s is no head they read.
+    edit("a parameter's type changed", lib(p, area_u64, other), &[("key moved", None, 1), ("read moved", sig, 2)], Some((1, 0)));
     let p2 = "    pub x: u32,\n    pub y: u32,\n";
-    // The field is part of the file's surface: every head task's key holds it (7 entered, 6
-    // identical, `P`'s moving), and the names move too. OPEN (lane EY, for the names lanes):
-    // three bodies that name no `P` are entered by a names cell that moved, all identical; which
-    // cell is not yet found, so it is asserted as seen, not as wanted.
-    edit("a struct gains a field", lib(p2, area_u64, other), &[("read moved", sig, 2), ("read moved", Some(blaze_drive::Kind::CrateScope), 3)], (7, 6));
-    edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 1)], (1, 1));
-    edit("a comment inside a body", lib(p2, area_u64, "    // four\n    4\n"), &[("key moved", None, 1)], (1, 1));
+    // `P`'s head moves (its key: its fields are its head), and `make`'s and `get`'s, which read
+    // it, come out identical. It was (7, 6) when every head's key held the file's surface. The
+    // names move too: OPEN (lane EY, for the names lanes): three bodies that name no `P` are
+    // entered by a names cell that moved, all identical; which cell is not yet found, so it is
+    // asserted as seen, not as wanted, and the head tasks such a cell enters are bounded, not
+    // counted: at least `P`'s and its two readers', at most the file's seven, and only `P`'s
+    // makes new heads.
+    let field = edit("a struct gains a field", lib(p2, area_u64, other), &[("read moved", sig, 2), ("read moved", Some(blaze_drive::Kind::CrateScope), 3)], None);
+    let (entered, identical) = heads(&field);
+    assert!((3..=7).contains(&entered) && identical + 1 == entered, "a struct gains a field: the head tasks (entered, identical) are `P`'s, moved, and readers that come out identical: {}", entries(&field));
+    edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 1)], Some((1, 1)));
+    edit("a comment inside a body", lib(p2, area_u64, "    // four\n    4\n"), &[("key moved", None, 1)], Some((1, 1)));
 }
 
 /// AN EDITION EDIT IS IN THE KEYS (rule 21): `a`'s body names a local `gen`, a name in 2021 and
@@ -432,7 +443,7 @@ fn engine_check_keys_an_outline_and_its_bodies_by_their_edition() {
 }
 
 /// The profile the last request wrote (`.blaze/v2/profile.txt` in the checkout).
-fn profile(io: &Io) -> std::string::String {
+pub(super) fn profile(io: &Io) -> std::string::String {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let mut bytes = bstd::mem::Bytes::new_in(cx.frame(), "the profile");

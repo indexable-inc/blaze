@@ -387,7 +387,7 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
 /// another item's `ConstParam(i)` as this impl's, and made the impl's type parameter `i` a
 /// const as soon as such an item had been built: the result of checking a body depended on
 /// what was checked before it (tests/front2_order.rs in blaze-ladder).
-pub(crate) fn fresh_for<'a, T: Tys>(tys: &mut T, h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
+pub fn fresh_for<'a, T: Tys>(tys: &mut T, h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
     let is_const = const_params(h, alloc)?;
     let mut v = Vec::with_capacity_in(h.generics as usize, alloc);
     for c in is_const {

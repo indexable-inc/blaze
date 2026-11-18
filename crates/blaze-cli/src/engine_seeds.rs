@@ -2,19 +2,29 @@
 //! body of `blaze engine-check` is checked from frozen heads, in one round, lowering no head.
 //!
 //! ONE TABLE A REQUEST ([`RequestTable`]), made on the coordinator after the Heads stage's
-//! merge, before the Bodies phase, and read only while it runs:
-//! - `members`: every head task's cells (engine_heads.rs `heads_of`; a record payload is "want
-//!   bytes, a u32 LE length, then the frozen bytes", one such run a cell), from the task's
-//!   result when it was entered this request, else from its standing record in the store, read
-//!   by the key the stored answer keeps (as engine_heads.rs `complete` reads a crate's tables);
-//! - `stored`: the dependency heads this machine froze before (A3, "once a machine"), each a
-//!   record under [`dependency_key`] (the dependency crate's names record key, the head's cell,
-//!   the freezing tool), listed by the root [`root_name`] and taken only when its crate's names
-//!   record key is today's (valid by its key: nothing of a dependency moves unless its names
-//!   record does).
+//! records are committed, before the Bodies phase, and read by the workers while it runs. It
+//! reads NO head record when made: only each head task's record key (the stored answer's) and
+//! the root's list. Every head is read by the worker whose body asks it, on its first ask,
+//! in place through the store's `Sync` snapshot (blaze-cas plain/snapshot.rs), checked once and
+//! kept as "what was read" in a request-wide map that only inserts:
+//! - a MEMBER's head: the cell of its outline entry's head task (engine_heads.rs `head_cell`, by
+//!   the item's name), found in that task's record (a payload run is "want bytes, the cell, a
+//!   u32 LE length, then the frozen bytes"). A stretch places a want ONE way ([`StretchHeads`]):
+//!   engine_heads.rs `Owners::place` over its own names, the function a body's read of the head
+//!   is placed by (engine_bodies.rs `widen`) and a head task lists its cells by
+//!   (`heads_of_crate`), so the cell a body asks is the cell the task defines for THE BODY'S
+//!   OWN UNIT: a head task freezes once a unit that holds its item, one cell a unit (the cell
+//!   holds the unit's crate prefix, engine_heads.rs `head_cell`; lane RU1), so a reader is
+//!   handed bytes frozen under its own unit's keys, never another's (lane EY's annoyance row
+//!   head-cell-by-checker-key-is-per-unit). A cell whose task froze under other units only is
+//!   refused by path, naming those units (`Lack::OtherUnits`, `SeedError::NotInItsUnit`);
+//! - a DEPENDENCY's head (a crate with no head tasks: core, std, a registry crate): the record
+//!   this machine froze before (A3, "once a machine") under [`dependency_key`] (the dependency
+//!   crate's names record key today, the head's cell, the freezing tool): valid by its key,
+//!   nothing of a dependency moves unless its names record does.
 //!
-//! ON FIRST READ, for a dependency's head (a crate with no head tasks: core, std, a registry
-//! crate; or a member's head the table holds under another unit's keys): the body's worker
+//! ON FIRST READ of a head neither holds (a dependency's never frozen here before; a member's
+//! that no entry covers): the body's worker
 //! freezes it on the spot (front2 tables/seeds.rs `RequestSeed`) and publishes the bytes into
 //! `fresh`, the request-wide map, so no other body freezes it again. The map only ever inserts:
 //! a freeze is a function of its cell and the names (head.rs `freeze_seeded`: the cell's key
@@ -29,22 +39,29 @@
 //! A body's read of a head is unchanged by where its bytes came from (engine_bodies.rs `widen`):
 //! a member's head is its head task's cell, a dependency's its crate's names record whole.
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::alloc::Global;
 
+use blaze_cas::plain::Snapshot;
 use blaze_core::Driver;
-use blaze_drive::{Input, Key, Kind, Name, Tool};
-use blaze_engine::{Planned, Stage, Tools, View};
+use blaze_drive::cells::Cell;
+use blaze_drive::record::Stored;
+use blaze_drive::{Key, Kind, Name, Tool};
+use blaze_engine::{CellId, Planned, Stage, Tools, View};
 use blaze_ids::ContentId;
 use blaze_ladder::front2::heads::Want;
-use blaze_ladder::front2::tables::head::{FrozenHead, KnownHeads, VERSION, WANT_BYTES, want_bytes};
-use blaze_ladder::front2::tables::seeds::{FrozenTable, MOST_CELLS, RequestHeads, SeedError};
+use blaze_ladder::front2::item_shown::ItemShown;
+use blaze_ladder::front2::source::{NamesSource, Records};
+use blaze_ladder::front2::tables::head::{FrozenHead, KnownHeads, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
+use blaze_ladder::front2::tables::seeds::{MOST_CELLS, RequestHeads, SeedError};
+use blaze_own::Alloc;
 use blaze_world::crate_list::{CrateGraph, CrateList};
 use bstd::cx::Cx;
 use bstd::mem::Frame;
 
 use crate::CliError;
-use crate::engine_heads::HeadsStage;
+use crate::engine_heads::{HeadAt, Owners, Subjects};
 use crate::engine_names::NamesStage;
 use crate::store::{CommandStore, Sharing, Store as _};
 
@@ -69,6 +86,10 @@ const ROOT_DOMAIN: &str = "blaze-cli engine dependency heads root 1";
 const FRESH_DOMAIN: &str = "blaze-cli engine heads frozen now 1";
 /// The bytes of a names record key at the front of a dependency head's record.
 const KEY_BYTES: usize = 32;
+/// The bytes of a head task's cell in each run of its payload (engine_heads.rs `heads_of`).
+const CELL_BYTES: usize = 16;
+/// How many member heads frozen now the profile names (the first, by their words' order).
+pub(crate) const MOST_SHOWN: usize = 3;
 
 /// The store key of dependency head `cell`'s record: from the dependency crate's names record
 /// key (`names_at`: its text and what it depends on), the cell's bytes, the frozen form's
@@ -187,29 +208,37 @@ impl SeedTally {
 /// The request's counts of its frozen heads (rule 53): in `Checked` and the profile.
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct SeedCounts {
-    /// Cells from head tasks (the table).
+    /// Head tasks whose records the table reads a member's head from (none read when made).
     pub(crate) table: u32,
-    /// Distinct dependency heads read (by a body or a freeze).
+    /// Distinct member heads taken from their head task's record (read through the snapshot).
+    pub(crate) taken: u32,
+    /// Distinct heads asked that the head tasks' records did not answer (by a body or a freeze).
     pub(crate) read: u32,
-    /// Of those, found in the store.
+    /// Of those, found in the store (a dependency's, frozen by an earlier request).
     pub(crate) found: u32,
     /// Distinct heads frozen now.
     pub(crate) frozen: u32,
     /// Freezes of a cell another worker had frozen already (equal bytes).
     pub(crate) twice: u32,
-    /// Dependency heads taken from the store into the table (read or not).
-    pub(crate) stored: u32,
-    /// Keys the root lists whose record the store no longer holds.
-    pub(crate) missing: u32,
+    /// Keys of dependency heads the root listed when the request began.
+    pub(crate) listed: u32,
+    /// Distinct dependency head records looked up in the store (found or not): only those a
+    /// body asked, never the root's whole list.
+    pub(crate) looked: u32,
     /// Dependency heads frozen now and put as records.
     pub(crate) put: u32,
     /// Keys the root could not list past its cap.
     pub(crate) unlisted: u32,
     /// Heads frozen now and not put, by why.
     pub(crate) not_put: NotPut,
+    /// The first [`MOST_SHOWN`] member heads frozen now (sorted words): the head's path, its
+    /// want's kind and why the head tasks' records did not hold it.
+    pub(crate) member_shown: [Option<&'static str>; MOST_SHOWN],
     /// The digest of every head frozen now, by cell (`fresh_digest`).
     pub(crate) fresh: ContentId,
     pub(crate) bodies: SeedTally,
+    /// What the head tasks entered this request froze, by unit (engine_heads.rs `UnitCounts`).
+    pub(crate) units: crate::engine_heads::UnitCounts,
 }
 
 /// The profile's line of the request's frozen heads.
@@ -218,88 +247,144 @@ pub(crate) fn profile(counts: &SeedCounts, into: &mut blaze_own::String<&Frame>)
     let per = if counts.bodies.seeded == 0 { 0.0 } else { counts.bodies.rounds as f64 / f64::from(counts.bodies.seeded) };
     let _ = writeln!(
         into,
-        "heads: table {} cells from head tasks; dependency heads read {}, found in the store {}, frozen now {}, frozen twice {}; bodies seeded {}, bodies refused at a seed {}, refused at a seed for a constant: {}; {per:.2} rounds a seeded body",
-        counts.table, counts.read, counts.found, counts.frozen, counts.twice, counts.bodies.seeded, counts.bodies.refused, counts.bodies.refused_const
+        "heads: table of {} head tasks; member heads taken from the table: {}; heads not in it read {}, found in the store {}, frozen now {}, frozen twice {}; bodies seeded {}, bodies refused at a seed {}, refused at a seed for a constant: {}; {per:.2} rounds a seeded body",
+        counts.table, counts.taken, counts.read, counts.found, counts.frozen, counts.twice, counts.bodies.seeded, counts.bodies.refused, counts.bodies.refused_const
     );
     let _ = writeln!(
         into,
-        "heads: {} dependency head(s) taken from the store, {} listed but gone, {} put now, {} not listed past the root's cap; frozen now digest {:?}",
-        counts.stored, counts.missing, counts.put, counts.unlisted, counts.fresh
+        "heads: dependency heads listed {}, read {}; {} put now, {} not listed past the root's cap; frozen now digest {:?}",
+        counts.listed, counts.looked, counts.put, counts.unlisted, counts.fresh
     );
-    let _ = writeln!(
+    let _ = write!(
         into,
         "heads: frozen now and not put: {} a member's (the head tasks' table lacked it), {} of no crate of the list, {} of a crate with no names record",
         counts.not_put.member, counts.not_put.unlisted, counts.not_put.no_names
     );
+    if counts.not_put.member > 0 {
+        let _ = write!(into, "; first");
+        for (at, one) in counts.member_shown.iter().flatten().enumerate() {
+            let _ = write!(into, "{} {one}", if at == 0 { "" } else { "," });
+        }
+    }
+    let _ = writeln!(into);
+    crate::engine_heads::unit_profile(&counts.units, into);
+}
+
+/// Why a member's head was not in its head task's record (the profile's words, rule 19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lack {
+    /// Its entry's head task failed this request (its refusal says why).
+    Failed,
+    /// Its entry has no head task with a record (none planned, or its row is gone).
+    NoTask,
+    /// Its head task's record holds no run of that cell.
+    NoCell,
+    /// Its head task froze its heads under these units only, none the reader's (lane RU1,
+    /// engine_heads.rs `head_cell`): a typed refusal, never another unit's bytes.
+    OtherUnits(Units),
+}
+
+impl Lack {
+    fn words(self) -> &'static str {
+        match self {
+            Lack::Failed => "its entry's head task failed",
+            Lack::NoTask => "its entry has no head task record",
+            Lack::NoCell => "its head task's record holds no such cell",
+            Lack::OtherUnits(_) => "its head task froze it under other units than the reader's",
+        }
+    }
+}
+
+/// A member head looked up in its head task's record through the snapshot, once (rule 74).
+#[derive(Clone, Copy, Debug)]
+enum MemberRead {
+    /// Its frozen bytes at `at..at + len` of the record under `key` (checked once, here).
+    Found { key: Key, at: usize, len: usize },
+    Lacked(Lack),
+    /// A record that does not read as its form (the request fails at the merge, rule 3).
+    Bad(&'static str),
+}
+
+/// A dependency head's record looked up through the snapshot, once (rule 74).
+#[derive(Clone, Copy, Debug)]
+enum DependencyRead {
+    /// Under its key, checked: its frozen bytes follow its names key.
+    Found,
+    /// No record under its key: frozen on this ask, put at the merge.
+    Absent,
+    /// A record that does not read as the head its key names (the request fails at the merge).
+    Bad(&'static str),
 }
 
 /// The request's frozen heads (module docs). Read only while the Bodies phase runs, but for
-/// `fresh` and `read`, which only insert.
+/// its maps, which only insert. `Sync`: the snapshot is, and so is every map.
 pub(crate) struct RequestTable {
-    members: FrozenTable<'static>,
-    stored: FrozenTable<'static>,
+    /// The committed store as the Bodies phase began: every head record is read through it.
+    snapshot: Snapshot<Global>,
+    /// Each head task with a record: its name and its record's key, sorted by name.
+    entries: std::vec::Vec<(Name, Key), Global>,
+    /// Each head task that failed this request, sorted.
+    failed: std::vec::Vec<Name, Global>,
+    /// The request's crates (as [`crates_of`] lists them).
+    crates: std::vec::Vec<CrateAt, Global>,
+    tool: Tool,
     /// The keys the root listed when the request began, sorted.
     listed: std::vec::Vec<Key, Global>,
-    missing: u32,
+    /// What was read of the head tasks' records, by member cell.
+    members: blaze_core::SharedMap<CellId, MemberRead, Global>,
+    /// The member cells taken from them.
+    taken: blaze_core::SharedSet<CellId, Global>,
+    /// What was read of the dependency heads' records, by key.
+    dependencies: blaze_core::SharedMap<Key, DependencyRead, Global>,
     fresh: blaze_core::SharedMap<ContentId, Fresh, Global>,
-    /// Every cell outside `members` asked this request: the dependency heads read.
+    /// Every cell asked that no head task's record answered.
     read: blaze_core::SharedSet<ContentId, Global>,
+    /// The member heads frozen now, as the profile says each (path, want kind, why).
+    shown: blaze_core::SharedMap<ContentId, &'static str, Global>,
     twice: AtomicU32,
     heap: &'static blaze_own::Heap,
 }
 
 impl RequestTable {
-    /// The request's table (module docs), on the coordinator: the head tasks' cells, then the
-    /// dependency heads the root lists whose crate's names record is today's.
+    /// The request's table (module docs), on the coordinator, after the Heads stage's records
+    /// are committed: the snapshot, each head task's record key (none of its bytes read), and
+    /// the keys the root lists (none of their records read).
     #[expect(clippy::too_many_arguments, reason = "the stage's edge: each argument one handle of it")]
     pub(crate) fn build<'m, D: Driver, S: Sharing>(
         cx: &Cx,
         store: &mut CommandStore<'m, '_, D, S>,
-        heads: &HeadsStage,
         planned: &[Planned],
         view: View<'_, '_>,
         record: &dyn Fn(Name) -> Option<Key>,
-        crates: &[CrateAt],
+        crates: std::vec::Vec<CrateAt, Global>,
         root: &str,
         tool: Tool,
         heap: &'static blaze_own::Heap,
-        frame: &Frame,
     ) -> Result<RequestTable, CliError> {
-        let cx = cx.span("engine: the request's frozen heads");
-        // 1. The head tasks' cells: this request's results, else the standing records.
-        let mut reads: std::vec::Vec<crate::work::Read<'_>, Global> = std::vec::Vec::new_in(Global);
-        let mut payloads: std::vec::Vec<&[u8], Global> = std::vec::Vec::new_in(Global);
+        let _cx = cx.span("engine: the request's frozen heads");
+        let mut entries: std::vec::Vec<(Name, Key), Global> = std::vec::Vec::new_in(Global);
+        let mut failed: std::vec::Vec<Name, Global> = std::vec::Vec::new_in(Global);
         for one in planned.iter().filter(|one| one.name.kind == Kind::Signature) {
-            if heads.result(one.name).is_some() {
-                continue;
-            }
             let Some(row) = view.row(one.name) else { continue };
             if row.failed {
                 // A failed head task holds no frozen head: a body that reads it fails by that
                 // read (engine_bodies.rs `widen`).
+                failed.push(one.name);
+                continue;
+            }
+            // A head no unit holds under its cfg (engine_heads.rs `no_units_out`): a row with no
+            // finding and no record. It froze nothing, so the table holds nothing of it; any
+            // OTHER row without a record key is the stop below.
+            if row.out == crate::engine_heads::no_units_out(one.name) {
                 continue;
             }
             let Some(at) = record(one.name) else {
-                return Err(CliError::Text { what: "a standing head task's row has no record key (pages.rs `records`; engine_seeds.rs `RequestTable::build`)" });
+                return Err(CliError::Text { what: "a head task's row has no record key (pages.rs `records`; engine_seeds.rs `RequestTable::build`)" });
             };
-            reads.push(crate::work::payload(&cx, &mut *store, &Input { name: one.name, at, out: row.out }, frame)?);
+            entries.push((one.name, at));
         }
-        for one in planned.iter().filter(|one| one.name.kind == Kind::Signature) {
-            if let Some(made) = heads.result(one.name) {
-                payloads.push(&made.payload[..]);
-            }
-        }
-        payloads.extend(reads.iter().map(|read| read.payload()));
-        let mut cells: std::vec::Vec<&[u8], Global> = std::vec::Vec::new_in(Global);
-        for payload in payloads.iter() {
-            cells_of(payload, &mut cells)?;
-        }
-        let members = FrozenTable::from_frozen(cells.iter().copied(), heap.alloc()).map_err(|_| CliError::Text { what: "the head tasks' frozen heads do not make one table: a record does not read, two cells disagree, or past its cap (front2 tables/seeds.rs `FrozenTable::from_frozen`)" })?;
-        // 2. The dependency heads the root lists, each valid by its key: its crate's names
-        //    record key is today's (a dependency's, never a member's).
-        let mut today: std::vec::Vec<Key, Global> = std::vec::Vec::new_in(Global);
-        today.extend(crates.iter().filter(|one| !one.member).filter_map(|one| one.names_at));
-        today.sort_unstable();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        failed.sort_unstable();
         let mut listed: std::vec::Vec<Key, Global> = std::vec::Vec::new_in(Global);
         if let Some(keys) = store.named(root)? {
             if keys.len() % 32 != 0 {
@@ -313,42 +398,137 @@ impl RequestTable {
         }
         listed.sort_unstable();
         listed.dedup();
-        let mut found: std::vec::Vec<&'m [u8], Global> = std::vec::Vec::new_in(Global);
-        let mut missing = 0u32;
-        for key in listed.iter() {
-            let Some(held) = store.get(&cx, *key)? else {
-                missing = missing.saturating_add(1);
-                continue;
-            };
-            let bytes: &'m [u8] = held.bytes;
-            if bytes.len() < KEY_BYTES {
-                return Err(CliError::Text { what: "a dependency head's record is shorter than its names key (engine_seeds.rs `RequestTable::merge`)" });
-            }
-            let mut names_at = [0u8; 32];
-            names_at.copy_from_slice(&bytes[..KEY_BYTES]);
-            let names_at = Key(ContentId(names_at));
-            if today.binary_search(&names_at).is_err() {
-                continue;
-            }
-            let frozen = &bytes[KEY_BYTES..];
-            // Its bytes are the head its key names (rule 21): verified once, here.
-            let want = FrozenHead::read(frozen).map_err(|_| CliError::Text { what: "a dependency head's record does not read as a frozen head (engine_seeds.rs)" })?.want();
-            if dependency_key(names_at, want, tool) != *key {
-                return Err(CliError::Text { what: "a dependency head's record holds another cell than its key names (engine_seeds.rs `dependency_key`)" });
-            }
-            found.push(frozen);
-        }
-        let stored = FrozenTable::from_frozen(found.iter().copied(), heap.alloc()).map_err(|_| CliError::Text { what: "the stored dependency heads do not make one table: two records of one cell disagree, or past its cap (front2 tables/seeds.rs)" })?;
         Ok(RequestTable {
-            members,
-            stored,
+            snapshot: store.snapshot_in(Global)?,
+            entries,
+            failed,
+            crates,
+            tool,
             listed,
-            missing,
+            members: blaze_core::SharedMap::new_in("engine.member heads read from their head tasks' records", Global),
+            taken: blaze_core::SharedSet::new_in("engine.member heads taken", Global),
+            dependencies: blaze_core::SharedMap::new_in("engine.dependency head records read", Global),
             fresh: blaze_core::SharedMap::new_in("engine.frozen heads, made this request", Global),
-            read: blaze_core::SharedSet::new_in("engine.dependency heads read", Global),
+            read: blaze_core::SharedSet::new_in("engine.heads not in the head tasks' records, read", Global),
+            shown: blaze_core::SharedMap::new_in("engine.member heads frozen now, as said", Global),
             twice: AtomicU32::new(0),
             heap,
         })
+    }
+
+    /// Member cell `id`'s frozen bytes, read from its head task's record on the first ask, by a
+    /// reader of unit `unit` (the cell holds it: engine_heads.rs `head_cell`).
+    fn member(&self, id: CellId, unit: [u8; 8]) -> Option<&[u8]> {
+        let read = {
+            let members = self.members.pin();
+            match members.get(&id) {
+                Some(read) => *read,
+                None => {
+                    let read = self.read_member(id, unit);
+                    match members.try_insert(id, read) {
+                        Ok(_) => read,
+                        Err(occupied) => *occupied.current,
+                    }
+                }
+            }
+        };
+        let MemberRead::Found { key, at, len } = read else { return None };
+        let bytes = self.snapshot.get(&blaze_cas::Key(key.0)).ok().flatten()?.get(at..at + len)?;
+        let taken = self.taken.pin();
+        if !taken.contains(&id) {
+            taken.insert(id);
+        }
+        Some(bytes)
+    }
+
+    /// Member cell `id` looked up in its entry's head task's record (module docs), for a reader
+    /// of unit `unit`.
+    fn read_member(&self, id: CellId, unit: [u8; 8]) -> MemberRead {
+        let Ok(at) = self.entries.binary_search_by_key(&id.of, |(name, _)| *name) else {
+            return MemberRead::Lacked(if self.failed.binary_search(&id.of).is_ok() { Lack::Failed } else { Lack::NoTask });
+        };
+        let key = self.entries[at].1;
+        let bytes = match self.snapshot.get(&blaze_cas::Key(key.0)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return MemberRead::Bad("a head task's record the answer names is not in the store's snapshot (engine_seeds.rs `RequestTable::read_member`)"),
+            Err(_) => return MemberRead::Bad("the store's snapshot could not read a head task's record (engine_seeds.rs `RequestTable::read_member`)"),
+        };
+        let payload = match blaze_drive::record::open(bytes) {
+            Ok(Stored::Whole(view)) => view.payload,
+            Ok(Stored::Shape(_)) | Err(_) => return MemberRead::Bad("a head task's record does not read as a whole record (engine_seeds.rs `RequestTable::read_member`)"),
+        };
+        let base = payload.as_ptr() as usize - bytes.as_ptr() as usize;
+        match run_of(payload, id.cell) {
+            Ok(Some((from, len))) => match FrozenHead::read(&payload[from..from + len]) {
+                Ok(_) => MemberRead::Found { key, at: base + from, len },
+                Err(_) => MemberRead::Bad("a head task's frozen head does not read (engine_seeds.rs `RequestTable::read_member`)"),
+            },
+            // No run of the cell: when the task froze under other units only, the reader's
+            // unit is one no run covers (a typed refusal at the publish, `StretchHeads`).
+            Ok(None) => match Units::other_than(payload, unit) {
+                Ok(Some(units)) => MemberRead::Lacked(Lack::OtherUnits(units)),
+                Ok(None) => MemberRead::Lacked(Lack::NoCell),
+                Err(why) => MemberRead::Bad(why),
+            },
+            Err(why) => MemberRead::Bad(why),
+        }
+    }
+
+    /// Why member cell `id` was not taken from the head tasks' records, once it was asked.
+    fn lack_of(&self, id: CellId) -> Option<Lack> {
+        match self.members.pin().get(&id) {
+            Some(MemberRead::Lacked(lack)) => Some(*lack),
+            Some(MemberRead::Found { .. } | MemberRead::Bad(_)) | None => None,
+        }
+    }
+
+    /// Dependency head `cell` of crate `krate` (as a stretch's names give it): its record
+    /// frozen by an earlier request, looked up under its key on the first ask. `None`: no
+    /// record (or its crate is a member's, or has no names record today).
+    fn dependency(&self, cell: Want, krate: blaze_id::CrateItemKey) -> Option<&[u8]> {
+        let at = crate_keyed(&self.crates, krate).filter(|one| !one.member)?;
+        let names_at = at.names_at?;
+        let key = dependency_key(names_at, cell, self.tool);
+        let read = {
+            let dependencies = self.dependencies.pin();
+            match dependencies.get(&key) {
+                Some(read) => *read,
+                None => {
+                    let read = self.read_dependency(key, names_at, cell);
+                    match dependencies.try_insert(key, read) {
+                        Ok(_) => read,
+                        Err(occupied) => *occupied.current,
+                    }
+                }
+            }
+        };
+        match read {
+            DependencyRead::Found => self.snapshot.get(&blaze_cas::Key(key.0)).ok().flatten().and_then(|bytes| bytes.get(KEY_BYTES..)),
+            DependencyRead::Absent | DependencyRead::Bad(_) => None,
+        }
+    }
+
+    /// The record under dependency key `key`, checked once: its names key is `names_at` and its
+    /// bytes are the frozen head of `cell` (rule 21).
+    fn read_dependency(&self, key: Key, names_at: Key, cell: Want) -> DependencyRead {
+        let bytes = match self.snapshot.get(&blaze_cas::Key(key.0)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return DependencyRead::Absent,
+            Err(_) => return DependencyRead::Bad("the store's snapshot could not read a dependency head's record (engine_seeds.rs `RequestTable::read_dependency`)"),
+        };
+        if bytes.len() < KEY_BYTES || bytes[..KEY_BYTES] != names_at.0.0 {
+            return DependencyRead::Bad("a dependency head's record does not begin with the names key its key holds (engine_seeds.rs `dependency_key`)");
+        }
+        match FrozenHead::read(&bytes[KEY_BYTES..]) {
+            Ok(head) if head.want() == cell => DependencyRead::Found,
+            Ok(_) => DependencyRead::Bad("a dependency head's record holds another cell than its key names (engine_seeds.rs `dependency_key`)"),
+            Err(_) => DependencyRead::Bad("a dependency head's record does not read as a frozen head (engine_seeds.rs `RequestTable::read_dependency`)"),
+        }
+    }
+
+    /// Cell `cell`'s bytes frozen this request by any worker.
+    fn fresh_of(&self, cell: Want) -> Option<&[u8]> {
+        self.fresh.pin().get(&cell_key(cell)).map(|one| one.bytes)
     }
 
     /// Cell `cell` asked outside the head tasks' table: one dependency head read.
@@ -375,13 +555,30 @@ impl RequestTable {
         &self,
         cx: &Cx,
         store: &mut CommandStore<'m, '_, D, S>,
-        crates: &[CrateAt],
         root: &str,
-        tool: Tool,
         ledger: &mut crate::engine_store::Ledger,
         bodies: SeedTally,
     ) -> Result<SeedCounts, CliError> {
         let cx = cx.span("engine: the dependency heads frozen now, put");
+        let (crates, tool) = (&self.crates[..], self.tool);
+        // A head record that did not read as its form stops the request here (rule 3): its
+        // bodies were not given it, and nothing is put over it.
+        if let Some(why) = self.members.pin().iter().find_map(|(_, read)| match read {
+            MemberRead::Bad(why) => Some(*why),
+            MemberRead::Found { .. } | MemberRead::Lacked(_) => None,
+        }) {
+            return Err(CliError::Text { what: why });
+        }
+        let mut looked = 0u32;
+        let mut found = 0u32;
+        for (_, read) in self.dependencies.pin().iter() {
+            looked = looked.saturating_add(1);
+            match read {
+                DependencyRead::Found => found = found.saturating_add(1),
+                DependencyRead::Absent => {}
+                DependencyRead::Bad(why) => return Err(CliError::Text { what: *why }),
+            }
+        }
         let fresh = self.fresh.pin();
         let mut puts: std::vec::Vec<(Key, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
         let mut not_put = NotPut::default();
@@ -414,7 +611,10 @@ impl RequestTable {
             store.put(&cx, *key, payload)?;
         }
         let mut unlisted = 0u32;
-        if !puts.is_empty() {
+        // Set again by every request that lists heads, not only one that puts some: a root a
+        // command reaches is renewed (store/roots.rs), so heads every checkout reads never expire
+        // while one reads them (equal keys within a day write nothing: blaze-cas `set_root`).
+        if !puts.is_empty() || !self.listed.is_empty() {
             let mut keys: std::vec::Vec<Key, Global> = std::vec::Vec::with_capacity_in(self.listed.len() + puts.len(), Global);
             keys.extend_from_slice(&self.listed);
             keys.extend(puts.iter().map(|(key, _)| *key));
@@ -427,24 +627,33 @@ impl RequestTable {
             }
             store.pin(root, &keys)?;
         }
-        let read = self.read.pin();
-        let found = self.stored.iter().filter(|(cell, _)| read.contains(&cell_key(*cell))).count();
+        // The member heads frozen now, as said (sorted: rule 25, never by which worker first).
+        let mut shown: std::vec::Vec<&'static str, Global> = std::vec::Vec::new_in(Global);
+        shown.extend(self.shown.pin().iter().map(|(_, words)| *words));
+        shown.sort_unstable();
+        let mut member_shown = [None; MOST_SHOWN];
+        for (slot, words) in member_shown.iter_mut().zip(shown.iter()) {
+            *slot = Some(*words);
+        }
         Ok(SeedCounts {
-            table: u32::try_from(self.members.len()).unwrap_or(u32::MAX),
-            read: u32::try_from(read.len()).unwrap_or(u32::MAX),
-            found: u32::try_from(found).unwrap_or(u32::MAX),
+            table: u32::try_from(self.entries.len()).unwrap_or(u32::MAX),
+            taken: u32::try_from(self.taken.pin().len()).unwrap_or(u32::MAX),
+            read: u32::try_from(self.read.pin().len()).unwrap_or(u32::MAX),
+            found,
             frozen: u32::try_from(fresh.len()).unwrap_or(u32::MAX),
             twice: self.twice.load(Ordering::Relaxed),
-            stored: u32::try_from(self.stored.len()).unwrap_or(u32::MAX),
-            missing: self.missing,
+            listed: u32::try_from(self.listed.len()).unwrap_or(u32::MAX),
+            looked,
             put: u32::try_from(puts.len()).unwrap_or(u32::MAX),
             unlisted,
             not_put,
+            member_shown,
             fresh: fresh_digest(&self.fresh),
             bodies,
+            // The Heads stage's, set by the command after the merge (engine_check.rs).
+            units: crate::engine_heads::UnitCounts::default(),
         })
     }
-
 }
 
 /// The digest of every head frozen this request, each its cell's bytes and its frozen bytes'
@@ -462,38 +671,230 @@ fn fresh_digest(fresh: &blaze_core::SharedMap<ContentId, Fresh, Global>) -> Cont
     h.finish()
 }
 
-/// Each frozen head of one head task's payload ("want bytes, a u32 LE length, then the frozen
-/// bytes", one run a cell: engine_heads.rs `heads_of`) pushed onto `cells`.
-fn cells_of<'p>(payload: &'p [u8], cells: &mut std::vec::Vec<&'p [u8], Global>) -> Result<(), CliError> {
-    let malformed = CliError::Text { what: "a head task's payload is not runs of a cell's want, a length and its frozen bytes (engine_heads.rs `heads_of`)" };
+/// Cell `cell`'s run in one head task's payload ("want bytes, the cell, a u32 LE length, then
+/// the frozen bytes", one run a (unit, cell): engine_heads.rs `heads_of`, `run_items`): where
+/// its frozen bytes start in `payload` and their length.
+fn run_of(payload: &[u8], cell: Cell) -> Result<Option<(usize, usize)>, &'static str> {
+    let mut found = None;
+    each_run(payload, &mut |_, this, from, len| {
+        if found.is_none() && this == &cell.0[..] {
+            found = Some((from, len));
+        }
+    })?;
+    Ok(found)
+}
+
+/// Each run of one head task's payload: its want's bytes, its cell's, where its frozen bytes
+/// start and their length; a payload that is not whole runs is refused.
+fn each_run(payload: &[u8], each: &mut dyn FnMut(&[u8], &[u8], usize, usize)) -> Result<(), &'static str> {
+    const MALFORMED: &str = "a head task's payload is not runs of a cell's want, its cell, a length and its frozen bytes (engine_heads.rs `heads_of`)";
     let mut at = 0usize;
     while at < payload.len() {
-        let len_at = at + WANT_BYTES;
-        let Some(len) = payload.get(len_at..len_at + 4) else { return Err(malformed) };
+        let cell_at = at + WANT_BYTES;
+        let len_at = cell_at + CELL_BYTES;
+        let (Some(want), Some(this), Some(len)) = (payload.get(at..cell_at), payload.get(cell_at..len_at), payload.get(len_at..len_at + 4)) else { return Err(MALFORMED) };
         let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
         let from = len_at + 4;
-        let Some(bytes) = payload.get(from..from + len) else { return Err(malformed) };
-        cells.push(bytes);
+        if payload.get(from..from + len).is_none() {
+            return Err(MALFORMED);
+        }
+        each(want, this, from, len);
         at = from + len;
     }
     Ok(())
 }
 
-impl KnownHeads for RequestTable {
-    fn known(&self, cell: Want) -> Option<&[u8]> {
-        if let Some(bytes) = self.members.bytes_of(cell) {
-            return Some(bytes);
+/// A want's unit: its key's crate prefix (front2 tables/head.rs `want_bytes`, bytes 1 to 8;
+/// engine_heads.rs `head_cell` holds the same bytes).
+fn unit_of(want: Want) -> [u8; 8] {
+    unit_in(&want_bytes(want))
+}
+
+/// The unit of a want's bytes ([`unit_of`]).
+fn unit_in(want: &[u8]) -> [u8; 8] {
+    let mut unit = [0u8; 8];
+    if let Some(bytes) = want.get(1..9) {
+        unit.copy_from_slice(bytes);
+    }
+    unit
+}
+
+/// How many units a refusal names at most ([`Units`]); past it, counted.
+const MOST_UNITS_SAID: usize = 4;
+
+/// The units a head task's record froze its heads under (each run's want's unit), sorted: what
+/// a reader of another unit is told (rule 19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Units {
+    said: [[u8; 8]; MOST_UNITS_SAID],
+    /// How many units, past [`MOST_UNITS_SAID`] too.
+    count: u32,
+}
+
+impl Units {
+    /// The units of `payload`'s runs when they are some and `reader`'s is none of them (a
+    /// reader whose unit the task froze under, but not this cell: `None`, its head's own lack).
+    /// No allocation: a payload's runs come a unit at a time, units in prefix order
+    /// (engine_heads.rs `UnitsMade::take`), so each unit starts where the one before ends.
+    fn other_than(payload: &[u8], reader: [u8; 8]) -> Result<Option<Units>, &'static str> {
+        let mut units = Units { said: [[0u8; 8]; MOST_UNITS_SAID], count: 0 };
+        let mut last: Option<[u8; 8]> = None;
+        let mut theirs = false;
+        each_run(payload, &mut |want, _, _, _| {
+            let unit = unit_in(want);
+            theirs |= unit == reader;
+            if last != Some(unit) {
+                if let Some(slot) = units.said.get_mut(usize::try_from(units.count).unwrap_or(usize::MAX)) {
+                    *slot = unit;
+                }
+                units.count = units.count.saturating_add(1);
+                last = Some(unit);
+            }
+        })?;
+        if units.count == 0 || theirs {
+            return Ok(None);
         }
-        let id = cell_key(cell);
-        self.mark_read(id);
-        if let Some(bytes) = self.stored.bytes_of(cell) {
-            return Some(bytes);
-        }
-        self.fresh.pin().get(&id).map(|one| one.bytes)
+        Ok(Some(units))
+    }
+
+    /// The units named (the first [`MOST_UNITS_SAID`]).
+    fn shown(&self) -> &[[u8; 8]] {
+        &self.said[..usize::try_from(self.count).unwrap_or(usize::MAX).min(MOST_UNITS_SAID)]
     }
 }
 
-impl RequestHeads for RequestTable {
+/// A unit's crate prefix as the words say it: 16 hex digits.
+struct UnitWords([u8; 8]);
+
+impl core::fmt::Display for UnitWords {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0.iter() {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a stretch's names place a want's head ([`StretchHeads::place`]).
+#[derive(Clone, Copy)]
+enum Placed {
+    /// A member crate's head that an outline entry covers: its head task's cell.
+    Member(CellId),
+    /// A member crate's head no entry covers (a macro wrote it): no head task holds it.
+    Unplaced,
+    /// A dependency's head (a crate with no head tasks), or one of no crate the names hold.
+    Dependency,
+}
+
+/// One stretch's view of the request's frozen heads (front2 tables/seeds.rs `RequestHeads`):
+/// a want placed ONE way, by the stretch's own names, the way a body's read of the head is
+/// placed (engine_heads.rs `Owners::place`, engine_bodies.rs `widen`) and a head task names its
+/// cells (`heads_of_crate`, `head_cell`): a member's head is its entry's task's cell, named by
+/// the item's name, never by a key of the reader's unit; a dependency's is its record under
+/// [`dependency_key`]. One worker's (its `Owners` fills on first ask), over the shared table.
+pub(crate) struct StretchHeads<'t, 's, 'n> {
+    table: &'t RequestTable,
+    names: &'n Records<'n>,
+    owners: RefCell<Owners<'s>>,
+    g: Alloc<'static>,
+}
+
+impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
+    /// `subjects`: the member crates' files (engine_heads.rs `Subjects`), as the Bodies stage
+    /// lists them for `widen`.
+    pub(crate) fn new(table: &'t RequestTable, names: &'n Records<'n>, subjects: &'s Subjects, g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
+        StretchHeads { table, names, owners: RefCell::new(Owners::new(subjects)), g }
+    }
+
+    /// Where `want`'s head is, by this stretch's names: the one placing (module docs).
+    fn place(&self, want: Want) -> Placed {
+        match self.owners.borrow_mut().place(self.names, &head_cell_id(want), self.g) {
+            Some(HeadAt::Cell { cell, .. }) => Placed::Member(cell),
+            Some(HeadAt::Unplaced(_)) => Placed::Unplaced,
+            Some(HeadAt::Dependency(_)) | None => Placed::Dependency,
+        }
+    }
+
+    /// The crate `want`'s item is in, as this stretch's names give it.
+    fn krate(&self, want: Want) -> Option<blaze_id::CrateItemKey> {
+        NamesSource::crate_of(self.names, want.key()).and_then(|k| NamesSource::crate_key(self.names, k))
+    }
+
+    /// A member head frozen now, said for the profile: its path, its want's kind, and why no
+    /// head task's record held it (rule 19).
+    fn say_member(&self, cell: Want, why: &'static str) {
+        let shown = ItemShown::of_lib(self.names, cell.key());
+        let words = bstd::mem::format_in!(self.table.heap.alloc(), "`{shown}` ({}: {why})", kind_words(cell));
+        let words: &'static str = core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head (its words are not text)");
+        // The first words kept (not first: another worker's for the same cell, the same words).
+        let _first = self.table.shown.pin().try_insert(cell_key(cell), words).is_ok();
+    }
+
+    /// The refusal's words for a member head its task froze under `units` only, none this
+    /// stretch's (rule 19): its path, its want's kind, the units that froze it and the reader's.
+    fn other_units(&self, cell: Want, units: Units) -> &'static str {
+        use core::fmt::Write as _;
+        let shown = ItemShown::of_lib(self.names, cell.key());
+        let mut words = bstd::mem::format_in!(self.table.heap.alloc(), "the head of `{shown}` ({}) was frozen by its head task under unit(s) ", kind_words(cell));
+        for (at, unit) in units.shown().iter().enumerate() {
+            let _ = write!(words, "{}{}", if at == 0 { "" } else { ", " }, UnitWords(*unit));
+        }
+        let more = units.count.saturating_sub(u32::try_from(units.shown().len()).unwrap_or(u32::MAX));
+        if more > 0 {
+            let _ = write!(words, " and {more} more");
+        }
+        let _ = write!(words, " and not under this body's unit {}: a head is frozen once a unit that holds its item (engine_heads.rs `head_cell`, `run_items`)", UnitWords(unit_of(cell)));
+        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head frozen under other units only (its words are not text)")
+    }
+}
+
+/// A want's kind as the profile says it.
+fn kind_words(cell: Want) -> &'static str {
+    match cell {
+        Want::Head(_) => "Head",
+        Want::Adt(_) => "Adt definition",
+        Want::Impl(_) => "Impl header",
+        Want::Fn(_) => "Fn sig",
+        Want::Members(_) => "trait Members",
+        Want::MemberFn(..) => "impl MemberFn sig",
+    }
+}
+
+impl KnownHeads for StretchHeads<'_, '_, '_> {
+    fn known(&self, cell: Want) -> Option<&[u8]> {
+        let table = self.table;
+        let held = match self.place(cell) {
+            Placed::Member(id) => match table.member(id, unit_of(cell)) {
+                Some(bytes) => return Some(bytes),
+                None => None,
+            },
+            Placed::Dependency => self.krate(cell).and_then(|krate| table.dependency(cell, krate)),
+            Placed::Unplaced => None,
+        };
+        // Not a head task's: a head read outside the table (rule 53: found or frozen, once).
+        table.mark_read(cell_key(cell));
+        held.or_else(|| table.fresh_of(cell))
+    }
+}
+
+impl RequestHeads for StretchHeads<'_, '_, '_> {
+    fn publish(&self, cell: Want, krate: Option<blaze_id::CrateItemKey>, bytes: &[u8]) -> Result<(), SeedError> {
+        match self.place(cell) {
+            // A member's head its task froze under other units only: refused by path, never
+            // taken from another unit nor kept as frozen here (rule 3, rule 19).
+            Placed::Member(id) => match self.table.lack_of(id) {
+                Some(Lack::OtherUnits(units)) => return Err(SeedError::NotInItsUnit { cell, said: self.other_units(cell, units) }),
+                lack => self.say_member(cell, lack.map_or("its head task's record was not read", Lack::words)),
+            },
+            Placed::Unplaced => self.say_member(cell, "no outline entry covers it (a macro wrote it)"),
+            Placed::Dependency => {}
+        }
+        self.table.publish(cell, krate, bytes)
+    }
+}
+
+impl RequestTable {
+    /// `bytes`, frozen now for `cell` by one worker (front2 tables/seeds.rs `RequestHeads`).
     fn publish(&self, cell: Want, krate: Option<blaze_id::CrateItemKey>, bytes: &[u8]) -> Result<(), SeedError> {
         let id = cell_key(cell);
         self.mark_read(id);

@@ -73,6 +73,7 @@
 
 mod adt;
 pub mod atoms;
+mod attr_path;
 mod attr_value;
 mod body;
 mod builtin;
@@ -102,6 +103,7 @@ pub mod seen;
 mod token_record;
 mod tokens;
 
+pub use crate::attr_path::{PathWord, PathWords, path_words, same_path};
 pub use crate::attr_value::{AttrLiteralError, MOST_ATTR_VALUE_DEPTH, attr_literal};
 pub use crate::rules::{CopyPlant, rules_copy_plant, rules_oracle, rules_oracle_counts};
 pub use crate::{

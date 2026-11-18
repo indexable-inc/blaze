@@ -392,6 +392,7 @@ fn why_range(why: &Why) -> Option<Range> {
     match why {
         Why::Need(_) => None,
         Why::Unsupported(_, r)
+        | Why::UnsupportedIn(_, _, r)
         | Why::Program(_, r)
         | Why::Resolve(_, r)
         | Why::NoCheckerType(_, r)

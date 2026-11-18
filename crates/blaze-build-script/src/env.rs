@@ -37,7 +37,7 @@
 use blaze_expand::seen::SeenRoot;
 use blaze_ids::Hasher;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
-use blaze_unit_graph::{CfgAtom, Text};
+use blaze_unit_graph::{CfgAtom, PackageMetaVars, Text};
 
 /// The manifest's package facts a script is told (`CARGO_PKG_*`); an absent value is `""`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,15 +45,10 @@ pub struct PackageFacts<'s> {
     pub name: &'s str,
     /// The full version: `2.1.2+zstd.1.5.7`.
     pub version: &'s str,
-    /// Already joined by `:`, as Cargo joins them.
-    pub authors: &'s str,
-    pub description: &'s str,
-    pub homepage: &'s str,
-    pub repository: &'s str,
-    pub license: &'s str,
-    pub license_file: &'s str,
-    pub rust_version: &'s str,
-    pub readme: &'s str,
+    /// The `[package]` metadata (`CARGO_PKG_AUTHORS`, ..), from the one table (blaze-manifest
+    /// layout meta.rs, carried as `UnitGraph::meta`): an unstated key `""` as cargo sets it.
+    /// `None`: the graph does not carry it, and the script is told none of those names.
+    pub meta: Option<PackageMetaVars<'s>>,
     pub links: Option<&'s str>,
 }
 
@@ -289,16 +284,13 @@ pub fn env<'a>(given: &Given<'_, '_>, alloc: Alloc<'a>) -> Env<'a> {
         ("CARGO_PKG_VERSION_MINOR", minor),
         ("CARGO_PKG_VERSION_PATCH", patch),
         ("CARGO_PKG_VERSION_PRE", pre),
-        ("CARGO_PKG_AUTHORS", p.authors),
-        ("CARGO_PKG_DESCRIPTION", p.description),
-        ("CARGO_PKG_HOMEPAGE", p.homepage),
-        ("CARGO_PKG_REPOSITORY", p.repository),
-        ("CARGO_PKG_LICENSE", p.license),
-        ("CARGO_PKG_LICENSE_FILE", p.license_file),
-        ("CARGO_PKG_RUST_VERSION", p.rust_version),
-        ("CARGO_PKG_README", p.readme),
     ] {
         set(named(name), value);
+    }
+    if let Some(meta) = p.meta {
+        for (name, value) in meta.pairs() {
+            set(named(name), value);
+        }
     }
 
     for dep in given.deps {

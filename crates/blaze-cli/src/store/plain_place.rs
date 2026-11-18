@@ -107,15 +107,18 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts) -> PlainC
         machine: Vec::new_in(Global),
         writes: settings.writes(),
         reads: settings.reads(),
-        // Everything, until every record a later command reads by key is reached from a root
-        // (store/roots.rs). The code store's entries and pointers and the start list are now
-        // (the program root, through one index record: store/reach_tests.rs). Still not: the
-        // drive's answer graph under the sealed last answer (`set_last` roots only the sealed
-        // record; its `cert` and page-table `root`, the pages and each row's `at` record are
-        // one more level each), the `run_ids` and `run_names` tables keyed by the certificate,
-        // and std's code under a toolchain root (a `CodeKey` does not say its crate). A reach
-        // sweep would let those go after each command. Then `Reached`, which keeps what the
-        // roots reach and what a running command's lease keeps.
+        // Everything, until the switch to the engine path (plan row D5) turns the sweep on:
+        // `Reached`, which keeps what the roots reach and what a running command's lease keeps.
+        // On the engine path every record a later command reads by key is reached now
+        // (store/roots.rs, the census): the program root (code entries, pointers, the start list,
+        // the `run_ids` and `run_names` tables of its certificate), the toolchain root (std's
+        // code, std's names records and their expansion records), the answer's `.pages` root
+        // (every standing row's record, and each names record's expansion records through the
+        // index beside it), the dependency-heads root and the rows-form answer's roots. The old
+        // drive answer graph under the sealed last answer (`set_last` roots only the sealed
+        // record, not its `cert`, page table, pages or rows' records) is old-path work, not
+        // rooted by decision: it goes with the old path, and a sweep before the switch would
+        // drop it after each command.
         liveness: Liveness::Everything,
     }
 }
@@ -239,9 +242,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// workspace crate's local one share it; else put in the namespace `all_names_public` (its
     /// owner's) says. Other bytes under `key` are refused (rule 21).
     pub fn put_record(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8]) -> Result<blaze_keyed::store::Put, PlaceError> {
-        if let Some(held) = self.lent.get(&CasKey(key.0))?
-            && held.bytes == bytes
-        {
+        // Asked by comparison, never by a get: a get of this command's own put keeps its arena
+        // chunk, and every record put beside it, out of place after the commit (blaze-cas
+        // lent.rs `holds`). An expansion record two units of one wave both put did that to
+        // the names records beside it (clap, tempo, 2026-11-17).
+        if self.lent.holds(&CasKey(key.0), bytes)? {
             return Ok(blaze_keyed::store::Put::Same);
         }
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
@@ -271,6 +276,68 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         let mut cas = Vec::with_capacity_in(keys.len(), Global);
         cas.extend(keys.iter().map(|key| CasKey(key.0)));
         Ok(Rooted::new(self.lent.root_for(name, &cas, ROOT_LIFE_NS)?))
+    }
+
+    /// [`PlainPlace::pin`] through index records: the root `name` names one index of `keys`
+    /// and the index filed beside each of `owners` that this store holds ([`PlainPlace::beside`]),
+    /// so reach keeps `keys` and every record an owner was put with (a names record's expansion
+    /// records: engine_store.rs `put_all`), with no read of the owners. An owner with no index
+    /// beside it was put with none.
+    pub(crate) fn pin_through(&self, name: &str, keys: &[Key], owners: &[Key]) -> Result<Rooted<Answer>, PlaceError> {
+        if self.plant == PlacePlant::ForgetsPin {
+            return Ok(Rooted::new(CasKey(blaze_ids::ContentId([0; 32]))));
+        }
+        let mut cas = Vec::with_capacity_in(keys.len(), Global);
+        cas.extend(keys.iter().map(|key| CasKey(key.0)));
+        let mut indexes = Vec::with_capacity_in(owners.len() + 1, Global);
+        indexes.push(self.lent.index(&cas)?);
+        for owner in owners {
+            if let Some(beside) = self.beside(*owner)? {
+                indexes.push(beside);
+            }
+        }
+        Ok(Rooted::new(self.lent.root_through(name, &indexes, ROOT_LIFE_NS)?))
+    }
+
+    /// The unexpired root `name` set again, naming what it names, for `life_ns` from the next
+    /// commit: a command that answered from what the root reaches without writing it again
+    /// (`engine-check` whose certificate stood) still renews it, so a checkout built every day
+    /// never sees its answer expire. Answers whether there was such a root (an expired one is
+    /// never named again: a slice may have swept what it named). Equal bytes within a day of the
+    /// last renewal write nothing (blaze-cas `set_root`).
+    pub(crate) fn renew(&self, name: &str, life_ns: u64) -> Result<bool, PlaceError> {
+        let Some(key) = self.lent.root_named(name) else { return Ok(false) };
+        let Some(held) = self.lent.get(&key)? else { return Ok(false) };
+        let indexed = held.tag == blaze_cas::plain::INDEXED_ROOT_TAG;
+        let mut named: Vec<CasKey, Global> = Vec::with_capacity_in(held.bytes.len() / 32, Global);
+        named.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
+        if indexed {
+            self.lent.root_through(name, &named, life_ns)?;
+        } else {
+            self.lent.root_for(name, &named, life_ns)?;
+        }
+        Ok(true)
+    }
+
+    /// The index of the records `owner` was put with, filed beside it (blaze-cas
+    /// `Plain::index_beside`): put with its owner, before any root names it.
+    pub(crate) fn index_beside(&self, owner: Key, keys: &[Key]) -> Result<CasKey, PlaceError> {
+        let mut cas = Vec::with_capacity_in(keys.len(), Global);
+        cas.extend(keys.iter().map(|key| CasKey(key.0)));
+        Ok(self.lent.index_beside(CasKey(owner.0), &cas)?)
+    }
+
+    /// The index filed beside `owner` when this store holds one (an index record there, by
+    /// its tag): `None` when `owner` was put with no records beside it.
+    pub(crate) fn beside(&self, owner: Key) -> Result<Option<CasKey>, PlaceError> {
+        let key = blaze_cas::plain::beside_key(CasKey(owner.0));
+        Ok(self.lent.get(&key)?.filter(|held| held.tag == blaze_cas::plain::INDEX_TAG).map(|_| key))
+    }
+
+    /// The store's owner, for a class root of store/roots.rs written beside the engine's
+    /// (the toolchain's, [`super::roots::keep_toolchain`]).
+    pub(crate) fn lent(&self) -> &'m Lent<D, Global> {
+        self.lent
     }
 
     /// Every segment named mapped, and every one parked checked: asked once, when the

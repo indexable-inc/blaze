@@ -673,6 +673,10 @@ pub fn lower_signature<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    // A text that spells `$crate` is read from its words, `$crate` one of them ([`spelled_words`]).
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        return lower_signature_words(text, w.item_words(), edition, cfg, alloc);
+    }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
@@ -680,6 +684,94 @@ pub fn lower_signature<'a, 't>(
     let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
     feed::feed(&mut m, &lexed, &output, 0);
     m.finish()
+}
+
+/// An item text's parser words when the text SPELLS `$crate` ([`spelled_words`]): the words, then
+/// [`parser::Tokens::PAD`] `EOF` words, and each word's range in the text.
+struct SpelledWords<'a> {
+    words: AVec<'a, u32>,
+    ranges: AVec<'a, Range>,
+}
+
+impl SpelledWords<'_> {
+    fn item_words(&self) -> ItemWords<'_> {
+        ItemWords { words: &self.words, ranges: &self.ranges }
+    }
+}
+
+/// The parser's words of `text` when it spells `$crate`, `$crate` ONE word (a path root, as the
+/// expander writes it: [`ItemWords`]), each word's range in `text`; `None` when `text` spells no
+/// `$crate` (the parser's lexer reads it as written, the common case).
+///
+/// Who writes such a text: a body's lowering copies an item a macro call in the body wrote out
+/// of the expansion's words (blaze-ladder front2 locals.rs `keep`, `frame.alloc_str(view.text_at
+/// (..))`), and those words spell `$crate` (blaze-expand `body_words`; a module-level rendering
+/// writes `crate` with a root mark instead). Lexed again by the parser's lexer, `$crate` is `$`
+/// and `crate`, and a path `$crate::x` is no path: std's `thread_local_inner!` writes, inside a
+/// closure of a const block of `OUTPUT_CAPTURE`'s initializer, `#[thread_local] static
+/// __RUST_STD_INTERNAL_VAL: $crate::thread::local_impl::EagerStorage<..> = $crate::..::new(..);`,
+/// whose `$` stopped the type, so the `=` was in an error node, not the static's own: the static
+/// had "no initializer" (`sig::HAS_BODY` unset) and std's hello world stopped at "a fn or static
+/// declared in a body with no body" (g204119; the copy is 219 bytes, the stop's range).
+///
+/// A `$` right before `crate` (no byte between) is folded into one `$crate` identifier token,
+/// then the tokens are made words as an expansion's are (blaze-expand `parser_words`). A text
+/// blaze-expand's lexer refuses (an unterminated literal) is `None` too: the parser's lexer then
+/// reads it, and its error tokens are the parse's, exactly as for any text that does not lex.
+fn spelled_words<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Option<SpelledWords<'a>> {
+    use blaze_expand::{Raw, TokenKind, TokenStream};
+    if !text.contains("$crate") {
+        return None;
+    }
+    let lexed = blaze_expand::lex(text, edition, alloc).ok()?;
+    let places = blaze_expand::origin_column::input_places(text, blaze_expand::origin_column::InputShape::Whole, edition, alloc).ok()?;
+    let tokens = lexed.tokens();
+    if places.len() != tokens.len() {
+        return None;
+    }
+    let mut folded = TokenStream::new_in(alloc);
+    // Each folded token's bytes in `text`.
+    let mut spans: AVec<'a, (u32, u32)> = AVec::with_capacity_in(tokens.len(), alloc);
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if let TokenKind::Punct { char: '$', .. } = t.kind
+            && let Some(next) = tokens.get(i + 1)
+            && let TokenKind::Ident { raw: Raw::No, spacing } = next.kind
+            && lexed.text_of(next) == "crate"
+            && places[i].1 == places[i + 1].0
+        {
+            folded.push(TokenKind::Ident { raw: Raw::No, spacing }, "$crate", t.ctx).ok()?;
+            spans.push((places[i].0, places[i + 1].1));
+            i += 2;
+            continue;
+        }
+        folded.push(t.kind, lexed.text_of(&t), t.ctx).ok()?;
+        spans.push(places[i]);
+        i += 1;
+    }
+    let pw = blaze_expand::parser_words(&folded, alloc);
+    let n = pw.words.len().saturating_sub(parser::Tokens::PAD);
+    // Word `w`'s range: from the first token that leads to it (a lifetime's `'` makes no word of
+    // its own: its name's word starts at the `'`) to the end of the token that made it.
+    let mut ranges: AVec<'a, Range> = AVec::with_capacity_in(n, alloc);
+    let mut pending: Option<u32> = None;
+    for (t, &(start, end)) in spans.iter().enumerate() {
+        let (at, next) = (pw.word_at[t], pw.word_at[t + 1]);
+        if next == at + 1 {
+            ranges.push(Range::new(pending.take().unwrap_or(start), end));
+        } else if next == at {
+            pending = pending.or(Some(start));
+        } else {
+            // A token of more than one word: none of a lexed text's tokens is (an invisible
+            // group's, a fragment's are an expansion's only).
+            return None;
+        }
+    }
+    if ranges.len() != n {
+        return None;
+    }
+    Some(SpelledWords { words: pw.words, ranges })
 }
 
 /// Lowers one item's body: a fn's block, or a const's or static's value. An item with none
@@ -695,6 +787,13 @@ pub fn lower_body<'a, 't>(
     values: &mut dyn ValueNames,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    // A text that spells `$crate`: from its words ([`spelled_words`]).
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(&w.words, false));
+        let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+        feed::feed_words(&mut m, &output, &w.ranges, None);
+        return m.finish();
+    }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
@@ -716,6 +815,10 @@ pub fn lower_body_expanding<'a, 't>(
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    // A text that spells `$crate`: from its words ([`spelled_words`]).
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        return lower_body_words_expanding(text, w.item_words(), edition, cfg, values, expand, alloc);
+    }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
@@ -739,6 +842,17 @@ pub fn lower_body_expanding_marked<'a, 't>(
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
     let text = marks.text();
+    // A copy of a body expansion's item spells `$crate` (blaze-ladder front2 locals.rs): read
+    // from its words, `$crate` one of them, its mark at the `$` ([`spelled_words`];
+    // `mark_site::column_of_copy` starts the `$crate` row there).
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(&w.words, false));
+        let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+        m.mark_item(marks);
+        expand.begin_body();
+        feed::feed_words(&mut m, &output, &w.ranges, Some(expand));
+        return m.finish();
+    }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);

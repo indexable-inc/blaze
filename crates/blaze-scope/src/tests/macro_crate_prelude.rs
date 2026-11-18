@@ -92,7 +92,7 @@ fn graph() -> UnitGraph<'static> {
     units.push(unit(1, "pm", UnitKind::ProcMacro, true, &[]));
     units.push(unit(1, "pm", UnitKind::Test { bin: None }, false, &[]));
     units.push(unit(0, "app", UnitKind::Test { bin: None }, false, &[("pm", 1)]));
-    UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V3 }
+    UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V3, meta: AVec::new_in(a()) }
 }
 
 struct Texts<'c> {

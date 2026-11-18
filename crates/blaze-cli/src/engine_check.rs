@@ -202,7 +202,18 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
     let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
     shown.each = flags.each;
     phases.mark_in("open checkout", frame);
-    let opts = Opts { tools, workers, toolchain: blaze_toolchain::PINNED, heap, place, fresh: false, heads_from: crate::engine_seeds::HeadsFrom::Frozen, frame };
+    let opts = Opts {
+        tools,
+        workers,
+        toolchain: blaze_toolchain::PINNED,
+        heap,
+        place,
+        fresh: false,
+        heads_from: crate::engine_seeds::HeadsFrom::Frozen,
+        head_units: crate::engine_heads::HeadUnits::Each,
+        frame,
+        scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
+    };
     let err = io.need_err()?;
     match why {
         None => Ok(check(cx, io, &root, opts, &mut shown, phases, out, &err)?.status),
@@ -242,10 +253,16 @@ pub(crate) struct Opts<'f> {
     /// Where the bodies take their heads from (engine_seeds.rs `HeadsFrom`): the command's is
     /// `Frozen`; a test sets `Lowered` to compare the two (rule 78).
     pub(crate) heads_from: crate::engine_seeds::HeadsFrom,
+    /// Under which units a head task freezes (engine_heads.rs `HeadUnits`): the command's is
+    /// `Each`; a test plants one unit alone (rule 23).
+    pub(crate) head_units: crate::engine_heads::HeadUnits,
     /// The request's frame (its caller's, at most [`REQUEST_FRAME`]): every stage's lists and
     /// records whose size follows the project (crates, files, bodies, findings, environments,
     /// labels) are in it, never in the command's fixed frame.
     pub(crate) frame: &'f Frame,
+    /// How a body's names reads are kept (engine_scope_reads.rs, rule 78): `Whole` until
+    /// `Cells` is admitted on the acceptance projects.
+    pub(crate) scope_reads: crate::engine_scope_reads::ScopeReadsAs,
 }
 
 /// The most one request's frame takes: its blocks are taken as it is used (blaze-mem
@@ -315,7 +332,7 @@ pub(crate) struct Checked {
 /// `err`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out) -> Result<Checked, CliError> {
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, frame } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, frame, scope_reads } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -391,11 +408,14 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             }
             phases.mark_in("answer printed (the certificate)", frame);
             let status = status_of(&tally, 0, shown, coverage.is_some());
+            // Read through, so renewed (store/roots.rs, the census).
+            let pages = bstd::mem::format_in!(frame, "{}.pages", answer_root.as_str());
+            store.renew(&[answer_root.as_str(), pages.as_str(), crate::engine_seeds::root_name(&tools, frame).as_str()], toolchain)?;
             crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
             drop(store);
-            crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
+            let cleanup = crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
             phases.mark_in("store committed", frame);
-            let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written\n{sweep_counts}\n{phases}");
+            let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written but the roots renewed\n{sweep_counts}\n{cleanup}\n{phases}");
             let file = root.create(cx, &Path::new(print::PROFILE)?)?;
             file.append(cx, text.as_bytes(), bstd::fs::Durable::No)?;
             file.close(cx, bstd::fs::Durable::No)?;
@@ -501,6 +521,9 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let mut scripts = ScriptsStage::new(frame);
     if let Some(stage) = &names {
         planned.extend(scripts.plan(stage, &discovered, tools, &env, alloc, frame)?);
+        // The build scripts' reads of the checkout, one `Given` cell a leaf row (engine_script_reads.rs).
+        let no_reads = Rows::new_in(frame);
+        planned.extend(scripts.plan_reads(followed_kept.as_ref().map_or(&no_reads, |followed: &sweep::Followed<'_>| &followed.now), alloc));
         planned.extend(stage.plan(alloc, frame)?);
         // Each crate's impl tables, with its names task's file (engine_heads.rs).
         planned.extend(crate::engine_heads::plan(stage, alloc)?);
@@ -515,8 +538,9 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     // The token lints (engine_lints.rs): one task a lint unit of each member's outline.
     planned.extend(crate::engine_lints::plan(&outlined, &linting.rules, alloc));
     let mut lints = crate::engine_lints::LintsStage::new(linting.rules);
-    let mut bodies = crate::engine_bodies::BodiesStage::new();
-    let mut heads = crate::engine_heads::HeadsStage::new();
+    let mut bodies = crate::engine_bodies::BodiesStage::new(scope_reads);
+    let mut heads = crate::engine_heads::HeadsStage::new(scope_reads);
+    heads.freeze = head_units;
     let graph = discovered.get(Name::unit_graph()).and_then(|one| one.made.as_ref().ok().map(|record| blaze_drive::Input { name: one.name, at: tools.key(one.name, &one.source), out: record.out }));
     // Each file once in the edit, with every task it plans (its outline and its bodies): the
     // engine takes a file's entry as all its tasks, so a second entry would drop the first's.
@@ -540,6 +564,8 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     for (name, row) in start.rows.iter() {
         let made = match (row.failed, row.phase.stage) {
             (true, _) | (false, Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies | Stage::Lints) => None,
+            // A build script's read of the checkout: a cell of today's answer, no record.
+            (false, Stage::Scripts) if name.kind == Kind::Given => None,
             (false, Stage::Names | Stage::Scripts) => {
                 // A row with no record key: the stored answer was written without one (rule 3).
                 let key = *records.get(name).ok_or(CliError::Text { what: "a stored row of the names or scripts stage has no record key (pages.rs `records`; engine_check.rs `check`)" })?;
@@ -612,7 +638,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 }
             }
             Stage::Names => match names.as_mut() {
-                Some(stage) => stage.run_phase(cx, &mut store, &handles, &entered, &mut buffers[0], &mut times, alloc, frame)?,
+                Some(stage) => stage.run_phase(cx, &mut store, &mut read, &handles, &entered, &mut buffers[0], &mut times, alloc, frame)?,
                 None => buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
             },
             Stage::Bodies => {
@@ -631,18 +657,17 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                     (crate::engine_seeds::HeadsFrom::Frozen, Some(stage), Some(graph)) => match bodies.kept.list(cx, &mut store, &graph, frame)? {
                         Some(list) => {
                             let crates = crate::engine_seeds::crates_of(&list, stage);
-                            let table = crate::engine_seeds::RequestTable::build(cx, &mut store, &heads, &planned, engine.view(), &|name| records.get(&name).copied(), &crates, &seed_root, seed_tool, heap, frame)?;
-                            Some((table, crates))
+                            Some(crate::engine_seeds::RequestTable::build(cx, &mut store, &planned, engine.view(), &|name| records.get(&name).copied(), crates, &seed_root, seed_tool, heap)?)
                         }
                         // No crate list: no body is checked, each says why (engine_bodies.rs `groups`).
                         None => None,
                     },
                     _ => None,
                 };
-                bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame, request_heads.as_ref().map(|(table, _)| table))?;
+                bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame, request_heads.as_ref())?;
                 // The dependency heads frozen now, put sorted by key and listed by the root.
-                if let Some((table, crates)) = &request_heads {
-                    seed_counts = table.merge(cx, &mut store, crates, &seed_root, seed_tool, &mut ledger, bodies.seeds)?;
+                if let Some(table) = &request_heads {
+                    seed_counts = table.merge(cx, &mut store, &seed_root, &mut ledger, bodies.seeds)?;
                 } else {
                     seed_counts.bodies = bodies.seeds;
                 }
@@ -794,11 +819,16 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     // A row with findings that stands and whose block the last record does not hold (a bug of
     // the write): counted and said, never a quiet pass (rule 3).
     let mut unprinted = 0u32;
+    // The first such task (by name), so the note names one (rule 19).
+    let mut first_unprinted: Option<Name> = None;
     for (name, _) in finished.answer.prints(&Everything, erased.handle()).iter() {
         if !entered_now.contains(name) {
             match last_lines.as_ref().and_then(|last| last.block(*name)) {
                 Some(block) => lines.keep(*name, block),
-                None => unprinted += 1,
+                None => {
+                    unprinted += 1;
+                    first_unprinted.get_or_insert(*name);
+                }
             }
             continue;
         }
@@ -825,6 +855,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             };
             let Some(one) = one else {
                 unprinted += 1;
+                first_unprinted.get_or_insert(*name);
                 continue;
             };
             match &one.made {
@@ -858,6 +889,8 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             }
         }
     }
+    // The plan's notes (a file no unit holds), no task's: made now, or kept (engine_body_plan.rs).
+    bodies.plan_lines(&outlined, last_lines.as_ref(), &mut lines);
     let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;
     crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
     let unchecked = tally.unchecked;
@@ -865,9 +898,16 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         print::note(cx, bstd::mem::format_in!(frame, "{} body(ies) in files no member crate's records hold were not checked (engine_bodies.rs)", bodies.ownerless).as_str(), shown, frame, out)?;
     }
     if unprinted > 0 {
+        // The first by its kind and its file's path (the row's file: an outline's name).
+        let first = first_unprinted.map(|name| {
+            let file = finished.answer.rows.get(&name).map(|row| row.file);
+            let path = file.and_then(|file| outlined.binary_search_by(|one| one.name.cmp(&file)).ok()).map_or("?", |at| core::str::from_utf8(&outlined[at].path).unwrap_or("?"));
+            (name.kind, path)
+        });
+        let (kind, path) = first.unwrap_or((Kind::BodyCheck, "?"));
         print::note(
             cx,
-            bstd::mem::format_in!(frame, "{unprinted} task(s) with findings stand from the stored answer, and the last request's lines record holds no block of theirs (engine_check.rs `check`, engine_lines.rs): they are not printed here").as_str(),
+            bstd::mem::format_in!(frame, "{unprinted} task(s) with findings, or failed, have no block in the lines record (engine_check.rs `check`, engine_lines.rs: no printer writes their kind, or the last request's record lacks it): they are not printed here; first: a {kind:?} task of `{path}`").as_str(),
             shown,
             frame,
             out,
@@ -891,25 +931,32 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let status = status_of(&tally, unprinted, shown, coverage.is_some());
     // The answer stored, its pointer written last, all in the store's one commit after it.
     let report = finished.report;
+    // The leaf rows of the scripts' reads a row of the answer still reads (engine_script_reads.rs).
+    scripts.script_rows(followed_kept.as_ref().map(|followed| &followed.now), |name| finished.answer.rows.contains_key(&name), &mut rows);
     let kept_answer = blaze_engine::pages::Kept::after(causes, finished.answer, &finished.causes, records);
     // Whether every line printed beyond the closing one and its coverage is in the lines record,
     // or the next certificate cannot stand (it prints that record alone).
     let replayable = unprinted == 0 && bodies.ownerless == 0;
     let printed = crate::engine_answer::Printed { names: names.is_some(), bodies_whole, replayable };
     let (lines_key, lines_bytes) = lines.record();
-    let saved = crate::engine_answer::save(cx, &mut store, &answer_root, &kept_answer, printed, (lines_key, &lines_bytes), last_root.as_ref(), &rows, &journal, alloc, frame)?;
+    let saved = crate::engine_answer::save(cx, &mut store, &answer_root, toolchain, &kept_answer, printed, (lines_key, &lines_bytes), last_root.as_ref(), &rows, &journal, alloc, frame)?;
     phases.mark_in("answer stored", frame);
     // The store's one commit, after the answer, as `check`'s (main.rs).
     crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
     // Nothing read in place outlives the store's borrow of its `Lent` (engine_records.rs).
     drop(read);
     drop(store);
-    crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
+    // The whole cleanup line: this profile is written after the commit (store.rs).
+    let cleanup = crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
     phases.mark_in("store committed", frame);
     let because = entered_because(&finished.causes, alloc);
-    let mut text = profile_text(&ran, &report, &because, &outlined, phases, frame);
+    let mut text = profile_text(&ran, &report, &because, &finished.causes, &outlined, phases, frame);
     bodies.profile(&outlined, workers, &mut text);
     lints.profile(&mut text);
+    scripts.profile(&mut text);
+    crate::engine_memory::profile(&ledger, names.as_ref(), &mut text);
+    // The head tasks' freezes by unit (engine_heads.rs `UnitCounts`), said beside the table's.
+    seed_counts.units = heads.units;
     crate::engine_seeds::profile(&seed_counts, &mut text);
     // A task by what it is about: a file's path, a crate's name, a script's crate, a body's item.
     let world = names.as_ref().and_then(|stage| stage.names.as_ref());
@@ -933,6 +980,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         let _ = writeln!(text, "stored answer: {from}; written: {} record(s) put, {} page(s), {} bytes", saved.puts, saved.pages, saved.bytes);
         let _ = writeln!(text, "files: {} outline(s) read back from the store (file not read), {} outlined (file read), {} probed by the planner", file_counts.read_back, file_counts.outlined, file_counts.probed);
         let _ = writeln!(text, "{sweep_counts}");
+        let _ = writeln!(text, "{cleanup}");
     }
     // Written in place, never synced, as `check`'s profile (print.rs `profile`).
     let file = root.create(cx, &Path::new(print::PROFILE)?)?;
@@ -973,6 +1021,9 @@ pub(crate) struct Because {
     pub(crate) stage: Stage,
     pub(crate) cause: &'static str,
     pub(crate) definer: Option<Name>,
+    /// The kind of the moved cell (engine_scope_reads.rs `CellKind`; a read moved; none for
+    /// the other causes): `whole record` names a coarse read.
+    pub(crate) cell: Option<crate::engine_scope_reads::CellKind>,
 }
 
 /// How many tasks each [`Because`] entered, the most first, then by the group (rule 25: the
@@ -980,11 +1031,7 @@ pub(crate) struct Because {
 fn entered_because<'a>(causes: &[blaze_engine::Entered], alloc: SharedAlloc<'a>) -> SVec<'a, (Because, u32)> {
     let mut groups: SMap<'_, Because, u32> = SMap::new_in(alloc);
     for one in causes.iter() {
-        let definer = match one.cause {
-            blaze_engine::Cause::ReadMoved { read, .. } => Some(read.of),
-            _ => None,
-        };
-        *groups.entry(Because { stage: one.phase.stage, cause: one.cause.kind(), definer }).or_insert(0) += 1;
+        *groups.entry(because_of(one)).or_insert(0) += 1;
     }
     let mut sorted: SVec<'a, (Because, u32)> = SVec::new_in(alloc);
     sorted.extend(groups.iter().map(|(group, count)| (*group, *count)));
@@ -992,13 +1039,27 @@ fn entered_because<'a>(causes: &[blaze_engine::Entered], alloc: SharedAlloc<'a>)
     sorted
 }
 
+/// The group one entered task falls in ([`entered_because`]): one home for the rule, so the
+/// profile's tasks under a group line are exactly the group's.
+fn because_of(one: &blaze_engine::Entered) -> Because {
+    let (definer, cell) = match one.cause {
+        blaze_engine::Cause::ReadMoved { read, .. } => (Some(read.of), Some(crate::engine_scope_reads::CellKind::of(&read))),
+        _ => (None, None),
+    };
+    Because { stage: one.phase.stage, cause: one.cause.kind(), definer, cell }
+}
+
 /// The most groups the profile lists.
 const BECAUSE_SHOWN: usize = 20;
+
+/// The most entered tasks the profile names under one group line (their kind and subject), in
+/// the order the engine entered them.
+const BECAUSE_TASKS_SHOWN: usize = 3;
 
 /// The profile's text: each phase's tasks planned and entered, each stage's entries and how many
 /// came out the bytes they had (a wasted entry), the top groups of why tasks were entered, then
 /// the command's phases.
-fn profile_text<'f>(ran: &[(Phase, u32, u32)], report: &blaze_engine::Report, because: &[(Because, u32)], outlined: &[Outlined<'_>], phases: &Phases, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+fn profile_text<'f>(ran: &[(Phase, u32, u32)], report: &blaze_engine::Report, because: &[(Because, u32)], causes: &[blaze_engine::Entered], outlined: &[Outlined<'_>], phases: &Phases, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
     use core::fmt::Write as _;
     let mut text = blaze_own::String::new_in(frame);
     // A `fmt::Write` into a frame string fails only when the frame is full; the profile is a
@@ -1014,16 +1075,22 @@ fn profile_text<'f>(ran: &[(Phase, u32, u32)], report: &blaze_engine::Report, be
             let _ = writeln!(text, "  {stage:?}: {:>7} {:>7}", count.entered, count.identical);
         }
     }
-    let _ = writeln!(text, "entered because (stage, cause, the moved cell's task: tasks), top {BECAUSE_SHOWN}");
+    let _ = writeln!(text, "entered because (stage, cause, the moved cell's task and kind: tasks), top {BECAUSE_SHOWN}");
     for (group, count) in because.iter().take(BECAUSE_SHOWN) {
+        let kind = group.cell.map_or("", crate::engine_scope_reads::CellKind::words);
         let _ = match group.definer {
             None => writeln!(text, "  {:?} {}: {count}", group.stage, group.cause),
             // A file's cell by its path, read as the sweep read it; any other task by its name.
             Some(name) => match outlined.binary_search_by(|one| one.name.cmp(&name)).ok().and_then(|at| core::str::from_utf8(&outlined[at].path).ok()) {
-                Some(path) => writeln!(text, "  {:?} {} {:?} {path}: {count}", group.stage, group.cause, name.kind),
-                None => writeln!(text, "  {:?} {} {name:?}: {count}", group.stage, group.cause),
+                Some(path) => writeln!(text, "  {:?} {} {:?} {path} ({kind}): {count}", group.stage, group.cause, name.kind),
+                None => writeln!(text, "  {:?} {} {name:?} ({kind}): {count}", group.stage, group.cause),
             },
         };
+        // Which tasks it entered, by kind and subject: the group key holds no entered task, so
+        // tests that compare groups are unmoved by this detail.
+        for one in causes.iter().filter(|one| because_of(one) == *group).take(BECAUSE_TASKS_SHOWN) {
+            let _ = writeln!(text, "      entered {:?} {:?}", one.name.kind, one.name.subject);
+        }
     }
     if because.len() > BECAUSE_SHOWN {
         let _ = writeln!(text, "  ({} groups more)", because.len() - BECAUSE_SHOWN);

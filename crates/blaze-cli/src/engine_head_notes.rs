@@ -243,6 +243,9 @@ pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b
         return Ok(());
     }
     all.sort_unstable();
+    // A head of two units (its lib and its test harness, engine_heads.rs `head_cell`) has a
+    // note a unit's cell, its path and reason the same: one failed head, counted once.
+    all.dedup();
     // (count, why, its first heads by name).
     let mut groups: std::vec::Vec<(usize, &str, &[(&str, &str)]), &Frame> = std::vec::Vec::new_in(frame);
     for run in all.chunk_by(|a, b| a.0 == b.0) {
@@ -334,6 +337,8 @@ fn why_words(why: &Why, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match why {
         Why::Need(_) => write!(f, "a head it needs was not made"),
         Why::Unsupported(what, _) => write!(f, "{what}"),
+        // The same refusal, raised for an item declared in a body: its words, then the item.
+        Why::UnsupportedIn(what, item, _) => write!(f, "{what}: {item}"),
         Why::Program(what, _) => write!(f, "{what}"),
         Why::Resolve(error, _) => write!(f, "a path did not resolve ({})", Variant(error)),
         Why::NoCheckerType(what, _) => write!(f, "the checker has no type for `{what}`"),

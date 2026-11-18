@@ -128,6 +128,7 @@ pub(crate) fn put_all(cx: &Cx, store: &mut dyn Store<'_>, puts: &mut [Put<'_>], 
         // `write`), each in its owner's namespace (`parts`).
         if let Some(extras) = put.extras {
             let (mut written, mut skipped) = (0u32, 0u32);
+            let mut beside = std::vec::Vec::with_capacity_in(extras.records.len(), alloc);
             for (key, bytes) in extras.records.iter() {
                 if planted_missing(bytes) {
                     skipped += 1;
@@ -137,6 +138,12 @@ pub(crate) fn put_all(cx: &Cx, store: &mut dyn Store<'_>, puts: &mut [Put<'_>], 
                 let put = store.put_record(&cx, key, crate::store::plain_place::EXPANSION_TAG, &parts, bytes)?;
                 written += u32::from(put == blaze_keyed::store::Put::Written);
                 ledger.put_extra(stage, key, bytes, put);
+                beside.push(key);
+            }
+            // Their keys filed beside their owner: a root naming the owner keeps them (store.rs
+            // `CommandStore::pin_through`).
+            if !beside.is_empty() {
+                store.index_beside(&cx, put.key, &beside)?;
             }
             // A planted skip is no row served: the same count is the rows a record held served.
             ledger.extras_named(stage, extras.calls.saturating_sub(skipped), written, extras.bytes());
@@ -214,6 +221,9 @@ impl core::fmt::Display for RecordLine {
 pub(crate) struct ReadLine {
     pub(crate) records: u64,
     pub(crate) bytes: u64,
+    /// The bytes of the sections handed to the stage's readers (engine_records.rs
+    /// `ReadCounts::sections`): what the copying route copies, twice for an exports section.
+    pub(crate) sections: u64,
     pub(crate) copied: u64,
     /// Asks answered by a record the request opened before (no read).
     pub(crate) again: u64,
@@ -250,6 +260,9 @@ pub(crate) struct Ledger {
     /// line counts its tasks' records' copies, so these are taken from it at the merge.
     extra_copies: [(u64, u64); STAGES],
     digest: blaze_ids::Hasher,
+    /// The process's memory at each stage's end (engine_memory.rs): the profile's alone, never
+    /// in the digest (rule 25).
+    pub(crate) memory: crate::engine_memory::Memory,
 }
 
 /// One stage's extra records as the profile prints them, after its records' line:
@@ -281,6 +294,7 @@ impl Ledger {
             seen_read: crate::engine_records::ReadCounts::default(),
             extra_copies: [(0, 0); STAGES],
             digest: blaze_ids::Hasher::new(PUTS_DIGEST),
+            memory: crate::engine_memory::Memory::new(),
         }
     }
 
@@ -289,6 +303,7 @@ impl Ledger {
         let line = &mut self.reads[stage.index()];
         line.records += now.records.saturating_sub(self.seen_read.records);
         line.bytes += now.bytes.saturating_sub(self.seen_read.bytes);
+        line.sections += now.sections.saturating_sub(self.seen_read.sections);
         line.copied += now.copied.saturating_sub(self.seen_read.copied);
         line.again += now.hits.saturating_sub(self.seen_read.hits);
         self.seen_read = now;
@@ -347,6 +362,7 @@ impl Ledger {
         line.copy_bytes += store.copy_bytes.saturating_sub(self.seen.copy_bytes).saturating_sub(extra_bytes);
         line.held = self.results[stage.index()] + store.held_bytes;
         self.seen = store;
+        self.memory.merged(stage);
     }
 
     /// The digest of every record put so far (key, length, bytes, in put order).

@@ -24,6 +24,7 @@ use crate::{
 mod asked;
 mod asked_digest;
 mod attr_after_derive;
+mod attr_path_from_expansion;
 mod attr_value;
 mod attrs;
 mod derive_where_shape;
@@ -74,6 +75,7 @@ mod oracle;
 /// The reference solver's seam a solver core is compared through (oracle.rs).
 pub(crate) use oracle::{B, Imp, reference_imports, reference_world};
 mod per_crate;
+mod pkg_meta_env;
 mod prelude_records;
 mod super_in_block;
 mod written_module;

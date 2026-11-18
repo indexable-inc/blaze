@@ -79,6 +79,8 @@ pub struct AttrCall<'a> {
 pub struct DeriveUse<'a> {
     /// As written, `::` kept, no spaces.
     pub path: AString<'a>,
+    /// The path's tokens: what a call of this derive is found by ([`crate::same_path`]).
+    pub tokens: TokenStream<'a>,
     pub constness: Constness,
 }
 
@@ -229,6 +231,19 @@ impl<'a> ItemAttrs<'a> {
         Ok(AttrCall { args, item, derives_taken })
     }
 
+    /// Whether the attribute `attr` (a [`NextAttr::Call`]'s, tokens of [`ItemAttrs::item`]) is
+    /// written with the path `path` (a stream holding one path): equal word by word
+    /// ([`crate::same_path`]), so an item of a file's text and one an expansion wrote are found
+    /// alike, a `$crate` head held as one token, as a `$` then `crate`, or rendered `crate`.
+    pub fn attr_is(&self, attr: Range<u32>, path: &TokenStream<'_>) -> bool {
+        // `#`, `[`, then the path.
+        let start = attr.start as usize + 2;
+        match crate::attr_path::path_end(&self.item, start) {
+            Some(end) if end < attr.end as usize => crate::attr_path::same_path(&self.item, start..end, path, 0..path.len()),
+            _ => false,
+        }
+    }
+
     /// When no attribute macro took the item: the rest of its outer attributes applied, then its
     /// derives in order and the item as they see it. `None` when a `#[cfg]` of the item is
     /// false.
@@ -247,7 +262,8 @@ impl<'a> ItemAttrs<'a> {
             let attr = self.item.copy_in(at..close + 1, alloc)?;
             if let Some((constness, paths)) = derive_meta(&attr, 2..index(attr.len() - 1), alloc) {
                 for p in paths.iter() {
-                    uses.push(DeriveUse { path: path_text(&attr, p.clone(), alloc), constness });
+                    let tokens = attr.copy_in(p.start as usize..p.end as usize, alloc)?;
+                    uses.push(DeriveUse { path: path_text(&attr, p.clone(), alloc), tokens, constness });
                 }
             }
             at = close + 1;
@@ -293,14 +309,14 @@ fn cfg_holds<E>(
     cfg_predicate_at(item, inside, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })
 }
 
-/// A path's tokens as written: `::` kept, no spaces.
+/// A path's tokens as written: `::` kept, no spaces (a `$` then `crate` as `$crate`).
 fn path_text<'a>(attr: &TokenStream<'_>, path: Range<u32>, alloc: Alloc<'a>) -> AString<'a> {
     let mut out = String::new_in(alloc);
     for at in path {
-        out.push_str(match attr.tokens()[at as usize].kind {
-            TokenKind::Punct { .. } => ":",
-            _ => attr.text_at(at as usize),
-        });
+        match attr.tokens()[at as usize].kind {
+            TokenKind::Punct { char, .. } => out.push(char),
+            _ => out.push_str(attr.text_at(at as usize)),
+        }
     }
     out
 }

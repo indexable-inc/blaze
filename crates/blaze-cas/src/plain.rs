@@ -162,6 +162,8 @@ mod cleanup_tests;
 #[cfg(test)]
 mod index_tests;
 #[cfg(test)]
+mod beside_tests;
+#[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]
 mod phase_commit_tests;
@@ -175,6 +177,7 @@ mod tests;
 pub use self::core::{
     Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, INDEX_KEYS_MOST, INDEX_TAG, INDEXED_ROOT_TAG, LEASE_NS, Liveness, Lost, Named, POINTER_LEN, POINTER_TAG,
     Placed, Plain, PlainConfig, Probe, Probes, PutError, ROOT_INDEXES_MOST, ROOT_LIFE_NS, ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
+    beside_key,
 };
 pub use self::lent::{Aligned16, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, first_difference};
 pub use self::snapshot::{SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};

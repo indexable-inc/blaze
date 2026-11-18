@@ -256,10 +256,10 @@ fn a_static_of_fn_pointers_calls_through_its_words() {
 /// `const F: fn() -> i32 = seven;` and `main` returns `F()`: no body names `seven` but the
 /// constant's. The evaluator's record of `F` is one word relocated to `seven`'s instance key;
 /// the builder asks the run's `Adts::const_fn_instance` which instance that is (run.rs
-/// `FrontAdts`, the program's non-generic fns keyed as the build loop keys them), files it in
-/// `main`'s `Built::refs`, and the loop reaches and builds it from there. Without the answer
-/// `main` is refused ("a constant's value holds a fn pointer to instance .., which the build's
-/// `Adts` does not give") and the strict run fails; if the reach did not follow `Built::refs`,
+/// `FrontAdts`: the record names the instance it made the word from, blaze-consteval
+/// `ConstRecord::fns`), files it in `main`'s `Built::refs`, and the loop reaches and builds it
+/// from there. Without the answer `main` is refused ("... holds a fn pointer to instance ..,
+/// which no record the build's `Adts` holds names") and the strict run fails; if the reach did not follow `Built::refs`,
 /// `seven`'s slot would be a stub and the run would stop at the call.
 ///
 /// Prints: `CONST FN POINTER: status 7 (strict), status 7, 0 not built` and

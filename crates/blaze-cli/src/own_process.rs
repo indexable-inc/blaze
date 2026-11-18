@@ -202,6 +202,7 @@ pub(crate) fn run_own<F: Front>(
     let folder = fs.home(cx, home, &records).map_err(|why| OwnError::Parent(ParentError::Home(why)))?;
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
+    let toolchain = builder.toolchain;
     let mut codes = HomeCodeStore::new(lent);
     let mut lazy = Lazy::new(cx, front, RecordsDir { cx, dir: &folder }, &mut codes, builder, alloc);
     let store = bstd::mem::format_in!(frame, "{}/{RECORDS}", home.trim_end_matches('/'));
@@ -260,6 +261,7 @@ pub(crate) fn run_own<F: Front>(
     // The walk is over: what the code store served and made is final (the program root's half).
     drop(lazy);
     let walked = codes.reached();
+    let toolchain_made = codes.toolchain_made();
     let ran = ran.map_err(|error| match error {
         LoopError::Start(error) => OwnError::NotStarted {
             launcher: std::boxed::Box::from(launcher.as_str()),
@@ -289,7 +291,7 @@ pub(crate) fn run_own<F: Front>(
     // The program's code and its list, named by the program root (per program, request shape
     // and user, store/roots.rs) for the next run from any checkout: the start list's keys and
     // the walk's, one index, one root.
-    match crate::store::roots::keep_program(lent, &today.name, list, &walked) {
+    match crate::store::roots::keep_program(lent, &today, list, &walked) {
         Ok((_rooted, kept)) if kept.stale_rows > 0 => {
             err.line(cx, format_args!("blaze run: {} start-list rows name code the store no longer holds; the next run builds them again", kept.stale_rows)).map_err(OwnError::Out)?;
         }
@@ -297,6 +299,11 @@ pub(crate) fn run_own<F: Front>(
         Err(why) => {
             err.line(cx, format_args!("blaze run: the program ended with {}, and its code was not kept for the next run: {why}", ran.status)).map_err(OwnError::Out)?;
         }
+    }
+    // The toolchain's code this run made, and the toolchain's root renewed: std's compiled code
+    // outlives this program's root, for every project on this toolchain.
+    if let Err(why) = crate::store::roots::keep_toolchain(lent, toolchain, &toolchain_made, &[]) {
+        err.line(cx, format_args!("blaze run: the program ended with {}, and the toolchain's code was not kept: {why}", ran.status)).map_err(OwnError::Out)?;
     }
     Ok(ran.status)
 }

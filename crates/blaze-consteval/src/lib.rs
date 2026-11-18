@@ -54,7 +54,7 @@ pub use error::{At, ConstError, Op, PanicPart, Refusal};
 pub use layout::{IntRepr, Layout, LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, TagWrite, ValidRange};
 pub use lit::LitError;
 pub use machine::{Answer, Codes, Need, NeedKind, Outcome, Settle, eval_discriminant, eval_len, value_of};
-pub use record::{ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
+pub use record::{ConstFn, ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
 
 /// The written text of every literal of a body, read where the literal was written: the item's
 /// own text or a macro expansion's (blaze-lower's `View::text_at` of the literal's range). A

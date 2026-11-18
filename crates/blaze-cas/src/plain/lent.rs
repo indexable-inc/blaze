@@ -423,6 +423,33 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         Ok(Some(Lend { tag, namespace, bytes: unsafe { lend(ptr, len) }, own: false }))
     }
 
+    /// Whether `key` is held with exactly `bytes`, in any namespace: this command's own put,
+    /// else the committed record (the store is asked as a get asks it). A comparison alone: it
+    /// lends nothing, so it keeps no arena chunk past its commit. A [`Lent::get`] of an own put
+    /// does (`lend`'s contract): its whole chunk, and every other key put into it, then reads
+    /// from the arena to the `Lent`'s end and is refused in place ([`NotInPlace::Arena`]). So
+    /// "is this record here already" is asked here, never by a get (blaze-cli plain_place.rs
+    /// `put_record`; aligned_tests.rs shows both).
+    pub fn holds(&self, key: &Key, bytes: &[u8]) -> Result<bool, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        if let Some(at) = inner.puts.get(&key.0.0).copied() {
+            if at.tag == POINTER_TAG {
+                return Err(LentError::PointerTag { key: *key });
+            }
+            let kept = block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize);
+            return Ok(kept == bytes);
+        }
+        let Some(found) = inner.store.get(key).map_err(stopped("checking whether a record is held"))? else {
+            return Ok(false);
+        };
+        let got = inner.store.got(found);
+        if got.tag == POINTER_TAG {
+            return Err(LentError::PointerTag { key: *key });
+        }
+        Ok(got.bytes == bytes)
+    }
+
     /// `bytes` under `key` in `namespace`, copied once into the arena; written by the next
     /// commit. A key held with equal bytes is left as it is (rule 25); with other bytes it is
     /// refused (rule 21). The store is asked too (it maps at a first probe, as a get does).
@@ -729,6 +756,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.root_through(name, indexes, life_ns).map_err(stopped("setting an indexed root"))
     }
 
+    /// An index of `keys` filed beside the record `owner` (`Plain::index_beside`).
+    pub fn index_beside(&self, owner: Key, keys: &[Key]) -> Result<Key, LentError> {
+        self.inner.borrow_mut().store.index_beside(owner, keys).map_err(stopped("putting an index beside a record"))
+    }
+
     /// Every root the generation this store holds names, with its expiry (wall ns): the
     /// command's cleanup line counts the unexpired ones (`Plain::roots_expiring`).
     pub fn roots_expiring(&self) -> Vec<(String, Key, u64)> {
@@ -744,6 +776,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// Records this process's commits carried forward (`Plain::carried`).
     pub fn carried(&self) -> u64 {
         self.inner.borrow().store.core().carried()
+    }
+
+    /// The record the root `name` names unexpired (`Plain::root_named`).
+    pub fn root_named(&self, name: &str) -> Option<Key> {
+        self.inner.borrow().store.core().root_named(name)
     }
 
     /// The roots this process set and the keys they name (`Plain::named`).

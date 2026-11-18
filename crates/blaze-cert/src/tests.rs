@@ -23,28 +23,34 @@ use blaze_solve::testing::run::PRELUDE;
 use blaze_solve::testing::tys::TestTys;
 use blaze_solve::testing::world::{Arena, Scope, World, def_of};
 use blaze_solve::tys::Tys;
+use blaze_solve::witness::{Emit, NoDerivation};
 
 use crate::check::{CheckError, Checker};
 use crate::derivation::{Builder, Builtin, By, FormatError, StepId, View};
 use crate::questions::Questions;
 use crate::{Today, today};
 
-fn alloc() -> Alloc<'static> {
+pub(crate) fn alloc() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 
 /// One case's world, arena, solver and environment.
-struct Fx {
-    world: World,
-    case: CaseA,
-    tys: TestTys,
+pub(crate) struct Fx<E = NoDerivation> {
+    pub(crate) world: World,
+    pub(crate) case: CaseA,
+    pub(crate) tys: TestTys,
     vars: HashMap<String, Ty>,
-    solver: Solver<'static>,
-    env: EnvId,
+    pub(crate) solver: Solver<'static, E>,
+    pub(crate) env: EnvId,
 }
 
 /// The world of `text` (one case) on the prelude, `extra` declarations added to the case's.
-fn fixture(text: &str, extra: &str) -> Fx {
+pub(crate) fn fixture(text: &str, extra: &str) -> Fx {
+    fixture_with(text, extra, NoDerivation)
+}
+
+/// [`fixture`] with a solver recording into `emit` (emit_tests.rs).
+pub(crate) fn fixture_with<E: Emit>(text: &str, extra: &str, emit: E) -> Fx<E> {
     let prelude = parse_file(PRELUDE).unwrap_or_else(|e| panic!("the prelude: {e}"));
     let f = parse_file(text).unwrap_or_else(|e| panic!("the fixture: {e}"));
     let x = parse_file(extra).unwrap_or_else(|e| panic!("the extra decls: {e}"));
@@ -58,7 +64,7 @@ fn fixture(text: &str, extra: &str) -> Fx {
     let world = World::build(&decls).unwrap_or_else(|e| panic!("the world: {e}"));
     let mut tys = TestTys::new();
     let mut vars = HashMap::new();
-    let mut solver = Solver::new_in(alloc());
+    let mut solver = Solver::with_emit_in(alloc(), emit);
     let sc = Scope { params: &case.params, bound: &[] };
     let mut cl: StdVec<Clause> = StdVec::new();
     {
@@ -74,9 +80,9 @@ fn fixture(text: &str, extra: &str) -> Fx {
     Fx { world, case: case.clone(), tys, vars, solver, env }
 }
 
-impl Fx {
+impl<E: Emit> Fx<E> {
     /// Goal line `i` of the case, in the arena.
-    fn goal(&mut self, i: usize) -> Pred {
+    pub(crate) fn goal(&mut self, i: usize) -> Pred {
         let g = &self.case.goals[i];
         let CheckA::Goal(p) = &g.check else { panic!("line {}: not a goal", g.line) };
         let sc = Scope { params: &self.case.params, bound: &[] };
@@ -89,7 +95,7 @@ impl Fx {
     }
 
     /// Goal `i` solved: its answer and the reads of the solve.
-    fn solve(&mut self, i: usize) -> (Answer, Vec<Read, Alloc<'static>>) {
+    pub(crate) fn solve(&mut self, i: usize) -> (Answer, Vec<Read, Alloc<'static>>) {
         let pred = self.goal(i);
         let mut reads: Vec<Read, Alloc<'static>> = Vec::new_in(alloc());
         let snap = self.tys.snapshot();
@@ -102,14 +108,14 @@ impl Fx {
     }
 
     /// Every goal of the case answers `yes` (the solver agrees with each step).
-    fn all_yes(&mut self) {
+    pub(crate) fn all_yes(&mut self) {
         for i in 0..self.case.goals.len() {
             let (a, _) = self.solve(i);
             assert_eq!(a, Answer::Yes, "goal {i} (line {})", self.case.goals[i].line);
         }
     }
 
-    fn check(&mut self, bytes: &[u8]) -> Result<crate::Cost, CheckError> {
+    pub(crate) fn check(&mut self, bytes: &[u8]) -> Result<crate::Cost, CheckError> {
         let view = View::read(bytes).unwrap_or_else(|e| panic!("{e}"));
         let mut checker = Checker::new_in(alloc());
         let env = self.solver.env_clauses(self.env);
@@ -133,12 +139,12 @@ impl Fx {
     }
 }
 
-fn imp(label: &str) -> Def {
+pub(crate) fn imp(label: &str) -> Def {
     def_of("impl", label)
 }
 
 /// A derivation's bytes from `rows` (goal index, by, nested rows) and back-edges closed after.
-fn bytes(fx: &mut Fx, rows: &[(usize, Row)], closes: &[(u32, u32)]) -> StdVec<u8> {
+pub(crate) fn bytes<E: Emit>(fx: &mut Fx<E>, rows: &[(usize, Row)], closes: &[(u32, u32)]) -> StdVec<u8> {
     let mut b = Builder::new_in(alloc());
     for (g, row) in rows {
         let goal = fx.goal(*g);
@@ -169,7 +175,7 @@ fn bytes(fx: &mut Fx, rows: &[(usize, Row)], closes: &[(u32, u32)]) -> StdVec<u8
 }
 
 #[derive(Clone, Copy)]
-enum K {
+pub(crate) enum K {
     Impl(&'static str),
     Normalize(&'static str),
     Env(u32),
@@ -179,24 +185,24 @@ enum K {
 }
 
 #[derive(Clone, Copy)]
-struct ByA {
+pub(crate) struct ByA {
     kind: K,
     args: &'static [UintTy],
 }
 
 #[derive(Clone, Copy)]
-enum Row {
+pub(crate) enum Row {
     By(ByA, &'static [u32]),
     Back,
 }
 
-const fn by(kind: K, args: &'static [UintTy], nested: &'static [u32]) -> Row {
+pub(crate) const fn by(kind: K, args: &'static [UintTy], nested: &'static [u32]) -> Row {
     Row::By(ByA { kind, args }, nested)
 }
 
-const SIZED: K = K::Builtin(Builtin::Sized);
+pub(crate) const SIZED: K = K::Builtin(Builtin::Sized);
 
-const CHAIN: &str = "
+pub(crate) const CHAIN: &str = "
 case chain = cert three-deep impl chain
 trait A
 trait B
@@ -212,7 +218,7 @@ goal u32: B => yes
 ";
 
 /// Rows 0 `u32: Sized`, 1 `u32: C`, 2 `u32: B`, 3 `W<u32>: A` (the root, last).
-fn chain_rows(ia_args: &'static [UintTy], ia_nested: &'static [u32]) -> [(usize, Row); 4] {
+pub(crate) fn chain_rows(ia_args: &'static [UintTy], ia_nested: &'static [u32]) -> [(usize, Row); 4] {
     [
         (1, by(SIZED, &[], &[])),
         (2, by(K::Impl("ic"), &[], &[])),

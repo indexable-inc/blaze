@@ -82,6 +82,10 @@ impl<'m> Store<'m> for Empty {
         Ok(())
     }
     fn public_crates(&mut self, _subjects: &[ContentId]) {}
+    fn toolchain_crates(&mut self, _subjects: &[ContentId]) {}
+    fn index_beside(&mut self, _cx: &Cx, _owner: Key, _keys: &[Key]) -> Result<(), CliError> {
+        Ok(())
+    }
     fn put_parts(&mut self, _cx: &Cx, _key: Key, _parts: &[&[u8]]) -> Result<(), CliError> {
         Ok(())
     }
@@ -331,6 +335,10 @@ fn a_table_is_put_at_its_certificate_and_absent_is_none() {
             Ok(())
         }
         fn public_crates(&mut self, _subjects: &[ContentId]) {}
+        fn toolchain_crates(&mut self, _subjects: &[ContentId]) {}
+        fn index_beside(&mut self, _cx: &Cx, _owner: Key, _keys: &[Key]) -> Result<(), CliError> {
+            Ok(())
+        }
         fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
             self.0.push((key, parts.concat()));
             Ok(())

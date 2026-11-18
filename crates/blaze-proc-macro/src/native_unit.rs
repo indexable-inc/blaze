@@ -264,7 +264,7 @@ pub fn native_outputs<'a>(
 
     // The same environment as the wasm path: the unit's features, the served unit's cfg.
     let serves_unit = &graph.units[serves.index()];
-    let facts = PackageFacts { name, version, links: unit.links.as_ref().map(|l| l.as_str()), ..PackageFacts::default() };
+    let facts = PackageFacts { name, version, meta: graph.meta_of(unit.package).map(|meta| meta.vars()), links: unit.links.as_ref().map(|l| l.as_str()) };
     // Brief N8: the key holds each `links` value in the record's form (the wasm sight: a
     // function of the producers' records alone) and what the producers serve (`views.key`
     // below), as a wasm reader's key does; the run is given the values as IT sees them (laid
@@ -471,7 +471,7 @@ mod tests {
         units.push(unit("autocfg", UnitKind::Lib, &[], None)); // 3
         units.push(unit("zstd-sys", UnitKind::Lib, &[], Some(0))); // 4
         units.push(unit("pure", UnitKind::Lib, &[], Some(2))); // 5
-        let graph = UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3 };
+        let graph = UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3, meta: AVec::new_in(alloc) };
 
         let native = placed(&graph, UnitId(0), Mode::Build, alloc);
         let wasm = placed(&graph, UnitId(2), Mode::Build, alloc);

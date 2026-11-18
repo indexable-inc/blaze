@@ -17,6 +17,7 @@ pub mod block_crates;
 pub mod scope_table;
 pub mod expansion_origin;
 pub mod block_traits;
+pub mod block_type_uses;
 pub mod body;
 pub mod body_host;
 pub mod body_left;

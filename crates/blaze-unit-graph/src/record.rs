@@ -5,7 +5,9 @@
 //!   length-prefixed. Two builders of one graph write equal bytes (rule 25), and nothing of what
 //!   was read to make it (a manifest's comments, its line numbers, a key) is in them: an edit
 //!   that does not change resolution leaves the record byte-equal, so everything keyed by its
-//!   digest downstream is cut off early.
+//!   digest downstream is cut off early. The one exception is each package's `CARGO_PKG_*`
+//!   metadata ([`UnitGraph::meta`]), which crates read: an `authors` edit changes the bytes,
+//!   and a crate's own tasks rerun only where a read list holds a value that moved.
 //! - [`decode`]: the bytes back, every length and index checked once; `encode(decode(b)) == b`.
 //! - [`Source`]: the record's source digest, what it read, in the order read: the lock's bytes
 //!   (which pin every dependency's sources, so their manifests are covered by it), each
@@ -24,10 +26,11 @@ use blaze_own::{AVec, Alloc, String, Vec};
 use edition::{Edition, PackageEdition};
 
 use crate::resolve::unit_cfg;
-use crate::{Ask, CfgAtom, ExtraUnit, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+use crate::{Ask, CfgAtom, ExtraUnit, PackageMeta, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 
 /// The record's form. A change to it is a new magic; an older one is refused by it.
-pub const MAGIC: &[u8; 4] = b"BUG1";
+/// `BUG2`: each package's `CARGO_PKG_*` metadata after the unavailable ids.
+pub const MAGIC: &[u8; 4] = b"BUG2";
 /// The domain of [`Source`]'s digest.
 pub const SOURCE_DOMAIN: &str = "blaze-unit-graph: what a request's unit graph read, v1";
 
@@ -134,6 +137,14 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
     w.u32(graph.unavailable.len() as u32);
     for id in graph.unavailable.iter() {
         w.u32(id.0);
+    }
+    // Each package's metadata (`CARGO_PKG_*`), by id: what a crate's environment reads.
+    w.u32(graph.meta.len() as u32);
+    for (id, meta) in graph.meta.iter() {
+        w.u32(id.0);
+        for value in meta.values() {
+            w.text(value);
+        }
     }
     Ok(w.0)
 }
@@ -268,10 +279,23 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
     for _ in 0..nu {
         unavailable.push(LockId(r.u32()?));
     }
+    let nm = r.count()?;
+    let mut meta: AVec<'a, (LockId, PackageMeta<'a>)> = Vec::with_capacity_in(nm, alloc);
+    for _ in 0..nm {
+        let id = LockId(r.u32()?);
+        if meta.last().is_some_and(|(last, _)| *last >= id) {
+            return r.refuse("package metadata not strictly by id");
+        }
+        let mut values: [Text<'a>; 8] = core::array::from_fn(|_| String::new_in(alloc));
+        for value in values.iter_mut() {
+            *value = r.text()?;
+        }
+        meta.push((id, PackageMeta::new(values)));
+    }
     if r.at != bytes.len() {
         return r.refuse("bytes after the record");
     }
-    Ok(Decoded { graph: UnitGraph { units, unavailable, resolver }, target, host })
+    Ok(Decoded { graph: UnitGraph { units, unavailable, resolver, meta }, target, host })
 }
 
 /// The digest of what a request's unit graph read: the record's source.

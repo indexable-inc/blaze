@@ -58,11 +58,113 @@ pub(crate) struct ScriptsStage<'f> {
     made: Vec<(Name, Option<(Key, ContentId)>), &'f Frame>,
     /// Each task's result, in the order entered.
     pub(crate) results: Vec<Published<'f>, &'f Frame>,
+    /// Each planned `Given` cell of a build script's read, by name, sorted, with today's answer
+    /// from the sweep's row (engine_script_reads.rs `plan`).
+    given: Vec<(Name, ContentId, crate::engine_script_reads::ReadKind), &'f Frame>,
+    /// Each read of the checkout a run of this request made, with the script that read it: the
+    /// leaf rows the answer keeps, and the `Given` records of reads no plan holds.
+    fresh: std::vec::Vec<(Name, crate::engine_script_reads::CheckoutRead)>,
+    /// The kinds' tools, from [`ScriptsStage::plan`]: a `Given` record's key.
+    tools: Option<Tools>,
+    /// The bug a test plants in the runs' read lists (engine_script_reads.rs `ReadsPlant`).
+    pub(crate) plant: crate::engine_script_reads::ReadsPlant,
+    /// The request planned the reads' `Given` cells ([`ScriptsStage::plan_reads`]): only then are
+    /// a member's reads kept as cells.
+    reads_planned: bool,
+    /// A test's runner in place of each `Script` task's job and run ([`ScriptRunner`]).
+    #[cfg(test)]
+    runner: Option<&'static dyn ScriptRunner>,
+    /// Runs this request whose record was kept with their reads as cells.
+    kept_runs: u32,
+    /// Runs this request that were holes, and the first one's words (its package, why).
+    holes: (u32, Option<std::string::String>),
+}
+
+/// What runs a `Script` task in a test: in place of its job (which opens the wasm runtime and
+/// the real checkout) and its run, on the stage's thread. The production stage has no runner
+/// and no such field; a test sets one for its thread with [`with_runner`].
+#[cfg(test)]
+pub(crate) trait ScriptRunner: Sync {
+    /// The run of `name` over the checkout `root`; `kept`: its reads are cells, with the plant
+    /// (`None`: they are a hole, as on the old path).
+    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: Name, kept: Option<crate::engine_script_reads::ReadsPlant>) -> crate::scripts::PooledScript;
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RUNNER: core::cell::Cell<Option<&'static dyn ScriptRunner>> = const { core::cell::Cell::new(None) };
+}
+
+/// `work` with `runner` in place of every `Script` task's run of the stages made on this thread.
+#[cfg(test)]
+pub(crate) fn with_runner<R>(runner: &'static dyn ScriptRunner, work: impl FnOnce() -> R) -> R {
+    RUNNER.with(|cell| cell.set(Some(runner)));
+    let out = work();
+    RUNNER.with(|cell| cell.set(None));
+    out
 }
 
 impl<'f> ScriptsStage<'f> {
     pub(crate) fn new(frame: &'f Frame) -> ScriptsStage<'f> {
-        ScriptsStage { scripts: None, macros: None, reads: Vec::new_in(frame), made: Vec::new_in(frame), results: Vec::new_in(frame) }
+        ScriptsStage {
+            scripts: None,
+            macros: None,
+            reads: Vec::new_in(frame),
+            made: Vec::new_in(frame),
+            results: Vec::new_in(frame),
+            given: Vec::new_in(frame),
+            fresh: std::vec::Vec::new(),
+            tools: None,
+            plant: crate::engine_script_reads::ReadsPlant::None,
+            reads_planned: false,
+            #[cfg(test)]
+            runner: RUNNER.with(|cell| cell.get()),
+            kept_runs: 0,
+            holes: (0, None),
+        }
+    }
+
+    /// The profile's line of the scripts' reads of the checkout: the cells this request planned
+    /// or made, by kind; the runs kept; the holes, and the first one's words.
+    pub(crate) fn profile(&self, text: &mut blaze_own::String<&Frame>) {
+        use core::fmt::Write as _;
+        use crate::engine_script_reads::ReadKind;
+        let mut cells: std::collections::BTreeMap<Name, ReadKind> = std::collections::BTreeMap::new();
+        for (name, _, kind) in self.given.iter() {
+            cells.insert(*name, *kind);
+        }
+        for (_, read) in self.fresh.iter() {
+            cells.insert(read.name(), read.kind);
+        }
+        let count = |kind: ReadKind| cells.values().filter(|one| **one == kind).count();
+        let (files, listings, stats) = (count(ReadKind::File), count(ReadKind::Listing), count(ReadKind::Stat));
+        let _ = write!(text, "  Scripts: script reads: {} cells ({files} files, {listings} listings, {stats} stats); kept {} runs; holes {}", cells.len(), self.kept_runs, self.holes.0);
+        let _ = match &self.holes.1 {
+            Some(first) => writeln!(text, " (first: {first})"),
+            None => writeln!(text),
+        };
+    }
+
+    /// The `Given` tasks of the build scripts' reads of the checkout, one a script-read row of
+    /// today's leaf rows (engine_check.rs hook H1: `planned.extend(scripts.plan_reads(&followed.now, alloc))`).
+    pub(crate) fn plan_reads<'h>(&mut self, rows: &crate::sweep::Rows<'_>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+        self.reads_planned = true;
+        let reads = crate::engine_script_reads::plan(rows, alloc);
+        let mut planned = SVec::with_capacity_in(reads.len(), alloc);
+        for (one, answer, kind) in reads.iter() {
+            self.given.push((one.name, *answer, *kind));
+            planned.push(*one);
+        }
+        self.given.sort_unstable_by_key(|(name, _, _)| *name);
+        self.given.dedup_by_key(|(name, _, _)| *name);
+        planned
+    }
+
+    /// Onto `out`, the leaf rows of the build scripts' reads the answer still reads: `reads(name)`
+    /// says whether the final answer has a row for the cell `name` (engine_check.rs hook H2,
+    /// before the answer's rows are saved).
+    pub(crate) fn script_rows(&self, followed: Option<&crate::sweep::Rows<'_>>, reads: impl Fn(Name) -> bool, out: &mut crate::sweep::Rows<'_>) {
+        crate::engine_script_reads::keep_rows(followed, self.fresh.iter().map(|(_, read)| read), reads, out);
     }
 
     /// The result of `name`, if this stage entered it.
@@ -74,6 +176,7 @@ impl<'f> ScriptsStage<'f> {
     /// when the graph was not made (no lock, or its task failed): no crate then has names.
     pub(crate) fn plan<'h>(&mut self, names: &NamesStage<'_>, discovered: &Discovered<'_>, tools: Tools, env: &FetchEnv<'_>, alloc: SharedAlloc<'h>, frame: &'f Frame) -> Result<SVec<'h, Planned>, CliError> {
         let mut planned = SVec::new_in(alloc);
+        self.tools = Some(tools);
         let (Some(names), Some(graph)) = (names.names.as_ref(), discovered.get(Name::unit_graph())) else { return Ok(planned) };
         let Ok(record) = &graph.made else { return Ok(planned) };
         let unit_graph = Name::unit_graph();
@@ -186,6 +289,18 @@ impl<'f> ScriptsStage<'f> {
     ) -> Result<(), CliError> {
         let cx = cx.span("engine: one scripts phase");
         let heap = handles.env.heap.alloc();
+        // Each `Given` cell of a script's read defines today's answer, the sweep's
+        // (engine_script_reads.rs); the rest run below.
+        let mut rest: Vec<EngineTask, &Frame> = Vec::with_capacity_in(tasks.len(), frame);
+        for task in tasks.iter() {
+            if task.planned.name.kind != Kind::Given {
+                rest.push(*task);
+                continue;
+            }
+            let at = self.given.binary_search_by_key(&task.planned.name, |(name, _, _)| *name).map_err(|_| CliError::from(EngineCheckError::Unseen { task: task.planned.name, read: task.planned.name }))?;
+            buffer.done.push(crate::engine_script_reads::given_done(task, self.given[at].1, alloc));
+        }
+        let tasks: &[EngineTask] = &rest;
         // Each task's drive task, its reads handed whole.
         let mut drives = Vec::with_capacity_in(tasks.len(), frame);
         for task in tasks.iter() {
@@ -208,6 +323,8 @@ impl<'f> ScriptsStage<'f> {
         // 1. Each lookup answered and each run's job made, on this thread.
         let mut answered: Vec<(usize, Result<work::Made<'f>, Failure<'f>>), &Frame> = Vec::new_in(frame);
         let mut ready: Vec<(usize, crate::scripts::ScriptJob<'f>), &Frame> = Vec::new_in(frame);
+        #[cfg(test)]
+        let mut doubled: Vec<(usize, crate::scripts::PooledScript), &Frame> = Vec::new_in(frame);
         // The tasks (by index) whose failure is not a function of their key and their reads (a
         // panic, a hole: work.rs `filed`, `Did::Hole`): owed, entered again each request. Every
         // other failure stands on what it was handed (plan row A8).
@@ -222,6 +339,14 @@ impl<'f> ScriptsStage<'f> {
                     }
                     answered.push((i, published(name, did)?));
                 }
+                // A test's runner in place of the job and its run (`ScriptRunner`).
+                #[cfg(test)]
+                Kind::Script if self.runner.is_some() => {
+                    let plant = self.reads_planned.then_some(self.plant);
+                    if let Some(runner) = self.runner {
+                        doubled.push((i, runner.run(&cx, handles.root, name, plant)));
+                    }
+                }
                 Kind::Script => {
                     // A panic while its job is made fails this run alone (rule 20), as work.rs's.
                     let made = work::unwinding(|| crate::scripts::job(&cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, handles.workers.get(), handles.lock, handles.members, drive, frame, frame));
@@ -232,7 +357,16 @@ impl<'f> ScriptsStage<'f> {
                             answered.push((i, Err(refusal(name, "a build script's job panicked while it was made (its words are on the error stream)"))));
                         }
                         Ok(made) => match made? {
-                            Prepared::Ready(job) => ready.push((i, job)),
+                            // Its reads of the checkout are cells here, its outputs kept
+                            // (scripts.rs `CheckoutReads`).
+                            Prepared::Ready(mut job) => {
+                                // Only once the request plans the reads' cells (hook H1 calls
+                                // `plan_reads`): else a read's record would stand on no task.
+                                if self.reads_planned {
+                                    job.checkout = crate::scripts::CheckoutReads::Kept(self.plant);
+                                }
+                                ready.push((i, job));
+                            }
                             Prepared::Need(wants) => return Err(EngineCheckError::Unseen { task: name, read: wants.first().map_or(name, |want| want.name) }.into()),
                             // Its failed need is read ABSENT: that task's fix moves this row.
                             Prepared::Waited(on) => answered.push((i, Err(Failure { failure: TaskFailure { name, why: Why::Waited { on } }, words: None }))),
@@ -257,6 +391,9 @@ impl<'f> ScriptsStage<'f> {
         }
         // 2. The wave's runs at once, on the workers, each in its own sandbox; a native run's
         // children share the command's jobserver (scripts.rs `Scripts::open`).
+        let mut finished: Vec<(usize, crate::scripts::PooledScript), &Frame> = Vec::new_in(frame);
+        #[cfg(test)]
+        finished.extend(doubled.drain(..));
         if !ready.is_empty() {
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
@@ -279,15 +416,30 @@ impl<'f> ScriptsStage<'f> {
             if let Some(error) = stopped {
                 return Err(CliError::Pool(error));
             }
-            for ((i, _), pooled) in ready.iter().zip(joined) {
+            finished.extend(ready.iter().map(|(i, _)| *i).zip(joined));
+        }
+        {
+            for (i, mut pooled) in finished.into_iter() {
+                let i = &i;
                 let name = drives[*i].name;
                 times.push(name, pooled.ns);
+                // A made record's reads of the checkout (empty for anything else: scripts.rs
+                // `pooled`), each with its reader.
+                self.fresh.extend(core::mem::take(&mut pooled.checkout).into_iter().map(|read| (name, read)));
                 let did = match pooled.did {
                     Err(why) => Did::Failed(TaskFailure { name, why }),
-                    Ok(Ran::Made(record)) => record.into_held(frame).map_or_else(|_| work::held_refused(name), Did::Done),
+                    Ok(Ran::Made(record)) => {
+                        self.kept_runs += u32::from(self.reads_planned);
+                        record.into_held(frame).map_or_else(|_| work::held_refused(name), Did::Done)
+                    }
                     Ok(Ran::Failed { what, words, hole }) => {
                         let failure = TaskFailure { name, why: Why::Refused { what, rule: crate::scripts::RULE } };
-                        let words = work::held_str(core::str::from_utf8(&words).map_err(|_| CliError::Text { what: "a build script's failure words are not UTF-8" })?, frame);
+                        let said = core::str::from_utf8(&words).map_err(|_| CliError::Text { what: "a build script's failure words are not UTF-8" })?;
+                        if hole {
+                            self.holes.0 += 1;
+                            self.holes.1.get_or_insert_with(|| std::string::String::from(said));
+                        }
+                        let words = work::held_str(said, frame);
                         match hole {
                             true => Did::Hole(failure, words),
                             false => Did::FailedSaying(failure, words),
@@ -319,6 +471,14 @@ impl<'f> ScriptsStage<'f> {
                     self.mark(name, Some((task.key, record.out)));
                     if name.kind == Kind::Script {
                         names.mark(name, Some((task.key, record.out)));
+                        // Each read no task of today's plan defines (new this request) is made by
+                        // its reader, at wave 0, keyed as next request's planned task.
+                        let tools = self.tools.ok_or(CliError::Text { what: "a build script ran before the scripts stage was planned (engine_scripts.rs `plan`)" })?;
+                        for (_, read) in self.fresh.iter().filter(|(by, _)| *by == name) {
+                            if self.given.binary_search_by_key(&read.name(), |(cell, _, _)| *cell).is_err() {
+                                buffer.made.push(crate::engine_script_reads::made(read, name, &tools, alloc));
+                            }
+                        }
                     }
                     Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false }
                 }

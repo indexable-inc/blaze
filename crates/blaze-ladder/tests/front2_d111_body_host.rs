@@ -84,6 +84,7 @@ fn a_body_call_s_read_outside_the_member_is_one_finding_the_item_host_s() {
         build_script: false,
         script: None,
         test_or_bench: false,
+        meta: None,
     };
     let env = CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the member's environment: {e:?}"));
     let member: &'static Member = std::boxed::Box::leak(std::boxed::Box::new(Member { env, told: Mutex::new(Vec::new()) }));

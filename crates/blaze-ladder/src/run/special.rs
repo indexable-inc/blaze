@@ -49,7 +49,7 @@ use blaze_typeck::{ItemKey, List, PTys};
 
 use crate::body_ids::DeclaredList;
 use crate::code_records::{
-    Builder, Callee, CodeKey, CodeRecordError, CodeStore, Declared, GETTER_NAME, InstanceNames, KeyParts, code_key, getter_parts, make_entry, make_getter_entry,
+    Builder, Callee, CodeClass, CodeKey, CodeRecordError, CodeStore, Declared, GETTER_NAME, InstanceNames, KeyParts, code_key, getter_parts, make_entry, make_getter_entry,
 };
 use crate::front2::heads::Store;
 use crate::front2::keys::{Keys, checker_of};
@@ -435,7 +435,8 @@ pub fn make_special(which: Special<'_>, builder: &Builder, store: &mut dyn CodeS
     let found = store.get(key).map_err(CodeRecordError::Store)?.is_some();
     if !found {
         let entry = which.make(builder.isa, alloc)?;
-        store.put(key, &entry).map_err(CodeRecordError::Store)?;
+        // Made from no text, for the builder alone: the toolchain's, whichever program asked.
+        store.put(CodeClass::Toolchain, key, &entry).map_err(CodeRecordError::Store)?;
     }
     Ok(SpecialMade { symbol: parts.symbol, key, parts, found })
 }

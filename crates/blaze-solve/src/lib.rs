@@ -33,6 +33,7 @@ pub mod share;
 pub mod term;
 pub mod trait_goals;
 pub mod tys;
+pub mod witness;
 
 // The helpers' modules (solve.md, "Candidates and merging").
 pub mod alias;

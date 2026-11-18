@@ -175,6 +175,11 @@ impl ListName {
 pub(crate) struct Today {
     pub certificate: Certificate,
     pub name: ListName,
+    /// The certificate's run tables (run_ids.rs `table_key`, run_names.rs `inputs_key`): read
+    /// by the next run under this certificate, so named by the program root beside the list
+    /// (store/roots.rs `keep_program`). An older certificate's tables are named by no root once
+    /// the program root is renewed under a new one: dead, and swept.
+    pub tables: [CasKey; 2],
 }
 
 /// One row: a function instance the parent answered, the code record's key it had then, and

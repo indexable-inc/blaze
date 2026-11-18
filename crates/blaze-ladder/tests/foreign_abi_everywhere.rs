@@ -466,8 +466,9 @@ fn in_body_macro() {
 
 /// Position 7: a block in a `const`'s initializer, beside the fn whose pointer the constant
 /// is; `main` calls through it, so the fn's instance (and its call of the foreign fn) is made.
+/// The constant's record names `get`'s instance (blaze-consteval `ConstRecord::fns`), so the
+/// walk needs no check of `get` before it asks (tests/const_fn_pointers.rs holds the class).
 #[test]
-#[ignore = "another gap, found by this test (2026-11-17): the record walk refuses `a constant's value holds a fn pointer to instance .., which the build's Adts does not give`: a const holding a fn pointer is not built on the lazy path"]
 fn a_foreign_fn_declared_in_a_const_initializer() {
     position(
         "const initializer",
@@ -492,7 +493,6 @@ fn a_foreign_fn_declared_in_a_const_initializer() {
 /// Position 8: std's `thread_local!` shape: the constant's initializer is an expansion in
 /// EXPRESSION position whose block declares an `extern` block and the fn the constant points to.
 #[test]
-#[ignore = "another gap, found by this test (2026-11-17): the record walk refuses `a constant's value holds a fn pointer to instance .., which the build's Adts does not give`: a const holding a fn pointer is not built on the lazy path"]
 fn a_foreign_fn_an_expression_expansion_writes_in_a_const() {
     position(
         "expression expansion in a const",
@@ -576,7 +576,6 @@ fn a_foreign_static_declared_in_a_body_is_answered_by_its_block() {
 /// class together, as std's hello world reaches several positions in one program.
 /// Prints "foreign abi every position: {counts}; run status 3".
 #[test]
-#[ignore = "holds the const-initializer position, which stops on another gap (a const holding a fn pointer is not built on the lazy path): see `a_foreign_fn_declared_in_a_const_initializer`"]
 fn every_position_in_one_program() {
     let items = "unsafe extern \"C\" {
     fn abs(x: i32) -> i32;

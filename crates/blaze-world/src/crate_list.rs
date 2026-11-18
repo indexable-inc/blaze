@@ -27,14 +27,16 @@ use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_scope::crate_env::{EnvFacts, SeenRoot};
 use blaze_scope::resolve::SourceTexts;
+use blaze_unit_graph::PackageMetaVars;
 
 use crate::{Origin, PackOrigin, Side, World};
 
 const MAGIC: &[u8; 4] = b"BZCL";
 /// 2: the tree table and the corrected files (a body job serves its dependencies' texts from
 /// them); a version-1 list is refused by name at [`CrateList::open`]. 3: each row's
-/// environment facts ([`CrateList::env_facts`]: a body's `env!` is answered from them).
-pub const VERSION: u16 = 3;
+/// environment facts ([`CrateList::env_facts`]: a body's `env!` is answered from them). 4: the
+/// package's `CARGO_PKG_*` metadata in each row ([`META_AT`]).
+pub const VERSION: u16 = 4;
 /// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16, `t` 4, `c` 4.
 pub const HEADER_LEN: usize = 44;
 /// kind 1 ([`SHELF`] or [`SOURCE`]), pad 3, its name 32 (shelf digest or store key), its files'
@@ -49,10 +51,13 @@ const SOURCE: u8 = 2;
 /// key 32, name 8, root 8, shown_from 8, deps 8, side 1, flags 1, script kind 1, pad 1, script
 /// subject 32, then the crate's environment facts (blaze-scope `EnvFacts`, from its
 /// `CrateEnv::facts`): crate name 8, package name 8, package version 8, binary name 8, the
-/// member's dir 8, env flags 1 ([`ENV_PACKAGE`] ..), pad 3.
-pub const ROW: usize = 144;
+/// member's dir 8, env flags 1 ([`ENV_PACKAGE`] ..), pad 3, then the package's metadata: 8
+/// strings of 8 in `PackageMetaVars::NAMES`' order (all `""` without [`ENV_META`]).
+pub const ROW: usize = 208;
 /// Where a row's environment facts start.
 const ENV_AT: usize = 100;
+/// Where a row's package metadata starts.
+const META_AT: usize = 144;
 
 /// The crate has a package (name and version at 108, 116); a toolchain crate has none.
 const ENV_PACKAGE: u8 = 1;
@@ -64,7 +69,10 @@ const ENV_BUILD_SCRIPT: u8 = 4;
 const ENV_TEST_OR_BENCH: u8 = 8;
 /// It sees its workspace member's dir (at 132; D96 `SeenRoot::Member`), else `/package`.
 const ENV_MEMBER: u8 = 16;
-const ENV_FLAGS: u8 = ENV_PACKAGE | ENV_BIN | ENV_BUILD_SCRIPT | ENV_TEST_OR_BENCH | ENV_MEMBER;
+/// Its package's metadata is known (at [`META_AT`]); without it, the `CARGO_PKG_*` metadata
+/// names are unknown.
+const ENV_META: u8 = 32;
+const ENV_FLAGS: u8 = ENV_PACKAGE | ENV_BIN | ENV_BUILD_SCRIPT | ENV_TEST_OR_BENCH | ENV_MEMBER | ENV_META;
 /// name 8, row 4.
 pub const DEP: usize = 12;
 /// No row (a sysroot crate the world has not).
@@ -250,7 +258,13 @@ pub fn encode<'a>(world: &World<'_>, script_of: &dyn Fn(usize) -> Option<[u8; 33
         if env.test_or_bench {
             env_flags |= ENV_TEST_OR_BENCH;
         }
+        if env.meta.is_some() {
+            env_flags |= ENV_META;
+        }
         rows.extend_from_slice(&[env_flags, 0, 0, 0]);
+        for value in env.meta.unwrap_or_default().values() {
+            rows.extend_from_slice(&text(value, &mut heap)?);
+        }
     }
     // The trees past the checkout, in the world's order (tree `k` is pack `k - 1`).
     let (packs, origins) = (world.texts.packs(), world.texts.origins());
@@ -395,7 +409,7 @@ impl<'b> CrateList<'b> {
             if row[64] > 1 {
                 return Err(form("a side that is neither target nor macro", HEADER_LEN + r * ROW + 64));
             }
-            for at in [ENV_AT, ENV_AT + 8, ENV_AT + 16, ENV_AT + 24, ENV_AT + 32] {
+            for at in [ENV_AT, ENV_AT + 8, ENV_AT + 16, ENV_AT + 24, ENV_AT + 32].into_iter().chain((0..8).map(|i| META_AT + 8 * i)) {
                 if !text_ok(row, at) {
                     return Err(form("a row's environment string is outside the heap", HEADER_LEN + r * ROW + at));
                 }
@@ -538,6 +552,7 @@ impl<'b> CrateList<'b> {
             build_script: flags & ENV_BUILD_SCRIPT != 0,
             script: None,
             test_or_bench: flags & ENV_TEST_OR_BENCH != 0,
+            meta: (flags & ENV_META != 0).then(|| PackageMetaVars::from_values(core::array::from_fn(|i| self.text(row, META_AT + 8 * i)))),
         }
     }
 }
@@ -552,6 +567,7 @@ fn same_facts(a: &EnvFacts<'_>, b: &EnvFacts<'_>) -> bool {
         && a.read_folder.trim_end_matches('/') == b.read_folder.trim_end_matches('/')
         && a.build_script == b.build_script
         && a.test_or_bench == b.test_or_bench
+        && a.meta == b.meta
 }
 
 impl<'b> CrateGraph<'b> for CrateList<'b> {

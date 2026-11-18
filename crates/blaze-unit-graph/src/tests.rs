@@ -207,6 +207,7 @@ impl P {
             links: None,
             features,
             deps,
+            meta: crate::PackageMeta::unstated(a()),
         }
     }
 }
@@ -1040,7 +1041,7 @@ fn the_record_round_trips_and_is_one_bytes() {
             return Err(Broke::Oracle("the decoded platforms are not the encoded ones".to_string()));
         }
         let back = back.graph;
-        if back.units != calm.units || back.unavailable != calm.unavailable || back.resolver != calm.resolver {
+        if back.units != calm.units || back.unavailable != calm.unavailable || back.resolver != calm.resolver || back.meta != calm.meta {
             return Err(Broke::Oracle("the decoded graph is not the encoded one".to_string()));
         }
         if encode(&back)? != bytes {
@@ -1146,9 +1147,15 @@ fn graph_record(files: &[(StdString, StdString)]) -> (StdVec<u8>, [u8; 32]) {
 #[test]
 fn an_edit_that_changes_no_resolution_leaves_the_record_equal() {
     let (before, key_before) = graph_record(&workspace_files("\"x\"", ""));
-    let (after, key_after) = graph_record(&workspace_files("\"x\"", "description = \"now described\"\n# a comment\nrepository = \"https://example.org/a\"\n"));
+    let (after, key_after) = graph_record(&workspace_files("\"x\"", "# a comment\n\n# another\n"));
     assert_ne!(key_before, key_after, "the edit must change what was read");
     assert_eq!(before, after, "an edit that changes no resolution changed the record");
+    // The metadata crates read as `CARGO_PKG_*` is the one thing kept beyond resolution: a
+    // description edit changes the record (record.rs), a comment beside it does not.
+    let (described, _) = graph_record(&workspace_files("\"x\"", "description = \"now described\"\n"));
+    let (described_again, _) = graph_record(&workspace_files("\"x\"", "description = \"now described\" # a comment\n"));
+    assert_ne!(before, described, "a description edit must reach CARGO_PKG_DESCRIPTION");
+    assert_eq!(described, described_again, "a comment beside the description changed the record");
     let (asked_more, _) = graph_record(&workspace_files("\"x\", \"y\"", ""));
     assert_ne!(before, asked_more, "the control: asking b for `y` must change the record");
 }

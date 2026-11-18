@@ -24,7 +24,7 @@ use crate::arith::{int_bits, smax, smin, umax};
 use crate::error::{At, ConstError, Op as Arith, PanicPart, Refusal};
 use crate::layout::{self, IntRepr, Layout, LayoutCx};
 use crate::mem::{AllocId, Memory, Origin, PTR, Pointer, Scalar};
-use crate::record::{ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
+use crate::record::{ConstFn, ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, Intrinsic, Limits};
 
@@ -384,7 +384,7 @@ pub(crate) struct Work<K: Allocator + Clone> {
     temps: Vec<AllocId, K>,
     decoded: Vec<(RecordKey, AllocId), K>,
     statics: Vec<(ItemKey, AllocId), K>,
-    fns: Vec<(InstanceKey, AllocId), K>,
+    fns: Vec<(ConstFn, AllocId), K>,
     reads: Vec<ContentId, K>,
     entered: Vec<u32, K>,
 }
@@ -423,7 +423,8 @@ struct Machine<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clon
     /// Records read and decoded: by key, the root allocation.
     decoded: Vec<(RecordKey, AllocId), K>,
     statics: Vec<(ItemKey, AllocId), K>,
-    fns: Vec<(InstanceKey, AllocId), K>,
+    /// Each fn pointer's allocation, by the instance it points to ([`ConstFn`]).
+    fns: Vec<(ConstFn, AllocId), K>,
     /// What the evaluation read, sorted and without repeats as it is added ([`Self::read_add`]).
     reads: Vec<ContentId, K>,
     /// The codes run so far, whose reads are in `reads`.
@@ -502,7 +503,24 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         data.check().map_err(|_| malformed("a record that breaks blaze-build's data form"))?;
         let mut reads = Vec::with_capacity_in(self.reads.len(), self.alloc);
         reads.extend_from_slice(&self.reads);
-        Ok(ConstRecord { key, data, reads })
+        let fns = self.fns_named(&data)?;
+        Ok(ConstRecord { key, data, reads, fns })
+    }
+
+    /// The instance of each fn word of `data` ([`ConstFn`]), sorted by key, each once: every
+    /// fn allocation this evaluation made or decoded was made from one (`fn_ptr`), so a word
+    /// with none is malformed, never a word the record leaves unnamed.
+    fn fns_named(&self, data: &DataRecord<Alloc<'a>>) -> R<'a, Vec<ConstFn, Alloc<'a>>> {
+        let mut fns: Vec<ConstFn, Alloc<'a>> = Vec::new_in(self.alloc);
+        for a in data.allocs.iter() {
+            for r in a.relocs.iter() {
+                let DataTarget::Fn(key) = r.target else { continue };
+                let Err(at) = fns.binary_search_by_key(&key, |f| f.key) else { continue };
+                let named = self.fns.iter().find(|(f, _)| f.key == key).ok_or(malformed("a fn word whose instance the evaluation did not make"))?;
+                fns.insert(at, named.0);
+            }
+        }
+        Ok(fns)
     }
 
     fn instance(&self, item: ItemKey, args: List) -> R<'a, InstanceKey> {
@@ -675,8 +693,8 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 _ => return Err(malformed("an unsizing coercion of a wide pointer")),
             },
             Op::FnPtr { dst, k } => {
-                let key = code.fns[k as usize];
-                let p = self.fn_ptr(key)?;
+                let named = code.fns[k as usize];
+                let p = self.fn_ptr(named)?;
                 self.set(b, dst, Out::V(Val::S(Scalar::Ptr(p))));
             }
             Op::Unary { dst, src, op, num } => {
@@ -1039,7 +1057,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         let world = self.world;
         let rec = world.record(key).map_err(|_| Stop::Need(Need { kind: NeedKind::Value, item, args: List::EMPTY }))?;
         self.read_add(key.0);
-        self.decode(&rec.data, Some(id))?;
+        self.decode(rec, Some(id))?;
         Ok(())
     }
 
@@ -1142,12 +1160,14 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         })
     }
 
-    fn fn_ptr(&mut self, key: InstanceKey) -> R<'a, Pointer> {
-        let id = match self.fns.iter().find(|(k, _)| *k == key) {
+    /// The pointer to fn instance `named`: one zero-sized allocation per instance key an
+    /// evaluation, which remembers the instance so the record can name it ([`ConstFn`]).
+    fn fn_ptr(&mut self, named: ConstFn) -> R<'a, Pointer> {
+        let id = match self.fns.iter().find(|(f, _)| f.key == named.key) {
             Some(&(_, id)) => id,
             None => {
-                let id = self.mem.allocate(0, 0, false, Origin::Fn(key))?;
-                self.fns.push((key, id));
+                let id = self.mem.allocate(0, 0, false, Origin::Fn(named.key))?;
+                self.fns.push((named, id));
                 id
             }
         };
@@ -1164,8 +1184,13 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         Ok(id)
     }
 
-    /// A record's allocations in memory: the root at `root` (a static's own) or a new one.
-    fn decode<A: core::alloc::Allocator>(&mut self, rec: &DataRecord<A>, root: Option<AllocId>) -> R<'a, AllocId> {
+    /// A record's allocations in memory: the root at `root` (a static's own) or a new one. A
+    /// fn word's instance is the one the record names ([`ConstRecord::fns`]): its arguments are
+    /// of this evaluation's ground table, as every record of one evaluator's world is (the
+    /// records are made over the one table the evaluator keeps: blaze-ladder front2/consts.rs
+    /// `Consts::unit`, run.rs `eval_consts`).
+    fn decode<A: core::alloc::Allocator>(&mut self, record: &ConstRecord<A>, root: Option<AllocId>) -> R<'a, AllocId> {
+        let rec = &record.data;
         let mut ids: Vec<AllocId, Alloc<'a>> = Vec::new_in(self.alloc);
         for (i, a) in rec.allocs.iter().enumerate() {
             let id = match (i, root) {
@@ -1185,7 +1210,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let target = match r.target {
                     DataTarget::Local(j) => *ids.get(j as usize).ok_or(malformed("a relocation past its record"))?,
                     DataTarget::Static(k) => self.static_alloc(k)?,
-                    DataTarget::Fn(key) => self.fn_ptr(key)?.alloc,
+                    DataTarget::Fn(key) => {
+                        let named = record.fn_named(key).ok_or(malformed("a record's fn word whose instance the record does not name"))?;
+                        self.fn_ptr(named)?.alloc
+                    }
                     // A `&dyn Tr` in a const (codegen.md, "Trait objects"): the builder refuses
                     // it in a const's record, so none reaches here yet; refused by name.
                     DataTarget::Vtable(_) => return Err(unsupported("a vtable's address in a constant (a `&dyn` in a const)")),
@@ -1206,7 +1234,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         let world = self.world;
         let rec = world.record(key).map_err(|_| Stop::Need(Need { kind: NeedKind::Value, item, args }))?;
         self.read_add(key.0);
-        let id = self.decode(&rec.data, None)?;
+        let id = self.decode(rec, None)?;
         self.decoded.push((key, id));
         Ok(Place::of(Pointer { alloc: id, offset: 0 }))
     }

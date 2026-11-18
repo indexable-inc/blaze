@@ -18,12 +18,12 @@
 //! the sandbox's `var` refuses an unknown one naming the variable and the crate.
 //!
 //! Control (the planted bug, the package as macro-env-per-unit made it: the set pairs alone):
-//! `PackageEnv::set_only(unit_env(..))` answers `CARGO_PRIMARY_PACKAGE` unset while `env!`
-//! refuses it.
+//! `PackageEnv::set_only(unit_env(..))` answers `CARGO_TARGET_TMPDIR` unset while `env!`
+//! refuses it. (`CARGO_PRIMARY_PACKAGE` is known now: `1` for this member's crate.)
 //!
 //! Expected (`lanecheck.sh blaze-cli test proc_env_unknown`): "test blaze-cli: exit 0; 1
 //! passed, 0 failed", the test printing "macro getenv agrees with env! on 14 names;
-//! CARGO_PRIMARY_PACKAGE refused in crate `app_it`; the set-only env answered it unset".
+//! CARGO_TARGET_TMPDIR refused in crate `app_it`; the set-only env answered it unset".
 
 use std::string::String;
 use std::sync::Arc;
@@ -62,6 +62,7 @@ fn integration_test() -> CrateEnv<'static> {
         build_script: true,
         script: None,
         test_or_bench: true,
+        meta: None,
     };
     CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of app_it: {e}"))
 }
@@ -86,7 +87,8 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
     }
     // The three truths are all met (the list is not vacuous).
     assert_eq!(package.env.get("CARGO_CRATE_NAME"), EnvAnswer::Set("app_it"));
-    assert_eq!(package.env.get("CARGO_PRIMARY_PACKAGE"), EnvAnswer::Unknown);
+    assert_eq!(package.env.get("CARGO_PRIMARY_PACKAGE"), EnvAnswer::Set("1"), "a member's crate is a selected package");
+    assert_eq!(package.env.get("CARGO_TARGET_TMPDIR"), EnvAnswer::Unknown);
     assert_eq!(package.env.get("OUT_DIR"), EnvAnswer::Unknown, "a script whose record is not joined");
     assert_eq!(package.env.get("CARGO_BIN_EXE_app"), EnvAnswer::Unknown, "an integration test's binary path");
     assert_eq!(package.env.get("CARGO_BIN_NAME"), EnvAnswer::Unset, "not a binary");
@@ -96,16 +98,16 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
     // The sandbox: an unknown read is a refusal naming the variable and the calling crate.
     let mut sandbox = Sandbox::new(Arc::new(package));
     assert_eq!(sandbox.var("PATH"), Ok(None), "unset is NotPresent");
-    let refused = sandbox.var("CARGO_PRIMARY_PACKAGE");
-    assert_eq!(refused, Err(EnvRefused { name: String::from("CARGO_PRIMARY_PACKAGE"), krate: Some(String::from("app_it")) }));
+    let refused = sandbox.var("CARGO_TARGET_TMPDIR");
+    assert_eq!(refused, Err(EnvRefused { name: String::from("CARGO_TARGET_TMPDIR"), krate: Some(String::from("app_it")) }));
 
     // The control: the set pairs alone answer the unknown name unset, where env! refuses it.
     let old = Package::new(member(), PackageEnv::set_only(set_pairs(&env)).unwrap_or_else(|e| panic!("{e}"))).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(old.env.get("CARGO_PRIMARY_PACKAGE"), EnvAnswer::Unset, "the planted set-only env refused an unknown name");
-    assert_ne!(old.env.get("CARGO_PRIMARY_PACKAGE"), truth(&env, "CARGO_PRIMARY_PACKAGE"));
+    assert_eq!(old.env.get("CARGO_TARGET_TMPDIR"), EnvAnswer::Unset, "the planted set-only env refused an unknown name");
+    assert_ne!(old.env.get("CARGO_TARGET_TMPDIR"), truth(&env, "CARGO_TARGET_TMPDIR"));
 
     println!(
-        "macro getenv agrees with env! on {} names; CARGO_PRIMARY_PACKAGE refused in crate `{}`; the set-only env answered it unset",
+        "macro getenv agrees with env! on {} names; CARGO_TARGET_TMPDIR refused in crate `{}`; the set-only env answered it unset",
         NAMES.len(),
         refused.err().and_then(|e| e.krate).unwrap_or_default()
     );
@@ -134,6 +136,7 @@ fn a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest() {
         build_script: false,
         script: None,
         test_or_bench: false,
+        meta: None,
     };
     let env = CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of reth_rpc_api: {e}"));
     let files = || {

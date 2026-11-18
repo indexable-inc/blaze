@@ -1,0 +1,15 @@
+{
+ "id": "engine-check-sweep-oracle-no-seam",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RC7",
+ "where": "crates/blaze-cli/src/store.rs open_for_command (plain_place.rs config, Liveness::Everything); crates/blaze-std/src/io.rs SimWorld (Io::simulated)",
+ "what": "the reach oracle for `engine-check` (after a sweep the next request is certified and enters 0 tasks) could not be written: the command's store takes its liveness from plain_place.rs `config` with no seam a test sets, and `Io::simulated` exposes no clock a test can move past a root's life, a lease and the grace, so a slice never judges anything dead inside an engine-check test",
+ "cost": "the oracle is missing; the engine path's roots are proven only at the store level (blaze-cas beside_tests, blaze-cli reach_tests over the code store)",
+ "cause": "engine-check tests drive the whole command through Io, whose simulated world has a fixed clock and whose store open hard-codes its config",
+ "whys": "the store's config is built at the edge from settings and facts, and liveness was never a setting because it is constant until plan row D5",
+ "class": "a property of the whole command (records survive cleanup) that only a lower layer can be made to show, because the command's world cannot move time",
+ "prevention": "wanted: a test-only liveness on engine_check::Opts (or a PlacePlant) and a SimWorld clock advance, then the oracle in reach_tests",
+ "annoyance": "write-only lanes cannot try whether a seam is enough before writing the test",
+ "workaround": "store-level tests: a root naming an owner's beside index keeps its expansion records (beside_tests), the toolchain root keeps std's code past a program root (reach_tests)",
+ "state": "open"
+}

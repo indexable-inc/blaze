@@ -74,12 +74,12 @@ fn cfg(n: u64) -> PlainConfig {
     }
 }
 
-fn key(n: u32) -> Key {
+pub(super) fn key(n: u32) -> Key {
     Key(ContentId::of("plain index test key", &n.to_le_bytes()))
 }
 
 /// Record `n`'s one value: 40 to 440 bytes; a dead one ([`dead`]) 2,000 more.
-fn value(n: u32) -> Vec<u8> {
+pub(super) fn value(n: u32) -> Vec<u8> {
     let long = if (DEAD_FROM..DEAD_FROM + DEAD).contains(&n) { 2000 } else { 0 };
     (0..40 + long + (n as usize * 37) % 400).map(|i| (n as usize).wrapping_mul(29).wrapping_add(i) as u8).collect()
 }
@@ -100,15 +100,15 @@ fn dead() -> impl Iterator<Item = u32> {
     DEAD_FROM..DEAD_FROM + DEAD
 }
 
-struct World {
-    sim: Sim,
-    next: u64,
-    plant: Plant,
+pub(super) struct World {
+    pub(super) sim: Sim,
+    pub(super) next: u64,
+    pub(super) plant: Plant,
 }
 
 impl World {
     /// A process's store, opened whole on the head as it is now.
-    fn open(&mut self, plant: Plant) -> Result<Plain, String> {
+    pub(super) fn open(&mut self, plant: Plant) -> Result<Plain, String> {
         let n = self.next;
         self.next += 1;
         let mut store = Plain::planted(cfg(n), plant);
@@ -141,7 +141,7 @@ impl World {
 
     /// One command: `puts` then `roots` (each given the store), one slice folded when `fold`,
     /// the lease let go of, one commit.
-    fn command(&mut self, puts: &[u32], roots: impl FnOnce(&mut Plain) -> Result<(), String>, fold: bool) -> Result<(), String> {
+    pub(super) fn command(&mut self, puts: &[u32], roots: impl FnOnce(&mut Plain) -> Result<(), String>, fold: bool) -> Result<(), String> {
         let mut store = self.open(self.plant)?;
         let mut effects = Vec::new_in(Global);
         for &n in puts {
@@ -184,7 +184,7 @@ fn unreadable(w: &mut World, records: impl Iterator<Item = u32>) -> Result<Vec<u
 }
 
 /// Which of `records` still read in a fresh reader.
-fn readable(w: &mut World, records: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
+pub(super) fn readable(w: &mut World, records: impl Iterator<Item = u32>) -> Result<Vec<u32>, String> {
     let r = w.open(Plant::None)?;
     Ok(records.filter(|&n| r.get(&key(n)).is_some()).collect())
 }

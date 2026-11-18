@@ -6,6 +6,7 @@
 //! | [`derivation`] | the format: a DAG of steps `(goal, by)` as rows in columns, written by a [`derivation::Builder`] and read in place by a [`derivation::View`] that checks every limit before a row is trusted |
 //! | [`check`] | the checker: proves a derivation against today's facts by matching only, and returns the proof [`check::Checked`] |
 //! | [`questions`] | the questions the solver's choice rested on, with the digests of their answers, and whether they still stand |
+//! | [`emit`] | the emitter: a recording solver's choices rebuilt into a derivation with the checker's own rules, or a typed "not certifiable" |
 //!
 //! [`today`] is the rule a consumer applies: a certificate is valid today iff every question in
 //! its list answers as recorded AND its derivation checks against today's facts.
@@ -21,8 +22,11 @@ extern crate std;
 
 pub mod check;
 pub mod derivation;
+pub mod emit;
 pub mod questions;
 
+#[cfg(test)]
+mod emit_tests;
 #[cfg(test)]
 mod tests;
 
@@ -32,6 +36,7 @@ use blaze_solve::tys::Tys;
 
 pub use check::{CheckError, Checked, Checker, Cost};
 pub use derivation::{BuildError, Builder, Builtin, By, FormatError, Step, StepId, View};
+pub use emit::{Count, Emitter, NotCertifiable};
 pub use questions::{Questions, StandError};
 
 /// What a certificate is today (the module doc's rule).

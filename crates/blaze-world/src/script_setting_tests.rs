@@ -103,7 +103,7 @@ fn hello(std: &str) -> World<'static> {
     };
     let mut units = AVec::new_in(a());
     units.push(member);
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2 }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2, meta: AVec::new_in(a()) }));
     let (id, files) = crate::fixture::shelf(TRIPLE, std, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
     let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut Member, a()).unwrap_or_else(|e| panic!("{e}"));

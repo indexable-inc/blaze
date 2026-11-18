@@ -30,6 +30,11 @@ pub enum Why {
     Need(LibKey),
     /// A construct this build does not take yet, by its plain Rust name.
     Unsupported(&'static str, Range),
+    /// [`Why::Unsupported`] of the head of an item declared in a body, with that item named
+    /// (rule 19): its kind, its name as written and the body it is declared in (heads.rs
+    /// `Store::named_local`), since its key names nothing a person can find. The construct
+    /// first, so a census groups it with [`Why::Unsupported`]'s class.
+    UnsupportedIn(&'static str, Box<str, Global>, Range),
     /// The program is refused for what it says.
     Program(Box<str, Global>, Range),
     /// The names library could not resolve the path.
@@ -350,6 +355,10 @@ pub struct Env<'e> {
     /// generics"): each one's index (among `params`, which names it) and its declared type.
     /// A name in `params` whose index is here is a constant, never a type.
     pub consts: &'e [(u32, PTy)],
+    /// The body whose blocks the type is written in: a path's first segment is asked of
+    /// their named imports before the module ([`super::block_type_uses`]). `None` for a type
+    /// no body's block holds (a signature, a head).
+    pub body: Option<super::block_type_uses::BodyScope<'e>>,
 }
 
 /// The checker's node for each built-in type the names library names (`Kind::Builtin(name)`,
@@ -808,7 +817,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// census r16, `check gap: UnreadImpl`, 41 of 53).
     #[expect(clippy::too_many_arguments, reason = "one path's resolution: the path, its view and the argument's place")]
     fn const_want(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], index: u32, r: Range) -> Result<PTy, Why> {
-        let found = super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, texts, Ns::Type, r)?;
+        let found = self.resolve_at(env, v, p, abs, texts, Ns::Type, r)?;
         if found.consumed as usize != texts.len() {
             return Err(Why::Unsupported("a const argument on an associated item's path", r));
         }
@@ -865,7 +874,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 // The name resolves where its token's mark says, as the
                                 // argument's own type would (`path_ty`): never at the module
                                 // alone when a macro wrote it.
-                                let at_mark = |ns: Ns| super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, tp, false, &[name], ns, ar);
+                                let at_mark = |ns: Ns| self.resolve_at(env, v, tp, false, &[name], ns, ar);
                                 // A type if a type parameter, or the names library's answer in
                                 // the type namespace is a type (a constant item answers there
                                 // too, as the library files it: then it is a constant).
@@ -986,6 +995,21 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     }
 
     /// A path type: `Self`, a generic parameter, an ADT, a primitive, or `<T as Tr>::X`.
+    /// What the written path `p` of `v` (segments `texts`, from `::` when `abs`) names in `ns`,
+    /// the one reading of a written type's path: in a body, through a block's named import of
+    /// its first segment ([`super::block_type_uses::through_use`]; the import's path read where
+    /// the `use` is written); else where its first token's mark says, from `env.module`
+    /// ([`super::item_site::resolve_written`]).
+    #[expect(clippy::too_many_arguments, reason = "one resolve of one path: the path, its view and its env")]
+    fn resolve_at(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], ns: Ns, r: Range) -> Result<crate::resolve::Target, Why> {
+        if let Some(body) = env.body
+            && let Some(found) = super::block_type_uses::through_use(&self.resolver, self.marks, &body, v, p, abs, texts, ns, r)?
+        {
+            return Ok(found);
+        }
+        super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, texts, ns, r)
+    }
+
     fn path_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, kids: &[PTy]) -> Result<PTy, Why> {
         let (abs, texts, segs, r) = path_texts(v, p)?;
         let shown = v.text_at(v.path_range(p)?)?;
@@ -1072,7 +1096,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         // A built-in type is the names library's answer (`Kind::Builtin`): front2 has no lookup
         // rule of its own for one. Where the path resolves is its first token's mark.
-        let found = super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, &texts, Ns::Type, r)?;
+        let found = self.resolve_at(env, v, p, abs, &texts, Ns::Type, r)?;
         if found.consumed as usize != texts.len() {
             return Err(Why::Unsupported("an associated type of a type (`T::X`)", r));
         }
@@ -1311,7 +1335,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// What a bound's path `p` of `v` names, by the names library where its first token's mark
     /// says (front2 item_site.rs): a trait or a trait alias.
     pub(super) fn bound_target(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], r: Range) -> Result<Bounded, Why> {
-        let found = super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, texts, Ns::Type, r)?;
+        let found = self.resolve_at(env, v, p, abs, texts, Ns::Type, r)?;
         match found.kind {
             _ if found.consumed as usize != texts.len() => Err(program(format!("this path is not a trait"), r)),
             Kind::Trait => Ok(Bounded::Trait(found.key)),

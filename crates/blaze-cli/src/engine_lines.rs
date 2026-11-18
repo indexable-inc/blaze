@@ -59,6 +59,9 @@ pub(crate) enum Class {
     /// (engine_head_notes.rs `words`), printed grouped by reason after the other notes
     /// (engine_head_notes.rs `print_grouped`), counted apart ([`Tally::heads`]).
     Head = 3,
+    /// Said, counted as nothing: a fact of the plan, not of a check (engine_body_plan.rs: a file
+    /// no unit of its crate holds under its cfg). Printed; fails nothing, leaves nothing unchecked.
+    Told = 4,
 }
 
 impl Class {
@@ -68,6 +71,7 @@ impl Class {
             1 => Some(Class::Unchecked),
             2 => Some(Class::Waited),
             3 => Some(Class::Head),
+            4 => Some(Class::Told),
             _ => None,
         }
     }
@@ -400,6 +404,7 @@ pub(crate) fn print_all<'f, 'b>(
                         }
                         // Printed grouped by reason (engine_head_notes.rs `print_grouped`).
                         Class::Head => tally.heads += 1,
+                        Class::Told => print::note(cx, words, shown, frame, out)?,
                     }
                     continue;
                 }

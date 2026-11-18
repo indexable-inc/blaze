@@ -46,6 +46,9 @@ pub struct Phases {
     /// `blaze run`'s parent's reads for its names records (run_names.rs `NamesRead`): the crates'
     /// records read in place, the bytes copied (0), the trees opened at their first read.
     pub(crate) run_names: Option<crate::run_names::NamesRead>,
+    /// The cleanup line's part known before the commit after the answer (store/roots.rs
+    /// `CleanupLine::before_commit`), for a profile written before that commit (main.rs).
+    pub(crate) cleanup: Option<crate::store::roots::BeforeCommit>,
     /// The command's own frame, by what took its bytes ([`Phases::mark_in`], [`Phases::took`]).
     held: Held,
 }
@@ -134,6 +137,7 @@ impl Phases {
             records: byte_rows::Records::new(),
             code_records: None,
             run_names: None,
+            cleanup: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
         }
     }
@@ -271,6 +275,9 @@ impl fmt::Display for Phases {
         }
         if let Some(read) = self.run_names {
             writeln!(f, "run          {read}")?;
+        }
+        if let Some(cleanup) = self.cleanup {
+            writeln!(f, "{cleanup}")?;
         }
         let held = &self.held;
         write!(f, "frame        the command's frame: {} of {} bytes used · by phase (bytes):", held.seen.0, held.seen.1)?;

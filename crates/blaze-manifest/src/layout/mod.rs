@@ -48,6 +48,9 @@
 //! by.
 
 mod extra;
+pub mod meta;
+#[cfg(test)]
+mod meta_tests;
 pub mod panic;
 pub mod profile;
 mod raw;
@@ -59,9 +62,10 @@ use core::fmt;
 use blaze_own::{Alloc, SortedMap, String, Vec};
 use edition::{NoEdition, PackageEdition};
 
-use raw::{GitRef as RawGitRef, Raw, RawBuild, RawDep, RawEdition, RawPackage, RawTarget, RawVersion, RawWorkspace};
+use raw::{GitRef as RawGitRef, Raw, RawBuild, RawDep, RawEdition, RawMeta, RawPackage, RawTarget, RawVersion, RawWorkspace};
 
 pub use extra::{ExtraKind, ExtraTarget, RefusedTarget, TargetRefused};
+pub use meta::{META_KEYS, PackageMeta, PackageMetaVars};
 pub use raw::GitRef;
 
 /// Text in the caller's allocator.
@@ -213,6 +217,9 @@ pub struct Member<'a> {
     /// `package.version`, the root's `workspace.package.version` when inherited; `None` when
     /// none is written (cargo reads that as `0.0.0`).
     pub version: Option<Text<'a>>,
+    /// The `[package]` metadata cargo gives each crate of the package as `CARGO_PKG_*`
+    /// (meta.rs), an inherited key the root's `[workspace.package]` value.
+    pub meta: PackageMeta<'a>,
 }
 
 /// A workspace's layout.
@@ -838,6 +845,39 @@ impl<'l, 'a> Passing<'l, 'a> {
                 None => return Err(LayoutError::NotInherited { at: *span, key: "version" }),
             },
         };
+        // The metadata, as cargo's normalization makes it (meta.rs).
+        let mut values: [Text<'a>; 8] = core::array::from_fn(|_| String::new_in(alloc));
+        for (at, raw) in package.meta.iter().enumerate() {
+            values[at] = match raw {
+                RawMeta::Written(value) => value.clone(),
+                RawMeta::Inherited(span) => match ws.and_then(|ws| ws.meta[at].as_ref()) {
+                    None => return Err(LayoutError::NotInherited { at: *span, key: META_KEYS[at] }),
+                    // A path the root states is the root's: made relative to this package's
+                    // directory (cargo's `resolve_relative_path`).
+                    Some(value) if (at == meta::README || at == meta::LICENSE_FILE) && !value.is_empty() => {
+                        let from_anchor = self.rooted(root_dir, value, *span)?;
+                        meta::relative_to(&from_anchor, &found.dir, alloc)
+                    }
+                    Some(value) => value.clone(),
+                },
+                // Unstated: the first default readme that is a file in the package's directory.
+                RawMeta::Absent if at == meta::README => match self.list(&found.dir) {
+                    None => return Ok(None),
+                    Some(entries) => {
+                        let mut readme = "";
+                        for name in meta::DEFAULT_READMES {
+                            if entries.is_some_and(|entries| entries.iter().any(|(n, d)| n.as_str() == name && !*d)) {
+                                readme = name;
+                                break;
+                            }
+                        }
+                        String::from_str_in(readme, alloc)
+                    }
+                },
+                RawMeta::Absent => String::new_in(alloc),
+            };
+        }
+        let meta = PackageMeta::new(values);
         let mut dependencies = Vec::with_capacity_in(package.dependencies.len(), alloc);
         for dep in package.dependencies.iter() {
             dependencies.push(self.dependency(dep, ws, root_dir, &found.dir, members)?);
@@ -877,6 +917,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             build,
             links: package.links.clone(),
             version,
+            meta,
         }))
     }
 

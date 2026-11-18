@@ -830,7 +830,7 @@ fn params(tys: &mut PortableTys<'_>, from: u32, to: u32, consts: &[(u32, PTy)]) 
 /// which refuses every other type by name). Their count.
 pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, module: LibKey, v: &View<'_>, base: u32, ps: &mut Vec<(Name, u32), Global>, consts: &mut Vec<(u32, PTy), Global>) -> Result<u32, Why> {
     let n = param_names(v, base, ps, Consts::Keep)?;
-    let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[] };
+    let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
     let mut i = base;
     let list = v.list(head::GENERICS);
     for (k, &row) in v.rows(list)?.iter().enumerate() {
@@ -1199,14 +1199,14 @@ impl<'n> Store<'n> {
             // A free constant's head is its type as a fn of no inputs (the checker reads a
             // `Def::Const` through `fn_sig`); its body is lowered by `lower_fn` like a fn's.
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
-                let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[] };
+                let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
                 self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, marks)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
-                let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[] };
+                let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
                 let made = self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, marks);
                 if made.is_ok() {
@@ -1244,8 +1244,23 @@ impl<'n> Store<'n> {
                 Ok(Step::Done)
             }
             Err(Why::Need(k)) => Ok(Step::Need(k)),
-            Err(why) => Err(HeadError::Item(key, why)),
+            Err(why) => Err(HeadError::Item(key, self.named_local(names, keys, ck, why))),
         }
+    }
+
+    /// `why`, refusing the head of item `ck`, with the item named when it is declared in a body
+    /// (rule 19): its key is derived at its body's lowering and names nothing a person can
+    /// find (std hello's stop printed "item ItemKey(1ef15ca1d9b8)"). A [`Why::Unsupported`]
+    /// becomes [`Why::UnsupportedIn`]: its kind, its name as written, and the body it is
+    /// declared in by that item's path ("a static in a block `__RUST_STD_INTERNAL_VAL`,
+    /// declared in the body of std::io::stdio::OUTPUT_CAPTURE (key ..)"). Every other `why`,
+    /// and every item with a names row, is returned as it is.
+    fn named_local<S: NamesSource<'n>>(&self, names: S, keys: &Keys, ck: ItemKey, why: Why) -> Why {
+        let Why::Unsupported(what, at) = why else { return why };
+        let Some(h) = self.locals.head(ck) else { return Why::Unsupported(what, at) };
+        let name = self.locals.body(h.enclosing).and_then(|b| b.rows.iter().find(|r| r.key == h.lib)).map_or("<a name its body's rows do not hold>", |r| r.name);
+        let body = super::item_shown::ItemShown::of(names, keys, h.enclosing);
+        Why::UnsupportedIn(what, format!("{} `{name}`, declared in the body of {body}", h.kind.form()).into_boxed_str(), at)
     }
 
     /// The heads of cell `want` read from its frozen record (front2/tables/head.rs `import`,
@@ -1387,7 +1402,7 @@ impl<'n> Store<'n> {
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         let me = intern(&mut self.tys, PNode::Param(0))?;
-        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs };
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 1, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -1428,7 +1443,7 @@ impl<'n> Store<'n> {
         let t = v.head_opt(head::TY).ok_or(Why::Unsupported("an extern type (`extern { type T; }`): the checker's portable type has no foreign node", Range::new(0, 0)))?;
         // A bound on an alias's parameter is not checked where the alias is used, but it is
         // what `T::X` in the aliased type is read through (core's `ChangeOutputType`).
-        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -1451,7 +1466,7 @@ impl<'n> Store<'n> {
         let marks = self.marks(names, key, v.item())?;
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let g = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
-        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut defaults = Vec::new_in(Global);
         own_defaults(&b, &mut self.tys, &env, v, 0, &mut defaults)?;
         // A fieldless enum is filed before its generics are: a path to it has a type only
@@ -1492,7 +1507,7 @@ impl<'n> Store<'n> {
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
-        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs };
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut defaults = Vec::new_in(Global);
         own_defaults(&b, &mut self.tys, &env, v, 1, &mut defaults)?;
         let ck = checker_of(key);
@@ -1561,7 +1576,7 @@ impl<'n> Store<'n> {
         let mut ps = Vec::new_in(Global);
         let own = param_names(v, 1, &mut ps, Consts::Keep)?;
         let cs = self.maps.const_params.get(&key).cloned().ok_or(Why::Need(key))?;
-        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs };
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let mut bounds = Vec::new_in(Global);
@@ -1749,7 +1764,7 @@ impl<'n> Store<'n> {
         let cs = self.maps.const_params.get(&key).cloned().ok_or(Why::Need(key))?;
         let pl = params(&mut self.tys, 0, generics, &cs)?;
         let self_ty = intern(&mut self.tys, PNode::Adt(ck, pl))?;
-        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(self_ty, None), self_assoc: &[], anon: &[], consts: &cs };
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(self_ty, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let mut bounds = Vec::new_in(Global);
@@ -1913,7 +1928,7 @@ impl<'n> Store<'n> {
         let marks = self.marks(names, key, v.item())?;
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
-        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         // The self type FIRST, then the bounds with `Self` known: the Reference, "Paths",
         // "`Self`": "In an implementation, it refers to the type being implemented", the
         // impl's where clauses included (ruint's `impl<.., T> UintTryTo<T> for Uint<BITS,
@@ -2138,7 +2153,7 @@ impl<'n> Store<'n> {
         // The return type's builder: an expanded return type is a text of its own, read at the
         // fn's module; the item's marks are not its tokens'.
         let rb = Builder { resolver: Paths { names }, heads: &self.maps, marks: if expanded.is_some() { None } else { marks } };
-        let env = Env { module: outer.module, params: &ps, bounds: Bounds::Building(&[]), self_: outer.self_, self_assoc: outer.self_assoc, anon: &anon, consts: &cs };
+        let env = Env { module: outer.module, params: &ps, bounds: Bounds::Building(&[]), self_: outer.self_, self_assoc: outer.self_assoc, anon: &anon, consts: &cs, body: None };
         b.param_bounds(&mut self.tys, &env, v, parent, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
         // The return type's env: its opaques by their ids in `rv`; the parameters' `impl`s are

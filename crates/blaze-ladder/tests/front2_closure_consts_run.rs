@@ -141,13 +141,14 @@ pub extern \"C\" fn main() -> i32 {
 /// constant and returns one of two fn items at `<T, F>` as a fn pointer, then called. At `u8`
 /// (1 byte, the first) the pointer's fn answers 3, at `[u64; 16]` (128 bytes) the second, 4.
 ///
-/// Still refused, by name, and asserted so: the constant evaluates (its record holds a fn
-/// pointer, `DataTarget::Fn(key)`), but the record names the fn only by its instance key, a
-/// hash with no inverse, and the build's `Adts::const_fn_instance` (run.rs) finds only a
-/// non-generic fn by that key; `small::<u8, {closure}>` is generic. The fix is the record
-/// carrying the instance it keyed (item and ground arguments), not a wider search.
+/// The constant evaluates (its record holds a fn pointer, `DataTarget::Fn(key)`, a hash with no
+/// inverse) and the record names the instance it keyed (blaze-consteval `ConstRecord::fns`:
+/// `small::<u8, {closure}>`, generic), which the build's `Adts::const_fn_instance` (run.rs,
+/// front2 consts.rs `Consts::fn_instance`) reads. Until the record named it this was refused
+/// ("a constant's value holds a fn pointer to instance .., which the build's `Adts` does not
+/// give"); now it runs: 3 * 10 + 4.
 #[test]
-fn a_const_block_choosing_a_fn_pointer_over_a_closure_type_is_refused_by_name() {
+fn a_const_block_choosing_a_fn_pointer_over_a_closure_type_runs() {
     let got = run("
 const fn inst<T, F: FnMut(&T, &T) -> bool>() -> fn(&T, &mut F) -> usize {
     const MOST: usize = 96;
@@ -174,11 +175,7 @@ pub extern \"C\" fn main() -> i32 {
 }
 ");
     println!("PARTITION'S CONST BLOCK: {got:?}");
-    // Runs 34 once the record carries its fn targets' instances.
-    assert!(
-        matches!(&got, Err(e) if e.contains("a constant's value holds a fn pointer to instance") && e.contains("`Adts` does not give")),
-        "partition's const block: the generic fn pointer's instance is not given yet, got {got:?}"
-    );
+    assert_eq!(got, Ok(34), "partition's const block: the generic fn pointer's instance is named by the record");
 }
 
 /// The control: a closure in a const block capturing the fn's parameter `x`, a value no

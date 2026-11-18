@@ -17,7 +17,7 @@ use blaze_ids::ContentId;
 use blaze_ids::producer::{CodeBuilder, Producers};
 use blaze_ladder::body_ids::{BodyId, Read, record_key};
 use blaze_ladder::code_records::{
-    Builder, CodeKey, CodeStore, KeyParts, KeyPlant, MemoryStore, PanicStrategy, RecordRun, Settings, StoreError, body_digest, code_key, code_key_planted, getter_parts, make_getter_entry,
+    Builder, CodeClass, CodeKey, CodeStore, KeyParts, KeyPlant, MemoryStore, PanicStrategy, RecordRun, Settings, StoreError, body_digest, code_key, code_key_planted, getter_parts, make_getter_entry,
 };
 use blaze_ladder::front2::body_reads::ReadsDigest;
 use blaze_ladder::run::OverflowChecks;
@@ -83,7 +83,7 @@ fn entries_reach_the_next_process_and_are_read_in_place() {
     let lent = process(Sim::new(1, Faults::default()), 1);
     let mut store = HomeCodeStore::new(&lent);
     for n in 0..64 {
-        store.put(code_key(&parts(n), &builder()), &entry(n)).expect("a put");
+        store.put(CodeClass::Program,code_key(&parts(n), &builder()), &entry(n)).expect("a put");
         assert_eq!(store.get(code_key(&parts(n), &builder())).expect("a get"), Some(&entry(n)[..]), "entry {n} from the arena");
     }
     drop(store);
@@ -97,11 +97,11 @@ fn entries_reach_the_next_process_and_are_read_in_place() {
     assert_eq!((counts.from_segments, counts.from_puts), (64, 0), "{counts:?}");
     assert_eq!(store.get(code_key(&parts(5000), &builder())).expect("a get"), None);
     let key = code_key(&parts(7), &builder());
-    match store.put(key, &entry(8)) {
+    match store.put(CodeClass::Program,key, &entry(8)) {
         Err(StoreError::TwoValues { key: refused }) => assert_eq!(refused, key),
         other => panic!("other bytes under a committed code key were not refused: {other:?}"),
     }
-    store.put(key, &entry(7)).expect("equal bytes under a held key are no write");
+    store.put(CodeClass::Program,key, &entry(7)).expect("equal bytes under a held key are no write");
     // A record of the drive's (or any other) tag under a key the code index asks.
     let other = CodeKey(ContentId::of("code store test other tag", b"x"));
     lent.put(&CasKey(other.0), Namespace::LOCAL, Tag(1), b"not a code entry").expect("a put of another tag");
@@ -197,8 +197,8 @@ fn every_covered_input_moved_alone_is_a_miss() {
 
     let lent = process(Sim::new(3, Faults::default()), 1);
     let mut store = HomeCodeStore::new(&lent);
-    store.put(code_key(&base_parts, &base), &entry(1)).expect("the base entry");
-    store.put(record_base, &entry(2)).expect("the record_key base entry");
+    store.put(CodeClass::Program,code_key(&base_parts, &base), &entry(1)).expect("the base entry");
+    store.put(CodeClass::Program,record_base, &entry(2)).expect("the record_key base entry");
     drop(store);
     after_answer(&lent, 0).expect("the commit after the answer");
     let lent = process(back(lent), 2);
@@ -236,12 +236,12 @@ fn a_key_without_an_input_is_caught_by_the_two_values_refusal() {
     let caught = |plant: KeyPlant, other: Builder, seed: u64| -> bool {
         let lent = process(Sim::new(seed, Faults::default()), 1);
         let mut store = HomeCodeStore::new(&lent);
-        store.put(code_key_planted(&parts(1), &base, plant), &entry(1)).expect("the first entry");
+        store.put(CodeClass::Program,code_key_planted(&parts(1), &base, plant), &entry(1)).expect("the first entry");
         drop(store);
         after_answer(&lent, 0).expect("the commit after the answer");
         let lent = process(back(lent), 2);
         let mut store = HomeCodeStore::new(&lent);
-        match store.put(code_key_planted(&parts(1), &other, plant), &entry(2)) {
+        match store.put(CodeClass::Program,code_key_planted(&parts(1), &other, plant), &entry(2)) {
             Err(StoreError::TwoValues { .. }) => true,
             Ok(()) => false,
             Err(failed) => panic!("the store failed otherwise: {failed}"),

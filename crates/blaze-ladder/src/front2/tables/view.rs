@@ -100,6 +100,14 @@ impl<'t, 'n> Tables<'t, 'n> {
         }
     }
 
+    /// Whether crate `krate` may write an incoherent impl: its one names cell
+    /// ([`NameCell::Incoherent`]).
+    fn incoherent(self, krate: usize) {
+        if let Some(krate) = self.prefix(krate) {
+            self.cell(NameCell::Incoherent { krate });
+        }
+    }
+
     fn whole(self, krate: usize, section: Section) {
         if let Some(krate) = self.prefix(krate) {
             self.cell(NameCell::Whole { krate, section });
@@ -205,6 +213,9 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
 
     fn may_write_incoherent(self, krate: usize) -> Option<bool> {
         self.root(krate);
+        // The flag itself: the root cell's digest leaves the root file's text out, and the
+        // flag is read from it (`#![rustc_attrs]`, `#![rustc_coherence_is_core]`).
+        self.incoherent(krate);
         self.records.may_write_incoherent(krate)
     }
 
@@ -363,6 +374,15 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     }
 
     fn incoherent_crates(self) -> Option<(&'n [usize], blaze_id::ContentId)> {
+        // The fact at cell grain (lane BH1): which crates are asked is the lang set, fixed by
+        // the owner's root (its `#![no_core]` and its dependencies: each lang crate's `Root`),
+        // and each one's answer is its `Incoherent` cell. The coarse read below stays for the
+        // engine's `Whole` strategy (blaze-cli engine_scope_reads.rs), which widens it to every
+        // scope crate's record; `Cells` drops it, these cells covering every fact behind it.
+        for krate in self.lang_crates.iter().copied() {
+            self.root(krate);
+            self.incoherent(krate);
+        }
         self.reads.read(TableRead::Impls { krate: [0; 16], bucket: INCOHERENT });
         self.records.incoherent_crates()
     }

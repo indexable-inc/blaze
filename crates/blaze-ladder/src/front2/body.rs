@@ -854,7 +854,7 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
     let b = Builder { resolver: Paths { names }, heads: &store.maps, marks };
     own_generics(&b, &mut store.tys, head_at, &sig.view(), 0, &mut params, &mut consts).map_err(|why| BodyError::Generics { item, why })?;
     let mut bounds = Vec::new_in(Global);
-    let env = Env { module: head_at, params: &params, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &consts };
+    let env = Env { module: head_at, params: &params, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &consts, body: None };
     b.param_bounds(&mut store.tys, &env, &sig.view(), 0, &mut bounds).map_err(|why| BodyError::Generics { item, why })?;
     // Its body's words keep the same marks as its generics: a fn a macro wrote is lowered with
     // them (`Site::marks`).
@@ -1130,7 +1130,18 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             // lowered into the body, and the item's own when a macro wrote it
             // (`lower_body_expanding_marked`), so the builder needs no second copy of them.
             builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None },
-            env: Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts },
+            // A written type's first segment is asked of the blocks' named imports first
+            // (super::block_type_uses): a block holding only `use`s is no module to read at.
+            env: Env {
+                module,
+                params: &params,
+                bounds: Bounds::Done(&bounds),
+                self_,
+                self_assoc: &self_assoc,
+                anon: &[],
+                consts: &consts,
+                body: Some(super::block_type_uses::BodyScope { locals: &store.locals, owner, module, alloc }),
+            },
             failed: None,
             text,
             misses: Vec::new_in(Global),

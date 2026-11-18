@@ -80,6 +80,7 @@ use blaze_drive::{Cell, CellRead, Key, Kind, Name, Tool, WireError};
 use blaze_id::CrateItemKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
+use blaze_ladder::code_records::CodeClass;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_toolchain::ToolchainId;
 use blaze_typeck::ItemKey;
@@ -1587,6 +1588,15 @@ impl BodyIds for RunIds<'_> {
             CrateGrain::Toolchain => Some(self.toolchain_read),
             CrateGrain::Locked(read) => Some(read),
             CrateGrain::Workspace(read) => read,
+        }
+    }
+
+    /// A crate of the pinned toolchain's shelf is the toolchain's (store/roots.rs
+    /// `Rooted<Toolchain>`); a locked or workspace crate, and an item of no crate, the program's.
+    fn class(&self, item: ItemKey) -> CodeClass {
+        match self.crate_of(item).map(|row| row.grain) {
+            Some(CrateGrain::Toolchain) => CodeClass::Toolchain,
+            _ => CodeClass::Program,
         }
     }
 }

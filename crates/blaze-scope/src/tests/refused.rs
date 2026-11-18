@@ -65,6 +65,7 @@ fn a_name_behind_a_refused_include_names_the_missing_out_dir() {
         build_script: true,
         script: None,
         test_or_bench: false,
+        meta: None,
     };
     let sources = NoOutputs { env: CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the crate's environment: {e:?}")) };
     let mut sys = input("sys", "/sys/src/lib.rs", &[]);

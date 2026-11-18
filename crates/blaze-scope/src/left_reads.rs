@@ -130,6 +130,7 @@ mod tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            meta: None,
         };
         let env = CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the member's environment: {e:?}"));
         let member = Member { env, told: Mutex::new(Vec::new()) };

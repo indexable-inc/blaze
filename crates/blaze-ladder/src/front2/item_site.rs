@@ -167,6 +167,27 @@ pub fn resolve_written<'n, S: NamesSource<'n>>(
     ns: Ns,
     r: Range,
 ) -> Result<Target, Why> {
+    let first = texts.first().copied().unwrap_or("");
+    let site = written_site(resolver, marks, module, v, p, abs, first, r)?;
+    resolver.path_with(site.module, site.dollar_crate, abs, texts, ns).map_err(|e| Why::Resolve(e, r))
+}
+
+/// Where the path `p` of `v` (first segment `first`, from `::` when `abs`), written in
+/// `module`, is read: the module and `$crate`'s crate its first token's mark says
+/// ([`site_in`]), the mark found as [`resolve_written`] finds it. The one reading of a written
+/// path's site for [`resolve_written`] and a written type read through a block's `use`
+/// (super::block_type_uses).
+#[expect(clippy::too_many_arguments, reason = "one site of one path: the path, its view and its marks")]
+pub fn written_site<'n, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    marks: Option<TextMarks<'_>>,
+    module: LibKey,
+    v: &View<'_>,
+    p: PathIdx,
+    abs: bool,
+    first: &str,
+    r: Range,
+) -> Result<PathSite, Why> {
     let range = v.path_range(p)?;
     let mark = match (v.mark_of_path(p)?, marks) {
         (Some(m), _) => Some(m),
@@ -176,12 +197,10 @@ pub fn resolve_written<'n, S: NamesSource<'n>>(
         }
         (None, _) => None,
     };
-    let first = texts.first().copied().unwrap_or("");
-    let site = site_in(resolver.names, mark, first, abs, module).map_err(|refused| match refused {
+    site_in(resolver.names, mark, first, abs, module).map_err(|refused| match refused {
         SiteRefused::UnmarkedDollarCrate => Why::Unsupported("`$crate` on a token no expansion wrote (drive.md, \"A token keeps its mark\")", r),
         SiteRefused::OpaqueWithoutModule { .. } => Why::Unsupported("a path under a def-site mark of a crate this build does not hold (drive.md, \"A token keeps its mark\")", r),
-    })?;
-    resolver.path_with(site.module, site.dollar_crate, abs, texts, ns).map_err(|e| Why::Resolve(e, r))
+    })
 }
 
 /// [`site_of`], with a def-site mark whose definition names no module read at its crate's

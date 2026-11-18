@@ -15,10 +15,17 @@
 //! The control (rule 23): the program root planted off (`keep_program` not called) makes the
 //! same history's last run make its code again, and the oracle says so.
 //!
-//! Not here (store/roots.rs NOT DONE): `engine-check` answering "certified" after the sweep
-//! needs the drive's answer records rooted through index records, and a toolchain root needs
-//! the code key to carry its crate's class: under `Reached` both would be swept today, so the
-//! command's store stays on `Liveness::Everything` (plain_place.rs `config`).
+//! The toolchain's code (`CodeClass::Toolchain`, std's instances) is kept by the toolchain's
+//! root (store/roots.rs `keep_toolchain`), not by a program's: a NEW checkout that first runs
+//! after the checkout that made std's code has expired finds all of it. Its control: the
+//! toolchain root planted off makes that checkout make std's code again.
+//!
+//! Not here: `engine-check` answering "certified" with 0 tasks entered after a sweep. The
+//! command's store has no liveness seam a test can set (store.rs `open_for_command` takes
+//! plain_place.rs `config`, `Liveness::Everything` until plan row D5), and `Io::simulated` has
+//! no clock a test can move past a root's life, a lease and the grace.
+
+use blaze_ladder::code_records::CodeClass;
 
 use std::alloc::Global;
 use std::time::Duration;
@@ -32,9 +39,9 @@ use blaze_ids::ContentId;
 use blaze_ladder::code_records::{CodeKey, CodeStore};
 
 use super::plain_place::{Facts, after_answer, config, open};
-use super::roots::{CleanupLine, keep_program};
+use super::roots::{CleanupLine, keep_program, keep_toolchain};
 use crate::code_store::HomeCodeStore;
-use crate::start_list::{self, HEAD, ListName, ROW};
+use crate::start_list::{self, Certificate, HEAD, ListName, ROW, Today};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const MINUTE: Duration = Duration::from_secs(60);
@@ -92,6 +99,12 @@ impl Checkout {
         ListName::of(&ContentId::of("reach test shape", &[self.which]))
     }
 
+    /// Its run's today: one certificate a checkout, its run tables two keys of it.
+    fn today(&self) -> Today {
+        let table = |what: &'static str| CasKey(ContentId::of(what, &[self.which]));
+        Today { certificate: Certificate([self.which; 32]), name: self.list_name(), tables: [table("reach test ids table"), table("reach test names table")] }
+    }
+
     /// The start list this program's run writes: one code row per instance.
     fn list(&self) -> std::vec::Vec<u8> {
         let mut bytes = std::vec![0u8; HEAD];
@@ -117,10 +130,26 @@ struct Ran {
 /// key's pointer and made (put under its content key, pointed) on a miss; the start list
 /// written; the program root set when `keep`; one slice folded; the commit after the answer.
 fn run(sim: Sim, n: u64, checkout: Checkout, keep: bool) -> (Sim, Ran) {
+    let (sim, ran, _) = run_with(sim, n, checkout, Keep { program: keep, toolchain: true }, 0..0);
+    (sim, ran)
+}
+
+/// Which roots a run sets at its exit (own_process.rs `run_own` sets both).
+#[derive(Clone, Copy)]
+struct Keep {
+    program: bool,
+    toolchain: bool,
+}
+
+/// [`run`] with the roots `keep` sets, the program also calling the toolchain's instances
+/// `std` (class `Toolchain`, as run_ids.rs `class` answers for a toolchain crate's item):
+/// answers what it made of them too.
+fn run_with(sim: Sim, n: u64, checkout: Checkout, keep: Keep, std: core::ops::Range<u32>) -> (Sim, Ran, u32) {
     let lent = process(sim, n);
-    let (mut made, mut found) = (0, 0);
+    let (mut made, mut found, mut std_made) = (0, 0, 0);
     let mut codes = HomeCodeStore::new(&lent);
-    for i in checkout.program.clone() {
+    let called = std.clone().map(|i| (i, CodeClass::Toolchain)).chain(checkout.program.clone().map(|i| (i, CodeClass::Program)));
+    for (i, class) in called {
         let hit = match codes.pointed(code(i)).expect("a pointer read") {
             Some(target) => codes.get(target).expect("an entry read") == Some(&entry(i)[..]),
             None => false,
@@ -128,22 +157,29 @@ fn run(sim: Sim, n: u64, checkout: Checkout, keep: bool) -> (Sim, Ran) {
         if hit {
             found += 1;
         } else {
-            codes.put(content(i), &entry(i)).expect("an entry put");
-            codes.point(code(i), content(i)).expect("a pointer put");
-            made += 1;
+            codes.put(class, content(i), &entry(i)).expect("an entry put");
+            codes.point(class, code(i), content(i)).expect("a pointer put");
+            match class {
+                CodeClass::Toolchain => std_made += 1,
+                CodeClass::Program => made += 1,
+            }
         }
     }
     let walked = codes.reached();
-    let name = checkout.list_name();
+    let tool_made = codes.toolchain_made();
+    let today = checkout.today();
     let list = checkout.list();
-    let held = start_list::held(&lent, &name).expect("the list read").map(<[u8]>::to_vec);
-    start_list::write(&lent, &name, held.as_deref(), &list).expect("the list written");
-    if keep {
-        let (_rooted, kept) = keep_program(&lent, &name, Some(&list), &walked).expect("the program's root");
+    let held = start_list::held(&lent, &today.name).expect("the list read").map(<[u8]>::to_vec);
+    start_list::write(&lent, &today.name, held.as_deref(), &list).expect("the list written");
+    if keep.program {
+        let (_rooted, kept) = keep_program(&lent, &today, Some(&list), &walked).expect("the program's root");
         assert_eq!(kept.stale_rows, 0, "a row just made names no target");
     }
+    if keep.toolchain {
+        keep_toolchain(&lent, blaze_toolchain::PINNED, &tool_made, &[]).expect("the toolchain's root");
+    }
     let after = after_answer(&lent, 1).expect("the commit after the answer");
-    (back(lent), Ran { made, found, cleanup: after.cleanup })
+    (back(lent), Ran { made, found, cleanup: after.cleanup }, std_made)
 }
 
 /// An idle command: one slice folded, its lease let go of.
@@ -235,6 +271,73 @@ fn history(keep: bool) -> (std::vec::Vec<std::string::String>, Ran) {
         problems.push(std::format!("the segments hold {on_disk} bytes, past twice the live {live} plus {slack}"));
     }
     (problems, last)
+}
+
+/// The toolchain's instances: std's, called by every checkout's program.
+const STD: core::ops::Range<u32> = 100..108;
+
+/// The toolchain history: the first checkout runs (making std's code and its own), then
+/// nothing runs for longer than a program root's life (shorter than the toolchain root's) while
+/// idle commands fold slices; then a NEW checkout runs for the first time. Answers what that
+/// run made of std's code and the slices' cleanup lines. `toolchain` false is the control.
+fn toolchain_history(toolchain: bool) -> (u32, std::vec::Vec<std::string::String>) {
+    let keep = Keep { program: true, toolchain };
+    let mut n = 0u64;
+    let mut next = || {
+        n += 1;
+        n
+    };
+    let mut problems = std::vec::Vec::new();
+    let sim = Sim::new(47, Faults::default());
+    let (mut sim, first, std_first) = run_with(sim, next(), Checkout { which: 1, program: A }, keep, STD);
+    if (first.made, std_first) != (32, 8) {
+        problems.push(std::format!("the first run made {} and {} of std's, not 32 and 8", first.made, std_first));
+    }
+    // Past the program root's life, inside the toolchain root's (twice it): idle commands sweep,
+    // a lease and a grace apart.
+    sim.advance(Duration::from_nanos(ROOT_LIFE_NS) + MINUTE);
+    for _ in 0..4 {
+        sim = idle(sim, next());
+        sim.advance(Duration::from_secs(1));
+    }
+    sim.advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)) + MINUTE);
+    for _ in 0..4 {
+        sim = idle(sim, next());
+        sim.advance(Duration::from_secs(1));
+    }
+    sim.advance(Duration::from_nanos(GRACE_NS) + MINUTE);
+    for _ in 0..2 {
+        sim = idle(sim, next());
+    }
+    // The program root expired: the first checkout's own instances went (the sweep ran).
+    let (sim, left, _) = a_left(sim, next());
+    if left != 0 {
+        problems.push(std::format!("the expired checkout left {left} of its {} own instances: no sweep ran", A_ONLY.len()));
+    }
+    let (_sim, _fresh, std_made) = run_with(sim, next(), Checkout { which: 3, program: 48..56 }, keep, STD);
+    (std_made, problems)
+}
+
+/// Asserts: a checkout that first runs after the one that made std's code expired makes none
+/// of it: the toolchain root kept it past the program root.
+/// Prints "reach toolchain: a new checkout after the first expired made 0 of std's 8".
+#[test]
+fn std_s_code_outlives_the_program_that_made_it() {
+    let (std_made, problems) = toolchain_history(true);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(std_made, 0, "the new checkout made std's code again");
+    std::println!("reach toolchain: a new checkout after the first expired made {std_made} of std's {}", STD.len());
+}
+
+/// The control (rule 23): no toolchain root, so std's code goes with the program root that
+/// made it, and the new checkout makes it again.
+/// Prints "reach toolchain control: no toolchain root: the new checkout made 8 of std's 8".
+#[test]
+fn a_toolchain_root_planted_off_makes_std_s_code_again() {
+    let (std_made, problems) = toolchain_history(false);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert!(std_made > 0, "std's code was kept without a toolchain root: the cause is not the root");
+    std::println!("reach toolchain control: no toolchain root: the new checkout made {std_made} of std's {}", STD.len());
 }
 
 /// Asserts: after the first checkout's root expired and slices folded, the live checkout's run

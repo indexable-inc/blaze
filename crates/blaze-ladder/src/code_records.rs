@@ -873,16 +873,30 @@ impl core::error::Error for StoreError {}
 /// content key ([`CodeStore::point`]), replaced when the entry is built again. Two different
 /// values under one plain key stay [`StoreError::TwoValues`], the alarm that a key missed an
 /// input (rule 21).
+///
+/// Every write says its [`CodeClass`]: which root keeps it after the command (blaze-cli
+/// store/roots.rs), so std's compiled code outlives any one program's root.
 pub trait CodeStore {
     /// The entry under `key`, if any.
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError>;
-    /// Writes `bytes` under `key` once; equal bytes again are no write; different bytes are
-    /// [`StoreError::TwoValues`].
-    fn put(&mut self, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError>;
+    /// Writes `bytes` under `key` once, as a record of `class`; equal bytes again are no write;
+    /// different bytes are [`StoreError::TwoValues`].
+    fn put(&mut self, class: CodeClass, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError>;
     /// The content key the pointer `key` names, if any.
     fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError>;
-    /// The pointer `key` names `content` from now on, whatever it named before.
-    fn point(&mut self, key: CodeKey, content: CodeKey) -> Result<(), StoreError>;
+    /// The pointer `key` names `content` from now on, whatever it named before; both of `class`.
+    fn point(&mut self, class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError>;
+}
+
+/// The lifetime class of a code record: what keeps it after the command that made it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CodeClass {
+    /// Made from the toolchain alone (every item of its instance name is of a toolchain crate,
+    /// or it is made from no text at all: the thread-local getter and ender): kept by the
+    /// toolchain's root, whichever program reached it.
+    Toolchain,
+    /// Anything else: kept by the program root of the run that reached it.
+    Program,
 }
 
 const CONTENT_DOMAIN: &str = "blaze-ladder code entry content 1";
@@ -934,7 +948,8 @@ impl CodeStore for MemoryStore<'_> {
         Ok(self.rows.binary_search_by(|row| row.0.cmp(&key)).ok().map(|at| &self.rows[at].1[..]))
     }
 
-    fn put(&mut self, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError> {
+    /// The class says nothing to a store kept in memory: everything it holds goes at its drop.
+    fn put(&mut self, _class: CodeClass, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError> {
         match self.rows.binary_search_by(|row| row.0.cmp(&key)) {
             Ok(at) if self.rows[at].1[..] == *bytes => Ok(()),
             Ok(_) => Err(StoreError::TwoValues { key }),
@@ -952,7 +967,7 @@ impl CodeStore for MemoryStore<'_> {
         Ok(self.pointers.binary_search_by(|row| row.0.cmp(&key)).ok().map(|at| self.pointers[at].1))
     }
 
-    fn point(&mut self, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
+    fn point(&mut self, _class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
         match self.pointers.binary_search_by(|row| row.0.cmp(&key)) {
             Ok(at) => self.pointers[at].1 = content,
             Err(at) => {

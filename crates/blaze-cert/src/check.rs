@@ -178,6 +178,18 @@ fn solve(step: StepId) -> impl Fn(SolveError) -> CheckError {
     move |error| CheckError::Solve { step, error }
 }
 
+/// A row's rule as the checker and the emitter share it ([`Checker::expect`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowRule {
+    Impl(Def),
+    Normalize(Def),
+    Env(u32),
+    Builtin(Builtin),
+    Auto,
+    Object(u32),
+    AliasBound(u32),
+}
+
 
 impl<'a> Checker<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Checker<'a> {
@@ -214,56 +226,97 @@ impl<'a> Checker<'a> {
             self.goals.push(goal);
             let class = class_of(&ask, &mut reads, goal).map_err(|s| stop(step, s))?;
             self.class.push(class);
-            self.expected.clear();
-            match view.step(step) {
+            let rule = match view.step(step) {
                 // Checked once every row is decoded: its target is a later row.
                 Step::Coinductive { .. } => continue,
                 Step::Impl { impl_, args } => {
                     self.decode_args(tys, args, step, &mut cost)?;
-                    let Pred::Trait { trait_, args: gargs, polarity } = goal else { return Err(CheckError::NotTrait { step }) };
-                    let h = ask.impl_header(&mut reads, impl_).map_err(|s| stop(step, s))?;
-                    cost.headers += 1;
-                    if h.trait_ != trait_ {
-                        return Err(CheckError::HeaderMismatch { step, impl_ });
-                    }
-                    if !matches!((h.polarity, polarity), (ImplPolarity::Positive, Polarity::Positive) | (ImplPolarity::Negative, Polarity::Negative)) {
-                        return Err(CheckError::Polarity { step, impl_ });
-                    }
-                    if len32(self.terms.len()) != Ok(h.generics) {
-                        return Err(CheckError::ArgCount { step, want: h.generics, have: self.terms.len() });
-                    }
-                    let w = &mut self.work;
-                    let header = import_list(tys, &mut w.scratch, h.portable, h.args, &self.terms, &mut w.list).map_err(solve(step))?;
-                    if !same_list(tys, header, gargs, &mut w.pairs, &mut cost).map_err(solve(step))? {
-                        return Err(CheckError::HeaderMismatch { step, impl_ });
-                    }
-                    for &p in h.where_clauses {
-                        let p = import_pred(tys, &mut w.scratch, h.portable, p, &self.terms, &mut w.list).map_err(solve(step))?;
-                        self.expected.push(p);
-                    }
+                    RowRule::Impl(impl_)
                 }
                 Step::Normalize { impl_, args } => {
                     self.decode_args(tys, args, step, &mut cost)?;
-                    self.by_normalize(tys, &ask, &mut reads, step, goal, impl_, &mut cost)?;
+                    RowRule::Normalize(impl_)
                 }
-                Step::Env { clause } => {
-                    let Some(c) = env.get(idx(clause)) else { return Err(CheckError::EnvIndex { step, index: clause, len: env.len() }) };
-                    if c.bound != 0 {
-                        return Err(CheckError::HigherRanked { step });
-                    }
-                    if !same_pred(tys, c.pred, goal, &mut self.work.pairs, &mut cost).map_err(solve(step))? {
-                        return Err(CheckError::EnvMismatch { step, index: clause });
-                    }
-                }
-                Step::Builtin(rule) => self.by_builtin(tys, &ask, &mut reads, step, goal, rule, &mut cost)?,
-                Step::Auto => self.by_auto(tys, &ask, &mut reads, step, goal, &mut cost)?,
-                Step::Object { bound } => self.by_object(tys, &ask, &mut reads, step, goal, bound, &mut cost)?,
-                Step::AliasBound { bound } => self.by_alias_bound(tys, &ask, &mut reads, step, goal, bound, &mut cost)?,
-            }
+                Step::Env { clause } => RowRule::Env(clause),
+                Step::Builtin(rule) => RowRule::Builtin(rule),
+                Step::Auto => RowRule::Auto,
+                Step::Object { bound } => RowRule::Object(bound),
+                Step::AliasBound { bound } => RowRule::AliasBound(bound),
+            };
+            self.expect(tys, &ask, &mut reads, env, step, goal, rule, &mut cost)?;
             self.nested_are(tys, view, step, &mut cost)?;
         }
         self.cycles(tys, view, &mut cost)?;
         Ok(Checked { view, reads, cost })
+    }
+
+    /// The row `step` proving `goal` by `rule` applies, and `self.expected` is its nested goals
+    /// in order. `Impl` and `Normalize` take their arguments from `self.terms`. The one home of
+    /// each rule's check: the checker runs it per row, the emitter (emit.rs) runs it to build
+    /// the row, so a built row's nested steps are what the check will compare by construction.
+    pub(crate) fn expect<T: Tys, F: Facts>(
+        &mut self,
+        tys: &mut T,
+        ask: &Ask<'_, F>,
+        reads: &mut Vec<Read, Alloc<'a>>,
+        env: &[Clause],
+        step: StepId,
+        goal: Pred,
+        rule: RowRule,
+        cost: &mut Cost,
+    ) -> Result<(), CheckError> {
+        self.expected.clear();
+        match rule {
+            RowRule::Impl(impl_) => {
+                let Pred::Trait { trait_, args: gargs, polarity } = goal else { return Err(CheckError::NotTrait { step }) };
+                let h = ask.impl_header(reads, impl_).map_err(|s| stop(step, s))?;
+                cost.headers += 1;
+                if h.trait_ != trait_ {
+                    return Err(CheckError::HeaderMismatch { step, impl_ });
+                }
+                if !matches!((h.polarity, polarity), (ImplPolarity::Positive, Polarity::Positive) | (ImplPolarity::Negative, Polarity::Negative)) {
+                    return Err(CheckError::Polarity { step, impl_ });
+                }
+                if len32(self.terms.len()) != Ok(h.generics) {
+                    return Err(CheckError::ArgCount { step, want: h.generics, have: self.terms.len() });
+                }
+                let w = &mut self.work;
+                let header = import_list(tys, &mut w.scratch, h.portable, h.args, &self.terms, &mut w.list).map_err(solve(step))?;
+                if !same_list(tys, header, gargs, &mut w.pairs, cost).map_err(solve(step))? {
+                    return Err(CheckError::HeaderMismatch { step, impl_ });
+                }
+                for &p in h.where_clauses {
+                    let p = import_pred(tys, &mut w.scratch, h.portable, p, &self.terms, &mut w.list).map_err(solve(step))?;
+                    self.expected.push(p);
+                }
+            }
+            RowRule::Normalize(impl_) => self.by_normalize(tys, ask, reads, step, goal, impl_, cost)?,
+            RowRule::Env(clause) => {
+                let Some(c) = env.get(idx(clause)) else { return Err(CheckError::EnvIndex { step, index: clause, len: env.len() }) };
+                if c.bound != 0 {
+                    return Err(CheckError::HigherRanked { step });
+                }
+                if !same_pred(tys, c.pred, goal, &mut self.work.pairs, cost).map_err(solve(step))? {
+                    return Err(CheckError::EnvMismatch { step, index: clause });
+                }
+            }
+            RowRule::Builtin(rule) => self.by_builtin(tys, ask, reads, step, goal, rule, cost)?,
+            RowRule::Auto => self.by_auto(tys, ask, reads, step, goal, cost)?,
+            RowRule::Object(bound) => self.by_object(tys, ask, reads, step, goal, bound, cost)?,
+            RowRule::AliasBound(bound) => self.by_alias_bound(tys, ask, reads, step, goal, bound, cost)?,
+        }
+        Ok(())
+    }
+
+    /// The arguments [`Checker::expect`] reads for an `Impl` or `Normalize` row.
+    pub(crate) fn set_terms(&mut self, args: &[Ty]) {
+        self.terms.clear();
+        self.terms.extend_from_slice(args);
+    }
+
+    /// The nested goals the last [`Checker::expect`] gave, in order.
+    pub(crate) fn expected(&self) -> &[Pred] {
+        &self.expected
     }
 
     fn decode_goal<T: Tys>(&mut self, tys: &mut T, view: View<'_>, step: StepId, cost: &mut Cost) -> Result<Pred, CheckError> {
@@ -792,7 +845,7 @@ fn auto_constituents<T: Tys, F: Facts>(
 }
 
 /// The portable list `l` of `p` with its parameters instantiated by `args`.
-fn import_list<T: Tys>(
+pub(crate) fn import_list<T: Tys>(
     tys: &mut T,
     s: &mut Scratch<'_>,
     p: Portable<'_>,

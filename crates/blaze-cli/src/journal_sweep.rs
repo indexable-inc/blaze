@@ -436,6 +436,10 @@ impl<'a> Index<'a> {
                 self.touched(rel) || self.children_of(rel).any(|name| sweep::wanted(last, name, true) || sweep::wanted(last, name, false))
             }
             LeafKind::MacroFolder | LeafKind::HomeListing => self.touched(rel) || self.children_of(rel).next().is_some(),
+            // A build script's read (engine_script_reads.rs): a file's bytes and a path's stat
+            // move only with the path or a folder above it; a listing with any entry of it.
+            LeafKind::ScriptFile | LeafKind::ScriptStat => self.touched(rel),
+            LeafKind::ScriptListing => self.touched(rel) || self.children_of(rel).next().is_some(),
             // Decided by its files' and folders' rows (macro_files.rs `proven`).
             LeafKind::MacroFiles => false,
         }

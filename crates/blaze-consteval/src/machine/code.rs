@@ -15,7 +15,6 @@
 use core::alloc::Allocator;
 use core::cell::Cell;
 
-use blaze_build::InstanceKey;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
@@ -30,7 +29,7 @@ use crate::error::Refusal;
 use crate::layout::{self, Layout};
 use crate::lit;
 use crate::mem::{PTR, Scalar};
-use crate::record::RecordKey;
+use crate::record::{ConstFn, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, FnKind, Intrinsic, Typed};
 
@@ -222,7 +221,8 @@ pub(super) struct Code<A: Allocator + Clone> {
     pub(super) bytes: Vec<u8, A>,
     /// The constants it reads: item, arguments, record key.
     pub(super) consts: Vec<(ItemKey, List, RecordKey), A>,
-    pub(super) fns: Vec<InstanceKey, A>,
+    /// The fn pointers it makes: each one's key and the instance it was made from.
+    pub(super) fns: Vec<ConstFn, A>,
     pub(super) calls: Vec<Call, A>,
     /// Argument registers of calls and their types.
     pub(super) regs_of: Vec<(Reg, PTy), A>,
@@ -753,6 +753,19 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         (code.ops.len() - 1) as u32
     }
 
+    /// Fn item type `ty`'s value as a fn pointer: the one reification, for the checker's
+    /// `ReifyFnPointer` adjustment and for an `as` cast of a fn item (`id::<T> as fn(T) -> T`)
+    /// alike. The record names the instance ([`ConstFn`]).
+    fn reify<A: Allocator + Clone>(&mut self, code: &mut Code<A>, cc: &mut Cc<'w, '_>, ty: PTy) -> R<'a, Reg> {
+        let PNode::FnDef(item, args) = self.node(ty)? else { return Err(malformed("a fn pointer made of a value that is not a fn item")) };
+        let (item, args) = self.resolve(item, args)?;
+        let key = self.instance(item, args)?;
+        code.fns.push(ConstFn { key, instance: blaze_build::Instance { item, args } });
+        let dst = self.reg(cc, Kind::V);
+        self.emit(code, cc, Op::FnPtr { dst, k: code.fns.len() as u32 - 1 });
+        Ok(dst)
+    }
+
     fn late<A: Allocator + Clone>(&self, code: &mut Code<A>, cc: &mut Cc<'w, '_>, s: Stop<'a>) {
         let k = self.keep_late(code, Late::of(s));
         self.emit(code, cc, Op::Late { k });
@@ -1209,6 +1222,24 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let from = self.final_ty_c(cc, operand)?;
                 let to = self.ety_c(cc, e)?;
                 let src = self.pop_r(cc)?;
+                match (self.node(from)?, self.node(to)?) {
+                    // A fn item cast to a fn pointer (`id::<T> as fn(T) -> T`) where the checker
+                    // left the operand a fn item: reified as the adjustment is. Its value is
+                    // zero-sized, so `src` holds nothing to read.
+                    (PNode::FnDef(..), PNode::FnPtr(..)) => {
+                        let dst = self.reify(code, cc, from)?;
+                        cc.rs.push(dst);
+                        return Ok(());
+                    }
+                    // A fn pointer to a fn pointer type (the operand already reified by its
+                    // adjustment): the same word, which names its instance in the record. Never
+                    // a numeric cast (`Machine::cast` would read the pointer as an integer).
+                    (PNode::FnPtr(..), PNode::FnPtr(..)) => {
+                        cc.rs.push(src);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
                 let dst = self.reg(cc, Kind::V);
                 if let PNode::Adt(..) = self.node(from)? {
                     // A fieldless enum to its discriminant.
@@ -1952,15 +1983,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     self.emit(code, cc, Op::Borrow { dst, src, meta });
                     dst
                 }
-                AdjustKind::ReifyFnPointer => {
-                    let PNode::FnDef(item, args) = self.node(ty)? else { return Err(malformed("a fn pointer made of a value that is not a fn item")) };
-                    let (item, args) = self.resolve(item, args)?;
-                    let key = self.instance(item, args)?;
-                    code.fns.push(key);
-                    let dst = self.reg(cc, Kind::V);
-                    self.emit(code, cc, Op::FnPtr { dst, k: code.fns.len() as u32 - 1 });
-                    dst
-                }
+                AdjustKind::ReifyFnPointer => self.reify(code, cc, ty)?,
                 // The pointer is the closure's `FnOnce::call_once` at `[C, (A..)]`, the one
                 // instance blaze-build's `closure_fn_addr` takes for the same coercion, so the
                 // record's fn word names the function the build makes. The arguments' tuple is
@@ -1972,10 +1995,17 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         return Err(malformed("a closure's fn pointer made of a value that is not a closure"));
                     };
                     let PNode::FnPtr(sig, _) = self.node(next)? else { return Err(malformed("a closure coerced to a type that is not a fn pointer")) };
+                    // Not answered yet is PENDING, never final: a world whose `FnOnce` trait's
+                    // head is not made notes it and answers `None` (blaze-ladder front2
+                    // consts.rs `ConstsWorld::fn_trait_method`); the front end makes it and this
+                    // code is compiled again (late.rs `Wait::Missing`). A final refusal here was
+                    // kept with the code, so the second round refused though the trait was made.
+                    // A world with no `fn_once` lang trait at all notes nothing, and the front
+                    // end refuses this by name.
                     let call_once = self
                         .world
                         .fn_trait_method(blaze_build::FnTrait::FnOnce)
-                        .ok_or(unsupported("a closure as a fn pointer in a world that names no `FnOnce::call_once` (ConstWorld::fn_trait_method)"))?;
+                        .ok_or(Stop::Refused(Refusal::Missing { what: "the `FnOnce::call_once` lang method a closure coerced to a fn pointer names (ConstWorld::fn_trait_method)", item: owner }))?;
                     let mut inputs: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
                     let all = self.ground.view().list(sig).map_err(|_| malformed("a list past the ground table"))?;
                     let (_, ins) = all.split_last().ok_or(malformed("a fn pointer type without its output"))?;
@@ -1990,7 +2020,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     let args = blaze_build::closure_method_key_args(method, self.ground, self.alloc)
                         .map_err(|_| malformed("a closure's `call_once` instance past the ground table"))?;
                     let key = self.instance(owner, args)?;
-                    code.fns.push(key);
+                    // The record names the method instance the build calls, under the key the
+                    // run's slot of it has.
+                    code.fns.push(ConstFn { key, instance: method });
                     let dst = self.reg(cc, Kind::V);
                     self.emit(code, cc, Op::FnPtr { dst, k: code.fns.len() as u32 - 1 });
                     dst

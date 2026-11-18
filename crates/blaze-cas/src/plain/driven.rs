@@ -587,6 +587,11 @@ impl<D: Driver> Driven<D> {
         self.core.root_through(name, indexes, life_ns)
     }
 
+    /// [`Plain::index_beside`].
+    pub fn index_beside(&mut self, owner: Key, keys: &[Key]) -> Result<Key, StoreError> {
+        self.core.index_beside(owner, keys)
+    }
+
     /// [`Plain::release_lease`].
     pub fn release_lease(&mut self) {
         self.core.release_lease()

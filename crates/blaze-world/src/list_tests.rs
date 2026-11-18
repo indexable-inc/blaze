@@ -132,7 +132,7 @@ fn graph(lock: &Lock<'static>) -> &'static UnitGraph<'static> {
     units.push(unit(lock, "dep", UnitKind::Lib, true, &[]));
     units.push(unit(lock, "pm", UnitKind::ProcMacro, true, &[("dep", 1)]));
     units.push(unit(lock, "app", UnitKind::Lib, false, &[("dep", 0), ("pm", 2)]));
-    StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2 }))
+    StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2, meta: AVec::new_in(a()) }))
 }
 
 /// `app` and `pm` in the checkout at their own directories; `dep` a fetched pack.
@@ -237,7 +237,7 @@ fn hello_on(edition: PackageEdition, shelf_of: ShelfOf) -> World<'static> {
     member.edition = edition;
     let mut units = AVec::new_in(a());
     units.push(member);
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2 }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2, meta: AVec::new_in(a()) }));
     let mut places = Places { lock, dep: &[] };
     let (id, files) = shelf_of(TRIPLE, crate::fixture::STD, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
@@ -395,7 +395,7 @@ fn sides_world() -> World<'static> {
     let mut pm_script = unit(lock, "pm", UnitKind::BuildScript, true, &[]);
     pm_script.root = t("build.rs");
     units.push(pm_script);
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2 }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2, meta: AVec::new_in(a()) }));
     let reg = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
     let mut places = Places { lock, dep: StdBox::leak(reg.into_boxed_slice()) };
     let (id, mut shelf) = shelf(true);
@@ -547,12 +547,24 @@ fn the_crate_list_reads_back_as_its_world() {
             });
             assert_eq!(by_world, by_list, "{what}: owner {} sees other crates over the list", w.crates[owner].input.name);
         }
-        // CONTROL: row 0's root range replaced by row 1's.
-        let mut planted = bytes.to_vec();
-        let (r0, r1) = (HEADER_LEN + 40, HEADER_LEN + ROW + 40);
-        let other: [u8; 8] = planted[r1..r1 + 8].try_into().expect("8 bytes");
-        planted[r0..r0 + 8].copy_from_slice(&other);
-        let control = differences(&w, &CrateList::open(&planted).unwrap_or_else(|e| panic!("{e}")));
+        // CONTROL: row 0's root range replaced by another row's, for each other row in turn: the
+        // most differences any of them makes. Not "row 1's": which crates are rows 0 and 1 moves
+        // with their keys (it did when the fixture's `core` gained items, 2026-11-17), and two
+        // rows can name one root (one crate on the host side and on the macro side), which
+        // differs in nothing.
+        let r0 = HEADER_LEN + 40;
+        let own: [u8; 8] = bytes[r0..r0 + 8].try_into().expect("8 bytes");
+        let mut control = 0;
+        for row in 1..w.crates.len() {
+            let at = HEADER_LEN + row * ROW + 40;
+            let other: [u8; 8] = bytes[at..at + 8].try_into().expect("8 bytes");
+            if other == own {
+                continue;
+            }
+            let mut planted = bytes.to_vec();
+            planted[r0..r0 + 8].copy_from_slice(&other);
+            control = control.max(differences(&w, &CrateList::open(&planted).unwrap_or_else(|e| panic!("{e}"))));
+        }
         assert!(control > 0, "{what}: CONTROL: a row holding another crate's root must differ");
         std::println!("crate list: {what}: {} crates, {} bytes, {differ} differences; control: {control} differences", w.crates.len(), bytes.len());
     }
@@ -618,11 +630,12 @@ fn an_old_crate_list_is_refused_by_name() {
     use crate::crate_list::{CrateList, ListError, VERSION, encode};
     let w = hello(BLAZE);
     let mut bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}")).to_vec();
-    assert_eq!(VERSION, 3);
+    // Version 4: each crate's row carries its package's metadata variables (lane RE3).
+    assert_eq!(VERSION, 4);
     bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
     let refused = CrateList::open(&bytes).err().expect("a version-2 list is refused");
     assert_eq!(refused, ListError::Version { found: 2 });
     let words = std::format!("{refused}");
-    assert!(words.contains("version 2, not 3"), "{words}");
+    assert!(words.contains("version 2, not 4"), "{words}");
     std::println!("crate list: an old list: {words}");
 }

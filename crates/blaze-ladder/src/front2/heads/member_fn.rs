@@ -116,7 +116,7 @@ impl<'n> Store<'n> {
             let clauses = self.preds.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: its head is made but its clauses are not filed").into_boxed_str(), whole))?;
             let mut inherited: Vec<PClause, Global> = Vec::with_capacity_in(clauses.clauses.len(), Global);
             inherited.extend_from_slice(&clauses.clauses);
-            let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts };
+            let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
             let marks = super::super::item_site::member_marks(names, impl_, m.written_by, m.text).map_err(super::super::item_site::MarksLost::why)?;
             return self.member_fn_head(names, impl_, fn_, Some(ck), &env, generics, &inherited, &v, m.text, marks);
         }

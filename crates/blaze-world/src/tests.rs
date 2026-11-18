@@ -191,7 +191,7 @@ fn graph(lock: &Lock<'static>, order: &[u32; 9]) -> &'static UnitGraph<'static> 
         u.build_script = u.build_script.map(|b| UnitId(at[b.index()]));
         units.push(u);
     }
-    StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2 }))
+    StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2, meta: AVec::new_in(g()) }))
 }
 
 /// The checkout: each member's files.
@@ -470,7 +470,7 @@ fn a_dependency_on_a_unit_not_kept_is_refused_by_name() {
     let mut units = graph(lock, &IN_ORDER).units.clone();
     // app's library made to depend on helper's host-side unit.
     units[5].deps.push(UnitDep { name: t("helper"), unit: UnitId(2) });
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2 }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2, meta: AVec::new_in(g()) }));
     let mut store = store(lock);
     match listed_or(graph, lock, &mut store) {
         Err(WorldError::Units(blaze_scope::units::UnitsError::DependencyNotKept { krate, dep, dep_for_host, .. })) => {
@@ -622,7 +622,7 @@ fn a_dependencys_records_are_equal_in_two_workspaces() {
     units[3].for_host = false;
     // A target-side library depends on the target's helper, not the host's.
     units[3].deps[0].unit = UnitId(8);
-    let other: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2 }));
+    let other: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2, meta: AVec::new_in(g()) }));
     let mut store = store(lock);
     let listed = listed(other, lock, &mut store);
     let second = world(other, lock, listed, &mut store, checkout(), g()).unwrap_or_else(|e| panic!("{e}"));

@@ -22,6 +22,15 @@ pub fn pack(files: &[(&str, &str)], alloc: Alloc<'_>) -> StdVec<u8> {
     builder.finish().expect("a pack").to_vec()
 }
 
+/// The text of the fixture's core: its prelude modules, and two items with heads a member body
+/// can call (`::core::fixture_one()`, `::core::FixtureCell(x).get()`), so a test reads a
+/// toolchain crate's head (blaze-cli engine_seeds_tests.rs).
+///
+/// It also has `rustc_coherence_is_core` and one inherent impl of a primitive, at the end: a
+/// probe of a primitive's method (`n.wrapping_add(1)`) has an answer, and asks the
+/// incoherent-impl fact the real core answers (blaze-cli engine_scope_reads_tests.rs).
+pub const CORE: &str = "#![no_core]\n#![feature(rustc_attrs)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\n";
+
 /// The text of the fixture's std when a test does not give its own.
 pub const STD: &str = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";
 
@@ -95,7 +104,9 @@ fn shelf_of(
     use blaze_toolchain::ImplicitSysroot;
     let library = pack(
         &[
-            ("core/src/lib.rs", "#![no_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }"),
+            // Two items a body calls through a head, a fn and a struct with an inherent method:
+            // what blaze-cli's engine tests read as toolchain heads (engine_seeds_tests.rs).
+            ("core/src/lib.rs", CORE),
             ("alloc/src/lib.rs", "#![no_std]\npub mod vec {}"),
             ("std/src/lib.rs", std),
             ("proc_macro/src/lib.rs", "#![no_std]\npub struct TokenStream;"),

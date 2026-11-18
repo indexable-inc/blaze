@@ -6,7 +6,7 @@
 
 use core::alloc::Allocator;
 
-use blaze_build::InstanceKey;
+use blaze_build::{Instance, InstanceKey};
 pub use blaze_build::data::{DataAlloc, DataRecord, DataReloc, DataTarget};
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::Vec;
@@ -28,13 +28,37 @@ impl RecordKey {
     }
 }
 
-/// One constant's record: its value, and what the evaluation read, by content (each other
-/// value's key and each body's text hash), sorted, each once (rule 25). The record stands
+/// A fn instance a value's words name: the key a `DataTarget::Fn` word holds (a hash with no
+/// inverse) and the instance the evaluator made it from: the fn item and its ground arguments,
+/// or, for a closure coerced to a fn pointer, its `FnOnce::call_once` at `[closure, (inputs..)]`
+/// (the instance blaze-build's `closure_fn_addr` takes for the same coercion). The arguments
+/// are a list of the evaluation's ground table, the one the key was made over: a reader copies
+/// them into its own table (blaze-ladder front2/consts.rs `Consts::fn_instance`), so a builder
+/// that meets the word knows which instance to call without searching the program (the fn
+/// is named in the constant's body, never in the function being built).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConstFn {
+    pub key: InstanceKey,
+    pub instance: Instance,
+}
+
+/// One constant's record: its value, what the evaluation read, by content (each other value's
+/// key and each body's text hash), sorted, each once (rule 25), and the fn instances its words
+/// name ([`ConstFn`], sorted by key, each once: exactly the keys of the value's
+/// `DataTarget::Fn` words, a value read from another record's included). The record stands
 /// while every read is unchanged (AGENTS.md: "valid by its key, or else by its read list").
 pub struct ConstRecord<A: Allocator> {
     pub key: RecordKey,
     pub data: DataRecord<A>,
     pub reads: Vec<ContentId, A>,
+    pub fns: Vec<ConstFn, A>,
+}
+
+impl<A: Allocator> ConstRecord<A> {
+    /// The instance fn word `key` of this record names.
+    pub fn fn_named(&self, key: InstanceKey) -> Option<ConstFn> {
+        self.fns.binary_search_by_key(&key, |f| f.key).ok().map(|at| self.fns[at])
+    }
 }
 
 impl<A: Allocator> core::fmt::Debug for ConstRecord<A> {

@@ -361,6 +361,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
             build_script: false,
             script: None,
             test_or_bench: false,
+            meta: None,
         };
         envs.push(CrateEnv::of(facts, alloc.clone()).map_err(WorldError::Env)?);
         crates.push(Crate {
@@ -441,6 +442,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     build_script: unit.build_script.is_some(),
                     script: None,
                     test_or_bench: matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_)),
+                    meta: graph.meta_of(unit.package).map(|meta| meta.vars()),
                 };
                 (root, shown_from, facts, Origin::Unit(id), unit.kind == UnitKind::ProcMacro, unit.name.as_str(), unit.version.as_str())
             }
@@ -466,6 +468,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     build_script: false,
                     script: None,
                     test_or_bench: false,
+                    meta: None,
                 };
                 (root, shown_from, facts, Origin::Toolchain(unit), false, c.name, version)
             }

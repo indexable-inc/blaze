@@ -336,6 +336,17 @@ pub trait FrontEnd {
         let _ = (need, from, args, closures);
         Err(crate::front2::const_at::ConstAtWhy::NoEvaluator)
     }
+    /// The fn instance that key `key` names in a constant's record this front end evaluated
+    /// (a [`FrontEnd::const_record`] or [`FrontEnd::const_at`] answer holding
+    /// `DataTarget::Fn(key)`), its arguments copied into `ground` (the build's): the record
+    /// names the instance it made each fn word from (blaze-consteval `ConstRecord::fns`), so
+    /// the answer is read, never searched for. `None` where no record of it names the key, and
+    /// for a front end that evaluates none (the old front: its constants hold no fn pointer a
+    /// build can resolve, refused by the builder as `BuildError::NoConstFnInstance`).
+    fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::Instance> {
+        let _ = (key, ground, scratch);
+        None
+    }
     /// Whether the build pulls each instance's constants at its ground arguments from
     /// [`FrontEnd::const_at`] (front2), or the front end evaluates constants only at no
     /// arguments, as records the build reads (the old front: run.rs `eval_consts`).

@@ -506,6 +506,21 @@ pub(crate) struct ScriptJob<'j> {
     files: Files<'j>,
     /// Each script of its `links` closure ([`links_closure`]), sorted by unit, each once.
     producers: &'j [Producer<'j>],
+    /// What a member's run that read the checkout gives ([`CheckoutReads`]): a hole unless its
+    /// caller keeps the reads as cells.
+    pub(crate) checkout: CheckoutReads,
+}
+
+/// The one seam between the two paths over a member build script's reads of the checkout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CheckoutReads {
+    /// The old path (work.rs): a run that read the checkout is a hole, its outputs not kept, run
+    /// again next command; it has no cell for a read.
+    Hole,
+    /// The engine (engine_scripts.rs): each read is a `Given` cell the record reads
+    /// (engine_script_reads.rs), the outputs kept; a read with no cell (a `git:` fact) is still
+    /// a hole, named.
+    Kept(crate::engine_script_reads::ReadsPlant),
 }
 
 /// A script whose run a reading script is served of: a direct `links` input (its metadata is
@@ -717,7 +732,7 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(files) => files,
         Err(refused) => return Ok(refused),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.leak() }))
+    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.leak(), checkout: CheckoutReads::Hole }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -732,6 +747,9 @@ pub(crate) struct PooledScript {
     pub(crate) did: Result<Ran, blaze_drive::Why>,
     pub(crate) used: usize,
     pub(crate) ns: u64,
+    /// The run's reads of the checkout as cells, its record's `Given` reads in the same order:
+    /// filled only for a kept member run ([`CheckoutReads::Kept`]) that made its record.
+    pub(crate) checkout: std::vec::Vec<crate::engine_script_reads::CheckoutRead>,
 }
 
 /// `job` on a pool worker, in the worker's task frame: a panic or a full frame fails this
@@ -739,10 +757,15 @@ pub(crate) struct PooledScript {
 pub(crate) fn pooled(cx: &Cx, job: &ScriptJob<'_>, clock: &bstd::clock::Clock) -> PooledScript {
     let began = clock.now();
     let scratch = cx.frame();
-    let ran = crate::work::unwinding(|| run(cx, job, scratch));
+    let mut checkout = std::vec::Vec::new();
+    let ran = crate::work::unwinding(|| run(cx, job, scratch, &mut checkout));
     let (used, limit) = (scratch.peak(), scratch.reserved());
     let did = ran.map_err(|crate::work::Panicked| blaze_drive::Why::Panicked { used: used as u64, limit: limit as u64 });
-    PooledScript { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) }
+    // Only a record stands on its reads: a failure's or a panic's are not handed on.
+    if !matches!(did, Ok(Ran::Made(_))) {
+        checkout.clear();
+    }
+    PooledScript { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)), checkout }
 }
 
 fn failed(what: &'static str, words: core::fmt::Arguments<'_>, hole: bool) -> Ran {
@@ -752,8 +775,8 @@ fn failed(what: &'static str, words: core::fmt::Arguments<'_>, hole: bool) -> Ra
     Ran::Failed { what, words: held, hole }
 }
 
-/// The run on the worker.
-fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame) -> Ran {
+/// The run on the worker; a kept member run's reads of the checkout onto `checkout`.
+fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut std::vec::Vec<crate::engine_script_reads::CheckoutRead>) -> Ran {
     let _cx = cx.span("script: run one build script");
     let erased = Erased::new(scratch);
     let alloc = erased.handle();
@@ -826,45 +849,72 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame) -> Ran {
         Side::Target => None,
         Side::Macro => Some(side_atoms(job.cfg, alloc.clone())),
     };
+    let member = matches!(job.files, Files::Member { .. });
+    // A kept member run's failure is a hole: the reads it made are not handed back with its
+    // error (`ScriptError`), so no read list makes it stand, and standing on its drive inputs
+    // alone would keep it failed past the edit that fixes it (rule 21). The old path keeps its
+    // filed failure as before.
+    let failed_hole = member && matches!(job.checkout, CheckoutReads::Kept(_));
     let ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
         Ok(ran) => ran,
-        Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), false),
+        Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
     };
     let outputs = &ran.outputs;
     if let Some(error) = outputs.errors.first() {
-        return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), false);
+        return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), failed_hole);
     }
     let mut made = Record::new_in(job.name, Global);
     // A member's tree is the checkout: what it read there is a read of today's file. A fetched
     // package's tree is its record, pinned by the lock in the graph's source: its reads (files,
     // listings, git facts from the lock's commit) are functions of that pin.
     //
-    // A member's read has no drive name yet: DRIVER runner 17 is adding `key::content_of(path)`
-    // (a name whose value is the sweep's content id of a checkout file). Then each `file:<path>`
-    // read becomes a read of that name, listed with the out the drive hands for it (the task
-    // enters again with those names as inputs: the runtime's own read digest is another
-    // domain and is never listed), a `git:` fact is covered by the `file:` reads it made
-    // (script_sandbox.rs `GitView::read`), and a `dir:`/`stat:` read waits for a listing fact.
-    // Until then such a run is a hole: its outputs serve nothing and it runs again next command.
-    // A member producer's tree, mounted at `/deps/<links>`, is the checkout too: its reads are
-    // among `ran.reads`, told apart from the package's own by nothing yet, so the run is a hole.
-    let reads_checkout = matches!(job.files, Files::Member { .. }) || job.producers.iter().any(|p| matches!(p.files, Files::Member { .. }));
-    if reads_checkout && let Some(read) = ran.reads.first() {
-        return failed(
-            "a member's build script read a checkout file the drive cannot name yet",
-            format_args!("the build script of {package} read `{}` of the checkout: a read of a checkout file is not a drive read yet (`key::content_of`), so its outputs are not kept; it runs again next command", read.subject),
-            true,
-        );
+    // On the engine a member's `file:`, `dir:` and `stat:` reads are cells whose digests are the
+    // sandbox's own answers (engine_script_reads.rs), so the record stands until one moves; a
+    // `git:` fact has no cell yet and stays a hole. On the old path (work.rs) every read of the
+    // checkout is a hole: its outputs serve nothing and it runs again next command.
+    let reads_checkout = member || job.producers.iter().any(|p| matches!(p.files, Files::Member { .. }));
+    match (job.checkout, member) {
+        // The engine keeps a member's reads: every read is of the checkout (its own tree, and a
+        // member producer's, served as the same tree under the same subjects: dep_mount.rs
+        // `Served::ReaderTree`), each a `Given` cell its record reads.
+        (CheckoutReads::Kept(plant), true) => match crate::engine_script_reads::cells_of(ran.reads.iter().map(|read| (read.subject.as_str(), read.digest)), plant) {
+            Ok(cells) => {
+                for read in cells.iter() {
+                    made.reads.push((read.name(), read.answer));
+                }
+                *checkout = cells;
+            }
+            Err(no_cell) => {
+                return failed("a member's build script made a read no cell names", format_args!("the build script of {package} is run again next command, its outputs not kept: {no_cell}"), true);
+            }
+        },
+        // The old path; and a fetched package served a member producer's files, whose reads are
+        // among its own pinned tree's subjects and told apart by nothing yet: a hole.
+        (CheckoutReads::Hole, _) | (CheckoutReads::Kept(_), false) => {
+            if reads_checkout && let Some(read) = ran.reads.first() {
+                return failed(
+                    "a member's build script read a checkout file the drive cannot name yet",
+                    format_args!("the build script of {package} read `{}` of the checkout: a read of a checkout file is not a drive read on this path (engine_script_reads.rs keeps them on the engine's), so its outputs are not kept; it runs again next command", read.subject),
+                    true,
+                );
+            }
+        }
     }
     // Every producer of the closure, by its out (dep_paths.rs: per producer mounted, its outputs
     // record's id; a fetched tree is under the graph's source, a member's is a hole above).
     for producer in job.producers.iter() {
         made.reads.push((producer.name, producer.out));
     }
-    // How it ran, then the outputs record ([`payload_parts`]); the out is the outputs' alone, so
-    // a reader moves only when what it reads moves. Encoded on the heap and handed whole to the
-    // record, which outlives this worker's frame (rules 11 and 51): never encoded in the frame
-    // and copied out.
+    outputs_record(made, ran_as, outputs, &package)
+}
+
+/// The record of a run that made `outputs`, its reads already on `made`: how it ran, then the
+/// outputs record ([`payload_parts`]); the out is the outputs' alone, so a reader moves only
+/// when what it reads moves. Encoded on the heap and handed whole to the record, which outlives
+/// the worker's frame (rules 11 and 51): never encoded in the frame and copied out. The one
+/// maker of a script's record: the real run's and a test's runner's (engine_scripts.rs
+/// `ScriptRunner`).
+pub(crate) fn outputs_record(mut made: Record<Global>, ran_as: RanAs, outputs: &blaze_build_script::outputs::Outputs<'_>, package: &str) -> Ran {
     let heap = Erased::new(Global);
     let mut payload: AVec<'_, u8> = AVec::new_in(heap.handle());
     payload.push(ran_as as u8);

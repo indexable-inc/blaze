@@ -9,10 +9,15 @@
 //! THE CELLS ([`NameCell`]), each a 16-byte key ([`NameCell::key`]) in its own domain:
 //! - `Binding(module, ns, name)`: the module's own binding of the name ([`cell_key`]), or
 //!   absent: what [`ScopeRead::get`] answered;
-//! - `Module(module)`: everything else the walk reads of the module: its chain and flags
-//!   (`#[no_implicit_prelude]`, a block's module), its glob edges, its first refused call, its
-//!   textual macro table and marks, and the traits it binds (named and `as _`); absent for a
-//!   module the record does not hold;
+//! - `Module(module)`: everything else the walk reads of the module but its textual macros: its
+//!   chain and flags (`#[no_implicit_prelude]`, a block's module), its glob edges, its first
+//!   refused call, and the traits it binds (named and `as _`); absent for a module the record
+//!   does not hold;
+//! - `Textual(module)`: the module's `macro_rules!` sequence and the marks of its `mod` lines
+//!   in it: what a textual macro lookup reads ([`LoggedScope`]'s `textual` and `marked`), and
+//!   nothing else does. Apart from `Module` so a `macro_rules!` added moves no path walk
+//!   through the module (blaze-cli engine_scope_reads_tests.rs, g203837: a `#[macro_use]`
+//!   macro added entered its module's 7 bodies and 11 heads, all identical);
 //! - `Root(crate)`: the crate root record (the extern prelude, the `#[macro_use]` prelude, the
 //!   `#[macro_export]` macros, the head) but the root file's content, which moves with every
 //!   edit of that file and which [`Logged`] does not hand out ([`walked_head`]);
@@ -56,8 +61,9 @@ use crate::resolve::{CrateNames, aligned};
 /// The domain of a cell's key: the schema's name, so a change of the recipe is a new domain
 /// and old reads miss.
 pub const KEY_DOMAIN: &str = "blaze v2 crate names cell key 1";
-/// The domain of a cell's digest.
-pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 1";
+/// The domain of a cell's digest. "1": a `Module` cell that held the module's textual macros
+/// and marks, now the `Textual` cell's.
+pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 2";
 
 static KEYS: Domain = Domain::new(KEY_DOMAIN);
 static DIGESTS: Domain = Domain::new(DIGEST_DOMAIN);
@@ -99,6 +105,16 @@ pub enum NameCell {
     /// walking every crate's `#[lang]` items reads of this one. Absent: the crate declares
     /// none (most crates), so a reader of a workspace crate moves only when one is added there.
     Lang { krate: [u8; 8] },
+    /// Whether the crate may write an inherent impl of a type it does not define
+    /// ([`ItemsRecord::may_write_incoherent`], question 16): what a probe of a primitive's or
+    /// a foreign type's inherent methods reads of each lang crate (blaze-ladder
+    /// `incoherent_crates`). Absent: it may not (every crate but `core`, `alloc` and `std`), so
+    /// an item added to a workspace crate never moves it.
+    Incoherent { krate: [u8; 8] },
+    /// A module's `macro_rules!` sequence and its `mod` lines' marks in it: what a textual
+    /// macro lookup reads of the module, and no other walk; absent for a module the record does
+    /// not hold a scope of.
+    Textual { module: ItemKey },
     /// A section of the crate's record read WHOLE, by a question no cell answers (every impl,
     /// every item, the lang rows, the files): its digest is the section's bytes'.
     Whole { krate: [u8; 8], section: Section },
@@ -130,6 +146,8 @@ impl NameCell {
             NameCell::VariantOf { variant } => h.update(&[10]).id(&variant.0),
             NameCell::Beginning { first } => h.update(&[11]).update(&first),
             NameCell::Lang { krate } => h.update(&[12]).update(&krate),
+            NameCell::Incoherent { krate } => h.update(&[13]).update(&krate),
+            NameCell::Textual { module } => h.update(&[14]).id(&module.0),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -139,8 +157,8 @@ impl NameCell {
     /// The first 8 bytes of every key of the crate the cell is of: whose `CrateScope` holds it.
     pub fn crate_prefix(self) -> [u8; 8] {
         match self {
-            NameCell::Binding { module, .. } | NameCell::Module { module } => module.crate_prefix(),
-            NameCell::Root { krate } | NameCell::Whole { krate, .. } | NameCell::Lang { krate } => krate,
+            NameCell::Binding { module, .. } | NameCell::Module { module } | NameCell::Textual { module } => module.crate_prefix(),
+            NameCell::Root { krate } | NameCell::Whole { krate, .. } | NameCell::Lang { krate } | NameCell::Incoherent { krate } => krate,
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
@@ -346,6 +364,13 @@ fn lang_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecord
     Ok(Some(h.finish()))
 }
 
+/// What `Incoherent(krate)` holds: one fixed digest when the crate may write an inherent impl
+/// of a type it does not define, `None` (absent) when it may not. The flag is the whole fact
+/// `incoherent_crates` reads of the crate, so the cell moves exactly when it flips.
+fn incoherent_digest(items: &ItemsRecord<'_>) -> Option<ContentId> {
+    items.may_write_incoherent().then(|| Hasher::of(&DIGESTS).update(&[13]).finish())
+}
+
 /// The first 16 bytes of a key: what [`NameCell::Beginning`] is keyed by (`key_beginning`'s
 /// question).
 pub fn first_16(key: ItemKey) -> [u8; 16] {
@@ -539,14 +564,8 @@ fn module_digest(record: &NamesRecord<'_>, module: ItemKey) -> Option<ContentId>
             for edge in ScopeView::globs(&view) {
                 h.std(&edge);
             }
+            // The textual macros and the marks are the `Textual` cell's ([`textual_cell_digest`]).
             h.update(&[0xfe]).std(&ScopeView::refused(&view));
-            for def in ScopeView::textual(&view) {
-                h.std(&def);
-            }
-            h.update(&[0xfd]);
-            for mark in view.marks() {
-                h.std(&mark);
-            }
             h.update(&[0xfc]);
             for anon in view.traits() {
                 h.std(&anon);
@@ -558,6 +577,27 @@ fn module_digest(record: &NamesRecord<'_>, module: ItemKey) -> Option<ContentId>
                 }
             }
         }
+    }
+    Some(h.finish())
+}
+
+/// What `Textual(module)` holds, `None` for a module the record holds no scope of: its
+/// `macro_rules!` sequence in order and each `mod` line's mark in it, what
+/// [`ScopeRead::textual`] and [`ScopeRead::marked`] answer from.
+fn textual_cell_digest(record: &NamesRecord<'_>, module: ItemKey) -> Option<ContentId> {
+    let view: ScopeView<'_> = record.scope(module)?;
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[14]);
+    // The inherent reads, named, as in [`module_digest`].
+    let defs = ScopeView::textual(&view);
+    h.update(&(defs.len() as u64).to_le_bytes());
+    for def in defs {
+        h.std(&def);
+    }
+    let marks = view.marks();
+    h.update(&(marks.len() as u64).to_le_bytes());
+    for mark in marks {
+        h.std(&mark);
     }
     Some(h.finish())
 }
@@ -688,10 +728,16 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         if let Some(digest) = lang_digest(items).map_err(CellsError::Items)? {
             rows.push((NameCell::Lang { krate }.key(), digest));
         }
+        if let Some(digest) = incoherent_digest(items) {
+            rows.push((NameCell::Incoherent { krate }.key(), digest));
+        }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
             rows.push((NameCell::Module { module }.key(), digest));
+        }
+        if let Some(digest) = textual_cell_digest(record, module) {
+            rows.push((NameCell::Textual { module }.key(), digest));
         }
         if let Some(view) = record.scope(module) {
             for entry in view.bindings() {
@@ -798,8 +844,9 @@ pub struct Logged<'l, W> {
     pub log: &'l dyn CellSink,
 }
 
-/// A module's scope as [`Logged`] hands it out: each `get` logs its binding's cell (the
-/// scope's other reads are its `Module` cell, logged when it was handed out).
+/// A module's scope as [`Logged`] hands it out: each `get` logs its binding's cell, each
+/// `textual` and `marked` its `Textual` cell (the scope's other reads are its `Module` cell,
+/// logged when it was handed out).
 #[derive(Clone, Copy)]
 pub struct LoggedScope<'w, S> {
     scope: S,
@@ -822,12 +869,13 @@ impl<'w, N: Name, S: ScopeRead<'w, N>> ScopeRead<'w, N> for LoggedScope<'w, S> {
     }
 
     fn textual(self, child: Option<ItemKey>, name: N) -> Option<(ItemKey, MacroShapes)> {
+        self.log.put(NameCell::Textual { module: self.module });
         self.scope.textual(child, name)
     }
 
-    /// The marks are the scope's `Module` cell's (names_cells `module_digest`), logged when
-    /// the scope was handed out.
+    /// The marks are the scope's `Textual` cell's ([`textual_cell_digest`]).
     fn marked(self, child: ItemKey) -> bool {
+        self.log.put(NameCell::Textual { module: self.module });
         self.scope.marked(child)
     }
 
@@ -918,6 +966,7 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
             view.bindings().find(|entry| cell_key(entry.ns, entry.name) == name).map(|entry| binding_digest(entry.binding))
         }
         NameCell::Module { module } => module_digest(record, module),
+        NameCell::Textual { module } => textual_cell_digest(record, module),
         NameCell::Root { krate } => (krate == record.key().prefix()).then(|| root_digest(record)),
         NameCell::Variants { owner } => variants_digest(record, owner),
         NameCell::Item { key } => item_digest(items_of()?, key, read_of()?).map_err(CellsError::Items)?,
@@ -939,6 +988,8 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::Beginning { first } => beginning_by_record(items_of()?, first)?,
         NameCell::Lang { krate } if krate == record.key().prefix() => lang_digest(items_of()?).map_err(CellsError::Items)?,
         NameCell::Lang { .. } => None,
+        NameCell::Incoherent { krate } if krate == record.key().prefix() => incoherent_digest(items_of()?),
+        NameCell::Incoherent { .. } => None,
     })
 }
 

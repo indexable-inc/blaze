@@ -110,6 +110,8 @@ use blaze_manifest::lock::LockId;
 use blaze_own::{AVec, Alloc, String};
 use edition::PackageEdition;
 
+/// A package's `CARGO_PKG_*` metadata: its home is blaze-manifest's layout (meta.rs).
+pub use blaze_manifest::layout::{PackageMeta, PackageMetaVars};
 pub use extra::{Extra, ExtraUnit};
 pub use implicit::{Implicit, Prelude, StdIs, Sysroot, ToolchainUnit, implicit};
 pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
@@ -196,6 +198,17 @@ pub struct UnitGraph<'a> {
     /// Locked packages whose manifests were not available (sorted).
     pub unavailable: AVec<'a, LockId>,
     pub resolver: Resolver,
+    /// Each package of a unit with its `[package]` metadata (`CARGO_PKG_*`, blaze-manifest
+    /// meta.rs), sorted by id, each id once. A package with no row is one whose metadata this
+    /// graph does not know: a crate of it reads those variables refused by name, never `""`.
+    pub meta: AVec<'a, (LockId, PackageMeta<'a>)>,
+}
+
+impl<'a> UnitGraph<'a> {
+    /// The metadata of `package`, when the graph knows it ([`UnitGraph::meta`]).
+    pub fn meta_of(&self, package: LockId) -> Option<&PackageMeta<'a>> {
+        self.meta.binary_search_by(|(id, _)| id.cmp(&package)).ok().map(|at| &self.meta[at].1)
+    }
 }
 
 /// Why no graph: each names the package and what of it.

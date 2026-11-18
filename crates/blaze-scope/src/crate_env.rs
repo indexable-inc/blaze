@@ -13,6 +13,14 @@
 //! - `CARGO_PKG_NAME`, `CARGO_PKG_VERSION` and its `_MAJOR`, `_MINOR`, `_PATCH`, `_PRE` parts:
 //!   the package's name and version as the lock and the manifest give them (the unit graph's
 //!   `Unit::name`, `Unit::version`);
+//! - `CARGO_PKG_AUTHORS`, `_DESCRIPTION`, `_HOMEPAGE`, `_LICENSE`, `_LICENSE_FILE`, `_README`,
+//!   `_REPOSITORY`, `_RUST_VERSION`: the package's `[package]` metadata as cargo normalizes it
+//!   (blaze-manifest layout meta.rs, the one table: authors joined with `:`, an unstated key
+//!   `""`, an inherited one the workspace root's), carried by the unit graph
+//!   (`UnitGraph::meta`). `""` for an unstated key is KNOWING, not guessing: cargo sets every
+//!   one of them for every crate, empty when the manifest says nothing;
+//! - `CARGO_PRIMARY_PACKAGE`: `1` for a workspace member's crate, unset for a dependency's
+//!   (every member is selected: blaze builds the workspace as `cargo --workspace` would);
 //! - `CARGO_CRATE_NAME`: the crate's name (`-` already `_` in the unit graph's `crate_name`);
 //! - `CARGO_BIN_NAME`: a binary's name;
 //! - `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`: the root the crate SEES (decision D96,
@@ -24,9 +32,10 @@
 //!
 //! `CARGO` is unset: there is no cargo binary ([`CARGO_ALWAYS`]'s doc).
 //!
-//! A name cargo always sets whose value this build does not know (the `[package]`
-//! metadata family: `CARGO_PKG_AUTHORS`, `_DESCRIPTION`, ..; `CARGO_PRIMARY_PACKAGE`;
-//! `OUT_DIR` of a unit whose script's record is not joined) is UNKNOWN: a read of it is
+//! A name cargo always sets whose value this build does not know (every `CARGO_PKG_*` of a
+//! toolchain crate, or of a package whose metadata the graph does not carry; `OUT_DIR` of a
+//! unit whose script's record is not joined; `CARGO_TARGET_TMPDIR` and `CARGO_BIN_EXE_<name>`
+//! of a test or bench) is UNKNOWN: a read of it is
 //! refused by name ([`EnvUnknown`]), never answered unset (rule 3: an unset answer would turn a
 //! valid program into a false `env!` error, or an `option_env!` into a wrong `None`). Any other
 //! name is unset: blaze's builds see no ambient environment (rule 75), so `env!` of it is the
@@ -43,7 +52,7 @@ use blaze_build_script::OutputsRef;
 /// that make environments.
 pub use blaze_expand::seen::{MemberDirError, SeenRoot};
 use blaze_own::{AString, AVec, Alloc};
-use blaze_unit_graph::{UnitGraph, UnitKind};
+use blaze_unit_graph::{PackageMetaVars, UnitGraph, UnitKind};
 
 use crate::units::{Origin, UnitCrates};
 
@@ -55,6 +64,9 @@ use crate::units::{Origin, UnitCrates};
 /// no value is true and none is unknown. `proc-macro-crate` (jsonrpsee's `#[rpc]`, ..) then
 /// skips `cargo locate-project` and reads the calling package's own manifest, as it does in a
 /// vendored folder; before, its read of `CARGO` refused every such call.
+///
+/// Not `CARGO_PRIMARY_PACKAGE`: cargo sets it only for a selected package, so it is `1` for a
+/// member's crate and unset for a dependency's, both known (the module's doc).
 pub const CARGO_ALWAYS: &[&str] = &[
     "CARGO_CRATE_NAME",
     "CARGO_MANIFEST_DIR",
@@ -73,7 +85,6 @@ pub const CARGO_ALWAYS: &[&str] = &[
     "CARGO_PKG_VERSION_MINOR",
     "CARGO_PKG_VERSION_PATCH",
     "CARGO_PKG_VERSION_PRE",
-    "CARGO_PRIMARY_PACKAGE",
 ];
 
 /// The facts a crate's environment is made from ([`CrateEnv::of`]).
@@ -98,6 +109,9 @@ pub struct EnvFacts<'p> {
     /// An integration test or a bench: `CARGO_TARGET_TMPDIR` and `CARGO_BIN_EXE_<name>` are set
     /// for it, to values this build does not know yet.
     pub test_or_bench: bool,
+    /// The package's `[package]` metadata (`CARGO_PKG_AUTHORS`, ..), when the graph carries it
+    /// (`UnitGraph::meta_of`); `None`: those names are [`EnvUnknown`]. Read only with `package`.
+    pub meta: Option<PackageMetaVars<'p>>,
 }
 
 /// A crate's environment: see the module's doc.
@@ -122,6 +136,9 @@ pub struct CrateEnv<'a> {
     crate_name: AString<'a>,
     bin: Option<AString<'a>>,
     build_script: bool,
+    /// The metadata it was made from, in [`PackageMetaVars::NAMES`]' order (a script's
+    /// `rustc-env` pair may shadow one in `vars`, so it is kept apart for [`CrateEnv::facts`]).
+    meta: Option<[AString<'a>; 8]>,
 }
 
 /// A variable cargo sets for the crate whose value this build does not know: a read of it is
@@ -198,6 +215,14 @@ impl<'a> CrateEnv<'a> {
             put(&mut given, "CARGO_PKG_VERSION_MINOR", minor);
             put(&mut given, "CARGO_PKG_VERSION_PATCH", patch);
             put(&mut given, "CARGO_PKG_VERSION_PRE", pre);
+            if let Some(meta) = facts.meta {
+                for (name, value) in meta.pairs() {
+                    put(&mut given, name, value);
+                }
+            }
+        }
+        if let SeenRoot::Member { .. } = facts.seen {
+            put(&mut given, "CARGO_PRIMARY_PACKAGE", "1");
         }
         if let Some(bin) = facts.bin {
             put(&mut given, "CARGO_BIN_NAME", bin);
@@ -232,6 +257,7 @@ impl<'a> CrateEnv<'a> {
         unknown.sort_unstable();
         unknown.dedup();
         let package = facts.package.map(|(name, version)| (AString::from_str_in(name, alloc), AString::from_str_in(version, alloc)));
+        let meta = facts.package.and(facts.meta).map(|meta| meta.values().map(|value| AString::from_str_in(value, alloc)));
         Ok(CrateEnv {
             vars,
             unknown,
@@ -243,7 +269,18 @@ impl<'a> CrateEnv<'a> {
             crate_name: AString::from_str_in(facts.crate_name, alloc),
             bin: facts.bin.map(|bin| AString::from_str_in(bin, alloc)),
             build_script: facts.build_script,
+            meta,
         })
+    }
+
+    /// The kept metadata as the table's borrowed values.
+    fn meta_vars(&self) -> Option<PackageMetaVars<'_>> {
+        self.meta.as_ref().map(|values| PackageMetaVars::from_values(values.each_ref().map(|value| value.as_str())))
+    }
+
+    /// The kept metadata copied into `alloc`.
+    fn meta_in<'b>(&self, alloc: Alloc<'b>) -> Option<[AString<'b>; 8]> {
+        self.meta.as_ref().map(|values| values.each_ref().map(|value| AString::from_str_in(value.as_str(), alloc)))
     }
 
     /// The facts this environment was made from: [`CrateEnv::of`] of them makes it again, equal
@@ -260,6 +297,7 @@ impl<'a> CrateEnv<'a> {
             build_script: self.build_script,
             script: self.script,
             test_or_bench: self.bin_exe_unknown,
+            meta: self.meta_vars(),
         }
     }
 
@@ -299,6 +337,7 @@ impl<'a> CrateEnv<'a> {
             crate_name: text(self.crate_name.as_str()),
             bin: self.bin.as_ref().map(|bin| text(bin.as_str())),
             build_script: self.build_script,
+            meta: self.meta_in(alloc),
         })
     }
 
@@ -348,6 +387,7 @@ impl<'a> CrateEnv<'a> {
             crate_name: text(self.crate_name.as_str()),
             bin: self.bin.as_ref().map(|bin| text(bin.as_str())),
             build_script: self.build_script,
+            meta: self.meta_in(alloc),
         }
     }
 
@@ -479,6 +519,7 @@ impl<'a> UnitCrates<'a> {
                     build_script: c.build_script,
                     script: c.script,
                     test_or_bench: matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_)),
+                    meta: graph.meta_of(unit.package).map(|meta| meta.vars()),
                 }
             }
             Origin::Toolchain { .. } => EnvFacts {
@@ -490,6 +531,7 @@ impl<'a> UnitCrates<'a> {
                 build_script: false,
                 script: None,
                 test_or_bench: false,
+                meta: None,
             },
         };
         CrateEnv::of(facts, alloc)
@@ -523,6 +565,7 @@ mod tests {
             build_script: false,
             script: None,
             test_or_bench: false,
+            meta: None,
         }
     }
 

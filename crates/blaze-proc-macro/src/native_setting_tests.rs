@@ -167,7 +167,7 @@ fn a_native_placed_script_with_a_setting_reaches_its_binary_lookup() {
     units.push(unit("zstd-sys", UnitKind::BuildScript, &[1], None)); // 0
     units.push(unit("cc", UnitKind::Lib, &[], None)); // 1
     units.push(unit("zstd-sys", UnitKind::Lib, &[], Some(0))); // 2
-    let graph = UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3 };
+    let graph = UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3, meta: AVec::new_in(alloc) };
 
     let store = folder("reaches-store");
     let runtime = ScriptRuntime::new(&store).unwrap_or_else(|e| panic!("{e}"));

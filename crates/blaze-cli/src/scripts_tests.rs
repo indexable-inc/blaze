@@ -70,7 +70,7 @@ fn links_graph(a_reaches_c: bool) -> UnitGraph<'static> {
     units.push(unit(2, "c", UnitKind::Lib, &[], Some(1), Some("c"))); // 5
     units.push(unit(3, "e", UnitKind::Lib, &[5], Some(7), None)); // 6
     units.push(unit(3, "e", UnitKind::BuildScript, &[], None, None)); // 7
-    UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3 }
+    UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3, meta: AVec::new_in(alloc) }
 }
 
 /// D115 piece 3: the `Script` records a run Needs are its `links` closure: each direct `links`

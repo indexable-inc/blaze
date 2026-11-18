@@ -509,6 +509,7 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                 let text = names.item_text(k).map(|t| t.text).unwrap_or("");
                 let at = match why {
                     Why::Unsupported(_, r)
+                    | Why::UnsupportedIn(_, _, r)
                     | Why::Program(_, r)
                     | Why::Resolve(_, r)
                     | Why::NoCheckerType(_, r)

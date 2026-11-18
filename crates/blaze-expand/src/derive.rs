@@ -136,19 +136,8 @@ pub fn derive_meta<'a>(
     let mut at = name + 2;
     while at < close {
         let start = at;
-        // A path: `::`? ident (`::` ident)*.
-        loop {
-            if punct(at, ':') && punct(at + 1, ':') {
-                at += 2;
-            }
-            if !ident(at) {
-                return None;
-            }
-            at += 1;
-            if !(punct(at, ':') && punct(at + 1, ':')) {
-                break;
-            }
-        }
+        // A path: `::`? ident (`::` ident)*, its head possibly `$crate` (crate::attr_path).
+        at = crate::attr_path::path_end(attr, at)?;
         paths.push(index(start)..index(at));
         match at == close {
             true => {}
@@ -166,7 +155,6 @@ pub fn derive_meta<'a>(
 pub fn attr_call(attr: &TokenStream<'_>) -> Option<(Range<u32>, Option<Range<u32>>)> {
     let tokens = attr.tokens();
     let punct = |at: usize, want: char| matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Punct { char, .. }) if char == want);
-    let ident = |at: usize| matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Ident { .. }));
     if !(punct(0, '#') && matches!(tokens.get(1).map(|t| t.kind), Some(TokenKind::Open(Delim::Bracket)))) {
         return None;
     }
@@ -175,19 +163,8 @@ pub fn attr_call(attr: &TokenStream<'_>) -> Option<(Range<u32>, Option<Range<u32
         return None;
     }
     let start = 2;
-    let mut at = start;
-    loop {
-        if punct(at, ':') && punct(at + 1, ':') {
-            at += 2;
-        }
-        if !ident(at) {
-            return None;
-        }
-        at += 1;
-        if !(punct(at, ':') && punct(at + 1, ':')) {
-            break;
-        }
-    }
+    // `$crate::..` too, a `$` then `crate` when lexed from text (crate::attr_path).
+    let at = crate::attr_path::path_end(attr, start)?;
     let path = index(start)..index(at);
     if at == close {
         return Some((path, None));

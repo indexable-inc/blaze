@@ -264,7 +264,7 @@ pub fn why_of<'n, 'a>(names: &'n Names<'n>, row: &LeftOut, alloc: Alloc<'a>) -> 
                 member_head(names, *item, said, &mut block, alloc);
                 return block;
             }
-            TyWhy::Unsupported(said, r) => {
+            TyWhy::Unsupported(said, r) | TyWhy::UnsupportedIn(said, _, r) => {
                 let text = names.item_text(*item).map(|t| t.text);
                 block.line(format_args!("the item {}: its head was refused: {said}", ItemShown::of_lib(names, *item)));
                 refused_range(names, *item, None, text, r.start as usize, r.end as usize, &mut block, alloc);

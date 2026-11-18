@@ -145,6 +145,13 @@ const INDEX_DOMAIN: &str = "blaze plain store index 1";
 /// What an indexed root's record key is derived under: never a plain root's key for the same
 /// bytes ([`Plain::root_through`]).
 const INDEXED_ROOT_DOMAIN: &str = "blaze plain store indexed root 1";
+/// The domain of the key an index beside a record is filed under ([`Plain::index_beside`]).
+const BESIDE_DOMAIN: &str = "blaze plain store index beside 1";
+
+/// The key of the index filed beside `owner` ([`Plain::index_beside`]).
+pub fn beside_key(owner: Key) -> Key {
+    Key(ContentId::of(BESIDE_DOMAIN, &owner.0.0))
+}
 
 const HEAD: &str = "head";
 const FLIP: &str = "flip";
@@ -1092,6 +1099,13 @@ impl Plain {
         out
     }
 
+    /// The record the root `name` names, when the head names it unexpired at the store's clock
+    /// (its last completion's wall time): what a writer renewing a root reads first, so an
+    /// expired root, whose records a slice may have swept, is never named again.
+    pub fn root_named(&self, name: &str) -> Option<Key> {
+        self.manifest.roots.iter().find(|it| it.name == name && it.expires_ns > self.now_ns).map(|it| Key(it.key))
+    }
+
     /// The roots this generation names with their expiry: `(name, record key, expires ns)`
     /// ([`format::NEVER`]: none).
     pub fn roots_expiring(&self) -> Vec<(String, Key, u64)> {
@@ -1375,6 +1389,25 @@ impl Plain {
             return Err(StoreError::IndexOver { keys: count, most: INDEX_KEYS_MOST as u64 });
         }
         let key = Key(ContentId::of(INDEX_DOMAIN, &bytes));
+        self.put(key, Namespace::LOCAL, INDEX_TAG, &bytes).map_err(|it| it.into_store(INDEX_TAG))?;
+        if !self.indexes_made.iter().any(|(it, _)| *it == key) {
+            self.indexes_made.push((key, count));
+        }
+        Ok(key)
+    }
+
+    /// An index of `keys` filed BESIDE the record `owner`: under [`beside_key`]`(owner)`, not
+    /// under its content, so a writer that names `owner` in a root finds the index again from
+    /// the owner's key alone (`owner`'s records made with it: a names record's expansion
+    /// records). The owner's key must cover what `keys` are (its record is a function of them):
+    /// other keys under one owner are the store's two-values refusal (rule 21).
+    pub fn index_beside(&mut self, owner: Key, keys: &[Key]) -> Result<Key, StoreError> {
+        let bytes = sorted_keys(keys);
+        let count = (bytes.len() / 32) as u64;
+        if count > INDEX_KEYS_MOST as u64 {
+            return Err(StoreError::IndexOver { keys: count, most: INDEX_KEYS_MOST as u64 });
+        }
+        let key = beside_key(owner);
         self.put(key, Namespace::LOCAL, INDEX_TAG, &bytes).map_err(|it| it.into_store(INDEX_TAG))?;
         if !self.indexes_made.iter().any(|(it, _)| *it == key) {
             self.indexes_made.push((key, count));

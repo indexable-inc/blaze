@@ -2058,14 +2058,14 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
             }
             bodies.sort_unstable();
             // Each head its own part, a `Signature` (signature.rs), named by the file's real path
-            // and the entry's chain, keyed by its head's bytes and the file's surface: a type
+            // and the entry's chain, keyed by its head's bytes, nothing of its siblings: a type
             // edit re-makes that one head, and moves only the bodies that read it.
             let subject = crate::signature::file_subject(path);
             for (index, item) in outline.items().iter().enumerate() {
                 if crate::signature::is_signature_entry(&outline, item) {
                     let at = blaze_surface::ItemIndex(index as u32);
                     let name = crate::signature::signature_name(subject, &outline, item, text);
-                    parts.push(Part { name, locate: Locate::Source(crate::signature::signature_source(&outline, at, text, surface)), place: item.range.start });
+                    parts.push(Part { name, locate: Locate::Source(crate::signature::signature_source(&outline, at, text)), place: item.range.start });
                 }
             }
             // Each lint unit its own part (lints.rs), when the step runs a rule: keyed by its
@@ -2761,7 +2761,7 @@ fn scope_job<'f: 'j, 'j>(
         place: crate::macros::Place { home: facts.fetch_env.home, checkout: facts.fetch_env.checkout, members, rows: &facts.rows },
         heap: facts.fetch_env.heap,
     });
-    match crate::names::prepare(cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, side.as_ref(), task, round, held)? {
+    match crate::names::prepare(cx, root, store, &mut crate::names::CopiedExports, &mut facts.names, lock, members, &facts.fetch_env, side.as_ref(), task, round, held)? {
         crate::names::Prepared::Resolve(job) => Ok(Some(job)),
         crate::names::Prepared::Answer(_) | crate::names::Prepared::Made => Ok(None),
     }

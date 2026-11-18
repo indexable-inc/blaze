@@ -87,6 +87,12 @@ impl From<LoadError> for ReadError {
 /// path does (front_load.rs `crate_records`) and counts the copy.
 pub(crate) trait Route {
     fn section<'r>(name: Name, which: &'static str, bytes: &'r [u8], counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<&'r [u8], ReadError>;
+
+    /// A dependency's exports section, as a names task reads it (names/scope.rs `prepare`,
+    /// [`EngineRecords::exports`]): in place on [`InPlace`]; on [`Copying`] as the names stage
+    /// read it before, copied twice (the record out of the store into the wave's frame, then the
+    /// section 16-aligned again), each copy counted.
+    fn exports<'r>(name: Name, bytes: &'r [u8], counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<&'r [u8], ReadError>;
 }
 
 /// The section borrowed where it lies in the mapping, refused when it is not aligned.
@@ -95,6 +101,10 @@ pub(crate) enum InPlace {}
 impl Route for InPlace {
     fn section<'r>(name: Name, which: &'static str, bytes: &'r [u8], _counts: &mut ReadCounts, _alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
         Aligned16::new(bytes).map(Aligned16::bytes).map_err(|why| ReadError::Misaligned { name, which, why })
+    }
+
+    fn exports<'r>(name: Name, bytes: &'r [u8], _counts: &mut ReadCounts, _alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
+        Aligned16::new(bytes).map(Aligned16::bytes).map_err(|why| ReadError::Misaligned { name, which: "exports section", why })
     }
 }
 
@@ -108,6 +118,28 @@ impl Route for Copying {
         counts.copied += bytes.len() as u64;
         Ok(blaze_scope::resolve::aligned(bytes, alloc))
     }
+
+    fn exports<'r>(_name: Name, bytes: &'r [u8], counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
+        // Twice, as before: out of the store, then aligned again (names/scope.rs before this
+        // reader: `work::payload` into the round's frame, then `aligned`).
+        counts.copied += 2 * bytes.len() as u64;
+        let once = blaze_scope::resolve::aligned(bytes, alloc);
+        Ok(blaze_scope::resolve::aligned(once, alloc))
+    }
+}
+
+/// The `CrateScope` record `record` of `name` cut where it lies: its payload, aligned, and the
+/// payload's sections. The one place a record of this form is opened in place, for
+/// [`open_record`] and [`EngineRecords::exports`] (rule 30).
+fn payload_of<'r>(name: Name, record: Aligned16<'r>) -> Result<(Aligned16<'r>, sections::Sections<'r>), ReadError> {
+    let view = match blaze_drive::record::open(record.bytes()) {
+        Ok(blaze_drive::record::Stored::Whole(view)) => view,
+        Ok(blaze_drive::record::Stored::Shape(_)) => return Err(LoadError::NotWhole { name, why: "a shape record, which holds no payload" }.into()),
+        Err(_) => return Err(LoadError::NotWhole { name, why: "its bytes are not a record of this tool's form" }.into()),
+    };
+    let payload = Aligned16::new(view.payload).map_err(|why| ReadError::Misaligned { name, which: "payload", why })?;
+    let parts = sections::sections(payload.bytes()).map_err(|error| LoadError::Sections { name, error })?;
+    Ok((payload, parts))
 }
 
 /// The `CrateScope` record `record` of `name`, crate `key`'s, opened by route `R`: its payload
@@ -124,13 +156,7 @@ pub(crate) fn open_record<'r, R: Route>(
     counts: &mut ReadCounts,
     alloc: Alloc<'r>,
 ) -> Result<CrateRecords<'r>, ReadError> {
-    let view = match blaze_drive::record::open(record.bytes()) {
-        Ok(blaze_drive::record::Stored::Whole(view)) => view,
-        Ok(blaze_drive::record::Stored::Shape(_)) => return Err(LoadError::NotWhole { name, why: "a shape record, which holds no payload" }.into()),
-        Err(_) => return Err(LoadError::NotWhole { name, why: "its bytes are not a record of this tool's form" }.into()),
-    };
-    let payload = Aligned16::new(view.payload).map_err(|why| ReadError::Misaligned { name, which: "payload", why })?;
-    let parts = sections::sections(payload.bytes()).map_err(|error| LoadError::Sections { name, error })?;
+    let (_, parts) = payload_of(name, record)?;
     counts.records += 1;
     counts.bytes += record.len() as u64;
     counts.sections += (parts.names.len() + parts.items.len() + parts.expansions.len()) as u64;
@@ -157,6 +183,18 @@ impl<'r> RecordSource<'r> for InPlaceRecords<'_, '_, 'r> {
         self.counts.bytes += place.len() as u64;
         Ok(Some(place.bytes()))
     }
+}
+
+/// A dependency's exports section as a names task is handed it ([`EngineRecords::exports`]),
+/// and the payload it was cut from (both where they lie on [`InPlace`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Exports<'j> {
+    /// The record's whole payload, in place: what the names tests' watch keeps
+    /// (names/sections.rs `watch`).
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the names tests' watch alone"))]
+    pub(crate) payload: &'j [u8],
+    /// The exports section, 16-aligned.
+    pub(crate) exports: &'j [u8],
 }
 
 /// The command's reader: every crate's records opened once a request, in place, for `'r`.
@@ -193,6 +231,30 @@ impl<'r> EngineRecords<'r> {
         self.counts.bytes += source.counts.bytes;
         self.read.push((input.name, input.at, records));
         Ok(records)
+    }
+
+    /// The exports section of the dependency record `input` names, for a names task (names/
+    /// scope.rs `prepare`, engine_names.rs): opened where it lies in the store's mapping and
+    /// borrowed for `'r`, never copied (route [`InPlace`]), counted in this reader's counts. Not
+    /// kept here: the wave that asks keeps each crate's borrow once (names/scope.rs
+    /// `ScopeRound`). The record was put and committed by an earlier names phase of this request
+    /// (engine_check.rs, `commit_puts` after each phase's puts) or by an earlier request; one in
+    /// this command's arena is [`ReadError::NotInPlace`] (rule 3).
+    pub(crate) fn exports<'j, R: Route>(&mut self, cx: &Cx, store: &mut dyn Store<'r>, input: &Input, alloc: Alloc<'j>) -> Result<Exports<'j>, ReadError>
+    where
+        'r: 'j,
+    {
+        let cx = cx.span("engine: a dependency's exports read in place");
+        let Some(held) = store.get(&cx, input.at).map_err(LoadError::Store)? else {
+            return Err(LoadError::NotInStore { name: input.name, at: input.at }.into());
+        };
+        let record = held.place.map_err(|why| ReadError::NotInPlace { name: input.name, why })?;
+        let (payload, parts) = payload_of(input.name, record)?;
+        self.counts.records += 1;
+        self.counts.bytes += record.len() as u64;
+        self.counts.sections += parts.exports.len() as u64;
+        let exports = R::exports(input.name, parts.exports, &mut self.counts, alloc)?;
+        Ok(Exports { payload: payload.bytes(), exports })
     }
 
     /// What it read so far.

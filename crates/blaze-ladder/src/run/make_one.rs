@@ -558,7 +558,9 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
 fn build_refusal<P: FrontEnd>(program: &P, function: Named, body: Option<&blaze_lower::typeck::TypeckBody<'static>>, error: BuildError) -> RunError {
     let ranges = |all: &[blaze_typeck::Range], i: u32| all.get(i as usize).copied();
     let range = match error {
-        BuildError::Unsupported { expr, .. } | BuildError::UnsupportedType { expr, .. } | BuildError::NoConstBlockValue { expr, .. } => body.and_then(|body| ranges(&body.expr_ranges, expr.0)),
+        BuildError::Unsupported { expr, .. } | BuildError::UnsupportedType { expr, .. } | BuildError::NoConstBlockValue { expr, .. } | BuildError::NoConstFnInstance { expr, .. } => {
+            body.and_then(|body| ranges(&body.expr_ranges, expr.0))
+        }
         BuildError::UnsupportedPat { pat, .. } => body.and_then(|body| ranges(&body.pat_ranges, pat.0)),
         BuildError::NoAdt { adt }
         | BuildError::NoAbi { item: adt }

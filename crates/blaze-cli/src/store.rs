@@ -84,6 +84,10 @@ pub trait Store<'m> {
     /// [`blaze_keyed::store::Put::Same`], whichever namespace holds them; other bytes are
     /// refused (rule 21).
     fn put_record(&mut self, cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError>;
+    /// The keys of the records put beside `owner` ([`Store::put_record`]) filed as one index
+    /// beside it (blaze-cas `Plain::index_beside`), so a root naming `owner` through an index
+    /// keeps them too ([`CommandStore::pin_through`]); a store with no roots keeps nothing.
+    fn index_beside(&mut self, cx: &Cx, owner: Key, keys: &[Key]) -> Result<(), CliError>;
     /// Every segment the head names mapped, and every parked one checked: asked once, when the
     /// request's first pool task is about to start (work.rs `run_batches`); later asks do
     /// nothing.
@@ -95,6 +99,10 @@ pub trait Store<'m> {
     /// toolchain's), told by the names step once its world is made: a trusted builder puts
     /// their records in the public namespace.
     fn public_crates(&mut self, subjects: &[ContentId]);
+    /// The `CrateScope` subjects of the toolchain's crates (a subset of the public ones), told
+    /// by the names step with them: their records are kept under the toolchain's root, for
+    /// every checkout on the toolchain (store/roots.rs `keep_toolchain`).
+    fn toolchain_crates(&mut self, subjects: &[ContentId]);
     /// What this store's puts cost the process so far (rules 50, 51): the copies of records it
     /// made into the heap and the bytes of them it holds now, counted where it copies.
     fn kept(&self) -> StoreKept;
@@ -143,6 +151,8 @@ pub enum StoreFailure {
     /// A put of other bytes under a key the store holds (rule 21): the store's refusal, and
     /// the two records opened, so the refusal names the record and where they differ.
     TwoValues { key: Key, lent: blaze_cas::plain::LentError, clash: Clash },
+    /// A class root of store/roots.rs could not be set (the toolchain's, from the engine's answer).
+    Root(roots::RootError),
 }
 
 /// A drive record's form, as [`record::open`](blaze_drive::record::open) reads it.
@@ -436,6 +446,7 @@ impl fmt::Display for StoreFailure {
             StoreFailure::Place(error) => write!(f, "{error}"),
             StoreFailure::Copy(stopped) => write!(f, "a record read from the store: {stopped}"),
             StoreFailure::Look { folder, error } => write!(f, "looking for the old store folder {folder}: {error}"),
+            StoreFailure::Root(error) => write!(f, "{error}"),
             StoreFailure::TwoValues { key, lent, clash } => {
                 write!(f, "the store under the home's .blaze/v2/store: two values under one key {key}: the record of ")?;
                 clash.write_subject(f)?;
@@ -619,6 +630,9 @@ impl Sharing for ToolchainCrates {
 pub struct CommandStore<'m, 'r, D: Driver, S: Sharing = ToolchainCrates> {
     place: PlainPlace<'m, D>,
     sharing: S,
+    /// The toolchain's crates by their `CrateScope` subjects, sorted ([`Store::toolchain_crates`]):
+    /// their records go under the toolchain's root ([`CommandStore::keep_toolchain`]).
+    toolchain: std::vec::Vec<ContentId, Global>,
     remote: Option<Remote<'r>>,
     mapped_all: bool,
     /// The open's time, for the profile and `--stats`.
@@ -643,7 +657,7 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
         if named > plain_place::SEGMENTS_NAMED_MOST {
             err.line(cx, format_args!("blaze: the store under the home's .blaze/{} names {named} segments, past {}: its compaction is behind", plain_place::STORE_DIR, plain_place::SEGMENTS_NAMED_MOST))?;
         }
-        Ok(CommandStore { place: PlainPlace::new(lent, public_writer), sharing: ToolchainCrates::new(), remote, mapped_all: false, open_ns })
+        Ok(CommandStore { place: PlainPlace::new(lent, public_writer), sharing: ToolchainCrates::new(), toolchain: std::vec::Vec::new_in(Global), remote, mapped_all: false, open_ns })
     }
 }
 
@@ -688,8 +702,11 @@ pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout
 /// After the answer is printed, once every handle over `lent` is gone: the ONE commit of this
 /// command's records and roots ([`plain_place::after_answer`]), and with `stats` its line on
 /// `err`: the commit's time, and the time from the answer's last byte to the store's last
-/// effect (the process exits right after).
-pub fn after_answer_printed(cx: &Cx, lent: CommandLent, stats: bool, clock: &Clock, err: &Out) -> Result<(), CliError> {
+/// effect (the process exits right after). Answers the cleanup line, whole (its slice and what
+/// the commit carried too): a caller that writes its profile after the commit (the engine's
+/// `check`, engine_check.rs) puts it there; one that wrote its profile before put
+/// [`roots::CleanupLine::before_commit`] there instead.
+pub fn after_answer_printed(cx: &Cx, lent: CommandLent, stats: bool, clock: &Clock, err: &Out) -> Result<roots::CleanupLine, CliError> {
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let answered = ns(clock);
     let after = plain_place::after_answer(&lent, AFTER_ANSWER_SLICES)?;
@@ -707,11 +724,10 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, stats: bool, clock: &Clo
                 ns(clock).saturating_sub(answered) as f64 / 1e6,
             ),
         )?;
-        // The cleanup the commit named (store/roots.rs `CleanupLine`): after the answer, so
-        // here and not in the profile written before it.
+        // The cleanup the commit named (store/roots.rs `CleanupLine`), whole.
         err.line(cx, format_args!("{}", after.cleanup))?;
     }
-    Ok(())
+    Ok(after.cleanup)
 }
 
 /// A planted bug of the nonce's test (`store/nonce_tests.rs`).
@@ -836,11 +852,61 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         self.place.pin(name, keys)?;
         Ok(())
     }
+
+    /// [`CommandStore::pin`] through index records: `keys`, and the records filed beside each
+    /// of `owners` (a names record's expansion records), kept by the root `name`
+    /// (plain_place.rs `pin_through`).
+    pub fn pin_through(&mut self, name: &str, keys: &[Key], owners: &[Key]) -> Result<(), CliError> {
+        self.place.pin_through(name, keys, owners)?;
+        Ok(())
+    }
+
+    /// The toolchain's records this command's answer names, `records` (std's names records and
+    /// the like: their `CrateScope` subjects were told public by the names step,
+    /// [`Store::public_crates`]) and those filed beside them, kept under the toolchain's root
+    /// for every checkout on `toolchain` (store/roots.rs `keep_toolchain`), renewed by every
+    /// command that answers with them.
+    pub fn keep_toolchain(&mut self, toolchain: blaze_toolchain::ToolchainId, records: &[Key]) -> Result<(), CliError> {
+        let mut made = std::vec::Vec::with_capacity_in(records.len(), Global);
+        made.extend(records.iter().map(|key| blaze_cas::Key(key.0)));
+        let mut beside = std::vec::Vec::new_in(Global);
+        for record in records {
+            if let Some(index) = self.place.beside(*record)? {
+                beside.push(index);
+            }
+        }
+        roots::keep_toolchain(self.place.lent(), toolchain, &made, &beside).map_err(|why| CliError::Store(StoreFailure::Root(why)))?;
+        Ok(())
+    }
+
+    /// A certified answer's roots renewed: each of `answer` (the answer's root and its
+    /// `.pages`, the dependency heads') for blaze-cas `ROOT_LIFE_NS`, and the toolchain's
+    /// root for its own life, naming what they named (plain_place.rs `renew`): the request
+    /// read through them and wrote nothing, and a root a command reaches is renewed.
+    pub fn renew(&mut self, answer: &[&str], toolchain: blaze_toolchain::ToolchainId) -> Result<(), CliError> {
+        for name in answer {
+            self.place.renew(name, blaze_cas::plain::ROOT_LIFE_NS)?;
+        }
+        self.place.renew(roots::RootName::toolchain(toolchain).as_str(), roots::TOOLCHAIN_LIFE_NS)?;
+        Ok(())
+    }
+
+    /// Whether `name` is a toolchain crate's record ([`Store::toolchain_crates`]): a
+    /// `CrateScope` name of one of its subjects.
+    pub fn is_toolchain(&self, name: Name) -> bool {
+        name.kind == Kind::CrateScope && self.toolchain.binary_search(&name.subject).is_ok()
+    }
 }
 
 impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     fn public_crates(&mut self, subjects: &[ContentId]) {
         self.sharing.add_public(subjects);
+    }
+
+    fn toolchain_crates(&mut self, subjects: &[ContentId]) {
+        self.toolchain.extend_from_slice(subjects);
+        self.toolchain.sort_unstable();
+        self.toolchain.dedup();
     }
 
     fn kept(&self) -> StoreKept {
@@ -916,6 +982,11 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn index_beside(&mut self, _cx: &Cx, owner: Key, keys: &[Key]) -> Result<(), CliError> {
+        self.place.index_beside(owner, keys)?;
+        Ok(())
     }
 
     fn map_all(&mut self, _cx: &Cx) -> Result<(), CliError> {

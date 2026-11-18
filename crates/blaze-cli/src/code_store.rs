@@ -30,7 +30,7 @@ use std::alloc::Global;
 use blaze_cas::Key as CasKey;
 use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace, Tag};
 use blaze_core::Driver;
-use blaze_ladder::code_records::{CodeKey, CodeStore, StoreError};
+use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, StoreError};
 
 use crate::store::plain_place::COMMIT_BYTES;
 
@@ -50,8 +50,13 @@ pub(crate) struct HomeCodeStore<'m, D: Driver> {
     /// Every key this run's code came from or went to: each entry found or put, each pointer
     /// found or pointed and its target. The program's root names exactly these and the start
     /// list's (store/roots.rs `keep_program`): code reaches the store through this handle
-    /// alone, so what a later run reads is named by construction, never by remembering.
+    /// alone, so what a later run reads is named by construction, never by remembering. A
+    /// toolchain-class write goes to `toolchain` instead (store/roots.rs `keep_toolchain`); a
+    /// hit of either class is the program's too (a get does not know its class, and naming a
+    /// toolchain record from the program root as well only keeps it longer).
     reached: RefCell<std::vec::Vec<CasKey, Global>>,
+    /// The toolchain-class keys this run wrote: entries and pointers with their targets.
+    toolchain: std::vec::Vec<CasKey, Global>,
 }
 
 /// The most keys one run's code may reach: one index's (blaze-cas `INDEX_KEYS_MOST`); one more
@@ -60,7 +65,30 @@ const REACHED_MOST: usize = INDEX_KEYS_MOST;
 
 impl<'m, D: Driver> HomeCodeStore<'m, D> {
     pub(crate) fn new(lent: &'m Lent<D, Global>) -> HomeCodeStore<'m, D> {
-        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(Global)) }
+        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(Global)), toolchain: std::vec::Vec::new_in(Global) }
+    }
+
+    /// The toolchain-class keys this run wrote, sorted, each once (the toolchain root's new
+    /// index, store/roots.rs `keep_toolchain`).
+    pub(crate) fn toolchain_made(&self) -> std::vec::Vec<CasKey, Global> {
+        let mut keys = self.toolchain.clone();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// `keys` written as `class` by `key`'s write: the toolchain's set or the program's.
+    fn wrote(&mut self, class: CodeClass, key: CodeKey, keys: &[CasKey]) -> Result<(), StoreError> {
+        match class {
+            CodeClass::Program => self.reach(key, keys),
+            CodeClass::Toolchain => {
+                if self.toolchain.len() + keys.len() > REACHED_MOST {
+                    return Err(StoreError::Failed { key, what: "this run made more toolchain records than one index of the toolchain's root holds (blaze-cas INDEX_KEYS_MOST)" });
+                }
+                self.toolchain.extend_from_slice(keys);
+                Ok(())
+            }
+        }
     }
 
     /// The keys this run's code reached, sorted, each once (the program root's walk half).
@@ -119,13 +147,13 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
         }
     }
 
-    fn put(&mut self, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError> {
+    fn put(&mut self, class: CodeClass, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError> {
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
             self.lent.commit().map_err(|error| refused(key, &error))?;
             self.commits += 1;
         }
         self.lent.put(&CasKey(key.0), Namespace::LOCAL, CODE_TAG, bytes).map_err(|error| refused(key, &error))?;
-        self.reach(key, &[CasKey(key.0)])
+        self.wrote(class, key, &[CasKey(key.0)])
     }
 
     /// The content key the code key `key` points at (`Lent::pointed`, the newest commit's
@@ -152,13 +180,13 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
 
     /// `key` pointed at the entry put under `content` (`Lent::point`): in the same commit as
     /// that entry, unless a commit came between the two (then the entry is durable first).
-    fn point(&mut self, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
+    fn point(&mut self, class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
             self.lent.commit().map_err(|error| refused(key, &error))?;
             self.commits += 1;
         }
         self.lent.point(CODE_TAG, &CasKey(key.0), &CasKey(content.0)).map_err(|error| refused(key, &error))?;
-        self.reach(key, &[CasKey(key.0), CasKey(content.0)])
+        self.wrote(class, key, &[CasKey(key.0), CasKey(content.0)])
     }
 }
 

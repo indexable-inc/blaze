@@ -370,6 +370,36 @@ fn stat_digest(filetype: Filetype, size: u64) -> ContentId {
     digest(&bytes)
 }
 
+/// The answer a run records for a `file:` read of a file holding `bytes`: what the checkout's
+/// sweep computes for the same path (blaze-cli engine_script_reads.rs), so one cell holds one
+/// digest whoever made it (rule 21).
+pub fn file_answer(bytes: &[u8]) -> ContentId {
+    digest(bytes)
+}
+
+/// The answer a run records for a `stat:` read: a folder's is its kind alone (the [`Filestat`]
+/// handed out says size 0 and no time, inode or count, so nothing inside it is observed); a
+/// file's is its kind and size.
+pub fn stat_answer(is_dir: bool, size: u64) -> ContentId {
+    match is_dir {
+        true => stat_digest(Filetype::Directory, 0),
+        false => stat_digest(Filetype::RegularFile, size),
+    }
+}
+
+/// The answer a run records for a `dir:` read of a folder whose entries are `entries` (name,
+/// whether it is a folder through any link), in name order: [`listing_digest`]'s bytes, one
+/// level, each entry not a folder counted a regular file as [`Tree::node`] lists it.
+pub fn listing_answer<'e>(entries: impl IntoIterator<Item = (&'e [u8], bool)>) -> ContentId {
+    let mut names = Vec::new();
+    for (name, is_dir) in entries {
+        names.extend_from_slice(name);
+        names.push(0);
+        names.push(if is_dir { Filetype::Directory } else { Filetype::RegularFile } as u8);
+    }
+    digest(&names)
+}
+
 fn filestat(filetype: Filetype, size: u64) -> Filestat {
     Filestat { dev: 0, ino: 0, filetype, nlink: 1, size, atim: 0, mtim: 0, ctim: 0 }
 }

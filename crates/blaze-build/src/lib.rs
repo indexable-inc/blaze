@@ -521,7 +521,9 @@ pub trait Adts {
     /// instance it keyed; the walk files the answer as a `Func` reference, as a direct fn-item
     /// to fn-pointer coercion does (walk/promote.rs `data_rows`, which also asks it for a
     /// promoted record's fn target its operand does not name). No answer is refused with
-    /// [`BuildError::NoConstFnInstance`].
+    /// [`BuildError::NoConstFnInstance`]. An evaluator's record names the instance of each of
+    /// its fn words (blaze-consteval `ConstRecord::fns`): a world answers from that, never by
+    /// searching its fns for one whose key matches.
     fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {
         let _ = (key, ground);
         None
@@ -969,7 +971,13 @@ impl fmt::Display for BuildError {
                 write!(f, "expression {}: fn {:#x} in a promoted value has no instance key in the build's `Adts`", expr.0, item.0)
             }
             BuildError::NoConstFnInstance { expr, key } => {
-                write!(f, "expression {}: a constant's value holds a fn pointer to instance {key:?}, which the build's `Adts` does not give", expr.0)
+                write!(
+                    f,
+                    "expression {}: the value of the constant this path or const block reads holds a fn pointer to instance {key:?}, \
+                     which no record the build's `Adts` holds names (every evaluated record names the instance of each of its fn words: \
+                     blaze-consteval `ConstRecord::fns`)",
+                    expr.0
+                )
             }
             BuildError::NoPatConstValue { pat, item } => {
                 write!(f, "pattern {}: const item {:#x} has no evaluated value in the build's `Adts`", pat.0, item.0)

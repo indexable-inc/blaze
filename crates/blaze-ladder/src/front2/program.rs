@@ -1904,6 +1904,12 @@ impl FrontEnd for Front2Program<'_> {
         made.map(super::const_at::data_record).map_err(super::const_at::ConstAtWhy::Eval)
     }
 
+    /// From the evaluator the program kept: the record that holds the fn word names its
+    /// instance (consts.rs `Consts::fn_instance`).
+    fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut tc::PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::Instance> {
+        self.consts.fn_instance(key, ground, scratch)
+    }
+
     fn evaluates_at_args(&self) -> bool {
         true
     }

@@ -319,8 +319,24 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         self.front.index.lang(name).map(|lib| crate::front2::keys::asked_key(names, lib))
     }
 
+    /// The method `name` of lang trait `trait_` by the key its trait's head files it under
+    /// (keys.rs `member_key_of`), from the library's member row when the head is not made yet:
+    /// the lazy program makes a head only when a checked body names the trait, and a closure
+    /// coerced to a fn pointer in a constant (`const C: fn(u8) -> u8 = |x| x + 1;`) is built
+    /// through `Fn::call` though no body of the program names `Fn` (the build of its
+    /// `call_once` entry, blaze-build closure.rs `body_instance`). The key is the one the head
+    /// files later, so the build's call and a later check name one item, as `lang_item` does for
+    /// a `#[lang]` member. `None`: the trait declares no fn `name`.
     fn lang_trait_fn(&self, trait_: LangItem, name: &str) -> Option<ItemKey> {
-        self.front.keys.filed_member(self.made_lang(trait_)?, MemberKind::Fn, name)
+        let tr = self.made_lang(trait_)?;
+        if let Some(filed) = self.front.keys.filed_member(tr, MemberKind::Fn, name) {
+            return Some(filed);
+        }
+        let names = self.front.names;
+        let lib = self.front.keys.library_in(names, tr)?;
+        let mut declared = false;
+        names.each_member(lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some(name));
+        declared.then(|| crate::front2::keys::member_key_of(tr, MemberKind::Fn, name))
     }
 
     fn fmt_argument_adt(&self) -> Option<ItemKey> {
@@ -476,6 +492,14 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
             }
         };
         made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)
+    }
+
+    /// As `Front2Program::const_fn_instance`: the record of the evaluator the program keeps
+    /// names the instance of each of its fn words (consts.rs `Consts::fn_instance`), whether the
+    /// value was made when its reader's body was checked (`const_record`) or pulled at an
+    /// instance's arguments (`const_at`).
+    fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut tc::PortableTys<'_>, scratch: blaze_own::Alloc<'_>) -> Option<blaze_build::Instance> {
+        self.consts.fn_instance(key, ground, scratch)
     }
 
     fn evaluates_at_args(&self) -> bool {

@@ -34,6 +34,7 @@ use crate::search::{Ans, FIXPOINT_STEP_LIMIT, Heads, Inputs, MAX_DEPTH, PathKind
 use crate::term::{Certainty, Def, Flags, GoalSource, Lang, MarkerTrait, Polarity, Pred, Ty, TyKind, TypingMode, VarKind};
 use crate::trait_goals;
 use crate::tys::Tys;
+use crate::witness::{Choice, Derivations, Emit, NoDerivation};
 
 /// A root goal's answer, its response applied to the caller's variables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,8 +184,11 @@ enum Shared<'a> {
 }
 
 /// The solver: its tables live as long as the allocator, across goals (the global cache, the
-/// interned inputs and envs). A solver serves one term arena.
-pub struct Solver<'a> {
+/// interned inputs and envs). A solver serves one term arena. `E` is the derivation sink
+/// (witness.rs, rule 78): `NoDerivation` by default.
+pub struct Solver<'a, E = NoDerivation> {
+    /// The choice each framed `Yes` goal's merge made (witness.rs).
+    emit: E,
     alloc: Alloc<'a>,
     pub(crate) inputs: Inputs<'a>,
     pub(crate) resps: Responses<'a>,
@@ -446,9 +450,38 @@ fn coinductive_as_inductive() -> bool {
     false
 }
 
-impl<'a> Solver<'a> {
+impl<'a> Solver<'a, NoDerivation> {
     pub fn new_in(alloc: Alloc<'a>) -> Solver<'a> {
-        Solver {
+        Solver::with_emit_in(alloc, NoDerivation)
+    }
+}
+
+impl<'a> Solver<'a, Derivations<'a>> {
+    /// The choice recorded for `goal` (witness.rs): the candidate the merge chose when the
+    /// goal was framed and answered `Yes`. `None`: never framed in this solver (or not `Yes`).
+    /// The goal is put in canonical form as the solver does, so a goal with an unconstrained
+    /// variable (a `NormalizesTo`'s term) finds the frame the solver pushed for it.
+    pub fn choice<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal) -> Result<Option<Choice>, Stop> {
+        let input = self.input_of(tys, mode, goal)?;
+        self.canon.clear();
+        Ok(self.emit.choice(input))
+    }
+
+    pub fn derivations(&self) -> &Derivations<'a> {
+        &self.emit
+    }
+}
+
+impl<'a, E: Emit> Solver<'a, E> {
+    /// A solver recording into `emit`. A recording solver turns the auto-trait summaries off
+    /// (every structural step is then a goal of its own, with its own choice) and skips the
+    /// ground fast path and the request's shared goals (each would answer without a frame,
+    /// so without a choice); each shortcut answers as the steps it shortcuts do (tests/cost.rs),
+    /// so the answers are the same (crates/blaze-cert/src/emit_tests.rs
+    /// `answers_equal_with_and_without_derivations`).
+    pub fn with_emit_in(alloc: Alloc<'a>, emit: E) -> Solver<'a, E> {
+        let mut s = Solver {
+            emit,
             alloc,
             inputs: Inputs::new_in(alloc),
             resps: Responses::new_in(alloc),
@@ -489,7 +522,11 @@ impl<'a> Solver<'a> {
             share_reads: Vec::new_in(alloc),
             share_work: Vec::new_in(alloc),
             steps_at: 0,
+        };
+        if E::ON {
+            s.scratch.off.summaries = true;
         }
+        s
     }
 
     /// The shared goals this solver took so far, in order (share.rs `GoalHit`): the one read
@@ -678,7 +715,10 @@ impl<'a> Solver<'a> {
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<Answer, Stop> {
         self.scratch.stats.evaluations += 1;
-        if let Some(a) = self.fast_path(tys, mode, goal, reads) {
+        // A recording solver frames every goal (`with_emit_in`).
+        if !E::ON
+            && let Some(a) = self.fast_path(tys, mode, goal, reads)
+        {
             self.scratch.stats.fast_path += 1;
             return Ok(a);
         }
@@ -843,7 +883,11 @@ impl<'a> Solver<'a> {
         // THE REQUEST'S SHARED GOALS (share.rs): a goal another body solved is one read here.
         let root_lo = self.reads.lo as usize;
         let mut audit: Option<Audit<'a>> = None;
-        if let Some(opts) = src.goals().map(|g| g.opts()) {
+        // A recording solver takes no shared answer (it has no choice behind it: witness.rs);
+        // it still puts its own final goals (`share_after`) for the bodies that do.
+        if !E::ON
+            && let Some(opts) = src.goals().map(|g| g.opts())
+        {
             match self.share_root(tys, src, input, goal, opts) {
                 Ok(Shared::Hit(ans)) => return Ok((ans, orig_lo)),
                 Ok(Shared::Audit(a)) => audit = Some(a),
@@ -1852,14 +1896,37 @@ impl<'a> Solver<'a> {
         self.reads.lo = f.reads_lo;
         let reads = &mut self.reads;
         let mut specializes = |a: Def, b: Def| ask.specializes(reads, a, b);
-        Ok(match f.kind {
+        let ans = match f.kind {
             Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, &mut dones, &mut specializes)? {
                 Some((r, via)) => Some(m.with_via(r, via)?),
                 None => None,
             },
             Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, &mut dones, &mut specializes)?,
             Kind::WellFormed | Kind::Other => m.merge_responses(&dones)?,
-        })
+        };
+        if E::ON
+            && let Some(r) = ans
+        {
+            self.note_choice(f.input, r, &dones)?;
+        }
+        Ok(ans)
+    }
+
+    /// Records the frame's choice (witness.rs): of the candidates the merge kept (`dones`,
+    /// as it filtered them), those answering `Yes` with the merged response's words; the least
+    /// by `witness::least`. Nothing is recorded for an answer other than `Yes`.
+    fn note_choice(&mut self, input: u32, r: RespId, dones: &[Done]) -> Result<(), Stop> {
+        if self.resps.certainty(r) != Certainty::Yes {
+            return Ok(());
+        }
+        let resps = &self.resps;
+        let best = crate::witness::least(
+            dones.iter().filter(|d| resps.certainty(d.resp) == Certainty::Yes && resps.equal(d.resp, r)).map(|d| Choice::of(&d.cand)),
+        );
+        if let Some(c) = best {
+            self.emit.record(input, c)?;
+        }
+        Ok(())
     }
 
     fn ans_eq(&self, a: Ans, b: Ans) -> bool {

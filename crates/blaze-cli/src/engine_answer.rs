@@ -278,6 +278,7 @@ pub(crate) fn save<'m, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
     name: &str,
+    toolchain: blaze_toolchain::ToolchainId,
     kept: &Kept<'_>,
     printed: Printed,
     lines: (Key, &[u8]),
@@ -319,9 +320,24 @@ pub(crate) fn save<'m, D: Driver, S: Sharing>(
     // Each standing row's task record: the next request reads it by this key, so the answer's
     // root reaches it (the store sweeps what no root reaches).
     pins.extend(kept.records.values().copied());
+    // A names record's expansion records were put beside it with an index of their keys
+    // (engine_store.rs `put_all`): the answer's root names that index too, so reach keeps them.
+    let mut owners: blaze_own::Vec<Key, &Frame> = blaze_own::Vec::new_in(frame);
+    // The toolchain's names records: kept under the toolchain's root too, for every checkout on
+    // it, so one checkout's answer expiring never drops std's (store/roots.rs `keep_toolchain`).
+    let mut toolchain_records: blaze_own::Vec<Key, &Frame> = blaze_own::Vec::new_in(frame);
+    for (row, record) in kept.records.iter() {
+        if row.kind == blaze_drive::Kind::CrateScope {
+            owners.push(*record);
+        }
+        if store.is_toolchain(*row) {
+            toolchain_records.push(*record);
+        }
+    }
     // Two roots, both in the one commit: a root's keys are a set to the store (not an order), so
     // the pointer has a root of its own and the answer's records another.
     store.pin(name, &[key])?;
-    store.pin(bstd::mem::format_in!(frame, "{name}.pages").as_str(), &pins)?;
+    store.pin_through(bstd::mem::format_in!(frame, "{name}.pages").as_str(), &pins, &owners)?;
+    store.keep_toolchain(toolchain, &toolchain_records)?;
     Ok(saved)
 }

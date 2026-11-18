@@ -7,6 +7,7 @@ use blaze_own::{Alloc, String, Vec};
 use blaze_toml::{Document, Item, Kind, Limits, Origin};
 use edition::PackageEdition;
 
+use super::meta::{AUTHORS, META_KEYS, README};
 use super::{DepKind, ExtraKind, Feature, LayoutError, ManifestId, Span, Text};
 
 type It<'d, 't, 'a> = Item<'d, 't, Alloc<'a>>;
@@ -22,8 +23,20 @@ pub(super) struct RawWorkspace<'a> {
     pub dependencies: Vec<RawDep<'a>, Alloc<'a>>,
     /// `workspace.package.version`.
     pub version: Option<Text<'a>>,
+    /// `workspace.package`'s metadata keys ([`META_KEYS`]' order), each in the form a crate
+    /// reads it ([`Reader::meta_value`]); `None` where the root does not offer the key.
+    pub meta: [Option<Text<'a>>; 8],
     /// `workspace.resolver`, as written, with its line.
     pub resolver: Option<(Text<'a>, Span)>,
+}
+
+/// A package's metadata key ([`META_KEYS`]) as written.
+pub(super) enum RawMeta<'a> {
+    Absent,
+    /// The value in the form a crate reads it ([`Reader::meta_value`]).
+    Written(Text<'a>),
+    /// `key.workspace = true`: the line that asks.
+    Inherited(Span),
 }
 
 /// A package's `build` key as written.
@@ -94,6 +107,8 @@ pub(super) struct RawPackage<'a> {
     pub build: RawBuild<'a>,
     pub links: Option<Text<'a>>,
     pub version: RawVersion<'a>,
+    /// The metadata keys, in [`META_KEYS`]' order.
+    pub meta: [RawMeta<'a>; 8],
     /// `package.resolver`, as written, with its line.
     pub resolver: Option<(Text<'a>, Span)>,
 }
@@ -241,19 +256,49 @@ impl<'s, 'a> Reader<'s, 'a> {
         };
         let mut edition = None;
         let mut version = None;
+        let mut meta: [Option<Text<'a>>; 8] = core::array::from_fn(|_| None);
         if let Some(package) = ws.get("package") {
             self.table(package, "workspace.package")?;
             if let Some(item) = package.get("edition") {
                 edition = Some(self.edition_value(item)?.0);
             }
             version = self.opt_text(package, "version")?;
+            for (at, &key) in META_KEYS.iter().enumerate() {
+                if let Some(item) = package.get(key) {
+                    meta[at] = Some(self.meta_value(item, at)?);
+                }
+            }
         }
         let mut dependencies = Vec::new_in(self.alloc);
         if let Some(deps) = ws.get("dependencies") {
             self.deps(deps, "workspace.dependencies", DepKind::Normal, None, &mut dependencies)?;
         }
         let resolver = self.resolver(ws, "workspace.resolver")?;
-        Ok(RawWorkspace { members, exclude, edition, dependencies, version, resolver })
+        Ok(RawWorkspace { members, exclude, edition, dependencies, version, meta, resolver })
+    }
+
+    /// The metadata key `META_KEYS[at]`'s value `item` in the form a crate reads it (meta.rs):
+    /// `authors` an array of strings joined with `:`; `readme` a path, `true` (`README.md`) or
+    /// `false` (`""`); every other key a string.
+    fn meta_value(&self, item: It<'_, '_, 'a>, at: usize) -> Result<Text<'a>, LayoutError<'a>> {
+        let key = META_KEYS[at];
+        if at == AUTHORS {
+            let authors = self.texts(item, key)?;
+            let mut joined = String::new_in(self.alloc);
+            for (i, author) in authors.iter().enumerate() {
+                if i > 0 {
+                    joined.push(':');
+                }
+                joined.push_str(author);
+            }
+            return Ok(joined);
+        }
+        if at == README
+            && let Some(on) = item.as_bool()
+        {
+            return Ok(String::from_str_in(if on { "README.md" } else { "" }, self.alloc));
+        }
+        self.text(item, key)
     }
 
     fn resolver(&self, table: It<'_, '_, 'a>, key: &'static str) -> Result<Option<(Text<'a>, Span)>, LayoutError<'a>> {
@@ -376,6 +421,15 @@ impl<'s, 'a> Reader<'s, 'a> {
                 false => RawVersion::Written(self.text(item, "package.version")?),
             },
         };
+        let mut meta: [RawMeta<'a>; 8] = core::array::from_fn(|_| RawMeta::Absent);
+        for (at, &key) in META_KEYS.iter().enumerate() {
+            if let Some(item) = package.get(key) {
+                meta[at] = match self.inherits(item, key)? {
+                    true => RawMeta::Inherited(self.line(item)),
+                    false => RawMeta::Written(self.meta_value(item, at)?),
+                };
+            }
+        }
         let resolver = self.resolver(package, "package.resolver")?;
         Ok(RawPackage {
             span,
@@ -395,6 +449,7 @@ impl<'s, 'a> Reader<'s, 'a> {
             build,
             links,
             version,
+            meta,
             resolver,
         })
     }

@@ -263,7 +263,12 @@ pub fn prepare_viewing_on<'a>(
     let path = module.join("module.wasm");
     let wasm = std::fs::read(&path).map_err(|error| UnitScriptError::ReadModule { path, error })?;
     let loaded = runtime.load(&package, &wasm).map_err(UnitScriptError::Script)?;
-    let facts = PackageFacts { name: unit.name.as_str(), version: unit.version.as_str(), links: unit.links.as_ref().map(|l| l.as_str()), ..PackageFacts::default() };
+    let facts = PackageFacts {
+        name: unit.name.as_str(),
+        version: unit.version.as_str(),
+        meta: graph.meta_of(unit.package).map(|meta| meta.vars()),
+        links: unit.links.as_ref().map(|l| l.as_str()),
+    };
     let target_cfg: &[CfgAtom<'_>] = match side_cfg {
         Some(cfg) => cfg,
         None => &serves.cfg,

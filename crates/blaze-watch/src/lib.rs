@@ -21,6 +21,7 @@
 //! | [`pairing`] | [`pairing::Pairing`]: a code shown by the page, confirmed by the next blaze command, a key per browser | the viewer |
 //! | [`viewer`] | [`viewer::Viewer`]: live runs, fan-in, pages, history, toggles, expiry | the viewer helper |
 //! | [`relay`] | [`relay::Uplink`]: the opt-in stream to the relay on ix.dev, activity only | the viewer |
+//! | [`since`] | [`since::Watcher`]: the Linux change watcher's core: places, the names heard since each, one flush per ask, typed refusals when it cannot vouch, expiry | the change-watcher helper (its driver not written yet) |
 //! | [`run_wire`] | the wire forms of blaze-run this crate reads and writes (its registry entry and its `Toggle`), until they have one home | the viewer |
 //!
 //! Every machine is sans-IO: it takes an event, changes its state, and pushes the effects its
@@ -56,6 +57,7 @@ pub mod recorder;
 pub mod relay;
 pub mod ring;
 pub mod run_wire;
+pub mod since;
 pub mod viewer;
 pub mod window;
 

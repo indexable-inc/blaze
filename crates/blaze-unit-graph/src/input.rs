@@ -3,7 +3,7 @@
 
 use core::cmp::Ordering;
 
-use blaze_manifest::layout::{DepKind, Member, Source};
+use blaze_manifest::layout::{DepKind, Member, PackageMeta, Source};
 use blaze_own::{AVec, Alloc, String, Vec};
 use edition::PackageEdition;
 
@@ -132,6 +132,8 @@ pub struct Package<'a> {
     /// adds them, by the edition's rule).
     pub features: AVec<'a, FeatureDef<'a>>,
     pub deps: AVec<'a, Dep<'a>>,
+    /// Its `[package]` metadata (`CARGO_PKG_*`): carried into [`crate::UnitGraph::meta`].
+    pub meta: PackageMeta<'a>,
 }
 
 impl<'a> Package<'a> {
@@ -198,6 +200,7 @@ impl<'a> Package<'a> {
             links: member.links.as_ref().map(|l| own(l)),
             features,
             deps,
+            meta: member.meta.clone_in(alloc),
         }
     }
 

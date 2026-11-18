@@ -25,7 +25,7 @@ fn printed_heads_from(io: &Io, workers: u32, fresh: bool, from: HeadsFrom) -> (s
 }
 
 /// The request's frozen heads as the profile says them (engine_seeds.rs `profile`).
-fn seeds_line(checked: &engine_check::Checked) -> std::string::String {
+pub(super) fn seeds_line(checked: &engine_check::Checked) -> std::string::String {
     let mut text = blaze_own::String::new_in(cx_frame_for_text());
     crate::engine_seeds::profile(&checked.seeds, &mut text);
     std::string::String::from(text.as_str())
@@ -36,13 +36,20 @@ fn cx_frame_for_text() -> &'static bstd::mem::Frame {
     std::boxed::Box::leak(std::boxed::Box::new(bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("a text frame")))
 }
 
-/// [`three_crates`] whose bodies read the toolchain's heads too (`Option` and its
-/// `unwrap_or`): dependency heads, which no head task of the request freezes.
+/// [`three_crates`] whose bodies read the toolchain's heads too (blaze-world fixture.rs `CORE`:
+/// `FixtureCell`, its constructor and its inherent `get` in `b`; `fixture_one` in `c`):
+/// dependency heads, which no head task of the request freezes.
 fn three_crates_reading_core(io: &Io) {
     three_crates(io);
-    write(io, "b/src/lib.rs", "pub fn g() -> Option<u8> {\n    Some(a::f() + a::m::k())\n}\n");
-    write(io, "c/src/lib.rs", "pub fn h() -> u8 {\n    b::g().unwrap_or(1)\n}\n");
+    write(io, "b/src/lib.rs", "pub fn g() -> u8 {\n    ::core::FixtureCell(a::f() + a::m::k()).get()\n}\n");
+    write(io, "c/src/lib.rs", C_READING_CORE);
 }
+
+/// `c`'s body in [`three_crates_reading_core`]: it reads one dependency head, `fixture_one`'s.
+const C_READING_CORE: &str = "pub fn h() -> u8 {\n    b::g() + ::core::fixture_one()\n}\n";
+
+/// [`C_READING_CORE`] edited in its body alone: the same heads read, its head's text another.
+const C_EDITED: &str = "pub fn h() -> u8 {\n    b::g() + ::core::fixture_one() + 0\n}\n";
 
 /// THE BODIES ARE CHECKED FROM FROZEN HEADS (plan rows A1, A3; runtime.md points 3 to 5): on
 /// the three-crate chain every body entered is seeded from the request's frozen heads (the head
@@ -64,6 +71,11 @@ fn engine_check_checks_bodies_from_frozen_heads() {
     assert_eq!(seeds.bodies.seeded, bodies, "every body entered was checked from frozen heads: {:?}\n{}", frozen.bodies.0, seeds_line(&frozen));
     assert_eq!(seeds.bodies.rounds, u64::from(seeds.bodies.seeded), "one round a seeded body:\n{}", seeds_line(&frozen));
     assert!(seeds.table > 0, "the head tasks' cells make the table:\n{}", seeds_line(&frozen));
+    // Every member head a body reads is its head task's cell, whichever unit's names the body
+    // reads it through (engine_seeds.rs `StretchHeads`): none frozen at a seed, and at least the
+    // three a body calls across crates (`a::f`, `a::m::k`, `b::g`) taken from the table.
+    assert_eq!(seeds.not_put.member, 0, "no member head frozen at a seed:\n{}", seeds_line(&frozen));
+    assert!(seeds.taken >= 3, "the member heads the bodies call taken from the table:\n{}", seeds_line(&frozen));
     let (lowered_ids, lowered_text, lowered) = printed_heads_from(&io, 2, true, HeadsFrom::Lowered);
     println!("lowered: {}\n{}", entries(&lowered), seeds_line(&lowered));
     assert_eq!(lowered.seeds.bodies.seeded, 0, "CONTROL: the lowered run seeds no body");
@@ -78,7 +90,6 @@ fn engine_check_checks_bodies_from_frozen_heads() {
 /// an edit of one body, the second request freezes none and finds them in the store. CONTROL:
 /// the first request found none (the store held none) and froze at least one.
 #[test]
-#[ignore = "the first run (2026-11-17) printed `frozen now and not put: 2 a member's (the head tasks' table lacked it)`: this fixture reads no dependency head at all, and two MEMBER heads a body asks for are not in the head tasks' table under the cell the body asks (a member's head reached through another unit's keys): the next piece fixes the table's lookup and gives this test a fixture that reads a toolchain head"]
 fn a_dependency_head_is_frozen_once_a_machine() {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
     three_crates_reading_core(&io);
@@ -86,14 +97,41 @@ fn a_dependency_head_is_frozen_once_a_machine() {
     println!("first: {}\n{}", entries(&first), seeds_line(&first));
     assert_eq!(first.seeds.bodies.refused, 0, "no body refused at a seed: {:?}", first.bodies.0);
     assert_eq!(first.seeds.found, 0, "CONTROL: an empty store holds no dependency head:\n{}", seeds_line(&first));
-    assert!(first.seeds.frozen > 0 && first.seeds.put > 0, "a dependency head was frozen and put:\n{}", seeds_line(&first));
-    write(&io, "c/src/lib.rs", "pub fn h() -> u8 {\n    b::g().unwrap_or(2)\n}\n");
+    assert_eq!(first.seeds.not_put.member, 0, "no member head frozen at a seed:\n{}", seeds_line(&first));
+    assert!(first.seeds.read > 0, "the bodies read toolchain heads:\n{}", seeds_line(&first));
+    assert!(first.seeds.frozen > 0 && first.seeds.put == first.seeds.frozen, "each dependency head was frozen and put:\n{}", seeds_line(&first));
+    write(&io, "c/src/lib.rs", C_EDITED);
     let (_, second) = engine_from(&io, 2, false);
     println!("second: {}\n{}", entries(&second), seeds_line(&second));
     assert!(second.stages[blaze_engine::Stage::Bodies.index()].entered >= 1, "the edited body entered: {}", entries(&second));
     assert_eq!(second.seeds.bodies.refused, 0, "no body refused at a seed: {:?}", second.bodies.0);
     assert_eq!(second.seeds.frozen, 0, "no dependency head frozen again:\n{}", seeds_line(&second));
     assert!(second.seeds.found > 0, "the dependency heads were found in the store:\n{}", seeds_line(&second));
+    assert_eq!(second.seeds.found, second.seeds.read, "every head read outside the table was found:\n{}", seeds_line(&second));
+}
+
+/// READ ON FIRST ASK (runtime.md end state 5): the request's table reads no head record when it
+/// is made; a worker reads the dependency heads its body asks, in place through the store's
+/// snapshot. After an edit of `c`'s body alone, the one body entered reads one dependency head
+/// record (`fixture_one`'s), though the root lists every head the first request put.
+/// CONTROL: the root lists more than one (the first request put `b`'s too), so a table that
+/// read every listed record would read more than one.
+#[test]
+fn a_request_reads_only_the_dependency_heads_its_bodies_ask() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    three_crates_reading_core(&io);
+    let (_, first) = engine_from(&io, 2, false);
+    println!("first: {}\n{}", entries(&first), seeds_line(&first));
+    assert_eq!(first.seeds.bodies.refused, 0, "no body refused at a seed: {:?}", first.bodies.0);
+    assert!(first.seeds.put > 1, "CONTROL: the first request put more than one dependency head:\n{}", seeds_line(&first));
+    write(&io, "c/src/lib.rs", C_EDITED);
+    let (_, second) = engine_from(&io, 2, false);
+    println!("second: {}\n{}", entries(&second), seeds_line(&second));
+    assert_eq!(second.stages[blaze_engine::Stage::Bodies.index()].entered, 1, "one body entered, `c::h`'s: {}", entries(&second));
+    assert_eq!(second.seeds.bodies.refused, 0, "no body refused at a seed: {:?}", second.bodies.0);
+    assert_eq!(second.seeds.listed, first.seeds.put, "the root lists each head the first request put:\n{}", seeds_line(&second));
+    assert_eq!(second.seeds.looked, 1, "one dependency head record read, the one `c::h` asks:\n{}", seeds_line(&second));
+    assert_eq!((second.seeds.found, second.seeds.frozen), (1, 0), "found in the store, frozen again none:\n{}", seeds_line(&second));
 }
 
 /// EQUAL BYTES WHOEVER FREEZES (rule 25; plan point 5): with 1 and with 8 workers, on two

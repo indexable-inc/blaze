@@ -15,7 +15,8 @@
 //!   read of the filing as its crate's names record whole (the Names stage defines that cell),
 //!   and a header text the filing lowered as every scope crate's names record whole (no task
 //!   defines a head's cell yet: the header's crate is one of the scope's, whose records hold its
-//!   text);
+//!   text); at cell grain (engine_scope_reads.rs `ScopeReads::TABLES_AT_CELLS`) each names read
+//!   is its cell instead and each header read the cell of the head task covering it;
 //! - its record in the store: the three records as one framed payload (buckets/records.rs
 //!   `framed`), which a later request puts on its shelf while the task stands ([`complete`]).
 //!
@@ -30,7 +31,8 @@
 //! [`head_cell`] of the task with the frozen head's meaning, so a head re-made to equal bytes
 //! moves no reader (early cutoff by digest, blaze-engine engine.rs). Its reads: each names cell its
 //! freeze consulted, and for each head the freeze read (followed through the heads those read),
-//! that head's file's `HEADS` cell (the Outlines phase's: a task reads no cell of its own phase)
+//! that head's head task's cell (a same-stage read, entered after its definer; before lane BH1
+//! its file's `HEADS` cell, which every sibling head added moved)
 //! or, for a dependency's head or one a macro wrote, its crate's names record whole. A body's
 //! read of a member's head is the head's cell ([`Owners::place`], engine_bodies.rs `widen`). A
 //! head that cannot be frozen fails ALONE (A8): the task defines the heads it froze, and the
@@ -40,6 +42,16 @@
 //! at all (its crate's records, a cap) is a failed row, named by its file. A dependency's head is
 //! read as its crate's names record whole (engine.md point 3). The freeze has a constant
 //! evaluator, and a head that evaluated reads what the evaluation read (engine_head_consts.rs).
+//!
+//! ONE FREEZE A UNIT (lane RU1): a member crate is checked as several units (its lib, its test
+//! harness, a bin that `mod`s its files), each with its own crate key, and an item's key holds
+//! its unit's prefix. A head task (one an entry, by text) freezes its heads once for EACH member
+//! unit whose items record lists its file, under that unit's records, and defines one cell a
+//! (unit, head) ([`head_cell`] holds the unit); its payload is each unit's runs, its reads the
+//! union of each unit's, and a unit that stops holding an item (a `cfg`) drops its cell. A
+//! reader finds the cell by its own key ([`Owners::place`]), so it is never handed bytes frozen
+//! under another unit's keys. The profile counts it: "heads frozen: N for M items in U units
+//! (K items held by 2+ units)" ([`UnitCounts`]).
 
 use core::convert::Infallible;
 
@@ -109,6 +121,9 @@ struct Worked {
     out: ContentId,
     defines: std::vec::Vec<(Cell, ContentId), Global>,
     reads: std::vec::Vec<CellId, Global>,
+    /// At cell grain: each header's head read where `Owners::place` put it (a head task's cell,
+    /// or a dependency's record whole), read as is ([`HeadsStage::run_phase`]).
+    heads: std::vec::Vec<CellId, Global>,
     payload: std::vec::Vec<u8, Global>,
 }
 
@@ -152,11 +167,18 @@ pub(crate) struct HeadsStage {
     pub(crate) refused: std::vec::Vec<crate::engine_head_notes::Refused, Global>,
     /// Crates whose standing tables were read back from the store this request.
     pub(crate) read_back: u32,
+    /// Under which units a head task freezes (the command's: [`HeadUnits::Each`]).
+    pub(crate) freeze: HeadUnits,
+    /// What the head tasks entered this request froze, by unit.
+    pub(crate) units: UnitCounts,
+    /// How the `ImplBucket` tasks' reads are kept (engine_scope_reads.rs
+    /// `ScopeReads::TABLES_AT_CELLS`), the command's choice, as the bodies'.
+    scope_reads: crate::engine_scope_reads::ScopeReadsAs,
 }
 
 impl HeadsStage {
-    pub(crate) fn new() -> HeadsStage {
-        HeadsStage { made: std::vec::Vec::new_in(Global), refused: std::vec::Vec::new_in(Global), read_back: 0 }
+    pub(crate) fn new(scope_reads: crate::engine_scope_reads::ScopeReadsAs) -> HeadsStage {
+        HeadsStage { made: std::vec::Vec::new_in(Global), refused: std::vec::Vec::new_in(Global), read_back: 0, freeze: HeadUnits::Each, units: UnitCounts::default(), scope_reads }
     }
 
     /// Task `name`'s record, when it was entered and made this request.
@@ -187,6 +209,7 @@ impl HeadsStage {
         let tasks = &tasks[..];
         self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, frame)?;
         let heap = handles.env.heap;
+        let at_cells = self.scope_reads.tables_at_cells();
         let refused = &mut self.refused;
         // A refusal with the cells it is a function of, each read as the view holds it today
         // (ABSENT where no task defines it: a crate whose names task failed or did not run), so
@@ -258,6 +281,12 @@ impl HeadsStage {
                 None => refuse(task, "its crate's names record or check scope could not be read (engine_bodies.rs `scope_of`)", &scope_cells(graph.name, &list, at, None), buffer),
             }
         }
+        // At cell grain, the members' files a header's head read is placed by (`Owners::place`).
+        let subjects = match at_cells && !jobs.is_empty() {
+            true => member_subjects(read, &cx, store, names, &list, handles.outlined, heap),
+            false => std::vec::Vec::new_in(Global),
+        };
+        let subjects: Option<&Subjects> = at_cells.then_some(&subjects[..]);
         // 2. The tables, at once, on the workers.
         let procs = names.names.as_ref().and_then(|names| names.procs());
         let root = handles.root;
@@ -271,7 +300,7 @@ impl HeadsStage {
                 let clock = clock.clone();
                 running.push(scope.may_overlap("engine impl tables", HEADS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
-                    let made = work::unwinding(|| tables_of(cx, root, packs, corrected, procs, job, heap));
+                    let made = work::unwinding(|| tables_of(cx, root, packs, corrected, procs, job, subjects, heap));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns)))
                 }));
             }
@@ -328,8 +357,18 @@ impl HeadsStage {
                         reads.push((whole, view.cell(&whole)));
                     }
                 } else {
-                    reads.push((*id, view.cell(id)));
+                    // A names cell kept by `tables_of` (at cell grain) as its crate defines it.
+                    let id = names_read(view, *id);
+                    reads.push((id, view.cell(&id)));
                 }
+            }
+            // Each header's head placed at its head task's cell (at cell grain, `tables_of`): a
+            // head task of this phase, entered before these tables (`run_items`), is read at the
+            // digest its row holds now, so the merge sends this task to no second wave for a
+            // head it saw (as a head's read of a sibling head, `job_cells`).
+            for id in one.heads.iter() {
+                let made = buffer.done.iter().find(|done| done.name == id.of).and_then(|done| done.defines.binary_search_by_key(&id.cell, |(cell, _)| *cell).ok().map(|at| done.defines[at].1));
+                reads.push((*id, made.unwrap_or_else(|| view.cell(id))));
             }
             reads.sort_unstable_by_key(|(id, _)| *id);
             reads.dedup_by_key(|(id, _)| *id);
@@ -373,6 +412,10 @@ pub(crate) fn complete(cx: &Cx, store: &mut dyn crate::store::Store<'_>, names: 
 }
 
 /// One crate's tables on a worker: its scope's records opened in the task's frame, its rows filed.
+/// `subjects`: `Some` at cell grain (engine_scope_reads.rs `ScopeReads::TABLES_AT_CELLS`): its
+/// names reads kept as cells and each header's head read placed (`Owners::place`); `None`: each
+/// names read its crate's record whole, each header read left for the coordinator to widen.
+#[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
 fn tables_of(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
@@ -380,6 +423,7 @@ fn tables_of(
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     job: &Job<'_>,
+    subjects: Option<&Subjects>,
     heap: &'static blaze_own::Heap,
 ) -> Result<Worked, &'static str> {
     let frame = cx.frame();
@@ -401,10 +445,24 @@ fn tables_of(
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let view = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &unused });
     let mut reads: std::vec::Vec<CellId, Global> = std::vec::Vec::with_capacity_in(done.reads.len(), Global);
+    let mut heads: std::vec::Vec<CellId, Global> = std::vec::Vec::new_in(Global);
+    let mut owners = subjects.map(Owners::new);
     for read in done.reads.iter() {
         match cell_id(view, *read) {
-            // A names read: its crate's names record whole, the cell the Names stage defines.
-            Ok(Some(id)) if id.of.kind == Kind::CrateScope => reads.push(CellId { of: id.of, cell: WHOLE }),
+            // A names read: at cell grain its cell (the coordinator keeps it where its crate
+            // defines a cell table, `names_read`); else its crate's names record whole, the cell
+            // the Names stage defines.
+            Ok(Some(id)) if id.of.kind == Kind::CrateScope => reads.push(match subjects {
+                Some(_) => id,
+                None => CellId { of: id.of, cell: WHOLE },
+            }),
+            // A header's head read: at cell grain placed as a body's is; a head of no crate the
+            // records hold (or `Whole`) is left for the coordinator, which widens it.
+            Ok(Some(id)) if id.of.kind == Kind::Signature => match owners.as_mut().and_then(|owners| owners.place(records, &id, g)) {
+                Some(HeadAt::Cell { cell, .. }) => heads.push(cell),
+                Some(HeadAt::Dependency(scope) | HeadAt::Unplaced(scope)) => heads.push(CellId { of: scope, cell: WHOLE }),
+                None => reads.push(id),
+            },
             Ok(Some(id)) => reads.push(id),
             Ok(None) => {}
             Err(_) => return Err("a read of its filing names a crate its scope does not hold (front2 tables/task.rs `cell_id`)"),
@@ -412,7 +470,7 @@ fn tables_of(
     }
     let mut defines = std::vec::Vec::with_capacity_in(done.defines.len(), Global);
     defines.extend(done.defines.iter().copied());
-    Ok(Worked { out: done.out, defines, reads, payload: framed(tables, Global) })
+    Ok(Worked { out: done.out, defines, reads, heads, payload: framed(tables, Global) })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -422,12 +480,27 @@ fn tables_of(
 /// (its crate key's prefix, the record's file index, the outline's `FileItems` name), sorted.
 pub(crate) type Subjects = [([u8; 8], u32, Name)];
 
-/// The domain of a head cell ([`head_cell`]).
-const HEAD_CELL_DOMAIN: &str = "blaze-cli engine head cell 2";
-/// The domain of a head task's source ([`plan_items`]).
-const HEAD_SOURCE_DOMAIN: &str = "blaze-cli engine head source 1";
-/// The domain of a head task's out: its cells and their digests, in order.
+/// The domain of a head cell ([`head_cell`]). 3: the cell holds its unit's crate prefix.
+const HEAD_CELL_DOMAIN: &str = "blaze-cli engine head cell 3";
+/// The domain of a head's item, of no unit ([`head_item`]).
+const HEAD_ITEM_DOMAIN: &str = "blaze-cli engine head item 1";
+/// The domain of a head task's source ([`plan_items`]). 2: its payload holds each run's cell
+/// ([`WorkedHead::payload`]), so no record of the old form is read by its key. 3: one run a
+/// (unit, cell), each frozen under its unit's records ([`HeadsStage::run_items`]).
+const HEAD_SOURCE_DOMAIN: &str = "blaze-cli engine head source 3";
+/// The domain of one unit's freeze of a head task: its cells and their digests, in order.
 const HEAD_OUT_DOMAIN: &str = "blaze-cli engine head entry out 1";
+/// The domain of a head task's out: each unit's freeze's out, in unit order.
+const HEAD_UNITS_OUT_DOMAIN: &str = "blaze-cli engine head entry units out 1";
+
+/// The out of a head task whose file no unit holds ([`HeadsStage::run_items`]): its name's alone.
+const HEAD_NO_UNIT_DOMAIN: &str = "blaze-cli engine head no unit's 1";
+
+/// The out of the head task `name` when no unit holds its file: a function of its name alone,
+/// so the heads table knows such a row without a record (engine_seeds.rs `RequestTable::build`).
+pub(crate) fn no_units_out(name: Name) -> ContentId {
+    ContentId::of(HEAD_NO_UNIT_DOMAIN, &name.subject.0)
+}
 /// The tool `head_task` folds into a key the engine does not use (the engine keys the task by
 /// its name and source, `Tools::key`).
 const HEAD_TOOL_DOMAIN: &str = "blaze-cli engine head task";
@@ -439,8 +512,30 @@ const HEAD_TOOL_DOMAIN: &str = "blaze-cli engine head task";
 /// no task defines (lane EY, the callers test). `part`: `WHOLE`, the whole head, the only part
 /// today, hashed in so a head can be split later (engine.md "ASPECTS"). Two heads of one entry
 /// under one cell are refused ([`heads_of`]).
+///
+/// ONE CELL A UNIT (lane RU1): a member's item is held by each unit whose records list its file
+/// (the lib, the test harness, a bin that `mod`s it), and its keys there hold that unit's crate
+/// prefix, so a head frozen under one unit's records names that unit's keys and cannot be read
+/// through another's names. The cell holds the unit: its crate prefix, the first 8 bytes of
+/// the want's key (front2 tables/head.rs `want_bytes`, bytes 1 to 8; front2 keys.rs
+/// `checker_of`), which a head task's freeze under a unit and a reader in that unit both take
+/// from their own records' want, so a reader's want places the cell of ITS unit, by
+/// construction. Nothing of the machine (rule 25): a crate prefix is a hash of the crate's text.
 pub(crate) fn head_cell(want: Want, item: &str, member: Option<&str>, part: Cell) -> Cell {
+    let bytes = want_bytes(want);
     let mut h = blaze_ids::Hasher::new(HEAD_CELL_DOMAIN);
+    h.update(&bytes[1..9]).update(&head_item(want, item, member, part).0);
+    let digest = h.finish();
+    let mut cell = [0u8; 16];
+    cell.copy_from_slice(&digest.0[..16]);
+    Cell(cell)
+}
+
+/// A head's item as an entry's text names it, of no unit: the want's kind, the item's name, an
+/// impl fn's name and the part. Two units' cells of one item ([`head_cell`]) share it; the
+/// profile counts the items held by two units and more by it ([`UnitCounts`]).
+fn head_item(want: Want, item: &str, member: Option<&str>, part: Cell) -> Cell {
+    let mut h = blaze_ids::Hasher::new(HEAD_ITEM_DOMAIN);
     h.update(&want_bytes(want)[..1]).part(item.as_bytes()).opt_part(member).update(&part.0);
     let digest = h.finish();
     let mut cell = [0u8; 16];
@@ -448,11 +543,45 @@ pub(crate) fn head_cell(want: Want, item: &str, member: Option<&str>, part: Cell
     Cell(cell)
 }
 
+/// Under which units a head task freezes its heads: the rule, or a test's plant (rule 23:
+/// the plant removes the cause and the tests watch the effect come back).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeadUnits {
+    /// Once for each member unit whose records hold its file (the rule, [`head_cell`]).
+    Each,
+    /// THE PLANT: under the first holding unit by crate prefix only (the form before lane RU1).
+    #[cfg_attr(not(test), expect(dead_code, reason = "the plant: only the tests take it (rule 23)"))]
+    OnlyFirst,
+    /// THE PLANT: under the last holding unit by crate prefix only.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the plant: only the tests take it (rule 23)"))]
+    OnlyLast,
+}
+
+/// What the head tasks froze this request, by unit (the profile's "heads frozen" line, rule 53).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct UnitCounts {
+    /// Cells defined: one a (unit, head), a head that failed too.
+    pub(crate) frozen: u32,
+    /// Heads by item, of no unit ([`head_item`]): each head task's items, summed.
+    pub(crate) items: u32,
+    /// Distinct units that froze a head.
+    pub(crate) units: u32,
+    /// Items frozen under two units or more (each a freeze a head form relative to "this crate"
+    /// would share).
+    pub(crate) shared: u32,
+}
+
+/// The profile's line of the head tasks' freezes by unit.
+pub(crate) fn unit_profile(counts: &UnitCounts, into: &mut blaze_own::String<&Frame>) {
+    use core::fmt::Write as _;
+    let _ = writeln!(into, "heads frozen: {} for {} items in {} units ({} items held by 2+ units)", counts.frozen, counts.items, counts.units, counts.shared);
+}
+
 /// One `Signature` task an outline entry that has a head (signature.rs `is_signature_entry`), in
 /// `Phase { stage: Heads, wave: 0 }`, named as the outline lists it (signature.rs
 /// `signature_name`: the file and the entry's chain), so its name and key are known from text
 /// before any phase runs. Its source (rule 21): the outline's head source (the entry's head bytes,
-/// its containers' heads and the file's surface, signature.rs `signature_source`), the item's
+/// its containers' heads, nothing of its siblings, signature.rs `signature_source`), the item's
 /// whole text when it has a body part (a frozen fn head holds its text's digest), and the edition.
 pub(crate) fn plan_items<'h>(outlined: &[Outlined<'_>], alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned = SVec::new_in(alloc);
@@ -505,7 +634,9 @@ impl<'s> Owners<'s> {
         Owners { subjects, crates: std::vec::Vec::new_in(Global), rows: std::vec::Vec::new_in(Global) }
     }
 
-    /// Where the head read `id` is read from; `None`: its crate is none of `records`'.
+    /// Where the head read `id` is read from; `None`: its crate is none of `records`'. By the
+    /// reader's OWN key: `id`'s crate prefix is the reader's unit's view of the item's crate,
+    /// so a member's head is the cell its head task froze under THAT unit ([`head_cell`]).
     pub(crate) fn place<'n>(&mut self, records: &'n Records<'n>, id: &CellId, g: Alloc<'static>) -> Option<HeadAt> {
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(&id.of.subject.0[..8]);
@@ -542,8 +673,10 @@ struct HeadRow {
     entry: Name,
     /// Its file's outline.
     file: Name,
-    /// Its cell in `entry`'s task ([`head_cell`]; of no unit).
+    /// Its cell in `entry`'s task ([`head_cell`]; of the unit of `records`' crate).
     cell: Cell,
+    /// Its item, of no unit ([`head_item`]).
+    item: Cell,
     want: Want,
 }
 
@@ -580,7 +713,7 @@ fn heads_of_crate<'n>(records: &'n Records<'n>, k: usize, prefix: [u8; 8], subje
         for (_, item, want, name, member) in run.iter() {
             let Some(cover) = crate::signature::covering_entry(&outline, ItemIndex(*item)) else { continue };
             let entry = crate::signature::signature_name(outline_name.subject, &outline, outline.item(cover), text);
-            each(HeadRow { sig: head_cell_id(*want).of, entry, file: outline_name, cell: head_cell(*want, name, *member, WHOLE), want: *want });
+            each(HeadRow { sig: head_cell_id(*want).of, entry, file: outline_name, cell: head_cell(*want, name, *member, WHOLE), item: head_item(*want, name, *member, WHOLE), want: *want });
         }
     }
 }
@@ -593,6 +726,40 @@ fn names_read(view: View<'_, '_>, id: CellId) -> CellId {
         Kind::CrateScope => CellId { of: id.of, cell: WHOLE },
         _ => id,
     }
+}
+
+/// Every member crate's files as its items record lists them, matched to the planner's outlines
+/// ([`Subjects`], sorted): what [`Owners::place`] places an `ImplBucket` task's header read by,
+/// at cell grain ([`HeadsStage::run_phase`]). The same match `run_items` and engine_bodies.rs
+/// `groups` make in their member loops (to be this one home once lane RU1's per-unit heads land
+/// there). A member whose records do not open lists no file: its heads are then placed as a
+/// dependency's (its record whole), never missed.
+fn member_subjects<'r>(
+    read: &mut EngineRecords<'r>,
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'r>,
+    names: &NamesStage<'_>,
+    list: &blaze_world::crate_list::CrateList<'static>,
+    outlined: &[Outlined<'_>],
+    heap: &'static blaze_own::Heap,
+) -> std::vec::Vec<([u8; 8], u32, Name), Global> {
+    let g = heap.alloc();
+    let mut subjects: std::vec::Vec<([u8; 8], u32, Name), Global> = std::vec::Vec::new_in(Global);
+    for member in (0..CrateGraph::len(list)).filter(|at| list.member(*at)) {
+        let Some((scope, _)) = crate::engine_bodies::scope_of(read, cx, store, names, list, member, heap) else { continue };
+        let Ok(items) = ItemsRecord::open(scope.own_records.items, g) else { continue };
+        let prefix = list.key(member).prefix();
+        for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+            let Ok(Some(row)) = items.file(file) else { continue };
+            let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
+            let Some(path) = path.strip_prefix("/0/") else { continue };
+            if let Some(one) = outlined.iter().find(|one| one.path.as_slice() == path.as_bytes()) {
+                subjects.push((prefix, file, one.name));
+            }
+        }
+    }
+    subjects.sort_unstable();
+    subjects
 }
 
 /// One member crate's head tasks, made on one worker over its check scope's records (in place
@@ -614,9 +781,13 @@ struct ItemJob<'r> {
 struct WorkedHead {
     out: ContentId,
     defines: std::vec::Vec<(Cell, ContentId), Global>,
+    /// Each cell's item ([`head_item`]) and its unit's crate prefix, as `defines` lists them:
+    /// what the profile counts by. Over the handed heap's `Sync` handle: it crosses back from
+    /// the worker.
+    items: SVec<'static, (Cell, [u8; 8])>,
     reads: std::vec::Vec<CellId, Global>,
-    /// Each cell's want (front2 head.rs `want_bytes`), its frozen bytes' length (u32 LE) and
-    /// the frozen bytes, in cell order.
+    /// Each cell's want (front2 head.rs `want_bytes`), its cell ([`head_cell`], 16 bytes), its
+    /// frozen bytes' length (u32 LE) and the frozen bytes, in cell order.
     payload: std::vec::Vec<u8, Global>,
     /// Each head it could not freeze: its cell, the head, why (engine_head_notes.rs).
     failed: std::vec::Vec<(Cell, &'static str, &'static str), Global>,
@@ -630,6 +801,62 @@ const HEAD_FAILED_DOMAIN: &str = "blaze-cli engine heads: a head not frozen";
 struct HeadFailed {
     why: &'static str,
     reads: std::vec::Vec<CellId, Global>,
+}
+
+/// One head task's freezes under each unit that holds its file, gathered in unit order (lane
+/// RU1, [`head_cell`]): its row is their union, each unit's cells its own. Allocates through
+/// the phase's handed `alloc` only; the first unit's [`WorkedHead`] holds the union of the
+/// rest (its vectors are the worker's).
+struct UnitsMade<'a> {
+    alloc: SharedAlloc<'a>,
+    /// Its share of each unit's worker time.
+    ns: u64,
+    /// The first unit's failure, the cells every failing unit's refusal is a function of, and
+    /// whether one is owed (a panic): the task is refused whole.
+    failed: Option<(&'static str, SVec<'a, CellId>, bool)>,
+    /// Each unit's crate prefix and out, in unit order ([`HEAD_UNITS_OUT_DOMAIN`]).
+    out: blaze_ids::Hasher,
+    /// What every unit read, and the refusal cells of a holding unit that was not whole.
+    reads: SVec<'a, CellId>,
+    /// The first unit's freeze, the later units' defines, items, runs and failed heads
+    /// appended in unit order ([`WorkedHead::payload`]: one run a (unit, cell)).
+    first: Option<WorkedHead>,
+}
+
+impl<'a> UnitsMade<'a> {
+    fn new(alloc: SharedAlloc<'a>) -> UnitsMade<'a> {
+        UnitsMade { alloc, ns: 0, failed: None, out: blaze_ids::Hasher::new(HEAD_UNITS_OUT_DOMAIN), reads: SVec::new_in(alloc), first: None }
+    }
+
+    /// Unit `prefix`'s freeze of the task (its items carry `prefix` already, `heads_of`).
+    fn take(&mut self, prefix: [u8; 8], one: WorkedHead) {
+        self.out.update(&prefix).update(&one.out.0);
+        self.reads.extend(one.reads.iter().copied());
+        match &mut self.first {
+            None => self.first = Some(one),
+            Some(all) => {
+                all.defines.extend(one.defines.iter().copied());
+                all.items.extend(one.items.iter().copied());
+                all.payload.extend_from_slice(&one.payload);
+                all.failed.extend(one.failed.iter().copied());
+            }
+        }
+    }
+
+    /// A unit could not freeze the task: why, and the cells that is a function of.
+    fn fail(&mut self, why: &'static str, cells: &[CellId], owed: bool) {
+        match &mut self.failed {
+            Some((_, all, was_owed)) => {
+                all.extend_from_slice(cells);
+                *was_owed |= owed;
+            }
+            None => {
+                let mut all = SVec::with_capacity_in(cells.len(), self.alloc);
+                all.extend_from_slice(cells);
+                self.failed = Some((why, all, owed));
+            }
+        }
+    }
 }
 
 impl HeadsStage {
@@ -707,11 +934,20 @@ impl HeadsStage {
         // record; ABSENT for a member whose names task failed, so its fix moves the row).
         let mut no_member: std::vec::Vec<CellId, Global> = std::vec::Vec::new_in(Global);
         no_member.push(graph_cell);
+        // Every member's items record was read: then a file none lists is no unit's (a `cfg` on
+        // its `mod` cut it in every unit, engine_body_plan.rs), not a refusal.
+        let mut every_member_read = true;
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
             no_member.push(CellId { of: blaze_drive::key::crate_scope_name(&list.key(member)), cell: WHOLE });
-            let Some((scope, whole)) = crate::engine_bodies::scope_of(read, cx, store, names, &list, member, heap) else { continue };
+            let Some((scope, whole)) = crate::engine_bodies::scope_of(read, cx, store, names, &list, member, heap) else {
+                every_member_read = false;
+                continue;
+            };
             let cells = scope_cells(graph.name, &list, member, Some(&scope));
-            let Ok(items) = ItemsRecord::open(scope.own_records.items, g) else { continue };
+            let Ok(items) = ItemsRecord::open(scope.own_records.items, g) else {
+                every_member_read = false;
+                continue;
+            };
             let prefix = list.key(member).prefix();
             for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
                 let Ok(Some(row)) = items.file(file) else { continue };
@@ -725,21 +961,64 @@ impl HeadsStage {
         }
         subjects.sort_unstable();
         jobs.sort_unstable_by_key(|job| job.prefix);
-        // Each task to the first member (by prefix) whose files hold its file.
+        // Each task to EVERY member unit (by prefix) whose files hold its file (lane RU1,
+        // `head_cell`): each freezes the task's heads under its own records, one cell a unit.
         let mut by_file: std::vec::Vec<(Name, [u8; 8]), Global> = std::vec::Vec::with_capacity_in(subjects.len(), Global);
         by_file.extend(subjects.iter().map(|(prefix, _, file)| (*file, *prefix)));
         by_file.sort_unstable();
+        by_file.dedup();
+        // Each task that some unit runs, sorted by name, and what its units made (step 3).
+        let mut accs: SVec<'a, (Task, UnitsMade<'a>)> = SVec::with_capacity_in(tasks.len(), alloc);
+        let mut holding: SVec<'a, usize> = SVec::new_in(alloc);
         for task in tasks.iter() {
             let at = by_file.partition_point(|(file, _)| *file < task.planned.file);
-            let job = by_file.get(at).filter(|(file, _)| *file == task.planned.file).and_then(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok());
-            match job {
-                Some(at) if jobs[at].whole => jobs[at].tasks.push(*task),
+            holding.clear();
+            holding.extend(by_file[at..].iter().take_while(|(file, _)| *file == task.planned.file).filter_map(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok()));
+            // The plant (`HeadUnits`): one unit alone, as before the rule.
+            match self.freeze {
+                HeadUnits::Each => {}
+                HeadUnits::OnlyFirst => holding.truncate(1),
+                HeadUnits::OnlyLast => {
+                    if let Some(last) = holding.last().copied() {
+                        holding.clear();
+                        holding.push(last);
+                    }
+                }
+            }
+            let whole = holding.iter().copied().find(|at| jobs[*at].whole);
+            match (holding.first().copied(), whole) {
+                // No unit holds its file under its cfg: no unit's head, a row with no finding on
+                // the cells that say so (each member's names cell, the graph's), so a unit that
+                // comes to hold it enters it again (engine_body_plan.rs, as its bodies).
+                (None, _) if every_member_read => {
+                    let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(no_member.len(), alloc);
+                    reads.extend(no_member.iter().map(|id| (*id, view.cell(id))));
+                    reads.sort_unstable_by_key(|(id, _)| *id);
+                    reads.dedup_by_key(|(id, _)| *id);
+                    let out = no_units_out(task.planned.name);
+                    buffer.done.push(Done { name: task.planned.name, key: task.key, out, defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
+                }
+                (None, _) => refuse(task, "its file is in no member crate's items record, and a member's records could not be read (engine_heads.rs `run_items`)", &no_member, buffer),
                 // Its member's names cell, each scope crate's that had records, and the one the
                 // scope was cut at, read ABSENT: its task that comes, or its fix, moves the row.
-                Some(at) => refuse(task, "a crate of its crate's check scope has no names record this command (its `Names` task failed)", &jobs[at].cells, buffer),
-                None => refuse(task, "its file is in no member crate's items record (engine_heads.rs `run_items`)", &no_member, buffer),
+                (Some(at), None) => refuse(task, "a crate of its crate's check scope has no names record this command (its `Names` task failed)", &jobs[at].cells, buffer),
+                // Frozen under each whole unit; a unit whose scope lacks a names record defines
+                // no cell (its readers read it ABSENT), and the row reads that unit's refusal
+                // cells, so the fix that makes it whole enters the task again (rule 21).
+                (Some(_), Some(_)) => {
+                    let mut made = UnitsMade::new(alloc);
+                    for at in holding.iter().copied() {
+                        match jobs[at].whole {
+                            true => jobs[at].tasks.push(*task),
+                            false => made.reads.extend(jobs[at].cells.iter().copied()),
+                        }
+                    }
+                    accs.push((*task, made));
+                }
             }
         }
+        accs.sort_unstable_by_key(|(task, _)| task.planned.name);
+        accs.dedup_by_key(|(task, _)| task.planned.name);
         jobs.retain(|job| !job.tasks.is_empty());
         // 2. Each member's heads, at once, on the workers.
         let procs = names.names.as_ref().and_then(|names| names.procs());
@@ -774,12 +1053,15 @@ impl HeadsStage {
                 return Err(CliError::Pool(error));
             }
         }
-        // 3. Each result as the engine's row, in task order.
-        let mut heads_failed: std::vec::Vec<crate::engine_head_notes::Refused, Global> = std::vec::Vec::new_in(Global);
+        // 3. Each unit's results gathered by task (units in prefix order), then each task as the
+        // engine's row, in task order.
+        let acc = |accs: &[(Task, UnitsMade<'a>)], task: &Task| -> Option<usize> { accs.binary_search_by_key(&task.planned.name, |(one, _)| one.planned.name).ok() };
         for (job, (ran, ns)) in jobs.iter().zip(worked) {
             let each = u64::try_from(job.tasks.len()).unwrap_or(1).max(1);
             for task in job.tasks.iter() {
-                times.push(task.planned.name, ns / each);
+                if let Some(at) = acc(&accs, task) {
+                    accs[at].1.ns = accs[at].1.ns.saturating_add(ns / each);
+                }
             }
             let made = match ran {
                 Ok(Ok(made)) => made,
@@ -787,49 +1069,107 @@ impl HeadsStage {
                 // (the packs) and each scope crate's names cell.
                 Ok(Err(why)) => {
                     for task in job.tasks.iter() {
-                        refuse(task, why, &job.cells, buffer);
+                        if let Some(at) = acc(&accs, task) {
+                            accs[at].1.fail(why, &job.cells, false);
+                        }
                     }
                     continue;
                 }
                 // A panic is not a function of reads: owed, entered again each request (rule 20).
                 Err(work::Panicked) => {
                     for task in job.tasks.iter() {
-                        refuse(task, "its crate's head tasks panicked; that crate's heads alone failed", &[], buffer);
+                        if let Some(at) = acc(&accs, task) {
+                            accs[at].1.fail("its crate's head tasks panicked; that crate's heads alone failed", &[], true);
+                        }
                     }
                     continue;
                 }
             };
             for (task, one) in job.tasks.iter().zip(made) {
-                let one = match one {
-                    Ok(one) => one,
+                let Some(at) = acc(&accs, task) else { continue };
+                match one {
+                    Ok(one) => accs[at].1.take(job.prefix, one),
                     // What its freeze read until it failed, and its member's names cell: its
                     // heads' rows are that crate's records' (`heads_of_crate`), so a refusal
                     // that read nothing else (two heads under one cell) stands on it too.
                     Err(mut failed) => {
                         failed.reads.push(job.cells[1]);
-                        refuse(task, failed.why, &failed.reads, buffer);
-                        continue;
+                        accs[at].1.fail(failed.why, &failed.reads, false);
                     }
-                };
-                let mut defines: SVec<'a, (Cell, ContentId)> = SVec::with_capacity_in(one.defines.len(), alloc);
-                defines.extend(one.defines.iter().copied());
-                defines.sort_unstable_by_key(|(cell, _)| *cell);
-                defines.dedup_by_key(|(cell, _)| *cell);
-                let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(one.reads.len(), alloc);
-                reads.extend(one.reads.iter().map(|id| (*id, view.cell(id))));
-                reads.sort_unstable_by_key(|(id, _)| *id);
-                reads.dedup_by_key(|(id, _)| *id);
-                let mut record_reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::with_capacity_in(reads.len(), Global);
-                record_reads.extend(reads.iter().map(|(id, digest)| (id.of, *digest)));
-                record_reads.dedup_by_key(|(of, _)| *of);
-                let name = task.planned.name;
-                // Each head it could not freeze: one finding, its reason a head note.
-                heads_failed.extend(one.failed.iter().map(|(cell, head, why)| crate::engine_head_notes::Refused { name, cell: Some(*cell), head: *head, why: *why }));
-                let findings = u32::try_from(one.failed.len()).unwrap_or(u32::MAX);
-                buffer.done.push(Done { name, key: task.key, out: one.out, defines, reads, findings, failed: false });
-                self.made.push(Made { name, out: one.out, reads: record_reads, payload: one.payload });
+                }
             }
         }
+        let mut heads_failed: std::vec::Vec<crate::engine_head_notes::Refused, Global> = std::vec::Vec::new_in(Global);
+        let mut counts = UnitCounts::default();
+        let mut units: SVec<'a, [u8; 8]> = SVec::new_in(alloc);
+        // The cells this phase's head tasks define, every unit's (a refused task defines none): a
+        // head's read of another head of this phase is recorded at today's digest (lane BH1),
+        // so the merge never sends it to a second wave for a cell it saw (blaze-engine
+        // engine.rs `readers_of`). Since heads are frozen per unit (lane RU1) a task's cells
+        // come from several jobs, so this is one table for the phase, not one a job.
+        let today = crate::engine_scope_reads::job_cells(accs.iter().map(|(task, made)| (task.planned.name, made.first.as_ref().filter(|_| made.failed.is_none()).map(|one| &one.defines[..]))));
+        for (task, made) in accs.into_iter() {
+            times.push(task.planned.name, made.ns);
+            // One unit's failure fails the task whole: its row is refused on the union of what
+            // each failing unit read (owed when one panicked).
+            if let Some((why, cells, owed)) = made.failed {
+                let cells: &[CellId] = if owed { &[] } else { &cells };
+                refuse(&task, why, cells, buffer);
+                continue;
+            }
+            // Each whole holding unit ran it and none failed, so one froze it (`heads_of` makes
+            // one result a task); none is a bug of this function, said by name (rule 3).
+            let Some(one) = made.first else {
+                refuse(&task, "no unit that holds its file froze it, and none failed (engine_heads.rs `run_items`)", &made.reads, buffer);
+                continue;
+            };
+            let mut defines: SVec<'a, (Cell, ContentId)> = SVec::with_capacity_in(one.defines.len(), alloc);
+            defines.extend(one.defines.iter().copied());
+            defines.sort_unstable_by_key(|(cell, _)| *cell);
+            defines.dedup_by_key(|(cell, _)| *cell);
+            // Each unit's reads, each cell once (rule 21: the row moves when any unit's do).
+            let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(made.reads.len(), alloc);
+            reads.extend(made.reads.iter().map(|id| (*id, crate::engine_scope_reads::today(&today, id).unwrap_or_else(|| view.cell(id)))));
+            reads.sort_unstable_by_key(|(id, _)| *id);
+            reads.dedup_by_key(|(id, _)| *id);
+            let mut record_reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::with_capacity_in(reads.len(), Global);
+            record_reads.extend(reads.iter().map(|(id, digest)| (id.of, *digest)));
+            record_reads.dedup_by_key(|(of, _)| *of);
+            let name = task.planned.name;
+            // Each head it could not freeze, under each unit: a head note a cell (a reader of
+            // either unit's cell quotes its own), one finding a head by path and reason.
+            heads_failed.extend(one.failed.iter().map(|(cell, head, why)| crate::engine_head_notes::Refused { name, cell: Some(*cell), head: *head, why: *why }));
+            let mut said: SVec<'a, (&'static str, &'static str)> = SVec::with_capacity_in(one.failed.len(), alloc);
+            said.extend(one.failed.iter().map(|(_, head, why)| (*head, *why)));
+            said.sort_unstable();
+            said.dedup();
+            let findings = u32::try_from(said.len()).unwrap_or(u32::MAX);
+            // The counts: each (item, unit) once; an item frozen under 2+ units counted shared.
+            let mut items = one.items;
+            items.sort_unstable();
+            items.dedup();
+            counts.frozen = counts.frozen.saturating_add(u32::try_from(items.len()).unwrap_or(u32::MAX));
+            for run in items.chunk_by(|a, b| a.0 == b.0) {
+                counts.items = counts.items.saturating_add(1);
+                if run.len() > 1 {
+                    counts.shared = counts.shared.saturating_add(1);
+                }
+            }
+            units.extend(items.iter().map(|(_, unit)| *unit));
+            let out = made.out.finish();
+            buffer.done.push(Done { name, key: task.key, out, defines, reads, findings, failed: false });
+            self.made.push(Made { name, out, reads: record_reads, payload: one.payload });
+        }
+        units.sort_unstable();
+        units.dedup();
+        counts.units = u32::try_from(units.len()).unwrap_or(u32::MAX);
+        // Summed over the request's Heads phases (the units: the most one phase froze under).
+        self.units = UnitCounts {
+            frozen: self.units.frozen.saturating_add(counts.frozen),
+            items: self.units.items.saturating_add(counts.items),
+            units: self.units.units.max(counts.units),
+            shared: self.units.shared.saturating_add(counts.shared),
+        };
         self.refused.extend(heads_failed);
         self.made.sort_unstable_by_key(|one| one.name);
         Ok(())
@@ -839,8 +1179,9 @@ impl HeadsStage {
 /// One member crate's head tasks on a worker: its scope's records opened in the task's frame,
 /// each task's heads frozen (front2 tables/head.rs `head_task`), each over a source of its own
 /// so its read list is its own: every names cell its freeze consulted (the recorder), and for
-/// each head its freeze read, the `HEADS` cell of that head's file (an earlier phase's, so no
-/// head task reads a cell of its own phase; engine.rs invariant 2), or its crate's names record.
+/// each head its freeze read, the cell of the head task that covers it (a same-stage read: the
+/// engine enters the reader at the wave after its definer, engine.rs), or its crate's names
+/// record.
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
 fn heads_of(
     cx: &Cx,
@@ -880,27 +1221,28 @@ fn heads_of(
             lang_reads.push(names_read(view, id));
         }
     }
-    // (entry, its cell, head name, want) of the crate at 0, sorted.
-    let mut rows: std::vec::Vec<(Name, Cell, Name, Want), Global> = std::vec::Vec::new_in(Global);
-    heads_of_crate(records, 0, job.prefix, subjects, g, &mut |one| rows.push((one.entry, one.cell, one.sig, one.want)));
-    rows.sort_unstable_by_key(|(entry, cell, sig, _)| (*entry, *cell, *sig));
-    rows.dedup_by_key(|(entry, cell, sig, _)| (*entry, *cell, *sig));
+    // (entry, its cell, head name, want, its item) of the crate at 0 (this job's unit), sorted.
+    let mut rows: std::vec::Vec<(Name, Cell, Name, Want, Cell), Global> = std::vec::Vec::new_in(Global);
+    heads_of_crate(records, 0, job.prefix, subjects, g, &mut |one| rows.push((one.entry, one.cell, one.sig, one.want, one.item)));
+    rows.sort_unstable_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
+    rows.dedup_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
     let mut owners = Owners::new(subjects);
     let tool = blaze_drive::key::Tool(ContentId::of(HEAD_TOOL_DOMAIN, b""));
     let mut done = std::vec::Vec::with_capacity_in(job.tasks.len(), Global);
     for task in job.tasks.iter() {
         let name = task.planned.name;
-        let from = rows.partition_point(|(entry, _, _, _)| *entry < name);
+        let from = rows.partition_point(|(entry, _, _, _, _)| *entry < name);
         let mut out = blaze_ids::Hasher::new(HEAD_OUT_DOMAIN);
-        let mut worked = WorkedHead { out: ContentId([0; 32]), defines: std::vec::Vec::new_in(Global), reads: std::vec::Vec::new_in(Global), payload: std::vec::Vec::new_in(Global), failed: std::vec::Vec::new_in(Global) };
+        let mut worked = WorkedHead { out: ContentId([0; 32]), defines: std::vec::Vec::new_in(Global), items: SVec::new_in(heap.shared()), reads: std::vec::Vec::new_in(Global), payload: std::vec::Vec::new_in(Global), failed: std::vec::Vec::new_in(Global) };
         let mut failed: Option<&'static str> = None;
-        let mine = &rows[from..from + rows[from..].iter().take_while(|(entry, _, _, _)| *entry == name).count()];
+        let mine = &rows[from..from + rows[from..].iter().take_while(|(entry, _, _, _, _)| *entry == name).count()];
         // Two heads under one cell would be two values under one key (rule 21).
         if mine.windows(2).any(|two| two[0].1 == two[1].1) {
             failed = Some("two heads of its entry fall under one cell: the same kind and name (engine_heads.rs `head_cell`)");
         }
         let mine = if failed.is_some() { &mine[..0] } else { mine };
-        for (_, cell, _, want) in mine.iter() {
+        for (_, cell, _, want, item) in mine.iter() {
+            worked.items.push((*item, job.prefix));
             let recorder = Recorder::new(RecorderOpts { alloc: g });
             let names = base.reading_into(&recorder);
             // The evaluator reads through a recorder of its own (engine_head_consts.rs).
@@ -965,7 +1307,17 @@ fn heads_of(
             }
             for w in seen.iter().filter(|w| **w != *want) {
                 let id = head_cell_id(*w);
+                // Another entry's head of this crate (`rows`): its head task's cell, never its
+                // file's `HEADS` digest, which every sibling head added moves (lane BH1). Made in
+                // this job, it is recorded at the digest the job made (`job_cells`), so the merge
+                // never sends it to a second wave; standing, at the view's, today's unless its own
+                // reads move, and then the wave rule enters this one after it. A head of this task's own entry is
+                // its own work, not a read. Another member's head is made by another job of the
+                // same phase: still its file's `HEADS` cell (an earlier phase's), so a fresh run
+                // enters no head twice (COARSE, lane BH1's census).
                 worked.reads.push(match owners.place(records, &id, g) {
+                    Some(HeadAt::Cell { cell, .. }) if cell.of == name => continue,
+                    Some(HeadAt::Cell { cell, .. }) if rows.binary_search_by(|(entry, _, _, _, _)| entry.cmp(&cell.of)).is_ok() => cell,
                     Some(HeadAt::Cell { file, .. }) => CellId { of: file, cell: crate::engine_tasks::HEADS },
                     Some(HeadAt::Dependency(scope) | HeadAt::Unplaced(scope)) => CellId { of: scope, cell: WHOLE },
                     None => id,
@@ -1000,7 +1352,9 @@ fn heads_of(
             }
             worked.defines.push((cell, made.out));
             out.update(&cell.0).update(&made.out.0);
+            // The cell too: a body finds a member's head by it (engine_seeds.rs `StretchHeads`).
             worked.payload.extend_from_slice(&want_bytes(*want));
+            worked.payload.extend_from_slice(&cell.0);
             worked.payload.extend_from_slice(&u32::try_from(made.bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
             worked.payload.extend_from_slice(&made.bytes);
         }
