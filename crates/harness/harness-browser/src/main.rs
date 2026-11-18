@@ -9,7 +9,7 @@
 //! - kernel: the Unix socket (accept, per-connection reader and writer threads).
 //! - app_link: the app's Mach messages.
 //! - ring: Metal blits into each watched view's ring of IOSurfaces.
-//! - cdp_ids, keys: sans-IO cores (DevTools id renumbering; Mac key codes to CEF key events).
+//! - cdp_ids, keys, ui: sans-IO cores (DevTools id renumbering; Mac key codes to CEF key events; a UI view's origin).
 //! - extensions: the profile's installed extensions.
 //! - manage: the Chrome-style manage window.
 //! - app_class: the NSApplication subclass CEF requires on macOS.
@@ -28,6 +28,7 @@ mod parent;
 mod places;
 mod ring;
 mod slots;
+mod ui;
 
 use cef::*;
 use std::ffi::{CString, c_char, c_int, c_void};

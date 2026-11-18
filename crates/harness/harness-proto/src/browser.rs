@@ -60,6 +60,10 @@ pub struct ViewInfo {
     /// Its size in points, and the device scale it renders at.
     pub size: [u32; 2],
     pub scale: f32,
+    /// A UI view ([`AppUp::Open`]'s `ui`): a page of the app's own, which only the app sees. Never set in what a
+    /// socket client gets (the host lists UI views to the app alone), so the kernel's wire is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ui: bool,
 }
 
 /// An extension installed in the profile (from the Web Store through the manage window, or unpacked under
@@ -322,7 +326,21 @@ pub enum AppUp {
     },
     Nav { view: u64, go: Nav },
     /// Open a tab (the sidebar's new tab, a link the person opened). Answered by [`AppDown::Opened`].
-    Open { req: u64, url: String },
+    ///
+    /// With `ui`, a **UI view**: a page of the app's own (`file://`, or an `http://localhost` dev server) that talks to
+    /// the app. Its documents have `window.harnessPost(string)`, each call an [`AppDown::Message`]; [`AppUp::Post`]
+    /// calls its `window.harnessRecv`. It never leaves `url`'s origin (a `file://` page its own file): any other
+    /// top-level navigation, popup or new tab is cancelled and sent as [`AppDown::Link`]. Socket clients neither see nor
+    /// drive it.
+    Open {
+        req: u64,
+        url: String,
+        #[serde(default)]
+        ui: bool,
+    },
+    /// Call UI view `view`'s `window.harnessRecv(<msg>)` in its main frame (nothing when the page defines none yet).
+    /// `msg` is JSON text. A view that is not a UI view, or text that is not JSON, is refused naming the view.
+    Post { view: u64, msg: String },
     Close { view: u64 },
     /// Open the manage window ([`KernelUp::Manage`]).
     Manage {
@@ -370,6 +388,11 @@ pub enum AppDown {
     Opened { req: u64, view: u64 },
     Closed { view: u64, why: String },
     Extensions { req: u64, extensions: Vec<Extension> },
+    /// UI view `view`'s page called `window.harnessPost(msg)` ([`AppUp::Open`]'s `ui`): `msg` exactly as it passed it.
+    Message { view: u64, msg: String },
+    /// UI view `view`'s page tried to go to `url`, outside its origin (a link, `window.open`, a location change): the
+    /// host cancelled it, and the app opens it where it opens links.
+    Link { view: u64, url: String },
     /// Something the app asked for was refused, naming it.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +414,20 @@ mod tests {
         assert_eq!(decode::<KernelDown>(&encode(&down)).unwrap(), down);
         let ring = AppDown::Ring { view: 7, generation: 2, w: 2560, h: 1600, slots: 3 };
         assert_eq!(decode::<AppDown>(&encode(&ring)).unwrap(), ring);
+        let open = AppUp::Open { req: 4, url: "file:///a/index.html".into(), ui: true };
+        assert_eq!(decode::<AppUp>(&encode(&open)).unwrap(), open);
+        let msg = AppDown::Message { view: 7, msg: r#"{"t":"ready"}"#.into() };
+        assert_eq!(decode::<AppDown>(&encode(&msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn a_view_that_is_not_ui_writes_no_ui_field() {
+        // The kernel's fixtures (KernelDown::Opened, Views) stay byte for byte what they were.
+        let plain = ViewInfo { view: 1, ..Default::default() };
+        let ui = ViewInfo { ui: true, ..plain.clone() };
+        assert!(!String::from_utf8_lossy(&encode(&plain)).contains("ui"));
+        assert_ne!(encode(&ui), encode(&plain));
+        assert_eq!(decode::<ViewInfo>(&encode(&ui)).unwrap(), ui);
     }
 
     #[test]

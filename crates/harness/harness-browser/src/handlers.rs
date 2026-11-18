@@ -370,7 +370,8 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut c_int>
         ) -> c_int {
-            // No native window: the page's new window opens as a view of its own (owner popup:<view>).
+            // No native window: the page's new window opens as a view of its own (owner popup:<view>); a UI view's goes
+            // to the app as a link instead (host::popup_requested).
             let url = target_url.map(ToString::to_string).unwrap_or_default();
             host::popup_requested(self.view, url);
             1
@@ -388,6 +389,27 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        fn on_before_browse(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, request: Option<&mut Request>, _user_gesture: c_int, _is_redirect: c_int) -> c_int {
+            // A UI view's top-level navigation outside its origin is cancelled and goes to the app as a link
+            // (host::navigation_refused); its frames (iframes) and every other view navigate freely.
+            if frame.is_none_or(|f| f.is_main() == 0) {
+                return 0;
+            }
+            let Some(r) = request else { return 0 };
+            let url = CefString::from(&r.url()).to_string();
+            c_int::from(host::navigation_refused(self.view, &url))
+        }
+
+        fn on_open_urlfrom_tab(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, target_url: Option<&CefString>, _target_disposition: WindowOpenDisposition, _user_gesture: c_int) -> c_int {
+            // A new tab or window asked for by a middle or cmd click: a UI view opens none, it hands the url to the app.
+            // Other views keep CEF's own handling (it goes on to OnBeforePopup).
+            if !host::is_ui(self.view) {
+                return 0;
+            }
+            host::ui_link(self.view, target_url.map(ToString::to_string).unwrap_or_default());
+            1
+        }
+
         fn on_render_process_terminated(&self, _browser: Option<&mut Browser>, status: TerminationStatus, error_code: c_int, error_string: Option<&CefString>) {
             let words = error_string.map(ToString::to_string).unwrap_or_default();
             host::renderer_gone(self.view, format!("its renderer ended ({status:?}, code {error_code}{}{words})", if words.is_empty() { "" } else { ": " }));
