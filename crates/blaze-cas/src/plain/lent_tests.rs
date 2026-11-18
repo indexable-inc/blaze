@@ -182,8 +182,8 @@ fn a_put_of_parts_is_the_put_of_their_concatenation() {
 /// THE ARENA HOLDS NO PUT PAST ITS COMMIT (rule 51): puts no get lent from are freed by the
 /// commit that writes them, and every later get reads them from the segment's mapping, byte-equal
 /// (`own: false`); a put of the same bytes again is the same value, of other bytes the refusal.
-/// A chunk a get lent from is kept with its lend standing (address and bytes), and takes no more
-/// puts. CONTROL: `LentPlant::FreesLent` (the commit frees a chunk under a live lend) leaves no
+/// A chunk a get lent from is kept with its lend standing (address and bytes), takes no more
+/// puts, and holds no key after the commit (a later get of its key reads the segment). CONTROL: `LentPlant::FreesLent` (the commit frees a chunk under a live lend) leaves no
 /// held bytes where the kept chunk must be (its lend is never read).
 #[test]
 fn a_commit_frees_every_put_no_get_lent() {
@@ -211,7 +211,12 @@ fn a_commit_frees_every_put_no_get_lent() {
         assert!(after.held_bytes > 0 && after.held_bytes <= 1 << 20, "only the lent chunk is held: {after:?}");
         assert!(after.freed_chunks >= 2, "the big put's chunk and the small puts' chunk freed: {after:?}");
         assert_eq!(early.bytes, &value(3000)[..], "the early lend stands");
-        assert_eq!(address(&lent, &key(3000)), early.bytes.as_ptr() as usize, "the early lend is still lent from its kept chunk");
+        // The key lent before the commit is read from its segment after it, like every other
+        // (aligned_tests.rs `a_get_before_the_commit_leaves_every_key_in_place_after_it`); the
+        // early lend is still the kept chunk's bytes, at another address.
+        let again = lent.get(&key(3000)).unwrap().expect("committed");
+        assert!(!again.own && again.bytes == &value(3000)[..], "the key lent before the commit is read from its segment after it");
+        assert_ne!(again.bytes.as_ptr(), early.bytes.as_ptr(), "the early lend is the kept chunk's, the later get the segment's");
         let gets = lent.counts().from_segments;
         for n in 3001u32..3100 {
             let want = if n == 3001 { big(n) } else { value(n) };

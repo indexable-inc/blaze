@@ -199,8 +199,18 @@ pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
 /// before it leaves the task that made it (drive.md, ruled 20:57), in `alloc` (the store's).
 fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
     let lib = r.keys.library_in(r.names, owner);
+    // A member of a trait or an impl has no library key (keys.rs `library_in`): it is placed by
+    // its container's, its text found in the container's (expansion_origin.rs
+    // `file_member_range`), never "no place".
+    let member = match lib {
+        Some(_) => None,
+        None => r.store.fns.get(&owner).filter(|h| h.container.is_some()).map(|h| (h.lib, h.text)),
+    };
     let mut filed = Vec::with_capacity_in(diags.len(), Global);
-    filed.extend(diags.iter().map(|(_, at, _)| super::expansion_origin::file_range(r.names, lib, *at, alloc)));
+    filed.extend(diags.iter().map(|(_, at, _)| match member {
+        Some((container, text)) => super::expansion_origin::file_member_range(r.names, container, text, *at, alloc),
+        None => super::expansion_origin::file_range(r.names, lib, *at, alloc),
+    }));
     CheckFail::Diags { owner, diags, filed }
 }
 
@@ -239,10 +249,15 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         let imported_at = r.store.imported.get();
         let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
         let view: BodyView<'_> = body.typeck.view(tys);
+        let trace_ask = r.store.trace;
         let world = world_at(r, scope);
         let mut cx = InferCtx::new_in(alloc);
         if root_keys.is_some() {
             cx.keep_root_keys();
+        }
+        // A measurement for tests (heads.rs `Store::trace`): the last round's trace is kept.
+        if let Some(ask) = trace_ask {
+            cx.trace_trait_goals(ask);
         }
         let out = match &mut count {
             Some((tally, clock)) => tc::check_counted(&view, &world, &mut cx, &hints, tally, *clock, alloc),
@@ -256,6 +271,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             Ok(out) => out,
             Err(error) => {
                 drop(world);
+                if trace_ask.is_some() {
+                    r.store.traced = cx.take_trace();
+                }
                 if super::opaque_auto::after_auto_gap(r, owner, &error, &mut leaks)? {
                     continue;
                 }
@@ -292,6 +310,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         // A failed candidate is a gap only of a question it is a candidate of (the world's
         // `impls_of`/`inherent`), never of every body checked after it failed.
         let mut gaps = world.gaps.into_inner();
+        if trace_ask.is_some() {
+            r.store.traced = cx.take_trace();
+        }
         // A const term the body's conversion left a hole (`[0u8; N * 2]`, `f::<{ N + 1 }>()`)
         // was checked as a const variable, which takes any value: a gap of every round, so
         // the finished check is no answer and none of its diagnostics is the program's.
@@ -609,7 +630,31 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
         }
         None => node_about(None, ty(d.found), ty(d.expected), d.name.map(|n| name_about(r, spell, tys, d.found, n))),
     };
+    let mut s = s;
+    // Rule 19: a finding whose range other nodes share (every node an expansion wrote has the
+    // call's range) names its node: its index, kind and shape (blaze-typeck diag/node.rs).
+    if let Some(node) = d.node {
+        let shared = tc::range_shared(v, node);
+        if shared > 1 {
+            node_words(&mut s, spell, v, node, shared);
+        }
+    }
     s.into_boxed_str()
+}
+
+/// `, at expression #i (a cast; its range is shared by n nodes): `{integer} as _``: the words
+/// [`diag_about`] adds for a node its range does not name.
+fn node_words(s: &mut String, spell: &Spelling<'_>, v: &BodyView<'_>, node: tc::Node, shared: usize) {
+    use core::fmt::Write;
+    let (what, index) = match node {
+        tc::Node::Expr(e) => ("expression", e.0),
+        tc::Node::Pat(p) => ("pattern", p.0),
+    };
+    let form = tc::node_form(v, node).unwrap_or("a node the body does not hold");
+    // A `String`'s `write!` cannot fail.
+    let _ = write!(s, ", at {what} #{index} ({form}; its range is shared by {shared} nodes): `");
+    let _ = tc::sketch(v, node, &|n| spell.get(n).ok(), s);
+    s.push('`');
 }
 
 /// An operation only `unsafe` code may do, in rustc's words (E0133 and the

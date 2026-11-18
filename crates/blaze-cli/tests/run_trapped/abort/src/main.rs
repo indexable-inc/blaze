@@ -28,7 +28,10 @@ fn give_up() -> ! {
     abort_immediate()
 }
 
+// `extern "C-unwind"`: an `extern "C"` fn that calls a fn which may unwind needs the
+// `panic_cannot_unwind` lang item for its abort (the Reference, [items.fn.extern.abort]), which
+// this program does not declare (blaze refuses it by name, as rustc does).
 #[unsafe(no_mangle)]
-pub extern "C" fn main() -> i32 {
+pub extern "C-unwind" fn main() -> i32 {
     give_up()
 }

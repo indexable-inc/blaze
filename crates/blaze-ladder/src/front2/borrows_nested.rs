@@ -93,6 +93,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn field_param(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<u32> {
         self.facts.field_param(adt, variant, field)
     }
+    fn field_lead(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<blaze_flow_lower::FieldLead> {
+        self.facts.field_lead(adt, variant, field)
+    }
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy(index)
     }

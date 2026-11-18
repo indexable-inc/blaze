@@ -1096,6 +1096,11 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.caller_site(owner, expr)
     }
 
+    /// From the front end (`FrontEnd::expr_site`): a trap row's site, with no file.
+    fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
+        self.0.expr_site(owner, expr)
+    }
+
     fn c_variadic(&self, item: ItemKey) -> Option<u32> {
         self.0.c_variadic(item)
     }

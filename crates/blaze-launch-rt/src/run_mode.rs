@@ -1940,6 +1940,8 @@ pub use thread_locals::ThreadKey;
 #[cfg(test)]
 mod entry_tests;
 #[cfg(test)]
+mod fault_code_window_tests;
+#[cfg(test)]
 mod fault_wire_tests;
 #[cfg(test)]
 mod personality_tests;

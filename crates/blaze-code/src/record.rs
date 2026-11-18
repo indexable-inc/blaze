@@ -24,12 +24,13 @@ use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
 /// The first eight bytes of every encoded record: the form's version. `bzcode04` added the trap
-/// table ([`TrapRow`]); `02` and `03` are blaze-tier's own forms (record/form.rs), so this form
-/// skips them and a record of one form is never read as another's.
-pub const MAGIC: [u8; 8] = *b"bzcode04";
+/// table ([`TrapRow`]), `bzcode05` its held values ([`Held`]) and subjects ([`Subject`]); `02`
+/// and `03` are blaze-tier's own forms (record/form.rs), so this form skips them and a record
+/// of one form is never read as another's.
+pub const MAGIC: [u8; 8] = *b"bzcode05";
 
-/// The bytes before the sections: magic, frame, flags, nine counts, a zero word (so the first
-/// section starts 8-aligned).
+/// The bytes before the sections: magic, frame, flags, ten counts (so the first section starts
+/// 8-aligned).
 const HEAD: usize = 56;
 
 /// A [`Word`]'s target meaning this record's own code: the word holds the address of code byte
@@ -234,6 +235,53 @@ impl TrapKind {
     }
 }
 
+/// Where the value a trap's construct switched on is when its `brk` strikes: what the emitter
+/// knows of the code it made (blaze-emit pass.rs), never a guess.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Held {
+    /// Not known: the `brk` is not reached from one switch alone, or the value is not kept.
+    Unknown,
+    /// In general register `xN` (`N` up to 30).
+    Reg(u8),
+    /// In the 8 bytes at `sp + offset`.
+    Stack(u32),
+}
+
+impl Held {
+    /// The encoding's tag byte.
+    fn tag(self) -> u8 {
+        match self {
+            Held::Unknown => 0,
+            Held::Reg(_) => 1,
+            Held::Stack(_) => 2,
+        }
+    }
+}
+
+/// How many of an enum's discriminants a [`Subject`] keeps.
+pub const SUBJECT_SHOWN: usize = 8;
+
+/// The enum whose discriminant a [`TrapKind::Discriminant`] trap read, as the layout the build
+/// used has it: what the report names and lists next to the value read. A function of the
+/// layout, an input of the code too (rule 25).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Subject {
+    /// The enum's item (its `ItemKey`'s bits), for the one printer of an item.
+    pub item: u128,
+    /// How many variants the enum has.
+    pub count: u32,
+    /// The first `min(count, SUBJECT_SHOWN)` variants' discriminants, as the switch compares
+    /// them (masked to 64 bits); the rest are 0 (sealed so).
+    pub discriminants: [u64; SUBJECT_SHOWN],
+}
+
+impl Subject {
+    /// The discriminants kept.
+    pub fn shown(&self) -> &[u64] {
+        &self.discriminants[..(self.count as usize).min(SUBJECT_SHOWN)]
+    }
+}
+
 /// One `unreachable`'s `brk` in the code: WHICH construct it ends.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TrapRow {
@@ -244,21 +292,30 @@ pub struct TrapRow {
     /// owner, by its `ItemKey`'s bits) and its first byte counted from the item's first byte;
     /// for one inside a macro's expansion its outermost call's. `None`: the build did not know.
     pub site: Option<(u128, u32)>,
+    /// Where the value the construct switched on is when the `brk` strikes (the emitter's).
+    pub held: Held,
+    /// The enum whose discriminant was read (the build's, for a [`TrapKind::Discriminant`]).
+    pub subject: Option<Subject>,
 }
 
 /// What a build knows of one `unreachable` it wrote, before the code exists: its `ordinal`
 /// among the function's `unreachable` instructions in layout order (what every rewrite between
-/// the build and the emitter keeps: legalize copies each one as it is), its kind and site. The
-/// emitter makes it the [`TrapRow`] of that instruction's `brk` (blaze-emit record.rs).
+/// the build and the emitter keeps: legalize copies each one as it is), its kind, site and
+/// subject. The emitter makes it the [`TrapRow`] of that instruction's `brk` (blaze-emit
+/// record.rs), adding where the switched value is held.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TrapSource {
     pub ordinal: u32,
     pub kind: TrapKind,
     pub site: Option<(u128, u32)>,
+    pub subject: Option<Subject>,
 }
 
 /// A [`TrapRow`]'s encoded site field meaning none.
 const NO_SITE: u32 = u32::MAX;
+
+/// The highest general register a [`Held::Reg`] names (`x30`).
+const MOST_REG: u8 = 30;
 
 /// Why a record was not sealed: the first broken rule, naming the offset it is about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -291,6 +348,8 @@ pub enum RecordError {
     TrapsTwice { at: u32 },
     /// A trap row's site names byte `NO_SITE`, the encoding's word for none.
     TrapSite { at: u32 },
+    /// A trap row's held value names register `reg`, past `x30`.
+    HeldReg { at: u32, reg: u8 },
 }
 
 impl fmt::Display for RecordError {
@@ -310,6 +369,7 @@ impl fmt::Display for RecordError {
             RecordError::TrapOutside { at, code } => write!(f, "a code record's trap row at {at} is not an instruction of its {code} bytes of code"),
             RecordError::TrapsTwice { at } => write!(f, "a code record has two trap rows at {at}"),
             RecordError::TrapSite { at } => write!(f, "a code record's trap row at {at} names site byte {NO_SITE}, the form's word for no site"),
+            RecordError::HeldReg { at, reg } => write!(f, "a code record's trap row at {at} says register x{reg} holds the switched value, past x{MOST_REG}"),
         }
     }
 }
@@ -464,6 +524,18 @@ impl<'a> CodeRecord<'a> {
             if let Some((_, NO_SITE)) = trap.site {
                 return Err(RecordError::TrapSite { at: trap.at });
             }
+            if let Held::Reg(reg) = trap.held
+                && reg > MOST_REG
+            {
+                return Err(RecordError::HeldReg { at: trap.at, reg });
+            }
+        }
+        // One form (rule 25): a subject's discriminants past the ones it keeps are 0.
+        for trap in traps.iter_mut() {
+            if let Some(subject) = trap.subject.as_mut() {
+                let kept = (subject.count as usize).min(SUBJECT_SHOWN);
+                subject.discriminants[kept..].fill(0);
+            }
         }
         // Names by symbol, each once, the text rebuilt in that order.
         let mut by_symbol = names;
@@ -520,10 +592,10 @@ impl<'a> Sealed<'a> {
         out.extend_from_slice(&MAGIC);
         put32(out, r.frame);
         put32(out, 0);
-        for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len(), r.traps.len()] {
+        let subjects = r.traps.iter().filter(|t| t.subject.is_some()).count();
+        for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len(), r.traps.len(), subjects] {
             put32(out, count as u32);
         }
-        put32(out, 0);
         out.extend_from_slice(&r.code);
         pad8(out, start);
         out.extend_from_slice(&r.relro);
@@ -553,11 +625,29 @@ impl<'a> Sealed<'a> {
         for t in r.traps.iter() {
             put32(out, t.at);
             out.push(t.kind as u8);
-            out.extend_from_slice(&[0; 3]);
+            out.push(t.held.tag());
+            out.push(match t.held {
+                Held::Reg(reg) => reg,
+                Held::Unknown | Held::Stack(_) => 0,
+            });
+            out.push(0);
             let (item, site) = t.site.unwrap_or((0, NO_SITE));
             put32(out, site);
-            put32(out, 0);
+            put32(out, match t.held {
+                Held::Stack(offset) => offset,
+                Held::Unknown | Held::Reg(_) => 0,
+            });
             out.extend_from_slice(&item.to_le_bytes());
+        }
+        // The subjects, one per trap row that has one, in the rows' order (by offset).
+        for t in r.traps.iter() {
+            let Some(subject) = t.subject else { continue };
+            put32(out, t.at);
+            put32(out, subject.count);
+            out.extend_from_slice(&subject.item.to_le_bytes());
+            for d in subject.discriminants {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
         }
         for &(symbol, at, len) in r.names.iter() {
             out.extend_from_slice(&symbol.0);
@@ -585,6 +675,7 @@ const WORD_ROW: usize = 16;
 const PAD_ROW: usize = 16;
 const NAME_ROW: usize = 40;
 const TRAP_ROW: usize = 32;
+const SUBJECT_ROW: usize = 24 + 8 * SUBJECT_SHOWN;
 
 /// Why bytes are not a code record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -599,13 +690,19 @@ pub enum DecodeError {
     Kind { row: u32, byte: u8 },
     /// Trap row `row` has the kind byte `byte`.
     TrapKind { row: u32, byte: u8 },
+    /// Trap row `row`'s held value is malformed: an unknown tag, or a register past `x30`.
+    Held { row: u32 },
+    /// Subject row `row` is not the subject of a trap row (offsets rising, each a trap row's).
+    Subject { row: u32 },
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode04` head (an older form is rebuilt, never read)"),
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode05` head (an older form is rebuilt, never read)"),
             DecodeError::TrapKind { row, byte } => write!(f, "a code record's trap row {row} has the unknown kind {byte}"),
+            DecodeError::Held { row } => write!(f, "a code record's trap row {row} has a malformed held value (an unknown tag or a register past x30)"),
+            DecodeError::Subject { row } => write!(f, "a code record's subject row {row} is not the subject of one of its trap rows"),
             DecodeError::Length { need, have } => write!(f, "a code record's head counts {need} bytes; it has {have}"),
             DecodeError::Space { row, byte } => write!(f, "a code record's target {row} has the unknown space {byte}"),
             DecodeError::Kind { row, byte } => write!(f, "a code record's site {row} has the unknown kind {byte}"),
@@ -616,13 +713,16 @@ impl fmt::Display for DecodeError {
 impl core::error::Error for DecodeError {}
 
 /// An encoded record read in place. Layout (little-endian; every section starts 8-aligned from
-/// the record's first byte): `MAGIC`; `frame: u32`, `flags: u32` (0); nine `u32` counts (code
-/// bytes, relro bytes, targets, sites, words, pads, names, text bytes, traps) and a zero `u32`;
-/// the code; the relro part; targets (space `u8`, 7 zero bytes, symbol 32); sites (`at: u32`,
-/// kind `u8`, 3 zero bytes, `target: u32`, `addend: u32`); words (`at: u32`, `target: u32`,
-/// `addend: i64`); pads (four `u32`); traps (`at: u32`, kind `u8`, 3 zero bytes, `site: u32`
-/// (`u32::MAX` for none), 4 zero bytes, `item: u128`, 0 for none), by `at`; names (symbol 32,
-/// text `at: u32`, `len: u32`); the text.
+/// the record's first byte): `MAGIC`; `frame: u32`, `flags: u32` (0); ten `u32` counts (code
+/// bytes, relro bytes, targets, sites, words, pads, names, text bytes, traps, subjects); the
+/// code; the relro part; targets (space `u8`, 7 zero bytes, symbol 32); sites (`at: u32`, kind
+/// `u8`, 3 zero bytes, `target: u32`, `addend: u32`); words (`at: u32`, `target: u32`, `addend:
+/// i64`); pads (four `u32`); traps (`at: u32`, kind `u8`, held tag `u8` (0 unknown, 1 a
+/// register, 2 a stack slot), held register `u8`, a zero byte, `site: u32` (`u32::MAX` for
+/// none), held stack offset `u32`, `item: u128`, 0 for none), by `at`; subjects (`at: u32` of
+/// its trap row, `count: u32`, `item: u128`, eight `u64` discriminants), by `at`; names
+/// (symbol 32, text `at: u32`, `len: u32`); the text. `bzcode05` added the held value and the
+/// subjects.
 #[derive(Clone, Copy)]
 pub struct CodeView<'b> {
     bytes: &'b [u8],
@@ -634,6 +734,7 @@ pub struct CodeView<'b> {
     words: &'b [u8],
     pads: &'b [u8],
     traps: &'b [u8],
+    subjects: &'b [u8],
     names: &'b [u8],
     text: &'b [u8],
 }
@@ -686,6 +787,7 @@ impl<'b> CodeView<'b> {
             count(6) * NAME_ROW,
             up8(count(7)),
             count(8) * TRAP_ROW,
+            count(9) * SUBJECT_ROW,
         ];
         let need = HEAD + lens.iter().sum::<usize>();
         if need != bytes.len() {
@@ -699,12 +801,27 @@ impl<'b> CodeView<'b> {
         let words = part(bytes, &mut at, lens[4], lens[4]);
         let pads = part(bytes, &mut at, lens[5], lens[5]);
         let traps = part(bytes, &mut at, lens[8], lens[8]);
+        let subjects = part(bytes, &mut at, lens[9], lens[9]);
         let names = part(bytes, &mut at, lens[6], lens[6]);
         let text = part(bytes, &mut at, lens[7], count(7));
         for row in 0..count(8) {
             let byte = traps[row * TRAP_ROW + 4];
             if TrapKind::from_byte(byte).is_none() {
                 return Err(DecodeError::TrapKind { row: row as u32, byte });
+            }
+            let (tag, reg) = (traps[row * TRAP_ROW + 5], traps[row * TRAP_ROW + 6]);
+            if tag > 2 || (tag == 1 && reg > MOST_REG) {
+                return Err(DecodeError::Held { row: row as u32 });
+            }
+        }
+        // Each subject names a trap row, the subjects' offsets rising: so `trap` finds a row's
+        // subject by halving over them.
+        let trap_ats = |at: u32| (0..count(8)).any(|row| get32(traps, row * TRAP_ROW) == at);
+        for row in 0..count(9) {
+            let at = get32(subjects, row * SUBJECT_ROW);
+            let rising = row == 0 || get32(subjects, (row - 1) * SUBJECT_ROW) < at;
+            if !rising || !trap_ats(at) {
+                return Err(DecodeError::Subject { row: row as u32 });
             }
         }
         for row in 0..count(2) {
@@ -719,7 +836,7 @@ impl<'b> CodeView<'b> {
                 return Err(DecodeError::Kind { row: row as u32, byte });
             }
         }
-        Ok(CodeView { bytes, frame, code, relro, targets, sites, words, pads, traps, names, text })
+        Ok(CodeView { bytes, frame, code, relro, targets, sites, words, pads, traps, subjects, names, text })
     }
 
     /// The whole encoding: equal records are equal bytes.
@@ -798,7 +915,37 @@ impl<'b> CodeView<'b> {
                 Some((u128::from_le_bytes(item), site))
             }
         };
-        TrapRow { at: get32(self.traps, row), kind, site }
+        let held = match self.traps[row + 5] {
+            1 => Held::Reg(self.traps[row + 6]),
+            2 => Held::Stack(get32(self.traps, row + 12)),
+            _ => Held::Unknown,
+        };
+        let at = get32(self.traps, row);
+        TrapRow { at, kind, site, held, subject: self.subject_at(at) }
+    }
+
+    /// The subject of the trap row at code offset `at`, by halving over the subjects (sorted by
+    /// offset, checked by `read`).
+    fn subject_at(&self, at: u32) -> Option<Subject> {
+        let (mut lo, mut hi) = (0usize, self.subjects.len() / SUBJECT_ROW);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let row = mid * SUBJECT_ROW;
+            match get32(self.subjects, row).cmp(&at) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    let mut item = [0u8; 16];
+                    item.copy_from_slice(&self.subjects[row + 8..row + 24]);
+                    let mut discriminants = [0u64; SUBJECT_SHOWN];
+                    for (i, d) in discriminants.iter_mut().enumerate() {
+                        *d = get64(self.subjects, row + 24 + 8 * i);
+                    }
+                    return Some(Subject { item: u128::from_le_bytes(item), count: get32(self.subjects, row + 4), discriminants });
+                }
+            }
+        }
+        None
     }
 
     /// The trap row of the `brk` at code offset `at`, by halving over the rows (sorted by

@@ -1,0 +1,136 @@
+//! THE BORROW FORMS OF THE DERIVES (piece RB7, NEVER COMPILED when written, 2026-11-17): the
+//! bodies clap's, serde's and thiserror's derives write, in miniature, through the engine's
+//! check, on the seam the real projects take. A subpattern that peels a reference under an ADT
+//! field (clap's `Some(Cmd::Hello { who })` against `Option<&Cmd>`) is lowered now, not refused
+//! `PeelUnderAdtField`; a call of a head that writes lifetimes and could not be related (a
+//! projection of a trait with a lifetime, `V::Value` of `Visitor<'de>`) is still refused, but its
+//! note says which callee and why (rule 19), never the bare "the flow lowering refused a form".
+//! Each miniature has a negative with one injected borrow error, which must be found with its
+//! code (rule 23: the check ran on that body). Notes "a trait fact of an ADT is not known" may
+//! appear (the fixture core has no `Copy` lang item) and are not asserted away.
+//! A child of main.rs's tests, beside engine_check_tests.rs, whose helpers it uses.
+
+use super::*;
+use super::engine_check_tests::{engine, error_lines};
+
+/// clap's `Cmd` match, the derive's `(a, Self::V { x })` against `(&u8, &Self)`, and a variant
+/// inside a wrapper's field.
+const CLAP: &str = "pub enum Cmd {\n    Hello { who: u8 },\n    Quit,\n}\n\npub enum Opt<T> {\n    No,\n    Yes(T),\n}\n\npub fn run(c: Opt<&Cmd>) -> u8 {\n    match c {\n        Opt::Yes(Cmd::Hello { who }) => *who,\n        _ => 0,\n    }\n}\n\npub enum Two {\n    V { x: u8 },\n    W,\n}\n\nimpl Two {\n    pub fn pick(a: &u8, b: &Two) -> u8 {\n        match (a, b) {\n            (a, Self::V { x }) => { let _ = a; *x }\n            _ => 0,\n        }\n    }\n}\n\npub struct Wrapper {\n    pub inner: Two,\n}\n\npub fn unwrap(w: &Wrapper) -> u8 {\n    match w {\n        Wrapper { inner: Two::V { x } } => *x,\n        _ => 0,\n    }\n}\n";
+
+/// [`CLAP`]'s `run` over `Opt<&mut Cmd>` with one injected error: `who: &mut u8` (the peel of
+/// `&mut` makes the mode `ref mut`), `r` reborrows `*who`, and `*who = 2` writes it while `r`
+/// is used after (E0506).
+const CLAP_WRONG: &str = "pub enum Cmd {\n    Hello { who: u8 },\n    Quit,\n}\n\npub enum Opt<T> {\n    No,\n    Yes(T),\n}\n\npub fn keep(_: &u8) {}\n\npub fn run(c: Opt<&mut Cmd>) -> u8 {\n    match c {\n        Opt::Yes(Cmd::Hello { who }) => { let r: &u8 = &*who; *who = 2; keep(r); 0 }\n        _ => 0,\n    }\n}\n";
+
+/// serde's `Deserialize` in miniature: a `Visitor<'de>` with a `visit_seq`-like fn, a
+/// `Deserializer<'de>` whose `deserialize_seq` returns `V::Value`, and the derive's
+/// `deserialize` calling it through the caller's `D: Deserializer<'de>`.
+const SERDE: &str = "pub trait Visitor<'de> {\n    type Value;\n    fn visit_seq(self, n: &'de [u8]) -> Self::Value;\n}\n\npub trait Deserializer<'de> {\n    fn deserialize_seq<V: Visitor<'de>>(self, v: V) -> V::Value;\n}\n\npub struct PointVisitor;\n\nimpl<'de> Visitor<'de> for PointVisitor {\n    type Value = u8;\n    fn visit_seq(self, n: &'de [u8]) -> u8 {\n        let _ = n;\n        0\n    }\n}\n\npub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> u8 {\n    d.deserialize_seq(PointVisitor)\n}\n";
+
+/// [`SERDE`] with one injected error in the visitor's `visit_seq`: a shared borrow while a
+/// mutable one is live (E0502).
+const SERDE_WRONG: &str = "pub trait Visitor<'de> {\n    type Value;\n    fn visit_seq(self, n: &'de [u8]) -> Self::Value;\n}\n\npub fn keep(_: &u8) {}\n\npub struct PointVisitor;\n\nimpl<'de> Visitor<'de> for PointVisitor {\n    type Value = u8;\n    fn visit_seq(self, n: &'de [u8]) -> u8 {\n        let _ = n;\n        let mut v = 1u8;\n        let a = &mut v;\n        let b = &v;\n        keep(b);\n        *a = 2;\n        0\n    }\n}\n";
+
+/// thiserror's `Display` in miniature: `fmt(&self, f: &mut Fmt<'_>)` writing through a helper
+/// whose head writes lifetimes, and an `Arguments<'_>` builder.
+const FAULT: &str = "pub struct Fmt<'a> {\n    pub buf: &'a mut u8,\n}\n\npub trait Show {\n    fn fmt(&self, f: &mut Fmt<'_>) -> u8;\n}\n\npub fn write_code(f: &mut Fmt<'_>, c: &u8) -> u8 {\n    *f.buf = *c;\n    0\n}\n\npub struct Fault {\n    code: u8,\n}\n\nimpl Show for Fault {\n    fn fmt(&self, f: &mut Fmt<'_>) -> u8 {\n        write_code(f, &self.code)\n    }\n}\n\npub struct Arguments<'a> {\n    pub parts: &'a [u8],\n    pub arg: &'a u8,\n}\n\nimpl<'a> Arguments<'a> {\n    pub fn new(parts: &'a [u8], arg: &'a u8) -> Arguments<'a> {\n        Arguments { parts, arg }\n    }\n}\n\npub fn build<'a>(p: &'a [u8], a: &'a u8) -> Arguments<'a> {\n    Arguments::new(p, a)\n}\n";
+
+/// [`FAULT`]'s `Fmt` with one injected error: a shared borrow of `*c` while `f` holds it
+/// mutably and is used after (E0502).
+const FMT_WRONG: &str = "pub struct Fmt<'a> {\n    pub buf: &'a mut u8,\n}\n\npub fn write_code(f: &mut Fmt<'_>, c: &u8) -> u8 {\n    *f.buf = *c;\n    0\n}\n\npub fn bad(c: &mut u8) -> u8 {\n    let mut f = Fmt { buf: &mut *c };\n    let r: &u8 = &*c;\n    write_code(&mut f, r)\n}\n";
+
+/// [`FAULT`]'s `Arguments` with one injected error: an assignment to `x` while the built
+/// `Arguments` holds it and is used after (E0506).
+const ARGS_WRONG: &str = "pub struct Arguments<'a> {\n    pub parts: &'a [u8],\n    pub arg: &'a u8,\n}\n\nimpl<'a> Arguments<'a> {\n    pub fn new(parts: &'a [u8], arg: &'a u8) -> Arguments<'a> {\n        Arguments { parts, arg }\n    }\n}\n\npub fn keep(_: &u8) {}\n\npub fn bad(p: &[u8]) -> u8 {\n    let mut x = 1u8;\n    let a = Arguments::new(p, &x);\n    x = 2;\n    keep(a.arg);\n    x\n}\n";
+
+/// One check of `text` on 2 workers: what it printed, the codes it listed, and its notes.
+fn check_text(text: &str) -> (std::string::String, std::vec::Vec<std::string::String>, std::vec::Vec<std::string::String>) {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    write(&io, "src/lib.rs", text);
+    let before = stdout(&io).len();
+    let (ids, checked) = engine(&io, 2);
+    let said = stdout(&io).split_off(before);
+    let codes = ids.into_iter().map(|(code, _)| code).collect();
+    let (notes, _) = &checked.bodies;
+    (said, codes, notes.iter().map(|n| n.to_string()).collect())
+}
+
+/// Each note of a body whose borrows were not checked says why, by name: never the bare
+/// lowering refusal of a call or a peel, and a call refused for its head names the callee's
+/// head and what it lacked, with the shape's or the alignment's reason (rule 19).
+fn notes_say_why(case: &str, notes: &[std::string::String], said: &str) {
+    for note in notes {
+        assert!(!note.contains("the flow lowering refused a form"), "{case}: a form the lowering refused without words: {note}\n{said}");
+        if note.contains("could not be related through that signature") {
+            let worded = note.contains("shape_why: Some(") || (note.contains("Unaligned(") && !note.contains("Unaligned(NotTried)")) || note.contains("lacks: Bounds");
+            assert!(worded, "{case}: a call refused without its reason: {note}\n{said}");
+            assert!(note.contains("head: \"") || note.contains("fn "), "{case}: the callee is named by its head: {note}\n{said}");
+        }
+    }
+}
+
+/// THE RULE (A): clap's peels under a field lower: no note of a refused form, no error.
+#[test]
+fn engine_check_lowers_a_peel_under_an_adt_field() {
+    let (said, codes, notes) = check_text(CLAP);
+    println!("clap miniature: codes {codes:?}, notes {notes:?}\n{said}");
+    notes_say_why("clap", &notes, &said);
+    assert!(notes.iter().all(|n| !n.contains("PeelUnderAdtField")), "the peel is lowered: {notes:?}\n{said}");
+    assert!(error_lines(&said).is_empty(), "clean text, no error: {said}");
+}
+
+/// RULE 23 for (A): one injected borrow error under the peel (`*who = 2` while `r`, a reborrow of
+/// `*who`, is used after) is found: E0506.
+#[test]
+#[ignore = "OPEN (first run, 2026-11-17 23:48): the engine tests' fixture core has no `Copy` lang item, so the borrow check does not run on a body that names an ADT (note `FactUnknown { fact: \"Copy\", why: NoLangItem }`) and no negative can be found on this seam; the peel's negative and its controls are judged in blaze-flow-lower `peel_tests` until the fixture gains the lang item"]
+fn engine_check_finds_a_borrow_error_under_a_peel() {
+    let (said, codes, notes) = check_text(CLAP_WRONG);
+    println!("clap miniature, wrong: codes {codes:?}, notes {notes:?}\n{said}");
+    notes_say_why("clap wrong", &notes, &said);
+    assert!(codes.iter().any(|c| c == "E0506"), "the assignment to the borrowed field is found: {codes:?}\n{said}");
+}
+
+/// (B) serde's `Deserialize`: every body's note says why; the visitor's body is checked. A call
+/// of `deserialize_seq` through `D: Deserializer<'de>` may stay refused (its `V::Value` is a
+/// projection of a trait with a lifetime, whose `'de` is the caller's: see the lane's report),
+/// but then by name and reason.
+#[test]
+fn engine_check_words_a_deserialize_call() {
+    let (said, codes, notes) = check_text(SERDE);
+    println!("serde miniature: codes {codes:?}, notes {notes:?}\n{said}");
+    notes_say_why("serde", &notes, &said);
+    assert!(error_lines(&said).is_empty(), "clean text, no error: {said}");
+}
+
+/// RULE 23 for (B): the visitor's injected borrow error is found: E0502.
+#[test]
+#[ignore = "OPEN (first run, 2026-11-17 23:48): the engine tests' fixture core has no `Copy` lang item, so the borrow check does not run on `visit_seq` (note `FactUnknown { fact: \"Copy\", why: NoLangItem }`); un-ignore when the fixture gains the lang item"]
+fn engine_check_finds_a_borrow_error_in_a_visitor() {
+    let (said, codes, notes) = check_text(SERDE_WRONG);
+    println!("serde miniature, wrong: codes {codes:?}, notes {notes:?}\n{said}");
+    notes_say_why("serde wrong", &notes, &said);
+    assert!(codes.iter().any(|c| c == "E0502"), "the visitor's injected borrow error is found: {codes:?}\n{said}");
+}
+
+/// (C) thiserror's `Display` and an `Arguments<'_>` builder: every note says why, the clean text
+/// has no error, and each negative's one injected error is found with its code.
+#[test]
+fn engine_check_lowers_display_and_arguments() {
+    let (said, codes, notes) = check_text(FAULT);
+    println!("thiserror miniature: codes {codes:?}, notes {notes:?}\n{said}");
+    notes_say_why("thiserror", &notes, &said);
+    assert!(error_lines(&said).is_empty(), "clean text, no error: {said}");
+}
+
+/// RULE 23 for (C): each negative's one injected error is found with its code.
+#[test]
+#[ignore = "OPEN (first run, 2026-11-17 23:48): the engine tests' fixture core has no `Copy` lang item, so the borrow check does not run on `bad` or `write_code` (note `FactUnknown { fact: \"Copy\", why: NoLangItem }`); un-ignore when the fixture gains the lang item"]
+fn engine_check_finds_the_borrow_errors_in_display_and_arguments() {
+    for (case, text, code) in [("fmt wrong", FMT_WRONG, "E0502"), ("arguments wrong", ARGS_WRONG, "E0506")] {
+        let (said, codes, notes) = check_text(text);
+        println!("{case}: codes {codes:?}, notes {notes:?}\n{said}");
+        notes_say_why(case, &notes, &said);
+        assert!(codes.iter().any(|c| c == code), "{case}: the injected error {code} is found: {codes:?}\n{said}");
+    }
+}

@@ -24,7 +24,7 @@
 
 use core::cell::RefCell;
 
-use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, Region, SigLife, SigRefusal};
+use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, FieldLead, Region, SigLife, SigRefusal};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use blaze_typeck::StableHasher;
@@ -33,7 +33,7 @@ use super::project::BodyVerdict;
 use super::reads::{Fact, FactKind, Read, ReadsError};
 
 /// The domain of a [`FactKind::BorrowAdt`] answer.
-const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v1";
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v2";
 /// The domain of a [`FactKind::BorrowHead`] answer.
 const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v1";
 
@@ -53,6 +53,8 @@ pub enum AdtAnswer<'f> {
         fields: &'f [tc::Name],
         /// Beside `fields`: the type parameter each is declared as, when a bare one.
         field_params: &'f [Option<u32>],
+        /// Beside `fields`: how each one's declared type begins (blaze-flow-lower `FieldLead`).
+        field_leads: &'f [FieldLead],
     },
 }
 
@@ -117,7 +119,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
     let mut h = StableHasher::new(ADT_DOMAIN);
     match answer {
         AdtAnswer::NotMade => h.tag(0),
-        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params } => {
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads } => {
             h.tag(1);
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
@@ -143,6 +145,18 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
                         h.u32(p);
                     }
                 }
+            }
+            h.u32(field_leads.len() as u32);
+            for &lead in field_leads {
+                let (tag, a, b) = match lead {
+                    FieldLead::Param(p) => (0, p, 0),
+                    FieldLead::Ref { mutbl, param } => (1 + u8::from(mutbl == tc::Mutbl::Mut), u32::from(param.is_some()), param.unwrap_or(0)),
+                    FieldLead::Plain => (3, 0, 0),
+                    FieldLead::Unread => (4, 0, 0),
+                };
+                h.tag(tag);
+                h.u32(a);
+                h.u32(b);
             }
         }
     }

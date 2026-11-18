@@ -292,6 +292,10 @@ pub(crate) enum LentPlant {
     /// The commit frees every chunk, a chunk a get lent from too (lent_tests: the held bytes
     /// after a commit under a live lend show it; the freed lend is never read).
     FreesLent,
+    /// The commit leaves the keys of a chunk a get lent from in `puts`, as it did until
+    /// 2026-11-18: a later get of any key of that chunk is answered from the arena, which a
+    /// reader in place refuses (aligned_tests: the key beside the one lent shows it).
+    KeepsLentKeys,
 }
 
 /// Sixteen bytes at sixteen-byte alignment: a put's payload starts as a segment's does.
@@ -346,8 +350,8 @@ pub struct Lent<D: Driver, A: Allocator + Clone> {
 /// was made from is never freed before the `Lent`: [`Lent::get`], the one place arena bytes
 /// are lent beyond a call, marks the chunk (`Inner::lent`) before it lends, and a commit frees
 /// only an unmarked chunk (whose bytes no reference outlives: every other read of a chunk, a
-/// put's compare, a commit's layout, a pointer's decode, ends inside its call), dropping its
-/// keys from `Inner::puts` so no later get reaches it. The caller borrows that `Lent` for `'l`,
+/// put's compare, a commit's layout, a pointer's decode, ends inside its call), and takes every
+/// key out of `Inner::puts`, so no later get reaches a freed chunk. The caller borrows that `Lent` for `'l`,
 /// so it lives, with nothing lent of it dropped, for `'l`; no `&mut` to those bytes is ever made
 /// (a mapping is read-only, a block is written once, before its first lend).
 unsafe fn lend<'l>(ptr: *const u8, len: usize) -> &'l [u8] {
@@ -384,9 +388,10 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         Lent { inner: RefCell::new(inner), alloc, plant }
     }
 
-    /// The record under `key`, in place, for the life of this borrow: this command's own put,
-    /// else the committed record of the first namespace read that holds it (a segment mapped
-    /// at its first probe, `Driven::get`). `None`: absent.
+    /// The record under `key`, for the life of this borrow: this command's own put while it
+    /// is not yet committed (from the arena: not in place), else the committed record of the
+    /// first namespace read that holds it (a segment mapped at its first probe, `Driven::get`),
+    /// in place. `None`: absent.
     pub fn get(&self, key: &Key) -> Result<Option<Lend<'_>>, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
@@ -426,9 +431,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// Whether `key` is held with exactly `bytes`, in any namespace: this command's own put,
     /// else the committed record (the store is asked as a get asks it). A comparison alone: it
     /// lends nothing, so it keeps no arena chunk past its commit. A [`Lent::get`] of an own put
-    /// does (`lend`'s contract): its whole chunk, and every other key put into it, then reads
-    /// from the arena to the `Lent`'s end and is refused in place ([`NotInPlace::Arena`]). So
-    /// "is this record here already" is asked here, never by a get (blaze-cli plain_place.rs
+    /// does (`lend`'s contract): its whole chunk stays allocated to the `Lent`'s end, though
+    /// after the commit every key of it is read from its segment like any other. So "is this
+    /// record here already" is asked here, never by a get (blaze-cli plain_place.rs
     /// `put_record`; aligned_tests.rs shows both).
     pub fn holds(&self, key: &Key, bytes: &[u8]) -> Result<bool, LentError> {
         let mut inner = self.inner.borrow_mut();
@@ -515,7 +520,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 inner.chunks[0].try_reserve(need).map_err(|_| LentError::Arena { bytes: total })?;
                 0
             }
-            LentPlant::None | LentPlant::RootFirst | LentPlant::PointerFirst | LentPlant::FreesLent => {
+            LentPlant::None | LentPlant::RootFirst | LentPlant::PointerFirst | LentPlant::FreesLent | LentPlant::KeepsLentKeys => {
                 // A chunk that lent takes no more puts: they would be kept with it.
                 let fits = inner.chunks.last().is_some_and(|chunk| chunk.capacity() - chunk.len() >= need) && inner.lent.last() == Some(&false);
                 if !fits {
@@ -661,8 +666,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     }
 
     /// What is not yet committed, one segment per namespace, one flip (a whole store: the
-    /// commit maps what is left first). Then every arena chunk no get lent from is freed and
-    /// its puts are read from the segment; what it lent stays lent (`lend`'s contract).
+    /// commit maps what is left first). From then on every put so far is read from its segment,
+    /// in place; every arena chunk no get lent from is freed, and what a get lent stays lent
+    /// (`lend`'s contract: its chunk is kept, holding no key).
     pub fn commit(&self) -> Result<Committed<A>, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
@@ -698,23 +704,24 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         inner.uncommitted_bytes = 0;
         drop(refs);
         drop(batches);
-        // Every put is in a segment now, read from its mapping: each chunk no get lent from is
-        // freed, and its keys leave `puts` so a later get reads the segment (`lend`'s contract).
-        // A chunk that lent stays, with its keys, to the `Lent`'s end.
+        // Every put is in a segment now and is read from its mapping from here on: EVERY key
+        // leaves `puts`, so a later get reads the segment in place whichever chunk held the put.
+        // (Until 2026-11-18 the keys of a chunk that lent stayed: one get of an own put before
+        // the commit, and every record put beside it was answered from the arena, refused in
+        // place, to the `Lent`'s end. The first `blaze run` in a fresh home ended so.) Each
+        // chunk no get lent from is freed; a chunk that lent stays to the `Lent`'s end, holding
+        // no key: its lends are read until then (`lend`'s contract), and nothing new reaches it.
         let free_lent = self.plant == LentPlant::FreesLent;
+        let keep_lent_keys = self.plant == LentPlant::KeepsLentKeys;
         let Inner { chunks, lent, puts, counts, .. } = inner;
-        let mut freed_any = false;
         for (chunk, lent) in chunks.iter_mut().zip(lent.iter()) {
             if (!*lent || free_lent) && chunk.capacity() > 0 {
                 counts.held_bytes = counts.held_bytes.saturating_sub(chunk.len() as u64 * 16);
                 counts.freed_chunks += 1;
                 *chunk = Vec::new_in(self.alloc.clone());
-                freed_any = true;
             }
         }
-        if freed_any {
-            puts.retain(|_, at| chunks[at.chunk as usize].capacity() > 0);
-        }
+        puts.retain(|_, at| keep_lent_keys && chunks[at.chunk as usize].capacity() > 0);
         Ok(committed)
     }
 

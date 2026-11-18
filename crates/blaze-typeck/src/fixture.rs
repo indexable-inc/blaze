@@ -27,6 +27,7 @@ use crate::world::{
     World,
 };
 
+mod pats;
 pub mod ranged;
 
 struct FnRow {

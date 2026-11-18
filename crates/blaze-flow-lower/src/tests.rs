@@ -88,7 +88,7 @@ impl Facts for Sigs {
 }
 
 /// The findings of one body under `facts` and `plant`, one line each; or the refusal.
-fn findings_with<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, plant: Plant) -> Result<vec::Vec<String>, Refusal> {
+pub(crate) fn findings_with<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, plant: Plant) -> Result<vec::Vec<String>, Refusal> {
     let c = checked(fx, b, owner, root);
     let view = b.view(owner, root);
     let lowered = lower_planted(&view, &c, facts, plant, Alloc::global())?;

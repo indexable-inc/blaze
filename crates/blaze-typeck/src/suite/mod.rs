@@ -97,6 +97,7 @@ mod blanket_beside_own_impl;
 mod self_fn_impl_args;
 mod specialize;
 mod dyn_closure_sig;
+mod diag_node;
 
 /// The keys of the world's items the cases name.
 struct Items {

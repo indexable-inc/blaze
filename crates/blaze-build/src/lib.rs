@@ -581,6 +581,16 @@ pub trait Adts {
         None
     }
 
+    /// Expression `expr` of `owner`'s body as a trap row keeps it: its first byte counted from
+    /// `owner`'s first byte (rule 71; for one inside a macro's expansion its outermost call's),
+    /// with no file. What a trap's site is (walk.rs `mark_trap`): a trap needs no `file!()`, so
+    /// an item whose file has no shown path (a toolchain crate's, an expansion's) still has
+    /// one; the report places it by the item (blaze-cli run_fault.rs). By default the offset of
+    /// [`Adts::caller_site`]'s answer.
+    fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
+        self.caller_site(owner, expr).map(|site| site.offset)
+    }
+
     /// The struct `core::panic::Location` (lang `panic_location`), the hidden parameter's
     /// pointee. No answer is refused with [`BuildError::NoLangFn`] naming `panic_location`.
     fn location_adt(&self) -> Option<ItemKey> {

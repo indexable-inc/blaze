@@ -191,9 +191,159 @@ enum Want {
     Refused(&'static str),
 }
 
-/// One program: [`HEAD`], its `PartialEq` impls, its items (a fn `f`), and `main` returning `f()`.
+/// core's own declarations, for the rows that ask whether a form of core's breaks the goal
+/// (lane RF11, 2026-11-17): `PartialEq` as cmp.rs writes it (`const trait`, `Rhs: PointeeSized =
+/// Self`, the supertrait `PointeeSized`), and the fieldless enum.
+const HEAD_CORE_FORM: &str = "#![feature(no_core, lang_items, unboxed_closures, rustc_attrs, const_trait_impl)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for bool {}
+impl Copy for u8 {}
+impl Copy for u16 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for i16 {}
+impl Copy for i32 {}
+
+#[lang = \"tuple_trait\"]
+trait Tuple {}
+
+#[lang = \"fn_once\"]
+#[rustc_paren_sugar]
+trait FnOnce<Args: Tuple> {
+    #[lang = \"fn_once_output\"]
+    type Output;
+    extern \"rust-call\" fn call_once(self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn_mut\"]
+#[rustc_paren_sugar]
+trait FnMut<Args: Tuple>: FnOnce<Args> {
+    extern \"rust-call\" fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn\"]
+#[rustc_paren_sugar]
+trait Fn<Args: Tuple>: FnMut<Args> {
+    extern \"rust-call\" fn call(&self, args: Args) -> Self::Output;
+}
+
+#[lang = \"eq\"]
+const trait PartialEq<Rhs: PointeeSized = Self>: PointeeSized {
+    fn eq(&self, other: &Rhs) -> bool;
+}
+
+enum K {
+    A,
+    B,
+    C,
+}
+
+";
+
+/// `u32`'s impl written out, and core's blanket impl over fn pointers (ptr/mod.rs:2622) with its
+/// lang trait (ops/function.rs:330): the goal `u32: PartialEq<?T>` has two impl candidates, and
+/// only `u32: FnPtr` having no solution (builtin.rs `assemble_fn_ptr_trait`) leaves one.
+const IMPLS_WITH_FN_PTR: &str = "
+#[lang = \"fn_ptr_trait\"]
+trait FnPtr: Copy {}
+
+impl<F: FnPtr> PartialEq for F {
+    fn eq(&self, other: &Self) -> bool {
+        true
+    }
+}
+
+impl PartialEq for u32 {
+    fn eq(&self, other: &u32) -> bool {
+        *self == *other
+    }
+}
+
+";
+
+/// The impls as core writes them (cmp.rs:2155 `impl_partial_eq_for_primitive!`: `const impl`,
+/// each self type a `ty` fragment, `other: &Self`), beside the blanket fn-pointer impl.
+const IMPLS_CORE_FORM: &str = "
+#[lang = \"fn_ptr_trait\"]
+trait FnPtr: Copy {}
+
+impl<F: FnPtr> PartialEq for F {
+    fn eq(&self, other: &Self) -> bool {
+        true
+    }
+}
+
+mod impls {
+    use crate::PartialEq;
+
+    macro_rules! impl_partial_eq_for_primitive {
+        ($($t:ty)*) => ($(
+            const impl PartialEq for $t {
+                #[inline]
+                fn eq(&self, other: &Self) -> bool { *self == *other }
+            }
+        )*)
+    }
+
+    impl_partial_eq_for_primitive! { bool u8 u16 u32 u64 i16 i32 }
+}
+
+";
+
+/// core's `from_prim` in its home: a `const fn` of an inherent impl over 44 variants (as many as
+/// `ErrorKind`'s list), so 44 goals `u32: PartialEq<?T>` are open in one body.
+const ITEMS_44: &str = "enum E {
+    V0, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21,
+    V22, V23, V24, V25, V26, V27, V28, V29, V30, V31, V32, V33, V34, V35, V36, V37, V38, V39, V40, V41,
+    V42, V43,
+}
+
+impl E {
+    const fn from_prim(ek: u32) -> u8 {
+        macro_rules! from_prim {
+            ($prim:expr => $Enum:ident { $($Variant:ident),* $(,)? }) => {{
+                // Force a compile error if the list gets out of date.
+                const _: fn(e: $Enum) = |e: $Enum| match e {
+                    $($Enum::$Variant => (),)*
+                };
+                match $prim {
+                    $(v if v == ($Enum::$Variant as _) => ($Enum::$Variant as u8) + 1,)*
+                    _ => 0,
+                }
+            }}
+        }
+        from_prim!(ek => E {
+            V0, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20,
+            V21, V22, V23, V24, V25, V26, V27, V28, V29, V30, V31, V32, V33, V34, V35, V36, V37, V38, V39,
+            V40, V41, V42, V43,
+        })
+    }
+}
+
+fn f() -> i32 {
+    E::from_prim(9) as i32
+}";
+
+/// One program: its head ([`HEAD`] or [`HEAD_CORE_FORM`]), its `PartialEq` impls, its items (a
+/// fn `f`), and `main` returning `f()`.
 struct Row {
     name: &'static str,
+    head: &'static str,
     impls: &'static str,
     items: &'static str,
     want: Want,
@@ -203,6 +353,7 @@ const ROWS: &[Row] = &[
     // (a) The shape: a match guard comparing the scrutinee with a variant cast to `_`.
     Row {
         name: "match_guard_shape",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn from_prim(ek: u32) -> u8 {
     match ek {
@@ -221,6 +372,7 @@ fn f() -> i32 {
     // `$Enum::$Variant as _`.
     Row {
         name: "macro_in_fn_shape",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn from_prim(ek: u32) -> u8 {
     macro_rules! from_prim {
@@ -243,6 +395,7 @@ fn f() -> i32 {
     // pointer, whose `match` must name every variant.
     Row {
         name: "macro_in_fn_with_the_const_line",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn from_prim(ek: u32) -> u8 {
     macro_rules! from_prim {
@@ -266,6 +419,7 @@ fn f() -> i32 {
     // (a) over impls made as core makes them (a `ty` fragment as each self type).
     Row {
         name: "shape_over_core_macro_impls",
+        head: HEAD,
         impls: IMPLS_BY_MACRO,
         items: "fn from_prim(ek: u32) -> u8 {
     match ek {
@@ -283,6 +437,7 @@ fn f() -> i32 {
     // (c) The target from the `let`'s written type.
     Row {
         name: "target_from_the_let",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn f() -> i32 {
     let x: u64 = 3u8 as _;
@@ -293,6 +448,7 @@ fn f() -> i32 {
     // (d) The target from the parameter the cast is passed to.
     Row {
         name: "target_from_the_parameter",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn take(x: i16) -> i16 {
     x
@@ -306,6 +462,7 @@ fn f() -> i32 {
     // (e) A hole inside a known head: `*const _`, filled by the cast's coercion.
     Row {
         name: "partial_hole_in_a_pointer",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn f() -> i32 {
     let p = &5u8 as *const _;
@@ -317,6 +474,7 @@ fn f() -> i32 {
     // (f) Resolved by a LATER statement: why the cast is judged at the end of the body.
     Row {
         name: "resolved_by_a_later_statement",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn f() -> i32 {
     let y = 7u8 as _;
@@ -328,6 +486,7 @@ fn f() -> i32 {
     // (g) Never constrained: type annotations needed, not `u8`.
     Row {
         name: "never_constrained_is_e0282",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn f() -> i32 {
     let w = 7u8 as _;
@@ -338,6 +497,7 @@ fn f() -> i32 {
     // (h) Invalid only once inference has run: an enum is no cast to `bool`.
     Row {
         name: "invalid_cast_found_after_inference",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn f() -> i32 {
     let s = K::A as _;
@@ -349,11 +509,81 @@ fn f() -> i32 {
     // (i) The comparison alone, in a plain fn.
     Row {
         name: "plain_comparison",
+        head: HEAD,
         impls: IMPLS_WRITTEN,
         items: "fn f() -> i32 {
     if 1u32 == (2u8 as _) { 1 } else { 3 }
 }",
         want: Want::Clean(3),
+    },
+    // THE FORMS OF CORE'S WORLD (lane RF11): each adds one thing core's `from_prim` has and
+    // the rows above do not, so the row that fails names the form that leaves the goal
+    // `u32: PartialEq<?T>` unsettled (E0282 at the cast).
+    // (j) core's blanket impl over fn pointers beside `u32`'s: two impl candidates, one held.
+    Row {
+        name: "fn_ptr_blanket_beside_u32_impl",
+        head: HEAD,
+        impls: IMPLS_WITH_FN_PTR,
+        items: "fn from_prim(ek: u32) -> u8 {
+    match ek {
+        v if v == (K::A as _) => 1,
+        v if v == (K::B as _) => 2,
+        _ => 0,
+    }
+}
+
+fn f() -> i32 {
+    from_prim(1) as i32
+}",
+        want: Want::Clean(2),
+    },
+    // (k) The blanket impl is the one a fn pointer's comparison takes.
+    Row {
+        name: "fn_pointers_compare_through_the_blanket_impl",
+        head: HEAD,
+        impls: IMPLS_WITH_FN_PTR,
+        items: "fn g() {}
+
+fn f() -> i32 {
+    let p: fn() = g;
+    if p == p { 1 } else { 0 }
+}",
+        want: Want::Clean(1),
+    },
+    // (l) core's declarations: `const trait PartialEq<Rhs: PointeeSized = Self>: PointeeSized`
+    // and `const impl PartialEq for $t` by macro in a module, with the blanket impl.
+    Row {
+        name: "core_form_trait_and_impls",
+        head: HEAD_CORE_FORM,
+        impls: IMPLS_CORE_FORM,
+        items: "fn from_prim(ek: u32) -> u8 {
+    match ek {
+        v if v == (K::A as _) => 1,
+        v if v == (K::B as _) => 2,
+        _ => 0,
+    }
+}
+
+fn f() -> i32 {
+    from_prim(1) as i32
+}",
+        want: Want::Clean(2),
+    },
+    // (m) core's body in its home: a `const fn` of an inherent impl, 44 variants.
+    Row {
+        name: "forty_four_variants_in_an_inherent_const_fn",
+        head: HEAD,
+        impls: IMPLS_WRITTEN,
+        items: ITEMS_44,
+        want: Want::Clean(10),
+    },
+    // (n) All of (j) to (m) at once: core's shape as far as a fixture writes it.
+    Row {
+        name: "core_s_whole_shape",
+        head: HEAD_CORE_FORM,
+        impls: IMPLS_CORE_FORM,
+        items: ITEMS_44,
+        want: Want::Clean(10),
     },
 ];
 
@@ -518,7 +748,7 @@ fn casts_to_inferred_targets_check_over_records() {
     let mut failed = 0usize;
     for row in ROWS {
         let mut text = AString::new_in(a);
-        text.push_str(HEAD);
+        text.push_str(row.head);
         text.push_str(row.impls);
         text.push_str(row.items);
         text.push_str(MAIN);

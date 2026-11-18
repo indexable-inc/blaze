@@ -90,9 +90,10 @@ pub(crate) struct Form<A: Allocator> {
     pub(crate) insts: u32,
     /// The calls' unwind rows (pass/unwind.rs).
     pub(crate) unwind: super::unwind::Rows<A>,
-    /// Per `unreachable` instruction in layout order, its `brk`'s offset: what a build's
+    /// Per `unreachable` instruction in layout order, its `brk`'s offset and where the value
+    /// a switch fell through on is held there (pass.rs `held_at_unreachable`): what a build's
     /// `TrapSource` ordinal names (record.rs makes the trap rows).
-    pub(crate) unreachables: Vec<u32, A>,
+    pub(crate) unreachables: Vec<(u32, blaze_code::record::Held), A>,
 }
 
 impl<A: Allocator + Clone> Form<A> {

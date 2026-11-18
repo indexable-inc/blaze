@@ -61,7 +61,11 @@ fn value(n: u32) -> Vec<u8> {
 }
 
 fn process(sim: Sim, n: u64, core: Plant, root: &Frame) -> Store<'_> {
-    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n, root), root, core).expect("the store opens"), root, LentPlant::None)
+    process_planted(sim, n, core, LentPlant::None, root)
+}
+
+fn process_planted(sim: Sim, n: u64, core: Plant, lent: LentPlant, root: &Frame) -> Store<'_> {
+    Lent::planted(Driven::planted(sim, Path::new("/sim"), cfg(n, root), root, core).expect("the store opens"), root, lent)
 }
 
 fn command(lent: &Store<'_>, range: std::ops::Range<u32>) -> Result<(), super::lent::LentError> {
@@ -131,11 +135,9 @@ fn an_own_put_is_refused_in_place_until_its_commit() {
 }
 
 /// Asking whether a put is held (`Lent::holds`) lends nothing: after the commit, in the SAME
-/// process, the key asked about and the key put beside it read from the segment's mapping. The
-/// control (rule 23): the same question asked by a get keeps the chunk, and the key beside it,
-/// never read before, is refused in place for the rest of the command. That was blaze-cli
-/// `put_record`'s equal-bytes check on a real project: an expansion record two units put kept
-/// the names records beside it in the arena, and every reader of them was refused.
+/// process, the key asked about and the key put beside it read from the segment's mapping, and
+/// no chunk is held. Asked by a get instead, the chunk is held to the `Lent`'s end (the lend is
+/// read after the commit), which is why blaze-cli `put_record`'s equal-bytes check asks `holds`.
 #[test]
 fn asking_whether_a_put_is_held_keeps_no_chunk_past_its_commit() {
     let root = test_root();
@@ -155,8 +157,42 @@ fn asking_whether_a_put_is_held_keeps_no_chunk_past_its_commit() {
     control.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
     assert!(control.get(&key(1)).expect("a get").is_some_and(|lend| lend.bytes == &value(1)[..]), "the same question, asked by a get");
     control.commit().expect("the commit");
-    assert_eq!(read(&control, 2), Read::NotInPlace(NotInPlace::Arena { len: value(2).len() }), "the control: a get kept the chunk, so the key beside it is not in place");
-    println!("holds: asked by comparison, both keys in place after the commit; asked by a get, the key beside it stayed in the arena");
+    assert_eq!(lent.counts().held_bytes, 0, "asked by `holds`: no chunk held after the commit: {:?}", lent.counts());
+    assert!(control.counts().held_bytes > 0, "asked by a get: its chunk is held after the commit: {:?}", control.counts());
+    println!("holds: asked by comparison, no chunk held after the commit; asked by a get, {} bytes held to the end", control.counts().held_bytes);
+}
+
+/// A get of an own put BEFORE its commit does not decide how anything reads AFTER it: the key
+/// lent, and the key put beside it in the same chunk, both read in place from the segment's
+/// mapping, while the bytes lent before the commit are still the same bytes (their chunk is
+/// kept). The control (rule 23, `LentPlant::KeepsLentKeys`, the commit as it was until
+/// 2026-11-18): the keys of the chunk that lent stay in the arena's table, and the key beside
+/// the one lent, never read before, is refused in place for the rest of the command. That was
+/// the first `blaze run` in a fresh home: the program's crate record, put in this command and
+/// read once before the phase's commit, was then "not read in place" by the run's names.
+#[test]
+fn a_get_before_the_commit_leaves_every_key_in_place_after_it() {
+    let root = test_root();
+    let lent = process(Sim::new(71, Faults::default()), 1, Plant::None, &root);
+    lent.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("a put");
+    lent.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
+    let before = lent.get(&key(1)).expect("a get").expect("the own put");
+    assert_eq!(before.in_place().err(), Some(NotInPlace::Arena { len: value(1).len() }), "before its commit an own put is lent from the arena");
+    lent.commit().expect("the commit");
+    assert_eq!((read(&lent, 1), read(&lent, 2)), (Read::InPlace, Read::InPlace), "after the commit: the key lent before and the key beside it, both in place");
+    assert_eq!(before.bytes, &value(1)[..], "the bytes lent before the commit are read after it");
+    // A put after the commit, in the same command, commits and reads in place as well.
+    lent.put(&key(3), Namespace::LOCAL, TAG, &value(3)).expect("a put after the commit");
+    lent.commit().expect("the second commit");
+    assert_eq!((read(&lent, 1), read(&lent, 2), read(&lent, 3)), (Read::InPlace, Read::InPlace, Read::InPlace), "after a second commit");
+
+    let control = process_planted(Sim::new(73, Faults::default()), 1, Plant::None, LentPlant::KeepsLentKeys, &root);
+    control.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("a put");
+    control.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("a put");
+    assert!(control.get(&key(1)).expect("a get").is_some(), "the get before the commit");
+    control.commit().expect("the commit");
+    assert_eq!(read(&control, 2), Read::NotInPlace(NotInPlace::Arena { len: value(2).len() }), "the control: the keys kept with the chunk, the key beside the one lent is not in place");
+    println!("lent then committed: both keys in place after the commit, the earlier lend still read; planted (keys kept with the chunk): the key beside it stayed in the arena");
 }
 
 /// Commits of records of every length mod 16, a compaction after every eighth (more segments

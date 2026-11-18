@@ -8,6 +8,8 @@ use crate::ty::{Ty, TyList};
 
 mod about;
 pub(crate) use about::About;
+mod node;
+pub use node::{Node, SKETCH_DEPTH, SKETCH_NODES, expr_form, node_form, pat_form, range_shared, sketch};
 
 /// The mark of a finding built by a constructor of src/diag/about.rs, each of which takes what
 /// the finding is about (rule 76). Private to `diag`, so no struct literal of [`Diag`] or
@@ -393,6 +395,10 @@ pub struct Diag {
     /// For an unmet bound (E0277): the impl's `where const` condition that is the reason, with
     /// `found` the bound's self type.
     pub because: Option<Because>,
+    /// The node of the body the finding was made at (src/diag/node.rs): what names it when its
+    /// range does not (in an expansion every node has the call's range; rule 19). `None` for a
+    /// finding about the whole body or about written text that is no node.
+    pub node: Option<Node>,
     /// Built only by [`PendingDiag::export`] or [`Diag::dyn_incompatible`].
     said: Said,
 }

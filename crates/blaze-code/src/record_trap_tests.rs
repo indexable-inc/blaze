@@ -4,7 +4,7 @@
 
 use blaze_own::{AVec, Alloc, Vec};
 
-use crate::record::{CodeRecord, CodeView, RecordError, TrapKind, TrapRow};
+use crate::record::{CodeRecord, CodeView, Held, RecordError, TrapKind, TrapRow};
 
 const BRK_UNREACHABLE: u32 = 0xD420_0000 | (0xff02 << 5);
 const RET: u32 = 0xD65F_03C0;
@@ -24,8 +24,8 @@ fn sealed(rows: &[TrapRow], alloc: Alloc<'static>) -> Result<AVec<'static, u8>, 
 #[test]
 fn traps_seal_by_offset_and_read_back() {
     let alloc = blaze_own::testing::heap().alloc();
-    let arm = TrapRow { at: 4, kind: TrapKind::MatchNoArm, site: Some((0x1234_5678_9abc_def0_0fed_cba9_8765_4321, 17)) };
-    let end = TrapRow { at: 12, kind: TrapKind::BodyEnd, site: None };
+    let arm = TrapRow { at: 4, kind: TrapKind::MatchNoArm, site: Some((0x1234_5678_9abc_def0_0fed_cba9_8765_4321, 17)), held: Held::Unknown, subject: None };
+    let end = TrapRow { at: 12, kind: TrapKind::BodyEnd, site: None, held: Held::Unknown, subject: None };
     let one = sealed(&[end, arm], alloc).unwrap();
     let other = sealed(&[arm, end], alloc).unwrap();
     assert_eq!(one[..], other[..], "the order rows were added in leaves no trace (rule 25)");
@@ -38,24 +38,24 @@ fn traps_seal_by_offset_and_read_back() {
     assert_eq!(view.trap_at(8), None, "a `ret` has no row");
     assert_eq!(view.trap_at(0), None);
     assert_eq!(view.trap_at(16), None);
-    assert_eq!(&one[..8], b"bzcode04");
+    assert_eq!(&one[..8], b"bzcode05");
 }
 
 #[test]
 fn a_bad_trap_row_is_refused() {
     let alloc = blaze_own::testing::heap().alloc();
-    let row = |at| TrapRow { at, kind: TrapKind::LetElse, site: None };
+    let row = |at| TrapRow { at, kind: TrapKind::LetElse, site: None, held: Held::Unknown, subject: None };
     assert_eq!(sealed(&[row(16)], alloc).err(), Some(RecordError::TrapOutside { at: 16, code: 16 }));
     assert_eq!(sealed(&[row(6)], alloc).err(), Some(RecordError::TrapOutside { at: 6, code: 16 }));
     assert_eq!(sealed(&[row(4), row(4)], alloc).err(), Some(RecordError::TrapsTwice { at: 4 }));
-    let none_word = TrapRow { at: 4, kind: TrapKind::LetElse, site: Some((1, u32::MAX)) };
+    let none_word = TrapRow { at: 4, kind: TrapKind::LetElse, site: Some((1, u32::MAX)), held: Held::Unknown, subject: None };
     assert_eq!(sealed(&[none_word], alloc).err(), Some(RecordError::TrapSite { at: 4 }));
 }
 
 #[test]
 fn an_unknown_trap_kind_is_refused_on_read() {
     let alloc = blaze_own::testing::heap().alloc();
-    let mut bytes = sealed(&[TrapRow { at: 4, kind: TrapKind::Intrinsic, site: None }], alloc).unwrap();
+    let mut bytes = sealed(&[TrapRow { at: 4, kind: TrapKind::Intrinsic, site: None, held: Held::Unknown, subject: None }], alloc).unwrap();
     // The trap rows follow the head (56), the code (16) and no relro, target, site, word or pad.
     let kind_byte = 56 + 16 + 4;
     assert_eq!(bytes[kind_byte], TrapKind::Intrinsic as u8);

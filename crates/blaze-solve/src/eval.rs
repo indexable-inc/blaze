@@ -34,7 +34,7 @@ use crate::search::{Ans, FIXPOINT_STEP_LIMIT, Heads, Inputs, MAX_DEPTH, PathKind
 use crate::term::{Certainty, Def, Flags, GoalSource, Lang, MarkerTrait, Polarity, Pred, Ty, TyKind, TypingMode, VarKind};
 use crate::trait_goals;
 use crate::tys::Tys;
-use crate::witness::{Choice, Derivations, Emit, NoDerivation};
+use crate::witness::{self, Answered, Choice, Derivations, Emit, Fate, NoDerivation, Refusal, Trace, TraceAsk, TracedRoot};
 
 /// A root goal's answer, its response applied to the caller's variables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +225,9 @@ pub struct Solver<'a, E = NoDerivation> {
     /// each ground root goal's canonical input with its environment's canonical words in place
     /// of the env id, so goals of different bodies (different solvers) compare.
     root_keys: Option<Vec<u64, Alloc<'a>>>,
+    /// A measurement, off unless asked for ([`Solver::trace_on`]): every candidate, merge and
+    /// root evaluation of the goals of one trait (witness.rs, "the trait-goal trace").
+    trace: Option<Trace<'a>>,
     /// The plain-goal memo: a goal with no inference variable, by its own identity (mode,
     /// env id, interned predicate handles, bound count), to its interned canonical input.
     /// Such a goal's canonical words are a function of those handles alone (`goal_input`
@@ -512,6 +515,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             marker_reads: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             marker_pool: Vec::new_in(alloc),
             root_keys: None,
+            trace: None,
             plain: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             sharing: false,
             share_new: Vec::new_in(alloc),
@@ -557,6 +561,18 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// reached the search, in order.
     pub fn root_keys(&self) -> &[u64] {
         self.root_keys.as_deref().unwrap_or(&[])
+    }
+
+    /// Traces the goals `ask` names from now on (witness.rs, "the trait-goal trace"): every
+    /// candidate a frame for one of them runs, with what became of it, each merge, and each
+    /// root evaluation. A measurement, off by default; asking again starts a new trace.
+    pub fn trace_on(&mut self, ask: TraceAsk) {
+        self.trace = Some(Trace::new_in(ask, self.alloc));
+    }
+
+    /// The trace kept since [`Solver::trace_on`], ending it; `None` when none was asked.
+    pub fn take_trace(&mut self) -> Option<Trace<'a>> {
+        self.trace.take()
     }
 
     /// What this solver did so far, counted ([`Stats`]).
@@ -707,6 +723,43 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// [`Solver::evaluate`] over a source that may fill a missing fact where it is met
     /// ([`FactSource`]): `Stop::Need` only when the source does not fill it.
     pub fn evaluate_from<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+        reads: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<Answer, Stop> {
+        // The trace's root row (witness.rs): one test of `None` when off.
+        let traced = match &self.trace {
+            Some(t) => t.ask().matches(&*tys, goal.pred),
+            None => None,
+        };
+        let Some(before) = traced else { return self.evaluate_once(tys, src, mode, goal, reads) };
+        let at = self.scratch.stats;
+        let r = self.evaluate_once(tys, src, mode, goal, reads);
+        let now = self.scratch.stats;
+        let how = if now.fast_path > at.fast_path {
+            Answered::FastPath
+        } else if now.frames > at.frames {
+            Answered::Framed
+        } else if now.shared_hits > at.shared_hits {
+            Answered::Shared
+        } else {
+            Answered::Cached
+        };
+        let after = match goal.pred {
+            Pred::Trait { args, .. } => witness::kinds_of(&*tys, args),
+            _ => before,
+        };
+        let answer = r.as_ref().ok().copied();
+        if let Some(t) = &mut self.trace {
+            t.root(TracedRoot { before, after, answer, how });
+        }
+        r
+    }
+
+    fn evaluate_once<T: Tys, S: FactSource<T>>(
         &mut self,
         tys: &mut T,
         src: &mut S,
@@ -1312,7 +1365,15 @@ impl<'a, E: Emit> Solver<'a, E> {
     ) -> Result<Option<Ans>, Stop> {
         let phase = self.frames[top].phase;
         match phase {
-            Phase::Start => self.pull(tys, src, top, |s, tys, facts| s.start(tys, facts, top))?,
+            Phase::Start => {
+                self.pull(tys, src, top, |s, tys, facts| s.start(tys, facts, top))?;
+                if let Some(t) = &mut self.trace {
+                    let f = &self.frames[top];
+                    if let (Some(args), Pred::Trait { trait_, .. }) = (t.ask().matches(&*tys, f.goal.pred), f.goal.pred) {
+                        t.admit(f.input, trait_, args);
+                    }
+                }
+            }
             Phase::Assemble(k) => self.assemble(tys, src, top, k)?,
             Phase::NextCand => self.next_cand(tys, src, probes, top)?,
             Phase::Step(k) => self.step(tys, src, probes, top, k)?,
@@ -1591,6 +1652,8 @@ impl<'a, E: Emit> Solver<'a, E> {
         top: usize,
         stage: u8,
     ) -> Result<(), Stop> {
+        // The trace's two counters before the step (witness.rs `Refusal`), only when tracing.
+        let at = self.trace.as_ref().map(|_| (self.scratch.stats.impl_prematch_rejected, self.scratch.stats.impl_header_mismatch));
         let (r, cand) = self.pull(tys, src, top, |s, tys, facts| {
             let mut cand = s.frames[top].cand;
             let mut cx = s.cx(tys, facts, top);
@@ -1606,6 +1669,19 @@ impl<'a, E: Emit> Solver<'a, E> {
             Ok((r, cand))
         })?;
         self.take_added();
+        if let Some((prematch, mismatch)) = at
+            && matches!(r, Step::No)
+        {
+            let now = self.scratch.stats;
+            let why = if now.impl_prematch_rejected > prematch {
+                Refusal::Prematch
+            } else if now.impl_header_mismatch > mismatch {
+                Refusal::Header
+            } else {
+                Refusal::Rule
+            };
+            self.trace_cand(top, cand, Fate::Refused(why));
+        }
         let fr = &mut self.frames[top];
         fr.cand = cand;
         let lo = fr.probe_lo;
@@ -1615,6 +1691,14 @@ impl<'a, E: Emit> Solver<'a, E> {
             Step::Done(c) => Self::begin_nested(fr, lo, After::Make(c)),
         }
         Ok(())
+    }
+
+    /// Candidate `cand` of frame `top` met `fate`: a trace row when the frame's goal is traced.
+    fn trace_cand(&mut self, top: usize, cand: Cand, fate: Fate) {
+        let input = self.frames[top].input;
+        if let Some(t) = &mut self.trace {
+            t.cand(input, Choice::of(&cand), fate);
+        }
     }
 
     fn end_probe<T: Tys>(&mut self, tys: &mut T, probes: &mut [Option<T::Snapshot>], top: usize, resp: Option<RespId>) {
@@ -1699,7 +1783,17 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.frames[top].fgoals_hi = f.goals_lo;
                 self.frames[top].phase = Phase::Merge;
             }
-            After::Step(_) | After::Make(_) => self.end_probe(tys, probes, top, None),
+            After::Step(_) | After::Make(_) => {
+                if self.trace.is_some() {
+                    // `receive` leaves `nested.i` at the goal that failed.
+                    let (trait_, self_kind) = match self.goals.get(f.nested.i as usize).map(|g| g.pred) {
+                        Some(Pred::Trait { trait_, args, .. }) => (Some(trait_), witness::kinds_of(&*tys, args)[0]),
+                        _ => (None, None),
+                    };
+                    self.trace_cand(top, f.cand, Fate::NestedNo { trait_, self_kind });
+                }
+                self.end_probe(tys, probes, top, None)
+            }
         }
     }
 
@@ -1714,6 +1808,10 @@ impl<'a, E: Emit> Solver<'a, E> {
             After::Step(k) => self.frames[top].phase = Phase::Step(k),
             After::Make(shallow) => {
                 let r = self.make_response(tys, top, shallow, c)?;
+                if self.trace.is_some() {
+                    let fate = Fate::Held { certainty: self.resps.certainty(r), constrains: !self.resps.is_identity(r) };
+                    self.trace_cand(top, f.cand, fate);
+                }
                 self.end_probe(tys, probes, top, Some(r));
             }
         }
@@ -1904,6 +2002,10 @@ impl<'a, E: Emit> Solver<'a, E> {
             Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, &mut dones, &mut specializes)?,
             Kind::WellFormed | Kind::Other => m.merge_responses(&dones)?,
         };
+        if let Some(t) = &mut self.trace {
+            let verdict = ans.map(|r| (self.resps.certainty(r), !self.resps.is_identity(r)));
+            t.merge(f.input, dones.len() as u32, verdict);
+        }
         if E::ON
             && let Some(r) = ans
         {

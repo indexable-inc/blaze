@@ -9,7 +9,7 @@ use std::alloc::Global;
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
 use blaze_lir::func::{BlockKind, Conv, Ext, RefId, RefKind, SlotId, SlotKind};
 use blaze_lir::{Block, Builder, Flags, Full, IntCond, Op, Ty, Value};
-use blaze_code::record::{TrapKind, TrapSource};
+use blaze_code::record::{SUBJECT_SHOWN, Subject, TrapKind, TrapSource};
 use blaze_own::Alloc;
 use blaze_typeck::{
     AdjustKind, AdtKind, BinOp, BodyView, Checked, CtorKind, Def, Edition, Expr, ExprId, FnSig, IntTy, ItemKey, LangItem, List, Lit, Mutbl,
@@ -667,8 +667,9 @@ pub(crate) fn build<A: Allocator + Clone>(
     w.into_built()
 }
 
-/// One `unreachable` a walk wrote to end a construct: its instruction, kind and site.
-type TrapMark = (u32, TrapKind, Option<(u128, u32)>);
+/// One `unreachable` a walk wrote to end a construct: its instruction, kind, site and subject
+/// (the enum an enum copy's switch read the discriminant of).
+type TrapMark = (u32, TrapKind, Option<(u128, u32)>, Option<Subject>);
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// An `unreachable` ending the construct of `kind` at expression `at`, and its row of the
@@ -677,7 +678,29 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// say or there is no expression.
     pub(crate) fn unreachable_of(&mut self, kind: TrapKind, at: Option<ExprId>) {
         let inst = self.b.unreachable_inst();
-        self.mark_trap(inst.0, kind, at);
+        self.mark_trap(inst.0, kind, at, None);
+    }
+
+    /// [`Walk::unreachable_of`] for the no-variant arm of an enum copy's switch on the
+    /// discriminant of enum layout `id`: its row also names the enum and its discriminants as
+    /// the switch compares them ([`Walk::subject_of`]).
+    fn unreachable_of_enum(&mut self, id: LayoutId, len: u32, at: Option<ExprId>) -> Result<(), BuildError> {
+        let subject = self.subject_of(id, len)?;
+        let inst = self.b.unreachable_inst();
+        self.mark_trap(inst.0, TrapKind::Discriminant, at, subject);
+        Ok(())
+    }
+
+    /// The enum of layout `id` as a trap row names it: its item and the first discriminants of
+    /// the `len` variants the copy's switch compares (`discriminant_case`, the same values).
+    /// `None` when its type is no ADT (an enum layout of another type has no item to name).
+    fn subject_of(&self, id: LayoutId, len: u32) -> Result<Option<Subject>, BuildError> {
+        let Ok(PNode::Adt(item, _)) = self.ground_node(self.ls.get(id).ty) else { return Ok(None) };
+        let mut discriminants = [0u64; SUBJECT_SHOWN];
+        for (v, d) in discriminants.iter_mut().enumerate().take(len as usize) {
+            *d = self.discriminant_case(id, v as u32)? as u64;
+        }
+        Ok(Some(Subject { item: item.0, count: len, discriminants }))
     }
 
     /// [`Walk::unreachable_of`] for the `unreachable` just written by another lowering (the
@@ -686,13 +709,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let ops = &self.b.func().ops;
         let last = ops.len().checked_sub(1).filter(|&i| ops[i] == Op::Unreachable as u8);
         let inst = last.ok_or(malformed("a diverging lowering that did not end in `unreachable` (a build bug)"))?;
-        self.mark_trap(inst as u32, kind, at);
+        self.mark_trap(inst as u32, kind, at, None);
         Ok(())
     }
 
-    fn mark_trap(&mut self, inst: u32, kind: TrapKind, at: Option<ExprId>) {
-        let site = at.and_then(|e| self.adts.caller_site(self.body.owner, e)).map(|s| (s.item.0, s.offset));
-        self.trap_marks.push((inst, kind, site));
+    fn mark_trap(&mut self, inst: u32, kind: TrapKind, at: Option<ExprId>, subject: Option<Subject>) {
+        let site = at.and_then(|e| self.adts.expr_site(self.body.owner, e)).map(|offset| (self.body.owner.0, offset));
+        self.trap_marks.push((inst, kind, site, subject));
     }
 
     /// The walk's function, finished and verified, with its tables: every walk ends here.
@@ -714,13 +737,13 @@ fn trap_sources<A: Allocator + Clone>(func: &blaze_lir::Func<A>, marks: &[TrapMa
     let unreachable = Op::Unreachable as u8;
     let mut out = Vec::with_capacity_in(marks.len(), alloc);
     let (mut ordinal, mut next) = (0u32, 0usize);
-    for &(inst, kind, site) in marks {
+    for &(inst, kind, site, subject) in marks {
         let at = inst as usize;
         if at < next || func.ops.get(at) != Some(&unreachable) {
             return Err(BuildError::Malformed { what: "a trap mark that is not the function's next `unreachable`" });
         }
         ordinal += func.ops[next..at].iter().filter(|&&op| op == unreachable).count() as u32;
-        out.push(TrapSource { ordinal, kind, site });
+        out.push(TrapSource { ordinal, kind, site, subject });
         ordinal += 1;
         next = at + 1;
     }
@@ -1758,7 +1781,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             self.switch(d, none, &cases);
                             // No variant has another discriminant: holding one is UB.
                             self.begin(none);
-                            self.unreachable_of(TrapKind::Discriminant, self.task_at);
+                            self.unreachable_of_enum(id, len, self.task_at)?;
                         }
                     }
                 }

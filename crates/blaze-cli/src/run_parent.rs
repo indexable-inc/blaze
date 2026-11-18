@@ -930,6 +930,13 @@ impl<F: Front, D: Folder> crate::run_fault::Places for Lazy<'_, '_, F, D> {
     fn site(&mut self, item: ItemKey, at: u32) -> Option<crate::run_fault::SiteShown> {
         self.site_of(item, at)
     }
+
+    /// The item itself, no instance (a trap row's subject enum): `Front::named` with no name,
+    /// which the maker's `instance_shown` reads as the bare item.
+    fn item(&mut self, item: ItemKey) -> crate::run_fault::Named {
+        let maker = self.started.as_ref().and_then(|started| started.heavy.as_ref()).map(|heavy| &heavy.maker);
+        self.front.named(maker, item, &[])
+    }
 }
 
 /// The roots and the walk, made on the first call (each root rooted, nothing stepped).

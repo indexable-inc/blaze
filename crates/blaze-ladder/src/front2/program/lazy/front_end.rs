@@ -205,6 +205,13 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         super::seam_rules::caller_site(self.front.names, &self.front.keys, owner, &live.again, expr)
     }
 
+    /// From `owner`'s live body by program/seam_rules.rs `expr_offset`: no file asked, so a
+    /// toolchain crate's trap keeps its site.
+    fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
+        let live = self.live_by_key(owner)?;
+        super::seam_rules::expr_offset(&live.again, expr)
+    }
+
     /// program/seam_rules.rs `source_position`: the item's first byte today and today's text of
     /// its file, from the names source (over records, item_grain.rs `row_now` and `file_now`).
     fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {

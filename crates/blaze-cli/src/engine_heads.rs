@@ -1365,6 +1365,8 @@ fn heads_of(
         let mut out = blaze_ids::Hasher::new(HEAD_OUT_DOMAIN);
         let mut worked = WorkedHead { out: ContentId([0; 32]), defines: std::vec::Vec::new_in(Global), items: SVec::new_in(heap.shared()), reads: std::vec::Vec::new_in(Global), payload: std::vec::Vec::new_in(Global), failed: std::vec::Vec::new_in(Global) };
         let mut failed: Option<&'static str> = None;
+        // How long `worked.reads` was when it was last settled (`once_each`).
+        let mut settled = 0usize;
         let mine = &rows[from..from + rows[from..].iter().take_while(|(entry, _, _, _, _)| *entry == name).count()];
         // Two heads under one cell would be two values under one key (rule 21): the whole
         // entry is refused, the two heads named as its text names them.
@@ -1475,6 +1477,11 @@ fn heads_of(
                     failed.get_or_insert("its head read more names cells than the recorder holds (front2 tables/recorder.rs)");
                 }
             }
+            // Each cell once so far, whenever the list has doubled since it last was.
+            if worked.reads.len() > settled.saturating_mul(2).max(SETTLE_AT) {
+                once_each(&mut worked.reads);
+                settled = worked.reads.len();
+            }
             let cell = *cell;
             // A head not frozen fails alone (module docs): its cell the digest of its reason.
             if let Some(error) = &made.failed {
@@ -1494,6 +1501,10 @@ fn heads_of(
             worked.payload.extend_from_slice(&u32::try_from(made.bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
             worked.payload.extend_from_slice(&made.bytes);
         }
+        // What the phase keeps of this task until its row is written: each cell once, in a
+        // block of that size.
+        once_each(&mut worked.reads);
+        worked.reads.shrink_to_fit();
         done.push(match failed {
             Some(why) => Err(HeadFailed { why, reads: worked.reads }),
             None => {
@@ -1508,3 +1519,18 @@ fn heads_of(
 /// The most heads one head's freeze is followed through ([`heads_of`], rule 18): past it the
 /// task fails by name.
 const MOST_HEAD_READS: usize = 1 << 12;
+
+/// A task's reads so far, each cell once. A read list is a set (`run_items` sorts and dedups
+/// its row's; a refusal's goes through `failed_with`), and a head's freeze pushes one entry a
+/// names read: thousands, which land on a few records' `WHOLE` cells (`names_read`). Left as
+/// pushed, the lists of a phase's tasks were 4.6 GB of the 9.0 GB live four minutes into a real
+/// workspace's check (tempo, 2026-11-17: 1125 lists of about 4 MB each, growing until the
+/// memory guard stopped the run).
+fn once_each<A: core::alloc::Allocator>(reads: &mut std::vec::Vec<CellId, A>) {
+    reads.sort_unstable();
+    reads.dedup();
+}
+
+/// A read list is settled ([`once_each`]) when it passes this many entries, and then each time
+/// it doubles, so the sorting stays linear in what was pushed.
+const SETTLE_AT: usize = 1 << 10;

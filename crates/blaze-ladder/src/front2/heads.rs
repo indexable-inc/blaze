@@ -690,6 +690,10 @@ pub struct Store<'n> {
     /// The shared goals the last check round of the body took (blaze-solve `GoalHit`): the
     /// one read each names, for the body's result (tables/task.rs `BodyOut::goal_hits`).
     pub goal_hits: Vec<blaze_solve::share::GoalHit, Global>,
+    /// A measurement for tests, off unless set: the trait goals each check round's solver
+    /// traces (blaze-solve witness.rs, "the trait-goal trace"), and the last round's trace.
+    pub trace: Option<blaze_solve::witness::TraceAsk>,
+    pub traced: Option<blaze_solve::witness::Trace<'static>>,
     /// The needs a step met beside the one it stopped at (`trait_members`), taken by the
     /// next step of [`Store::ensure_noting`].
     more_needs: Vec<LibKey, Global>,
@@ -1018,6 +1022,8 @@ impl<'n> Store<'n> {
             cost: None,
             goals: None,
             goal_hits: Vec::new_in(Global),
+            trace: None,
+            traced: None,
             more_needs: Vec::new_in(Global),
             seeds: None,
             seed_error: None,

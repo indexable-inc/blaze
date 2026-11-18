@@ -101,7 +101,7 @@ use blaze_own::Vec;
 use blaze_typeck::{ExprId, ItemKey, List, Name, PNode, PTy, PTys};
 use core::alloc::Allocator;
 
-use crate::sig::{Region, SigLife, SigRefusal};
+use crate::sig::{Region, SigLife};
 use crate::{At, Facts, Form, Lower, Refusal, TyD, Val};
 
 /// One origin position of a head's written type, in the lowering's order (a reference, then
@@ -166,6 +166,75 @@ pub struct CallBounds<'s> {
     pub trait_bounded: &'s [u32],
 }
 
+/// Why [`read_shape`] gave a head no generic shape, by the input or output it met it in (`part`:
+/// the input's index; the output's is the number of inputs). A call of such a head that writes
+/// lifetimes is refused `CallWritesLifetimes { lacks: Shape }`; the caller words it with this
+/// (rule 19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeRefusal {
+    /// A type of the table could not be read.
+    Unknown { part: u32 },
+    /// The walk went past its bound.
+    Bound { part: u32 },
+    /// An ADT whose head's lifetime count is not known.
+    AdtUnknown { part: u32, adt: ItemKey },
+    /// A projection `<A0 as Tr<..>>::Name` that is not CLOSED (the module doc, "PROJECTIONS"):
+    /// `Tr` declares a lifetime parameter (`Deserializer<'de>`, `Visitor<'de>`,
+    /// `AsDisplay<'a>`) or `Name` has generics of its own (`closed` said `Some(false)`), or the
+    /// trait's text was not read (`None`). Its normalized type may hold the trait's lifetime
+    /// ARGUMENT, which no type argument of the call carries (portable types hold no regions):
+    /// at a call through a caller's `D: Deserializer<'de>` that region is the caller's `'de`,
+    /// fixed by the caller's where clause, not a region the call may choose, so standing for
+    /// it with a fresh region per call could accept what rustc refuses.
+    OpenProjection { part: u32, trait_: ItemKey, name: Name, closed: Option<bool> },
+    /// A closed projection whose arguments hold a region of the head's own (a reference, a
+    /// trait object, an ADT with a lifetime): that position is not one the mark stands for.
+    ProjectionHoldsRegion { part: u32, trait_: ItemKey, name: Name },
+    /// An opaque type (`impl Trait`): which lifetimes it captures is not read.
+    Opaque { part: u32, opaque: ItemKey },
+    /// A closure, async block or coroutine type in a head.
+    Unnameable { part: u32 },
+}
+
+/// Why a call of a head that writes lifetimes was not lined up with its instantiated signature
+/// (`call_by_generic_signature` related nothing), the detail of
+/// `CallLacks::Unaligned` (rule 19). `part`: the operand's index; the destination's is the
+/// number of operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Misfit {
+    /// The instantiation was not tried at this call.
+    NotTried,
+    /// The head's shape has `shape` inputs, its lifetime part `sig`, and the call `call`
+    /// operands.
+    Inputs { shape: u32, sig: u32, call: u32 },
+    /// The shape's marks or the lifetime part's regions for `part` are out of order: a
+    /// malformed row.
+    Malformed { part: u32 },
+    /// The lifetime part has another number of regions for `part` than the shape has written
+    /// lifetime positions there.
+    RegionCount { part: u32 },
+    /// A region the head's text does not say (an opaque type's or an associated type's,
+    /// `Region::Hidden`) at a written lifetime position of `part`.
+    HiddenRegion { part: u32 },
+    /// A projection in an input (its demand is the impl's to say: impl_call.rs), or two in one
+    /// part.
+    InputProjection { part: u32 },
+    /// The output's projection stands for the destination's positions, and the destination is
+    /// no exact place or has fewer positions than the output's others.
+    ProjectionUnplaced { part: u32 },
+    /// The output projection's arguments hold lifetimes that are not positions (a trait
+    /// object, a closure's captures) or a type parameter of the body.
+    ProjectionLoose { part: u32 },
+    /// The operand or destination `part` is no exact place (`exact`), or has `have` positions
+    /// where the instantiated parameter has `want`.
+    Positions { part: u32, want: u32, have: u32, exact: bool },
+}
+
+/// A table read's error at `part`, whatever the table's error type: [`ShapeRefusal::Unknown`].
+fn unread<E>(part: u32) -> impl FnOnce(E) -> ShapeRefusal {
+    move |_| ShapeRefusal::Unknown { part }
+}
+
 /// What stands at one origin position of an instantiated part.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Slot {
@@ -195,7 +264,7 @@ pub fn read_shape<A: Allocator + Clone>(
     closed: &dyn Fn(ItemKey, Name) -> Option<bool>,
     out: &mut ShapeBuf<A>,
     alloc: A,
-) -> Result<(), SigRefusal> {
+) -> Result<(), ShapeRefusal> {
     out.marks.clear();
     out.ends.clear();
     out.joins.clear();
@@ -203,56 +272,59 @@ pub fn read_shape<A: Allocator + Clone>(
     // A work list in the lowering's order: popped last first, so children go in reversed.
     let mut stack: Vec<PTy, A> = Vec::new_in(alloc);
     for (j, &top) in inputs.iter().chain(core::iter::once(&output)).enumerate() {
+        let part = j as u32;
         stack.clear();
         stack.push(top);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST {
-                return Err(SigRefusal::Bound);
+                return Err(ShapeRefusal::Bound { part });
             }
-            match tys.node(t).map_err(|_| SigRefusal::Unknown)? {
+            match tys.node(t).map_err(unread(part))? {
                 PNode::Ref(_, i) => {
                     out.marks.push(Mark::Own);
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
                 PNode::Tuple(l) => {
-                    for &x in tys.list(l).map_err(|_| SigRefusal::Unknown)?.iter().rev() {
+                    for &x in tys.list(l).map_err(unread(part))?.iter().rev() {
                         stack.push(x);
                     }
                 }
                 PNode::Adt(k, l) => {
-                    for _ in 0..adt_lifetimes(k).ok_or(SigRefusal::Unknown)? {
+                    for _ in 0..adt_lifetimes(k).ok_or(ShapeRefusal::AdtUnknown { part, adt: k })? {
                         out.marks.push(Mark::Own);
                     }
-                    for &x in tys.list(l).map_err(|_| SigRefusal::Unknown)?.iter().rev() {
+                    for &x in tys.list(l).map_err(unread(part))?.iter().rev() {
                         stack.push(x);
                     }
                 }
                 PNode::Dynamic(_) => out.marks.push(Mark::Own),
                 PNode::Param(i) => out.marks.push(Mark::Param(i)),
                 PNode::Alias { trait_, name, args } => {
-                    if closed(trait_, name) != Some(true) {
-                        return Err(SigRefusal::TypeNode);
+                    let is_closed = closed(trait_, name);
+                    if is_closed != Some(true) {
+                        return Err(ShapeRefusal::OpenProjection { part, trait_, name, closed: is_closed });
                     }
                     // The parameters its arguments name; any region of the head's own in them
                     // (a reference, a trait object, an ADT with a lifetime) is not a position
                     // this mark stands for: refused.
+                    let holds = ShapeRefusal::ProjectionHoldsRegion { part, trait_, name };
                     let lo = out.joins.len() as u32;
                     inner.clear();
-                    inner.extend_from_slice(tys.list(args).map_err(|_| SigRefusal::Unknown)?);
+                    inner.extend_from_slice(tys.list(args).map_err(unread(part))?);
                     while let Some(x) = inner.pop() {
                         steps += 1;
                         if steps > MOST {
-                            return Err(SigRefusal::Bound);
+                            return Err(ShapeRefusal::Bound { part });
                         }
-                        match tys.node(x).map_err(|_| SigRefusal::Unknown)? {
+                        match tys.node(x).map_err(unread(part))? {
                             PNode::Param(i) => out.joins.push(i),
-                            PNode::Adt(k, l) if adt_lifetimes(k).ok_or(SigRefusal::Unknown)? == 0 => {
-                                inner.extend_from_slice(tys.list(l).map_err(|_| SigRefusal::Unknown)?);
+                            PNode::Adt(k, l) if adt_lifetimes(k).ok_or(ShapeRefusal::AdtUnknown { part, adt: k })? == 0 => {
+                                inner.extend_from_slice(tys.list(l).map_err(unread(part))?);
                             }
-                            PNode::Tuple(l) => inner.extend_from_slice(tys.list(l).map_err(|_| SigRefusal::Unknown)?),
+                            PNode::Tuple(l) => inner.extend_from_slice(tys.list(l).map_err(unread(part))?),
                             PNode::Slice(i) | PNode::Array(i, _) | PNode::Pat(i, _) | PNode::Ptr(_, i) => inner.push(i),
                             PNode::Bool
                             | PNode::Char
@@ -263,7 +335,7 @@ pub fn read_shape<A: Allocator + Clone>(
                             | PNode::Never
                             | PNode::ConstValue { .. }
                             | PNode::ConstParam(_) => {}
-                            _ => return Err(SigRefusal::TypeNode),
+                            _ => return Err(holds),
                         }
                     }
                     out.joins[lo as usize..].sort_unstable();
@@ -277,8 +349,8 @@ pub fn read_shape<A: Allocator + Clone>(
                     out.joins.truncate(kept);
                     out.marks.push(Mark::Hidden { lo, hi: out.joins.len() as u32 });
                 }
-                PNode::Opaque(_, _) => return Err(SigRefusal::TypeNode),
-                PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(SigRefusal::TypeNode),
+                PNode::Opaque(opaque, _) => return Err(ShapeRefusal::Opaque { part, opaque }),
+                PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(ShapeRefusal::Unnameable { part }),
                 _ => {}
             }
         }
@@ -290,6 +362,12 @@ pub fn read_shape<A: Allocator + Clone>(
 }
 
 impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
+    /// Notes why this call was not lined up ([`Misfit`]) and relates nothing (`Ok(false)`).
+    fn misfit(&mut self, why: Misfit) -> Result<bool, Refusal> {
+        self.misfit = why;
+        Ok(false)
+    }
+
     /// Origin `k` of the call's type argument for `Param(p)`: one set per argument per call,
     /// made when first asked (`arg_at[p]`: where its origins start in `arg_origs`, `u32::MAX`
     /// until made; its position count). `p` and `k` were checked by the caller.
@@ -326,8 +404,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         dest_ty: TyD,
         e: ExprId,
     ) -> Result<bool, Refusal> {
+        self.misfit = Misfit::NotTried;
         if shape.ends.len() != vs.len() || life.ends.len() != vs.len() {
-            return Ok(false);
+            return self.misfit(Misfit::Inputs { shape: shape.ends.len() as u32, sig: life.ends.len() as u32, call: vs.len() as u32 });
         }
         let args: &'c [PTy] = self.list(g, e)?;
         // Each type argument's position count; where its origins start once made.
@@ -361,8 +440,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let (mut mlo, mut rlo) = (0usize, 0usize);
         for i in 0..=vs.len() {
             let (mhi, rhi) = if i < vs.len() { (shape.ends[i] as usize, life.ends[i] as usize) } else { (shape.marks.len(), life.regions.len()) };
+            let part = i as u32;
             if mhi < mlo || mhi > shape.marks.len() || rhi < rlo || rhi > life.regions.len() {
-                return Ok(false);
+                return self.misfit(Misfit::Malformed { part });
             }
             let mut r = rlo;
             let part_lo = seq.len();
@@ -374,8 +454,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     Mark::Own => {
                         // A hidden region not under a projection mark (an opaque type) is
                         // not taken.
-                        if r >= rhi || matches!(life.regions[r], Region::Hidden(_)) {
-                            return Ok(false);
+                        if r >= rhi {
+                            return self.misfit(Misfit::RegionCount { part });
+                        }
+                        if matches!(life.regions[r], Region::Hidden(_)) {
+                            return self.misfit(Misfit::HiddenRegion { part });
                         }
                         seq.push(Slot::Sig(life.regions[r]));
                         r += 1;
@@ -383,10 +466,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     Mark::Hidden { lo, hi } => {
                         // Only the output's, one per part: an input's demand needs the impl's
                         // text (impl_call.rs), and two in one place cannot be split.
-                        if i < vs.len() || joined.is_some() || r >= rhi || !matches!(life.regions[r], Region::Hidden(_)) {
-                            return Ok(false);
+                        if i < vs.len() || joined.is_some() {
+                            return self.misfit(Misfit::InputProjection { part });
                         }
-                        let Some(ps) = shape.joins.get(lo as usize..hi as usize) else { return Ok(false) };
+                        if r >= rhi || !matches!(life.regions[r], Region::Hidden(_)) {
+                            return self.misfit(Misfit::RegionCount { part });
+                        }
+                        let Some(ps) = shape.joins.get(lo as usize..hi as usize) else { return self.misfit(Misfit::Malformed { part }) };
                         let mut loose = false;
                         for &p in ps {
                             let Some(&t) = args.get(p as usize) else {
@@ -420,7 +506,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 }
             }
             if r != rhi {
-                return Ok(false);
+                return self.misfit(Misfit::RegionCount { part });
             }
             // The projection stands for as many positions as the destination has beyond the
             // part's others (its normalized type's: the destination's type is the output's
@@ -429,7 +515,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 let d = self.info(dest);
                 let others = (seq.len() - part_lo - 1) as u32;
                 if !d.exact || d.len < others {
-                    return Ok(false);
+                    return self.misfit(Misfit::ProjectionUnplaced { part });
                 }
                 let n = (d.len - others) as usize;
                 match n {
@@ -442,7 +528,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     0 => {
                         seq.remove_shift(at);
                     }
-                    _ if loose => return Ok(false),
+                    _ if loose => return self.misfit(Misfit::ProjectionLoose { part }),
                     _ => {
                         for _ in 1..n {
                             seq.insert_shift(at, Slot::Joined(lo, hi));
@@ -469,7 +555,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             if let Some(p) = place {
                 let s = self.info(p);
                 if !s.exact || s.len != hi - lo {
-                    return Ok(false);
+                    return self.misfit(Misfit::Positions { part: i as u32, want: hi - lo, have: s.len, exact: s.exact });
                 }
             }
             lo = hi;

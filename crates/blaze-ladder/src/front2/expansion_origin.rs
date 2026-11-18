@@ -58,6 +58,10 @@ pub enum Unmapped {
     Input { call: LibKey },
     /// More than [`MOST_LEVELS`] nested calls.
     Levels,
+    /// A member's text is not a part of its container's text as the source holds it (a member
+    /// a macro call in the container's body wrote, or a text served again at another address
+    /// over records): its place in the container is not known ([`file_member_range`]).
+    MemberText { container: LibKey },
 }
 
 /// Where a finding is filed.
@@ -98,6 +102,21 @@ fn line_col(text: &str, at: u32) -> (u32, u32) {
     let line = head.bytes().filter(|&b| b == b'\n').count();
     let col = head.rsplit('\n').next().map_or(0, |l| l.chars().count());
     (u32::try_from(line + 1).unwrap_or(u32::MAX), u32::try_from(col + 1).unwrap_or(u32::MAX))
+}
+
+/// Files a finding of a MEMBER (of the trait or impl `container`, whose text is `member`) at
+/// `range`, relative to the member's first byte: a member has no library key of its own
+/// (front2 keys.rs `library_in`), so the range is moved to the container's text, where the
+/// member's text is, and filed as the container's ([`file_range`]). Before this every finding of
+/// an impl's or a trait's fn printed "not mapped to its source: NoPlace" (lane RF13: core's
+/// `<impl ErrorKind>::from_prim`).
+pub fn file_member_range<'n, S: NamesSource<'n>>(names: S, container: LibKey, member: &str, range: tc::Range, alloc: Alloc<'_>) -> Filed {
+    let Some(whole) = names.text_of(container) else { return Filed::Unmapped(Unmapped::NoPlace) };
+    let Some(offset) = blaze_scope::expansion_origins::offset_in(whole.text, member) else {
+        return Filed::Unmapped(Unmapped::MemberText { container });
+    };
+    let moved = tc::Range { start: range.start.saturating_add(offset), end: range.end.saturating_add(offset) };
+    file_range(names, Some(container), moved, alloc)
 }
 
 /// Files a finding of item `lib` at `range` (relative to the item's first byte, as the checker's

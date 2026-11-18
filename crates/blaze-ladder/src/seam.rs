@@ -271,6 +271,13 @@ pub trait FrontEnd {
     fn caller_site(&self, _owner: ItemKey, _expr: blaze_typeck::ExprId) -> Option<blaze_build::CallerSite<'_>> {
         None
     }
+    /// The first byte of expression `expr` of `owner`'s body counted from `owner`'s first, with
+    /// no file: a trap row's site (blaze-build `Adts::expr_site`). By default the offset of
+    /// [`FrontEnd::caller_site`]'s answer; the lazy front end answers from the body alone, so
+    /// an item whose file has no shown path (a toolchain crate's) still has one.
+    fn expr_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<u32> {
+        self.caller_site(owner, expr).map(|site| site.offset)
+    }
     /// The line and the column (each from 1; the column in chars) of byte `site` of item
     /// `item`'s text, from the item's present first byte in today's text of its file and that
     /// file's line starts: what a `#[track_caller]` `Location`'s line and column are when the

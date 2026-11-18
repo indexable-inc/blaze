@@ -395,6 +395,17 @@ impl<'a> InferCtx<'a> {
         self.solver.root_keys()
     }
 
+    /// Traces the trait goals `ask` names from now on (blaze-solve witness.rs, "the trait-goal
+    /// trace"): a measurement for tests, off by default.
+    pub fn trace_trait_goals(&mut self, ask: blaze_solve::witness::TraceAsk) {
+        self.solver.trace_on(ask);
+    }
+
+    /// The trace kept since [`InferCtx::trace_trait_goals`], ending it.
+    pub fn take_trace(&mut self) -> Option<blaze_solve::witness::Trace<'a>> {
+        self.solver.take_trace()
+    }
+
     fn node(&self, bits: u32) -> Node {
         match self.terms.cx.tys.node_at(bits) {
             Some(n) => n,

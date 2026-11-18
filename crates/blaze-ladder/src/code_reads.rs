@@ -860,6 +860,10 @@ impl Adts for Recorded<'_> {
         self.world.caller_site(owner, expr)
     }
 
+    fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
+        self.world.expr_site(owner, expr)
+    }
+
     fn location_adt(&self) -> Option<ItemKey> {
         self.world.location_adt()
     }

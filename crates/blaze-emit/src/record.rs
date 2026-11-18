@@ -159,10 +159,10 @@ pub(crate) fn emit_record_sourced<'a>(
     }
     pass::unwind::into_record(&form.unwind, &mut record).map_err(RecordEmitError::Emit)?;
     for source in traps {
-        let Some(&at) = form.unreachables.get(source.ordinal as usize) else {
+        let Some(&(at, held)) = form.unreachables.get(source.ordinal as usize) else {
             return Err(RecordEmitError::TrapOrdinal { ordinal: source.ordinal, unreachables: form.unreachables.len() as u32 });
         };
-        record.traps.push(TrapRow { at, kind: source.kind, site: source.site });
+        record.traps.push(TrapRow { at, kind: source.kind, site: source.site, held, subject: source.subject });
     }
     Ok((record, form.insts, called))
 }

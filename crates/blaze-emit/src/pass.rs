@@ -113,6 +113,8 @@ struct Pass<'a, 'c, A: Allocator> {
     most_align: u64,
     /// Where each landing block's `sp` restore starts (pass/stack.rs), patched with the frame.
     sp_fixes: Vec<u32, Global>,
+    /// The block being lowered.
+    block: Block,
 }
 
 /// Runs the pass (see [`crate::emit`]).
@@ -207,6 +209,7 @@ pub(crate) fn run<A: Allocator>(
         record,
         most_align,
         sp_fixes: Vec::new_in(Global),
+        block: Block(0),
     };
 
     // The prologue; the frame's size is patched in at the end, when the staging is known.
@@ -264,6 +267,7 @@ pub(crate) fn run<A: Allocator>(
     pass.unwind_begin()?;
     for block in 0..view.blocks() {
         pass.block_at[block] = pass.here();
+        pass.block = Block(block as u32);
         pass.block_entry(Block(block as u32));
         let next = (block + 1 < view.blocks()).then_some(block as u32 + 1);
         let range = view.block(Block(block as u32));
@@ -552,6 +556,21 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.sp_addr(X12, off);
                 self.put(enc::str(Size::X, rt, X12, 0));
             }
+        }
+    }
+
+    /// Where the value a switch fell through on is when the `unreachable` at `inst` strikes
+    /// (blaze-code record.rs `Held`): `x9`, when the `unreachable` begins its block and that
+    /// block's one incoming edge is a switch's default with no arguments (blaze-lir
+    /// `sole_switch_default`). `Op::Switch` below loads its scrutinee into `x9` and compares
+    /// it with each case in place; a case's argument moves run only on its own taken path
+    /// (`b.ne` over them), and the default edge has no moves: so from the switch to the `brk`
+    /// nothing writes `x9`. Any other `unreachable` is `Unknown`, never a guess.
+    fn held_at_unreachable(&self, inst: usize) -> blaze_code::record::Held {
+        let first = self.view.block(self.block).start == inst;
+        match first && blaze_lir::verify::sole_switch_default(&self.view, self.block).is_some() {
+            true => blaze_code::record::Held::Reg(X9 as u8),
+            false => blaze_code::record::Held::Unknown,
         }
     }
 
@@ -1236,8 +1255,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::Unreachable => {
                 let at = self.here();
                 self.put(enc::brk(BRK_UNREACHABLE));
-                if let Some(form) = self.record.as_deref_mut() {
-                    form.unreachables.push(at);
+                if self.record.is_some() {
+                    let held = self.held_at_unreachable(inst);
+                    if let Some(form) = self.record.as_deref_mut() {
+                        form.unreachables.push((at, held));
+                    }
                 }
             }
             Op::Param => return Err(unsupported(inst, op, "a parameter after a block's first instruction")),

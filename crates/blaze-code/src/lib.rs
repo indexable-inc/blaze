@@ -38,6 +38,8 @@ mod eh_tests;
 #[cfg(test)]
 mod place_tests;
 #[cfg(test)]
+mod record_held_tests;
+#[cfg(test)]
 mod record_trap_tests;
 #[cfg(test)]
 mod tests;

@@ -23,9 +23,9 @@
 
 use core::fmt;
 
-use blaze_code::record::CodeView;
+use blaze_code::record::{CodeView, Held, Subject};
 use blaze_code::trap::{self, Reason, TrapAt};
-use blaze_launch::wire::fault::{Fault, Placed, Spot};
+use blaze_launch::wire::fault::{Fault, Placed, Regs, Spot};
 use blaze_typeck::ItemKey;
 
 use crate::run_parent::ParentError;
@@ -79,6 +79,8 @@ pub(crate) struct Report {
     site: Option<SiteShown>,
     /// Why the pc's record was not read, when it was not.
     unread: Option<Unread>,
+    /// The enum the trap row's subject names, when it has one.
+    subject: Option<Named>,
 }
 
 /// What names a run's places for a report: the walk (run_parent.rs `Lazy`), while it is alive.
@@ -88,6 +90,8 @@ pub(crate) trait Places {
     /// Byte `at` of item `item`'s text (a trap row's item-relative site), placed in today's
     /// text; `None` when it cannot be.
     fn site(&mut self, item: ItemKey, at: u32) -> Option<SiteShown>;
+    /// Item `item` itself (a trap row's subject: the enum whose discriminant was read).
+    fn item(&mut self, item: ItemKey) -> Named;
 }
 
 /// The report of `fault`: each place named by `places`, the trap read from `record` (the bytes
@@ -113,7 +117,50 @@ pub(crate) fn report(fault: Fault, places: &mut dyn Places, record: Option<Resul
     }
     let callee = trap.and_then(|trap| trap.after_call).map(|symbol| places.named(symbol.0));
     let site = trap.and_then(|trap| trap.construct).and_then(|row| row.site).and_then(|(item, at)| places.site(ItemKey(item), at));
-    Report { fault, at, touched, trap, callee, site, unread }
+    let subject = trap.and_then(|trap| trap.construct).and_then(|row| row.subject).map(|subject| places.item(ItemKey(subject.item)));
+    Report { fault, at, touched, trap, callee, site, unread, subject }
+}
+
+/// What a trap row says the switched value is, read from the fault's registers (the child's,
+/// at the `brk`): ` it read 0x3 (x9)`; ` it read a value the code holds in x9, and this host
+/// sent no registers`; nothing when the row says the value is not known.
+fn held_value(f: &mut fmt::Formatter<'_>, held: Held, regs: Option<&Regs>) -> fmt::Result {
+    match held {
+        Held::Unknown => Ok(()),
+        Held::Reg(n) => match regs.and_then(|regs| regs.general(n)) {
+            Some(value) => write!(f, ": it read {value:#x} (x{n})"),
+            None => write!(f, ": it read the value in x{n}, and the program sent no registers on this host"),
+        },
+        // A slot's value is in the child's stack; it sends the registers alone.
+        Held::Stack(offset) => match regs {
+            Some(regs) => write!(f, ": it read the 8 bytes at sp + {offset:#x} (sp {:#x})", regs.sp()),
+            None => write!(f, ": it read the 8 bytes at sp + {offset:#x}"),
+        },
+    }
+}
+
+/// `; `AlignmentEnum` has discriminants 0x1, 0x2, 0x4, .. (64)`: the subject and the
+/// discriminants its row keeps, `..` and the count when it has more.
+fn subject_said(f: &mut fmt::Formatter<'_>, subject: &Subject, named: &Named) -> fmt::Result {
+    match named {
+        // Its last segment: the fn's path is said already; the enum's own name says enough.
+        Named::Shown { item, .. } => match item.path() {
+            Some(path) => write!(f, "; `{}` has discriminants ", path.rsplit("::").next().unwrap_or(path))?,
+            None => write!(f, "; {} has discriminants ", Thing(named, "enum"))?,
+        },
+        Named::Path(path) => write!(f, "; `{}` has discriminants ", path.rsplit("::").next().unwrap_or(path))?,
+        other => write!(f, "; {} has discriminants ", Thing(other, "enum"))?,
+    }
+    for (i, d) in subject.shown().iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{d:#x}")?;
+    }
+    match subject.count as usize > subject.shown().len() {
+        true => write!(f, ", .. ({})", subject.count),
+        false => Ok(()),
+    }
 }
 
 /// The first six bytes in hex.
@@ -191,9 +238,16 @@ impl fmt::Display for Report {
                 match (&self.site, row.site) {
                     (Some(site), _) => write!(f, " at {}:{}:{}", site.file, site.line, site.column)?,
                     (None, Some((item, at))) => write!(f, " at byte {at} of item {} (not placed in today's text)", Hex16(&item.to_be_bytes()))?,
-                    (None, None) => {}
+                    // Said, never silent (piece 3): the build made the construct outside any
+                    // task (a parameter's copy before the body's first), or its expression has
+                    // no range in its item's text.
+                    (None, None) => f.write_str(" (the build kept no site: it was made outside any of the body's expressions, or that expression has no range in its item's text)")?,
                 }
                 write!(f, " {}", row.kind.happened())?;
+                held_value(f, row.held, self.fault.regs.as_ref())?;
+                if let (Some(subject), Some(named)) = (row.subject, &self.subject) {
+                    subject_said(f, &subject, named)?;
+                }
             }
             if let Some(callee) = &self.callee {
                 write!(f, ", right after the call of {}", Thing(callee, "fn"))?;
@@ -232,3 +286,7 @@ mod tests;
 #[cfg(test)]
 #[path = "run_fault_trap_tests.rs"]
 mod trap_tests;
+
+#[cfg(test)]
+#[path = "run_fault_held_tests.rs"]
+mod held_tests;

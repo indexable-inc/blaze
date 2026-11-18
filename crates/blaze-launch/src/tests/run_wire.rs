@@ -163,7 +163,7 @@ const NEED: [u8; 46] = [
     0, 0, 0, 42, // the frame's length
     0xa3, // a map of 3
     0x62, b'i', b'd', 0x01, //
-    0x63, b'r', b'u', b'n', 0x01, // the run schema
+    0x63, b'r', b'u', b'n', 0x02, // the run schema
     0x64, b'b', b'o', b'd', b'y', //
     0xa1, 0x64, b'N', b'e', b'e', b'd', //
     0xa2, //
@@ -176,7 +176,7 @@ const NEED: [u8; 46] = [
 /// Expected: passes with no output.
 #[test]
 fn a_need_by_slot_is_these_bytes() {
-    assert_eq!(RUN_SCHEMA, 1, "a schema step changes the pinned bytes: update NEED");
+    assert_eq!(RUN_SCHEMA, 2, "a schema step changes the pinned bytes: update NEED");
     let need = Up::Need { need: Needed::Slot(Slot(3)), thread: Thread(7) };
     assert_eq!(encoded(&Message::Up(need), 1), NEED);
     assert_eq!(cbor::check(&NEED[4..]).map_err(|it| it.to_string()), Ok(()));
@@ -189,11 +189,12 @@ fn a_need_by_slot_is_these_bytes() {
 #[test]
 fn what_is_not_a_run_message_is_refused_by_name() {
     let item = &NEED[4..];
-    // Schema 2 in the `run` key's value (byte 9 of the item).
+    // Schema 1 (the one before `Up::Fault` carried registers) in the `run` key's value (byte 9
+    // of the item).
     let mut other = item.to_vec();
-    other[9] = 0x02;
-    assert_eq!(Up::decode(&other), Err(WireError::RunSchema { said: 2 }));
-    assert!(WireError::RunSchema { said: 2 }.to_string().contains("schema 2"));
+    other[9] = 0x01;
+    assert_eq!(Up::decode(&other), Err(WireError::RunSchema { said: 1 }));
+    assert!(WireError::RunSchema { said: 1 }.to_string().contains("schema 1"));
 
     // The patch protocol's `Need`: `{id, body, schema}` is refused at its second key.
     let mut patch = Vec::new();

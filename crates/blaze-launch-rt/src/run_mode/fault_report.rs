@@ -38,7 +38,9 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsiz
 
 use blaze_code::record::Symbol as CodeSymbol;
 use blaze_launch::wire::RecordId;
-use blaze_launch::wire::fault::{Fault, Placed, Signal, Spot};
+use blaze_launch::wire::fault::{AROUND, Around, Fault, Placed, Regs, Signal, Spot};
+#[cfg(target_arch = "aarch64")]
+use blaze_launch::wire::fault::Arm64;
 use blaze_launch::wire::run::{Symbol as WireSymbol, Up};
 
 use super::RunModeError;
@@ -178,6 +180,8 @@ pub fn note(row: Row) {
 extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
     // SAFETY: the kernel hands an SA_SIGINFO handler a live `siginfo_t` and `ucontext_t`.
     let (address, (pc, write)) = unsafe { ((*info).si_addr() as u64, regs(ctx)) };
+    // SAFETY: as above: the same live `ucontext_t`.
+    let state = unsafe { thread_state(ctx) };
     let rows = ROWS.load(Ordering::Acquire);
     let count = COUNT.load(Ordering::Acquire);
     let placed: &[Row] = match rows.is_null() {
@@ -195,7 +199,11 @@ extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void
     // run_fault.rs). The child's own line is written only when the parent could not be told:
     // a signal the frame does not carry, no socket, or a failed write (then with why).
     let told = match fault_of(struck, placed) {
-        Some(fault) => tell_parent(&fault),
+        Some(mut fault) => {
+            fault.regs = state;
+            fault.code = code_around(struck, placed);
+            tell_parent(&fault)
+        }
         None => Err("a signal the parent's report does not carry"),
     };
     if let Err(why) = told {
@@ -219,9 +227,10 @@ static CHANNEL: AtomicI32 = AtomicI32::new(-1);
 static CHANNEL_HELD: AtomicBool = AtomicBool::new(false);
 /// How many 1 ms waits a holder of the socket is waited for (rule 18): 2 s.
 const HOLD_WAITS: u32 = 2000;
-/// The room a fault's frame is encoded in on the handler's stack (a frame is under 400 bytes:
-/// two spots of 32-byte ids and short keys).
-const FRAME_ROOM: usize = 1024;
+/// The room a fault's frame is encoded in on the handler's stack (a frame is under 900 bytes:
+/// two spots of 32-byte ids, 34 register words of at most 9 bytes each, 32 code bytes, short
+/// keys).
+const FRAME_ROOM: usize = 2048;
 
 /// Names the parent's socket for the crash report's frame. Called once, by the control thread,
 /// before any program code runs.
@@ -270,14 +279,81 @@ pub fn fault_of(struck: Struck, rows: &[Row]) -> Option<Fault> {
         libc::SIGTRAP => Signal::Trap,
         _ => return None,
     };
+    // The registers and the code bytes are read from the delivery by the handler (`on_signal`):
+    // this is pure, and the rows a test gives place nothing at their addresses.
     Some(Fault {
         signal,
         pc: struck.pc,
         at: struck.pc.and_then(|pc| spot(pc, rows)),
+        code: None,
+        regs: None,
         address: struck.address,
         touched: spot(struck.address, rows),
         write: struck.write,
     })
+}
+
+/// The page every window of [`code_around`] stays inside: the smallest page of the hosts run
+/// mode serves (a 16 KiB macOS page holds whole 4 KiB ones).
+const SMALLEST_PAGE: u64 = 4096;
+
+/// Which bytes of code [`code_around`] reads: up to 16 before the pc and 16 from it, clipped to
+/// the placed code row holding the pc and to the pc's own 4 KiB page; `None` when the pc is in
+/// no placed code, or the fault is the fetch of the pc itself (a SIGSEGV or SIGBUS whose
+/// address is on the pc's page: that page may not be mapped). Pure, so it is tested without a
+/// signal.
+pub fn code_window(struck: Struck, rows: &[Row]) -> Option<(u64, usize)> {
+    let pc = struck.pc?;
+    let row = holding(pc, rows).filter(|row| row.kind == Kind::Code)?;
+    let page = pc & !(SMALLEST_PAGE - 1);
+    let fetch = matches!(struck.sig, libc::SIGSEGV | libc::SIGBUS) && struck.address & !(SMALLEST_PAGE - 1) == page;
+    if fetch {
+        return None;
+    }
+    let half = (AROUND / 2) as u64;
+    let start = pc.saturating_sub(half).max(row.at).max(page);
+    let end = pc.saturating_add(half).min(row.at + row.len).min(page + SMALLEST_PAGE);
+    Some((start, end.saturating_sub(start) as usize))
+}
+
+/// The code bytes around the pc ([`code_window`]), copied onto the handler's stack.
+fn code_around(struck: Struck, rows: &[Row]) -> Option<Around> {
+    let (start, len) = code_window(struck, rows)?;
+    let mut bytes = [0u8; AROUND];
+    let len = len.min(AROUND);
+    // SAFETY: the window is inside a published code row (its bytes are mapped for the run's
+    // life: the table's rows are never unmapped while the program runs, as `on_signal`'s read
+    // of them assumes) and inside the page of the pc, which the core just fetched an
+    // instruction from (a fetch fault is excluded by `code_window`), so every byte is mapped
+    // and readable (run-mode code is mapped readable and executable, never execute-only). A
+    // byte copy into a stack buffer is async-signal-safe.
+    unsafe { ptr::copy_nonoverlapping(start as *const u8, bytes.as_mut_ptr(), len) };
+    Some(Around { start, len: len as u8, bytes })
+}
+
+/// The interrupted thread's general registers (`None` where run mode does not read them).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+unsafe fn thread_state(ctx: *mut c_void) -> Option<Regs> {
+    // SAFETY: the caller's contract; `uc_mcontext` points at the state the kernel saved.
+    let ss = unsafe { &(*(*ctx.cast::<libc::ucontext_t>()).uc_mcontext).__ss };
+    let mut x = [0u64; 31];
+    x[..29].copy_from_slice(&ss.__x);
+    x[29] = ss.__fp;
+    x[30] = ss.__lr;
+    Some(Regs::Arm64(Arm64 { x, sp: ss.__sp, pc: ss.__pc, pstate: u64::from(ss.__cpsr) }))
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+unsafe fn thread_state(ctx: *mut c_void) -> Option<Regs> {
+    // SAFETY: the caller's contract; Linux's `ucontext_t` holds the saved registers inline.
+    let mc = unsafe { &(*ctx.cast::<libc::ucontext_t>()).uc_mcontext };
+    Some(Regs::Arm64(Arm64 { x: mc.regs, sp: mc.sp, pc: mc.pc, pstate: mc.pstate }))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn thread_state(_ctx: *mut c_void) -> Option<Regs> {
+    // Run mode is AArch64 only (`run_mode::run` refuses x86-64 before any code).
+    None
 }
 
 /// The latest row holding `at` (rows never overlap; the latest is the one placed last).

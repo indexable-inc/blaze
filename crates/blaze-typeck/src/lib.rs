@@ -84,7 +84,7 @@ pub use body::{
 };
 pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
 pub use selected::{Projected, Selected};
-pub use diag::{Because, Diag, DiagCode, UnmetGoal, UnsafeOp};
+pub use diag::{Because, Diag, DiagCode, Node, UnmetGoal, UnsafeOp, expr_form, node_form, pat_form, range_shared, sketch};
 pub use asm::{ASM_NORETURN, AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg};
 pub use path_miss::{MissWhy, PathAnswer, PathMiss, PathPrefix, Refusal};
 /// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.

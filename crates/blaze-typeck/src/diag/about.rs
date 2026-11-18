@@ -116,7 +116,7 @@ impl PendingDiag {
     /// its types exported, `because` its reason (the unmet goal exported, else its own). The
     /// content is this finding's, so the record's is never emptier than the walk's.
     pub(crate) const fn export(self, at: Range, expected: Option<PTy>, found: Option<PTy>, because: Option<Because>) -> Diag {
-        Diag { code: self.code, at, expected, found, name: self.name, because, said: Said(()) }
+        Diag { code: self.code, at, expected, found, name: self.name, because, node: super::node::Node::of(self.at), said: Said(()) }
     }
 }
 
@@ -131,6 +131,7 @@ impl Diag {
             found: None,
             name: member,
             because: Some(because),
+            node: None,
             said: Said(()),
         }
     }

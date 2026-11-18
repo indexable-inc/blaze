@@ -73,6 +73,9 @@ use blaze_surface::ItemKind;
 use blaze_toolchain::ToolchainId;
 use blaze_typeck::ItemKey;
 
+#[path = "match_layouts_run/small_main.rs"]
+mod small_main;
+
 const DIR: &str = "/ladder/";
 const ROOT: &str = "/ladder/src/main.rs";
 /// The crates that can declare a lang item: the program's own, the only one.

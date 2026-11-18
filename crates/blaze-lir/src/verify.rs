@@ -600,6 +600,36 @@ fn edges<'a>(view: &View<'a>, at: usize, mut f: impl FnMut(Edge<'a>)) {
     }
 }
 
+/// The value a `switch` scrutinises, when `block`'s ONE incoming edge is that switch's default
+/// with no arguments: then every run that reaches `block` has just compared that value with
+/// each case and matched none. `None` when any other edge reaches it, or none does. One scan
+/// of the terminators (the edges' one reader, [`edges`]); what the emitter asks of an
+/// `unreachable` that begins its block, to say where the value it fell through on is held
+/// (blaze-emit pass.rs, blaze-code record.rs `Held`).
+pub fn sole_switch_default(view: &View<'_>, block: Block) -> Option<Value> {
+    let mut reached = 0u32;
+    let mut scrutinee = None;
+    for b in 0..view.blocks() {
+        let at = view.terminator(Block(b as u32));
+        edges(view, at, |edge| reached += u32::from(edge.to == block));
+        if reached > 1 {
+            return None;
+        }
+        if view.op(at) == Op::Switch {
+            let mut operands = view.operands(at);
+            let value = operands.value();
+            let default = operands.target();
+            if default.block == block && default.args.is_empty() {
+                scrutinee = Some(value);
+            }
+        }
+    }
+    match reached {
+        1 => scrutinee,
+        _ => None,
+    }
+}
+
 /// The block of each instruction, by layout.
 fn block_of(view: &View<'_>) -> Vec<u32> {
     // alloc: the verifier's scratch, one word per instruction, for one function

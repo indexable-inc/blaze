@@ -18,7 +18,10 @@
 
 use blaze_flow::loans::{Access, conflicts, for_each_access};
 use blaze_flow::{BorrowFinding, BorrowKind, Flow, Loan, MoveFindingKind, MoveOut, Point, StmtKind, Value};
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Refusal, SigBuf, SigLife, SigRefusal, read_async_signature, read_impl_signature, read_signature};
+use blaze_flow_lower::{
+    AdtFacts, CallLacks, CalleeFacts, Facts, FieldLead, Refusal, ShapeRefusal, SigBuf, SigLife, SigRefusal, read_async_signature, read_impl_signature,
+    read_signature,
+};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use core::alloc::Allocator;
@@ -90,6 +93,23 @@ pub enum BorrowRefused {
     /// (`Form::CallWritesLifetimes` lacking `CallLacks::Sig`): the callee by checker key and
     /// library item, its head's first words, and why its text was not read.
     CallSigUnread { callee: tc::ItemKey, item: Option<blaze_id::ItemKey>, head: Words, why: SigRefusal, start: u32, end: u32 },
+    /// The lowering refused a call of `callee`, whose head writes lifetimes and whose lifetime
+    /// part WAS read, at the item-relative `start..end`, because the call could not be related
+    /// through that signature (`Form::CallWritesLifetimes` lacking anything but `Sig`):
+    /// `lacks` says what (`Shape`: the head's generic shape was not read, `shape_why` says at
+    /// which input or output and why; `Bounds`: its declared bounds were not filed;
+    /// `Unaligned`: the call's types did not line up with the instantiated head, its `Misfit`
+    /// says where), with the callee by checker key and library item and its head's first words
+    /// (rule 19).
+    CallUnrelated {
+        callee: tc::ItemKey,
+        item: Option<blaze_id::ItemKey>,
+        head: Words,
+        lacks: CallLacks,
+        shape_why: Option<ShapeRefusal>,
+        start: u32,
+        end: u32,
+    },
 }
 
 impl BorrowRefused {
@@ -105,6 +125,7 @@ impl BorrowRefused {
             BorrowRefused::NestedOutlives { .. } => "a closure or async block needs a lifetime relation its owner must prove (not built)",
             BorrowRefused::AdtNotMade { .. } => "an ADT the body moves or drops could not be made from the records",
             BorrowRefused::CallSigUnread { .. } => "a callee's signature writes lifetimes its text was not read for",
+            BorrowRefused::CallUnrelated { .. } => "a call of a fn whose signature writes lifetimes could not be related through that signature",
         }
     }
 
@@ -115,6 +136,7 @@ impl BorrowRefused {
             BorrowRefused::NestedOutlives { start, end } => Some((*start, *end)),
             BorrowRefused::AdtNotMade { start, end, .. } => Some((*start, *end)),
             BorrowRefused::CallSigUnread { start, end, .. } => Some((*start, *end)),
+            BorrowRefused::CallUnrelated { start, end, .. } => Some((*start, *end)),
             _ => None,
         }
     }
@@ -166,6 +188,9 @@ pub struct BorrowFacts<'a> {
     /// Beside `fields`: the type parameter each field is declared as, when its declared type
     /// is a bare one (blaze-flow-lower `Facts::field_param`).
     field_params: AVec<'a, Option<u32>>,
+    /// Beside `fields`: how each field's declared type begins ([`field_lead`]), what a pattern
+    /// that peels references under the field peels (blaze-flow-lower `Facts::field_lead`).
+    field_leads: AVec<'a, FieldLead>,
     callees: AVec<'a, (u128, CalleeFacts)>,
     /// The lifetime part of each fn whose text `read_signature` could line up with its head
     /// (the stand-in for question H1: read from the fn's own text, never guessed).
@@ -179,6 +204,9 @@ pub struct BorrowFacts<'a> {
     /// The generic shape of each callee head whose signature was read (blaze-flow-lower
     /// `read_shape`): a call whose type arguments carry origins is related through it.
     shapes: AVec<'a, (u128, blaze_flow_lower::ShapeBuf<Alloc<'a>>)>,
+    /// Each head whose lifetime part was read but whose generic shape was not, and why, sorted
+    /// by checker key: what a `CallWritesLifetimes { lacks: Shape }` refusal is worded with.
+    shape_refused: AVec<'a, (u128, ShapeRefusal)>,
     /// Each trait that is the principal of a trait object of the body's types, sorted, and
     /// whether its header declares a lifetime (`None`: its text not read; sig_impl.rs
     /// `trait_lifetimes`, its row `trait_read`).
@@ -205,11 +233,13 @@ impl<'a> BorrowFacts<'a> {
             variants: AVec::new_in(alloc),
             fields: AVec::new_in(alloc),
             field_params: AVec::new_in(alloc),
+            field_leads: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             sigs: AVec::new_in(alloc),
             sig_refused: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
             shapes: AVec::new_in(alloc),
+            shape_refused: AVec::new_in(alloc),
             object_traits: AVec::new_in(alloc),
             items: AVec::new_in(alloc),
             unknown: AVec::new_in(alloc),
@@ -287,6 +317,13 @@ impl Facts for BorrowFacts<'_> {
         }
         self.field_params.get((first + field) as usize).copied().flatten()
     }
+    fn field_lead(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<FieldLead> {
+        let (first, count) = self.variant(adt, variant)?;
+        if field >= count {
+            return None;
+        }
+        self.field_leads.get((first + field) as usize).copied()
+    }
     fn param_copy(&self, _: u32) -> bool {
         false
     }
@@ -306,6 +343,43 @@ fn writes_lifetime(text: &str) -> bool {
     let head = text.split('{').next().unwrap_or(text);
     let b = head.as_bytes();
     (0..b.len()).any(|i| b[i] == b'\'' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') && b.get(i + 2) != Some(&b'\''))
+}
+
+/// How a field's declared type `t` (a type of the store's table) begins, for a pattern that peels
+/// references under the field (blaze-flow-lower `FieldLead`): a bare type parameter, one
+/// reference to a type parameter or to a type with no reference at its head, a type with no
+/// reference at its head, or not read (a projection, an opaque type or a trait object, which may
+/// stand for a reference; two references deep).
+fn field_lead(tys: tc::PTys<'_>, t: tc::PTy) -> FieldLead {
+    let plain = |n: tc::PNode| {
+        matches!(
+            n,
+            tc::PNode::Bool
+                | tc::PNode::Char
+                | tc::PNode::Int(_)
+                | tc::PNode::Uint(_)
+                | tc::PNode::Float(_)
+                | tc::PNode::Str
+                | tc::PNode::Never
+                | tc::PNode::Tuple(_)
+                | tc::PNode::Ptr(..)
+                | tc::PNode::Array(..)
+                | tc::PNode::Slice(_)
+                | tc::PNode::Adt(..)
+                | tc::PNode::FnDef(..)
+                | tc::PNode::FnPtr(..)
+        )
+    };
+    match tys.node(t) {
+        Ok(tc::PNode::Param(p)) => FieldLead::Param(p),
+        Ok(tc::PNode::Ref(mutbl, inner)) => match tys.node(inner) {
+            Ok(tc::PNode::Param(p)) => FieldLead::Ref { mutbl, param: Some(p) },
+            Ok(n) if plain(n) => FieldLead::Ref { mutbl, param: None },
+            _ => FieldLead::Unread,
+        },
+        Ok(n) if plain(n) => FieldLead::Plain,
+        _ => FieldLead::Unread,
+    }
 }
 
 /// How many lifetime parameters an ADT's head declares ([`declared_lifetimes`] of its text):
@@ -562,6 +636,7 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
                     Ok(tc::PNode::Param(p)) => Some(p),
                     _ => None,
                 });
+                g.field_leads.push(field_lead(r.store.tys.view(), f.ty));
             }
             g.variants.push((k, vi as u32, first, g.fields.len() as u32 - first));
         }
@@ -607,6 +682,7 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
                 variant_lens: &variant_lens,
                 fields: &g.fields[fields_from..],
                 field_params: &g.field_params[fields_from..],
+                field_leads: &g.field_leads[fields_from..],
             },
         );
         g.reads.push(read);
@@ -714,8 +790,10 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
             super::sig_impl::trait_closed(names, keys, t, name, alloc)
         };
         let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
-        if blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &closed, &mut shape, alloc).is_ok() {
-            g.shapes.push((k, shape));
+        match blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &closed, &mut shape, alloc) {
+            Ok(()) => g.shapes.push((k, shape)),
+            // Kept, never dropped (rule 3): the note of a call refused for it says why.
+            Err(why) => g.shape_refused.push((k, why)),
         }
     }
     let mut asked_traits = asked_traits.into_inner();
@@ -807,14 +885,31 @@ fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan, return
     }
 }
 
-/// A call of a head that writes lifetimes refused because the head's text was not read
-/// (`CallWritesLifetimes` lacking `Sig`): the callee and why, by name (rule 19), from the facts'
-/// `sig_refused`. `None` for any other refusal.
-fn sig_unread<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowFacts<'_>, refusal: Refusal) -> Option<BorrowRefused> {
-    let blaze_flow_lower::Form::CallWritesLifetimes { callee, lacks: blaze_flow_lower::CallLacks::Sig } = refusal.form else {
+/// A call of a head that writes lifetimes refused by the lowering (`CallWritesLifetimes`), by
+/// name (rule 19): lacking `Sig`, the head's text was not read, and why, from the facts'
+/// `sig_refused` ([`BorrowRefused::CallSigUnread`]); lacking anything else, what could not be
+/// related, with the shape's refusal from `shape_refused` when that is what it lacked
+/// ([`BorrowRefused::CallUnrelated`]). `None` for any other refusal.
+fn call_refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowFacts<'_>, refusal: Refusal) -> Option<BorrowRefused> {
+    let blaze_flow_lower::Form::CallWritesLifetimes { callee, lacks } = refusal.form else {
         return None;
     };
+    let head = head_words(r, callee);
+    let item = r.keys.library_in(r.names, callee);
+    let (start, end) = (refusal.range.start, refusal.range.end);
+    if lacks != CallLacks::Sig {
+        let shape_why = match lacks {
+            CallLacks::Shape => facts.shape_refused.binary_search_by_key(&callee.0, |&(k, _)| k).ok().map(|i| facts.shape_refused[i].1),
+            _ => None,
+        };
+        return Some(BorrowRefused::CallUnrelated { callee, item, head, lacks, shape_why, start, end });
+    }
     let &(_, why) = facts.sig_refused().iter().find(|(k, _)| *k == callee.0)?;
+    Some(BorrowRefused::CallSigUnread { callee, item, head, why, start, end })
+}
+
+/// The first words of `callee`'s head, up to its body (rule 19: a person reads which fn).
+fn head_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, callee: tc::ItemKey) -> Words {
     let mut head = Words::EMPTY;
     if let Some(f) = r.store.fns.get(&callee) {
         use core::fmt::Write;
@@ -823,14 +918,7 @@ fn sig_unread<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowFact
             let _ = write!(head, "{}{word}", if i == 0 { "" } else { " " });
         }
     }
-    Some(BorrowRefused::CallSigUnread {
-        callee,
-        item: r.keys.library_in(r.names, callee),
-        head,
-        why,
-        start: refusal.range.start,
-        end: refusal.range.end,
-    })
+    head
 }
 
 /// The move and borrow check of `body`, whose type check gave `done`: the facts gathered, the
@@ -896,7 +984,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                         start: refusal.range.start,
                         end: refusal.range.end,
                     },
-                    _ => sig_unread(r, &facts, refusal).unwrap_or(BorrowRefused::Lower(refusal)),
+                    _ => call_refused(r, &facts, refusal).unwrap_or(BorrowRefused::Lower(refusal)),
                 });
                 break;
             }

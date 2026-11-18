@@ -48,7 +48,7 @@ mod storage_end_tests;
 mod impl_call;
 #[cfg(test)]
 mod impl_call_tests;
-pub use generic_call::{CallBounds, Mark, Shape, ShapeBuf, read_shape};
+pub use generic_call::{CallBounds, Mark, Misfit, Shape, ShapeBuf, ShapeRefusal, read_shape};
 pub use impl_call::ImplSource;
 /// A caller's own type parameters under a callee's `T: 'a` (static-param-gap-1).
 mod param_outlives;
@@ -56,6 +56,9 @@ pub use param_outlives::ParamOrigin;
 mod super_let;
 #[cfg(test)]
 mod tests;
+/// A subpattern that peels references under an ADT field (piece RB7).
+#[cfg(test)]
+mod peel_tests;
 
 pub use sig::{
     AssocWhy, BodyOut, BodyState, CallableRefusal, ImplText, Region, SigBuf, SigLife, SigRefusal, impl_header_end, read_async_signature,
@@ -92,6 +95,31 @@ pub struct AdtFacts {
     pub union: bool,
     pub is_enum: bool,
     pub is_box: bool,
+}
+
+/// How a field's declared type begins, for a pattern that peels references under the field
+/// ([`Facts::field_lead`]). The Reference, "Binding modes": a non-reference pattern (a struct,
+/// tuple struct, tuple or slice pattern) met by a reference derefs it and makes the default
+/// binding mode `ref` (`ref mut` for a `&mut` met under a move mode). The type the subpattern
+/// meets is the field's declared type at the ADT's type arguments, which the type checker's
+/// record does not hold (it records the subpattern's type AFTER its peels, rules/pat.rs
+/// `step_pat`, not `pat_adjustments`): this is what lets the lowering rebuild it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FieldLead {
+    /// Declared as the ADT's type parameter `i` (`Some(T)`'s field): the field's type is the
+    /// `i`th type argument, whatever references it holds.
+    Param(u32),
+    /// Declared `&'a T` or `&'a mut T` (`mutbl`), whose referent is the ADT's type parameter
+    /// `param` (`Some`), or a type whose head is no reference, type parameter, projection,
+    /// opaque type or trait object (`None`: after this one peel the subpattern meets its own
+    /// type).
+    Ref { mutbl: Mutbl, param: Option<u32> },
+    /// Declared as a type whose head is no reference, type parameter, projection, opaque type
+    /// or trait object (an ADT, a tuple, a scalar, an array): nothing to peel there.
+    Plain,
+    /// Any other declared type (a projection or an opaque type that may normalize to a
+    /// reference, two references over a non-parameter): its peels are not read.
+    Unread,
 }
 
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
@@ -186,6 +214,15 @@ pub trait Facts {
     fn field_param(&self, _adt: ItemKey, _variant: u32, _field: u32) -> Option<u32> {
         None
     }
+    /// How field `field` of `variant`'s DECLARED type begins ([`FieldLead`]): what a pattern
+    /// that peels references under that field (`Some(Cmd::Hello { who })` against
+    /// `Option<&Cmd>`, a field declared `&'a E` matched by `E::V(x)`) peels. `None`: not known,
+    /// and only a field [`Facts::field_param`] names is taken; a peeling pattern under any
+    /// other field is refused (`Form::PeelUnderAdtField`). Whoever answers files the read of
+    /// the ADT's field types in the body's read list (rule 21).
+    fn field_lead(&self, _adt: ItemKey, _variant: u32, _field: u32) -> Option<FieldLead> {
+        None
+    }
     /// The number of fields of `variant`.
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32>;
     /// Whether the body's generic parameter `index` is bounded by `Copy`.
@@ -215,8 +252,11 @@ pub enum Form {
     DestructuringAssign,
     OrPatternBinding,
     SlicePatternBinding,
-    /// A peeling pattern under an ADT's field binds: the peeled references are not recorded
-    /// (typeck's `pat_adjustments`, omitted there).
+    /// A peeling pattern under an ADT's field binds, and the field's declared type is not
+    /// known well enough to say what it peels: [`Facts::field_lead`] gave `None` or
+    /// [`FieldLead::Unread`] and the field is no bare type parameter ([`Facts::field_param`]).
+    /// The record holds the subpattern's type after its peels only (typeck's
+    /// `pat_adjustments`, omitted there), so the lowering rebuilds the field's type from these.
     PeelUnderAdtField,
     /// The binding's recorded type is not the place's type or a reference to it.
     BindingMode,
@@ -299,16 +339,17 @@ pub enum CallLacks {
     Shape,
     /// No declared type-outlives bounds for the callee ([`Facts::call_bounds`] gave `None`).
     Bounds,
-    /// Every row was given, and they did not line up with the call: the lifetime part or the
-    /// shape has another count of inputs than the call has operands, a part's positions do
-    /// not match its place, or the lifetime part holds a hidden region.
-    Unaligned,
+    /// Every row was given, and they did not line up with the call: the [`Misfit`] says
+    /// where (another count of inputs than the call has operands, a part's positions that do
+    /// not match its place, a hidden region, a projection in an input).
+    Unaligned(Misfit),
 }
 
 impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// Which row a call of `item`, whose head writes lifetimes, lacked to be related by its
     /// signature: the first of [`Facts::sig`], [`Facts::shape`], [`Facts::call_bounds`] that
-    /// is `None`, else [`CallLacks::Unaligned`].
+    /// is `None`, else [`CallLacks::Unaligned`] with why the last instantiation tried at this
+    /// call did not line up (`misfit`, reset at each try).
     fn call_lacks(&self, item: ItemKey) -> CallLacks {
         if self.facts.sig(item).is_none() {
             CallLacks::Sig
@@ -317,7 +358,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         } else if self.facts.call_bounds(item).is_none() {
             CallLacks::Bounds
         } else {
-            CallLacks::Unaligned
+            CallLacks::Unaligned(self.misfit)
         }
     }
 }
@@ -592,6 +633,9 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone> {
     /// Per local: what it stands for (identity.rs): the one table of identities, emitted in
     /// `LoweredAsync::identity`.
     identity: Vec<Identity, A>,
+    /// Why the last `call_by_generic_signature` related nothing (generic_call.rs `Misfit`):
+    /// what a `CallWritesLifetimes { lacks: Unaligned(..) }` refusal says.
+    misfit: Misfit,
 }
 
 /// Every type walk visits each node at most once per position: bounded by the table's size.
@@ -650,6 +694,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             upvar_places: Vec::new_in(alloc.clone()),
             points: Vec::new_in(alloc.clone()),
             identity: Vec::new_in(alloc.clone()),
+            misfit: Misfit::NotTried,
         };
         Ok(l)
     }
@@ -1117,7 +1162,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 },
             }
         } else if proj == Proj::Deref {
-            info.deref = 1;
+            // A deref below an ADT's field (a peeled pattern's `*(opt as Some).0`): a `&mut`
+            // there is a mutable deref, so a reborrow through it walks on to the prefixes above
+            // and takes their references' regions too (RFC 2094, "Reborrow constraints": the
+            // walk stops after a deref of a shared reference only). Taken as shared, the walk
+            // stopped here and dropped `'a: 'r` for `&'r mut *(*s).f` with `s: &'a mut W`.
+            let mutbl = match (parent_ty.wrap, self.node(parent_ty.ty, e)?) {
+                (Some(m), _) | (None, PNode::Ref(m, _)) => Some(m),
+                _ => None,
+            };
+            info.deref = if mutbl == Some(Mutbl::Mut) { 2 } else { 1 };
         }
         self.ensure_pinfo(p, info);
         Ok(p)
@@ -3508,7 +3562,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
 
     /// The fields of an ADT pattern: each binding subpattern's place is the variant's field; its
     /// type is the subpattern's recorded type when the subpattern does not peel (the field's own
-    /// type); a peeling subpattern that binds is refused (the peeled references are not recorded).
+    /// type), else the field's type rebuilt from its declaration ([`Self::peeled_field_ty`]),
+    /// whose references the work list then peels as it peels a top-level pattern's.
     #[expect(clippy::too_many_arguments, reason = "one pattern's frame")]
     fn bind_fields(
         &mut self,
@@ -3539,17 +3594,64 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 None => return self.refuse_pat(Form::Malformed, sp),
             };
             let peels = matches!(spat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. });
-            let ft = match self.ck.pat_ty.get(sp.ix()) {
-                Some(&t) => TyD::of(t),
+            let own = match self.ck.pat_ty.get(sp.ix()) {
+                Some(&t) => t,
                 None => return self.refuse_pat(Form::Malformed, sp),
             };
-            if peels {
-                return self.refuse_pat(Form::PeelUnderAdtField, sp);
-            }
+            let ft = if peels { self.peeled_field_ty(ty, adt, variant, fi, sp, own)? } else { TyD::of(own) };
             let q = self.project(base, ty, Proj::Field(fi), ft, f.drop_impl, root)?;
             stack.push((sp, q, ft, mode));
         }
         Ok(())
+    }
+
+    /// The type of field `fi` of `variant` of the ADT `ty` (its type arguments' ADT, peeled to
+    /// it), under a subpattern `sp` that peels references and whose recorded type is `own`
+    /// (the type after its peels: rules/pat.rs `step_pat`). The Reference, "Binding modes":
+    /// each reference the subpattern meets is dereferenced and sets the default binding mode
+    /// (`&` makes it `ref`; `&mut` makes a move mode `ref mut` and leaves `ref` as it is), and
+    /// the field's type is its declared type at the ADT's type arguments: a parameter's
+    /// argument ([`FieldLead::Param`], or [`Facts::field_param`] when no lead is given), one
+    /// reference to it or to a type without references at its head ([`FieldLead::Ref`]), or
+    /// the subpattern's own type when nothing is peeled ([`FieldLead::Plain`]). The work list
+    /// then peels the result as it peels any pattern's place, each peel a deref of the field
+    /// place, so each binding below is a reborrow `&(*field).sub` (or `&mut`) whose region the
+    /// peeled reference's outlives (`borrow`'s supporting prefixes), and a by-value binding
+    /// there (`mut x` before edition 2024) moves out of the deref: E0507 (blaze-flow
+    /// `MoveOut::Deref`). Checked, not assumed: the peels must land on `own`, else the
+    /// binding modes the check took are not the ones rebuilt here (`Form::BindingMode`).
+    fn peeled_field_ty(&self, ty: TyD, adt: ItemKey, variant: u32, fi: u32, sp: PatId, own: PTy) -> Result<TyD, Refusal> {
+        let root = self.body.root;
+        let args: &'c [PTy] = match (ty.wrap, self.node(ty.ty, root)?) {
+            (None, PNode::Adt(k, l)) if k == adt => self.list(l, root)?,
+            _ => return self.refuse_pat(Form::Malformed, sp),
+        };
+        let arg = |p: u32| match args.get(p as usize) {
+            Some(&t) => Ok(t),
+            None => self.refuse_pat(Form::Malformed, sp),
+        };
+        let field = match self.facts.field_lead(adt, variant, fi) {
+            Some(FieldLead::Param(p)) => TyD::of(arg(p)?),
+            Some(FieldLead::Ref { mutbl, param: Some(p) }) => TyD { wrap: Some(mutbl), ty: arg(p)? },
+            Some(FieldLead::Ref { mutbl, param: None }) => TyD { wrap: Some(mutbl), ty: own },
+            Some(FieldLead::Plain) => TyD::of(own),
+            Some(FieldLead::Unread) | None => match self.facts.field_param(adt, variant, fi) {
+                Some(p) => TyD::of(arg(p)?),
+                None => return self.refuse_pat(Form::PeelUnderAdtField, sp),
+            },
+        };
+        let mut t = field;
+        for _ in 0..MOST_POSITIONS {
+            t = match (t.wrap, self.node(t.ty, root)?) {
+                (Some(_), _) => TyD::of(t.ty),
+                (None, PNode::Ref(_, i)) => TyD::of(i),
+                _ => break,
+            };
+        }
+        if t.wrap.is_some() || t.ty != own {
+            return self.refuse_pat(Form::BindingMode, sp);
+        }
+        Ok(field)
     }
 
     fn stmt(&mut self, s: StmtId) -> Result<(), Refusal> {

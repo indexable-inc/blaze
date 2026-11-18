@@ -62,13 +62,21 @@ pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, k
 /// item is not written in a file of its crate (an expansion's item), or the source does not
 /// answer.
 pub(in crate::front2::program) fn caller_site<'n, S: NamesSource<'n>>(names: S, keys: &Keys, owner: ItemKey, body: &Body<'_>, expr: ExprId) -> Option<blaze_build::CallerSite<'n>> {
-    let view = body.lowered.view();
-    let offset = view.site(view.expr_range(expr).ok()?).ok()?.start;
+    let offset = expr_offset(body, expr)?;
     let lib = keys.library_in(names, owner)?;
     let place = names.place_of(lib)?;
     let blaze_scope::resolve::At::File(i) = place.at else { return None };
     let file = names.file_shown(place.krate, i)?;
     Some(blaze_build::CallerSite { file, item: owner, offset })
+}
+
+/// THE TRAP-SITE RULE: [`caller_site`]'s offset alone, `expr`'s first byte from its item's
+/// (`View::site`), with no file: what a trap row keeps (blaze-build `Adts::expr_site`). It
+/// needs no shown path, so a toolchain crate's body (core's `AlignmentEnum` copy) keeps its
+/// trap's site; the report places it by the item. `None`: the expression has no range.
+pub(in crate::front2::program) fn expr_offset(body: &Body<'_>, expr: ExprId) -> Option<u32> {
+    let view = body.lowered.view();
+    Some(view.site(view.expr_range(expr).ok()?).ok()?.start)
 }
 
 /// The file item `item`'s text is in, as the program observes it (`file!()`, as
