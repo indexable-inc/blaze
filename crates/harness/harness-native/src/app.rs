@@ -326,6 +326,9 @@ pub struct App {
     arch_scroll: archive::ListScroll,
     /// Learn, the home: its courses, what was learned, the lesson being walked (app/learn.rs).
     learn: std::cell::RefCell<learn::Learn>,
+    /// At home: nothing is selected on purpose, so the main card shows Learn and no session is selected in its place.
+    /// True at launch and after the sidebar's Learn row; false once anything is selected.
+    home: bool,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
     fold: fold::TreeFold,
     /// The tree has the keyboard (a tree row was pressed): arrows move in it until a pane is pressed or another key typed.
@@ -547,8 +550,6 @@ impl App {
         let foot = side.child("hn.SideFoot");
         let link_note = foot.child("hn.LinkNote");
         let status = foot.child("hn.SideStatus");
-        // The way home (scene/widgets/learn.flecs): no session selected, the main card shows Learn.
-        status.child("hn.LearnHomeButton");
         let archive_row = status
             .child("hn.ArchiveRow")
             .props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
@@ -649,6 +650,7 @@ impl App {
             tree: sidebar::TreeScroll::default(),
             arch_scroll: archive::ListScroll::default(),
             learn: std::cell::RefCell::new(learn::Learn::default()),
+            home: true,
             fold: fold::TreeFold::default(),
             tree_focus: false,
             press: (0, KeyMods::default()),
@@ -892,12 +894,17 @@ impl App {
         let rows = model::tree(w);
         // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
         if up && let Some(last) = self.restore.take() {
-            if let Some(e) = last.and_then(|sid| self.entity_of(sid)) {
+            // The app opens on Learn, its home: what was selected last is a press away in the sidebar.
+            if let Some(e) = last.and_then(|sid| self.entity_of(sid)).filter(|_| !self.home) {
                 model::select(w, Some(e));
             }
         }
-        // Nothing selected (or it went): the first running object, else the first.
-        if self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
+        // Anything selected leaves home; home is left only by selecting something.
+        if self.selected().is_some() {
+            self.home = false;
+        }
+        // Nothing selected (or it went), and not at home: the first running object, else the first.
+        if !self.home && self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
             let first = rows
                 .iter()
                 .find(|(e, _)| self.status_of(*e) == "running")

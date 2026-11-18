@@ -54,7 +54,7 @@ struct Saved {
 
 pub struct Learn {
     /// A shot's fixed state ([`App::shot_learn`]): nothing is read from or written to disk.
-    shot: bool,
+    pub(super) shot: bool,
     loaded: bool,
     saved: Saved,
     screen: Screen,
@@ -183,6 +183,19 @@ impl Learn {
         self.screen = Screen::Done { kicker, title, score, next, course };
         self.save();
     }
+}
+
+/// What a chat message asks to be taught, if it asks: the words after "teach me" (or "i want to learn"), without the
+/// filler around them. A message that names nothing ("teach me something") leaves the pick to the tutor.
+pub(super) fn topic_of(message: &str) -> Option<String> {
+    let lower = message.to_lowercase();
+    let at = ["teach me", "i want to learn", "help me learn"].iter().find_map(|k| lower.find(k).map(|i| i + k.len()))?;
+    // The byte offset is the same in the original: lowercasing ASCII keeps lengths, and a message with other letters
+    // before the phrase is checked for a char boundary.
+    let rest = message.get(at..).unwrap_or("").trim().trim_end_matches(['?', '.', '!']).trim();
+    let rest = ["about ", "how to ", "to "].iter().find_map(|p| rest.strip_prefix(p)).unwrap_or(rest).trim();
+    let vague = rest.len() < 3 || ["something", "somthing", "anything", "a thing", "stuff"].iter().any(|v| rest.to_lowercase().starts_with(v));
+    Some(if vague { "one genuinely useful idea from computer science that most programmers never learned properly (your pick; name it in the course title)".to_owned() } else { rest.to_owned() })
 }
 
 /// Typed text as a field takes it: no control characters, no AppKit function-key code points.
@@ -347,8 +360,10 @@ impl App {
     pub(super) fn learn_action(&mut self, what: &str) {
         self.tree_focus = false;
         if what == "show" {
-            // The sidebar's house: nothing selected, so the main card shows Learn.
+            // The sidebar's Learn row: home, so nothing is selected and the main card shows Learn.
+            self.home = true;
             self.select(None);
+            self.poke();
             return;
         }
         {
@@ -436,6 +451,24 @@ impl App {
         l.run = None;
         l.screen = Screen::Home;
         l.save();
+    }
+
+    /// "Teach me …" typed into a chat: the lesson is made here, not said there. Home, and a course on `topic` started.
+    pub(super) fn learn_teach(&mut self, topic: &str) {
+        self.home = true;
+        self.select(None);
+        self.tree_focus = false;
+        {
+            let me = &*self;
+            let mut l = me.learn.borrow_mut();
+            let l = &mut *l;
+            l.load();
+            l.run = None;
+            l.screen = Screen::Home;
+            l.draft = topic.to_owned();
+            me.learn_next(l);
+        }
+        self.poke();
     }
 
     /// A key of ctx.Learn (scene/20-keys.flecs).

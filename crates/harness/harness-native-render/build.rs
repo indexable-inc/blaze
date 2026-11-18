@@ -16,9 +16,11 @@ use std::process::Command;
 /// exists and the offscreen shots of the two match, and its pass then takes the MSL blaze wrote
 /// (`BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS`) and binds through the slots its Rust signatures
 /// generated. Never both: a shader off this list whose Rust build fails fails the build, naming it.
-/// mascot left first (phase 3): Kip's pass (src/kip.rs) takes harness-native-shaders' `mascot`
-/// from the device build, and shaders/mascot.slang is gone.
-const SLANG: [&str; 1] = ["harness"];
+/// mascot.slang's port is written (harness-native-shaders/src/mascot.rs) and waits on the device
+/// build (the plan's phase 2).
+// TODO(2026-11-17): move mascot back to its Rust port (harness-native-shaders/src/mascot.rs, commit 8b42e56c01) once
+// blaze builds the harness reliably again; until then it is Slang, so cargo can build the workspace.
+const SLANG: [&str; 2] = ["harness", "mascot"];
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));

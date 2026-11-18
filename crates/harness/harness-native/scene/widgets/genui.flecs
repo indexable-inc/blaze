@@ -135,13 +135,13 @@ hn {
   }
 
   // Children on the card's plate, a column; a `title` goes first, bold.
+  // A soft plate a step over the page, no outline: cards side by side read as one calm group, not three boxes.
   prefab GenCard : ui.Column {
-    Fill: $tone_well
-    Edge: {dark: $tone_line.dark, light: $tone_line.light}
-    Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+    Fill: $tone_card
+    Shape: {radius: $radius_card, n: 4, border: 0, feather: 0}
     Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 12, r: 12, t: 10, b: 11}
+    Padding: {l: 16, r: 16, t: 14, b: 16}
   }
 
   // A hairline across, and room that grows (or `size` points of it).

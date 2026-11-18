@@ -2529,6 +2529,15 @@ impl App {
         if self.chat.borrow().get(&sid).is_some_and(|st| is_aside(&st.draft)) {
             return self.chat_ask_aside(sid);
         }
+        // "Teach me …" is not answered with a wall of words here: it becomes a course in Learn (short steps, questions,
+        // what is missed coming back), and the draft is spent on that.
+        let topic = self.chat.borrow().get(&sid).filter(|st| st.images.is_empty()).and_then(|st| super::learn::topic_of(&st.draft.text));
+        if let Some(topic) = topic {
+            if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+                st.draft.take_wire();
+            }
+            return self.learn_teach(&topic);
+        }
         let (text, images) = {
             let mut states = self.chat.borrow_mut();
             let Some(st) = states.get_mut(&sid) else { return };
@@ -3493,8 +3502,9 @@ fn turn_chip(t: &Transcript, now: u64) -> Chip {
                         let bash = ["bash", "shell", "exec", "command"].iter().any(|k| name.to_ascii_lowercase().contains(k));
                         words = match (bash, arg.is_empty()) {
                             (true, false) => super::short_cmd(&arg),
-                            (false, false) => format!("{}: {arg}", name.rsplit("__").next().unwrap_or(name)),
-                            (_, true) => name.rsplit("__").next().unwrap_or(name).to_owned(),
+                            // What it works on, never the tool's name ("ts", "exec"): a name says nothing to a person.
+                            (false, false) => arg,
+                            (_, true) => "Working".to_owned(),
                         };
                     }
                 }
@@ -3521,7 +3531,9 @@ fn turn_chip(t: &Transcript, now: u64) -> Chip {
         PopLine::Step(kind, _) => Some(*kind),
         _ => None,
     });
-    let mut pop = vec![PopLine::Item(kind.unwrap_or("think")), PopLine::Head(words.clone()), PopLine::Meta(meta(&["This turn", &running_for(&turn)]))];
+    // Words only: what it is on and for how long, then its steps. No picture of the step over them.
+    let _ = kind;
+    let mut pop = vec![PopLine::Head(words.clone()), PopLine::Meta(meta(&["This turn", &running_for(&turn)]))];
     pop.extend(steps);
     Chip { key: "step".to_owned(), state: "running", words, took, action: String::new(), pop }
 }

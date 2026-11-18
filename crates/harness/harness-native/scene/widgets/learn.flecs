@@ -430,6 +430,30 @@ hn {
   prefab SideNew : ui.Column {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $side_inset, r: $side_inset, t: 0, b: 6}
+    // Home: Learn. The first row, so the way back to it is always in the same place.
+    learn : ui.Row {
+      Pressable
+      Action: {name: "learn:show"}
+      Cursor: {shape: Arrow}
+      Fill: $tone_clear
+      Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+      HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+      PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
+      Padding: {l: $label_inset - $side_inset, r: $tree_pad_r, t: 0, b: 0}
+      house : ui.Node {
+        Fill: $tone_clear
+        Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
+        Size: {w: {kind: Fixed, value: $tree_kind, min: 0, max: 0}, h: {kind: Fixed, value: $tree_kind, min: 0, max: 0}}
+        Vector: {d: "M2.5 7.5 L8 2.5 L13.5 7.5 M4 6.5 V13 H12 V6.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+          inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: 1.4}
+      }
+      label : ui.Lead, Ink {
+        Text: {s: "Learn"}
+        TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+      }
+    }
     row : ui.Row {
       Pressable
       Action: {name: "chat:new"}

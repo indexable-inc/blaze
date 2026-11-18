@@ -43,8 +43,6 @@ hn {
     // outside the template's reactive inputs): a dot in the strong ink while its agent works, the same dot in the error
     // ink when it failed, nothing else; a shell its terminal glyph. Which agent it is ends the row's tooltip.
     kind_icon : hn.tree.Kind {}
-    // Explicit live mood reports from this agent, separate from model capability and task status.
-    emotion : ui.Row {}
     name : hn.tree.Head {
       Text: {s: $name}
       Padding: {l: 0, r: $tree_gap, t: 0, b: 0}
