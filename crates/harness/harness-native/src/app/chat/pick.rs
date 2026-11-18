@@ -451,6 +451,18 @@ impl App {
                 super::context::fill_context_pop(pop, slot.part("meter"), context, agent, menu_open || self.palette.is_some(), ctx_open, (self.pointer.x, self.pointer.y));
             }
         }
+        // "Understand this": once the agent has answered and rests, the conversation can become a lesson in Learn.
+        if let Some(slot) = bar.part("understand") {
+            let answered = t.items.iter().any(|i| matches!(i, Item::Text { done: true, .. }));
+            view::for_each_of(slot, (answered && !t.busy).then_some(("go", "hn.ChatBarControl", ())), |v, (), new| {
+                if new {
+                    v.add(Pressable::id());
+                    v.child("hn.ChatBarWord").text("Understand this");
+                    v.set(Tooltip { text: "Turn what happened here into a short lesson with questions".into() });
+                }
+                v.action(&format!("learn:from:{sid}"));
+            });
+        }
         if let Some(slot) = bar.part("send") {
             let (key, prefab, action) = match (t.busy && !ended, can_send && editable) {
                 (true, _) => ("stop", "hn.ChatSendStop", format!("chat:stop:{sid}")),

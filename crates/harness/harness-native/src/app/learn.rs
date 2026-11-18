@@ -67,6 +67,11 @@ pub struct Learn {
     want: Option<Want>,
     ask: u64,
     inbox: Arc<Mutex<Vec<Arrived>>>,
+    /// The tutor's session is being started (its id has not come yet): nothing starts another meanwhile.
+    starting: bool,
+    /// The session this launch started, and how many it started: at most one, ever.
+    started: Option<u64>,
+    starts: u32,
 }
 
 impl Default for Learn {
@@ -82,6 +87,9 @@ impl Default for Learn {
             want: None,
             ask: 0,
             inbox: Arc::new(Mutex::new(Vec::new())),
+            starting: false,
+            started: None,
+            starts: 0,
         }
     }
 }
@@ -239,6 +247,8 @@ impl App {
         for a in arrived {
             match a {
                 Arrived::Tutor(id) => {
+                    l.starting = false;
+                    l.started = Some(id);
                     l.saved.tutor = Some(id);
                     l.save();
                     self.link.rename(id, "Tutor");
@@ -300,9 +310,23 @@ impl App {
     /// session arrives).
     fn learn_ask(&self, l: &mut Learn) {
         let Some(want) = l.want.clone() else { return };
-        // The daemon still has the tutor's session, and it runs.
-        let alive = l.saved.tutor.filter(|&sid| self.entity_of(sid).is_some_and(|e| self.status_of(e) == "running"));
+        // The session started this launch is the tutor (the daemon's list may not show it yet, so it is not looked up);
+        // else the saved one, if the daemon still has it and it runs.
+        let alive = l.started.or_else(|| l.saved.tutor.filter(|&sid| self.entity_of(sid).is_some_and(|e| self.status_of(e) == "running")));
         let Some(tutor) = alive else {
+            // One start at a time, and one for the app's life: a session that cannot be started is said, never tried
+            // again on its own (each try is an agent process).
+            if l.starting {
+                return;
+            }
+            if l.starts >= 1 {
+                l.want = None;
+                l.note = "The tutor's session could not be started; see the harness daemon's log.".to_owned();
+                l.screen = Screen::Home;
+                return;
+            }
+            l.starting = true;
+            l.starts += 1;
             let inbox = l.inbox.clone();
             self.link.spawn("claude", None, None, None, 100, 30, move |id| {
                 inbox.lock().unwrap_or_else(|e| e.into_inner()).push(Arrived::Tutor(id));
@@ -366,6 +390,9 @@ impl App {
             self.poke();
             return;
         }
+        if let Some(sid) = what.strip_prefix("from:").and_then(|s| s.parse::<u64>().ok()) {
+            return self.learn_from_chat(sid);
+        }
         {
             let me = &*self;
             let mut l = me.learn.borrow_mut();
@@ -418,7 +445,9 @@ impl App {
                 l.note.clear();
                 l.ask += 1;
                 l.want = Some(Want::Outline { topic: topic.clone() });
-                l.screen = Screen::Making { title: "Planning your course".to_owned(), sub: format!("{topic} \u{b7} five to seven short lessons. About half a minute.") };
+                // The first line of what was asked, kept short: a long ask (a conversation to understand) is not echoed.
+                let named: String = topic.lines().next().unwrap_or("").chars().take(72).collect();
+                l.screen = Screen::Making { title: "Planning your course".to_owned(), sub: format!("{named} \u{b7} five to seven short lessons. About half a minute.") };
                 self.learn_ask(l);
             }
             Screen::Making { .. } => {}
@@ -451,6 +480,38 @@ impl App {
         l.run = None;
         l.screen = Screen::Home;
         l.save();
+    }
+
+    /// "Understand this" on chat `sid`'s composer: what was asked and done in that conversation becomes a course, so
+    /// the person can explain and redo what an agent did for them. The tutor is given the conversation's words (the
+    /// person's and the agent's, newest kept, tool output left out).
+    pub(super) fn learn_from_chat(&mut self, sid: u64) {
+        /// The most of the conversation the tutor is given, in bytes: its newest part.
+        const CONTEXT_MAX: usize = 12_000;
+        let mut said = String::new();
+        if let Some(t) = self.chats.borrow().get(&sid) {
+            for item in &t.items {
+                match item {
+                    model::chat::Item::User { text, .. } => said.push_str(&format!("\nPerson: {}\n", text.trim())),
+                    model::chat::Item::Text { text, .. } => said.push_str(&format!("\nAgent: {}\n", text.trim())),
+                    _ => {}
+                }
+            }
+        }
+        if said.trim().is_empty() {
+            return;
+        }
+        let mut from = said.len().saturating_sub(CONTEXT_MAX);
+        while !said.is_char_boundary(from) {
+            from += 1;
+        }
+        let topic = format!(
+            "Understanding what was done in the conversation below, well enough to explain it and do it again without \
+help: the ideas it relied on, why each decision was made, and what would have gone wrong otherwise. Teach the ideas, \
+not the transcript.\n\nThe conversation:\n{}",
+            &said[from..]
+        );
+        self.learn_teach(&topic);
     }
 
     /// "Teach me …" typed into a chat: the lesson is made here, not said there. Home, and a course on `topic` started.
@@ -593,6 +654,20 @@ impl App {
     }
 }
 
+/// A field's words (hn.LearnField's `text`), its caret after the last of them: the text primitive draws the caret
+/// (TextEdit, in UTF-16 units), so it sits where the words end.
+fn field_text(field: View<'_>, s: &str) {
+    use harness_native_ui_text_api::TextEdit;
+    let Some(t) = field.part("text") else { return };
+    t.text(s);
+    let at = s.encode_utf16().count() as u32;
+    let was = t.entity().try_cloned::<&TextEdit>().unwrap_or_default();
+    let next = TextEdit { caret: at, anchor: at, mark_lo: 0, mark_hi: 0, focused: true, ..was };
+    if next != was {
+        t.set(next);
+    }
+}
+
 fn set_text(v: View<'_>, part: &str, s: &str) {
     if let Some(p) = v.part(part) {
         p.text(s);
@@ -602,7 +677,7 @@ fn set_text(v: View<'_>, part: &str, s: &str) {
 fn fill_home(v: View<'_>, l: &Learn) {
     let day = today();
     if let Some(f) = v.part("field") {
-        set_text(f, "text", &l.draft);
+        field_text(f, &l.draft);
         set_text(f, "hint", if l.draft.is_empty() { "A topic, a tool, a paper, a codebase\u{2026}" } else { "" });
         if let Some(go) = f.part("go") {
             let (key, prefab) = if l.draft.trim().is_empty() { ("off", "hn.ChatSendOff") } else { ("on", "hn.ChatSend") };
@@ -755,7 +830,7 @@ fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
             }
             Step::Fill { answer, .. } => {
                 view::for_each_of(list, [("field".to_owned(), "hn.LearnField", ())], |f, (), _| {
-                    set_text(f, "text", s.typed);
+                    field_text(f, s.typed);
                     let hint = match (s.mark, s.typed.is_empty()) {
                         (Some(Mark::Wrong), _) => format!("   \u{2192} {answer}"),
                         (None, true) => "Type the missing part".to_owned(),

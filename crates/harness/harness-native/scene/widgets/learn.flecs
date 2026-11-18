@@ -119,12 +119,13 @@ hn {
     Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_field_h, min: 0, max: 0}}
     Padding: {l: 18, r: 12, t: 0, b: 0}
-    text : ui.Lead, Strong {
+    // The words, with the text primitive's own caret (TextEdit: at the end of what was typed, blinking as every field's
+    // does), never a bar drawn beside them.
+    text : ui.Line, Strong {
+      FixedSize: {h: true, v: false}
       TextStyle: {size: $size_learn, line: 22, role: 0, bold: 0}
-    }
-    caret : ui.Node {
-      Fill: $tone_ink_strong
-      Size: {w: {kind: Fixed, value: 1.5, min: 0, max: 0}, h: {kind: Fixed, value: 20, min: 0, max: 0}}
+      TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: true,
+        caret_dark: $tone_ink_strong.dark, caret_light: $tone_ink_strong.light}
     }
     hint : ui.Lead, Faint {
       TextStyle: {size: $size_learn, line: 22, role: 0, bold: 0}

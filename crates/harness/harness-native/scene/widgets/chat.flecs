@@ -116,6 +116,12 @@ hn {
             Padding: {l: 0, r: 0, t: 0, b: 0}
           }
           spacer : ui.Spacer {}
+          // What was done here, as a lesson: a press makes a short course in Learn out of this conversation, so work an
+          // agent did is something the person comes to understand, not only something that happened. Shown once there
+          // is an answer to understand (src/app/chat/pick.rs sets its words and action; empty, it takes no room).
+          understand : ui.Row {
+            Padding: {l: 0, r: $chat_bar_trail, t: 0, b: 0}
+          }
           context : ui.Row {
             Padding: {l: 0, r: $chat_bar_trail, t: 0, b: 0}
           }
