@@ -85,6 +85,9 @@ impl<'m> Store<'m> for Empty {
     fn put_parts(&mut self, _cx: &Cx, _key: Key, _parts: &[&[u8]]) -> Result<(), CliError> {
         Ok(())
     }
+    fn put_record(&mut self, _cx: &Cx, _key: Key, _tag: blaze_keyed::kind::Tag, _owner: &[&[u8]], _bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
+        Ok(blaze_keyed::store::Put::Written)
+    }
     fn kept(&self) -> crate::store::StoreKept {
         crate::store::StoreKept::default()
     }
@@ -331,6 +334,10 @@ fn a_table_is_put_at_its_certificate_and_absent_is_none() {
         fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
             self.0.push((key, parts.concat()));
             Ok(())
+        }
+        fn put_record(&mut self, _cx: &Cx, key: Key, _tag: blaze_keyed::kind::Tag, _owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
+            self.0.push((key, bytes.to_vec()));
+            Ok(blaze_keyed::store::Put::Written)
         }
         fn kept(&self) -> crate::store::StoreKept {
             let bytes = self.0.iter().map(|(_, bytes)| bytes.len() as u64).sum();

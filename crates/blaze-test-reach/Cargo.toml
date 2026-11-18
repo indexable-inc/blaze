@@ -1,0 +1,29 @@
+[package]
+name = "blaze-test-reach"
+description = "The Tests stage's core (docs/v2/plan/design/tests-stage.md, plan row E2) as a sans-IO crate: a test's reach (each code record, datum, file and variable its process read, each once, sorted, with its digest), its result record (encoded and opened with every limit checked), whether it may be reused, and the decision to reuse or rerun it, naming the first moved cell; `no_std`, its allocator a value"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The reach's digest, each name's and value's hash.
+blaze-blake3.workspace = true
+# `Vec` with the allocator always named: the crate's only collection.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `check` and `control`: the record's round trip and the program model with its planted controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

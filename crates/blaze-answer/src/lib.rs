@@ -233,6 +233,9 @@ impl Flags {
     pub const OWED: u8 = 2;
     /// Made inline: no file's plan lists it.
     pub const INLINE: u8 = 4;
+    /// Owed and never made: the row holds the plan alone (its key, out and lists are empty), and
+    /// the engine sees no row (blaze-engine last.rs: `Cause::New`, not `Cause::KeyMoved`).
+    pub const UNMADE: u8 = 8;
 }
 
 /// The digest of the checkout's tree an answer answers (opaque here): the certificate's key, by

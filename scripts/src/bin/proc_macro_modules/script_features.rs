@@ -24,22 +24,74 @@ use super::{build_scripts::build_dep_names, feature_names, table_value};
 pub(super) fn script_feature_line(manifest: &str, feature: &str) -> String {
     let build_deps = build_dep_names(manifest);
     let declared = feature_names(manifest);
+    let optional = optional_build_deps(manifest);
     let entries = table_value(manifest, "features", feature).map(quoted_strings).unwrap_or_default();
     let kept: Vec<String> =
-        entries.into_iter().filter(|entry| script_keeps(entry, &build_deps, &declared)).map(|entry| format!("{entry:?}")).collect();
+        entries.into_iter().filter_map(|entry| script_entry(&entry, &build_deps, &optional, &declared)).map(|entry| format!("{entry:?}")).collect();
     format!("{feature:?} = [{}]\n", kept.join(", "))
 }
 
-/// Whether the script's manifest keeps the feature entry `entry`.
-fn script_keeps(entry: &str, build_deps: &[String], declared: &[String]) -> bool {
+/// The feature entry `entry` as the script's manifest writes it, `None` when it is dropped.
+///
+/// A name can be an OPTIONAL normal dependency and a plain build-dependency at once
+/// (tempo-precompiles: `serde = { workspace = true, optional = true }` under `[dependencies]`,
+/// `serde.workspace = true` under `[build-dependencies]`, and `serde = ["dep:serde", ..]`). The
+/// script builds with the build-dependency alone, which is always there, so `dep:serde` and the
+/// implicit feature `serde` name nothing the script can turn on (Cargo: "feature `serde` includes
+/// `dep:serde`, but `serde` is not an optional dependency") and are dropped, and `serde?/x` is
+/// `serde/x`: the dependency it waits for is always present.
+fn script_entry(entry: &str, build_deps: &[String], optional: &[String], declared: &[String]) -> Option<String> {
     let is_build_dep = |name: &str| build_deps.iter().any(|dep| dep == name);
+    let is_optional = |name: &str| optional.iter().any(|dep| dep == name);
     if let Some(dep) = entry.strip_prefix("dep:") {
-        return is_build_dep(dep);
+        return is_optional(dep).then(|| entry.to_owned());
     }
-    if let Some((dep, _)) = entry.split_once('/') {
-        return is_build_dep(dep.strip_suffix('?').unwrap_or(dep));
+    if let Some((dep, feat)) = entry.split_once('/') {
+        let name = dep.strip_suffix('?').unwrap_or(dep);
+        if !is_build_dep(name) {
+            return None;
+        }
+        return Some(if dep.ends_with('?') && !is_optional(name) { format!("{name}/{feat}") } else { entry.to_owned() });
     }
-    declared.iter().any(|name| name == entry) || is_build_dep(entry)
+    (declared.iter().any(|name| name == entry) || is_optional(entry)).then(|| entry.to_owned())
+}
+
+/// The build-dependencies `manifest` declares optional: `optional = true` in a dependency's
+/// inline table or dotted key under a `[build-dependencies]` table, or under its own
+/// `[build-dependencies.name]` table, and the `[target.*]` forms of each.
+fn optional_build_deps(manifest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    // Inside a `[..build-dependencies]` table (each line a dependency), or inside one
+    // dependency's own `[..build-dependencies.name]` table.
+    let mut inside = false;
+    let mut table: Option<String> = None;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            let header = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+            let rest = header.strip_prefix("build-dependencies").or_else(|| header.split_once(".build-dependencies").map(|(_, rest)| rest));
+            inside = rest == Some("");
+            table = rest.and_then(|rest| rest.strip_prefix('.')).map(|name| name.trim_matches('"').to_owned());
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else { continue };
+        let (key, value) = (key.trim(), value.trim());
+        if inside {
+            let name = key.split('.').next().unwrap_or("").trim_matches('"');
+            let squeezed: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+            if squeezed.contains("optional=true") || (key.ends_with(".optional") && value.starts_with("true")) {
+                names.push(name.to_owned());
+            }
+        } else if let Some(name) = &table
+            && key == "optional"
+            && value.starts_with("true")
+        {
+            names.push(name.clone());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The strings of a TOML array's text (`["a", 'b',\n # note\n "c"]`), in order: basic strings
@@ -125,5 +177,30 @@ native = [\"cc?/parallel\", \"dep:cc\", \"extra?/x\", \"dep:extra\"]\n";
         assert_eq!(line("default"), "\"default\" = [\"static\", \"bindgen/runtime\"]");
         assert_eq!(line("native"), "\"native\" = [\"cc?/parallel\", \"dep:cc\"]");
         assert_eq!(line("static"), "\"static\" = []");
+    }
+
+    /// tempo-precompiles 1.18.3's shape (the 1,100-crate workspace, 2026-11-17: "feature `serde`
+    /// includes `dep:serde`, but `serde` is not an optional dependency", and no module was
+    /// built): a name that is an optional normal dependency AND a plain build-dependency. The
+    /// script's manifest has the build-dependency alone, so `dep:serde` and the implicit
+    /// feature are dropped and the weak `serde?/derive` is `serde/derive`. Prints the lines.
+    #[test]
+    fn a_plain_build_dependency_that_is_also_an_optional_dependency_keeps_no_dep_entry() {
+        const BOTH: &str = "[package]\nname = \"pre\"\nversion = \"1.0.0\"\nedition = \"2024\"\n\n\
+[dependencies]\nserde = { version = \"1\", optional = true }\nserde_json = { version = \"1\", optional = true }\n\n\
+[build-dependencies]\nserde = { version = \"1\" }\nserde_json = { version = \"1\", features = [\"std\"] }\n\n\
+[features]\n\
+default = [\"rpc\"]\n\
+rpc = []\n\
+serde = [\"dep:serde\", \"serde?/derive\", \"other/serde\"]\n\
+test-utils = [\"dep:serde\", \"dep:serde_json\", \"serde_json\", \"rpc\"]\n";
+        let features: Vec<String> = ["default", "rpc", "serde", "test-utils"].iter().map(|it| (*it).to_owned()).collect();
+        let manifest = script_manifest(BOTH, Path::new("/build/pre/build.rs"), "pre", "1.0.0", &features);
+        let line = |name: &str| manifest.lines().find(|line| line.starts_with(&format!("\"{name}\" ="))).expect("a feature line").to_owned();
+        println!("script manifest serde: {} | test-utils: {}", line("serde"), line("test-utils"));
+        assert_eq!(line("serde"), "\"serde\" = [\"serde/derive\"]");
+        assert_eq!(line("test-utils"), "\"test-utils\" = [\"rpc\"]");
+        assert_eq!(super::optional_build_deps(BOTH), Vec::<String>::new());
+        assert_eq!(super::optional_build_deps(PACKAGE), vec!["cc".to_owned()]);
     }
 }

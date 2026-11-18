@@ -29,10 +29,12 @@ use std::alloc::Global;
 use blaze_cas::plain::{Aligned16, Misaligned, NotInPlace};
 use blaze_drive::{Input, Key, Name};
 use blaze_id::CrateItemKey;
+use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use bstd::cx::Cx;
 
 use crate::front_load::{CrateRecords, LoadError};
+use crate::names::expansion_texts::{Eager, RecordSource, ServeError};
 use crate::names::sections;
 use crate::store::Store;
 
@@ -110,9 +112,18 @@ impl Route for Copying {
 
 /// The `CrateScope` record `record` of `name`, crate `key`'s, opened by route `R`: its payload
 /// and its three sections cut where they lie, checked once (front_load.rs `checked_records`),
-/// counted in `counts`. `alloc` holds what the items record's open check makes, and the
+/// counted in `counts`; the expansion records its directory names served [`Eager`]ly through
+/// `source` (the command's: [`InPlaceRecords`], each borrowed where it lies and counted by it).
+/// `alloc` holds what the items record's open check makes, the served rows' table, and the
 /// [`Copying`] route's copies.
-pub(crate) fn open_record<'r, R: Route>(name: Name, record: Aligned16<'r>, key: CrateItemKey, counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<CrateRecords<'r>, ReadError> {
+pub(crate) fn open_record<'r, R: Route>(
+    name: Name,
+    record: Aligned16<'r>,
+    key: CrateItemKey,
+    source: &mut dyn RecordSource<'r>,
+    counts: &mut ReadCounts,
+    alloc: Alloc<'r>,
+) -> Result<CrateRecords<'r>, ReadError> {
     let view = match blaze_drive::record::open(record.bytes()) {
         Ok(blaze_drive::record::Stored::Whole(view)) => view,
         Ok(blaze_drive::record::Stored::Shape(_)) => return Err(LoadError::NotWhole { name, why: "a shape record, which holds no payload" }.into()),
@@ -125,8 +136,27 @@ pub(crate) fn open_record<'r, R: Route>(name: Name, record: Aligned16<'r>, key: 
     counts.sections += (parts.names.len() + parts.items.len() + parts.expansions.len()) as u64;
     let names = R::section(name, "names section", parts.names, counts, alloc)?;
     let items = R::section(name, "items section", parts.items, counts, alloc)?;
-    let expansions = R::section(name, "expansion texts section", parts.expansions, counts, alloc)?;
-    Ok(crate::front_load::checked_records(name, key, names, items, expansions, alloc)?)
+    let expansions = R::section(name, "expansions directory", parts.expansions, counts, alloc)?;
+    Ok(crate::front_load::checked_records::<Eager>(name, key, names, items, expansions, source, alloc)?)
+}
+
+/// The command's store as the in-place reader's [`RecordSource`]: each expansion record
+/// borrowed where it lies in the mapping for `'r` (never copied), counted in `counts` as a
+/// record read; one not in place is [`ServeError::NotInPlace`], naming its key.
+pub(crate) struct InPlaceRecords<'c, 's, 'r> {
+    pub(crate) cx: &'c Cx,
+    pub(crate) store: &'s mut dyn Store<'r>,
+    pub(crate) counts: ReadCounts,
+}
+
+impl<'r> RecordSource<'r> for InPlaceRecords<'_, '_, 'r> {
+    fn record(&mut self, key: ContentId, _alloc: Alloc<'r>) -> Result<Option<&'r [u8]>, ServeError> {
+        let Some(held) = self.store.get(self.cx, Key(key)).map_err(ServeError::Store)? else { return Ok(None) };
+        let place = held.place.map_err(|why| ServeError::NotInPlace { key, why })?;
+        self.counts.records += 1;
+        self.counts.bytes += place.len() as u64;
+        Ok(Some(place.bytes()))
+    }
 }
 
 /// The command's reader: every crate's records opened once a request, in place, for `'r`.
@@ -155,7 +185,12 @@ impl<'r> EngineRecords<'r> {
             return Err(LoadError::NotInStore { name: input.name, at: input.at }.into());
         };
         let record = held.place.map_err(|why| ReadError::NotInPlace { name: input.name, why })?;
-        let records = open_record::<InPlace>(input.name, record, key, &mut self.counts, alloc)?;
+        // The expansion records its directory names, read in place from the same store and
+        // counted with it.
+        let mut source = InPlaceRecords { cx: &cx, store, counts: ReadCounts::default() };
+        let records = open_record::<InPlace>(input.name, record, key, &mut source, &mut self.counts, alloc)?;
+        self.counts.records += source.counts.records;
+        self.counts.bytes += source.counts.bytes;
         self.read.push((input.name, input.at, records));
         Ok(records)
     }

@@ -12,9 +12,10 @@
 //!   tests record", piece 6), read through `TestsRecord::open`: one row per `#[test]` or
 //!   `#[bench]` function, from attributes alone. EMPTY for a unit without `test` in its cfg
 //!   (`NotATestUnit`): a plain library or binary has no tests record.
-//! - `expansions`: the text each macro call of the crate made ([`super::expansion_texts`],
-//!   piece 16), served to a body's check by front_load.rs `StoreLoad::expansion`. EMPTY for a
-//!   crate whose calls made no text.
+//! - `expansions`: the crate's expansions directory (blaze-scope expansion_records.rs): a row
+//!   each macro call that made a text, naming the expansion record (its own record in the
+//!   store) that holds the text ([`super::expansion_texts`]), served to a body's check by
+//!   front_load.rs `StoreLoad::expansion`. EMPTY for a crate whose calls made no text.
 //! - `links`: the crate's link table (`#[link]` lines, `extern` names, exported C names:
 //!   [`blaze_ladder::native_links::scope_table`], run.md "the native image as a task"), made
 //!   from the names this job already holds (rule 77). The record lists it as the crate's
@@ -79,7 +80,7 @@ impl Section {
             Section::Names => "the names record",
             Section::Items => "the items record",
             Section::Tests => "the tests record",
-            Section::Expansions => "the expansion texts",
+            Section::Expansions => "the expansions directory",
             Section::Links => "the link table",
             Section::Cells => "the cell table",
         }
@@ -110,7 +111,7 @@ pub(crate) struct Sections<'p> {
     pub items: &'p [u8],
     /// The unit's tests record; empty when the unit is not compiled with `test`.
     pub tests: &'p [u8],
-    /// The texts its macro calls made ([`super::expansion_texts`]); empty when none did.
+    /// Its expansions directory ([`super::expansion_texts`]); empty when no call made a text.
     pub expansions: &'p [u8],
     /// The crate's link table ([`blaze_ladder::native_links::open_table`] reads it); empty only
     /// in a failed crate's record.

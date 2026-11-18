@@ -51,6 +51,9 @@ use crate::CliError;
 pub(crate) mod plain_place;
 pub use plain_place::{AfterAnswer, Checked, Counts, Facts, Held, PlaceError, PlainPlace};
 
+/// What keeps a record after its command: one typed root per lifetime class.
+pub(crate) mod roots;
+
 /// The seam the request reads and writes records through. `'m` is the borrow of the command's
 /// [`Lent`]: a [`Held<'m>`] outlives every later get and put (blaze-cas plain/lent.rs).
 pub trait Store<'m> {
@@ -73,6 +76,14 @@ pub trait Store<'m> {
     /// [`Store::put`] of the concatenation of `parts` (a record's head and payload), never
     /// joined first: the bytes go to the store from where their writer made them.
     fn put_parts(&mut self, cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError>;
+    /// A record a task made beside its own (an expansion record: `tag`
+    /// [`plain_place::EXPANSION_TAG`]), keyed by its bytes and put beside its owner's record
+    /// (right after it on the engine's path, right before it on the machine's: work.rs
+    /// `PendingExtras`), whose parts are `owner` (as [`Store::put_parts`] took them): it goes to the
+    /// namespace its owner goes to. Equal bytes already held under `key` are
+    /// [`blaze_keyed::store::Put::Same`], whichever namespace holds them; other bytes are
+    /// refused (rule 21).
+    fn put_record(&mut self, cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError>;
     /// Every segment the head names mapped, and every parked one checked: asked once, when the
     /// request's first pool task is about to start (work.rs `run_batches`); later asks do
     /// nothing.
@@ -696,6 +707,9 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, stats: bool, clock: &Clo
                 ns(clock).saturating_sub(answered) as f64 / 1e6,
             ),
         )?;
+        // The cleanup the commit named (store/roots.rs `CleanupLine`): after the answer, so
+        // here and not in the profile written before it.
+        err.line(cx, format_args!("{}", after.cleanup))?;
     }
     Ok(())
 }
@@ -885,6 +899,19 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
                     bytes.extend_from_slice(part);
                 }
                 let clash = Clash::of(held.map(|held| held.bytes), &bytes);
+                Err(CliError::Store(StoreFailure::TwoValues { key, lent, clash }))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn put_record(&mut self, _cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
+        let public = self.sharing.all_names_public(owner);
+        match self.place.put_record(key, public, tag, bytes) {
+            Ok(put) => Ok(put),
+            Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
+                let held = self.place.get(key)?;
+                let clash = Clash::of(held.map(|held| held.bytes), bytes);
                 Err(CliError::Store(StoreFailure::TwoValues { key, lent, clash }))
             }
             Err(error) => Err(error.into()),
@@ -1211,3 +1238,9 @@ mod sharing_tests;
 #[cfg(test)]
 #[path = "store/snapshot_tests.rs"]
 mod snapshot_tests;
+
+/// Every record a later command reads is reached from a root, under a reach sweep: two
+/// checkouts' programs over one store, one checkout let expire (store/roots.rs).
+#[cfg(test)]
+#[path = "store/reach_tests.rs"]
+mod reach_tests;

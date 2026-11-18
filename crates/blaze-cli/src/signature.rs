@@ -71,8 +71,9 @@ use blaze_surface::{Edition, Item, ItemIndex, ItemKind};
 const NAME_DOMAIN: &str = "blaze-cli signature name 1";
 /// The domain of a `Signature` part's source ([`signature_source`]).
 const SOURCE_DOMAIN: &str = "blaze-cli signature source 1";
-/// The domain of a head's tokens ([`unencoded`]).
-const TOKENS_DOMAIN: &str = "blaze-cli signature tokens 1";
+/// The domain of a head's tokens ([`unencoded`]). 2: each piece is its `token_digest`
+/// (kinds, joints, doc comments and the edition in), no longer its bare lexemes.
+const TOKENS_DOMAIN: &str = "blaze-cli signature tokens 2";
 /// The domain of a `Signature`'s out ([`signature_out`]).
 const OUT_DOMAIN: &str = "blaze-cli signature out 1";
 /// The want digest of an entry front2 makes no head for (a `const _`, an item a macro rewrote):
@@ -258,17 +259,20 @@ pub(crate) fn signature_source(outline: &Outline<'_>, at: ItemIndex, text: &str,
     h.finish()
 }
 
-/// The tokens of `piece` in `edition`, whitespace and comments dropped, each after its length.
+/// The tokens of `piece` in `edition` into `h`: their `token_digest`
+/// (docs/v2/plan/design/token-keys.md), so a re-format or a plain comment moves nothing while
+/// `1 >> 2` and `1 > > 2`, a doc comment's text and the edition do. Lexemes alone, as this was
+/// before, gave those pairs one digest: two programs under one key (rule 21).
 fn tokens(h: &mut Hasher, piece: &str, edition: Edition) {
-    let pe = crate::work::parser_edition(edition);
-    let lexed = parser::LexedStr::new(pe, piece);
-    for i in 0..lexed.len() {
-        if lexed.kind(i).is_trivia() {
-            continue;
-        }
-        let range = lexed.text_range(i);
-        let token = &piece[range.start..range.end];
-        h.update(&(token.len() as u32).to_le_bytes()).update(token.as_bytes());
+    h.id(&piece_digest(piece, edition));
+}
+
+/// [`tokens`]' digest of one piece. A piece is a range of an outline, whose ranges are u32, so
+/// it fits a token key and the refusal cannot be met; met, it fails this one job (rule 20).
+fn piece_digest(piece: &str, edition: Edition) -> ContentId {
+    match parser::token_key::token_digest(piece, crate::work::parser_edition(edition)) {
+        Ok(digest) => digest,
+        Err(error) => panic!("a head's piece of an outline has no token key: {error}"),
     }
 }
 
@@ -362,3 +366,7 @@ pub(crate) fn expansion_out(digests: &[ContentId], outline: &Outline<'_>, text: 
     }
     h.finish()
 }
+
+#[cfg(test)]
+#[path = "signature_tokens_tests.rs"]
+mod tokens_tests;

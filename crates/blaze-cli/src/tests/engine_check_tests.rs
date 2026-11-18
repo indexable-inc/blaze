@@ -18,7 +18,7 @@ fn workspace(io: &Io) {
 }
 
 /// What `engine-check` listed (each finding's code and id) and its counts.
-fn engine(io: &Io, workers: u32) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
+pub(super) fn engine(io: &Io, workers: u32) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
     engine_from(io, workers, true)
 }
 
@@ -44,6 +44,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
             exe_dir: Err(fetch::ExeDirWhy::NotRead),
         },
         fresh,
+        heads_from: crate::engine_seeds::HeadsFrom::Frozen,
         frame,
     }
 }
@@ -64,6 +65,12 @@ fn why(io: &Io, target: &str) -> std::string::String {
 
 /// [`engine`], starting from the stored answer unless `fresh`.
 pub(super) fn engine_from(io: &Io, workers: u32, fresh: bool) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
+    engine_opts(io, opts(io, workers, fresh))
+}
+
+/// [`engine_from`] with the command's options as given (`opts`, one field changed by a test).
+pub(super) fn engine_opts(io: &Io, opts: engine_check::Opts<'static>) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
+    let fresh = opts.fresh;
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let frame = cx.frame();
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
@@ -71,7 +78,6 @@ pub(super) fn engine_from(io: &Io, workers: u32, fresh: bool) -> (std::vec::Vec<
     let mut phases = Phases::new(io.need_clock().expect("a clock"));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
     let err = io.need_err().expect("err");
-    let opts = opts(io, workers, fresh);
     let checked = match engine_check::check(&cx, io, &root, opts, &mut shown, &mut phases, &out, &err) {
         Ok(checked) => checked,
         Err(error) => panic!("engine-check (fresh {fresh}) answers: {error:?}"),
@@ -435,7 +441,7 @@ fn profile(io: &Io) -> std::string::String {
 }
 
 /// The profile's `phases` and `files` lines.
-fn profile_lines(io: &Io) -> std::string::String {
+pub(super) fn profile_lines(io: &Io) -> std::string::String {
     profile(io).lines().filter(|line| line.contains("phases") || line.starts_with("files:") || line.starts_with("stored answer:")).collect::<std::vec::Vec<_>>().join("\n")
 }
 
@@ -607,7 +613,7 @@ fn engine_check_lists_what_check_lists_for_the_outlines() {
 }
 
 /// Each stage's entries and the "entered because" table of one request, for a message.
-fn entries(checked: &engine_check::Checked) -> std::string::String {
+pub(super) fn entries(checked: &engine_check::Checked) -> std::string::String {
     let stages: std::vec::Vec<_> = blaze_engine::Stage::ALL.iter().map(|stage| (*stage, checked.stages[stage.index()])).filter(|(_, count)| count.entered > 0).collect();
     let because: std::vec::Vec<_> = checked.because.iter().map(|(group, count)| (group.stage, group.cause, group.definer.map(|name| name.kind), *count)).collect();
     format!(
@@ -726,7 +732,7 @@ fn engine_why_walks_back_to_the_edit() {
 
 /// One request's listed findings, its printed lines but the closing one (it holds the time and
 /// the count entered), and its counts.
-fn said(io: &Io, fresh: bool) -> (std::vec::Vec<(std::string::String, std::string::String)>, std::vec::Vec<std::string::String>, engine_check::Checked) {
+pub(super) fn said(io: &Io, fresh: bool) -> (std::vec::Vec<(std::string::String, std::string::String)>, std::vec::Vec<std::string::String>, engine_check::Checked) {
     let before = stdout(io).len();
     let (ids, checked) = engine_from(io, 2, fresh);
     let text = stdout(io).split_off(before);
@@ -736,7 +742,7 @@ fn said(io: &Io, fresh: bool) -> (std::vec::Vec<(std::string::String, std::strin
 }
 
 /// The lines of `said` that print an error finding (`error[<code>]`), in order.
-fn error_lines(said: &str) -> std::vec::Vec<std::string::String> {
+pub(super) fn error_lines(said: &str) -> std::vec::Vec<std::string::String> {
     said.lines().filter(|line| line.contains("error[")).map(str::to_owned).collect()
 }
 
@@ -751,7 +757,7 @@ fn closing(io: &Io) -> std::string::String {
 }
 
 /// The listed findings that are placed (an id shown), sorted: what two commands compare.
-fn placed_ids(ids: &[(std::string::String, std::string::String)]) -> std::vec::Vec<(std::string::String, std::string::String)> {
+pub(super) fn placed_ids(ids: &[(std::string::String, std::string::String)]) -> std::vec::Vec<(std::string::String, std::string::String)> {
     let mut placed: std::vec::Vec<_> = ids.iter().filter(|(_, id)| !id.is_empty()).cloned().collect();
     placed.sort();
     placed

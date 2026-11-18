@@ -53,6 +53,24 @@ pub const POINTER_TAG: Tag = Tag(u16::MAX - 4);
 /// A pointer's payload: its target's key.
 pub const POINTER_LEN: usize = 32;
 
+/// The tag of an INDEX ([`Plain::index`]): a record of sorted 32-byte keys under
+/// [`Namespace::LOCAL`], keyed by its bytes. It keeps nothing by itself; reached through an
+/// indexed root ([`INDEXED_ROOT_TAG`]), it and every key it holds are live. One level: an index
+/// naming an index keeps the inner index's record, not what that holds. Reserved, after the
+/// pointers' ([`POINTER_TAG`]) and blaze-cli's start lists (`START_LIST_TAG`, `u16::MAX - 5`).
+pub const INDEX_TAG: Tag = Tag(u16::MAX - 6);
+
+/// The tag of an indexed root's record ([`Plain::root_through`]): sorted keys, each an index
+/// ([`INDEX_TAG`]). A slice reads a root's record anyway; its tag says whether to follow it.
+pub const INDEXED_ROOT_TAG: Tag = Tag(u16::MAX - 7);
+
+/// The most keys one index holds (128 MiB of keys): a program reaching more is refused by
+/// name ([`StoreError::IndexOver`]), never cut.
+pub const INDEX_KEYS_MOST: usize = 1 << 22;
+
+/// The most indexes one indexed root names.
+pub const ROOT_INDEXES_MOST: usize = 1 << 16;
+
 /// The tags a store asks with: `tags .. tags + TAGS`.
 pub const TAGS: u64 = 1 << 40;
 
@@ -122,6 +140,11 @@ const LOCK_STEPS_MOST: u32 = 30_000;
 /// What a root's record key is derived under.
 const ROOT_DOMAIN: &str = "blaze plain store root 1";
 const LOG_DOMAIN: &str = "blaze plain store log 1";
+/// What an index's record key is derived under ([`Plain::index`]).
+const INDEX_DOMAIN: &str = "blaze plain store index 1";
+/// What an indexed root's record key is derived under: never a plain root's key for the same
+/// bytes ([`Plain::root_through`]).
+const INDEXED_ROOT_DOMAIN: &str = "blaze plain store indexed root 1";
 
 const HEAD: &str = "head";
 const FLIP: &str = "flip";
@@ -395,6 +418,9 @@ pub(crate) enum Plant {
     /// A commit whose roots name a record a slice swept since flips anyway without carrying
     /// it forward: the generation's root names a record no live segment holds (cleanup_tests).
     CarrySkipped,
+    /// Reach takes an indexed root's record as a plain root's: the indexes it names are live,
+    /// the keys they hold are not (index_tests).
+    IndexNotFollowed,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -779,6 +805,22 @@ pub struct Plain {
     carry_rounds: u32,
     /// Records carried forward by this process's commits, ever ([`Plain::carried`]).
     carried: u64,
+    /// The indexes this process made, with how many keys each holds: what an indexed root
+    /// that names one counts ([`Plain::named`]).
+    indexes_made: Vec<(Key, u64)>,
+    /// The roots this process set and the keys they name ([`Plain::named`]).
+    named: Named,
+}
+
+/// The roots one process set and the keys they name: the command's cleanup line.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Named {
+    /// Roots set (each `root_for` or `root_through` call that named one).
+    pub roots: u32,
+    /// Keys named, directly or through an index this process made.
+    pub keys: u64,
+    /// Of them, through index records.
+    pub indexed: u64,
 }
 
 /// One namespace's held puts, and where each key is in them.
@@ -958,6 +1000,8 @@ impl Plain {
             carrying: Vec::new_in(Global),
             carry_rounds: 0,
             carried: 0,
+            indexes_made: Vec::new_in(Global),
+            named: Named::default(),
         }
     }
 
@@ -1306,15 +1350,65 @@ impl Plain {
     /// more than its life less [`TOUCH_NS`] left is not set again, so a build that changed
     /// nothing flips nothing for it.
     pub fn root_for(&mut self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, StoreError> {
-        let mut sorted = Vec::with_capacity_in(keys.len(), Global);
-        sorted.extend_from_slice(keys);
-        sorted.sort_unstable();
-        sorted.dedup();
-        let mut bytes = Vec::with_capacity_in(sorted.len() * 32, Global);
-        for key in &sorted {
-            bytes.extend_from_slice(&key.0.0);
+        let bytes = sorted_keys(keys);
+        let key = self.set_root(name, &bytes, life_ns, ROOT_TAG, ROOT_DOMAIN)?;
+        self.named.roots += 1;
+        self.named.keys += (bytes.len() / 32) as u64;
+        Ok(key)
+    }
+
+    /// The roots this process set so far and the keys they name (an index counted by its keys
+    /// when this process made it, else as one key): the command's cleanup line.
+    pub fn named(&self) -> Named {
+        self.named
+    }
+
+    /// An INDEX of `keys` ([`INDEX_TAG`]): one record of their sorted 32-byte keys under
+    /// [`Namespace::LOCAL`], keyed by its bytes, so equal sets are one record that many roots
+    /// share. It keeps nothing by itself: a root that names it through
+    /// [`Plain::root_through`] keeps it and every key it holds (reach follows one level).
+    /// Over [`INDEX_KEYS_MOST`] keys is refused by name ([`StoreError::IndexOver`]).
+    pub fn index(&mut self, keys: &[Key]) -> Result<Key, StoreError> {
+        let bytes = sorted_keys(keys);
+        let count = (bytes.len() / 32) as u64;
+        if count > INDEX_KEYS_MOST as u64 {
+            return Err(StoreError::IndexOver { keys: count, most: INDEX_KEYS_MOST as u64 });
         }
-        let key = Key(ContentId::of(ROOT_DOMAIN, &bytes));
+        let key = Key(ContentId::of(INDEX_DOMAIN, &bytes));
+        self.put(key, Namespace::LOCAL, INDEX_TAG, &bytes).map_err(|it| it.into_store(INDEX_TAG))?;
+        if !self.indexes_made.iter().any(|(it, _)| *it == key) {
+            self.indexes_made.push((key, count));
+        }
+        Ok(key)
+    }
+
+    /// [`Plain::root_for`] of INDEXES: the root `name` names the index records `indexes` (each
+    /// made by [`Plain::index`], in this process or before), kept for `life_ns`; reach keeps the
+    /// root's record, each index and every key each index holds. Its record is filed under
+    /// [`INDEXED_ROOT_TAG`], so a slice tells it from a plain root by the entry it already
+    /// reads, with no probe of the keys it names. Over [`ROOT_INDEXES_MOST`] indexes is refused
+    /// by name.
+    pub fn root_through(&mut self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, StoreError> {
+        let bytes = sorted_keys(indexes);
+        let count = (bytes.len() / 32) as u64;
+        if count > ROOT_INDEXES_MOST as u64 {
+            return Err(StoreError::IndexOver { keys: count, most: ROOT_INDEXES_MOST as u64 });
+        }
+        let key = self.set_root(name, &bytes, life_ns, INDEXED_ROOT_TAG, INDEXED_ROOT_DOMAIN)?;
+        self.named.roots += 1;
+        for index in bytes.chunks_exact(32) {
+            let index = Key(ContentId(index.try_into().expect("32 bytes")));
+            let held = self.indexes_made.iter().find(|(it, _)| *it == index).map_or(1, |(_, n)| *n);
+            self.named.keys += held;
+            self.named.indexed += held;
+        }
+        Ok(key)
+    }
+
+    /// The root `name` set to the record `bytes` (sorted keys) under `tag`, its key derived
+    /// under `domain`: the one body of [`Plain::root_for`] and [`Plain::root_through`].
+    fn set_root(&mut self, name: &str, bytes: &[u8], life_ns: u64, tag: Tag, domain: &'static str) -> Result<Key, StoreError> {
+        let key = Key(ContentId::of(domain, bytes));
         let pending = self.roots_pending.iter().any(|it| matches!(it, RootEdit::Set { name: n, .. } | RootEdit::Unset(n) if n == name));
         let fresh = life_ns != NEVER
             && !pending
@@ -1323,7 +1417,7 @@ impl Plain {
             // Named so already, long enough: nothing to write (its record is committed).
             return Ok(key);
         }
-        self.put(key, Namespace::LOCAL, ROOT_TAG, &bytes).map_err(|it| it.into_store(ROOT_TAG))?;
+        self.put(key, Namespace::LOCAL, tag, bytes).map_err(|it| it.into_store(tag))?;
         self.roots_pending.push(RootEdit::Set { name: name.to_owned(), key, life_ns });
         Ok(key)
     }
@@ -1761,9 +1855,32 @@ impl Plain {
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
             };
-            out.push((root.key, self.maps[at].payload(&entry)));
+            let named = self.maps[at].payload(&entry);
+            out.push((root.key, named));
+            if entry.tag == INDEXED_ROOT_TAG && self.plant() != Plant::IndexNotFollowed {
+                self.follow(root.key, named, &mut out)?;
+            }
         }
         Ok(out)
+    }
+
+    /// Each index the indexed root `root` names (`named`, its record's sorted keys), pushed as
+    /// `(its key, its sorted keys)`: what [`reached`] searches as it searches a root's, so the
+    /// index's own record and every key it holds are live. One level: what an index names is
+    /// not looked into. An index no segment holds, or a record there of another tag, stops the
+    /// slice by name, as a root's missing record does.
+    fn follow<'s>(&'s self, root: ContentId, named: &[u8], out: &mut Vec<(ContentId, &'s [u8])>) -> Result<(), StoreError> {
+        for index in named.chunks_exact(32) {
+            let index = ContentId(index.try_into().expect("32 bytes"));
+            let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
+                return Err(StoreError::IndexGone { generation: self.manifest.generation, root, index });
+            };
+            if entry.tag != INDEX_TAG {
+                return Err(StoreError::NotAnIndex { root, key: index, tag: entry.tag });
+            }
+            out.push((index, self.maps[at].payload(&entry)));
+        }
+        Ok(())
     }
 
     /// `(live, all)`: the bytes `seg`'s records take (each payload aligned, and its entry),
@@ -1802,6 +1919,28 @@ impl Plain {
             for key in got.bytes.chunks_exact(32) {
                 look(&ContentId(key.try_into().expect("32 bytes")), &mut out);
             }
+            if got.tag != INDEXED_ROOT_TAG || self.plant() == Plant::IndexNotFollowed {
+                continue;
+            }
+            // An indexed root: what each index holds is named too, one level. An index this
+            // view follows already (an entry of `live` of its own, as `follow` pushes it) keeps
+            // what it holds here; only another's keys are looked at. (A plain root naming an
+            // index keeps its record, not what it holds: not followed, so looked at.)
+            for index in got.bytes.chunks_exact(32) {
+                let index = ContentId(index.try_into().expect("32 bytes"));
+                if live.iter().any(|(followed, _)| *followed == index) {
+                    continue;
+                }
+                let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
+                    return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
+                };
+                if held.tag != INDEX_TAG {
+                    return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
+                }
+                for key in held.bytes.chunks_exact(32) {
+                    look(&ContentId(key.try_into().expect("32 bytes")), &mut out);
+                }
+            }
         }
         out.sort_unstable();
         out.dedup();
@@ -1825,15 +1964,12 @@ impl Plain {
     }
 
     /// The keys roots name, and the roots' own records.
+    /// An indexed root's indexes followed one level, as reach follows them ([`Plain::live_roots`]).
     fn rooted(&self, now_ns: u64) -> Result<BTreeSet<ContentId>, StoreError> {
         let mut out = BTreeSet::new();
-        for root in self.manifest.roots.iter().filter(|it| it.expires_ns > now_ns) {
-            out.insert(root.key);
-            let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
-                return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
-            };
-            let bytes = self.maps[at].payload(&entry);
-            for key in bytes.chunks_exact(32) {
+        for (key, named) in self.live_roots(now_ns)? {
+            out.insert(key);
+            for key in named.chunks_exact(32) {
                 out.insert(ContentId(key.try_into().expect("32 bytes")));
             }
         }
@@ -3362,6 +3498,19 @@ fn laid_of(mut out: Batch) -> Result<Laid, StoreError> {
     let mut pieces = Vec::with_capacity_in(1, Global);
     pieces.push((HEADER as u64, out.bytes));
     Ok(Laid { pieces, index_at, run, namespace })
+}
+
+/// `keys` sorted and each once, as the 32-byte array a root's or an index's record holds.
+fn sorted_keys(keys: &[Key]) -> Vec<u8> {
+    let mut sorted = Vec::with_capacity_in(keys.len(), Global);
+    sorted.extend_from_slice(keys);
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut bytes = Vec::with_capacity_in(sorted.len() * 32, Global);
+    for key in &sorted {
+        bytes.extend_from_slice(&key.0.0);
+    }
+    bytes
 }
 
 /// `key` is one of `roots`' own keys, or among the sorted 32-byte keys a root's record holds:

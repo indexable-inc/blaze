@@ -681,6 +681,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         if plain {
             let found = self.resolver.path(env.module, abs, &segs, Ns::Value).map_err(|e| Why::Resolve(e, r))?;
             if found.kind == Kind::Const && found.consumed as usize == segs.len() {
+                // Tried and refused by the evaluator (front2/tables/head.rs `freeze_seeded`
+                // files it, as for an anonymous constant below): this head's refusal by name.
+                if let (None, Some(why)) = (self.heads.const_bits(found.key), self.heads.anon_failed(found.key)) {
+                    return Err(Why::ConstPath(format!("{text}: {why}").into_boxed_str(), r));
+                }
                 return self.heads.const_bits(found.key).ok_or(Why::NeedConst(found.key, r));
             }
         }

@@ -244,6 +244,32 @@ impl<'s> OriginsView<'s> {
     /// lies (an expansion record's column, its crate directory's call part): equal to
     /// [`OriginsView::open`] of the two joined.
     pub fn open_parts(call: &'s [u8], column: &'s [u8]) -> Result<OriginsView<'s>, OriginsError> {
+        let CallView { text, item, input_start, input_len, shape, implicit, macro_name } = CallView::open(call)?;
+        let (column, _) = OriginsRef::open(column).map_err(|error| OriginsError::Column { call: None, error })?;
+        Ok(OriginsView { text, item, input_start, input_len, shape, implicit, macro_name, column })
+    }
+}
+
+/// The CALL part of an expansion's origins alone ([`split`]'s first half), read where it lies:
+/// where the call stands and the macro's path, without the column. What a walk up a call's
+/// callers reads (blaze-cli body_types/covered.rs `callers`): it is in the crate's directory
+/// (expansion_records.rs), so the walk reads no expansion record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CallView<'s> {
+    /// The text the call is written in.
+    pub text: At,
+    pub item: ItemIndex,
+    pub input_start: u32,
+    pub input_len: u32,
+    pub shape: InputShape,
+    pub implicit: bool,
+    /// The macro's path as written.
+    pub macro_name: &'s str,
+}
+
+impl<'s> CallView<'s> {
+    /// The call part `call`: exactly its fixed words and its padded path, no column.
+    pub fn open(call: &'s [u8]) -> Result<CallView<'s>, OriginsError> {
         let at = call_len(call)?;
         if at != call.len() {
             return Err(OriginsError::Head { what: "call part's length (not its path's padded end)", word: u32::try_from(call.len()).unwrap_or(u32::MAX) });
@@ -265,7 +291,6 @@ impl<'s> OriginsView<'s> {
         };
         let name_end = FIXED + word(5) as usize;
         let macro_name = core::str::from_utf8(&bytes[FIXED..name_end]).map_err(|_| OriginsError::Head { what: "macro path (not UTF-8)", word: word(5) })?;
-        let (column, _) = OriginsRef::open(column).map_err(|error| OriginsError::Column { call: None, error })?;
-        Ok(OriginsView { text, item: ItemIndex(word(0)), input_start: word(1), input_len: word(2), shape, implicit, macro_name, column })
+        Ok(CallView { text, item: ItemIndex(word(0)), input_start: word(1), input_len: word(2), shape, implicit, macro_name })
     }
 }

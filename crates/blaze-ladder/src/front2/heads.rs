@@ -41,6 +41,11 @@ pub use member_fn::{MemberFrame, member_fn_want, member_head_want};
 /// The most steps one [`Store::ensure`] takes: past it the needs are a cycle.
 const MOST_STEPS: usize = 1 << 16;
 
+/// Why the head of a fn or static declared in a body is refused when it has no body and no
+/// `extern` block of that body declares it (`Store::fn_head`): never asked of the names source,
+/// which holds no row for an item its body's lowering keys (front2/locals.rs).
+const LOCAL_NO_BODY: &str = "a fn or static declared in a body with no body, and no `extern` block of that body declares it (the Reference, [items.fn.body], [items.static.init])";
+
 /// A crate's cfg as blaze-lower asks it: an atom is on when the crate's set holds it.
 pub struct CrateCfg<'c>(pub &'c [(&'c str, Option<&'c str>)]);
 
@@ -605,7 +610,9 @@ pub struct Store<'n> {
     /// The member fns whose signature could not be made, by why: their container's head is
     /// made without them, and a body that uses one gets [`super::world_items::Gap::FnHead`]
     /// (a trait's head does not depend on its fns' signatures: `FnMut` and `extern "rust-call"`).
-    pub fn_gaps: HashMap<ItemKey, Why, Global>,
+    /// Filed from a frozen record too ([`Store::file_heads`], head_record.rs form 13), through
+    /// `&self` as the other rows are.
+    pub fn_gaps: Rows<ItemKey, Why>,
     /// Each impl's frame its fns' signatures are made in ([`member_fn::MemberFrame`]), kept
     /// when its head is made, by the impl's checker key.
     member_frames: Rows<ItemKey, member_fn::MemberFrame>,
@@ -967,7 +974,7 @@ impl<'n> Store<'n> {
             sized,
             pointers: super::receiver::Pointers::NOT_LOOKED_UP,
             trait_defs: Rows::new_in(Global),
-            fn_gaps: HashMap::new_in(Global),
+            fn_gaps: Rows::new_in(Global),
             member_frames: Rows::new_in(Global),
             ctors: Rows::new_in(Global),
             statics: Rows::new_in(Global),
@@ -1347,6 +1354,11 @@ impl<'n> Store<'n> {
                     let text = core::str::from_utf8(&why).map_err(|_| HeadError::Filed { want, at, what: "a refused type alias whose why is not UTF-8" })?;
                     self.maps.aliases.insert(key, None);
                     self.maps.alias_gaps.insert(key, AliasGap { text: text.into(), why: None });
+                }
+                // A member refused alone: its gap again, its why the record's text (form 13).
+                Head::FnRefused { key, why } => {
+                    let text = core::str::from_utf8(&why).map_err(|_| HeadError::Filed { want, at, what: "a refused member fn whose why is not UTF-8" })?;
+                    self.fn_gaps.insert(key, Why::Program(text.into(), Range::new(0, 0)));
                 }
                 Head::TraitAlias { key, head } => {
                     self.maps.trait_aliases.insert(key, head);
@@ -2216,13 +2228,30 @@ impl<'n> Store<'n> {
         // A fn an `extern` block in a body declares ([`super::foreign_locals`]): its own text
         // carries no ABI, its block's does, and it "is implicitly unsafe unless the safe
         // function qualifier is present" (the Reference, "External blocks").
+        // A foreign STATIC of such a block takes the same answer (a static's head is made here
+        // too, `Want::Fn` of a static): its block's ABI and `unsafe` unless written `safe`
+        // (the Reference, [items.extern.static.safety]), exactly as `module_foreign_header`
+        // answers a module-level block's static. Before, only a `ForeignKind::Fn` was taken
+        // here and a body's foreign static fell through to the names source, which holds no
+        // row for an item declared in a body (its key is derived at lowering, locals.rs): "a fn
+        // with no body whose `extern` block the names source did not answer".
+        //
+        // The answer comes from where the head's TEXT came from (rule 30): an item whose text
+        // is the body lowering's (`Locals::head`) is answered by `Locals` alone, never by the
+        // names source, which cannot know it; any other item by the names source's row.
+        let local = self.locals.head(key).is_some();
         let header = match self.locals.foreign(key) {
-            Some(f) if f.kind == super::foreign_locals::ForeignKind::Fn => tc::FnPtrHeader { abi: super::types::fn_ptr_abi(f.abi, whole)?, safety: if f.safe { tc::Safety::Safe } else { tc::Safety::Unsafe }, c_variadic: false },
+            Some(f) => tc::FnPtrHeader { abi: super::types::fn_ptr_abi(f.abi, whole)?, safety: if f.safe { tc::Safety::Safe } else { tc::Safety::Unsafe }, c_variadic: false },
+            // An item declared in a body outside every `extern` block: a fn or static with no
+            // body there is no Rust ("Functions", [items.fn.body]; "Static items": a static
+            // outside an extern block has an initializer), refused by name.
+            None if local && flags & sig::HAS_BODY == 0 => return Err(Why::Unsupported(LOCAL_NO_BODY, whole)),
+            None if local => header,
             // A fn a MODULE-LEVEL `extern` block declares: its block's ABI, and `unsafe` unless
             // written `safe` (super::foreign_head). Read as its own head before, it was a safe
             // Rust fn: aws-lc-rs's `EVP_aead_chacha20_poly1305` was no `unsafe extern "C" fn`
             // pointer (E0308) and libc's variadic `open` was refused as a `...` on a Rust fn.
-            _ => super::foreign_head::module_foreign_header(names, lib, container.is_some(), flags, header, whole)?,
+            None => super::foreign_head::module_foreign_header(names, lib, container.is_some(), flags, header, whole)?,
         };
         if c_variadic && !matches!(header.abi, tc::Abi::C | tc::Abi::CUnwind | tc::Abi::System | tc::Abi::SystemUnwind) {
             return Err(Why::Unsupported("`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])", whole));

@@ -40,6 +40,7 @@ mod shortcuts;
 mod sink;
 mod syntax_kind;
 mod token_set;
+pub mod token_key;
 pub mod unescape;
 
 pub use T_ as T;

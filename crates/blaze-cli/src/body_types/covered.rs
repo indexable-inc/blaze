@@ -51,7 +51,6 @@ use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::front2::project_records::{ByChain, Listed};
 use blaze_ladder::front2::source::{NamesSource, Records};
 use blaze_own::{AVec, Alloc};
-use blaze_scope::expansion_origins::OriginsView;
 use blaze_scope::items_record::{ItemsRecord, MacroBodyAt};
 use blaze_scope::resolve::At;
 use blaze_surface::{Item, ItemIndex, ItemKind};
@@ -177,19 +176,19 @@ pub(crate) fn walk_up<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut 
         if stop(at) {
             return Ok(Up::Stopped(at));
         }
-        let bytes = match texts.origins(at) {
-            Ok(Some(bytes)) => bytes,
+        // The call part alone, from the crate's directory: the walk reads no expansion record.
+        let view = match texts.call(at) {
+            Ok(Some(Some(view))) => view,
             Ok(None) => return Err("a macro call's expansion holds no text in its crate's record (names/expansion_texts.rs)"),
-            Err(_) => return Err("a macro call's expansion origins run past their section (names/expansion_texts.rs)"),
-        };
-        if bytes.is_empty() {
             // The texts blaze-scope writes as `Rewritten` (resolve.rs): a call's statements read
             // as items and a block's module text, both inside a body; and a text whose column
             // could not be made. The lowering knows the call's entry (`CallSrc::place`): the
             // piece owed is blaze-scope writing the call's part for them too.
-            return Err("the expansion that wrote it keeps no origins: a call's statements read as items or a block's module text (blaze-scope expansion_origins.rs `Rewritten`), or a column that could not be made, and blaze-scope writes no calling entry without its column, so the entry its call is at is not known");
-        }
-        let view = OriginsView::open(bytes).map_err(|_| "a macro call's expansion origins do not open (blaze-scope expansion_origins.rs)")?;
+            Ok(Some(None)) => {
+                return Err("the expansion that wrote it keeps no origins: a call's statements read as items or a block's module text (blaze-scope expansion_origins.rs `Rewritten`), or a column that could not be made, and blaze-scope writes no calling entry without its column, so the entry its call is at is not known");
+            }
+            Err(_) => return Err("a macro call's origins do not read from its crate's expansions directory (names/expansion_texts.rs, blaze-scope expansion_records.rs)"),
+        };
         each(view.macro_name);
         match view.text {
             At::File(file) => return Ok(Up::File((file, view.item))),
@@ -206,7 +205,11 @@ pub(crate) fn walk_up<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut 
 pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, WrittenBy<'n>> {
     let mut calls: AVec<'n, (ItemKey, Listed<'n>)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
-        if let Some(At::Expansion(call)) = NamesSource::place_of(records, placed_by(l.body)).map(|p| p.at) {
+        // From the items row alone (front2 source.rs `Records::text_at`): `place_of` reads the
+        // text first, and a body whose expansion record is missing then dropped out of its
+        // call's task, which passed clean with nothing checked; its check now reads the text
+        // and is refused naming the record.
+        if let Some(At::Expansion(call)) = records.text_at(placed_by(l.body)) {
             calls.push((call, *l));
         }
     }
@@ -296,7 +299,7 @@ pub(crate) fn in_blocks<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>
     // Each body of a block: (its key, the body whose block it is in, it).
     let mut links: AVec<'n, (ItemKey, ItemKey, Listed<'n>)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
-        let Some(At::Expansion(call)) = NamesSource::place_of(records, placed_by(l.body)).map(|p| p.at) else { continue };
+        let Some(At::Expansion(call)) = records.text_at(placed_by(l.body)) else { continue };
         let Ok(Up::Stopped(block)) = walk_up(texts, call, &mut |_| {}, &stop) else { continue };
         let Ok(at) = blocks.binary_search_by(|b| b.0.cmp(&block)) else { continue };
         let key = body_key(records, l.body).ok_or("a body of a block's module has no key of its own in its crate's records (body_types/covered.rs `in_blocks`)")?;

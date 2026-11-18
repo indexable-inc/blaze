@@ -9,15 +9,23 @@
 //!   does not hold is a typed refusal ([`SeedError::NotFrozen`]), never lowered instead (rule 3).
 //! - [`Freezing`]: a [`SeededHeads`] behind a `RefCell`, freezing each cell on its first ask:
 //!   one worker's, for making a table (the cost test freezes the fixture's heads this way, once).
+//! - [`RequestSeed`]: the engine's (blaze-cli engine_seeds.rs). A cell the request knows
+//!   ([`RequestHeads`]: the head tasks' table, the dependency heads found in the store, what
+//!   another worker froze) is imported from those bytes; any other (a dependency's head on its
+//!   first read) is frozen here, on the spot, by one worker's [`SeededHeads`] that takes every
+//!   need it knows from the request too, and what it froze is published to every other worker.
+//!   A freeze is a function of its cell and the names (head.rs `freeze_seeded`), so a body's
+//!   result never depends on which worker froze a head first: two workers that freeze one cell
+//!   at once make equal bytes, one is kept, and other bytes are a typed refusal.
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use blaze_own::{AVec, Alloc};
 
 use super::super::heads::{Seeded, Store, Want};
 use super::super::keys::Keys;
 use super::super::source::NamesSource;
-use super::head::{FreezeError, FrozenHead, HeadSource, SeededHeads, cell_of, seed, want_bytes};
+use super::head::{FreezeError, FrozenHead, HeadSource, KnownHeads, SeededHeads, cell_of, seed, want_bytes};
 
 /// What a body's store asks for each head it needs (heads.rs `Store::seeds`).
 pub trait HeadSeed<'n> {
@@ -34,6 +42,11 @@ pub enum SeedError {
     /// The table holds no frozen record of `cell`, the cell of need `need`: the request froze
     /// too few heads (a fault of the plan, never lowered here).
     NotFrozen { need: Want, cell: Want },
+    /// Two freezes of cell `cell` in one request made other bytes: a freeze that is not a
+    /// function of its cell and the names (rule 21), never one kept quietly.
+    Unequal { cell: Want },
+    /// The request's heads frozen now hold `most` cells: cell `cell` is not taken (rule 18).
+    Full { cell: Want, most: usize },
 }
 
 impl core::fmt::Display for SeedError {
@@ -41,6 +54,8 @@ impl core::fmt::Display for SeedError {
         match self {
             SeedError::Freeze(e) => write!(f, "{e}"),
             SeedError::NotFrozen { need, cell } => write!(f, "{need:?} needs cell {cell:?}, which the request's frozen heads do not hold (front2 tables/seeds.rs)"),
+            SeedError::Unequal { cell } => write!(f, "cell {cell:?} was frozen twice in one request to other bytes: its freeze is not a function of its cell (front2 tables/seeds.rs `RequestHeads::publish`)"),
+            SeedError::Full { cell, most } => write!(f, "cell {cell:?}: the request's heads frozen now already hold {most} cells (front2 tables/seeds.rs `RequestHeads::publish`)"),
         }
     }
 }
@@ -58,6 +73,14 @@ pub struct FrozenTable<'a> {
     cells: AVec<'a, (Want, AVec<'a, u8>)>,
 }
 
+// SAFETY: the table is read by every worker of a request at once (blaze-cli engine_seeds.rs
+// `RequestTable`). What keeps an `Alloc` handle from being `Sync` is that allocating or freeing
+// through it from two threads at once races on its header; a `&FrozenTable` reaches the
+// handles only through `AVec`'s shared methods (`iter`, `len`, a slice index, `binary_search`:
+// this file's `bytes_of`, `iter`, `len`, `view`), none of which allocates or frees. Growing or
+// dropping the table takes `&mut` or ownership, so one thread. `Want` and `u8` are plain data.
+unsafe impl Sync for FrozenTable<'_> {}
+
 /// One group's view of the request's [`FrozenTable`]: its names turn a need into a cell, the
 /// table gives the cell's bytes. Copied freely; nothing in it changes.
 pub struct TableView<'t, 'a, N> {
@@ -71,6 +94,10 @@ pub enum TableError {
     /// More than [`MOST_CELLS`] cells.
     Full { cells: usize },
     Freeze(FreezeError),
+    /// A record's bytes do not read as a frozen head.
+    Read(super::head::FrozenError),
+    /// Two records of one cell hold other bytes (rule 21).
+    Twice { cell: Want },
 }
 
 impl<'a> FrozenTable<'a> {
@@ -91,6 +118,35 @@ impl<'a> FrozenTable<'a> {
         }
         cells.sort_unstable_by(|a, b| want_bytes(a.0).cmp(&want_bytes(b.0)));
         Ok(FrozenTable { cells })
+    }
+
+    /// The table of frozen heads `each` hands (each the `BZFZ` form, its cell read from its own
+    /// header), copied into `alloc`: the request's table from its head tasks' records. A cell
+    /// handed twice with equal bytes is kept once; with other bytes it is refused (rule 21).
+    pub fn from_frozen<'b>(each: impl Iterator<Item = &'b [u8]>, alloc: Alloc<'a>) -> Result<FrozenTable<'a>, TableError> {
+        let mut cells: AVec<'a, (Want, AVec<'a, u8>)> = AVec::new_in(alloc);
+        for bytes in each {
+            if cells.len() == MOST_CELLS {
+                return Err(TableError::Full { cells: MOST_CELLS + 1 });
+            }
+            let want = FrozenHead::read(bytes).map_err(TableError::Read)?.want();
+            let mut copy: AVec<'a, u8> = AVec::with_capacity_in(bytes.len(), alloc);
+            copy.extend_from_slice(bytes);
+            cells.push((want, copy));
+        }
+        cells.sort_unstable_by(|a, b| want_bytes(a.0).cmp(&want_bytes(b.0)).then_with(|| a.1[..].cmp(&b.1[..])));
+        for two in cells.windows(2) {
+            if two[0].0 == two[1].0 && two[0].1[..] != two[1].1[..] {
+                return Err(TableError::Twice { cell: two[0].0 });
+            }
+        }
+        cells.dedup_by(|a, b| a.0 == b.0);
+        Ok(FrozenTable { cells })
+    }
+
+    /// Every cell and its bytes, sorted by the cell's bytes.
+    pub fn iter(&self) -> impl Iterator<Item = (Want, &[u8])> + '_ {
+        self.cells.iter().map(|(w, bytes)| (*w, &bytes[..]))
     }
 
     /// This table read through `names`: what a body of that names' group is handed.
@@ -159,5 +215,72 @@ impl<'n, N: NamesSource<'n>> HeadSeed<'n> for Freezing<'n, '_, N> {
     fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
         let mut heads = self.heads.borrow_mut();
         seed(self.names, None, need, &mut *heads, store, keys, scratch).map_err(SeedError::Freeze)
+    }
+}
+
+/// The request's frozen heads as every worker sees them ([`RequestSeed`]): what it knows
+/// ([`KnownHeads::known`]: read only, or inserted once with equal bytes), and where a worker
+/// publishes a head it froze. Shared by every worker of the request (`Sync`).
+pub trait RequestHeads: KnownHeads + Sync {
+    /// `bytes`, frozen now for `cell` by one worker, handed to every other. A cell published
+    /// before keeps the first bytes; equal bytes again are counted, other bytes refused
+    /// ([`SeedError::Unequal`]); past the table's cap, [`SeedError::Full`]. `krate`: the crate
+    /// the freezing worker's names hold the cell's item in (`NamesSource::crate_of`, then
+    /// `crate_key`), `None` when they hold it in none: what decides whether the head is a
+    /// dependency's, kept beyond the request, by the names' own answer, not by a key's bytes.
+    fn publish(&self, cell: Want, krate: Option<blaze_id::CrateItemKey>, bytes: &[u8]) -> Result<(), SeedError>;
+}
+
+/// One stretch's seed on the engine (module docs): `names` is the stretch's records, `heads`
+/// the request's, `freezer` this stretch's own freezer (its known heads `heads`). Not `Sync`:
+/// one a worker's stretch.
+pub struct RequestSeed<'k, 'n, 'a, N, H> {
+    names: N,
+    heads: &'k H,
+    freezer: RefCell<SeededHeads<'n, 'a, N>>,
+    /// Asks answered from the request's heads.
+    pub known: Cell<u32>,
+    /// Asks whose cell this stretch froze (with what that freeze needed and froze first).
+    pub froze: Cell<u32>,
+}
+
+/// What a [`RequestSeed`] is made over. `freezer` is made with `known: Some(heads)`, so a
+/// freeze takes every need the request knows.
+pub struct RequestSeedOpts<'k, 'n, 'a, N, H> {
+    pub names: N,
+    pub heads: &'k H,
+    pub freezer: SeededHeads<'n, 'a, N>,
+}
+
+impl<'k, 'n, 'a, N: NamesSource<'n>, H: RequestHeads> RequestSeed<'k, 'n, 'a, N, H> {
+    pub fn new(o: RequestSeedOpts<'k, 'n, 'a, N, H>) -> RequestSeed<'k, 'n, 'a, N, H> {
+        RequestSeed { names: o.names, heads: o.heads, freezer: RefCell::new(o.freezer), known: Cell::new(0), froze: Cell::new(0) }
+    }
+
+    /// The wants this stretch's freezes lowered, and the freeze attempts they took.
+    pub fn freezer_counts(&self) -> (u32, u32) {
+        let freezer = self.freezer.borrow();
+        (freezer.lowered, freezer.attempts)
+    }
+}
+
+impl<'n, N: NamesSource<'n>, H: RequestHeads> HeadSeed<'n> for RequestSeed<'_, 'n, '_, N, H> {
+    fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
+        let cell = cell_of(self.names, need).map_err(SeedError::Freeze)?;
+        if let Some(bytes) = self.heads.known(cell) {
+            self.known.set(self.known.get().saturating_add(1));
+            return seed(self.names, None, need, &mut OneCell { cell, bytes }, store, keys, scratch).map_err(SeedError::Freeze);
+        }
+        // Not known: frozen here (its needs taken from the request where known), then each
+        // cell this ask froze published, needs first, before the body reads on.
+        let mut freezer = self.freezer.borrow_mut();
+        let from = freezer.kept_len();
+        let seeded = seed(self.names, None, need, &mut *freezer, store, keys, scratch);
+        for (w, bytes) in freezer.frozen_from(from) {
+            let krate = NamesSource::crate_of(self.names, w.key()).and_then(|k| NamesSource::crate_key(self.names, k));
+            self.heads.publish(w, krate, bytes)?;
+        }
+        self.froze.set(self.froze.get().saturating_add(1));
+        seeded.map_err(SeedError::Freeze)
     }
 }

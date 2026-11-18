@@ -76,10 +76,27 @@
 //!    re-validates the record, and its user is entered only when the record's bytes moved
 //!    (`a_hit_is_one_read`).
 //!
+//! # The last answer and this request's writes
+//!
+//! The engine reads the answer the last request left through the seam (last.rs `LastAnswer`), a
+//! type parameter `L` (rule 78): `Engine<Answer>` over the in-memory maps (last_mem.rs), the
+//! default and the engine as it always was; a stored form read in place behind the same seam.
+//! What this request writes goes to its working set (overlay.rs `Work`), never to `L`, and every
+//! question goes through one [`Overlay`]: what this request did first, the last answer second.
+//! Where the invariants above say "the answer's rows", "a row" or "the reverse index", they mean
+//! the overlay's: a row this request put or retired shadows the last answer's row of that name
+//! (invariants 3, 7, 10); a cell this request moved shadows the last answer's digest (4, 5, 9); a
+//! reader this request dropped is no reader of the cell, one it added is (4, 10, 12); the owed
+//! tasks and cells are this request's sets, started from the last answer's (5). A row stands
+//! by the digests it saw where the form keeps them (invariant 4 as written), and otherwise by
+//! generation: none of its reads moved after its serial (overlay.rs `first_moved`). The finished
+//! request's writes go to the form at [`Engine::finish`] (overlay.rs `Fold`).
+//!
 //! # Cost
 //!
 //! A phase costs a sort of its results and a constant; an edit costs its changed files' plans,
-//! the moved cells and their readers. Nothing scans the answer's rows.
+//! the moved cells and their readers. Nothing scans the answer's rows: each question to the last
+//! answer names one row, one cell or one file ([`Finished::touched`] counts the rows asked).
 //!
 //! # Threads
 //!
@@ -90,10 +107,14 @@
 
 use core::fmt;
 
+use blaze_answer::CellDigest;
 use blaze_drive::cells::Cell;
 use blaze_drive::key::{self, ABSENT, Key, Name, Tool};
 use blaze_id::ContentId;
 use blaze_own::{AVec, Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
+
+use crate::last::{LastAnswer, LastError, Touched};
+use crate::overlay::{Fold, Overlay, RowFacts};
 
 /// A vector over a `Sync` allocator: what a buffer holds and a view reads.
 pub type SVec<'a, T> = Vec<T, SharedAlloc<'a>>;
@@ -382,30 +403,6 @@ impl<'a> Answer<'a> {
         }
         out
     }
-
-    /// The first read of `row`, in its read order, whose cell moved since the row saw it, and how
-    /// many reads were looked up to find it: the walk stops there, so a read that exists only
-    /// because of an earlier answer is never looked up once that answer moved (invariant 9).
-    /// `reverse` walks from the last read: [`Plant::LaterReadFirst`] alone.
-    fn first_moved(&self, row: &Row<'_>, reverse: bool) -> (Option<Cause>, u32) {
-        let mut compared = 0u32;
-        let mut moved = |(id, seen): &(CellId, ContentId)| {
-            compared += 1;
-            let now = self.cell(id);
-            (now != *seen).then_some(Cause::ReadMoved { read: *id, was: *seen, now })
-        };
-        let found = match reverse {
-            true => row.reads.iter().rev().find_map(&mut moved),
-            false => row.reads.iter().find_map(&mut moved),
-        };
-        (found, compared)
-    }
-
-    /// Whether `name` is a made record no plan lists: re-validated only while still needed
-    /// (invariant 10).
-    fn made_only(&self, name: &Name) -> bool {
-        !self.owed_tasks.contains_key(name) && self.rows.get(name).is_some_and(|row| row.inline)
-    }
 }
 
 /// The first cell `reads` holds twice, if any (invariant 9: each cell once, at its first read).
@@ -480,6 +477,10 @@ pub enum Plant {
     /// A reader of a cell moved in its own stage and wave is dropped instead of entered at the
     /// next wave: left stale for a request (invariant 2).
     SameStageStale,
+    /// The overlay answers a cell's readers from the last answer alone, ignoring the readers
+    /// this request dropped (overlay.rs, shadowing rule 3): a row that no longer reads a made
+    /// record still keeps it (last_sim.rs's control).
+    ReadersStale,
 }
 
 /// What one request did.
@@ -551,6 +552,21 @@ pub enum EngineError {
     GrownForeign { by: Name, name: Name },
     /// `by` grew `count` tasks, past [`GROWN_CAP`] (rule 18).
     GrownTooMany { by: Name, count: u32 },
+    /// The last answer refused a question (last.rs): it contradicts itself.
+    Last { error: LastError },
+    /// The last answer names a `what` (a task, a cell) its dictionary does not: in the row, the
+    /// reader list or the plan of `by`, or among the owed cells (`None`).
+    LastUnnamed { what: &'static str, by: Option<Name> },
+    /// A task's question to the last answer through its view was refused (overlay.rs
+    /// `Overlay::refuse`): the phase's merge stops (`None`: found at the finish, before any
+    /// phase merged).
+    ViewRefused { phase: Option<Phase> },
+}
+
+impl From<LastError> for EngineError {
+    fn from(error: LastError) -> EngineError {
+        EngineError::Last { error }
+    }
 }
 
 impl fmt::Display for EngineError {
@@ -589,26 +605,45 @@ impl fmt::Display for EngineError {
             EngineError::GrownTooMany { by, count } => {
                 write!(f, "{by:?} grew {count} tasks, past the cap of {GROWN_CAP} (rule 18, engine.rs `grow`)")
             }
+            EngineError::Last { error } => write!(f, "{error} (engine.rs, read through overlay.rs)"),
+            EngineError::LastUnnamed { what, by: Some(by) } => {
+                write!(f, "the stored answer: {by:?}'s entry names {what} its dictionary does not (overlay.rs)")
+            }
+            EngineError::LastUnnamed { what, by: None } => write!(f, "the stored answer: {what} its dictionary does not name (overlay.rs)"),
+            EngineError::ViewRefused { phase } => {
+                write!(f, "a task of {phase:?} asked the stored answer through its view and was refused: the answer contradicts itself (overlay.rs `refuse`)")
+            }
         }
     }
 }
 
-/// What a finished request gives.
-pub struct Finished<'a> {
-    pub answer: Answer<'a>,
+/// What a finished request gives: the next answer in the form the last answer's [`Fold`] gives
+/// (`Answer` for `Engine<Answer>`).
+pub struct Finished<'a, A = Answer<'a>> {
+    pub answer: A,
     pub report: Report,
     /// The names entered, in phase order and name order within a phase.
     pub entered: SVec<'a, Name>,
     /// Why each was entered, in the same order as `entered`.
     pub causes: SVec<'a, Entered>,
+    /// What the request's questions to the last answer cost (last.rs): the rows, reads and
+    /// readers it was asked for, never the answer's size.
+    pub touched: Touched,
 }
 
 /// The read-only view a task reads the tables through (E2 grows it): `Copy + Sync`, one per
 /// phase, shared by every worker.
-#[derive(Clone, Copy)]
-pub struct View<'e, 'a> {
-    answer: &'e Answer<'a>,
+pub struct View<'e, 'a, L = Answer<'a>> {
+    overlay: &'e Overlay<'a, L>,
 }
+
+impl<L> Clone for View<'_, '_, L> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<L> Copy for View<'_, '_, L> {}
 
 /// Held at compile time: a view is shared by the workers and a buffer sent to one.
 const _: () = {
@@ -618,32 +653,44 @@ const _: () = {
     send::<Buffer<'static>>();
 };
 
-impl View<'_, '_> {
+impl<L: LastAnswer> View<'_, '_, L> {
     /// The cell's digest today: complete for every earlier phase.
     pub fn cell(&self, id: &CellId) -> ContentId {
-        self.answer.cell(id)
+        self.overlay.digest(id)
     }
 
-    /// `name`'s row as it stands: merged this request, or standing from the last answer.
-    pub fn row(&self, name: Name) -> Option<&Row<'_>> {
-        self.answer.rows.get(&name)
+    /// `name`'s row as it stands: merged this request, or standing from the last answer. A
+    /// question the last answer refuses answers `None` and stops the phase's merge
+    /// ([`EngineError::ViewRefused`]).
+    pub fn row(&self, name: Name) -> Option<RowFacts> {
+        match self.overlay.row(name) {
+            Ok(found) => found,
+            Err(_) => {
+                self.overlay.refuse();
+                None
+            }
+        }
     }
-}
 
-impl<'e, 'a> View<'e, 'a> {
     /// A record a task needs inline (engine.md, "The design" 3), found standing: `name`'s row
     /// under `key`, owed nothing, every read of it today in its read order (the validation a
     /// planned task's row gets, invariant 8). The hit is one read: the caller reads the cells of
     /// it that it uses, as any cell, and none of the record's own reads, which the record keeps
     /// (invariant 12). `None`: no such row stands, and the task makes the record itself
     /// ([`Made`]), reading its cells the same way.
-    pub fn hit(&self, name: Name, key: Key) -> Option<&'e Row<'a>> {
-        let answer: &'e Answer<'a> = self.answer;
-        let row = answer.rows.get(&name)?;
-        if row.key != key || answer.owed_tasks.contains_key(&name) || answer.first_moved(row, false).0.is_some() {
+    pub fn hit(&self, name: Name, key: Key) -> Option<RowFacts> {
+        let row = self.row(name)?;
+        if row.key != key || self.overlay.owed(name).is_some() {
             return None;
         }
-        Some(row)
+        match self.overlay.first_moved(name, false) {
+            Ok((None, _)) => Some(row),
+            Ok((Some(_), _)) => None,
+            Err(_) => {
+                self.overlay.refuse();
+                None
+            }
+        }
     }
 }
 
@@ -658,13 +705,15 @@ pub trait Pool<'a> {
     fn run(&mut self, tasks: &[Task], buffers: &mut [Buffer<'a>], work: &(dyn Fn(&Self::Cx, &Task, &mut Buffer<'a>) + Sync));
 }
 
-/// One request's engine.
-pub struct Engine<'a, S: Scope> {
+/// One request's engine, over the last answer in the form `L` (the module's "The last answer
+/// and this request's writes").
+pub struct Engine<'a, S: Scope, L = Answer<'a>> {
     alloc: SharedAlloc<'a>,
     tools: Tools,
     plant: Plant,
     scope: S,
-    answer: Answer<'a>,
+    /// The last answer under this request's writes: every table question and every write.
+    view: Overlay<'a, L>,
     serial: Gen,
     /// Candidates by phase.
     pending: SMap<'a, Phase, SSet<'a, Name>>,
@@ -692,18 +741,19 @@ pub struct Engine<'a, S: Scope> {
     orphans: SSet<'a, Name>,
 }
 
-impl<'a, S: Scope> Engine<'a, S> {
+impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
     /// Plans a request from the last answer and the edit (invariant 1): each changed file's
     /// tasks whose key moved, its tasks gone (their cells move to absent), the owed tasks, and
     /// the readers of the owed cells.
-    pub fn new_in(tools: Tools, answer: Answer<'a>, edit: &Edit<'_>, scope: S, plant: Plant, alloc: SharedAlloc<'a>) -> Result<Engine<'a, S>, EngineError> {
-        let serial = Gen(answer.serial.0 + 1);
+    pub fn new_in(tools: Tools, last: L, edit: &Edit<'_>, scope: S, plant: Plant, alloc: SharedAlloc<'a>) -> Result<Engine<'a, S, L>, EngineError> {
+        let serial = Gen(last.serial().0 + 1);
+        let view = Overlay::new_in(last, serial, plant, alloc)?;
         let mut engine = Engine {
             alloc,
             tools,
             plant,
             scope,
-            answer,
+            view,
             serial,
             pending: BTreeMap::new_in(alloc),
             planned: BTreeMap::new_in(alloc),
@@ -720,7 +770,7 @@ impl<'a, S: Scope> Engine<'a, S> {
             orphans: BTreeSet::new_in(alloc),
         };
         for (file, plan) in edit.files.iter() {
-            let old = engine.answer.by_file.remove(file).unwrap_or_else(|| Vec::new_in(alloc));
+            let old = engine.view.take_file(*file)?;
             let mut names: SVec<'a,Name> = Vec::with_capacity_in(plan.len(), alloc);
             for planned in plan.iter() {
                 names.push(planned.name);
@@ -729,36 +779,27 @@ impl<'a, S: Scope> Engine<'a, S> {
             names.sort_unstable();
             for name in old.iter() {
                 if names.binary_search(name).is_err() {
-                    engine.answer.owed_tasks.remove(name);
-                    engine.report.retired += u32::from(engine.answer.rows.contains_key(name));
+                    engine.view.unowe(*name);
+                    engine.report.retired += u32::from(engine.view.row(*name)?.is_some());
                     engine.remove_row(*name, None)?;
                 }
             }
             for planned in plan.iter() {
                 let key = tools.key(planned.name, &planned.source);
-                if engine.answer.rows.get(&planned.name).is_none_or(|row| row.key != key) {
+                if engine.view.row(planned.name)?.is_none_or(|row| row.key != key) {
                     engine.candidate(*planned, None)?;
                 }
             }
             if !names.is_empty() {
-                engine.answer.by_file.insert(*file, names);
+                engine.view.put_file(*file, names);
             }
         }
-        let owed: SVec<'a,Planned> = {
-            let mut owed = Vec::new_in(alloc);
-            for planned in engine.answer.owed_tasks.values() {
-                owed.push(*planned);
-            }
-            owed
-        };
+        let owed: SVec<'a,Planned> = engine.view.owed_tasks();
         for planned in owed.iter() {
             let planned = engine.planned.get(&planned.name).copied().unwrap_or(*planned);
             engine.candidate(planned, None)?;
         }
-        let mut cells: SVec<'a,CellId> = Vec::new_in(alloc);
-        for id in engine.answer.owed_cells.keys() {
-            cells.push(*id);
-        }
+        let cells: SVec<'a,CellId> = engine.view.owed_cells();
         for id in cells.iter() {
             engine.readers_of(*id, None)?;
         }
@@ -782,7 +823,7 @@ impl<'a, S: Scope> Engine<'a, S> {
             let mut made_rows: SVec<'a, Name> = Vec::new_in(self.alloc);
             for name in names.iter() {
                 // Changed and still needed (invariant 10): a made row is decided below.
-                if self.plant != Plant::RemakesUnneeded && !self.planned.contains_key(name) && self.answer.made_only(name) {
+                if self.plant != Plant::RemakesUnneeded && !self.planned.contains_key(name) && self.view.made_only(*name)? {
                     continue;
                 }
                 if let Some(stale) = self.consider(phase, *name)?
@@ -792,7 +833,7 @@ impl<'a, S: Scope> Engine<'a, S> {
                 }
             }
             for name in names.iter() {
-                if self.plant != Plant::RemakesUnneeded && !self.planned.contains_key(name) && self.answer.made_only(name) && !made_rows.contains(name) {
+                if self.plant != Plant::RemakesUnneeded && !self.planned.contains_key(name) && self.view.made_only(*name)? && !made_rows.contains(name) {
                     made_rows.push(*name);
                 }
             }
@@ -801,7 +842,7 @@ impl<'a, S: Scope> Engine<'a, S> {
             // still uses it, and a record nobody needs is retired, never made again.
             let mut needed: SVec<'a, Name> = Vec::new_in(self.alloc);
             for name in made_rows.iter() {
-                if self.still_needed(*name) && self.tasks.binary_search_by_key(name, |task| task.planned.name).is_err() {
+                if self.still_needed(*name)? && self.tasks.binary_search_by_key(name, |task| task.planned.name).is_err() {
                     needed.push(*name);
                 }
             }
@@ -847,27 +888,27 @@ impl<'a, S: Scope> Engine<'a, S> {
     /// digest the cell holds today (invariant 2): the made row's name is returned, for the phase
     /// to decide it.
     fn consider(&mut self, phase: Phase, name: Name) -> Result<Option<Name>, EngineError> {
-        let Some(planned) = self.planned_of(name) else { return Ok(None) };
+        let Some(planned) = self.planned_of(name)? else { return Ok(None) };
         let key = self.tools.key(planned.name, &planned.source);
         if !self.scope.runs(&planned) {
             self.report.not_run += 1;
-            if self.answer.rows.get(&name).is_none_or(|row| row.key != key) {
-                self.answer.owed_tasks.insert(name, planned);
+            if self.view.row(name)?.is_none_or(|row| row.key != key) {
+                self.view.owe(planned);
             }
             return Ok(None);
         }
         // Why, or `None` when its row stands: no row, its key, the first read in read order that
         // moved (the walk stops there, invariant 9), owed.
         let reverse = self.plant == Plant::LaterReadFirst;
-        let cause = match self.answer.rows.get(&name) {
+        let cause = match self.view.row(name)? {
             None => Some(Cause::New),
             Some(row) if row.key != key => Some(Cause::KeyMoved),
-            Some(row) => {
-                let owed = self.answer.owed_tasks.contains_key(&name);
+            Some(_) => {
+                let owed = self.view.owed(name).is_some();
                 if self.plant == Plant::ReadsNotCompared && !owed {
                     None
                 } else {
-                    let (moved, compared) = self.answer.first_moved(row, reverse);
+                    let (moved, compared) = self.view.first_moved(name, reverse)?;
                     self.report.compared += compared;
                     match moved {
                         Some(_) if self.plant == Plant::WrongCause => Some(Cause::KeyMoved),
@@ -881,7 +922,7 @@ impl<'a, S: Scope> Engine<'a, S> {
         if let Cause::ReadMoved { read, .. } = cause
             && matches!(phase.stage, Stage::Heads | Stage::Bodies)
             && read.of != name
-            && self.stale_made(read.of)
+            && self.stale_made(read.of)?
         {
             if phase.wave >= WAVE_CAP {
                 return Err(EngineError::WaveTooDeep { reader: name, read, wave: phase.wave });
@@ -896,24 +937,28 @@ impl<'a, S: Scope> Engine<'a, S> {
     }
 
     /// Whether `name` is a made row whose row is not today's: a read of it moved (invariant 10).
-    fn stale_made(&self, name: Name) -> bool {
-        !self.planned.contains_key(&name) && self.answer.made_only(&name) && self.answer.rows.get(&name).is_some_and(|row| self.answer.first_moved(row, false).0.is_some())
+    fn stale_made(&self, name: Name) -> Result<bool, EngineError> {
+        Ok(!self.planned.contains_key(&name) && self.view.made_only(name)? && self.view.first_moved(name, false)?.0.is_some())
     }
 
     /// Whether the made row `made` is still needed by the request (invariant 10): a row other
     /// than itself reads one of its cells, the scope runs that row, and the phase being opened
     /// does not enter it (`self.tasks`, sorted by name, holds the phase's other tasks).
-    fn still_needed(&self, made: Name) -> bool {
-        let Some(row) = self.answer.rows.get(&made) else { return false };
-        row.defines.iter().any(|(cell, _)| {
-            self.answer.readers.get(&CellId { of: made, cell: *cell }).is_some_and(|readers| {
-                readers.iter().any(|reader| {
-                    *reader != made
-                        && self.tasks.binary_search_by_key(reader, |task| task.planned.name).is_err()
-                        && self.planned_of(*reader).is_some_and(|planned| self.scope.runs(&planned))
-                })
-            })
-        })
+    fn still_needed(&self, made: Name) -> Result<bool, EngineError> {
+        if self.view.row(made)?.is_none() {
+            return Ok(false);
+        }
+        for cell in self.view.defines(made)?.iter() {
+            for reader in self.view.readers(CellId { of: made, cell: *cell })?.iter() {
+                if *reader != made
+                    && self.tasks.binary_search_by_key(reader, |task| task.planned.name).is_err()
+                    && self.planned_of(*reader)?.is_some_and(|planned| self.scope.runs(&planned))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// The open phase's tasks, sorted by name.
@@ -938,7 +983,7 @@ impl<'a, S: Scope> Engine<'a, S> {
         if self.open.is_some() {
             return Err(EngineError::OutOfTurn);
         }
-        let Some(grower) = self.answer.rows.get(&by) else { return Err(EngineError::GrownByUnmerged { by }) };
+        let Some(grower) = self.view.row(by)? else { return Err(EngineError::GrownByUnmerged { by }) };
         if grower.serial != self.serial {
             return Err(EngineError::GrownByUnmerged { by });
         }
@@ -970,7 +1015,7 @@ impl<'a, S: Scope> Engine<'a, S> {
         if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
             return Err(EngineError::TwoValues { name: pair[0] });
         }
-        let old = self.answer.by_file.remove(&by).unwrap_or_else(|| Vec::new_in(alloc));
+        let old = self.view.take_file(by)?;
         for name in old.iter() {
             if names.binary_search(name).is_ok() {
                 continue;
@@ -979,21 +1024,21 @@ impl<'a, S: Scope> Engine<'a, S> {
                 // The planted bug: dropped from the plan, its row kept.
                 continue;
             }
-            self.answer.owed_tasks.remove(name);
+            self.view.unowe(*name);
             self.planned.remove(name);
-            self.report.retired += u32::from(self.answer.rows.contains_key(name));
+            self.report.retired += u32::from(self.view.row(*name)?.is_some());
             self.remove_row(*name, Some(after))?;
         }
         for one in planned.iter() {
             self.planned.insert(one.name, *one);
             self.report.grown += 1;
             let key = self.tools.key(one.name, &one.source);
-            if self.answer.rows.get(&one.name).is_none_or(|row| row.key != key) {
+            if self.view.row(one.name)?.is_none_or(|row| row.key != key) {
                 self.candidate(*one, None)?;
             }
         }
         if !names.is_empty() {
-            self.answer.by_file.insert(by, names);
+            self.view.put_file(by, names);
         }
         Ok(())
     }
@@ -1006,33 +1051,39 @@ impl<'a, S: Scope> Engine<'a, S> {
             return Ok(());
         }
         while let Some(name) = self.orphans.pop_first() {
-            let Some(row) = self.answer.rows.get(&name) else { continue };
+            let Some(row) = self.view.row(name)? else { continue };
             if !row.inline || self.planned.contains_key(&name) {
                 continue;
             }
-            let answer = &self.answer;
-            let read = row.defines.iter().any(|(cell, _)| {
-                answer.readers.get(&CellId { of: name, cell: *cell }).is_some_and(|readers| readers.iter().any(|reader| *reader != name))
-            });
+            let mut read = false;
+            for cell in self.view.defines(name)?.iter() {
+                if self.view.readers(CellId { of: name, cell: *cell })?.iter().any(|reader| *reader != name) {
+                    read = true;
+                    break;
+                }
+            }
             if read {
                 continue;
             }
             self.report.retired += 1;
-            self.answer.owed_tasks.remove(&name);
+            self.view.unowe(name);
             self.remove_row(name, self.passed)?;
         }
         Ok(())
     }
 
     /// The tables as they stand: complete for every phase before the open one.
-    pub fn view(&self) -> View<'_, 'a> {
-        View { answer: &self.answer }
+    pub fn view(&self) -> View<'_, 'a, L> {
+        View { overlay: &self.view }
     }
 
     /// Merges the open phase's buffers in bulk, sorted by name (invariant 3): rows, cells, the
     /// reverse index, and the readers of every moved cell as candidates of later phases.
     pub fn merge(&mut self, buffers: &mut [Buffer<'a>]) -> Result<(), EngineError> {
         let phase = self.open.take().ok_or(EngineError::OutOfTurn)?;
+        if self.view.refused() {
+            return Err(EngineError::ViewRefused { phase: Some(phase) });
+        }
         let mut done: SVec<'a,Done<'a>> = Vec::new_in(self.alloc);
         let mut made: SVec<'a,Made<'a>> = Vec::new_in(self.alloc);
         for buffer in buffers.iter_mut() {
@@ -1093,7 +1144,8 @@ impl<'a, S: Scope> Engine<'a, S> {
                     }
                 }
                 Err(_) => {
-                    if let Some(row) = self.answer.rows.get(&name)
+                    // A row of this request's serial is one this request put.
+                    if let Some(row) = self.view.row_now(name)
                         && row.serial == self.serial
                         && !same(row, &one.done)
                     {
@@ -1119,7 +1171,7 @@ impl<'a, S: Scope> Engine<'a, S> {
         for (task, cause) in tasks.iter().zip(opened.iter()) {
             let result = done_iter.next().ok_or(EngineError::NoResult { name: task.planned.name })?;
             // A made row re-validated as a task stays a made row (invariant 10).
-            let inline = !self.planned.contains_key(&task.planned.name) && self.answer.rows.get(&task.planned.name).is_some_and(|row| row.inline);
+            let inline = !self.planned.contains_key(&task.planned.name) && self.view.row(task.planned.name)?.is_some_and(|row| row.inline);
             let identical = self.apply(task.planned, result, phase, inline, &mut changes)?;
             self.count(task.planned, *cause, identical);
         }
@@ -1129,7 +1181,7 @@ impl<'a, S: Scope> Engine<'a, S> {
                 continue;
             }
             // Made earlier in this request, the same bytes (compared above): merged once.
-            if self.answer.rows.get(&name).is_some_and(|row| row.serial == self.serial) {
+            if self.view.row_now(name).is_some_and(|row| row.serial == self.serial) {
                 continue;
             }
             self.report.made += 1;
@@ -1168,39 +1220,6 @@ impl<'a, S: Scope> Engine<'a, S> {
         Ok(())
     }
 
-    /// Ends the request: the owed cells are this request's moved ones and the earlier ones, less
-    /// each whose every reader's row saw its digest.
-    pub fn finish(mut self) -> Result<Finished<'a>, EngineError> {
-        if self.open.is_some() {
-            return Err(EngineError::OutOfTurn);
-        }
-        self.retire_orphans()?;
-        for id in self.moved.iter() {
-            self.answer.owed_cells.insert(*id, self.serial);
-        }
-        let answer = &self.answer;
-        let mut settled: SVec<'a,CellId> = Vec::new_in(self.alloc);
-        for id in answer.owed_cells.keys() {
-            let digest = answer.cell(id);
-            let all = answer.readers.get(id).is_none_or(|readers| {
-                // A read list is in read order (invariant 9): the cell is found by a walk.
-                readers.iter().all(|reader| answer.rows.get(reader).is_none_or(|row| row.reads.iter().any(|(read, seen)| read == id && *seen == digest)))
-            });
-            if all {
-                settled.push(*id);
-            }
-        }
-        for id in settled.iter() {
-            self.answer.owed_cells.remove(id);
-        }
-        if self.plant == Plant::OwedForgotten {
-            self.answer.owed_cells.clear();
-        }
-        self.answer.serial = self.serial;
-        self.report.certified = self.report.entered == 0 && self.moved.is_empty();
-        Ok(Finished { answer: self.answer, report: self.report, entered: self.entered, causes: self.causes })
-    }
-
     /// One entered task's cause row, and its stage's counts.
     fn count(&mut self, planned: Planned, cause: Cause, identical: bool) {
         self.causes.push(Entered { name: planned.name, phase: planned.phase, cause, identical });
@@ -1209,14 +1228,14 @@ impl<'a, S: Scope> Engine<'a, S> {
         stage.identical += u32::from(identical);
     }
 
-    fn planned_of(&self, name: Name) -> Option<Planned> {
+    fn planned_of(&self, name: Name) -> Result<Option<Planned>, EngineError> {
         if let Some(planned) = self.planned.get(&name) {
-            return Some(*planned);
+            return Ok(Some(*planned));
         }
-        if let Some(planned) = self.answer.owed_tasks.get(&name) {
-            return Some(*planned);
+        if let Some(planned) = self.view.owed(name) {
+            return Ok(Some(planned));
         }
-        self.answer.rows.get(&name).map(|row| row.planned(name))
+        Ok(self.view.row(name)?.map(|row| row.planned(name)))
     }
 
     /// Puts `planned` in its phase's candidates; `moved_in` is the phase merging, whose readers
@@ -1247,17 +1266,17 @@ impl<'a, S: Scope> Engine<'a, S> {
     }
 
     fn readers_of(&mut self, id: CellId, moved_in: Option<Phase>) -> Result<(), EngineError> {
-        let Some(readers) = self.answer.readers.get(&id) else { return Ok(()) };
-        let now = self.answer.cell(&id);
+        let readers = self.view.readers(id)?;
+        let now = self.view.digest(&id);
         let mut found: SVec<'a,Planned> = Vec::with_capacity_in(readers.len(), self.alloc);
         for reader in readers.iter() {
             // A reader whose row saw today's digest of the cell is today's for it: the maker of
             // an inline record, or a reader merged in the same phase (invariant 4). A made row
             // is a candidate like any; the phase decides whether it is still needed (invariant 10).
-            if self.answer.rows.get(reader).is_some_and(|row| row.reads.iter().any(|(read, seen)| *read == id && *seen == now)) {
+            if self.view.saw(*reader, id, now)? == Some(true) {
                 continue;
             }
-            if let Some(planned) = self.planned_of(*reader) {
+            if let Some(planned) = self.planned_of(*reader)? {
                 found.push(planned);
             }
         }
@@ -1269,14 +1288,7 @@ impl<'a, S: Scope> Engine<'a, S> {
 
     /// A cell's digest changed (or it went): recorded, owed, and its readers made candidates.
     fn move_cell(&mut self, id: CellId, digest: Option<ContentId>, phase: Option<Phase>) -> Result<(), EngineError> {
-        match digest {
-            Some(digest) => {
-                self.answer.cells.insert(id, (digest, self.serial));
-            }
-            None => {
-                self.answer.cells.remove(&id);
-            }
-        }
+        self.view.set_cell(id, digest);
         self.moved.insert(id);
         self.readers_of(id, phase)
     }
@@ -1288,21 +1300,20 @@ impl<'a, S: Scope> Engine<'a, S> {
         let mut stack: SVec<'a, Name> = Vec::new_in(self.alloc);
         stack.push(name);
         while let Some(name) = stack.pop() {
-            let Some(row) = self.answer.rows.remove(&name) else { continue };
-            self.answer.with_findings.remove(&name);
-            for (id, _) in row.reads.iter() {
-                self.unread(*id, name);
+            let Some(row) = self.view.take_row(name)? else { continue };
+            self.view.set_findings(name, false);
+            for id in row.reads.iter() {
+                self.unread(*id, name)?;
             }
             for (cell, _) in row.defines.iter() {
                 self.move_cell(CellId { of: name, cell: *cell }, None, phase)?;
             }
-            if row.file != name
-                && let Some(grown) = self.answer.by_file.remove(&name)
-            {
+            if row.facts.file != name {
+                let grown = self.view.take_file(name)?;
                 for one in grown.iter() {
-                    self.answer.owed_tasks.remove(one);
+                    self.view.unowe(*one);
                     self.planned.remove(one);
-                    self.report.retired += u32::from(self.answer.rows.contains_key(one));
+                    self.report.retired += u32::from(self.view.row(*one)?.is_some());
                     stack.push(*one);
                 }
             }
@@ -1310,21 +1321,13 @@ impl<'a, S: Scope> Engine<'a, S> {
         Ok(())
     }
 
-    fn unread(&mut self, id: CellId, reader: Name) {
-        let empty = match self.answer.readers.get_mut(&id) {
-            Some(readers) => {
-                readers.remove(&reader);
-                readers.is_empty()
-            }
-            None => false,
-        };
-        if empty {
-            self.answer.readers.remove(&id);
-        }
+    fn unread(&mut self, id: CellId, reader: Name) -> Result<(), EngineError> {
+        self.view.unread_by(id, reader);
         // A made record that lost a reader may have none left (invariant 10).
-        if id.of != reader && self.answer.rows.get(&id.of).is_some_and(|row| row.inline) {
+        if id.of != reader && self.view.row(id.of)?.is_some_and(|row| row.inline) {
             self.orphans.insert(id.of);
         }
+        Ok(())
     }
 
     /// Applies one result; true when it came out the same bytes as the task's last row (`out`
@@ -1332,35 +1335,37 @@ impl<'a, S: Scope> Engine<'a, S> {
     /// to move once the phase's rows are all in.
     fn apply(&mut self, planned: Planned, done: Done<'a>, phase: Phase, inline: bool, moved: &mut SVec<'a, (CellId, Option<ContentId>)>) -> Result<bool, EngineError> {
         let name = planned.name;
-        let identical = self.answer.rows.get(&name).is_some_and(|old| old.out == done.out);
+        let identical = self.view.row(name)?.is_some_and(|old| old.out == done.out);
         if done.failed {
             self.report.failed += 1;
             if self.plant == Plant::FailureNotKept {
-                self.answer.owed_tasks.insert(name, planned);
+                self.view.owe(planned);
                 return self.remove_row(name, Some(phase)).map(|()| identical);
             }
         }
-        self.answer.owed_tasks.remove(&name);
+        self.view.unowe(name);
         let alloc = self.alloc;
-        let old = self.answer.rows.remove(&name);
+        let old = self.view.take_row(name)?;
         // The reverse index: old reads out, new reads in.
         if let Some(old) = old.as_ref() {
-            for (id, _) in old.reads.iter() {
-                self.unread(*id, name);
+            for id in old.reads.iter() {
+                self.unread(*id, name)?;
             }
         }
         for (id, _) in done.reads.iter() {
-            self.answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc)).insert(name);
+            self.view.read_by(*id, name);
         }
-        // The defined cells: each that moved is recorded and its readers made candidates.
+        // The defined cells: each that moved is recorded and its readers made candidates. The
+        // last row's digests are the answer's kept form (`CellDigest`): equal bytes compare
+        // equal there too, so a define compares by `CellDigest::of` (a 160-bit prefix).
         let mut changes: SVec<'a,(CellId, Option<ContentId>)> = Vec::new_in(alloc);
-        let empty: &[(Cell, ContentId)] = &[];
+        let empty: &[(Cell, CellDigest)] = &[];
         let before = old.as_ref().map_or(empty, |old| old.defines.as_slice());
         let (mut i, mut j) = (0, 0);
         while i < before.len() || j < done.defines.len() {
             match (before.get(i), done.defines.get(j)) {
                 (Some(b), Some(n)) if b.0 == n.0 => {
-                    if b.1 != n.1 || self.answer.cells.get(&CellId { of: name, cell: n.0 }).is_none() {
+                    if b.1 != CellDigest::of(&n.1) || !self.view.has_cell(&CellId { of: name, cell: n.0 }) {
                         changes.push((CellId { of: name, cell: n.0 }, Some(n.1)));
                     }
                     i += 1;
@@ -1381,12 +1386,8 @@ impl<'a, S: Scope> Engine<'a, S> {
                 (None, None) => break,
             }
         }
-        if done.findings > 0 || done.failed {
-            self.answer.with_findings.insert(name);
-        } else {
-            self.answer.with_findings.remove(&name);
-        }
-        self.answer.rows.insert(
+        self.view.set_findings(name, done.findings > 0 || done.failed);
+        self.view.put_row(
             name,
             Row {
                 key: done.key,
@@ -1411,24 +1412,68 @@ impl<'a, S: Scope> Engine<'a, S> {
     }
 }
 
+impl<'a, S: Scope, L: Fold<'a>> Engine<'a, S, L> {
+    /// Ends the request: the owed cells are this request's moved ones and the earlier ones, less
+    /// each whose every reader's row saw its digest; this request's writes go to the form
+    /// ([`Fold`]).
+    pub fn finish(mut self) -> Result<Finished<'a, L::Out>, EngineError> {
+        if self.open.is_some() {
+            return Err(EngineError::OutOfTurn);
+        }
+        if self.view.refused() {
+            return Err(EngineError::ViewRefused { phase: self.passed });
+        }
+        self.retire_orphans()?;
+        for id in self.moved.iter() {
+            self.view.owe_cell(*id, self.serial);
+        }
+        let mut settled: SVec<'a,CellId> = Vec::new_in(self.alloc);
+        for id in self.view.owed_cells().iter() {
+            let digest = self.view.digest(id);
+            // A reader with no row reads nothing: it does not keep the cell owed.
+            let mut all = true;
+            for reader in self.view.readers(*id)?.iter() {
+                if self.view.saw(*reader, *id, digest)? == Some(false) {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                settled.push(*id);
+            }
+        }
+        for id in settled.iter() {
+            self.view.settle(*id);
+        }
+        if self.plant == Plant::OwedForgotten {
+            self.view.forget_owed_cells();
+        }
+        self.report.certified = self.report.entered == 0 && self.moved.is_empty();
+        let touched = self.view.touched();
+        let (last, work) = self.view.into_parts();
+        let answer = last.fold(work)?;
+        Ok(Finished { answer, report: self.report, entered: self.entered, causes: self.causes, touched })
+    }
+}
+
 /// One request's loop: each phase opened, run on the pool into the buffers, merged.
-pub fn drive<'a, S: Scope, P: Pool<'a>>(
-    engine: &mut Engine<'a, S>,
+pub fn drive<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync>(
+    engine: &mut Engine<'a, S, L>,
     pool: &mut P,
     buffers: &mut [Buffer<'a>],
-    work: &(dyn Fn(&P::Cx, View<'_, 'a>, &Task, &mut Buffer<'a>) + Sync),
+    work: &(dyn Fn(&P::Cx, View<'_, 'a, L>, &Task, &mut Buffer<'a>) + Sync),
 ) -> Result<(), EngineError> {
     drive_growing(engine, pool, buffers, work, &mut |_| Ok(()))
 }
 
 /// [`drive`] with growth (invariant 11): after each phase's merge, `grow` is handed the engine to
 /// call [`Engine::grow`] for each grower among [`Engine::merged`], before the next phase opens.
-pub fn drive_growing<'a, S: Scope, P: Pool<'a>>(
-    engine: &mut Engine<'a, S>,
+pub fn drive_growing<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync>(
+    engine: &mut Engine<'a, S, L>,
     pool: &mut P,
     buffers: &mut [Buffer<'a>],
-    work: &(dyn Fn(&P::Cx, View<'_, 'a>, &Task, &mut Buffer<'a>) + Sync),
-    grow: &mut dyn FnMut(&mut Engine<'a, S>) -> Result<(), EngineError>,
+    work: &(dyn Fn(&P::Cx, View<'_, 'a, L>, &Task, &mut Buffer<'a>) + Sync),
+    grow: &mut dyn FnMut(&mut Engine<'a, S, L>) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
     while engine.next_phase()?.is_some() {
         {

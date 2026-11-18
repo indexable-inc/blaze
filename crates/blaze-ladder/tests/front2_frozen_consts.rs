@@ -46,7 +46,7 @@ fn frozen_a(text: &str, evaluate: bool) -> Result<(ContentId, u128), String> {
     let prepared = Prepares::new_in(alloc);
     let mut evaluator = StoreConsts { names: &names, index: &front.index, prepared };
     let consts: Option<&mut dyn blaze_ladder::front2::tables::head::ConstValues<'_>> = if evaluate { Some(&mut evaluator) } else { None };
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: &names, sized: front.index.lang("sized"), frame: &frame, scratch: alloc, alloc, consts });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: &names, sized: front.index.lang("sized"), frame: &frame, scratch: alloc, alloc, consts, known: None });
     let cell = cell_of(&names, Want::Head(a)).unwrap_or_else(|e| panic!("the cell of `A`: {e}"));
     let got = source.cell(cell).map(|(frozen, reads)| (frozen.meaning(), reads.consts.iter().find(|(k, _)| *k == n).map(|(_, b)| *b)));
     match got {

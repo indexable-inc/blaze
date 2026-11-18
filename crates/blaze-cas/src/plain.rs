@@ -129,6 +129,12 @@
 //! into a segment of its own and flips again (at most [`CARRY_ROUNDS`]), so no command's
 //! work after its answer is refused or lost.
 //!
+//! A root may name INDEXES instead of records ([`Plain::root_through`], its record filed under
+//! [`INDEXED_ROOT_TAG`]): an index ([`Plain::index`], [`INDEX_TAG`]) is one record of sorted
+//! keys, keyed by its bytes, so a program that reached 100,000 records is kept by a root of
+//! one key, and a set many roots share (a toolchain's compiled code) is one record. Reach
+//! follows one level: the root's record, each index, every key each index holds.
+//!
 //! # The shared cache ([`Source`], [`Verifier`])
 //!
 //! A manifest may name segments not held here (published by a trusted builder). On a miss,
@@ -154,6 +160,8 @@ mod aligned_tests;
 #[cfg(test)]
 mod cleanup_tests;
 #[cfg(test)]
+mod index_tests;
+#[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]
 mod phase_commit_tests;
@@ -165,8 +173,8 @@ mod root_commit_tests;
 mod tests;
 
 pub use self::core::{
-    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, LEASE_NS, Liveness, Lost, POINTER_LEN, POINTER_TAG, Placed, Plain, PlainConfig, Probe,
-    Probes, PutError, ROOT_LIFE_NS, ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
+    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, INDEX_KEYS_MOST, INDEX_TAG, INDEXED_ROOT_TAG, LEASE_NS, Liveness, Lost, Named, POINTER_LEN, POINTER_TAG,
+    Placed, Plain, PlainConfig, Probe, Probes, PutError, ROOT_INDEXES_MOST, ROOT_LIFE_NS, ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
 };
 pub use self::lent::{Aligned16, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, first_difference};
 pub use self::snapshot::{SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};

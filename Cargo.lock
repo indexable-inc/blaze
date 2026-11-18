@@ -230,6 +230,16 @@ name = "blaze-alloc-count"
 version = "0.0.0"
 
 [[package]]
+name = "blaze-answer"
+version = "0.0.0"
+dependencies = [
+ "blaze-drive",
+ "blaze-id",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-apple-sdk"
 version = "0.0.0"
 
@@ -362,6 +372,7 @@ dependencies = [
 name = "blaze-build"
 version = "0.0.0"
 dependencies = [
+ "blaze-code",
  "blaze-emit",
  "blaze-flow-lower",
  "blaze-ids",
@@ -465,6 +476,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-drive",
  "blaze-emit",
+ "blaze-engine",
  "blaze-expand",
  "blaze-fetch",
  "blaze-file-items",
@@ -486,6 +498,7 @@ dependencies = [
  "blaze-report",
  "blaze-run",
  "blaze-scope",
+ "blaze-screen",
  "blaze-sha256",
  "blaze-sim",
  "blaze-std",
@@ -496,6 +509,7 @@ dependencies = [
  "blaze-toolchain",
  "blaze-typeck",
  "blaze-unit-graph",
+ "blaze-wasi",
  "blaze-world",
  "edition",
  "parser",
@@ -637,6 +651,16 @@ dependencies = [
  "blaze-sim",
  "blaze-std",
  "blaze-tier",
+]
+
+[[package]]
+name = "blaze-engine"
+version = "0.0.0"
+dependencies = [
+ "blaze-drive",
+ "blaze-id",
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1097,7 +1121,9 @@ dependencies = [
  "blaze-code",
  "blaze-consteval",
  "blaze-core",
+ "blaze-drive",
  "blaze-emit",
+ "blaze-engine",
  "blaze-expand",
  "blaze-export",
  "blaze-fetch",
@@ -1107,6 +1133,7 @@ dependencies = [
  "blaze-hash",
  "blaze-id",
  "blaze-ids",
+ "blaze-impls",
  "blaze-launch",
  "blaze-launch-rt",
  "blaze-lir",
@@ -1118,6 +1145,7 @@ dependencies = [
  "blaze-run",
  "blaze-scope",
  "blaze-sim",
+ "blaze-solve",
  "blaze-std",
  "blaze-surface",
  "blaze-tier",
@@ -1429,9 +1457,11 @@ dependencies = [
  "blaze-spawn",
  "blaze-std",
  "blaze-surface",
+ "blaze-toolchain",
  "blaze-typeck",
  "blaze-unit-graph",
  "blaze-wasi",
+ "blaze-world",
  "edition",
  "libc",
  "tracing",

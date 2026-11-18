@@ -26,7 +26,7 @@ use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
 use blaze_keyed::store::{Holder, Put, StoreError, TwoValues};
 
-use super::core::{Batch, Committed, POINTER_LEN, POINTER_TAG, Probes, Report, Sliced};
+use super::core::{Batch, Committed, Named, POINTER_LEN, POINTER_TAG, Probes, Report, Sliced};
 use super::driven::Driven;
 use crate::Key;
 
@@ -715,6 +715,40 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// [`Lent::root`], kept for `life_ns` from the commit that sets it (`Plain::root_for`).
     pub fn root_for(&self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, LentError> {
         self.inner.borrow_mut().store.root_for(name, keys, life_ns).map_err(stopped("setting a root"))
+    }
+
+    /// An index of `keys` for the next commit (`Plain::index`): its key, which an indexed root
+    /// names ([`Lent::root_through`]).
+    pub fn index(&self, keys: &[Key]) -> Result<Key, LentError> {
+        self.inner.borrow_mut().store.index(keys).map_err(stopped("putting an index"))
+    }
+
+    /// The root `name` naming the indexes `indexes` from the next commit on, for `life_ns`
+    /// (`Plain::root_through`): reach keeps each index and every key it holds.
+    pub fn root_through(&self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, LentError> {
+        self.inner.borrow_mut().store.root_through(name, indexes, life_ns).map_err(stopped("setting an indexed root"))
+    }
+
+    /// Every root the generation this store holds names, with its expiry (wall ns): the
+    /// command's cleanup line counts the unexpired ones (`Plain::roots_expiring`).
+    pub fn roots_expiring(&self) -> Vec<(String, Key, u64)> {
+        self.inner.borrow().store.core().roots_expiring()
+    }
+
+    /// The leases the generation this store holds names, `(holder, expires wall ns)`
+    /// (`Plain::leases`).
+    pub fn leases(&self) -> Vec<(u64, u64)> {
+        self.inner.borrow().store.core().leases()
+    }
+
+    /// Records this process's commits carried forward (`Plain::carried`).
+    pub fn carried(&self) -> u64 {
+        self.inner.borrow().store.core().carried()
+    }
+
+    /// The roots this process set and the keys they name (`Plain::named`).
+    pub fn named(&self) -> Named {
+        self.inner.borrow().store.core().named()
     }
 
     /// This command's lease let go of at the next commit: its answer roots its records

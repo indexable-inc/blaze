@@ -8,12 +8,25 @@
 //! type parameter (rule 78): blaze-cli's `PagesAnswer` over the page form (pages.rs, read whole
 //! by `load_answer`) and `RowsAnswer` over blaze-answer's segments read in place.
 //!
+//! The engine reads the last answer through this seam alone (engine.rs over overlay.rs: this
+//! request's writes over the last answer's rows), so a third form, the engine's in-memory
+//! `Answer` (last_mem.rs), and a test form answering by binary search (last_sim.rs) stand behind
+//! it too, and the history simulation holds every form's engine equal to the in-memory one's.
+//!
+//! The digest a row saw of each cell it read is carried where the form keeps it
+//! ([`LastAnswer::seen`]: the in-memory and the page form), and the engine then compares digests
+//! as it always has: a cell that moved and moved back leaves its readers standing. The rows form
+//! keeps none: its rows stand by generation (no cell read moved after the row's serial,
+//! [`LastAnswer::moved`], [`LastAnswer::stands`]), and the digests are in the task's record,
+//! which is what a fetched record or a restart from a lost answer is checked against.
+//!
 //! What the seam does not carry, by design:
-//! - The digest a row saw of each cell it read. A row stands by generation: no cell it read
-//!   moved after the row's serial ([`LastAnswer::stands`]). The digests then are in the task's
-//!   record, which is what a fetched record or a restart from a lost answer is checked against.
 //! - The causes (why each row was last entered): the profile's, not the answer's.
 //! - The record key of each row (pages.rs `records`): the rows form has no column for it yet.
+//!
+//! A row the seam returns for an owed task carries [`Flags::OWED`] and the plan's phase, file
+//! and source; one owed with no row made carries [`Flags::UNMADE`] too, and is no row to the
+//! engine (`Cause::New`, not `Cause::KeyMoved`).
 //!
 //! A handle ([`LastAnswer::Task`], [`LastAnswer::Cell`]) means something inside one answer only:
 //! the page form's are the engine's `Name` and `CellId`, the rows form's its dense ids.
@@ -108,6 +121,10 @@ pub trait LastAnswer {
     type Defines<'r>: Iterator<Item = (Self::Cell, CellDigest)>
     where
         Self: 'r;
+    /// A row's reads in the order recorded, each with the digest the row saw of it.
+    type Seen<'r>: Iterator<Item = (Self::Cell, ContentId)>
+    where
+        Self: 'r;
 
     /// The request that made this answer.
     fn serial(&self) -> Serial;
@@ -141,6 +158,20 @@ pub trait LastAnswer {
     fn saw(&self, task: Self::Task, cell: Self::Cell) -> bool;
     /// What `cell` holds today ([`CellDigest::ABSENT`]: nothing defines it).
     fn digest(&self, cell: Self::Cell) -> CellDigest;
+    /// What `cell` holds today, whole: what a task reading it through the engine's view is
+    /// handed (`ABSENT`: nothing defines it). The rows form keeps the first
+    /// [`blaze_answer::DIGEST_BYTES`] alone and answers them padded with zeros, which
+    /// [`CellDigest::of`] maps back to its digest; a task's read of such a cell is the switch's
+    /// question (lane RD8's report, NOT DONE).
+    fn content(&self, cell: Self::Cell) -> ContentId;
+    /// The request `cell` last moved in ([`Serial`]`(0)`: never moved, or the form lost it when
+    /// the cell went absent and every reader saw that).
+    fn moved(&self, cell: Self::Cell) -> Serial;
+    /// `task`'s reads in the order recorded, each with the digest its row saw: how the engine
+    /// finds the first read that moved, and names its cause, when the form keeps them. `None`:
+    /// no row, or a form that keeps no seen digests (the rows form), whose rows stand by
+    /// generation: a read moved when its cell [`LastAnswer::moved`] after the row's serial.
+    fn seen(&self, task: Self::Task) -> Option<Self::Seen<'_>>;
 
     /// The tasks whose rows read `cell`, ascending by handle: how work is found forward from a
     /// moved cell (`readers_of`, `inline_readers`).

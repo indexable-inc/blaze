@@ -24,10 +24,11 @@
 //! (`Lent::point`, the plain store's `POINTER_TAG` record: the newest commit's value wins, a
 //! stale entry's rebuild replaces it), committed with the entry it names.
 
+use core::cell::RefCell;
 use std::alloc::Global;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{Lent, LentError, Namespace, Tag};
+use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace, Tag};
 use blaze_core::Driver;
 use blaze_ladder::code_records::{CodeKey, CodeStore, StoreError};
 
@@ -46,11 +47,43 @@ pub(crate) struct HomeCodeStore<'m, D: Driver> {
     /// Commits made on the command's path (the arena past `COMMIT_BYTES`).
     #[allow(dead_code, reason = "read by the tests; the profile row that shows it is owed")]
     pub commits: u32,
+    /// Every key this run's code came from or went to: each entry found or put, each pointer
+    /// found or pointed and its target. The program's root names exactly these and the start
+    /// list's (store/roots.rs `keep_program`): code reaches the store through this handle
+    /// alone, so what a later run reads is named by construction, never by remembering.
+    reached: RefCell<std::vec::Vec<CasKey, Global>>,
 }
+
+/// The most keys one run's code may reach: one index's (blaze-cas `INDEX_KEYS_MOST`); one more
+/// is refused by name, never dropped from the root.
+const REACHED_MOST: usize = INDEX_KEYS_MOST;
 
 impl<'m, D: Driver> HomeCodeStore<'m, D> {
     pub(crate) fn new(lent: &'m Lent<D, Global>) -> HomeCodeStore<'m, D> {
-        HomeCodeStore { lent, commits: 0 }
+        HomeCodeStore { lent, commits: 0, reached: RefCell::new(std::vec::Vec::new_in(Global)) }
+    }
+
+    /// The keys this run's code reached, sorted, each once (the program root's walk half).
+    pub(crate) fn reached(&self) -> std::vec::Vec<CasKey, Global> {
+        let mut keys = self.reached.borrow().clone();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// `keys` recorded as reached by `key`'s ask; past [`REACHED_MOST`] (after folding
+    /// repeats) refused, naming the key.
+    fn reach(&self, key: CodeKey, keys: &[CasKey]) -> Result<(), StoreError> {
+        let mut reached = self.reached.borrow_mut();
+        if reached.len() + keys.len() > REACHED_MOST {
+            reached.sort_unstable();
+            reached.dedup();
+            if reached.len() + keys.len() > REACHED_MOST {
+                return Err(StoreError::Failed { key, what: "this run's code reached more records than one index of the program's root holds (blaze-cas INDEX_KEYS_MOST)" });
+            }
+        }
+        reached.extend_from_slice(keys);
+        Ok(())
     }
 }
 
@@ -74,7 +107,10 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
         match self.lent.get(&CasKey(key.0)) {
             Ok(None) => Ok(None),
-            Ok(Some(lend)) if lend.tag == CODE_TAG => Ok(Some(lend.bytes)),
+            Ok(Some(lend)) if lend.tag == CODE_TAG => {
+                self.reach(key, &[CasKey(key.0)])?;
+                Ok(Some(lend.bytes))
+            }
             Ok(Some(_)) => Err(StoreError::Failed { key, what: "a record under a code key is filed under another tag than CODE_TAG: not a code entry" }),
             // A code key held as a pointer has no entry under it: its entry is the pointer's
             // target, read through `pointed` (`entry_of` asks it first).
@@ -89,17 +125,22 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
             self.commits += 1;
         }
         self.lent.put(&CasKey(key.0), Namespace::LOCAL, CODE_TAG, bytes).map_err(|error| refused(key, &error))?;
-        Ok(())
+        self.reach(key, &[CasKey(key.0)])
     }
 
     /// The content key the code key `key` points at (`Lent::pointed`, the newest commit's
-    /// value), its target an entry under [`CODE_TAG`]. A target compaction let go of over the
-    /// store's cap (pruning keeps what roots name, and a run's entries are not rooted yet) is
-    /// the cache's miss: the instance is built again, put, and `key` pointed anew; that is the
+    /// value), its target an entry under [`CODE_TAG`]. A target compaction let go of (a
+    /// program root that expired, store/roots.rs) is the cache's miss: the instance is built again, put, and `key` pointed anew; that is the
     /// path every miss takes, not another route.
     fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
         match self.lent.pointed(CODE_TAG, &CasKey(key.0)) {
-            Ok(found) => Ok(found.map(|target| CodeKey(target.0))),
+            // A pointer is kept by naming its name AND its target (blaze-cas `POINTER_TAG`: reach
+            // does not follow a pointer), so both are this run's.
+            Ok(Some(target)) => {
+                self.reach(key, &[CasKey(key.0), target])?;
+                Ok(Some(CodeKey(target.0)))
+            }
+            Ok(None) => Ok(None),
             Err(LentError::TargetGone { .. }) => Ok(None),
             // A code key that holds a plain entry, no pointer (the thread-local getter's and
             // ender's, put under their code keys by `RecordRun::getter`/`ender`): no target, as
@@ -117,7 +158,7 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
             self.commits += 1;
         }
         self.lent.point(CODE_TAG, &CasKey(key.0), &CasKey(content.0)).map_err(|error| refused(key, &error))?;
-        Ok(())
+        self.reach(key, &[CasKey(key.0), CasKey(content.0)])
     }
 }
 

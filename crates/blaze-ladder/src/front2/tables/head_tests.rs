@@ -615,7 +615,7 @@ fn a_store_filed_from_frozen_heads_alone_lowers_nothing() {
     let (names, sized, frame) = world();
     let cells = cells(names);
     let alone = alone(names, sized, frame, &cells, Plant::None);
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None });
     let mut store = Store::new(sized, frame, a());
     let keys = Keys::new();
     for w in cells.iter().copied() {
@@ -755,7 +755,7 @@ fn a_seeded_store_answers_every_ctor_lookup_as_lowering() {
     for w in cells.iter().copied() {
         lowered.ensure(names, &mut lkeys, w).unwrap_or_else(|e| panic!("ensure {w:?}: {e}"));
     }
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None });
     let seeded = Store::new(sized, frame, a());
     let skeys = Keys::new();
     for w in cells.iter().copied() {
@@ -813,7 +813,7 @@ fn a_seeded_freeze_lowers_each_item_once() {
     for w in cells.iter().copied() {
         unseeded += freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}")).lowered;
     }
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None });
     let mut seeded: AVec<'static, (Want, AVec<'static, u8>)> = AVec::new_in(a());
     for w in cells.iter().copied() {
         let f = source.frozen(w).unwrap_or_else(|e| panic!("seeded {w:?}: {e}"));
@@ -859,7 +859,7 @@ fn head_tasks_are_equal_in_any_order() {
     let cells = cells(names);
     let tool = blaze_drive::key::Tool(ContentId::of("blaze-ladder head task test", b"head"));
     let run = |order: &[Want]| {
-        let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+        let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None });
         let mut done: AVec<'static, (Want, super::head::HeadDone<'static>)> = AVec::new_in(a());
         for w in order.iter().copied() {
             let d = head_task(names, &mut source, w, tool, a());
@@ -892,7 +892,7 @@ fn head_tasks_are_equal_in_any_order() {
     }
     // Control: the key is the tool's too; the out is not.
     let other = blaze_drive::key::Tool(ContentId::of("blaze-ladder head task test", b"another"));
-    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None, known: None });
     let (w, f) = &fwd[0];
     let d = head_task(names, &mut source, *w, other, a());
     assert!(d.key != f.key && d.out == f.out, "another tool: another key, the same out");

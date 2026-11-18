@@ -55,6 +55,10 @@ pub(crate) enum Class {
     Unchecked = 1,
     /// A task that waited on another's failure: a failure, counted under one line.
     Waited = 2,
+    /// A head that could not be frozen: its words are its cell, head and reason
+    /// (engine_head_notes.rs `words`), printed grouped by reason after the other notes
+    /// (engine_head_notes.rs `print_grouped`), counted apart ([`Tally::heads`]).
+    Head = 3,
 }
 
 impl Class {
@@ -63,6 +67,7 @@ impl Class {
             0 => Some(Class::Failure),
             1 => Some(Class::Unchecked),
             2 => Some(Class::Waited),
+            3 => Some(Class::Head),
             _ => None,
         }
     }
@@ -259,7 +264,7 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
         }
         NOTE => {
             let at = reader.at;
-            let class = Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the three" })?;
+            let class = Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the four" })?;
             let words = reader.sized("a note's words")?;
             if core::str::from_utf8(words).is_err() {
                 return Err(LinesError { at: reader.at, what: "a note's words are not UTF-8" });
@@ -312,12 +317,25 @@ pub(crate) fn decode<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<
     Ok(Last { blocks })
 }
 
+/// Each [`Class::Head`] note's words of `block`, in order (engine_head_notes.rs).
+pub(crate) fn head_notes<'m>(block: &'m [u8], each: &mut dyn FnMut(&'m str)) -> Result<(), LinesError> {
+    let mut reader = Reader { bytes: block, at: 0 };
+    while reader.at < block.len() {
+        if let Entry::Note { class: Class::Head, words } = entry(&mut reader)? {
+            each(core::str::from_utf8(words).map_err(|_| LinesError { at: reader.at, what: "a note's words are not UTF-8" })?);
+        }
+    }
+    Ok(())
+}
+
 /// What [`print_all`] counted, for the command's status.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Tally {
     pub(crate) failures: u32,
     pub(crate) unchecked: u32,
     pub(crate) waited: u32,
+    /// Heads that could not be frozen ([`Class::Head`]).
+    pub(crate) heads: u32,
     /// Findings listed (after one finding of two tasks is folded into one).
     pub(crate) listed: u32,
 }
@@ -380,6 +398,8 @@ pub(crate) fn print_all<'f, 'b>(
                             tally.failures += 1;
                             tally.waited += 1;
                         }
+                        // Printed grouped by reason (engine_head_notes.rs `print_grouped`).
+                        Class::Head => tally.heads += 1,
                     }
                     continue;
                 }

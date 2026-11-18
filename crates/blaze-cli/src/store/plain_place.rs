@@ -29,6 +29,8 @@ use blaze_drive::Key;
 use blaze_keyed::kind::{Namespace, Tag};
 use blaze_keyed::store::StoreError;
 
+use super::roots::{Answer, Rooted};
+
 /// The store's folder under blaze's folder in the home (drive.md ruling 1).
 pub(crate) const STORE_DIR: &str = "v2/store";
 
@@ -36,6 +38,13 @@ pub(crate) const STORE_DIR: &str = "v2/store";
 /// own head says which drive kind it is; the store needs one number apart from its roots'
 /// ([`blaze_cas::plain::ROOT_TAG`], `u16::MAX`) and the startup image's (`u16::MAX - 1`).
 pub(crate) const DRIVE_TAG: Tag = Tag(u16::MAX - 2);
+
+/// The kind an expansion record is filed under (blaze-scope expansion_records.rs: a macro
+/// call's text and origin column, keyed by their bytes, put after its crate's `CrateScope`
+/// record): a family apart from the drive records', read only when a body reads a text a macro
+/// wrote. `u16::MAX - 3` is [`crate::code_store::CODE_TAG`], `- 4` blaze-cas's pointers, `- 5`
+/// [`crate::start_list::START_LIST_TAG`].
+pub(crate) const EXPANSION_TAG: Tag = Tag(u16::MAX - 6);
 
 /// The store's effect tags on the lent driver (`PlainConfig::tags`).
 const STORE_TAGS: u64 = 1 << 50;
@@ -98,10 +107,15 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts) -> PlainC
         machine: Vec::new_in(Global),
         writes: settings.writes(),
         reads: settings.reads(),
-        // Everything, until every record a later command reads by key is reached from a root:
-        // the code store's entries and pointers (code_store.rs) are rooted by nothing yet, so a
-        // reach sweep would let the compiled code go after each command. Then `Reached`, which
-        // keeps what the answers' roots reach and what a running command's lease keeps.
+        // Everything, until every record a later command reads by key is reached from a root
+        // (store/roots.rs). The code store's entries and pointers and the start list are now
+        // (the program root, through one index record: store/reach_tests.rs). Still not: the
+        // drive's answer graph under the sealed last answer (`set_last` roots only the sealed
+        // record; its `cert` and page-table `root`, the pages and each row's `at` record are
+        // one more level each), the `run_ids` and `run_names` tables keyed by the certificate,
+        // and std's code under a toolchain root (a `CodeKey` does not say its crate). A reach
+        // sweep would let those go after each command. Then `Reached`, which keeps what the
+        // roots reach and what a running command's lease keeps.
         liveness: Liveness::Everything,
     }
 }
@@ -218,6 +232,24 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         Ok(())
     }
 
+    /// A record keyed by its own bytes (an expansion record: `tag` [`EXPANSION_TAG`]) that many
+    /// owners of either namespace may name: equal bytes already held under `key`, this
+    /// command's or committed, in any namespace and under any tag (a record a remote fetch
+    /// filed under [`DRIVE_TAG`]), is [`Put::Same`], so a toolchain crate's public record and a
+    /// workspace crate's local one share it; else put in the namespace `all_names_public` (its
+    /// owner's) says. Other bytes under `key` are refused (rule 21).
+    pub fn put_record(&mut self, key: Key, all_names_public: bool, tag: Tag, bytes: &[u8]) -> Result<blaze_keyed::store::Put, PlaceError> {
+        if let Some(held) = self.lent.get(&CasKey(key.0))?
+            && held.bytes == bytes
+        {
+            return Ok(blaze_keyed::store::Put::Same);
+        }
+        if self.lent.uncommitted_bytes() > COMMIT_BYTES {
+            self.commit()?;
+        }
+        Ok(self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), tag, &[bytes])?)
+    }
+
     /// The record the root `name` is, in place (its bytes the 32-byte keys it names, in order):
     /// a root is a name in the newest manifest, not a probe (drive.md ruling 7). `None`: no
     /// root of that name.
@@ -230,15 +262,15 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// `ROOT_LIFE_NS` from it (each commit that names them again renews it): cleanup keeps
     /// every record an unexpired root names (a running program's code records; a checkout's
     /// last answer for each request shape: drive.md ruling 3), and nothing else past a
-    /// command's lease.
-    pub fn pin(&self, name: &str, keys: &[Key]) -> Result<(), PlaceError> {
+    /// command's lease. The one function of the [`Answer`] class (store/roots.rs): its
+    /// [`Rooted`] says the root expires with the checkout.
+    pub(crate) fn pin(&self, name: &str, keys: &[Key]) -> Result<Rooted<Answer>, PlaceError> {
         if self.plant == PlacePlant::ForgetsPin {
-            return Ok(());
+            return Ok(Rooted::new(CasKey(blaze_ids::ContentId([0; 32]))));
         }
         let mut cas = Vec::with_capacity_in(keys.len(), Global);
         cas.extend(keys.iter().map(|key| CasKey(key.0)));
-        self.lent.root_for(name, &cas, ROOT_LIFE_NS)?;
-        Ok(())
+        Ok(Rooted::new(self.lent.root_for(name, &cas, ROOT_LIFE_NS)?))
     }
 
     /// Every segment named mapped, and every one parked checked: asked once, when the
@@ -277,6 +309,8 @@ pub struct AfterAnswer {
     pub sealed: bool,
     /// Cleanup slices the commit's flip named (0 or 1: one a command).
     pub compaction_slices: u32,
+    /// The cleanup line: roots set, keys named, what the slice swept, carried, leases.
+    pub cleanup: super::roots::CleanupLine,
 }
 
 /// After the answer is printed, never waited on by it (the command's outer function calls it
@@ -292,11 +326,8 @@ pub fn after_answer<D: Driver>(lent: &Lent<D, Global>, slices: u32) -> Result<Af
     lent.release_lease();
     let committed = lent.commit()?;
     let sealed = lent.seal()?;
-    let compaction_slices = match lent.take_sliced() {
-        Some(slice) if slice.segments > 0 && !slice.aborted => 1,
-        _ => 0,
-    };
-    Ok(AfterAnswer { segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX), sealed, compaction_slices })
+    let cleanup = super::roots::CleanupLine::of(lent, lent.take_sliced());
+    Ok(AfterAnswer { segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX), sealed, compaction_slices: cleanup.slices, cleanup })
 }
 
 #[cfg(test)]

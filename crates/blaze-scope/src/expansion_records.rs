@@ -16,7 +16,8 @@
 //!   make one record. The key is the record's content, not its inputs: the record is never
 //!   looked up before the expansion is made (the names task expands, then files it), and the
 //!   cell a reader of the text records is `NameCell::Expansion`, whose digest covers the items
-//!   row's text id: the text the record holds.
+//!   row's text id and the directory row's record key (names_cells.rs `expansion_digest`): the
+//!   text and the column the record holds, so a reader is entered when either moves.
 //! - The crate's DIRECTORY ([`Directory`]), the section the texts were in, holds a row a call:
 //!   its key, its record's key, the text's length, the column's length and the CALL PART of its
 //!   origins (the calling text, the entry, where the input starts, the macro's path: blaze-scope
@@ -387,15 +388,25 @@ impl<'s> Directory<'s> {
     /// The row of `call`, by binary search over the sorted keys; `None` when the call made no
     /// text.
     pub fn entry(&self, call: ItemKey) -> Result<Option<Entry<'s>>, ExpansionRecordsError> {
+        match self.position(call) {
+            Some(at) => self.entry_at(at).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The row index of `call`, by binary search over the sorted keys: what a reader that keeps
+    /// one served record per row indexes by (blaze-cli names/expansion_texts.rs); `None` when
+    /// the call made no text.
+    pub fn position(&self, call: ItemKey) -> Option<usize> {
         let (mut low, mut high) = (0usize, self.len());
         while low < high {
             let mid = low + (high - low) / 2;
             match self.call_at(mid).cmp(&call) {
                 core::cmp::Ordering::Less => low = mid + 1,
                 core::cmp::Ordering::Greater => high = mid,
-                core::cmp::Ordering::Equal => return self.entry_at(mid).map(Some),
+                core::cmp::Ordering::Equal => return Some(mid),
             }
         }
-        Ok(None)
+        None
     }
 }

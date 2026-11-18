@@ -94,6 +94,8 @@ mod engine_answer_rows;
 mod engine_check;
 mod engine_bodies;
 mod engine_heads;
+mod engine_head_consts;
+mod engine_head_notes;
 mod engine_lines;
 mod engine_lints;
 mod engine_why;
@@ -102,6 +104,7 @@ mod engine_times;
 mod engine_pool;
 mod engine_records;
 mod engine_scripts;
+mod engine_seeds;
 mod engine_store;
 mod engine_tasks;
 mod engine_units;
@@ -217,6 +220,14 @@ pub enum CliError {
     AnswerInFull { again: bool },
     /// `blaze run`'s live status line failed (run_line.rs): its thread, or a write of it.
     RunLine(run_line::RunLineError),
+    /// Records a task made beside its own (work.rs `PendingExtras`: a `CrateScope`'s expansion
+    /// records) whose owner the machine never put this request, so their namespace (the
+    /// owner's) is not known, and the store does not hold the record `key` already: refused,
+    /// never filed under another namespace (rule 21).
+    ExtrasOwnerNotPut { owner: blaze_drive::Name, key: blaze_drive::Key },
+    /// A task's extra records held twice for one owner before it was put (work.rs
+    /// `PendingExtras::hold`).
+    ExtrasHeldTwice { owner: blaze_drive::Name },
 }
 
 impl fmt::Display for CliError {
@@ -256,6 +267,11 @@ impl fmt::Display for CliError {
             CliError::Lints(error) => write!(f, "{error}"),
             CliError::RunNames(error) => write!(f, "{error}"),
             CliError::RunLine(error) => write!(f, "{error}"),
+            CliError::ExtrasOwnerNotPut { owner, key } => write!(
+                f,
+                "the record {key:?} made beside {owner}'s was not put: {owner} was never put this request, so its namespace is not known, and the store does not hold the record (rule 21, work.rs `PendingExtras::finish`)"
+            ),
+            CliError::ExtrasHeldTwice { owner } => write!(f, "{owner}'s extra records were held twice before it was put (rule 3, work.rs `PendingExtras::hold`)"),
             CliError::AnswerInFull { again: false } => {
                 write!(f, "the run stood on its certificate and the store holds no record of its program's names rows (run_names.rs `stood`): it is asked again in full")
             }
@@ -1012,7 +1028,7 @@ fn request<'f>(
     // of its own, so it is erased into one here, on this stack, for this request.
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
-    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()?, sdk, exe_dir, heap }, macros: None, names: None, bodies: body_types::Kept::default(), scripts: None, producer: producers.get::<blaze_ids::producer::Whole>(), lints: lints.rules };
+    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()?, sdk, exe_dir, heap }, macros: None, names: None, bodies: body_types::Kept::default(), scripts: None, producer: producers.get::<blaze_ids::producer::Whole>(), lints: lints.rules, extras: work::PendingExtras::empty() };
     if cold || followed.layout_moved {
         facts.laid = Some(units::lay(&cx, root, &stamps, &mut facts.rows, toolchain, heap, frame, alloc)?);
         // The proc-macro module store's listing, read with the layout: in the units' source, so
@@ -1233,6 +1249,9 @@ fn request<'f>(
                 phases.request.steps += phases.since(stepped);
             }
             Effect::Put { key, bytes } => {
+                // A `CrateScope`'s expansion records first, under its namespace (work.rs
+                // `PendingExtras`), so no reader of the record finds one absent.
+                facts.extras.put_before(&cx, &mut store, &bytes)?;
                 if let Err(mut error) = store.put(&cx, key, &bytes) {
                     if let CliError::Store(crate::store::StoreFailure::TwoValues { clash, .. }) = &mut error {
                         clash.label_with(facts.names.as_ref());
@@ -1368,6 +1387,8 @@ fn request<'f>(
         }
         phases.took(kind, frame);
     };
+    // Extra records whose owner was never put (settled from the store) must be held already.
+    facts.extras.finish(&cx, &mut store)?;
     let mut answer = answer;
     // A seeded hit: its `Last` already names this certificate, so the drive asked no write. This
     // checkout's own root gets it, sealed with today's stamps, so its next command follows its
@@ -1885,7 +1906,12 @@ mod tests {
     mod members_tests;
     mod names_records_tests;
     mod engine_check_tests;
+    mod engine_seeds_tests;
     mod engine_answer_rows_tests;
+    mod engine_module_facts_tests;
+    mod engine_unnamed_calls_tests;
+    mod engine_expansion_tests;
+    mod engine_head_notes_tests;
     mod native_image_tests;
     mod include_data_tests;
     mod include_outside_tests;

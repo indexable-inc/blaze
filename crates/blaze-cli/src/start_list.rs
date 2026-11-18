@@ -162,6 +162,11 @@ impl ListName {
     pub(crate) fn of(shape: &ContentId) -> ListName {
         ListName(ContentId::of(NAME_DOMAIN, &shape.0))
     }
+
+    /// The name's key: what the program root's name is made from (store/roots.rs).
+    pub(crate) fn id(&self) -> ContentId {
+        self.0
+    }
 }
 
 /// What `blaze run` reads and writes the list under: today's certificate and the list's name,
@@ -658,6 +663,36 @@ pub(crate) fn write<D: Driver>(lent: &Lent<D, Global>, name: &ListName, held: Op
     lent.put(&content, Namespace::LOCAL, START_LIST_TAG, bytes).map_err(ListError::Store)?;
     lent.point(START_LIST_TAG, &CasKey(name.0), &content).map_err(ListError::Store)?;
     Ok(Wrote::Written)
+}
+
+/// The keys that keep the list `name` and the code it names (store/roots.rs `keep_program`),
+/// pushed onto `out`: the list's pointer and record, and each code row's key and, when the key
+/// is a pointer, its target (reach does not follow a pointer: blaze-cas `POINTER_TAG`). `bytes`
+/// is the list just written ([`encode`]d by this run, so its form is known). Answers the rows
+/// whose key has no target the store holds: named by key alone and counted, never dropped
+/// quietly (rule 3); the next run builds them again. A row's record id is a file in the records
+/// folder, not a store record: it is not the store's to keep.
+pub(crate) fn rooted_keys<D: Driver>(lent: &Lent<D, Global>, name: &ListName, bytes: &[u8], out: &mut std::vec::Vec<CasKey, Global>) -> Result<u32, ListError> {
+    out.push(CasKey(name.0));
+    out.push(CasKey(ContentId::of(RECORD_DOMAIN, bytes)));
+    let mut stale = 0u32;
+    for row in bytes.get(HEAD..).unwrap_or(&[]).chunks_exact(ROW) {
+        if row[0] != KIND_CODE {
+            continue;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&row[33..65]);
+        let key = CasKey(ContentId(key));
+        out.push(key);
+        match lent.pointed(crate::code_store::CODE_TAG, &key) {
+            Ok(Some(target)) => out.push(target),
+            // An entry under its code key (the getter's and ender's): the key is the record.
+            Err(LentError::PointerTag { .. }) => {}
+            Ok(None) | Err(LentError::TargetGone { .. }) => stale += 1,
+            Err(why) => return Err(ListError::Store(why)),
+        }
+    }
+    Ok(stale)
 }
 
 /// 32 bytes as 64 lowercase hex digits.

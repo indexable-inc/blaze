@@ -1224,13 +1224,23 @@ impl<'n> FileTypes<'n> {
                     SourceError::Items { error: ItemsRecordError::Gone { krate, file: None, call: Some(call) }, name: krate_name, .. } => {
                         // `ItemsRecord::whole` files `Gone` for an expansion in two places: no
                         // row for the call, or the loader gave no text. The loader files every
-                        // call it was asked in `unserved`, so which one it is shows here.
-                        let which = if asked.iter().any(|(_, c)| c == call) {
-                            "the record has the call's expansion row but its expansion texts section holds no text for it (StoreLoad::expansion, names/expansion_texts.rs)"
-                        } else {
-                            "the record has no expansion row for the call (the loader was never asked)"
-                        };
-                        bstd::mem::format_in!(frame, "the records did not answer: the expansion text of macro call {call:x} in crate `{krate_name}` ({krate:x}), read while checking item `{name}`: {which}")
+                        // call it was asked in `unserved`, with why when its directory names
+                        // one (the store lacks its expansion record: `Missing`, naming the key),
+                        // so which one it is shows here.
+                        match asked.iter().find(|one| one.call == *call) {
+                            Some(crate::front_load::Unserved { why: Some(why), .. }) => bstd::mem::format_in!(
+                                frame,
+                                "the records did not answer: the expansion text of macro call {call:x} in crate `{krate_name}` ({krate:x}), read while checking item `{name}`: {why} (StoreLoad::expansion, names/expansion_texts.rs)"
+                            ),
+                            Some(_) => bstd::mem::format_in!(
+                                frame,
+                                "the records did not answer: the expansion text of macro call {call:x} in crate `{krate_name}` ({krate:x}), read while checking item `{name}`: the record has the call's expansion row but its expansions directory names no text for it (StoreLoad::expansion, names/expansion_texts.rs)"
+                            ),
+                            None => bstd::mem::format_in!(
+                                frame,
+                                "the records did not answer: the expansion text of macro call {call:x} in crate `{krate_name}` ({krate:x}), read while checking item `{name}`: the record has no expansion row for the call (the loader was never asked)"
+                            ),
+                        }
                     }
                     _ => {
                         let said = record_words(error, checker.readers, checker.packs, frame, checker.heap);
@@ -1367,7 +1377,14 @@ impl<'n> FileTypes<'n> {
                 }
             }
             if unserved_now {
-                crate::not_checked::items::file(made, (0, 0), item_path, "a macro call's expansion text is not in its crate's record", "StoreLoad::expansion, names/expansion_texts.rs");
+                // The first call the loader could not serve with why (the store lacks its
+                // expansion record: `Missing`, naming the call and the key), else the plain words.
+                let why = checker.load.unserved().get(unserved..).and_then(|asked| asked.iter().find_map(|one| one.why));
+                let words = match why {
+                    Some(why) => bstd::mem::format_in!(frame, "{why} (StoreLoad::expansion, names/expansion_texts.rs)"),
+                    None => bstd::mem::format_in!(frame, "StoreLoad::expansion, names/expansion_texts.rs"),
+                };
+                crate::not_checked::items::file(made, (0, 0), item_path, "a macro call's expansion text is not in its crate's record", words.as_str());
             }
             }
         }

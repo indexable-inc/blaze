@@ -217,6 +217,11 @@ pub trait NamesSource<'n>: Copy {
     /// `"C"` when none is written (the Reference, items.extern.abi.default): `Some(Some(abi))`;
     /// `Some(None)`: no `extern` block declares it (every member, every module-level item
     /// outside one); `None`: not answered (over records the error is in the log).
+    ///
+    /// Asked of an item with a names row only: an item declared in a body (its key derived at
+    /// its body's lowering, front2 locals.rs) has none, and its block's ABI is `Locals::foreign`'s,
+    /// which its readers ask instead (heads.rs `fn_head`, program/head_abi.rs `placed_fn`); over
+    /// records such a key is `None` with a gap naming it in the log.
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>>;
 
     /// Question 11, the kind: what an item's outline entry is, without its detail's data.
@@ -877,6 +882,24 @@ impl<'n> Records<'n> {
         self.read(krate, self.items.whole(krate, at))
     }
 
+    /// The text item `key` is written in, from its items row alone: NO text is read, so no
+    /// expansion record is asked. What finds the call that wrote a body (blaze-cli
+    /// body_types/covered.rs `written_by`): [`NamesSource::place_of`] proves the text first,
+    /// so a body whose expansion record the store lacks had no place and fell out of its call's
+    /// task, which then passed clean with nothing checked (rule 3). Placed here, the body stays
+    /// its call's, and its check, which reads the text, is refused naming the record.
+    /// `None`: no such item, or no place (the reason filed in the log).
+    pub fn text_at(&'n self, key: ItemKey) -> Option<blaze_scope::resolve::At> {
+        let krate = self.items.crate_of(key)?;
+        let record = self.items_of(krate)?;
+        let row = self.read(krate, record.item(key))??;
+        let Some(span) = row.text else {
+            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key } });
+            return None;
+        };
+        Some(span.at)
+    }
+
     /// [`NamesSource::walk`] with every cell the walk consults put in `sink` (blaze-scope
     /// names_cells.rs `Logged`, the one seam a reader by cell walks through): what the
     /// read-only view (front2 tables/view.rs) answers a path from.
@@ -1354,7 +1377,16 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         if self.member_owner(key).is_some() {
             return Some(None);
         }
-        match self.kind_of_item(key)? {
+        let Some(kind) = self.kind_of_item(key) else {
+            // No row: an item declared in a body (its key is its body's lowering's, front2
+            // locals.rs, and its block's ABI is `Locals::foreign`'s, which every head and
+            // program reader asks first: heads.rs `fn_head`, program/head_abi.rs `placed_fn`),
+            // or a key of no item. Never answered as "no block" (rule 3): named in the log, so
+            // a reader that asked it anyway is found by the key it asked.
+            self.gap("`extern_abi` of a key the items record holds no row for (an item declared in a body is answered by its body's lowering, `Locals::foreign`)", Some(key));
+            return None;
+        };
+        match kind {
             // Only a fn or a static can be a foreign item: its items row's `foreign` field
             // (`Records::block_abi`), which needs no text read.
             ItemKind::Function | ItemKind::Static => self.block_abi(key),

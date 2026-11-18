@@ -43,8 +43,8 @@ use super::super::index::{Index, LangTwice};
 use super::super::keys::{Keys, MemberKind};
 use super::super::project::{BodyRef, BodyVerdict, ProjectWorld};
 use super::super::reads::{FactKind, ReadsError};
-use super::super::by_origin::{KeyKind, kind_of_key};
-use super::super::fill::FillError;
+use super::super::by_origin::{FactHolder, fact_holder, kind_of_key};
+use super::super::item_shown::ItemShown;
 use super::super::source::{NamesSource, Records};
 use super::head::{FreezeError, cell_id as head_cell_id, fact_cell};
 use super::super::texts::Texts;
@@ -108,8 +108,10 @@ pub struct BodyFrame<'n> {
 pub enum TaskError {
     /// A head the body needed could not be filed from the request's frozen heads.
     Seed { body: Name, error: SeedError },
-    /// No head cell holds the fact of checker key `key` (head.rs `fact_cell`).
-    Cell { key: blaze_typeck::ItemKey, error: FreezeError },
+    /// No head cell holds the fact of checker key `key`, an item of a kind with a head
+    /// (by_origin.rs [`FactHolder::Head`]; head.rs `fact_cell`): `shown` names it by its path
+    /// (rule 19).
+    Cell { key: blaze_typeck::ItemKey, shown: ItemShown, error: FreezeError },
     /// The task's name is not a body's (`Kind::BodyCheck` of a fn, `const` or `static` item,
     /// or a fn or `const` member).
     NotABody { name: Name },
@@ -138,7 +140,7 @@ impl core::fmt::Display for TaskError {
             TaskError::Make(refused) => write!(f, "no digest for the cell {:?} (front2 tables/task.rs `Make`)", refused.want),
             TaskError::Write => write!(f, "the body's result could not be written"),
             TaskError::Seed { body, error } => write!(f, "body {body:?}: a head it needs could not be seeded: {error}"),
-            TaskError::Cell { key, error } => write!(f, "no head cell holds the body's fact of {key:?}: {error} (front2 tables/task.rs `fact_read`)"),
+            TaskError::Cell { key: _, shown, error } => write!(f, "no head cell holds the body's fact of {shown}: {error} (front2 tables/task.rs `fact_read`)"),
         }
     }
 }
@@ -368,10 +370,20 @@ fn body_of<'n>(view: Tables<'_, 'n>, name: Name) -> Result<BodyRef<'n>, TaskErro
 /// impl table bucket. Names facts (paths, traits in scope, lang paths) were recorded by the
 /// view as asked; a fact of the body's own closures and async blocks is its own.
 ///
-/// THE CELL is the one that holds the fact (head.rs [`fact_cell`], FI's one home): a
-/// constructor's is its ADT's, a trait member's its trait's, an impl constant's its impl's;
-/// an anonymous constant's is the item it is written in. ONE PART: a head cell is read whole
-/// (head.rs `cell_id`, part 0), whatever the fact's kind.
+/// THE CELL is the one that holds the fact, by the key's class (by_origin.rs [`FactHolder`],
+/// told once over every kind):
+/// - a kind with a head: its head cell (head.rs [`fact_cell`], FI's one home): a
+///   constructor's is its ADT's, a trait member's its trait's, an impl constant's its impl's.
+///   ONE PART: a head cell is read whole (head.rs `cell_id`, part 0), whatever the fact's kind;
+/// - a kind with no head (a module, a `use`, a macro, ..): its names cell `Item { key }`,
+///   which holds all a check takes of it (that it is there, and of which kind). Before, such a
+///   key was asked for a head cell no want makes (`NoHead(.., Module)`) and the body refused;
+/// - an anonymous constant: no cell. Its fact is a function of its key and of reads the task
+///   records anyway ([`FactHolder::OwnKey`]). Before, its fact was sent to its MODULE's head
+///   cell (`KeyKind::Anon`'s `module`), which no want makes: every body whose store filed an
+///   anonymous constant (an array length or a repeat count written as an expression, in its
+///   own text or in a head or constant it lowered) was refused, 467 of them on the
+///   1,100-crate workspace (g190500).
 fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128) -> Result<Option<TableRead>, TaskError> {
     use FactKind as K;
     match kind {
@@ -379,18 +391,19 @@ fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128)
             if key != 0 =>
         {
             let fact = blaze_typeck::ItemKey(key);
-            let want = match fact_cell(names, keys, fact) {
-                Ok(want) => want,
-                Err(FreezeError::NoWant { error: FillError::AnonConst(_), .. }) => match kind_of_key(names, keys, fact) {
-                    Ok(KeyKind::Anon { module, .. }) => fact_cell(names, keys, module).map_err(|error| TaskError::Cell { key: fact, error })?,
-                    _ => return Err(TaskError::Cell { key: fact, error: FreezeError::NoWant { key: fact, error: FillError::AnonConst(fact) } }),
-                },
-                Err(error) => return Err(TaskError::Cell { key: fact, error }),
-            };
-            let id = head_cell_id(want);
-            let mut item = [0u8; 16];
-            item.copy_from_slice(&id.of.subject.0[..16]);
-            Ok(Some(TableRead::Head { item, part: 0 }))
+            let refused = |error: FreezeError| TaskError::Cell { key: fact, shown: ItemShown::of(names, keys, fact), error };
+            let class = kind_of_key(names, keys, fact).map_err(|error| refused(FreezeError::NoWant { key: fact, error }))?;
+            match fact_holder(class) {
+                FactHolder::Head => {
+                    let want = fact_cell(names, keys, fact).map_err(refused)?;
+                    let id = head_cell_id(want);
+                    let mut item = [0u8; 16];
+                    item.copy_from_slice(&id.of.subject.0[..16]);
+                    Ok(Some(TableRead::Head { item, part: 0 }))
+                }
+                FactHolder::Names { lib, .. } => Ok(Some(TableRead::Names(NameCell::Item { key: lib }))),
+                FactHolder::OwnKey => Ok(None),
+            }
         }
         // `CrateBucket`: recorded as each lookup read it (view.rs `bucket`, `unfiled`,
         // `impls_read`); names facts: recorded by the view's walks.

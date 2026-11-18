@@ -202,7 +202,7 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
     let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
     shown.each = flags.each;
     phases.mark_in("open checkout", frame);
-    let opts = Opts { tools, workers, toolchain: blaze_toolchain::PINNED, heap, place, fresh: false, frame };
+    let opts = Opts { tools, workers, toolchain: blaze_toolchain::PINNED, heap, place, fresh: false, heads_from: crate::engine_seeds::HeadsFrom::Frozen, frame };
     let err = io.need_err()?;
     match why {
         None => Ok(check(cx, io, &root, opts, &mut shown, phases, out, &err)?.status),
@@ -239,6 +239,9 @@ pub(crate) struct Opts<'f> {
     pub(crate) heap: &'static blaze_own::Heap,
     /// Answer in full: the stored answer is not read (one is still written).
     pub(crate) fresh: bool,
+    /// Where the bodies take their heads from (engine_seeds.rs `HeadsFrom`): the command's is
+    /// `Frozen`; a test sets `Lowered` to compare the two (rule 78).
+    pub(crate) heads_from: crate::engine_seeds::HeadsFrom,
     /// The request's frame (its caller's, at most [`REQUEST_FRAME`]): every stage's lists and
     /// records whose size follows the project (crates, files, bodies, findings, environments,
     /// labels) are in it, never in the command's fixed frame.
@@ -303,13 +306,16 @@ pub(crate) struct Checked {
     /// What the sweep cost: the journal's use, its events, the rows statted of the leaf table
     /// (journal_sweep.rs; the profile's `sweep:` line).
     pub(crate) sweep: crate::journal_sweep::SweepCounts,
+    /// The request's frozen heads: the table, the dependency heads read, found and frozen, and
+    /// the bodies seeded and refused (engine_seeds.rs `SeedCounts`).
+    pub(crate) seeds: crate::engine_seeds::SeedCounts,
 }
 
 /// The check of the checkout at `root`, printed through `shown` to `out`; the store's words on
 /// `err`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out) -> Result<Checked, CliError> {
-    let Opts { tools, workers, toolchain, heap, place, fresh, frame } = opts;
+    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, frame } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -374,6 +380,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         if !moved && facts.printed.replayable && facts.owed == 0 {
             // The whole answer's lines through the one printer, as the request that wrote them.
             let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;
+            crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
             let whole = facts.printed.bodies_whole;
             let (ran_stages, not_stages) = crate::check_coverage(facts.printed.names, whole, whole, frame);
             let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
@@ -414,6 +421,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 pages_written: 0,
                 records: crate::engine_store::Ledger::new(),
                 sweep: sweep_counts,
+                seeds: crate::engine_seeds::SeedCounts::default(),
             });
         }
     }
@@ -580,6 +588,8 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let clock = &env.clock;
     let mut times = crate::engine_times::Times::new();
     let mut phase_times = std::vec::Vec::new_in(std::alloc::Global);
+    // The request's frozen heads, counted at the Bodies phase's merge (engine_seeds.rs).
+    let mut seed_counts = crate::engine_seeds::SeedCounts::default();
     while let Some(phase) = engine.next_phase()? {
         let mut entered: SVec<'_, Task> = SVec::new_in(alloc);
         entered.extend_from_slice(engine.tasks());
@@ -611,7 +621,31 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 if let Some(stage) = names.as_ref() {
                     heads.read_back += crate::engine_heads::complete(cx, &mut store, stage, &mut bodies.shelf, &|name| records.get(&name).copied(), engine.view(), frame)?;
                 }
-                bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
+                // The heads not frozen, a body that reads one quotes (engine_head_notes.rs).
+                bodies.heads_failed = crate::engine_head_notes::Failed::of(&heads, last_lines.as_ref(), heap.alloc())?;
+                // The request's frozen heads, read only while the phase runs (engine_seeds.rs):
+                // the head tasks' cells and the dependency heads this machine froze before.
+                let seed_root = crate::engine_seeds::root_name(&tools, frame);
+                let seed_tool = crate::engine_seeds::tool_of(&tools);
+                let request_heads = match (heads_from, names.as_ref(), graph) {
+                    (crate::engine_seeds::HeadsFrom::Frozen, Some(stage), Some(graph)) => match bodies.kept.list(cx, &mut store, &graph, frame)? {
+                        Some(list) => {
+                            let crates = crate::engine_seeds::crates_of(&list, stage);
+                            let table = crate::engine_seeds::RequestTable::build(cx, &mut store, &heads, &planned, engine.view(), &|name| records.get(&name).copied(), &crates, &seed_root, seed_tool, heap, frame)?;
+                            Some((table, crates))
+                        }
+                        // No crate list: no body is checked, each says why (engine_bodies.rs `groups`).
+                        None => None,
+                    },
+                    _ => None,
+                };
+                bodies.run_phase(cx, &mut store, &mut read, &handles, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame, request_heads.as_ref().map(|(table, _)| table))?;
+                // The dependency heads frozen now, put sorted by key and listed by the root.
+                if let Some((table, crates)) = &request_heads {
+                    seed_counts = table.merge(cx, &mut store, crates, &seed_root, seed_tool, &mut ledger, bodies.seeds)?;
+                } else {
+                    seed_counts.bodies = bodies.seeds;
+                }
             }
             Stage::Scripts => match names.as_mut() {
                 Some(stage) => scripts.run_phase(cx, &mut store, &handles, stage, &entered, &mut buffers[0], &mut times, alloc, frame)?,
@@ -675,7 +709,16 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             };
             records.insert(name, key);
             marks.push((name, Some((key, out))));
-            put.push(Put { key, name, source: task.planned.source, out, reads, payload, listing });
+            // A crate's expansion records, put after its record (engine_store.rs `put_all`).
+            let extras = match phase.stage {
+                Stage::Names => names
+                    .as_ref()
+                    .and_then(|stage| stage.results.iter().rev().find(|one| one.name == name))
+                    .and_then(|one| one.made.as_ref().ok())
+                    .map(|record| &record.extras),
+                _ => None,
+            };
+            put.push(Put { key, name, source: task.planned.source, out, reads, payload, listing, extras });
         }
         let put_now = crate::engine_store::put_all(cx, &mut store, &mut put, phase.stage, &mut ledger, heap.alloc())?;
         puts += put_now;
@@ -767,6 +810,14 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             lints.lines(*name, &outlined, &mut lines, frame)?;
             continue;
         }
+        // A head task's heads not frozen, each with its reason (engine_head_notes.rs).
+        if crate::engine_head_notes::is_head_task(*name) {
+            if !bodies.heads_failed.ready {
+                bodies.heads_failed = crate::engine_head_notes::Failed::of(&heads, last_lines.as_ref(), heap.alloc())?;
+            }
+            bodies.heads_failed.note(&heads, *name, &mut lines, frame);
+            continue;
+        }
         let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(name)) else {
             let one = match discovered.get(*name) {
                 Some(one) => Some(one),
@@ -808,6 +859,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         }
     }
     let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;
+    crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
     let unchecked = tally.unchecked;
     if bodies.ownerless > 0 {
         print::note(cx, bstd::mem::format_in!(frame, "{} body(ies) in files no member crate's records hold were not checked (engine_bodies.rs)", bodies.ownerless).as_str(), shown, frame, out)?;
@@ -858,6 +910,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let mut text = profile_text(&ran, &report, &because, &outlined, phases, frame);
     bodies.profile(&outlined, workers, &mut text);
     lints.profile(&mut text);
+    crate::engine_seeds::profile(&seed_counts, &mut text);
     // A task by what it is about: a file's path, a crate's name, a script's crate, a body's item.
     let world = names.as_ref().and_then(|stage| stage.names.as_ref());
     let label = |name: Name| -> Option<std::string::String> {
@@ -909,6 +962,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         pages_written: saved.new_pages,
         records: ledger,
         sweep: sweep_counts,
+        seeds: seed_counts,
     })
 }
 
@@ -1017,7 +1071,7 @@ fn not_checked_notes(cx: &Cx, not: &[&'static str], shown: &print::Shown<'_>, fr
 fn status_of(tally: &crate::engine_lines::Tally, unprinted: u32, shown: &print::Shown<'_>, partial: bool) -> Status {
     if shown.counts.errors > 0 || shown.counts.failures > 0 || tally.failures > 0 {
         Status::FAILED
-    } else if tally.unchecked > 0 {
+    } else if tally.unchecked > 0 || tally.heads > 0 {
         crate::UNCHECKED_ITEMS
     } else if partial || unprinted > 0 {
         crate::INCOMPLETE

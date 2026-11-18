@@ -77,6 +77,8 @@ struct Stored {
     names: std::vec::Vec<u8>,
     items: std::vec::Vec<u8>,
     expansions: std::vec::Vec<u8>,
+    /// The expansion records its directory names, by key, put beside it.
+    extras: std::vec::Vec<(Key, std::vec::Vec<u8>)>,
 }
 
 /// The three crates solved in memory and each one's whole `CrateScope` record (a plain head,
@@ -90,8 +92,11 @@ fn stored() -> std::vec::Vec<Stored> {
     for c in names.crates().iter() {
         let n = blaze_scope::names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name));
         let i = blaze_scope::items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name));
-        let e = crate::names::expansion_texts::write(c).unwrap_or_else(|e| panic!("expansion texts of `{}`: {e}", c.name));
-        let payload = sections::write(0, [&[], &[], &n[..], &i[..], &[], &e[..], &[], &[]]);
+        // The writer names.rs `scope_record` writes through: the directory is the section, the
+        // expansion records are put beside the crate's record (front_load.rs's tests' `payloads`).
+        let split = blaze_scope::expansion_records::write(c, g).unwrap_or_else(|e| panic!("expansions of `{}`: {e}", c.name));
+        let extras: std::vec::Vec<(Key, std::vec::Vec<u8>)> = split.records.iter().map(|r| (Key(r.key), r.bytes.to_vec())).collect();
+        let payload = sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]);
         let parts = sections::sections(&payload).unwrap_or_else(|e| panic!("the sections of `{}`: {e}", c.name));
         let (names_bytes, items_bytes, expansions_bytes) = (parts.names.to_vec(), parts.items.to_vec(), parts.expansions.to_vec());
         let name = blaze_drive::key::crate_scope_name(&c.key);
@@ -102,9 +107,13 @@ fn stored() -> std::vec::Vec<Stored> {
         whole.extend_from_slice(&head);
         whole.extend_from_slice(&payload);
         let at = Key(ContentId::of("blaze-cli run records in place test key", c.name.as_bytes()));
-        out.push(Stored { key: c.key, input: Input { name, at, out: made }, whole, names: names_bytes, items: items_bytes, expansions: expansions_bytes });
+        out.push(Stored { key: c.key, input: Input { name, at, out: made }, whole, names: names_bytes, items: items_bytes, expansions: expansions_bytes, extras });
     }
     assert_eq!(out.len(), 3, "the fixture is three crates");
+    // The three crates call no macro: no expansion record, so each directory is empty and the
+    // counts below (3 records, 3 gets) are the crates' records alone. A macro call here adds a
+    // record read and a get per expansion record served (engine_records.rs `InPlaceRecords`).
+    assert!(out.iter().all(|one| one.extras.is_empty()), "the fixture grew a macro call: its counts no longer hold");
     out
 }
 
@@ -130,6 +139,10 @@ impl<'m> Store<'m> for Placed<'m> {
     }
     fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
         Ok(self.place.put_parts(key, false, parts)?)
+    }
+    fn put_record(&mut self, _cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, _owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
+        // Every put here is local (`put` and `put_parts` above), so the owner's namespace is too.
+        Ok(self.place.put_record(key, false, tag, bytes)?)
     }
     fn map_all(&mut self, _cx: &Cx) -> Result<(), CliError> {
         Ok(())
@@ -167,6 +180,9 @@ fn the_runs_reader_reads_each_crates_sections_in_place() {
     let mut store = Placed { place: PlainPlace::new(&lent, false), gets: 0 };
     for one in crates.iter() {
         store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("the put of {:?}: {e}", one.input.name));
+        for (key, bytes) in one.extras.iter() {
+            store.put_record(&cx, *key, crate::store::plain_place::EXPANSION_TAG, &[&one.whole], bytes).unwrap_or_else(|e| panic!("the expansion record {key:?} of {:?}: {e}", one.input.name));
+        }
     }
     store.place.commit().unwrap_or_else(|e| panic!("the commit: {e:?}"));
     let mut read = EngineRecords::new();

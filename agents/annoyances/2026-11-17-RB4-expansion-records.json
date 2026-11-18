@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-17",
+  "model": "claude-opus-5-5",
+  "lane": "RB4",
+  "area": "blaze-cli store: putting expansion records beside a CrateScope record (store/plain_place.rs, engine_store.rs put_all)",
+  "annoyance": "The brief named `Tag(u16::MAX - 3)` for EXPANSION_TAG, which is CODE_TAG already (ROOT MAX, IMAGE MAX-1, DRIVE MAX-2, CODE MAX-3, POINTER MAX-4, START_LIST MAX-5). blaze-cas `Lent::put_parts` refuses equal bytes under another namespace or tag, so a content-keyed record shared by many owners cannot be put blindly a second time.",
+  "workaround": "EXPANSION_TAG is MAX-6. `put_record` probes with `get` first and answers `Same` for equal bytes held under any namespace or tag; only new bytes are put."
+}

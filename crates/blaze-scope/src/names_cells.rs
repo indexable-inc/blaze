@@ -46,6 +46,7 @@ use blaze_own::{AVec, Alloc};
 use blaze_surface::{Binding, CrateRootHead, CrateRootView, DefKind, Globs, ItemKind, MacroShapes, Namespace, RefusedWhy, ScopeView};
 
 use crate::cell_key::{CellKey, cell_key};
+use crate::expansion_records::{Directory, ExpansionRecordsError};
 use crate::facts::Name;
 use crate::items_record::{ItemsRecord, ItemsRecordError, TextOf, TextSpan};
 use crate::names::{RootRead, ScopeRead, VariantHit, World};
@@ -77,7 +78,10 @@ pub enum NameCell {
     Item { key: ItemKey },
     /// An owner's member rows, in order (`RecordItems::members`); absent for no owner.
     Members { owner: ItemKey },
-    /// A macro call's expansion row (its text's content id and length); absent for none.
+    /// A macro call's expansion row (its text's content id and length) and, when the crate's
+    /// expansions directory is given (`Whole { section: Expansions }`'s bytes), the key of the
+    /// expansion record its directory row names (expansion_records.rs: the text AND its origin
+    /// column), so a reader of the text or its origins moves when either does; absent for none.
     Expansion { call: ItemKey },
     /// Which trait or impl owns the named member `member`, and its name
     /// ([`ItemsRecord::member_owner`]); absent for no named member of that key: the "not
@@ -300,9 +304,31 @@ fn members_digest<'a>(items: &ItemsRecord<'a>, owner: ItemKey, read: ReadText<'_
     Ok(Some(h.finish()))
 }
 
-/// What `Expansion(call)` holds, `None` for no expansion row.
-fn expansion_digest(items: &ItemsRecord<'_>, call: ItemKey) -> Option<ContentId> {
-    items.expansion(call).map(|row| Hasher::of(&DIGESTS).update(&[7]).std(&row).finish())
+/// What `Expansion(call)` holds, `None` for no expansion row: the items row, then the record key
+/// `directory`'s row for the call names (a 0 byte when no directory is given or it has no row
+/// for the call, a 1 and the key when it has).
+fn expansion_digest(items: &ItemsRecord<'_>, directory: Option<&Directory<'_>>, call: ItemKey) -> Result<Option<ContentId>, CellsError> {
+    let Some(row) = items.expansion(call) else { return Ok(None) };
+    let record = match directory {
+        Some(directory) => directory.entry(call).map_err(CellsError::Expansions)?.map(|entry| entry.record),
+        None => None,
+    };
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[7]).std(&row);
+    match record {
+        Some(key) => h.update(&[1]).id(&key),
+        None => h.update(&[0]),
+    };
+    Ok(Some(h.finish()))
+}
+
+/// The expansions directory among `wholes` (the `Expansions` section's bytes), opened; `None`
+/// when it is not given.
+fn directory_of<'w>(wholes: &[(Section, &'w [u8])]) -> Result<Option<Directory<'w>>, CellsError> {
+    match wholes.iter().find(|(section, _)| *section == Section::Expansions) {
+        Some((_, bytes)) => Directory::open(bytes).map(Some).map_err(CellsError::Expansions),
+        None => Ok(None),
+    }
 }
 
 /// What `Lang(krate)` holds: every lang row of the crate in order, each name and key; `None`
@@ -553,6 +579,9 @@ pub enum CellsError {
     Unsorted { what: &'static str },
     /// A crate's cell table past [`MAX_ROWS`] (rule 18).
     TooManyRows { rows: usize },
+    /// The expansions directory given as a whole section does not open, or its row of a call
+    /// does not read (expansion_records.rs).
+    Expansions(ExpansionRecordsError),
 }
 
 /// The most rows one crate's cell table holds: four of each item, module, variant and member
@@ -606,9 +635,10 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
                 rows.push((NameCell::Item { key: *key }.key(), digest));
             }
         }
+        let directory = directory_of(wholes)?;
         for i in 0..items.expansions() {
             if let Some(row) = items.expansion_at(i) {
-                if let Some(digest) = expansion_digest(items, row.call) {
+                if let Some(digest) = expansion_digest(items, directory.as_ref(), row.call)? {
                     rows.push((NameCell::Expansion { call: row.call }.key(), digest));
                 }
             }
@@ -892,7 +922,7 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::Variants { owner } => variants_digest(record, owner),
         NameCell::Item { key } => item_digest(items_of()?, key, read_of()?).map_err(CellsError::Items)?,
         NameCell::Members { owner } => members_digest(items_of()?, owner, read_of()?).map_err(CellsError::Items)?,
-        NameCell::Expansion { call } => expansion_digest(items_of()?, call),
+        NameCell::Expansion { call } => expansion_digest(items_of()?, directory_of(wholes)?.as_ref(), call)?,
         NameCell::Whole { section, .. } => wholes.iter().find(|(s, _)| *s == section).map(|(s, bytes)| whole_digest(*s, bytes)),
         NameCell::MemberOf { member } => member_of_digest(items_of()?, member).map_err(CellsError::Items)?,
         NameCell::VariantOf { variant } => {

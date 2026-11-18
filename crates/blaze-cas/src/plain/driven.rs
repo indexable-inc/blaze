@@ -577,6 +577,16 @@ impl<D: Driver> Driven<D> {
         self.core.root_for(name, keys, life_ns)
     }
 
+    /// [`Plain::index`].
+    pub fn index(&mut self, keys: &[Key]) -> Result<Key, StoreError> {
+        self.core.index(keys)
+    }
+
+    /// [`Plain::root_through`].
+    pub fn root_through(&mut self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, StoreError> {
+        self.core.root_through(name, indexes, life_ns)
+    }
+
     /// [`Plain::release_lease`].
     pub fn release_lease(&mut self) {
         self.core.release_lease()

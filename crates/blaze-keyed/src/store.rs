@@ -554,6 +554,13 @@ pub enum StoreError {
     /// when the record cannot be carried: not mapped here, or a pointer), never a flip naming
     /// a record that may be gone.
     SweptUnder { key: ContentId, segment: u64 },
+    /// The indexed root `root` of generation `generation` names the index `index`, which no
+    /// segment holds (blaze-cas `Plain::root_through`).
+    IndexGone { generation: u64, root: ContentId, index: ContentId },
+    /// The indexed root `root` names `key`, whose record is filed under `tag`, not as an index.
+    NotAnIndex { root: ContentId, key: ContentId, tag: Tag },
+    /// An index of `keys` keys (or an indexed root of `keys` indexes), past the most one holds.
+    IndexOver { keys: u64, most: u64 },
     /// A bucket object (`object`: its name in the bucket) was refused or failed: `what`, with
     /// the bucket's status (0 when it gave none).
     RemoteObject { what: &'static str, object: String, status: u32 },
@@ -630,6 +637,15 @@ impl fmt::Display for StoreError {
                 f,
                 "a root of this commit names the record {key:?}, read from segment {segment:016x}, which another process's cleanup slice replaced since, after the commit carried such records forward as many rounds as it may (or this one could not be carried): the commit is not flipped, and the next command makes its records again"
             ),
+            StoreError::IndexGone { generation, root, index } => {
+                write!(f, "the indexed root {root:?} of generation {generation} names the index {index:?}, which no segment holds")
+            }
+            StoreError::NotAnIndex { root, key, tag } => {
+                write!(f, "the indexed root {root:?} names {key:?}, a record of kind {}, not an index", tag.0)
+            }
+            StoreError::IndexOver { keys, most } => {
+                write!(f, "an index of {keys} keys is past the most one holds, {most}: refused, never cut")
+            }
             StoreError::RemoteObject { what, object, status } => {
                 write!(f, "the remote cache: {what} for `{object}` ({status})")
             }

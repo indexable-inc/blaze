@@ -230,8 +230,8 @@ pub fn digest_of_heads(count: usize, digests: impl IntoIterator<Item = ContentId
 /// then the heads made with it, each group sorted by key:
 /// - a fn (free or of an impl): its `impl Trait` return types' opaques;
 /// - an ADT: its constructors, then its field defaults' anonymous constants (RFC 3681);
-/// - a trait's members: its fns and associated constants that have a head (a refused one is a
-///   gap, `Store::fn_gaps`), then those fns' opaques;
+/// - a trait's members: its fns and associated constants that have a head or were refused alone
+///   (`Store::fn_gaps`: head_record.rs `FnRefused`, its why), then those fns' opaques;
 /// - an impl: its associated constants.
 ///
 /// A trait's associated types' item bounds (filed in `Store::preds` under each type's key) are
@@ -289,9 +289,10 @@ pub fn want_heads<'a>(store: &crate::front2::heads::Store<'_>, want: Want, alloc
             out.push(HeadAt::Trait(lib));
             if let Some(head) = store.maps.traits.get(&lib) {
                 let mut fns: AVec<'a, ItemKey> = AVec::new_in(alloc);
-                fns.extend(head.fns.iter().map(|(_, k)| *k).filter(|k| store.fns.contains_key(k)));
+                let held = |k: &ItemKey| store.fns.contains_key(k) || store.fn_gaps.contains_key(k);
+                fns.extend(head.fns.iter().map(|(_, k)| *k).filter(held));
                 if let Some(extra) = store.trait_defs.get(&checker_of(lib)) {
-                    fns.extend(extra.consts.iter().map(|(_, k)| *k).filter(|k| store.fns.contains_key(k)));
+                    fns.extend(extra.consts.iter().map(|(_, k)| *k).filter(held));
                 }
                 fns.sort_unstable();
                 fns.dedup();

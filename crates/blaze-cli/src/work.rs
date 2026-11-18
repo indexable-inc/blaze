@@ -192,6 +192,43 @@ pub(crate) struct Record<A: Allocator + Copy> {
     /// body_types.rs `FileTypes::check` in the order reached. Sealed into the record's payload
     /// in its sorted form by [`seal_body_payload`]; empty for every other kind.
     pub(crate) covered: Vec<blaze_typeck::ItemKey, A>,
+    /// The records the task made beside its own, each keyed by its own bytes and put right after
+    /// it: a `CrateScope`'s expansion records (names.rs `scope_record`, blaze-scope
+    /// expansion_records.rs). In `Global` with the handed payload they were made beside, moved
+    /// with it ([`Record::into_held`]) and freed with it ([`Record::release_handed`]).
+    pub(crate) extras: Extras,
+}
+
+/// A task's records beside its own ([`Record::extras`]): each distinct one once, sorted by key,
+/// and how many rows of the task's own record name them (a crate's macro calls that made a
+/// text), so the puts can say how many were shared.
+pub(crate) struct Extras {
+    pub(crate) records: Vec<(ContentId, Vec<u8, Global>), Global>,
+    pub(crate) calls: u32,
+    /// The bytes of `records` freed after their put; `records` is then empty.
+    pub(crate) released: Option<usize>,
+}
+
+impl Extras {
+    pub(crate) fn none() -> Extras {
+        Extras { records: Vec::new_in(Global), calls: 0, released: None }
+    }
+
+    /// The bytes the records hold now.
+    pub(crate) fn bytes(&self) -> usize {
+        self.records.iter().map(|(_, bytes)| bytes.len()).sum()
+    }
+
+    /// A copy, each record's bytes copied in `Global` (a clone of a record, [`Record::clone_in`]).
+    fn copied(&self) -> Extras {
+        let mut records = Vec::with_capacity_in(self.records.len(), Global);
+        for (key, bytes) in self.records.iter() {
+            let mut copy = Vec::with_capacity_in(bytes.len(), Global);
+            copy.extend_from_slice(bytes);
+            records.push((*key, copy));
+        }
+        Extras { records, calls: self.calls, released: self.released }
+    }
 }
 
 /// A record's handed payload, in its three states: none handed (the built payload is the
@@ -220,6 +257,7 @@ impl<A: Allocator + Copy> Record<A> {
             path_bytes: Vec::new_in(alloc),
             reads: Vec::new_in(alloc),
             covered: Vec::new_in(alloc),
+            extras: Extras::none(),
         }
     }
 
@@ -253,6 +291,7 @@ impl<A: Allocator + Copy> Record<A> {
             path_bytes: copied_in(&self.path_bytes, frame)?,
             reads: copied_in(&self.reads, frame)?,
             covered: copied_in(&self.covered, frame)?,
+            extras: self.extras.copied(),
         })
     }
 
@@ -283,18 +322,41 @@ impl<A: Allocator + Copy> Record<A> {
     /// built in the record's own allocator stays, as do its lists (findings, reads, paths). A
     /// later [`Record::payload_bytes`] is refused ([`InputWhy::Released`]).
     pub(crate) fn release_handed(&mut self) -> usize {
-        match core::mem::replace(&mut self.handed, Handed::None) {
-            Handed::Kept(bytes) => {
-                let len = bytes.len();
-                self.handed = Handed::Released { bytes: len };
-                len
+        let extras = self.release_extras();
+        extras
+            + match core::mem::replace(&mut self.handed, Handed::None) {
+                Handed::Kept(bytes) => {
+                    let len = bytes.len();
+                    self.handed = Handed::Released { bytes: len };
+                    len
+                }
+                Handed::None => 0,
+                Handed::Released { bytes } => {
+                    self.handed = Handed::Released { bytes };
+                    0
+                }
             }
-            Handed::None => 0,
-            Handed::Released { bytes } => {
-                self.handed = Handed::Released { bytes };
-                0
-            }
+    }
+
+    /// The task's records beside its own ([`Record::extras`]) handed to it, moved: refused when it
+    /// already has some (rule 3), as [`Record::hand`].
+    pub(crate) fn hand_extras(&mut self, extras: Extras) -> Result<(), CliError> {
+        if !self.extras.records.is_empty() || self.extras.calls != 0 || self.extras.released.is_some() {
+            return Err(CliError::Text { what: "a record handed its extra records already has some (rule 3, work.rs `Record::hand_extras`)" });
         }
+        self.extras = extras;
+        Ok(())
+    }
+
+    /// The extra records freed once put (rule 51): how many bytes went.
+    fn release_extras(&mut self) -> usize {
+        if self.extras.released.is_some() {
+            return 0;
+        }
+        let bytes = self.extras.bytes();
+        self.extras.records = Vec::new_in(Global);
+        self.extras.released = Some(bytes);
+        bytes
     }
 
     /// The part `name`'s file is at `path`.
@@ -331,6 +393,7 @@ impl Record<Global> {
             path_bytes: copied_in(&self.path_bytes, frame)?,
             reads: copied_in(&self.reads, frame)?,
             covered: copied_in(&self.covered, frame)?,
+            extras: self.extras,
         })
     }
 }
@@ -400,6 +463,9 @@ pub struct Facts<'f, S> {
     /// root manifest's for `check`, none (no `Lint` part) for every other command. Its id is in
     /// the `FileItems` and `Lint` kinds' tools (home.rs `tools`).
     pub lints: blaze_lint::RuleSet,
+    /// The extra records of the tasks answered this request, held until their owners are put
+    /// (main.rs `Effect::Put`), then checked held at the end ([`PendingExtras::finish`]).
+    pub extras: PendingExtras,
 }
 
 pub(crate) enum Did<'f> {
@@ -1162,8 +1228,12 @@ fn answer_batch<'f, 'r>(
             None => None,
         };
         keep_failed(failed, &done, path)?;
-        if let Did::Done(made) = &done {
+        let mut done = done;
+        if let Did::Done(made) = &mut done {
             tally(&mut phases.records, req, facts.names.as_ref(), task, made);
+            // Held until the machine puts their owner (main.rs `Effect::Put`), which gives
+            // their namespace: the owner's.
+            facts.extras.hold(made.name, core::mem::replace(&mut made.extras, Extras::none()))?;
             #[cfg(test)]
             answers_for_test::answered(made);
         }
@@ -1190,6 +1260,69 @@ fn answer_batch<'f, 'r>(
     phases.took(crate::STEP, request_frame);
     phases.request.steps += phases.since(stepped);
     Ok(())
+}
+
+/// The machine's path for the records a task makes beside its own ([`Record::extras`], a
+/// `CrateScope`'s expansion records): each goes to the store under its OWNER's namespace
+/// (store.rs `Sharing` over the owner's bytes), never another (a public owner naming a local
+/// record publishes one no other machine can read: rule 21). The owner's bytes are the
+/// machine's to make, so the extras are held here, by the owner's name, from the batch's join
+/// ([`hold`](PendingExtras::hold)) until main.rs performs the owner's `Effect::Put`
+/// ([`put_before`](PendingExtras::put_before)), which puts them first, so no reader of the
+/// owner finds one absent. The engine's puts give the owner's bytes at once (engine_store.rs
+/// `put_all`).
+pub struct PendingExtras {
+    /// By owner, in hold order; an owner at most once.
+    held: Vec<(Name, Extras), Global>,
+}
+
+impl PendingExtras {
+    /// None held.
+    pub fn empty() -> PendingExtras {
+        PendingExtras { held: Vec::new_in(Global) }
+    }
+
+    /// `extras` of the task `owner`, held until its record is put; none is nothing to hold.
+    pub(crate) fn hold(&mut self, owner: Name, extras: Extras) -> Result<(), CliError> {
+        if extras.records.is_empty() {
+            return Ok(());
+        }
+        if self.held.iter().any(|(name, _)| *name == owner) {
+            return Err(CliError::ExtrasHeldTwice { owner });
+        }
+        self.held.push((owner, extras));
+        Ok(())
+    }
+
+    /// Before the record `bytes` is put: when it is a whole drive record whose name holds
+    /// extras, each of them put under its namespace (`bytes` as the owner), in key order.
+    pub(crate) fn put_before(&mut self, cx: &Cx, store: &mut dyn Store<'_>, bytes: &[u8]) -> Result<(), CliError> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(bytes) else { return Ok(()) };
+        let Some(at) = self.held.iter().position(|(name, _)| *name == view.name) else { return Ok(()) };
+        let (_, extras) = self.held.swap_remove(at);
+        for (key, record) in extras.records.iter() {
+            store.put_record(cx, blaze_drive::Key(*key), crate::store::plain_place::EXPANSION_TAG, &[bytes], record)?;
+        }
+        Ok(())
+    }
+
+    /// At the request's end: an owner the machine never put (its record was settled from the
+    /// store, put by an earlier command with its extras) must find every extra record held
+    /// already; one the store lacks has no known namespace and is refused by name.
+    pub(crate) fn finish(&mut self, cx: &Cx, store: &mut dyn Store<'_>) -> Result<(), CliError> {
+        for (owner, extras) in core::mem::replace(&mut self.held, Vec::new_in(Global)).iter() {
+            for (key, _) in extras.records.iter() {
+                let key = blaze_drive::Key(*key);
+                if store.get(cx, key)?.is_none() {
+                    return Err(CliError::ExtrasOwnerNotPut { owner: *owner, key });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A task's answer `done`, kept for the closing note when it failed (with `path`, its file): its
@@ -1958,13 +2091,13 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 .map_err(|_| Unread::Text("the outline is not one of its file"))?;
             let payload = Vec::from_slice_in(&record, held);
             let out = parts_out(&parts);
-            Ok(Ok(Record { name: job.name, out, parts, findings, messages, payload, handed: Handed::None, paths, path_bytes, reads: Vec::new_in(held), covered: Vec::new_in(held) }))
+            Ok(Ok(Record { name: job.name, out, parts, findings, messages, payload, handed: Handed::None, paths, path_bytes, reads: Vec::new_in(held), covered: Vec::new_in(held), extras: Extras::none() }))
         }
     }
 }
 
 /// The domain of a `BodyCheck` part's subject ([`body_name`]).
-const BODY_DOMAIN: &str = "blaze-cli body check name 1";
+const BODY_DOMAIN: &str = "blaze-cli body check name 2";
 
 /// The form of a `BodyCheck` record's payload ([`seal_body_payload`], [`body_payload`]):
 ///
@@ -2157,33 +2290,30 @@ pub(crate) fn expansion_entry(outline: &blaze_file_items::Outline<'_>, item: &bl
 
 /// A body's name: its file's subject and its entry's chain up to the file (each kind, name as
 /// written and disambiguator), so it stands while other items move and its own text changes.
+///
+/// The chain is the ONE chain of an item (blaze-file-items chain.rs `item_chain`, rule 30), which
+/// holds an unnamed entry's head. This function walked the chain itself without that head until
+/// 2026-11-17, so two unnamed siblings with different heads (`write_p!();` beside `write_q!();`,
+/// each with disambiguator 0) had ONE name, and the bodies stage kept one of the two calls'
+/// tasks and dropped the other without a word (`two_macro_calls_side_by_side_are_two_bodies`).
 pub(crate) fn body_name(file: Name, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> Name {
     let mut h = blaze_ids::Hasher::new(BODY_DOMAIN);
-    h.update(&file.subject.0);
-    let mut at = Some(item);
-    while let Some(entry) = at {
-        let name = entry.name.map_or("", |range| entry.text(text, range));
-        h.update(&[entry.kind() as u8]).update(&(name.len() as u32).to_le_bytes()).update(name.as_bytes()).update(&entry.disambiguator.to_le_bytes());
-        at = entry.parent.map(|up| outline.item(up));
-    }
+    h.update(&file.subject.0).update(&blaze_file_items::item_chain(outline, item, text).0);
     Name::new(Kind::BodyCheck, h.finish())
 }
 
 /// The domain of an item's chain digest ([`item_chain`]).
-const CHAIN_DOMAIN: &str = "blaze-cli item chain 1";
+const CHAIN_DOMAIN: &str = "blaze-cli item chain 2";
 
 /// An item's identity in its file that no edit elsewhere moves (rule 71): the digest of its
 /// chain up to the file (each kind, name as written and disambiguator), as [`body_name`] names
 /// a body. A record that places a finding in an item holds this and the range from the item's
 /// start; the printer finds the item's start in the file as it is today ([`item_by_chain`]).
 pub(crate) fn item_chain(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> u64 {
+    // The one chain (blaze-file-items chain.rs, with an unnamed entry's head), under this
+    // record's own domain and cut to the 64 bits a placed finding holds.
     let mut h = blaze_ids::Hasher::new(CHAIN_DOMAIN);
-    let mut at = Some(item);
-    while let Some(entry) = at {
-        let name = entry.name.map_or("", |range| entry.text(text, range));
-        h.update(&[entry.kind() as u8]).update(&(name.len() as u32).to_le_bytes()).update(name.as_bytes()).update(&entry.disambiguator.to_le_bytes());
-        at = entry.parent.map(|up| outline.item(up));
-    }
+    h.update(&blaze_file_items::item_chain(outline, item, text).0);
     let digest = h.finish();
     u64::from_le_bytes(digest.0[..8].try_into().expect("a digest holds 8 bytes"))
 }

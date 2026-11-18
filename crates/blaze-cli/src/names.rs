@@ -70,11 +70,14 @@ pub(crate) mod sections;
 // table; "8": form 5, without the cell table; "9": a cell table without the names section's
 // whole row; "10": a cell table without the `MemberOf`, `VariantOf` and `Beginning` rows, whose
 // readers would read those cells absent; "11": an items record of version 8, whose item rows
-// hold no `extern` block ABI, and `Item` cells that do not cover it) are under other names,
-// never found, made again.
+// hold no `extern` block ABI, and `Item` cells that do not cover it; "12": the expansion texts
+// section (form 3) in place of the expansions directory, the texts and columns in the record
+// itself) are under other names, never found, made again.
 // The subject's domain is blaze-drive key.rs `CRATE_SCOPE_DOMAIN` (the name's one home,
-// `crate_scope_name`): bump it there with this one.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 12";
+// `crate_scope_name`): it names the crate's task, not its record's form, so a form change
+// moves this source domain alone (every key moves; the name a reader reads by stays). Bump it
+// there only when what a name stands for changes.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 13";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -231,6 +234,9 @@ pub(crate) struct Resolved {
     /// What the tests record says about single functions of the crate's own code, each with
     /// its rule ([`test_marks::findings`]).
     test_marks: blaze_own::Vec<(u16, Unresolved), Global>,
+    /// The crate's expansion records, which its payload's directory names: put after its
+    /// record ([`crate::work::Record::extras`]).
+    expansions: crate::work::Extras,
 }
 
 /// A resolved crate's payload ([`sections::write`]) with its unresolved paths as findings.
@@ -242,6 +248,9 @@ struct ScopeRecord {
     tests_refused: Option<std::string::String>,
     /// What the tests record says about single functions ([`test_marks::findings`]).
     test_marks: blaze_own::Vec<(u16, Unresolved), Global>,
+    /// Each distinct expansion record the payload's directory names, copied out of the task's
+    /// frame into `Global` with the payload.
+    expansions: crate::work::Extras,
 }
 
 /// A section of a resolved crate's record that could not be written: the crate's failure.
@@ -295,9 +304,21 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
         Some(section) => &section.bytes[..],
         None => &[],
     };
-    // The texts the crate's macro calls made, beside the items rows that name them (piece 16):
-    // a body's check reads an item an expansion wrote from here.
-    let expansions = expansion_texts::write(done.names).map_err(|error| unwritten("expansion texts", std::format!("{error}")))?;
+    // The crate's expansions (runtime.md plan row B3): its directory is the record's section, a
+    // row a call that made a text, beside the items rows that name them; each distinct text
+    // with its origin column is its own record, keyed by its bytes, put after this one
+    // ([`expansion_texts`]): a text many calls made is held once, however many crates made it.
+    let split = blaze_scope::expansion_records::write(done.names, alloc).map_err(|error| unwritten("expansions", std::format!("{error}")))?;
+    let expansions = &split.directory[..];
+    let mut records = blaze_own::Vec::with_capacity_in(split.records.len(), Global);
+    for record in split.records.iter() {
+        let mut bytes = blaze_own::Vec::with_capacity_in(record.bytes.len(), Global);
+        bytes.extend_from_slice(&record.bytes);
+        records.push((record.key, bytes));
+    }
+    let calls = u32::try_from(blaze_scope::expansion_records::Directory::open(expansions).map_err(|error| unwritten("expansions", std::format!("{error}")))?.len())
+        .map_err(|_| unwritten("expansions", "more than a u32 of macro calls".into()))?;
+    let extras = crate::work::Extras { records, calls, released: None };
     // The crate's link table, from the names resolved here (run.md, "the native image as a
     // task"): a refused table is written as its refusal (state 1), so only a program that links
     // the crate fails; an error here is a table that could not be written at all.
@@ -311,13 +332,13 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
     let wholes = [
         (blaze_scope::names_cells::Section::Names, &names_record[..]),
         (blaze_scope::names_cells::Section::Items, &items_record[..]),
-        (blaze_scope::names_cells::Section::Expansions, &expansions[..]),
+        (blaze_scope::names_cells::Section::Expansions, expansions),
     ];
     let cells = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, alloc).map_err(|error| unwritten("cell table", std::format!("{error:?}")))?;
-    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, &expansions[..], &links[..], &cells[..]]);
+    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, expansions, &links[..], &cells[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
-    Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks })
+    Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras })
 }
 
 /// The rule of a `use` or macro path in a project's own crate that names nothing.

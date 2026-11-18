@@ -77,8 +77,12 @@ const MAGIC: [u8; 4] = *b"BZFZ";
 /// 3: the records are form 10 (every lifetime part, made or refused).
 /// 4: an enum's cell holds its tuple variants' ctor heads (head_digest.rs `want_heads`).
 /// 5: the records are form 12 (a refused type alias is a record, `K_ALIAS_REFUSED`).
-pub const VERSION: u32 = 5;
-const WANT_BYTES: usize = 1 + 32 + 16;
+/// 6: the records are form 13 (a member refused alone is a record, `K_FN_REFUSED`), and a
+/// trait's members cell holds them (head_digest.rs `want_heads`).
+pub const VERSION: u32 = 6;
+/// How many bytes [`want_bytes`] writes: a cell's name in the form's header, and in a head
+/// task's payload (blaze-cli engine_heads.rs `heads_of`).
+pub const WANT_BYTES: usize = 1 + 32 + 16;
 const AT_BYTES: usize = 1 + 32;
 const HEADER: usize = 4 + 4 + WANT_BYTES + 4;
 const ENTRY: usize = AT_BYTES + 32 + 4 + 4;
@@ -520,7 +524,16 @@ pub fn freeze_seeded<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
                 Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
             }
         }
-        source.eval_const(&mut store, &mut keys, c).map_err(|error| FreezeError::Const { want, c, error })?;
+        match source.eval_const(&mut store, &mut keys, c) {
+            Ok(()) => {}
+            // In a trait's members it is the asking member's gap, as an anonymous constant's
+            // refusal is (`Maps::anon_failed`; types.rs `const_value_bits`): the member is
+            // refused by name with this reason (head_record.rs `FnRefused`), the others stand.
+            Err(error) if matches!(want, Want::Members(_)) => {
+                store.maps.anon_failed.insert(c, std::format!("{error}").into_boxed_str());
+            }
+            Err(error) => return Err(FreezeError::Const { want, c, error }),
+        }
     }
     let c = asked.last().copied().unwrap_or(want.key());
     Err(FreezeError::Const { want, c, error: ConstRefused::TooMany { most: MOST_FREEZE_CONSTS } })
@@ -1038,7 +1051,23 @@ pub struct SeededHeads<'n, 'a, N> {
     pub lowered: u32,
     /// The needs met of a cell up the stack ([`HeadSource::open`]), each lowered where met.
     pub reentered: u32,
+    /// The frozen heads known before this source freezes a cell itself (the request's, seeds.rs
+    /// `RequestHeads`): a cell it knows is copied in, never frozen again.
+    known: Option<&'a (dyn KnownHeads + 'a)>,
+    /// For each kept cell (at its index in `kept`), whether it was copied from `known`.
+    from_known: AVec<'a, bool>,
+    /// The cells copied from `known`.
+    pub taken: u32,
     alloc: Alloc<'a>,
+}
+
+/// Frozen heads a [`SeededHeads`] takes before it freezes a cell itself: the request's table
+/// and what other workers froze (seeds.rs `RequestSeed`). The bytes handed back are the cell's
+/// frozen head as [`freeze_seeded`] would make it: a freeze is a function of its cell and the
+/// names, so a known head and one made here are equal bytes.
+pub trait KnownHeads {
+    /// Cell `cell`'s frozen bytes (the `BZFZ` form), if known.
+    fn known(&self, cell: Want) -> Option<&[u8]>;
 }
 
 /// What a [`SeededHeads`] is made over: [`freeze`]'s inputs and the constant evaluator.
@@ -1050,6 +1079,10 @@ pub struct SeededHeadsOpts<'n, 'a, N> {
     pub alloc: Alloc<'a>,
     /// `None`: a head whose type holds a constant is refused ([`ConstRefused::NoEvaluator`]).
     pub consts: Option<&'a mut (dyn ConstValues<'n> + 'a)>,
+    /// The heads known before a freeze ([`KnownHeads`]); `None`: every cell is frozen here. A
+    /// cell taken from it keeps no reads ([`HeadCells::cell`] answers it with none), so a head
+    /// task, whose read list is its source's, takes none.
+    pub known: Option<&'a (dyn KnownHeads + 'a)>,
 }
 
 impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
@@ -1069,6 +1102,9 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             consts: o.consts,
             lowered: 0,
             reentered: 0,
+            known: o.known,
+            from_known: AVec::new_in(o.alloc),
+            taken: 0,
             alloc: o.alloc,
         }
     }
@@ -1076,6 +1112,18 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
     /// The cells frozen so far, in the order they were finished.
     pub fn cells(&self) -> impl Iterator<Item = Want> + '_ {
         self.kept.cells.iter().map(|(w, _)| *w)
+    }
+
+    /// How many cells it keeps (frozen here or taken from its known heads).
+    pub fn kept_len(&self) -> usize {
+        self.kept.cells.len()
+    }
+
+    /// Each cell kept from index `from` on that this source froze itself (not one taken from
+    /// its known heads), with its frozen bytes, in the order finished: what a caller publishes
+    /// after an ask (seeds.rs `RequestSeed`).
+    pub fn frozen_from(&self, from: usize) -> impl Iterator<Item = (Want, &[u8])> + '_ {
+        self.kept.cells.iter().zip(self.from_known.iter()).skip(from).filter(|(_, known)| !**known).map(|((w, bytes), _)| (*w, &bytes[..]))
     }
 
     /// Cell `want`'s index in `kept`, frozen on first ask ([`freeze_seeded`], this source the
@@ -1089,6 +1137,18 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         }
         if let Some(&(_, failed)) = self.failed.iter().find(|(w, _)| *w == want) {
             return Err(FreezeError::Again { want, failed });
+        }
+        // Known already (the request's table, another worker's freeze): copied in, so its
+        // bytes are read like a cell frozen here, and never frozen again.
+        if let Some(bytes) = self.known.and_then(|known| known.known(want)) {
+            let mut copy = RecordBytes::with_capacity_in(bytes.len(), self.alloc);
+            copy.extend_from_slice(bytes);
+            self.kept.cells.push((want, copy));
+            self.reads.push(AVec::new_in(self.alloc));
+            self.values.push(AVec::new_in(self.alloc));
+            self.from_known.push(true);
+            self.taken += 1;
+            return Ok(self.kept.cells.len() - 1);
         }
         if !self.making.is_empty() {
             return Err(FreezeError::Unfrozen { need: want });
@@ -1119,6 +1179,7 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
                     self.kept.cells.push((top, f.bytes));
                     self.reads.push(f.reads);
                     self.values.push(f.consts);
+                    self.from_known.push(false);
                 }
                 Err(FreezeError::Unfrozen { need }) => {
                     // The attempt given up counts its re-entries when it is made again.

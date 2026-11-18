@@ -16,7 +16,7 @@ use bstd::cx::Cx;
 
 use crate::CliError;
 use crate::store::Store;
-use crate::work::Record;
+use crate::work::{Extras, Record};
 
 /// The domain of the engine's per-kind tools: every kind's tool (home.rs `tools`) hashed under
 /// it, so an edit of one producer still moves only its kinds' keys (rule 52).
@@ -57,6 +57,31 @@ pub(crate) struct Put<'r> {
     /// A file's outline: its parts, paths and findings too, so a later request that finds the
     /// file unchanged reads the whole outline back ([`outline_from`]) and never the file.
     pub(crate) listing: Option<Listing<'r>>,
+    /// The records the task made beside its own (a `CrateScope`'s expansion records,
+    /// work.rs `Record::extras`), put right after it, in its namespace.
+    pub(crate) extras: Option<&'r Extras>,
+}
+
+/// A test's planted bug: every expansion record whose text holds `marker` is not put, so a
+/// reader of it meets [`blaze_scope::expansion_records::ExpansionRecordsError::Missing`].
+#[cfg(test)]
+pub(crate) fn plant_missing_expansion(marker: Option<&'static str>) {
+    MISSING_EXPANSION.with(|plant| plant.set(marker));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static MISSING_EXPANSION: core::cell::Cell<Option<&'static str>> = const { core::cell::Cell::new(None) };
+}
+
+/// Whether the plant skips the record `bytes` (never outside a test).
+fn planted_missing(bytes: &[u8]) -> bool {
+    #[cfg(test)]
+    if let Some(marker) = MISSING_EXPANSION.with(|plant| plant.get()) {
+        return bytes.windows(marker.len()).any(|window| window == marker.as_bytes());
+    }
+    let _ = bytes;
+    false
 }
 
 /// What an outline record lists besides its payload, as `work::Record` holds it.
@@ -99,6 +124,23 @@ pub(crate) fn put_all(cx: &Cx, store: &mut dyn Store<'_>, puts: &mut [Put<'_>], 
         let parts: [&[u8]; 2] = [&head, put.payload];
         ledger.put(stage, put.key, &parts, put.payload.len());
         store.put_parts(&cx, put.key, &parts)?;
+        // Its extra records after it, in key order (sorted by their writer, expansion_records.rs
+        // `write`), each in its owner's namespace (`parts`).
+        if let Some(extras) = put.extras {
+            let (mut written, mut skipped) = (0u32, 0u32);
+            for (key, bytes) in extras.records.iter() {
+                if planted_missing(bytes) {
+                    skipped += 1;
+                    continue;
+                }
+                let key = Key(*key);
+                let put = store.put_record(&cx, key, crate::store::plain_place::EXPANSION_TAG, &parts, bytes)?;
+                written += u32::from(put == blaze_keyed::store::Put::Written);
+                ledger.put_extra(stage, key, bytes, put);
+            }
+            // A planted skip is no row served: the same count is the rows a record held served.
+            ledger.extras_named(stage, extras.calls.saturating_sub(skipped), written, extras.bytes());
+        }
     }
     Ok(u32::try_from(puts.len()).unwrap_or(u32::MAX))
 }
@@ -194,13 +236,38 @@ pub(crate) struct Ledger {
     /// What each stage read of earlier stages' records, counted where each was opened
     /// (engine_records.rs `EngineRecords::records`).
     pub(crate) reads: [ReadLine; STAGES],
+    /// Each stage's records put beside its tasks' own (a `CrateScope`'s expansion records),
+    /// apart from `lines`, which count the tasks' records.
+    pub(crate) extras: [ExtraLine; STAGES],
     /// Payload bytes each stage's results hold after their put.
     results: [u64; STAGES],
     /// The store's counts at the last merge.
     seen: crate::store::StoreKept,
     /// The reader's counts at the last merge.
     seen_read: crate::engine_records::ReadCounts,
+    /// The copies the extra records written since the last merge made in the store's arena
+    /// (each one, its bytes in 16-byte blocks: blaze-cas plain/lent.rs `copy_in`): the stage's
+    /// line counts its tasks' records' copies, so these are taken from it at the merge.
+    extra_copies: [(u64, u64); STAGES],
     digest: blaze_ids::Hasher,
+}
+
+/// One stage's extra records as the profile prints them, after its records' line:
+/// "expansions: N put, B bytes, S same".
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ExtraLine {
+    /// Records written (new to the store).
+    pub(crate) puts: u64,
+    pub(crate) bytes: u64,
+    /// Rows of the tasks' records that named a record already held: the calls a record served
+    /// beside the one that wrote it, or every call of a record an earlier request wrote.
+    pub(crate) same: u64,
+}
+
+impl core::fmt::Display for ExtraLine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "expansions: {} put, {} bytes, {} same", self.puts, self.bytes, self.same)
+    }
 }
 
 impl Ledger {
@@ -208,9 +275,11 @@ impl Ledger {
         Ledger {
             lines: [RecordLine::default(); STAGES],
             reads: [ReadLine::default(); STAGES],
+            extras: [ExtraLine::default(); STAGES],
             results: [0; STAGES],
             seen: crate::store::StoreKept::default(),
             seen_read: crate::engine_records::ReadCounts::default(),
+            extra_copies: [(0, 0); STAGES],
             digest: blaze_ids::Hasher::new(PUTS_DIGEST),
         }
     }
@@ -223,6 +292,29 @@ impl Ledger {
         line.copied += now.copied.saturating_sub(self.seen_read.copied);
         line.again += now.hits.saturating_sub(self.seen_read.hits);
         self.seen_read = now;
+    }
+
+    /// An extra record of `stage`'s task put under `key` after its owner ([`put_all`]), the
+    /// store's answer `put`: in the digest in put order, written or not; counted when written.
+    pub(crate) fn put_extra(&mut self, stage: Stage, key: Key, bytes: &[u8], put: blaze_keyed::store::Put) {
+        self.digest.update(&key.0.0).update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
+        if put == blaze_keyed::store::Put::Written {
+            let line = &mut self.extras[stage.index()];
+            line.puts += 1;
+            line.bytes += bytes.len() as u64;
+            let copies = &mut self.extra_copies[stage.index()];
+            copies.0 += 1;
+            copies.1 += (bytes.len().div_ceil(16).max(1) * 16) as u64;
+        }
+    }
+
+    /// A task of `stage` whose record's rows name its extras `calls` times, `written` of them
+    /// new (every other row is served by a record already held), its extras `held` bytes still
+    /// in its result until [`Ledger::released`] (work.rs `Record::release_handed` frees them
+    /// with the payload).
+    pub(crate) fn extras_named(&mut self, stage: Stage, calls: u32, written: u32, held: usize) {
+        self.extras[stage.index()].same += u64::from(calls.saturating_sub(written));
+        self.results[stage.index()] += held as u64;
     }
 
     /// A record of `stage` put under `key`, its bytes the concatenation of `parts`, its payload
@@ -249,8 +341,10 @@ impl Ledger {
     /// stage's, and its line's `held` is the gauge now.
     pub(crate) fn merged(&mut self, stage: Stage, store: crate::store::StoreKept) {
         let line = &mut self.lines[stage.index()];
-        line.copies += store.copies.saturating_sub(self.seen.copies);
-        line.copy_bytes += store.copy_bytes.saturating_sub(self.seen.copy_bytes);
+        // The extra records' own copies are theirs, not the tasks' records'.
+        let (extra, extra_bytes) = core::mem::take(&mut self.extra_copies[stage.index()]);
+        line.copies += store.copies.saturating_sub(self.seen.copies).saturating_sub(extra);
+        line.copy_bytes += store.copy_bytes.saturating_sub(self.seen.copy_bytes).saturating_sub(extra_bytes);
         line.held = self.results[stage.index()] + store.held_bytes;
         self.seen = store;
     }
@@ -264,9 +358,11 @@ impl Ledger {
     pub(crate) fn write(&self, text: &mut impl core::fmt::Write) {
         // A report: a full frame cuts it short where it stood (engine_check.rs `profile_text`).
         for stage in Stage::ALL {
-            let line = self.lines[stage.index()];
-            if line.puts > 0 {
+            let (line, extras) = (self.lines[stage.index()], self.extras[stage.index()]);
+            if line.puts > 0 && extras == ExtraLine::default() {
                 let _ = writeln!(text, "records ({stage:?}): {line}");
+            } else if line.puts > 0 {
+                let _ = writeln!(text, "records ({stage:?}): {line}; {extras}");
             }
             let read = self.reads[stage.index()];
             if read.records + read.again > 0 {

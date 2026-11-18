@@ -408,6 +408,11 @@ impl<'a> LastAnswer for RowsAnswer<'a> {
         = RowDefines<'r>
     where
         Self: 'r;
+    /// The rows form keeps no seen digests: its rows stand by generation (last.rs).
+    type Seen<'r>
+        = core::iter::Empty<(CellNo, ContentId)>
+    where
+        Self: 'r;
 
     fn serial(&self) -> Serial {
         self.view.serial()
@@ -484,6 +489,22 @@ impl<'a> LastAnswer for RowsAnswer<'a> {
         Counters::add(&self.counters.rows, 1);
         Counters::add(&self.counters.bytes, 4 + 16 + self.rows_segments * PROBE_BYTES + ROW_BYTES + PROBE_BYTES + len64(DEFINE_BYTES));
         self.view.digest(cell)
+    }
+
+    /// The kept prefix padded with zeros (last.rs `content`): `CellDigest::of` maps it back.
+    fn content(&self, cell: CellNo) -> ContentId {
+        let kept = LastAnswer::digest(self, cell);
+        let mut whole = [0u8; 32];
+        whole[..kept.0.len()].copy_from_slice(&kept.0);
+        ContentId(whole)
+    }
+
+    fn moved(&self, cell: CellNo) -> Serial {
+        RowsAnswer::moved(self, cell)
+    }
+
+    fn seen(&self, _task: TaskId) -> Option<core::iter::Empty<(CellNo, ContentId)>> {
+        None
     }
 
     fn readers<'m>(&self, cell: CellNo, alloc: Alloc<'m>) -> Result<AVec<'m, TaskId>, LastError> {
@@ -634,7 +655,8 @@ impl<'m> NextAnswer for RowsNext<'_, '_, 'm> {
             }
             self.defines.extend(old.defines());
         }
-        let flags = Flags(old.map_or(0, |row| row.flags().0) | Flags::OWED);
+        // Owed and never made: the row holds the plan alone (last.rs, `Flags::UNMADE`).
+        let flags = Flags(old.map_or(Flags::UNMADE, |row| row.flags().0) | Flags::OWED);
         let key = old.map_or(Key::default(), |row| row.key());
         let findings = old.map_or(0, |row| row.findings());
         let stage = stage_byte(planned.phase.stage);
@@ -828,6 +850,10 @@ impl LastAnswer for PagesAnswer<'_, '_> {
         = PageDefines<'r>
     where
         Self: 'r;
+    type Seen<'r>
+        = core::iter::Copied<core::slice::Iter<'r, (CellId, ContentId)>>
+    where
+        Self: 'r;
 
     fn serial(&self) -> Serial {
         Serial(self.kept.answer.serial.0)
@@ -864,7 +890,7 @@ impl LastAnswer for PagesAnswer<'_, '_> {
                 phase: planned.phase,
                 file: planned.file,
                 source: planned.source,
-                flags: Flags(Flags::OWED),
+                flags: Flags(Flags::OWED | Flags::UNMADE),
                 findings: 0,
                 reads: 0,
                 defines: 0,
@@ -922,13 +948,38 @@ impl LastAnswer for PagesAnswer<'_, '_> {
         }
     }
 
+    /// A read list is in read order (engine.rs invariant 9), not sorted: the cell is found by a
+    /// walk (a binary search here missed reads out of cell order).
     fn saw(&self, task: Name, cell: CellId) -> bool {
         let answer = &self.kept.answer;
-        answer.rows.get(&task).is_some_and(|row| row.reads.binary_search_by_key(&cell, |(read, _)| *read).is_ok_and(|at| row.reads[at].1 == answer.cell(&cell)))
+        let now = answer.cell(&cell);
+        answer.rows.get(&task).is_some_and(|row| row.reads.iter().any(|(read, seen)| *read == cell && *seen == now))
     }
 
     fn digest(&self, cell: CellId) -> CellDigest {
         CellDigest::of(&self.kept.answer.cell(&cell))
+    }
+
+    fn content(&self, cell: CellId) -> ContentId {
+        self.kept.answer.cell(&cell)
+    }
+
+    fn moved(&self, cell: CellId) -> Serial {
+        let answer = &self.kept.answer;
+        match answer.cells.get(&cell) {
+            Some((_, at)) => Serial(at.0),
+            None => Serial(answer.owed_cells.get(&cell).map_or(0, |at| at.0)),
+        }
+    }
+
+    fn seen(&self, task: Name) -> Option<core::iter::Copied<core::slice::Iter<'_, (CellId, ContentId)>>> {
+        let reads = match self.kept.answer.rows.get(&task) {
+            Some(row) => &row.reads[..],
+            None if self.kept.answer.owed_tasks.contains_key(&task) => &[],
+            None => return None,
+        };
+        Counters::add(&self.counters.reads, len64(reads.len()));
+        Some(reads.iter().copied())
     }
 
     fn readers<'m>(&self, cell: CellId, alloc: Alloc<'m>) -> Result<AVec<'m, Name>, LastError> {

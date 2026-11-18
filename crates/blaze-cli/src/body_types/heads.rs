@@ -236,7 +236,8 @@ impl<'n> Checker<'n> {
             let text = match texts.text(*call) {
                 Ok(Some(text)) => text,
                 Ok(None) => return Err("a macro call that wrote a head has no expansion text in its crate's record (names/expansion_texts.rs)"),
-                Err(_) => return Err("a macro call's expansion text does not read from its crate's record (names/expansion_texts.rs)"),
+                // The why names the call and the record the store lacks (`Missing`).
+                Err(why) => return Err(super::held_str(bstd::mem::format_in!(frame, "a macro call's expansion text does not read from its crate's record: {why} (names/expansion_texts.rs)").as_str(), frame)),
             };
             let outline = blaze_file_items::outline(text, edition, self.heap);
             outs.push(expansion_out(&digests, &outline, text, edition));

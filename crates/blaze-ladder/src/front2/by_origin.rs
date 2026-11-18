@@ -315,6 +315,56 @@ pub fn key_want<'n, S: NamesSource<'n>>(names: S, keys: &Keys, key: ItemKey, kin
     }
 }
 
+/// Which cell holds what a body's check takes about a key (tables/task.rs `fact_read`): the
+/// two classes of every kind, told HERE once and whole (rule 76: no wildcard arm, so a kind
+/// added to [`ItemKind`] or [`KeyKind`] does not compile until it is classed). Which
+/// outline kinds are [`ItemKind::Other`] is [`kind_of_lib`]'s match, total over the
+/// surface's kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FactHolder {
+    /// A kind with a head: a head task's cell holds its facts (a signature, predicates, a
+    /// definition, a header), the cell of the want [`key_want`] makes (tables/head.rs
+    /// `cell_of`): a variant's and a constructor's is its ADT's, a member's its container's.
+    Head,
+    /// A kind with no head (a module, a `use`, a `macro_rules!`, a `macro`, an `extern crate`,
+    /// a field, an `extern` block, a macro call, an error or unhandled item): a check takes of
+    /// it only what the names record holds of its key, that it is there and is of this kind
+    /// (its outline row; a module's: its parent and path), which is the names cell
+    /// `Item { key: lib }` (blaze-scope names_cells.rs). Its head-shaped questions are answered
+    /// by that kind alone (world_items.rs: `fn_sig_once` answers none for `ItemKind::Other`,
+    /// `attrs_once` refuses `NotAHead`), so that cell is all such an answer can move by.
+    Names { lib: LibKey, kind: SurfaceKind },
+    /// An anonymous constant ([`super::anon`]): no cell. Its head (no inputs, its type as
+    /// output, no predicates: anon.rs `file_asked`) is a function of its key, which is of its
+    /// module, its type and its text; its value is evaluated in the asking task's own world,
+    /// its text's names read there through the task's recorded view and each head it reaches
+    /// filed in that task's store, or else inside the freeze of the head that wrote it, whose
+    /// cell holds the value in its bytes. Nothing moves its answer that one of those reads
+    /// does not see.
+    OwnKey,
+}
+
+/// The [`FactHolder`] of a key of kind `kind`.
+pub fn fact_holder(kind: KeyKind<'_>) -> FactHolder {
+    match kind {
+        KeyKind::Item(item) => match item {
+            ItemKind::Adt(_)
+            | ItemKind::Trait(_)
+            | ItemKind::TraitAlias(_)
+            | ItemKind::Impl(_)
+            | ItemKind::Fn(_)
+            | ItemKind::Const(_)
+            | ItemKind::Static(_)
+            | ItemKind::TypeAlias(_)
+            | ItemKind::Variant { .. }
+            | ItemKind::LibMember { .. } => FactHolder::Head,
+            ItemKind::Other { lib, kind } => FactHolder::Names { lib, kind },
+        },
+        KeyKind::MemberFn { .. } | KeyKind::MemberConst { .. } | KeyKind::MemberType { .. } | KeyKind::Ctor { .. } => FactHolder::Head,
+        KeyKind::Anon { .. } => FactHolder::OwnKey,
+    }
+}
+
 /// [`key_want`] for a body's world: an opaque type's record is made with its fn's head.
 pub fn world_want<'n, S: NamesSource<'n>>(names: S, keys: &Keys, key: ItemKey, kind: WorldKind<'_>) -> Result<Want, FillError> {
     match kind {

@@ -407,6 +407,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
             failed: Some(words),
             failed_calls: blaze_own::Vec::new_in(Global),
             test_marks: blaze_own::Vec::new_in(Global),
+            expansions: crate::work::Extras::none(),
         },
         ok: false,
         unresolved: 0,
@@ -458,7 +459,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     // `prepare`): a path into one is counted, never a finding (plan row A8, rule 19).
     let mut quiet: blaze_own::Vec<&str, Global> = blaze_own::Vec::new_in(Global);
     quiet.extend(job.input.deps.iter().filter(|(_, at)| job.deps.get(*at).is_some_and(|bytes| blaze_scope::crate_scope::is_error_record(bytes))).map(|(name, _)| *name));
-    let (out, payload, findings, failed, ok, unresolved, test_marks) = match done {
+    let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
         Ok(done) => match scope_record(&done, crate_name, &quiet, alloc) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
@@ -469,7 +470,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
                 let mut out = blaze_ids::Hasher::new(OUT_DOMAIN);
                 out.update(&(done.record.len() as u64).to_le_bytes()).update(&done.record);
                 out.update(&(done.inner.len() as u64).to_le_bytes()).update(&done.inner);
-                (Some(out), record.payload, record.findings, record.tests_refused, true, record.unresolved, record.test_marks)
+                (Some(out), record.payload, record.findings, record.tests_refused, true, record.unresolved, record.test_marks, record.expansions)
             }
             Err(unwritten) => (
                 None,
@@ -479,6 +480,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
                 true,
                 0,
                 blaze_own::Vec::new_in(Global),
+                crate::work::Extras::none(),
             ),
         },
         Err(CrateScopeError::Need(keys)) => return Resolution::Need(keys.iter().copied().collect()),
@@ -493,6 +495,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
             false,
             0,
             blaze_own::Vec::new_in(Global),
+            crate::work::Extras::none(),
         ),
     };
     // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
@@ -535,7 +538,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         }
         None => crate::work::failed_out(),
     };
-    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, test_marks }, ok, unresolved }
+    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, test_marks, expansions }, ok, unresolved }
 }
 
 /// A resolution filed on the main thread: a need is the task's answer; a made crate is kept
@@ -672,7 +675,10 @@ fn hand_payload(resolved: &mut Resolved, made: &mut Made<'_>) -> Result<(), CliE
         return Err(CliError::Text { what: "a crate's `CrateScope` record answered twice this command: its payload went to the first answer (names/scope.rs `hand_payload`)" });
     }
     let payload = core::mem::replace(&mut resolved.payload, blaze_own::Vec::new_in(Global));
-    made.hand(payload)
+    made.hand(payload)?;
+    // Its expansion records with it, moved: the directory in the payload names them, so they
+    // go to the store after it (engine_store.rs `put_all`, work.rs `PendingExtras`).
+    made.hand_extras(core::mem::replace(&mut resolved.expansions, crate::work::Extras::none()))
 }
 
 /// [`MADE`], for a test.
@@ -791,6 +797,7 @@ mod tests {
             failed: None,
             failed_calls: blaze_own::Vec::new_in(Global),
             test_marks: blaze_own::Vec::new_in(Global),
+            expansions: crate::work::Extras::none(),
         };
         let frame = Frame::with_reserve(FRAME, Tag::Other).expect("a test frame");
         assert!(LEN > frame.reserved(), "the payload ({LEN} bytes) is larger than the frame ({} bytes)", frame.reserved());

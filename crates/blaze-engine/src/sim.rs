@@ -18,15 +18,17 @@ use crate::engine::{
     Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Everything, Finished, Gen, Made, Phase, Plant, Planned, Pool, SMap, SVec, Scope, Stage,
     Task, View, drive, drive_growing,
 };
+use crate::last::LastAnswer;
+use crate::overlay::Fold;
 use crate::pages::{Kept, PagesPlant, Root};
 
 const TOOL: Tool = Tool(ContentId([7; 32]));
 
-fn alloc() -> SharedAlloc<'static> {
+pub(crate) fn alloc() -> SharedAlloc<'static> {
     blaze_own::testing::heap().shared()
 }
 
-fn oracle(holds: bool, why: impl FnOnce() -> String) -> Result<(), Broke> {
+pub(crate) fn oracle(holds: bool, why: impl FnOnce() -> String) -> Result<(), Broke> {
     match holds {
         true => Ok(()),
         false => Err(Broke::Oracle(why())),
@@ -64,7 +66,7 @@ const MACROS: u8 = 11;
 /// A names record's expansion of one item's derive.
 const GEN: u8 = 12;
 /// A body text whose check fails.
-const POISON: u32 = 13;
+pub(crate) const POISON: u32 = 13;
 
 /// Whether an item with this signature carries a derive, whose expansion the crate's names make
 /// and grow into a head and a body (invariant 11). Never below 4: the fixtures' signatures.
@@ -113,7 +115,7 @@ fn konst_read() -> CellId {
 }
 
 /// The record of the constant `v` made over the view: its value is a function of what it read.
-fn make_konst(v: u32, view: View<'_, 'static>) -> Done<'static> {
+fn make_konst<L: LastAnswer>(v: u32, view: View<'_, 'static, L>) -> Done<'static> {
     let a = alloc();
     let read = konst_read();
     let seen = view.cell(&read);
@@ -143,7 +145,7 @@ fn growth_of(world: &World, c: usize) -> StdVec<Planned> {
 }
 
 /// The driver's half of growth: each names task merged grows its crate's expansions, whole.
-fn grow_names(world: &World, engine: &mut Engine<'static, impl Scope>) -> Result<(), EngineError> {
+fn grow_names<L: LastAnswer>(world: &World, engine: &mut Engine<'static, impl Scope, L>) -> Result<(), EngineError> {
     let merged: StdVec<Name> = engine.merged().to_vec();
     for name in merged.iter() {
         if name.kind != Kind::CrateScope {
@@ -156,20 +158,20 @@ fn grow_names(world: &World, engine: &mut Engine<'static, impl Scope>) -> Result
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Item {
-    id: u32,
-    sig: u32,
-    body: u32,
-    refs: StdVec<u32>,
+pub(crate) struct Item {
+    pub(crate) id: u32,
+    pub(crate) sig: u32,
+    pub(crate) body: u32,
+    pub(crate) refs: StdVec<u32>,
 }
 
 #[derive(Clone, Debug)]
-struct World {
+pub(crate) struct World {
     /// Each crate's dependencies, all of lower index.
-    crates: StdVec<StdVec<usize>>,
+    pub(crate) crates: StdVec<StdVec<usize>>,
     /// Each file's crate and items.
-    files: StdVec<(usize, StdVec<Item>)>,
-    next_id: u32,
+    pub(crate) files: StdVec<(usize, StdVec<Item>)>,
+    pub(crate) next_id: u32,
 }
 
 impl World {
@@ -213,7 +215,7 @@ impl World {
     }
 
     /// Every file's and manifest's plan, by its name.
-    fn plans(&self) -> BTreeMap<Name, StdVec<Planned>> {
+    pub(crate) fn plans(&self) -> BTreeMap<Name, StdVec<Planned>> {
         let mut plans = BTreeMap::new();
         for f in 0..self.files.len() {
             plans.insert(outline(f), self.plan_of_file(f));
@@ -227,9 +229,18 @@ impl World {
 
 /// The scope: bodies of the asked crates; every name, head and outline (a body's reads).
 #[derive(Clone)]
-struct Crates {
-    asked: BTreeSet<usize>,
-    crate_of: BTreeMap<Name, usize>,
+pub(crate) struct Crates {
+    pub(crate) asked: BTreeSet<usize>,
+    pub(crate) crate_of: BTreeMap<Name, usize>,
+}
+
+impl Crates {
+    /// The scope of `asked` over `world`: a grown task's file is its grower, the crate's names,
+    /// so its bodies are the crate's too.
+    pub(crate) fn of(world: &World, asked: BTreeSet<usize>) -> Crates {
+        let crate_of = (0..world.files.len()).map(|f| (outline(f), world.files[f].0)).chain((0..world.crates.len()).map(|c| (names(c), c))).collect();
+        Crates { asked, crate_of }
+    }
 }
 
 impl Scope for Crates {
@@ -240,7 +251,7 @@ impl Scope for Crates {
 
 /// The pools the simulation drives the engine with.
 #[derive(Clone, Copy, Debug)]
-enum Pools {
+pub(crate) enum Pools {
     One,
     Many(usize),
     Reversed,
@@ -260,7 +271,7 @@ impl<'a> Pool<'a> for Pools {
 
 /// The model's tasks, over the world's text and the view's cells. `plant` is
 /// [`Plant::HitWithoutReads`] alone when a body drops its read of the constant it hit or made.
-fn work(world: &World, plant: Plant, view: View<'_, 'static>, task: &Task, buffer: &mut Buffer<'static>) {
+fn work<L: LastAnswer>(world: &World, plant: Plant, view: View<'_, 'static, L>, task: &Task, buffer: &mut Buffer<'static>) {
     let name = task.planned.name;
     let a = alloc();
     let mut defines: SVec<'static, (Cell, ContentId)> = Vec::new_in(a);
@@ -401,10 +412,11 @@ fn work(world: &World, plant: Plant, view: View<'_, 'static>, task: &Task, buffe
     buffer.done.push(Done { name, key: task.key, out: d("sim engine out", &out_parts), defines, reads, findings, failed });
 }
 
-/// One request on the engine.
-fn request(
+/// One request on the engine, over the last answer in any form `L` (last_sim.rs runs the same
+/// history over two forms and holds them equal).
+pub(crate) fn request<L: Fold<'static, Out = Answer<'static>> + Sync>(
     world: &World,
-    answer: Answer<'static>,
+    answer: L,
     changed: &BTreeMap<Name, StdVec<Planned>>,
     scope: Crates,
     plant: Plant,
@@ -419,7 +431,7 @@ fn request(
     engine.finish()
 }
 
-fn first_world(tape: &Tape) -> World {
+pub(crate) fn first_world(tape: &Tape) -> World {
     let crates: StdVec<StdVec<usize>> = (0..1 + tape.index(3, "crates"))
         .map(|c| (0..c).filter(|dep| tape.one_in(2, "a dependency")).collect())
         .collect();
@@ -452,7 +464,7 @@ fn add_item(tape: &Tape, world: &mut World, f: usize) {
     world.files[f].1.push(item);
 }
 
-fn edit(tape: &Tape, world: &World) -> World {
+pub(crate) fn edit(tape: &Tape, world: &World) -> World {
     let mut next = world.clone();
     let f = tape.index(next.files.len(), "the file edited");
     let len = next.files[f].1.len();
@@ -573,8 +585,7 @@ struct Step {
 
 impl History {
     fn new(world: World, plant: Plant) -> History {
-        // A grown task's file is its grower, the crate's names: its bodies are the crate's too.
-        let crate_of = (0..world.files.len()).map(|f| (outline(f), world.files[f].0)).chain((0..world.crates.len()).map(|c| (names(c), c))).collect();
+        let crate_of = Crates::of(&world, BTreeSet::new()).crate_of;
         History {
             world,
             plant,

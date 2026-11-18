@@ -257,6 +257,9 @@ pub(crate) fn run_own<F: Front>(
     };
     let tally = lazy.tally();
     *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed) });
+    // The walk is over: what the code store served and made is final (the program root's half).
+    drop(lazy);
+    let walked = codes.reached();
     let ran = ran.map_err(|error| match error {
         LoopError::Start(error) => OwnError::NotStarted {
             launcher: std::boxed::Box::from(launcher.as_str()),
@@ -276,8 +279,24 @@ pub(crate) fn run_own<F: Front>(
     let wrote = start_list::encode(today.certificate, head, needs.first(), &mut bytes)
         .map_err(start_list::ListError::Cap)
         .and_then(|()| start_list::write(lent, &today.name, held, bytes.as_slice()));
-    if let Err(why) = wrote {
-        err.line(cx, format_args!("blaze run: the program ended with {}, and its start list was not kept: {why}", ran.status)).map_err(OwnError::Out)?;
+    let list = match wrote {
+        Ok(_) => Some(bytes.as_slice()),
+        Err(why) => {
+            err.line(cx, format_args!("blaze run: the program ended with {}, and its start list was not kept: {why}", ran.status)).map_err(OwnError::Out)?;
+            None
+        }
+    };
+    // The program's code and its list, named by the program root (per program, request shape
+    // and user, store/roots.rs) for the next run from any checkout: the start list's keys and
+    // the walk's, one index, one root.
+    match crate::store::roots::keep_program(lent, &today.name, list, &walked) {
+        Ok((_rooted, kept)) if kept.stale_rows > 0 => {
+            err.line(cx, format_args!("blaze run: {} start-list rows name code the store no longer holds; the next run builds them again", kept.stale_rows)).map_err(OwnError::Out)?;
+        }
+        Ok(_) => {}
+        Err(why) => {
+            err.line(cx, format_args!("blaze run: the program ended with {}, and its code was not kept for the next run: {why}", ran.status)).map_err(OwnError::Out)?;
+        }
     }
     Ok(ran.status)
 }

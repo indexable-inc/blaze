@@ -1,0 +1,15 @@
+{
+ "id": "engine-generic-over-last-answer",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RD8",
+ "where": "crates/blaze-engine/src/engine.rs over overlay.rs; last.rs (the seam); blaze-cli engine_answer_rows.rs (RowsAnswer, PagesAnswer)",
+ "what": "Making the engine generic over the last answer (Engine<'a, S, L = Answer>) needed more from the seam than its first cut gave: the whole digest a row saw of each read (the engine names `Cause::ReadMoved { was, now }` and compares digests, so a cell that moved and moved back leaves its readers standing), the digest a task reads through its view (32 bytes; the rows form keeps 20), when a cell last moved, and whether an owed task's row was ever made (the seam returned an owed-no-row as a row with flag OWED, which the engine would read as `Cause::KeyMoved` instead of `Cause::New`). Added `seen`, `content`, `moved` and `Flags::UNMADE`. PagesAnswer::saw also binary-searched a read list that is in read order, not cell order.",
+ "cost": "most of the lane's design time went into the seam's gaps before the overlay could be a pure substitution; nothing compiled in-lane (write-only)",
+ "cause": "the seam was written from the rows form's columns, not from what engine.rs asks",
+ "whys": "no form behind the seam was the engine's own in-memory answer, so no test held a seam answer against the engine's own lookups",
+ "class": "an interface cut from the implementation's storage, not from its caller's questions",
+ "prevention": "done: `impl LastAnswer for Answer` (last_mem.rs) is the default form, and last_sim.rs runs every history on Engine<Answer> and Engine<SimLast> and holds them equal; a planted bug in the overlay (Plant::ReadersStale) is the control. Not done: the rows form (generation rule, 20-byte digests) is held to the engine by no oracle yet",
+ "annoyance": "write-only lane without Grep/Glob tools: read-only grep/sed through Bash only",
+ "workaround": "grep/sed -n through Bash, as the lane rules allow",
+ "state": "open"
+}

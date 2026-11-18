@@ -30,8 +30,8 @@
 //! closure type and an async block's future in a head's terms (body types, never a head's); an
 //! alias whose head was refused (its why is a `Why`, not a record). Every lifetime part is in
 //! the form (10): a fn's, an ADT's, a trait's and an impl's, made or refused, so an edit of a
-//! lifetime bound alone moves the head's reader digest. Not in this form: the store's gaps
-//! (`fn_gaps`, `alias_gaps`: refusals, not heads). An impl's const parameters are its frame's
+//! lifetime bound alone moves the head's reader digest. A refused alias and a member refused
+//! alone are records of their why's text (forms 12 and 13: `alias_gaps`, `fn_gaps`). An impl's const parameters are its frame's
 //! (form 9), filed under the impl's library key by whoever holds it (the want).
 
 use blaze_build::layout::{IntRepr, ReprAttrs};
@@ -81,7 +81,11 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// associated types had its bounds refused is refused by name (`Unencoded`).
 /// 12: a type alias whose head was refused is a record too (`K_ALIAS_REFUSED`: its key and its
 /// why as the store keeps it, `Maps::alias_gaps`' text), filed back as refused.
-pub const VERSION: u32 = 12;
+/// 13: a member fn or constant whose signature was refused alone is a record too
+/// (`K_FN_REFUSED`: its key and its why's text, `Store::fn_gaps`), filed back as that member's
+/// gap: a trait whose one member's type holds a constant that does not evaluate is frozen with
+/// its other members, and a body that calls that one is refused for its reason.
+pub const VERSION: u32 = 13;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -98,6 +102,7 @@ const K_ALIAS: u8 = 6;
 const K_TRAIT_ALIAS: u8 = 7;
 const K_OPAQUE: u8 = 8;
 const K_ALIAS_REFUSED: u8 = 9;
+const K_FN_REFUSED: u8 = 10;
 
 // Term tags, one per `PNode` form written.
 const T_BOOL: u8 = 0;
@@ -211,6 +216,10 @@ pub enum HeadRef<'h, 'n> {
     /// where-clauses and its lifetime part (form 10: made or refused; `None` when never made,
     /// lifetimes.rs `Store::make_lives`).
     Fn { key: ItemKey, head: &'h FnHead<'n>, preds: Option<&'h Preds>, static_: Option<tc::Mutbl>, life: Option<Result<&'h FnLife, LifeRefusal>> },
+    /// A member fn or constant whose signature was refused when its container was made
+    /// (`Store::fn_gaps`, form 13): its why, so a body that uses it is refused for that reason
+    /// and the container's other members stand.
+    FnRefused { key: ItemKey, why: GapWhy<'h> },
     /// A struct, enum or union: its row, its parameters' defaults and const parameters, its
     /// where-clauses and lifetime part.
     Adt {
@@ -342,6 +351,8 @@ pub enum Head<'n> {
     Alias { key: LibKey, generics: u32, ty: PTy, defaults: Vec<Option<PTy>, Mem>, const_params: Vec<(u32, PTy), Mem> },
     /// Its why's text ([`HeadRef::AliasRefused`]).
     AliasRefused { key: LibKey, why: Vec<u8, Mem> },
+    /// Its why's text ([`HeadRef::FnRefused`]).
+    FnRefused { key: ItemKey, why: Vec<u8, Mem> },
     TraitAlias { key: LibKey, head: TraitAliasHead },
     Opaque { key: ItemKey, fn_: ItemKey, index: u32, preds: Option<Preds> },
 }
@@ -385,8 +396,37 @@ impl<'n> Head<'n> {
                 const_params: &const_params[..],
             },
             Head::AliasRefused { key, why } => HeadRef::AliasRefused { key: *key, why: &why[..] },
+            Head::FnRefused { key, why } => HeadRef::FnRefused { key: *key, why: GapWhy::Text(&why[..]) },
             Head::TraitAlias { key, head } => HeadRef::TraitAlias { key: *key, head },
             Head::Opaque { key, fn_, index, preds } => HeadRef::Opaque { key: *key, fn_: *fn_, index: *index, preds: preds.as_ref() },
+        }
+    }
+}
+
+/// Why a member's signature was refused ([`HeadRef::FnRefused`]): the store's own `Why` as it
+/// filed it (`Store::fn_gaps`), or the text a record held. The record holds the text (the
+/// `Why`'s `Debug`, as `Maps::alias_gaps` keeps an alias's), so two builders write equal bytes.
+#[derive(Clone, Copy)]
+pub enum GapWhy<'h> {
+    Made(&'h super::types::Why),
+    Text(&'h [u8]),
+}
+
+impl GapWhy<'_> {
+    /// Its text, written into `out` (a `Why` by its `Debug`, a record's as held).
+    fn write_into(self, out: &mut RecordBytes<'_>) {
+        match self {
+            GapWhy::Text(text) => out.extend_from_slice(text),
+            GapWhy::Made(why) => out.extend_from_slice(std::format!("{why:?}").as_bytes()),
+        }
+    }
+
+    /// Whether two say the same text.
+    fn same(self, other: GapWhy<'_>) -> bool {
+        match (self, other) {
+            (GapWhy::Text(a), GapWhy::Text(b)) => a == b,
+            (GapWhy::Made(a), GapWhy::Made(b)) => std::format!("{a:?}") == std::format!("{b:?}"),
+            (GapWhy::Made(why), GapWhy::Text(text)) | (GapWhy::Text(text), GapWhy::Made(why)) => std::format!("{why:?}").as_bytes() == text,
         }
     }
 }
@@ -448,6 +488,10 @@ pub fn from_store<'h, 'n>(store: &'h Store<'n>, at: HeadAt) -> Result<HeadRef<'h
     };
     Ok(match at {
         HeadAt::Fn(k) => {
+            // A member refused alone (`Store::member_fn_head`): its why (form 13).
+            if let (None, Some(why)) = (store.fns.get(&k), store.fn_gaps.get(&k)) {
+                return Ok(HeadRef::FnRefused { key: k, why: GapWhy::Made(why) });
+            }
             let head = store.fns.get(&k).ok_or(none)?;
             HeadRef::Fn { key: k, head, preds: store.preds.get(&k), static_: store.statics.get(&k).copied(), life: fn_life }
         }
@@ -814,6 +858,14 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
             o.count(why.len(), "an alias's refusal")?;
             o.body.extend_from_slice(why);
             K_ALIAS_REFUSED
+        }
+        HeadRef::FnRefused { key, why } => {
+            o.key(key);
+            let mut text = RecordBytes::new_in(alloc);
+            why.write_into(&mut text);
+            o.count(text.len(), "a refused fn's why")?;
+            o.body.extend_from_slice(&text);
+            K_FN_REFUSED
         }
         HeadRef::TraitAlias { key, head } => {
             o.lib(key);
@@ -1490,6 +1542,14 @@ pub fn decode<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableTys<'_>, al
             let mut why = Vec::with_capacity_in(n, r.alloc);
             why.extend_from_slice(text);
             Head::AliasRefused { key, why }
+        }
+        K_FN_REFUSED => {
+            let key = r.key("a refused fn's key")?;
+            let n = r.count("a refused fn's why")?;
+            let text = r.take(n, "a refused fn's why")?;
+            let mut why = Vec::with_capacity_in(n, r.alloc);
+            why.extend_from_slice(text);
+            Head::FnRefused { key, why }
         }
         K_TRAIT_ALIAS => {
             let key = r.lib("a trait alias's key")?;
@@ -2343,6 +2403,10 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
         }
         (HeadRef::AliasRefused { key: k1, why: w1 }, HeadRef::AliasRefused { key: k2, why: w2 }) => {
             need!(k1 == k2 && w1 == w2, "a refused alias's key and why");
+            None
+        }
+        (HeadRef::FnRefused { key: k1, why: w1 }, HeadRef::FnRefused { key: k2, why: w2 }) => {
+            need!(k1 == k2 && w1.same(w2), "a refused fn's key and why");
             None
         }
         _ => Some("the head's kind"),
