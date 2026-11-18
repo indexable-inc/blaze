@@ -1140,6 +1140,45 @@ fn ar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+/// The standard library names the C runtime as a `+verbatim` library whose name is link.exe's
+/// argument (`/defaultlib:libcmt` with `crt-static`, `/defaultlib:msvcrt` without): a directive,
+/// found and followed as a `/DEFAULTLIB` is, not a file called that.
+#[test]
+fn a_verbatim_defaultlib_argument_is_a_default_library_not_a_file() {
+    let (vc, kits) = (temp("vc-arg"), temp("kits-arg"));
+    touch(
+        &vc.join("libcmt.lib"),
+        &ar(&[("crt.obj", coff("/DEFAULTLIB:libvcruntime /DEFAULTLIB:\"libucrt.lib\""))]),
+    );
+    touch(&vc.join("libvcruntime.lib"), ARCHIVE);
+    touch(&kits.join("libucrt.lib"), ARCHIVE);
+    let answers = Answers::new().var("LIB", format!("{};{}", vc.display(), kits.display()));
+    let cache = Cache::new();
+    let output = executable(&cache, &answers, "x86_64-pc-windows-msvc").unwrap();
+    let expected = [
+        (vc.join("libcmt.lib"), ARCHIVED),
+        (vc.join("libvcruntime.lib"), ARCHIVED),
+        (kits.join("libucrt.lib"), ARCHIVED),
+    ];
+    // As written, in the case written, and the other way of spelling the option. The path is
+    // compared without case: a file system that ignores it (Windows') gives the name as written.
+    let folded = |line: Vec<(PathBuf, NativeKind)>| -> Vec<(String, NativeKind)> {
+        line.into_iter().map(|(path, kind)| (path.to_string_lossy().to_lowercase(), kind)).collect()
+    };
+    for name in ["/defaultlib:libcmt", "/DEFAULTLIB:LIBCMT", "-defaultlib:libcmt.lib"] {
+        let located = locate_plain(&cache, &answers, &output, &[verbatim(name)], &[]).unwrap();
+        assert_eq!(folded(line(&located)), folded(expected.to_vec()), "{name}");
+    }
+    // A verbatim name that is a file's stays one: it is not found as `/defaultlib:..`.
+    touch(&vc.join("whole.lib"), ARCHIVE);
+    let located = locate_plain(&cache, &answers, &output, &[verbatim("whole.lib")], &[]).unwrap();
+    assert_eq!(line(&located), [(vc.join("whole.lib"), ARCHIVED)]);
+    // Not there: the error names the library the argument asks for.
+    let error = locate_plain(&cache, &answers, &output, &[verbatim("/defaultlib:nowhere")], &[])
+        .unwrap_err();
+    assert!(error.what.contains("nowhere.lib"), "{}", error.what);
+}
+
 #[test]
 fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     let top = top();

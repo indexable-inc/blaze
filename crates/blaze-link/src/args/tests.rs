@@ -34,6 +34,47 @@ fn refused(spelling: Spelling, kind: Kind, args: &[&str]) -> String {
     errors[0].to_string()
 }
 
+/// `+crt-static` is `libcmt` on PE, which the standard library names; the other formats have no
+/// static C runtime that blaze links.
+#[test]
+fn static_c_runtime_is_taken_on_pe_only() {
+    use blaze_codegen::Arch;
+
+    use super::rustflags::{CodegenOption, set};
+    use crate::output::{Debug, Format, Output, OutputKind};
+
+    let output = |format, triple: &str| Output {
+        format,
+        arch: Arch::X86_64,
+        kind: OutputKind::Executable { entry: "main".into() },
+        interpreter: None,
+        platform: None,
+        incremental: false,
+        debug: Debug::None,
+        live: None,
+        tags: 0,
+        stack: None,
+        windows_subsystem: false,
+        dev_run: None,
+        exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        rpaths: Vec::new(),
+        link: crate::LinkArgs::default(),
+        triple: triple.into(),
+    };
+    let on = CodegenOption::CrtStatic(true);
+
+    set(&mut output(Format::Pe, "x86_64-pc-windows-msvc"), &on).expect("taken on PE");
+    for (format, triple) in
+        [(Format::Elf, LINUX), (Format::MachO, MAC), (Format::Wasm, "wasm32-wasip1")]
+    {
+        let why = set(&mut output(format, triple), &on).expect_err("refused off PE");
+        assert!(why.contains("static C runtime"), "{triple}: {why}");
+    }
+    // A dynamic C runtime is taken everywhere, as before.
+    set(&mut output(Format::Elf, LINUX), &CodegenOption::CrtStatic(false)).expect("dynamic");
+}
+
 #[test]
 fn spellings_to_options() {
     use Kind::{Executable as Exe, Shared};
