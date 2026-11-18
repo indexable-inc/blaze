@@ -30,6 +30,8 @@ enum Want {
 /// Which screen shows.
 enum Screen {
     Home,
+    /// A course's path: its lessons, and where the person is on it.
+    Course { course: String },
     /// A tutor is writing: what, in words.
     Making { title: String, sub: String },
     /// A lesson or a review is walked ([`Learn::run`]).
@@ -357,7 +359,21 @@ impl App {
             match name {
                 "next" => me.learn_next(l),
                 "back" | "home" => me.learn_leave(l),
-                "course" => me.learn_continue(l, arg),
+                // A course's card on the home: its path.
+                "course" => {
+                    if l.course(arg).is_some() {
+                        l.note.clear();
+                        l.screen = Screen::Course { course: arg.to_owned() };
+                    }
+                }
+                // The path's button: the next right thing in the course.
+                "go" => me.learn_continue(l, arg),
+                // A lesson on the path (`<course>/<lesson>`): walk it, again if it was finished.
+                "lesson" => {
+                    if let Some((course, lesson)) = arg.split_once('/') {
+                        me.learn_open(l, course, lesson);
+                    }
+                }
                 "pick" => {
                     if let (Some(run), Ok(i)) = (l.run.as_mut(), arg.parse::<usize>()) {
                         run.step(Input::Choose(i), &mut l.saved.progress, today());
@@ -391,6 +407,10 @@ impl App {
                 self.learn_ask(l);
             }
             Screen::Making { .. } => {}
+            Screen::Course { course } => {
+                let course = course.clone();
+                self.learn_continue(l, &course);
+            }
             Screen::Step => {
                 let Some(run) = l.run.as_mut() else { return };
                 run.step(Input::Next, &mut l.saved.progress, today());
@@ -505,6 +525,7 @@ impl App {
             (Screen::Step, Some(_)) => ("step", "hn.LearnStep"),
             (Screen::Making { .. }, _) => ("making", "hn.LearnMaking"),
             (Screen::Done { .. }, _) => ("done", "hn.LearnDone"),
+            (Screen::Course { course }, _) if l.course(course).is_some() => ("course", "hn.LearnPath"),
             _ => ("home", "hn.LearnHome"),
         };
         view::for_each_of(page, [(key, prefab, ())], |v, (), _| match (&l.screen, &l.run) {
@@ -512,6 +533,11 @@ impl App {
             (Screen::Making { title, sub }, _) => {
                 set_text(v, "title", title);
                 set_text(v, "sub", sub);
+            }
+            (Screen::Course { course }, _) if l.course(course).is_some() => {
+                if let Some(c) = l.course(course) {
+                    fill_path(v, l, c);
+                }
             }
             (Screen::Done { kicker, title, score, next, course }, _) => {
                 set_text(v, "kicker", kicker);
@@ -585,6 +611,66 @@ fn fill_home(v: View<'_>, l: &Learn) {
         1 => "1 day in a row".to_owned(),
         n => format!("{n} days in a row"),
     });
+}
+
+/// A course's path (hn.LearnPath): its goal, how much is learned, its lessons (finished, next, later) and the one
+/// button that does the next right thing.
+fn fill_path(v: View<'_>, l: &Learn, c: &Course) {
+    let day = today();
+    let p = &l.saved.progress;
+    set_text(v, "title", &c.title);
+    set_text(v, "goal", &c.goal);
+    let mastery = p.mastery(c);
+    if let Some(fill) = v.part("meter").and_then(|m| m.part("fill")) {
+        percent(fill, mastery);
+    }
+    let done = c.lessons.iter().filter(|x| p.finished(&c.id, &x.id)).count();
+    set_text(v, "learned", &format!("{done} of {} lessons \u{b7} {:.0}% learned", c.lessons.len(), mastery * 100.0));
+    let next = p.next_lesson(c).map(|x| x.id.as_str());
+    if let Some(list) = v.part("lessons") {
+        let rows = c.lessons.iter().enumerate().map(|(i, x)| {
+            let look = if p.finished(&c.id, &x.id) {
+                "hn.LearnLesson"
+            } else if next == Some(x.id.as_str()) {
+                "hn.LearnLessonNext"
+            } else {
+                "hn.LearnLessonLater"
+            };
+            (format!("{}:{look}", x.id), look, (i, x, look))
+        });
+        view::for_each_of(list, rows, |row, (i, x, look), _| {
+            if let Some(d) = row.part("disc") {
+                set_text(d, "label", &(i + 1).to_string());
+            }
+            if let Some(words) = row.part("words") {
+                set_text(words, "title", &x.title);
+                set_text(words, "about", &x.about);
+            }
+            let state = match look {
+                "hn.LearnLesson" => format!("{:.0}% held", p.lesson_mastery(&c.id, x) * 100.0),
+                "hn.LearnLessonNext" => "Next".to_owned(),
+                _ => String::new(),
+            };
+            set_text(row, "state", &state);
+            if look != "hn.LearnLessonLater" {
+                row.action(&format!("learn:lesson:{}/{}", c.id, x.id));
+            }
+        });
+    }
+    if let Some(go) = v.part("foot").and_then(|f| f.part("go")) {
+        let due = p.due(c, day).len();
+        let label = match (due, next) {
+            (0, Some(_)) if done == 0 => "Start".to_owned(),
+            (0, Some(_)) => "Next lesson".to_owned(),
+            (0, None) => String::new(),
+            (n, _) => format!("Review {n}"),
+        };
+        if label.is_empty() {
+            view::for_each_of(go, std::iter::empty::<(&str, &str, ())>(), |_, (), _| {});
+        } else {
+            button(go, &label, &format!("learn:go:{}", c.id));
+        }
+    }
 }
 
 fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
@@ -726,7 +812,7 @@ impl App {
         let to_fill = [Input::Next, Input::Choose(2), Input::Submit, Input::Next];
         match screen {
             "new" => {}
-            "home" => {
+            "home" | "course" => {
                 p.finish_lesson(&course.id, "owner", day.saturating_sub(1));
                 for c in ["c1", "f1", "o1"] {
                     p.record(&format!("{}/owner/{c}", course.id), true, day.saturating_sub(1));
@@ -757,6 +843,10 @@ impl App {
                 walk(&mut run, &mut p, &[Input::Submit, Input::Next, Input::Type("dropped".into()), Input::Submit, Input::Next]);
             }
             other => return Err(format!("HARNESS_NATIVE_SHOT_LEARN {other:?}: not a screen (new, home, making, read, choice, picked, right, wrong, fill, order, done)")),
+        }
+        if screen == "course" {
+            l.draft.clear();
+            l.screen = Screen::Course { course: course.id.clone() };
         }
         l.saved = Saved { courses: if screen == "new" { Vec::new() } else { vec![course] }, progress: p, tutor: None };
         if matches!(screen, "read" | "choice" | "picked" | "right" | "wrong" | "fill" | "order" | "done") {
