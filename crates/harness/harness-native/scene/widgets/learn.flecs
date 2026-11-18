@@ -442,6 +442,12 @@ hn {
       }
     }
   }
+  // The item the arrow keys are on (up and down move the highlight, shift with them moves the item).
+  prefab LearnItemPicked : hn.LearnItem {
+    Fill: $tone_selection_focus
+    Edge: {dark: $tone_ink_strong.dark, light: $tone_ink_strong.light}
+    words { Fill: $tone_ink_strong }
+  }
   prefab LearnItemRight : hn.LearnOptionRight {}
   prefab LearnItemWrong : hn.LearnOptionWrong {}
 
@@ -556,9 +562,9 @@ hn {
 
 // ---- a course's path ----
 // What a press on a course shows (src/app/learn.rs Screen::Course): where the course goes and where the person is on
-// it. Its lessons down a path, each a numbered disc, its title and the one idea it teaches: finished ones say how well
-// they are held, the next one is lit, the ones after it are faint until they are reached. One button at the foot does
-// the next right thing (review what is due, else the next lesson).
+// it, at a glance. Its lessons are a short list of titles, one line each: finished ones quiet with how well they are
+// held, later ones faint. Only the lesson to do now is opened out, as a card: its title, the one idea it teaches in
+// full, and the button that starts it. So the screen has one thing to read and one thing to press.
 @tree ChildOf
 hn {
   prefab LearnPath : ui.Column {
@@ -580,59 +586,49 @@ hn {
         }
       }
     }
-    a0 : hn.LearnAirSmall {}
-    title : hn.LearnDisplay {}
+    top : ui.Node {
+      Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.04, min: 0, max: 0}}
+    }
+    // Where the person is: "Lesson 3 of 7", or that it is all done.
+    kicker : hn.LearnLabel {}
     a1 : hn.LearnAirSmall {}
+    title : hn.LearnDisplay {}
+    a2 : hn.LearnAirSmall {}
     goal : hn.LearnSmall {
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
-    a2 : hn.LearnAir {}
-    meter : hn.LearnMeter {}
-    a3 : hn.LearnAirSmall {}
-    learned : ui.Line, Faint {
-      TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
-    }
-    a4 : hn.LearnAir {}
+    a3 : hn.LearnAir {}
     lessons : ui.List {
-      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+      Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    }
-    rest : ui.Spacer {}
-    foot : ui.Row {
-      Flex: {axis: Row, gap: 8, align: Center, justify: End, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      go : ui.Row {}
     }
   }
 
-  // A lesson on the path. hn.LearnLesson: one that can be opened (finished, or the next). hn.LearnLessonNext: the next
-  // one, lit. hn.LearnLessonLater: not reached yet, faint, no press.
+  // A lesson's number on the path.
+  prefab LearnDisc : ui.Row {
+    Fill: $tone_wash
+    Shape: {radius: $learn_disc / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $learn_disc, min: 0, max: 0}, h: {kind: Fixed, value: $learn_disc, min: 0, max: 0}}
+    label : ui.Line, Muted {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 1, weight: $weight_label}
+    }
+  }
+
+  // A lesson as one line: its number and title, and trailing how well it is held (a finished one).
+  // hn.LearnLesson: finished, so a press walks it again. hn.LearnLessonLater: not reached, faint, no press.
   prefab LearnLessonLook : ui.Row {
     Fill: $tone_clear
-    Shape: {radius: $learn_radius, n: 4, border: 0, feather: 0}
-    Flex: {axis: Row, gap: 14, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: $learn_option_h, max: 0}}
-    Padding: {l: 10, r: $learn_option_pad, t: 8, b: 8}
-    disc : ui.Row {
-      Fill: $tone_wash
-      Shape: {radius: $learn_disc / 2, n: 2, border: 0, feather: 0}
-      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-      Size: {w: {kind: Fixed, value: $learn_disc, min: 0, max: 0}, h: {kind: Fixed, value: $learn_disc, min: 0, max: 0}}
-      label : ui.Line, Muted {
-        FixedSize: {h: true, v: false}
-        TextStyle: {size: $size_learn_small, line: 16, role: 0, bold: 1, weight: $weight_label}
-      }
+    Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $learn_lesson_h, min: 0, max: 0}}
+    Padding: {l: $learn_course_pad, r: $learn_course_pad, t: 0, b: 0}
+    disc : hn.LearnDisc {}
+    title : ui.Lead, Ink {
+      TextStyle: {size: $size_chat, line: 20, role: 0, bold: 0}
     }
-    words : ui.Column {
-      Flex: {axis: Column, gap: 2, align: Stretch, justify: Center, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      title : ui.Lead, Ink {
-        TextStyle: {size: $size_chat_h3, line: 22, role: 0, bold: 0, weight: $weight_row}
-      }
-      about : ui.Lead, Muted {
-        TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
-      }
-    }
+    spacer : ui.Spacer {}
     state : ui.Line, Faint {
       FixedSize: {h: true, v: false}
       TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
@@ -645,21 +641,54 @@ hn {
     HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
     PressLook: {dark: $tone_press.dark, light: $tone_press.light}
   }
-  prefab LearnLessonNext : hn.LearnLesson {
-    Fill: $tone_card
-    disc {
-      Fill: $tone_ink_strong
-      label { Fill: $tone_ground }
-    }
-    words {
-      title { Fill: $tone_ink_strong }
-    }
-    state { Fill: $tone_ink }
-  }
   prefab LearnLessonLater : hn.LearnLessonLook {
-    words {
-      title { Fill: $tone_ink_faint }
-      about { Fill: $tone_ink_faint }
+    disc {
+      Fill: $tone_hover
+      label { Fill: $tone_ink_faint }
+    }
+    title { Fill: $tone_ink_faint }
+  }
+
+  // The lesson to do now, opened out: a card with its number lit, its title, the one idea it teaches (all of it, wrapped),
+  // and the button that starts it.
+  prefab LearnLessonNext : ui.Column {
+    Fill: $tone_card
+    Edge: {dark: $tone_line.dark, light: $tone_line.light}
+    Shape: {radius: $learn_radius, n: 4, border: 1, feather: 0}
+    Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $learn_course_pad, r: $learn_course_pad, t: 16, b: 18}
+    head : ui.Row {
+      Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      disc : hn.LearnDisc {
+        Fill: $tone_ink_strong
+        label { Fill: $tone_ground }
+      }
+      title : ui.Words, Strong {
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        TextStyle: {size: $size_chat_h2, line: $line_chat_h2, role: 0, bold: 1, weight: $weight_label}
+      }
+    }
+    // In line with the title (past the disc), as the button under it is.
+    body : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $learn_disc + 12, r: 0, t: 0, b: 0}
+      about : ui.Words, Ink {
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+      }
+    }
+    foot : ui.Row {
+      Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $learn_disc + 12, r: 0, t: 6, b: 0}
+      go : ui.Row {}
+      hint : ui.Line, Faint {
+        Text: {s: "return"}
+        TextStyle: {size: $size_learn_small, line: $line_learn_small, role: 0, bold: 0}
+      }
     }
   }
 }

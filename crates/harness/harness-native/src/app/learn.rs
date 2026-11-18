@@ -72,6 +72,8 @@ pub struct Learn {
     inbox: Arc<Mutex<Vec<Arrived>>>,
     /// The tutor's session is being started (its id has not come yet): nothing starts another meanwhile.
     starting: bool,
+    /// Where the arrow keys are in an order check: the item highlighted (its place in the list now).
+    at: usize,
     /// The session this launch started, and how many it started: at most one, ever.
     started: Option<u64>,
     starts: u32,
@@ -90,6 +92,7 @@ impl Default for Learn {
             want: None,
             ask: 0,
             inbox: Arc::new(Mutex::new(Vec::new())),
+            at: 0,
             starting: false,
             started: None,
             starts: 0,
@@ -461,7 +464,12 @@ impl App {
             }
             Screen::Step => {
                 let Some(run) = l.run.as_mut() else { return };
+                let marked = run.view().is_some_and(|v| v.mark.is_some() || matches!(v.step, Step::Read { .. }));
                 run.step(Input::Next, &mut l.saved.progress, today());
+                if marked {
+                    // A new step: the arrows start from its first item.
+                    l.at = 0;
+                }
                 if run.view().is_none() {
                     l.finish();
                 } else {
@@ -554,6 +562,38 @@ not the transcript.\n\nThe conversation:\n{}",
                     };
                     if free {
                         me.learn_next(l);
+                    }
+                }
+                "up" | "down" | "move_up" | "move_down" => {
+                    let down = key.ends_with("down");
+                    let today = today();
+                    if let (Screen::Step, Some(run)) = (&l.screen, l.run.as_mut()) {
+                        // What the arrows act on now: a choice's options, or an order's items.
+                        let on = run.view().filter(|v| v.mark.is_none()).map(|v| match v.step {
+                            Step::Choice { options, .. } => (false, options.len(), v.picked),
+                            Step::Order { items, .. } => (true, items.len(), None),
+                            Step::Read { .. } | Step::Fill { .. } => (false, 0, None),
+                        });
+                        match on {
+                            Some((false, n, picked)) if n > 0 && !key.starts_with("move") => {
+                                let to = match (picked, down) {
+                                    (None, true) => 0,
+                                    (None, false) => n - 1,
+                                    (Some(i), true) => (i + 1).min(n - 1),
+                                    (Some(i), false) => i.saturating_sub(1),
+                                };
+                                run.step(Input::Choose(to), &mut l.saved.progress, today);
+                            }
+                            Some((true, n, _)) if n > 0 => {
+                                let from = l.at.min(n - 1);
+                                let to = if down { (from + 1).min(n - 1) } else { from.saturating_sub(1) };
+                                if key.starts_with("move") {
+                                    run.step(Input::Move { from, to }, &mut l.saved.progress, today);
+                                }
+                                l.at = to;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 "back" => match l.screen {
@@ -728,64 +768,65 @@ fn fill_home(v: View<'_>, l: &Learn) {
     });
 }
 
-/// A course's path (hn.LearnPath): its goal, how much is learned, its lessons (finished, next, later) and the one
-/// button that does the next right thing.
+/// A course's path (hn.LearnPath): where the person is, the course's title and goal, and its lessons as one line each,
+/// with only the lesson to do now opened out as a card holding the button that starts it (or the review that is due).
 fn fill_path(v: View<'_>, l: &Learn, c: &Course) {
     let day = today();
     let p = &l.saved.progress;
+    let done = c.lessons.iter().filter(|x| p.finished(&c.id, &x.id)).count();
+    let next = p.next_lesson(c).map(|x| x.id.as_str());
+    let due = p.due(c, day).len();
+    let kicker = match (next, due) {
+        (Some(_), _) => format!("Lesson {} of {}", done + 1, c.lessons.len()),
+        (None, 0) => "Course finished".to_owned(),
+        (None, n) => format!("Course finished \u{b7} {n} to review"),
+    };
+    set_text(v, "kicker", &kicker);
     set_text(v, "title", &c.title);
     set_text(v, "goal", &c.goal);
-    let mastery = p.mastery(c);
-    if let Some(fill) = v.part("meter").and_then(|m| m.part("fill")) {
-        percent(fill, mastery);
-    }
-    let done = c.lessons.iter().filter(|x| p.finished(&c.id, &x.id)).count();
-    set_text(v, "learned", &format!("{done} of {} lessons \u{b7} {:.0}% learned", c.lessons.len(), mastery * 100.0));
-    let next = p.next_lesson(c).map(|x| x.id.as_str());
-    if let Some(list) = v.part("lessons") {
-        let rows = c.lessons.iter().enumerate().map(|(i, x)| {
-            let look = if p.finished(&c.id, &x.id) {
-                "hn.LearnLesson"
-            } else if next == Some(x.id.as_str()) {
-                "hn.LearnLessonNext"
-            } else {
-                "hn.LearnLessonLater"
-            };
-            (format!("{}:{look}", x.id), look, (i, x, look))
-        });
-        view::for_each_of(list, rows, |row, (i, x, look), _| {
-            if let Some(d) = row.part("disc") {
-                set_text(d, "label", &(i + 1).to_string());
-            }
-            if let Some(words) = row.part("words") {
-                set_text(words, "title", &x.title);
-                set_text(words, "about", &x.about);
-            }
-            let state = match look {
-                "hn.LearnLesson" => format!("{:.0}% held", p.lesson_mastery(&c.id, x) * 100.0),
-                "hn.LearnLessonNext" => "Next".to_owned(),
-                _ => String::new(),
-            };
-            set_text(row, "state", &state);
-            if look != "hn.LearnLessonLater" {
-                row.action(&format!("learn:lesson:{}/{}", c.id, x.id));
-            }
-        });
-    }
-    if let Some(go) = v.part("foot").and_then(|f| f.part("go")) {
-        let due = p.due(c, day).len();
-        let label = match (due, next) {
-            (0, Some(_)) if done == 0 => "Start".to_owned(),
-            (0, Some(_)) => "Next lesson".to_owned(),
-            (0, None) => String::new(),
-            (n, _) => format!("Review {n}"),
-        };
-        if label.is_empty() {
-            view::for_each_of(go, std::iter::empty::<(&str, &str, ())>(), |_, (), _| {});
+    let Some(list) = v.part("lessons") else { return };
+    let rows = c.lessons.iter().enumerate().map(|(i, x)| {
+        let look = if next == Some(x.id.as_str()) {
+            "hn.LearnLessonNext"
+        } else if p.finished(&c.id, &x.id) {
+            "hn.LearnLesson"
         } else {
-            button(go, &label, &format!("learn:go:{}", c.id));
+            "hn.LearnLessonLater"
+        };
+        (format!("{}:{look}", x.id), look, (i, x, look))
+    });
+    view::for_each_of(list, rows, |row, (i, x, look), _| {
+        let number = (i + 1).to_string();
+        if look == "hn.LearnLessonNext" {
+            if let Some(head) = row.part("head") {
+                if let Some(d) = head.part("disc") {
+                    set_text(d, "label", &number);
+                }
+                set_text(head, "title", &x.title);
+            }
+            if let Some(body) = row.part("body") {
+                set_text(body, "about", &x.about);
+            }
+            if let Some(go) = row.part("foot").and_then(|f| f.part("go")) {
+                let label = match (due, done) {
+                    (0, 0) => "Start".to_owned(),
+                    (0, _) => "Start lesson".to_owned(),
+                    (n, _) => format!("Review {n} first"),
+                };
+                button(go, &label, &format!("learn:go:{}", c.id));
+            }
+            return;
         }
-    }
+        if let Some(d) = row.part("disc") {
+            set_text(d, "label", &number);
+        }
+        set_text(row, "title", &x.title);
+        let held = if look == "hn.LearnLesson" { format!("{:.0}% held", p.lesson_mastery(&c.id, x) * 100.0) } else { String::new() };
+        set_text(row, "state", &held);
+        if look == "hn.LearnLesson" {
+            row.action(&format!("learn:lesson:{}/{}", c.id, x.id));
+        }
+    });
 }
 
 fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
@@ -850,6 +891,7 @@ fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
                 let n = s.order.len();
                 let rows = s.order.iter().enumerate().map(|(at, &item)| {
                     let look = match s.mark {
+                        None if at == l.at.min(n.saturating_sub(1)) => "hn.LearnItemPicked",
                         None => "hn.LearnItem",
                         Some(_) if at == item => "hn.LearnItemRight",
                         Some(_) => "hn.LearnItemWrong",
@@ -886,7 +928,8 @@ fn fill_step(v: View<'_>, l: &Learn, run: &Run) {
             (false, None, false) => ("Check", ""),
         };
         let hint = match (s.step, s.mark) {
-            (Step::Choice { .. }, None) => "1\u{2013}9 to pick \u{b7} return to check",
+            (Step::Choice { .. }, None) => "\u{2191}\u{2193} or 1\u{2013}9 to pick \u{b7} return to check",
+            (Step::Order { .. }, None) => "\u{2191}\u{2193} to choose \u{b7} shift \u{2191}\u{2193} to move \u{b7} return to check",
             _ => "return",
         };
         set_text(foot, "hint", hint);

@@ -138,6 +138,11 @@ act {
   LearnNext {}
   // The right arrow: on to the next screen, only where nothing is left to answer.
   LearnForward {}
+  // Up and down: the option picked (a choice), the item highlighted (an order); with shift, that item moves.
+  LearnUp {}
+  LearnDown {}
+  LearnMoveUp {}
+  LearnMoveDown {}
   LearnBack {}
   LearnErase {}
 
@@ -411,6 +416,18 @@ key {
     (When, ctx.Learn) }
   learn_right { Keybind: {key: "right"}
     (Does, act.LearnForward)
+    (When, ctx.Learn) }
+  learn_up { Keybind: {key: "up"}
+    (Does, act.LearnUp)
+    (When, ctx.Learn) }
+  learn_down { Keybind: {key: "down"}
+    (Does, act.LearnDown)
+    (When, ctx.Learn) }
+  learn_move_up { Keybind: {key: "up", shift: 1}
+    (Does, act.LearnMoveUp)
+    (When, ctx.Learn) }
+  learn_move_down { Keybind: {key: "down", shift: 1}
+    (Does, act.LearnMoveDown)
     (When, ctx.Learn) }
   learn_escape { Keybind: {key: "escape"}
     (Does, act.LearnBack)

@@ -120,6 +120,10 @@ const HANDLERS: &[(&str, Handler)] = &[
     ("LearnNext", |a, _, _| a.learn_key("next")),
     ("LearnForward", |a, _, _| a.learn_key("forward")),
     ("LearnBack", |a, _, _| a.learn_key("back")),
+    ("LearnUp", |a, _, _| a.learn_key("up")),
+    ("LearnDown", |a, _, _| a.learn_key("down")),
+    ("LearnMoveUp", |a, _, _| a.learn_key("move_up")),
+    ("LearnMoveDown", |a, _, _| a.learn_key("move_down")),
     ("LearnErase", |a, _, _| a.learn_key("erase")),
     ("SendBytes", |a, act, _| {
         let bytes = a

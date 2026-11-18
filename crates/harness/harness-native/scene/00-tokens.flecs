@@ -1141,4 +1141,6 @@ export const learn_course_pad = 18
 export const learn_meter_h = 4
 export const learn_code_pad = 14
 // A lesson's numbered disc on a course's path (hn.LearnLessonLook).
-export const learn_disc = 30
+export const learn_disc = 26
+// A lesson's one line on the path.
+export const learn_lesson_h = 40
