@@ -670,6 +670,41 @@ fn each_fixpoint_round_is_its_own_frame() {
     assert_eq!(ROUND_FRESH.load(Ordering::SeqCst), runs, "a round began in a frame another had used");
 }
 
+/// Runs of `self_first_member`, counted to bound the rounds.
+static SELF_FIRST_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Heads a cycle through `self_first_member`, and stands at 7 whatever it reads.
+#[blaze_memo::tracked(returns(copy), cycle_initial = |_db, _leaf| 0)]
+fn self_first_head(db: &dyn Db, leaf: Leaf) -> u64 {
+    _ = self_first_member(db, leaf);
+    7
+}
+
+/// Reaches itself first, then the head, and stands at 5 whatever it reads: its value never
+/// changes between rounds, so the cycle settles once each run reads its last round's value.
+#[blaze_memo::tracked(returns(copy), cycle_initial = |_db, _leaf| 0)]
+fn self_first_member(db: &dyn Db, leaf: Leaf) -> u64 {
+    SELF_FIRST_RUNS.fetch_add(1, Ordering::SeqCst);
+    _ = self_first_member(db, leaf);
+    _ = self_first_head(db, leaf);
+    5
+}
+
+/// The invariant: a member that reaches itself before it reaches its cycle's head reads its own
+/// last round's value there, not the initial one, so a member whose value stands lets the cycle
+/// settle in a few rounds. The control is the same cycle with the member reaching the head
+/// first (`round_a`/`round_b`'s shape), which settles either way.
+#[test]
+fn a_member_that_reaches_itself_before_its_head_settles() {
+    let mut world = World::new(values());
+    let first = db(world.first(config(Plant::None)));
+    let leaf = world.krate(1).leaves(&first)[0];
+    assert_eq!(self_first_head(&first, leaf), 7);
+    assert_eq!(self_first_member(&first, leaf), 5);
+    let runs = SELF_FIRST_RUNS.load(Ordering::SeqCst);
+    assert!(runs <= 8, "the member ran {runs} times: its cycle settled late or never");
+}
+
 // `keep_owned`.
 
 /// Drops of the values `kept_sum` kept (with the one drop list) and of those `kept_unlisted_sum`
