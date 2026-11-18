@@ -39,6 +39,7 @@ an existing harness installation. Agent CLIs use the tool PATH captured at insta
 | `harness-native/` | the macOS app: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders |
 | `harness-native-render/` | the renderer the app and harness-video share: Metal (shaders in Slang and in Rust), text, vector marks, the paint pass |
 | `harness-native-blaze/` | blaze's fire wordmark, live (drop in, catch, burn to embers), and its synthesised soundtrack (from indexable-inc/anim) |
+| `harness-learn/` | Learn, the app's home, as sans-IO state machines: a course of short lessons (told one idea, asked it back), each question's spaced memory, the walk through a lesson or a review, and what the tutor agent is asked; the app's side is `harness-native/src/app/learn.rs` and `scene/widgets/learn.flecs` |
 | `harness-video/` | videos from flecs scenes loaded into the app's own scene (its tokens, prims and `hn.*` widgets), a timeline of `Cue`s as data (blaze's launch video: `scene/launch.flecs`) |
 | `harness-native-*` | the app's layers: model, flecs glue, ECS, UI layout/motion/draw/input/text and their `-api` crates, prims (`harness-native-ui-prims/scene/`), scroll physics |
 | `vendor/` | the hyperion-* crates over flecs (flecs itself is the indexable-inc/flecs fork, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; `vendor/SOURCE.md`) |

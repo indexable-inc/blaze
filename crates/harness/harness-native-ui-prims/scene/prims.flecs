@@ -115,6 +115,42 @@ ui {
     PressLook: {dark: $tone_press.dark, light: $tone_press.light}
   }
 
+  // The one main action of a surface (a sheet's, a card's, a screen's): a pill in the strong ink, its label in the
+  // ground's, so it is the brightest thing on the surface and there is only ever one. Children: `label : ui.Line`.
+  prefab ButtonPrimary : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_ink_strong
+    PressLook: {dark: $tone_ink.dark, light: $tone_ink.light}
+    Shape: {radius: $button_h / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $button_h, min: 0, max: 0}}
+    Padding: {l: $button_pad, r: $button_pad, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_ground
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 1, weight: $weight_label}
+    }
+  }
+  // A second action beside the main one: the same pill with no plate, a wash under the pointer, its label muted.
+  prefab ButtonQuiet : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Shape: {radius: $button_h / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $button_h, min: 0, max: 0}}
+    Padding: {l: $button_pad, r: $button_pad, t: 0, b: 0}
+    label : ui.Line, Muted {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0, weight: $weight_row}
+    }
+  }
+
   // An icon button, the borderless way (a macOS toolbar or sidebar button): no plate, at rest or under the pointer. Its
   // glyph is in muted ink, easing to strong ink on hover (Inks, on the hover spring); held, it gives (PressGive: scaled a
   // little and dimmed) and springs back. Its square is the hit area, with an optional Tooltip. Children: `icon : ui.Symbol`.

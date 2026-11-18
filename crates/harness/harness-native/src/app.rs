@@ -541,6 +541,8 @@ impl App {
         if let Some(w) = side_w {
             set_side_width(side.entity(), w);
         }
+        // The sidebar's first row: start a chat (scene/widgets/learn.flecs hn.SideNew).
+        side.child("hn.SideNew");
         let tree = side.child("hn.Tree");
         let foot = side.child("hn.SideFoot");
         let link_note = foot.child("hn.LinkNote");
@@ -2418,6 +2420,9 @@ impl App {
             } else if let Some(sid) = a.strip_prefix("chat:stop:").and_then(|s| s.parse::<u64>().ok()) {
                 // The composer's button while a turn runs (hn.ChatSendStop): what Escape does.
                 self.link.chat_interrupt(sid);
+            } else if a == "chat:new" {
+                // The sidebar's New chat row: what cmd+N does.
+                self.new_chat();
             } else if let Some(what) = a.strip_prefix("learn:") {
                 // A press in Learn, the home (app/learn.rs).
                 self.learn_action(what);

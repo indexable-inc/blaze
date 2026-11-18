@@ -10,10 +10,16 @@
 //    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
 // The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
 //    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
-// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8. The one
+// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass. Corners come from one
+//    scale: 8 for a control or a row, 10 for a menu, 12 for a card, 14 for an overlay or a Learn plate, 18 for a chat
+//    bubble and the composer, and half its height for a pill (a button, the send disc). The one
 //    translucent surface, asked for by name: the sidebar (tone_sidebar), a tint over the system's blur of what is behind
 //    the window. Everything else is opaque.
 // 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
+// 5. One place per thing. How a chat runs (its model, effort, context) is on its composer, never on its sidebar row;
+//    a row is a title and at most one trailing word. One main action per surface (ui.ButtonPrimary), in the strong ink.
+// 6. Home is Learn (scene/widgets/learn.flecs): with no session selected the main card asks what to learn; a screen
+//    of a lesson holds one idea or one question.
 //
 // ---- The theme: the one place a colour is chosen ----
 // Every surface names one of these roles, never a colour: a widget's `Fill: $tone_card`, Rust's `look::tone(w, "card")`
@@ -298,6 +304,9 @@ export const spring_pose_zeta = 1
 // The Archive pane: its title, search line, filter chips, day headings and the right-hand columns (duration, time).
 export const size_title = 15
 export const field_h = 32
+// Buttons (ui.ButtonPrimary, ui.ButtonQuiet): pills button_h tall, their label button_pad in from each end.
+export const button_h = 30
+export const button_pad = 14
 export const chip_h = 26
 export const chip_radius = 13
 export const section_h = 30
