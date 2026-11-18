@@ -137,6 +137,12 @@ pub enum SolveError {
     /// A goal needs a part of Rust's semantics the solver does not port (solve.md,
     /// "Not ported"): stopped, never answered wrongly (rule 3).
     Unsupported(Unsupported),
+    /// A root goal passed [`crate::eval::MAX_STEPS`] solver steps (frames pushed, cycle heads
+    /// rerun, candidates run): a COUNT, so the same goal stops at the same step whoever asks
+    /// (rule 18; never a wall-clock limit). `goal` is the root goal.
+    Steps { goal: Option<BadPred>, most: u64 },
+    /// The goals shared by a request's bodies (share.rs): the audit's finding, a collision.
+    Share(crate::share::ShareError),
 }
 
 impl core::fmt::Display for SolveError {
@@ -145,6 +151,8 @@ impl core::fmt::Display for SolveError {
             SolveError::Limit(l) => write!(f, "blaze-solve: bound reached: {l:?} (rule 18)"),
             SolveError::Malformed(m) => write!(f, "blaze-solve: malformed input: {m:?}"),
             SolveError::Unsupported(u) => write!(f, "blaze-solve: not ported: {u:?} (solve.md, \"Not ported\")"),
+            SolveError::Steps { goal, most } => write!(f, "blaze-solve: the goal {goal:?} took more than {most} solver steps (eval.rs `MAX_STEPS`, rule 18)"),
+            SolveError::Share(e) => write!(f, "blaze-solve: shared goals (share.rs): {e:?}"),
         }
     }
 }

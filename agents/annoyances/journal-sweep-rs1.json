@@ -1,0 +1,12 @@
+{
+ "id": "journal-sweep-rs1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RS1",
+ "where": "crates/blaze-std/src/fs/journal.rs (Dir::changes_since), crates/blaze-cli/src/journal_sweep.rs, engine_check.rs's sweep call site",
+ "what": "The write-only lane had no Grep or Glob tool in this session, only the REPL's typed rg/glob; and the certificate path saves nothing, so a stored journal place is never advanced by a request that stands on its certificate: the replay grows with every unrelated change (a README edit, a store write in the home) until a request writes its answer again.",
+ "cost": "about twenty minutes finding signatures through the REPL; the second is a design note, not yet a cost",
+ "cause": "Effect::Journal names only a FileName, so the driver's root (a checkout opened as Checkout::Here) cannot be journaled whole: the checkout's top-level folders are journaled one by one instead, and the first request after a cold one still sweeps them all (no place saved yet).",
+ "whys": "blaze-core's FileName refuses the empty name; the root has no FileName",
+ "class": "an effect that cannot name the root",
+ "fix": "either a DirName in Effect::Journal (the root watchable), or the checkout always opened Named; and a certificate request that writes only the pointer's places when the replay told any event (one small record)"
+}

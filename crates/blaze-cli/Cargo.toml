@@ -30,6 +30,9 @@ blaze-drive.workspace = true
 # The execution engine (engine.md, D131): `blaze engine-check` drives a request through it
 # (engine_check.rs, engine_pool.rs, engine_tasks.rs) beside the old machine until the switch.
 blaze-engine = { path = "../blaze-engine" }
+# The answer's stored form read in place (engine_answer_rows.rs), beside the page form until
+# the switch (runtime.md D5).
+blaze-answer = { path = "../blaze-answer" }
 # The store under the command (D114 (b), store/plain_place.rs): blaze-cas's plain store, its
 # vocabulary (blaze-keyed's `Namespace`, `Tag`, `StoreError`), and the arena's index by key.
 blaze-cas.workspace = true

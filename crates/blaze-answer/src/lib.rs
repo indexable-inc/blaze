@@ -153,7 +153,7 @@ use core::fmt;
 
 use blaze_id::ContentId;
 
-pub use crate::answer::{AnswerView, Health, SegmentRef, nothing_changed};
+pub use crate::answer::{AnswerView, Health, SegmentRef, nothing_changed, summary_of};
 pub use crate::commit::{Commit, Effects, RowIn, RunWriter, Write, compact};
 pub use crate::segment::{Reads, RowView, RowsBytes, SegmentKind};
 

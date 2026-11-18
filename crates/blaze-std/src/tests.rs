@@ -113,6 +113,7 @@ mod hosted;
 mod inflight;
 mod input;
 mod kv;
+mod journal;
 mod local;
 mod looks;
 mod read_sized;

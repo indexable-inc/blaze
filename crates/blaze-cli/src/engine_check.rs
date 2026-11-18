@@ -285,16 +285,24 @@ pub(crate) struct Checked {
     /// Each `ImplBucket` task's row, (entered, failed), and the crates whose tables standing
     /// rows put on the shelf from the store (engine_heads.rs `complete`).
     pub(crate) heads: (u32, u32, u32),
+    /// The `Lint` tasks entered this request and their findings (engine_lints.rs `seen`).
+    pub(crate) lints: crate::engine_lints::LintsSeen,
     /// The bodies in files no member crate's module tree reaches (engine_bodies.rs
     /// `BodiesStage::ownerless`), and the first such files' paths: 0 on every project.
     pub(crate) ownerless: (u32, std::vec::Vec<std::string::String, std::alloc::Global>),
     /// The planner's file counts (`plan`).
     pub(crate) files: Files,
+    /// The units stage: the graph read back or discovered, and the fetches run
+    /// (engine_units.rs `discover`).
+    pub(crate) units: crate::engine_units::Units,
     /// The stored answer's pages this request wrote (engine_answer.rs `save`).
     pub(crate) pages_written: u32,
     /// What each stage's records cost this process, and the digest of every record put
     /// (engine_store.rs `Ledger`).
     pub(crate) records: crate::engine_store::Ledger,
+    /// What the sweep cost: the journal's use, its events, the rows statted of the leaf table
+    /// (journal_sweep.rs; the profile's `sweep:` line).
+    pub(crate) sweep: crate::journal_sweep::SweepCounts,
 }
 
 /// The check of the checkout at `root`, printed through `shown` to `out`; the store's words on
@@ -304,6 +312,10 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let Opts { tools, workers, toolchain, heap, place, fresh, frame } = opts;
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
+    // The lint step and rules the root manifest names, as `check` reads them (lints.rs
+    // `of_root`): the level each lint finding prints at, and what the Lints stage runs.
+    let linting = crate::lints::of_root(cx, root, frame)?;
+    shown.lints = linting.step;
     // The one store, opened as `check` opens it (main.rs), committed after the answer.
     let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
@@ -335,12 +347,25 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         }
     }
     let pointer = pointer.filter(|_| last_lines.is_some());
+    // The journal of changes replayed from the pointer's places, BEFORE any file of the
+    // checkout is read (journal_sweep.rs): a write after this and before its file's read is
+    // after the place this request saves, so the next request's replay names it. Moved below
+    // the sweep or the plan's reads, such a write would be missed for good.
+    let stored_places = pointer.as_ref().map_or(crate::journal_sweep::Stored::NONE, |pointer| pointer.journal);
+    let journal = crate::journal_sweep::take(cx, root, opened.home.dir(), phases.clock(), stored_places, pointer.as_ref().map(|pointer| &pointer.leaves), frame)?;
+    let mut sweep_counts = journal.counts(0, 0);
+    phases.mark_in("journal replayed", frame);
     // Each module slot the last answer read, as the sweep found it today: the planner takes a
     // slot's state from here and reads no file whose stamp proves it ([`Kept`]).
     let mut followed_kept = None;
     let mut today_slots: std::vec::Vec<(&str, sweep::Probed), &Frame> = std::vec::Vec::new_in(frame);
     if let (Some(pointer), Some(lines)) = (&pointer, &last_lines) {
-        let followed: &sweep::Followed<'_> = followed_kept.insert(sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None }.follow(cx, root, Some(opened.home.dir()), &pointer.leaves, frame)?);
+        // Only the rows the journal's changes reach are looked at; all where it says nothing.
+        let marked = journal.marked(&pointer.leaves, frame);
+        let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
+        let (followed, statted) = follow.follow_marked(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), frame)?;
+        sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX));
+        let followed: &sweep::Followed<'_> = followed_kept.insert(followed);
         today_slots.extend(followed.now.rows.iter().filter(|leaf| leaf.kind == sweep::LeafKind::Slot).map(|leaf| (followed.now.path(leaf), (leaf.flags, leaf.stamp, leaf.id))));
         today_slots.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let moved = followed.layout_moved || followed.now.rows.iter().zip(followed.was.iter()).any(|(now, was)| now.state() != *was);
@@ -363,7 +388,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             drop(store);
             crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
             phases.mark_in("store committed", frame);
-            let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written\n{phases}");
+            let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written\n{sweep_counts}\n{phases}");
             let file = root.create(cx, &Path::new(print::PROFILE)?)?;
             file.append(cx, text.as_bytes(), bstd::fs::Durable::No)?;
             file.close(cx, bstd::fs::Durable::No)?;
@@ -382,10 +407,13 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 unreadable: None,
                 undefined_reads: (std::vec::Vec::new_in(std::alloc::Global), 0, 0),
                 heads: (0, 0, 0),
+                lints: crate::engine_lints::LintsSeen::default(),
                 ownerless: (0, std::vec::Vec::new_in(std::alloc::Global)),
                 files: Files::default(),
+                units: crate::engine_units::Units::default(),
                 pages_written: 0,
                 records: crate::engine_store::Ledger::new(),
+                sweep: sweep_counts,
             });
         }
     }
@@ -438,8 +466,11 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         let host = crate::graph::target(cx, &env, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
         laid.graph = Some(crate::graph::Graph::new(parts, lockfile, units, target, host, true, heap, frame));
     }
-    let mut discovered = crate::engine_units::discover(cx, root, &mut store, &mut laid, units, tools, &env, frame)?;
-    phases.mark_in("plan (the units, the fetches and the graph)", frame);
+    // The graph and its fetches read back when nothing it is a function of moved (plan row D2),
+    // else discovered; the phase's line says which, and why.
+    let back = crate::engine_units::Back { rows: &start.rows, records: &records };
+    let mut discovered = crate::engine_units::discover(cx, root, &mut store, &mut laid, units, tools, &back, &env, frame)?;
+    phases.mark_in(discovered.cause.phase(), frame);
     let alloc = heap.shared();
     let kept = Kept { slots: &today_slots, rows: &start.rows, records: &records };
     let (outlined, probes, file_counts) = plan(cx, root, &stamps, &laid, workers, &kept, &mut store, alloc)?;
@@ -473,6 +504,9 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     if names.is_some() {
         planned.extend(crate::engine_heads::plan_items(&outlined, alloc));
     }
+    // The token lints (engine_lints.rs): one task a lint unit of each member's outline.
+    planned.extend(crate::engine_lints::plan(&outlined, &linting.rules, alloc));
+    let mut lints = crate::engine_lints::LintsStage::new(linting.rules);
     let mut bodies = crate::engine_bodies::BodiesStage::new();
     let mut heads = crate::engine_heads::HeadsStage::new();
     let graph = discovered.get(Name::unit_graph()).and_then(|one| one.made.as_ref().ok().map(|record| blaze_drive::Input { name: one.name, at: tools.key(one.name, &one.source), out: record.out }));
@@ -497,7 +531,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     // entry this request marks over it).
     for (name, row) in start.rows.iter() {
         let made = match (row.failed, row.phase.stage) {
-            (true, _) | (false, Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies) => None,
+            (true, _) | (false, Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies | Stage::Lints) => None,
             (false, Stage::Names | Stage::Scripts) => {
                 // A row with no record key: the stored answer was written without one (rule 3).
                 let key = *records.get(name).ok_or(CliError::Text { what: "a stored row of the names or scripts stage has no record key (pages.rs `records`; engine_check.rs `check`)" })?;
@@ -516,7 +550,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                     stage.mark(*name, made);
                 }
             }
-            Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies => {}
+            Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies | Stage::Lints => {}
         }
     }
 
@@ -588,6 +622,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                 let crate::engine_bodies::BodiesStage { kept, shelf, .. } = &mut bodies;
                 heads.run_phase(cx, &mut store, &mut read, &handles, kept, shelf, &entered, engine.view(), &mut buffers[0], &mut times, alloc, frame)?;
             }
+            Stage::Lints => lints.run_phase(cx, root, &outlined, workers, phases.clock(), &entered, &mut buffers[0], &mut times, alloc)?,
         }
         let wall = clock.now().since(began).map_or(0, crate::engine_times::ns);
         let merging = clock.now();
@@ -622,6 +657,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                     .map(|record| (record.out, &record.reads[..], record.payload_bytes())),
                 Stage::Scripts => scripts.result(name).and_then(|one| one.made.as_ref().ok()).map(|record| (record.out, &record.reads[..], record.payload_bytes())),
                 Stage::Heads => heads.result(name).map(|one| (one.out, &one.reads[..], Ok(&one.payload[..]))),
+                Stage::Lints => lints.result(name).map(|one| (one.record.out, &one.record.reads[..], one.record.payload_bytes())),
                 Stage::Bodies => None,
             };
             let Some((out, reads, payload)) = found else {
@@ -656,7 +692,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
             let result = match phase.stage {
                 Stage::Names => names.as_mut().and_then(|stage| stage.results.iter_mut().rev().find(|one| one.name == name)),
                 Stage::Scripts => scripts.results.iter_mut().find(|one| one.name == name),
-                Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies => None,
+                Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies | Stage::Lints => None,
             };
             let freed = result.and_then(|one| one.made.as_mut().ok()).map_or(0, |record| record.release_handed());
             ledger.released(phase.stage, freed);
@@ -677,7 +713,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
                         stage.mark(name, made);
                     }
                 }
-                Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies => {}
+                Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies | Stage::Lints => {}
             }
         }
         phase_times.push(times.fold(phase, wall, merge, clock.now().since(putting).map_or(0, crate::engine_times::ns)));
@@ -725,6 +761,10 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         }
         if name.kind == blaze_drive::Kind::BodyCheck {
             bodies.lines(*name, &outlined, &mut lines, frame)?;
+            continue;
+        }
+        if name.kind == blaze_drive::Kind::Lint {
+            lints.lines(*name, &outlined, &mut lines, frame)?;
             continue;
         }
         let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(name)) else {
@@ -805,7 +845,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let replayable = unprinted == 0 && bodies.ownerless == 0;
     let printed = crate::engine_answer::Printed { names: names.is_some(), bodies_whole, replayable };
     let (lines_key, lines_bytes) = lines.record();
-    let saved = crate::engine_answer::save(cx, &mut store, &answer_root, &kept_answer, printed, (lines_key, &lines_bytes), last_root.as_ref(), &rows, alloc, frame)?;
+    let saved = crate::engine_answer::save(cx, &mut store, &answer_root, &kept_answer, printed, (lines_key, &lines_bytes), last_root.as_ref(), &rows, &journal, alloc, frame)?;
     phases.mark_in("answer stored", frame);
     // The store's one commit, after the answer, as `check`'s (main.rs).
     crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
@@ -817,6 +857,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let because = entered_because(&finished.causes, alloc);
     let mut text = profile_text(&ran, &report, &because, &outlined, phases, frame);
     bodies.profile(&outlined, workers, &mut text);
+    lints.profile(&mut text);
     // A task by what it is about: a file's path, a crate's name, a script's crate, a body's item.
     let world = names.as_ref().and_then(|stage| stage.names.as_ref());
     let label = |name: Name| -> Option<std::string::String> {
@@ -838,6 +879,7 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         // A full frame cuts the profile short where it stood (as `profile_text`).
         let _ = writeln!(text, "stored answer: {from}; written: {} record(s) put, {} page(s), {} bytes", saved.puts, saved.pages, saved.bytes);
         let _ = writeln!(text, "files: {} outline(s) read back from the store (file not read), {} outlined (file read), {} probed by the planner", file_counts.read_back, file_counts.outlined, file_counts.probed);
+        let _ = writeln!(text, "{sweep_counts}");
     }
     // Written in place, never synced, as `check`'s profile (print.rs `profile`).
     let file = root.create(cx, &Path::new(print::PROFILE)?)?;
@@ -860,10 +902,13 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         unreadable,
         undefined_reads,
         heads: (heads_entered, u32::try_from(heads.refused.len()).unwrap_or(u32::MAX), heads.read_back),
+        lints: lints.seen(&outlined),
         ownerless: (bodies.ownerless, bodies.ownerless_paths(&outlined)),
         files: file_counts,
+        units: discovered.units,
         pages_written: saved.new_pages,
         records: ledger,
+        sweep: sweep_counts,
     })
 }
 
@@ -1191,7 +1236,9 @@ fn outline_one<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, want: &Wan
     }
     let mut path = SVec::new_in(alloc);
     path.extend_from_slice(&sweep::real_path(slot, flags, scratch));
-    let job = Job { name: want.name, slot, flags, edition: want.edition, plant: work::Plant::None, expect: source, lints: false };
+    // Every outline lists its lint units (lints.rs `parts`) whatever the step, so what it holds
+    // never depends on the rule set, which is in each `Lint` task's source (engine_lints.rs).
+    let job = Job { name: want.name, slot, flags, edition: want.edition, plant: work::Plant::None, expect: source, lints: true };
     let made = match work::unwinding(|| work::outline_file(cx, root, &job, scratch, alloc)) {
         Ok(Ok(made)) => made,
         Ok(Err(Unread::Changed)) => Err(Why::Changed),

@@ -21,6 +21,8 @@ blaze-id = { path = "../blaze-id" }
 # Names, kinds, keys, tools and cells (key.rs, cells.rs): kept, not rewritten (engine.md "What
 # stays"). Depended on until the old machine is deleted, then moved here with their files.
 blaze-drive.workspace = true
+# The answer's stored form: the seam's digest, serial, flags and tree types (last.rs).
+blaze-answer = { path = "../blaze-answer" }
 
 [dev-dependencies]
 # `check` and `control`: the history simulations and their planted-bug controls.

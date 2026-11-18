@@ -160,7 +160,7 @@ impl Plain {
     }
 
     /// The mapped segment of `row`, when it is mapped, proved and not lost.
-    pub(super) fn mapped_row(&self, row: usize) -> Option<usize> {
+    pub(crate) fn mapped_row(&self, row: usize) -> Option<usize> {
         let seg = &self.manifest.segments[row];
         if self.dropped.contains(&seg.id) {
             return None;

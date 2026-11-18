@@ -121,6 +121,12 @@ pub enum RunError {
     /// the language's builtin impls is told from an impl the program lacks, and that one by
     /// its type.
     Resolve { function: Named, callee: ItemKey, path: Option<Box<str>>, at: Box<str>, error: ResolveError },
+    /// A call of `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once` (`callee`, `path` its
+    /// name) whose `Self` is a shape the LANGUAGE gives the `Fn*` impls of, with no impl item to
+    /// select, and whose built-in rule on this path did not make it (fn_shim.rs
+    /// `builtin_shape`): `shape` names which ("a fn item whose fn no row tables", "an async
+    /// block (a coroutine)", ..); `error` is what impl selection said when asked anyway.
+    NoBuiltinCall { function: Named, callee: ItemKey, path: Option<Box<str>>, shape: &'static str, error: ResolveError },
     /// A vtable the function takes the address of could not be made.
     Vtable { function: Named, principal: ItemKey, why: VtableFail },
     Place(PlaceError),
@@ -251,6 +257,13 @@ impl core::fmt::Display for RunError {
                 Some(path) => write!(f, "`{function}` calls trait fn `{path}` ({:#x}) with Self {at}: {error}", callee.0),
                 None => write!(f, "`{function}` calls trait fn {:#x} with Self {at}: {error}", callee.0),
             },
+            RunError::NoBuiltinCall { function, callee, path, shape, error } => {
+                match path {
+                    Some(path) => write!(f, "`{function}` calls trait fn `{path}` ({:#x}) with Self {shape}", callee.0)?,
+                    None => write!(f, "`{function}` calls trait fn {:#x} with Self {shape}", callee.0)?,
+                }
+                write!(f, ": the language gives this `Fn*` impl (no impl item to select), and the built-in rule for {shape} is not built on this path (fn_shim.rs `builtin_shape`; impl selection said: {error})")
+            }
             RunError::Vtable { function, principal, why } => {
                 write!(f, "`{function}` takes a vtable of trait {:#x}: ", principal.0)?;
                 match why {
@@ -372,6 +385,7 @@ impl RunError {
             | RunError::LeftOut { ref function, .. }
             | RunError::Projection { ref function, .. }
             | RunError::Resolve { ref function, .. }
+            | RunError::NoBuiltinCall { ref function, .. }
             | RunError::Vtable { ref function, .. }
             | RunError::MainShape { main: ref function, .. }
             | RunError::NoHost { start: ref function }
@@ -547,6 +561,23 @@ fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, g
     crate::front2::coroutines::owner_of(program, adts, called, ground)
         .or_else(|| closure_owner(program, adts, called, ground))
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
+}
+
+/// The refusal of `function`'s call of trait fn `called` when impl selection refused it: a
+/// [`RunError::NoBuiltinCall`] when `called` is an `Fn*` method at a `Self` the language gives
+/// that impl for (fn_shim.rs `builtin_shape`: its built-in rule did not make it, so "no impl
+/// holds" would name the wrong gap), else [`RunError::Resolve`] with `Self`'s form. A
+/// `Missing` answer stays a `Resolve`: it is a question to ask and take the step again
+/// (`asks_again`), never a refusal of the shape.
+fn resolve_refusal<P: FrontEnd>(program: &P, adts: &dyn Adts, ground: &PortableTys<'_>, function: Named, called: Instance, error: blaze_typeck::ResolveError) -> RunError {
+    let path = program.item_named(called.item);
+    if !matches!(error, blaze_typeck::ResolveError::Missing(_))
+        && let Some(shape) = crate::fn_shim::builtin_shape(adts, called, ground)
+    {
+        return RunError::NoBuiltinCall { function, callee: called.item, path, shape, error };
+    }
+    let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
+    RunError::Resolve { function, callee: called.item, path, at, error }
 }
 
 /// The lang ADTs the builder asks for ([`blaze_build::Adts::lang_adt`]), asked of the front end
@@ -1829,6 +1860,11 @@ fn filed(sink: &mut Sink<'_>, e: RunError) -> Result<(), RunError> {
             let shown = path.as_deref().map_or_else(|| format!("{:#x}", callee.0), |p| format!("`{p}`"));
             (function, format!("callee: resolve {} at {at}: {shown}", class_chain(&format!("{error:?}"), 3)).into_boxed_str())
         }
+        // By the shape and the `Fn*` method: one class per built-in rule not built.
+        RunError::NoBuiltinCall { function, callee, path, shape, .. } => {
+            let shown = path.as_deref().map_or_else(|| format!("{:#x}", callee.0), |p| format!("`{p}`"));
+            (function, format!("callee: no built-in Fn* call at {shape}: {shown}").into_boxed_str())
+        }
         RunError::Vtable { function, why, .. } => (function, format!("vtable: {}", class_of(&format!("{why:?}"))).into_boxed_str()),
         _ => return Err(e),
     };
@@ -2007,6 +2043,7 @@ fn stubbed(e: &RunError) -> bool {
             | RunError::LeftOut { .. }
             | RunError::ConstAt { .. }
             | RunError::Resolve { .. }
+            | RunError::NoBuiltinCall { .. }
             | RunError::Vtable { .. }
     )
 }
@@ -2688,8 +2725,7 @@ fn build_from<P: FrontEnd>(
                     break;
                 }
                 Err(error) => {
-                    let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
-                    let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error };
+                    let refusal = resolve_refusal(program, &adts, &ground, name(), called, error);
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
                             via.push(Via::Slot);

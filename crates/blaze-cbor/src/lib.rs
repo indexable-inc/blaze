@@ -92,6 +92,7 @@ pub mod why {
     pub const NOT_BYTES: &str = "not a byte string";
     pub const NOT_TEXT: &str = "not a text string";
     pub const NOT_ARRAY: &str = "not an array";
+    pub const NOT_MAP: &str = "not a map";
     pub const FIXED_LONGER: &str = "a byte string longer than its field's";
     pub const FIXED_LENGTH: &str = "a byte string of another length than its field's";
     pub const RECORD_LENGTH: &str = "an array of another length than its record's";

@@ -441,9 +441,15 @@ pub fn list_dir<'f>(cx: &Cx, root: &Dir<ReadWrite>, dir: &str, frame: &'f Frame)
     Ok(Some(Listing { names, dirs: kinds }))
 }
 
+/// Whether `name`, in the checkout's root, is blaze's, git's or cargo's folder: no row is under
+/// it, and the journal's names there move none (journal_sweep.rs).
+pub(crate) fn not_the_checkouts(name: &str) -> bool {
+    name == HOME || name == GIT || name == CARGO_TARGET
+}
+
 /// Whether the layout reads entry `name` of the folder whose last component is `last` (`""`
 /// for the checkout's root).
-fn wanted(last: &str, name: &str, is_dir: bool) -> bool {
+pub(crate) fn wanted(last: &str, name: &str, is_dir: bool) -> bool {
     match (last, is_dir) {
         // blaze's own home is derived data, never the checkout's: a first command makes it,
         // and a listing that held it would move the layout under the second (a certificate
@@ -586,7 +592,17 @@ impl<S: Stamps> Follow<S> {
     /// `home`: blaze's folder in the home, where a [`LeafKind::HomeListing`] row is (none: such
     /// a row is absent today).
     pub fn follow<'f>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, frame: &'f Frame) -> Result<Followed<'f>, CliError> {
+        self.follow_marked(cx, root, home, last, None, frame).map(|(followed, _)| followed)
+    }
+
+    /// [`Follow::follow`] of the rows `marked` (one mark a row of `last`; `None`: all) and the
+    /// rows looked at: an unmarked row is today's row as the table has it, nothing asked of
+    /// it (journal_sweep.rs says why that is sound: the journal named no change to it since
+    /// its read). A [`LeafKind::MacroFiles`] row is decided by its files' and folders' rows
+    /// either way, and not counted.
+    pub fn follow_marked<'f>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, marked: Option<&[bool]>, frame: &'f Frame) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
+        let mut statted = 0u32;
         let mut now = Rows::new_in(frame);
         let mut was = Vec::with_capacity_in(last.len(), frame);
         let mut bytes = Bytes::new_in(frame, "a file the last answer read");
@@ -598,6 +614,15 @@ impl<S: Stamps> Follow<S> {
             let old = last.row(i);
             let path = last.path(i);
             let old_state = old.state();
+            let unmarked = marked.is_some_and(|marked| !marked.get(i).copied().unwrap_or(true));
+            if unmarked && old.kind != LeafKind::MacroFiles {
+                now.push(old.kind, old.flags, path, old.stamp, old.id);
+                was.push(old_state);
+                continue;
+            }
+            if old.kind != LeafKind::MacroFiles {
+                statted = statted.saturating_add(1);
+            }
             let (flags, stamp, id) = match old.kind {
                 LeafKind::Slot => slot_now(&cx, root, &self.stamps, self.plant, path, old.flags & MODULE != 0, Some(&old), &mut bytes, frame)?,
                 LeafKind::Manifest if old.absent() && self.plant == Plant::AbsentForgotten => (ABSENT, None, old.id),
@@ -644,7 +669,7 @@ impl<S: Stamps> Follow<S> {
                 layout_moved = true;
             }
         }
-        Ok(Followed { now, was, layout_moved })
+        Ok((Followed { now, was, layout_moved }, statted))
     }
 }
 

@@ -321,7 +321,14 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 }
                 return Err(said(r, owner, diags, alloc));
             }
-            Outcome::Done(done) if !round_gaps => return Ok(done),
+            Outcome::Done(done) if !round_gaps => {
+                // The shared goals the finished round took (blaze-solve share.rs `GoalHit`): the
+                // one read each, which the body's result names (tables/task.rs).
+                let mut hits = Vec::with_capacity_in(cx.goal_hits().len(), Global);
+                hits.extend_from_slice(cx.goal_hits());
+                r.store.goal_hits = hits;
+                return Ok(done);
+            }
             // A gap answered `Missing`, so a finished check past one is no answer.
             Outcome::Done(done) => {
                 if let Some(asked) = asked.as_deref_mut() {

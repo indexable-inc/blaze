@@ -117,6 +117,25 @@ struct Job<'r> {
     crates: Vec<Crate<'r>, Global>,
     /// Each scope crate's `CrateScope` name, sorted: what a header read widens to.
     scope: Vec<Name, Global>,
+    /// The cells a refusal of its tables is a function of ([`scope_cells`]).
+    cells: std::vec::Vec<CellId, Global>,
+}
+
+/// The cells a refusal over crate `at`'s check scope is a function of (plan row A8): the
+/// graph's (the crate list, the check scope and the packs are its record's), the crate's own
+/// names cell, and with its `scope` each scope crate's names cell and the crate it was cut at
+/// ([`crate::engine_bodies::Scope::cut`]), each `WHOLE`. A crate whose names task failed or did
+/// not run defines no cell: read ABSENT, so its task that comes, or its fix, moves the row.
+/// Unsorted: `failed_with` sorts and dedups.
+fn scope_cells(graph: Name, list: &blaze_world::crate_list::CrateList<'static>, at: usize, scope: Option<&crate::engine_bodies::Scope<'_>>) -> std::vec::Vec<CellId, Global> {
+    let mut cells: std::vec::Vec<CellId, Global> = std::vec::Vec::with_capacity_in(2 + scope.map_or(1, |scope| scope.scope.len() + 1), Global);
+    cells.push(CellId { of: graph, cell: WHOLE });
+    cells.push(CellId { of: blaze_drive::key::crate_scope_name(&list.key(at)), cell: WHOLE });
+    if let Some(scope) = scope {
+        cells.extend(scope.scope.iter().map(|one| CellId { of: *one, cell: WHOLE }));
+        cells.extend(scope.cut_name(list).map(|one| CellId { of: one, cell: WHOLE }));
+    }
+    cells
 }
 
 /// The stage: each task's result and refusal.
@@ -163,28 +182,41 @@ impl HeadsStage {
         self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, frame)?;
         let heap = handles.env.heap;
         let refused = &mut self.refused;
-        let mut refuse = |task: &Task, why: &'static str, buffer: &mut Buffer<'a>| {
-            buffer.done.push(crate::engine_tasks::failed(task, alloc));
+        // A refusal with the cells it is a function of, each read as the view holds it today
+        // (ABSENT where no task defines it: a crate whose names task failed or did not run), so
+        // its row stands until one moves (plan row A8). None: owed, entered again each request,
+        // said at each such call.
+        let mut refuse = |task: &Task, why: &'static str, cells: &[CellId], buffer: &mut Buffer<'a>| {
+            let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(cells.len(), alloc);
+            reads.extend(cells.iter().map(|id| (*id, view.cell(id))));
+            buffer.done.push(crate::engine_tasks::failed_with(task, reads, alloc));
             refused.push((task.planned.name, why));
         };
         // 1. Each task's scope, on this thread.
         let (Some(graph), Some(names)) = (handles.graph, handles.names) else {
+            // No `UnitGraph` task planned, or no names stage: no cell of this command says so,
+            // so owed until the plan's inputs are cells (plan row D2).
             for task in tasks.iter() {
-                refuse(task, "this command has no unit graph or no crate's names, so no crate's impl tables", buffer);
+                refuse(task, "this command has no unit graph or no crate's names, so no crate's impl tables", &[], buffer);
             }
             return Ok(());
         };
+        // The crate list, each crate's check scope and the packs are the graph record's.
+        let graph_cell = CellId { of: graph.name, cell: WHOLE };
         let Some(list) = kept.list(&cx, store, &graph, frame)? else {
             for task in tasks.iter() {
-                refuse(task, "the crates' inputs could not be made (names.rs `world`; the `UnitGraph` record's finding says why)", buffer);
+                refuse(task, "the crates' inputs could not be made (names.rs `world`; the `UnitGraph` record's finding says why)", &[graph_cell], buffer);
             }
             return Ok(());
         };
         let (packs, corrected) = match kept.trees(&cx, handles.env, graph.out, &list, frame) {
             Ok(trees) => trees,
             Err(why) => {
+                // A pack missing from the shelf or the sources store, or not the one the list's
+                // world read (body_types.rs `open_trees`): the machine's files, not a cell, so
+                // owed (rule 3: no invented read).
                 for task in tasks.iter() {
-                    refuse(task, why, buffer);
+                    refuse(task, why, &[], buffer);
                 }
                 return Ok(());
             }
@@ -196,21 +228,28 @@ impl HeadsStage {
         let mut jobs: std::vec::Vec<Job<'r>, Global> =std::vec::Vec::with_capacity_in(tasks.len(), Global);
         for task in tasks.iter() {
             let Ok(found) = by_name.binary_search_by_key(&task.planned.name, |(name, _)| *name) else {
-                refuse(task, "an `ImplBucket` task of a crate the crate list does not hold", buffer);
+                // The list is the graph's: a new graph record moves it.
+                refuse(task, "an `ImplBucket` task of a crate the crate list does not hold", &[graph_cell], buffer);
                 continue;
             };
             let at = by_name[found].1;
             match crate::engine_bodies::scope_of(read, &cx, store, names, &list, at, heap) {
                 Some((scope, true)) => {
+                    let cells = scope_cells(graph.name, &list, at, Some(&scope));
                     let own = names.input_of(blaze_drive::key::crate_scope_name(&list.key(at))).map(|input| input.name);
                     let Some(own) = own else {
-                        refuse(task, "its crate has no names record this command (its `Names` task failed)", buffer);
+                        refuse(task, "its crate has no names record this command (its `Names` task failed)", &cells, buffer);
                         continue;
                     };
-                    jobs.push(Job { task: *task, krate: list.key(at), own, crates: scope.crates, scope: scope.scope });
+                    jobs.push(Job { task: *task, krate: list.key(at), own, crates: scope.crates, scope: scope.scope, cells });
                 }
-                Some((_, false)) => refuse(task, "a crate of its check scope has no names record this command (its `Names` task failed)", buffer),
-                None => refuse(task, "its crate's names record or check scope could not be read (engine_bodies.rs `scope_of`)", buffer),
+                // The crate's names cell and each scope crate's that had records, and the first
+                // that had none read ABSENT (`Scope::cut`): its task that comes, or its fix,
+                // moves the row (engine_bodies.rs `scope_of`).
+                Some((scope, false)) => refuse(task, "a crate of its check scope has no names record this command (its `Names` task failed)", &scope_cells(graph.name, &list, at, Some(&scope)), buffer),
+                // `scope_of` reads the crate's own names record (ABSENT when its task failed)
+                // and the check scope the graph makes: both cells.
+                None => refuse(task, "its crate's names record or check scope could not be read (engine_bodies.rs `scope_of`)", &scope_cells(graph.name, &list, at, None), buffer),
             }
         }
         // 2. The tables, at once, on the workers.
@@ -251,17 +290,21 @@ impl HeadsStage {
             times.push(name, ns);
             let one = match made {
                 Ok(Ok(one)) => one,
+                // `tables_of` over the scope's records: a refusal of them is a function of the
+                // graph's cell (the packs) and each scope crate's names cell.
                 Ok(Err(why)) => {
-                    refuse(task, why, buffer);
+                    refuse(task, why, &job.cells, buffer);
                     continue;
                 }
+                // A panic is not a function of reads: owed, entered again each request (rule 20).
                 Err(work::Panicked) => {
-                    refuse(task, "its impl tables' task panicked; that crate's tables alone failed", buffer);
+                    refuse(task, "its impl tables' task panicked; that crate's tables alone failed", &[], buffer);
                     continue;
                 }
             };
             if shelf.put_framed(job.krate, &one.payload).is_err() {
-                refuse(task, "its tables could not be put on the request's shelf (front2 buckets/records.rs `ImplShelf::put_framed`)", buffer);
+                // The request's shelf, filled this request (its cap, its order): no cell, so owed.
+                refuse(task, "its tables could not be put on the request's shelf (front2 buckets/records.rs `ImplShelf::put_framed`)", &[], buffer);
                 continue;
             }
             let mut defines: SVec<'a, (Cell, ContentId)> = SVec::with_capacity_in(one.defines.len() + 1, alloc);
@@ -554,6 +597,9 @@ struct ItemJob<'r> {
     lang: Vec<usize, Global>,
     /// Every crate of its scope had records (else its tasks are refused by name).
     whole: bool,
+    /// The cells a refusal of its tasks is a function of ([`scope_cells`]): at 0 the graph's,
+    /// at 1 the member's own names cell.
+    cells: std::vec::Vec<CellId, Global>,
     /// Its tasks, sorted by name.
     tasks: std::vec::Vec<Task, Global>,
 }
@@ -598,29 +644,35 @@ impl HeadsStage {
         let heap = handles.env.heap;
         let g = heap.alloc();
         let refused = &mut self.refused;
-        let mut refuse = |task: &Task, why: &'static str, reads: &[CellId], buffer: &mut Buffer<'a>| {
-            let mut done = crate::engine_tasks::failed(task, alloc);
-            done.reads.extend(reads.iter().map(|id| (*id, view.cell(id))));
-            done.reads.sort_unstable_by_key(|(id, _)| *id);
-            done.reads.dedup_by_key(|(id, _)| *id);
-            buffer.done.push(done);
+        // A refusal with the cells it is a function of, each as the view holds it today (ABSENT
+        // where no task defines it), through `failed_with` (sorted, once each): its row stands
+        // until one moves (plan row A8). None: owed, said at each such call.
+        let mut refuse = |task: &Task, why: &'static str, cells: &[CellId], buffer: &mut Buffer<'a>| {
+            let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(cells.len(), alloc);
+            reads.extend(cells.iter().map(|id| (*id, view.cell(id))));
+            buffer.done.push(crate::engine_tasks::failed_with(task, reads, alloc));
             refused.push((task.planned.name, why));
         };
         let (Some(graph), Some(names)) = (handles.graph, handles.names) else {
+            // No `UnitGraph` task planned, or no names stage: no cell of this command says so,
+            // so owed until the plan's inputs are cells (plan row D2).
             for task in tasks.iter() {
                 refuse(task, "this command has no unit graph or no crate's names, so no head", &[], buffer);
             }
             return Ok(());
         };
+        // The crate list, each member's check scope and the packs are the graph record's.
+        let graph_cell = CellId { of: graph.name, cell: WHOLE };
         let Some(list) = kept.list(cx, store, &graph, frame)? else {
             for task in tasks.iter() {
-                refuse(task, "the crates' inputs could not be made (names.rs `world`; the `UnitGraph` record's finding says why)", &[], buffer);
+                refuse(task, "the crates' inputs could not be made (names.rs `world`; the `UnitGraph` record's finding says why)", &[graph_cell], buffer);
             }
             return Ok(());
         };
         let (packs, corrected) = match kept.trees(cx, handles.env, graph.out, &list, frame) {
             Ok(trees) => trees,
             Err(why) => {
+                // The machine's packs (body_types.rs `open_trees`), not a cell: owed (rule 3).
                 for task in tasks.iter() {
                     refuse(task, why, &[], buffer);
                 }
@@ -632,8 +684,15 @@ impl HeadsStage {
         // scopes hold it (engine_records.rs), and the workers below handed shared borrows of them.
         let mut subjects: std::vec::Vec<([u8; 8], u32, Name), Global> = std::vec::Vec::new_in(Global);
         let mut jobs: std::vec::Vec<ItemJob<'r>, Global> = std::vec::Vec::new_in(Global);
+        // What "its file is in no member crate's items record" is a function of: the graph's
+        // cell (which crates are members, their roots) and every member's names cell (its items
+        // record; ABSENT for a member whose names task failed, so its fix moves the row).
+        let mut no_member: std::vec::Vec<CellId, Global> = std::vec::Vec::new_in(Global);
+        no_member.push(graph_cell);
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
+            no_member.push(CellId { of: blaze_drive::key::crate_scope_name(&list.key(member)), cell: WHOLE });
             let Some((scope, whole)) = crate::engine_bodies::scope_of(read, cx, store, names, &list, member, heap) else { continue };
+            let cells = scope_cells(graph.name, &list, member, Some(&scope));
             let Ok(items) = ItemsRecord::open(scope.own_records.items, g) else { continue };
             let prefix = list.key(member).prefix();
             for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
@@ -644,7 +703,7 @@ impl HeadsStage {
                     subjects.push((prefix, file, one.name));
                 }
             }
-            jobs.push(ItemJob { prefix, crates: scope.crates, lang: scope.lang, whole, tasks: std::vec::Vec::new_in(Global) });
+            jobs.push(ItemJob { prefix, crates: scope.crates, lang: scope.lang, whole, cells, tasks: std::vec::Vec::new_in(Global) });
         }
         subjects.sort_unstable();
         jobs.sort_unstable_by_key(|job| job.prefix);
@@ -657,8 +716,10 @@ impl HeadsStage {
             let job = by_file.get(at).filter(|(file, _)| *file == task.planned.file).and_then(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok());
             match job {
                 Some(at) if jobs[at].whole => jobs[at].tasks.push(*task),
-                Some(_) => refuse(task, "a crate of its crate's check scope has no names record this command (its `Names` task failed)", &[], buffer),
-                None => refuse(task, "its file is in no member crate's items record (engine_heads.rs `run_items`)", &[], buffer),
+                // Its member's names cell, each scope crate's that had records, and the one the
+                // scope was cut at, read ABSENT: its task that comes, or its fix, moves the row.
+                Some(at) => refuse(task, "a crate of its crate's check scope has no names record this command (its `Names` task failed)", &jobs[at].cells, buffer),
+                None => refuse(task, "its file is in no member crate's items record (engine_heads.rs `run_items`)", &no_member, buffer),
             }
         }
         jobs.retain(|job| !job.tasks.is_empty());
@@ -703,12 +764,15 @@ impl HeadsStage {
             }
             let made = match ran {
                 Ok(Ok(made)) => made,
+                // The scope's records not opened (`heads_of`): a function of the graph's cell
+                // (the packs) and each scope crate's names cell.
                 Ok(Err(why)) => {
                     for task in job.tasks.iter() {
-                        refuse(task, why, &[], buffer);
+                        refuse(task, why, &job.cells, buffer);
                     }
                     continue;
                 }
+                // A panic is not a function of reads: owed, entered again each request (rule 20).
                 Err(work::Panicked) => {
                     for task in job.tasks.iter() {
                         refuse(task, "its crate's head tasks panicked; that crate's heads alone failed", &[], buffer);
@@ -719,7 +783,11 @@ impl HeadsStage {
             for (task, one) in job.tasks.iter().zip(made) {
                 let one = match one {
                     Ok(one) => one,
-                    Err(failed) => {
+                    // What its freeze read until it failed, and its member's names cell: its
+                    // heads' rows are that crate's records' (`heads_of_crate`), so a refusal
+                    // that read nothing else (two heads under one cell) stands on it too.
+                    Err(mut failed) => {
+                        failed.reads.push(job.cells[1]);
                         refuse(task, failed.why, &failed.reads, buffer);
                         continue;
                     }

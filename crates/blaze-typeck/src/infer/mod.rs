@@ -216,6 +216,10 @@ impl<'a, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, '_, '_, W> {
         &*self.facts
     }
 
+    fn goals(&self) -> Option<&dyn blaze_solve::share::GoalShare> {
+        self.reads.goal_share()
+    }
+
     fn fill(&mut self, _tys: &mut Terms<'a>, q: blaze_solve::facts::Question) -> bool {
         if self.err.is_some() {
             return false;
@@ -378,6 +382,12 @@ impl<'a> InferCtx<'a> {
     /// `Solver::keep_root_keys`: a measurement of goals shared across bodies).
     pub fn keep_root_keys(&mut self) {
         self.solver.keep_root_keys();
+    }
+
+    /// The shared goals this context's solver took (blaze-solve share.rs `GoalHit`): the one
+    /// read each hit names, for the body's result.
+    pub fn goal_hits(&self) -> &[blaze_solve::share::GoalHit] {
+        self.solver.goal_hits()
     }
 
     /// The digests kept since [`InferCtx::keep_root_keys`].

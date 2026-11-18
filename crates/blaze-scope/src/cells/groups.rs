@@ -625,6 +625,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             if let Some(rec) = self.textual_rec_log.take() {
                 texts.extend(rec.iter().copied().filter(|&t| t != m));
             }
+            // The `#[macro_use]` children its scope's textual sequence flattens in (write.rs): its
+            // record holds their sequences, so it reads them (rule 21), whether a walk did or not.
+            self.flattened_into(m, &mut texts);
             texts.sort_unstable();
             texts.dedup();
             // Each cell read, as the binding and globs cells its lookup went through (its own
@@ -692,14 +695,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 rows.extend(r.rows.iter().filter(|(t, _)| !inside(*t)).map(|(_, row)| *row));
                 for &t in r.texts.iter() {
                     if !inside(t) {
-                        let seen = match textual.get(&t) {
-                            Some(&d) => d,
-                            None => {
-                                let d = self.textual_digest(&frags_of[t as usize], &expansion_of);
-                                textual.insert(t, d);
-                                d
-                            }
-                        };
+                        let seen = self.textual_digest(t, &frags_of, &expansion_of, &mut textual);
                         rows.push(GroupRead::Textual { module: self.modules[t as usize].key, seen });
                     }
                 }
@@ -721,14 +717,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 let m = local[i as usize];
                 defines.push((globs_cell(key), self.globs_digest(m)));
                 // Each member's textual sequence: what a `macro_rules!` lookup walking its text reads.
-                let d = match textual.get(&m) {
-                    Some(&d) => d,
-                    None => {
-                        let d = self.textual_digest(&frags_of[m as usize], &expansion_of);
-                        textual.insert(m, d);
-                        d
-                    }
-                };
+                let d = self.textual_digest(m, &frags_of, &expansion_of, &mut textual);
                 defines.push((textual_cell(key), d));
             }
             calls.sort_unstable();
@@ -748,11 +737,59 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         Ok(groups)
     }
 
-    /// The digest of a module's textual sequence, over its fragments `of` (its text, then its
-    /// calls' expansions by the call's key), each slot in text order with no position: a
-    /// `macro_rules!` by name and definition, a `mod` line by the child's key and its
-    /// `#[macro_use]`, a call by its key and whether it grew.
-    fn textual_digest(&self, of: &[FragId], expansion_of: &HashMap<FragId, ItemKey, Alloc<'a>>) -> ContentId {
+    /// The `#[macro_use]` children whose sequences module `m`'s scope flattens into its own
+    /// (write.rs, the same walk): through its text and its calls' expansions, into each such
+    /// child read here and its own. A child outside a one-group solve's members is flattened
+    /// from its record alone, whose digest covers its own children ([`Cells::textual_digest`]).
+    /// Each fragment belongs to one module or one call, so each is met once (the module tree
+    /// and its calls bound the walk: rule 18).
+    fn flattened_into(&self, m: ModId, out: &mut AVec<'a, ModId>) {
+        let text = self.modules[m as usize].text;
+        if text == FragId::MAX {
+            return;
+        }
+        let mut todo: AVec<'a, FragId> = AVec::new_in(self.alloc);
+        todo.push(text);
+        while let Some(f) = todo.pop() {
+            for &(_, slot) in self.frags[f as usize].slots.iter() {
+                match slot {
+                    Slot::Mod(child, true) => {
+                        let c = &self.modules[child as usize];
+                        if c.foreign || c.unread {
+                            continue;
+                        }
+                        if child != m {
+                            out.push(child);
+                        }
+                        if c.text != FragId::MAX {
+                            todo.push(c.text);
+                        }
+                    }
+                    Slot::Call(j) => {
+                        if let Some(e) = self.items[j as usize].expansion {
+                            todo.push(e);
+                        }
+                    }
+                    Slot::Rules(..) | Slot::Mod(_, false) => {}
+                }
+            }
+        }
+    }
+
+    /// The digest of module `m`'s textual sequence, memoized in `memo` (which holds the
+    /// recorded digest of each module outside a one-group solve's members), over its fragments
+    /// (`frags_of[m]`: its text, then its calls' expansions by the call's key), each slot in
+    /// text order with no position: a `macro_rules!` by name and definition, a `mod` line by
+    /// the child's key and its `#[macro_use]`, a call by its key and whether it grew. A
+    /// `#[macro_use]` child's line carries the child's own digest too: the record answers a
+    /// reader of `m`'s sequence with the children's flattened in (write.rs, `textual_recorded`),
+    /// so the cell moves when what it answers moves (rule 21). The recursion follows the module
+    /// tree down, so it ends.
+    fn textual_digest(&self, m: ModId, frags_of: &[AVec<'a, FragId>], expansion_of: &HashMap<FragId, ItemKey, Alloc<'a>>, memo: &mut HashMap<ModId, ContentId, Alloc<'a>>) -> ContentId {
+        if let Some(&d) = memo.get(&m) {
+            return d;
+        }
+        let of = &frags_of[m as usize];
         let mut frags: AVec<'_, (Option<ItemKey>, FragId)> = AVec::with_capacity_in(of.len(), self.alloc);
         // An expansion's fragment by its call's key; the module's text first.
         frags.extend(of.iter().map(|&f| (expansion_of.get(&f).copied(), f)));
@@ -777,6 +814,17 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         b.push(2);
                         b.extend_from_slice(&self.modules[child as usize].key.0.0);
                         b.push(u8::from(macro_use));
+                        let c = &self.modules[child as usize];
+                        if macro_use && !c.foreign && !c.unread {
+                            // Its sequence, flattened into `m`'s: read here, or its record's
+                            // (in `memo`); none held is absent (write.rs counts it unknown).
+                            let d = match memo.get(&child) {
+                                Some(&d) => d,
+                                None if c.text != FragId::MAX && child != m => self.textual_digest(child, frags_of, expansion_of, memo),
+                                None => ABSENT,
+                            };
+                            b.extend_from_slice(&d.0);
+                        }
                     }
                     Slot::Call(j) => {
                         let it = &self.items[j as usize];
@@ -789,7 +837,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
             }
         }
-        ContentId::of(TEXTUAL_DOMAIN, &b)
+        let d = ContentId::of(TEXTUAL_DOMAIN, &b);
+        memo.insert(m, d);
+        d
     }
 }
 

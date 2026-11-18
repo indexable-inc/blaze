@@ -84,10 +84,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
         read_ids.dedup();
         for read in read_ids {
             reads.push((read, id(seed, version, 9)));
-            let readers = kept.answer.readers.entry(read).or_insert_with(|| Vec::new_in(a));
-            if let Err(at) = readers.binary_search(&me) {
-                readers.insert(at, me);
-            }
+            kept.answer.readers.entry(read).or_insert_with(|| blaze_own::BTreeSet::new_in(a)).insert(me);
         }
         let findings = (version % 5 == 0) as u32;
         if findings > 0 {

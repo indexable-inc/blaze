@@ -5,6 +5,7 @@ pub mod plant;
 
 mod cost;
 mod head_shape;
+mod share;
 
 use std::format;
 use std::string::String;

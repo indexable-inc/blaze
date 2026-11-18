@@ -22,6 +22,10 @@ use crate::tys::{Relate, Tys};
 /// The most words one canonical form holds (rule 18).
 pub const MAX_WORDS: usize = 1 << 16;
 
+/// The highest variable index a [`Decode`] accepts (rule 18): its slot table's cap, over every
+/// form it decodes until `reset` (a certificate's rows share one numbering).
+pub const MAX_VARS: u32 = 1 << 22;
+
 // Term tags.
 const T_BOOL: u32 = 1;
 const T_CHAR: u32 = 2;
@@ -443,6 +447,13 @@ impl<'a> Decode<'a> {
     }
 
     fn slot<T: Tys>(&mut self, tys: &mut T, i: u32, kind: VarKind) -> Result<Ty, SolveError> {
+        // Variables are numbered by first occurrence, and a decoder kept across forms (one
+        // certificate's rows, blaze-cert) numbers them across all of them: an index past
+        // `MAX_VARS` is malformed input (a fetched certificate's words), refused before the
+        // slot table grows to it.
+        if i > MAX_VARS {
+            return Err(SolveError::Malformed(Malformed::Canonical { at: i }));
+        }
         while self.slots.len() <= i as usize {
             self.slots.push(Ty::NONE);
         }
@@ -837,7 +848,14 @@ impl<'a> Responses<'a> {
         if r.is_cached() { self.cached.rows[(r.0 & !RespId::CACHED) as usize] } else { self.scratch.rows[r.0 as usize] }
     }
 
-    fn words_of(&self, r: RespId) -> &[u32] {
+    /// A shared goal's answer taken into the cached pool (share.rs: a hit's response, its
+    /// words as the table holds them).
+    pub(crate) fn push_cached(&mut self, words: &[u32], certainty: Certainty, via: Via) -> Result<RespId, SolveError> {
+        self.push(true, words, certainty, via)
+    }
+
+    /// A response's words (what a shared goal's answer holds: share.rs).
+    pub(crate) fn words_of(&self, r: RespId) -> &[u32] {
         let row = self.row(r);
         let pool = if r.is_cached() { &self.cached } else { &self.scratch };
         &pool.words[row.start as usize..(row.start + row.len) as usize]

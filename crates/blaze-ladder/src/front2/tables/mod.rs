@@ -7,6 +7,7 @@
 //! Nothing mutable is shared between tasks and nothing is kept from one task to the next.
 
 pub mod cost;
+pub mod goals;
 pub mod head;
 #[cfg(test)]
 mod head_tests;

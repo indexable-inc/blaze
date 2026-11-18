@@ -26,7 +26,8 @@ use blaze_own::{Alloc, Vec};
 use crate::assembly::{AStep, Added, Cand, Clause, Cx, Done, EnvId, Goal, Langs, Merger, Rule as CandRule, Source, Step, Via};
 use crate::canon::{self, Canon, Decode, RespGoal, RespId, Responses};
 use crate::error::{Limit, Malformed, SolveError, Stop};
-use crate::facts::{Ask, Facts, Read, Source as FactSource, Stopping, TraitFlags};
+use crate::facts::{Ask, Facts, Question, Read, Source as FactSource, Stopping, TraitFlags};
+use crate::share::{self, Audit, GoalHit, GoalKey, NewGoal, Taken, Refuse, ShareError, ShareOpts, ShareRefused, SharedAns, SharedGoal};
 use crate::fold::{self, Inst, Scratch};
 use crate::readlog::{ReadLog, SegLog};
 use crate::search::{Ans, FIXPOINT_STEP_LIMIT, Heads, Inputs, MAX_DEPTH, PathKind, Prov};
@@ -172,6 +173,15 @@ enum Got {
     Pushed,
 }
 
+/// What a root's look into the request's table gave (`Solver::share_root`).
+enum Shared<'a> {
+    /// The answer, taken: the root is done.
+    Hit(Ans),
+    /// A hit the audit solves again (share.rs `ShareOpts::audit`).
+    Audit(Audit<'a>),
+    Miss,
+}
+
 /// The solver: its tables live as long as the allocator, across goals (the global cache, the
 /// interned inputs and envs). A solver serves one term arena.
 pub struct Solver<'a> {
@@ -217,7 +227,30 @@ pub struct Solver<'a> {
     /// reads `tys` only to resolve variables), so a hit skips the canonical walk. Only goals
     /// whose canonical form has no variable are kept; at most [`MAX_PLAIN`] entries.
     plain: Map<(TypingMode, Goal), u32, FixedState, Alloc<'a>>,
+    /// Whether the root being solved shares its goals (its source hands a table:
+    /// `facts::Source::goals`): `finish` then keeps each final goal in `share_new`.
+    sharing: bool,
+    /// The final goals of the root being solved, put when it ends (share.rs `NewGoal`).
+    share_new: Vec<NewGoal, Alloc<'a>>,
+    /// The shared goals this solver took, in order (share.rs `GoalHit`): the one read each.
+    share_hits: Vec<GoalHit, Alloc<'a>>,
+    /// Scratch of the sharing: a key's words, an entry copied out, read ids, reads, a walk.
+    share_key: Vec<u32, Alloc<'a>>,
+    share_got: Taken<'a>,
+    share_ids: Vec<u32, Alloc<'a>>,
+    share_reads: Vec<Read, Alloc<'a>>,
+    share_work: Vec<(Ty, u32), Alloc<'a>>,
+    /// The step count ([`Solver::steps_now`]) when the root being solved started.
+    steps_at: u64,
 }
+
+/// The most solver steps (frames pushed, cycle heads rerun, candidates run) one root goal may
+/// take (rule 18): a count, so a goal stops at the same step whoever asks it, never a time.
+/// The depth limit and the fixpoint's rerun limit give their goals an overflow ANSWER (a
+/// result like any other, shared as one); this cap is a typed failure naming the root goal
+/// (`SolveError::Steps`), for a search wide rather than deep (one typo made rustc's solver run
+/// for hours).
+pub const MAX_STEPS: u64 = 1 << 22;
 
 /// The plain-goal memo's cap (rule 18): past it goals are canonicalized each time.
 pub const MAX_PLAIN: usize = 1 << 16;
@@ -286,6 +319,20 @@ pub struct Stats {
     pub pulls: u64,
     /// Frames finished with a provisional answer (inside a cycle, not in the global cache).
     pub provisional: u64,
+    /// THE SHARED GOALS (share.rs): root goals answered from the request's table; entries this
+    /// solver put there; puts of a goal already there; hits the audit solved again.
+    pub shared_hits: u64,
+    pub shared_puts: u64,
+    pub shared_present: u64,
+    pub shared_audited: u64,
+    /// Goals not shared, in all and by reason (share.rs `Refuse`).
+    pub shared_refused: u64,
+    pub shared_refused_vars: u64,
+    pub shared_refused_local: u64,
+    pub shared_refused_const_holds: u64,
+    pub shared_refused_overflow: u64,
+    pub shared_refused_scope: u64,
+    pub shared_refused_full: u64,
 }
 
 /// `add` and `since` over every field of [`Stats`], named once: a field left out of the list
@@ -333,6 +380,17 @@ stats_fields!(
     frames_abandoned,
     pulls,
     provisional,
+    shared_hits,
+    shared_puts,
+    shared_present,
+    shared_audited,
+    shared_refused,
+    shared_refused_vars,
+    shared_refused_local,
+    shared_refused_const_holds,
+    shared_refused_overflow,
+    shared_refused_scope,
+    shared_refused_full,
 );
 
 /// Which of the solver's shortcuts are off. Each answers as the steps it shortcuts do; the
@@ -422,7 +480,22 @@ impl<'a> Solver<'a> {
             marker_pool: Vec::new_in(alloc),
             root_keys: None,
             plain: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            sharing: false,
+            share_new: Vec::new_in(alloc),
+            share_hits: Vec::new_in(alloc),
+            share_key: Vec::new_in(alloc),
+            share_got: Taken::new_in(alloc),
+            share_ids: Vec::new_in(alloc),
+            share_reads: Vec::new_in(alloc),
+            share_work: Vec::new_in(alloc),
+            steps_at: 0,
         }
+    }
+
+    /// The shared goals this solver took so far, in order (share.rs `GoalHit`): the one read
+    /// each hit names, for the body's result.
+    pub fn goal_hits(&self) -> &[GoalHit] {
+        &self.share_hits
     }
 
     pub fn alloc(&self) -> Alloc<'a> {
@@ -767,10 +840,36 @@ impl<'a> Solver<'a> {
             self.reads.seg.extend(lo, self.inputs.reads_of(&e))?;
             return Ok((e.ans, orig_lo));
         }
+        // THE REQUEST'S SHARED GOALS (share.rs): a goal another body solved is one read here.
+        let root_lo = self.reads.lo as usize;
+        let mut audit: Option<Audit<'a>> = None;
+        if let Some(opts) = src.goals().map(|g| g.opts()) {
+            match self.share_root(tys, src, input, goal, opts) {
+                Ok(Shared::Hit(ans)) => return Ok((ans, orig_lo)),
+                Ok(Shared::Audit(a)) => audit = Some(a),
+                Ok(Shared::Miss) => {}
+                Err(e) => {
+                    self.origs.truncate(orig_lo as usize);
+                    return Err(e);
+                }
+            }
+        }
+        self.sharing = src.goals().is_some();
+        self.share_new.clear();
+        self.steps_at = self.steps_now();
         let mut snaps: Vec<T::Snapshot, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut probes: Vec<Option<T::Snapshot>, Alloc<'a>> = Vec::new_in(self.alloc);
         self.push_frame(tys, &mut snaps, &mut probes, input, mode, self.limit, PathKind::Inductive);
         let r = self.drive(tys, src, &mut snaps, &mut probes);
+        self.sharing = false;
+        let r = match r {
+            Ok(ans) => match self.share_after(&*tys, &*src, ans, root_lo, goal, audit) {
+                Ok(()) => Ok(ans),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        self.share_new.clear();
         match r {
             Ok(ans) => Ok((ans, orig_lo)),
             Err(e) => {
@@ -796,6 +895,273 @@ impl<'a> Solver<'a> {
                 Err(e)
             }
         }
+    }
+
+    /// The solver's steps so far (the count [`MAX_STEPS`] bounds per root).
+    fn steps_now(&self) -> u64 {
+        let s = &self.scratch.stats;
+        s.frames + s.reruns + s.candidates
+    }
+
+    /// Why a goal may not be shared, or `None` (share.rs, "WHAT IS SHARED"): `vars` is the
+    /// number of canonical variables of its input, `pred` its predicate in the arena.
+    fn share_refusal<T: Tys>(&mut self, tys: &T, pred: Pred, vars: u32) -> Result<Option<Refuse>, SolveError> {
+        if vars != 0 {
+            return Ok(Some(Refuse::Vars));
+        }
+        let mut local = false;
+        let work = &mut self.share_work;
+        pred_terms(tys, pred, &mut |t| {
+            if local {
+                return Ok(());
+            }
+            if tys.flags(t).has(Flags::HAS_INFER | Flags::HAS_PLACEHOLDER | Flags::HAS_ERROR | Flags::HAS_CANONICAL) {
+                local = true;
+                return Ok(());
+            }
+            fold::visit(tys, work, t, |_, k| {
+                if matches!(k, TyKind::Closure(..) | TyKind::Coroutine(..)) {
+                    local = true;
+                }
+                !local
+            })
+        })?;
+        Ok(if local { Some(Refuse::Local) } else { None })
+    }
+
+    fn count_refused(&mut self, why: Refuse) {
+        let s = &mut self.scratch.stats;
+        s.shared_refused += 1;
+        match why {
+            Refuse::Vars => s.shared_refused_vars += 1,
+            Refuse::Local => s.shared_refused_local += 1,
+            Refuse::ConstHolds => s.shared_refused_const_holds += 1,
+            Refuse::Overflow => s.shared_refused_overflow += 1,
+            Refuse::Scope => s.shared_refused_scope += 1,
+            Refuse::Full => s.shared_refused_full += 1,
+        }
+    }
+
+    /// The shared key's words of interned input `input` (share.rs, "THE KEY"): the code id,
+    /// the recursion limit, the mode, the bound count, the environment's canonical words (its
+    /// length first) in place of this solver's env id, then the predicate's words.
+    fn key_words(&self, input: u32, out: &mut Vec<u32, Alloc<'a>>) -> Result<(), SolveError> {
+        let w = self.inputs.words_of(input);
+        let [mode, env, bound, pred @ ..] = w else {
+            return Err(SolveError::Malformed(Malformed::Canonical { at: 0 }));
+        };
+        let env_words = match self.env_word_rows.get(*env as usize) {
+            Some(&(s, l)) => &self.env_words[s as usize..(s + l) as usize],
+            None => &[],
+        };
+        if env_words.len() + pred.len() + 5 > share::MOST_KEY_WORDS {
+            return Err(SolveError::Limit(Limit::CanonicalSize));
+        }
+        out.clear();
+        out.push(share::SOLVER_CODE_ID);
+        out.push(self.limit);
+        out.push(*mode);
+        out.push(*bound);
+        out.push(env_words.len() as u32);
+        out.extend_from_slice(env_words);
+        out.extend_from_slice(pred);
+        Ok(())
+    }
+
+    /// The root goal `input` looked up in the request's table (share.rs). A hit's read list is
+    /// checked against this body's facts first (`share_replay`, "THE SCOPE").
+    fn share_root<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, input: u32, goal: Goal, opts: ShareOpts) -> Result<Shared<'a>, Stop> {
+        let vars = self.canon.orig.len() as u32;
+        if self.share_refusal(&*tys, goal.pred, vars)?.is_some() {
+            // Counted once, where the goal would be put (`share_after`).
+            return Ok(Shared::Miss);
+        }
+        let mut kw = core::mem::replace(&mut self.share_key, Vec::new_in(self.alloc));
+        let mut got = core::mem::replace(&mut self.share_got, Taken::new_in(self.alloc));
+        let r = self.share_root_with(tys, src, input, opts, &mut kw, &mut got);
+        self.share_key = kw;
+        self.share_got = got;
+        r
+    }
+
+    fn share_root_with<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        input: u32,
+        opts: ShareOpts,
+        kw: &mut Vec<u32, Alloc<'a>>,
+        got: &mut Taken<'a>,
+    ) -> Result<Shared<'a>, Stop> {
+        self.key_words(input, kw)?;
+        let digest = share::key_digest(kw);
+        got.clear();
+        let found = match src.goals() {
+            Some(table) => table.get(GoalKey { digest, words: &kw[..] }, &mut |g| got.fill(g)),
+            None => return Ok(Shared::Miss),
+        };
+        let found = match found {
+            Ok(found) => found,
+            Err(ShareRefused::Collision { digest }) => return Err(Stop::Error(SolveError::Share(ShareError::Collision { digest }))),
+            Err(ShareRefused::Full { .. }) => false,
+        };
+        if !found {
+            return Ok(Shared::Miss);
+        }
+        // THE SCOPE: the entry is taken only if every fact it read answers the same digest in
+        // this body's facts (filled where they lack one, as solving the goal here would).
+        if !opts.one_read_only && !self.share_replay(tys, src, &got.reads)? {
+            self.count_refused(Refuse::Scope);
+            return Ok(Shared::Miss);
+        }
+        let plant = opts.plant_hit_without_read;
+        self.scratch.stats.shared_hits += 1;
+        self.share_hits.push(GoalHit { key: digest, reads_digest: got.reads_digest });
+        if opts.audit {
+            // THE AUDIT: the hit is solved again by the caller (`evaluate_root`), the fresh
+            // solve's reads are the ones recorded, and `share_after` compares.
+            let hit_reads = if plant || opts.one_read_only { share::reads_digest(&[]) } else { got.reads_digest };
+            let mut words: Vec<u32, Alloc<'a>> = Vec::new_in(self.alloc);
+            words.extend_from_slice(&got.words);
+            return Ok(Shared::Audit(Audit { key: digest, ans: got.ans, words, reads_digest: got.reads_digest, hit_reads }));
+        }
+        let ans = match got.ans {
+            Some((c, via)) => Some(self.resps.push_cached(&got.words, c, via)?),
+            None => None,
+        };
+        let mut ids = core::mem::replace(&mut self.share_ids, Vec::new_in(self.alloc));
+        ids.clear();
+        if !opts.one_read_only && !plant {
+            for &r in got.reads.iter() {
+                ids.push(self.reads.intern(r)?);
+            }
+            // SOUND WITH TODAY'S ENGINE (plan row A4, this piece): the hit ALSO appends the
+            // goal's own reads to the body's list, exactly as solving the goal in the body
+            // would, so a body is invalidated by the same facts as before. The one goal read
+            // (`share_hits`) is recorded beside them; `ShareOpts::one_read_only` (tests, until
+            // the engine keeps goals as records with their own rows) records it alone.
+            let lo = self.reads.lo;
+            self.reads.seg.extend(lo, &ids)?;
+        }
+        if !opts.one_read_only {
+            // Into this solver's own cache, applicable only with an empty stack (its nested
+            // goals are not known here): the next root ask of it is this solver's hit.
+            self.inputs.insert(input, self.limit, got.overflow, ans, got.required_depth, &[], true, &ids)?;
+        }
+        self.share_ids = ids;
+        Ok(Shared::Hit(ans))
+    }
+
+    /// Asks every read of a shared entry again of this body's facts: `true` when each answers
+    /// the digest the entry holds. A fact the facts lack is filled by the source (and noted in
+    /// the body's own list by it, as solving would); one it does not fill stops the root
+    /// (`Stop::Need`), and the caller fills it and asks again.
+    fn share_replay<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, reads: &[Read]) -> Result<bool, Stop> {
+        for r in reads {
+            let mut filled = 0u32;
+            loop {
+                let got = Ask::new(src.facts()).replay(r.question);
+                match got {
+                    Ok(d) if d == r.digest => break,
+                    Ok(_) => return Ok(false),
+                    Err(Stop::Need(q)) if S::PULLS && filled < MAX_PULLS => {
+                        if !src.fill(tys, q) {
+                            return Err(Stop::Need(q));
+                        }
+                        filled += 1;
+                        self.scratch.stats.pulls += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// After a root finished: each final goal of its solve put in the request's table, and the
+    /// audit's comparison when the root was a hit solved again.
+    fn share_after<T: Tys, S: FactSource<T>>(&mut self, tys: &T, src: &S, root_ans: Ans, root_lo: usize, goal: Goal, audit: Option<Audit<'a>>) -> Result<(), Stop> {
+        let Some(table) = src.goals() else { return Ok(()) };
+        let news = core::mem::replace(&mut self.share_new, Vec::new_in(self.alloc));
+        let mut kw = core::mem::replace(&mut self.share_key, Vec::new_in(self.alloc));
+        let mut rs = core::mem::replace(&mut self.share_reads, Vec::new_in(self.alloc));
+        let r = self.share_after_with(tys, table, &news, root_ans, root_lo, goal, audit, &mut kw, &mut rs);
+        self.share_new = news;
+        self.share_key = kw;
+        self.share_reads = rs;
+        r
+    }
+
+    fn share_after_with<T: Tys>(
+        &mut self,
+        tys: &T,
+        table: &dyn share::GoalShare,
+        news: &[NewGoal],
+        root_ans: Ans,
+        root_lo: usize,
+        goal: Goal,
+        audit: Option<Audit<'a>>,
+        kw: &mut Vec<u32, Alloc<'a>>,
+        rs: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<(), Stop> {
+        if let Some(a) = audit {
+            self.scratch.stats.shared_audited += 1;
+            let same_ans = match (root_ans, a.ans) {
+                (None, None) => true,
+                (Some(id), Some((c, via))) => self.resps.certainty(id) == c && self.resps.via(id) == via && self.resps.words_of(id) == &a.words[..],
+                _ => false,
+            };
+            rs.clear();
+            for &id in self.reads.seg.from(root_lo) {
+                rs.push(self.reads.read(id));
+            }
+            rs.sort_unstable();
+            rs.dedup();
+            let fresh = share::reads_digest(rs);
+            let what = if !same_ans {
+                Some(share::AuditMiss::Answer)
+            } else if fresh != a.reads_digest {
+                Some(share::AuditMiss::EntryReads)
+            } else if !table.opts().one_read_only && a.hit_reads != fresh {
+                Some(share::AuditMiss::HitReads)
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                return Err(Stop::Error(SolveError::Share(ShareError::Audit { goal: bad_pred_of(tys, goal.pred), key: a.key, what })));
+            }
+        }
+        for n in news {
+            if let Some(why) = n.why {
+                self.count_refused(why);
+                continue;
+            }
+            rs.clear();
+            let mut const_holds = false;
+            for &id in self.inputs.reads_of(&n.entry) {
+                let read = self.reads.read(id);
+                const_holds |= matches!(read.question, Question::ConstHolds(..));
+                rs.push(read);
+            }
+            if const_holds {
+                self.count_refused(Refuse::ConstHolds);
+                continue;
+            }
+            rs.sort_unstable();
+            rs.dedup();
+            let reads_digest = share::reads_digest(rs);
+            self.key_words(n.input, kw)?;
+            let key = GoalKey { digest: share::key_digest(&kw[..]), words: &kw[..] };
+            let ans = n.entry.ans.map(|id| SharedAns { certainty: self.resps.certainty(id), via: self.resps.via(id), words: self.resps.words_of(id) });
+            let put = table.put(key, SharedGoal { ans, required_depth: n.entry.required_depth, overflow: n.overflow, reads: &rs[..], reads_digest });
+            match put {
+                Ok(true) => self.scratch.stats.shared_puts += 1,
+                Ok(false) => self.scratch.stats.shared_present += 1,
+                Err(ShareRefused::Full { .. }) => self.count_refused(Refuse::Full),
+                Err(ShareRefused::Collision { digest }) => return Err(Stop::Error(SolveError::Share(ShareError::Collision { digest }))),
+            }
+        }
+        Ok(())
     }
 
     fn push_frame<T: Tys>(
@@ -862,6 +1228,10 @@ impl<'a> Solver<'a> {
         probes: &mut Vec<Option<T::Snapshot>, Alloc<'a>>,
     ) -> Result<Ans, Stop> {
         loop {
+            if self.steps_now().saturating_sub(self.steps_at) > MAX_STEPS {
+                let goal = self.frames.first().map(|f| bad_pred_of(&*tys, f.goal.pred));
+                return Err(Stop::Error(SolveError::Steps { goal, most: MAX_STEPS }));
+            }
             let top = self.frames.len() - 1;
             match self.drive_one(tys, src, snaps, probes, top) {
                 Ok(Some(done)) => return Ok(done),
@@ -1549,6 +1919,9 @@ impl<'a> Solver<'a> {
             }
         }
         self.inputs.drop_provisional(top as u32);
+        // Whether the goal may be shared (share.rs, "WHAT IS SHARED"): asked of its decoded
+        // goal while its terms are still in the arena, before the pop rolls them back.
+        let share_why = if self.sharing { Some(self.share_refusal(&*tys, f.goal.pred, f.vars)?) } else { None };
         // Pop.
         if let Some(s) = probes[top].take() {
             tys.rollback_to(s);
@@ -1573,7 +1946,16 @@ impl<'a> Solver<'a> {
         heads.remove(top as u32);
         if heads.is_empty() {
             let (inputs, nested, reads) = (&mut self.inputs, self.nested_ids.from(nl), self.reads.seg.from(rl));
-            inputs.insert(f.input, f.depth, f.overflow, ans, f.required_depth, nested, f.big, reads)?;
+            let entry = inputs.insert(f.input, f.depth, f.overflow, ans, f.required_depth, nested, f.big, reads)?;
+            // A FINAL result (no cycle head below it): put when the root ends. A cycle's
+            // members other than its head finish provisional (the branch below) and are never
+            // put; the head is the goal whose frame is lowest on the stack, so every worker
+            // that enters the cycle at one goal puts that goal's answer, a function of it
+            // alone (share.rs). A nested goal's overflow holds only at its depth: not put.
+            if let Some(why) = share_why {
+                let why = if why.is_none() && f.overflow && top != 0 { Some(Refuse::Overflow) } else { why };
+                self.share_new.push(NewGoal { input: f.input, entry, overflow: f.overflow, why });
+            }
         } else if let Some(highest) = heads.highest() {
             self.scratch.stats.provisional += 1;
             let path = {

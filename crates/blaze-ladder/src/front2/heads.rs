@@ -648,6 +648,12 @@ pub struct Store<'n> {
     pub type_misses: HashMap<ItemKey, Vec<TypeMiss, Global>, Global>,
     /// The body task's meter (front2 tables/cost.rs), when one measures: a measurement only.
     pub cost: Option<&'n super::tables::cost::Cost<'n>>,
+    /// The request's table of trait goals shared by every body (front2 tables/goals.rs,
+    /// blaze-solve share.rs), when the body task shares them; `None` solves every goal here.
+    pub goals: Option<&'n dyn blaze_solve::share::GoalShare>,
+    /// The shared goals the last check round of the body took (blaze-solve `GoalHit`): the
+    /// one read each names, for the body's result (tables/task.rs `BodyOut::goal_hits`).
+    pub goal_hits: Vec<blaze_solve::share::GoalHit, Global>,
     /// The needs a step met beside the one it stopped at (`trait_members`), taken by the
     /// next step of [`Store::ensure_noting`].
     more_needs: Vec<LibKey, Global>,
@@ -974,6 +980,8 @@ impl<'n> Store<'n> {
             closures: super::foreign_closures::ClosureRows::new_in(Global),
             type_misses: HashMap::new_in(Global),
             cost: None,
+            goals: None,
+            goal_hits: Vec::new_in(Global),
             more_needs: Vec::new_in(Global),
             seeds: None,
             seed_error: None,

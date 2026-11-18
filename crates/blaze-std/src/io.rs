@@ -274,6 +274,8 @@ pub(crate) enum Ends {
     Once,
     /// A listen's: it ends with [`Done::Unlistened`] or [`Done::Failed`].
     Stream,
+    /// A watch's or a journal's: it ends with [`Done::Unwatched`] or [`Done::Failed`].
+    Watch,
 }
 
 /// Everything behind one [`Io`].
@@ -1558,6 +1560,24 @@ impl Io {
         None
     }
 
+    /// Whether the system keeps a journal of changes across a restart, so an
+    /// [`Effect::Journal`] from a saved cursor names what changed while nothing ran: macOS
+    /// (FSEvents' per-volume store) and Windows (NTFS's USN journal) do; Linux does not, and
+    /// there a journal costs a watch's start (an inotify walk of every folder) to say only
+    /// that everything is lost. The simulation's by the journal it plays
+    /// ([`blaze_core::sim::Sim::journal`]); a hosted program's world has none it can reach.
+    pub(crate) fn keeps_journal(&self) -> bool {
+        match &self.reach {
+            Reach::Shared { world, .. } => match &world.lock().driver {
+                #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+                Backend::Native(_) => cfg!(any(target_os = "macos", windows)),
+                Backend::Sim(sim) => sim.journal() != blaze_core::sim::Journal::None,
+                Backend::Guest(_) => false,
+            },
+            Reach::Hosted => false,
+        }
+    }
+
     /// Whether this world is the simulation's.
     pub(crate) fn is_sim(&self) -> bool {
         match &self.reach {
@@ -1757,6 +1777,7 @@ fn keep(got: &mut Vec<Completion>, abandoned: &mut Vec<(Tag, Ends)>, completion:
     let last = match abandoned[at].1 {
         Ends::Once => true,
         Ends::Stream => matches!(completion.done, Done::Unlistened | Done::Failed(_)),
+        Ends::Watch => matches!(completion.done, Done::Unwatched | Done::Failed(_)),
     };
     if last {
         abandoned.swap_remove(at);

@@ -24,6 +24,7 @@
 extern crate std;
 
 pub mod engine;
+pub mod last;
 pub mod pages;
 
 #[cfg(test)]
@@ -33,5 +34,5 @@ mod sim;
 
 pub use crate::engine::{
     Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Entered, Everything, Finished, Gen, Made, Phase, Plant,
-    Planned, Pool, Report, Row, SMap, SSet, STAGES, SVec, Scope, Stage, StageCount, Task, Tools, View, drive,
+    Planned, Pool, Report, Row, SMap, SSet, STAGES, SVec, Scope, Stage, StageCount, Task, Tools, View, drive, drive_growing, GROWN_CAP, WAVE_CAP,
 };

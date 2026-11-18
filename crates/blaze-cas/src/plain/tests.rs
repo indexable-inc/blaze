@@ -84,7 +84,7 @@ fn space(n: u32) -> Namespace {
 }
 
 fn cfg(n: u64, boot: u64, durable: bool) -> PlainConfig {
-    PlainConfig { dir: dir(), tags: n * TAGS, cap_bytes: u64::MAX, boot, nonce: 100 + n, durable, machine: vec![MACHINE.to_vec()], writes: writes(), reads: reads() }
+    PlainConfig { dir: dir(), tags: n * TAGS, cap_bytes: u64::MAX, boot, nonce: 100 + n, durable, machine: vec![MACHINE.to_vec()], writes: writes(), reads: reads(), liveness: super::Liveness::Everything }
 }
 
 fn key(n: u32) -> Key {
@@ -1694,7 +1694,7 @@ fn a_previous_layout_is_refused_by_name() {
     };
     let old = refused(b"BLZHEAD\x03 a content-addressed store's head".to_vec());
     assert_eq!(old, StoreError::Head { what: format::HEAD_FOREIGN, at: format::SLOT_AT[0] });
-    for (format, at) in [(3u32, 0usize), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)] {
+    for (format, at) in [(4u32, 0usize), (4, 1), (3, 0), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)] {
         let slot = Slot { generation: 2 + at as u64, log: 7, manifest_at: 0, manifest_len: 64, manifest_crc: 0 }.encode_as(format);
         let mut head = vec![0u8; format::HEAD_LEN];
         let start = format::SLOT_AT[at] as usize;
@@ -1702,9 +1702,9 @@ fn a_previous_layout_is_refused_by_name() {
         assert_eq!(refused(head), StoreError::Format { what: format::HEAD_SLOT, found: format, wanted: FORMAT }, "slot {at} of format {format}");
     }
 
-    // Manifests of formats 2 and 3 (3: before the sealed flag): this format's bytes with only
-    // the format word changed.
-    for old in [2u32, 3] {
+    // Manifests of formats 2, 3 and 4 (3: before the sealed flag; 4: before root expiry and
+    // leases): this format's bytes with only the format word changed.
+    for old in [2u32, 3, 4] {
         let mut manifest = format::Manifest::default().encode();
         manifest[4..8].copy_from_slice(&old.to_le_bytes());
         assert_eq!(format::Manifest::decode(&manifest), Err(StoreError::Format { what: "a plain store's manifest", found: old, wanted: FORMAT }));
@@ -1713,7 +1713,11 @@ fn a_previous_layout_is_refused_by_name() {
     let marked = format::Manifest {
         generation: 4,
         segments: Vec::new_in(Global),
-        roots: Vec::new_in(Global),
+        roots: vec![
+            format::Root { name: "kept".to_owned(), key: key(1).0, generation: 3, expires_ns: format::NEVER },
+            format::Root { name: "a checkout's answer".to_owned(), key: key(2).0, generation: 4, expires_ns: 99 },
+        ],
+        leases: vec![format::Lease { holder: 7, since: 4, opened_ns: 5, expires_ns: 6 }],
         retired: vec![
             format::Retired { id: 1, log: false, since_ns: 10, lost: None },
             format::Retired { id: 2, log: true, since_ns: 11, lost: None },
@@ -1840,7 +1844,10 @@ fn compaction_keeps_roots_and_the_grace_period() {
 fn pruning_keeps_what_roots_name() {
     let mut sim = Sim::new(13, Faults::default());
     let mut c = cfg(0, 1, false);
-    c.cap_bytes = 1;
+    // Above any one commit here (the first holds four records and the root, about 720 bytes;
+    // each later one record of at most 699 bytes), below what the 18 commits hold together: the
+    // store goes over the cap, and no commit is refused as larger than it alone.
+    c.cap_bytes = 2048;
     let mut w = [Actor::new(c, Plant::None)];
     settle(&mut sim, &mut w);
     w[0].store.root("kept", &[key(0), key(1)]).unwrap();

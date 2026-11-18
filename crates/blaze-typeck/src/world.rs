@@ -657,6 +657,14 @@ pub trait World {
         let (_, _, _) = (seal, owner, ordinal);
         Err(Missing)
     }
+    /// The request's table of trait goals shared by every body (blaze-solve share.rs), when
+    /// the world's request shares them: the solver looks each root goal up there before it
+    /// solves it and puts what it solved. Not a fact (nothing of it is in a read list: an
+    /// entry is taken only when its own read list answers the same in this body's facts).
+    /// DEFAULTED to none, so every world that does not share is unchanged.
+    fn goal_share(&self) -> Option<&dyn blaze_solve::share::GoalShare> {
+        None
+    }
     fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs>;
     /// The definition of trait `trait_` (`None`: not a trait).
     fn trait_def(&self, seal: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>>;
@@ -1605,6 +1613,11 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         let asked_at = self.stamp();
         let got = self.world.coroutine(Self::seal(), owner, ordinal);
         self.record_tabled(Question::Coroutine(owner, ordinal), got, asked_at)
+    }
+
+    /// The world's table of shared goals ([`World::goal_share`]), for the solver's source.
+    pub(crate) fn goal_share(&self) -> Option<&'w dyn blaze_solve::share::GoalShare> {
+        self.world.goal_share()
     }
     pub fn attrs(&mut self, item: ItemKey) -> Result<TypeAttrs, Stop> {
         let asked_at = self.stamp();

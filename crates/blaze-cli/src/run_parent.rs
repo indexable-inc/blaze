@@ -25,12 +25,15 @@
 //!   of its symbol and of every symbol it declares (`Declare`) before it (`Publish`); a later
 //!   need by that slot gets the record alone; a symbol the resolver does not know is `Failed`
 //!   with `Unresolved`, naming the need, every time it is needed, and never resolved again.
-//!   [`Needs::place_ahead`] publishes a start list's rows (start_list.rs) before any need is
-//!   read, and [`Needs::first`] is this run's first-answer order, the next list.
+//!   [`Needs::place_ahead`] publishes a start list's groups (start_list.rs: each first answer's
+//!   data, the statics it names, its code row) before any need is read, each as the run sent
+//!   it (its data in one `Data`, then its `Publish`, through the one writer), and
+//!   [`Needs::first`] is this run's first-answer order with each answer's statics, the next list.
 //! - [`ahead_of`]: the program's personality routine named (its slot declared, then
 //!   `Down::Personality`, before any `Publish`: [`Needs::name_personality`]), today's start list
-//!   placed ([`Needs::place_ahead`]), each row whose record's file is not in the folder left out
-//!   (rule 3: nothing is published that is not there; it is resolved at its first call), and
+//!   placed ([`Needs::place_ahead`]), each group whose record's or datum's file is not in the
+//!   folder, or that names a static no group kept before it sent, left out whole (rule 3:
+//!   nothing is published that is not there; it is resolved at its first call), and
 //!   the start's head (entry line and personality, run/special.rs `StartHead`): the list's
 //!   under today's certificate (no front end built), else the roots'.
 //! - [`status_of`]: how the child ended as `blaze run`'s status: an exit's status unchanged; an
@@ -72,7 +75,7 @@ use bstd::path::{Path, PathError};
 use bstd::procs::Ended;
 
 use crate::run_ids::{Checked, Grain, RunIds};
-use crate::start_list::{self, Row, TodayRows};
+use crate::start_list::{self, Line, Row, TodayRows};
 
 /// How long the parent waits for the program's next message before it looks at the child
 /// again (the launcher's own tick is 250 ms: `blaze_launch_rt::run_mode::TICK_MS`).
@@ -201,6 +204,9 @@ pub enum ParentError {
     StartList(start_list::CapError),
     /// A row placed ahead has no record answer after it was settled (a bug of `place_ahead`).
     UndeclaredSymbol { symbol: [u8; 32] },
+    /// Start-list rows of data or names placed with no code row after them (static `symbol`
+    /// the first): `read` and [`ahead_of`] leave no group open, so a bug.
+    StartGroupOpen { symbol: [u8; 32] },
     /// The walk forward from the roots stepped `most` functions the program has not called and
     /// did not reach `symbol` (rule 18).
     TooFar { symbol: [u8; 32], most: usize },
@@ -266,6 +272,7 @@ impl fmt::Display for ParentError {
             ParentError::NotEmitting(why) => write!(f, "{rule}: {why}"),
             ParentError::StartList(why) => write!(f, "{rule}: {why}"),
             ParentError::UndeclaredSymbol { symbol } => write!(f, "{rule}: the start list's row of symbol {} was placed ahead without a slot", Hex(symbol)),
+            ParentError::StartGroupOpen { symbol } => write!(f, "{rule}: the start list's rows naming static {} were placed with no code row after them (run_parent.rs `Needs::place_ahead`)", Hex(symbol)),
             ParentError::TooFar { symbol, most } => write!(f, "{rule}: the walk forward from the roots stepped {most} functions the program has not called and did not reach symbol {}", Hex(symbol)),
         }
     }
@@ -353,7 +360,8 @@ pub(crate) enum Resolved<'r> {
     /// the record's `Publish` (a static has no stub; run.md, "Statics in the run").
     /// `named`: every static the record and those data name, read from their own targets
     /// ([`Front::statics_named`]), sorted, each once: [`Needs::publish`] refuses the record
-    /// unless each is on the child before it, and a record naming any is no start-list row.
+    /// unless each is on the child before it; the start list keeps them with the record's row
+    /// (start_list.rs version 4), so a replay sends the same.
     Record { key: CodeKey, record: RecordId, declares: &'r [Symbol], data: &'r [Datum], named: &'r [Symbol] },
     /// No function of the program by that symbol: the need is answered `Failed` with
     /// `Failure::Unresolved`, naming it.
@@ -620,6 +628,83 @@ impl fmt::Display for Tally {
     }
 }
 
+/// Whether the run built the front end (the roots and the walk: [`ensure`]'s first build), and
+/// for what (rule 16: the profile says why a warm run cost one).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Built {
+    /// Never built: every answer came from the start list.
+    No,
+    /// Built for the start's head: no list under today's certificate was placed.
+    Head,
+    /// Built by the first resolve, of `symbol`'s need.
+    Need { symbol: [u8; 32] },
+}
+
+/// What the start list held at the run's start, as the profile says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ListHeld {
+    /// No list under the list's name.
+    None,
+    /// A list under today's certificate: its groups placed.
+    Today,
+    /// A list under another certificate: its symbols only, each resolved at its first call.
+    Other,
+    /// A list that did not read (an older form among them), rebuilt by this run.
+    Unread(start_list::ReadError),
+}
+
+/// The start list's half of the closing count: `start list: placed P of F first answers (D
+/// data); resolved after the list R; front end built: no` (or `yes (..)`, naming why).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StartTally {
+    /// Code rows placed from today's list.
+    pub placed: usize,
+    /// This run's first answers with a record, the placed ones included.
+    pub answered: usize,
+    /// Datum rows placed from today's list.
+    pub data: usize,
+    /// Symbols asked of the resolver (each once; an unknown one too).
+    pub resolved: usize,
+    pub built: Built,
+    pub held: ListHeld,
+}
+
+impl fmt::Display for StartTally {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "start list: placed {} of {} first answers ({} data); resolved after the list {}; front end built: ",
+            self.placed, self.answered, self.data, self.resolved
+        )?;
+        match self.built {
+            Built::No => f.write_str("no")?,
+            Built::Head => f.write_str("yes (the start's head: no list under today's certificate)")?,
+            Built::Need { symbol } => {
+                // The symbol's first 12 hex digits.
+                f.write_str("yes (first need: ")?;
+                for byte in &symbol[..6] {
+                    write!(f, "{byte:02x}")?;
+                }
+                f.write_str(")")?;
+            }
+        }
+        match self.held {
+            ListHeld::None => f.write_str("; no list held"),
+            ListHeld::Today => Ok(()),
+            ListHeld::Other => f.write_str("; the list held is another certificate's, its rows resolved at their first calls"),
+            ListHeld::Unread(why) => write!(f, "; the list held was not read ({why}), and this run's replaces it"),
+        }
+    }
+}
+
+/// The run's closing count for the profile (phases.rs): the code records' line and the start
+/// list's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RunTally {
+    pub codes: Tally,
+    pub start: StartTally,
+}
+
 /// The body ids and the maker: made on the first row stepped.
 struct Heavy<I, M> {
     ids: I,
@@ -665,6 +750,8 @@ pub(crate) struct Lazy<'r, 'a, F: Front, D: Folder> {
     /// [`Resolved::Record`].
     named: AVec<'a, Symbol>,
     tally: Tally,
+    /// Whether, and for what, the front end was built ([`ensure`]'s first build).
+    built: Built,
 }
 
 /// A row stepped ahead of its first call, as `step` answered it: its entry kept when it is not
@@ -695,12 +782,21 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
             statics: Vec::new_in(alloc),
             named: Vec::new_in(alloc),
             tally: Tally::default(),
+            built: Built::No,
         }
     }
 
     /// The start's head from the roots (made now if they are not yet).
     pub(crate) fn head(&mut self) -> Result<StartHead, ParentError> {
+        if self.started.is_none() && self.built == Built::No {
+            self.built = Built::Head;
+        }
         Ok(ensure(&mut self.started, &mut self.front, self.alloc)?.start.head())
+    }
+
+    /// Whether, and for what, the front end was built.
+    pub(crate) fn built(&self) -> Built {
+        self.built
     }
 
     /// Whether nothing of the front end has been made: no roots, no walk, no body ids, no maker.
@@ -721,16 +817,31 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         &self.folder
     }
 
-    /// `rows` placed ahead from today's start list.
-    fn placed(&mut self, rows: &[Row]) {
-        for row in rows {
-            self.placed.push(row.symbol.0);
+    /// `lines` placed ahead from today's start list: each code row's symbol among the placed
+    /// (the walk steps such a row only to reach a callee), each datum's among the statics told
+    /// (a later record reaching it sends it again never), each row reached and found.
+    fn placed(&mut self, lines: &[Line]) {
+        let mut rows = 0usize;
+        for line in lines {
+            match line {
+                Line::Code(row) => {
+                    self.placed.push(row.symbol.0);
+                    rows += 1;
+                }
+                Line::Datum(datum) => {
+                    if let Err(at) = self.told.binary_search(&datum.symbol.0) {
+                        self.told.insert(at, datum.symbol.0);
+                    }
+                    rows += 1;
+                }
+                Line::Named(_) => {}
+            }
         }
         self.placed.sort_unstable();
         self.placed.dedup();
-        self.tally.reached += rows.len();
-        self.tally.found += rows.len();
-        self.front.watch().see(Step::Placed { rows: u32::try_from(rows.len()).unwrap_or(u32::MAX) });
+        self.tally.reached += rows;
+        self.tally.found += rows;
+        self.front.watch().see(Step::Placed { rows: u32::try_from(rows).unwrap_or(u32::MAX) });
     }
 }
 
@@ -848,7 +959,11 @@ fn count(tally: &mut Tally, how: How) {
 
 impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
-        let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, told, data, statics, named, tally } = self;
+        let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, told, data, statics, named, tally, built } = self;
+        // The profile's why (rule 16): the first need that built the front end, by its symbol.
+        if started.is_none() && *built == Built::No {
+            *built = Built::Need { symbol: symbol.0 };
+        }
         let started = ensure(started, front, *alloc)?;
         let builder = *builder;
         let code = CodeSymbol(symbol.0);
@@ -995,15 +1110,20 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
 
 /// Before the spawn, onto `out`: the personality routine named ([`Needs::name_personality`],
 /// first, so no `Publish` precedes it), then today's start list (`today`, the rows under
-/// today's certificate) placed, each row whose record's file `lazy`'s folder does not hold left
-/// out (it is resolved at its first call like any other). The start's head: the list's when
-/// there is one (nothing of the front end is made), else the roots'. `kept` holds the rows
-/// placed.
+/// today's certificate) placed. A first answer's group (start_list.rs: its data, the statics
+/// it names, its code row) is kept WHOLE or left out whole: out when the folder does not hold
+/// its record's file or one of its data's files, or when it names a static that neither a
+/// group kept before it nor its own data send (a group left out takes its data with it, so
+/// a later namer of those goes too); the thread-local descriptor is no datum, and the one
+/// writer tells it before the first record naming it. Whatever is left out is resolved at its
+/// first call like any other (rule 3: nothing is published that is not there). The start's
+/// head: the list's when there is one (nothing of the front end is made), else the roots'.
+/// `kept` holds the rows placed.
 pub(crate) fn ahead_of<F: Front, D: Folder, A: Allocator>(
     today: Option<TodayRows<'_>>,
     lazy: &mut Lazy<'_, '_, F, D>,
     needs: &mut Needs<'_>,
-    kept: &mut AVec<'_, Row>,
+    kept: &mut AVec<'_, Line>,
     out: &mut std::vec::Vec<u8, A>,
 ) -> Result<StartHead, ParentError> {
     let Some(today) = today else {
@@ -1013,11 +1133,39 @@ pub(crate) fn ahead_of<F: Front, D: Folder, A: Allocator>(
     };
     let head = today.head();
     needs.name_personality(head.personality, out)?;
-    for row in today.iter() {
-        if lazy.folder().holds(&row.record)? {
-            kept.push(row);
+    let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
+    // The statics the groups kept so far send, sorted.
+    let mut on: AVec<'_, [u8; 32]> = Vec::new_in(lazy.alloc);
+    let mut group = kept.len();
+    let mut whole = true;
+    for line in today.lines() {
+        match line {
+            Line::Datum(datum) => whole &= lazy.folder().holds(&datum.record)?,
+            Line::Named(_) => {}
+            Line::Code(row) => whole &= lazy.folder().holds(&row.record)?,
         }
+        kept.push(line);
+        let Line::Code(_) = line else { continue };
+        let lines = &kept[group..];
+        let stands = |symbol: &Symbol| {
+            symbol.0 == descriptor || on.binary_search(&symbol.0).is_ok() || lines.iter().any(|it| matches!(it, Line::Datum(datum) if datum.symbol == *symbol))
+        };
+        if whole && !lines.iter().any(|it| matches!(it, Line::Named(symbol) if !stands(symbol))) {
+            for it in lines {
+                if let Line::Datum(datum) = it
+                    && let Err(at) = on.binary_search(&datum.symbol.0)
+                {
+                    on.insert(at, datum.symbol.0);
+                }
+            }
+        } else {
+            kept.truncate(group);
+        }
+        group = kept.len();
+        whole = true;
     }
+    // `read` refused a list ending in data or names with no code row; nothing is left open.
+    kept.truncate(group);
     needs.place_ahead(kept.as_slice(), out)?;
     lazy.placed(kept.as_slice());
     Ok(head)
@@ -1061,21 +1209,32 @@ pub(crate) struct Needs<'a> {
     batch: AVec<'a, Datum>,
     /// The next message's id.
     next_id: u64,
+    /// The start list's window closed: a first answer's group did not fit under its cap, so no
+    /// later answer (which may stand on that group's statics) is kept.
+    closed: bool,
+    /// A placed group's data and names, gathered from its rows ([`Needs::place_ahead`]), reused.
+    group_data: AVec<'a, Datum>,
+    group_named: AVec<'a, Symbol>,
+    alloc: Alloc<'a>,
+    /// The start list's count ([`StartTally`]): code rows and datum rows placed, first answers,
+    /// symbols asked of the resolver.
+    placed: usize,
+    placed_data: usize,
+    answered: usize,
+    resolved: usize,
 }
 
 /// What a `Publish` stands on ([`Needs::publish`]): how the statics its record names are on the
 /// child before it.
 #[derive(Clone, Copy)]
 enum Stands<'n> {
-    /// A record answered now: `data` (its datums and theirs, each sent in one `Data` before it
-    /// unless sent already) and `named`, every static the record and those datums name: each
-    /// must be on the child once `data` is, or the publish is refused by name.
+    /// A record answered now, or a start-list group placed (its rows hold the same two lists,
+    /// as the run that wrote it sent them): `data` (its datums and theirs, each sent in one
+    /// `Data` before it unless sent already) and `named`, every static the record and those
+    /// datums name: each must be on the child once `data` is, or the publish is refused by name.
     Answered { named: &'n [Symbol], data: &'n [Datum] },
     /// A record published before in this run: what it names went then.
     Again,
-    /// A start-list row: the list's form (start_list.rs, version 3) holds no record naming a
-    /// static, as [`Needs::answer`] keeps none.
-    StartRow,
 }
 
 impl<'a> Needs<'a> {
@@ -1089,7 +1248,22 @@ impl<'a> Needs<'a> {
             cleared: Vec::new_in(alloc),
             batch: Vec::new_in(alloc),
             next_id: 0,
+            closed: false,
+            group_data: Vec::new_in(alloc),
+            group_named: Vec::new_in(alloc),
+            alloc,
+            placed: 0,
+            placed_data: 0,
+            answered: 0,
+            resolved: 0,
         }
+    }
+
+    /// The start list's line of the closing count: what was placed, answered and asked, with
+    /// `built` (the resolver's: whether the front end was built, and for what) and `held` (what
+    /// the list was at the start).
+    pub(crate) fn start_tally(&self, built: Built, held: ListHeld) -> StartTally {
+        StartTally { placed: self.placed, answered: self.answered, data: self.placed_data, resolved: self.resolved, built, held }
     }
 
     /// THE ONE WRITER OF `Publish` (rule 76; run.md, "Statics in the run"): the pairs not yet
@@ -1142,11 +1316,6 @@ impl<'a> Needs<'a> {
                     return Err(ParentError::NotCleared { record: record.0 });
                 }
             }
-            Stands::StartRow => {
-                if let Err(at) = self.cleared.binary_search(&record.0) {
-                    self.cleared.insert(at, record.0);
-                }
-            }
         }
         let id = self.id();
         Down::Publish { slot, tier: Tier::Zero, record }.encode(id, out)?;
@@ -1159,9 +1328,10 @@ impl<'a> Needs<'a> {
         id
     }
 
-    /// This run's first answers with a record, in order (at most the start list's cap): the
-    /// rows of the list written at exit.
-    pub(crate) fn first(&self) -> &[Row] {
+    /// This run's first answers with a record, in order, each as its group (its data sent, the
+    /// statics it names, its code row; at most the start list's cap): the rows of the list
+    /// written at exit.
+    pub(crate) fn first(&self) -> &[Line] {
         self.first.as_slice()
     }
 
@@ -1202,13 +1372,21 @@ impl<'a> Needs<'a> {
         }
     }
 
-    /// A record answered for the first time: a row of the next start list while the window is
-    /// open (its cap: past it the rows are not kept, and nothing fails).
-    fn first_answer(&mut self, row: Row) -> Result<(), ParentError> {
-        if self.first.is_full() {
+    /// A record answered for the first time, just published: a group of the next start list
+    /// while the window is open, the data its `Publish` stood on as sent now (the batch: each
+    /// datum once, in the group of its first namer) and `named`, then its row. The window
+    /// closes at the first group that does not fit under the cap: no later answer is kept (it
+    /// may stand on that group's statics), and nothing fails.
+    fn first_answer(&mut self, row: Row, named: &[Symbol]) -> Result<(), ParentError> {
+        self.answered += 1;
+        if self.closed {
             return Ok(());
         }
-        self.first.push(row).map_err(ParentError::StartList)
+        if !self.first.fits(self.batch.len() + named.len() + 1) {
+            self.closed = true;
+            return Ok(());
+        }
+        self.first.push_answer(self.batch.as_slice(), named, row).map_err(ParentError::StartList)
     }
 
     /// The pairs numbered since the last `Declare`, told in one.
@@ -1237,22 +1415,52 @@ impl<'a> Needs<'a> {
     }
 
     /// Today's start list placed before any need is read (run.md D124: "its rows are published
-    /// as they are before `Begin`, nothing keyed or looked up"): every row's slot told in one
-    /// `Declare`, then each row's `Publish`, in the list's order; each row is this run's first
-    /// answer of its symbol, so a need of it later resolves nothing. `rows` are those whose
-    /// record's file is there ([`ahead_of`]).
-    pub(crate) fn place_ahead<A: Allocator>(&mut self, rows: &[Row], out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
-        for row in rows {
-            let slot = self.slot_of(row.symbol)?;
-            self.settle(row.symbol, Answer::Record { record: row.record, slot });
-            self.first_answer(*row)?;
+    /// as they are before `Begin`, nothing keyed or looked up"): every code row's slot told in
+    /// one `Declare`, then each group in the list's order as its run sent it, through the one
+    /// writer ([`Needs::publish`] with the group's data and names: its data not on the child
+    /// yet in one `Data`, the descriptor told if it names it, each static it names checked on
+    /// the child, then its `Publish`); each group is this run's first answer of its symbol, so a
+    /// need of it later resolves nothing. `lines` are the groups kept whole ([`ahead_of`]); a
+    /// row of data or names after the last code row is refused by name.
+    pub(crate) fn place_ahead<A: Allocator>(&mut self, lines: &[Line], out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+        for line in lines {
+            if let Line::Code(row) = line {
+                let slot = self.slot_of(row.symbol)?;
+                self.settle(row.symbol, Answer::Record { record: row.record, slot });
+            }
         }
         self.declare(out)?;
-        for row in rows {
+        self.group_data.clear();
+        self.group_named.clear();
+        for line in lines {
+            let row = match *line {
+                Line::Datum(datum) => {
+                    self.group_data.push(datum);
+                    continue;
+                }
+                Line::Named(symbol) => {
+                    self.group_named.push(symbol);
+                    continue;
+                }
+                Line::Code(row) => row,
+            };
             let Some(Seen { answer: Answer::Record { record, slot }, .. }) = self.met.get(&row.symbol.0).copied() else {
                 return Err(ParentError::UndeclaredSymbol { symbol: row.symbol.0 });
             };
-            self.publish(slot, record, Stands::StartRow, out)?;
+            // The group's two lists out of `self` while the one writer borrows it, then back.
+            let data = core::mem::replace(&mut self.group_data, Vec::new_in(self.alloc));
+            let named = core::mem::replace(&mut self.group_named, Vec::new_in(self.alloc));
+            let placed = self.publish(slot, record, Stands::Answered { named: named.as_slice(), data: data.as_slice() }, out).and_then(|()| self.first_answer(row, named.as_slice()));
+            self.placed += 1;
+            self.placed_data += data.len();
+            self.group_data = data;
+            self.group_named = named;
+            self.group_data.clear();
+            self.group_named.clear();
+            placed?;
+        }
+        if let Some(open) = self.group_data.first().map(|datum| datum.symbol).or(self.group_named.first().copied()) {
+            return Err(ParentError::StartGroupOpen { symbol: open.0 });
         }
         Ok(())
     }
@@ -1281,29 +1489,27 @@ impl<'a> Needs<'a> {
         match self.meet(symbol)?.answer {
             Answer::Record { record, slot } => self.publish(slot, record, Stands::Again, out),
             Answer::Unknown => self.failed(need, out),
-            Answer::NotAsked => match resolve.resolve(&symbol)? {
-                Resolved::Unknown => {
-                    self.settle(symbol, Answer::Unknown);
-                    self.failed(need, out)
-                }
-                Resolved::Record { key, record, declares, data, named } => {
-                    let slot = self.slot_of(symbol)?;
-                    for each in declares {
-                        self.slot_of(*each)?;
+            Answer::NotAsked => {
+                self.resolved += 1;
+                match resolve.resolve(&symbol)? {
+                    Resolved::Unknown => {
+                        self.settle(symbol, Answer::Unknown);
+                        self.failed(need, out)
                     }
-                    self.settle(symbol, Answer::Record { record, slot });
-                    // A record that names a static is not a start-list row: the list places a
-                    // row's record alone, before any need and any `Data`, so its statics would
-                    // not be on the child first. That holds for a static sent by an EARLIER
-                    // answer of this run too: the next run's list has no such answer before the
-                    // row (start_list.rs's form has no static rows yet; run.md, "Statics in the
-                    // run").
-                    if named.is_empty() {
-                        self.first_answer(Row { symbol, key, record })?;
+                    Resolved::Record { key, record, declares, data, named } => {
+                        let slot = self.slot_of(symbol)?;
+                        for each in declares {
+                            self.slot_of(*each)?;
+                        }
+                        self.settle(symbol, Answer::Record { record, slot });
+                        // Published first, so the batch is what this `Publish` stood on; then
+                        // the next list's group: those data, every static named, the row
+                        // (start_list.rs version 4; run.md, "Statics in the run").
+                        self.publish(slot, record, Stands::Answered { named, data }, out)?;
+                        self.first_answer(Row { symbol, key, record }, named)
                     }
-                    self.publish(slot, record, Stands::Answered { named, data }, out)
                 }
-            },
+            }
         }
     }
 
@@ -1318,3 +1524,9 @@ impl<'a> Needs<'a> {
 #[cfg(test)]
 #[path = "run_parent_tests.rs"]
 mod tests;
+
+/// A warm run replayed from today's list: every first call answered with no resolve, statics
+/// included, and the control without the static-naming groups (run_replay_tests.rs).
+#[cfg(test)]
+#[path = "run_replay_tests.rs"]
+mod replay_tests;

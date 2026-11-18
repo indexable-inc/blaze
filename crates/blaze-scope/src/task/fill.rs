@@ -81,6 +81,12 @@ pub trait Par {
     fn names_part(&self, part: NamesPart) {
         let _ = part;
     }
+
+    /// A one-group solve decoded the crate's module tree record of `bytes` bytes
+    /// (tree_record.rs): a count of the solve's cost (rule 16), nothing by default.
+    fn tree_record_read(&self, bytes: usize) {
+        let _ = bytes;
+    }
 }
 
 /// The stretches of one crate's solve finer than a [`Stage`] ([`Par::names_part`]), in the

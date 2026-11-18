@@ -29,6 +29,7 @@ pub mod object_shape;
 pub mod prefilter;
 pub mod readlog;
 pub mod search;
+pub mod share;
 pub mod term;
 pub mod trait_goals;
 pub mod tys;

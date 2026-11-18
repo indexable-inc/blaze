@@ -1,0 +1,21 @@
+{
+ "id": "rc5-unrooted-reads",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RC5 (C5: disk cleanup that never blocks)",
+ "where": "crates/blaze-cas/src/plain/core.rs (the reach sweep), crates/blaze-cli/src/code_store.rs, crates/blaze-cli/src/engine_answer.rs",
+ "what": "Keeping only what roots reach could not be turned on for the command: records a later command reads by key are rooted by nothing. The engine's task records (Kept::records) were outside its answer's root, and the code store's entries and pointers have no root at all, so a reach sweep would drop them after each command and the next command would rebuild them.",
+ "cost": "the command's store stays on Liveness::Everything (unbounded disk) until the code store roots its entries; found by reading, before any run",
+ "cause": "a store whose records live by key, with no statement of who keeps each one alive",
+ "whys": [
+  "why wrong: a sweep by reach would drop records the next command reads",
+  "why possible: a get by key reads any record present, rooted or not, so nothing noticed that a reader relied on an unrooted record",
+  "why not caught: the store kept everything (the old pruning ran only past a cap that defaults to none)",
+  "why easy: rooting was optional, and the tests that read across processes never sweep (after_answer with 0 slices)",
+  "property: what keeps a record alive is not part of the record's interface"
+ ],
+ "class": "liveness by accident: data kept alive by no reclamation, not by a reference",
+ "prevention": "engine_answer.rs roots Kept::records under the answer's pages root; a commit's root that reuses a record dead in its view marks the segment touched, and a slice that would replace it aborts (Segment::touched); open: the code store must root its entries (a root per running program or checkout), then plain_place.rs config takes Liveness::Reached, and a test reads across processes WITH slices",
+ "workaround": "Liveness::Everything for the command's store",
+ "fix": "see prevention",
+ "state": "written on lane RC5, not compiled (the lane runs nothing)"
+}

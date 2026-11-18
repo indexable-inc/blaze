@@ -20,10 +20,10 @@
 
 use core::fmt;
 use core::marker::PhantomData;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, PlainConfig, Probes, Settings};
+use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError};
 use blaze_core::{Driver, FileName};
 use blaze_drive::Key;
 use blaze_keyed::kind::{Namespace, Tag};
@@ -54,6 +54,8 @@ pub enum PlaceError {
     Open { why: StoreError },
     /// The store's owner refused (two values, a namespace not writable, the arena, the store).
     Lent(LentError),
+    /// A snapshot of the committed segments could not be taken (blaze-cas plain/snapshot.rs).
+    Snapshot(SnapshotError),
 }
 
 impl fmt::Display for PlaceError {
@@ -61,6 +63,7 @@ impl fmt::Display for PlaceError {
         match self {
             PlaceError::Open { why } => write!(f, "the store under the home's .blaze/{STORE_DIR} would not open: {why}"),
             PlaceError::Lent(error) => write!(f, "the store under the home's .blaze/{STORE_DIR}: {error}"),
+            PlaceError::Snapshot(error) => write!(f, "the store under the home's .blaze/{STORE_DIR}: {error}"),
         }
     }
 }
@@ -95,6 +98,11 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts) -> PlainC
         machine: Vec::new_in(Global),
         writes: settings.writes(),
         reads: settings.reads(),
+        // Everything, until every record a later command reads by key is reached from a root:
+        // the code store's entries and pointers (code_store.rs) are rooted by nothing yet, so a
+        // reach sweep would let the compiled code go after each command. Then `Reached`, which
+        // keeps what the answers' roots reach and what a running command's lease keeps.
+        liveness: Liveness::Everything,
     }
 }
 
@@ -218,16 +226,18 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         self.get(Key(at.0))
     }
 
-    /// Keeps `keys` under the root `name` from the next commit on: compaction keeps every
-    /// record a root names (a running program's code records; a checkout's last answer for each
-    /// request shape: drive.md ruling 3).
+    /// Keeps `keys` under the root `name` from the next commit on, for blaze-cas
+    /// `ROOT_LIFE_NS` from it (each commit that names them again renews it): cleanup keeps
+    /// every record an unexpired root names (a running program's code records; a checkout's
+    /// last answer for each request shape: drive.md ruling 3), and nothing else past a
+    /// command's lease.
     pub fn pin(&self, name: &str, keys: &[Key]) -> Result<(), PlaceError> {
         if self.plant == PlacePlant::ForgetsPin {
             return Ok(());
         }
         let mut cas = Vec::with_capacity_in(keys.len(), Global);
         cas.extend(keys.iter().map(|key| CasKey(key.0)));
-        self.lent.root(name, &cas)?;
+        self.lent.root_for(name, &cas, ROOT_LIFE_NS)?;
         Ok(())
     }
 
@@ -245,6 +255,13 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         Ok(())
     }
 
+    /// A `Send + Sync` read-only snapshot of what is committed now, its list in `alloc`
+    /// (blaze-cas `Lent::snapshot_in`: every segment mapped first). The arena's puts not yet
+    /// committed are not in it.
+    pub fn snapshot_in<B: Allocator>(&self, alloc: B) -> Result<Snapshot<B>, PlaceError> {
+        self.lent.snapshot_in(alloc).map_err(PlaceError::Snapshot)
+    }
+
     /// This command's counts so far (before the commit after the answer: [`after_answer`]).
     pub fn counts(&self) -> Counts {
         let (mapped, named) = self.lent.mapped_of_named();
@@ -258,19 +275,26 @@ pub struct AfterAnswer {
     pub segments_written: u32,
     /// Whether the exit tail's seal flipped.
     pub sealed: bool,
+    /// Cleanup slices the commit's flip named (0 or 1: one a command).
     pub compaction_slices: u32,
 }
 
 /// After the answer is printed, never waited on by it (the command's outer function calls it
-/// once every handle over `lent` is gone): the commit of what is left as one segment a
-/// namespace and one flip, the exit tail's seal, then at most `slices` compaction slices (each
-/// bounded by blaze-cas `SLICE_BYTES`).
+/// once every handle over `lent` is gone): with `slices` past zero, one cleanup slice (bounded
+/// by blaze-cas `SLICE_BYTES`) written with no lock; this command's lease let go of (its answer's
+/// roots, set before, keep what it made); the commit of what is left as one segment a namespace
+/// and ONE flip, which names the slice too; then the exit tail's seal. No lock is taken for
+/// cleanup, so no command waits on it (blaze-cas `Driven::fold_slice`).
 pub fn after_answer<D: Driver>(lent: &Lent<D, Global>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+    if slices > 0 {
+        lent.fold_slice()?;
+    }
+    lent.release_lease();
     let committed = lent.commit()?;
     let sealed = lent.seal()?;
-    let compaction_slices = match slices {
-        0 => 0,
-        _ => u32::try_from(lent.compact(slices)?.len()).unwrap_or(u32::MAX),
+    let compaction_slices = match lent.take_sliced() {
+        Some(slice) if slice.segments > 0 && !slice.aborted => 1,
+        _ => 0,
     };
     Ok(AfterAnswer { segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX), sealed, compaction_slices })
 }

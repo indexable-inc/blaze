@@ -15,7 +15,7 @@ use crate::sequences::{
     ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, NE, NO_WORD, OPEN, OTHER, SEP, SEQS, TRIE, WORD,
 };
 use crate::{
-    Arg, Block, Finding, Findings, Fix, LintError, Linted, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
+    Arg, Block, Cost, Finding, Findings, Fix, LintError, Linted, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
     Template, TestBits, Unit, Walk, count,
 };
 
@@ -172,6 +172,7 @@ pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &
         in_use: false,
         defining: false,
         last_fn: None,
+        cost: Cost::NONE,
     };
     pass.lex(unit.holes)?;
     pass.walk();
@@ -182,7 +183,9 @@ pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &
     let from = count(out.list.len())?;
     pass.emit(out)?;
     let to = count(out.list.len())?;
-    Ok(Linted { findings: Run { from, to }, children: pass.children, test_at_end })
+    // Holes are tokens of the walk too, but not of the lex: the item's own tokens alone.
+    let tokens = count(pass.toks.len().saturating_sub(unit.holes.len()))?;
+    Ok(Linted { findings: Run { from, to }, children: pass.children, test_at_end, cost: pass.cost, tokens })
 }
 
 /// The bytes of `unit` outside its holes (holes not yet checked: a bad one only mis-sizes).
@@ -214,6 +217,8 @@ struct Pass<'u, 'a> {
     defining: bool,
     /// The last `fn` read: where a local's declaration is looked for from.
     last_fn: Option<usize>,
+    /// The sites each rule tried ([`Cost`]): one count at each dispatch into a rule.
+    cost: Cost,
 }
 
 impl<'u, 'a> Pass<'u, 'a> {
@@ -250,6 +255,7 @@ impl<'u, 'a> Pass<'u, 'a> {
                 TokenKind::Whitespace | TokenKind::BlockComment { .. } => continue,
                 TokenKind::LineComment { .. } => {
                     if self.rules.runs(Rule::Allocs) {
+                        self.cost.add(Rule::Allocs);
                         self.alloc_comment(start, end);
                     }
                     continue;
@@ -533,6 +539,7 @@ impl<'u, 'a> Pass<'u, 'a> {
                 K::P(b'[') => {
                     self.deeper();
                     if self.rules.runs(Rule::Stops) {
+                        self.cost.add(Rule::Stops);
                         self.index(i);
                     }
                 }
@@ -605,6 +612,7 @@ impl<'u, 'a> Pass<'u, 'a> {
             // in sequences.rs): only a recursive call can be its use.
             self.defining = false;
             if self.rules.runs(Rule::Recursion) {
+                self.cost.add(Rule::Recursion);
                 self.recursion_name(i, t, w);
             }
             return;
@@ -613,9 +621,16 @@ impl<'u, 'a> Pass<'u, 'a> {
         let rules = self.rules;
         match w {
             "use" => self.in_use = true,
-            "as" if rules.runs(Rule::Casts) => self.cast(i, t),
-            "clone" if rules.runs(Rule::Clones) => self.clone_call(i, t),
+            "as" if rules.runs(Rule::Casts) => {
+                self.cost.add(Rule::Casts);
+                self.cast(i, t);
+            }
+            "clone" if rules.runs(Rule::Clones) => {
+                self.cost.add(Rule::Clones);
+                self.clone_call(i, t);
+            }
             "Global" if rules.runs(Rule::Allocs) && !self.in_use => {
+                self.cost.add(Rule::Allocs);
                 self.push(Template::AllocGlobal, t.start, t.end, None);
             }
             "fn" => self.fn_word(i, t),
@@ -637,18 +652,40 @@ impl<'u, 'a> Pass<'u, 'a> {
                     self.fns[sig.item as usize].has_self = true;
                 }
             }
-            "unwrap" | "expect" if rules.runs(Rule::Stops) => self.stop(i, t, w),
-            "std" | "alloc" if rules.runs(Rule::Ambient) => self.ambient_head(i, t, w),
-            "unsafe" if rules.runs(Rule::UnsafeComment) => self.unsafe_word(i, t),
+            "unwrap" | "expect" if rules.runs(Rule::Stops) => {
+                self.cost.add(Rule::Stops);
+                self.stop(i, t, w);
+            }
+            "std" | "alloc" if rules.runs(Rule::Ambient) => {
+                self.cost.add(Rule::Ambient);
+                self.ambient_head(i, t, w);
+            }
+            "unsafe" if rules.runs(Rule::UnsafeComment) => {
+                self.cost.add(Rule::UnsafeComment);
+                self.unsafe_word(i, t);
+            }
             _ => {}
         }
+        if w == "fn" {
+            // `fn_word` reads the signature for each of these rules that runs.
+            for rule in [Rule::Allocs, Rule::Untyped, Rule::Recursion] {
+                if rules.runs(rule) {
+                    self.cost.add(rule);
+                }
+            }
+        } else if w == "type" && rules.runs(Rule::Untyped) {
+            self.cost.add(Rule::Untyped);
+        }
         if rules.runs(Rule::Ambient) && COLLECTIONS.contains(&w) && !self.in_use && !was_defining {
+            self.cost.add(Rule::Ambient);
             self.collection(i, t, w);
         }
         if rules.runs(Rule::Renamed) && rules.renames().iter().any(|r| r.old == w) {
+            self.cost.add(Rule::Renamed);
             self.renamed(i, t, w);
         }
         if rules.runs(Rule::Recursion) {
+            self.cost.add(Rule::Recursion);
             self.recursion_name(i, t, w);
         }
     }
@@ -1449,6 +1486,7 @@ impl<'u, 'a> Pass<'u, 'a> {
         if !self.rules.runs(seq.template.rule()) {
             return false;
         }
+        self.cost.add(seq.template.rule());
         let pass = match seq.guard {
             Guard::None => true,
             Guard::NotMethod => !self.method(first) && !self.is_word(self.back(first, 1), "fn"),

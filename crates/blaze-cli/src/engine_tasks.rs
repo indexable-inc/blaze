@@ -109,7 +109,7 @@ impl Tasks<'_, '_> {
             // here is a failure row, named, never skipped.
             // The units, scripts and names stages run on the coordinator (engine_units.rs,
             // engine_scripts.rs, engine_names.rs), never through this runner.
-            Stage::Units | Stage::Scripts | Stage::Names | Stage::Heads | Stage::Bodies => failed(task, alloc),
+            Stage::Units | Stage::Scripts | Stage::Names | Stage::Heads | Stage::Bodies | Stage::Lints => failed(task, alloc),
         });
         buffer.done.push(match ran {
             Ok(done) => done,
@@ -143,18 +143,23 @@ impl Tasks<'_, '_> {
     }
 }
 
-/// A failed result: no cell, one finding (the failure itself), the failure's out.
-///
-/// Its read list is empty: such a row stands forever or is owed on every request. A stage that
-/// knows what the task read before it failed passes that list through [`failed_with`] instead
-/// (plan row A8; the names stage does).
+/// A failed result: no cell, one finding (the failure itself), the failure's out. It reads
+/// nothing, so it is owed: entered again by every request (a panic, a machine fault, a task with
+/// no runner); a refusal that is a function of cells is [`failed_with`]'s (plan row A8).
 pub(crate) fn failed<'a>(task: &Task, alloc: SharedAlloc<'a>) -> Done<'a> {
     failed_with(task, SVec::new_in(alloc), alloc)
 }
 
-/// A failed result with the reads it saw before it failed, sorted by cell id, each once: the
-/// row stands until one of them moves, and is then entered again once (invariant 7).
+/// A failed result that stands on what its failure saw (plan row A8): `reads`, each cell with
+/// the digest the view held when the task refused (an absent cell read as ABSENT). They are
+/// sorted by cell id and kept once each here, whatever order the caller gathered them in, so a
+/// read list names each cell once (rules 21, 25). The row stands until one of them moves, and is
+/// then entered again once (invariant 7); with no read it is [`failed`]'s, owed. No cell, one
+/// finding (the failure itself), the failure's out.
 pub(crate) fn failed_with<'a>(task: &Task, reads: SVec<'a, (CellId, ContentId)>, alloc: SharedAlloc<'a>) -> Done<'a> {
+    let mut reads = reads;
+    reads.sort_unstable_by_key(|(id, _)| *id);
+    reads.dedup_by_key(|(id, _)| *id);
     Done {
         name: task.planned.name,
         key: task.key,

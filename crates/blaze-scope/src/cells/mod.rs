@@ -61,7 +61,7 @@ pub use groups::{ABSENT as GROUP_ABSENT, GroupRead, GroupSeen, GroupShape, Group
 use groups::OwnError;
 pub use lazy_deps::{LazyDep, MOST_ROUNDS as MOST_WANT_ROUNDS, OnDemand, OnDemandError, Refused as OnDemandRefused, Want, names_on_demand};
 pub use lazy::{DemandError, Demanded, DemandedOpts, MOST_DEPTH as MOST_DEMAND_DEPTH, MOST_SOLVES as MOST_DEMAND_SOLVES, NoRecordOf, demand};
-pub use edit::{Edit, EditError, Edited, GroupRecords, GroupRef, GroupSolver, MOST_WIDENINGS, MemberRefusal, Members, OneGroup, OneGroupRefusal, most_entries, re_solve};
+pub use edit::{Edit, EditError, Edited, GroupRecords, GroupRef, GroupSolver, MOST_WIDENINGS, MemberRefusal, Members, OneGroup, OneGroupRefusal, Solved, most_entries, re_solve};
 #[cfg(test)]
 pub(crate) use edit::{EditPlant, re_solve_planted};
 pub use groups::{globs_cell, own_digest, textual_cell};

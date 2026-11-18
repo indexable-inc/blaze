@@ -612,7 +612,7 @@ fn cost_of_one_body() {
     let mut all_reads: HashMap<ItemKey, Vec<String>> = HashMap::new();
     let start = Instant::now();
     for (key, _) in bodies.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None, goals: None };
         let (before, b0, t0) = (cost.spent(), BYTES.load(Ordering::Relaxed), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let us = t0.elapsed().as_micros() as u64;
@@ -676,7 +676,7 @@ fn cost_of_one_body() {
     let mut differ: Vec<String> = Vec::new();
     let mut reads_differ: Vec<String> = Vec::new();
     for (key, bytes, reads) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None };
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
         if out.bytes.as_slice() != bytes.as_slice() {
@@ -696,6 +696,50 @@ fn cost_of_one_body() {
         }
     }
     say!("NEEDS ONE AT A TIME: {} bodies in {} ms; answers differ: {differ:?}; read lists differ (reads only with all needs met +, only one at a time -): {reads_differ:?}", kept_outs.len(), start.elapsed().as_millis());
+
+    // 3b. SHARED GOALS (blaze-solve share.rs, plan row A4): the same tasks over ONE request's
+    //     table of trait goals, forward and reversed, THE AUDIT ON (every hit solved again in
+    //     the body and compared: a difference fails the body's check). Equal bytes body by
+    //     body; then THE PLANTED BUG (a hit without its read) must be caught by the audit.
+    let shared_pass = |opts: blaze_solve::share::ShareOpts, reversed: bool| -> (Vec<String>, usize, Vec<(String, usize)>) {
+        use blaze_ladder::front2::tables::goals::{GoalTable, GoalTableOpts, MOST_GOALS};
+        let table: &'static GoalTable = Box::leak(Box::new(GoalTable::new(GoalTableOpts { share: opts, most: MOST_GOALS })));
+        let mut order: Vec<&(ItemKey, Vec<u8>, String)> = kept_outs.iter().collect();
+        if reversed {
+            order.reverse();
+        }
+        let mut differ: Vec<String> = Vec::new();
+        let mut per_body: Vec<(String, usize)> = Vec::new();
+        for (key, bytes, _) in order {
+            let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: Some(table) };
+            let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
+            let label = NamesSource::name_of(task_records, *key).unwrap_or("?").to_string();
+            if out.bytes.as_slice() != bytes.as_slice() {
+                // (Printed plainly: `note!` holds the said-so-far buffer, which the lines after this closure also write.)
+                println!("SHARED DIFFER `{label}`:\n{}\nalone:\n{}", String::from_utf8_lossy(&out.bytes), String::from_utf8_lossy(bytes));
+                differ.push(label.clone());
+            }
+            per_body.push((label, out.goal_hits.len()));
+        }
+        per_body.sort();
+        (differ, table.len(), per_body)
+    };
+    let audit = blaze_solve::share::ShareOpts { audit: true, ..Default::default() };
+    let start = Instant::now();
+    let (fwd_differ, fwd_rows, fwd_hits) = shared_pass(audit, false);
+    let (rev_differ, rev_rows, rev_hits) = shared_pass(audit, true);
+    let hits: usize = fwd_hits.iter().map(|h| h.1).sum();
+    say!("SHARED GOALS (audit on): {} bodies forward and reversed in {} ms; {fwd_rows} goals put forward, {rev_rows} reversed; {hits} hits forward, {} reversed",
+        kept_outs.len(), start.elapsed().as_millis(), rev_hits.iter().map(|h| h.1).sum::<usize>());
+    for (label, n) in fwd_hits.iter().filter(|h| h.1 != 0) {
+        say!("SHARED BODY `{label}`: {n} goals taken from the table forward");
+    }
+    assert!(fwd_differ.is_empty() && rev_differ.is_empty(), "shared goals changed answers: forward {fwd_differ:?}, reversed {rev_differ:?}");
+    assert!(hits > 0, "no body took a shared goal: the table is not reached");
+    let plant = blaze_solve::share::ShareOpts { audit: true, plant_hit_without_read: true, ..Default::default() };
+    let (plant_differ, _, _) = shared_pass(plant, false);
+    say!("SHARED PLANT (a hit without its read, audit on): bodies refused {plant_differ:?}");
+    assert!(!plant_differ.is_empty(), "the audit missed the planted hit without its read");
 
     // 4. SEEDED: the request's heads frozen ONCE (lane FJ's `SeededHeads`, each item lowered
     //    once; counted apart), then every body's heads filed from that one READ-ONLY table:
@@ -717,7 +761,7 @@ fn cost_of_one_body() {
     // type: counted with its reason, and left out of the seeded run.
     let mut refused: HashMap<ItemKey, String> = HashMap::new();
     for (key, _, _) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None, goals: None };
         if let Err(e) = check_body(view, &task_of(*key), &body_frame, &NameMake, shared) {
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
             note!("SEED REFUSED `{label}`: {e}");
@@ -748,7 +792,7 @@ fn cost_of_one_body() {
     // `Part::Heads` entries) and its impl questions filed (`Part::Impls` entries), its name.
     let mut per_body: Vec<(u64, u64, u64, String)> = Vec::new();
     for (key, bytes, _) in kept_outs.iter().filter(|(k, _, _)| !refused.contains_key(k)) {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None, goals: None };
         let (before, t0) = (cost.spent(), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("seeded, the body task of {key:x}: {e}"));
         let spent = cost.spent().since(&before);

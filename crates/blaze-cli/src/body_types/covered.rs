@@ -43,7 +43,7 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_id::ItemKey;
+use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ids::ContentId;
 use blaze_ladder::front2::program::run_entry::{EntryRefusal, root_main};
 use blaze_ladder::front2::project::every_body::Reached;
@@ -152,8 +152,31 @@ fn placed_by(body: BodyRef<'_>) -> ItemKey {
 /// item's text (`#[derive(..)] #[helper(..)] struct S`) names its entry, the item itself
 /// (blaze-scope expansion_origins.rs `kept`).
 pub(super) fn callers<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut dyn FnMut(&'n str)) -> Result<(u32, ItemIndex), &'static str> {
+    match walk_up(texts, call, each, &|_| false)? {
+        Up::File(top) => Ok(top),
+        // `stop` stops at no key.
+        Up::Stopped(_) => Err("a macro call's walk stopped at no file (body_types/covered.rs `callers`)"),
+    }
+}
+
+/// Where [`walk_up`] ended: at the file entry the outermost call is at, or at the first key of
+/// the chain (`call` itself included) that `stop` names, before its origins are read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Up {
+    File((u32, ItemIndex)),
+    Stopped(ItemKey),
+}
+
+/// The one walk of [`callers`], stopping at the first key `stop` names: a block's module text
+/// keeps no origins (blaze-scope resolve.rs `make_blocks`: `Rewritten`), so a walk that is to
+/// end at the body whose block it is stops at that block's key ([`in_blocks`]) instead of
+/// reading its empty origins.
+pub(crate) fn walk_up<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut dyn FnMut(&'n str), stop: &dyn Fn(ItemKey) -> bool) -> Result<Up, &'static str> {
     let mut at = call;
     for _ in 0..=texts.len() {
+        if stop(at) {
+            return Ok(Up::Stopped(at));
+        }
         let bytes = match texts.origins(at) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Err("a macro call's expansion holds no text in its crate's record (names/expansion_texts.rs)"),
@@ -169,7 +192,7 @@ pub(super) fn callers<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut 
         let view = OriginsView::open(bytes).map_err(|_| "a macro call's expansion origins do not open (blaze-scope expansion_origins.rs)")?;
         each(view.macro_name);
         match view.text {
-            At::File(file) => return Ok((file, view.item)),
+            At::File(file) => return Ok(Up::File((file, view.item))),
             At::Expansion(up) => at = up,
         }
     }
@@ -206,6 +229,97 @@ pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n
         out.push(WrittenBy { listed: l, call, by, top });
     }
     out
+}
+
+/// The key a listed body is checked by (`check_body` finds a body by it): a free fn's own, a
+/// member's own key among its container's members. `None`: the records list no such member.
+pub(crate) fn body_key<'n>(records: &'n Records<'n>, body: BodyRef<'n>) -> Option<ItemKey> {
+    match body {
+        BodyRef::Free(key) => Some(key),
+        BodyRef::Member { container, name, .. } => {
+            let mut key = None;
+            NamesSource::each_member(records, container, &mut |m| {
+                if m.name == Some(name) {
+                    key = Some(m.key);
+                }
+            });
+            key
+        }
+    }
+}
+
+/// What a finding of a body of a block's module says after "in `<the body's path>`, ": its
+/// module text keeps no origins, so it is shown at its entry's start, said so. The one wording.
+pub(crate) const BLOCK_UNPLACED: &str = "a body of a block's module (its module text keeps no origins yet: blaze-scope resolve.rs `make_blocks`), shown at the item's start: ";
+
+/// The key of the text a body's blocks are written in as modules: blaze-scope blocks.rs
+/// `block_modules`'s fragment `(body, "blocks", "", 0)`, the `call` resolve.rs `make_blocks`
+/// places every item of the body's block modules at (`At::Expansion(call)`). A function of the
+/// body's key alone, so the walk from a block's item reaches its body forward, by key, never by
+/// a path's prefix or a second parse.
+fn block_key(krate: CrateItemKey, body: ItemKey) -> ItemKey {
+    blaze_scope::task::key_of(krate, body, "blocks", "", 0)
+}
+
+/// A body of crate 0 written in a block's module (blaze-scope blocks.rs: a body's block that
+/// holds an impl, a type, a `mod` or a statement call is an unnamed module; serde's derive is
+/// `const _: () = { extern crate serde as _serde; impl _serde::Serialize for T { .. } };`), and
+/// the body whose block it is.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InBlock<'n> {
+    pub(crate) listed: Listed<'n>,
+    /// Its own key ([`body_key`]).
+    pub(crate) key: ItemKey,
+    /// The body whose block it is written in.
+    pub(crate) within: ItemKey,
+    /// `within`, walked up through bodies of blocks to the first that is no block's: an entry's
+    /// own body or a body a macro wrote at module level, whose task checks it.
+    pub(crate) owner: ItemKey,
+}
+
+/// Every listed body of crate 0 written in a block's module ([`InBlock`]), sorted by (owner,
+/// key), each once. A body is a block's when the walk up from where it is placed (its own place,
+/// or its container's: [`placed_by`]) through the calls that wrote it stops at a listed body's
+/// [`block_key`]; the walk is [`callers`]'s ([`walk_up`]). A body whose walk ends in a file, or
+/// cannot be walked, is no block's and is not here ([`written_by`] says where it is).
+pub(crate) fn in_blocks<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> Result<AVec<'n, InBlock<'n>>, &'static str> {
+    let krate = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
+    // Each listed body's block text key beside the body, sorted by the block key.
+    let mut blocks: AVec<'n, (ItemKey, ItemKey)> = AVec::with_capacity_in(listed.len(), alloc);
+    for l in listed.iter() {
+        if let Some(key) = body_key(records, l.body) {
+            blocks.push((block_key(krate, key), key));
+        }
+    }
+    blocks.sort_unstable();
+    let stop = |at: ItemKey| blocks.binary_search_by(|b| b.0.cmp(&at)).is_ok();
+    // Each body of a block: (its key, the body whose block it is in, it).
+    let mut links: AVec<'n, (ItemKey, ItemKey, Listed<'n>)> = AVec::new_in(alloc);
+    for l in listed.iter().filter(|l| l.entry.is_none()) {
+        let Some(At::Expansion(call)) = NamesSource::place_of(records, placed_by(l.body)).map(|p| p.at) else { continue };
+        let Ok(Up::Stopped(block)) = walk_up(texts, call, &mut |_| {}, &stop) else { continue };
+        let Ok(at) = blocks.binary_search_by(|b| b.0.cmp(&block)) else { continue };
+        let key = body_key(records, l.body).ok_or("a body of a block's module has no key of its own in its crate's records (body_types/covered.rs `in_blocks`)")?;
+        links.push((key, blocks[at].1, *l));
+    }
+    links.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    links.dedup_by(|a, b| a.0 == b.0);
+    let mut out: AVec<'n, InBlock<'n>> = AVec::with_capacity_in(links.len(), alloc);
+    for &(key, within, listed) in links.iter() {
+        // Up through the bodies of blocks, at most one step a body of a block (rule 18).
+        let mut owner = within;
+        let mut steps = 0usize;
+        while let Ok(at) = links.binary_search_by(|x| x.0.cmp(&owner)) {
+            owner = links[at].1;
+            steps += 1;
+            if steps > links.len() {
+                return Err("bodies of blocks' modules name each other as the body whose block they are in, in a loop (body_types/covered.rs `in_blocks`)");
+            }
+        }
+        out.push(InBlock { listed, key, within, owner });
+    }
+    out.sort_unstable_by(|a, b| a.owner.cmp(&b.owner).then(a.key.cmp(&b.key)));
+    Ok(out)
 }
 
 /// The files of crate 0 that define a declarative macro by a name `called` holds (a path's

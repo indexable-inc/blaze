@@ -164,17 +164,25 @@ fn row<'n>(
         None => return Err(Front2Refusal::NoBody { function: function() }),
     };
     let intrinsic = match (symbols.intrinsic, &body) {
+        // The rule of front2/intrinsic_rule.rs. A fn this walk lowered a body for is built from
+        // it (the `_` arm: an intrinsic with a fallback body); one it holds no body for is the
+        // table's, and else refused by the reason its declaration gives.
         (true, None) => {
-            let name = row_path.ident();
-            match blaze_build::intrinsics::Which::named(name) {
-                Ok(which) => Some(Intrinsic::Table(which)),
-                Err(_) => return Err(Front2Refusal::Intrinsic { function: function() }),
+            use crate::front2::intrinsic_rule::{Built, built, declared_at};
+            match built(row_path.ident(), symbols.intrinsic_declared) {
+                Ok(Built::Table(which)) => Some(Intrinsic::Table(which)),
+                // A body the declaration has and this walk did not lower: no body to build.
+                Ok(Built::FallbackBody) => return Err(Front2Refusal::NoBody { function: function() }),
+                Err(unbuilt) => return Err(Front2Refusal::Intrinsic { function: function(), unbuilt, at: declared_at(names, head.lib) }),
             }
         }
         (false, None) if alloc_shim == Some(crate::front2::alloc_shim::Shim::Marker) => {
             match blaze_build::intrinsics::Which::named(crate::front2::alloc_shim::Shim::Marker.declared()) {
                 Ok(which) => Some(Intrinsic::Table(which)),
-                Err(_) => return Err(Front2Refusal::Intrinsic { function: function() }),
+                Err(_) => {
+                    let at = crate::front2::intrinsic_rule::declared_at(names, head.lib);
+                    return Err(Front2Refusal::Intrinsic { function: function(), unbuilt: crate::front2::intrinsic_rule::Unbuilt::NoBody, at });
+                }
             }
         }
         _ => None,
@@ -194,7 +202,7 @@ pub(super) fn class(refusal: &Front2Refusal) -> Box<str> {
         Front2Refusal::Abi { abi, .. } => format!("ABI {abi:?}: neither Rust nor C").into_boxed_str(),
         Front2Refusal::NoBody { .. } => Box::from("no body (front2's)"),
         Front2Refusal::TargetIntrinsic { .. } => Box::from("a target intrinsic"),
-        Front2Refusal::Intrinsic { function } => {
+        Front2Refusal::Intrinsic { function, .. } => {
             let name = function.rsplit("::").next().unwrap_or(function);
             format!("the intrinsic `{name}`, which the build's table does not name").into_boxed_str()
         }
@@ -347,6 +355,7 @@ mod tests {
         let f = || Box::<str>::from("a::b::ctpop_like");
         assert_eq!(&*class(&Front2Refusal::NoHead { function: f() }), "no head in the store (front2's)");
         assert_eq!(&*class(&Front2Refusal::NoBody { function: f() }), "no body (front2's)");
-        assert_eq!(&*class(&Front2Refusal::Intrinsic { function: f() }), "the intrinsic `ctpop_like`, which the build's table does not name");
+        let unbuilt = crate::front2::intrinsic_rule::Unbuilt::NoBody;
+        assert_eq!(&*class(&Front2Refusal::Intrinsic { function: f(), unbuilt, at: Box::from("a.rs:1") }), "the intrinsic `ctpop_like`, which the build's table does not name");
     }
 }

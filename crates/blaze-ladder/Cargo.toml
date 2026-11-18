@@ -39,6 +39,9 @@ blaze-drive.workspace = true
 parser.workspace = true
 # The body form, the checker and its type context (`InferCtx`).
 blaze-typeck = { workspace = true }
+# front2/tables/goals.rs: the shared goal table implements the solver's `GoalShare` seam
+# (tests/front2_solver_cost.rs names its question kinds too).
+blaze-solve = { workspace = true }
 blaze-own = { workspace = true, features = ["std"] }
 # Signatures and bodies lowered from text, and bodies converted to the checker's form.
 blaze-lower = { path = "../blaze-lower" }
@@ -99,8 +102,6 @@ blaze-sim.workspace = true
 blaze-std.workspace = true
 # tests/front2_borrows.rs: `blaze_own::testing::heap()`, the test's root allocator.
 blaze-own = { workspace = true, features = ["std", "testing"] }
-# tests/front2_solver_cost.rs: the solver's question kinds, to name its counters.
-blaze-solve.workspace = true
 
 [lints]
 workspace = true

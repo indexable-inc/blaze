@@ -655,6 +655,13 @@ fn name_ref<'p, P: FrontEnd>(
     if let Some(c) = language_owner(program, adts, called, ground, i) {
         return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(sym);
     }
+    // A fn item's (or a closure's) `Fn*` method whose item no row tables yet: the fn item was
+    // passed as a zero-sized value, named by no body's callees (fn_shim.rs `untabled_owner`).
+    // Checked, which tables its row, then this instance made again: the shim is declared then.
+    if let Some(owner) = crate::fn_shim::untabled_owner(program, adts, called, ground) {
+        let refusal = callee_refusal(program, name(), at, owner, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+        return Ok(Named1::Untabled(owner.item, refusal));
+    }
     // A ctor is no trait's fn: it runs as itself, with no world asked (build_from's refs loop).
     // Known by its ADT's head (`ctor_of`), whether or not a row tables it yet: a lazy front end
     // tables a body's CALLEES, and a ctor used as a value (`let p: fn(..) -> S = S`) is none.
@@ -665,10 +672,7 @@ fn name_ref<'p, P: FrontEnd>(
     };
     let (item, resolved) = match selected {
         Ok(r) => r,
-        Err(error) => {
-            let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
-            return Err(RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error });
-        }
+        Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
     };
     let callee = Instance { item, args: resolved };
     // `at`: the arguments of the instance whose body makes this call (its `Self` first).
@@ -796,14 +800,21 @@ fn vtable_rows<P: FrontEnd>(
                 word(reach.declare(program.function(c).key, f, ground, alloc).map_err(sym)?);
                 continue;
             }
+            // A `dyn Fn*` made from a fn item (or a closure) whose item no row tables yet: as
+            // `name_ref`'s, checked and the instance made again (fn_shim.rs `untabled_owner`).
+            if let Some(owner) = crate::fn_shim::untabled_owner(program, adts, f, ground) {
+                if !untabled.iter().any(|(k, _)| *k == owner.item) {
+                    let refusal = callee_refusal(program, name(), at, owner, crate::callee_shown::CalleeGap::VtableWord, ground.view());
+                    untabled.push((owner.item, refusal));
+                }
+                whole = false;
+                continue;
+            }
             let (item, args) = match Some(f.item) == glue_item {
                 true => (f.item, f.args),
                 false => match program.resolve(i, f.item, f.args, &mut *ground) {
                     Ok(r) => r,
-                    Err(error) => {
-                        let at = crate::callee_shown::self_shown(program, ground.view(), f.args);
-                        return Err(RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at, error });
-                    }
+                    Err(error) => return Err(resolve_refusal(program, adts, ground, name(), f, error)),
                 },
             };
             let refusal = || callee_refusal(program, name(), at, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view());

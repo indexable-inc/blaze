@@ -63,7 +63,7 @@ use crate::task::{
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
 use crate::task::{Attrs, inline_child, walk_rows};
-use crate::tree_record::{TreeModule, TreeRecord};
+use crate::tree_record::{TreeEnum, TreeModule, TreeRecord};
 use crate::task::{ProcAttr, ProcDecls, ProcExport};
 use blaze_surface::ProcKind;
 use crate::{ExpandRequest, NameAnswer, Node, Passed, Resolved, ScopeFacts};
@@ -594,6 +594,13 @@ impl<'a> CrateNames<'a> {
             return Some(self.tree.modules[i].path.as_str());
         }
         self.made.get(&module).map(|m| m.path)
+    }
+
+    /// The path of the module whose own text declares enum `key`, among the modules this solve
+    /// lowered (a refusal naming an enum prints where it is: rule 19).
+    pub fn enum_path_of(&self, key: ItemKey) -> Option<&str> {
+        let (&module, _) = self.decls.iter().find(|(_, (_, d))| d.items.iter().any(|it| it.def.key == key && it.def.kind == DefKind::Enum))?;
+        self.path_of(module)
     }
 
     /// A module's place, walked or made.
@@ -1207,7 +1214,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let tree_record: &'a [u8] = match &record {
         Some((bytes, _)) => bytes,
         None => {
-            let written = tree_record_of(&set, &tree, &decls, &low.tables.macros, &cfg, edition, &crate_root_record.tools, root_attrs, root_bytes, alloc);
+            let written = tree_record_of(&set, &tree, &decls, &low.tables.macros, &low.tables.enums, &cfg, edition, &crate_root_record.tools, root_attrs, root_bytes, alloc);
             aligned(&written.map_err(|error| NamesError::TreeRecord { krate: input.name, error })?, alloc)
         }
     };
@@ -1510,6 +1517,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     use crate::cells::MemberRefusal;
     let refuse = |r: MemberRefusal| NamesError::Cells { krate: input.name, error: crate::cells::Unwritten::Member(r) };
     par.stage(crate::task::Stage::Files);
+    par.tree_record_read(bytes.len());
     let record = TreeRecord::read(bytes, alloc).map_err(|error| refuse(MemberRefusal::TreeRecord { error }))?;
     par.names_part(crate::task::NamesPart::Outline);
     let n = record.modules.len();
@@ -1650,6 +1658,20 @@ fn members_moved<'a>(krate: CrateItemKey, tree: &Tree<'a, 'a>, low: &Lowering<'a
         if exports != row.exports {
             return true;
         }
+        // Its enums and their variants: what the record answers a solve that does not lower it.
+        let mut own: AVec<'a, (ItemKey, &[Variant<&'a str>])> = AVec::from_iter_in(module_enums(&d, &low.tables.enums), alloc);
+        own.sort_unstable_by_key(|e| e.0);
+        own.dedup_by_key(|e| e.0);
+        let mut recorded = record.enums.iter().filter(|e| e.module as usize == i);
+        for &(key, variants) in own.iter() {
+            match recorded.next() {
+                Some(e) if e.key == key && e.variants[..] == *variants => {}
+                _ => return true,
+            }
+        }
+        if recorded.next().is_some() {
+            return true;
+        }
     }
     let defined = macros_by_module(&low.tables.macros, alloc);
     low.at.iter().any(|&i| defined.get(&tree.modules[i].key).copied().unwrap_or(0) != record.modules[i].macros)
@@ -1672,6 +1694,7 @@ fn tree_record_of<'a>(
     tree: &Tree<'a, 'a>,
     decls: &HashMap<ItemKey, (ModuleInfo<&'a str>, DeclsBuilder<'a, &'a str>), Alloc<'a>>,
     macros: &HashMap<ItemKey, MacroSrc<'a>, Alloc<'a>>,
+    enums: &HashMap<ItemKey, AVec<'a, Variant<&'a str>>, Alloc<'a>>,
     cfg: &Cfg<'a, 'a>,
     edition: Edition,
     tools: &[&'a str],
@@ -1706,8 +1729,19 @@ fn tree_record_of<'a>(
             macros: defined.get(&m.key).copied().unwrap_or(0),
         });
     }
+    let mut tree_enums: AVec<'a, TreeEnum<'a>> = AVec::new_in(alloc);
+    for (i, m) in tree.modules.iter().enumerate() {
+        if let Some((_, d)) = decls.get(&m.key) {
+            for (key, variants) in module_enums(d, enums) {
+                tree_enums.push(TreeEnum { key, module: i as u32, variants: AVec::from_slice_in(variants, alloc) });
+            }
+        }
+    }
+    tree_enums.sort_unstable_by_key(|e| e.key);
+    tree_enums.dedup_by_key(|e| e.key);
     let record = TreeRecord {
         modules,
+        enums: tree_enums,
         tools: AVec::from_slice_in(tools, alloc),
         no_std: root_attrs.no_std,
         no_core: root_attrs.no_core,
@@ -1715,6 +1749,13 @@ fn tree_record_of<'a>(
         crate_root,
     };
     record.write(alloc)
+}
+
+/// The enums module `d`'s own text declares (its `ModuleDecls` read back), in declaration
+/// order, with their variants as the lowering made them (`enums`, the lowered table). The
+/// callers sort them by key and keep each once, the tree record's form.
+fn module_enums<'d, 'a>(d: &'d DeclsBuilder<'a, &'a str>, enums: &'d HashMap<ItemKey, AVec<'a, Variant<&'a str>>, Alloc<'a>>) -> impl Iterator<Item = (ItemKey, &'d [Variant<&'a str>])> + 'd {
+    d.items.iter().filter(|it| it.def.kind == DefKind::Enum).filter_map(move |it| enums.get(&it.def.key).map(|v| (it.def.key, v.as_slice())))
 }
 
 fn lower_modules<'a, P: Par>(
@@ -1974,7 +2015,7 @@ struct Facts<'r, 'a, S> {
 /// This crate's enums for the cell core: the lowered text's, then the expansions' so far.
 impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, S> {
     fn holds(&self, of: ItemKey) -> bool {
-        self.base.tables.enums.contains_key(&of) || held(self.run.tables.read(), "tables").enums.contains_key(&of)
+        self.base.tables.enums.contains_key(&of) || held(self.run.tables.read(), "tables").enums.contains_key(&of) || self.recorded_enum(of).is_some()
     }
 
     fn variant(&self, of: ItemKey, ns: Namespace, name: &'a str) -> crate::cells::DepAnswer {
@@ -1985,10 +2026,22 @@ impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, S> {
         if let Some(v) = self.base.tables.enums.get(&of) {
             return answer(v);
         }
-        match held(self.run.tables.read(), "tables").enums.get(&of) {
+        if let Some(v) = held(self.run.tables.read(), "tables").enums.get(&of) {
+            return answer(v);
+        }
+        match self.recorded_enum(of) {
             Some(v) => answer(v),
             None => crate::cells::DepAnswer::Unknown,
         }
+    }
+}
+
+impl<'a, S> Facts<'_, 'a, S> {
+    /// An enum of a module this one-group solve did not lower, as the module tree record holds
+    /// it (the module's text is the record's: `members_moved` walked again otherwise). A lowered
+    /// module's enums are the tables' (equal to its row), an expansion's are the run's.
+    fn recorded_enum(&self, of: ItemKey) -> Option<&[Variant<&'a str>]> {
+        self.base.record.and_then(|r| r.enum_of(of)).map(|e| &e.variants[..])
     }
 }
 
@@ -2138,6 +2191,9 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
             return Held::Variants { variants: AVec::from_slice_in(v, alloc), krate: self.base.key };
         }
         if let Some(v) = held(self.run.tables.read(), "tables").enums.get(&key) {
+            return Held::Variants { variants: AVec::from_slice_in(v, alloc), krate: self.base.key };
+        }
+        if let Some(v) = self.facts.recorded_enum(key) {
             return Held::Variants { variants: AVec::from_slice_in(v, alloc), krate: self.base.key };
         }
         let Some(other) = self.base.built.of(key) else { return Held::Unknown };

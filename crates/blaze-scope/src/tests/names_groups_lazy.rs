@@ -17,7 +17,7 @@ use blaze_own::AVec;
 
 use super::entry::{Texts, input};
 use super::names_groups::Groups;
-use crate::cells::{Demanded, DemandedOpts, Members, OneGroup, demand};
+use crate::cells::{Demanded, DemandedOpts, Members, OneGroup, Solved, demand};
 use crate::crate_scope::{CrateScopeError, Ready, resolve_by_records};
 use crate::graph::Sysroot;
 use crate::task::{Par, Serial};
@@ -91,13 +91,13 @@ fn predicted(whole: &Groups, asked: &[ItemKey]) -> BTreeSet<ItemKey> {
 /// The asked modules' groups on demand, `order` giving the demands (one call each).
 fn on_demand(texts: &'static Texts, order: &[&[ItemKey]]) -> Demanded<'static> {
     let alloc = blaze_own::testing::heap().alloc();
-    let solve_crate = move |members: Members<'_>| -> Result<AVec<'static, NameGroup<'static>>, CrateScopeError<'static>> {
+    let solve_crate = move |members: Members<'_>| -> Result<Solved<'static>, CrateScopeError<'static>> {
         let g = blaze_own::testing::heap().alloc();
         let inputs = [input("k0", "/k0/lib.rs", &[])];
         let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Only { members }, &Ready::serial(WAIT), g).map_err(|(_, e)| e)?;
-        let mut out = AVec::new_in(g);
+        let mut out: AVec<'static, NameGroup<'static>> = AVec::new_in(g);
         out.extend(solved[0].names.groups.iter().cloned());
-        Ok(out)
+        Ok(Solved { groups: out, tree: solved[0].names.tree_record })
     };
     let mut solver = OneGroup { solve_crate, alloc, tree: None };
     let mut into = Demanded::new(DemandedOpts { alloc });

@@ -121,7 +121,7 @@ pub(crate) fn run<'h>(
     names: &mut dyn FnMut() -> Result<blaze_ladder::run::make_one::NamesRecords<'h>, crate::run_parent::ParentError>,
     ids: &mut dyn FnMut() -> Result<crate::run_ids::RunIds<'h>, crate::run_parent::ParentError>,
     // The run's closing count, for the profile (own_process.rs `run_own`).
-    counted: &mut Option<crate::run_parent::Tally>,
+    counted: &mut Option<crate::run_parent::RunTally>,
     // The sink the run's events go to (blaze-screen `Watch`): main.rs's live line on a
     // terminal, else `Unwatched`.
     watch: &dyn blaze_screen::Watch,

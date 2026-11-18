@@ -201,16 +201,28 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         } else {
             (FnKind::Free, Box::<str>::from(""))
         };
+        // A `#[rustc_intrinsic]` fn is built by the ONE rule (front2/intrinsic_rule.rs): the
+        // table's row when the table names it; else, when its declaration has a fallback body
+        // (and is not `#[rustc_intrinsic_must_be_overridden]`), from that body like any fn: no
+        // table entry, the row `Free`, and `check_one` makes the body on its first call (core's
+        // `integer_min`, `if a < b { a } else { b }`); else refused, naming which and where.
         let intrinsic = if symbols.intrinsic {
-            let name = row_path.ident();
-            match blaze_build::intrinsics::Which::named(name) {
-                Ok(which) => Some(Intrinsic::Table(which)),
-                Err(_) => return Err(refuse(Front2Refusal::Intrinsic { function: Box::from(path.as_str()) })),
+            use crate::front2::intrinsic_rule::{Built, built, declared_at};
+            match built(row_path.ident(), symbols.intrinsic_declared) {
+                Ok(Built::Table(which)) => Some(Intrinsic::Table(which)),
+                Ok(Built::FallbackBody) => None,
+                Err(unbuilt) => {
+                    let at = declared_at(self.front.names, lib);
+                    return Err(refuse(Front2Refusal::Intrinsic { function: Box::from(path.as_str()), unbuilt, at }));
+                }
             }
         } else if alloc_shim == Some(crate::front2::alloc_shim::Shim::Marker) {
             match blaze_build::intrinsics::Which::named(crate::front2::alloc_shim::Shim::Marker.declared()) {
                 Ok(which) => Some(Intrinsic::Table(which)),
-                Err(_) => return Err(refuse(Front2Refusal::Intrinsic { function: Box::from(path.as_str()) })),
+                Err(_) => {
+                    let at = crate::front2::intrinsic_rule::declared_at(self.front.names, lib);
+                    return Err(refuse(Front2Refusal::Intrinsic { function: Box::from(path.as_str()), unbuilt: crate::front2::intrinsic_rule::Unbuilt::NoBody, at }));
+                }
             }
         } else {
             None

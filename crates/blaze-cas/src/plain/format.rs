@@ -25,9 +25,11 @@ use blaze_keyed::{
 /// shared their number with the segments'; format 3 gives each retired row a mark, "lost, not
 /// yet reported" ([`LostMark`]), in the u32 that format 2 kept zero; format 4 adds a segment
 /// row's flag 4, sealed ([`Segment::sealed`]), which format 3 refused as a row no commit
-/// writes. A head or a manifest of another format is refused naming both; there is no
+/// writes; format 5 gives each root an expiry ([`Root::expires_ns`]) and adds the leases a
+/// running command holds ([`Lease`], counted in the header's last word, which format 4 kept
+/// zero), and a segment row's touch ([`Segment::touched`], a u64 at its end). A head or a manifest of another format is refused naming both; there is no
 /// migration: the store is rebuilt from what made it.
-pub const FORMAT: u32 = 4;
+pub const FORMAT: u32 = 5;
 
 /// The format of a plain segment, which outlives any one store (a published segment is shared
 /// through a bucket): its own number, so a change to the store's own files never changes a
@@ -59,7 +61,7 @@ pub(crate) const OFFSET_MOST: u64 = (1 << 40) * ALIGN;
 const MANIFEST_HEADER: usize = 32;
 
 /// One segment's row in a manifest.
-const SEGMENT_ROW: usize = 80;
+const SEGMENT_ROW: usize = 88;
 
 /// `at` rounded up to [`ALIGN`].
 pub const fn aligned(at: u64) -> u64 {
@@ -560,6 +562,11 @@ pub struct Segment {
     /// this row with no byte read ([`super::verified::Verified::sealed`]); one not sealed, the
     /// tail of the boot before, is checked whole as before.
     pub sealed: bool,
+    /// The newest generation whose commit set a root naming a record of it that the commit
+    /// did not write (a record reused by key): a cleanup slice planned before that generation
+    /// may have judged the record dead, so it does not replace this segment ([`super::core`],
+    /// the reach sweep). Zero: never.
+    pub touched: u64,
 }
 
 impl Segment {
@@ -578,6 +585,7 @@ impl Segment {
             local: true,
             published: false,
             sealed: false,
+            touched: 0,
         }
     }
 
@@ -723,39 +731,66 @@ impl LostMark {
 }
 
 /// A named root: the store's own record (tag [`super::ROOT_TAG`]) listing the keys compaction
-/// keeps for it.
+/// keeps for it, until `expires_ns` on the wall clock the flips pass in ([`NEVER`]: kept until
+/// it is unset). A root past its expiry keeps nothing, and the next flip drops it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Root {
     pub name: String,
     pub key: ContentId,
     pub generation: u64,
+    pub expires_ns: u64,
 }
 
-/// What one generation holds: its segments (oldest first), its roots, its retired files.
+/// No expiry: a root set with no life ([`super::core::Plain::root`]) or a lease never let go.
+pub(crate) const NEVER: u64 = u64::MAX;
+
+/// What a running command holds while its records are not yet named by a root: every segment
+/// of generation `since` or newer is kept whole, and no file retired after `opened_ns` (less
+/// the grace) is unlinked, until `expires_ns`. Set by the holder's commits, let go by its last;
+/// a process that dies holding one is let go of by the clock.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Lease {
+    /// The holder's [`super::core::PlainConfig::nonce`].
+    pub holder: u64,
+    /// The generation the holder opened on, plus one: the first its commits can name.
+    pub since: u64,
+    /// The wall clock at the holder's open.
+    pub opened_ns: u64,
+    pub expires_ns: u64,
+}
+
+/// What one generation holds: its segments (oldest first), its roots, its leases, its retired
+/// files.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Manifest {
     pub generation: u64,
     pub segments: Vec<Segment>,
     pub roots: Vec<Root>,
+    pub leases: Vec<Lease>,
     pub retired: Vec<Retired>,
 }
 
+/// One lease row: holder u64, since u64, opened ns u64, expires ns u64.
+const LEASE_ROW: usize = 32;
+
 impl Manifest {
     /// Bytes 0..4 magic `BLPM`, 4..8 format, 8..16 generation, 16..20 segments `s`, 20..24
-    /// retired `r`, 24..28 roots `t`, 28..32 zero; then `s` x 80 (digest 32, length u64, index
-    /// offset u64, entries u32, flags u32 (1 here, 2 published, 4 sealed), namespace u64, generation
-    /// u64, boot u64), `r` x 24 (id u64, 1 for a log u32, the mark u32 ([`LostMark::encode`]:
-    /// zero for none, never set on a log), since ns u64), and `t` roots, each 32 key, 8
-    /// generation, 2 name length, the name's UTF-8, zeros to a multiple of 8. Little-endian.
+    /// retired `r`, 24..28 roots `t`, 28..32 leases `l`; then `s` x 88 (digest 32, length u64,
+    /// index offset u64, entries u32, flags u32 (1 here, 2 published, 4 sealed), namespace u64,
+    /// generation u64, boot u64, touched u64), `r` x 24 (id u64, 1 for a log u32, the mark u32
+    /// ([`LostMark::encode`]: zero for none, never set on a log), since ns u64), `l` x 32
+    /// ([`Lease`]: holder, since, opened ns, expires ns, each u64), and `t` roots, each 32 key,
+    /// 8 generation, 8 expiry ns, 2 name length, the name's UTF-8, zeros to a multiple of 8.
+    /// Little-endian.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity_in(MANIFEST_HEADER + SEGMENT_ROW * self.segments.len() + 24 * self.retired.len(), Global);
+        let mut out = Vec::with_capacity_in(MANIFEST_HEADER + SEGMENT_ROW * self.segments.len() + 24 * self.retired.len() + LEASE_ROW * self.leases.len(), Global);
         out.extend_from_slice(&MANIFEST_MAGIC);
         out.extend_from_slice(&FORMAT.to_le_bytes());
         out.extend_from_slice(&self.generation.to_le_bytes());
         out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.retired.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.roots.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&(self.leases.len() as u32).to_le_bytes());
         for it in &self.segments {
             out.extend_from_slice(&it.digest.0);
             out.extend_from_slice(&it.len.to_le_bytes());
@@ -765,6 +800,7 @@ impl Manifest {
             out.extend_from_slice(&it.namespace.0.to_le_bytes());
             out.extend_from_slice(&it.generation.to_le_bytes());
             out.extend_from_slice(&it.boot.to_le_bytes());
+            out.extend_from_slice(&it.touched.to_le_bytes());
         }
         for it in &self.retired {
             out.extend_from_slice(&it.id.to_le_bytes());
@@ -772,9 +808,16 @@ impl Manifest {
             out.extend_from_slice(&LostMark::encode(it.lost).to_le_bytes());
             out.extend_from_slice(&it.since_ns.to_le_bytes());
         }
+        for it in &self.leases {
+            out.extend_from_slice(&it.holder.to_le_bytes());
+            out.extend_from_slice(&it.since.to_le_bytes());
+            out.extend_from_slice(&it.opened_ns.to_le_bytes());
+            out.extend_from_slice(&it.expires_ns.to_le_bytes());
+        }
         for root in &self.roots {
             out.extend_from_slice(&root.key.0);
             out.extend_from_slice(&root.generation.to_le_bytes());
+            out.extend_from_slice(&root.expires_ns.to_le_bytes());
             out.extend_from_slice(&(root.name.len() as u16).to_le_bytes());
             out.extend_from_slice(root.name.as_bytes());
             while !out.len().is_multiple_of(8) {
@@ -800,8 +843,9 @@ impl Manifest {
         if u32_at(bytes, 4) != FORMAT {
             return Err(StoreError::Format { what: "a plain store's manifest", found: u32_at(bytes, 4), wanted: FORMAT });
         }
-        let (s, r, t) = (u32_at(bytes, 16) as usize, u32_at(bytes, 20) as usize, u32_at(bytes, 24) as usize);
-        let fixed = MANIFEST_HEADER.saturating_add(SEGMENT_ROW.saturating_mul(s)).saturating_add(24usize.saturating_mul(r));
+        let (s, r, t, l) = (u32_at(bytes, 16) as usize, u32_at(bytes, 20) as usize, u32_at(bytes, 24) as usize, u32_at(bytes, 28) as usize);
+        let rows = MANIFEST_HEADER.saturating_add(SEGMENT_ROW.saturating_mul(s)).saturating_add(24usize.saturating_mul(r));
+        let fixed = rows.saturating_add(LEASE_ROW.saturating_mul(l));
         if bytes.len() < fixed {
             return Err(short());
         }
@@ -822,10 +866,11 @@ impl Manifest {
                 namespace: Namespace(u64_at(bytes, at + 56)),
                 generation: u64_at(bytes, at + 64),
                 boot: u64_at(bytes, at + 72),
+                touched: u64_at(bytes, at + 80),
             };
             let end = it.index_at.checked_add(u64::from(it.count) * ENTRY as u64 + FOOTER as u64);
-            if !it.index_at.is_multiple_of(ALIGN) || it.len > SEGMENT_MOST || end != Some(it.len) || it.generation > generation || flags > 7 {
-                return Err(bad("a segment row is not one a commit writes (its index unaligned, its length past 4 GiB or not its index's end, its generation newer than the manifest's, or flags past 7)", at));
+            if !it.index_at.is_multiple_of(ALIGN) || it.len > SEGMENT_MOST || end != Some(it.len) || it.generation > generation || it.touched > generation || flags > 7 {
+                return Err(bad("a segment row is not one a commit writes (its index unaligned, its length past 4 GiB or not its index's end, its generation or touch newer than the manifest's, or flags past 7)", at));
             }
             segments.push(it);
         }
@@ -843,24 +888,34 @@ impl Manifest {
             }
             retired.push(Retired { id: u64_at(bytes, at), log, since_ns: u64_at(bytes, at + 16), lost });
         }
+        let mut leases = Vec::with_capacity_in(l, Global);
+        for i in 0..l {
+            let at = rows + LEASE_ROW * i;
+            let it = Lease { holder: u64_at(bytes, at), since: u64_at(bytes, at + 8), opened_ns: u64_at(bytes, at + 16), expires_ns: u64_at(bytes, at + 24) };
+            if it.since > generation || leases.iter().any(|other: &Lease| other.holder == it.holder) {
+                return Err(bad("a lease row is not one a flip writes (its generation newer than the manifest's, or a second lease of one holder)", at));
+            }
+            leases.push(it);
+        }
         let mut roots = Vec::with_capacity_in(t, Global);
         let mut at = fixed;
         for _ in 0..t {
-            if bytes.len() < at + 42 {
+            if bytes.len() < at + 50 {
                 return Err(short());
             }
             let key = id_at(bytes, at);
             let generation = u64_at(bytes, at + 32);
-            let len = u16::from_le_bytes([bytes[at + 40], bytes[at + 41]]) as usize;
-            let Some(name) = bytes.get(at + 42..at + 42 + len) else { return Err(short()) };
-            let name = std::str::from_utf8(name).map_err(|_| bad("a root's name is not UTF-8", at + 42))?.to_owned();
-            roots.push(Root { name, key, generation });
-            at = (at + 42 + len).div_ceil(8) * 8;
+            let expires_ns = u64_at(bytes, at + 40);
+            let len = u16::from_le_bytes([bytes[at + 48], bytes[at + 49]]) as usize;
+            let Some(name) = bytes.get(at + 50..at + 50 + len) else { return Err(short()) };
+            let name = std::str::from_utf8(name).map_err(|_| bad("a root's name is not UTF-8", at + 50))?.to_owned();
+            roots.push(Root { name, key, generation, expires_ns });
+            at = (at + 50 + len).div_ceil(8) * 8;
         }
         if at != bytes.len() {
             return Err(bad("its fields end before its last byte", at));
         }
-        Ok(Manifest { generation, segments, roots, retired })
+        Ok(Manifest { generation, segments, roots, leases, retired })
     }
 
     /// The bytes its segments hold.

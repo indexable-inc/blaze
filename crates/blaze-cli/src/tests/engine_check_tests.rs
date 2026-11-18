@@ -25,7 +25,7 @@ fn engine(io: &Io, workers: u32) -> (std::vec::Vec<(std::string::String, std::st
 /// The command's options as the tests' `check` runs (main.rs `ask_framed`), on the checkout `ws`.
 /// Its request frame is leaked: a cap whose blocks are taken as used (engine_check.rs
 /// `REQUEST_FRAME`), one a call, as `engine_check::serve` makes one a request.
-fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'static> {
+pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'static> {
     let frame: &'static bstd::mem::Frame = std::boxed::Box::leak(std::boxed::Box::new(bstd::mem::Frame::with_reserve(engine_check::REQUEST_FRAME, bstd::mem::Tag::Other).expect("the request's frame")));
     let producers = blaze_ids::producer::Producers::for_tests(b"test");
     engine_check::Opts {
@@ -63,7 +63,7 @@ fn why(io: &Io, target: &str) -> std::string::String {
 }
 
 /// [`engine`], starting from the stored answer unless `fresh`.
-fn engine_from(io: &Io, workers: u32, fresh: bool) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
+pub(super) fn engine_from(io: &Io, workers: u32, fresh: bool) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let frame = cx.frame();
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
@@ -549,6 +549,9 @@ fn engine_check_plans_a_project_sized_workspace() {
     assert_eq!(edit.files, engine_check::Files { read_back: CRATES as u32 - 1, outlined: 1, probed: 0 }, "one file outlined and read");
     assert_eq!(edit.stages[blaze_engine::Stage::Outlines.index()].entered, 1, "one outline entered\n{}", entries(&edit));
     assert_eq!(edit.stages[blaze_engine::Stage::Bodies.index()].entered, 1, "one body entered\n{}", entries(&edit));
+    // THE UNIT GRAPH IS READ BACK (plan row D2): no manifest moved, so the graph of 400 crates
+    // is its stored record, no fetch run, no lock walked.
+    assert_eq!(edit.units, crate::engine_units::Units { read_back: 1, discovered: 0, fetches_run: 0 }, "the graph read back\n{}", profile_lines(&io));
 }
 
 /// BODIES A MACRO WROTE ARE CHECKED (serde-root printed "an entry a macro takes ... not
@@ -712,7 +715,8 @@ fn engine_why_walks_back_to_the_edit() {
     let said = why(&io, "b/src/lib.rs::h");
     let lines: std::vec::Vec<&str> = said.lines().collect();
     assert!(lines.len() >= 2, "a chain of steps: {said}\n{}", entries(&item));
-    assert!(lines[0].starts_with("the body of `b/src/lib.rs::h`: entered in request") && lines[0].contains("a read moved"), "first, the body and its moved read: {said}");
+    // The label now ends in the edition the body was read under ("(read as edition 2024, ..)"), before the colon.
+    assert!(lines[0].starts_with("the body of `b/src/lib.rs::h`") && lines[0].contains(": entered in request") && lines[0].contains("a read moved"), "first, the body and its moved read: {said}");
     let last = lines[lines.len() - 1];
     assert!(last.starts_with("`a/src/lib.rs`'s outline: entered in request") && last.contains("its key moved"), "last, the edited file: {said}");
     let file = why(&io, "a/src/lib.rs");
@@ -804,6 +808,55 @@ fn engine_check_prints_a_body_error_as_check_does() {
     assert_eq!((fixed_ids, fixed_checked.status.0), (clean_ids, clean.status.0), "fixed: as a clean fresh run");
 }
 
+/// A REFUSED BODY STANDS ON WHAT ITS REFUSAL SAW (plan row A8): `b` calls into `a`, a member
+/// proc macro whose names cannot be made at all (the test shelf has no `wasm32-wasip1` side,
+/// names/scope.rs `prepare`'s refused crate, as `failed_dep`), so `b`'s body is refused with a
+/// note naming why. (A syntax error in `a` no longer does it: `a` still writes its names record
+/// with the finding in it, and `b` is checked, `an_unresolved_import_stops_only_what_reads_it`.)
+/// With nothing changed the refusal stands on its reads (each crate's names cell, the graph's):
+/// no body task is entered again. Fixed (`a` a plain library), the graph's cell and `a`'s names
+/// cell move, and exactly the refused bodies, `one` and `h`, are entered and checked clean.
+/// CONTROL: the fixture's `a` really failed (its failure is printed); before `failed_with`,
+/// every refusal read nothing, so it was owed and entered again by each request.
+#[test]
+fn engine_check_keeps_a_refused_body_until_what_it_read_moves() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    typed_crates(&io, Typed::Plain);
+    let plain = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    write(&io, "a/Cargo.toml", &format!("{plain}\n[lib]\nproc-macro = true\n"));
+    // (1) The member's body is refused by name, never checked under a scope without `a`.
+    let (_, first_lines, first) = said(&io, false);
+    let (notes, _) = &first.bodies;
+    println!("a broken dependency: {}, notes {notes:?}\n{}", entries(&first), first_lines.join("\n"));
+    assert!(first_lines.iter().any(|line| line.contains("crate `a`")), "control: `a`'s names failed, naming it (else the fixture fails nothing):\n{}", first_lines.join("\n"));
+    let refused: std::vec::Vec<&std::string::String> = notes.iter().filter(|note| note.starts_with("`b/src/lib.rs`") && note.contains("was not checked")).collect();
+    assert_eq!(refused.len(), 1, "`b`'s one body is refused with a note: {notes:?}\n{}", entries(&first));
+    assert!(
+        refused[0].contains("no names record") || refused[0].contains("no `Names` task") || refused[0].contains("check scope could not be read"),
+        "the note says its scope's names are missing: {}",
+        refused[0]
+    );
+
+    // (2) Nothing changed: no task entered, the refusal stands on its reads. (The certificate
+    // standing WITH `a`'s failure, its stored notes and lines printed again, is plan row D6's
+    // assertion: until "owed" is exact and a certificate may hold findings, a kept finding
+    // means no certificate; as `a_failed_dependency_leaves_its_dependents_solved`.)
+    let (_, again_lines, again) = said(&io, false);
+    println!("nothing changed: {}\n{}", entries(&again), again_lines.join("\n"));
+    assert_eq!(again.stages[blaze_engine::Stage::Bodies.index()].entered, 0, "a refusal with nothing changed enters no body: {}", entries(&again));
+    assert_eq!(again.entered, 0, "nothing changed: no task entered, each failed row stands by its reads; {}", entries(&again));
+
+    // (3) Fixed: exactly the refused bodies are entered, and each checks clean.
+    write(&io, "a/Cargo.toml", plain);
+    let (_, fixed_lines, fixed) = said(&io, false);
+    println!("fixed: {}\n{}", entries(&fixed), fixed_lines.join("\n"));
+    assert_eq!(fixed.stages[blaze_engine::Stage::Bodies.index()].entered, 2, "`one` and `h` entered after the fix: {}", entries(&fixed));
+    let (fixed_notes, clean) = &fixed.bodies;
+    assert!(fixed_notes.is_empty(), "fixed: no body is refused: {fixed_notes:?}");
+    assert_eq!(*clean, 2, "`one` and `h` checked clean after the fix");
+    assert!(error_lines(&fixed_lines.join("\n")).is_empty(), "fixed: no error printed:\n{}", fixed_lines.join("\n"));
+}
+
 /// A LINT FINDING IS PRINTED AS `check` PRINTS IT: an unsafe operation outside an `unsafe`
 /// block in a 2024 `unsafe fn` (the typed lint `unsafe-op-in-unsafe-fn`, advice at every step):
 /// the engine lists what `check` lists and prints the same warning line, and the certificate
@@ -841,6 +894,77 @@ fn engine_check_prints_a_lint_and_a_borrow_finding_as_check_does() {
     // The closing line holds the time and the rebuilt count, which a certificate changes.
     let body = |lines: &[std::string::String]| lines[..lines.len() - 1].to_vec();
     assert_eq!((again_ids, body(&again)), (ids, body(&lines)), "the certificate prints the same");
+}
+
+/// A workspace of one member, `app`, under the `suggest` step, its module `a` holding `f`, which
+/// calls itself (blaze-lint `recursion`), and `g`, which does not. `f`'s comment and `g`'s body
+/// are the edits below, each keeping every length.
+fn linted(io: &Io, comment: &str, g_body: &str) {
+    write(io, "Cargo.toml", "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n\n[workspace.metadata.blaze]\nlints = \"suggest\"\n");
+    write(io, "app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(io, "app/src/lib.rs", "pub mod a;\n");
+    write(io, "app/src/a.rs", &format!("pub fn f(n: u8) -> u8 {{\n    // {comment}\n    if n == 0 {{ 0 }} else {{ f(n - 1) }}\n}}\n\npub fn g(n: u8) -> u8 {{\n    {g_body}\n}}\n"));
+}
+
+/// The `Lints` stage's counts of one request: (entered, identical).
+fn lint_counts(checked: &engine_check::Checked) -> (u32, u32) {
+    let count = checked.stages[blaze_engine::Stage::Lints.index()];
+    (count.entered, count.identical)
+}
+
+/// THE LINTS STAGE (engine_lints.rs, lints-stage.md): ONE task an item, every selected rule in
+/// its one walk, keyed by the item's text.
+/// (a) A token lint in `f` and none in `g`: `engine-check` prints the warning line `check` prints
+///     (CONTROL: there is one, `recursion` at `f`'s name).
+/// (b) An edit of `g`'s body (its length kept) enters `g`'s lint task alone, not `f`'s; `f`'s
+///     finding stands and prints from the stored answer.
+/// (c) A comment edit inside `f` (its length kept): the floor, 1 entered and 1 identical.
+/// (d) Nothing changed: the certificate enters no lint task and prints the same lines.
+/// (e) The profile's by-rule line names `recursion` with a nonzero cost and its one finding.
+/// Prints `lints stage: a <warning>; b entered <units>; c <entered, identical>; e <line>`.
+#[test]
+fn engine_check_lints_each_item_by_its_text() {
+    let io = Io::simulated(SimWorld::new(14, Limits::USUAL));
+    linted(&io, "aa", "n");
+    // (a) As `check` prints it.
+    let _ = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
+    let old_said = stdout(&io);
+    let (_, first, checked) = said(&io, false);
+    let first_said = first.join("\n");
+    let mut check_warnings = warning_lines(&old_said);
+    check_warnings.dedup();
+    let warnings = warning_lines(&first_said);
+    assert_eq!(warnings.len(), 1, "one warning, `f`'s recursion:\ncheck said:\n{old_said}\nengine-check said:\n{first_said}\n{}", entries(&checked));
+    assert!(warnings[0].contains("app/src/a.rs:1:8: warning[recursion]: `f` calls itself (at `f`)"), "placed at `f`'s name, naming the call: {warnings:?}");
+    assert_eq!(warnings, check_warnings, "the warning line is check's:\ncheck said:\n{old_said}\nengine-check said:\n{first_said}");
+    assert!(checked.lints.entered.contains(&std::string::String::from("app/src/a.rs::f")) && checked.lints.entered.contains(&std::string::String::from("app/src/a.rs::g")), "every unit linted first: {:?}", checked.lints);
+    assert_eq!(checked.lints.findings, 1, "one finding made: {:?}", checked.lints);
+    // (e) The by-rule line: `recursion`, a nonzero cost, one finding.
+    let text = profile(&io);
+    let line = text.lines().find(|line| line.starts_with("lints: ") && line.contains("by rule:")).unwrap_or_else(|| panic!("the profile has the lints line:\n{text}")).to_owned();
+    let recursion = line.split("by rule:").nth(1).and_then(|rules| rules.split(',').map(str::trim).find(|one| one.starts_with("recursion "))).unwrap_or_else(|| panic!("`recursion` is on the line: {line}"));
+    let numbers: std::vec::Vec<u32> = recursion.split(' ').skip(1).map(|word| word.parse().expect("a count")).collect();
+    assert!(numbers.len() == 2 && numbers[0] > 0 && numbers[1] == 1, "`recursion`: a nonzero cost and one finding: {line}");
+
+    // (d) Nothing changed: the certificate, no lint task, the same lines.
+    let (_, again, certificate) = said(&io, false);
+    assert!(certificate.certified && lint_counts(&certificate) == (0, 0), "nothing changed: no lint task; {}", entries(&certificate));
+    assert_eq!(warning_lines(&again.join("\n")), warnings, "the certificate prints the warning again");
+
+    // (b) `g`'s body edited: `g`'s lint task alone; `f`'s finding from the stored answer.
+    linted(&io, "aa", "7");
+    let (_, edited, body) = said(&io, false);
+    assert_eq!(body.lints.entered, [std::string::String::from("app/src/a.rs::g")], "only `g`'s lint task: {:?}\n{}", body.lints, entries(&body));
+    assert_eq!(lint_counts(&body).0, 1, "one lint task entered: {}", entries(&body));
+    assert_eq!(warning_lines(&edited.join("\n")), warnings, "`f`'s finding stands and prints from the stored answer");
+
+    // (c) A comment inside `f`, every range kept: the floor, 1 entered and 1 identical.
+    linted(&io, "bb", "7");
+    let (_, commented, comment) = said(&io, false);
+    assert_eq!(comment.lints.entered, [std::string::String::from("app/src/a.rs::f")], "only `f`'s lint task: {:?}", comment.lints);
+    assert_eq!(lint_counts(&comment), (1, 1), "a comment: 1 entered, 1 identical; {}", entries(&comment));
+    assert_eq!(warning_lines(&commented.join("\n")), warnings, "the same warning after a comment");
+    std::println!("lints stage: a {}; b entered {:?}; c {:?}; e {line}", warnings[0], body.lints.entered, lint_counts(&comment));
 }
 
 /// Every request prints the WHOLE answer (engine_lines.rs): with nothing changed the certificate
@@ -1014,7 +1138,7 @@ fn adding_a_private_fn_rechecks_one_body() {
 }
 
 /// Three members in a chain: `c` reads `b`, `b` reads `a`.
-fn three_crates(io: &Io) {
+pub(super) fn three_crates(io: &Io) {
     write(io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n");
     write(io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write(io, "a/src/lib.rs", "pub mod m;\n\npub fn f() -> u8 {\n    1\n}\n");
@@ -1177,6 +1301,8 @@ fn a_failed_dependency_leaves_its_dependents_solved() {
     }
     let (_, again, certificate) = printed(&io, false);
     assert!(certificate.entered == 0, "nothing changed: no task entered, the failed row stands by its reads; {}", entries(&certificate));
+    // (The certificate standing WITH `p`'s failure is plan row D6's assertion: until "owed" is
+    // exact and a certificate may hold findings, a kept finding means no certificate.)
     assert!(again.contains("crate `p`"), "and the failure is printed again:\n{again}");
 }
 
@@ -1243,4 +1369,255 @@ fn engine_check_reads_records_in_place() {
     let digest = format!("{:?}", answers.finish());
     println!("READS_IN_PLACE_DIGEST {digest}");
     assert_ne!(digest, READS_IN_PLACE_DIGEST, "a digest of the answers is printed above");
+}
+
+// THE SWEEP COSTS THE CHANGES (plan row S1, journal_sweep.rs): on a world whose system keeps a
+// journal of changes across a restart (FSEvents'), a repeat request replays it from the place
+// the pointer saved and stats only the rows its names reach. Each test prints its `sweep:` line.
+
+/// A world playing FSEvents' journal, from before its first write.
+fn journaled(seed: u64) -> Io {
+    let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+    io.with_sim(|sim| sim.set_journal(blaze_core::sim::Journal::FsEvents)).expect("a simulated world");
+    io
+}
+
+/// The profile's `sweep:` line.
+fn sweep_line(io: &Io) -> std::string::String {
+    profile(io).lines().find(|line| line.starts_with("sweep:")).map(std::string::String::from).unwrap_or_default()
+}
+
+/// (a) NOTHING CHANGED: the journal names nothing since the pointer's place, no row is statted,
+/// and the certificate stands. CONTROL: the first request had no place saved and says so.
+#[test]
+fn a_repeat_with_nothing_changed_stats_no_path() {
+    let io = journaled(21);
+    typed_crates(&io, Typed::Plain);
+    let (_, first) = engine_from(&io, 2, false);
+    assert_eq!(first.sweep.journal, journal_sweep::JournalUse::Refused(journal_sweep::Refused::NoCursor), "the first request has no place: {}", sweep_line(&io));
+    let (_, again) = engine_from(&io, 2, false);
+    println!("nothing changed: {}", sweep_line(&io));
+    assert!(again.certified, "nothing moved: the certificate");
+    assert_eq!(again.sweep.journal, journal_sweep::JournalUse::Used, "{}", sweep_line(&io));
+    assert_eq!((again.sweep.events, again.sweep.statted), (0, 0), "no event, no path statted: {}", sweep_line(&io));
+    assert!(again.sweep.leaves > 0, "the leaf table holds the answer's reads");
+    assert!(sweep_line(&io).starts_with("sweep: journal used; events 0; paths statted 0 of "), "{}", sweep_line(&io));
+}
+
+/// (b) ONE FILE WRITTEN: the journal names it (and the publish's temporary name beside it, which
+/// no listing reads), its row alone is statted, and its outline alone is entered.
+#[test]
+fn a_repeat_after_one_write_stats_that_file_alone() {
+    let io = journaled(22);
+    typed_crates(&io, Typed::Plain);
+    write(&io, "a/src/lib.rs", "pub mod m;\n\npub fn one() -> u8 {\n    m::two()\n}\n");
+    write(&io, "a/src/m.rs", "pub fn two() -> u8 {\n    2\n}\n");
+    let _ = engine_from(&io, 2, false);
+    write(&io, "a/src/m.rs", "pub fn two() -> u8 {\n    2\n}\n// a comment\n");
+    let (_, now) = engine_from(&io, 2, false);
+    println!("one write: {}", sweep_line(&io));
+    assert_eq!(now.sweep.journal, journal_sweep::JournalUse::Used, "{}", sweep_line(&io));
+    assert!(now.sweep.events >= 1, "the write is named: {}", sweep_line(&io));
+    assert_eq!(now.sweep.statted, 1, "the written file's row alone: {}", sweep_line(&io));
+    assert!(!now.certified, "the file moved");
+    assert_eq!(now.stages[blaze_engine::Stage::Outlines.index()].entered, 1, "its outline alone entered\n{}", entries(&now));
+}
+
+/// (c) THE JOURNAL WAS RESET (another volume UUID): the stated full sweep, said with its reason,
+/// and the answer is a fresh run's.
+#[test]
+fn a_reset_journal_sweeps_all_and_says_why() {
+    let io = journaled(23);
+    typed_crates(&io, Typed::Wrong);
+    let _ = engine_from(&io, 2, false);
+    io.with_sim(|sim| sim.reset_journal()).expect("a simulated world");
+    write(&io, "b/src/lib.rs", "pub fn h() -> u8 {\n    a::one() + 2\n}\n\npub fn wrong() -> u8 {\n    true\n}\n");
+    let (ids, now) = engine_from(&io, 2, false);
+    let line = sweep_line(&io);
+    println!("reset: {line}");
+    assert_eq!(now.sweep.journal, journal_sweep::JournalUse::Refused(journal_sweep::Refused::Lost(bstd::fs::Lost::Reset)), "{line}");
+    assert_eq!(now.sweep.statted, now.sweep.leaves, "every row statted: {line}");
+    assert!(line.contains("refused: the journal of changes was reset"), "the reason is printed: {line}");
+    let (fresh_ids, fresh) = engine_from(&io, 2, true);
+    assert_eq!((ids, now.status.0, now.bodies.0.clone()), (fresh_ids, fresh.status.0, fresh.bodies.0.clone()), "the answer is a fresh run's");
+}
+
+/// (d) ONE FOLDER TO SCAN AGAIN (FSEvents' `MustScanSubDirs` on `b`): the rows beneath it (and
+/// the listing it is in) are statted, none of `a`'s. CONTROL: the whole checkout lost stats
+/// every row.
+#[test]
+fn a_lost_subtree_stats_that_subtree_alone() {
+    let io = journaled(24);
+    typed_crates(&io, Typed::Plain);
+    let _ = engine_from(&io, 2, false);
+    let b = blaze_core::FileName::new("ws/b").expect("a name");
+    io.with_sim(|sim| sim.lose_changes(&b, bstd::fs::Lost::Rescan)).expect("a simulated world");
+    let (_, now) = engine_from(&io, 2, false);
+    println!("b to scan again: {}", sweep_line(&io));
+    assert_eq!(now.sweep.journal, journal_sweep::JournalUse::Used, "{}", sweep_line(&io));
+    assert!(now.certified, "nothing in b moved: the certificate");
+    assert!(now.sweep.statted >= 3, "b's manifest, root and listing at least: {}", sweep_line(&io));
+    assert!(now.sweep.statted < now.sweep.leaves, "a's rows are not statted: {}", sweep_line(&io));
+    let ws = blaze_core::FileName::new("ws").expect("a name");
+    io.with_sim(|sim| sim.lose_changes(&ws, bstd::fs::Lost::Rescan)).expect("a simulated world");
+    let (_, all) = engine_from(&io, 2, false);
+    println!("ws to scan again: {}", sweep_line(&io));
+    // Every row of the checkout: all but the home's listings, whose journal lost nothing.
+    assert!(all.sweep.statted > now.sweep.statted && all.sweep.statted + 2 >= all.sweep.leaves, "the checkout lost: every row of it statted: {}", sweep_line(&io));
+}
+
+/// (e) THE PLACE IS TAKEN BEFORE THE READS: a file written after a request's replay (and before
+/// it would read the file) is named by the next replay from the place that request saves. The
+/// save's bytes are read back as the next request reads them. CONTROL: with nothing written
+/// between, the replay names nothing.
+#[test]
+fn a_write_after_the_replay_is_seen_by_the_next() {
+    let io = journaled(25);
+    typed_crates(&io, Typed::Plain);
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = cx.frame();
+    let fs = io.need_fs().expect("files");
+    let root = fs.open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+    let home = fs.open_dir(&cx, &Path::new("h/.blaze").expect("a path")).expect("open");
+    let clock = io.need_clock().expect("a clock");
+    let saved = |taken: &journal_sweep::Taken<'_>| {
+        let mut bytes = blaze_own::Vec::new_in(frame);
+        taken.encode(&mut bytes);
+        bytes
+    };
+    let first = journal_sweep::take(&cx, &root, &home, &clock, journal_sweep::Stored::NONE, None, frame).expect("the replay");
+    let first_bytes = saved(&first);
+    // CONTROL: nothing written since the place.
+    let stored = journal_sweep::Stored::of(&first_bytes).expect("the places read back whole");
+    let quiet = journal_sweep::take(&cx, &root, &home, &clock, stored, None, frame).expect("the replay");
+    assert_eq!((quiet.journal.clone(), quiet.events), (journal_sweep::JournalUse::Used, 0), "nothing written: nothing named");
+    // The write a request's reads would race: after the place, before the read.
+    write(&io, "a/src/lib.rs", "pub fn one() -> u8 {\n    1\n}\n// late\n");
+    let next = journal_sweep::take(&cx, &root, &home, &clock, stored, None, frame).expect("the replay");
+    println!("a write after the place: {} event(s)", next.events);
+    assert_eq!(next.journal, journal_sweep::JournalUse::Used);
+    assert!(next.events >= 1, "the late write is named by the next replay");
+}
+
+/// (f) A DEPENDENCY'S SOURCE IS NEVER STATTED: a file written under the home's registry sources
+/// (a settled class, keyed by the lock) moves no row and is not counted: the certificate stands
+/// with no path statted, and no settled class is checked.
+#[test]
+fn a_dependency_source_is_never_statted() {
+    let io = journaled(26);
+    typed_crates(&io, Typed::Plain);
+    let _ = engine_from(&io, 2, false);
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let source = Path::new(&format!("h/.blaze/v2/sources/{}/src/lib.rs", "0".repeat(64))).expect("a path");
+    io.need_fs().expect("files").root().publish(&cx, &source, Content::bytes(b"pub fn dep() {}\n"), Durable::No).expect("write");
+    let (_, now) = engine_from(&io, 2, false);
+    println!("a dependency's source written: {}", sweep_line(&io));
+    assert!(now.certified, "a dependency's source moves no row of the checkout");
+    assert_eq!((now.sweep.events, now.sweep.statted, now.sweep.settled), (0, 0, 0), "{}", sweep_line(&io));
+}
+
+/// The stored answer's unit graph row: its out, the digest of the whole sealed payload (the
+/// graph's bytes and the crate list), so two equal outs are two equal records.
+fn stored_graph_out(io: &Io) -> blaze_ids::ContentId {
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+    let err = io.need_err().expect("err");
+    let mut phases = Phases::new(io.need_clock().expect("a clock"));
+    let got = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| kept.answer.rows.get(&blaze_drive::Name::unit_graph()).map(|row| row.out));
+    got.expect("the stored answer opens").expect("an answer opens").expect("the answer has a unit graph row")
+}
+
+/// The tasks entered past the units stage: the graph's readers and theirs.
+fn entered_past_units(checked: &engine_check::Checked) -> u32 {
+    blaze_engine::Stage::ALL.iter().filter(|stage| **stage != blaze_engine::Stage::Units).map(|stage| checked.stages[stage.index()].entered).sum()
+}
+
+/// THE UNIT GRAPH IS MADE ONCE AND READ BACK (plan row D2): on three crates in a chain the first
+/// request discovers it (no stored answer), a body edit reads it back (no manifest, lock,
+/// toolchain or config moved: no fetch run, no graph walk), and a request with nothing moved is
+/// the certificate, which does not open the units stage. The profile's plan line says which.
+/// CONTROL: before D2 every request discovered the graph, and the plan line named no cause.
+#[test]
+fn engine_check_reads_the_unit_graph_back() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    three_crates(&io);
+    let (_, first) = engine_from(&io, 2, false);
+    println!("first: units {:?}\n{}", first.units, profile_lines(&io));
+    assert_eq!((first.units.read_back, first.units.discovered), (0, 1), "the first request discovers the graph: {:?}", first.units);
+    assert!(profile(&io).contains("plan (the units, the fetches and the graph)"), "the first request's plan line says the graph was discovered:\n{}", profile_lines(&io));
+    write(&io, "a/src/m.rs", "pub fn k() -> u8 {\n    let _ = 0u8;\n    2\n}\n");
+    let (body_ids, body) = engine_from(&io, 2, false);
+    println!("a body edit: units {:?}\n{}", body.units, profile_lines(&io));
+    assert_eq!(body.units, crate::engine_units::Units { read_back: 1, discovered: 0, fetches_run: 0 }, "a body edit reads the graph back\n{}", profile_lines(&io));
+    assert!(profile(&io).contains("plan (the units read back"), "the plan line says the graph was read back:\n{}", profile_lines(&io));
+    // The read-back answer is a fresh run's.
+    let (fresh_ids, fresh) = engine_from(&io, 2, true);
+    assert_eq!((body_ids, body.status.0, body.bodies.0.clone()), (fresh_ids, fresh.status.0, fresh.bodies.0.clone()), "the answer over the graph read back is a fresh run's");
+    let (_, again) = engine_from(&io, 2, false);
+    assert!(again.certified, "nothing moved: the certificate");
+    assert_eq!(again.units, crate::engine_units::Units::default(), "the certificate opens no units stage");
+}
+
+/// EARLY CUTOFF OF THE GRAPH (plan row D2): a comment in a member's `Cargo.toml` moves the
+/// manifests, so the graph is discovered again, but it is the same graph: its record's bytes
+/// equal the stored ones (its out, the digest of the sealed payload), and no task past the units
+/// stage is entered. CONTROL: a dependency added in `c/Cargo.toml` writes another graph and
+/// enters `c`'s names (engine_check_adds_a_dependency_to_the_graph).
+#[test]
+fn engine_check_cuts_off_a_manifest_comment() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    three_crates(&io);
+    let _ = engine_from(&io, 2, false);
+    let before = stored_graph_out(&io);
+    write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n# a comment\n\n[package.metadata.docs]\nall = true\n\n[dependencies]\na = { path = \"../a\" }\n");
+    let (ids, now) = engine_from(&io, 2, false);
+    println!("a manifest comment: units {:?}, entered {}\n{}", now.units, entries(&now), profile_lines(&io));
+    assert_eq!((now.units.read_back, now.units.discovered), (0, 1), "a manifest moved: the graph discovered again");
+    assert_eq!(stored_graph_out(&io), before, "the same graph: its record's bytes are the stored ones");
+    assert_eq!(entered_past_units(&now), 0, "no task past the units stage entered\n{}", entries(&now));
+    assert!(ids.is_empty(), "the comment adds no finding: {ids:?}");
+}
+
+/// A DEPENDENCY ADDED (plan row D2, the control of the cutoff): `c` now also depends on `a`
+/// directly. The graph is discovered again, its record differs, and the names stage is entered
+/// (`c`'s scope now holds `a`); the answer is a fresh run's.
+#[test]
+fn engine_check_adds_a_dependency_to_the_graph() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    three_crates(&io);
+    let _ = engine_from(&io, 2, false);
+    let before = stored_graph_out(&io);
+    write(&io, "c/Cargo.toml", "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\nb = { path = \"../b\" }\n");
+    write(&io, "c/src/lib.rs", "pub fn h() -> u8 {\n    b::g() + a::f()\n}\n");
+    let (ids, now) = engine_from(&io, 2, false);
+    println!("a dependency added: units {:?}, entered {}\n{}", now.units, entries(&now), profile_lines(&io));
+    assert_eq!((now.units.read_back, now.units.discovered), (0, 1), "a manifest moved: the graph discovered again");
+    assert!(stored_graph_out(&io) != before, "another graph: `c` depends on `a`");
+    assert!(now.stages[blaze_engine::Stage::Names.index()].entered >= 1, "`c`'s names entered\n{}", entries(&now));
+    let (fresh_ids, fresh) = engine_from(&io, 2, true);
+    assert_eq!((ids, now.status.0, now.bodies.0.clone()), (fresh_ids, fresh.status.0, fresh.bodies.0.clone()), "the answer is a fresh run's");
+}
+
+/// `blaze why` READS A FILE UNDER ITS CRATE'S EDITION (plan row D2; engine_why.rs once looked
+/// every item up under 2024): `a` is a 2021 crate, and `why` of its body names edition 2021,
+/// from the stored unit graph; after `a/Cargo.toml` moves to 2024 it names 2024. CONTROL: with
+/// the edition a constant, both said nothing of it, and a 2021-only parse was missed.
+#[test]
+fn engine_why_reads_a_body_under_its_crates_edition() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    let a = |edition: &str| format!("[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n");
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
+    write(&io, "a/Cargo.toml", &a("2021"));
+    write(&io, "a/src/lib.rs", "pub fn one() -> u8 {\n    let gen = 1u8;\n    gen\n}\n");
+    let _ = engine_from(&io, 2, false);
+    let said = why(&io, "a/src/lib.rs::one");
+    println!("why under 2021:\n{said}");
+    assert!(said.contains("the body of `a/src/lib.rs::one` (read as edition 2021"), "why names the crate's edition, 2021: {said}");
+    write(&io, "a/Cargo.toml", &a("2024"));
+    // `gen` is a keyword in 2024: the body written without it, so its item stands either way.
+    write(&io, "a/src/lib.rs", "pub fn one() -> u8 {\n    let x = 1u8;\n    x\n}\n");
+    let _ = engine_from(&io, 2, false);
+    let said = why(&io, "a/src/lib.rs::one");
+    println!("why under 2024:\n{said}");
+    assert!(said.contains("(read as edition 2024"), "why names the crate's edition, 2024: {said}");
 }

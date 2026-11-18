@@ -10,7 +10,11 @@
 //! moved the record's inputs: the solve makes the tree again from the files (every file walked
 //! and lowered, as a whole solve does) and its `tree_record` is the new one.
 //!
-//! What it is a function of: the `mod` lines and inner attributes of every module's text, the
+//! It also lists every enum a module's own text declares, with its variants: a one-group solve
+//! answers an enum of a module it does not lower from here (a member whose enums are not its
+//! rows' moved the record's inputs too).
+//!
+//! What it is a function of: the `mod` lines, enums and inner attributes of every module's text, the
 //! file set (which of `x.rs` and `x/mod.rs` exist), the cfg, the root's attributes and the
 //! dependencies' roots (the crate root). A caller hands it to a one-group solve only while the
 //! texts outside the members and the file set are the ones it was written from.
@@ -19,10 +23,10 @@ use blaze_format::cursor::{self, Reader};
 use blaze_id::{ContentId, ItemKey};
 use blaze_own::{AVec, Alloc};
 
-use crate::task::WalkRow;
+use crate::task::{Variant, WalkRow};
 
 const MAGIC: [u8; 4] = *b"BZMT";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const NONE: u32 = u32::MAX;
 
 /// One module of the tree, root first, each after its parent (the walk's order).
@@ -56,10 +60,25 @@ pub struct TreeModule<'r> {
     pub macros: u32,
 }
 
+/// An enum a module's own text declares, with its variants as the lowering made them: what a
+/// one-group solve answers a path or a glob through an enum of a module it does not lower by
+/// (`use Cow::*;` in a module outside the members: alloc's `borrow`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TreeEnum<'r> {
+    pub key: ItemKey,
+    /// Its module's index in [`TreeRecord::modules`].
+    pub module: u32,
+    /// In declaration order.
+    pub variants: AVec<'r, Variant<&'r str>>,
+}
+
 /// The module tree record, decoded (or to be written).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TreeRecord<'r> {
     pub modules: AVec<'r, TreeModule<'r>>,
+    /// The enums the modules' own texts declare, sorted by key, each once (an enum an
+    /// expansion writes is not here: its call's solve makes it).
+    pub enums: AVec<'r, TreeEnum<'r>>,
     /// The root's `#![register_tool]`s.
     pub tools: AVec<'r, &'r str>,
     pub no_std: bool,
@@ -185,7 +204,23 @@ impl<'r> TreeRecord<'r> {
                 out.str(row.path.unwrap_or(""), "row path")?;
             }
         }
+        out.u32(self.enums.len(), "enums")?;
+        for e in self.enums.iter() {
+            out.key(e.key);
+            out.u32(e.module as usize, "enum module")?;
+            out.u32(e.variants.len(), "variants")?;
+            for v in e.variants.iter() {
+                out.key(v.key);
+                out.flag(v.record);
+                out.str(v.name, "variant name")?;
+            }
+        }
         Ok(out.bytes)
+    }
+
+    /// The enum `key` a module's own text declares, if the record holds it.
+    pub fn enum_of(&self, key: ItemKey) -> Option<&TreeEnum<'r>> {
+        self.enums.binary_search_by_key(&key, |e| e.key).ok().map(|i| &self.enums[i])
     }
 
     /// The record in `bytes`, its texts borrowed from them.
@@ -250,7 +285,29 @@ impl<'r> TreeRecord<'r> {
                 macros,
             });
         }
+        let n = count(&mut r)?;
+        // Each enum takes more than 32 bytes, each variant more than 32 too.
+        let mut enums: AVec<'r, TreeEnum<'r>> = AVec::with_capacity_in(n.min(bytes.len() / 32), alloc);
+        for _ in 0..n {
+            let enum_key = key(&mut r)?;
+            if enums.last().is_some_and(|e: &TreeEnum<'r>| e.key >= enum_key) {
+                return Err(TreeRecordError::Malformed { what: "enum order" });
+            }
+            let module = r.u32().map_err(TreeRecordError::Short)?;
+            if module as usize >= modules.len() {
+                return Err(TreeRecordError::Malformed { what: "enum module" });
+            }
+            let v = count(&mut r)?;
+            let mut variants = AVec::with_capacity_in(v.min(bytes.len() / 32), alloc);
+            for _ in 0..v {
+                let variant = key(&mut r)?;
+                let record = flag(&mut r)?;
+                let name = text(&mut r)?;
+                variants.push(Variant { name, key: variant, record });
+            }
+            enums.push(TreeEnum { key: enum_key, module, variants });
+        }
         r.finish().map_err(TreeRecordError::Short)?;
-        Ok(TreeRecord { modules, tools, no_std, no_core, arbitrary_ints, crate_root })
+        Ok(TreeRecord { modules, enums, tools, no_std, no_core, arbitrary_ints, crate_root })
     }
 }

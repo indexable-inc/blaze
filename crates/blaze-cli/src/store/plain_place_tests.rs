@@ -196,11 +196,15 @@ fn a_crash_loses_a_commands_records_but_never_serves_other_bytes() {
     println!("plain place: 32 seeds crashed; every record held had its own bytes");
 }
 
-/// A pin keeps a running program's records through compaction past the cap: records of an old
-/// segment that no root names are pruned (shown, so the pruning ran), every pinned one stays.
-/// The planted pin that does nothing is caught by the same oracle.
+/// A pin keeps a running program's records through cleanup past the cap: records no root names
+/// are swept (shown, so the sweep ran), every pinned one stays. Each process folds one slice
+/// into its commit after the answer; two processes, so a store that keeps a command's records by
+/// its lease until that commit (`Liveness::Reached`) sweeps them at the second. The planted pin
+/// that does nothing is caught by the same oracle.
 fn pinned_after_compaction(plant: PlacePlant) -> (Vec<u32>, usize) {
-    let lent = process(Sim::new(7, Faults::default()), 1, 1);
+    // Past the whole store's bytes (about 30 KiB here), never past one commit's.
+    const CAP: u64 = 16 << 10;
+    let lent = process(Sim::new(7, Faults::default()), 1, CAP);
     let mut place = PlainPlace::planted(&lent, false, plant);
     // The first commit: pinned 0..20, unpinned 100..120.
     for n in (0..20).chain(100..120) {
@@ -217,11 +221,13 @@ fn pinned_after_compaction(plant: PlacePlant) -> (Vec<u32>, usize) {
         place.commit().expect("a later commit");
     }
     drop(place);
-    after_answer(&lent, 64).expect("compaction past the cap");
-    let lent = process(back(lent), 2, 1);
+    after_answer(&lent, 1).expect("the first process's commit after the answer");
+    let lent = process(back(lent), 2, CAP);
+    after_answer(&lent, 1).expect("the second process's slice past the cap");
+    let lent = process(back(lent), 3, CAP);
     let place = PlainPlace::new(&lent, false);
     let missing: Vec<u32> = (0..20).filter(|n| read(&place, *n) != Some(value(*n))).collect();
-    let pruned = (100..120).filter(|n| read(&place, *n).is_none()).count();
+    let pruned = (100..120).chain(1000..1080).filter(|n| read(&place, *n).is_none()).count();
     (missing, pruned)
 }
 

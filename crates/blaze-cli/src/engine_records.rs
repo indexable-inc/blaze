@@ -43,6 +43,9 @@ pub(crate) struct ReadCounts {
     pub(crate) records: u64,
     /// Their whole bytes (head and payload), read where they lie.
     pub(crate) bytes: u64,
+    /// The bytes of their names, items and expansion texts sections, handed to the readers
+    /// (in place on [`InPlace`]; [`Copying`] copies the same bytes).
+    pub(crate) sections: u64,
     /// Bytes of them copied into this process's heap on the way (0 in place).
     pub(crate) copied: u64,
     /// Asks answered by a crate opened before.
@@ -119,6 +122,7 @@ pub(crate) fn open_record<'r, R: Route>(name: Name, record: Aligned16<'r>, key: 
     let parts = sections::sections(payload.bytes()).map_err(|error| LoadError::Sections { name, error })?;
     counts.records += 1;
     counts.bytes += record.len() as u64;
+    counts.sections += (parts.names.len() + parts.items.len() + parts.expansions.len()) as u64;
     let names = R::section(name, "names section", parts.names, counts, alloc)?;
     let items = R::section(name, "items section", parts.items, counts, alloc)?;
     let expansions = R::section(name, "expansion texts section", parts.expansions, counts, alloc)?;
@@ -126,7 +130,8 @@ pub(crate) fn open_record<'r, R: Route>(name: Name, record: Aligned16<'r>, key: 
 }
 
 /// The command's reader: every crate's records opened once a request, in place, for `'r`.
-/// Local to the request (engine_check.rs `check`), dropped with the store before its `Lent` is
+/// Local to the request (engine_check.rs `check`; `blaze run`'s parent, main.rs at
+/// `Effect::StartProgram` through run_names.rs), dropped with the store before its `Lent` is
 /// committed and let go: nothing of `'r` lives in a stage.
 pub(crate) struct EngineRecords<'r> {
     read: std::vec::Vec<(Name, Key, CrateRecords<'r>), Global>,

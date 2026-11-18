@@ -990,6 +990,40 @@ pub struct Unit<'t> {
     pub scope: Scope,
 }
 
+/// What a pass did for each rule, by [`Rule`] id: how many sites it tried for that rule (one
+/// entry into the rule's matcher: a word dispatched to it, a `[` to the index rule, a line
+/// comment to the hatch rule, a sequence of the shared trie that ended under it, a probe of the
+/// file's `variant-count` fact). Deterministic (a count of the bytes' tokens, never a time), so
+/// it is a record's and a profile's alike: what a rule costs is printed beside what it found
+/// (D135: one linter's rules cost 72% of a check's CPU, so each rule's share is said).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Cost(pub [u32; Rule::COUNT]);
+
+impl Cost {
+    /// Nothing tried.
+    pub const NONE: Cost = Cost([0; Rule::COUNT]);
+
+    /// The sites tried for `rule`.
+    #[inline]
+    pub const fn of(&self, rule: Rule) -> u32 {
+        self.0[rule as usize - 1]
+    }
+
+    /// One more site tried for `rule`.
+    #[inline]
+    pub(crate) fn add(&mut self, rule: Rule) {
+        let at = rule as usize - 1;
+        self.0[at] = self.0[at].saturating_add(1);
+    }
+
+    /// `other`'s sites added to these, rule by rule: a file's or a request's cost from its units'.
+    pub fn add_all(&mut self, other: &Cost) {
+        for (mine, theirs) in self.0.iter_mut().zip(other.0.iter()) {
+            *mine = mine.saturating_add(*theirs);
+        }
+    }
+}
+
 /// What a pass gives besides its findings.
 pub struct Linted<'a> {
     /// The findings it pushed, in [`Findings::list`].
@@ -999,6 +1033,11 @@ pub struct Linted<'a> {
     /// The test code the item's last byte is in (an out-of-line `mod m;` declared in test
     /// code makes `m`'s file test code).
     pub test_at_end: TestBits,
+    /// The sites each rule tried in this pass ([`Cost`]).
+    pub cost: Cost,
+    /// The tokens of the item's own bytes the one lex made: the cost every rule shares (the
+    /// floor, rule 67), counted once whatever the number of rules.
+    pub tokens: u32,
 }
 
 /// Why a unit could not be linted: a bad input, named.
@@ -1045,6 +1084,8 @@ pub fn lint_in<'a>(
 ) -> Result<Linted<'a>, LintError> {
     let mut linted = engine::run(rules, unit, alloc, out)?;
     if rules.runs(Rule::VariantCount) {
+        // One probe of the file's fact a unit.
+        linted.cost.add(Rule::VariantCount);
         variants.find(unit, base, out)?;
         linted.findings.to = count(out.list.len())?;
     }

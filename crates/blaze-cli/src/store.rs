@@ -25,7 +25,7 @@ use blaze_ids::ContentId;
 use core::fmt;
 use core::time::Duration;
 
-use blaze_cas::plain::{Lent, Settings};
+use blaze_cas::plain::{Lent, Settings, Snapshot};
 use blaze_core::Driver;
 use blaze_own::Alloc;
 use blaze_remote::PublicKey;
@@ -34,7 +34,7 @@ use bstd::Stopped;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, Fs, FsError, FsKind, ReadWrite};
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use bstd::mem::Bytes;
 use bstd::out::Out;
 use bstd::path::Path;
@@ -805,6 +805,16 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(())
     }
 
+    /// A `Send + Sync` read-only snapshot of the records committed now (blaze-cas
+    /// plain/snapshot.rs), its list of segments in `alloc`: the engine's phase loop takes one
+    /// after [`CommandStore::commit_puts`], hands `&Snapshot` to the stage's pool workers (who
+    /// read records by key with it, in place, with no lock), and drops it at the stage's end.
+    /// Not in it: this command's puts since the last commit, and any record an origin would
+    /// serve (a snapshot reads the local segments alone, never fetches).
+    pub fn snapshot_in<B: Allocator>(&self, alloc: B) -> Result<Snapshot<B>, CliError> {
+        Ok(self.place.snapshot_in(alloc)?)
+    }
+
     /// Keeps `keys` under the root `name` from the commit after the answer on: the engine's
     /// stored answer, its sealed pointer first, then the answer's root and pages
     /// (engine_answer.rs; the order simulated in blaze-engine pages_sim.rs).
@@ -1196,3 +1206,8 @@ mod nonce_tests;
 #[cfg(test)]
 #[path = "store/sharing_tests.rs"]
 mod sharing_tests;
+
+/// A snapshot taken after a phase's commit, read from eight threads, byte-equal to `Store::get`.
+#[cfg(test)]
+#[path = "store/snapshot_tests.rs"]
+mod snapshot_tests;

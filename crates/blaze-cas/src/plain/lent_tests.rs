@@ -37,6 +37,7 @@ fn cfg(n: u64) -> PlainConfig {
         machine: Vec::new_in(Global),
         writes,
         reads,
+        liveness: super::super::Liveness::Everything,
     }
 }
 

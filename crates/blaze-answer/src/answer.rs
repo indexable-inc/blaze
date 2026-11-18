@@ -117,6 +117,12 @@ pub fn nothing_changed(root: &[u8], tree: &TreeDigest) -> Result<bool, AnswerErr
     Ok(RootView::parse(root)?.tree == *tree)
 }
 
+/// The closing line's summary the root holds, read from the root alone (no segment): what a
+/// certificate prints when [`nothing_changed`] says the root answers today's tree.
+pub fn summary_of(root: &[u8]) -> Result<&[u8], AnswerError> {
+    Ok(RootView::parse(root)?.summary)
+}
+
 /// Whether the answer's segments call for compaction (rule 18: a state, never a failure).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Health {

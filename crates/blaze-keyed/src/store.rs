@@ -539,10 +539,21 @@ pub enum StoreError {
     Changed { segment: u64, generation: u64, len: u64, named: u64 },
     /// A commit took `took_s` seconds, past the grace of `grace_s` that keeps its files.
     CommitTooSlow { took_s: u64, grace_s: u64 },
+    /// One commit's segments alone are `request_bytes`, past the store's cap of `cap_bytes`: no
+    /// reclamation could make room for it. (A store over its cap otherwise only owes
+    /// reclamation, which the next commands' slices pay; nothing fails or waits for it.)
+    OverCap { request_bytes: u64, cap_bytes: u64 },
     /// The store was asked for something while in `phase`, which takes no such ask.
     Busy { phase: &'static str },
     /// The root `key` of generation `generation` names a record no segment holds.
     RootGone { generation: u64, key: ContentId },
+    /// A commit's root names the record `key`, which this process read from the segment
+    /// `segment`; a cleanup slice of another process replaced that segment since, judging the
+    /// record dead in its own view. The commit carries such records forward into a segment of
+    /// its own and flips again; this is the stop after blaze-cas `CARRY_ROUNDS` rounds (or
+    /// when the record cannot be carried: not mapped here, or a pointer), never a flip naming
+    /// a record that may be gone.
+    SweptUnder { key: ContentId, segment: u64 },
     /// A bucket object (`object`: its name in the bucket) was refused or failed: `what`, with
     /// the bucket's status (0 when it gave none).
     RemoteObject { what: &'static str, object: String, status: u32 },
@@ -607,10 +618,18 @@ impl fmt::Display for StoreError {
             StoreError::CommitTooSlow { took_s, grace_s } => {
                 write!(f, "a commit took {took_s} s, past the {grace_s} s that keep its files")
             }
+            StoreError::OverCap { request_bytes, cap_bytes } => write!(
+                f,
+                "one commit of {request_bytes} bytes is larger than the store's cap of {cap_bytes} bytes (plain store settings `cap_mib`): raise the cap"
+            ),
             StoreError::Busy { phase } => write!(f, "the store is {phase}, and takes no such ask then"),
             StoreError::RootGone { generation, key } => {
                 write!(f, "the root {key:?} of generation {generation} names a record no segment holds")
             }
+            StoreError::SweptUnder { key, segment } => write!(
+                f,
+                "a root of this commit names the record {key:?}, read from segment {segment:016x}, which another process's cleanup slice replaced since, after the commit carried such records forward as many rounds as it may (or this one could not be carried): the commit is not flipped, and the next command makes its records again"
+            ),
             StoreError::RemoteObject { what, object, status } => {
                 write!(f, "the remote cache: {what} for `{object}` ({status})")
             }

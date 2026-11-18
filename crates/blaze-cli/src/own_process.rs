@@ -186,7 +186,7 @@ pub(crate) fn run_own<F: Front>(
     today: start_list::Today,
     // The run's closing count, for the profile's `run` line on every run (phases.rs): set once
     // the program's loop ends, whether it ended well or not.
-    counted: &mut Option<crate::run_parent::Tally>,
+    counted: &mut Option<crate::run_parent::RunTally>,
     frame: &Frame,
 ) -> Result<u8, OwnError> {
     let io = launch.io;
@@ -208,20 +208,30 @@ pub(crate) fn run_own<F: Front>(
     // 2. The start list held for this (program, request shape), read before the spawn; its
     // rows placed, and the entry line.
     let held = start_list::held(lent, &today.name).map_err(OwnError::StartList)?;
+    // What the list was, for the profile's start-list line (an older form is said there too).
+    let mut listed = run_parent::ListHeld::None;
     let list = match held.map(|bytes| start_list::read(bytes, alloc)) {
         None => None,
         Some(Ok(view)) => Some(view.under(today.certificate)),
         Some(Err(why)) => {
+            listed = run_parent::ListHeld::Unread(why);
             run_parent::Resolve::watch(&lazy).see(blaze_screen::Step::Says);
             err.line(cx, format_args!("blaze run: {why}; the program starts without it, and this run's list replaces it at exit")).map_err(OwnError::Out)?;
             None
         }
     };
     let rows = match list {
-        Some(start_list::Held::Today(rows)) => Some(rows),
+        Some(start_list::Held::Today(rows)) => {
+            listed = run_parent::ListHeld::Today;
+            Some(rows)
+        }
         // Another certificate's symbols: each is resolved at its first call (compiled-behind,
         // run.md piece 10, will resolve them ahead on idle workers).
-        Some(start_list::Held::Other(_)) | None => None,
+        Some(start_list::Held::Other(_)) => {
+            listed = run_parent::ListHeld::Other;
+            None
+        }
+        None => None,
     };
     let mut needs = Needs::new(alloc);
     let mut ahead = std::vec::Vec::new_in(alloc);
@@ -246,7 +256,7 @@ pub(crate) fn run_own<F: Front>(
         run_loop::run_program(&cx, &spawner, &started, &mut needs, &mut lazy, &ahead, alloc)
     };
     let tally = lazy.tally();
-    *counted = Some(tally);
+    *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed) });
     let ran = ran.map_err(|error| match error {
         LoopError::Start(error) => OwnError::NotStarted {
             launcher: std::boxed::Box::from(launcher.as_str()),

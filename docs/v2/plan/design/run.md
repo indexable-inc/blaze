@@ -402,8 +402,11 @@ program, its initializer evaluated at compile time, never dropped; `static mut` 
   after the `Declare` of every slot the record and its data name (a fn's address in a datum is its slot's
   thunk) and before the record's `Publish`; a datum's own statics come in the same message, so a cycle
   of statics (`static A: N = N(&B); static B: N = N(&A);`) is one batch. Each static is told once a run.
-  A record that brings data is not a start-list row until the list's form carries static rows (a row is
-  placed alone, before any need); until then it is answered at its first call.
+  The start list carries them (start_list.rs version 4, 2026-11-17): each first answer is a group, the
+  data its `Publish` stood on as sent then (each datum once, in its first namer's group), the statics its
+  record and data name, then its code row; a replay sends each group as the run did, through the one
+  `Publish` writer. A group whose record or datum file is gone, or that names a static no group kept
+  before it sent, is left out whole and resolved at its first call.
 - **Placed by the child before anything names it** (launch-rt run_mode.rs): for one `Data` message, every
   datum is read and given its address first (so words inside the batch resolve, cycles included), then
   each is filled (blaze-code `datum::fill`: the bytes, then each word through the run's `Words`) and

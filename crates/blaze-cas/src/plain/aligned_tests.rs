@@ -17,7 +17,7 @@ use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
 
 use super::{
-    core::{PlainConfig, Plant, TAGS},
+    core::{Liveness, PlainConfig, Plant, TAGS},
     driven::{Cut, Driven},
     lent::{Aligned16, Lent, LentPlant, NotInPlace},
 };
@@ -41,6 +41,7 @@ fn cfg(n: u64) -> PlainConfig {
         machine: Vec::new_in(Global),
         writes,
         reads,
+        liveness: Liveness::Everything,
     }
 }
 

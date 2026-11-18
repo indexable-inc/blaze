@@ -20,7 +20,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Found, Got, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, Committed, Found, Got, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::{Form, Settings},
 };
@@ -213,6 +213,8 @@ impl Driven<Native> {
             machine: vec![root.as_os_str().as_encoded_bytes().to_vec()],
             writes: settings.writes(),
             reads: settings.reads(),
+            // The keyed handle's callers root nothing of their own.
+            liveness: Liveness::Everything,
         };
         let mut it = Driven::with(driver, root, cfg)?;
         it.open_files()?;
@@ -551,6 +553,33 @@ impl<D: Driver> Driven<D> {
             }
         }
         Ok(out)
+    }
+
+    /// After the answer: one cleanup slice written with no lock, for the next commit's flip to
+    /// name ([`Plain::fold_slice`]), on a lowered thread. Whether one is parked; a slice that
+    /// found nothing to do is [`Driven::take_sliced`]'s at once.
+    pub fn fold_slice(&mut self) -> Result<bool, StoreError> {
+        lower_this_thread()?;
+        self.map_all()?;
+        if self.core.fold_slice(&mut self.effects)? {
+            self.run("writing a cleanup slice")?;
+        }
+        Ok(self.core.slice_parked())
+    }
+
+    /// The last slice's outcome, once: a folded one's after the commit that flipped it.
+    pub fn take_sliced(&mut self) -> Option<Sliced> {
+        self.core.take_sliced()
+    }
+
+    /// [`Plain::root_for`].
+    pub fn root_for(&mut self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, StoreError> {
+        self.core.root_for(name, keys, life_ns)
+    }
+
+    /// [`Plain::release_lease`].
+    pub fn release_lease(&mut self) {
+        self.core.release_lease()
     }
 
     /// The exit tail sealed ([`Plain::seal`]): a command calls it after it answered, before or

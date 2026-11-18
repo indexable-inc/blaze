@@ -98,6 +98,10 @@
 //! segment, from the page cache when warm), plus for `get_into` one `pread`, for `get` the
 //! payload's pages faulted on first touch; no checksum of any kind.
 //!
+//! A pool reads through a [`Snapshot`] ([`Lent::snapshot_in`], after a commit): the
+//! generation's mapped segments, their mappings shared, `Send + Sync`, read with `&self` alone;
+//! what is committed after it, and the command's puts not yet committed, are not in it.
+//!
 //! # Compaction ([`Driven::compact`])
 //!
 //! Run by a command after it has answered, or by its own invocation, on a lowered thread
@@ -112,6 +116,18 @@
 //! a head maps what it names within milliseconds, and a mapping outlives an unlink. A
 //! published segment is never rewritten: a merge leaves it, and pruning only stops holding it
 //! here.
+//!
+//! A [`Liveness::Reached`] store keeps only what reaches from its roots, each
+//! with an expiry ([`ROOT_LIFE_NS`] for a checkout's answer), and what a running command's
+//! lease keeps ([`LEASE_NS`] past its last commit, so a process that dies holding one is let
+//! go of by the clock). A slice rewrites a run from a segment under half live, so the store
+//! holds at most twice its live bytes and a slice. A command's slice is folded into its own
+//! commit after the answer ([`Driven::fold_slice`]): written with no lock, named by the flip
+//! the command makes anyway, so no command ever waits on cleanup. A retired file also waits
+//! for every live lease whose holder opened before it was retired. A commit whose roots name
+//! a record a slice swept since it was read carries the record forward from its own mapping
+//! into a segment of its own and flips again (at most [`CARRY_ROUNDS`]), so no command's
+//! work after its answer is refused or lost.
 //!
 //! # The shared cache ([`Source`], [`Verifier`])
 //!
@@ -130,10 +146,13 @@ mod format;
 mod handle;
 mod image;
 mod lent;
+mod snapshot;
 mod verified;
 
 #[cfg(test)]
 mod aligned_tests;
+#[cfg(test)]
+mod cleanup_tests;
 #[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]
@@ -146,10 +165,11 @@ mod root_commit_tests;
 mod tests;
 
 pub use self::core::{
-    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, Committed, Found, GRACE_NS, Got, Lost, POINTER_LEN, POINTER_TAG, Placed, Plain, PlainConfig, Probe, Probes, PutError,
-    ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, Scrubbed, Sliced, TAGS, WINDOW,
+    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, LEASE_NS, Liveness, Lost, POINTER_LEN, POINTER_TAG, Placed, Plain, PlainConfig, Probe,
+    Probes, PutError, ROOT_LIFE_NS, ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
 };
 pub use self::lent::{Aligned16, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, first_difference};
+pub use self::snapshot::{SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};
 pub use self::driven::{Driven, LocalDir, Opened, lower_this_thread};
 pub use self::format::{Described, Entry, FORMAT, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};

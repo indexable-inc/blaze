@@ -25,10 +25,6 @@ use crate::phases::Phases;
 use crate::sweep::Leaves;
 use crate::{CliError, work};
 
-/// The edition an item path is looked up under: the item is found by its chain of names, so
-/// another edition's parse can only miss it, which is said, never a wrong answer.
-const LOOKUP_EDITION: blaze_surface::Edition = blaze_surface::Edition::E2024;
-
 /// The explanation of `target` from the checkout's stored answer, printed to `out`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 pub(crate) fn explain(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, target: &str, phases: &mut Phases, out: &Out, err: &Out) -> Result<Status, CliError> {
@@ -53,8 +49,12 @@ pub(crate) fn explain(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, 
                 line(&mut text, format_args!("{why}"));
                 Status::FAILED
             }
+            // A file is outlined under its crate's edition, from the stored unit graph (plan row
+            // D2): a graph that does not read is said where an edition is needed, never an
+            // edition chosen in its place.
             Ok((kept, _)) => {
-                let names = Names { cx, root, leaves: &pointer.leaves, kept: &kept, frame };
+                let editions = crate::engine_units::stored_editions(cx, &mut store, &kept.records, frame)?;
+                let names = Names { cx, root, leaves: &pointer.leaves, kept: &kept, editions: &editions, frame };
                 walk(&names, target, &mut text)?
             }
         },
@@ -79,22 +79,39 @@ struct Names<'n, 'm, 'a> {
     root: &'n Dir<ReadWrite>,
     leaves: &'n Leaves<'m>,
     kept: &'n Kept<'a>,
+    /// Each member crate's edition, from the stored unit graph, or why that graph did not read.
+    editions: &'n Result<crate::engine_units::Editions<'n>, crate::engine_units::BackRefused>,
     frame: &'n Frame,
 }
 
 impl Names<'_, '_, '_> {
+    /// The edition `path` is outlined under: its crate's, from the stored unit graph. `Err`
+    /// says why there is none (rule 3).
+    fn edition_of(&self, path: &str) -> Result<blaze_surface::Edition, blaze_own::String<&Frame>> {
+        let mut why = blaze_own::String::new_in(self.frame);
+        match self.editions {
+            Ok(editions) => match editions.of(path) {
+                Some(edition) => return Ok(edition),
+                None => line_into(&mut why, format_args!("`{path}` is a file of no member crate of the stored unit graph, so no edition reads it")),
+            },
+            Err(refused) => line_into(&mut why, format_args!("`{path}` has no edition to be read under: {refused}")),
+        }
+        Err(why)
+    }
+
     /// The checkout path whose outline task is `file`, from the leaf table.
     fn path_of(&self, file: Name) -> Option<&str> {
         (0..self.leaves.len()).map(|k| self.leaves.path(k)).find(|path| Name::file(path.as_bytes()) == file)
     }
 
-    /// `path`'s text outlined, each item with a body by its chain of names, as `(chain, body)`.
-    fn bodies(&self, path: &str) -> Result<blaze_own::Vec<(blaze_own::String<&Frame>, Name), &Frame>, CliError> {
+    /// `path`'s text outlined under `edition` (its crate's, [`Names::edition_of`]), each item
+    /// with a body by its chain of names, as `(chain, body)`.
+    fn bodies(&self, path: &str, edition: blaze_surface::Edition) -> Result<blaze_own::Vec<(blaze_own::String<&Frame>, Name), &Frame>, CliError> {
         let mut bytes = Bytes::new_in(self.frame, "a source file `blaze why` names an item in");
         self.root.read_all(self.cx, &Path::new(path)?, &mut bytes)?;
         let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "a source file is not UTF-8" })?;
         let erased = blaze_own::Erased::new(self.frame);
-        let outline = blaze_file_items::outline(text, LOOKUP_EDITION, erased.handle());
+        let outline = blaze_file_items::outline(text, edition, erased.handle());
         let file = Name::file(path.as_bytes());
         let mut found = blaze_own::Vec::new_in(self.frame);
         for item in outline.items().iter() {
@@ -126,9 +143,13 @@ impl Names<'_, '_, '_> {
         };
         match (name.kind, path) {
             (Kind::FileItems, Some(path)) => line_into(&mut shown, format_args!("`{path}`'s outline")),
-            (Kind::BodyCheck, Some(path)) => match self.bodies(path)?.iter().find(|(_, body)| *body == name) {
-                Some((chain, _)) => line_into(&mut shown, format_args!("the body of `{path}::{chain}`")),
-                None => line_into(&mut shown, format_args!("a body in `{path}` no item of its text names today")),
+            (Kind::BodyCheck, Some(path)) => match self.edition_of(path) {
+                Ok(edition) => match self.bodies(path, edition)?.iter().find(|(_, body)| *body == name) {
+                    // Its edition said: the one its file was outlined under to find it.
+                    Some((chain, _)) => line_into(&mut shown, format_args!("the body of `{path}::{chain}` (read as edition {edition}, its crate's in the stored unit graph)")),
+                    None => line_into(&mut shown, format_args!("a body in `{path}` no item of its text names today (read as edition {edition})")),
+                },
+                Err(why) => line_into(&mut shown, format_args!("a body in `{path}` ({why})")),
             },
             (kind, _) => {
                 line_into(&mut shown, format_args!("{} ", kind.name()));
@@ -169,13 +190,22 @@ fn walk(names: &Names<'_, '_, '_>, target: &str, text: &mut blaze_own::String<&F
     let file = Name::file(path.as_bytes());
     let start = match item {
         None => file,
-        Some(item) => match names.bodies(path)?.iter().find(|(chain, _)| chain.as_str() == item) {
-            Some((_, body)) => *body,
-            None => {
-                line(text, format_args!("`{path}` has no item `{item}` with a body today"));
-                return Ok(Status::FAILED);
+        Some(item) => {
+            let edition = match names.edition_of(path) {
+                Ok(edition) => edition,
+                Err(why) => {
+                    line(text, format_args!("{why}"));
+                    return Ok(Status::FAILED);
+                }
+            };
+            match names.bodies(path, edition)?.iter().find(|(chain, _)| chain.as_str() == item) {
+                Some((_, body)) => *body,
+                None => {
+                    line(text, format_args!("`{path}` has no item `{item}` with a body today"));
+                    return Ok(Status::FAILED);
+                }
             }
-        },
+        }
     };
     let kept = names.kept;
     if !kept.answer.rows.contains_key(&start) {

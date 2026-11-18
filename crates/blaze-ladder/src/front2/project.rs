@@ -237,6 +237,17 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         self.store.cost = cost;
     }
 
+    /// The request's table of shared trait goals (front2 tables/goals.rs): every body checked
+    /// over this world looks its root goals up there and puts what it solved.
+    pub fn set_goal_share(&mut self, goals: Option<&'n dyn blaze_solve::share::GoalShare>) {
+        self.store.goals = goals;
+    }
+
+    /// The shared goals the last body's check took, in order (blaze-solve `GoalHit`).
+    pub fn goal_hits(&self) -> &[blaze_solve::share::GoalHit] {
+        &self.store.goal_hits
+    }
+
     /// How the head store meets a trait's members' needs (heads.rs `NeedsMet`).
     pub fn set_needs(&mut self, needs: super::heads::NeedsMet) {
         self.store.needs = needs;

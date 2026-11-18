@@ -96,6 +96,10 @@ pub struct BodyFrame<'n> {
     /// (project.rs `set_body_sources`). `None`: each body `env!`, include and proc macro is
     /// refused by name.
     pub sources: Option<&'n dyn super::super::body_host::BodySources>,
+    /// The request's table of shared trait goals (goals.rs [`GoalTable`](super::goals::GoalTable),
+    /// one for the request's workers): each root goal the body asks is looked up there first.
+    /// `None`: every goal is solved in the body.
+    pub goals: Option<&'n dyn blaze_solve::share::GoalShare>,
 }
 
 /// Why a body task gave no result: each a fault of the plan or the engine, never of the body
@@ -154,6 +158,11 @@ pub struct BodyOut<'a> {
     /// home of a refusal's words and cause): each type diagnostic, typed lint finding and
     /// borrow finding with its item-relative range, then the reason a body was not checked.
     pub said: AVec<'a, Said<'a>>,
+    /// The shared goals the body's check took (blaze-solve share.rs `GoalHit`: the goal's key
+    /// and its read digest), in the order taken: the one read each hit is. TODAY each hit's
+    /// own reads are in `reads` too (share.rs, "A HIT IS ONE READ"); the engine names a goal
+    /// as a cell of its own once goals are records.
+    pub goal_hits: AVec<'a, blaze_solve::share::GoalHit>,
 }
 
 /// One line of a body's verdict ([`BodyOut::said`]): `start..end` is item-relative (rule 71).
@@ -206,6 +215,7 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     world.set_cost(frame.cost);
     world.set_needs(frame.needs);
     world.set_seeds(frame.heads);
+    world.set_goal_share(frame.goals);
     if let Some(sources) = frame.sources {
         world.set_body_sources(sources);
     }
@@ -243,6 +253,8 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     }
     held.sort_unstable();
     let said = said_of(&verdict, &borrows, view.records(), &world.front.keys, alloc)?;
+    let mut goal_hits: AVec<'a, blaze_solve::share::GoalHit> = AVec::with_capacity_in(world.goal_hits().len(), alloc);
+    goal_hits.extend_from_slice(world.goal_hits());
     drop(world);
     let reads = recorder.finish().map_err(TaskError::Full)?;
     let bytes = verdict_bytes(&verdict, &borrows, Facts::Digest, alloc)?;
@@ -265,7 +277,7 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     }
     let done = Done { name, key: task.key, out, defines, reads: cells, findings: u32::try_from(findings).unwrap_or(u32::MAX), failed };
     drop(reading);
-    Ok(BodyOut { done, made, bytes, reads, held, said })
+    Ok(BodyOut { done, made, bytes, reads, held, said, goal_hits })
 }
 
 /// The lines `check` prints for a verdict (blaze-cli body_types.rs, today's path), in `alloc`.

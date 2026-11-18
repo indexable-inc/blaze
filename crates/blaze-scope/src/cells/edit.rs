@@ -119,7 +119,12 @@ pub enum MemberRefusal {
     MacroExports { module: ItemKey },
     /// `module`'s scope holds an ambiguous binding of its own.
     Ambiguous { module: ItemKey },
-    /// A glob edge of `module` names `source`, which is no module or enum held here.
+    /// A glob edge of `module` (filled from its record) names `source`, which is no module or
+    /// enum held here. A module of the crate is always held (the tree record has every one;
+    /// one with no record yet is then read as [`MemberRefusal::NoRecord`], a demand), and an
+    /// enum its text declares is the tree record's (`TreeRecord::enums`); what is left is an
+    /// enum an expansion wrote in a module outside the members, or a dependency's module or
+    /// enum its names do not hold: a typed refusal (rule 3).
     GlobSource { module: ItemKey, source: ItemKey },
     /// D116's check re-decides the whole crate: never asked with members.
     DecideCheck,
@@ -146,6 +151,15 @@ impl MemberRefusal {
     }
 }
 
+/// What a crate solve asked with [`Members`] answers: the members' groups, and the module tree
+/// record the solve ended with: the one handed in when the members matched their rows, or the
+/// one it made when the record's inputs moved and it walked the tree again (tree_record.rs).
+#[derive(Debug)]
+pub struct Solved<'a> {
+    pub groups: AVec<'a, NameGroup<'a>>,
+    pub tree: &'a [u8],
+}
+
 /// The one-group solve over a crate solve: `solve_crate` solves the members it is given from
 /// their text, every other module from `records` ([`Members`]), and answers with the members'
 /// groups. A member that reads a module outside whose group reads back into the members (an
@@ -155,7 +169,11 @@ impl MemberRefusal {
 pub struct OneGroup<'a, F> {
     pub solve_crate: F,
     pub alloc: Alloc<'a>,
-    /// The crate's module tree record, handed to each crate solve ([`Members::tree`]).
+    /// The crate's module tree record, handed to each crate solve ([`Members::tree`]); after
+    /// each solve, the record it ended with ([`Solved::tree`]). So a solve that walked again
+    /// (a member gave a module its first `macro_rules!`, or a `mod` line) hands the new record
+    /// to every later solve of the same edit, never the stale one; after the driver returns it
+    /// is the crate's newest record, the one the caller keeps.
     pub tree: Option<&'a [u8]>,
 }
 
@@ -171,7 +189,7 @@ pub enum OneGroupRefusal<R> {
 /// The most widenings one [`OneGroup::solve`] takes.
 pub const MOST_WIDENINGS: usize = 64;
 
-impl<'a, R: core::fmt::Debug, F: FnMut(Members<'_>) -> Result<AVec<'a, NameGroup<'a>>, R>> GroupSolver<'a> for OneGroup<'a, F> {
+impl<'a, R: core::fmt::Debug, F: FnMut(Members<'_>) -> Result<Solved<'a>, R>> GroupSolver<'a> for OneGroup<'a, F> {
     type Refusal = OneGroupRefusal<R>;
 
     fn solve(&mut self, members: &[ItemKey], records: &dyn GroupRecords) -> Result<AVec<'a, NameGroup<'a>>, Self::Refusal> {
@@ -179,7 +197,10 @@ impl<'a, R: core::fmt::Debug, F: FnMut(Members<'_>) -> Result<AVec<'a, NameGroup
         asked.sort_unstable();
         asked.dedup();
         for _ in 0..MOST_WIDENINGS {
-            let got = (self.solve_crate)(Members { members: &asked, records, tree: self.tree }).map_err(OneGroupRefusal::Crate)?;
+            let Solved { groups: got, tree } = (self.solve_crate)(Members { members: &asked, records, tree: self.tree }).map_err(OneGroupRefusal::Crate)?;
+            // The newest record goes on: the texts of one edit are fixed, so the record a solve
+            // ended with is the tree of those texts.
+            self.tree = Some(tree);
             let more = closing(&asked, &got, records, self.alloc);
             if more.is_empty() {
                 return Ok(got);

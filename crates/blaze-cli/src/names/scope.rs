@@ -423,7 +423,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         cx: &cx,
         root,
         frame,
-        packs: job.packs,
+        packs: crate::job_texts::Packs::Open(job.packs),
         corrected: job.corrected,
         env: env.map(|env| (job.at, env)),
         read: RefCell::new(std::vec::Vec::new()),

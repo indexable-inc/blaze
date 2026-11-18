@@ -208,29 +208,51 @@ impl<'f> ScriptsStage<'f> {
         // 1. Each lookup answered and each run's job made, on this thread.
         let mut answered: Vec<(usize, Result<work::Made<'f>, Failure<'f>>), &Frame> = Vec::new_in(frame);
         let mut ready: Vec<(usize, crate::scripts::ScriptJob<'f>), &Frame> = Vec::new_in(frame);
+        // The tasks (by index) whose failure is not a function of their key and their reads (a
+        // panic, a hole: work.rs `filed`, `Did::Hole`): owed, entered again each request. Every
+        // other failure stands on what it was handed (plan row A8).
+        let mut owed: Vec<usize, &Frame> = Vec::new_in(frame);
         for (i, drive) in drives.iter().enumerate() {
             let name = drive.name;
             match name.kind {
                 Kind::MacroModule => {
                     let did = self.lookup(&cx, store, handles, names, drive, frame)?;
+                    if !stands_on_reads(&did) {
+                        owed.push(i);
+                    }
                     answered.push((i, published(name, did)?));
                 }
                 Kind::Script => {
                     // A panic while its job is made fails this run alone (rule 20), as work.rs's.
                     let made = work::unwinding(|| crate::scripts::job(&cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, handles.workers.get(), handles.lock, handles.members, drive, frame, frame));
                     match made {
-                        Err(work::Panicked) => answered.push((i, Err(refusal(name, "a build script's job panicked while it was made (its words are on the error stream)")))),
+                        // A panic is not a function of reads: owed.
+                        Err(work::Panicked) => {
+                            owed.push(i);
+                            answered.push((i, Err(refusal(name, "a build script's job panicked while it was made (its words are on the error stream)"))));
+                        }
                         Ok(made) => match made? {
                             Prepared::Ready(job) => ready.push((i, job)),
                             Prepared::Need(wants) => return Err(EngineCheckError::Unseen { task: name, read: wants.first().map_or(name, |want| want.name) }.into()),
+                            // Its failed need is read ABSENT: that task's fix moves this row.
                             Prepared::Waited(on) => answered.push((i, Err(Failure { failure: TaskFailure { name, why: Why::Waited { on } }, words: None }))),
-                            Prepared::Said { what, words, hole: _ } => {
+                            Prepared::Said { what, words, hole } => {
+                                // `hole`: the cause is outside its key (scripts.rs `Prepared::Said`:
+                                // the command's scripts not set up, a package's sources not
+                                // fetched), so no read makes it stand: owed.
+                                if hole {
+                                    owed.push(i);
+                                }
                                 answered.push((i, Err(Failure { failure: TaskFailure { name, why: Why::Refused { what, rule: crate::scripts::RULE } }, words: Some(words) })));
                             }
                         },
                     }
                 }
-                _ => answered.push((i, Err(refusal(name, "a task of a kind the scripts stage does not run")))),
+                // A plan fault, not a function of a cell: owed.
+                _ => {
+                    owed.push(i);
+                    answered.push((i, Err(refusal(name, "a task of a kind the scripts stage does not run"))));
+                }
             }
         }
         // 2. The wave's runs at once, on the workers, each in its own sandbox; a native run's
@@ -272,6 +294,10 @@ impl<'f> ScriptsStage<'f> {
                         }
                     }
                 };
+                // A panic on its worker, its record not held, a hole: owed.
+                if !stands_on_reads(&did) {
+                    owed.push(*i);
+                }
                 answered.push((*i, published(name, did)?));
             }
         }
@@ -301,7 +327,23 @@ impl<'f> ScriptsStage<'f> {
                     if name.kind == Kind::Script {
                         names.mark(name, None);
                     }
-                    crate::engine_tasks::failed(task, alloc)
+                    if owed.contains(&i) {
+                        crate::engine_tasks::failed(task, alloc)
+                    } else {
+                        // What its failure saw (plan row A8): every record its plan handed it,
+                        // with the out it had, and each of its plan's reads that failed this
+                        // command, read ABSENT (a failed task defines no cell), so that task's
+                        // fix moves this row. Its script's sources, its placement and the SDK
+                        // are in its key (scripts.rs `parts`: the subject, its crate's world key,
+                        // the run's mode); its environment is the world row's cfg, the graph's
+                        // record, which every run reads; a module the store lacks is in its
+                        // lookup's key (the store's listing) and read here as that lookup's cell.
+                        let drive = &drives[i];
+                        let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(drive.inputs.len() + drive.failed.len(), alloc);
+                        reads.extend(drive.inputs.iter().map(|input| (CellId { of: input.name, cell: WHOLE }, input.out)));
+                        reads.extend(drive.failed.iter().map(|read| (CellId { of: *read, cell: WHOLE }, blaze_drive::key::ABSENT)));
+                        crate::engine_tasks::failed_with(task, reads, alloc)
+                    }
                 }
             };
             buffer.done.push(done);
@@ -331,6 +373,21 @@ impl<'f> ScriptsStage<'f> {
             Ok(at) => self.made[at].1 = made,
             Err(at) => self.made.insert(at, (name, made)),
         }
+    }
+}
+
+/// Whether a lookup's or a run's result is a function of its key and what it was handed, so a
+/// failure stands on its reads (work.rs `filed`, the old path's rule): not a hole (a fact outside
+/// the key and the reads, `Did::Hole`), a panic (a bug or a frame too small), or a file that
+/// changed while the command ran.
+fn stands_on_reads(did: &Did<'_>) -> bool {
+    match did {
+        Did::Done(_) | Did::FailedSaying(..) => true,
+        Did::Failed(failure) => match failure.why {
+            Why::Panicked { .. } | Why::Changed => false,
+            Why::Waited { .. } | Why::Refused { .. } | Why::NotBuilt => true,
+        },
+        Did::Hole(..) | Did::Need(_) => false,
     }
 }
 

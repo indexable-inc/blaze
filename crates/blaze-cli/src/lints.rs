@@ -167,6 +167,15 @@ pub fn lints_of(manifest: &str) -> Result<Lints, StepError> {
     Ok(Lints { step, rules })
 }
 
+/// What the checkout at `root` lints with: its root `Cargo.toml` read (in `frame`) and
+/// [`lints_of`] it. The one reading of the step for `check` and `engine-check` alike.
+pub(crate) fn of_root(cx: &bstd::Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, frame: &bstd::mem::Frame) -> Result<Lints, crate::CliError> {
+    let mut manifest = bstd::mem::Bytes::new_in(frame, "the root manifest, for its lint step");
+    root.read_all(cx, &bstd::path::Path::new("Cargo.toml")?, &mut manifest)?;
+    let text = core::str::from_utf8(manifest.as_slice()).map_err(|_| crate::CliError::Text { what: "the root `Cargo.toml` is not UTF-8" })?;
+    Ok(lints_of(text)?)
+}
+
 /// A file's root scope from its path, as blaze-lint's example reads it: a test file (under
 /// `tests/` or `benches/`, or `tests.rs`, `test.rs`), a binary's root, a build script. A module
 /// declared in test code in ANOTHER file is not test code here (owed: its parent's `Lint` record
@@ -300,7 +309,7 @@ pub(crate) fn lint_units(
         let Some(task) = wanted[at] else { continue };
         let (name, _, source) = asked[task];
         made[task] = Some(match unit_source(&units, at, text, scope, &variants) == source {
-            true => Ok(record(name, rules, unit.text, &findings, linted.findings)),
+            true => Ok(record(name, rules, unit.text, &findings, &linted)),
             false => Err(Why::Refused { what: "a `Lint` unit whose text or scope is not the one its key was made from", rule: "blaze-cli lints.rs, lint_units" }),
         });
     }
@@ -310,11 +319,14 @@ pub(crate) fn lint_units(
     Ok(())
 }
 
-/// One unit's record, named `name`: each finding of `run` (in `findings`) a drive finding with
-/// its message's words; the payload the findings in the engine's form ([`payload`]); the out a
-/// digest of both, so a reader moves only when what it prints moves.
-fn record(name: Name, rules: &RuleSet, item: &str, findings: &Findings<'_>, run: blaze_lint::Run) -> Record<Global> {
+/// One unit's record, named `name`: each finding of the pass `linted` (in `findings`) a drive
+/// finding with its message's words; the payload the findings in the engine's form ([`payload`])
+/// and then the pass's cost ([`COST_BYTES`]); the out a digest of the findings and words alone,
+/// so a reader moves only when what it prints moves (a comment that adds a token moves the cost,
+/// never the out).
+fn record(name: Name, rules: &RuleSet, item: &str, findings: &Findings<'_>, linted: &blaze_lint::Linted<'_>) -> Record<Global> {
     let mut made = Record::new_in(name, Global);
+    let run = linted.findings;
     let list = &findings.list[run.from as usize..run.to as usize];
     for finding in list {
         let mut words = blaze_own::String::new_in(Global);
@@ -325,7 +337,28 @@ fn record(name: Name, rules: &RuleSet, item: &str, findings: &Findings<'_>, run:
     let mut h = Hasher::new(UNIT_OUT_DOMAIN);
     h.update(&made.payload).update(&made.messages);
     made.out = h.finish();
+    made.payload.extend_from_slice(&linted.tokens.to_le_bytes());
+    for sites in linted.cost.0 {
+        made.payload.extend_from_slice(&sites.to_le_bytes());
+    }
     made
+}
+
+/// The bytes a unit's cost takes at the end of its record's payload: its own tokens, then the
+/// sites of each rule by id, each a little-endian `u32`.
+pub(crate) const COST_BYTES: usize = 4 * (1 + Rule::COUNT);
+
+/// A unit record's cost, read back from the end of its `payload` ([`record`]): its tokens and
+/// each rule's sites. `None` for a payload shorter than a cost (not a unit's record).
+pub(crate) fn cost_of(payload: &[u8]) -> Option<(u32, blaze_lint::Cost)> {
+    let at = payload.len().checked_sub(COST_BYTES)?;
+    let tail = &payload[at..];
+    let word = |i: usize| u32::from_le_bytes([tail[4 * i], tail[4 * i + 1], tail[4 * i + 2], tail[4 * i + 3]]);
+    let mut cost = blaze_lint::Cost::NONE;
+    for (rule, sites) in cost.0.iter_mut().enumerate() {
+        *sites = word(rule + 1);
+    }
+    Some((word(0), cost))
 }
 
 /// The engine's findings `list` as bytes (each little-endian): their count; then each finding's

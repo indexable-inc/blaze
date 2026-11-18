@@ -10,12 +10,20 @@
 //! trait, and `implement!`, which writes such a block at module level as a derive does) and
 //! `app` (one block by hand, one by `implement!`). Without the planted error every body is
 //! checked and none is refused; with `let _x: u32 = T;` in the hand-written block the type error
-//! is reported (the control: the body holding the block-local call is really checked). NOT
-//! covered here: the fns of an impl inside a block are bodies of the block's module, which
-//! engine-check plans no task for yet (body_types/covered.rs `written_by`: the block module's
-//! text keeps no origins, so no entry covers them); the lane report names it.
+//! is reported (the control: the body holding the block-local call is really checked).
 //!
-//! Expected line: `BLOCK EXTERN CRATE: clean 0 errors, planted <n> errors, <m> findings note(s)`.
+//! THE BODIES OF A BLOCK'S MODULE (plan row A6): the fns of an impl inside a block are bodies of
+//! the block's module, each checked by the task of the body whose block it is (body_types/
+//! covered.rs `in_blocks`, walked by key from the block's text to its body). An error planted in
+//! the hand-written block's impl fn, and one planted through `implement!`'s `$e` (a derive's
+//! shape written by a `macro_rules!` call), are each the one `error[` line and "1 error". The
+//! clean run checks each item body once: five (the two constants, their blocks' two `f`s, and
+//! `g`) in three tasks (the hand-written constant, `implement!`'s entry, `g`), counted in the
+//! profile's "item bodies" line. CONTROL: before `in_blocks`, the two `f`s were checked by no
+//! task: three item bodies, and neither planted error was reported.
+//!
+//! Expected line: `BLOCK EXTERN CRATE: clean 0 errors, planted <n> errors, in the block's fn
+//! <a>, through the macro <b>; <profile line>`.
 //!
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain` (linked into a fresh home).
 
@@ -39,8 +47,20 @@ const DEP: &str = "#![no_std]\n#[macro_export]\nmacro_rules! the_macro {\n    ()
 
 /// `app`'s lib.rs: one block written by hand, one written by `implement!` (each constant's
 /// initializer holds the call through the block's `_dep`); `{RET}` initializes a `u32` in the
-/// hand-written block, so the planted `T` is an error of the body that holds the call.
-const APP: &str = "#![no_std]\npub struct T;\npub struct U;\nconst _: () = {\n    extern crate dep as _dep;\n    _dep::the_macro!();\n    let _x: u32 = {RET};\n    impl _dep::Trait for T {\n        fn f(&self) -> u32 {\n            7\n        }\n    }\n};\ndep::implement!(U, 9);\npub fn g() -> u32 {\n    1\n}\n";
+/// hand-written block, so the planted `T` is an error of the body that holds the call; `{FN}`
+/// is a statement in the block's impl fn, a body of the block's module; `{E}` is `implement!`'s
+/// expression, the body of the fn of the block that call writes.
+const APP: &str = "#![no_std]\npub struct T;\npub struct U;\nconst _: () = {\n    extern crate dep as _dep;\n    _dep::the_macro!();\n    let _x: u32 = {RET};\n    impl _dep::Trait for T {\n        fn f(&self) -> u32 {\n            {FN}7\n        }\n    }\n};\ndep::implement!(U, {E});\npub fn g() -> u32 {\n    1\n}\n";
+
+/// What `workspace` writes into `APP`'s holes: clean, each is a value or nothing.
+#[derive(Clone, Copy)]
+struct Holes {
+    ret: &'static str,
+    fn_body: &'static str,
+    e: &'static str,
+}
+
+const CLEAN: Holes = Holes { ret: "7", fn_body: "", e: "9" };
 
 fn write(path: &Path, text: &str) {
     if let Some(dir) = path.parent() {
@@ -49,14 +69,14 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
 }
 
-fn workspace(ws: &Path, ret: &str) {
+fn workspace(ws: &Path, holes: Holes) {
     write(&ws.join("Cargo.toml"), "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"2\"\n");
     write(
         &ws.join("Cargo.lock"),
         "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"dep\"]\n\n[[package]]\nname = \"dep\"\nversion = \"0.1.0\"\n",
     );
     write(&ws.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
-    write(&ws.join("app/src/lib.rs"), &APP.replace("{RET}", ret));
+    write(&ws.join("app/src/lib.rs"), &APP.replace("{RET}", holes.ret).replace("{FN}", holes.fn_body).replace("{E}", holes.e));
     write(&ws.join("dep/Cargo.toml"), "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write(&ws.join("dep/src/lib.rs"), DEP);
 }
@@ -120,26 +140,68 @@ fn refusals(said: &str) -> Vec<&str> {
     said.lines().filter(|line| (line.contains("lowering refused") || line.contains("NOT checked") || line.contains("not checked")) && !line.contains("borrows")).collect()
 }
 
+/// The profile's phase lines and its bodies lines, for a message.
+fn profile_of(ws: &Path) -> String {
+    let profile = std::fs::read_to_string(ws.join(".blaze/v2/profile.txt")).unwrap_or_else(|error| format!("(no profile: {error})"));
+    let phases = profile.lines().skip_while(|line| !line.starts_with("engine phases")).take_while(|line| !line.starts_with("entered because"));
+    let bodies = profile.lines().filter(|line| line.starts_with("bodies:"));
+    phases.chain(bodies).collect::<Vec<_>>().join("\n")
+}
+
+/// The profile's item bodies line (engine_bodies.rs `BodiesStage::profile`): how many item bodies
+/// were checked, in how many tasks, and how many bodies a macro wrote that no entry covers.
+fn item_bodies(ws: &Path) -> (u32, u32, u32, String) {
+    let profile = std::fs::read_to_string(ws.join(".blaze/v2/profile.txt")).unwrap_or_else(|error| panic!("no profile in {}: {error}", ws.display()));
+    let line = profile.lines().find(|line| line.starts_with("bodies: ") && line.contains(" item bodies checked in ")).unwrap_or_else(|| panic!("no item bodies line in the profile:\n{profile}")).to_owned();
+    let numbers: Vec<u32> = line.split(|c: char| !c.is_ascii_digit()).filter(|word| !word.is_empty()).filter_map(|word| word.parse().ok()).collect();
+    match numbers[..] {
+        [items, tasks, uncovered, ..] => (items, tasks, uncovered, line),
+        _ => panic!("the item bodies line holds three counts: {line}"),
+    }
+}
+
+/// One planted error: the run is not refused, prints exactly one `error[` line and says "1 error".
+fn planted_once(ws: &Path, home: &Path, holes: Holes, what: &str) -> String {
+    workspace(ws, holes);
+    let said = engine_check(ws, home, what);
+    assert!(refusals(&said).is_empty(), "{what}: a body was not checked:\n{said}");
+    let lines: Vec<&str> = said.lines().filter(|line| line.contains("error[")).collect();
+    assert_eq!(lines.len(), 1, "{what}: the planted type error is the one `error[` line:\n{said}\n{}", profile_of(ws));
+    assert_eq!(errors(&said), 1, "{what}: the closing line says 1 error:\n{said}");
+    assert!(said.lines().any(|line| line.ends_with(": blaze check") && line.contains("1 error")), "{what}: \"1 error\" closes the run:\n{said}");
+    lines[0].to_owned()
+}
+
 #[test]
 fn a_call_through_a_blocks_extern_crate_is_checked_on_the_engine() {
     let base = fresh_home("engine_block_extern_crate", true);
     let (home, ws) = (base.join("home"), base.join("ws"));
-    workspace(&ws, "7");
+    workspace(&ws, CLEAN);
     let clean = engine_check(&ws, &home, "clean");
     assert!(refusals(&clean).is_empty(), "a body was not checked:\n{clean}");
     let clean_errors = errors(&clean);
     assert_eq!(clean_errors, 0, "the clean fixture has errors:\n{clean}");
     assert!(!clean.contains(FINDINGS), "the clean fixture has findings:\n{clean}");
+    // Each item body checked once: the hand-written constant and its block's `f`; `implement!`'s
+    // constant and its block's `f`; `g`. Three tasks: the constant, the call's entry, `g`.
+    let (items, tasks, uncovered, line) = item_bodies(&ws);
+    assert_eq!((items, tasks), (5, 3), "each item body checked once, the blocks' fns with their constants: {line}\n{}", profile_of(&ws));
+    assert_eq!(uncovered, 0, "no body a macro wrote is left without a task: {line}");
     // The control: `let _x: u32 = T;` beside the block's call. engine-check
     // carries a body's finding count, not yet its words (engine_bodies.rs `note`): the note
     // naming `implement!`'s entry, or an error line, is the report.
-    workspace(&ws, "T");
+    workspace(&ws, Holes { ret: "T", ..CLEAN });
     let planted = engine_check(&ws, &home, "planted");
     assert!(refusals(&planted).is_empty(), "a body was not checked:\n{planted}");
     let planted_errors = errors(&planted);
     let noted = planted.lines().filter(|line| line.contains(FINDINGS)).count();
-    let profile = std::fs::read_to_string(ws.join(".blaze/v2/profile.txt")).unwrap_or_else(|error| format!("(no profile: {error})"));
-    let phases: String = profile.lines().skip_while(|line| !line.starts_with("engine phases")).take_while(|line| !line.starts_with("entered because")).collect::<Vec<_>>().join("\n");
-    assert!(planted_errors >= 1 || noted >= 1, "the planted type error beside the block's call is not reported:\n{planted}\nclean:\n{clean}\n{phases}");
-    println!("BLOCK EXTERN CRATE: clean {clean_errors} errors, planted {planted_errors} errors, {noted} findings note(s)\n{planted}");
+    assert!(planted_errors >= 1 || noted >= 1, "the planted type error beside the block's call is not reported:\n{planted}\nclean:\n{clean}\n{}", profile_of(&ws));
+    // A6: the error in the impl fn inside the hand-written block, and the one `implement!`'s
+    // `$e` writes into its block's fn, each reported with its file and line.
+    let in_fn = planted_once(&ws, &home, Holes { fn_body: "let _x: u32 = T;\n            ", ..CLEAN }, "in-block-fn");
+    let in_macro = planted_once(&ws, &home, Holes { e: "{ let _y: u32 = T; 9 }", ..CLEAN }, "in-macro-block-fn");
+    for (what, line) in [("in the block's fn", &in_fn), ("through the macro", &in_macro)] {
+        assert!(line.contains("app/src/lib.rs:"), "the error {what} names its file and line: {line}");
+    }
+    println!("BLOCK EXTERN CRATE: clean {clean_errors} errors, planted {planted_errors} errors, in the block's fn {in_fn:?}, through the macro {in_macro:?}; {line}\n{planted}");
 }

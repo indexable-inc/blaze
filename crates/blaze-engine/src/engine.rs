@@ -8,13 +8,22 @@
 //!    (`a_shrinking_scope_answers_as_fresh_builds`; lane DR's finding 1, 2026-11-17).
 //! 2. **Phases in order.** A task enters in its [`Phase`] only after every earlier phase merged,
 //!    so it reads complete tables, and a part is never entered before its file's outline is made
-//!    again (finding 2). A moved cell read by a task of the same or an earlier phase is
-//!    [`EngineError::BackwardRead`], never a second entry: entries equal results.
+//!    again (finding 2). A moved cell read by a task of an earlier stage, or of the same stage
+//!    outside Heads and Bodies at the same or an earlier wave, is [`EngineError::BackwardRead`].
+//!    Inside Heads and Bodies a reader of a cell moved at wave `w` of its own stage, whose row did
+//!    not see the cell's digest today, is entered at wave `w + 1` (the plan's point 3: "a row's
+//!    wave is one more than the highest same-stage row it read"), so a head that reads a head is
+//!    ordered after it and never refused or left stale (`a_same_stage_reader_enters_after_its_definer`).
+//!    A merge moves its cells after every row of the phase is in, so a reader merged in the same
+//!    phase is seen whatever the order. Waves past [`WAVE_CAP`] are [`EngineError::WaveTooDeep`].
 //! 3. **Entered once.** Each task a phase names gets exactly one result ([`EngineError::NoResult`],
 //!    [`EngineError::Unplanned`], [`EngineError::TwoValues`]); results are merged sorted by name.
 //! 4. **Dirtying by cell, forward.** A result whose defined cells moved puts the cells' readers (the
 //!    reverse index) in their phase's candidates. A candidate is entered when its key moved, it has
 //!    no row, or a cell it read now holds another digest than its row saw. Nothing else enters.
+//!    The reads are compared in the row's read order and the walk stops at the first that moved
+//!    (invariant 9): its cause names that read, and no later read is looked up
+//!    ([`Report::compared`]; `a_later_read_is_never_looked_up`).
 //! 5. **The walk is global, the running scoped.** A candidate the scope does not run writes
 //!    nothing. What makes its row not today's is kept in proportion to the edit, never to its
 //!    readers: a moved cell is owed ([`Answer::owed_cells`], with the [`Gen`] it moved at) until
@@ -30,7 +39,42 @@
 //!    read moves, so the request after a failure with nothing changed is the certificate (tempo,
 //!    tag g090627). The rest of the request is merged and compared like any (finding 6).
 //! 8. **Inline needs.** A result may carry records the plan did not name ([`Made`]), each keyed
-//!    from its own text; the merge takes them like any result, equal duplicates once.
+//!    from its own text, with a name, key, out, defines and reads like a task's; the merge takes
+//!    them like any result, equal duplicates once. Two records under one name in a request (two
+//!    makers, a maker and the planned task, or makers in two phases) must be equal bytes, else
+//!    [`EngineError::TwoValues`] (rule 21). A later request finds a made row standing or moved by
+//!    the same validation as a planned task's ([`View::hit`]). A made row whose own read moved is
+//!    re-validated in its phase when a row the scope runs, not entered in that phase, reads it
+//!    (invariant 10); a reader entered in the same phase makes it again through its claim. Its
+//!    re-made cells move its readers only when their bytes moved (early cutoff, invariant 12).
+//! 9. **Read lists in read order.** A result's reads are in the order the task first read each
+//!    cell, each cell once ([`EngineError::ReadTwice`], checked in debug builds): a later read may
+//!    exist only because of an earlier answer (a question formed from what an earlier read said),
+//!    so the order is part of the result. A deterministic task reads in a deterministic order, so
+//!    the row's bytes are still a function of the task alone (rule 25). A sorted list is one valid
+//!    order. The reverse index stays keyed by cell and does not see the order.
+//! 10. **Changed and still needed.** A candidate is entered only when the request still needs it:
+//!    a task of today's plan (a file's, grown, or owed), or a made row that a row the scope runs
+//!    and not entered in the phase still reads (`RemakesUnneeded`). A
+//!    row no plan lists and no row reads, a made record whose last reader went, is retired: its
+//!    row leaves the answer and its cells move to absent ([`Report::retired`]). A task whose file
+//!    or grower dropped it is retired the same way, and its readers are entered for the read
+//!    whose definer went ([`Cause::definer_gone`]).
+//! 11. **The plan grows inside a request.** [`Engine::grow`] adds the tasks a merged task's result
+//!    names (a crate's names name the items its macros made; their heads and bodies are planned)
+//!    to later phases, before those phases start: growing a phase already passed is
+//!    [`EngineError::GrownLate`]. A grown task is keyed from text like any other and reused by
+//!    key like any other; the grower's last growth that it no longer names is retired. The
+//!    grown tasks are listed under their grower in [`Answer::by_file`], so the answer is over the
+//!    plan closed under growth: a request where nothing changed enters no grower, grows nothing
+//!    and is the certificate. A grower's row removed retires its growth with it.
+//! 12. **Every hit is a read.** A hit is ONE read, of the hit record's result; the record keeps
+//!    its own reads (the plan's point 6). A task that uses a made record (made by itself, by
+//!    another task, or standing from an earlier request) reads the record's cells it uses and
+//!    none of the record's own reads; a task that made a record inline and read none of its
+//!    cells is [`EngineError::HitWithoutReads`]. So an edit to a cell only the made record read
+//!    re-validates the record, and its user is entered only when the record's bytes moved
+//!    (`a_hit_is_one_read`).
 //!
 //! # Cost
 //!
@@ -77,6 +121,8 @@ pub enum Stage {
     Heads = 4,
     /// Bodies, at body grain.
     Bodies = 5,
+    /// Token lints: one task an item, every selected rule in its one walk, keyed by its text.
+    Lints = 6,
 }
 
 /// Each kind's tool, by `Kind::index` (decision D105): a task's key is its kind's tool's, so an
@@ -112,7 +158,7 @@ impl Phase {
 
 impl Stage {
     /// Every stage, in phase order: `Stage::ALL[stage.index()] == stage`.
-    pub const ALL: [Stage; STAGES] = [Stage::Units, Stage::Scripts, Stage::Outlines, Stage::Names, Stage::Heads, Stage::Bodies];
+    pub const ALL: [Stage; STAGES] = [Stage::Units, Stage::Scripts, Stage::Outlines, Stage::Names, Stage::Heads, Stage::Bodies, Stage::Lints];
 
     pub const fn index(self) -> usize {
         self as usize
@@ -120,7 +166,7 @@ impl Stage {
 }
 
 /// How many stages there are.
-pub const STAGES: usize = 6;
+pub const STAGES: usize = 7;
 
 /// Why a task was entered: the first reason the engine found, in this order. Kept for every
 /// entered task and nothing for a task that stood, so a profile says why each was redone and
@@ -131,8 +177,10 @@ pub enum Cause {
     New,
     /// Its key moved: its own text (its source), or its tool.
     KeyMoved,
-    /// Its key stands and a cell it read moved: the first such in its sorted read list, the
-    /// digest its row saw and the digest today. The cell's defining task is `read.of`.
+    /// Its key stands and a cell it read moved: the first such in its read list's order (the
+    /// order it read them, invariant 9), the digest its row saw and the digest today. The cell's
+    /// defining task is `read.of`; `now` is [`ABSENT`] when that task no longer defines it or was
+    /// retired ([`Cause::definer_gone`]).
     ReadMoved { read: CellId, was: ContentId, now: ContentId },
     /// Owed from an earlier request whose scope did not run it, its key and reads standing.
     Owed,
@@ -150,6 +198,12 @@ impl Cause {
             Cause::Owed => "owed",
             Cause::Inline => "inline",
         }
+    }
+
+    /// Entered because the cell it read first among those that moved has no definer today: its
+    /// task was retired or no longer defines it (invariant 10).
+    pub fn definer_gone(&self) -> bool {
+        matches!(self, Cause::ReadMoved { now, .. } if *now == ABSENT)
     }
 }
 
@@ -208,7 +262,9 @@ pub struct Done<'a> {
     pub out: ContentId,
     /// The cells it defines and their digests, sorted by cell.
     pub defines: SVec<'a, (Cell, ContentId)>,
-    /// The cells it read and the digest each held, sorted by cell id ([`ABSENT`]: none).
+    /// The cells it read and the digest each held ([`ABSENT`]: none), in the order it first read
+    /// each, each cell once (invariant 9; sorted is one valid order). A made record it used is
+    /// one read of that record's cell, never the record's own reads (invariant 12).
     pub reads: SVec<'a, (CellId, ContentId)>,
     pub findings: u32,
     /// The task failed on its reads: its row is the failure (invariant 7), its `defines` empty.
@@ -220,6 +276,16 @@ pub struct Done<'a> {
 pub struct Made<'a> {
     pub planned: Planned,
     pub done: Done<'a>,
+    /// The task that made it, whose result must read it (invariant 12). Not part of the
+    /// record: two makers of one record make equal `planned` and `done`.
+    pub by: Name,
+}
+
+impl Made<'_> {
+    /// The record's bytes, without its maker: what two makers must agree on (rule 21).
+    fn same_record(&self, other: &Made<'_>) -> bool {
+        self.planned == other.planned && self.done == other.done
+    }
 }
 
 /// One worker's results for a phase: `Send`, so a worker thread fills it.
@@ -245,6 +311,7 @@ pub struct Row<'a> {
     /// The request that made or checked it last.
     pub serial: Gen,
     pub defines: SVec<'a, (Cell, ContentId)>,
+    /// In read order, as the result gave them (invariant 9).
     pub reads: SVec<'a, (CellId, ContentId)>,
     pub findings: u32,
     /// Made inline: no file's plan lists it.
@@ -267,8 +334,13 @@ pub struct Answer<'a> {
     pub rows: SMap<'a, Name, Row<'a>>,
     /// Each cell's digest and the request it last moved in.
     pub cells: SMap<'a, CellId, (ContentId, Gen)>,
-    /// Each cell's readers, sorted.
-    pub readers: SMap<'a, CellId, SVec<'a, Name>>,
+    /// Each cell's readers, in order: a SET, so one reader added or dropped costs the logarithm
+    /// of the cell's readers. As a sorted vector each insert moved half the list, and a cell
+    /// that every task of a crate reads (its crate's scope, `core`'s) made the merge quadratic:
+    /// 72% of a 6,111-body crate's check on one worker was that move (2026-11-17, release build
+    /// g190500, sampled: `Engine::apply` under `Engine::merge`; the profile's "merge ms" of the
+    /// Heads and Bodies stages against their "task ms" is where it shows).
+    pub readers: SMap<'a, CellId, SSet<'a, Name>>,
     /// Each file's planned tasks, sorted.
     pub by_file: SMap<'a, Name, SVec<'a, Name>>,
     /// Cells that moved while a reader of them was not run, with the request they moved in.
@@ -311,15 +383,50 @@ impl<'a> Answer<'a> {
         out
     }
 
-    /// Whether `name`'s row saw today's digest of every cell it read.
-    fn today(&self, row: &Row<'_>) -> bool {
-        self.first_moved(row).is_none()
+    /// The first read of `row`, in its read order, whose cell moved since the row saw it, and how
+    /// many reads were looked up to find it: the walk stops there, so a read that exists only
+    /// because of an earlier answer is never looked up once that answer moved (invariant 9).
+    /// `reverse` walks from the last read: [`Plant::LaterReadFirst`] alone.
+    fn first_moved(&self, row: &Row<'_>, reverse: bool) -> (Option<Cause>, u32) {
+        let mut compared = 0u32;
+        let mut moved = |(id, seen): &(CellId, ContentId)| {
+            compared += 1;
+            let now = self.cell(id);
+            (now != *seen).then_some(Cause::ReadMoved { read: *id, was: *seen, now })
+        };
+        let found = match reverse {
+            true => row.reads.iter().rev().find_map(&mut moved),
+            false => row.reads.iter().find_map(&mut moved),
+        };
+        (found, compared)
     }
 
-    /// The first read of `row`, in its sorted order, whose cell moved since the row saw it.
-    fn first_moved(&self, row: &Row<'_>) -> Option<Cause> {
-        row.reads.iter().find(|(id, seen)| self.cell(id) != *seen).map(|(id, seen)| Cause::ReadMoved { read: *id, was: *seen, now: self.cell(id) })
+    /// Whether `name` is a made record no plan lists: re-validated only while still needed
+    /// (invariant 10).
+    fn made_only(&self, name: &Name) -> bool {
+        !self.owed_tasks.contains_key(name) && self.rows.get(name).is_some_and(|row| row.inline)
     }
+}
+
+/// The first cell `reads` holds twice, if any (invariant 9: each cell once, at its first read).
+fn read_twice(reads: &[(CellId, ContentId)], alloc: SharedAlloc<'_>) -> Option<CellId> {
+    let mut ids: SVec<'_, CellId> = Vec::with_capacity_in(reads.len(), alloc);
+    for (id, _) in reads.iter() {
+        ids.push(*id);
+    }
+    ids.sort_unstable();
+    ids.windows(2).find(|pair| pair[0] == pair[1]).map(|pair| pair[0])
+}
+
+/// Whether `row` holds exactly the result `done` (rule 21: two records under one name are equal
+/// bytes or a refusal).
+fn same(row: &Row<'_>, done: &Done<'_>) -> bool {
+    row.key == done.key
+        && row.out == done.out
+        && row.defines[..] == done.defines[..]
+        && row.reads[..] == done.reads[..]
+        && row.findings == done.findings
+        && row.failed == done.failed
 }
 
 /// What a request runs (`check`: every body asked; `run`: its closure's). The walk is global:
@@ -359,6 +466,20 @@ pub enum Plant {
     FailureNotKept,
     /// A task entered for a moved read is said to be entered for its key.
     WrongCause,
+    /// A row's reads are compared from the last: a later read, which may exist only because of an
+    /// earlier answer, is looked up first (invariant 9).
+    LaterReadFirst,
+    /// A made row is entered for its own moved read whether or not a row still needs it, and
+    /// never retired when its last reader goes (invariant 10).
+    RemakesUnneeded,
+    /// A grower's growth it no longer names is kept (invariant 11).
+    GrownNotRetired,
+    /// Planted in the simulation's tasks, not here: a task that hits or makes a made record
+    /// records no read of it (invariant 12).
+    HitWithoutReads,
+    /// A reader of a cell moved in its own stage and wave is dropped instead of entered at the
+    /// next wave: left stale for a request (invariant 2).
+    SameStageStale,
 }
 
 /// What one request did.
@@ -376,7 +497,22 @@ pub struct Report {
     pub certified: bool,
     /// Each stage's entries, by [`Stage::index`].
     pub stages: [StageCount; STAGES],
+    /// Reads looked up to decide whether a candidate stands: each candidate's walk stops at its
+    /// first moved read (invariant 9).
+    pub compared: u32,
+    /// Rows retired: dropped by their file or grower, or made records nobody reads (invariant 10).
+    pub retired: u32,
+    /// Tasks grown into later phases by merged results (invariant 11).
+    pub grown: u32,
 }
+
+/// The most tasks one grower may grow in a request (rule 18): a crate's macros made more items
+/// than this, or a grower loops.
+pub const GROWN_CAP: usize = 1 << 20;
+
+/// The highest wave a same-stage read may raise a reader to (rule 18, invariant 2): a chain of
+/// heads reading heads deeper than this, or a cycle of them, is refused by name.
+pub const WAVE_CAP: u16 = 1 << 12;
 
 /// Why a request stopped. Each names the thing (rule 19).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -393,6 +529,28 @@ pub enum EngineError {
     BackwardRead { reader: Name, read: CellId, reader_phase: Phase, phase: Phase },
     /// A phase was merged with no phase open, or a phase opened with one not merged.
     OutOfTurn,
+    /// `name`'s result reads `read` twice: a read list holds each cell once (invariant 9).
+    ReadTwice { name: Name, read: CellId },
+    /// `reader` made the record `made` inline and its result reads no cell of it (invariant 12:
+    /// every hit is a read).
+    HitWithoutReads { reader: Name, made: Name },
+    /// `reader` reads `read`, moved at wave `wave` of its own stage, and the next wave would pass
+    /// [`WAVE_CAP`] (rule 18, invariant 2): a same-stage chain that deep, or a cycle.
+    WaveTooDeep { reader: Name, read: CellId, wave: u16 },
+    /// `name` was grown into `phase`, at or before `passed`, the phase its grower ran in or the
+    /// last phase the request passed (invariant 11).
+    GrownLate { by: Name, name: Name, phase: Phase, passed: Phase },
+    /// `by` grew tasks and has no result merged this request.
+    GrownByUnmerged { by: Name },
+    /// `by` grew twice in one request: a grower's growth is given whole, once.
+    GrownTwice { by: Name },
+    /// `by` is its own file's namesake (an outline): its file's plan is listed under its name,
+    /// so it grows nothing.
+    GrownByFile { by: Name },
+    /// `name`, grown by `by`, names another grower in its `file`.
+    GrownForeign { by: Name, name: Name },
+    /// `by` grew `count` tasks, past [`GROWN_CAP`] (rule 18).
+    GrownTooMany { by: Name, count: u32 },
 }
 
 impl fmt::Display for EngineError {
@@ -409,6 +567,28 @@ impl fmt::Display for EngineError {
                 "{read:?} moved in {phase:?} and {reader:?} reads it in {reader_phase:?}: a phase reads only earlier ones (engine.md, invariant 2)"
             ),
             EngineError::OutOfTurn => write!(f, "a merge with no phase open, or a phase opened before the last merged (engine.rs)"),
+            EngineError::ReadTwice { name, read } => {
+                write!(f, "{name:?}'s result reads {read:?} twice: a read list holds each cell once, at its first read (engine.rs invariant 9)")
+            }
+            EngineError::HitWithoutReads { reader, made } => {
+                write!(f, "{reader:?} made the record {made:?} and read none of its cells: every hit is a read (engine.rs invariant 12)")
+            }
+            EngineError::WaveTooDeep { reader, read, wave } => write!(
+                f,
+                "{reader:?} reads {read:?}, moved at wave {wave} of its own stage: past the cap of {WAVE_CAP} waves, a chain too deep or a cycle (rule 18, engine.rs invariant 2)"
+            ),
+            EngineError::GrownLate { by, name, phase, passed } => {
+                write!(f, "{by:?} grew {name:?} into {phase:?}, which is not after {passed:?}: a phase is grown before it starts (engine.rs invariant 11)")
+            }
+            EngineError::GrownByUnmerged { by } => write!(f, "{by:?} grew tasks with no result merged this request (engine.rs `grow`)"),
+            EngineError::GrownTwice { by } => write!(f, "{by:?} grew twice in one request: a growth is given whole, once (engine.rs `grow`)"),
+            EngineError::GrownByFile { by } => {
+                write!(f, "{by:?} is its file's namesake, whose plan is listed under its name: it cannot grow (engine.rs `grow`)")
+            }
+            EngineError::GrownForeign { by, name } => write!(f, "{name:?}, grown by {by:?}, names another grower as its file (engine.rs `grow`)"),
+            EngineError::GrownTooMany { by, count } => {
+                write!(f, "{by:?} grew {count} tasks, past the cap of {GROWN_CAP} (rule 18, engine.rs `grow`)")
+            }
         }
     }
 }
@@ -450,6 +630,23 @@ impl View<'_, '_> {
     }
 }
 
+impl<'e, 'a> View<'e, 'a> {
+    /// A record a task needs inline (engine.md, "The design" 3), found standing: `name`'s row
+    /// under `key`, owed nothing, every read of it today in its read order (the validation a
+    /// planned task's row gets, invariant 8). The hit is one read: the caller reads the cells of
+    /// it that it uses, as any cell, and none of the record's own reads, which the record keeps
+    /// (invariant 12). `None`: no such row stands, and the task makes the record itself
+    /// ([`Made`]), reading its cells the same way.
+    pub fn hit(&self, name: Name, key: Key) -> Option<&'e Row<'a>> {
+        let answer: &'e Answer<'a> = self.answer;
+        let row = answer.rows.get(&name)?;
+        if row.key != key || answer.owed_tasks.contains_key(&name) || answer.first_moved(row, false).0.is_some() {
+            return None;
+        }
+        Some(row)
+    }
+}
+
 /// The pool behind a small trait, so the simulation drives it with 1 worker, N, or reversed, and
 /// the driver with real threads.
 pub trait Pool<'a> {
@@ -481,8 +678,18 @@ pub struct Engine<'a, S: Scope> {
     /// Cells moved this request.
     moved: SSet<'a, CellId>,
     entered: SVec<'a, Name>,
+    /// Where the last opened phase's names start in `entered`: [`Engine::merged`].
+    merged_from: usize,
     causes: SVec<'a, Entered>,
     report: Report,
+    /// The last phase taken from the candidates, entered or not: nothing grows into it or
+    /// before it (invariant 11).
+    passed: Option<Phase>,
+    /// The growers that grew this request: each grows once.
+    grew: SSet<'a, Name>,
+    /// Made records that lost a reader: retired at the next phase unless one is left
+    /// (invariant 10).
+    orphans: SSet<'a, Name>,
 }
 
 impl<'a, S: Scope> Engine<'a, S> {
@@ -505,8 +712,12 @@ impl<'a, S: Scope> Engine<'a, S> {
             opened: Vec::new_in(alloc),
             moved: BTreeSet::new_in(alloc),
             entered: Vec::new_in(alloc),
+            merged_from: 0,
             causes: Vec::new_in(alloc),
             report: Report::default(),
+            passed: None,
+            grew: BTreeSet::new_in(alloc),
+            orphans: BTreeSet::new_in(alloc),
         };
         for (file, plan) in edit.files.iter() {
             let old = engine.answer.by_file.remove(file).unwrap_or_else(|| Vec::new_in(alloc));
@@ -519,6 +730,7 @@ impl<'a, S: Scope> Engine<'a, S> {
             for name in old.iter() {
                 if names.binary_search(name).is_err() {
                     engine.answer.owed_tasks.remove(name);
+                    engine.report.retired += u32::from(engine.answer.rows.contains_key(name));
                     engine.remove_row(*name, None)?;
                 }
             }
@@ -560,42 +772,63 @@ impl<'a, S: Scope> Engine<'a, S> {
         if self.open.is_some() {
             return Err(EngineError::OutOfTurn);
         }
+        self.retire_orphans()?;
         while let Some((phase, names)) = self.pending.pop_first() {
+            self.passed = Some(phase);
             self.tasks.clear();
             self.opened.clear();
+            // The made rows to decide once this phase's other tasks are known: those pending, and
+            // those a reader was deferred for (`consider`).
+            let mut made_rows: SVec<'a, Name> = Vec::new_in(self.alloc);
             for name in names.iter() {
-                let Some(planned) = self.planned_of(*name) else { continue };
-                if !self.scope.runs(&planned) {
-                    self.report.not_run += 1;
-                    let key = self.tools.key(planned.name, &planned.source);
-                    if self.answer.rows.get(name).is_none_or(|row| row.key != key) {
-                        self.answer.owed_tasks.insert(*name, planned);
-                    }
+                // Changed and still needed (invariant 10): a made row is decided below.
+                if self.plant != Plant::RemakesUnneeded && !self.planned.contains_key(name) && self.answer.made_only(name) {
                     continue;
                 }
-                let key = self.tools.key(planned.name, &planned.source);
-                let stands = self.answer.rows.get(name).is_some_and(|row| {
-                    row.key == key && !self.answer.owed_tasks.contains_key(name) && (self.plant == Plant::ReadsNotCompared || self.answer.today(row))
-                });
-                if stands {
-                    continue;
+                if let Some(stale) = self.consider(phase, *name)?
+                    && !made_rows.contains(&stale)
+                {
+                    made_rows.push(stale);
                 }
-                // Why, in the order the test above reads it: no row, its key, a read, owed.
-                let cause = match self.answer.rows.get(name) {
-                    None => Cause::New,
-                    Some(row) if row.key != key => Cause::KeyMoved,
-                    Some(row) => match self.answer.first_moved(row) {
-                        Some(_) if self.plant == Plant::WrongCause => Cause::KeyMoved,
-                        Some(moved) => moved,
-                        None => Cause::Owed,
-                    },
-                };
-                self.opened.push(cause);
-                self.tasks.push(Task { planned, key });
+            }
+            for name in names.iter() {
+                if self.plant != Plant::RemakesUnneeded && !self.planned.contains_key(name) && self.answer.made_only(name) && !made_rows.contains(name) {
+                    made_rows.push(*name);
+                }
+            }
+            // A made row is re-validated only when a row the scope runs, and not entered in this
+            // phase, reads it: a reader entered here makes it again through its claim if it
+            // still uses it, and a record nobody needs is retired, never made again.
+            let mut needed: SVec<'a, Name> = Vec::new_in(self.alloc);
+            for name in made_rows.iter() {
+                if self.still_needed(*name) && self.tasks.binary_search_by_key(name, |task| task.planned.name).is_err() {
+                    needed.push(*name);
+                }
+            }
+            if !needed.is_empty() {
+                for name in needed.iter() {
+                    // A made row that reads another stale made row is deferred like any reader
+                    // (`consider` puts it at the next wave); its definer is not decided again
+                    // here, it is pending where its own read moved.
+                    let _deferred_for = self.consider(phase, *name)?;
+                }
+                // The phase's tasks are sorted by name (invariant 3), their causes beside them.
+                let mut pairs: SVec<'a, (Task, Cause)> = Vec::with_capacity_in(self.tasks.len(), self.alloc);
+                for (task, cause) in self.tasks.iter().zip(self.opened.iter()) {
+                    pairs.push((*task, *cause));
+                }
+                pairs.sort_unstable_by_key(|(task, _)| task.planned.name);
+                self.tasks.clear();
+                self.opened.clear();
+                for (task, cause) in pairs.iter() {
+                    self.tasks.push(*task);
+                    self.opened.push(*cause);
+                }
             }
             if !self.tasks.is_empty() {
                 self.report.phases += 1;
                 self.report.entered += self.tasks.len() as u32;
+                self.merged_from = self.entered.len();
                 for task in self.tasks.iter() {
                     self.entered.push(task.planned.name);
                 }
@@ -606,9 +839,189 @@ impl<'a, S: Scope> Engine<'a, S> {
         Ok(None)
     }
 
+    /// Puts the candidate `name` in `phase`, being opened, when it is to be entered: a candidate
+    /// the scope does not run is left as it is, owed by name when its key moved (invariant 5);
+    /// one whose row is today's is not entered (invariant 4). Inside Heads and Bodies, one whose
+    /// first moved read is a cell of a made row that is not today's (its own read moved) is put
+    /// at the next wave instead, after the made row is re-validated, so its cause names the
+    /// digest the cell holds today (invariant 2): the made row's name is returned, for the phase
+    /// to decide it.
+    fn consider(&mut self, phase: Phase, name: Name) -> Result<Option<Name>, EngineError> {
+        let Some(planned) = self.planned_of(name) else { return Ok(None) };
+        let key = self.tools.key(planned.name, &planned.source);
+        if !self.scope.runs(&planned) {
+            self.report.not_run += 1;
+            if self.answer.rows.get(&name).is_none_or(|row| row.key != key) {
+                self.answer.owed_tasks.insert(name, planned);
+            }
+            return Ok(None);
+        }
+        // Why, or `None` when its row stands: no row, its key, the first read in read order that
+        // moved (the walk stops there, invariant 9), owed.
+        let reverse = self.plant == Plant::LaterReadFirst;
+        let cause = match self.answer.rows.get(&name) {
+            None => Some(Cause::New),
+            Some(row) if row.key != key => Some(Cause::KeyMoved),
+            Some(row) => {
+                let owed = self.answer.owed_tasks.contains_key(&name);
+                if self.plant == Plant::ReadsNotCompared && !owed {
+                    None
+                } else {
+                    let (moved, compared) = self.answer.first_moved(row, reverse);
+                    self.report.compared += compared;
+                    match moved {
+                        Some(_) if self.plant == Plant::WrongCause => Some(Cause::KeyMoved),
+                        Some(moved) => Some(moved),
+                        None => owed.then_some(Cause::Owed),
+                    }
+                }
+            }
+        };
+        let Some(cause) = cause else { return Ok(None) };
+        if let Cause::ReadMoved { read, .. } = cause
+            && matches!(phase.stage, Stage::Heads | Stage::Bodies)
+            && read.of != name
+            && self.stale_made(read.of)
+        {
+            if phase.wave >= WAVE_CAP {
+                return Err(EngineError::WaveTooDeep { reader: name, read, wave: phase.wave });
+            }
+            let alloc = self.alloc;
+            self.pending.entry(Phase::new(phase.stage, phase.wave + 1)).or_insert_with(|| BTreeSet::new_in(alloc)).insert(name);
+            return Ok(Some(read.of));
+        }
+        self.opened.push(cause);
+        self.tasks.push(Task { planned, key });
+        Ok(None)
+    }
+
+    /// Whether `name` is a made row whose row is not today's: a read of it moved (invariant 10).
+    fn stale_made(&self, name: Name) -> bool {
+        !self.planned.contains_key(&name) && self.answer.made_only(&name) && self.answer.rows.get(&name).is_some_and(|row| self.answer.first_moved(row, false).0.is_some())
+    }
+
+    /// Whether the made row `made` is still needed by the request (invariant 10): a row other
+    /// than itself reads one of its cells, the scope runs that row, and the phase being opened
+    /// does not enter it (`self.tasks`, sorted by name, holds the phase's other tasks).
+    fn still_needed(&self, made: Name) -> bool {
+        let Some(row) = self.answer.rows.get(&made) else { return false };
+        row.defines.iter().any(|(cell, _)| {
+            self.answer.readers.get(&CellId { of: made, cell: *cell }).is_some_and(|readers| {
+                readers.iter().any(|reader| {
+                    *reader != made
+                        && self.tasks.binary_search_by_key(reader, |task| task.planned.name).is_err()
+                        && self.planned_of(*reader).is_some_and(|planned| self.scope.runs(&planned))
+                })
+            })
+        })
+    }
+
     /// The open phase's tasks, sorted by name.
     pub fn tasks(&self) -> &[Task] {
         &self.tasks
+    }
+
+    /// The names the last opened phase entered, its tasks then its made records: after its merge,
+    /// the results a driver grows from ([`Engine::grow`]).
+    pub fn merged(&self) -> &[Name] {
+        &self.entered[self.merged_from..]
+    }
+
+    /// Plans the tasks `by`'s result names (invariant 11): `by` was merged this request, and
+    /// `planned` is its whole growth, each task with `by` as its `file` and a phase after `by`'s
+    /// and after every phase passed. A driver calls it once for each grower it merged (an empty
+    /// `planned` when it grew nothing), after the merge and before the next phase opens. A grown
+    /// task is keyed from its source like a file's; one whose row stands under that key is
+    /// reused, one with no row or another key is a candidate, and `by`'s last growth that it
+    /// no longer names is retired, its readers entered for the definer gone.
+    pub fn grow(&mut self, by: Name, planned: &[Planned]) -> Result<(), EngineError> {
+        if self.open.is_some() {
+            return Err(EngineError::OutOfTurn);
+        }
+        let Some(grower) = self.answer.rows.get(&by) else { return Err(EngineError::GrownByUnmerged { by }) };
+        if grower.serial != self.serial {
+            return Err(EngineError::GrownByUnmerged { by });
+        }
+        if grower.file == by {
+            return Err(EngineError::GrownByFile { by });
+        }
+        let after = match self.passed {
+            Some(passed) if passed > grower.phase => passed,
+            _ => grower.phase,
+        };
+        if planned.len() > GROWN_CAP {
+            return Err(EngineError::GrownTooMany { by, count: u32::try_from(planned.len()).unwrap_or(u32::MAX) });
+        }
+        if !self.grew.insert(by) {
+            return Err(EngineError::GrownTwice { by });
+        }
+        let alloc = self.alloc;
+        let mut names: SVec<'a, Name> = Vec::with_capacity_in(planned.len(), alloc);
+        for one in planned.iter() {
+            if one.file != by {
+                return Err(EngineError::GrownForeign { by, name: one.name });
+            }
+            if one.phase <= after {
+                return Err(EngineError::GrownLate { by, name: one.name, phase: one.phase, passed: after });
+            }
+            names.push(one.name);
+        }
+        names.sort_unstable();
+        if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(EngineError::TwoValues { name: pair[0] });
+        }
+        let old = self.answer.by_file.remove(&by).unwrap_or_else(|| Vec::new_in(alloc));
+        for name in old.iter() {
+            if names.binary_search(name).is_ok() {
+                continue;
+            }
+            if self.plant == Plant::GrownNotRetired {
+                // The planted bug: dropped from the plan, its row kept.
+                continue;
+            }
+            self.answer.owed_tasks.remove(name);
+            self.planned.remove(name);
+            self.report.retired += u32::from(self.answer.rows.contains_key(name));
+            self.remove_row(*name, Some(after))?;
+        }
+        for one in planned.iter() {
+            self.planned.insert(one.name, *one);
+            self.report.grown += 1;
+            let key = self.tools.key(one.name, &one.source);
+            if self.answer.rows.get(&one.name).is_none_or(|row| row.key != key) {
+                self.candidate(*one, None)?;
+            }
+        }
+        if !names.is_empty() {
+            self.answer.by_file.insert(by, names);
+        }
+        Ok(())
+    }
+
+    /// Retires each made record that lost a reader and has none left (invariant 10): its row
+    /// leaves the answer, its cells move to absent, and its own reads may orphan another.
+    fn retire_orphans(&mut self) -> Result<(), EngineError> {
+        if self.plant == Plant::RemakesUnneeded {
+            self.orphans.clear();
+            return Ok(());
+        }
+        while let Some(name) = self.orphans.pop_first() {
+            let Some(row) = self.answer.rows.get(&name) else { continue };
+            if !row.inline || self.planned.contains_key(&name) {
+                continue;
+            }
+            let answer = &self.answer;
+            let read = row.defines.iter().any(|(cell, _)| {
+                answer.readers.get(&CellId { of: name, cell: *cell }).is_some_and(|readers| readers.iter().any(|reader| *reader != name))
+            });
+            if read {
+                continue;
+            }
+            self.report.retired += 1;
+            self.answer.owed_tasks.remove(&name);
+            self.remove_row(name, self.passed)?;
+        }
+        Ok(())
     }
 
     /// The tables as they stand: complete for every phase before the open one.
@@ -647,17 +1060,12 @@ impl<'a, S: Scope> Engine<'a, S> {
                 (None, None) => break,
             }
         }
-        // Results are in task order now: both are sorted by name and matched one to one.
-        self.report.results += done.len() as u32;
-        let mut done_iter = done.into_iter();
-        for (task, cause) in tasks.iter().zip(opened.iter()) {
-            let result = done_iter.next().ok_or(EngineError::NoResult { name: task.planned.name })?;
-            let identical = self.apply(task.planned, result, phase, false)?;
-            self.count(task.planned, *cause, identical);
-        }
+        // Every hit is a read (invariant 12): each maker's result reads a cell of what it made.
+        Self::audit_makers(&done, &made)?;
+        // The made records, keyed from their own text, sorted by name, equal duplicates once.
+        let mut kept: SVec<'a, Made<'a>> = Vec::new_in(self.alloc);
         if self.plant != Plant::MadeDropped {
             let mut last: Option<Name> = None;
-            let mut kept: SVec<'a,Made<'a>> = Vec::new_in(self.alloc);
             for one in made.into_iter() {
                 let key = self.tools.key(one.planned.name, &one.planned.source);
                 if one.done.key != key {
@@ -665,7 +1073,7 @@ impl<'a, S: Scope> Engine<'a, S> {
                 }
                 if last == Some(one.planned.name) {
                     // Records are equal bytes by key: a duplicate made by two workers is one.
-                    if kept.last().is_some_and(|prev| *prev != one) {
+                    if kept.last().is_some_and(|prev| !prev.same_record(&one)) {
                         return Err(EngineError::TwoValues { name: one.planned.name });
                     }
                     continue;
@@ -673,16 +1081,88 @@ impl<'a, S: Scope> Engine<'a, S> {
                 last = Some(one.planned.name);
                 kept.push(one);
             }
-            for one in kept.into_iter() {
-                if tasks.iter().any(|task| task.planned.name == one.planned.name) {
-                    continue;
+        }
+        // A record made under the name of a task of this phase, or of a row merged earlier in
+        // this request, is that result's bytes (invariant 8, rule 21).
+        for one in kept.iter() {
+            let name = one.planned.name;
+            match tasks.binary_search_by_key(&name, |task| task.planned.name) {
+                Ok(at) => {
+                    if done[at] != one.done {
+                        return Err(EngineError::TwoValues { name });
+                    }
                 }
-                self.report.made += 1;
-                self.report.entered += 1;
-                self.report.results += 1;
-                self.entered.push(one.planned.name);
-                let identical = self.apply(one.planned, one.done, phase, true)?;
-                self.count(one.planned, Cause::Inline, identical);
+                Err(_) => {
+                    if let Some(row) = self.answer.rows.get(&name)
+                        && row.serial == self.serial
+                        && !same(row, &one.done)
+                    {
+                        return Err(EngineError::TwoValues { name });
+                    }
+                }
+            }
+        }
+        // Each result's read list: each cell once (invariant 9).
+        for result in done.iter().chain(kept.iter().map(|one| &one.done)) {
+            if cfg!(debug_assertions)
+                && let Some(read) = read_twice(&result.reads, self.alloc)
+            {
+                return Err(EngineError::ReadTwice { name: result.name, read });
+            }
+        }
+        // Results are in task order now: both are sorted by name and matched one to one. Every
+        // row goes in before any cell moves, so a reader merged in this phase is seen as it now
+        // reads, whatever the order (invariant 2).
+        let mut changes: SVec<'a, (CellId, Option<ContentId>)> = Vec::new_in(self.alloc);
+        self.report.results += done.len() as u32;
+        let mut done_iter = done.into_iter();
+        for (task, cause) in tasks.iter().zip(opened.iter()) {
+            let result = done_iter.next().ok_or(EngineError::NoResult { name: task.planned.name })?;
+            // A made row re-validated as a task stays a made row (invariant 10).
+            let inline = !self.planned.contains_key(&task.planned.name) && self.answer.rows.get(&task.planned.name).is_some_and(|row| row.inline);
+            let identical = self.apply(task.planned, result, phase, inline, &mut changes)?;
+            self.count(task.planned, *cause, identical);
+        }
+        for one in kept.into_iter() {
+            let name = one.planned.name;
+            if tasks.binary_search_by_key(&name, |task| task.planned.name).is_ok() {
+                continue;
+            }
+            // Made earlier in this request, the same bytes (compared above): merged once.
+            if self.answer.rows.get(&name).is_some_and(|row| row.serial == self.serial) {
+                continue;
+            }
+            self.report.made += 1;
+            self.report.entered += 1;
+            self.report.results += 1;
+            self.entered.push(name);
+            let identical = self.apply(one.planned, one.done, phase, true, &mut changes)?;
+            self.count(one.planned, Cause::Inline, identical);
+            // A record whose makers no longer read it is retired at the next phase.
+            self.orphans.insert(name);
+        }
+        for (id, digest) in changes.iter() {
+            self.move_cell(*id, *digest, Some(phase))?;
+        }
+        Ok(())
+    }
+
+    /// Every record made inline is read by the task that made it (invariant 12: a hit is one
+    /// read, of the record's result, and so is a make): a maker whose result reads no cell of
+    /// the record is refused. `done` is sorted by name; a maker that is itself a made record is
+    /// looked up in `made`.
+    fn audit_makers(done: &[Done<'a>], made: &[Made<'a>]) -> Result<(), EngineError> {
+        for one in made.iter() {
+            let record = one.planned.name;
+            let reads = match done.binary_search_by_key(&one.by, |result| result.name) {
+                Ok(at) => &done[at].reads,
+                Err(_) => match made.iter().find(|other| other.planned.name == one.by) {
+                    Some(other) => &other.done.reads,
+                    None => return Err(EngineError::Unplanned { name: one.by }),
+                },
+            };
+            if !reads.iter().any(|(id, _)| id.of == record) {
+                return Err(EngineError::HitWithoutReads { reader: one.by, made: record });
             }
         }
         Ok(())
@@ -694,6 +1174,7 @@ impl<'a, S: Scope> Engine<'a, S> {
         if self.open.is_some() {
             return Err(EngineError::OutOfTurn);
         }
+        self.retire_orphans()?;
         for id in self.moved.iter() {
             self.answer.owed_cells.insert(*id, self.serial);
         }
@@ -702,9 +1183,8 @@ impl<'a, S: Scope> Engine<'a, S> {
         for id in answer.owed_cells.keys() {
             let digest = answer.cell(id);
             let all = answer.readers.get(id).is_none_or(|readers| {
-                readers.iter().all(|reader| {
-                    answer.rows.get(reader).is_none_or(|row| row.reads.binary_search_by_key(id, |(read, _)| *read).is_ok_and(|at| row.reads[at].1 == digest))
-                })
+                // A read list is in read order (invariant 9): the cell is found by a walk.
+                readers.iter().all(|reader| answer.rows.get(reader).is_none_or(|row| row.reads.iter().any(|(read, seen)| read == id && *seen == digest)))
             });
             if all {
                 settled.push(*id);
@@ -740,22 +1220,43 @@ impl<'a, S: Scope> Engine<'a, S> {
     }
 
     /// Puts `planned` in its phase's candidates; `moved_in` is the phase merging, whose readers
-    /// must come later (invariant 2).
+    /// must come later (invariant 2). A reader of Heads or Bodies at or before the merging wave
+    /// of its own stage is put at the next wave instead: its row keeps its planned phase, and the
+    /// wave it is entered at is the one its read gives.
     fn candidate(&mut self, planned: Planned, moved_in: Option<(Phase, CellId)>) -> Result<(), EngineError> {
+        let mut at = planned.phase;
         if let Some((phase, read)) = moved_in
             && planned.phase <= phase
         {
-            return Err(EngineError::BackwardRead { reader: planned.name, read, reader_phase: planned.phase, phase });
+            let waved = matches!(phase.stage, Stage::Heads | Stage::Bodies) && planned.phase.stage == phase.stage;
+            if !waved {
+                return Err(EngineError::BackwardRead { reader: planned.name, read, reader_phase: planned.phase, phase });
+            }
+            if phase.wave >= WAVE_CAP {
+                return Err(EngineError::WaveTooDeep { reader: planned.name, read, wave: phase.wave });
+            }
+            if self.plant == Plant::SameStageStale {
+                // The planted bug: the reader is dropped, its row left on the old digest.
+                return Ok(());
+            }
+            at = Phase::new(phase.stage, phase.wave + 1);
         }
         let alloc = self.alloc;
-        self.pending.entry(planned.phase).or_insert_with(|| BTreeSet::new_in(alloc)).insert(planned.name);
+        self.pending.entry(at).or_insert_with(|| BTreeSet::new_in(alloc)).insert(planned.name);
         Ok(())
     }
 
     fn readers_of(&mut self, id: CellId, moved_in: Option<Phase>) -> Result<(), EngineError> {
         let Some(readers) = self.answer.readers.get(&id) else { return Ok(()) };
+        let now = self.answer.cell(&id);
         let mut found: SVec<'a,Planned> = Vec::with_capacity_in(readers.len(), self.alloc);
         for reader in readers.iter() {
+            // A reader whose row saw today's digest of the cell is today's for it: the maker of
+            // an inline record, or a reader merged in the same phase (invariant 4). A made row
+            // is a candidate like any; the phase decides whether it is still needed (invariant 10).
+            if self.answer.rows.get(reader).is_some_and(|row| row.reads.iter().any(|(read, seen)| *read == id && *seen == now)) {
+                continue;
+            }
             if let Some(planned) = self.planned_of(*reader) {
                 found.push(planned);
             }
@@ -780,15 +1281,31 @@ impl<'a, S: Scope> Engine<'a, S> {
         self.readers_of(id, phase)
     }
 
-    /// Removes `name`'s row: its reads leave the reverse index and its cells move to absent.
+    /// Removes `name`'s row: its reads leave the reverse index and its cells move to absent. A
+    /// grower's growth goes with it (invariant 11): the tasks listed under it in `by_file`, when
+    /// it is not its own file (an outline is its file's namesake, never a grower).
     fn remove_row(&mut self, name: Name, phase: Option<Phase>) -> Result<(), EngineError> {
-        let Some(row) = self.answer.rows.remove(&name) else { return Ok(()) };
-        self.answer.with_findings.remove(&name);
-        for (id, _) in row.reads.iter() {
-            self.unread(*id, name);
-        }
-        for (cell, _) in row.defines.iter() {
-            self.move_cell(CellId { of: name, cell: *cell }, None, phase)?;
+        let mut stack: SVec<'a, Name> = Vec::new_in(self.alloc);
+        stack.push(name);
+        while let Some(name) = stack.pop() {
+            let Some(row) = self.answer.rows.remove(&name) else { continue };
+            self.answer.with_findings.remove(&name);
+            for (id, _) in row.reads.iter() {
+                self.unread(*id, name);
+            }
+            for (cell, _) in row.defines.iter() {
+                self.move_cell(CellId { of: name, cell: *cell }, None, phase)?;
+            }
+            if row.file != name
+                && let Some(grown) = self.answer.by_file.remove(&name)
+            {
+                for one in grown.iter() {
+                    self.answer.owed_tasks.remove(one);
+                    self.planned.remove(one);
+                    self.report.retired += u32::from(self.answer.rows.contains_key(one));
+                    stack.push(*one);
+                }
+            }
         }
         Ok(())
     }
@@ -796,9 +1313,7 @@ impl<'a, S: Scope> Engine<'a, S> {
     fn unread(&mut self, id: CellId, reader: Name) {
         let empty = match self.answer.readers.get_mut(&id) {
             Some(readers) => {
-                if let Ok(at) = readers.binary_search(&reader) {
-                    readers.remove(at);
-                }
+                readers.remove(&reader);
                 readers.is_empty()
             }
             None => false,
@@ -806,11 +1321,16 @@ impl<'a, S: Scope> Engine<'a, S> {
         if empty {
             self.answer.readers.remove(&id);
         }
+        // A made record that lost a reader may have none left (invariant 10).
+        if id.of != reader && self.answer.rows.get(&id.of).is_some_and(|row| row.inline) {
+            self.orphans.insert(id.of);
+        }
     }
 
     /// Applies one result; true when it came out the same bytes as the task's last row (`out`
-    /// equal), a wasted entry.
-    fn apply(&mut self, planned: Planned, done: Done<'a>, phase: Phase, inline: bool) -> Result<bool, EngineError> {
+    /// equal), a wasted entry. Its defined cells that moved are pushed on `moved`, for the merge
+    /// to move once the phase's rows are all in.
+    fn apply(&mut self, planned: Planned, done: Done<'a>, phase: Phase, inline: bool, moved: &mut SVec<'a, (CellId, Option<ContentId>)>) -> Result<bool, EngineError> {
         let name = planned.name;
         let identical = self.answer.rows.get(&name).is_some_and(|old| old.out == done.out);
         if done.failed {
@@ -830,10 +1350,7 @@ impl<'a, S: Scope> Engine<'a, S> {
             }
         }
         for (id, _) in done.reads.iter() {
-            let readers = self.answer.readers.entry(*id).or_insert_with(|| Vec::new_in(alloc));
-            if let Err(at) = readers.binary_search(&name) {
-                readers.insert(at, name);
-            }
+            self.answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc)).insert(name);
         }
         // The defined cells: each that moved is recorded and its readers made candidates.
         let mut changes: SVec<'a,(CellId, Option<ContentId>)> = Vec::new_in(alloc);
@@ -885,46 +1402,12 @@ impl<'a, S: Scope> Engine<'a, S> {
                 failed: done.failed,
             },
         );
-        for (id, digest) in changes.iter() {
-            // An inline record is read in its own phase by the task that made it: it moves no
-            // reader of an earlier entry this request (its readers are later or its makers).
-            let moved_in = if inline { None } else { Some(phase) };
-            match moved_in {
-                Some(phase) => self.move_cell(*id, *digest, Some(phase))?,
-                None => {
-                    match digest {
-                        Some(digest) => {
-                            self.answer.cells.insert(*id, (*digest, self.serial));
-                        }
-                        None => {
-                            self.answer.cells.remove(id);
-                        }
-                    }
-                    self.moved.insert(*id);
-                    self.inline_readers(*id, name, phase)?;
-                }
-            }
+        // Moved by the merge once every row of the phase is in (invariant 2); an inline record's
+        // cells too: its makers saw them as made, and any other reader of them is entered after.
+        for one in changes.iter() {
+            moved.push(*one);
         }
         Ok(identical)
-    }
-
-    /// The readers of an inline record's moved cell: those of later phases are candidates; one
-    /// of its own phase read it as it made it (or made it itself), so it is today's.
-    fn inline_readers(&mut self, id: CellId, made: Name, phase: Phase) -> Result<(), EngineError> {
-        let Some(readers) = self.answer.readers.get(&id) else { return Ok(()) };
-        let mut found: SVec<'a,Planned> = Vec::with_capacity_in(readers.len(), self.alloc);
-        for reader in readers.iter() {
-            if *reader != made
-                && let Some(planned) = self.planned_of(*reader)
-                && planned.phase > phase
-            {
-                found.push(planned);
-            }
-        }
-        for planned in found.iter() {
-            self.candidate(*planned, None)?;
-        }
-        Ok(())
     }
 }
 
@@ -935,6 +1418,18 @@ pub fn drive<'a, S: Scope, P: Pool<'a>>(
     buffers: &mut [Buffer<'a>],
     work: &(dyn Fn(&P::Cx, View<'_, 'a>, &Task, &mut Buffer<'a>) + Sync),
 ) -> Result<(), EngineError> {
+    drive_growing(engine, pool, buffers, work, &mut |_| Ok(()))
+}
+
+/// [`drive`] with growth (invariant 11): after each phase's merge, `grow` is handed the engine to
+/// call [`Engine::grow`] for each grower among [`Engine::merged`], before the next phase opens.
+pub fn drive_growing<'a, S: Scope, P: Pool<'a>>(
+    engine: &mut Engine<'a, S>,
+    pool: &mut P,
+    buffers: &mut [Buffer<'a>],
+    work: &(dyn Fn(&P::Cx, View<'_, 'a>, &Task, &mut Buffer<'a>) + Sync),
+    grow: &mut dyn FnMut(&mut Engine<'a, S>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
     while engine.next_phase()?.is_some() {
         {
             let view = engine.view();
@@ -942,6 +1437,7 @@ pub fn drive<'a, S: Scope, P: Pool<'a>>(
             pool.run(tasks, buffers, &|cx: &P::Cx, task: &Task, buffer: &mut Buffer<'a>| work(cx, view, task, buffer));
         }
         engine.merge(buffers)?;
+        grow(engine)?;
     }
     Ok(())
 }

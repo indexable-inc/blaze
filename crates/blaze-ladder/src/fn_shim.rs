@@ -57,6 +57,63 @@ pub(crate) fn fn_shim_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: I
     }
 }
 
+/// The item (and its arguments) whose row a LANGUAGE-GIVEN `Fn*` method instance tables at
+/// ([`fn_shim_owner`]: a fn item's shim at the item; run.rs `closure_owner`: a closure's body at
+/// its owner) when no row tables that item yet; `None` for any other call, and for one whose
+/// row is tabled.
+///
+/// The class (hello world on the real std, release g194537, 2026-11-17): "`<impl<T>
+/// AtomicPtr<T>>::try_update` calls trait fn `FnMut::call_mut` with Self a fn item: .. no impl
+/// of trait .. holds". `try_update(.., mut f: impl FnMut(..))` calls `f(prev)` at `F` a fn
+/// item. A fn item is a ZERO-SIZED VALUE: the body that passes it (`fetch_update(.., some_fn)`)
+/// names the fn only in a type, never as a callee or a reference, so the lazy front end
+/// (front2/program/lazy) tabled no row for it; `fn_shim_owner` then found no index, the call
+/// fell through to impl selection, and the language's built-in `FnMut` for a fn item has no
+/// impl item to select. The fix is the one an untabled CALLEE already takes (run/make_one.rs
+/// `Named1::Untabled`, a vtable's untabled word): the item is checked, which tables its row,
+/// and the instance is made again; this time `fn_shim_owner` finds the row and the shim is
+/// declared. A ctor's fn item (`.map(Some)`) is tabled the same way (`MakerState::ensure_one`
+/// makes a ctor's row by `ctor_row`).
+pub(crate) fn untabled_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>) -> Option<Instance> {
+    let view = ground.view();
+    let &first = view.list(called.args).ok()?.first()?;
+    if !METHODS.into_iter().any(|w| adts.fn_trait_method(w) == Some(called.item)) {
+        return None;
+    }
+    let owner = match view.node(first).ok()? {
+        PNode::FnDef(item, args) => Instance { item, args },
+        PNode::Closure { owner, args, .. } => Instance { item: owner, args },
+        _ => return None,
+    };
+    program.fn_index(owner.item).is_none().then_some(owner)
+}
+
+/// The shape of an `Fn*` method call's `Self` that reached impl selection although the
+/// language, not an impl item, would give its impl: `Some(shape)` names it for the refusal
+/// ([`crate::run::RunError::NoBuiltinCall`]); `None` when `called` is no `Fn*` method or its
+/// `Self` is a type whose `Fn*` impls are library impl items (`&F`, `&mut F`, `Box<F>`, an
+/// ADT): those are selected, and their refusal is selection's own.
+///
+/// A fn item, fn pointer or closure reaches here only when its rule could not table it
+/// ([`fn_shim_owner`] and `closure_owner` gave no row, and [`untabled_owner`]'s check tabled
+/// none). An async block, a coroutine or a trait object has no built-in `Fn*` impl the
+/// language gives on this path: a call of one is named so, never "no impl .. holds".
+pub(crate) fn builtin_shape(adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>) -> Option<&'static str> {
+    let view = ground.view();
+    let &first = view.list(called.args).ok()?.first()?;
+    if !METHODS.into_iter().any(|w| adts.fn_trait_method(w) == Some(called.item)) {
+        return None;
+    }
+    Some(match view.node(first).ok()? {
+        PNode::FnDef(..) => "a fn item whose fn no row tables",
+        PNode::FnPtr(..) => "a fn pointer",
+        PNode::Closure { .. } => "a closure whose owner fn no row tables",
+        PNode::Coroutine { .. } | PNode::Future(..) => "an async block (a coroutine)",
+        PNode::Dynamic(_) => "a trait object",
+        _ => return None,
+    })
+}
+
 /// Whether `instance`'s first argument (an `Fn*` method's self) is a fn item or a fn pointer.
 pub(crate) fn self_is_fn(instance: Instance, ground: &PortableTys<'_>) -> bool {
     let view = ground.view();

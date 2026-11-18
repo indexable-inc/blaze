@@ -1335,8 +1335,10 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
 /// E4's one-group solve of one crate (cells/edit.rs `OneGroup`): the modules `members` solved
 /// from their text against the dependencies' records `deps` (as [`resolve_crate_with`] takes
 /// them), every other module of the crate answered from its group's record; the answer is the
-/// members' groups alone. No crate record is written or decoded: the groups' records are the
-/// answer (the crate's exports are its groups' business, read by cell).
+/// members' groups alone, with the module tree record the solve ended with (the one handed in,
+/// or the one it made walking again: the caller hands that one to its next solve). No crate
+/// record is written or decoded: the groups' records are the answer (the crate's exports are
+/// its groups' business, read by cell).
 #[allow(clippy::too_many_arguments, reason = "the entry's arguments, each named")]
 pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
     input: &CrateInput<'a>,
@@ -1347,7 +1349,7 @@ pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     members: crate::cells::Members<'_>,
     alloc: Alloc<'a>,
-) -> Result<AVec<'a, crate::NameGroup<'a>>, CrateScopeError<'a>> {
+) -> Result<crate::cells::Solved<'a>, CrateScopeError<'a>> {
     let mut decoded = AVec::with_capacity_in(deps.len(), alloc);
     for (at, bytes) in deps.iter().enumerate() {
         decoded.push(&*Box::leak(Box::new_in(read_record(bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?, alloc)));
@@ -1357,14 +1359,16 @@ pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let members_of = |mut names: CrateNames<'a>, _: &Built<'_, 'a>| {
         let groups = core::mem::replace(&mut names.groups, AVec::new_in(alloc));
+        // In `alloc`: it outlives `names`.
+        let tree: &'a [u8] = names.tree_record;
         // The rest lives in `alloc`, which frees it whole (as a crate solve's names are leaked
         // there): walking every module's tables to drop them is the cost of the crate, not of
         // the members (2.7 ms of a 2,000-module crate's one-group solve, 2026-11-17).
         core::mem::forget(names);
-        Ok(groups)
+        Ok(crate::cells::Solved { groups, tree })
     };
-    let (groups, _) = with_names(input, &decoded, sysroot, sources, source, &par, prepares, &kept, alloc, members_of)?;
-    Ok(groups)
+    let (solved, _) = with_names(input, &decoded, sysroot, sources, source, &par, prepares, &kept, alloc, members_of)?;
+    Ok(solved)
 }
 
 /// `par` asked to solve `members` alone, their groups written ([`Par::names_members`]).

@@ -79,6 +79,8 @@ mod start_list;
 mod signature;
 mod store;
 mod sweep;
+// The sweep's change detection from the system's journal of changes (plan row S1).
+mod journal_sweep;
 mod graph;
 mod graph_payload;
 mod test_args;
@@ -88,10 +90,12 @@ mod toolchain;
 mod units;
 mod work;
 mod engine_answer;
+mod engine_answer_rows;
 mod engine_check;
 mod engine_bodies;
 mod engine_heads;
 mod engine_lines;
+mod engine_lints;
 mod engine_why;
 mod engine_names;
 mod engine_times;
@@ -940,12 +944,7 @@ fn request<'f>(
     // `check` lints by the step and the added rules the root manifest names (lints.rs
     // `lints_of`), read once a command; every other command runs no rule.
     let lints = match command {
-        Command::Check => {
-            let mut manifest = bstd::mem::Bytes::new_in(frame, "the root manifest, for its lint step");
-            root.read_all(&cx, &Path::new("Cargo.toml")?, &mut manifest)?;
-            let text = core::str::from_utf8(manifest.as_slice()).map_err(|_| CliError::Text { what: "the root `Cargo.toml` is not UTF-8" })?;
-            lints::lints_of(text)?
-        }
+        Command::Check => lints::of_root(&cx, root, frame)?,
         _ => lints::Lints::NONE,
     };
     shown.lints = lints.step;
@@ -1279,7 +1278,15 @@ fn request<'f>(
                 // its root finds its crate, its package names the child (rule 77).
                 let picked = picked.ok_or(CliError::RunNames(run_names::RunNamesError::NonePicked))?;
                 watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
-                let Some(found) = run_names::found(&cx, &req, picked.root, &mut store, &mut facts.bodies, heap, frame).map_err(CliError::RunNames)? else {
+                // The program's crates' records are read IN PLACE from the store's mapping
+                // (engine_records.rs, the one reader `blaze check` reads through): what this
+                // request put (a `CrateScope` task an edit reran) is committed first, so it is
+                // read from its segment like every other; a record still lent from the arena is
+                // refused by name, never copied (rule 3). The trees are opened at their first read.
+                store.commit_puts()?;
+                let mut read = engine_records::EngineRecords::new();
+                let seen = body_types::TreesSeen::default();
+                let Some(found) = run_names::found(&cx, &req, picked.root, &mut store, &mut facts.bodies, &mut read, heap, frame).map_err(CliError::RunNames)? else {
                     return Err(CliError::AnswerInFull { again: in_full });
                 };
                 // The body ids (run_ids.rs), also decided before the start: a walk builds them
@@ -1308,13 +1315,21 @@ fn request<'f>(
                 // each closure is called at most once, and only when a first call needs it. The
                 // names records are made the one way `blaze check`'s are (run_names.rs).
                 let (fetch_env, procs) = (&facts.fetch_env, facts.names.as_ref().and_then(|names| names.procs()));
-                let (bodies, codes) = (&mut facts.bodies, &mut store);
+                let (bodies, codes, reads, seen) = (&mut facts.bodies, &mut store, &mut read, &seen);
                 let mut names = || {
-                    run_names::names_of(&cx, root, &found, picked.root, &mut *codes, &mut *bodies, fetch_env, procs, frame, heap)
+                    run_names::names_of(&cx, root, &found, picked.root, &mut *codes, &mut *bodies, &mut *reads, fetch_env, procs, seen, frame, heap)
                         .map_err(|error| run_parent::ParentError::Names { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
                 };
                 let mut ids = || made.take().ok_or_else(|| run_parent::ParentError::BodyIds { shown: Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
-                let ok = match program::run(&cx, root, launch, &picked, units, native, producers.get::<blaze_ids::producer::CodeBuilder>(), lent, today, &mut names, &mut ids, &mut phases.code_records, watch, heap, frame) {
+                let run = program::run(&cx, root, launch, &picked, units, native, producers.get::<blaze_ids::producer::CodeBuilder>(), lent, today, &mut names, &mut ids, &mut phases.code_records, watch, heap, frame);
+                // What the parent read for its names (the closing lines, rule 16); a tree a read
+                // asked and that could not be opened stops the command by its words (rule 3),
+                // whatever the run made of the text it was not served.
+                phases.run_names = Some(run_names::NamesRead::of(read.counts(), seen));
+                if let Some(why) = seen.refused() {
+                    return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
+                }
+                let ok = match run {
                     Ok(status) => {
                         *ran = Some(status);
                         status == 0
@@ -1870,6 +1885,7 @@ mod tests {
     mod members_tests;
     mod names_records_tests;
     mod engine_check_tests;
+    mod engine_answer_rows_tests;
     mod native_image_tests;
     mod include_data_tests;
     mod include_outside_tests;
@@ -1879,6 +1895,7 @@ mod tests {
     mod pooled_scope_tests;
     mod refused_targets_tests;
     mod run_scope_tests;
+    mod run_records_in_place_tests;
     mod signature_grain_tests;
     mod stale_facts_tests;
 

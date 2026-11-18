@@ -42,7 +42,10 @@ pub struct Phases {
     pub records: byte_rows::Records,
     /// `blaze run`'s closing count of code records (run_parent.rs `Tally`), on every run that
     /// started its program: the proof a repeat made nothing (its error-stream line is quiet then).
-    pub(crate) code_records: Option<crate::run_parent::Tally>,
+    pub(crate) code_records: Option<crate::run_parent::RunTally>,
+    /// `blaze run`'s parent's reads for its names records (run_names.rs `NamesRead`): the crates'
+    /// records read in place, the bytes copied (0), the trees opened at their first read.
+    pub(crate) run_names: Option<crate::run_names::NamesRead>,
     /// The command's own frame, by what took its bytes ([`Phases::mark_in`], [`Phases::took`]).
     held: Held,
 }
@@ -130,6 +133,7 @@ impl Phases {
             worlds: 0,
             records: byte_rows::Records::new(),
             code_records: None,
+            run_names: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
         }
     }
@@ -262,7 +266,11 @@ impl fmt::Display for Phases {
         }
         write!(f, "{}", self.records)?;
         if let Some(tally) = self.code_records {
-            writeln!(f, "run          {tally}")?;
+            writeln!(f, "run          {}", tally.codes)?;
+            writeln!(f, "run          {}", tally.start)?;
+        }
+        if let Some(read) = self.run_names {
+            writeln!(f, "run          {read}")?;
         }
         let held = &self.held;
         write!(f, "frame        the command's frame: {} of {} bytes used · by phase (bytes):", held.seen.0, held.seen.1)?;

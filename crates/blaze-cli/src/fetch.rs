@@ -323,6 +323,16 @@ fn record_path(key: &ContentId) -> Result<Path, CliError> {
     Ok(Path::new(hex)?)
 }
 
+/// Whether the sources store `root` ([`sources_dir`]) has a record at `key`: one stat, no read.
+/// For a stored `Fetch` row that stands (engine_units.rs `fetch_stands`): every record is
+/// published whole under its key ([`write_record`]'s rename) and its bytes were checked once
+/// when it was fetched or adopted ([`held_record`]), so a file there is the record the row names
+/// (rule 74: checked once, never on each read).
+pub(crate) fn holds(cx: &Cx, root: &Dir<ReadWrite>, key: &ContentId) -> Result<bool, CliError> {
+    let path = record_path(key)?;
+    Ok(root.stat(cx, &path)?.is_some_and(|meta| !meta.dir))
+}
+
 /// Whether the sources store `root` ([`sources_dir`]) holds `unit`'s record whole: read and
 /// checked against its BLAKE3. One that fails the check is removed (it is made again).
 fn held_record(cx: &Cx, root: &Dir<ReadWrite>, unit: &Unit<'_, '_>) -> Result<bool, CliError> {

@@ -21,11 +21,15 @@
 //! the root name   engine.<16 hex of H(checkout, every kind's tool)>
 //! it names        the sealed pointer's key; `<it>.pages` names the answer root, the page keys
 //!                 and the lines record's key
-//! sealed pointer  seal.rs form: last = "BEL3" | answer root key [32] | lines key [32] |
+//! sealed pointer  seal.rs form: last = "BEL4" | answer root key [32] | lines key [32] |
 //!                 files u32 | printed u8 (bit 0 names checked, 1 bodies whole, 2 every
 //!                 printed line is in the lines record) | findings u32 | owed u32 (the
-//!                 certificate's facts); leaves = the BCL table
+//!                 certificate's facts) | the journal's places (journal_sweep.rs `Stored`);
+//!                 leaves = the BCL table
 //! ```
+//!
+//! BEL3 had no journal places: an older form, reported and rebuilt. The places are the
+//! pointer's own sweep state: no record key or task row holds them (journal_sweep.rs).
 
 use core::fmt;
 use core::fmt::Write as _;
@@ -44,9 +48,9 @@ use crate::sweep::{Leaves, Rows};
 use crate::{CliError, seal};
 
 /// The pointer's form inside its seal.
-pub(crate) const POINTER_MAGIC: &[u8; 4] = b"BEL3";
+pub(crate) const POINTER_MAGIC: &[u8; 4] = b"BEL4";
 /// The magic, the answer's root, the lines record's key, then the [`Facts`]: files u32, printed
-/// u8, findings u32, owed u32.
+/// u8, findings u32, owed u32. The journal's places follow, of their own length.
 const POINTER_BYTES: usize = 4 + 32 + 32 + 4 + 1 + 4 + 4;
 const POINTER_DOMAIN: &str = "blaze-cli engine-check pointer";
 
@@ -90,7 +94,7 @@ pub(crate) enum Unreadable {
 impl fmt::Display for Unreadable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Unreadable::Older = self {
-            return write!(f, "the stored engine answer is an old home's answer (its pointer is of an older form than `BEL3`), rebuilt (rule 26)");
+            return write!(f, "the stored engine answer is an old home's answer (its pointer is of an older form than `BEL4`), rebuilt (rule 26)");
         }
         write!(f, "the stored engine answer is not read (engine_answer.rs `load`): ")?;
         match self {
@@ -159,6 +163,8 @@ pub(crate) struct Pointer<'m> {
     pub(crate) lines: Key,
     pub(crate) facts: Facts,
     pub(crate) leaves: Leaves<'m>,
+    /// Where the journal of changes stood when the request that wrote it began its reads.
+    pub(crate) journal: crate::journal_sweep::Stored<'m>,
 }
 
 fn key_at(bytes: &[u8], at: usize) -> Key {
@@ -224,9 +230,12 @@ pub(crate) fn load_pointer<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut Comma
         Ok(opened) => opened,
         Err(torn) => return Ok(Some(Err(Unreadable::Torn(torn)))),
     };
-    if pointer.len() != POINTER_BYTES || !pointer.starts_with(POINTER_MAGIC) {
+    if pointer.len() < POINTER_BYTES || !pointer.starts_with(POINTER_MAGIC) {
         return Ok(Some(Err(Unreadable::Older)));
     }
+    let Some(journal) = crate::journal_sweep::Stored::of(&pointer[POINTER_BYTES..]) else {
+        return Ok(Some(Err(Unreadable::Older)));
+    };
     let (leaves, older) = Leaves::of(leaves)?;
     if older.is_some() {
         return Ok(Some(Err(Unreadable::Older)));
@@ -235,7 +244,7 @@ pub(crate) fn load_pointer<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut Comma
     if pointer[72] > 7 {
         return Ok(Some(Err(Unreadable::Older)));
     }
-    Ok(Some(Ok(Pointer { root: key_at(pointer, 4), lines: key_at(pointer, 36), facts, leaves })))
+    Ok(Some(Ok(Pointer { root: key_at(pointer, 4), lines: key_at(pointer, 36), facts, leaves, journal })))
 }
 
 /// The printed lines' record the pointer names, every entry checked (engine_lines.rs `decode`).
@@ -274,6 +283,7 @@ pub(crate) fn save<'m, D: Driver, S: Sharing>(
     lines: (Key, &[u8]),
     last: Option<&Root<'_>>,
     rows: &Rows<'_>,
+    journal: &crate::journal_sweep::Taken<'_>,
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<Saved, CliError> {
@@ -298,6 +308,7 @@ pub(crate) fn save<'m, D: Driver, S: Sharing>(
     pointer.push(facts.printed.byte());
     pointer.extend_from_slice(&facts.findings.to_le_bytes());
     pointer.extend_from_slice(&facts.owed.to_le_bytes());
+    journal.encode(&mut pointer);
     let sealed = seal::seal(&pointer, &leaves, frame)?;
     let key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
     store.put(cx, key, &sealed)?;
@@ -305,6 +316,9 @@ pub(crate) fn save<'m, D: Driver, S: Sharing>(
     let mut pins = encoded.pins(alloc);
     saved.pages = u32::try_from(pins.len() - 1).unwrap_or(u32::MAX);
     pins.push(lines.0);
+    // Each standing row's task record: the next request reads it by this key, so the answer's
+    // root reaches it (the store sweeps what no root reaches).
+    pins.extend(kept.records.values().copied());
     // Two roots, both in the one commit: a root's keys are a set to the store (not an order), so
     // the pointer has a root of its own and the answer's records another.
     store.pin(name, &[key])?;

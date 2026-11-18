@@ -51,7 +51,7 @@ use blaze_drive::answers::{bits_kept, page_of};
 use blaze_drive::cells::Cell;
 use blaze_drive::key::{Key, Kind, Name, content_key};
 use blaze_id::ContentId;
-use blaze_own::{BTreeMap, SharedAlloc, Vec};
+use blaze_own::{BTreeMap, BTreeSet, SharedAlloc, Vec};
 
 use crate::engine::{Answer, Cause, CellId, Entered, Gen, Phase, Planned, Row, SMap, SVec, Stage};
 
@@ -540,11 +540,8 @@ pub fn decode<'a, 'g>(key: Key, mut get: impl FnMut(Key) -> Option<&'g [u8]>, al
         }
         decode_page(bytes, page, root.bits, &mut kept, alloc)?;
     }
-    // The reverse index, made again from the rows' reads: each list sorted (rows came page by
-    // page, and a name's page is its subject's bits, not its order).
-    for list in kept.answer.readers.values_mut() {
-        list.sort_unstable();
-    }
+    // The reverse index was made again from the rows' reads as they were decoded: each cell's
+    // readers are a set, in order whatever the order the pages came in.
     Ok(kept)
 }
 
@@ -615,10 +612,7 @@ fn decode_page<'a>(bytes: &[u8], page: u32, bits: u8, kept: &mut Kept<'a>, alloc
             reads.push(one);
         }
         for (id, _) in reads.iter() {
-            let readers = answer.readers.entry(*id).or_insert_with(|| Vec::new_in(alloc));
-            if readers.last() != Some(&name) {
-                readers.push(name);
-            }
+            answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc)).insert(name);
         }
         let failed = flags & FAILED != 0;
         if findings > 0 || failed {

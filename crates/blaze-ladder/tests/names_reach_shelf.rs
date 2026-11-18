@@ -327,12 +327,23 @@ fn reach(label: &str, main: &str) {
     // First, so a 30-line window of the output holds it.
     let (want, got, out): (usize, usize, usize) = rows.iter().enumerate().filter(|(k, _)| *k != root).fold((0, 0, 0), |a, (_, r)| (a.0 + r.reached_groups, a.1 + r.on_demand, a.2 + r.outside));
     match (&lazy, &refused) {
-        (Some(lazy), _) => say(format!(
-            "ONDEMAND {label}: {got} groups solved on demand, {out} of them outside the predicted reach of {want}; {} root solves; {:.2} s (the whole solve {solve_s:.2} s); {} groups not byte-equal",
-            lazy.root_solves,
-            lazy_s,
-            mismatched.len()
-        )),
+        (Some(lazy), _) => {
+            // B2's floor: one walk per crate read (its tree record taken by every one-group
+            // solve after it), none for a crate never read.
+            let deps = || (0..all.len()).filter(|&k| k != root);
+            let walks: usize = deps().map(|k| lazy.walks[k]).sum();
+            let walked = deps().filter(|&k| lazy.walks[k] > 0).count();
+            let most = deps().max_by_key(|&k| (lazy.walks[k], core::cmp::Reverse(k)));
+            let most = most.map_or_else(String::new, |k| format!("{} {}", all[k].name, lazy.walks[k]));
+            let one_group: usize = deps().map(|k| lazy.one_group_solves[k]).sum();
+            say(format!(
+                "ONDEMAND {label}: {got} groups solved on demand against {want} predicted by the reach, {out} of them outside it; walks {walks} over {walked} crates walked (most: {most}; floor 1 a crate); {one_group} one-group solves; {} root solves; {:.2} s (the whole solve {solve_s:.2} s); {} groups not byte-equal; by crate: {}",
+                lazy.root_solves,
+                lazy_s,
+                mismatched.len(),
+                lazy.counts
+            ))
+        }
         (None, refused) => say(format!("ONDEMAND {label}: REFUSED after {lazy_s:.2} s (predicted reach {want} groups): {}", refused.as_deref().unwrap_or("?"))),
     }
     say(format!("ROOT {label}: {}", rows[root].line("crate")));

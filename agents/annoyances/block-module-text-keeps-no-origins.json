@@ -1,0 +1,15 @@
+{
+ "id": "block-module-text-keeps-no-origins",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RB6",
+ "where": "crates/blaze-scope/src/resolve.rs `make_blocks` (~3190-3199, origins empty; ~1312 `run.block_places` dropped), crates/blaze-cli/src/body_types/covered.rs `written_by`/`in_blocks`, crates/blaze-cli/src/engine_bodies.rs `groups`",
+ "what": "the fns of an impl inside a block (serde's `const _: () = { .. impl Serialize for T { .. } };`) were checked by no engine-check task: the walk from a block item's place reaches the block's fragment, whose module text keeps no origins, so `callers` failed with 'keeps no origins' and no entry took the body; every body task refusal also read nothing, so each was owed and entered again by every request",
+ "cost": "reading resolve.rs, blocks.rs and covered.rs to learn the fragment key is a function of the body's key alone; writing blind (no build in this lane) against several in-flight lanes' files",
+ "cause": "make_blocks computes `copies` (which slices of the body text the module text is) and `block_places` (fragment to body place), then keeps neither in the record",
+ "whys": "blocks were made modules for name resolution only; nobody downstream needed where their text came from until bodies were planned at item grain",
+ "class": "a record that is made from text it does not say it came from (a rewritten text with empty origins)",
+ "prevention": "done here: covered.rs `in_blocks` derives the fragment key forward from each listed body's key (blaze_scope::task::key_of(krate, body, \"blocks\", \"\", 0)) and stops the walk at it, so each block body attaches to its owner's task once; proposed: make_blocks records the fragment's origins (the calling text At::File/At::Expansion of the body and the `copies` column) so findings land at their own line, and one helper blaze_scope::blocks::fragment_key is the one home of the key derivation",
+ "annoyance": "the \"blocks\" key derivation is written in two places (blocks.rs and make_blocks) and now a third (covered.rs `block_key`), with no shared helper to call",
+ "workaround": "covered.rs `block_key` cites both places; a test (engine_block_extern_crate) fails if the derivations drift",
+ "state": "written, not compiled (lane writes only)"
+}

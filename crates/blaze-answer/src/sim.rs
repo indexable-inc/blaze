@@ -18,7 +18,7 @@ use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::{
     AnswerError, AnswerView, CellDigest, CellNo, Commit, DEFINE_BYTES, Effects, Flags, Health, LinesKey, Plant, ROW_FIXED_BYTES, RowIn, RunWriter, SegmentKind, TaskId, TreeDigest, Write, compact,
-    nothing_changed,
+    nothing_changed, summary_of,
 };
 
 fn alloc() -> Alloc<'static> {
@@ -431,6 +431,8 @@ fn check_root(store: &Store, model: &Model, plant: Plant, at: &str) -> Result<()
     oracle(same && !changed, || format!("{at}: nothing_changed is wrong about the root's tree"))?;
     let adopted = AnswerView::adopt(&TreeDigest(model.tree), root, |one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), plant, alloc()).map_err(refused("adopt"))?;
     compare(&adopted, model, at)?;
+    // The root alone gives the summary the opened answer gives (blaze-cli's certificate reads it so).
+    oracle(summary_of(root).ok() == Some(adopted.summary()), || format!("{at}: summary_of disagrees with the opened root's summary"))?;
     let wrong = AnswerView::adopt(&TreeDigest(other), root, |one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), plant, alloc());
     oracle(matches!(wrong, Err(AnswerError::TreeMismatch)), || format!("{at}: adopt took a root of another tree"))
 }

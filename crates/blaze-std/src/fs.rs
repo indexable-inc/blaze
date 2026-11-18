@@ -126,6 +126,12 @@ mod walk;
 
 // Directories made empty and removed empty (`Dir::make_dir`, `Dir::remove_dir`).
 mod dirs;
+
+// What changed beneath a folder since a saved place in the system's journal of changes, asked
+// with no process having been alive in between (`Dir::changes_since`).
+mod journal;
+pub use journal::{CHANGES_MOST, Changes, JournalError};
+pub use blaze_core::{Cursor, Lost};
 #[cfg(test)]
 pub(crate) use dirs::DirsPlant;
 #[cfg(test)]
@@ -554,6 +560,9 @@ pub enum FsOp {
     Entries,
     MakeDir,
     RemoveDir,
+    /// What changed beneath a folder since a saved place in the system's journal
+    /// ([`Dir::changes_since`]).
+    Journal,
 }
 
 impl FsOp {
@@ -579,6 +588,7 @@ impl FsOp {
             FsOp::Entries => "entries",
             FsOp::MakeDir => "make_dir",
             FsOp::RemoveDir => "remove_dir",
+            FsOp::Journal => "changes_since",
         }
     }
 }

@@ -441,8 +441,9 @@ fn whole_line(text: &str, span: Span) -> (u32, u32) {
     (first as u32, last as u32)
 }
 
-/// The outline's edition of a Rust edition.
-fn syntax_of(edition: edition::Edition) -> Edition {
+/// The outline's edition of a Rust edition (also what `blaze why` outlines a member's file
+/// under, engine_units.rs `stored_editions`).
+pub(crate) fn syntax_of(edition: edition::Edition) -> Edition {
     match edition {
         edition::Edition::Edition2015 => Edition::E2015,
         edition::Edition::Edition2018 => Edition::E2018,

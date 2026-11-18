@@ -269,6 +269,9 @@ pub struct LentCounts {
     /// Chunks freed by commits.
     pub freed_chunks: u32,
     pub chunks: u32,
+    /// Records a commit carried forward because a cleanup slice swept their segment under it
+    /// (`Plain::carried`): work kept, not refused.
+    pub carried: u64,
 }
 
 /// The planted bug of `lent_tests` (an arena that moves what it lent); outside tests, none.
@@ -698,6 +701,28 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.compact(slices).map_err(stopped("compacting"))
     }
 
+    /// After the answer, before its commit: one cleanup slice written with no lock, which the
+    /// next [`Lent::commit`]'s flip names (`Driven::fold_slice`). Whether one is parked.
+    pub fn fold_slice(&self) -> Result<bool, LentError> {
+        self.inner.borrow_mut().store.fold_slice().map_err(stopped("writing a cleanup slice"))
+    }
+
+    /// The last slice's outcome, once: a folded one's after the commit that named it.
+    pub fn take_sliced(&self) -> Option<Sliced> {
+        self.inner.borrow_mut().store.take_sliced()
+    }
+
+    /// [`Lent::root`], kept for `life_ns` from the commit that sets it (`Plain::root_for`).
+    pub fn root_for(&self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, LentError> {
+        self.inner.borrow_mut().store.root_for(name, keys, life_ns).map_err(stopped("setting a root"))
+    }
+
+    /// This command's lease let go of at the next commit: its answer roots its records
+    /// (`Plain::release_lease`).
+    pub fn release_lease(&self) {
+        self.inner.borrow_mut().store.release_lease()
+    }
+
     /// Adds what names this machine to the scan of every put into a shared namespace.
     pub fn machine(&self, paths: &[&std::path::Path]) {
         self.inner.borrow_mut().store.machine(paths);
@@ -714,12 +739,20 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     }
 
     pub fn counts(&self) -> LentCounts {
-        self.inner.borrow().counts
+        let inner = self.inner.borrow();
+        LentCounts { carried: inner.store.core().carried(), ..inner.counts }
     }
 
     /// The open's report (and losses found at first probes since), for the profile.
     pub fn report_with<T>(&self, read: impl FnOnce(&Report) -> T) -> T {
         read(self.inner.borrow().store.report())
+    }
+
+    /// The store lent to `read` by shared reference for the call alone: what a snapshot
+    /// (snapshot.rs, `Lent::snapshot_in`) is taken from. Never `&mut`: `read` cannot replace the
+    /// store or drop a mapping (the module's docs), and nothing it gets outlives the call.
+    pub(crate) fn store_with<T>(&self, read: impl FnOnce(&Driven<D>) -> T) -> T {
+        read(&self.inner.borrow().store)
     }
 
     /// A test's power cut on the store inside (`Driven::cut`).

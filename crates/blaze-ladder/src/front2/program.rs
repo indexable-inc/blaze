@@ -118,8 +118,10 @@ pub enum Front2Refusal {
     /// An ADT the program made narrows its valid range (`rustc_layout_scalar_valid_range_*`),
     /// which the back half's `valid_range` does not read yet.
     Layout { adt: Box<str> },
-    /// A `#[rustc_intrinsic]` fn the build's intrinsic table does not name.
-    Intrinsic { function: Box<str> },
+    /// A `#[rustc_intrinsic]` fn the build's intrinsic table does not name and that its
+    /// declaration gives no fallback body to build from (front2/intrinsic_rule.rs): which of
+    /// the two reasons, and where the declaration stands (`file:line`, made when refused).
+    Intrinsic { function: Box<str>, unbuilt: super::intrinsic_rule::Unbuilt, at: Box<str> },
     /// A declaration of an `extern "llvm-intrinsic"` block naming an LLVM intrinsic `symbol`
     /// (front2/llvm_intrinsic.rs) outside blaze-build's set (intrinsics/target.rs `named`).
     TargetIntrinsic { function: Box<str>, symbol: Box<str> },
@@ -210,7 +212,10 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::Layout { adt } => {
                 write!(f, "front2: `{adt}` narrows its valid range and the back half reads none (run.rs `valid_range`)")
             }
-            Front2Refusal::Intrinsic { function } => write!(f, "front2: `{function}` is an intrinsic the build's table does not name (blaze-build intrinsics)"),
+            Front2Refusal::Intrinsic { function, unbuilt, at } => write!(
+                f,
+                "front2: `{function}` is an intrinsic the build's table does not name (blaze-build intrinsics), and its declaration at {at} cannot be built from: {unbuilt} (front2/intrinsic_rule.rs)"
+            ),
             Front2Refusal::TargetIntrinsic { function, symbol } => {
                 write!(f, "front2: `{function}` is a target intrinsic (`{symbol}`) outside the set the builder builds (blaze-build intrinsics/target.rs)")
             }
@@ -1371,8 +1376,11 @@ struct Symbols {
     export: Option<Box<str>>,
     /// A foreign fn's `#[link_name = ".."]`.
     link_name: Option<Box<str>>,
-    /// `#[rustc_intrinsic]`: the build makes its body from the intrinsic table.
+    /// `#[rustc_intrinsic]`: built by the rule of front2/intrinsic_rule.rs (the table's row,
+    /// else its fallback body, else refused).
     intrinsic: bool,
+    /// What the declaration says for that rule: a body, and `#[rustc_intrinsic_must_be_overridden]`.
+    intrinsic_declared: super::intrinsic_rule::Declared,
     /// `#[rustc_nounwind]`: the fn never unwinds whatever its ABI (program/head_abi.rs).
     nounwind: bool,
     /// `#[track_caller]`: the fn takes its caller's `Location` as a hidden last parameter
@@ -1397,7 +1405,11 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, text
     let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), Alloc::global())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
-    let mut out = Symbols { export: None, link_name: None, intrinsic: false, nounwind: false, track_caller: false };
+    // A body (`{ .. }`, not `;`) is the signature lowering's own flag (blaze-lower machine.rs
+    // `sig::HAS_BODY`), as front2/const_fn_fact.rs `head_fact` reads it.
+    let has_body = v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY != 0;
+    let intrinsic_declared = super::intrinsic_rule::Declared { has_body, must_be_overridden: false };
+    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false };
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
         let value = || v.text_at(a.args).map(|t| Box::<str>::from(unquote(t))).map_err(|e| refuse(format!("{e:?}")));
@@ -1412,6 +1424,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, text
             "export_name" => out.export = Some(value()?),
             "link_name" => out.link_name = Some(value()?),
             "rustc_intrinsic" => out.intrinsic = true,
+            super::intrinsic_rule::MUST_BE_OVERRIDDEN => out.intrinsic_declared.must_be_overridden = true,
             "rustc_nounwind" => out.nounwind = true,
             "track_caller" => out.track_caller = true,
             _ => {}

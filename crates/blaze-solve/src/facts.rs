@@ -372,6 +372,12 @@ pub trait Source<T: crate::tys::Tys> {
     /// A source must not fill a question with an answer it would not have given before: the
     /// world's records are read-only for the evaluation (rule 25).
     fn fill(&mut self, tys: &mut T, q: Question) -> bool;
+    /// The request's table of shared goals (share.rs), when the caller shares goals between
+    /// bodies: the root goals of this evaluation are looked up and put there. DEFAULTED to
+    /// none, so every source that does not share is unchanged.
+    fn goals(&self) -> Option<&dyn crate::share::GoalShare> {
+        None
+    }
 }
 
 /// The source that fills nothing: a missing fact stops the evaluation (`Stop::Need`).
@@ -489,6 +495,28 @@ impl<'f, F: Facts> Ask<'f, F> {
     pub fn specializes<L: Log + ?Sized>(&self, log: &mut L, a: Def, b: Def) -> Result<bool, Stop> {
         let got = self.facts.specializes(Self::seal(), a, b);
         Self::note(log, Question::Specializes(a, b), got, |s| u64::from(*s))
+    }
+
+    /// The digest `q` answers today, asked again (a shared goal's read list checked against a
+    /// body's facts: eval.rs `share_replay`). Noted nowhere: the caller notes the list whole
+    /// once every digest is equal. `Stop::Need(q)` when the facts lack it.
+    pub fn replay(&self, q: Question) -> Result<u64, Stop> {
+        let s = Self::seal;
+        let got = match q {
+            Question::TraitDef(t) => self.facts.trait_def(s(), t).map(|a| a.digest),
+            Question::Impls(t, shape) => self.facts.impls(s(), t, shape).map(|a| a.digest),
+            Question::ImplHeader(i) => self.facts.impl_header(s(), i).map(|a| a.digest),
+            Question::Adt(d) => self.facts.adt(s(), d).map(|a| a.digest),
+            Question::FnSig(d) => self.facts.fn_sig(s(), d).map(|a| a.digest),
+            Question::Assoc(d) => self.facts.assoc(s(), d).map(|a| a.digest),
+            Question::Opaque(d) => self.facts.opaque(s(), d).map(|a| a.digest),
+            Question::Lang(l) => self.facts.lang(s(), l).map(lang_digest),
+            Question::IsLocal(d) => self.facts.is_local(s(), d).map(u64::from),
+            Question::Specializes(a, b) => self.facts.specializes(s(), a, b).map(u64::from),
+            // Its question names the asker's arena terms: a goal that read one is never put.
+            Question::ConstHolds(..) => return Err(Stop::Error(crate::error::SolveError::Share(crate::share::ShareError::Unreplayable))),
+        };
+        got.map_err(|Missing| Stop::Need(q))
     }
 
     /// `cond` at the ground `args`, which `list` holds (the question a `Need` names).

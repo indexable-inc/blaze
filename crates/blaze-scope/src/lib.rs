@@ -104,7 +104,7 @@ pub use error::{GlobBug, ResolveError};
 pub use facts::{Name, RecordFacts, ScopeFacts};
 
 pub use cells::{
-    DecideCheck, DecideError, GroupRecords, GroupRef, MemberRefusal as GroupMemberRefusal, Members as GroupMembers, OneGroup as OneGroupSolver, OneGroupRefusal, Edit as GroupsEdit, EditError as GroupsEditError, Edited as GroupsEdited, GROUP_ABSENT, GroupOwnError, GroupRead, GroupRecordError, GroupSeen, GroupShape, GroupSolver,
+    DecideCheck, DecideError, GroupRecords, GroupRef, MemberRefusal as GroupMemberRefusal, Members as GroupMembers, OneGroup as OneGroupSolver, OneGroupRefusal, Solved as GroupsSolved, Edit as GroupsEdit, EditError as GroupsEditError, Edited as GroupsEdited, GROUP_ABSENT, GroupOwnError, GroupRead, GroupRecordError, GroupSeen, GroupShape, GroupSolver,
     GroupsError, ItemResult as CellResult, NameGroup, NodeAt as GroupNodeAt, Outcome as CellOutcome, globs_cell as group_globs_cell, most_entries as group_most_entries,
     own_digest as group_own_digest, re_solve as re_solve_groups, DemandError as GroupDemandError, Demanded as GroupsDemanded, DemandedOpts as GroupsDemandedOpts, MOST_DEMAND_DEPTH, MOST_DEMAND_SOLVES, NoRecordOf as GroupNoRecordOf, demand as demand_groups, names_on_demand, OnDemand as NamesOnDemand, OnDemandError as NamesOnDemandError, OnDemandRefused as NamesOnDemandRefused, LazyDep, Want as NamesWant, MOST_WANT_ROUNDS, textual_cell as group_textual_cell, write_groups,
 };

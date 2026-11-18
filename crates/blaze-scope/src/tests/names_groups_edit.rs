@@ -21,7 +21,7 @@ use blaze_own::AVec;
 
 use super::entry::{Texts, input};
 use super::names_groups::{CUT_T, CYCLE_EDIT_T, CYCLE_T, Groups, PLAIN_FN_T, PLAIN_T, RECUT_T, RULES_ABOVE_T, RULES_BELOW_T, USE_ADDED_T, USE_T};
-use crate::cells::{Edit, EditError, EditPlant, Edited, Members, OneGroup, OneGroupRefusal, re_solve_planted};
+use crate::cells::{Edit, EditError, EditPlant, Edited, Members, OneGroup, OneGroupRefusal, Solved, re_solve_planted};
 use crate::crate_scope::{CrateScopeError, resolve_members};
 use crate::graph::Sysroot;
 use crate::task::{Par, Serial};
@@ -87,15 +87,16 @@ fn drive_marked(before: &Groups, after: &Groups, texts: &'static Texts, moved: &
     let mut own: Vec<(ItemKey, ContentId)> = after.groups.iter().flat_map(|(_, g)| g.members.iter().copied().zip(g.own.iter().copied())).collect();
     own.sort();
     let edit = Edit { old: &old, own: &own, moved };
-    let solve_crate = move |members: Members<'_>| -> Result<AVec<'static, NameGroup<'static>>, CrateScopeError<'static>> {
+    let solve_crate = move |members: Members<'_>| -> Result<Solved<'static>, CrateScopeError<'static>> {
         mark(marks, String::from("graph"));
         let g = blaze_own::testing::heap().alloc();
-        let groups = resolve_members(&input("k0", "/k0/lib.rs", &[]), &[], Sysroot::default(), texts, 0, &Only { marks }, members, g)?;
+        let solved = resolve_members(&input("k0", "/k0/lib.rs", &[]), &[], Sysroot::default(), texts, 0, &Only { marks }, members, g)?;
         mark(marks, String::from("driver.re_solve"));
-        Ok(groups)
+        Ok(solved)
     };
     mark(marks, String::from("driver.re_solve"));
     // The module tree record as the records were written: the solve reads its members' files.
+    // A solve that walks again hands its new record on (`OneGroup::tree`).
     let edited = re_solve_planted(edit, &mut OneGroup { solve_crate, alloc, tree: Some(before.tree) }, plant, alloc)?;
     mark(marks, String::from("driver.paths"));
     let path = |k: &ItemKey| {
@@ -269,7 +270,7 @@ fn solve_alone(texts: &'static Texts, records: &Groups, paths: &[&str], tree: Op
     members.sort();
     let g = blaze_own::testing::heap().alloc();
     let members = Members { members: &members, records: &FreshRecords(records), tree };
-    resolve_members(&input("k0", "/k0/lib.rs", &[]), &[], Sysroot::default(), texts, 0, &Serial, members, g).unwrap_or_else(|e| panic!("solve alone: {e:?}")).iter().cloned().collect()
+    resolve_members(&input("k0", "/k0/lib.rs", &[]), &[], Sysroot::default(), texts, 0, &Serial, members, g).unwrap_or_else(|e| panic!("solve alone: {e:?}")).groups.iter().cloned().collect()
 }
 
 /// Where two answers of one solve differ: groups, members, then each list's first unequal row.
@@ -527,6 +528,59 @@ fn names_groups_edit_a_macro_use_child_outside_the_group_comes_from_its_record()
     assert_eq!(entered, std::vec![one("k0::m")], "floor 1: `m`'s group alone");
     let (_, entered) = case("the root beside a #[macro_use] child outside", &MACRO_USE_T, &MACRO_USE_ROOT_T);
     assert_eq!(entered, std::vec![one("k0")], "floor 1: the root's group alone");
+}
+
+// A `#[macro_use]` child of the root with no macro yet, and `m`, which calls none.
+const FIRST_MACRO: &str = "#![no_core]
+#[macro_use]
+mod macros {
+    pub struct Z;
+}
+pub mod a {
+    pub struct S;
+}
+pub mod m {
+    pub struct Q;
+}
+";
+// In one edit: `macros` gets its FIRST `macro_rules!` (its tree row's macro count moves: its
+// solve walks the tree again) and `m`, another group, calls it.
+const FIRST_MACRO_CALLED: &str = "#![no_core]
+#[macro_use]
+mod macros {
+    pub struct Z;
+    macro_rules! mac { () => { pub struct One; } }
+}
+pub mod a {
+    pub struct S;
+}
+pub mod m {
+    pub struct Q;
+    mac!();
+}
+";
+static FIRST_MACRO_T: Texts = Texts(&[&[("/k0/lib.rs", FIRST_MACRO)]]);
+static FIRST_MACRO_CALLED_T: Texts = Texts(&[&[("/k0/lib.rs", FIRST_MACRO_CALLED)]]);
+
+/// The stale record within one edit (plan row B2's step 2): the driver hands every solve the
+/// record the LAST solve ended with (`OneGroup::tree`). `macros`' solve finds its macro count
+/// moved and walks the tree again; `m`'s solve, in the same edit, must lower `macros` for the
+/// crate's macro table, which only the new record says it defines. Handed the record of before
+/// (macro count 0), `m`'s call finds no definition and its record is not a fresh solve's.
+#[test]
+fn names_groups_edit_a_first_macro_and_its_call_in_one_edit() {
+    let (b, a) = (Groups::solve(&FIRST_MACRO_T), Groups::solve(&FIRST_MACRO_CALLED_T));
+    assert!(b.tree != a.tree, "the fixture: the first macro moved no tree record row");
+    let moved = expansions_moved(&b, &a);
+    let marks = Marks::default();
+    let (edited, entered) = drive_marked(&b, &a, &FIRST_MACRO_CALLED_T, &moved, EditPlant::None, &marks).unwrap_or_else(|e| panic!("a first macro and its call: {e:?}"));
+    let again = marks.borrow().iter().filter(|(p, _)| p == ".TreeAgain").count();
+    std::println!("NAMES EDIT: a first macro and its call in one edit: entered {entered:?}; tree walked again {again} time(s)");
+    assert!(entered.contains(&one("k0::m")), "the caller's group was not entered: {entered:?}");
+    let wrong = differ(&edited, &a);
+    assert!(wrong.is_empty(), "the call did not resolve as a fresh solve's: {wrong:?}");
+    // One walk again: the first solve that saw the moved row; every later solve took its record.
+    assert_eq!(again, 1, "the tree was walked again {again} times: the new record was not handed on");
 }
 
 /// E4's cost (rule 67, the floor is one group's own work): a generated crate of 2,000 modules

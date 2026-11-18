@@ -63,6 +63,7 @@ pub mod foreign_closures;
 pub mod foreign_locals;
 mod foreign_head;
 pub mod llvm_intrinsic;
+pub mod intrinsic_rule;
 pub mod head_record;
 pub mod head_text;
 pub mod heads;

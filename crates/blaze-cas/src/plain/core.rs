@@ -24,8 +24,8 @@ use blaze_keyed::{
 };
 
 use super::format::{
-    self, Entry, FORMAT, HEAD_LEN, HeadRead, LostKind, LostMark, Manifest, OFFSET_MOST, Retired, Root,
-    SLOT_AT, Segment, Slot, aligned, record_crc,
+    self, Entry, FORMAT, HEAD_LEN, HeadRead, Lease, LostKind, LostMark, Manifest, NEVER, OFFSET_MOST, Retired,
+    Root, SLOT_AT, Segment, Slot, aligned, record_crc,
 };
 use super::verified::{Boot, Checks, Unverified, Verified};
 use super::lent::two_values;
@@ -63,8 +63,41 @@ pub const TAGS: u64 = 1 << 40;
 /// mapped a file keeps reading it whatever happens after.
 pub const GRACE_NS: u64 = 10 * 60 * 1_000_000_000;
 
-/// Records no root names are kept for this many generations after the one that put them.
+/// Records no root names are kept for this many generations after the one that put them
+/// ([`Liveness::Everything`]; a [`Liveness::Reached`] store keeps what a lease keeps instead).
 pub const WINDOW: u64 = 16;
+
+/// How long a checkout's root keeps what it names after it was last set
+/// ([`Plain::root_for`]): a checkout not built for this long lets go of its records, and the
+/// slices after reclaim them.
+pub const ROOT_LIFE_NS: u64 = 14 * DAY_NS;
+
+/// A root set again with the same key is written again (one flip) only when less than its
+/// life less this is left: a checkout built a hundred times a day touches its root once.
+pub const TOUCH_NS: u64 = DAY_NS;
+
+const DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+/// How long a running command's lease ([`format::Lease`]) lasts past its last commit: a
+/// process that dies holding one is let go of this long after, by the clock the flips pass in.
+pub const LEASE_NS: u64 = 60 * 60 * 1_000_000_000;
+
+/// The bytes of segments one [`Liveness::Reached`] slice looks at for their live share, from
+/// a place that moves with each generation: what bounds a slice's reading of indexes.
+pub const SWEEP_BYTES: u64 = 2 * SLICE_BYTES;
+
+/// How many times one commit carries forward records its roots name whose segment a slice
+/// replaced since the command read it ([`Plain::carried`]), before
+/// [`StoreError::SweptUnder`] stops it (rule 18: a retry has a count). Why 3: a round is owed
+/// only when another process's slice flipped between this commit's read and its flip, and a
+/// carried record lies in a segment of this commit's, which no slice can have planned on;
+/// what can still go is a record of ANOTHER segment this commit reuses, swept by a second
+/// slice landing in the next few milliseconds (each command folds at most one slice, after
+/// its answer, from a place that moves with the generation). One round is the expected case,
+/// two is two commands' slices meeting one commit, and a third means cleanup lands faster
+/// than one commit can flip: that is a store being swept by many processes at once, named
+/// by the refusal rather than chased. The rounds cost at most 3 x the carried bytes.
+pub const CARRY_ROUNDS: u32 = 3;
 
 /// Compaction merges the oldest segments while a generation names more than this many: the
 /// bound on index probes a miss costs.
@@ -136,6 +169,25 @@ pub struct PlainConfig {
     /// The namespaces [`Plain::get`] answers from, in the order it asks them; no other is
     /// searched.
     pub reads: Vec<Namespace>,
+    /// What a compaction slice keeps.
+    pub liveness: Liveness,
+}
+
+/// What a compaction slice counts as live.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Liveness {
+    /// Everything, but what pruning over [`PlainConfig::cap_bytes`] lets go of: records no root
+    /// names, older than [`WINDOW`] generations. Merges copy dead records forward: a store whose
+    /// callers root nothing (the keyed handle's, the tests').
+    Everything,
+    /// Only what reaches from the store's roots: each key an unexpired root names, the roots'
+    /// own records, and every segment a live lease keeps (a running command's, not yet rooted).
+    /// A slice rewrites a run of segments from one under half live, so the store holds at most
+    /// twice its live bytes and a slice; over the cap, from one with any dead record. A
+    /// pointer row is live at its newest value only, and only when a root reaches it. For a
+    /// store whose callers root everything a later process reads by key (the command's, once
+    /// its code store roots its entries: blaze-cli plain_place.rs).
+    Reached,
 }
 
 /// A record read in place.
@@ -328,6 +380,21 @@ pub(crate) enum Plant {
     /// A pointer's read walks the rows OLDEST first: the first value ever committed of a name
     /// answers, not the last (pointer_tests).
     PointerOldest,
+    /// Reach skips the generation's first root: what only it names is dropped (cleanup_tests).
+    ReachSkipsRoot,
+    /// A folded slice unlinks the segments it replaces before its flip's slot lands, while
+    /// the generation on disk still names them (cleanup_tests).
+    UnlinkEarly,
+    /// A lease is never let go of by the clock: a process that died holding one keeps every
+    /// segment since its open for good (cleanup_tests).
+    LeaseNeverExpires,
+    /// [`Plain::fold_slice`] flips its slice on its own, under the flip lock, as the old
+    /// compaction did, instead of in the command's commit: another command's commit waits on
+    /// cleanup (cleanup_tests).
+    SliceFlipsAlone,
+    /// A commit whose roots name a record a slice swept since flips anyway without carrying
+    /// it forward: the generation's root names a record no live segment holds (cleanup_tests).
+    CarrySkipped,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -440,10 +507,29 @@ const BARRIER: u8 = 20;
 /// open; durable: a commit's segments and its log, before the slot that names them) survive a
 /// power cut, as a file's own sync does not make its name do.
 const DIR_SYNC: u8 = 21;
+/// The index the planted [`Plant::UnlinkEarly`]'s unlinks start at, apart from a flip's own.
+const EARLY_REMOVE: u32 = 1 << 30;
 
+/// What a commit changes of what keeps records: roots, and this process's lease.
 enum RootEdit {
-    Set { name: String, key: Key },
+    /// `name` names `key`, for `life_ns` from the flip ([`NEVER`]: until unset).
+    Set { name: String, key: Key, life_ns: u64 },
     Unset(String),
+    /// This process's lease set or renewed: segments of generation `since` on are kept whole
+    /// until [`LEASE_NS`] from the flip.
+    Lease { since: u64, opened_ns: u64 },
+    /// This process's lease let go of: its records are rooted by now.
+    Release,
+}
+
+/// A compaction slice written with no lock and flipped by the command's next commit
+/// ([`Plain::fold_slice`]): its copy (none when the slice only drops), the segments it
+/// replaces, the orphans it retires.
+struct Folded {
+    seg: Option<(Segment, FileName)>,
+    candidates: Vec<u64>,
+    orphans: Vec<(u64, bool)>,
+    stats: Sliced,
 }
 
 /// Why a head is being read: at the open, or under the lock for a flip.
@@ -517,6 +603,12 @@ struct Flip {
     /// The commit was refused under the lock, or the compaction aborted: unlock and stop.
     refused: Option<StoreError>,
     aborted: bool,
+    /// The commit found a record its roots reuse swept since: not flipped; unlock, write
+    /// what `carrying` lists into a segment of the commit's own, and flip again.
+    carry: bool,
+    /// [`Plant::UnlinkEarly`]: unlinks in flight before the log's write, which waits here.
+    early: u32,
+    deferred: Option<Effect>,
 }
 
 enum Phase {
@@ -594,7 +686,7 @@ pub struct Plain {
     by_id: BTreeMap<u64, usize>,
     /// This generation's local rows not lost, as indices into `manifest.segments`, in probe
     /// order (largest first, ties newest first: [`Plain::order_view`]). A row may be unmapped.
-    view: Vec<usize>,
+    pub(super) view: Vec<usize>,
     /// Earlier-boot unsealed segments a probe mapped, length checked, not yet proved: each is
     /// checked whole at its first hit, or by [`Plain::map_all`] (probe.rs).
     unchecked: BTreeMap<u64, Unverified>,
@@ -664,6 +756,29 @@ pub struct Plain {
     /// flip writes past it (over the torn slot, which the newest does not hold; a generation
     /// whose manifest is whole beside the other), so it is reported once, not at every open.
     torn_stamp: bool,
+    /// The generation the open read: this process's lease keeps every segment newer.
+    opened_generation: u64,
+    /// The wall clock of the last completion taken, as the driver passed it: what a root set
+    /// again is measured against ([`Plain::root_for`]) and a mapped generation's next slice
+    /// planned with.
+    now_ns: u64,
+    /// A generation this process flipped names its lease, and no later flip let it go.
+    leased: bool,
+    /// [`Plain::release_lease`] was asked: no later commit sets the lease again.
+    released: bool,
+    /// The slice [`Plain::fold_slice`] wrote, for the next commit's flip; then, being flipped.
+    folding: Option<Folded>,
+    /// The slice in flight is [`Plain::fold_slice`]'s: it parks in `folding`, not flipped.
+    fold_asked: bool,
+    /// The commit in flight's reused records, by segment ([`Plain::reused`]).
+    touches: Vec<(u64, ContentId)>,
+    /// The commit in flight's reused records whose segment the flip found replaced: what its
+    /// next round carries forward ([`Plain::carry`]).
+    carrying: Vec<(u64, ContentId)>,
+    /// The rounds the commit in flight carried records forward: at most [`CARRY_ROUNDS`].
+    carry_rounds: u32,
+    /// Records carried forward by this process's commits, ever ([`Plain::carried`]).
+    carried: u64,
 }
 
 /// One namespace's held puts, and where each key is in them.
@@ -833,6 +948,16 @@ impl Plain {
             holds_lock: false,
             head_torn: None,
             torn_stamp: false,
+            opened_generation: 0,
+            now_ns: 0,
+            leased: false,
+            released: false,
+            folding: None,
+            fold_asked: false,
+            touches: Vec::new_in(Global),
+            carrying: Vec::new_in(Global),
+            carry_rounds: 0,
+            carried: 0,
         }
     }
 
@@ -921,6 +1046,29 @@ impl Plain {
         let mut out = Vec::with_capacity_in(self.manifest.roots.len(), Global);
         out.extend(self.manifest.roots.iter().map(|it| (it.name.clone(), Key(it.key))));
         out
+    }
+
+    /// The roots this generation names with their expiry: `(name, record key, expires ns)`
+    /// ([`format::NEVER`]: none).
+    pub fn roots_expiring(&self) -> Vec<(String, Key, u64)> {
+        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), Global);
+        out.extend(self.manifest.roots.iter().map(|it| (it.name.clone(), Key(it.key), it.expires_ns)));
+        out
+    }
+
+    /// The leases this generation names: `(holder's nonce, expires ns)`.
+    pub fn leases(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::with_capacity_in(self.manifest.leases.len(), Global);
+        out.extend(self.manifest.leases.iter().map(|it| (it.holder, it.expires_ns)));
+        out
+    }
+
+    /// This process holds the flip lock for a flip of cleanup's own (a slice not folded into a
+    /// commit): what another process's wait on the lock then waits for (cleanup_tests counts
+    /// these; the folded slice makes none).
+    #[cfg(test)]
+    pub(crate) fn cleanup_holds_lock(&self) -> bool {
+        self.holds_lock && matches!(&self.phase, Phase::Flipping(flip) if matches!(flip.change, Change::Compact { .. }))
     }
 
     fn stop(&mut self, why: StoreError) {
@@ -1150,6 +1298,14 @@ impl Plain {
     /// sorted keys under [`Namespace::LOCAL`], and the root. Compaction keeps every record a
     /// root names.
     pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, StoreError> {
+        self.root_for(name, keys, NEVER)
+    }
+
+    /// [`Plain::root`], kept for `life_ns` from the flip that sets it ([`NEVER`]: until it is
+    /// unset): a checkout's answer, [`ROOT_LIFE_NS`]. A root already named with these keys and
+    /// more than its life less [`TOUCH_NS`] left is not set again, so a build that changed
+    /// nothing flips nothing for it.
+    pub fn root_for(&mut self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, StoreError> {
         let mut sorted = Vec::with_capacity_in(keys.len(), Global);
         sorted.extend_from_slice(keys);
         sorted.sort_unstable();
@@ -1159,14 +1315,32 @@ impl Plain {
             bytes.extend_from_slice(&key.0.0);
         }
         let key = Key(ContentId::of(ROOT_DOMAIN, &bytes));
+        let pending = self.roots_pending.iter().any(|it| matches!(it, RootEdit::Set { name: n, .. } | RootEdit::Unset(n) if n == name));
+        let fresh = life_ns != NEVER
+            && !pending
+            && self.manifest.roots.iter().any(|it| it.name == name && it.key == key.0 && it.expires_ns != NEVER && it.expires_ns >= self.now_ns.saturating_add(life_ns.saturating_sub(TOUCH_NS)));
+        if fresh {
+            // Named so already, long enough: nothing to write (its record is committed).
+            return Ok(key);
+        }
         self.put(key, Namespace::LOCAL, ROOT_TAG, &bytes).map_err(|it| it.into_store(ROOT_TAG))?;
-        self.roots_pending.push(RootEdit::Set { name: name.to_owned(), key });
+        self.roots_pending.push(RootEdit::Set { name: name.to_owned(), key, life_ns });
         Ok(key)
     }
 
     /// Lets go of the root `name` at the next commit.
     pub fn unroot(&mut self, name: &str) {
         self.roots_pending.push(RootEdit::Unset(name.to_owned()));
+    }
+
+    /// Lets go of this process's lease at the next commit: the command's records are rooted by
+    /// then (its answer's commit). No later commit sets it again. Nothing is written for it
+    /// when no generation names it.
+    pub fn release_lease(&mut self) {
+        self.released = true;
+        if self.leased && !self.roots_pending.iter().any(|it| matches!(it, RootEdit::Release)) {
+            self.roots_pending.push(RootEdit::Release);
+        }
     }
 
     // ---- the commit ----
@@ -1210,12 +1384,40 @@ impl Plain {
                 return Err(why);
             }
         };
+        // A request larger than the cap alone can never fit under it: refused by name, as no
+        // reclamation could make room for it (a commit is never refused for the cap otherwise:
+        // over it, reclamation is owed, and the next slices pay it).
+        let request: u64 = laid.iter().map(|it| it.index_at + it.run.len() as u64 + FOOTER as u64).sum();
+        if request > self.cfg.cap_bytes {
+            self.sealed_back();
+            return Err(StoreError::OverCap { request_bytes: request, cap_bytes: self.cfg.cap_bytes });
+        }
         self.committing.clear();
+        self.carrying.clear();
+        self.carry_rounds = 0;
         // The roots this commit's records were put with: one set after it started is the next's.
-        let roots = std::mem::take(&mut self.roots_pending);
+        let mut roots = std::mem::take(&mut self.roots_pending);
+        // The segments of records this commit's roots name but did not write, dead in this
+        // view: computed here, before the lock; the flip marks them touched.
+        self.touches = match self.cfg.liveness {
+            Liveness::Everything => Vec::new_in(Global),
+            Liveness::Reached => match self.reused(&roots, now_ns) {
+                Ok(it) => it,
+                Err(why) => {
+                    self.roots_pending = roots;
+                    self.sealed_back();
+                    return Err(why);
+                }
+            },
+        };
+        if self.cfg.liveness == Liveness::Reached && !laid.is_empty() && !self.released {
+            // Records no root names yet: this process's lease keeps them, and every segment
+            // newer than the generation it opened on, until its answer roots them.
+            roots.push(RootEdit::Lease { since: self.opened_generation + 1, opened_ns: self.opened_ns });
+        }
         let mut rest = laid.into_iter();
         match rest.next() {
-            None if roots.is_empty() && !self.pending_stamps() => {
+            None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() => {
                 self.committed = Some(Ok(Committed { generation: self.manifest.generation, segments: Vec::new_in(Global) }));
                 self.sealed.clear();
             }
@@ -1353,6 +1555,7 @@ impl Plain {
             && candidates.contains(&seg.id)
         {
             // The slice would write back what it read: nothing to do.
+            self.fold_asked = false;
             self.sliced = Some(Sliced { segments: 0, ..*stats });
             self.phase = Phase::Ready;
             return;
@@ -1416,6 +1619,34 @@ impl Plain {
         true
     }
 
+    /// Cleanup that no command waits for: one slice listed, planned and its copy written with
+    /// no lock, as [`Plain::compact`]'s, then parked for this process's next [`Plain::commit`],
+    /// whose flip (made anyway, for the command's own records and roots) names it. The lock
+    /// is never taken for cleanup, so no other process's flip waits on it; one that finds
+    /// cleanup running elsewhere reads its own generation and goes on (a reader takes no
+    /// lock). The commit's flip applies the slice only while every segment it replaces is
+    /// named as it planned; else the commit lands alone and the copy, named by no generation,
+    /// is removed. Whether it started (not when one is parked already); the store is ready
+    /// again with the slice parked ([`Plain::slice_parked`]) or with nothing to do (its
+    /// [`Plain::take_sliced`] then), and the commit carries a parked one to
+    /// [`Plain::take_sliced`].
+    pub fn fold_slice(&mut self, effects: &mut Vec<Effect>) -> Result<bool, StoreError> {
+        if !self.ready() {
+            return Err(StoreError::Busy { phase: self.what() });
+        }
+        if self.folding.is_some() {
+            return Ok(false);
+        }
+        self.compact(effects);
+        self.fold_asked = self.plant() != Plant::SliceFlipsAlone;
+        Ok(true)
+    }
+
+    /// A slice [`Plain::fold_slice`] wrote waits for the next commit's flip.
+    pub fn slice_parked(&self) -> bool {
+        self.folding.is_some()
+    }
+
     /// Which segments a slice replaces, and whether it prunes.
     fn plan(&self) -> (Vec<Segment>, bool) {
         let current = self.manifest.generation;
@@ -1458,10 +1689,145 @@ impl Plain {
         (out, over)
     }
 
+    /// Which segments a [`Liveness::Reached`] slice replaces: a contiguous run of one
+    /// namespace's rows, from the first found under half live (over the cap: holding any dead
+    /// record) among at most [`SWEEP_BYTES`] of rows looked at from a place that moves with the
+    /// generation, up to [`SLICE_BYTES`]; else, while more than [`SEGMENTS_MOST`] are named, a
+    /// merge of two or more from the oldest. A row a live lease keeps, a published row and one
+    /// not here are never in a run (a run stops at one).
+    fn plan_reached(&self, now_ns: u64) -> Result<Vec<Segment>, StoreError> {
+        let roots = self.live_roots(now_ns)?;
+        let over = self.manifest.bytes() > self.cfg.cap_bytes;
+        let segs = &self.manifest.segments;
+        let eligible = |it: &Segment| it.local && !it.published && self.by_id.contains_key(&it.id) && !self.leased(it, now_ns);
+        let mut sparse = None;
+        if !segs.is_empty() {
+            let start = (self.manifest.generation % segs.len() as u64) as usize;
+            let mut looked = 0u64;
+            for k in 0..segs.len() {
+                let i = (start + k) % segs.len();
+                if !eligible(&segs[i]) {
+                    continue;
+                }
+                if looked >= SWEEP_BYTES {
+                    break;
+                }
+                looked += segs[i].file_len();
+                let (live, all) = self.live_of(&segs[i], &roots);
+                if live * 2 < segs[i].file_len() || (over && live < all) {
+                    sparse = Some(i);
+                    break;
+                }
+            }
+        }
+        let from = match sparse {
+            Some(i) => i,
+            None if segs.iter().filter(|it| it.local).count() > SEGMENTS_MOST => match segs.iter().position(|it| eligible(it)) {
+                Some(i) => i,
+                None => return Ok(Vec::new_in(Global)),
+            },
+            None => return Ok(Vec::new_in(Global)),
+        };
+        let namespace = segs[from].namespace;
+        let mut out = Vec::new_in(Global);
+        let mut bytes = 0u64;
+        // Contiguous, as [`Plain::plan`]'s: the copy takes the first one's place.
+        for seg in segs[from..].iter().filter(|it| it.local && it.namespace == namespace) {
+            if !eligible(seg) || (!out.is_empty() && bytes + seg.file_len() > SLICE_BYTES) {
+                break;
+            }
+            bytes += seg.file_len();
+            out.push(*seg);
+        }
+        if sparse.is_none() && out.len() < 2 {
+            out.clear();
+        }
+        Ok(out)
+    }
+
+    /// A live lease keeps `seg` whole: it is of the lease's generation or newer.
+    fn leased(&self, seg: &Segment, now_ns: u64) -> bool {
+        self.manifest.leases.iter().any(|it| seg.generation >= it.since && (it.expires_ns > now_ns || self.plant() == Plant::LeaseNeverExpires))
+    }
+
+    /// Each unexpired root's key and its record's sorted keys, read in place: what
+    /// [`reached`] searches. A root whose record no segment holds stops the slice by name.
+    fn live_roots(&self, now_ns: u64) -> Result<Vec<(ContentId, &[u8])>, StoreError> {
+        let mut out = Vec::with_capacity_in(self.manifest.roots.len(), Global);
+        for (i, root) in self.manifest.roots.iter().enumerate() {
+            if root.expires_ns <= now_ns || (i == 0 && self.plant() == Plant::ReachSkipsRoot) {
+                continue;
+            }
+            let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
+                return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
+            };
+            out.push((root.key, self.maps[at].payload(&entry)));
+        }
+        Ok(out)
+    }
+
+    /// `(live, all)`: the bytes `seg`'s records take (each payload aligned, and its entry),
+    /// those reached from `roots` (a pointer's only in the row of its newest value) and all.
+    /// The committed segment of each record a root in `edits` names (the root's own record
+    /// too) that this view holds and no unexpired root of this view reaches: a slice planned
+    /// from a view like this one may have judged it dead, so the flip marks the segment
+    /// touched ([`Segment::touched`]) and a slice that replaces it aborts. Sorted, each once.
+    fn reused(&self, edits: &[RootEdit], now_ns: u64) -> Result<Vec<(u64, ContentId)>, StoreError> {
+        let mut out = Vec::new_in(Global);
+        let sets: Vec<Key> = {
+            let mut it = Vec::new_in(Global);
+            it.extend(edits.iter().filter_map(|it| match it {
+                RootEdit::Set { key, .. } => Some(*key),
+                _ => None,
+            }));
+            it
+        };
+        if sets.is_empty() {
+            return Ok(out);
+        }
+        let live = self.live_roots(now_ns)?;
+        let look = |key: &ContentId, out: &mut Vec<(u64, ContentId)>| {
+            if reached(&live, key) {
+                return;
+            }
+            if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(*key)) {
+                out.push((self.maps[at].seg().id, *key));
+            }
+        };
+        for root in &sets {
+            look(&root.0, &mut out);
+            let Some(got) = self.get_in(&[Namespace::LOCAL], root) else {
+                return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.0 });
+            };
+            for key in got.bytes.chunks_exact(32) {
+                look(&ContentId(key.try_into().expect("32 bytes")), &mut out);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    fn live_of(&self, seg: &Segment, roots: &[(ContentId, &[u8])]) -> (u64, u64) {
+        let Some(&at) = self.by_id.get(&seg.id) else { return (seg.file_len(), seg.file_len()) };
+        let run = self.maps[at].run();
+        let (mut live, mut all) = (0u64, 0u64);
+        for i in 0..seg.count as usize {
+            let entry = Entry::read(&run[i * ENTRY..(i + 1) * ENTRY]);
+            let bytes = aligned(u64::from(entry.len)) + ENTRY as u64;
+            all += bytes;
+            let newest = entry.tag != POINTER_TAG || self.newest_mapped(seg.namespace, &Key(entry.key)).is_some_and(|(it, _)| it == at);
+            if newest && reached(roots, &entry.key) {
+                live += bytes;
+            }
+        }
+        (live, all)
+    }
+
     /// The keys roots name, and the roots' own records.
-    fn rooted(&self) -> Result<BTreeSet<ContentId>, StoreError> {
+    fn rooted(&self, now_ns: u64) -> Result<BTreeSet<ContentId>, StoreError> {
         let mut out = BTreeSet::new();
-        for root in &self.manifest.roots {
+        for root in self.manifest.roots.iter().filter(|it| it.expires_ns > now_ns) {
             out.insert(root.key);
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
@@ -1486,28 +1852,72 @@ impl Plain {
                 orphans.push((id, log));
             }
         }
-        let (candidates, prune) = self.plan();
+        let planned = match self.cfg.liveness {
+            Liveness::Everything => Ok(self.plan()),
+            Liveness::Reached => self.plan_reached(now_ns).map(|it| (it, true)),
+        };
+        let (candidates, prune) = match planned {
+            Ok(it) => it,
+            Err(why) => return self.stop(why),
+        };
         let mut stats = Sliced { orphans: orphans.len() as u32, ..Sliced::default() };
         let expired = self.manifest.retired.iter().any(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= now_ns);
         if candidates.is_empty() {
             if orphans.is_empty() && !expired {
+                self.fold_asked = false;
                 self.sliced = Some(stats);
                 self.phase = Phase::Ready;
                 return;
             }
-            self.start_flip(Change::Compact { seg: None, candidates: Vec::new_in(Global), orphans, stats }, effects);
+            self.slice_ready(None, Vec::new_in(Global), orphans, stats, effects);
             return;
         }
-        let live = match prune.then(|| self.rooted()).transpose() {
-            Ok(live) => live,
+        let copied = self.copy_live(candidates, prune, now_ns, &mut stats);
+        let (out, ids) = match copied {
+            Ok(it) => it,
             Err(why) => return self.stop(why),
         };
+        if out.is_empty() {
+            self.slice_ready(None, ids, orphans, stats, effects);
+            return;
+        }
+        let laid = match laid_of(out) {
+            Ok(laid) => laid,
+            Err(why) => return self.stop(why),
+        };
+        stats.bytes_out = laid.index_at + laid.run.len() as u64 + FOOTER as u64;
+        self.orphans_for_compact = orphans;
+        self.write_segment(laid, Why::Compact { candidates: ids, stats }, effects);
+    }
+
+    /// A slice's change is ready: parked for the next commit's flip when
+    /// [`Plain::fold_slice`] asked it, else flipped on its own ([`Plain::compact`]).
+    fn slice_ready(&mut self, seg: Option<(Segment, FileName)>, candidates: Vec<u64>, orphans: Vec<(u64, bool)>, stats: Sliced, effects: &mut Vec<Effect>) {
+        if std::mem::take(&mut self.fold_asked) {
+            self.folding = Some(Folded { seg, candidates, orphans, stats });
+            self.phase = Phase::Ready;
+            return;
+        }
+        self.start_flip(Change::Compact { seg, candidates, orphans, stats }, effects);
+    }
+
+    /// What of `candidates` a slice keeps, copied into one batch, and the candidates it
+    /// replaces (a published one only when it holds nothing live: it is let go of whole, or
+    /// kept whole, never rewritten).
+    fn copy_live(&self, candidates: Vec<Segment>, prune: bool, now_ns: u64, stats: &mut Sliced) -> Result<(Batch, Vec<u64>), StoreError> {
+        let live = match (prune, self.cfg.liveness) {
+            (false, _) => Live::All,
+            (true, Liveness::Everything) => Live::Rooted(self.rooted(now_ns)?),
+            (true, Liveness::Reached) => Live::Reached(self.live_roots(now_ns)?),
+        };
         let current = self.manifest.generation;
-        // A published segment is let go of whole, or kept whole: it is never rewritten.
         let holds_live = |seg: &Segment| -> bool {
-            let (Some(live), Some(&at)) = (live.as_ref(), self.by_id.get(&seg.id)) else { return true };
+            if matches!(live, Live::All) {
+                return true;
+            }
+            let Some(&at) = self.by_id.get(&seg.id) else { return true };
             let run = self.maps[at].run();
-            (0..seg.count as usize).any(|i| live.contains(&format::key_at(run, i)))
+            (0..seg.count as usize).any(|i| live.keeps(&format::key_at(run, i), false))
         };
         let mut kept_candidates = Vec::with_capacity_in(candidates.len(), Global);
         kept_candidates.extend(candidates.into_iter().filter(|seg| !seg.published || !holds_live(seg)));
@@ -1527,7 +1937,7 @@ impl Plain {
             for i in 0..seg.count as usize {
                 // A proved segment's entry: read, not checked (decision 18).
                 let entry = Entry::read(&run[i * ENTRY..(i + 1) * ENTRY]);
-                let keep = live.as_ref().is_none_or(|live| young || live.contains(&entry.key));
+                let keep = live.keeps(&entry.key, young);
                 // A pointer keeps only its newest value: the one in the newest row holding its
                 // name (in this slice or after it); an older value is let go.
                 let newest = entry.tag != POINTER_TAG || self.newest_mapped(seg.namespace, &Key(entry.key)).is_some_and(|(at, _)| at == self.by_id[&seg.id]);
@@ -1540,33 +1950,14 @@ impl Plain {
                 }
                 // Copied from a proved segment with its CRC as recorded: nothing is checked
                 // or computed again.
-                if let Err(error) = out.put_known(&entry, mapped.payload(&entry)) {
-                    return self.stop(error.into_store(entry.tag));
-                }
+                out.put_known(&entry, mapped.payload(&entry)).map_err(|error| error.into_store(entry.tag))?;
                 stats.kept += 1;
             }
         }
         stats.segments = candidates.len() as u32;
         let mut ids: Vec<u64> = Vec::with_capacity_in(candidates.len(), Global);
         ids.extend(candidates.iter().map(|it| it.id));
-        if out.is_empty() {
-            self.start_flip(Change::Compact { seg: None, candidates: ids, orphans, stats }, effects);
-            return;
-        }
-        let mut entries = std::mem::take(&mut out.entries);
-        for entry in entries.iter_mut() {
-            entry.at += HEADER as u64;
-        }
-        let run = match format::sorted_run(entries) {
-            Ok(run) => run,
-            Err(why) => return self.stop(why),
-        };
-        let index_at = HEADER as u64 + out.bytes.len() as u64;
-        stats.bytes_out = index_at + run.len() as u64 + FOOTER as u64;
-        self.orphans_for_compact = orphans;
-        let mut pieces = Vec::with_capacity_in(1, Global);
-        pieces.push((HEADER as u64, out.bytes));
-        self.write_segment(Laid { pieces, index_at, run, namespace }, Why::Compact { candidates: ids, stats }, effects);
+        Ok((out, ids))
     }
 
     // ---- the flip: the one lock, held for it alone ----
@@ -1583,6 +1974,9 @@ impl Plain {
             removals: Vec::new_in(Global),
             refused: None,
             aborted: false,
+            carry: false,
+            early: 0,
+            deferred: None,
         }));
         effects.push(Effect::Lock { file: self.flip.clone(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
     }
@@ -1625,13 +2019,88 @@ impl Plain {
         adopt_orphans(&mut m, &orphans);
         let mut refused = None;
         let mut aborted = false;
+        let mut carry = false;
+        // A slice's change, on the manifest being built: whether it aborted (a segment it
+        // replaces is no longer named as this process planned it: a row committed again since
+        // moved to the end with a newer generation, and a pointer's newest value may be in it,
+        // so the copy may not take its place).
+        let apply_slice = |m: &mut Manifest, seg: &mut Option<(Segment, FileName)>, candidates: &[u64], orphans: &[(u64, bool)]| -> bool {
+            // As planned: named, here, of the same generation, and touched by no commit since
+            // (a root that reuses a record the plan judged dead: [`Plain::reused`]).
+            let planned = |id: &u64| self.manifest.segments.iter().find(|it| it.id == *id).map(|it| (it.generation, it.touched));
+            // The copy's bytes may equal a named segment's (a merge of pointers keeps each
+            // name's newest value alone, which can be one candidate's whole content or an
+            // older row's): that file is the copy, so it is never removed or retired here.
+            let copy = seg.as_ref().map(|(it, _)| it.id);
+            if candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id && it.local && Some((it.generation, it.touched)) == planned(id))) {
+                if copy.is_some_and(|id| m.segments.iter().any(|it| it.id == id)) {
+                    *seg = None;
+                }
+                return true;
+            }
+            // A row holding the copy's bytes (a candidate, or an older row: a pointer's copied
+            // value is its newest, so no later row holds it) gives way to the copy at the run's
+            // place.
+            if let Some(copy) = copy {
+                m.segments.retain(|it| it.published || it.id != copy || candidates.contains(&it.id));
+            }
+            let first = m.segments.iter().position(|it| candidates.first() == Some(&it.id));
+            // A published candidate stays named, as not here: a source has it.
+            for it in m.segments.iter_mut().filter(|it| it.published && candidates.contains(&it.id)) {
+                it.local = false;
+                it.sealed = false;
+            }
+            m.segments.retain(|it| it.published || !candidates.contains(&it.id));
+            if let Some((seg, _)) = seg {
+                m.retired.retain(|it| !(it.id == seg.id && !it.log));
+                // The copy is as old as the oldest it replaced: pruning sees its records' age,
+                // not the slice's, and no lease taken since keeps it.
+                let oldest = self.manifest.segments.iter().filter(|it| candidates.contains(&it.id)).map(|it| it.generation).min();
+                seg.generation = oldest.unwrap_or(generation);
+                m.segments.insert(first.unwrap_or(0).min(m.segments.len()), *seg);
+            }
+            for id in candidates.iter().filter(|id| copy != Some(**id)) {
+                retire(m, *id, false);
+            }
+            adopt_orphans(m, orphans);
+            false
+        };
+        // The slice [`Plain::fold_slice`] parked rides this commit's flip.
+        let mut folded = if matches!(flip.change, Change::Commit { .. }) { self.folding.take() } else { None };
+        // Unlinked before the slot lands ([`Plant::UnlinkEarly`]).
+        let mut early = Vec::new_in(Global);
         match &mut flip.change {
             Change::Commit { segs, started_ns, roots } => {
                 if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
                     // A compaction may have retired its segment as named by no generation:
                     // it is not flipped.
                     refused = Some(StoreError::CommitTooSlow { took_s: now_ns.saturating_sub(*started_ns) / 1_000_000_000, grace_s: GRACE_NS / 1_000_000_000 });
+                } else if let Some(&(segment, key)) = self.touches.iter().find(|(id, _)| !m.segments.iter().any(|it| it.id == *id))
+                    && self.plant() != Plant::CarrySkipped
+                {
+                    // A record this commit's roots name, dead in its view, was in a segment a
+                    // slice replaced since: the slice may have let it go. The command still
+                    // holds its bytes (its mapping of the retired file stays valid: the unlink
+                    // rule below keeps the file while this process's lease, opened before the
+                    // retirement, lives, and a mapping outlives an unlink anyway), so the
+                    // commit carries it forward: not flipped now; the records are written into
+                    // a segment of the commit's own, outside the lock, and it flips again
+                    // ([`Plain::carry`]). After [`CARRY_ROUNDS`] the refusal is the stop.
+                    if self.carry_rounds >= CARRY_ROUNDS || !self.cfg.writes.contains(&Namespace::LOCAL) {
+                        refused = Some(StoreError::SweptUnder { key, segment });
+                    } else {
+                        self.carrying.clear();
+                        self.carrying.extend(self.touches.iter().filter(|(id, _)| !m.segments.iter().any(|it| it.id == *id)).copied());
+                        carry = true;
+                    }
                 } else {
+                    // Marked before the slice below: a slice of this process that would drop
+                    // a record this commit's roots reuse aborts as another's would.
+                    for (id, _) in self.touches.iter() {
+                        if let Some(it) = m.segments.iter_mut().find(|it| it.id == *id) {
+                            it.touched = generation;
+                        }
+                    }
                     for (seg, _) in segs.iter_mut() {
                         m.retired.retain(|it| !(it.id == seg.id && !it.log));
                         seg.generation = generation;
@@ -1657,11 +2126,29 @@ impl Plain {
                     }
                     for edit in roots.iter() {
                         match edit {
-                            RootEdit::Set { name, key } => {
+                            RootEdit::Set { name, key, life_ns } => {
                                 m.roots.retain(|it| it.name != *name);
-                                m.roots.push(Root { name: name.clone(), key: key.0, generation });
+                                let expires_ns = if *life_ns == NEVER { NEVER } else { now_ns.saturating_add(*life_ns).min(NEVER - 1) };
+                                m.roots.push(Root { name: name.clone(), key: key.0, generation, expires_ns });
                             }
                             RootEdit::Unset(name) => m.roots.retain(|it| it.name != *name),
+                            RootEdit::Lease { since, opened_ns } => {
+                                let holder = self.cfg.nonce;
+                                let since = m.leases.iter().find(|it| it.holder == holder).map_or(*since, |it| it.since.min(*since));
+                                m.leases.retain(|it| it.holder != holder);
+                                m.leases.push(Lease { holder, since, opened_ns: *opened_ns, expires_ns: now_ns.saturating_add(LEASE_NS) });
+                            }
+                            RootEdit::Release => m.leases.retain(|it| it.holder != self.cfg.nonce),
+                        }
+                    }
+                    if let Some(slice) = folded.as_mut() {
+                        slice.stats.aborted = apply_slice(&mut m, &mut slice.seg, &slice.candidates, &slice.orphans);
+                        if !slice.stats.aborted && self.plant() == Plant::UnlinkEarly {
+                            let copy = slice.seg.as_ref().map(|(it, _)| it.id);
+                            for id in slice.candidates.iter().copied().filter(|id| copy != Some(*id)) {
+                                m.retired.retain(|it| !(it.id == id && !it.log));
+                                early.push(self.segment_file(id));
+                            }
                         }
                     }
                 }
@@ -1699,52 +2186,24 @@ impl Plain {
                 }
             }
             Change::Compact { seg, candidates, orphans, .. } => {
-                // Each candidate still named here as this process planned it: a row committed
-                // again since moved to the end with a newer generation (a pointer's newest
-                // value may be in it), so the copy may not take its place.
-                let planned = |id: &u64| self.manifest.segments.iter().find(|it| it.id == *id).map(|it| it.generation);
-                // The copy's bytes may equal a named segment's (a merge of pointers keeps each
-                // name's newest value alone, which can be one candidate's whole content or an
-                // older row's): that file is the copy, so it is never removed or retired here.
-                let copy = seg.as_ref().map(|(it, _)| it.id);
-                let named = |id: u64| m.segments.iter().any(|it| it.id == id);
-                if candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id && it.local && Some(it.generation) == planned(id))) {
-                    aborted = true;
-                    if copy.is_some_and(named) {
-                        *seg = None;
-                    }
-                } else {
-                    // A row holding the copy's bytes (a candidate, or an older row: a pointer's
-                    // copied value is its newest, so no later row holds it) gives way to the
-                    // copy at the run's place.
-                    if let Some(copy) = copy {
-                        m.segments.retain(|it| it.published || it.id != copy || candidates.contains(&it.id));
-                    }
-                    let first = m.segments.iter().position(|it| candidates.first() == Some(&it.id));
-                    // A published candidate stays named, as not here: a source has it.
-                    for it in m.segments.iter_mut().filter(|it| it.published && candidates.contains(&it.id)) {
-                        it.local = false;
-                        it.sealed = false;
-                    }
-                    m.segments.retain(|it| it.published || !candidates.contains(&it.id));
-                    if let Some((seg, _)) = seg {
-                        m.retired.retain(|it| !(it.id == seg.id && !it.log));
-                        // The copy is as old as the oldest it replaced: pruning sees its
-                        // records' age, not the slice's.
-                        let oldest = self.manifest.segments.iter().filter(|it| candidates.contains(&it.id)).map(|it| it.generation).min();
-                        seg.generation = oldest.unwrap_or(generation);
-                        m.segments.insert(first.unwrap_or(0).min(m.segments.len()), *seg);
-                    }
-                    for id in candidates.iter().filter(|id| copy != Some(**id)) {
-                        retire(&mut m, *id, false);
-                    }
-                    adopt_orphans(&mut m, orphans);
-                }
+                aborted = apply_slice(&mut m, seg, candidates, orphans);
             }
         }
-        if refused.is_some() || aborted {
+        // What expired by the clock this flip passes in goes: a root past its life, and a lease
+        // whose holder neither renewed nor let go of it (it died, or ran past [`LEASE_NS`]
+        // between two commits).
+        m.roots.retain(|it| it.expires_ns > now_ns);
+        if self.plant() != Plant::LeaseNeverExpires {
+            m.leases.retain(|it| it.expires_ns > now_ns);
+        }
+        if refused.is_some() || carry {
+            // Not flipped: the slice waits for the next commit (or the carry's flip), unchanged.
+            self.folding = folded.take();
+        }
+        if refused.is_some() || aborted || carry {
             flip.refused = refused;
             flip.aborted = aborted;
+            flip.carry = carry;
             self.phase = Phase::Flipping(flip);
             self.unlock(effects);
             return;
@@ -1772,9 +2231,27 @@ impl Plain {
         }
         // Files retired past their grace go now: out of the list, and unlinked once unlocked;
         // a row marked lost stays until its report is handed, whatever its age.
+        //
+        // THE UNLINK RULE. A file is unlinked only when no generation a process may still
+        // read names it: it left the manifest a grace period ago, and no live lease's holder
+        // opened before that (a holder reads the generation it opened on, lazily, for as long
+        // as it runs). The one assumption, which the platform gives: a file mapped before its
+        // unlink stays readable through its mapping until it is unmapped (POSIX `munmap`; the
+        // kernel drops the pages only with the last reference), so a reader that mapped a
+        // segment is never hurt by the unlink, and one that has not is held off by the rule.
         let mut removals = Vec::new_in(Global);
+        let mut holders = Vec::with_capacity_in(m.leases.len(), Global);
+        holders.extend(m.leases.iter().map(|it| it.opened_ns));
+        if let Some(slice) = folded.as_ref()
+            && slice.stats.aborted
+            && let Some((_, file)) = slice.seg.as_ref()
+        {
+            // The slice did not land: its copy, named by no generation, is this process's own.
+            removals.push(file.clone());
+        }
         m.retired.retain(|it| {
-            let keep = it.lost.is_some() || it.since_ns.saturating_add(GRACE_NS) > now_ns;
+            let held = holders.iter().any(|opened| *opened < it.since_ns.saturating_add(GRACE_NS));
+            let keep = it.lost.is_some() || it.since_ns.saturating_add(GRACE_NS) > now_ns || held;
             if !keep {
                 removals.push(if it.log { self.log_file(it.id) } else { self.segment_file(it.id) });
             }
@@ -1802,12 +2279,25 @@ impl Plain {
         flip.fresh = fresh;
         flip.removals = removals;
         flip.next = Some((slot, m));
-        if flip.new_log {
-            effects.push(Effect::Truncate { file: flip.log.clone(), len: 0, tag: self.tag(LOG_TRUNCATE, 0) });
+        let first = if flip.new_log {
             flip.manifest_bytes = bytes;
+            Effect::Truncate { file: flip.log.clone(), len: 0, tag: self.tag(LOG_TRUNCATE, 0) }
         } else {
-            effects.push(Effect::WriteAt { file: flip.log.clone(), at, bytes, tag: self.tag(LOG_WRITE, 0) });
+            Effect::WriteAt { file: flip.log.clone(), at, bytes, tag: self.tag(LOG_WRITE, 0) }
+        };
+        if early.is_empty() {
+            effects.push(first);
+        } else {
+            // The planted bug: what the slice replaced is unlinked first, while the generation
+            // on disk names it, and the log waits for the unlinks.
+            flip.early = early.len() as u32;
+            flip.deferred = Some(first);
+            for (i, file) in early.into_iter().enumerate() {
+                effects.push(Effect::Remove { file, tag: self.tag(REMOVE, EARLY_REMOVE + i as u32) });
+            }
         }
+        // The folded slice's outcome, for [`Plain::flipped`].
+        self.folding = folded;
         self.phase = Phase::Flipping(flip);
     }
 
@@ -1862,13 +2352,16 @@ impl Plain {
         let Phase::Flipping(flip) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("an unlock is a flip's") };
         let flip = *flip;
         if let Some(why) = flip.refused {
-            self.committed = Some(Err(why));
-            if let Change::Commit { roots, .. } = flip.change {
-                let later = std::mem::replace(&mut self.roots_pending, roots);
-                self.roots_pending.extend(later);
-            }
-            self.sealed_back();
-            self.phase = Phase::Ready;
+            let roots = match flip.change {
+                Change::Commit { roots, .. } => roots,
+                _ => Vec::new_in(Global),
+            };
+            self.commit_refused(why, roots);
+            return;
+        }
+        if flip.carry {
+            let Change::Commit { segs, started_ns, roots } = flip.change else { unreachable!("only a commit carries") };
+            self.carry(segs, started_ns, roots, effects);
             return;
         }
         if flip.aborted {
@@ -1892,6 +2385,9 @@ impl Plain {
             Change::Commit { segs, .. } => {
                 self.committing.clear();
                 self.committing.extend(segs.iter().map(|(it, _)| it.id));
+                if let Some(slice) = self.folding.take() {
+                    self.sliced = Some(Sliced { removed: flip.removals.len() as u32, segments: if slice.stats.aborted { 0 } else { slice.stats.segments }, ..slice.stats });
+                }
                 Then::Commit
             }
             Change::Stamp | Change::Adopt { .. } | Change::Publish { .. } | Change::Seal { .. } => Then::Stamp,
@@ -1905,6 +2401,7 @@ impl Plain {
         self.torn_stamp = false;
         self.slot = Some(slot);
         self.manifest = manifest;
+        self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
         // The slot names the log this flip wrote its manifest to.
         self.log_lost = false;
         if self.cfg.durable && self.plant() == Plant::FlipBeforeSync {
@@ -1922,6 +2419,56 @@ impl Plain {
         } else {
             self.phase = Phase::Removing { left, then };
         }
+    }
+
+    /// A refused commit's outcome: `why`, its roots and held records kept for the next.
+    fn commit_refused(&mut self, why: StoreError, roots: Vec<RootEdit>) {
+        self.committed = Some(Err(why));
+        let later = std::mem::replace(&mut self.roots_pending, roots);
+        self.roots_pending.extend(later);
+        self.sealed_back();
+        self.phase = Phase::Ready;
+    }
+
+    /// One round of a commit carrying forward the records its roots name whose segment a
+    /// slice replaced since this process read it (`carrying`, listed by the flip that found
+    /// them, which unlocked without flipping): each copied from this process's own mapping of
+    /// the retired file (valid: the unlink rule keeps the file while the lease of a holder
+    /// that opened before its retirement lives, and a mapping outlives an unlink) with its CRC
+    /// as recorded, into one segment of [`Namespace::LOCAL`] written with no lock; the flip is
+    /// then asked again, naming the commit's segments and it. The records are the commit's
+    /// own from then on: no longer reused, so nothing more is checked of them. Counted in
+    /// [`Plain::carried`].
+    fn carry(&mut self, segs: Vec<(Segment, FileName)>, started_ns: u64, roots: Vec<RootEdit>, effects: &mut Vec<Effect>) {
+        self.carry_rounds += 1;
+        let carrying = std::mem::replace(&mut self.carrying, Vec::new_in(Global));
+        let mut out = Batch::new(Namespace::LOCAL);
+        for &(segment, key) in carrying.iter() {
+            // Each key once: `reused` lists it with the one segment its lookup found.
+            let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(key)) else {
+                // Not mapped here any more: nothing to carry from. The typed stop.
+                return self.commit_refused(StoreError::SweptUnder { key, segment }, roots);
+            };
+            if entry.tag == POINTER_TAG {
+                // A pointer's carried value would read as its newest: not carried.
+                return self.commit_refused(StoreError::SweptUnder { key, segment }, roots);
+            }
+            if let Err(error) = out.put_known(&entry, self.maps[at].payload(&entry)) {
+                return self.commit_refused(error.into_store(entry.tag), roots);
+            }
+        }
+        self.touches.retain(|it| !carrying.contains(it));
+        self.carried += out.entries.len() as u64;
+        match laid_of(out) {
+            Ok(laid) => self.write_segment(laid, Why::Commit { started_ns, roots, rest: Vec::new_in(Global), done: segs }, effects),
+            Err(why) => self.commit_refused(why, roots),
+        }
+    }
+
+    /// Records this process's commits carried forward, ever ([`CARRY_ROUNDS`]): the store's
+    /// count of commits that met a slice landing under them and lost nothing.
+    pub fn carried(&self) -> u64 {
+        self.carried
     }
 
     /// A refused commit's held records are held again, for the next.
@@ -2232,8 +2779,14 @@ impl Plain {
                 self.sealed.clear();
             }
             Then::Compact(mut stats) => {
-                let (next, _) = self.plan();
-                stats.more = !next.is_empty();
+                let next = match self.cfg.liveness {
+                    Liveness::Everything => Ok(self.plan().0),
+                    Liveness::Reached => self.plan_reached(self.now_ns),
+                };
+                match next {
+                    Ok(next) => stats.more = !next.is_empty(),
+                    Err(why) => return self.stop(why),
+                }
                 self.sliced = Some(stats);
             }
             Then::Open | Then::Stamp | Then::Probe => {}
@@ -2254,6 +2807,7 @@ impl Plain {
         debug_assert!(self.owns(completion.tag));
         let op = ((completion.tag.0 - self.cfg.tags) >> 32) as u8;
         let index = completion.tag.0 as u32;
+        self.now_ns = now_ns;
         if op == LATE_SYNC {
             return;
         }
@@ -2280,7 +2834,17 @@ impl Plain {
     fn step(&mut self, op: u8, index: u32, done: Done, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         let unexpected = |phase: &'static str| StoreError::Unasked { op, index, phase };
         let fail = |doing: &'static str, file: &FileName, done: &Done| io(doing, file, done);
+        let unlink_early = self.plant() == Plant::UnlinkEarly;
         match (op, &mut self.phase) {
+            (REMOVE, Phase::Flipping(flip)) if unlink_early && index >= EARLY_REMOVE && flip.early > 0 => {
+                flip.early -= 1;
+                if flip.early == 0
+                    && let Some(first) = flip.deferred.take()
+                {
+                    effects.push(first);
+                }
+                Ok(())
+            }
             (HEAD_READ, Phase::ReadHead(ctx)) => {
                 let ctx = *ctx;
                 let Done::Read(bytes) = done else {
@@ -2736,6 +3300,7 @@ impl Plain {
                 self.slot = base.slot;
                 self.manifest = base.manifest;
                 self.opened_ns = now_ns;
+                self.opened_generation = self.manifest.generation;
                 // Rows retired as lost and not yet reported to a caller who got the report
                 // (whoever wrote them: this open's process before a crash, or another): this
                 // open reports them, and clears them only after its own report is handed.
@@ -2766,7 +3331,7 @@ impl Plain {
     /// none left, the flip names them all.
     fn segment_written(&mut self, writing: Writing, why: Why, effects: &mut Vec<Effect>) {
         let seg = (writing.seg, writing.file);
-        let change = match why {
+        match why {
             Why::Commit { started_ns, roots, mut rest, mut done } => {
                 done.push(seg);
                 if !rest.is_empty() {
@@ -2774,13 +3339,67 @@ impl Plain {
                     self.write_segment(next, Why::Commit { started_ns, roots, rest, done }, effects);
                     return;
                 }
-                Change::Commit { segs: done, started_ns, roots }
+                self.start_flip(Change::Commit { segs: done, started_ns, roots }, effects);
             }
             Why::Compact { candidates, stats } => {
-                Change::Compact { seg: Some(seg), candidates, orphans: std::mem::take(&mut self.orphans_for_compact), stats }
+                let orphans = std::mem::take(&mut self.orphans_for_compact);
+                self.slice_ready(Some(seg), candidates, orphans, stats, effects);
             }
-        };
-        self.start_flip(change, effects);
+        }
+    }
+}
+
+/// A batch of copied records (a slice's, a carry's: each payload at a multiple of [`ALIGN`]
+/// of its bytes) as a segment's layout: its entries placed after the [`HEADER`] and sorted.
+fn laid_of(mut out: Batch) -> Result<Laid, StoreError> {
+    let namespace = out.namespace;
+    let mut entries = std::mem::take(&mut out.entries);
+    for entry in entries.iter_mut() {
+        entry.at += HEADER as u64;
+    }
+    let run = format::sorted_run(entries)?;
+    let index_at = HEADER as u64 + out.bytes.len() as u64;
+    let mut pieces = Vec::with_capacity_in(1, Global);
+    pieces.push((HEADER as u64, out.bytes));
+    Ok(Laid { pieces, index_at, run, namespace })
+}
+
+/// `key` is one of `roots`' own keys, or among the sorted 32-byte keys a root's record holds:
+/// a binary search of each record in place, nothing collected.
+fn reached(roots: &[(ContentId, &[u8])], key: &ContentId) -> bool {
+    roots.iter().any(|(root, keys)| root == key || sorted_holds(keys, key))
+}
+
+fn sorted_holds(keys: &[u8], key: &ContentId) -> bool {
+    let (mut lo, mut hi) = (0usize, keys.len() / 32);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match keys[mid * 32..mid * 32 + 32].cmp(&key.0[..]) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+/// What a slice's copy keeps.
+enum Live<'a> {
+    /// Everything (a merge of a [`Liveness::Everything`] store).
+    All,
+    /// What roots name, or younger than [`WINDOW`] (its pruning over the cap).
+    Rooted(BTreeSet<ContentId>),
+    /// What reaches from an unexpired root ([`Liveness::Reached`]).
+    Reached(Vec<(ContentId, &'a [u8])>),
+}
+
+impl Live<'_> {
+    fn keeps(&self, key: &ContentId, young: bool) -> bool {
+        match self {
+            Live::All => true,
+            Live::Rooted(set) => young || set.contains(key),
+            Live::Reached(roots) => reached(roots, key),
+        }
     }
 }
 

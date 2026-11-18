@@ -1856,6 +1856,12 @@ impl Sim {
         self.disk.kind = journal;
     }
 
+    /// Which system's journal of changes the simulation plays: [`Journal::None`] keeps none
+    /// across a restart, as Linux.
+    pub fn journal(&self) -> Journal {
+        self.disk.kind
+    }
+
     /// The journal of changes made again, with a new ID: a cursor into the old one is
     /// [`crate::Lost::Reset`].
     pub fn reset_journal(&mut self) {

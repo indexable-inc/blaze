@@ -23,7 +23,7 @@ use bstd::test::BUDGET;
 use super::*;
 use crate::run_ids::Missing;
 
-fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
+pub(super) fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
     let mut said = std::vec::Vec::new();
     let mut at = 0;
     while let Some((item, len)) = split(&bytes[at..]).expect("a frame") {
@@ -48,7 +48,7 @@ fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
     said
 }
 
-fn need(need: Needed) -> std::vec::Vec<u8> {
+pub(super) fn need(need: Needed) -> std::vec::Vec<u8> {
     let mut out = std::vec::Vec::new();
     Up::Need { need, thread: blaze_launch::Thread(1) }.encode(7, &mut out).expect("a need encodes");
     out
@@ -142,12 +142,12 @@ fn a_symbol_is_resolved_once_and_declared_before_published() {
         "a record's slots are told before it, once"
     );
     assert_eq!(counting.asks.iter().map(|(s, n)| (*s, *n)).collect::<std::vec::Vec<_>>(), [(1, 1), (2, 1), (9, 1)], "a symbol was resolved more than once, or 3 (never needed) was resolved");
-    let first: std::vec::Vec<(u8, u8, u8)> = needs.first().iter().map(|row| (row.symbol.0[0], row.key.0.0[0], row.record.0[0])).collect();
+    let first: std::vec::Vec<(u8, u8, u8)> = needs.first().iter().filter_map(Line::code).map(|row| (row.symbol.0[0], row.key.0.0[0], row.record.0[0])).collect();
     assert_eq!(first, [(1, 1, 10), (2, 2, 20)], "the first-answer order");
 
     let rows = [
-        Row { symbol: Symbol([5; 32]), key: CodeKey(blaze_ids::ContentId([5; 32])), record: RecordId([50; 32]) },
-        Row { symbol: Symbol([6; 32]), key: CodeKey(blaze_ids::ContentId([6; 32])), record: RecordId([60; 32]) },
+        Line::Code(Row { symbol: Symbol([5; 32]), key: CodeKey(blaze_ids::ContentId([5; 32])), record: RecordId([50; 32]) }),
+        Line::Code(Row { symbol: Symbol([6; 32]), key: CodeKey(blaze_ids::ContentId([6; 32])), record: RecordId([60; 32]) }),
     ];
     let mut ahead = Needs::new(alloc);
     let mut none = Counting { asks: std::collections::BTreeMap::new(), one: [Symbol([2; 32]), Symbol([3; 32])], two: [Symbol([1; 32])] };
@@ -165,18 +165,18 @@ fn a_symbol_is_resolved_once_and_declared_before_published() {
 const MAIN: u128 = 0xA001;
 const A: u128 = 0xA002;
 const B: u128 = 0xA003;
-const LEAF: u128 = 0xA004;
+pub(super) const LEAF: u128 = 0xA004;
 
 /// The statics model's root: it calls `leaf` and names static `S`.
-const SHOUT: u128 = 0xA005;
+pub(super) const SHOUT: u128 = 0xA005;
 /// Two statics whose values point at each other (a cycle: one batch).
-const S: u128 = 0xA0E1;
-const T: u128 = 0xA0E2;
+pub(super) const S: u128 = 0xA0E1;
+pub(super) const T: u128 = 0xA0E2;
 
 /// The wire model's root: it calls `echo` and `shout`, and names no static.
-const HUB: u128 = 0xA008;
+pub(super) const HUB: u128 = 0xA008;
 /// Made on demand (`hub`'s callee), the FIRST record of its run to name `S`.
-const ECHO: u128 = 0xA007;
+pub(super) const ECHO: u128 = 0xA007;
 /// A fn touching thread-local [`V`]: its entry declares `V` (its template is a row), and its
 /// record names `V`'s template and the thread-local descriptor ([`toy_named`]).
 const THREADY: u128 = 0xA006;
@@ -290,7 +290,7 @@ fn tls_of(item: u128) -> Symbol {
     Symbol(blaze_ladder::symbols::tls_symbol(ItemKey(item)).0)
 }
 
-fn static_of(item: u128) -> Symbol {
+pub(super) fn static_of(item: u128) -> Symbol {
     Symbol(blaze_ladder::symbols::static_symbol(ItemKey(item)).0)
 }
 
@@ -301,7 +301,7 @@ fn name_of(item: u128) -> [u8; 20] {
     name
 }
 
-fn symbol_of(item: u128) -> Symbol {
+pub(super) fn symbol_of(item: u128) -> Symbol {
     Symbol(blaze_ladder::symbols::fn_symbol_of_name(&name_of(item)).0)
 }
 
@@ -311,7 +311,7 @@ const PERSONALITY: u128 = 0xA00F;
 
 /// The run's roots: `main` alone, called directly; the model is built to unwind, so its head
 /// names [`PERSONALITY`].
-struct ToyStart {
+pub(super) struct ToyStart {
     root: u128,
     main: [u8; 20],
 }
@@ -340,7 +340,7 @@ impl Start for ToyStart {
 
 /// Every fn a workspace body, with a BodyCheck record that read one fact; `clean` is what the
 /// gate left.
-struct ToyIds {
+pub(super) struct ToyIds {
     reads: [Read; 1],
     clean: bool,
 }
@@ -377,7 +377,7 @@ impl Gate for ToyIds {
 
 /// The maker: an entry is its declared rows, per row the tabled fn (16), the name's length
 /// (4) and the name.
-struct ToyMaker<'t> {
+pub(super) struct ToyMaker<'t> {
     calls: &'t Cell<usize>,
 }
 
@@ -450,12 +450,12 @@ impl Form for ToyForm {
 }
 
 /// The model's front end: what was made of it is counted.
-struct ToyFront<'t> {
-    calls: &'t Cell<usize>,
-    starts: &'t Cell<usize>,
-    clean: bool,
+pub(super) struct ToyFront<'t> {
+    pub(super) calls: &'t Cell<usize>,
+    pub(super) starts: &'t Cell<usize>,
+    pub(super) clean: bool,
     /// The fn the run starts at: `MAIN`, or `SHOUT` for the statics model.
-    root: u128,
+    pub(super) root: u128,
 }
 
 impl<'t> Front for ToyFront<'t> {
@@ -501,8 +501,8 @@ impl<'t> Front for ToyFront<'t> {
 /// The records folder: the ids filed, and each record's bytes (the wire checker reads what a
 /// published record names).
 #[derive(Default)]
-struct ToyFolder {
-    held: BTreeSet<[u8; 32]>,
+pub(super) struct ToyFolder {
+    pub(super) held: BTreeSet<[u8; 32]>,
     bytes: std::collections::BTreeMap<[u8; 32], std::vec::Vec<u8>>,
 }
 
@@ -519,7 +519,7 @@ impl Folder for &mut ToyFolder {
     }
 }
 
-fn builder() -> Builder {
+pub(super) fn builder() -> Builder {
     Builder {
         isa: Isa { os: Os::MacOs, lse: true },
         tier: TierName::Reference,
@@ -626,7 +626,7 @@ fn the_personality_is_named_before_the_first_publish() {
     let (calls, starts) = (Cell::new(0), Cell::new(0));
     let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN }, &mut folder, &mut store, builder(), alloc);
     let mut needs = Needs::new(alloc);
-    let mut kept: AVec<'_, Row> = Vec::new_in(alloc);
+    let mut kept: AVec<'_, Line> = Vec::new_in(alloc);
     let mut out = std::vec::Vec::new();
     let head = ahead_of(None, &mut lazy, &mut needs, &mut kept, &mut out).expect("the roots");
     assert_eq!(head.personality, Some(CodeSymbol(symbol_of(PERSONALITY).0)), "the roots' head names no routine");
@@ -667,10 +667,10 @@ fn a_list_under_todays_certificate_starts_cold() {
     let mut out = std::vec::Vec::new();
     needs.serve(&mut first, &need(Needed::Symbol(symbol_of(MAIN))), &mut out).expect("served");
     drop(first);
-    let mut rows: std::vec::Vec<Row> = needs.first().to_vec();
+    let mut rows: std::vec::Vec<Line> = needs.first().to_vec();
     // A row whose file is gone: b, with a record never filed.
     let gone = Row { symbol: symbol_of(B), key: CodeKey(blaze_ids::ContentId([0xb; 32])), record: RecordId([0xee; 32]) };
-    rows.push(gone);
+    rows.push(Line::Code(gone));
     let today = start_list::Certificate([1; 32]);
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
     start_list::encode(today, line, &rows, &mut bytes).expect("two rows");
@@ -680,7 +680,7 @@ fn a_list_under_todays_certificate_starts_cold() {
     calls.set(0);
     let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN }, &mut folder, &mut store, builder(), alloc);
     let mut needs = Needs::new(alloc);
-    let mut kept: AVec<'_, Row> = Vec::new_in(alloc);
+    let mut kept: AVec<'_, Line> = Vec::new_in(alloc);
     let mut out = std::vec::Vec::new();
     let entry = ahead_of(Some(placed), &mut lazy, &mut needs, &mut kept, &mut out).expect("placed");
     assert_eq!(entry, line, "the list's head is not the one written");
@@ -748,8 +748,8 @@ fn an_unreached_callee_is_walked_to_from_the_roots() {
 /// at `T`, whose value points back at `S`, is answered with BOTH statics' data, each made once
 /// and filed, `S` first, never as declared slots; the cycle is one batch and neither is sent
 /// again (`leaf`, asked later, brings none); a static's symbol is no need (`Unknown`). On the
-/// wire the order is `Declare`, `Data`, `Publish`, and the record that brought data is not a
-/// start-list row. A second run over the same store finds all three and makes nothing.
+/// wire the order is `Declare`, `Data`, `Publish`, and the record that brought data is a
+/// start-list group, its data before its row (start_list.rs version 4). A second run over the same store finds all three and makes nothing.
 /// Controls: a parent that sent a static per record, or as a slot, or after the `Publish`, fails.
 /// Prints "lazy parent: statics told once with the first record, Declare Data Publish; second run found 3".
 #[test]
@@ -792,7 +792,12 @@ fn a_records_statics_are_told_once_before_its_publish() {
     assert_eq!(kinds, ["Declare", "Data", "Publish"], "{said:?}");
     let datum = |s: u128| data.iter().find(|d| d.symbol == static_of(s)).map(|d| (d.symbol.0[0], d.record.0[0])).expect("told");
     assert_eq!(said[1], std::format!("Data {:?}", [datum(S), datum(T)]), "the found data are the made data");
-    assert!(needs.first().is_empty(), "a record that brought data was kept as a start-list row");
+    let codes: std::vec::Vec<Symbol> = needs.first().iter().filter_map(Line::code).map(|row| row.symbol).collect();
+    let kept: std::vec::Vec<Symbol> = needs.first().iter().filter_map(|line| match line {
+        Line::Datum(datum) => Some(datum.symbol),
+        Line::Code(_) | Line::Named(_) => None,
+    }).collect();
+    assert_eq!((codes, kept), (std::vec![symbol_of(SHOUT)], std::vec![static_of(S), static_of(T)]), "the record that brought data is not a start-list group with its data before it");
     assert_eq!(again.tally(), Tally { reached: 3, found: 3, made: 0, unkeyed: 0 });
     assert_eq!(calls.get(), 4, "the second run made a static or an instance its store holds");
     std::println!("lazy parent: statics told once with the first record, Declare Data Publish; second run found {}", again.tally().found);
@@ -821,17 +826,17 @@ impl Resolve for TwoNamers {
     }
 }
 
-/// Asserts (run.md, "Statics in the run"): (1) a record that names a static an EARLIER answer
-/// sent (so it brings no data itself) is still no start-list row: the next run places its
-/// list's rows before any need and any `Data`; only the record naming no static is a row, and
-/// `Data` precedes the first namer's `Publish`. (2) A record naming a static nothing sent is
-/// refused by name (`StaticUnsent`) and NO `Publish` of it is written: `Needs::publish` is the
-/// one writer. CONTROLS: keep a row by `data.is_empty()` (the rule before) and the list holds
-/// symbol 2, failing (1); publish without checking `named` and a `Publish` of record 40
-/// follows, failing (2).
-/// Prints "run_parent: a record naming a static sent before is no start-list row; one never sent is refused".
+/// Asserts (run.md, "Statics in the run"; start_list.rs version 4): (1) every first answer is
+/// a start-list group in order, a record naming a static an EARLIER answer sent included: the
+/// datum once, in its first namer's group, before that namer's row; the later namer's group
+/// names it and carries no datum; `Data` precedes the first namer's `Publish`. (2) A record
+/// naming a static nothing sent is refused by name (`StaticUnsent`) and NO `Publish` of it is
+/// written: `Needs::publish` is the one writer. CONTROLS: record a group's datum from `data`
+/// rather than the batch sent, and symbol 2's group holds the datum again, failing (1);
+/// publish without checking `named` and a `Publish` of record 40 follows, failing (2).
+/// Prints "run_parent: a record naming a static sent before is a group after the datum's; one never sent is refused".
 #[test]
-fn a_record_naming_a_static_told_before_is_no_start_list_row() {
+fn a_record_naming_a_static_told_before_is_a_group_after_its_datum() {
     let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
     let erased = blaze_own::Erased::new(&frame);
     let alloc = erased.handle();
@@ -845,21 +850,29 @@ fn a_record_naming_a_static_told_before_is_no_start_list_row() {
     let said = frames(&out);
     let kinds: std::vec::Vec<&str> = said.iter().map(|frame| frame.split(' ').next().unwrap_or("")).collect();
     assert_eq!(kinds, ["Declare", "Data", "Publish", "Declare", "Publish", "Declare", "Publish"], "{said:?}");
-    let first: std::vec::Vec<u8> = needs.first().iter().map(|row| row.symbol.0[0]).collect();
-    assert_eq!(first, [3], "a record naming a static was kept as a start-list row");
+    let (one, two, three) = (Symbol([1; 32]), Symbol([2; 32]), Symbol([3; 32]));
+    let row = |symbol: Symbol| {
+        let n = symbol.0[0];
+        Line::Code(Row { symbol, key: CodeKey(blaze_ids::ContentId([n; 32])), record: RecordId([n * 10; 32]) })
+    };
+    assert_eq!(
+        needs.first(),
+        &[Line::Datum(namers.told[0]), Line::Named(namers.s[0]), row(one), Line::Named(namers.s[0]), row(two), row(three)][..],
+        "the first answers are not each a group in order, the datum once before its first namer"
+    );
 
     let mut rogue = std::vec::Vec::new();
     let refused = needs.serve(&mut namers, &need(Needed::Symbol(Symbol([4; 32]))), &mut rogue);
     assert!(matches!(refused, Err(ParentError::StaticUnsent { record, symbol, touches_tls: false, .. }) if record == [40; 32] && symbol == [0x77; 32]), "{refused:?}");
     assert!(!frames(&rogue).iter().any(|frame| frame.starts_with("Publish")), "a record naming an unsent static was published: {:?}", frames(&rogue));
-    std::println!("run_parent: a record naming a static sent before is no start-list row; one never sent is refused");
+    std::println!("run_parent: a record naming a static sent before is a group after the datum's; one never sent is refused");
 }
 
 /// THE WIRE INVARIANT (run.md, "Statics in the run"; the child's `StaticNotTold`): reading the
 /// parent's messages in order, every `Publish` names a record whose every static (what
 /// [`toy_named`] reads from its bytes in `folder`) an EARLIER `Data` sent, and no static is sent
 /// twice. The publishes checked, or the first breach, named.
-fn statics_before_publish(bytes: &[u8], folder: &ToyFolder) -> Result<usize, std::string::String> {
+pub(super) fn statics_before_publish(bytes: &[u8], folder: &ToyFolder) -> Result<usize, std::string::String> {
     let mut sent: BTreeSet<[u8; 32]> = BTreeSet::new();
     let mut published = 0;
     let mut at = 0;
@@ -930,15 +943,16 @@ fn the_wire_checker_catches_a_publish_before_its_data() {
 /// - a record made ON DEMAND that is the first to name `S` (`echo`): `S` and `T` (a static in a
 ///   static, a cycle) go in one `Data` before it;
 /// - a second record naming `S` (`shout`), with no `Data`, and the same record published AGAIN;
-/// - the next run's start-list rows placed ahead (`Needs::place_ahead`), then a callee of a
-///   placed row made on demand: the list holds `hub` and `leaf` alone, never a namer;
+/// - the next run's start-list groups placed ahead (`Needs::place_ahead`): the list holds all
+///   four first answers, `echo`'s group with the data of `S` and `T` before its row, so the
+///   replay's `Data` goes before `echo`'s and `shout`'s `Publish`;
 /// - a record touching a thread-local (`thready`, the hello world's old stop): the template of
 ///   `V` goes in a `Data` and the descriptor in one `ThreadLocals`, both before its `Publish`;
 ///   a second record touching `V` (the same record again) sends neither again.
 /// CONTROLS: the planted bug in `the_wire_checker_catches_a_publish_before_its_data`; and run
 /// 3's messages with the `ThreadLocals` cut out (a parent that never told the descriptor) fail
 /// the checker, naming the descriptor.
-/// Prints "wire: every Publish stands on its statics; 5 + 5 + 1 publishes checked; the descriptor told once, before its first namer".
+/// Prints "wire: every Publish stands on its statics; 5 + 7 + 1 publishes checked; the descriptor told once, before its first namer".
 #[test]
 fn every_publish_stands_on_its_statics_on_the_wire() {
     let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
@@ -952,7 +966,7 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
 
     let mut out = std::vec::Vec::new();
     let mut needs = Needs::new(alloc);
-    let first: std::vec::Vec<Row> = {
+    let first: std::vec::Vec<Line> = {
         let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: HUB }, &mut folder, &mut store, builder(), alloc);
         let head = lazy.head().expect("the head");
         needs.name_personality(head.personality, &mut out).expect("the personality named");
@@ -966,8 +980,8 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
     let said = frames(&out);
     assert!(said.iter().any(|frame| frame.starts_with("Personality")) && said.iter().any(|frame| frame.starts_with("Failed")), "{said:?}");
     assert_eq!(statics_before_publish(&out, &folder), Ok(5), "run 1: {said:?}");
-    let rows: std::vec::Vec<Symbol> = first.iter().map(|row| row.symbol).collect();
-    assert_eq!(rows, [symbol_of(HUB), symbol_of(LEAF)], "the start list kept a record naming a static, or lost one naming none");
+    let rows: std::vec::Vec<Symbol> = first.iter().filter_map(Line::code).map(|row| row.symbol).collect();
+    assert_eq!(rows, [symbol_of(HUB), symbol_of(ECHO), symbol_of(SHOUT), symbol_of(LEAF)], "the start list lost a first answer, a namer of a static or not");
 
     let mut again = std::vec::Vec::new();
     {
@@ -980,7 +994,9 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
         inbox.extend_from_slice(&need(Needed::Symbol(symbol_of(SHOUT))));
         needs.serve(&mut lazy, &inbox, &mut again).expect("served from the list");
     }
-    assert_eq!(statics_before_publish(&again, &folder), Ok(5), "run 2: {:?}", frames(&again));
+    // The four groups placed (echo's with the `Data` of S and T), then three needs of placed
+    // rows published again.
+    assert_eq!(statics_before_publish(&again, &folder), Ok(7), "run 2: {:?}", frames(&again));
 
     let mut thready = std::vec::Vec::new();
     {
@@ -1004,13 +1020,13 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
     }
     let breach = statics_before_publish(&untold, &folder).expect_err("a Publish naming the descriptor, never told, passed the checker");
     assert!(breach.contains(&std::format!("{:02x?}", &tls[..6])), "the breach does not name the descriptor: {breach}");
-    std::println!("wire: every Publish stands on its statics; 5 + 5 + 1 publishes checked; the descriptor told once, before its first namer");
+    std::println!("wire: every Publish stands on its statics; 5 + 7 + 1 publishes checked; the descriptor told once, before its first namer");
 }
 
 /// Asserts (run.md, "Statics in the run"; code_records.rs `VtableDatum`): a record naming a
 /// vtable (`dyn`'s, `W`) is published only after a `Data` carrying the vtable's datum, the datum
 /// filed in the records folder under its content, and its method word's instance (`leaf`)
-/// declared in the same `Declare`; a namer is no start-list row; a second need of the record
+/// declared in the same `Declare`; the namer's start-list group is the datum, the name, its row; a second need of the record
 /// sends the datum no more. CONTROL: the same messages with the `Data` cut out (a parent that
 /// never sent the vtable) fail the wire checker, naming the vtable.
 /// Prints "wire: a vtable's datum is sent before its first namer, once; a cut `Data` is caught".
@@ -1031,12 +1047,16 @@ fn a_record_naming_a_vtable_stands_on_its_datum() {
         let mut inbox = need(Needed::Symbol(symbol_of(DYN)));
         inbox.extend_from_slice(&need(Needed::Symbol(symbol_of(DYN))));
         needs.serve(&mut lazy, &inbox, &mut out).expect("a record naming a vtable served");
-        needs.first().len()
+        needs.first().iter().map(|line| match line {
+            Line::Datum(datum) => ('d', datum.symbol),
+            Line::Named(symbol) => ('n', *symbol),
+            Line::Code(row) => ('c', row.symbol),
+        }).collect::<std::vec::Vec<_>>()
     };
     let said = frames(&out);
     let kinds: std::vec::Vec<&str> = said.iter().map(|frame| frame.split(' ').next().unwrap_or("")).collect();
     assert_eq!(kinds, ["Declare", "Data", "Publish", "Publish"], "{said:?}");
-    assert_eq!(first, 0, "a record naming a vtable was kept as a start-list row");
+    assert_eq!(first, [('d', vtable_of(W)), ('n', vtable_of(W)), ('c', symbol_of(DYN))], "a record naming a vtable is not a group with the vtable's datum before its row");
     let mut sent = std::vec::Vec::new();
     let mut at = 0;
     while let Some((item, len)) = split(&out[at..]).expect("the frames") {

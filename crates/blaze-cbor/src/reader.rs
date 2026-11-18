@@ -169,6 +169,14 @@ impl<'a> Reader<'a> {
         self.length(crate::major::ARRAY, why::NOT_ARRAY, most, what, why::ARRAY_PAST_INPUT)
     }
 
+    /// The number of entries of a map whose keys and values follow, at most `most`. As for
+    /// [`Reader::array`], a count past what is left of the input is refused before a caller
+    /// sizes anything by it. The keys are the caller's to read and to hold to the order of
+    /// their encodings (a record keyed by small integers reads them in ascending order).
+    pub fn map(&mut self, most: usize, what: &'static str) -> Result<usize, Error> {
+        self.length(crate::major::MAP, why::NOT_MAP, most, what, why::MAP_PAST_INPUT)
+    }
+
     /// An array of exactly `len` items.
     pub fn array_of(&mut self, len: usize) -> Result<(), Error> {
         let start = self.at;

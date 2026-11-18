@@ -436,6 +436,9 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
 
 /// The world's answers, each asked again after an import on the spot ([`BodyWorld::again`]).
 impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
+    fn goal_share(&self) -> Option<&dyn blaze_solve::share::GoalShare> {
+        self.store.goals
+    }
     fn fn_sig(&self, _: Seal, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
         self.again(|| self.fn_sig_once(item))
     }
