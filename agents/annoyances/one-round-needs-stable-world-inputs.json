@@ -1,0 +1,15 @@
+{
+ "id": "one-round-needs-stable-world-inputs",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane VD",
+ "where": "crates/blaze-ladder/src/front2/world_items.rs (BodyWorld holds &'w Records parts), heads.rs Store, keys.rs Keys, buckets.rs Buckets, blaze-typeck portable.rs PortableTys",
+ "what": "Making a head inside a body's check (one round a body) needs every table the world's answers borrow from to accept rows while those answers live. The heads maps were only part of it: the type table (PortableTys nodes/lists, a Vec), Keys::origins, the Maps fields answers borrow (traits, const_params, alias_defaults), and Buckets' answers/inherent maps grow during making too, and `make` takes &mut Records while the world holds &'w Records.",
+ "cost": "three lanes (VW, VB, VC) above 200k tokens each before the storage question was cut into pieces; this lane landed the first piece (front2/rows.rs) only",
+ "cause": "World answers borrow for the world's lifetime from tables that are plain HashMap/Vec owned by &mut-made structs",
+ "whys": "the round design made every growth happen between rounds, so nothing needed stable addresses",
+ "class": "a borrowed answer over a growable table",
+ "prevention": "front2/rows.rs Rows<K, V> (AppendVec rows, index-only map, insert through &self, safe code) for the seven answer maps of Store; the rest listed in lane VD's report",
+ "annoyance": "the runner has no wait command; a backgrounded ask needs an until-loop watcher to wake the lane",
+ "workaround": "a single background until-grep on the ask's output file",
+ "state": "open"
+}

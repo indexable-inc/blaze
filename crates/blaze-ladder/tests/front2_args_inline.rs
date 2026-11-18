@@ -171,7 +171,7 @@ fn the_mark_survives_the_head_record() {
         let found = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global()).unwrap_or_else(|e| panic!("`{n}`: {e}"));
         let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
         store.ensure(&names, &mut front.keys, Want::Adt(k)).unwrap_or_else(|e| panic!("`{n}`'s head: {e:?}"));
-        let head = from_store(&store, HeadAt::Adt(k), None, None).unwrap_or_else(|e| panic!("`{n}`: {e}"));
+        let head = from_store(&store, HeadAt::Adt(k)).unwrap_or_else(|e| panic!("`{n}`: {e}"));
         let HeadRef::Adt { row, .. } = head else { panic!("`{n}` is no ADT head") };
         assert_eq!(row.args, marked, "`{n}`'s made head");
         let bytes = encode(head, store.tys.view(), Alloc::global()).unwrap_or_else(|e| panic!("`{n}`: not encoded: {e}"));

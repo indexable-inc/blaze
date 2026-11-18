@@ -51,8 +51,9 @@ pub fn tool(producers: &Producers) -> Tool {
 }
 
 /// Each kind's tool, by `Kind::index` (decision D105): the row of the producer that makes the
-/// kind ([`row_of`]) and every form, so an edit to one producer moves only the keys of its kinds
-/// and a release that leaves a producer's crates alone keeps its records. The certificate and the
+/// kind ([`row_of`]) and every form. Every row is the binary's id today (producers.rs), so any
+/// rebuilt blaze moves every kind's key; the split stays so a producer that moves into a crate
+/// whose closure is what it runs moves only its own kinds' keys. The certificate and the
 /// pointer keep [`tool`], which every producer moves. The rule set that runs (the step's and
 /// `lints-add`'s, lints.rs `lints_of`; `blaze_lint::RuleSet::id`) joins the `FileItems` tool
 /// (whether it lists lint units) and the `Lint` tool (which rules a unit's findings are of):
@@ -75,13 +76,35 @@ pub fn tools(producers: &Producers, lints: blaze_lint::RuleSet) -> [Tool; blaze_
 
 /// The producer that makes each kind of record: one exhaustive match, so a new kind is placed
 /// here or does not compile.
+///
+/// What keys each kind, and what that identity covers (rule 21: a key covers the code that made
+/// its value; rule 52). Every producing function is in this crate, so its code runs over this
+/// crate's whole dependency graph: the binary. Since 2026-11-17 every row is the binary's linker
+/// id (producers.rs), so every kind's identity covers its producer. Before, the five source rows
+/// were digests of named crates' closures (`[package.metadata.blaze] producer`: blaze-expand and
+/// blaze-proc-macro `expander`, blaze-lower `lowering`, blaze-ladder `body-checker` and
+/// `code-builder`, blaze-scope and blaze-world `names`, blaze-drive all five) plus this crate's
+/// own files alone (`producer-own`), and none covered what its kind's maker ran:
+///
+/// | kind or key | row | made by (in blaze-cli) | ran outside its row before (examples) |
+/// |---|---|---|---|
+/// | CrateScope (ModuleScope, Group: no task today, work.rs `builds`) | Names | names.rs, names/scope.rs | blaze-ladder (`native_links::table_digest` is in the record, scope.rs); blaze-world's caller code; the `sandbox` feature (a build without it refuses the expansions one with it makes) |
+/// | Expansion (no task today; kept expansions, blaze-expand `kept_key`, inside CrateScope) | Expander | macros.rs, macro_files | blaze-world, blaze-manifest; the `sandbox` feature |
+/// | BodyCheck | BodyChecker | body_types.rs, body_types/ | blaze-lint, blaze-world (verdicts to findings) |
+/// | Code (no task today); code records (blaze-ladder `ProducerId<CodeBuilder>`) | CodeBuilder | program.rs, run_parent.rs | this crate's features and profile |
+/// | Units, UnitGraph, Fetch, FileItems, Surface, Signature, ImplBucket, Test, MacroModule, Owners, Script, Links, Native (`ProducerId<Whole>`), Given, Lint | Whole | work.rs and the drive | nothing: always the binary's id |
+///
+/// The new engine's tools (engine_store.rs `tools`) are these per kind, so the same holds there.
+/// The rows stay apart, so a producer whose function moves into a crate whose closure is exactly
+/// what it runs can take a source row again (blaze-producers digests such a closure) and keep
+/// its records across a rebuilt binary; until then no row claims less than the binary.
 pub fn row_of(kind: Kind) -> Row {
     match kind {
         Kind::Expansion => Row::Expander,
         Kind::BodyCheck => Row::BodyChecker,
         Kind::CrateScope | Kind::ModuleScope | Kind::Group => Row::Names,
         Kind::Code => Row::CodeBuilder,
-        // No row of their own yet: the binary's id, so any rebuilt blaze makes them again.
+        // No row of their own: the binary's id under the whole row's name.
         // `Signature` and `ImplBucket` are the checker's, placed when a test shows their records
         // made by the body checker's code alone.
         Kind::Units
@@ -134,5 +157,27 @@ mod tests {
         );
         assert_eq!(current("f", b"BCL2rest", b"BCL2"), Ok(&b"BCL2rest"[..]));
         assert_eq!(current("f", b"BC", b"BCL2"), Ok(&b"BC"[..]), "too short to name a form: the reader refuses it");
+    }
+
+    /// Rule 21 across builds: two builds of blaze (two linker ids, one source tree) never share
+    /// a key for any kind, the old engine's tools and the new engine's alike. Before 2026-11-17
+    /// the `CrateScope` tool was the Names row, a digest of named crates' sources, which two
+    /// builds with other code elsewhere (blaze-ladder's table digest, the `sandbox` feature)
+    /// shared: this test failed there for every kind but the `Whole` ones. The control: one
+    /// build id gives one table.
+    #[test]
+    fn another_build_moves_every_kinds_key() {
+        let rules = crate::lints::Lints::NONE.rules;
+        let one = tools(&crate::producers::table(b"one build"), rules);
+        let other = tools(&crate::producers::table(b"another build"), rules);
+        for kind in Kind::ALL {
+            assert_ne!(one[kind.index()], other[kind.index()], "{kind:?} keeps its tool across builds");
+        }
+        let (new_one, new_other) = (crate::engine_store::tools(&one), crate::engine_store::tools(&other));
+        for kind in Kind::ALL {
+            assert_ne!(new_one.0[kind.index()], new_other.0[kind.index()], "{kind:?} keeps its engine tool across builds");
+        }
+        assert_eq!(tools(&crate::producers::table(b"one build"), rules), one, "the control: one build, one table");
+        std::println!("home: another build moves all {} kinds' tools", Kind::ALL.len());
     }
 }

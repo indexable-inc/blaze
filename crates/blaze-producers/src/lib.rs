@@ -2,8 +2,17 @@
 //! the sans-IO core the entry's build step drives. Given the workspace's manifests, lock,
 //! toolchain file and source files AS VALUES (bytes the driver read), it finds each producer's
 //! crates from the manifests (the crates whose `[package.metadata.blaze] producer` names it,
-//! and every workspace crate they depend on, transitively, by normal and build dependencies;
-//! `producer-own` adds a crate's own files alone) and digests each row: never a hand-kept list.
+//! and every workspace crate they depend on, transitively, by normal and build dependencies)
+//! and digests each row: never a hand-kept list.
+//!
+//! A row is sound only when the producing function lives in a crate that names the row: then
+//! every line it can run is in that crate's closure, and a change anywhere in it moves the row
+//! (rule 21). A crate's own files without its closure (the `producer-own` list, until
+//! 2026-11-17) is refused by name ([`Refused::OwnFilesOnly`]): its function calls into crates
+//! the row left out, so two builds wrote different bytes under one key. No binary keys a record
+//! by these rows today: every producing function is in blaze-cli, whose closure is the binary,
+//! so the entry keys every row by the binary's linker id (blaze-cli `producers.rs`, `home.rs`
+//! `row_of` has the table). The walk is for a producer whose function moves into its own crate.
 //!
 //! The walk is a state machine (rule 14): [`Walk::next`] says what it needs ([`Step::Read`] a
 //! file, [`Step::List`] a directory, both by path relative to the workspace root), the driver
@@ -135,7 +144,10 @@ pub enum Refused<'a> {
     Escapes { path: Text<'a>, dep: Text<'a> },
     /// A `producer` list naming no source row.
     UnknownRow { path: Text<'a>, name: Text<'a> },
-    /// No crate names this row as its `producer` or `producer-own`.
+    /// A `producer-own` list: a crate's own files without its closure, less than its producing
+    /// function runs (rule 21).
+    OwnFilesOnly { path: Text<'a> },
+    /// No crate names this row as its `producer`.
     NoRoot { row: Row },
     /// A `x.workspace = true` with no `[workspace.dependencies] x`.
     NoWorkspaceDep { path: Text<'a>, key: Text<'a> },
@@ -162,11 +174,11 @@ impl fmt::Display for Refused<'_> {
                 f,
                 "{path}: `[package.metadata.blaze]` names producer `{name}`, which is no source row (expander, lowering, body-checker, names, code-builder)"
             ),
-            Refused::NoRoot { row } => write!(
+            Refused::OwnFilesOnly { path } => write!(
                 f,
-                "no crate's `[package.metadata.blaze] producer` or `producer-own` names `{}`",
-                row.name()
+                "{path}: `[package.metadata.blaze] producer-own` digests a crate's own files without the crates its code calls, so a key would miss code that makes its value (rule 21): name the row in `producer`, which covers the whole closure"
             ),
+            Refused::NoRoot { row } => write!(f, "no crate's `[package.metadata.blaze] producer` names `{}`", row.name()),
             Refused::NoWorkspaceDep { path, key } => {
                 write!(f, "{path}: `{key}.workspace = true` with no `[workspace.dependencies] {key}`")
             }
@@ -194,6 +206,7 @@ impl Refused<'_> {
             | Refused::Shape { path, .. }
             | Refused::Escapes { path, .. }
             | Refused::UnknownRow { path, .. }
+            | Refused::OwnFilesOnly { path }
             | Refused::NoWorkspaceDep { path, .. } => Some(path.as_str()),
             Refused::NoRoot { .. } | Refused::NotLocked { .. } | Refused::NoPathCrate { .. } | Refused::Unasked { .. } => None,
         }
@@ -205,7 +218,6 @@ struct Crate<'a> {
     dir: Text<'a>,
     name: Text<'a>,
     producer: u8,
-    own: u8,
     /// Each dependency, and whether it is `optional = true`.
     deps: Vec<(Dep<'a>, bool), Alloc<'a>>,
     /// Its files' (path, digest), filled in the files phase.
@@ -214,8 +226,8 @@ struct Crate<'a> {
 
 /// What one row covers, fixed once every manifest is read.
 struct Plan<'a> {
-    /// Crate indices, sorted by directory: the closure, then (marked `false`) the own-only.
-    crates: Vec<(usize, bool), Alloc<'a>>,
+    /// Crate indices of the closure, sorted by directory.
+    crates: Vec<usize, Alloc<'a>>,
     /// Indices into the root's `[workspace.dependencies]`, sorted, each once.
     ws: Vec<usize, Alloc<'a>>,
     /// The lock rows reached (indices into the sorted lock), ascending.
@@ -368,7 +380,6 @@ impl<'a> Walk<'a> {
                 let krate = &mut self.crates[at];
                 krate.name = member.name;
                 krate.producer = member.producer;
-                krate.own = member.own;
                 krate.deps = member.deps;
                 for dir in reach.iter() {
                     self.want_crate(dir.as_str());
@@ -469,8 +480,8 @@ impl<'a> Walk<'a> {
             }
             let mut hasher = Hasher::new(ROW_DOMAIN);
             hasher.part(row.name().as_bytes());
-            for &(krate, closure) in plan.crates.iter() {
-                hasher.part(if closure { b"crate" } else { b"own" }).id(&crate_ids[krate]);
+            for &krate in plan.crates.iter() {
+                hasher.part(b"crate").id(&crate_ids[krate]);
             }
             for &ws in plan.ws.iter() {
                 hasher.part(root.deps[ws].key.as_bytes()).id(&root.deps[ws].digest);
@@ -511,7 +522,6 @@ impl<'a> Walk<'a> {
             dir: text(dir, alloc),
             name: Text::new_in(alloc),
             producer: 0,
-            own: 0,
             deps: Vec::new_in(alloc),
             files: Vec::new_in(alloc),
         });
@@ -532,18 +542,14 @@ impl<'a> Walk<'a> {
             let bit = 1u8 << row.index();
             let mut seen = Vec::new_in(alloc);
             seen.resize(self.crates.len(), false);
-            let mut own_only = Vec::new_in(alloc);
-            own_only.resize(self.crates.len(), false);
             let mut work: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
             for (at, krate) in self.crates.iter().enumerate() {
                 if krate.producer & bit != 0 {
                     seen[at] = true;
                     work.push(at);
-                } else if krate.own & bit != 0 {
-                    own_only[at] = true;
                 }
             }
-            if work.is_empty() && !own_only.iter().any(|&o| o) {
+            if work.is_empty() {
                 return Err(Refused::NoRoot { row });
             }
             let mut ws = Vec::new_in(alloc);
@@ -636,12 +642,12 @@ impl<'a> Walk<'a> {
             }
             let mut crates = Vec::new_in(alloc);
             for at in 0..self.crates.len() {
-                if seen[at] || own_only[at] {
+                if seen[at] {
                     digested[at] = true;
-                    crates.push((at, seen[at]));
+                    crates.push(at);
                 }
             }
-            crates.sort_unstable_by(|a, b| self.crates[a.0].dir.as_str().cmp(self.crates[b.0].dir.as_str()));
+            crates.sort_unstable_by(|&a, &b| self.crates[a].dir.as_str().cmp(self.crates[b].dir.as_str()));
             ws.sort_unstable();
             ws.dedup();
             let mut locked = Vec::new_in(alloc);

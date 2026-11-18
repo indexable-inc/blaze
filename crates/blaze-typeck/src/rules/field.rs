@@ -59,7 +59,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
         for (i, step) in steps.iter().enumerate() {
             let found = match self.view(step.ty) {
                 TyView::Tuple(l) if name.is_none() => {
-                    if index < self.ty.list_len(l) { Some((self.ty.list_get(l, index), 0, index)) } else { None }
+                    if index < self.ty.list_len(l) { Some((self.ty.list_get(l, index), 0, index, false)) } else { None }
                 }
                 TyView::Adt(k, args) => {
                     let Some(adt) = self.field_adt(k)? else { continue };
@@ -72,7 +72,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                         match fields.iter().position(|fl| fl.name == want) {
                             Some(at) => {
                                 let ty = self.lower(adt.types, fields[at].ty, Lower::Args(args), Cause::Expr(e))?;
-                                Some((ty, 0, at as u32))
+                                Some((ty, 0, at as u32, adt.kind == AdtKind::Union))
                             }
                             None => None,
                         }
@@ -80,9 +80,14 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 }
                 _ => None,
             };
-            if let Some((ty, variant, at)) = found {
+            if let Some((ty, variant, at, union_)) = found {
                 self.adjust_autoderef(base, &steps, i);
                 self.fields.push((e, variant, at));
+                if union_ {
+                    // Read by the unsafety pass (rules/unsafety.rs): a union's field read is
+                    // `unsafe`, its write is not. Pushed in walk order, sorted there.
+                    self.union_fields.push(e);
+                }
                 return Ok(Flow::Done(ty));
             }
         }

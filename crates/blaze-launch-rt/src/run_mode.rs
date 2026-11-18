@@ -171,6 +171,45 @@ pub enum Plant {
     StoreBeforeRegister,
 }
 
+/// A C name as an error keeps it: its first [`CName::MOST`] bytes, cut at a character, and
+/// whether it was cut. An error is `Copy` and outlives the record whose bytes name it, so it
+/// holds the bytes, not a borrow; [`CName::NONE`] where the record keeps no name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CName {
+    bytes: [u8; CName::MOST],
+    len: u8,
+    cut: bool,
+}
+
+impl CName {
+    /// The most bytes of a name an error keeps: every C name a std program binds is shorter.
+    pub const MOST: usize = 96;
+    /// No name: the record keeps none for the symbol.
+    pub const NONE: CName = CName { bytes: [0; CName::MOST], len: 0, cut: false };
+
+    /// `name`'s first [`CName::MOST`] bytes, cut back to a character boundary.
+    pub fn new(name: &str) -> CName {
+        let mut len = name.len().min(CName::MOST);
+        while !name.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut bytes = [0u8; CName::MOST];
+        bytes[..len].copy_from_slice(&name.as_bytes()[..len]);
+        CName { bytes, len: len as u8, cut: len < name.len() }
+    }
+}
+
+impl fmt::Display for CName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.len == 0 && !self.cut {
+            return f.write_str("(unnamed)");
+        }
+        // The bytes are a prefix of a `&str` cut at a character boundary (`CName::new`).
+        let text = core::str::from_utf8(&self.bytes[..usize::from(self.len)]).map_err(|_| fmt::Error)?;
+        write!(f, "`{text}{}`", if self.cut { "..." } else { "" })
+    }
+}
+
 /// A C name bound for a run: the word a site loads, and the address it holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Outside {
@@ -213,17 +252,38 @@ pub trait Memory {
     fn reserve_hot(&mut self, len: usize, align: usize) -> Result<u64, RunModeError>;
     /// One step of a publication (code_unwind's order).
     fn carry(&mut self, step: Step, placing: &Placing<'_>) -> Result<(), RunModeError>;
+    /// `len` bytes on `align` of the run's writable data area, every byte zero: read-write in
+    /// the run view, for the statics the program writes (`static mut`, interior mutability).
+    /// No code is placed there and no site reaches it by `adrp`: code finds a static by its
+    /// word, so the area may lie anywhere.
+    fn reserve_data(&mut self, len: usize, align: usize) -> Result<u64, RunModeError>;
     /// The address of static number `index`'s word: what a load of the static's address reads.
     fn static_word(&self, index: u32) -> u64;
-    /// Copies static number `index`'s filled `bytes` to `at` (room [`Memory::reserve`] gave),
-    /// then stores `at` in its word: nothing names the static before both hold.
-    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8]) -> Result<(), RunModeError>;
+    /// Copies static number `index`'s filled `bytes` to `at` (room [`Memory::reserve`] gave for
+    /// [`Room::Code`], [`Memory::reserve_data`] for [`Room::Data`]), then stores `at` in its
+    /// word: nothing names the static before both hold.
+    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8], room: Room) -> Result<(), RunModeError>;
     /// Makes the run's one pthread key with the function at `ender` (the ender's entry thunk)
     /// as its destructor: the key and the descriptor's `root` word (run_mode/thread_locals.rs).
     fn thread_key(&mut self, ender: u64) -> Result<ThreadKey, RunModeError>;
     /// Copies `bytes` to `at`, inside room [`Memory::reserve`] gave, before any record naming
     /// them is published: a thread-local's row, the descriptor's count, an index word.
     fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), RunModeError>;
+    /// Told after each publication: what now lies at `row.at`, for the crash report
+    /// (run_mode/fault_report.rs). The native memory keeps it; a simulation has no crash to
+    /// report, and its memory keeps nothing (the one method with a body here: an observer).
+    fn note(&mut self, row: fault_report::Row) {
+        let _ = row;
+    }
+}
+
+/// Where a static's datum lies (blaze-code datum.rs `Place`): never written, in the code area
+/// (read-only in the run view, written once through the write view); written by the program,
+/// in the writable data area.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Room {
+    Code,
+    Data,
 }
 
 /// Why the run mode stopped, naming the thing.
@@ -271,12 +331,19 @@ pub enum RunModeError {
     /// The record could not be placed.
     Place { record: RecordId, why: PlaceError },
     /// A C name the record calls or reads: unnamed in the record, too long, or not in this
-    /// process.
-    Outside { symbol: CodeSymbol, why: &'static str },
+    /// process. `name` is the C name as far as the record gave it ([`CName`]): the words name
+    /// it, so a stop at `_tlv_atexit` says `_tlv_atexit`, not a hash.
+    Outside { symbol: CodeSymbol, name: CName, why: &'static str },
     /// More C names than [`MOST_OUTSIDE`].
     OutsideFull,
     /// The code area has no room for `want` more bytes.
     AreaFull { want: u64, left: u64 },
+    /// The writable data area could not be mapped (`mmap`'s `errno`).
+    DataMap { errno: i32 },
+    /// The writable data area has no room for a static of `want` bytes.
+    DataFull { want: u64, left: u64 },
+    /// A writable static's `len` bytes at `at` are outside the room the data area gave.
+    DataPast { at: u64, len: u64 },
     /// A call of the system failed.
     Sys(crate::sys::SysError),
     /// The launcher's own code cannot reach what it must.
@@ -351,7 +418,7 @@ impl fmt::Display for RunModeError {
             RunModeError::NotBuilt { what } => write!(f, "the launcher's run mode does not do this yet: {what}"),
             RunModeError::Target { record, space, symbol } => write!(
                 f,
-                "record {} names {space:?} {symbol} where the run mode binds no such target: functions, C names, statics and a load of a thread-local's index are bound; a call of a static or a thread-local, a vtable, and a thread-local's address in a static's value are not (run.md, \"Statics in the run\")",
+                "record {} names {space:?} {symbol} where the run mode binds no such target: functions, C names, statics, vtables and a load of a thread-local's index are bound; a call of a static, a vtable or a thread-local, and a thread-local's address in a static's value are not (run.md, \"Statics in the run\")",
                 Short(&record.0)
             ),
             RunModeError::StaticNotTold { record, symbol } => write!(
@@ -378,10 +445,17 @@ impl fmt::Display for RunModeError {
             RunModeError::Unwind { record, why } => write!(f, "record {}: {why}", Short(&record.0)),
             RunModeError::Eh { record, why } => write!(f, "record {}: {why}", Short(&record.0)),
             RunModeError::Place { record, why } => write!(f, "record {}: {why}", Short(&record.0)),
-            RunModeError::Outside { symbol, why } => write!(f, "the C name of symbol {symbol}: {why}"),
+            RunModeError::Outside { symbol, name, why } => write!(f, "the C name {name} (symbol {symbol}): {why}"),
             RunModeError::OutsideFull => write!(f, "the program binds more than {MOST_OUTSIDE} C names"),
             RunModeError::AreaFull { want, left } => {
                 write!(f, "the code area has {left} bytes left and a record needs {want} (the run's reservation, run.md \"Slot table\")")
+            }
+            RunModeError::DataMap { errno } => write!(f, "the run's writable data area ({DATA_BYTES} bytes) could not be mapped: errno {errno}"),
+            RunModeError::DataFull { want, left } => {
+                write!(f, "the run's writable data area has {left} bytes left and a static the program writes needs {want}")
+            }
+            RunModeError::DataPast { at, len } => {
+                write!(f, "a writable static's {len} bytes at {at:#x} are outside the room the run's data area gave")
             }
             RunModeError::Sys(why) => write!(f, "{why}"),
             RunModeError::Reach(why) => write!(f, "{why}"),
@@ -805,28 +879,27 @@ impl<'a> RunMode<'a> {
     /// each is filled against the run's words and published ([`Memory::publish_static`]: the
     /// bytes, then the word).
     pub fn place_statics(&mut self, source: &impl RecordSource, memory: &mut impl Memory) -> Result<(), RunModeError> {
-        let mut rows: AVec<'_, (CodeSymbol, RecordId, DatumView<'_>, StaticAt)> = Vec::with_capacity_in(self.told.len(), self.alloc);
+        let mut rows: AVec<'_, (CodeSymbol, RecordId, DatumView<'_>, StaticAt, Room)> = Vec::with_capacity_in(self.told.len(), self.alloc);
         for i in 0..self.told.len() {
             let (symbol, record) = self.told[i];
             let view = DatumView::read(source.bytes(record)?).map_err(|why| RunModeError::Datum { record, why })?;
-            match view.place() {
-                DatumPlace::ReadOnly => {}
-                DatumPlace::Writable | DatumPlace::Zeroed { .. } => {
-                    return Err(RunModeError::NotBuilt { what: "a writable or zeroed static (run.md, \"Statics in the run\", step 3)" });
-                }
-            }
             let index = u32::try_from(self.statics.len()).ok().filter(|&n| n < MOST_STATICS).ok_or(RunModeError::StaticsFull)?;
             // `DatumView::read` checked the length fits a u32, and the alignment a page.
-            let at = memory.reserve(view.len() as usize, view.align() as usize)?;
+            let (len, align) = (view.len() as usize, view.align() as usize);
+            let (at, room) = match view.place() {
+                DatumPlace::ReadOnly => (memory.reserve(len, align)?, Room::Code),
+                // A zeroed datum keeps no bytes: its room is zero as reserved.
+                DatumPlace::Writable | DatumPlace::Zeroed { .. } => (memory.reserve_data(len, align)?, Room::Data),
+            };
             let row = StaticAt { index, at, len: view.len(), align: view.align() };
             match self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
                 Ok(_) => return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) }),
                 Err(pos) => self.statics.insert_shift(pos, (symbol, row)),
             }
-            rows.push((symbol, record, view, row));
+            rows.push((symbol, record, view, row, room));
         }
         self.told.clear();
-        for &(symbol, record, view, row) in rows.iter() {
+        for &(symbol, record, view, row, room) in rows.iter() {
             let mut bytes: AVec<'_, u8> = Vec::from_elem_in(0, view.bytes().len(), self.alloc);
             {
                 let mut binder = Binder {
@@ -844,7 +917,12 @@ impl<'a> RunMode<'a> {
                 }
                 filled.map_err(|why| RunModeError::Fill { record, why })?;
             }
-            memory.publish_static(row.index, row.at, &bytes[..])?;
+            memory.publish_static(row.index, row.at, &bytes[..], room)?;
+            let kind = match room {
+                Room::Code => fault_report::Kind::ReadOnlyDatum,
+                Room::Data => fault_report::Kind::WritableDatum,
+            };
+            memory.note(fault_report::Row::new(kind, row.at, u64::from(row.len), symbol, record));
         }
         Ok(())
     }
@@ -919,6 +997,10 @@ impl<'a> RunMode<'a> {
         if let Some(why) = publication.failed {
             return Err(why);
         }
+        memory.note(fault_report::Row::new(fault_report::Kind::Code, code_at, code.len() as u64, symbol, record));
+        if !relro.is_empty() {
+            memory.note(fault_report::Row::new(fault_report::Kind::Relro, relro_at, relro.len() as u64, symbol, record));
+        }
         Ok(())
     }
 }
@@ -949,7 +1031,7 @@ impl<M: Memory> Binder<'_, '_, M> {
 
     fn outside(&mut self, symbol: CodeSymbol) -> Result<Outside, RunModeError> {
         let Some(name) = self.names.and_then(|view| view.name(symbol)) else {
-            return Err(RunModeError::Outside { symbol, why: "the record keeps no name for it" });
+            return Err(RunModeError::Outside { symbol, name: CName::NONE, why: "the record keeps no name for it" });
         };
         self.memory.outside(symbol, name)
     }
@@ -979,8 +1061,9 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
                 false => self.memory.address_word(slot),
             }),
             Space::Outside => self.outside(target.symbol).map(|it| it.word),
-            // A load of the static's address reads its word; nothing calls a static.
-            Space::Static if !call => self.static_at(target.symbol).map(|it| self.memory.static_word(it.index)),
+            // A load of the static's address reads its word; nothing calls a static. A vtable is
+            // a datum the parent sent as a static's (code_records.rs `VtableDatum`), bound alike.
+            Space::Static | Space::Vtable if !call => self.static_at(target.symbol).map(|it| self.memory.static_word(it.index)),
             // A load of a thread-local's index reads a word holding it (run_mode/thread_locals.rs).
             Space::Tls if !call => {
                 let template = self.static_at(target.symbol);
@@ -998,8 +1081,9 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
         let found = match target.space {
             Space::Func => self.func(target.symbol).map(|slot| self.memory.thunk(slot)),
             Space::Outside => self.outside(target.symbol).map(|it| it.value),
-            Space::Static => self.static_at(target.symbol).map(|it| it.at),
-            Space::Vtable | Space::Tls => {
+            // A vtable's first word (a supertrait's table, in a vtable's datum) is its datum's.
+            Space::Static | Space::Vtable => self.static_at(target.symbol).map(|it| it.at),
+            Space::Tls => {
                 Err(RunModeError::Target { record: self.record, space: target.space, symbol: target.symbol })
             }
         };
@@ -1240,6 +1324,26 @@ struct NativeMemory<'a> {
     /// The run's unwind registry's one writer (run_mode/personality.rs `run_registry`): every
     /// placed record's entry is added through it at its publication's Register step.
     unwind: crate::unwind_reg::Writer<'static>,
+    /// The writable data area ([`Memory::reserve_data`]): [`DATA_BYTES`] at `data_base`.
+    data_base: u64,
+    /// The next free byte of the data area, from its base.
+    data_next: usize,
+}
+
+/// The writable data area's length: address space only, each page backed by the kernel on its
+/// first touch (an anonymous private mapping), so its size costs nothing until used.
+const DATA_BYTES: usize = 1 << 30;
+
+/// Maps the writable data area: read-write, zero, never executable, never unmapped (a static
+/// lives as long as the process).
+fn map_data() -> Result<u64, RunModeError> {
+    // SAFETY: a fresh anonymous private mapping at an address the kernel picks: nothing else
+    // is there, and no Rust object is aliased by it.
+    let at = unsafe { libc::mmap(core::ptr::null_mut(), DATA_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+    match at == libc::MAP_FAILED {
+        true => Err(RunModeError::DataMap { errno: errno() }),
+        false => Ok(at as u64),
+    }
 }
 
 impl<'a> NativeMemory<'a> {
@@ -1263,7 +1367,25 @@ impl<'a> NativeMemory<'a> {
         code.write(layout.stubs, &crate::arch::stub_head(context, entry)).map_err(RunModeError::Sys)?;
         let next = layout.area;
         let hot_next = layout.hot;
-        Ok(NativeMemory { code, layout, base: base as u64, next, hot_next, outside: Vec::new_in(alloc), shared, unwind })
+        let at = |offset: usize| (base + offset) as u64;
+        let regions = fault_report::Regions {
+            edges: [
+                at(layout.words),
+                at(layout.address_words),
+                at(layout.outside),
+                at(layout.statics),
+                at(layout.stubs),
+                at(layout.thunks),
+                at(layout.area),
+                at(layout.hot),
+                at(layout.whole),
+            ],
+        };
+        // SAFETY: once a process, here, on the control thread, before the entry's stub is
+        // written and so before any program code runs.
+        unsafe { fault_report::install(regions) }?;
+        let data_base = map_data()?;
+        Ok(NativeMemory { code, layout, base: base as u64, next, hot_next, outside: Vec::new_in(alloc), shared, unwind, data_base, data_next: 0 })
     }
 
     fn at(&self, offset: usize) -> u64 {
@@ -1316,13 +1438,13 @@ impl Memory for NativeMemory<'_> {
                 }
                 let mut cname = [0u8; 512];
                 if name.len() >= cname.len() || name.as_bytes().contains(&0) {
-                    return Err(RunModeError::Outside { symbol, why: "its name is longer than 511 bytes or holds a NUL" });
+                    return Err(RunModeError::Outside { symbol, name: CName::new(name), why: "its name is longer than 511 bytes or holds a NUL" });
                 }
                 cname[..name.len()].copy_from_slice(name.as_bytes());
                 // SAFETY: a lookup, by a NUL-terminated name, among the images this process loaded.
                 let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr().cast()) };
                 if address.is_null() {
-                    return Err(RunModeError::Outside { symbol, why: "no image of this process defines it (`dlsym`)" });
+                    return Err(RunModeError::Outside { symbol, name: CName::new(name), why: "no image of this process defines it (`dlsym`)" });
                 }
                 self.code.store(self.layout.outside + count as usize * 8, address as u64).map_err(RunModeError::Sys)?;
                 self.outside.insert_shift(at, (symbol, count));
@@ -1386,13 +1508,36 @@ impl Memory for NativeMemory<'_> {
         self.at(self.layout.statics + index as usize * 8)
     }
 
-    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8]) -> Result<(), RunModeError> {
+    fn reserve_data(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
+        let at = self.data_next.next_multiple_of(align);
+        let end = at + len;
+        if end > DATA_BYTES {
+            return Err(RunModeError::DataFull { want: len as u64, left: (DATA_BYTES - self.data_next) as u64 });
+        }
+        self.data_next = end;
+        Ok(self.data_base + at as u64)
+    }
+
+    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8], room: Room) -> Result<(), RunModeError> {
         if index >= MOST_STATICS {
             return Err(RunModeError::StaticsFull);
         }
-        // The bytes through the write view (the area is read-only in the run view, as a relro
-        // part is), then the word: a load of the address finds the bytes.
-        self.code.copy(self.offset(at), bytes).map_err(RunModeError::Sys)?;
+        match room {
+            // Through the write view (the area is read-only in the run view, as a relro part
+            // is).
+            Room::Code => self.code.copy(self.offset(at), bytes).map_err(RunModeError::Sys)?,
+            Room::Data => {
+                let inside = at.checked_sub(self.data_base).and_then(|off| off.checked_add(bytes.len() as u64)).is_some_and(|end| end <= self.data_next as u64);
+                if !inside {
+                    return Err(RunModeError::DataPast { at, len: bytes.len() as u64 });
+                }
+                // SAFETY: `at..at + bytes.len()` lies in room `reserve_data` gave (checked
+                // above) of the data mapping, read-write and never unmapped; no program code
+                // can name it yet (its word is stored below), so nothing reads it meanwhile.
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+            }
+        }
+        // Then the word: a load of the address finds the bytes.
         self.code.store(self.layout.statics + index as usize * 8, at).map_err(RunModeError::Sys)?;
         Ok(())
     }
@@ -1404,6 +1549,10 @@ impl Memory for NativeMemory<'_> {
     fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), RunModeError> {
         // Through the write view: the area is read-only in the run view.
         self.code.copy(self.offset(at), bytes).map_err(RunModeError::Sys)
+    }
+
+    fn note(&mut self, row: fault_report::Row) {
+        fault_report::note(row);
     }
 }
 
@@ -1776,6 +1925,7 @@ impl fmt::Display for WhyText {
     }
 }
 
+pub mod fault_report;
 mod native;
 mod personality;
 mod thread_locals;

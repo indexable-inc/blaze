@@ -77,7 +77,14 @@ pub struct Spent {
     pub steps: u64,
     pub stopped: u64,
     pub stopped_ns: u64,
+    /// Rounds that ended in a need (each one round more), by the kind of the first hole the
+    /// round met (blaze-typeck `QUESTION_KINDS`; the one need that is not speculative).
+    pub again_for: [u64; QUESTION_KINDS.len()],
+    /// Every hole of those rounds, by kind (speculative ones included).
+    pub holes: [u64; QUESTION_KINDS.len()],
 }
+
+use blaze_typeck::QUESTION_KINDS;
 
 impl Spent {
     /// What was spent after `before`.
@@ -94,6 +101,10 @@ impl Spent {
         out.steps = self.steps - before.steps;
         out.stopped = self.stopped - before.stopped;
         out.stopped_ns = self.stopped_ns - before.stopped_ns;
+        for i in 0..QUESTION_KINDS.len() {
+            out.again_for[i] = self.again_for[i] - before.again_for[i];
+            out.holes[i] = self.holes[i] - before.holes[i];
+        }
         out
     }
 
@@ -110,6 +121,10 @@ impl Spent {
         self.steps += other.steps;
         self.stopped += other.stopped;
         self.stopped_ns += other.stopped_ns;
+        for i in 0..QUESTION_KINDS.len() {
+            self.again_for[i] += other.again_for[i];
+            self.holes[i] += other.holes[i];
+        }
     }
 }
 
@@ -213,6 +228,18 @@ impl<'g> Cost<'g> {
         let mut spent = self.spent.get();
         spent.solve.add(solve);
         spent.rounds += 1;
+        self.spent.set(spent);
+    }
+
+    /// A check round ended in `needs`: one round more, for its first hole.
+    pub fn again(&self, needs: &blaze_typeck::Needs<'_>) {
+        let mut spent = self.spent.get();
+        if let Some(first) = needs.first {
+            spent.again_for[blaze_typeck::question_kind(first)] += 1;
+        }
+        for &q in needs.missing.iter() {
+            spent.holes[blaze_typeck::question_kind(q)] += 1;
+        }
         self.spent.set(spent);
     }
 

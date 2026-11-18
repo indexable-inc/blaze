@@ -194,6 +194,20 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
         mode: TypingMode,
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<(), Stop> {
+        self.select_from(solver, tys, &mut crate::facts::Stopping(facts), mode, reads)
+    }
+
+    /// [`Fulfill::select`] over a source that fills a missing fact where a goal meets it
+    /// (`Solver::evaluate_from`): no pass stops for a fact, so no obligation is registered
+    /// again for one.
+    pub fn select_from<T: Tys, Src: crate::facts::Source<T>>(
+        &mut self,
+        solver: &mut Solver<'a>,
+        tys: &mut T,
+        src: &mut Src,
+        mode: TypingMode,
+        reads: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<(), Stop> {
         for _ in 0..MAX_PASSES {
             if S::WAKE {
                 self.wake(&*tys);
@@ -217,7 +231,7 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
                 let g = self.goal[ob as usize];
                 self.evaluations += 1;
                 self.stamp[ob as usize] += 1;
-                let a = solver.evaluate(tys, facts, mode, g, reads)?;
+                let a = solver.evaluate_from(tys, src, mode, g, reads)?;
                 self.state[ob as usize] = match a {
                     Answer::Yes => State::Holds,
                     Answer::No => State::Fails,

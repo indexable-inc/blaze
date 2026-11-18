@@ -315,7 +315,7 @@ pub(crate) fn held_refused<'f>(name: Name) -> Did<'f> {
 /// place where it is: the graph's record is handed to its task's record on the heap (graph.rs
 /// `hand_graph`), so the list and trailer are appended there, never to an empty built payload
 /// beside it. Returns the record's out.
-fn seal_graph<A: Allocator + Copy>(record: &mut Record<A>, list: &[u8]) -> ContentId {
+pub(crate) fn seal_graph<A: Allocator + Copy>(record: &mut Record<A>, list: &[u8]) -> ContentId {
     match &mut record.handed {
         Some(payload) => crate::graph_payload::seal(payload, list),
         None => crate::graph_payload::seal(&mut record.payload, list),
@@ -2026,7 +2026,7 @@ pub(crate) fn body_payload(bytes: &[u8]) -> Result<BodyPayload<'_>, BodyPayloadE
 
 /// Whether `item` is a body's own entry: a `fn`, `const` or `static` with a body, under none:
 /// an item written inside a body is parsed with it, never twice. Its body range, entry-relative.
-fn checked_body(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item) -> Option<blaze_surface::Range> {
+pub(crate) fn checked_body(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item) -> Option<blaze_surface::Range> {
     let holds = |kind: ItemKind| matches!(kind, ItemKind::Function | ItemKind::Const | ItemKind::Static);
     if !holds(item.kind()) {
         return None;
@@ -2098,7 +2098,7 @@ pub(crate) fn expansion_entry(outline: &blaze_file_items::Outline<'_>, item: &bl
 
 /// A body's name: its file's subject and its entry's chain up to the file (each kind, name as
 /// written and disambiguator), so it stands while other items move and its own text changes.
-fn body_name(file: Name, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> Name {
+pub(crate) fn body_name(file: Name, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> Name {
     let mut h = blaze_ids::Hasher::new(BODY_DOMAIN);
     h.update(&file.subject.0);
     let mut at = Some(item);

@@ -212,6 +212,7 @@ pub(crate) fn run_own<F: Front>(
         None => None,
         Some(Ok(view)) => Some(view.under(today.certificate)),
         Some(Err(why)) => {
+            run_parent::Resolve::watch(&lazy).see(blaze_screen::Step::Says);
             err.line(cx, format_args!("blaze run: {why}; the program starts without it, and this run's list replaces it at exit")).map_err(OwnError::Out)?;
             None
         }

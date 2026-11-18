@@ -45,6 +45,10 @@ pub enum HeadClass {
     NeedMade,
     KeyClash,
     Item { why: WhyClass, at: Option<(u32, u32)> },
+    /// A need's frozen head was not filed (heads.rs `HeadError::Seed`).
+    Seed,
+    /// A frozen head's record could not be filed (heads.rs `HeadError::Filed`).
+    Filed(&'static str),
 }
 
 /// A [`Why`] by its variant (the boxed words stay with the error; the variant and the range
@@ -80,6 +84,8 @@ impl HeadClass {
             HeadError::Cycle(_) => HeadClass::Cycle,
             HeadError::NeedMade { .. } => HeadClass::NeedMade,
             HeadError::Key(_) => HeadClass::KeyClash,
+            HeadError::Seed { .. } => HeadClass::Seed,
+            HeadError::Filed { what, .. } => HeadClass::Filed(what),
             HeadError::Item(_, why) => {
                 let (why, at) = match why {
                     Why::Need(_) => (WhyClass::Need, None),

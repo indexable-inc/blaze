@@ -29,6 +29,9 @@ use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
 use blaze_ladder::front2::tables::cost::{Cost, Gauge, PARTS, Spent};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
+use blaze_ladder::front2::tables::head::{ConstValues, SeededHeads, SeededHeadsOpts, StoreConsts};
+use blaze_lower::scoped::Prepares;
+use blaze_ladder::front2::tables::seeds::{Freezing, FrozenTable, TableView};
 use blaze_ladder::front2::tables::task::{BodyFrame, Make, MakeRefused, check_body};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::Alloc;
@@ -464,12 +467,27 @@ fn parts(s: &Spent, n: u64) -> String {
         }
     }
     out.push_str(&format!(" | head steps {} stopped at a need {} ({} us)", s.steps / n, s.stopped / n, s.stopped_ns / 1000 / n));
-    out.push_str(&format!(" | rounds {} solver frames {} candidates {} cache hits {}", s.rounds / n, s.solve.stats.frames / n, s.solve.stats.candidates / n, s.solve.stats.cache_hits / n));
+    out.push_str(&format!(" | rounds {}.{:02} solver frames {} candidates {} cache hits {}", s.rounds / n, s.rounds * 100 / n % 100, s.solve.stats.frames / n, s.solve.stats.candidates / n, s.solve.stats.cache_hits / n));
+    // Each round more, by the kind of its first hole (all n bodies, not per body); then every
+    // hole of those rounds by kind.
+    let kinds = |counts: &[u64]| -> String {
+        let mut by: Vec<(u64, &str)> = counts.iter().zip(blaze_typeck::QUESTION_KINDS).filter(|(c, _)| **c > 0).map(|(c, k)| (*c, k)).collect();
+        by.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        by.iter().map(|(c, k)| format!("{k} {c}")).collect::<Vec<_>>().join(", ")
+    };
+    out.push_str(&format!(" | rounds more for (first hole): [{}] holes: [{}]", kinds(&s.again_for), kinds(&s.holes)));
     out
 }
 
+/// Run on the test's own thread and its default stack: `SeededHeads` freezes a cell's needs by
+/// an explicit, capped stack of wants (head.rs `MOST_MAKING`), not by recursion, so core's
+/// head chains no longer need the 1 GB thread this ran on before.
 #[test]
 fn the_cost_of_one_body_by_part() {
+    cost_of_one_body();
+}
+
+fn cost_of_one_body() {
     let mut said = String::new();
     macro_rules! say {
         ($($t:tt)*) => {{
@@ -477,6 +495,8 @@ fn the_cost_of_one_body_by_part() {
             println!("{line}");
             said.push_str(&line);
             said.push('\n');
+            // Kept as it is said: a crash still leaves the stages reached.
+            let _ = std::fs::write(std::env::temp_dir().join("front2_tables_cost.out"), &said);
         }};
     }
     // A line for the file only (the queue cuts a long output before a failure's text).
@@ -592,7 +612,7 @@ fn the_cost_of_one_body_by_part() {
     let mut all_reads: HashMap<ItemKey, Vec<String>> = HashMap::new();
     let start = Instant::now();
     for (key, _) in bodies.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None };
         let (before, b0, t0) = (cost.spent(), BYTES.load(Ordering::Relaxed), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let us = t0.elapsed().as_micros() as u64;
@@ -656,7 +676,7 @@ fn the_cost_of_one_body_by_part() {
     let mut differ: Vec<String> = Vec::new();
     let mut reads_differ: Vec<String> = Vec::new();
     for (key, bytes, reads) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None };
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
         if out.bytes.as_slice() != bytes.as_slice() {
@@ -676,9 +696,100 @@ fn the_cost_of_one_body_by_part() {
         }
     }
     say!("NEEDS ONE AT A TIME: {} bodies in {} ms; answers differ: {differ:?}; read lists differ (reads only with all needs met +, only one at a time -): {reads_differ:?}", kept_outs.len(), start.elapsed().as_millis());
+
+    // 4. SEEDED: the request's heads frozen ONCE (lane FJ's `SeededHeads`, each item lowered
+    //    once; counted apart), then every body's heads filed from that one READ-ONLY table:
+    //    a body lowers no head. Equal answers to the lowering task, body by body.
+    let sized = today.front.index.lang("sized");
+    let freeze_records = reader();
+    // The freeze's constant evaluator: the store path's own (check.rs `eval_len`), over the
+    // program's index and no prepared macros, as a `ProjectWorld` sets it up.
+    let const_world: &'static ProjectWorld<'static, &'static Records<'static>> =
+        Box::leak(Box::new(ProjectWorld::from_records(freeze_records, frame(), lang, g).unwrap_or_else(|e| panic!("the world did not start: {e}"))));
+    let prepared: &'static Prepares<'static> = Prepares::new_in(g);
+    let evaluator: &'static mut (dyn ConstValues<'static> + 'static) = Box::leak(Box::new(StoreConsts { names: freeze_records, index: &const_world.front.index, prepared }));
+    let start = Instant::now();
+    let freezing: &'static Freezing<'static, 'static, &'static Records<'static>> = Box::leak(Box::new(Freezing::new(
+        freeze_records,
+        SeededHeads::new(SeededHeadsOpts { names: freeze_records, sized, frame: frame(), scratch: g, alloc: g, consts: Some(evaluator) }),
+    )));
+    // A body whose heads the record form cannot carry yet (FJ's known limits) is REFUSED by
+    // type: counted with its reason, and left out of the seeded run.
+    let mut refused: HashMap<ItemKey, String> = HashMap::new();
+    for (key, _, _) in kept_outs.iter() {
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None };
+        if let Err(e) = check_body(view, &task_of(*key), &body_frame, &NameMake, shared) {
+            let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
+            note!("SEED REFUSED `{label}`: {e}");
+            refused.insert(*key, e.to_string());
+        }
+    }
+    let mut reasons: HashMap<String, usize> = HashMap::new();
+    for why in refused.values() {
+        // The reason without the body's own name and keys: the text after the last `: `.
+        *reasons.entry(why.rsplit(": ").next().unwrap_or(why).to_string()).or_default() += 1;
+    }
+    let mut reasons: Vec<(String, usize)> = reasons.into_iter().collect();
+    reasons.sort();
+    say!("SEED REFUSED {} of {} bodies (record form limits); by reason {reasons:?}", refused.len(), kept_outs.len());
+    let frozen: &'static FrozenTable<'static> = Box::leak(Box::new(FrozenTable::of(freezing, g).unwrap_or_else(|e| panic!("the frozen table: {e:?}"))));
+    // Read through the BODIES' own names, not the freezer's: one table of frozen bytes serves
+    // every reader (seeds.rs `TableView`).
+    let table: &'static TableView<'static, 'static, &'static Records<'static>> = Box::leak(Box::new(frozen.view(task_records)));
+    let (froze_lowered, reentered, attempts) = { let h = freezing.heads.borrow(); (h.lowered, h.reentered, h.attempts) };
+    say!("FREEZE ONCE: {} cells in {} ms ({} wants lowered in all, {} met up the stack, {attempts} freeze attempts)", frozen.len(), start.elapsed().as_millis(), froze_lowered, reentered);
+    let (mut seeded_sum, mut seeded_differ, mut seeded_wrong) = (Spent::default(), Vec::new(), Vec::new());
+    let mut seeded_gaps: HashMap<String, usize> = HashMap::new();
+    // The seeded bodies that answer as lowered: their cost alone, and today's (one world) for them.
+    let (mut equal_sum, mut equal_n, mut equal_us, mut lowered_us) = (Spent::default(), 0u64, 0u64, 0u64);
+    let start = Instant::now();
+    let seeded_n = (kept_outs.len() - refused.len()) as u64;
+    for (key, bytes, _) in kept_outs.iter().filter(|(k, _, _)| !refused.contains_key(k)) {
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None };
+        let (before, t0) = (cost.spent(), Instant::now());
+        let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("seeded, the body task of {key:x}: {e}"));
+        let spent = cost.spent().since(&before);
+        seeded_sum.add(&spent);
+        if out.bytes.as_slice() == bytes.as_slice() {
+            equal_sum.add(&spent);
+            equal_n += 1;
+            equal_us += t0.elapsed().as_micros() as u64;
+            lowered_us += today_us.get(key).copied().unwrap_or(0);
+        }
+        if out.bytes.as_slice() != bytes.as_slice() {
+            let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
+            if !out.done.failed {
+                // A DIFFERENT ANSWER: never allowed.
+                seeded_wrong.push(format!("`{label}`"));
+            }
+            // A refusal (a gap of the import, FJ's record form): counted by its first gap.
+            let text = String::from_utf8_lossy(&out.bytes).to_string();
+            let gap = text.split("gaps [").nth(1).map(|g| g.split(['{', '(', ']']).take(3).collect::<Vec<_>>().join("/")).unwrap_or_default();
+            *seeded_gaps.entry(gap).or_default() += 1;
+            seeded_differ.push(format!("`{label}`"));
+            note!("SEEDED DIFFER `{label}` lowered:\n{}\nseeded:\n{}", String::from_utf8_lossy(bytes), String::from_utf8_lossy(&out.bytes));
+        }
+    }
+    let total = start.elapsed();
+    say!("SEEDED {seeded_n} bodies in {} ms: {} us a body;{}", total.as_millis(), total.as_micros() as u64 / seeded_n.max(1), parts(&seeded_sum, seeded_n));
+    say!("SEEDED EQUAL {equal_n} bodies: {} us a body (today's one world: {} us a body for the same);{}", equal_us / equal_n.max(1), lowered_us / equal_n.max(1), parts(&equal_sum, equal_n));
+    let mut seeded_gaps: Vec<(String, usize)> = seeded_gaps.into_iter().collect();
+    seeded_gaps.sort();
+    say!("SEEDED answers differ from the lowering task: {} of {seeded_n} (each a refusal, by first gap {seeded_gaps:?}): {seeded_differ:?}; a different clean answer: {seeded_wrong:?}", seeded_differ.len());
+
     let out = std::env::temp_dir().join("front2_tables_cost.out");
     std::fs::write(&out, &said).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
     assert!(differ.is_empty(), "answers differ with needs met one at a time: {differ:?}");
+    // OPEN (reported): the import's gaps (FJ's record form) refuse bodies; counted above. A
+    // seeded body never answers otherwise than the lowering one.
+    // KNOWN WRONG (a ratchet: a new one fails, a fixed one must be removed here). Fixed by lane
+    // FL: `res` (`match r { Ok(v) => v, Err(()) => 0 }`), whose enum's ctors were not in its
+    // frozen record (head_tests.rs `a_seeded_store_answers_every_ctor_lookup_as_lowering`).
+    const KNOWN_WRONG: &[&str] = &[];
+    let new_wrong: Vec<&String> = seeded_wrong.iter().filter(|w| !KNOWN_WRONG.contains(&w.as_str())).collect();
+    let fixed: Vec<&&str> = KNOWN_WRONG.iter().filter(|k| !seeded_wrong.iter().any(|w| w == *k)).collect();
+    assert!(new_wrong.is_empty(), "a body seeded from the frozen table answered otherwise than lowering it: {new_wrong:?}");
+    assert!(fixed.is_empty(), "known wrong seeded answers now right: remove them from KNOWN_WRONG: {fixed:?}");
     let errors: Vec<String> = task_records.errors().iter().map(|e| e.to_string()).collect();
     say!("RECORD ERRORS: {errors:?}");
     let out = std::env::temp_dir().join("front2_tables_cost.out");

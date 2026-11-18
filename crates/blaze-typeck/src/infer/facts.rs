@@ -2,13 +2,13 @@
 //! body's own read seam, so a body's read list holds every fact its goals read.
 //!
 //! `Facts` answers from `&self` and may only say `Missing`; reading the world needs
-//! `&mut Reads`. So the adapter is a cache the context owns: the solver runs against it, a
-//! question it lacks stops the solve with `Need(question)`, and [`FactCache::fill`] reads that
-//! question through `Reads` (entering the read list, or stopping the body with typeck's own
-//! `Need`), converts the answer to the solver's portable form and keeps it; the goal is then
-//! evaluated again. Each such retry is counted ([`FactCache::retries`]): it is repeated work
-//! the cost example reports. Nothing here depends on being re-run: the cache is a function of
-//! the answers read, and a fresh run fills it the same way.
+//! `&mut Reads`. So the adapter is a cache the context owns: the solver runs against it, and a
+//! question it lacks is pulled (infer/mod.rs `Pull`): between two solver steps
+//! [`FactCache::fill`] reads that question through `Reads` (entering the read list, or
+//! stopping the body with typeck's own `Need`), converts the answer to the solver's portable
+//! form and keeps it, and the step that asked runs again. Nothing here depends on the order
+//! questions come in: the cache is a function of the answers read, and a fresh run fills it
+//! the same way.
 //!
 //! Associated types: typeck names one by its trait and name; the solver by a def. The def is
 //! [`assoc_def`]`(trait, name)`, a 128-bit hash, used for every alias, every trait's associated

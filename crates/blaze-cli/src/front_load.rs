@@ -272,7 +272,7 @@ mod tests {
     }
 
     fn scope_name(key: CrateItemKey) -> Name {
-        crate::names::name_of(key)
+        blaze_drive::key::crate_scope_name(&key)
     }
 
     /// Every answer about every item of every crate, as text: one function over both sources.

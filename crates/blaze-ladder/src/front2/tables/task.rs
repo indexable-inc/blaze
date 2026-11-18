@@ -43,10 +43,14 @@ use super::super::index::{Index, LangTwice};
 use super::super::keys::{Keys, MemberKind};
 use super::super::project::{BodyRef, BodyVerdict, ProjectWorld};
 use super::super::reads::{FactKind, ReadsError};
-use super::super::source::NamesSource;
+use super::super::by_origin::{KeyKind, kind_of_key};
+use super::super::fill::FillError;
+use super::super::source::{NamesSource, Records};
+use super::head::{FreezeError, cell_id as head_cell_id, fact_cell};
 use super::super::texts::Texts;
 use super::super::heads::NeedsMet;
 use super::cost::{Cost, Part};
+use super::seeds::{HeadSeed, SeedError};
 use super::recorder::{ReadOf, ReadSink, ReadsFull, Recorder, RecorderOpts, TableRead};
 use super::view::Tables;
 
@@ -85,12 +89,25 @@ pub struct BodyFrame<'n> {
     /// How heads' needs are met (heads.rs `NeedsMet::All` outside the equality test).
     #[doc(hidden)]
     pub needs: NeedsMet,
+    /// The request's frozen heads (seeds.rs [`FrozenTable`](super::seeds::FrozenTable), read
+    /// only and shared): every head the body needs is filed from them, none lowered. `None`:
+    /// the body's store lowers each head it needs (the path before frozen heads).
+    pub heads: Option<&'n dyn HeadSeed<'n>>,
+    /// What the body's macro calls expand with (body_host.rs `BodySources`: the owner's
+    /// environment, the expansion texts, the proc-macro runner), as `check`'s path sets them
+    /// (project.rs `set_body_sources`). `None`: each body `env!`, include and proc macro is
+    /// refused by name.
+    pub sources: Option<&'n dyn super::super::body_host::BodySources>,
 }
 
 /// Why a body task gave no result: each a fault of the plan or the engine, never of the body
 /// (a body's own failure is a [`Done`] with `failed`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TaskError {
+    /// A head the body needed could not be filed from the request's frozen heads.
+    Seed { body: Name, error: SeedError },
+    /// No head cell holds the fact of checker key `key` (head.rs `fact_cell`).
+    Cell { key: blaze_typeck::ItemKey, error: FreezeError },
     /// The task's name is not a body's (`Kind::BodyCheck` of a fn, `const` or `static` item,
     /// or a fn or `const` member).
     NotABody { name: Name },
@@ -118,6 +135,8 @@ impl core::fmt::Display for TaskError {
             TaskError::NoCrate { prefix } => write!(f, "a read names the crate {prefix:02x?}, which the tables do not hold"),
             TaskError::Make(refused) => write!(f, "no digest for the cell {:?} (front2 tables/task.rs `Make`)", refused.want),
             TaskError::Write => write!(f, "the body's result could not be written"),
+            TaskError::Seed { body, error } => write!(f, "body {body:?}: a head it needs could not be seeded: {error}"),
+            TaskError::Cell { key, error } => write!(f, "no head cell holds the body's fact of {key:?}: {error} (front2 tables/task.rs `fact_read`)"),
         }
     }
 }
@@ -130,6 +149,39 @@ pub struct BodyOut<'a> {
     pub bytes: AVec<'a, u8>,
     /// The recorder's list (sorted, each once), before it is named as cells.
     pub reads: AVec<'a, TableRead>,
+    /// The head read of each head the body's own store held after the check, with the head's
+    /// checker key (sorted): what the read-list control compares `reads` against.
+    pub held: AVec<'a, (TableRead, u128)>,
+    /// What the verdict says, as `check` prints it from today's path (front2 said.rs, the one
+    /// home of a refusal's words and cause): each type diagnostic, typed lint finding and
+    /// borrow finding with its item-relative range, then the reason a body was not checked.
+    pub said: AVec<'a, Said<'a>>,
+}
+
+/// One line of a body's verdict ([`BodyOut::said`]): `start..end` is item-relative (rule 71).
+#[derive(Debug)]
+pub struct Said<'a> {
+    pub what: SaidWhat<'a>,
+    pub start: u32,
+    pub end: u32,
+    /// The finding's words; for a body not checked, the words after `body `<name>`: `.
+    pub words: AString<'a>,
+}
+
+/// Which line a [`Said`] is.
+#[derive(Debug)]
+pub enum SaidWhat<'a> {
+    /// A type error, by its code.
+    Type { code: &'static str },
+    /// A typed lint's finding, by the lint's name (blaze-lint `Rule::from_name`).
+    Lint { lint: &'static str },
+    /// A move or borrow error, by its code.
+    Borrow { code: &'static str },
+    /// The body was not checked: refused or past a gap, grouped under `cause` (said.rs). A
+    /// failed macro call's expansion (body_types.rs `failed_calls`) is not split out yet.
+    NotChecked { cause: AString<'a> },
+    /// The borrow check was refused (not for want of clean types).
+    BorrowsNotChecked,
 }
 
 /// The body `task` names, checked over `tables` (module docs).
@@ -143,6 +195,11 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     }
     let view = tables.reading_into(&recorder);
     let body = body_of(view, name)?;
+    // The item whose head holds the body's signature: a member's is its container's.
+    let own = match body {
+        BodyRef::Member { container, .. } => container,
+        BodyRef::Free(key) => key,
+    };
     let lang_crates = view.lang_crates();
     let index = Index::from_source(view, lang_crates).map_err(TaskError::Lang)?;
     view.records().name_lang_crates(lang_crates);
@@ -150,16 +207,45 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     let mut world = ProjectWorld::over(front, frame.alloc);
     world.set_cost(frame.cost);
     world.set_needs(frame.needs);
+    world.set_seeds(frame.heads);
+    if let Some(sources) = frame.sources {
+        world.set_body_sources(sources);
+    }
     drop(setup);
     let (verdict, borrows) = world.check_borrows(body, frame.alloc);
+    if let Some(error) = world.take_seed_error() {
+        return Err(TaskError::Seed { body: name, error });
+    }
     let reading = Cost::enter(frame.cost, Part::Reads);
-    drop(world);
     let facts = verdict.facts.as_ref().map_err(|e| TaskError::Facts(*e))?;
     for row in facts.rows.iter() {
-        if let Some(read) = fact_read(row.fact.kind, row.fact.key) {
+        // By the records, unrecorded: which cell holds a fact is the plan's, not the body's.
+        // An opaque type's facts are its fn's head's (the fn's head files it).
+        let key = world.opaque_fn(blaze_typeck::ItemKey(row.fact.key)).map_or(row.fact.key, |fn_| fn_.0);
+        if let Some(read) = fact_read(view.records(), &world.front.keys, row.fact.kind, key)? {
             recorder.read(read);
         }
     }
+    // THE BODY'S OWN HEAD (rule 21): its signature (a member's: its container's cell) is an
+    // input of every check of it, also one refused before any question (a trait member's
+    // missing default body), so it is read whether or not the checker asked for it.
+    let own = super::super::keys::checker_of(own);
+    if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, own.0)? {
+        recorder.read(read);
+    }
+    // THE CONTROL'S INSTRUMENT: the cell of each head the body's own store holds, beside the
+    // read list (tests: every one must be in it; the store makes a head only when asked).
+    let mut held_keys: AVec<'_, u128> = AVec::new_in(alloc);
+    world.each_held_head(&mut |k| held_keys.push(k));
+    let mut held: AVec<'a, (TableRead, u128)> = AVec::with_capacity_in(held_keys.len(), alloc);
+    for &k in held_keys.iter() {
+        if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, k)? {
+            held.push((read, k));
+        }
+    }
+    held.sort_unstable();
+    let said = said_of(&verdict, &borrows, view.records(), &world.front.keys, alloc)?;
+    drop(world);
     let reads = recorder.finish().map_err(TaskError::Full)?;
     let bytes = verdict_bytes(&verdict, &borrows, Facts::Digest, alloc)?;
     let out = ContentId::of(OUT_DOMAIN, &bytes);
@@ -181,7 +267,42 @@ pub fn check_body<'n, 'a>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     }
     let done = Done { name, key: task.key, out, defines, reads: cells, findings: u32::try_from(findings).unwrap_or(u32::MAX), failed };
     drop(reading);
-    Ok(BodyOut { done, made, bytes, reads })
+    Ok(BodyOut { done, made, bytes, reads, held, said })
+}
+
+/// The lines `check` prints for a verdict (blaze-cli body_types.rs, today's path), in `alloc`.
+fn said_of<'n, 'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, names: &'n Records<'n>, keys: &Keys, alloc: Alloc<'a>) -> Result<AVec<'a, Said<'a>>, TaskError> {
+    let text = |s: &str| -> AString<'a> {
+        let mut t = AString::new_in(alloc);
+        t.push_str(s);
+        t
+    };
+    let mut said: AVec<'a, Said<'a>> = AVec::new_in(alloc);
+    for d in verdict.diagnostics.iter() {
+        said.push(Said { what: SaidWhat::Type { code: d.code }, start: d.start, end: d.end, words: text(d.text.as_str()) });
+    }
+    for d in verdict.findings.iter() {
+        said.push(Said { what: SaidWhat::Lint { lint: d.lint }, start: d.start, end: d.end, words: text(d.text.as_str()) });
+    }
+    if let Some(refused) = &verdict.refused {
+        let cause = super::super::said::refused_cause(names, keys, refused);
+        let words = super::super::said::refused_words(names, refused);
+        said.push(Said { what: SaidWhat::NotChecked { cause: text(&cause) }, start: 0, end: 0, words: text(&words) });
+    } else if let Some(words) = super::super::said::gap_words(&verdict.gaps) {
+        said.push(Said { what: SaidWhat::NotChecked { cause: text(super::super::said::GAP_CAUSE) }, start: 0, end: 0, words: text(&words) });
+    }
+    for d in borrows.findings.iter() {
+        said.push(Said { what: SaidWhat::Borrow { code: d.code }, start: d.start, end: d.end, words: text(d.text) });
+    }
+    if let Some(refused) = &borrows.refused
+        && !matches!(refused, BorrowRefused::Untyped(_))
+    {
+        let (start, end) = refused.range().unwrap_or((0, 0));
+        let mut words = AString::new_in(alloc);
+        write!(words, "{}: {refused:?}", refused.text()).map_err(|_| TaskError::Write)?;
+        said.push(Said { what: SaidWhat::BorrowsNotChecked, start, end, words });
+    }
+    Ok(said)
 }
 
 /// Whether [`verdict_bytes`] holds the digest of the body's facts.
@@ -236,35 +357,52 @@ fn body_of<'n>(view: Tables<'_, 'n>, name: Name) -> Result<BodyRef<'n>, TaskErro
 /// signature, predicates, ADT, impl header, constant, ..) by the item's checker key, and an
 /// impl table bucket. Names facts (paths, traits in scope, lang paths) were recorded by the
 /// view as asked; a fact of the body's own closures and async blocks is its own.
-fn fact_read(kind: FactKind, key: u128) -> Option<TableRead> {
+///
+/// THE CELL is the one that holds the fact (head.rs [`fact_cell`], FI's one home): a
+/// constructor's is its ADT's, a trait member's its trait's, an impl constant's its impl's;
+/// an anonymous constant's is the item it is written in. ONE PART: a head cell is read whole
+/// (head.rs `cell_id`, part 0), whatever the fact's kind.
+fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128) -> Result<Option<TableRead>, TaskError> {
     use FactKind as K;
     match kind {
         K::Head | K::Predicates | K::Adt | K::ImplHeader | K::AssocItem | K::Const | K::Opaque | K::Attrs | K::TraitDef | K::AssocParent | K::ConstHolds | K::ConstParams | K::AssocGenerics | K::BorrowAdt | K::BorrowHead | K::TypeAlias | K::FieldDefaults
             if key != 0 =>
         {
-            Some(TableRead::Head { item: key.to_be_bytes(), part: kind as u8 })
+            let fact = blaze_typeck::ItemKey(key);
+            let want = match fact_cell(names, keys, fact) {
+                Ok(want) => want,
+                Err(FreezeError::NoWant { error: FillError::AnonConst(_), .. }) => match kind_of_key(names, keys, fact) {
+                    Ok(KeyKind::Anon { module, .. }) => fact_cell(names, keys, module).map_err(|error| TaskError::Cell { key: fact, error })?,
+                    _ => return Err(TaskError::Cell { key: fact, error: FreezeError::NoWant { key: fact, error: FillError::AnonConst(fact) } }),
+                },
+                Err(error) => return Err(TaskError::Cell { key: fact, error }),
+            };
+            let id = head_cell_id(want);
+            let mut item = [0u8; 16];
+            item.copy_from_slice(&id.of.subject.0[..16]);
+            Ok(Some(TableRead::Head { item, part: 0 }))
         }
         // `CrateBucket`: recorded as each lookup read it (view.rs `bucket`, `unfiled`,
         // `impls_read`); names facts: recorded by the view's walks.
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// A read as the engine names it (recorder.rs [`ReadOf`]): a names or lang read is a cell of
 /// its crate's `CrateScope` record, a head read a cell of the item's `Signature`, an impl read
 /// a cell of its crate's `ImplBucket` table (all zero: the fact of the whole graph).
-fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, TaskError> {
+pub fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, TaskError> {
     let records = view.records();
-    let crate_by = |test: &dyn Fn(&[u8; 32]) -> bool| -> Option<ContentId> {
-        (0..records.crate_count()).find_map(|k| records.crate_key(k).filter(|key| test(&key.0.0)).map(|key| key.0))
-    };
+    let crate_by = |test: &dyn Fn(&[u8; 32]) -> bool| -> Option<blaze_id::CrateItemKey> { (0..records.crate_count()).find_map(|k| records.crate_key(k).filter(|key| test(&key.0.0))) };
     let of = match read.of() {
         // A builtin type's cell (`u32`'s item) is the language's, in no crate's record: the
         // toolchain every key covers fixes it, so no edit moves it.
         ReadOf::Names { krate } if krate == blaze_scope::BUILTIN_PREFIX => return Ok(None),
         ReadOf::Names { krate } | ReadOf::Lang { krate } => {
-            let subject = crate_by(&|key| key[..8] == krate).ok_or(TaskError::NoCrate { prefix: krate })?;
-            Name::new(Kind::CrateScope, subject)
+            // The crate's names task by its one name (blaze-drive key.rs): before, the raw key
+            // was the subject, a name no task defines, so a names edit dirtied no body.
+            let key = crate_by(&|key| key[..8] == krate).ok_or(TaskError::NoCrate { prefix: krate })?;
+            blaze_drive::key::crate_scope_name(&key)
         }
         ReadOf::Head { item } => super::head::signature_name(item),
         ReadOf::Impls { krate } if krate == [0; 16] => Name::new(Kind::ImplBucket, ABSENT),

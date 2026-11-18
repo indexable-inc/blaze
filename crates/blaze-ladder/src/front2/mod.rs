@@ -66,6 +66,7 @@ pub mod llvm_intrinsic;
 pub mod head_record;
 pub mod head_text;
 pub mod heads;
+pub mod rows;
 pub mod index;
 pub mod keys;
 pub mod linked;
@@ -124,6 +125,8 @@ mod written;
 pub mod item_site;
 pub mod header_written;
 pub mod item_shown;
+/// What a body's verdict says, as `check` prints it: one home for both paths.
+pub mod said;
 pub mod row_path;
 /// WHY a census row is left out: the evidence under a build census's `SPLIT` rows.
 pub mod census_why;

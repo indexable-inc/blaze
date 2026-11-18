@@ -23,11 +23,12 @@ use blaze_surface::{Edition, ItemKind};
 use blaze_typeck::PortableTys;
 use blaze_unit_graph::{Implicit, Prelude, StdIs};
 
-use super::head::{FreezeError, FrozenHead, FrozenHeads, FrozenHeadsOpts, HeadSource, Plant, StoreHeads, StoreHeadsOpts, export, freeze, import, reads_seen, want_bytes};
+use super::head::{FreezeError, FrozenHead, FrozenHeads, FrozenHeadsOpts, HeadSource, Plant, SeededHeads, SeededHeadsOpts, StoreHeads, StoreHeadsOpts, export, freeze, head_task, import, reads_seen, want_bytes};
 use crate::front2::by_origin;
 use crate::front2::head_record::{self, HeadAt};
 use crate::front2::heads::{Store, Want};
 use crate::front2::keys::{Keys, MemberKind, checker_of, member_key_of};
+use crate::front2::lifetimes::LifeOf;
 use crate::front2::project::head_digest::want_digest_in;
 use crate::front2::source::{Load, Log, NamesSource, Records};
 
@@ -139,12 +140,15 @@ pub fn longer<'a, 'b: 'a>(x: &'a u32, y: &'b u32) -> &'a u32 {
 const APP_AT: usize = 0;
 const CORE_AT: usize = 1;
 
-struct Texts;
+/// The fixture's texts: `app` is [`APP`], or an edit of it.
+struct Texts {
+    app: &'static str,
+}
 
 impl SourceTexts<'static> for Texts {
     fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
         match (krate, path) {
-            (APP_AT, "/app/lib.rs") => Some(APP),
+            (APP_AT, "/app/lib.rs") => Some(self.app),
             (CORE_AT, "/core/lib.rs") => Some(CORE),
             _ => None,
         }
@@ -208,9 +212,14 @@ impl Load<'static> for Kept {
 /// met, so a fresh key map is a whole one (the solved `Names` source needs every key filed
 /// first, `Front2::for_program`).
 fn world() -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
+    world_of(APP)
+}
+
+/// [`world`] over `app` as the app's text.
+fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
     let crates = [input("app", "/app/lib.rs", &[("core", CORE_AT)]), input("core", "/core/lib.rs", &[])];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let solved = resolve_crates(&crates, sysroot, &Texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let solved: &'static Names<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(solved, a()));
     let g = a();
     let mut kept = Kept { names: AVec::new_in(g), items: AVec::new_in(g), files: AVec::new_in(g) };
@@ -273,7 +282,7 @@ fn in_one_store(names: Src, sized: Option<LibKey>, frame: &'static blaze_mem::Fr
     let mut store = Store::new(sized, frame, a());
     let mut keys = Keys::new();
     let mut out: AVec<'static, (Want, AVec<'static, u8>)> = AVec::new_in(a());
-    let put = |store: &Store<'static>, keys: &Keys, w: Want, out: &mut AVec<'static, (Want, AVec<'static, u8>)>| {
+    let put = |store: &mut Store<'static>, keys: &Keys, w: Want, out: &mut AVec<'static, (Want, AVec<'static, u8>)>| {
         let bytes = export(names, keys, store, w, plant, a()).unwrap_or_else(|e| panic!("export {w:?}: {e}"));
         let mut kept = AVec::new_in(a());
         kept.extend_from_slice(&bytes);
@@ -282,12 +291,12 @@ fn in_one_store(names: Src, sized: Option<LibKey>, frame: &'static blaze_mem::Fr
     for w in order.iter().copied() {
         store.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure {w:?}: {e}"));
         if each_at_once {
-            put(&store, &keys, w, &mut out);
+            put(&mut store, &keys, w, &mut out);
         }
     }
     if !each_at_once {
         for w in order.iter().copied() {
-            put(&store, &keys, w, &mut out);
+            put(&mut store, &keys, w, &mut out);
         }
     }
     out.sort_unstable_by_key(|(w, _)| want_bytes(*w));
@@ -393,7 +402,7 @@ fn a_frozen_head_imports_as_today_s_head() {
         let f = freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
         let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("read {w:?}: {e}"));
         // Its meaning is the `Signature` out's digest of the same want in today's store.
-        let today = want_digest_in(names, &keys, &store, w, a()).unwrap_or_else(|e| panic!("digest {w:?}: {e:?}"));
+        let today = want_digest_in(names, &keys, &mut store, w, a()).unwrap_or_else(|e| panic!("digest {w:?}: {e:?}"));
         assert_eq!(frozen.meaning(), today, "{w:?}: the frozen head means other than the store's");
         // The fn texts, as the body has them.
         let mut texts: AVec<'static, (HeadAt, &'static str)> = AVec::new_in(a());
@@ -407,7 +416,7 @@ fn a_frozen_head_imports_as_today_s_head() {
         // Into the store's own table: equal to the head filed there, term for term.
         let heads = import(&frozen, &mut text_of, &mut store.tys, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for (at, head) in heads.iter() {
-            let filed = head_record::from_store(&store, *at, None, None).unwrap_or_else(|e| panic!("{at:?}: {e}"));
+            let filed = head_record::from_store(&store, *at).unwrap_or_else(|e| panic!("{at:?}: {e}"));
             if let Some(what) = head_record::same(head.as_ref(), filed, store.tys.view()) {
                 panic!("ORACLE: {w:?}, head {at:?} imported differs from the store's in {what}");
             }
@@ -428,10 +437,8 @@ fn a_frozen_head_imports_as_today_s_head() {
 /// Step 1 (head_record.rs form 9): a frozen head carries the store's side tables a later head
 /// or a body reads, so the import gives what the store gave: `Walk`'s GAT outlives clause and
 /// its associated type's own const parameter, `Dir`'s fieldless-enum count, `Grid`'s impl's
-/// members' frame with its const parameter. The lifetime parts stay out of the form: every
-/// fn's and ADT's decoded lifetime part is `None` (`longer`'s `'b: 'a` included); what a body
-/// reads of them is the borrow check's `BorrowHead` row (borrow_reads.rs), not the head.
-/// Control: `same` sees a side row dropped (the fieldless count of a filed enum set to none).
+/// members' frame with its const parameter, and (form 10) every fn's, ADT's, trait's and
+/// impl's lifetime part, made or refused. Control: `same` sees a side row dropped (the fieldless count of a filed enum set to none).
 /// Expected line: `side tables: assoc rows R (where W, consts C), fieldless F, frames M`.
 #[test]
 fn a_frozen_head_carries_the_store_s_side_tables() {
@@ -457,7 +464,8 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
         let heads = import(&frozen, &mut text_of, &mut fresh, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for (at, head) in heads.iter() {
             match head {
-                head_record::Head::Trait { assoc_side, .. } => {
+                head_record::Head::Trait { assoc_side, life, .. } => {
+                    assert!(life.is_some(), "ORACLE: {at:?}: a trait's lifetime part is not in its record");
                     for r in assoc_side.iter() {
                         rows += 1;
                         wheres += usize::from(r.where_.is_some_and(|w| !w.is_empty()));
@@ -465,14 +473,15 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
                     }
                 }
                 head_record::Head::Adt { fieldless: f, life, .. } => {
-                    assert!(life.is_none(), "{at:?}: an ADT's lifetime part is in the form");
+                    assert!(life.is_some(), "ORACLE: {at:?}: an ADT's lifetime part is not in its record");
                     fieldless += usize::from(*f == Some(2));
                 }
-                head_record::Head::Impl { frame: m, .. } => {
+                head_record::Head::Impl { frame: m, life, .. } => {
                     let m = m.as_ref().unwrap_or_else(|| panic!("ORACLE: {at:?}: an impl's frame is not in its record"));
+                    assert!(life.is_some(), "ORACLE: {at:?}: an impl's lifetime part is not in its record");
                     frames += usize::from(m.consts.len() == 1);
                 }
-                head_record::Head::Fn { life, .. } => assert!(life.is_none(), "{at:?}: a fn's lifetime part is in the form"),
+                head_record::Head::Fn { life, .. } => assert!(life.is_some(), "ORACLE: {at:?}: a fn's lifetime part is not in its record"),
                 _ => {}
             }
         }
@@ -484,7 +493,7 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
     // Control: a filed enum with its fieldless count dropped is told apart by `same`.
     let mut caught = false;
     for at in head_record::heads_in(&store, a()).iter().copied() {
-        let Ok(filed) = head_record::from_store(&store, at, None, None) else { continue };
+        let Ok(filed) = head_record::from_store(&store, at) else { continue };
         if let head_record::HeadRef::Adt { fieldless: Some(_), .. } = filed {
             let mut planted = filed;
             if let head_record::HeadRef::Adt { fieldless, .. } = &mut planted {
@@ -590,4 +599,363 @@ fn the_two_sources_answer_alike() {
     let f = freeze(names, sized, Want::Fn(total), frame, a(), a()).unwrap_or_else(|e| panic!("freeze total: {e}"));
     assert!(f.reads.iter().any(|w| *w == Want::Members(area)), "`total`'s reads miss `Area`: {:?}", &f.reads[..]);
     std::println!("sources: {} cells alike; {reads} reads, `total` reads `Area`", cells.len());
+}
+
+/// A body's store filed from frozen heads alone (`seed` with no own cell, as a body's world
+/// would build it): no lowering, and each cell exports the bytes a lowering store does.
+/// Expected line: `filed: N cells from frozen heads, 0 lowered, bytes equal`.
+#[test]
+fn a_store_filed_from_frozen_heads_alone_lowers_nothing() {
+    let (names, sized, frame) = world();
+    let cells = cells(names);
+    let alone = alone(names, sized, frame, &cells, Plant::None);
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let mut store = Store::new(sized, frame, a());
+    let mut keys = Keys::new();
+    for w in cells.iter().copied() {
+        if !store.made(w) {
+            let s = super::head::seed(names, None, w, &mut source, &mut store, &mut keys, a()).unwrap_or_else(|e| panic!("seed {w:?}: {e}"));
+            assert_eq!(s, crate::front2::heads::Seeded::Filed, "{w:?}");
+        }
+        assert!(store.made(w), "ORACLE: {w:?} filed from its frozen head is not made");
+    }
+    assert_eq!(store.lowered, 0, "ORACLE: a store filed from frozen heads lowered");
+    let mut filed: AVec<'static, (Want, AVec<'static, u8>)> = AVec::new_in(a());
+    for w in cells.iter().copied() {
+        let bytes = export(names, &keys, &mut store, w, Plant::None, a()).unwrap_or_else(|e| panic!("export {w:?}: {e}"));
+        let mut kept = AVec::new_in(a());
+        kept.extend_from_slice(&bytes);
+        filed.push((w, kept));
+    }
+    let moved = differing(&alone, &filed);
+    assert!(moved.is_empty(), "ORACLE: filed from frozen heads, these cells export other bytes than lowered: {moved:?}");
+    std::println!("filed: {} cells from frozen heads, 0 lowered, bytes equal", cells.len());
+}
+
+/// Traits whose members name each other's heads, as core's `Iterator` and `DoubleEndedIterator`
+/// do (`fn rev(self) -> Rev<Self> where Self: DoubleEndedIterator`, `trait DoubleEndedIterator:
+/// Iterator { fn next_back(&mut self) -> Option<Self::Item>; }`): no cycle in Rust (the
+/// Reference, "Traits": only supertraits may not form one), so every cell is made, under both
+/// `NeedsMet` strategies, to equal bytes. clap-root's `Cmd` was refused under `All` with "these
+/// items need each other's heads in a cycle: [Iterator, .., Rev, ExactSizeIterator,
+/// DoubleEndedIterator]"; this shape does NOT reproduce it (it passes under both), so it guards
+/// the shape, not that cause. Expected line: `naming traits: N cells made alike under All and First`.
+const NAMING: &str = "#![no_std]
+pub struct R<T>(pub T);
+pub struct S<T>(pub T);
+pub trait A {
+    type Item;
+    fn next(&mut self) -> Self::Item;
+    fn r(self) -> R<Self>
+    where
+        Self: B + Sized;
+    fn s(self) -> S<Self>
+    where
+        Self: C + Sized;
+    fn d(&self) -> u32
+    where
+        Self: D;
+}
+pub trait B: A {
+    fn back(&mut self) -> Self::Item;
+    fn rb(self) -> R<Self>
+    where
+        Self: Sized;
+}
+pub trait C: A {
+    fn len(&self) -> Self::Item;
+    fn cs(self) -> S<Self>
+    where
+        Self: B + Sized;
+}
+pub trait D: B + C {
+    fn both(&self) -> R<Self::Item>;
+}
+impl<T: B> A for R<T> {
+    type Item = T::Item;
+    fn next(&mut self) -> T::Item {
+        self.0.back()
+    }
+    fn r(self) -> R<Self>
+    where
+        Self: B,
+    {
+        R(self)
+    }
+    fn s(self) -> S<Self>
+    where
+        Self: C,
+    {
+        S(self)
+    }
+    fn d(&self) -> u32
+    where
+        Self: D,
+    {
+        0
+    }
+}
+impl<T: B> B for R<T> {
+    fn back(&mut self) -> T::Item {
+        self.0.back()
+    }
+    fn rb(self) -> R<Self> {
+        R(self)
+    }
+}
+";
+
+#[test]
+fn traits_naming_each_other_are_made_under_both_strategies() {
+    let (names, sized, frame) = world_of(NAMING);
+    let cells = cells(names);
+    let mut each: AVec<'static, AVec<'static, (Want, AVec<'static, u8>)>> = AVec::new_in(a());
+    for needs in [crate::front2::heads::NeedsMet::All, crate::front2::heads::NeedsMet::First] {
+        // Every cell asked in one store from the first, as a body's store asks them.
+        let mut store = Store::new(sized, frame, a());
+        store.needs = needs;
+        let mut keys = Keys::new();
+        for w in cells.iter().copied() {
+            store.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ORACLE: {needs:?}: ensure {w:?}: {e}"));
+        }
+        let mut out: AVec<'static, (Want, AVec<'static, u8>)> = AVec::new_in(a());
+        for w in cells.iter().copied() {
+            let bytes = export(names, &keys, &mut store, w, Plant::None, a()).unwrap_or_else(|e| panic!("{needs:?}: export {w:?}: {e}"));
+            let mut kept = AVec::new_in(a());
+            kept.extend_from_slice(&bytes);
+            out.push((w, kept));
+        }
+        each.push(out);
+    }
+    let moved = differing(&each[0], &each[1]);
+    assert!(moved.is_empty(), "ORACLE: these cells froze otherwise under All than under First: {moved:?}");
+    std::println!("naming traits: {} cells made alike under All and First", cells.len());
+}
+
+/// A store filed from frozen heads answers every constructor lookup of every ADT as a store
+/// that lowered them: each variant's ctor fn present in one is present in the other, with an
+/// equal record. The body `res` of the cost test (`match r { Ok(v) => .., Err(()) => 0 }`)
+/// got E0423 when seeded: an enum's tuple-variant ctors were left out of its cell's record
+/// (head_digest.rs `want_heads` searched ctors by a key origin only a struct's has).
+/// Control: the fixture's enum `Shape` has tuple variants (`Sq`, `Pair`), counted apart; before
+/// the fix the seeded store had none of them. Expected line: `ctors: E enum and S struct
+/// ctors alike over A ADTs`.
+#[test]
+fn a_seeded_store_answers_every_ctor_lookup_as_lowering() {
+    let (names, sized, frame) = world();
+    let cells = cells(names);
+    let mut lowered = Store::new(sized, frame, a());
+    let mut lkeys = Keys::new();
+    for w in cells.iter().copied() {
+        lowered.ensure(names, &mut lkeys, w).unwrap_or_else(|e| panic!("ensure {w:?}: {e}"));
+    }
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let mut seeded = Store::new(sized, frame, a());
+    let mut skeys = Keys::new();
+    for w in cells.iter().copied() {
+        if !seeded.made(w) {
+            super::head::seed(names, None, w, &mut source, &mut seeded, &mut skeys, a()).unwrap_or_else(|e| panic!("seed {w:?}: {e}"));
+        }
+    }
+    let (mut enums, mut structs, mut adts) = (0, 0, 0);
+    for (adt, row) in lowered.adts.iter() {
+        let s = seeded.adts.get(adt).unwrap_or_else(|| panic!("ORACLE: ADT {adt:?} lowered but not filed from its frozen head"));
+        assert_eq!(s.variants.len(), row.variants.len(), "ORACLE: ADT {adt:?}'s variants");
+        adts += 1;
+        for (v, sv) in row.variants.iter().zip(s.variants.iter()) {
+            assert_eq!((v.key, v.name, v.ctor), (sv.key, sv.name, sv.ctor), "ORACLE: ADT {adt:?}'s variant");
+            let at = HeadAt::Ctor(v.key);
+            match (lowered.ctors.contains_key(&v.key), seeded.ctors.contains_key(&v.key)) {
+                (false, false) => continue,
+                (true, true) => {}
+                (l, s) => panic!("ORACLE: ADT {adt:?} variant {:?}: ctor fn lowered {l}, seeded {s}", v.name),
+            }
+            let x = head_record::encode(head_record::from_store(&lowered, at).unwrap_or_else(|e| panic!("{at:?}: {e}")), lowered.tys.view(), a()).unwrap_or_else(|e| panic!("{at:?}: {e}"));
+            let y = head_record::encode(head_record::from_store(&seeded, at).unwrap_or_else(|e| panic!("{at:?}: {e}")), seeded.tys.view(), a()).unwrap_or_else(|e| panic!("{at:?}: {e}"));
+            assert!(x[..] == y[..], "ORACLE: ADT {adt:?} variant {:?}: the seeded ctor fn differs from the lowered one", v.name);
+            if row.kind == blaze_typeck::AdtKind::Enum {
+                enums += 1;
+            } else {
+                structs += 1;
+            }
+        }
+    }
+    assert!(enums >= 2, "CONTROL: `Shape`'s tuple variants' ctors were not compared ({enums})");
+    assert!(structs >= 1, "CONTROL: `Square`'s ctor was not compared ({structs})");
+    std::println!("ctors: {enums} enum and {structs} struct ctors alike over {adts} ADTs");
+}
+
+/// The wants a cell's own item makes: an ADT's head and definition, a trait's head and
+/// members; one for any other cell.
+fn own_wants(cell: Want) -> u32 {
+    match cell {
+        Want::Adt(_) | Want::Members(_) => 2,
+        Want::Head(_) | Want::Impl(_) | Want::Fn(_) | Want::MemberFn(..) => 1,
+    }
+}
+
+/// A store seeded from frozen heads lowers only each item's own wants, and freezes to the
+/// bytes a store that lowered everything does. Expected line: `seeded: N cells, L wants
+/// lowered (own O), unseeded U, bytes equal`.
+#[test]
+fn a_seeded_freeze_lowers_each_item_once() {
+    let (names, sized, frame) = world();
+    let cells = cells(names);
+    let alone = alone(names, sized, frame, &cells, Plant::None);
+    // Today's: each cell frozen alone lowers every head it needs again.
+    let mut unseeded = 0u32;
+    for w in cells.iter().copied() {
+        unseeded += freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}")).lowered;
+    }
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let mut seeded: AVec<'static, (Want, AVec<'static, u8>)> = AVec::new_in(a());
+    for w in cells.iter().copied() {
+        let f = source.frozen(w).unwrap_or_else(|e| panic!("seeded {w:?}: {e}"));
+        let mut kept = AVec::new_in(a());
+        kept.extend_from_slice(f.bytes());
+        seeded.push((w, kept));
+    }
+    seeded.sort_unstable_by_key(|(w, _)| want_bytes(*w));
+    let moved = differing(&alone, &seeded);
+    assert!(moved.is_empty(), "ORACLE: seeded from frozen heads, these cells froze to other bytes than alone: {moved:?}");
+    // Every cell the source froze: the app's, and core's its items need (`Sized` and the rest).
+    let made = source.cells().count();
+    let own: u32 = source.cells().map(own_wants).sum();
+    let app_own: u32 = cells.iter().map(|w| own_wants(*w)).sum();
+    // Beyond them, one lowering per need met of a cell up the stack: two cells whose items
+    // need each other's heads (core's sizedness traits: a cell is a trait's head AND members).
+    assert_eq!(
+        source.lowered,
+        own + source.reentered,
+        "ORACLE: seeded, {made} cells lowered other than each item's own wants and one per re-entry ({} needs met of a cell up the stack; unseeded: {unseeded}, the app's own {app_own})",
+        source.reentered
+    );
+    // The control: without the seed, a dependency is lowered again by each item that needs it.
+    assert!(unseeded > app_own, "the fixture's items need no other's head: unseeded {unseeded}, own {app_own}");
+    std::println!(
+        "seeded: {} app cells ({made} with core's), {} wants lowered (own {own}, re-entered {}), unseeded {unseeded} for the app's, bytes equal",
+        cells.len(),
+        source.lowered,
+        source.reentered
+    );
+}
+
+/// One head task per cell of the app, in forward and in reversed order, each order over one
+/// shared seeded source: every task's result (name, key, out, bytes, defines, reads) is equal
+/// across the orders; each item is lowered once (the source's lowerings are its cells' own
+/// wants plus one per re-entry, as `a_seeded_freeze_lowers_each_item_once` states); `out` is the
+/// meaning of `bytes`, `defines` that one cell, `reads` sorted and free of the task's own cell.
+/// Control: another tool gives another key, the same out. Expected line:
+/// `head tasks: N cells, forward and reversed equal, lowered L (own O, re-entered R) in each`.
+#[test]
+fn head_tasks_are_equal_in_any_order() {
+    let (names, sized, frame) = world();
+    let cells = cells(names);
+    let tool = blaze_drive::key::Tool(ContentId::of("blaze-ladder head task test", b"head"));
+    let run = |order: &[Want]| {
+        let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+        let mut done: AVec<'static, (Want, super::head::HeadDone<'static>)> = AVec::new_in(a());
+        for w in order.iter().copied() {
+            let d = head_task(names, &mut source, w, tool, a());
+            if let Some(e) = &d.failed {
+                panic!("head task of {w:?} failed: {e}");
+            }
+            done.push((w, d));
+        }
+        done.sort_unstable_by_key(|(w, _)| want_bytes(*w));
+        let own: u32 = source.cells().map(own_wants).sum();
+        (done, source.lowered, own, source.reentered)
+    };
+    let mut reversed: AVec<'static, Want> = AVec::new_in(a());
+    reversed.extend(cells.iter().rev().copied());
+    let (fwd, lowered_f, own_f, re_f) = run(&cells[..]);
+    let (rev, lowered_r, own_r, re_r) = run(&reversed[..]);
+    assert_eq!(lowered_f, own_f + re_f, "ORACLE: forward, an item was lowered more than once");
+    assert_eq!(lowered_r, own_r + re_r, "ORACLE: reversed, an item was lowered more than once");
+    assert_eq!(fwd.len(), rev.len());
+    for ((w, f), (_, r)) in fwd.iter().zip(rev.iter()) {
+        assert_eq!((f.name, f.key, f.out), (r.name, r.key, r.out), "ORACLE: {w:?}'s name, key or out differs by order");
+        assert!(f.bytes[..] == r.bytes[..], "ORACLE: {w:?}'s bytes differ by order");
+        assert!(f.defines[..] == r.defines[..] && f.reads[..] == r.reads[..], "ORACLE: {w:?}'s defines or reads differ by order");
+        let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("{w:?}: {e}"));
+        assert_eq!(frozen.meaning(), f.out, "{w:?}: out is the bytes' meaning");
+        assert_eq!(f.name, super::head::cell_id(*w).of, "{w:?}: named as its cell");
+        assert!(f.defines[..] == [(super::head::cell_id(*w).cell, f.out)], "{w:?}: defines its one cell");
+        assert!(f.reads.windows(2).all(|p| p[0].0 < p[1].0), "{w:?}: reads sorted, one row a cell");
+        assert!(f.reads.iter().all(|(c, _)| *c != super::head::cell_id(*w)), "{w:?}: reads its own cell");
+    }
+    // Control: the key is the tool's too; the out is not.
+    let other = blaze_drive::key::Tool(ContentId::of("blaze-ladder head task test", b"another"));
+    let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
+    let (w, f) = &fwd[0];
+    let d = head_task(names, &mut source, *w, other, a());
+    assert!(d.key != f.key && d.out == f.out, "another tool: another key, the same out");
+    std::println!(
+        "head tasks: {} cells, forward and reversed equal, lowered {lowered_f} (own {own_f}, re-entered {re_f}) forward, {lowered_r} (own {own_r}, re-entered {re_r}) reversed",
+        cells.len()
+    );
+}
+
+/// Step 1 (head_record.rs form 10): a REAL edit of only a lifetime bound moves the head's
+/// meaning, frozen and today's (`want_digest_in`, a `Signature`'s out) alike; a comment written
+/// inside the signature moves neither. Control: the comment edit does change the record's bytes
+/// (the fn text's digest), so the equal meaning is the reader digest's doing.
+/// Expected line: `lifetimes: `longer` moves with `'b: 'a` (bounds 1 -> 0), not with a comment`.
+#[test]
+fn a_lifetime_bound_alone_moves_the_head() {
+    let base = longer_of(APP);
+    let unbound = longer_of(edited(APP, "'b: 'a>", "'b>"));
+    let commented = longer_of(edited(APP, "y: &'b u32)", "/* the other */ y: &'b u32)"));
+    assert_eq!(base.frozen, base.today, "a frozen head means other than today's");
+    assert_ne!(base.frozen, unbound.frozen, "ORACLE: dropping `'b: 'a` left the frozen head's meaning");
+    assert_ne!(base.today, unbound.today, "ORACLE: dropping `'b: 'a` left the `Signature`'s digest");
+    assert_eq!(base.frozen, commented.frozen, "ORACLE: a comment in the signature moved the frozen head");
+    assert_eq!(base.today, commented.today, "ORACLE: a comment in the signature moved the `Signature`'s digest");
+    assert!(base.bytes[..] != commented.bytes[..], "CONTROL: the comment edit changed nothing the record holds");
+    assert_eq!((base.bounds, unbound.bounds), (1, 0), "`longer`'s declared bounds");
+    std::println!("lifetimes: `longer` moves with `'b: 'a` (bounds {} -> {}), not with a comment", base.bounds, unbound.bounds);
+}
+
+/// `longer`'s cell in a world over `app`: its frozen meaning, today's digest, its frozen
+/// bytes, and how many lifetime bounds its lifetime part declares.
+struct Longer {
+    frozen: ContentId,
+    today: ContentId,
+    bytes: AVec<'static, u8>,
+    bounds: usize,
+}
+
+fn longer_of(app: &'static str) -> Longer {
+    let (names, sized, frame) = world_of(app);
+    let mut found = None;
+    NamesSource::each_item(names, APP_AT, &mut |key, _| {
+        if NamesSource::name_of(names, key) == Some("longer") {
+            found = Some(key);
+        }
+    });
+    let lib = found.expect("`longer`");
+    let w = Want::Fn(lib);
+    let f = freeze(names, sized, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze `longer`: {e}"));
+    let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("read `longer`: {e}")).meaning();
+    let mut store = Store::new(sized, frame, a());
+    let mut keys = Keys::new();
+    store.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure `longer`: {e}"));
+    let today = want_digest_in(names, &keys, &mut store, w, a()).unwrap_or_else(|e| panic!("digest `longer`: {e:?}"));
+    let bounds = match store.lives_of(HeadAt::Fn(checker_of(lib))) {
+        Some(LifeOf::Fn(Ok(l))) => l.bounds.len(),
+        other => panic!("ORACLE: `longer`'s lifetime part: {other:?}"),
+    };
+    let mut bytes = AVec::new_in(a());
+    bytes.extend_from_slice(&f.bytes);
+    Longer { frozen, today, bytes, bounds }
+}
+
+/// `from` with its one `old` written as `new`, kept for the test run.
+fn edited(from: &'static str, old: &str, new: &str) -> &'static str {
+    let at = from.find(old).unwrap_or_else(|| panic!("`{old}` is not in the fixture"));
+    let mut v: AVec<'static, u8> = AVec::new_in(a());
+    v.extend_from_slice(from[..at].as_bytes());
+    v.extend_from_slice(new.as_bytes());
+    v.extend_from_slice(from[at + old.len()..].as_bytes());
+    core::str::from_utf8(v.leak()).expect("an edit of UTF-8 by UTF-8")
 }

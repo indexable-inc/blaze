@@ -59,8 +59,8 @@ unreached = { path = "vendor/unreached" }
 
 /// The workspace: blaze-lower depends on blaze-expand and blaze-typeck; blaze-ladder on
 /// blaze-typeck (under a target table); blaze-scope on an outside crate, and on blaze-typeck
-/// only for its tests; blaze-cli adds its own files to the body checker; blaze-other and
-/// tools/lone are in no closure; crates/parked is excluded and has no manifest. vendor/patched
+/// only for its tests; blaze-cli (an entry that names no row), blaze-other and tools/lone are in
+/// no closure; crates/parked is excluded and has no manifest. vendor/patched
 /// is a `[patch]` path crate (its lock row has no source) that `outside` depends on, so it is in
 /// the names row by its files (its optional `absent`, in no lock, is not built: no refusal);
 /// vendor/unreached is patched and reached by none.
@@ -102,7 +102,7 @@ const TREE: &[(&str, &str)] = &[
     ("crates/blaze-ladder/src/lib.rs", "pub fn front() {}\n"),
     (
         "crates/blaze-cli/Cargo.toml",
-        "[package]\nname = \"blaze-cli\"\n\n[package.metadata.blaze]\nproducer-own = [\"body-checker\"]\n\n[dependencies]\nblaze-ladder = { path = \"../blaze-ladder\" }\nblaze-lower = { path = \"../blaze-lower\" }\nblaze-scope = { path = \"../blaze-scope\" }\n",
+        "[package]\nname = \"blaze-cli\"\n\n[dependencies]\nblaze-ladder = { path = \"../blaze-ladder\" }\nblaze-lower = { path = \"../blaze-lower\" }\nblaze-scope = { path = \"../blaze-scope\" }\n",
     ),
     ("crates/blaze-cli/src/main.rs", "fn main() {}\n"),
     ("crates/blaze-cli/build.rs", "fn main() {}\n"),
@@ -210,7 +210,7 @@ fn one_producers_source_moves_its_rows_alone() {
         ("crates/blaze-expand/src/lib.rs", "pub fn expand() { 1; }\n", &["expander", "lowering"]),
         ("crates/blaze-typeck/src/tests/mod.rs", "// changed\n", &["lowering", "body-checker", "code-builder"]),
         ("crates/blaze-own/src/lib.rs", "pub struct Vec(u8);\n", &["expander", "lowering", "body-checker", "code-builder"]),
-        ("crates/blaze-cli/src/main.rs", "fn main() { 2; }\n", &["body-checker"]),
+        ("crates/blaze-cli/src/main.rs", "fn main() { 2; }\n", &[]),
         ("crates/blaze-scope/src/lib.rs", "pub fn names() { 3; }\n", &["names"]),
         ("Cargo.lock", inner_moved.as_str(), &["names"]),
         ("Cargo.lock", unused_moved.as_str(), &[]),
@@ -248,8 +248,7 @@ fn watch_names_the_digested_entries_and_every_manifest() {
         "harness/toolchain",
         "crates/blaze-expand/src",
         "crates/blaze-expand/Cargo.toml",
-        "crates/blaze-cli/build",
-        "crates/blaze-cli/build.rs",
+        "crates/blaze-cli/Cargo.toml",
         "crates/blaze-other/Cargo.toml",
         "tools/lone/Cargo.toml",
         "vendor/patched/src",
@@ -262,6 +261,8 @@ fn watch_names_the_digested_entries_and_every_manifest() {
         "crates/blaze-expand/tests",
         "crates/blaze-expand/.DS_Store",
         "crates/blaze-other/src",
+        "crates/blaze-cli/src",
+        "crates/blaze-cli/build.rs",
         "docs",
         "vendor/patched/tests",
         "vendor/unreached/src",
@@ -308,9 +309,75 @@ fn refusals_name_the_thing() {
     ));
     assert!(matches!(refused(&[("Cargo.toml", &*ROOT.replace("exclude = [\"crates/parked\"]\n", ""))]), Refused::Missing { .. }));
     assert!(matches!(refused(&[("Cargo.toml", "[package]\nname = \"x\"\n")]), Refused::Shape { .. }));
+    let own = "[package]\nname = \"blaze-cli\"\n[package.metadata.blaze]\nproducer-own = [\"body-checker\"]\n";
+    match refused(&[("crates/blaze-cli/Cargo.toml", own)]) {
+        why @ Refused::OwnFilesOnly { .. } => {
+            assert_eq!(why.path(), Some("crates/blaze-cli/Cargo.toml"));
+            let shown = std::format!("{why}");
+            assert!(shown.contains("producer-own") && shown.contains("rule 21"), "{shown}");
+        }
+        other => panic!("`producer-own` read as {other:?}"),
+    }
     let text = std::format!("{}", refused(&[(scope, "[package]\nname = \"blaze-scope\"\n")]));
     assert!(text.contains("names") && text.contains("producer-id.md"), "{text}");
-    std::println!("producers: seven refusals each named");
+    std::println!("producers: eight refusals each named");
+}
+
+/// The class this crate closes (rule 21; 2026-11-17, two builds of blaze wrote two values under
+/// one `CrateScope` key): a row covers every line its producing function can run. The function
+/// is in `cli`, which names the row and calls `writer`, which calls `format`; neither is named
+/// anywhere. An edit to either moves the row; an edit outside the closure moves nothing, and no
+/// edit moves nothing (the control). The form that left them out, `producer-own` (the crate's
+/// own files alone), is refused by name: under it an edit to `writer` moved no row.
+#[test]
+fn a_row_covers_every_crate_its_producer_calls() {
+    let alloc = blaze_own::testing::heap().alloc();
+    const SMALL: &[(&str, &str)] = &[
+        ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nedition = \"2024\"\n"),
+        ("Cargo.lock", "version = 4\n"),
+        ("harness/toolchain", "nightly-2026-11-01\n"),
+        (
+            "crates/cli/Cargo.toml",
+            "[package]\nname = \"cli\"\n\n[package.metadata.blaze]\nproducer = [\"names\"]\n\n[dependencies]\nwriter = { path = \"../writer\" }\n",
+        ),
+        ("crates/cli/src/lib.rs", "pub fn scope() { writer::put(); }\n"),
+        ("crates/writer/Cargo.toml", "[package]\nname = \"writer\"\n\n[dependencies]\nformat = { path = \"../format\" }\n"),
+        ("crates/writer/src/lib.rs", "pub fn put() { format::bytes(); }\n"),
+        ("crates/format/Cargo.toml", "[package]\nname = \"format\"\n"),
+        ("crates/format/src/lib.rs", "pub fn bytes() {}\n"),
+        (
+            "crates/rest/Cargo.toml",
+            "[package]\nname = \"rest\"\n\n[package.metadata.blaze]\nproducer = [\"expander\", \"lowering\", \"body-checker\", \"code-builder\"]\n",
+        ),
+        ("crates/rest/src/lib.rs", "pub fn rest() {}\n"),
+        ("crates/elsewhere/Cargo.toml", "[package]\nname = \"elsewhere\"\n"),
+        ("crates/elsewhere/src/lib.rs", "pub fn elsewhere() {}\n"),
+    ];
+    let edited = |path: &str, text: &'static str| {
+        let mut out: Vec<(&str, &str), Alloc<'_>> = Vec::new_in(alloc);
+        for &(at, was) in SMALL {
+            out.push((at, if at == path { text } else { was }));
+        }
+        out
+    };
+    let base = run(SMALL, false, alloc).expect("the small workspace walks");
+    assert!(moved(&base, &run(SMALL, true, alloc).expect("walks backwards"), alloc).is_empty(), "the control: no edit");
+    let cases: &[(&str, &'static str, &[&str])] = &[
+        ("crates/cli/src/lib.rs", "pub fn scope() { writer::put(); writer::put(); }\n", &["names"]),
+        ("crates/writer/src/lib.rs", "pub fn put() { format::bytes(); 1; }\n", &["names"]),
+        ("crates/format/src/lib.rs", "pub fn bytes() { 2; }\n", &["names"]),
+        ("crates/elsewhere/src/lib.rs", "pub fn elsewhere() { 3; }\n", &[]),
+    ];
+    for &(path, text, wanted) in cases {
+        let made = run(&edited(path, text), false, alloc).expect("the edited workspace walks");
+        assert_eq!(&moved(&base, &made, alloc)[..], wanted, "an edit of {path}");
+    }
+    let own = "[package]\nname = \"cli\"\n\n[package.metadata.blaze]\nproducer-own = [\"names\"]\n\n[dependencies]\nwriter = { path = \"../writer\" }\n";
+    match run(&edited("crates/cli/Cargo.toml", own), false, alloc) {
+        Err(Refused::OwnFilesOnly { path }) => assert_eq!(path.as_str(), "crates/cli/Cargo.toml"),
+        other => panic!("`producer-own` walked: {:?}", other.map(|made| made.rows.map(|(row, _)| row))),
+    }
+    std::println!("producers: an edit to each crate the producer calls moved its row; outside, none; `producer-own` refused");
 }
 
 /// A name a closure reaches that the lock lacks (a lock of another moment than the sources, as a

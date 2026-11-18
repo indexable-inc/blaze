@@ -155,7 +155,7 @@ fn closure<'s>(list: &CrateList<'_>, root: usize, scratch: &'s Frame) -> Vec<usi
 
 /// The `Script` name a crate list row's run is (`CrateList::script`: its kind byte, then its
 /// subject).
-fn script_name(bytes: [u8; 33]) -> Option<Name> {
+pub(crate) fn script_name(bytes: [u8; 33]) -> Option<Name> {
     let kind = Kind::from_u8(bytes[0])?;
     let mut subject = [0u8; 32];
     subject.copy_from_slice(&bytes[1..]);
@@ -210,7 +210,7 @@ pub(crate) fn native<'b>(
     let mut crates = Vec::with_capacity_in(order.len(), scratch);
     let mut wants = Vec::new_in(held);
     for r in order.iter().copied() {
-        let scope = crate::names::name_of(list.key(r));
+        let scope = blaze_drive::key::crate_scope_name(&list.key(r));
         let links = Name::links_of(scope);
         let script = match list.script(r) {
             None => None,

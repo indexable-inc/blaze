@@ -282,6 +282,103 @@ fn want_shown<'n, S: NamesSource<'n>>(names: S, w: Want) -> String {
     format!("{what} {}", ItemShown::of_lib(names, k))
 }
 
+/// What stopped a body's check ([`CheckFail`](super::check::CheckFail)), as a phrase a refusal
+/// note groups items by (rule 19: `blaze check` said "check stopped" and named no reason,
+/// port27/mini/clap-root 2026-11-17): the variant and its error's class, each item it is about
+/// by its PATH (never a key or a range, so one cause of many bodies is one line); an item the
+/// names source holds no path for says so. The whole refusal, keys and all, stays in the
+/// finding's detail.
+pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super::check::CheckFail) -> String {
+    use super::check::CheckFail;
+    let path = |k: ItemKey| -> String {
+        match ItemShown::of(names, keys, k).path() {
+            Some(p) => format!("`{p}`"),
+            None => String::from("an item the names source holds no path for"),
+        }
+    };
+    let lib = |k: LibKey| -> String {
+        match ItemShown::of_lib(names, k).path() {
+            Some(p) => format!("`{p}`"),
+            None => String::from("an item the names source holds no path for"),
+        }
+    };
+    match e {
+        CheckFail::Gap { gaps, .. } => match gaps.first() {
+            Some(first) => format!("a question the world cannot answer yet ({})", debug_class(&format!("{first:?}"), 2)),
+            None => String::from("a question the world cannot answer yet"),
+        },
+        CheckFail::NothingToFill { questions, .. } => match questions.first() {
+            Some(q) => format!("the checker needs a record the world noted nothing to make for ({})", debug_class(&format!("{q:?}"), 1)),
+            None => String::from("the checker needs a record the world noted nothing to make for"),
+        },
+        CheckFail::Head { error, .. } => format!("a head the store could not make: {}", head_error_shown(names, error)),
+        CheckFail::Buckets { error, .. } => match error {
+            super::buckets::Unfilled::Impl(k) => format!("the candidate impl {} has no header in the store when its question is answered", lib(*k)),
+            super::buckets::Unfilled::Fn(k) => format!("the inherent impl fn {} has no `self` flag in its impl's head", path(*k)),
+        },
+        CheckFail::Tables { error, .. } => format!("the impl tables could not file a question's impls: {error}"),
+        CheckFail::Check { error, .. } => format!("the checker stopped: {}", check_error_class(&path, error)),
+        CheckFail::Diags { .. } => String::from("the check found errors"),
+        CheckFail::Rounds { last, .. } => match last.first() {
+            Some(q) => format!("still asking after {} rounds ({})", super::check::MOST_ROUNDS, debug_class(&format!("{q:?}"), 1)),
+            None => format!("still asking after {} rounds", super::check::MOST_ROUNDS),
+        },
+        CheckFail::Const { shown, error, .. } => format!("the constant `{shown}` an array length names has no value ({})", debug_class(&format!("{error:?}"), 2)),
+        CheckFail::Resolve { item, error, .. } => {
+            let why = match error {
+                blaze_typeck::ResolveError::Missing(q) => format!("the world has no answer to {}", debug_class(&format!("{q:?}"), 1)),
+                blaze_typeck::ResolveError::NoImpl { trait_, .. } => format!("no impl of {} holds", path(*trait_)),
+                blaze_typeck::ResolveError::Overlap { trait_, .. } => format!("two impls of {} hold", path(*trait_)),
+                blaze_typeck::ResolveError::NotGround { .. } => String::from("an argument is not ground"),
+                blaze_typeck::ResolveError::Check(c) => check_error_class(&path, c),
+            };
+            format!("instance resolution of the call of {} failed: {why}", path(*item))
+        }
+        CheckFail::ReadsDiffer { .. } => String::from("checked again, the body read other answers than its first check (rule 21)"),
+    }
+}
+
+/// [`blaze_typeck::CheckError`]'s class: its variant and the inner variant, items by `path`.
+fn check_error_class(path: &dyn Fn(ItemKey) -> String, e: &blaze_typeck::CheckError) -> String {
+    use blaze_typeck::CheckError as E;
+    match e {
+        E::Limit(l) => format!("a bound of the checker passed ({l:?})"),
+        E::Malformed(m) => format!("malformed input ({})", debug_class(&format!("{m:?}"), 1)),
+        E::Solve(s) => format!("the trait solver ({})", debug_class(&format!("{s:?}"), 2)),
+        E::Unported(what) => format!("{what} is not checked yet"),
+        E::DynUndecided { trait_, .. } => format!("the dyn compatibility of {} is not decided", path(*trait_)),
+        E::UnknownInCleanBody { .. } => String::from("a body with no diagnostic recorded an unknown type (the checker's own invariant)"),
+        E::DiagWithoutPlace { code, .. } => format!("diagnostic {} has an empty range (the checker's own invariant)", code.code()),
+        E::ImplTraitArity { trait_, .. } => format!("an impl header of {} has the wrong number of trait arguments", path(*trait_)),
+        E::OpaqueHiddenUnknown { trait_, .. } => format!("a goal of {} on an opaque type with no hidden type", path(*trait_)),
+        E::TraitDefaultsNotKnown { trait_ } => format!("the defaults of {} were not read", path(*trait_)),
+    }
+}
+
+/// The leading variant names of a `Debug` text, `depth` levels into tuple variants:
+/// `Malformed(Expr(ExprId(3)))` at depth 2 is `Malformed Expr`; a struct variant stops at its
+/// name. No key, number or range survives, so one class of many bodies is one phrase.
+fn debug_class(d: &str, depth: usize) -> String {
+    let mut out = String::new();
+    let mut rest = d;
+    for _ in 0..depth {
+        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+        let name = &rest[..end];
+        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(name);
+        match rest[end..].strip_prefix('(') {
+            Some(inner) => rest = inner,
+            None => break,
+        }
+    }
+    out
+}
+
 /// [`HeadError`]'s text with each key shown by its path ([`ItemShown`]): what its `Display`
 /// says, which holds no names and so prints keys. An [`HeadError::Item`] reads
 /// `item a::B (key ..): <why>`, so a census that cuts at the first `"): "` keeps one class per
@@ -310,12 +407,28 @@ pub fn head_error_shown<'n, S: NamesSource<'n>>(names: S, e: &HeadError) -> Stri
         ),
         HeadError::Key(c) => format!("{c}"),
         HeadError::Item(k, why) => format!("item {}: {why:?}", item(*k)),
+        HeadError::Seed { need, by } => format!(
+            "{} needs {}, whose frozen head could not be filed (the seed holds why)",
+            want_shown(names, *by),
+            want_shown(names, *need)
+        ),
+        HeadError::Filed { want, at, what } => format!("the frozen head of {}, head {at:?}: {what}", want_shown(names, *want)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::impl_shown;
+    use super::{debug_class, impl_shown};
+
+    /// A check refusal's class keeps variant names only: no key, number or struct field, so
+    /// two bodies stopped by one class group under one note.
+    #[test]
+    fn debug_class_keeps_variants_only() {
+        assert_eq!(debug_class("Malformed(Expr(ExprId(3)))", 2), "Malformed Expr");
+        assert_eq!(debug_class("NoRecord(FnSig(ItemKey(12)))", 1), "NoRecord");
+        assert_eq!(debug_class("Assoc { trait_: ItemKey(1) }", 2), "Assoc");
+        assert_eq!(debug_class("Solve(Unported(\"x\"))", 3), "Solve Unported");
+    }
 
     /// core's RawVec impl as its header span holds it (a comment line before `const impl`), an
     /// impl with a doc comment, an attribute whose string holds `]`, nested block comments and

@@ -482,7 +482,6 @@ dependencies = [
  "blaze-mem",
  "blaze-own",
  "blaze-proc-macro",
- "blaze-producers",
  "blaze-remote",
  "blaze-report",
  "blaze-run",

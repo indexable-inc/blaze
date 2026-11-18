@@ -92,14 +92,17 @@ const LOG_DOMAIN: &str = "blaze plain store log 1";
 
 const HEAD: &str = "head";
 const FLIP: &str = "flip";
-const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+/// The cache directory tag's file in the store's directory: also how `blaze clean --store`
+/// tells a directory is blaze's store (blaze-cli clean.rs).
+pub const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
 
 /// What [`StoreError::Io`] says a failed map was doing.
 const MAPPING: &str = "mapping a segment its generation names";
 
 /// The cache directory tag (bford.info/cachedir): backup and indexing tools that honour it
-/// skip the store.
-const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by blaze: its plain store.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
+/// skip the store. Its first two lines (the standard signature, and "created by blaze") are
+/// what `blaze clean --store` requires before it removes a directory.
+pub const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by blaze: its plain store.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
 
 /// What a store is opened on.
 #[derive(Clone, PartialEq, Eq, Debug)]

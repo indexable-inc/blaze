@@ -453,6 +453,61 @@ fn static_table_built_by_a_loop() {
     assert_eq!(eval_int(&mut w, "AT"), Ok(u128::from(want[255])), "a constant reads a static's record");
 }
 
+/// The Reference, "Static items": a static "may contain interior mutability", so the
+/// allocations of its record that are written in place are exactly those whose type is not
+/// `Freeze` (an `UnsafeCell` held by value, through fields, tuples, arrays and enum payloads),
+/// and each allocation it points to is decided by its pointee type (`&AtomicU8::new(0)` in a
+/// static is its own written allocation). A plain value, a slice of plain bytes and a constant
+/// (copied from, never written) stay read-only. Removing the cause (the cell marked as a cell)
+/// makes every mark false: the last assertion.
+#[test]
+fn a_static_is_written_in_place_exactly_where_its_type_is_not_freeze() {
+    let build = |cells: bool| {
+        let mut w = world();
+        let cell = w.strukt("UnsafeCell", &[("value", "u8")]);
+        let wide = w.strukt("UnsafeCellUsize", &[("value", "usize")]);
+        if cells {
+            w.unsafe_cell_is(cell);
+            w.unsafe_cell_is(wide);
+        }
+        w.strukt("AtomicU8", &[("v", "UnsafeCell")]);
+        w.strukt("AtomicUsize", &[("v", "UnsafeCellUsize")]);
+        w.strukt("Cell", &[("value", "UnsafeCell")]);
+        w.enum_("Slot", None, &[("Empty", &[], None), ("Full", &["UnsafeCell"], None)]);
+        w.stat("A", "AtomicU8", "AtomicU8 { v: UnsafeCell { value: 0 } }");
+        w.stat("B", "(u8, Cell)", "(1, Cell { value: UnsafeCell { value: 2 } })");
+        w.stat("C", "[AtomicUsize; 2]", "[AtomicUsize { v: UnsafeCellUsize { value: 3 } }, AtomicUsize { v: UnsafeCellUsize { value: 4 } }]");
+        w.stat("S", "Slot", "Slot::Full(UnsafeCell { value: 5 })");
+        w.stat("D", "&AtomicU8", "&AtomicU8 { v: UnsafeCell { value: 6 } }");
+        w.stat("E", "u32", "7");
+        w.stat("F", "&[u8]", "&[1, 2]");
+        w.stat("G", "&(u8, &AtomicU8)", "&(8, &AtomicU8 { v: UnsafeCell { value: 9 } })");
+        w.konst("K", "AtomicU8", "AtomicU8 { v: UnsafeCell { value: 0 } }");
+        w.build();
+        w
+    };
+    let marks = |w: &mut World, name: &str| -> StdVec<bool> { w.eval(name).expect(name).data.allocs.iter().map(|a| a.mutable).collect() };
+    let mut w = build(true);
+    let want: [(&str, &[bool]); 9] = [
+        ("A", &[true]),
+        ("B", &[true]),
+        ("C", &[true]),
+        ("S", &[true]),
+        ("D", &[false, true]),
+        ("E", &[false]),
+        ("F", &[false, false]),
+        ("G", &[false, false, true]),
+        ("K", &[false]),
+    ];
+    for (name, marked) in want {
+        assert_eq!(marks(&mut w, name), marked, "{name}");
+    }
+    let mut plain = build(false);
+    for (name, marked) in want {
+        assert!(marks(&mut plain, name).iter().all(|m| !m), "{name}: no cell, nothing written in place (was {marked:?})");
+    }
+}
+
 /// The Reference, "Enumerations", "Discriminants": an explicit discriminant is its constant's
 /// value; an implicit one is the previous variant's plus one, the first's 0; in the `repr`
 /// type, `isize` without one; past the type's range is an error. `as` reads it.

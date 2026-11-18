@@ -381,6 +381,10 @@ pub fn lower_refusal(e: &BodyError) -> String {
     let class = lower_class(e);
     match e {
         BodyError::Lowered { findings, .. } => match findings.first() {
+            // An expansion's own error (an unset `env!` variable, `compile_error!`, no rule
+            // matched) also says what it names (blaze-lower by_name.rs `Failure::Diagnostic`:
+            // the variable, the message): "`env!` failed" alone does not say which (rule 19).
+            Some(super::body::BodyFinding::Macro { path, why, cause, .. }) if cause.starts_with("Failed(Diagnostic") => format!("{class}, the call of `{path}!`: {why}"),
             Some(super::body::BodyFinding::Macro { path, .. }) => format!("{class}, the call of `{path}!`"),
             _ => class,
         },

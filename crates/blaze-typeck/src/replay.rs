@@ -230,6 +230,7 @@ mod tests {
             asm_clobbers: &[],
             asm_text: "",
             call_arg_ints: &[],
+            unsafe_blocks: &[],
         }
     }
 

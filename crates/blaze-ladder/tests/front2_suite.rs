@@ -170,7 +170,7 @@ fn show(suite: &Suite<'_, '_, '_>) -> Vec<Shown> {
 fn with_suite<R>(tc: &Toolchain, text: &str, f: impl FnOnce(&Names<'_>, &Suite<'_, '_, '_>) -> R) -> R {
     with_unit(tc, text, true, |names, _cfg, sources| {
         let g = Alloc::global();
-        let bytes = encode(names.krate(0), g).unwrap_or_else(|e| panic!("the tests record: {e}"));
+        let bytes = encode(names.krate(0), g).unwrap_or_else(|e| panic!("the tests record: {e}")).bytes;
         let record = TestsRecord::open(aligned(&bytes, g)).unwrap_or_else(|e| panic!("the tests record does not open: {e}"));
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let mut left: Vec<(Box<str>, blaze_ladder::front2::program::LeftOut)> = Vec::new();

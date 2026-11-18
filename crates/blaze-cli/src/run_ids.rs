@@ -1006,7 +1006,7 @@ impl<'a> RunIds<'a> {
                     CrateGrain::Locked(read)
                 }
                 Place::Checkout => {
-                    let scope = crate::names::name_of(key);
+                    let scope = blaze_drive::key::crate_scope_name(&key);
                     let read = today_of(scope).map(|out| Read { fact: fact_of(scope), digest: out.0 });
                     // Not reached this walk: the last answer's read stands (`previous`, above).
                     let read = read.or_else(|| match previous?.crate_by_key(key)?.grain {

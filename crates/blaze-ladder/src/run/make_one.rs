@@ -49,7 +49,7 @@ use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_own::AVec;
 
 use crate::body_ids::{BodyIds, Counts, EntryForm, Make, Walk, WalkError, each_item};
-use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared, InstanceNames, make_entry};
+use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared, InstanceNames, VtableDatum, make_entry_with_vtables};
 use crate::front2::const_at::{ConstTable, Needs};
 use crate::front2::coroutines::{CoroutineTable, Coroutines};
 use crate::front2::program::lazy::LazyRefusal;
@@ -516,8 +516,9 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             }
         }
     }
+    let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(work.alloc);
     for &want in built.vtables.iter() {
-        vtable_rows(program, &adts, &mut work.ground, &mut work.layouts, work.alloc, &mut reach, i, instance.args, want, &mut untabled)?;
+        vtable_rows(program, &adts, &mut work.ground, &mut work.layouts, work.alloc, &mut reach, i, instance.args, want, &mut untabled, &mut vtable_data)?;
     }
     // Every untabled callee of this build at once (its calls' and its vtables' words): checked,
     // then the instance made again.
@@ -538,7 +539,12 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         let (tabled, name_bytes) = reach.row(n);
         declared.push(Declared { tabled, name: name_bytes });
     }
-    let made = make_entry(&built.func, &names, routines, &mut declared, work.isa, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error })?;
+    let mut carried: AVec<'_, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), work.alloc);
+    for (symbol, datum) in vtable_data.iter() {
+        carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
+    }
+    let made = make_entry_with_vtables(&built.func, &names, &mut carried, routines, &mut declared, &crate::code_records::reads::ReadList::empty(), work.isa, work.alloc)
+        .map_err(|error| RunError::CodeRecord { function: name(), error })?;
     entry.extend_from_slice(&made);
     // The coroutine's part leaves the stash with its entry made, not before.
     if let Some((at, part)) = from_coroutine {
@@ -705,7 +711,8 @@ fn bodied<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], c: usi
 /// A word whose fn no row tables yet (the drop glue `drop_in_place`, an impl's method no body
 /// called: a lazy front end tables a body's CALLEES, and a vtable's words are no body's) goes
 /// to `untabled`, as an untabled callee of a call does ([`Named1::Untabled`]): checked, then
-/// the instance made again.
+/// the instance made again. Each table's DATUM goes onto `data` by its symbol, each once (the
+/// entry carries it: code_records.rs `VtableDatum`), when every word of it is named.
 #[allow(clippy::too_many_arguments)]
 fn vtable_rows<P: FrontEnd>(
     program: &P,
@@ -718,6 +725,7 @@ fn vtable_rows<P: FrontEnd>(
     at: List,
     want: VtableRef,
     untabled: &mut Vec<(ItemKey, RunError), Global>,
+    data: &mut AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)>,
 ) -> Result<(), RunError> {
     let function = program.function(i);
     let name = || function.named();
@@ -754,8 +762,27 @@ fn vtable_rows<P: FrontEnd>(
         let mut targs: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
         targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
         let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, Global).map_err(|e| fail(VtableFail::Build(e)))?;
-        for &(_, to) in table.relocs.iter() {
-            let VtableTarget::Fn(f) = to else { continue };
+        // The table's datum (code_records.rs `VtableDatum`): its bytes as built (the header's
+        // size and alignment, every address word 0), each address word a target by symbol.
+        let mut datum = blaze_code::datum::Datum::new_in(blaze_code::datum::Place::ReadOnly, 3, alloc);
+        datum.bytes.extend_from_slice(&table.bytes);
+        // False once a word's fn is untabled: the instance is made again ([`Step::Table`]), and
+        // this table's datum with it.
+        let mut whole = true;
+        for &(off, to) in table.relocs.iter() {
+            let f = match to {
+                VtableTarget::Fn(f) => f,
+                VtableTarget::Super(s) => {
+                    let symbol = vtable_symbol(VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY }, ground.view(), alloc).map_err(sym)?;
+                    let target = datum.target(blaze_code::record::Target { space: blaze_code::record::Space::Vtable, symbol });
+                    datum.words.push(blaze_code::record::Word { at: off, target, addend: 0 });
+                    continue;
+                }
+            };
+            let mut word = |symbol: blaze_code::record::Symbol| {
+                let target = datum.target(blaze_code::record::Target { space: blaze_code::record::Space::Func, symbol });
+                datum.words.push(blaze_code::record::Word { at: off, target, addend: 0 });
+            };
             // As a call's callee (`name_ref` above): a fn item of a trait's method resolved
             // to the body that runs, then what the language gives (`language_owner`).
             let f = match crate::fn_item_resolve::resolved_shim_self(program, adts, i, f, ground) {
@@ -766,7 +793,7 @@ fn vtable_rows<P: FrontEnd>(
                 }
             };
             if let Some(c) = language_owner(program, adts, f, ground, i) {
-                reach.declare(program.function(c).key, f, ground, alloc).map_err(sym)?;
+                word(reach.declare(program.function(c).key, f, ground, alloc).map_err(sym)?);
                 continue;
             }
             let (item, args) = match Some(f.item) == glue_item {
@@ -784,12 +811,22 @@ fn vtable_rows<P: FrontEnd>(
                 if !untabled.iter().any(|(k, _)| *k == item) {
                     untabled.push((item, refusal()));
                 }
+                whole = false;
                 continue;
             };
             if !bodied(program, adts.4.checked, c) {
                 return Err(refusal());
             }
-            reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(sym)?;
+            word(reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(sym)?);
+        }
+        if whole {
+            let symbol = vtable_symbol(t, ground.view(), alloc).map_err(sym)?;
+            let sealed = datum.seal().map_err(|why| RunError::CodeRecord { function: name(), error: CodeRecordError::VtableDatum(why) })?;
+            let mut bytes: AVec<'static, u8> = blaze_own::Vec::new_in(alloc);
+            sealed.encode(&mut bytes);
+            if !data.iter().any(|(s, _)| *s == symbol) {
+                data.push((symbol, bytes));
+            }
         }
     }
     Ok(())

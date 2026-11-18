@@ -1,0 +1,15 @@
+{
+ "id": "engine-check-two-printers-drift",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane EV",
+ "where": "crates/blaze-cli/src/engine_check.rs `check`: the certificate's early return and the full path's print section",
+ "what": "the certificate printed its own copy of the `NOT checked: <stage>` notes; another lane changed the full path's copy (a stage this build does not run now says the build's reason), so a request with nothing changed printed other words than the request before it. The new test comparing the certificate's lines with the first request's caught it on its first run.",
+ "cost": "one queue round",
+ "cause": "two printers of one answer: the certificate path and the full path each wrote the notes and the status",
+ "whys": "the certificate was written as a shortcut that printed nothing but the closing line, so its copy of the notes looked too small to share",
+ "class": "a second printer of the same answer drifts from the first",
+ "prevention": "done: one printer (engine_lines.rs `print_all`) for every finding and note, one `not_checked_notes` and one `status_of`, both paths through them; the tests compare an incremental request's lines with a fresh one's and the certificate's with the first's",
+ "annoyance": "an ask over three minutes moves to the background, and its output file stays empty until it ends",
+ "workaround": "wait for the completion notice; do not poll",
+ "state": "fixed"
+}

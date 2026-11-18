@@ -164,7 +164,7 @@ fn line(name: &str, t: &Tally) -> String {
     let s = &t.solve;
     let st = &s.stats;
     format!(
-        "{name}: goals {} frames {} hits {} fast {} distinct {} terms {} adt_fields {} summaries {} summary_fields {} prematch_rejected {} impl_candidates {} header_mismatch {} reruns {} provisional {} need_stops {} abandoned {} canon {} ({} words) decoded {} fills {} ({} missed) rows {}/{} entries {} kept {} rounds {} solver_calls {} solver_us {} check_us {}",
+        "{name}: goals {} frames {} hits {} fast {} distinct {} terms {} adt_fields {} summaries {} summary_fields {} prematch_rejected {} impl_candidates {} header_mismatch {} reruns {} provisional {} need_stops {} abandoned {} pulls {} canon {} ({} words) canon_skipped {} decoded {} fills {} ({} missed) rows {}/{} entries {} kept {} rounds {} solver_calls {} solver_us {} check_us {}",
         st.evaluations,
         st.frames,
         st.cache_hits,
@@ -181,8 +181,10 @@ fn line(name: &str, t: &Tally) -> String {
         st.provisional,
         st.need_stops,
         st.frames_abandoned,
+        st.pulls,
         st.canonicalized,
         st.canon_words,
+        st.canon_skipped,
         st.decoded,
         s.fills,
         s.fill_misses,
@@ -302,10 +304,21 @@ fn the_solver_s_cost_per_real_body() {
     // counters in its message. Each fix of a counter lowers its ceiling.
     let s = &total.solve.stats;
     let ceil = |name: &str, got: u64, max: u64| assert!(got <= max, "{name}: {got} over its ceiling {max}\n{lines}");
-    ceil("frames", s.frames, 3990);
-    ceil("frames abandoned", s.frames_abandoned, 2655);
-    ceil("need stops", s.need_stops, 1805);
-    ceil("canonicalized", s.canonicalized, 7225);
-    ceil("terms imported", s.terms_imported, 12430);
+    // The pull (blaze-solve facts.rs `Source`, typeck infer/mod.rs `Pull`; lane SW): a fact
+    // the cache lacks is filled at the step that met it, so each distinct goal is one frame
+    // (3194 frames for 1114 goals before; 1114 after) and the 1415 pulls stop nothing. The
+    // stops left (30, 44 frames) are typeck's `Need` of the world, which ends the check round
+    // (check.rs's rounds: 84), not the fact cache's.
+    ceil("frames", s.frames, 1170);
+    ceil("frames over distinct goals", s.frames, s.distinct_goals);
+    ceil("frames abandoned", s.frames_abandoned, 50);
+    ceil("need stops", s.need_stops, 35);
+    // One canonical walk per goal asked (frames + cache hits: 2510), less the goals with no
+    // inference variable seen before, found by their own identity (blaze-solve eval.rs
+    // `Solver::input_of`: 71 skipped, 2439 walked).
+    ceil("canonicalized", s.canonicalized, 2560);
+    ceil("canonical walks over goals asked", s.canonicalized + s.canon_skipped, s.frames + s.cache_hits);
+    assert!(s.canon_skipped > 0, "no goal was found by its plain key\n{lines}");
+    ceil("terms imported", s.terms_imported, 6190);
     ceil("fact cache misses", total.solve.fill_misses, 2115);
 }

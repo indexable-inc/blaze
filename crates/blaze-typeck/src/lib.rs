@@ -75,6 +75,7 @@ pub use instance::{ResolveError, Resolved, holds, normalize_projection, resolve_
 pub use drop_impl::adt_drop_impl;
 pub use rules::async_fn::INTERIOR_GAP;
 pub use rules::args_inline::{ArgsMisuse, TypedFinding};
+pub use rules::unsafety::Undecided;
 pub use stalled::{Stalled, StalledError, check_deferring, decide_stalled, decide_stalled_listed};
 pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
@@ -83,7 +84,7 @@ pub use body::{
 };
 pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
 pub use selected::{Projected, Selected};
-pub use diag::{Because, Diag, DiagCode, UnmetGoal};
+pub use diag::{Because, Diag, DiagCode, UnmetGoal, UnsafeOp};
 pub use asm::{ASM_NORETURN, AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg};
 pub use path_miss::{MissWhy, PathAnswer, PathMiss, PathPrefix, Refusal};
 /// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.
@@ -95,7 +96,7 @@ pub use ids::{
     Abi, Edition, ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range,
     Safety, ScopeId, StmtId, UintTy,
 };
-pub use portable::{MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, OwnTys, PNode, PTy, PTys, PortableTys, canonical_ranges, object_principal};
+pub use portable::{Full, MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, OwnTys, PNode, PTy, PTys, PortableTys, Stable, canonical_ranges, object_principal};
 pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 pub use world::{
     Adt, AdtKind, AliasDef, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, CoroutineFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
@@ -249,5 +250,7 @@ fn walk<W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, '_, W, C>) -> Result<(
     m.finish_body(output)?;
     m.end_sequence()?;
     // The typed lints, over the settled types (rules/args_inline.rs).
-    m.args_inline(output)
+    m.args_inline(output)?;
+    // What only `unsafe` code may do, over the settled types and callees (rules/unsafety.rs).
+    m.unsafety()
 }

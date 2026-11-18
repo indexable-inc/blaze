@@ -142,7 +142,7 @@ mod root_commit_tests;
 mod tests;
 
 pub use self::core::{
-    Batch, Committed, Found, GRACE_NS, Got, Lost, POINTER_LEN, POINTER_TAG, Placed, Plain, PlainConfig, Probe, Probes, PutError,
+    Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, Committed, Found, GRACE_NS, Got, Lost, POINTER_LEN, POINTER_TAG, Placed, Plain, PlainConfig, Probe, Probes, PutError,
     ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, Scrubbed, Sliced, TAGS, WINDOW,
 };
 pub use self::lent::{Lend, Lent, LentCounts, LentError, first_difference};

@@ -65,14 +65,18 @@ pub enum Stage {
     /// the plan is made from (the crates and their dependency depths). Its own stage, first,
     /// because every later task's plan and key come from it, and nothing of it reads code.
     Units = 0,
+    /// Build scripts and the module lookups they and the proc macros read: one task a run or a
+    /// module, in the unit graph's order (a script after the scripts whose `links` metadata it
+    /// is served), keyed from manifests and text; before every crate's names, which read them.
+    Scripts = 1,
     /// One file's outline: its items and the cells of their text.
-    Outlines = 1,
+    Outlines = 2,
     /// Names: crates in dependency waves, modules inside.
-    Names = 2,
+    Names = 3,
     /// Frozen heads and impl tables.
-    Heads = 3,
+    Heads = 4,
     /// Bodies, at body grain.
-    Bodies = 4,
+    Bodies = 5,
 }
 
 /// Each kind's tool, by `Kind::index` (decision D105): a task's key is its kind's tool's, so an
@@ -108,7 +112,7 @@ impl Phase {
 
 impl Stage {
     /// Every stage, in phase order: `Stage::ALL[stage.index()] == stage`.
-    pub const ALL: [Stage; STAGES] = [Stage::Units, Stage::Outlines, Stage::Names, Stage::Heads, Stage::Bodies];
+    pub const ALL: [Stage; STAGES] = [Stage::Units, Stage::Scripts, Stage::Outlines, Stage::Names, Stage::Heads, Stage::Bodies];
 
     pub const fn index(self) -> usize {
         self as usize
@@ -116,7 +120,7 @@ impl Stage {
 }
 
 /// How many stages there are.
-pub const STAGES: usize = 5;
+pub const STAGES: usize = 6;
 
 /// Why a task was entered: the first reason the engine found, in this order. Kept for every
 /// entered task and nothing for a task that stood, so a profile says why each was redone and
@@ -438,6 +442,11 @@ impl View<'_, '_> {
     /// The cell's digest today: complete for every earlier phase.
     pub fn cell(&self, id: &CellId) -> ContentId {
         self.answer.cell(id)
+    }
+
+    /// `name`'s row as it stands: merged this request, or standing from the last answer.
+    pub fn row(&self, name: Name) -> Option<&Row<'_>> {
+        self.answer.rows.get(&name)
     }
 }
 

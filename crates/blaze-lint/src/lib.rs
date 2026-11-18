@@ -174,6 +174,11 @@ pub enum Rule {
     /// rules/args_inline.rs), never by this crate's token pass ([`Rule::typed`]). On from
     /// [`Step::Edition`] (advice), an error in [`Step::Strict`] ([`Step::levels`]).
     ArgsInline = 18,
+    /// An operation only `unsafe` code may do, written in an `unsafe fn`'s body of edition 2024
+    /// outside any `unsafe` block: rustc's `unsafe_op_in_unsafe_fn`, warn by default in 2024 (the
+    /// Edition Guide, "unsafe_op_in_unsafe_fn warning"). A TYPED rule (blaze-typeck
+    /// rules/unsafety.rs), filed only for 2024 bodies; advice at every step, as rustc warns.
+    UnsafeOpInUnsafeFn = 19,
 }
 
 impl Rule {
@@ -200,6 +205,7 @@ impl Rule {
         Rule::AmbientHasher,
         Rule::VariantCount,
         Rule::ArgsInline,
+        Rule::UnsafeOpInUnsafeFn,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -242,6 +248,7 @@ impl Rule {
             Rule::AmbientHasher => "ambient-hasher",
             Rule::VariantCount => "variant-count",
             Rule::ArgsInline => "args-inline",
+            Rule::UnsafeOpInUnsafeFn => "unsafe-op-in-unsafe-fn",
         }
     }
 
@@ -250,7 +257,7 @@ impl Rule {
     /// A typed rule is in no [`RuleSet`] a step makes, so a token record's key never moves with
     /// it; the step turns it on through its level alone ([`Step::levels`]).
     pub const fn typed(self) -> bool {
-        matches!(self, Rule::ArgsInline)
+        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn)
     }
 
     /// The rule configuration names `name` ([`Rule::name`]'s spelling), if any.
@@ -960,7 +967,9 @@ impl Step {
     /// The levels this step prints its findings at: advice for every token rule (one a step
     /// does not run makes no finding). A typed rule ([`Rule::typed`]) files its findings at
     /// every step, so its level is what turns it on: `args-inline` is off below
-    /// [`Step::Edition`] (a blaze-edition API rule), advice there, an error in [`Step::Strict`].
+    /// [`Step::Edition`] (a blaze-edition API rule), advice there, an error in [`Step::Strict`];
+    /// `unsafe-op-in-unsafe-fn` is Rust's own warning, advice at every step (the levels start
+    /// as advice).
     pub const fn levels(self) -> Levels {
         let mut levels = Levels::ADVICE.0;
         levels[Rule::ArgsInline as usize - 1] = match self {

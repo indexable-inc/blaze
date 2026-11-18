@@ -64,6 +64,9 @@ mod no_spelled_dollar_crate;
 mod names_inplace;
 mod names_cells;
 mod names_groups;
+mod names_groups_edit;
+mod names_groups_lazy;
+mod names_groups_lazy_deps;
 mod name_rules;
 mod oracle;
 /// The reference solver's seam a solver core is compared through (oracle.rs).

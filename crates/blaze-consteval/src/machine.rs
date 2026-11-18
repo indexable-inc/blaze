@@ -13,7 +13,7 @@ use core::alloc::Allocator;
 use blaze_build::{InstanceKey, instance_key};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{BinOp, FloatTy, IntTy, ItemKey, List, PNode, PTy, PTys, PortableTys, UnOp};
+use blaze_typeck::{BinOp, FloatTy, IntTy, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys, UnOp};
 
 pub use code::Codes;
 use code::{EnumFacts, Meta, Num, Op, Reg, TyInfo, Valid};
@@ -494,7 +494,11 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         let key = RecordKey::of(instance_key(code_id, args, self.ground.view(), self.alloc).map_err(|_| malformed("an instance's arguments past the ground table"))?);
         self.enter(codes, ci, 0, 0)?;
         let v = self.run(codes)?;
-        let data = self.intern(v, ret)?;
+        let held = match self.world.is_static(item) {
+            true => Held::Static,
+            false => Held::Copied,
+        };
+        let data = self.intern(v, ret, held)?;
         data.check().map_err(|_| malformed("a record that breaks blaze-build's data form"))?;
         let mut reads = Vec::with_capacity_in(self.reads.len(), self.alloc);
         reads.extend_from_slice(&self.reads);
@@ -1673,7 +1677,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
 
     /// The value as a record: the root, then every allocation it reaches, in the order reached
     /// (rule 25: no address, no map order).
-    fn intern(&mut self, v: Val, t: PTy) -> R<'a, DataRecord<Alloc<'a>>> {
+    /// `held`: a static's record marks the allocations written in place
+    /// ([`Machine::written_in_place`]); a copied value's marks none.
+    fn intern(&mut self, v: Val, t: PTy, held: Held) -> R<'a, DataRecord<Alloc<'a>>> {
         let (size, align) = self.size_align(t)?;
         // A value already a whole temporary of its size is the root as it is.
         let whole = match v {
@@ -1734,8 +1740,159 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             }
             allocs.push(DataAlloc { bytes, align: align_log2, mutable: false, relocs });
         }
+        if held == Held::Static {
+            let written = self.written_in_place(&allocs, t)?;
+            for (a, w) in allocs.iter_mut().zip(written.iter()) {
+                a.mutable = *w;
+            }
+        }
         Ok(DataRecord { allocs })
     }
+
+    /// Which allocations of a static's record, of type `t`, are written in place: the
+    /// Reference, "Static items": a static "may contain interior mutability", so it is not
+    /// placed in read-only memory when its type is not `Freeze` (core/src/marker.rs); nor is an
+    /// allocation it points to whose pointee type is not (`static D: &AtomicU8 =
+    /// &AtomicU8::new(0)`: the temporary lives as long as the static and is written through
+    /// `D`), nor one behind a `&mut` or `*mut` (`static mut S: &mut [u8] = &mut [1, 2]`).
+    ///
+    /// The walk follows `t` over the record's bytes, only into parts that hold a relocation:
+    /// each struct, tuple and union field at its offset, an array's and a slice's elements, and
+    /// EVERY variant of an enum (the record does not say which is live, so a pointer any
+    /// variant could hold at an offset is typed by each; one that is not `Freeze` decides).
+    /// An allocation the walk reaches by no typed pointer (one behind a trait object, an
+    /// unsized struct, a closure's environment) is written in place: read-only is decided
+    /// only by a type that proves it.
+    fn written_in_place(&mut self, allocs: &[DataAlloc<Alloc<'a>>], t: PTy) -> R<'a, Vec<bool, Alloc<'a>>> {
+        /// The most parts one walk visits (rule 18).
+        const MOST_PARTS: usize = 1 << 20;
+        let n = allocs.len();
+        let mut written: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
+        let mut typed: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
+        for _ in 0..n {
+            written.push(false);
+            typed.push(false);
+        }
+        written[0] = self.interior_mut(t)?;
+        typed[0] = true;
+        let mut todo: Vec<(u32, u64, PTy), Alloc<'a>> = Vec::new_in(self.alloc);
+        todo.push((0, 0, t));
+        let mut parts = 0usize;
+        let too_many = || unsupported("a static whose value has more than 2^20 parts holding pointers to walk");
+        while let Some((i, base, ty)) = todo.pop() {
+            parts += 1;
+            if parts > MOST_PARTS || todo.len() > MOST_PARTS {
+                return Err(too_many());
+            }
+            let a = allocs.get(i as usize).ok_or(malformed("a relocation to an allocation past the record"))?;
+            let end = base.saturating_add(self.size_align(ty)?.0);
+            if !a.relocs.iter().any(|r| (base..end).contains(&u64::from(r.offset))) {
+                continue;
+            }
+            match self.node(ty)? {
+                PNode::Ref(m, p) | PNode::Ptr(m, p) => {
+                    let Some(r) = a.relocs.iter().find(|r| u64::from(r.offset) == base) else { continue };
+                    let DataTarget::Local(j) = r.target else { continue };
+                    let ju = j as usize;
+                    let target = allocs.get(ju).ok_or(malformed("a relocation to an allocation past the record"))?;
+                    // The word holds the addend: where in the target the pointee starts.
+                    let addend = word(&a.bytes, base)?;
+                    typed[ju] = true;
+                    written[ju] |= m == Mutbl::Mut;
+                    match self.node(p)? {
+                        PNode::Str => {}
+                        PNode::Slice(e) => {
+                            written[ju] |= self.interior_mut(e)?;
+                            let len = word(&a.bytes, base + PTR)?;
+                            let es = self.size_align(e)?.0;
+                            let to = addend.saturating_add(len.saturating_mul(es));
+                            if es != 0 && target.relocs.iter().any(|r| (addend..to).contains(&u64::from(r.offset))) {
+                                if len > MOST_PARTS as u64 {
+                                    return Err(too_many());
+                                }
+                                for k in 0..len {
+                                    todo.push((j, addend + k * es, e));
+                                }
+                            }
+                        }
+                        PNode::Dynamic(_) => written[ju] = true,
+                        _ if layout::is_unsized(self.world, self.ground, p, self.alloc)? => written[ju] = true,
+                        _ => {
+                            written[ju] |= self.interior_mut(p)?;
+                            todo.push((j, addend, p));
+                        }
+                    }
+                }
+                PNode::Tuple(l) => {
+                    let len = self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?.len() as u32;
+                    for f in 0..len {
+                        let (off, ft) = (self.field_offset(ty, 0, f)?, self.field_ty(ty, 0, f)?);
+                        todo.push((i, base + off, ft));
+                    }
+                }
+                PNode::Array(e, _) => {
+                    let es = self.size_align(e)?.0;
+                    if es != 0 {
+                        let count = (end - base) / es;
+                        if count > MOST_PARTS as u64 {
+                            return Err(too_many());
+                        }
+                        for k in 0..count {
+                            todo.push((i, base + k * es, e));
+                        }
+                    }
+                }
+                PNode::Adt(key, _) => {
+                    let variants = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?.variants.len() as u32;
+                    // One laid-out variant (a struct, a union, an enum whose others are
+                    // uninhabited): only its fields have offsets.
+                    let (mut cx, l) = self.cx();
+                    let tag = l.tag(ty, &mut cx)?;
+                    let live = match tag.at {
+                        None => {
+                            let index = tag.variant(0, &[])?;
+                            index..index + 1
+                        }
+                        Some(_) => 0..variants,
+                    };
+                    for v in live {
+                        for f in 0..self.variant_fields(ty, v)? {
+                            let (off, ft) = (self.field_offset(ty, v, f)?, self.field_ty(ty, v, f)?);
+                            todo.push((i, base + off, ft));
+                        }
+                    }
+                }
+                PNode::Pat(e, _) => todo.push((i, base, e)),
+                // A closure's environment, a coroutine: the pointers they hold are typed by
+                // nothing here, so what they point to is written in place (below).
+                _ => {}
+            }
+        }
+        for (w, t) in written.iter_mut().zip(typed.iter()).skip(1) {
+            *w |= !*t;
+        }
+        Ok(written)
+    }
+
+    fn interior_mut(&mut self, t: PTy) -> R<'a, bool> {
+        let (mut cx, l) = self.cx();
+        Ok(l.interior_mut(t, &mut cx)?)
+    }
+}
+
+/// How the evaluated value is held: a static's record is the static's memory (its
+/// interior-mutable allocations written in place); every other constant's is copied from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Held {
+    Static,
+    Copied,
+}
+
+/// The little-endian word at `at` of `bytes` (a relocation's addend, a slice's length).
+fn word<'a>(bytes: &[u8], at: u64) -> R<'a, u64> {
+    let at = usize::try_from(at).map_err(|_| malformed("a word past its allocation"))?;
+    let w = bytes.get(at..at + 8).ok_or(malformed("a word past its allocation"))?;
+    Ok(u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]))
 }
 
 /// The validity of a scalar read at a type ("Behavior considered undefined": invalid values).

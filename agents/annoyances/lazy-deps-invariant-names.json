@@ -1,0 +1,15 @@
+{
+ "id": "lazy-deps-invariant-names",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane LY",
+ "where": "crates/blaze-scope/src/crate_scope.rs `Dep`, crates/blaze-scope/src/cells/lazy_deps.rs `LazyDep`; seen as resolve.rs `Names::shorter` failing to compile",
+ "what": "A dependency solved on demand first held its growing scopes in a RefCell inside the `Dep::Lazy` it was read through. That made `Dep<'a>`, and so `Names<'a>`, invariant in 'a; `Names::shorter` (and six tests that borrow names) stopped compiling with 'lifetime may not live long enough', far from the change.",
+ "cost": "one ask (about 10 minutes in the queue)",
+ "cause": "interior mutability of 'a data inside a type `Names` needs covariant",
+ "whys": "the miss sink and the growing state were one object; only the sink needs mutation",
+ "class": "a RefCell/Cell of lifetime-carrying data inside a type that must be covariant",
+ "prevention": "done: `LazyDep` is a frozen view per solve (its solves and scopes copied as references) and its sink a `&'a (dyn WantSink + 'a)`, a lifetime-free trait object; the driver owns the mutable state",
+ "annoyance": "the runner's queue is 3-5 asks deep: a typo costs 5-20 minutes",
+ "workaround": "read the error line and fix both shapes before asking again",
+ "state": "fixed"
+}

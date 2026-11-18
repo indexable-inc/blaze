@@ -35,6 +35,7 @@ use blaze_ladder::front2::project::ProjectWorld;
 use blaze_ladder::front2::project_records::{ByChain, Listed, index_by_chain};
 use blaze_ladder::front2::source::{Records, SourceError};
 use blaze_own::{AVec, Alloc, Vec};
+use blaze_scope::crate_env::EnvLent;
 use blaze_scope::items_record::{ItemsRecord, ItemsRecordError};
 use blaze_scope::resolve::SourceTexts;
 use blaze_surface::ItemKind;
@@ -57,7 +58,7 @@ pub(crate) use heads::handed_reads;
 
 /// Which bodies an outline entry's check covers: its root, and each fn declared in a body it
 /// reaches (front2 every_body.rs's work list); the one home of it.
-mod covered;
+pub(crate) mod covered;
 
 /// The check scopes of a deep crate list in a task-sized frame (`owner_wants`).
 #[cfg(test)]
@@ -309,7 +310,87 @@ pub(crate) struct Owner<'j> {
     /// The body's file is this owner's crate root (its `CrateInput::root` after `/0/`): where
     /// the root's `fn main` is (covered.rs `root_of`).
     root_file: bool,
+    /// The owner crate's environment, what its bodies' `env!`/`option_env!` read: made by
+    /// blaze-scope's `CrateEnv::of` from the crate list's facts of it (the world's own, rule
+    /// 30) with its build script's outputs joined ([`owner_env`]). Lent: each worker copies it
+    /// into its frame. `None` for an owner with no crates.
+    env: Option<EnvLent<'j, 'j>>,
+    /// The owner's build-script run read for `env` (name, out): in every body's read list, so a
+    /// script that sets another `rustc-env` value reruns the bodies ([`reads_of`]).
+    script: Option<(Name, ContentId)>,
 }
+
+/// The `Script` part's name of the crate at list row `at`, when it has a build script whose run
+/// is a task; refused by name when the row names a kind of no task.
+fn owner_script(list: &CrateList<'_>, at: usize) -> Result<Option<Name>, &'static str> {
+    match list.script(at) {
+        None => Ok(None),
+        Some(bytes) => crate::native_image::script_name(bytes).map(Some).ok_or("a crate list row names a build-script run of no kind (crate_list.rs `script`)"),
+    }
+}
+
+/// The environment of the owner crate at list row `at`: `CrateEnv::of` of the list's facts of
+/// it (the ones the world made the crate's item-level environment from) and, when it has a
+/// build script, the outputs record of its run (`task`'s input, asked in [`prepare`]), whose
+/// `OUT_DIR` files are read from the home's file area as the names task reads them
+/// (names/scope.rs). Made in `jobs`, lent to the pool. Refused by name: a script record that is
+/// not an outputs record, a version that is not SemVer.
+fn owner_env<'j>(
+    cx: &Cx,
+    store: &mut dyn Store<'_>,
+    task: &Task<'_>,
+    list: &CrateList<'static>,
+    at: usize,
+    home: Option<&str>,
+    jobs: &'j Frame,
+) -> Result<Result<OwnerEnv<'j>, &'static str>, CliError> {
+    owner_env_by(cx, store, &|script| task.inputs.iter().find(|input| input.name == script).copied(), list, at, home, jobs)
+}
+
+/// [`owner_env`] with the build-script run's input found by `handed` (a drive task's inputs, or
+/// the engine's Scripts stage, engine_bodies.rs).
+pub(crate) fn owner_env_by<'j>(
+    cx: &Cx,
+    store: &mut dyn Store<'_>,
+    handed: &dyn Fn(Name) -> Option<Input>,
+    list: &CrateList<'static>,
+    at: usize,
+    home: Option<&str>,
+    jobs: &'j Frame,
+) -> Result<Result<OwnerEnv<'j>, &'static str>, CliError> {
+    let erased: &'j blaze_own::Erased<&'j Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::Erased::new(jobs), jobs));
+    let alloc = erased.handle();
+    let mut facts: blaze_scope::crate_env::EnvFacts<'j> = list.env_facts(at);
+    let mut read = None;
+    let script = match owner_script(list, at) {
+        Ok(script) => script,
+        Err(refused) => return Ok(Err(refused)),
+    };
+    if let Some(script) = script {
+        let Some(handed) = handed(script) else {
+            return Ok(Err("a body's owner's build-script run, asked for, is not among its inputs"));
+        };
+        let payload = crate::work::payload(cx, store, &handed, jobs)?;
+        let bytes: &'j [u8] = blaze_own::Vec::from_slice_in(payload.payload(), jobs).leak();
+        let Some((_, record)) = crate::scripts::payload_parts(bytes) else {
+            return Ok(Err("a body's owner's build-script record is not a `Script` payload (scripts.rs `payload_parts`)"));
+        };
+        let Ok(outputs) = blaze_build_script::outputs::OutputsRef::open(record) else {
+            return Ok(Err("a body's owner's build-script record is not an outputs record (blaze-build-script `OutputsRef::open`)"));
+        };
+        let area: &'j blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::file_area(home, &outputs), jobs));
+        facts.script = Some(outputs.with_area(area));
+        read = Some((handed.name, handed.out));
+    }
+    let Ok(env) = blaze_scope::crate_env::CrateEnv::of(facts, alloc) else {
+        return Ok(Err("a body's owner's package version is not MAJOR.MINOR.PATCH (the cargo book, \"The `version` field\")"));
+    };
+    let env: &'j blaze_scope::crate_env::CrateEnv<'j> = blaze_own::Box::leak(blaze_own::Box::new_in(env, jobs));
+    Ok(Ok((Some(EnvLent::new(env)), read)))
+}
+
+/// An owner's lent environment and the script read it was made with ([`owner_env`]).
+pub(crate) type OwnerEnv<'j> = (Option<EnvLent<'j, 'j>>, Option<(Name, ContentId)>);
 
 /// The note of an owner whose root file the file's `Owners` names and no crate of the names
 /// world has as its root (a unit the graph does not make, such as a test target's root).
@@ -378,6 +459,7 @@ fn reads_of<'j>(graph: Option<(Name, ContentId)>, units: Option<(Name, ContentId
     reads.extend(owned);
     for owner in owners {
         reads.extend(owner.readers.iter().map(|r| (r.name, r.out)));
+        reads.extend(owner.script);
     }
     let kept = canonical_reads(&mut reads);
     reads.truncate(kept);
@@ -517,11 +599,13 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     // The crates as the `UnitGraph` record lists them, one row a crate read in place (drive.md,
     // "The crate list is a record"): no world is made here, on a cold check or an edit.
     let heap = facts.fetch_env.heap;
+    // Where a build script's stored `OUT_DIR` files are (an owner's environment, [`owner_env`]).
+    let home = facts.fetch_env.home;
     let kept = &mut facts.bodies;
     let Some(list) = kept.list(&cx, store, graph, jobs)? else {
         return Ok(Prepared::NotRun(WORLD_NOT_MADE));
     };
-    let name_at = |at: usize| crate::names::name_of(list.key(at));
+    let name_at = |at: usize| blaze_drive::key::crate_scope_name(&list.key(at));
     // The name is hashed once per lookup, never per input compared: inside `find` it was a
     // blake3 key derivation per (crate, input) pair, per member, per body (RUNNER 16: 1226 of
     // 3213 main-thread samples of a cold clone check in `derive_key_with`).
@@ -575,6 +659,15 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     for at in owners.iter().copied() {
         if input_at(at).is_none() {
             want(at, &mut wants);
+        }
+        // The owner's build-script run, when it has one: its `OUT_DIR` and `rustc-env` pairs
+        // are the crate's environment, which its bodies' `env!` reads ([`owner_env`]).
+        match owner_script(&list, at) {
+            Ok(Some(script)) if !task.inputs.iter().any(|input| input.name == script) && !wants.iter().any(|w| w.name == script) => {
+                wants.push(Want { name: script, home: Name::unit_graph() });
+            }
+            Ok(_) => {}
+            Err(refused) => return Ok(Prepared::Refused(refused)),
         }
         let asked = owner_wants(&list, at, scratch, |seen| {
             if input_at(seen).is_none() {
@@ -647,10 +740,14 @@ pub(crate) fn prepare<'f: 'j, 'j>(
             let package = list.shown_from(at);
             readers.push(Reader { name: input.name, out: input.out, crate_name, package, world_at: at, member: list.member(at), records });
         }
-        built.push(Owner { readers: readers.leak(), lang: lang.leak(), missing: None, root_file });
+        let (env, script) = match owner_env(&cx, store, task, &list, owner_at, home, jobs)? {
+            Ok(made) => made,
+            Err(refused) => return Ok(Prepared::Refused(refused)),
+        };
+        built.push(Owner { readers: readers.leak(), lang: lang.leak(), missing: None, root_file, env, script });
     }
     for _ in missing.iter() {
-        built.push(Owner { readers: &[], lang: &[], missing: Some(NOT_IN_WORLD), root_file: false });
+        built.push(Owner { readers: &[], lang: &[], missing: Some(NOT_IN_WORLD), root_file: false, env: None, script: None });
     }
     // The packs and corrections the list's tree table names, opened once a command and kept on
     // the heap (`Kept::trees`): no world is made for them (rule 25: one answer whatever made
@@ -669,6 +766,70 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     Ok(Prepared::Ready(blaze_own::Box::leak(blaze_own::Box::new_in(job, jobs))))
 }
 
+
+/// The macro calls of a refused lowering whose expansion failed by its own words (blaze-ladder
+/// body.rs `BodyFinding::Macro` whose cause is `Failed(Diagnostic ..`: an unset `env!`
+/// variable, `compile_error!`, no rule matched): each call's range, path and the expansion's
+/// words, and the first other finding (something blaze cannot take: a host refusal is blaze's
+/// gap, not the program's error, so the body is then not checked too). `None` for any other
+/// refusal, or a lowering with no such call.
+fn failed_calls(refused: &blaze_ladder::front2::project::Refused) -> Option<FailedCalls<'_>> {
+    use blaze_ladder::front2::body::{BodyError, BodyFinding};
+    let blaze_ladder::front2::project::Refused::Lower(BodyError::Lowered { findings, .. }) = refused else { return None };
+    let failed = |f: &&BodyFinding| matches!(f, BodyFinding::Macro { cause, .. } if cause.starts_with("Failed(Diagnostic"));
+    if !findings.iter().any(|f| failed(&f)) {
+        return None;
+    }
+    // A macro call node left unlowered with no expander finding of its own is the place a
+    // failed expansion wrote nothing (the call of `dep::missing_of!()` whose `env!` failed):
+    // the failed call's error stands for it. A call the expander could not run has its own
+    // `Macro` finding, so it still stops the body below.
+    let leftover = |f: &&BodyFinding| matches!(f, BodyFinding::Unhandled { syntax: blaze_file_items::SyntaxKind::MACRO_CALL, .. });
+    let other = findings.iter().find(|f| !failed(f) && !leftover(f));
+    // Where each failed call is shown: the user-written call that wrote nothing (the leftover
+    // node) holding it, else the first such, else its own range. A call inside an expansion
+    // has a range past the item's text (body.rs `BodyFinding`), which names no place in the
+    // user's file; the call written in the file is what Rust points at ("in this macro
+    // invocation").
+    let sites: std::vec::Vec<blaze_surface::Range, Global> = findings
+        .iter()
+        .filter_map(|f| match f {
+            BodyFinding::Unhandled { syntax: blaze_file_items::SyntaxKind::MACRO_CALL, range, .. } => Some(*range),
+            _ => None,
+        })
+        .collect();
+    let mut calls: std::vec::Vec<(blaze_surface::Range, &str, &str), Global> = std::vec::Vec::new();
+    for f in findings.iter().filter(failed) {
+        let BodyFinding::Macro { at, path, why, .. } = f else { continue };
+        let site = sites.iter().find(|s| s.start <= at.start && at.end <= s.end).or(sites.first()).copied().unwrap_or(*at);
+        let call = (site, &**path, &**why);
+        // One call met twice (the expander's findings of a call and of its expansion) is one
+        // error.
+        if !calls.iter().any(|(r, p, w)| (r.start, r.end, *p, *w) == (site.start, site.end, call.1, call.2)) {
+            calls.push(call);
+        }
+    }
+    Some(FailedCalls { calls, other })
+}
+
+/// [`failed_calls`]'s answer: each failed call (range, path, the expansion's words), and the
+/// first finding that is not one (the body is then also not checked, by that finding's class).
+struct FailedCalls<'r> {
+    calls: std::vec::Vec<(blaze_surface::Range, &'r str, &'r str), Global>,
+    other: Option<&'r blaze_ladder::front2::body::BodyFinding>,
+}
+
+/// A lowering finding's class for a not-checked note (reach.rs `lower_class`'s form, one
+/// finding): what groups items, with the macro's path for a call.
+fn finding_class(f: &blaze_ladder::front2::body::BodyFinding) -> std::string::String {
+    use blaze_ladder::front2::body::BodyFinding;
+    match f {
+        BodyFinding::Macro { path, cause, .. } => std::format!("Lowered: Macro {cause}, the call of `{path}!`"),
+        BodyFinding::Unhandled { syntax, .. } => std::format!("Lowered: Unhandled {syntax:?}"),
+        BodyFinding::Diag { kind, .. } => std::format!("Lowered: Diag {kind:?}"),
+        BodyFinding::CfgOut => std::string::String::from("Lowered: CfgOut"),
+    }
+}
 
 /// The words of a record error, in `frame`: for a file text the loader did not serve
 /// (`ItemsRecordError::Gone` of file `n` of reader `krate`'s items record, no macro call), the
@@ -1021,54 +1182,42 @@ impl<'n> FileTypes<'n> {
                         None => crate::not_checked::items::file(made, (0, 0), item_path, "a typed lint's finding names no rule of blaze-lint", d.lint),
                     }
                 }
+                // What the check could not decide (blaze-typeck rules/unsafety.rs `Undecided`):
+                // "not checked" at its place, never a pass (rule 3).
+                for u in verdict.undecided.iter() {
+                    crate::not_checked::items::file(made, at_entry(u.start, u.end), item_path, u.cause, u.text.as_str());
+                }
                 if unserved_now {
                     // Said once, after every body (below).
+                } else if let Some(failed) = verdict.refused.as_ref().and_then(failed_calls) {
+                    // A macro call whose expansion FAILED by its own words (an unset `env!`
+                    // variable, `compile_error!`, no rule matched) is Rust's error in the
+                    // program, never "not checked" (core's `env!` doc: "a compilation error will
+                    // be emitted"). Filed as the failed call an item-level call files
+                    // (names/failed_call.rs, rule 22), at the call, with the expansion's words.
+                    for (range, path, why) in failed.calls.iter() {
+                        // Rule 22's two arguments (blaze-report words.rs): the call, the reason;
+                        // once, though two owners of the file (a binary and its test unit) or
+                        // two bodies reached both meet it.
+                        let call = bstd::mem::format_in!(frame, "{prefix}the call of `{path}!`");
+                        covered::find_once(made, crate::names::failed_call::FAILED_CALL, at_entry(range.start, range.end), call.as_str(), "", why);
+                    }
+                    // What else the lowering did not take: the body is not checked by it.
+                    if let Some(other) = failed.other {
+                        let cause = bstd::mem::format_in!(frame, "lowering refused ({})", finding_class(other).replace('\x1f', " "));
+                        let words = bstd::mem::format_in!(frame, "body `{shown}`: {other:?}");
+                        crate::not_checked::items::file(made, (0, 0), item_path, cause.as_str(), words.as_str());
+                    }
                 } else if let Some(refused) = &verdict.refused {
-                    // A head that did not resolve names its item by name and quotes the item's
-                    // text from the records (rule 19): a key alone says nothing to a reader.
-                    let named = match refused {
-                        blaze_ladder::front2::project::Refused::Check(blaze_ladder::front2::check::CheckFail::Head {
-                            error: blaze_ladder::front2::heads::HeadError::Item(key, _),
-                            ..
-                        }) => blaze_ladder::front2::source::NamesSource::text_of(checker.records, *key),
-                        _ => None,
-                    };
-                    let words = match named {
-                        Some(it) => {
-                            let quoted = it.text.get(..it.text.len().min(240)).unwrap_or(it.text);
-                            bstd::mem::format_in!(frame, "body `{shown}`: {}: {refused:?}; the item is `{}`: {quoted:?}", refused.text(), it.name.unwrap_or("_"))
-                        }
-                        None => bstd::mem::format_in!(frame, "body `{shown}`: {}: {refused:?}", refused.text()),
-                    };
-                    // Rule 19: a lowering's refusal groups by WHAT it refused (the construct and
-                    // why, the macro call and its host ask), never by "lowering refused" alone,
-                    // which named nothing (port27/mini/clap-root, tempo's clap derives).
-                    let cause = match refused {
-                        // A head the body needs: which head (its item by path) and why, as the
-                        // impl candidates' refusals name it (header_written.rs `head_failed`);
-                        // `Head` alone named neither (port27/mini/clap-root, 2026-11-17).
-                        // One line per head and reason: the head's item by its path, no key and
-                        // no range (two keys of one impl at two ranges were eight lines); the
-                        // key and the range stay in the finding's words.
-                        blaze_ladder::front2::project::Refused::Lower(error @ blaze_ladder::front2::body::BodyError::Head { item, error: head }) => {
-                            let at = match head {
-                                blaze_ladder::front2::heads::HeadError::Item(k, _) => *k,
-                                _ => *item,
-                            };
-                            let shown = blaze_ladder::front2::item_shown::ItemShown::of_lib(checker.records, at);
-                            let path = shown.path().unwrap_or("an item the names source holds no path for").replace('\x1f', " ");
-                            let class = blaze_ladder::front2::reach::lower_class(error).replace('\x1f', " ");
-                            bstd::mem::format_in!(frame, "{} ({class}, in the head of `{path}`)", refused.text())
-                        }
-                        blaze_ladder::front2::project::Refused::Lower(error) => {
-                            bstd::mem::format_in!(frame, "{} ({})", refused.text(), blaze_ladder::front2::reach::lower_refusal(error).replace('\x1f', " "))
-                        }
-                        _ => bstd::mem::format_in!(frame, "{}", refused.text()),
-                    };
+                    // The words and the cause from their one home (blaze-ladder front2 said.rs),
+                    // which the body task carries for `engine-check` too.
+                    let words = blaze_ladder::front2::said::refused_words(checker.records, refused);
+                    let words = bstd::mem::format_in!(frame, "body `{shown}`: {words}");
+                    let cause = blaze_ladder::front2::said::refused_cause(checker.records, &checker.world.front.keys, refused);
                     crate::not_checked::items::file(made, (0, 0), item_path, cause.as_str(), words.as_str());
-                } else if let Some(gap) = verdict.gaps.first() {
-                    let words = bstd::mem::format_in!(frame, "body `{shown}`: {} questions the front end cannot answer yet, the first {gap:?}", verdict.gaps.len());
-                    crate::not_checked::items::file(made, (0, 0), item_path, "a question the front end cannot answer yet", words.as_str());
+                } else if let Some(words) = blaze_ladder::front2::said::gap_words(&verdict.gaps) {
+                    let words = bstd::mem::format_in!(frame, "body `{shown}`: {words}");
+                    crate::not_checked::items::file(made, (0, 0), item_path, blaze_ladder::front2::said::GAP_CAUSE, words.as_str());
                 }
                 // The move and borrow check's verdict, filed whatever `BORROWS_ARE_ERRORS` says
                 // (print.rs decides how it is shown), so the day it flips no body is made again.
@@ -1200,7 +1349,17 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
     }
     let mut read = std::vec::Vec::new_in(Global);
     read.push((job.path, Some(text)));
-    let opened = crate::run_names::names_records(cx, root, &crates, job.packs, job.corrected, job.procs, read, frame, g).map_err(|error| match error {
+    // The owner's environment, copied into this worker's frame (`EnvLent`: no allocator of the
+    // preparing thread is called here).
+    let env = match owner.env {
+        None => None,
+        Some(lent) => {
+            let erased: &'n blaze_own::Erased<&'n Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
+            let env = lent.copy_in(erased.handle()).map_err(|error| words(format_args!("the environment of `{}`: its build-script record did not open again: {error:?}", owner.readers.first().map_or("?", |reader| reader.crate_name))))?;
+            Some(&*blaze_own::Box::leak(blaze_own::Box::new_in(env, frame)))
+        }
+    };
+    let opened = crate::run_names::names_records(cx, root, &crates, job.packs, job.corrected, job.procs, read, env, frame, g).map_err(|error| match error {
         crate::run_names::NamesError::Items { at, why } => words(format_args!("the items record of `{}`: {why:?}", owner.readers.get(at).map_or("?", |reader| reader.crate_name))),
     })?;
     let (records, load) = (opened.records, opened.load);

@@ -163,6 +163,11 @@ pub enum DiagCode {
     /// An `asm!` register that is no class or register of the target, a reserved one, or one
     /// explicit register twice among the inputs or the outputs; `name` the register.
     AsmRegister,
+    /// E0133: an operation only `unsafe` code may do, outside any `unsafe` block or `unsafe fn`
+    /// (the Reference, "Unsafety"); the operation is [`Because::Unsafe`] (rules/unsafety.rs).
+    RequiresUnsafe,
+    /// E0784: a union's struct pattern that names other than exactly one field (rules/pat.rs).
+    UnionPatternFields,
 }
 
 impl DiagCode {
@@ -231,6 +236,8 @@ impl DiagCode {
             DiagCode::AmbiguousAssocTyInBounds => "E0221",
             DiagCode::AmbiguousAssocTy => "E0223",
             DiagCode::AsmOperandType | DiagCode::AsmRegister => "E0000",
+            DiagCode::RequiresUnsafe => "E0133",
+            DiagCode::UnionPatternFields => "E0784",
         }
     }
 }
@@ -277,6 +284,29 @@ pub enum Because {
     /// The finding is about the path written at its range, and the body keeps no segment of it
     /// to name (src/diag/about.rs, `About::Path`): the range is the thing.
     NoSegment,
+    /// E0133: the operation that needs `unsafe` (rules/unsafety.rs).
+    Unsafe(UnsafeOp),
+}
+
+/// An operation only `unsafe` code may do (the Reference, "Unsafety": "the following language
+/// level features cannot be used in the safe subset of Rust"), as an E0133 finding names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnsafeOp {
+    /// A call of an `unsafe` fn: the item where the callee is one (a fn, a method, an
+    /// intrinsic, a foreign fn not written `safe`), `None` through an `unsafe fn` pointer.
+    Call(Option<ItemKey>),
+    /// A call of a safe `#[target_feature]` fn from a body that enables none of its features.
+    TargetFeatureCall(ItemKey),
+    /// `*p` of a raw pointer `p`, not directly under `&raw`.
+    RawDeref,
+    /// A read or write of a `static mut`, not directly under `&raw`.
+    MutStatic(ItemKey),
+    /// A use of a static of an `extern` block not written `safe`, not directly under `&raw`.
+    ExternStatic(ItemKey),
+    /// A read of a union's field (assigning to one is safe).
+    UnionField,
+    /// `asm!`.
+    InlineAsm,
 }
 
 /// A goal as a finding keeps it: every argument, `Self` first, a list of the record's type

@@ -25,12 +25,14 @@ use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PortableTys};
 
 use super::dyn_ty::Member as DynMember;
+use super::head_record::{Head, HeadAt};
 use super::item_site::MarksLost;
 use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
+use super::rows::Rows;
 use super::source::NamesSource;
 use super::type_miss::TypeMiss;
-use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHead, Why, intern, intern_list};
+use super::types::{AliasGap, Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHead, Why, intern, intern_list};
 use crate::resolve::Paths;
 
 mod member_fn;
@@ -66,7 +68,27 @@ pub enum HeadError {
     Key(KeyClash),
     /// The item's types: what and where in its text.
     Item(LibKey, Why),
+    /// `by` needs `need`, whose cell the seed ([`Store::ensure_seeded`]) was to file from its
+    /// frozen record and could not: the seed's caller holds why (front2/tables/head.rs
+    /// `freeze_seeded` returns that error). Never lowered here instead (rule 3).
+    Seed { need: Want, by: Want },
+    /// Head `at` of cell `want`'s record could not be filed ([`Store::file_heads`]): `what`.
+    Filed { want: Want, at: HeadAt, what: &'static str },
 }
+
+/// What a seed ([`Store::ensure_seeded`]) did with a need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seeded {
+    /// The need's cell was filed from its frozen record: the need is made.
+    Filed,
+    /// The need is of the cell being made (its own item), or of one being made up the
+    /// seeding stack (two cells whose items need each other's heads): lowered in this store.
+    Lower,
+}
+
+/// A seed could not file a need's cell; the seed keeps why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeedFailed;
 
 impl core::fmt::Display for HeadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -89,6 +111,8 @@ impl core::fmt::Display for HeadError {
             HeadError::NeedMade { need, by } => write!(f, "{by:?} needs {need:?}, which is made, yet asks for it again (its lookup reads what that want does not make)"),
             HeadError::Key(c) => write!(f, "{c}"),
             HeadError::Item(k, why) => write!(f, "item {k:?}: {why:?}"),
+            HeadError::Seed { need, by } => write!(f, "{by:?} needs {need:?}, whose frozen head could not be filed (the seed holds why)"),
+            HeadError::Filed { want, at, what } => write!(f, "the frozen head of {want:?}, head {at:?}: {what}"),
         }
     }
 }
@@ -112,34 +136,34 @@ pub struct TraitHead {
 pub struct Maps {
     /// Each struct's, enum's and union's type parameter count and their defaults (over its
     /// own parameters, `None` where none is written).
-    pub generics: HashMap<LibKey, (u32, Vec<Option<PTy>, Global>), Global>,
-    pub traits: HashMap<LibKey, TraitHead, Global>,
+    pub generics: Rows<LibKey, (u32, Vec<Option<PTy>, Global>)>,
+    pub traits: Rows<LibKey, TraitHead>,
     /// Each trait's associated type's count of its OWN type and const parameters (`type
     /// MapStorage<V>`: one), by the trait and the name, filed with the trait's members
     /// ([`Heads::assoc_generics`]): what `<K as Key>::MapStorage<V>` is checked against.
-    pub assoc_generics: HashMap<(LibKey, Name), u32, Global>,
+    pub assoc_generics: Rows<(LibKey, Name), u32>,
     /// The outlives where clauses of each trait's associated type that writes one (`type
     /// Iter<'a> where Self: 'a;`), by the trait and the name: read and kept, not checked
     /// (gat.rs [`super::gat::OUTLIVES_NOT_CHECKED`]).
-    pub assoc_where: HashMap<(LibKey, Name), super::gat::AssocWhere, Global>,
+    pub assoc_where: Rows<(LibKey, Name), super::gat::AssocWhere>,
     /// Each trait's associated type's own const parameters (own position, declared type), by
     /// the trait and the name, filed with the trait's members ([`Heads::assoc_const_params`]):
     /// the type a constant written in `Tr<Buf<3>: Bound>` is made at (gat_bounds.rs).
-    pub assoc_consts: HashMap<(LibKey, Name), Vec<(u32, PTy), Global>, Global>,
+    pub assoc_consts: Rows<(LibKey, Name), Vec<(u32, PTy), Global>>,
     /// Each trait's supertraits written as bounds on `Self` (see [`Heads::trait_supers`]):
     /// made with its members ([`Want::Members`]), since a supertrait's head may need the
     /// trait's (`FromResidual<R = <Self as Try>::Residual>`).
-    pub supers: HashMap<LibKey, Vec<(LibKey, List), Global>, Global>,
+    pub supers: Rows<LibKey, Vec<(LibKey, List), Global>>,
     /// Each type alias's generic count and aliased type ([`Heads::alias`]); `None` where its
     /// head was refused, with the why in `alias_gaps`: an alias no path uses never fails a
     /// check, and one that is used fails only the item that names it.
-    pub aliases: HashMap<LibKey, Option<(u32, PTy)>, Global>,
+    pub aliases: Rows<LibKey, Option<(u32, PTy)>>,
     /// Each type alias's parameter defaults (over its own parameters, `None` where none is
     /// written), made with its head: `type Result<T, E = Error>`.
-    pub alias_defaults: HashMap<LibKey, Vec<Option<PTy>, Global>, Global>,
-    pub alias_gaps: HashMap<LibKey, Why, Global>,
+    pub alias_defaults: Rows<LibKey, Vec<Option<PTy>, Global>>,
+    pub alias_gaps: Rows<LibKey, AliasGap>,
     /// Each trait alias's head ([`Heads::trait_alias`]; made by `Store::trait_alias`).
-    pub trait_aliases: HashMap<LibKey, TraitAliasHead, Global>,
+    pub trait_aliases: Rows<LibKey, TraitAliasHead>,
     /// Each `usize` constant item a head's array length names, by its value
     /// ([`Why::NeedConst`]): filled by the driver that has the constant evaluator.
     pub const_lens: HashMap<LibKey, u64, Global>,
@@ -172,12 +196,12 @@ pub struct Maps {
     /// struct's, enum's, union's, trait's and alias's own (made with its head, what
     /// [`Heads::const_params`] reads), an impl's own, and a fn's with its container's first
     /// (the checker's `const_params`). An item with none has an empty row once made.
-    pub const_params: HashMap<LibKey, Vec<(u32, PTy), Global>, Global>,
+    pub const_params: Rows<LibKey, Vec<(u32, PTy), Global>>,
     /// Each enum with no generic parameters whose every variant is a unit variant, by its
     /// checker key, with its variant count: what a const parameter's type may be past the
     /// integers, `char` and `bool` ([`super::const_enum`]). Filed by `Store::adt_head` with
     /// the enum's generics, so before any path to the enum has a type.
-    pub fieldless_enums: HashMap<ItemKey, u32, Global>,
+    pub fieldless_enums: Rows<ItemKey, u32>,
     /// How many lowerings of a written bound's arguments are nested right now
     /// ([`Heads::written_depth`]): zero between any two heads.
     pub written_depth: core::cell::Cell<u32>,
@@ -232,7 +256,7 @@ impl Heads for Maps {
     fn alias_defaults(&self, alias: LibKey) -> &[Option<PTy>] {
         self.alias_defaults.get(&alias).map_or(&[], |d| &d[..])
     }
-    fn alias_gap(&self, alias: LibKey) -> Option<&Why> {
+    fn alias_gap(&self, alias: LibKey) -> Option<&AliasGap> {
         self.alias_gaps.get(&alias)
     }
     fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead> {
@@ -550,21 +574,26 @@ impl Want {
 }
 
 /// The lowered heads, by key, and the type table they are in.
+///
+/// The tables a body's check borrows its answers from (`adts`, `field_defaults`, `impls`,
+/// `fns`, `preds`, `trait_defs`, `ctors`) are [`Rows`]: each row filed once at an address that
+/// holds until the store drops, filed through `&self`, so a row filed during a check moves no
+/// row an earlier answer of that check holds (front2 rows.rs says why that is sound).
 pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
-    pub adts: HashMap<ItemKey, AdtRow, Global>,
+    pub adts: Rows<ItemKey, AdtRow>,
     /// Each ADT's field defaults (`struct S { a: u8 = 1 }`, RFC 3681), made with its head in
     /// `adts`: one per field of `AdtRow::fields`, the key of the default's head in `fns` (an
     /// anonymous constant of the field's type over the ADT's generics), or `None`; empty when
     /// no field has one. A head record carries them (head_record.rs, form 8); a row filed
     /// without its entry is the world's gap `field_defaults`, never "no defaults".
-    pub field_defaults: HashMap<ItemKey, Vec<Option<ItemKey>, Global>, Global>,
-    pub impls: HashMap<ItemKey, ImplHead, Global>,
-    pub fns: HashMap<ItemKey, FnHead<'n>, Global>,
+    pub field_defaults: Rows<ItemKey, Vec<Option<ItemKey>, Global>>,
+    pub impls: Rows<ItemKey, ImplHead>,
+    pub fns: Rows<ItemKey, FnHead<'n>>,
     /// Each ADT's, trait's, impl's and fn's where-clauses, own and inherited (a fn's from its
     /// trait or impl), with its `where const` conditions.
-    pub preds: HashMap<ItemKey, Preds, Global>,
+    pub preds: Rows<ItemKey, Preds>,
     /// The `sized` lang trait: each own type parameter's implied bound.
     pub sized: Option<LibKey>,
     /// The library's `Box`, `Rc`, `Arc` and `Pin`, a trait method's typed receiver is read
@@ -572,24 +601,24 @@ pub struct Store<'n> {
     /// the store: [`Store::new`] leaves them not looked up, so every such receiver is a gap).
     pub pointers: super::receiver::Pointers,
     /// Each trait's parts of the checker's `TraitDef` that need its members lowered.
-    pub trait_defs: HashMap<ItemKey, TraitExtra, Global>,
+    pub trait_defs: Rows<ItemKey, TraitExtra>,
     /// The member fns whose signature could not be made, by why: their container's head is
     /// made without them, and a body that uses one gets [`super::world_items::Gap::FnHead`]
     /// (a trait's head does not depend on its fns' signatures: `FnMut` and `extern "rust-call"`).
     pub fn_gaps: HashMap<ItemKey, Why, Global>,
     /// Each impl's frame its fns' signatures are made in ([`member_fn::MemberFrame`]), kept
     /// when its head is made, by the impl's checker key.
-    member_frames: HashMap<ItemKey, member_fn::MemberFrame, Global>,
+    member_frames: Rows<ItemKey, member_fn::MemberFrame>,
     /// Each tuple struct's and tuple variant's constructor fn, by the variant's key: made with
     /// its ADT's head.
-    pub ctors: HashMap<ItemKey, CtorSig, Global>,
+    pub ctors: Rows<ItemKey, CtorSig>,
     /// Each static whose head is made (its type is its [`FnHead`] of no inputs, as a const's),
     /// with its mutability (`static mut`): the checker's `Def::Static`.
-    pub statics: HashMap<ItemKey, tc::Mutbl, Global>,
+    pub statics: Rows<ItemKey, tc::Mutbl>,
     /// Each opaque type a fn's head made (an `impl Trait` in its return type, an `async fn`'s
     /// `impl Future`), by its key ([`super::keys::opaque_key`]): its fn and its index. Its
     /// bounds are in `preds` under the same key, with the opaque type as `Self`.
-    pub opaques: HashMap<ItemKey, (ItemKey, u32), Global>,
+    pub opaques: Rows<ItemKey, (ItemKey, u32)>,
     /// The hidden types of the opaques defined by the bodies checked clean in this command,
     /// and the running check's leak list ([`super::opaque_auto`]).
     pub hidden: super::opaque_auto::HiddenTable<'static>,
@@ -624,15 +653,26 @@ pub struct Store<'n> {
     more_needs: Vec<LibKey, Global>,
     /// How a trait's members' needs are met: the seam the cost test proves equal.
     pub needs: NeedsMet,
+    /// A body task's frozen heads (front2 tables/seeds.rs): with one, every head
+    /// [`Store::ensure`] needs, the asked one first, is filed from its frozen record, never
+    /// lowered; `None` lowers (today's path, and a store that freezes).
+    pub seeds: Option<&'n dyn super::tables::seeds::HeadSeed<'n>>,
+    /// Why the last seed failed ([`HeadError::Seed`] names the need; this, why).
+    pub seed_error: Option<super::tables::seeds::SeedError>,
+    /// The wants this store made by lowering (a step that made its want: `Store::step`),
+    /// not counting those filed from frozen records ([`Store::file_heads`]): the measure a
+    /// seeded freeze is held to (front2/tables/head_tests.rs).
+    pub lowered: u32,
 }
 
 /// How [`Store::ensure`] meets the needs of a trait's members (front2_tables_cost.rs runs
 /// every body both ways and asserts equal bytes and read lists).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NeedsMet {
-    /// Every member's need met before the trait is made again (the default).
+    /// Every member's need met before the trait is made again.
     All,
-    /// The trait made again after each need (the form before 2026-11-17: quadratic).
+    /// The trait made again after each need (quadratic; the default again since clap-root's
+    /// cycle under `All`, see `Store::new`).
     First,
 }
 
@@ -903,21 +943,25 @@ impl<'n> Store<'n> {
     /// in it, and `tys.alloc()` gives it to everything the store keeps for the check.
     pub fn new(sized: Option<LibKey>, frame: &'n blaze_mem::Frame, alloc: Alloc<'static>) -> Store<'n> {
         Store {
-            tys: PortableTys::new_in(alloc),
+            tys: match super::rows::stable_tys(alloc) {
+                Ok(tys) => tys,
+                // `new_stable` refuses only columns that already hold rows; these are new.
+                Err(error) => panic!("the heads store's type table over fresh columns was refused: {error:?}"),
+            },
             maps: Maps::default(),
-            adts: HashMap::new_in(Global),
-            field_defaults: HashMap::new_in(Global),
-            impls: HashMap::new_in(Global),
-            fns: HashMap::new_in(Global),
-            preds: HashMap::new_in(Global),
+            adts: Rows::new_in(Global),
+            field_defaults: Rows::new_in(Global),
+            impls: Rows::new_in(Global),
+            fns: Rows::new_in(Global),
+            preds: Rows::new_in(Global),
             sized,
             pointers: super::receiver::Pointers::NOT_LOOKED_UP,
-            trait_defs: HashMap::new_in(Global),
+            trait_defs: Rows::new_in(Global),
             fn_gaps: HashMap::new_in(Global),
-            member_frames: HashMap::new_in(Global),
-            ctors: HashMap::new_in(Global),
-            statics: HashMap::new_in(Global),
-            opaques: HashMap::new_in(Global),
+            member_frames: Rows::new_in(Global),
+            ctors: Rows::new_in(Global),
+            statics: Rows::new_in(Global),
+            opaques: Rows::new_in(Global),
             hidden: super::opaque_auto::HiddenTable::new_in(alloc),
             locals: super::locals::Locals::new(frame),
             lives: super::lifetimes::Lives::new_in(alloc),
@@ -927,7 +971,15 @@ impl<'n> Store<'n> {
             type_misses: HashMap::new_in(Global),
             cost: None,
             more_needs: Vec::new_in(Global),
-            needs: NeedsMet::All,
+            seeds: None,
+            seed_error: None,
+            // `First` until `All` is proven on clap-root: under `All`, clap's `Cmd` was refused
+            // with a cycle among core's `Iterator`, `Rev`, `DoubleEndedIterator`,
+            // `ExactSizeIterator`, `FnMut`, `TrustedRandomAccessNoCoerce` (lane FL, 2026-11-17;
+            // not reproduced by head_tests.rs `traits_naming_each_other_are_made_under_both_
+            // strategies` nor by the cost test's real core).
+            needs: NeedsMet::First,
+            lowered: 0,
         }
     }
 
@@ -964,6 +1016,43 @@ impl<'n> Store<'n> {
     /// need, at the moment it is met, before it is made). Over a store that held nothing, that
     /// is every head `want`'s making read beside its own (front2/tables/head.rs `freeze`).
     pub fn ensure_noting<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want, noted: &mut dyn FnMut(Want)) -> Result<(), HeadError> {
+        let Some(seeds) = self.seeds else {
+            return self.ensure_seeded(names, keys, want, noted, &mut |_, _, _| Ok(Seeded::Lower));
+        };
+        // Seeded: the asked want first (`ensure_seeded` seeds only what a step needs), then
+        // every need its steps meet. Its record files it whole; the steps below find it made.
+        let scratch = self.tys.alloc();
+        let mut failed = None;
+        let made = {
+            let mut seed = |store: &mut Store<'n>, keys: &mut Keys, need: Want| {
+                seeds.seed(store, keys, need, scratch).map_err(|e| {
+                    failed = Some(e);
+                    SeedFailed
+                })
+            };
+            match if self.made(want) { Ok(Seeded::Filed) } else { seed(self, keys, want) } {
+                Err(SeedFailed) => Err(HeadError::Seed { need: want, by: want }),
+                Ok(_) => self.ensure_seeded(names, keys, want, noted, &mut seed),
+            }
+        };
+        if failed.is_some() {
+            self.seed_error = failed;
+        }
+        made
+    }
+
+    /// [`Store::ensure_noting`], asking `seed` first of each need as it is met: [`Seeded::Filed`]
+    /// (its cell filed from a frozen record, [`Store::file_heads`]) makes it without a
+    /// lowering; [`Seeded::Lower`] lowers it here. A seed that fails is
+    /// [`HeadError::Seed`]: the need is never lowered instead (rule 3).
+    pub fn ensure_seeded<S: NamesSource<'n>>(
+        &mut self,
+        names: S,
+        keys: &mut Keys,
+        want: Want,
+        noted: &mut dyn FnMut(Want),
+        seed: &mut dyn FnMut(&mut Store<'n>, &mut Keys, Want) -> Result<Seeded, SeedFailed>,
+    ) -> Result<(), HeadError> {
         let _cost = super::tables::cost::Cost::enter_want(self.cost, want);
         let mut stack = Vec::new_in(Global);
         stack.push(want);
@@ -1000,11 +1089,24 @@ impl<'n> Store<'n> {
                     let w = self.need(*k);
                     if w != need && !self.made(w) && !stack.iter().any(|s| *s == w) {
                         noted(w);
-                        stack.push(w);
+                        match seed(self, keys, w) {
+                            Ok(Seeded::Filed) => {}
+                            Ok(Seeded::Lower) => stack.push(w),
+                            Err(SeedFailed) => return Err(HeadError::Seed { need: w, by: top }),
+                        }
                     }
                 }
             }
             noted(need);
+            match seed(self, keys, need) {
+                Ok(Seeded::Filed) => {
+                    // Asked again at once by `top`, the filed record did not make what it reads.
+                    just_made = Some(need);
+                    continue;
+                }
+                Ok(Seeded::Lower) => {}
+                Err(SeedFailed) => return Err(HeadError::Seed { need, by: top }),
+            }
             stack.push(need);
         }
         Err(HeadError::Cycle(cycle(&stack)))
@@ -1025,7 +1127,10 @@ impl<'n> Store<'n> {
                 return Ok(Step::First(Want::Impl(impl_)));
             }
             return match self.member_fn(names, keys, impl_, f) {
-                Ok(()) => Ok(Step::Done),
+                Ok(()) => {
+                    self.lowered += 1;
+                    Ok(Step::Done)
+                }
                 Err(Why::Need(k)) => Ok(Step::Need(k)),
                 Err(why) => Err(HeadError::Item(impl_, why)),
             };
@@ -1053,7 +1158,7 @@ impl<'n> Store<'n> {
                 Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
                 Err(why) => {
                     self.maps.aliases.insert(key, None);
-                    self.maps.alias_gaps.insert(key, why);
+                    self.maps.alias_gaps.insert(key, AliasGap::made(why));
                     Ok(())
                 }
                 Ok(()) => Ok(()),
@@ -1114,10 +1219,134 @@ impl<'n> Store<'n> {
             }
         };
         match got {
-            Ok(()) => Ok(Step::Done),
+            Ok(()) => {
+                self.lowered += 1;
+                Ok(Step::Done)
+            }
             Err(Why::Need(k)) => Ok(Step::Need(k)),
             Err(why) => Err(HeadError::Item(key, why)),
         }
+    }
+
+    /// The heads of cell `want` read from its frozen record (front2/tables/head.rs `import`,
+    /// into this store's `tys`), filed where `Store::step` files them: the inverse of
+    /// head_record.rs `from_store`, so each want the cell makes is [`Store::made`] with no
+    /// lowering. An impl's frame's const parameters are the impl's own, filed under `want`'s
+    /// library key as `Store::impl_` files them. Not in the form, so never filed: lifetime parts
+    /// (made from the text when asked), the job's key origins (the caller files them).
+    /// Through `&self`: every table it files into is [`Rows`], so a head imported while a
+    /// body's check holds answers from this store moves none of them.
+    pub fn file_heads<I: IntoIterator<Item = (HeadAt, Head<'n>)>>(&self, want: Want, heads: I) -> Result<(), HeadError> {
+        let lib = want.key();
+        for (at, head) in heads {
+            match head {
+                Head::Fn { key, head, preds, static_, life } => {
+                    if let Some(l) = life {
+                        self.file_fn_life(key, l);
+                    }
+                    if let Some(p) = preds {
+                        self.preds.insert(key, p);
+                    }
+                    if let Some(m) = static_ {
+                        self.statics.insert(key, m);
+                    }
+                    self.fns.insert(key, head);
+                }
+                Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless } => {
+                    if let Some(l) = life {
+                        self.file_adt_life(key, l);
+                    }
+                    let ck = checker_of(key);
+                    if let Some(n) = fieldless {
+                        self.maps.fieldless_enums.insert(ck, n);
+                    }
+                    self.maps.generics.insert(key, (row.generics, defaults.iter().copied().collect()));
+                    self.maps.const_params.insert(key, const_params.iter().copied().collect());
+                    self.field_defaults.insert(ck, field_defaults.iter().copied().collect());
+                    if let Some(p) = preds {
+                        self.preds.insert(ck, p);
+                    }
+                    self.adts.insert(ck, row);
+                }
+                Head::Ctor { key, sig } => {
+                    self.ctors.insert(key, sig);
+                }
+                Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life } => {
+                    let ck = checker_of(key);
+                    if let Some(l) = life {
+                        self.file_container_life(ck, l);
+                    }
+                    for side in assoc_side {
+                        if let Some(n) = side.generics {
+                            self.maps.assoc_generics.insert((key, side.name), n);
+                        }
+                        if let Some(w) = side.where_ {
+                            self.maps.assoc_where.insert((key, side.name), w);
+                        }
+                        if let Some(c) = &side.consts {
+                            self.maps.assoc_consts.insert((key, side.name), c.iter().copied().collect());
+                        }
+                        // Its item bounds (form 11), under its key as `Store::trait_members`
+                        // files them (the decoder refuses bounds with no members row).
+                        if let Some(b) = side.bounds {
+                            let item = extra.as_ref().and_then(|x| x.assoc.iter().find(|a| a.name == side.name)).map(|a| a.item);
+                            let Some(item) = item else {
+                                return Err(HeadError::Filed { want, at, what: "an associated type's item bounds with no members row" });
+                            };
+                            self.preds.insert(item, b);
+                        }
+                    }
+                    // Filed with its members (`Store::trait_members`), as `trait_defs` is.
+                    if extra.is_some() || !supers.is_empty() {
+                        self.maps.supers.insert(key, supers.iter().copied().collect());
+                    }
+                    if let Some(x) = extra {
+                        self.trait_defs.insert(ck, x);
+                    }
+                    if let Some(p) = preds {
+                        self.preds.insert(ck, p);
+                    }
+                    self.maps.const_params.insert(key, const_params.iter().copied().collect());
+                    self.maps.traits.insert(key, head);
+                }
+                Head::Impl { key, head, preds, frame, life } => {
+                    if key != checker_of(lib) {
+                        return Err(HeadError::Filed { want, at, what: "an impl other than the cell's own" });
+                    }
+                    if let Some(l) = life {
+                        self.file_container_life(key, l);
+                    }
+                    if let Some(f) = frame {
+                        self.maps.const_params.insert(lib, f.consts.clone());
+                        self.member_frames.insert(key, f);
+                    }
+                    if let Some(p) = preds {
+                        self.preds.insert(key, p);
+                    }
+                    self.impls.insert(key, head);
+                }
+                Head::Alias { key, generics, ty, defaults, const_params } => {
+                    self.maps.alias_defaults.insert(key, defaults.iter().copied().collect());
+                    self.maps.const_params.insert(key, const_params.iter().copied().collect());
+                    self.maps.aliases.insert(key, Some((generics, ty)));
+                }
+                Head::AliasRefused { key, why } => {
+                    let text = core::str::from_utf8(&why).map_err(|_| HeadError::Filed { want, at, what: "a refused type alias whose why is not UTF-8" })?;
+                    self.maps.aliases.insert(key, None);
+                    self.maps.alias_gaps.insert(key, AliasGap { text: text.into(), why: None });
+                }
+                Head::TraitAlias { key, head } => {
+                    self.maps.trait_aliases.insert(key, head);
+                }
+                Head::Opaque { key, fn_, index, preds } => {
+                    if let Some(p) = preds {
+                        self.preds.insert(key, p);
+                    }
+                    self.opaques.insert(key, (fn_, index));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): its generics (`Self` first)
@@ -1630,6 +1859,12 @@ impl<'n> Store<'n> {
             if path == "repr" {
                 let r = v.site(v.row_range(attrs.start + i as u32)?)?;
                 crate::front::repr_parts(v.text_at(a.args)?, &mut repr).map_err(|what| Why::Unsupported(what, r))?;
+            }
+            // `UnsafeCell` and `UnsafePinned` hide their field's niche (core/src/cell.rs: "the
+            // niche of `T` is not visible", `UnsafeCell<NonZero<u8>>` has none) and are not
+            // `Freeze`: what layout and a static's place read (layout.rs `interior_mut`).
+            if path == "lang" && matches!(crate::front::unquote(v.text_at(a.args)?), "unsafe_cell" | "unsafe_pinned") {
+                repr.hide_niche = true;
             }
             narrowed |= path.starts_with("rustc_layout_scalar_valid_range");
             args |= is_args_attr(path);

@@ -143,15 +143,15 @@ fn an_options_struct_from_another_crate() {
     store.ensure(&names, &mut front.keys, Want::Adt(lib)).unwrap_or_else(|e| panic!("`opts::Opts`'s head: {e:?}"));
     let filed: Vec<_> = store.field_defaults.get(&checker_of(lib)).expect("`opts::Opts` files its field defaults").iter().copied().collect();
     assert_eq!(filed.iter().filter(|d| d.is_some()).count(), 2, "`width` and `wrap` have defaults, `name` none: {filed:?}");
-    let bytes = encode(from_store(&store, HeadAt::Adt(lib), None, None).expect("made"), store.tys.view(), alloc).unwrap_or_else(|e| panic!("`opts::Opts` not encoded: {e}"));
+    let bytes = encode(from_store(&store, HeadAt::Adt(lib)).expect("made"), store.tys.view(), alloc).unwrap_or_else(|e| panic!("`opts::Opts` not encoded: {e}"));
     let decoded = decode(&bytes, None, &mut store.tys, alloc).unwrap_or_else(|e| panic!("`opts::Opts` not decoded: {e}"));
-    let lowered = from_store(&store, HeadAt::Adt(lib), None, None).expect("made");
+    let lowered = from_store(&store, HeadAt::Adt(lib)).expect("made");
     if let Some(part) = same(lowered, decoded.as_ref(), store.tys.view()) {
         panic!("`opts::Opts`: the decoded head differs from the lowered one in {part}");
     }
     // Each default is a fn record of its own: the anonymous constant, with its text.
     for k in filed.iter().flatten() {
-        let head = from_store(&store, HeadAt::Fn(*k), None, None).unwrap_or_else(|e| panic!("the default {k:?}'s head: {e}"));
+        let head = from_store(&store, HeadAt::Fn(*k)).unwrap_or_else(|e| panic!("the default {k:?}'s head: {e}"));
         let text = head.text().expect("a default's head keeps its text");
         assert!(text.starts_with("const _: "), "the default {k:?}'s text is its constant: {text:?}");
         let fn_bytes = encode(head, store.tys.view(), alloc).unwrap_or_else(|e| panic!("the default {k:?} not encoded: {e}"));

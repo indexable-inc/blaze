@@ -13,8 +13,8 @@
 //! plan did not see: a typed stop ([`EngineCheckError::Unseen`]), never a second entry.
 //!
 //! A crate's macro expansion rounds stay inside its task for now. A crate whose package has a
-//! build script fails, named: `engine-check` runs no build script yet (the `Scripts` stage is
-//! the next piece), and the crates above it fail `Waited` on it, as the old path's do.
+//! build script is handed its run's record, made in the `Scripts` stage before every names
+//! phase (engine_scripts.rs); a failed run fails the crate `Waited` on it, as the old path's do.
 
 use core::convert::Infallible;
 
@@ -29,7 +29,7 @@ use bstd::mem::{Frame, Tag};
 use bstd::task::Class;
 
 use crate::engine_check::EngineCheckError;
-use crate::engine_tasks::{Outlined, WHOLE};
+use crate::engine_tasks::{CELLS, Outlined, WHOLE};
 use crate::engine_units::{Failure, Published, drive_task, published};
 use crate::fetch::FetchEnv;
 use crate::names::{Names, Prepared, ScopeRound};
@@ -91,7 +91,7 @@ impl<'f> NamesStage<'f> {
             }
             rounds += 1;
             if rounds > count {
-                return Err(EngineCheckError::Cycle { krate: crate::names::name_of(world.crates[0].input.key) }.into());
+                return Err(EngineCheckError::Cycle { krate: blaze_drive::key::crate_scope_name(&world.crates[0].input.key) }.into());
             }
         }
         let mut planned = SVec::new_in(alloc);
@@ -103,7 +103,9 @@ impl<'f> NamesStage<'f> {
         Ok(planned)
     }
 
-    /// One names phase: every task entered once, its result in `buffer`.
+    /// One names phase: every task entered once, its result in `buffer`, each resolution's
+    /// time on its worker in `times`.
+    #[expect(clippy::too_many_arguments, reason = "the phase loop's handles, each named")]
     pub(crate) fn run_phase<'a>(
         &mut self,
         cx: &Cx,
@@ -111,6 +113,7 @@ impl<'f> NamesStage<'f> {
         handles: &Handles<'_, 'f>,
         tasks: &[EngineTask],
         buffer: &mut Buffer<'a>,
+        times: &mut crate::engine_times::Times,
         alloc: SharedAlloc<'a>,
         frame: &'f Frame,
     ) -> Result<(), CliError> {
@@ -129,15 +132,20 @@ impl<'f> NamesStage<'f> {
                 answered.push((i, Err(refusal(name, "a `CrateScope` task of a crate the world does not hold"))));
                 continue;
             };
-            if names.script_of(at).is_some() {
-                answered.push((i, Err(refusal(name, "a crate with a build script: `engine-check` runs no build script yet (the `Scripts` stage)"))));
-                continue;
-            }
+            // Its build script's run, made in the `Scripts` stage (engine_scripts.rs), which
+            // marked it here: handed by its out, or failed (the crate then fails `Waited`).
+            let script = match names.script_of(at) {
+                None => None,
+                Some(script) => match self.made.binary_search_by_key(&script, |(name, _)| *name) {
+                    Ok(found) => Some((script, self.made[found].1)),
+                    Err(_) => return Err(EngineCheckError::Unseen { task: name, read: script }.into()),
+                },
+            };
             closure_of(names, at, &mut closure, frame);
             let mut inputs = blaze_own::Vec::new_in(heap);
             let mut failed = blaze_own::Vec::new_in(heap);
             for g in closure.iter() {
-                let dep = crate::names::name_of(names.world().crates[*g].input.key);
+                let dep = blaze_drive::key::crate_scope_name(&names.world().crates[*g].input.key);
                 match self.made.binary_search_by_key(&dep, |(name, _)| *name) {
                     Ok(at) => match self.made[at].1 {
                         Some((key, out)) => inputs.push(Input { name: dep, at: key, out }),
@@ -145,6 +153,11 @@ impl<'f> NamesStage<'f> {
                     },
                     Err(_) => return Err(EngineCheckError::Unseen { task: name, read: dep }.into()),
                 }
+            }
+            match script {
+                Some((script, Some((key, out)))) => inputs.push(Input { name: script, at: key, out }),
+                Some((script, None)) => failed.push(script),
+                None => {}
             }
             failed.sort_unstable();
             let drive = drive_task(name, task.key, task.planned.source, inputs, failed, heap);
@@ -162,16 +175,23 @@ impl<'f> NamesStage<'f> {
             scope.narrow_workers(handles.workers, Class::Foreground);
             let mut running = Vec::new_in(frame);
             let root = handles.root;
-            for (_, _, job) in jobs.iter() {
+            let clock = &handles.env.clock;
+            for (_, drive, job) in jobs.iter() {
                 let job: &crate::names::ScopeJob<'_> = job;
+                let name = drive.name;
                 running.push(scope.may_overlap("crate scope", crate::names::SCOPE_FRAME, move |cx: &Cx| {
-                    Ok::<_, Infallible>(work::unwinding(|| crate::names::resolve(cx, root, job, cx.frame()).0))
+                    let began = clock.now();
+                    let resolution = work::unwinding(|| crate::names::resolve(cx, root, job, cx.frame()).0);
+                    Ok::<_, Infallible>((resolution, name, clock.now().since(began).map_or(0, crate::engine_times::ns)))
                 }));
             }
             let mut stopped = None;
             for handle in running.into_iter() {
                 match handle.join(&cx) {
-                    Ok(resolution) => resolutions.push(resolution),
+                    Ok((resolution, name, ns)) => {
+                        times.push(name, ns);
+                        resolutions.push(resolution);
+                    }
                     Err(error) => {
                         stopped.get_or_insert(error);
                     }
@@ -227,21 +247,20 @@ impl<'f> NamesStage<'f> {
                     let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
                     for (read, digest) in record.reads.iter() {
                         reads.push(match read.kind {
-                            // A file's surface is read as its outline (the planner's `Outlines`
-                            // task defines the one whole cell), until the names record's cells
-                            // are wired (E4).
+                            // A file's surface is its outline's `SURFACE` cell (engine_tasks.rs),
+                            // with the digest that task defines: a comment or a body's statement
+                            // leaves it, so this crate's names are not entered for them.
                             Kind::Surface => {
                                 let file = Name::new(Kind::FileItems, read.subject);
-                                let out = handles.outlined.binary_search_by(|one| one.name.cmp(&file)).ok().and_then(|at| handles.outlined[at].made.as_ref().ok()).map_or(*digest, |record| record.out);
-                                (CellId { of: file, cell: WHOLE }, out)
+                                let out = handles.outlined.binary_search_by(|one| one.name.cmp(&file)).ok().and_then(|at| handles.outlined[at].made.as_ref().ok()).and_then(crate::engine_tasks::surface_of).unwrap_or(*digest);
+                                (CellId { of: file, cell: crate::engine_tasks::SURFACE }, out)
                             }
                             _ => (CellId { of: *read, cell: WHOLE }, *digest),
                         });
                     }
                     reads.sort_unstable_by_key(|(id, _)| *id);
                     reads.dedup_by_key(|(id, _)| *id);
-                    let mut defines: SVec<'a, (Cell, ContentId)> = SVec::new_in(alloc);
-                    defines.push((WHOLE, record.out));
+                    let defines = cells_of(name, record, alloc)?;
                     self.mark(name, Some((task.key, record.out)));
                     Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false }
                 }
@@ -256,7 +275,16 @@ impl<'f> NamesStage<'f> {
         Ok(())
     }
 
-    fn mark(&mut self, name: Name, made: Option<(Key, ContentId)>) {
+    /// The crate `name`'s `CrateScope` as a reader takes it (its key and out), when its task
+    /// was entered and made its record: what the Bodies stage reads a crate's records by.
+    pub(crate) fn input_of(&self, name: Name) -> Option<Input> {
+        let at = self.made.binary_search_by_key(&name, |(name, _)| *name).ok()?;
+        self.made[at].1.map(|(at, out)| Input { name, at, out })
+    }
+
+    /// `name` entered: its key and out, `None` when it failed. The `Scripts` stage marks each
+    /// run here too, so a crate's task finds its script's record as it finds its dependencies'.
+    pub(crate) fn mark(&mut self, name: Name, made: Option<(Key, ContentId)>) {
         match self.made.binary_search_by_key(&name, |(name, _)| *name) {
             Ok(at) => self.made[at].1 = made,
             Err(at) => self.made.insert(at, (name, made)),
@@ -265,6 +293,55 @@ impl<'f> NamesStage<'f> {
 }
 
 /// A crate refused on this path, naming why.
+/// The domain of the [`CELLS`] mark's digest: the cell table's bytes.
+const CELLS_DOMAIN: &str = "blaze v2 engine names cell table 1";
+
+/// What the crate `name`'s `CrateScope` task defines (engine.md E4): its record's [`WHOLE`]
+/// cell, and, for a crate whose names read a file of the checkout (a `Surface` read: the crates
+/// an edit can move), the [`CELLS`] mark and every row of its payload's cell table (names/
+/// sections.rs `cells`, blaze-scope names_cells.rs `crate_table`) as its own cell with its
+/// digest. The engine then moves only the cells whose digest changed (blaze-engine engine.rs
+/// `apply`), so a body that read none of them is not entered. A dependency's table is not
+/// defined: no edit of the checkout moves its names, and defining its rows would put every
+/// cell of `core` in the stored answer for nothing; its readers read it [`WHOLE`]. Sorted by
+/// cell, each once (the engine's merge walk; rule 25).
+fn cells_of<'a>(name: Name, record: &work::Made<'_>, alloc: SharedAlloc<'a>) -> Result<SVec<'a, (Cell, ContentId)>, EngineCheckError> {
+    const WHAT: &str = "the cells a `CrateScope` task defines (engine_names.rs `cells_of`)";
+    let mut defines: SVec<'a, (Cell, ContentId)> = SVec::new_in(alloc);
+    EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
+    if !record.reads.iter().any(|(read, _)| read.kind == Kind::Surface) {
+        return Ok(defines);
+    }
+    let parts = crate::names::sections::sections(record.payload_bytes()).map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload whose sections do not read" })?;
+    let table = parts.cells;
+    let row = blaze_scope::names_cells::TABLE_ROW;
+    if table.len() % row != 0 {
+        return Err(EngineCheckError::CellTable { task: name, what: "is not whole rows" });
+    }
+    EngineCheckError::push(&mut defines, (CELLS, ContentId::of(CELLS_DOMAIN, table)), WHAT)?;
+    let mut last: Option<[u8; 16]> = None;
+    for bytes in table.chunks_exact(row) {
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&bytes[..16]);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&bytes[16..]);
+        // The table is sorted by key, each once (names_cells.rs `table`): a row out of order
+        // would be a reader's binary search missing it, so it is refused here, not sorted.
+        if last.is_some_and(|last| last >= key) {
+            return Err(EngineCheckError::CellTable { task: name, what: "is not sorted by key, each once" });
+        }
+        last = Some(key);
+        // The engine's own cells of a record are all but their first byte zero; a hashed key
+        // equal to one would stand for two cells.
+        if key[1..] == [0u8; 15] {
+            return Err(EngineCheckError::CellTable { task: name, what: "holds a key equal to one of the engine's own cells" });
+        }
+        EngineCheckError::push(&mut defines, (Cell(key), ContentId(digest)), WHAT)?;
+    }
+    defines.sort_unstable_by_key(|(cell, _)| *cell);
+    Ok(defines)
+}
+
 fn refusal(name: Name, what: &'static str) -> Failure<'static> {
     Failure { failure: TaskFailure { name, why: Why::Refused { what, rule: RULE } }, words: None }
 }

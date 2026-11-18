@@ -13,7 +13,9 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# Only blaze-cli depends on this crate, as a build-dependency (crates/blaze-cli/build/producers.rs).
+# No crate depends on it since 2026-11-17: every producing function is in blaze-cli, so the entry
+# keys every row by the binary's id (crates/blaze-cli/src/producers.rs). It returns as the entry's
+# build-dependency when a producer's function moves into a crate that names its row.
 [dependencies]
 # `Row`, `ContentId`, `Hasher`. By path: the workspace entry turns on serde adapters.
 blaze-ids = { path = "../blaze-ids" }

@@ -52,8 +52,6 @@ pub(crate) struct Member<'a> {
     pub name: Text<'a>,
     /// `[package.metadata.blaze] producer`: a bit per [`Row::index`].
     pub producer: u8,
-    /// `[package.metadata.blaze] producer-own`: a bit per [`Row::index`].
-    pub own: u8,
     /// Each dependency, and whether it is `optional = true`.
     pub deps: Vec<(Dep<'a>, bool), Alloc<'a>>,
 }
@@ -146,7 +144,11 @@ pub(crate) fn member<'a>(dir: &str, path: &str, source: &str, alloc: Alloc<'a>) 
     };
     let blaze = root.get("package").and_then(|p| p.get("metadata")).and_then(|m| m.get("blaze"));
     let producer = rows(path, blaze.and_then(|b| b.get("producer")), alloc)?;
-    let own = rows(path, blaze.and_then(|b| b.get("producer-own")), alloc)?;
+    // A crate's own files without its closure cover less than the code its producing function
+    // runs (rule 21): the list is refused by name, never read as a narrower row.
+    if blaze.and_then(|b| b.get("producer-own")).is_some() {
+        return Err(Refused::OwnFilesOnly { path: text(path, alloc) });
+    }
     let mut deps = Vec::new_in(alloc);
     let mut tables = Vec::new_in(alloc);
     for name in DEP_TABLES {
@@ -194,10 +196,10 @@ pub(crate) fn member<'a>(dir: &str, path: &str, source: &str, alloc: Alloc<'a>) 
             deps.push((dep, optional));
         }
     }
-    Ok(Member { name: text(name, alloc), producer, own, deps })
+    Ok(Member { name: text(name, alloc), producer, deps })
 }
 
-/// A `producer` or `producer-own` list as row bits; a name that is no row, or `whole` (which
+/// A `producer` list as row bits; a name that is no row, or `whole` (which
 /// is the build's, never a source's), is refused by name.
 fn rows<'a>(path: &str, item: Option<Item<'_, '_, Alloc<'a>>>, alloc: Alloc<'a>) -> Result<u8, Refused<'a>> {
     let mut bits = 0u8;

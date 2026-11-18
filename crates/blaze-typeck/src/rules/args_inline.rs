@@ -71,6 +71,9 @@ impl ArgsMisuse {
 pub enum TypedFinding {
     /// `args-inline`: `adt`, an options struct (`#[blaze::args]`), written as `misuse` says.
     ArgsInline { misuse: ArgsMisuse, adt: ItemKey, at: Range },
+    /// `unsafe-op-in-unsafe-fn` (rustc's `unsafe_op_in_unsafe_fn`): `op`, in an `unsafe fn`'s
+    /// body of edition 2024 outside any `unsafe` block (rules/unsafety.rs).
+    UnsafeOpInUnsafeFn { op: crate::diag::UnsafeOp, at: Range },
 }
 
 impl TypedFinding {
@@ -78,20 +81,23 @@ impl TypedFinding {
     pub const fn lint(&self) -> &'static str {
         match self {
             TypedFinding::ArgsInline { .. } => "args-inline",
+            TypedFinding::UnsafeOpInUnsafeFn { .. } => "unsafe-op-in-unsafe-fn",
         }
     }
 
     /// Its item-relative range.
     pub const fn at(&self) -> Range {
         match *self {
-            TypedFinding::ArgsInline { at, .. } => at,
+            TypedFinding::ArgsInline { at, .. } | TypedFinding::UnsafeOpInUnsafeFn { at, .. } => at,
         }
     }
 
-    /// The order the record keeps them in: by place, then by kind (rule 25).
-    pub const fn order(&self) -> (u32, u32, ArgsMisuse) {
+    /// The order the record keeps them in: by place, then by lint, then by kind (rule 25). One
+    /// expression or pattern is one unsafe operation, so no two of that lint share a place.
+    pub const fn order(&self) -> (u32, u32, u8, u8) {
         match *self {
-            TypedFinding::ArgsInline { misuse, at, .. } => (at.start, at.end, misuse),
+            TypedFinding::ArgsInline { misuse, at, .. } => (at.start, at.end, 0, misuse as u8),
+            TypedFinding::UnsafeOpInUnsafeFn { at, .. } => (at.start, at.end, 1, 0),
         }
     }
 }

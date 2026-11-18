@@ -1,0 +1,14 @@
+{
+ "id": "one-group-unknown-masks-no-record",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane LZ",
+ "where": "crates/blaze-scope/src/cells/switch.rs solve_and_write: the scopes loop's `Unwritten::Unknown` came before the `member_refusal` check",
+ "what": "a one-group solve whose member reads a module with no record decides that module's cells `Outside`, so the member's import is unknown; the solve then refused `Unknown { module: member }` and never reported the cause it had recorded (`MemberRefusal::NoRecord { module }`), which is the one refusal an on-demand driver (cells/lazy.rs) can answer",
+ "cost": "found by reading before the first run; would have been a confusing failure",
+ "cause": "two refusals of one cause, checked in the order the code was written rather than cause first",
+ "class": "a symptom refusal reported before the refusal of its cause",
+ "prevention": "done: the member refusal is checked before the scopes are written",
+ "annoyance": "the queue's 30-line cap per test cuts a two-table measurement: split it into one test per table",
+ "workaround": "one #[test] per table; each test also writes its lines to a temp file",
+ "state": "fixed"
+}

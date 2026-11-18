@@ -297,6 +297,16 @@ pub fn content_of(path: &[u8]) -> Name {
     Name { kind: Kind::Given, subject: Name::file(path).subject }
 }
 
+/// The domain of a crate's [`Kind::CrateScope`] subject (the string kept from blaze-cli
+/// names.rs, where the name was made before 2026-11-17: the same names in every home).
+const CRATE_SCOPE_DOMAIN: &str = "blaze-cli crate scope 9";
+
+/// A crate's names task: a [`Kind::CrateScope`] whose subject is the digest of the crate's key.
+/// The one home of that name: the names task defines it, a body task's names reads name it.
+pub fn crate_scope_name(key: &blaze_id::CrateItemKey) -> Name {
+    Name::new(Kind::CrateScope, ContentId::of(CRATE_SCOPE_DOMAIN, &key.0.0))
+}
+
 /// The name of a fact the command gives (an environment variable a task reads, the target, the
 /// profile): a [`Kind::Given`] whose subject is `what`'s digest. Its value is in
 /// [`crate::request::Ask::facts`]; never read from the machine by a task.

@@ -85,6 +85,19 @@ pub struct BodyLintFinding<'a> {
     pub end: u32,
 }
 
+/// A construct of a checked body that the check could not decide (blaze-typeck `Undecided`):
+/// no error and no pass, so the command files it as "not checked" (rule 3), never as clean.
+#[derive(Debug)]
+pub struct BodyUndecided<'a> {
+    /// Why it is not checked (blaze-typeck `Undecided::says`).
+    pub cause: &'static str,
+    /// What it is about, naming the item (rule 19).
+    pub text: AString<'a>,
+    /// Item-relative (rule 71).
+    pub start: u32,
+    pub end: u32,
+}
+
 /// Why a body was not checked to its end: each a refusal, never a pass.
 #[derive(Debug)]
 pub enum Refused {
@@ -134,6 +147,9 @@ pub struct BodyVerdict<'a> {
     /// The typed lints' findings of a check that finished, sorted by range; none of them makes
     /// the body unclean ([`BodyVerdict::is_clean`]).
     pub findings: AVec<'a, BodyLintFinding<'a>>,
+    /// What a check that finished could not decide, sorted by range: each is "not checked" to
+    /// whoever prints the verdict ([`BodyUndecided`]).
+    pub undecided: AVec<'a, BodyUndecided<'a>>,
     /// The questions the world could not answer yet, each typed (the body is then not checked).
     pub gaps: AVec<'a, Gap>,
     /// The one refusal that stopped the body, if any.
@@ -196,16 +212,17 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
     }
-
-    /// The run's sources a body's macro calls expand with (the crate's environment, texts and
-    /// proc-macro runner: [`super::body_host::BodySources`]), set once by the command before
-    /// any body; until then every body `env!`, include and proc macro is refused by name.
-    pub fn set_body_sources(&mut self, sources: &'n dyn super::body_host::BodySources) {
-        self.store.sources = Some(sources);
-    }
 }
 
 impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
+    /// The run's sources a body's macro calls expand with (the crate's environment, texts and
+    /// proc-macro runner: [`super::body_host::BodySources`]), set once by the command before
+    /// any body (over records, or per body task over the view: tables/task.rs `BodyFrame`);
+    /// until then every body `env!`, include and proc macro is refused by name.
+    pub fn set_body_sources(&mut self, sources: &'n dyn super::body_host::BodySources) {
+        self.store.sources = Some(sources);
+    }
+
     /// The world over a front end its caller made: front2 tables/task.rs makes one per BODY
     /// over the read-only view (`Tables`), so its key map, head store, impl index, constants
     /// and prepared macros are the task's own and nothing is kept from one body to the next.
@@ -223,6 +240,34 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// How the head store meets a trait's members' needs (heads.rs `NeedsMet`).
     pub fn set_needs(&mut self, needs: super::heads::NeedsMet) {
         self.store.needs = needs;
+    }
+
+    /// The frozen heads the store files every head from (front2 tables/seeds.rs): it lowers none.
+    pub fn set_seeds(&mut self, seeds: Option<&'n dyn super::tables::seeds::HeadSeed<'n>>) {
+        self.store.seeds = seeds;
+    }
+
+    /// Each head the store holds (a fn's, an ADT's, an impl's, a trait's, a constructor's), by
+    /// checker key, in the store's order (callers sort): what a body's own store made for it.
+    pub fn each_held_head(&self, f: &mut dyn FnMut(u128)) {
+        let s = &self.store;
+        s.fns.keys().chain(s.adts.keys()).chain(s.impls.keys()).chain(s.trait_defs.keys()).chain(s.ctors.keys()).for_each(|k| f(k.0));
+    }
+
+    /// Why the store's last seed failed, taken.
+    pub fn take_seed_error(&mut self) -> Option<super::tables::seeds::SeedError> {
+        self.store.seed_error.take()
+    }
+
+    /// The wants the store made by lowering (heads.rs `Store::lowered`).
+    pub fn lowered(&self) -> u32 {
+        self.store.lowered
+    }
+
+    /// The fn whose head filed opaque type `key` (heads.rs `Store::opaques`), if it is one: an
+    /// opaque's key is in no row of the key map, and its head is its fn's.
+    pub fn opaque_fn(&self, key: blaze_typeck::ItemKey) -> Option<blaze_typeck::ItemKey> {
+        self.store.opaques.get(&key).map(|&(fn_, _)| fn_)
     }
 
     /// Every body of the program's own crate, in key order (free fns, then each container's
@@ -291,7 +336,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         F: FnOnce(&mut Records<'_, 'n, S>, &Body<'n>, &blaze_typeck::Checked<'static>),
     {
         let mut verdict =
-            BodyVerdict { diagnostics: AVec::new_in(alloc), findings: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
+            BodyVerdict { diagnostics: AVec::new_in(alloc), findings: AVec::new_in(alloc), undecided: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
         let prepared = self.prepared;
         let mut r = Records {
             names: self.front.names,
@@ -359,6 +404,15 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 for f in done.findings.iter() {
                     verdict.findings.push(lint_finding(&r, f, alloc));
                 }
+                for u in done.undecided.iter() {
+                    let at = u.at();
+                    let text = match *u {
+                        blaze_typeck::Undecided::TargetFeatureCall { callee, .. } => {
+                            format!("the call of `{}` is not checked for `unsafe`", super::check::item_shown(&r, callee))
+                        }
+                    };
+                    verdict.undecided.push(BodyUndecided { cause: u.says(), text: AString::from_str_in(&text, alloc), start: at.start, end: at.end });
+                }
                 then(&mut r, &lowered, &done);
             }
             Err(CheckFail::Diags { diags, .. }) => {
@@ -392,6 +446,11 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
             }
             text.push_str("` is an options struct (`#[blaze::args]`), a call's named arguments and nothing else: it ");
             text.push_str(misuse.says());
+        }
+        // rustc's words for `unsafe_op_in_unsafe_fn` (edition 2024).
+        blaze_typeck::TypedFinding::UnsafeOpInUnsafeFn { op, .. } => {
+            text.push_str(&super::check::unsafe_op_shown(r, op));
+            text.push_str(" is unsafe and requires unsafe block (the body of an `unsafe fn` is no unsafe block in edition 2024)");
         }
     }
     BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }

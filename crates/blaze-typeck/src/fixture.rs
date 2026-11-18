@@ -1106,6 +1106,10 @@ pub struct Bb {
     coroutine: Option<CoroutineKind>,
     /// `BodyView::call_arg_ints`, ascending (each pushed as its literal is made).
     call_arg_ints: Vec<(ExprId, u128)>,
+    /// Every expression made, as `BodyView::unsafe_blocks`: a fixture body is checked as
+    /// written inside `unsafe`, so its calls of `unsafe` fns (an intrinsic, a C fn) need no
+    /// block; the unsafety check's own tests are blaze-ladder's tests/front2_unsafety.rs.
+    unsafe_blocks: Vec<ExprId>,
     pub t: PortableTys<'static>,
 }
 
@@ -1132,6 +1136,7 @@ impl Bb {
             fmt_uses: Vec::new(),
             coroutine: None,
             call_arg_ints: Vec::new(),
+            unsafe_blocks: Vec::new(),
             t: PortableTys::new_in(Alloc::global()),
         }
     }
@@ -1146,6 +1151,7 @@ impl Bb {
 
     pub(crate) fn e(&mut self, x: Expr) -> ExprId {
         let at = self.exprs.len() as u32;
+        self.unsafe_blocks.push(ExprId(at));
         self.exprs.push(x);
         self.ranges.push(Range { start: at, end: at + 1 });
         ExprId(at)
@@ -1436,6 +1442,7 @@ impl Bb {
             asm_clobbers: &[],
             asm_text: "",
             call_arg_ints: &self.call_arg_ints,
+            unsafe_blocks: &self.unsafe_blocks,
         }
     }
 

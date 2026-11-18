@@ -231,7 +231,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         }
                     }
                 }
-                if !rest && let Some(missing) = declared.iter().find(|d| !fps.iter().any(|fp| fp.name == d.name)) {
+                if adt.kind == crate::world::AdtKind::Union {
+                    // The Reference, "Struct patterns": "A struct pattern used to match a union
+                    // must specify exactly one field", and it names no other (E0784).
+                    if fps.len() != 1 {
+                        self.diag(DiagCode::UnionPatternFields, at, About::Count { expected: 1, got: fps.len() as u32, found: Some(expected) });
+                    }
+                } else if !rest && let Some(missing) = declared.iter().find(|d| !fps.iter().any(|fp| fp.name == d.name)) {
                     self.diag(DiagCode::MissingFieldPats, at, About::found_named(expected, missing.name));
                 }
                 for (fp, &t) in fps.iter().zip(tys.iter()).rev() {

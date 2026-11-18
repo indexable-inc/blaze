@@ -154,6 +154,35 @@ impl<'t> ExpansionTokens<'t> {
     fn word(&self, token: u32) -> Option<u32> {
         self.words.get(token as usize).copied().flatten()
     }
+
+    /// The same tokens placing `text`, a text written of `copies` of slices of
+    /// [`ExpansionTokens::text`] (each `from` an offset there; sorted by `to`, as written): a
+    /// statement call's statements read as items and a block's module text
+    /// (crate::expanded_blocks `render`). Each placed piece wholly inside a copied slice moves
+    /// with it; one of no slice is in no call of the new text. The words stay the expansion's:
+    /// a call's input lies inside one copied slice (an item or a call is copied whole), so its
+    /// words as written, counted from the input's first ([`InputTokens::written`]), are the same.
+    ///
+    /// Without it a call in such a text lexed its input from the text again, and a `$crate` of
+    /// another crate in it, written `crate`, named the calling crate: antithesis_sdk's
+    /// `assert_helper!` block, whose `#[$crate::linkme::distributed_slice($crate::assert::..)]`
+    /// static gave linkme a bare `crate`, so its `crate::assert::ANTITHESIS_CATALOG! { .. }` was
+    /// "no `assert` in `crate`" in every tempo member asserting (2026-11-17 g105938, 27 names).
+    /// The Reference, "Macros By Example", "Hygiene": `$crate` names the crate of the macro that
+    /// wrote it wherever its tokens end up.
+    pub fn moved(&self, text: &'t str, copies: &[crate::crate_roots::Copied], alloc: Alloc<'t>) -> ExpansionTokens<'t> {
+        let mut places: AVec<'t, (u32, u32, u32)> = AVec::new_in(alloc);
+        for copy in copies {
+            let end = copy.from.saturating_add(copy.len);
+            let first = self.places.partition_point(|p| p.0 < copy.from);
+            for &(start, stop, token) in self.places[first..].iter().take_while(|p| p.0 < end) {
+                if stop <= end {
+                    places.push((start - copy.from + copy.to, stop - copy.from + copy.to, token));
+                }
+            }
+        }
+        ExpansionTokens { stream: self.stream, text, places: places.leak(), words: self.words }
+    }
 }
 
 /// Whether stream token `at` is a `$` the renderer wrote as one `$crate` with the next.

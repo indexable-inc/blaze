@@ -140,6 +140,10 @@ const F_ACTIVE: u32 = 1 << 15;
 const F_SKIP: u32 = 1 << 16;
 const F_FOR: u32 = 1 << 17;
 const F_POPPED: u32 = 1 << 18;
+/// An item of a block whose outer attributes are being read (`Machine::enter`): a false `cfg`
+/// among them removes the item, as it removes a statement; at its first other child or token
+/// the rest of it is skipped wholesale (`Machine::attrs_read`).
+const F_ATTRS: u32 = 1 << 19;
 
 const NO_RANGE: Range = Range::new(NONE, NONE);
 
@@ -816,6 +820,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     // Events
 
     pub(crate) fn enter(&mut self, kind: SyntaxKind) {
+        if self.skip == 0 && !matches!(kind, ATTR | DOC_COMMENT) && self.frames.last().is_some_and(|f| f.flags & F_ATTRS != 0) {
+            self.attrs_read();
+        }
         if self.skip > 0 {
             self.skip += 1;
             if self.skip == 2 && kind == NAME && self.skip_name.start == NONE {
@@ -827,6 +834,13 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             self.root_depth = if matches!(kind, SOURCE_FILE | MACRO_ITEMS) { 1 } else { 0 };
         }
         let skip = self.should_skip(kind);
+        // An item of a block is skipped wholesale (its own lowering reads it), but its outer
+        // attributes first, as a statement's: the Reference, "Conditional compilation"
+        // [cfg.attr.behavior]: "If the predicate is false, the thing the attribute is attached to
+        // is removed from the source code". A `#[cfg(..)] use libc::open64 as open;` false for
+        // the target (the pinned std's `sanitize_standard_fds`) leaves no row of the block's
+        // scope, so no reader (the block's imports and traits, its values) sees it.
+        let attrs_first = skip && is_item(kind) && self.frames.last().is_some_and(|p| matches!(p.kind, STMT_LIST | MACRO_STMTS));
         if !skip {
             self.before_child(kind);
         }
@@ -838,8 +852,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             pending: idx(self.pending.len()),
             saved_barrier: self.barrier,
             aux: NONE,
-            flags: if skip { F_SKIP } else { 0 },
+            flags: match (attrs_first, skip) {
+                (true, _) => F_ATTRS,
+                (false, true) => F_SKIP,
+                (false, false) => 0,
+            },
         });
+        if attrs_first {
+            return;
+        }
         if skip {
             self.skip = 1;
             self.skip_name = NO_RANGE;
@@ -857,6 +878,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             f.start = range.start;
         }
         self.last_end = range.end;
+        if self.skip == 0 && self.frames.last().is_some_and(|f| f.flags & F_ATTRS != 0) {
+            self.attrs_read();
+        }
         if self.skip > 0 {
             if self.skip_arm {
                 self.skip_name = range;
@@ -919,6 +943,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             f.start = range.start;
         }
         self.last_end = range.end;
+        if self.skip == 0 && self.frames.last().is_some_and(|f| f.flags & F_ATTRS != 0) {
+            self.attrs_read();
+        }
         if self.skip > 0 {
             return;
         }
@@ -2895,6 +2922,20 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.push_pending(hash, pat);
         let p = Param { pat: Some(pat), ty, self_kind, lifetime, variadic: false, attrs: List { start: 0, len: 0 } };
         self.push_node(V::Row(ROW_PARAM), p.encode(), r);
+    }
+
+    /// The open item of a block ([`F_ATTRS`]) has no false `cfg` among its outer attributes:
+    /// the rest of it is skipped wholesale from here, as [`Self::should_skip`] skips it, its
+    /// attributes' values dropped (its own lowering reads them). Its exit leaves
+    /// `V::Skipped(kind)` over its whole range, attributes included, as before.
+    fn attrs_read(&mut self) {
+        let top = self.top_mut();
+        top.flags = (top.flags & !F_ATTRS) | F_SKIP;
+        let base = top.base as usize;
+        self.vals.truncate(base);
+        self.skip = 1;
+        self.skip_name = NO_RANGE;
+        self.skip_arm = false;
     }
 
     fn attr(&mut self, f: &Frame, r: Range) {

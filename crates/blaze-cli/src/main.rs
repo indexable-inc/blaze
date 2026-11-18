@@ -30,6 +30,7 @@ mod body_types;
 mod code_store;
 mod item_name;
 mod checkout;
+mod clean;
 mod data_include;
 mod fetch;
 mod fix;
@@ -84,9 +85,15 @@ mod test_run;
 mod toolchain;
 mod units;
 mod work;
+mod engine_answer;
 mod engine_check;
+mod engine_bodies;
+mod engine_lines;
+mod engine_why;
 mod engine_names;
+mod engine_times;
 mod engine_pool;
+mod engine_scripts;
 mod engine_store;
 mod engine_tasks;
 mod engine_units;
@@ -167,14 +174,13 @@ pub enum CliError {
     Store(store::StoreFailure),
     /// The running binary carries no linker id, the tool identity every key starts from.
     BuildId(bstd::host::NoBuildId),
-    /// The build's producer digests name other rows than this binary's table (producers.rs):
-    /// a bug of the build step, refused by name (decision D105).
-    Producers(blaze_ids::producer::SourcesRefused),
     /// The pool could not run or join a batch's tasks (its frame not made, or a wait that
     /// stopped); a task's own panic or refusal is a failed task, never this.
     Pool(bstd::task::TaskError),
     /// `blaze engine-check` stopped (engine_check.rs).
     EngineCheck(engine_check::EngineCheckError),
+    /// `blaze clean` refused (clean.rs): the path that is not blaze's, named.
+    Clean(clean::CleanError),
     /// A settled input a task needed could not be read (work.rs, `payload`).
     Input { name: blaze_drive::Name, why: work::InputWhy },
     /// [`CliError::Input`] while the job of `task` was made (work.rs): the task and its input.
@@ -206,7 +212,7 @@ pub enum CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CliError::Usage(what) => write!(f, "usage: blaze <check|run|test> [dir] [--color=auto|always|never] [--stats] [--workers N]: {what}"),
+            CliError::Usage(what) => write!(f, "usage: blaze <check|run|test> [dir] [--color=auto|always|never] [--stats] [--workers N], blaze clean [dir] [--store], blaze explain [status]: {what}"),
             CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
             CliError::NoSuchCommand { command, instead } => write!(f, "blaze has no `{command}` command: {instead}"),
             CliError::Missing(missing) => write!(f, "{missing}"),
@@ -228,9 +234,9 @@ impl fmt::Display for CliError {
             CliError::Remote(error) => write!(f, "{error}"),
             CliError::Store(failure) => write!(f, "{failure}"),
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
-            CliError::Producers(error) => write!(f, "{error}"),
             CliError::Pool(error) => write!(f, "{error}"),
             CliError::EngineCheck(error) => write!(f, "engine-check: {error}"),
+            CliError::Clean(error) => write!(f, "{error}"),
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
             CliError::TaskInput { task, name, why } => write!(f, "the input {name} of the task {task} could not be read while its job was made: {why}"),
             CliError::Shelf(error) => write!(f, "{error}"),
@@ -262,15 +268,16 @@ macro_rules! from {
     };
 }
 
-from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull), BuildId(bstd::host::NoBuildId), Producers(blaze_ids::producer::SourcesRefused), Lints(lints::StepError));
+from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull), BuildId(bstd::host::NoBuildId), Lints(lints::StepError));
 
 /// `blaze run` and `test` fail on any finding, lints included (bottom.md 11); `check` reports.
 /// A body whose types were not checked (`body_types::TYPES_NOT_CHECKED`) says what the command
 /// left out, not what is wrong with the program: it is no error, and the closing line says
 /// "incomplete" for it (`check_coverage`).
 fn every_rule(rule: u16) -> bool {
-    // D111: an include outside its package inside the workspace is a warning, never an error.
-    rule != names::include_outside::INCLUDE_OUTSIDE_PACKAGE
+    // A names warning (D111's include outside its package; a test marked twice) is never an
+    // error.
+    !names::warning(rule)
         && rule != body_types::TYPES_NOT_CHECKED
         && rule != body_types::BORROWS_NOT_CHECKED
         // A task that failed only because one it needs failed: its root is the failure.
@@ -461,13 +468,16 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         // `check` through the execution engine (engine_check.rs), `check`'s arguments; deleted
         // at the switch, when `check` itself is this path.
         Some("engine-check") => return engine_check::run(cx, io, out, phases, heap),
+        Some("why") => return engine_check::why(cx, io, out, phases, heap),
         Some("run") => (Command::Run, "run"),
         Some("test") => (Command::Test, "test"),
         // The commands are `check`, `run`, `test` and, later, `export`: there is no `build`.
         Some("build") => return Err(CliError::NoSuchCommand { command: "build", instead: NO_BUILD }),
         Some("export") => return Err(CliError::NotBuilt { command: "export" }),
         Some("explain") => return explain(cx, args.get(2), out),
-        Some(_) | None => return Err(CliError::Usage("the command is check, run, test or explain")),
+        // The checkout's state, and with `--store` the home's store, removed (clean.rs).
+        Some("clean") => return clean::run(cx, io, &args, out),
+        Some(_) | None => return Err(CliError::Usage("the command is check, run, test, clean or explain")),
     };
     let flags = flags(&args)?;
     if command != Command::Run && flags.select != run_package::Select::NONE {
@@ -493,11 +503,10 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
     };
     let host = io.need_host()?;
     let workers = host.cores().get();
-    // Every producer's identity, made once here and handed down (decision D105, rule 75): each
-    // source row the digest of its producer's crates as this binary was built, the rest the
-    // binary's linker id (bstd `Host::build_id`): a release that leaves a producer's crates alone
-    // keeps its records' keys (producers.rs; rules 21, 52).
-    let producers = producers::table(host.build_id()?.as_bytes())?;
+    // Every producer's identity, made once here and handed down (decision D105, rule 75): every
+    // row the binary's linker id (bstd `Host::build_id`), since every producing function is in
+    // this binary and runs its whole graph (producers.rs; rules 21, 52).
+    let producers = producers::table(host.build_id()?.as_bytes());
     let origin = store::NamedOrigin::of(cx, &fs, io.net().as_ref(), flags.origin, flags.origin_key)?;
     // The terminal's abilities, from the conventional variables and the findings' stream, read
     // here at the edge: whether it is a terminal, and how wide.
@@ -553,7 +562,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         // request asked in full walks, so a second one is blaze's bug, named).
         let mut in_full = false;
         loop {
-            let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, sdk, exe_dir), origin.as_ref(), (&opened.home, &opened.lent, opened.open_ns), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases, heap, in_full);
+            let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, sdk, exe_dir), origin.as_ref(), (&opened.home, &opened.lent, opened.open_ns), (command, word), workers, &producers, work::Sizes::USUAL, &launch, &blaze_screen::Unwatched, frame, out, err, ran, &mut shown, phases, heap, in_full);
             if !in_full && matches!(finished, Err(CliError::AnswerInFull { .. })) {
                 in_full = true;
                 continue;
@@ -741,8 +750,8 @@ pub(crate) const UNCHECKED_ITEMS: Status = Status(4);
 /// The exit statuses `blaze` returns, each with what it means: `blaze explain <status>` prints
 /// one, `blaze explain` all.
 const STATUSES: [(u8, &str); 5] = [
-    (0, "check: every stage `check` is defined to run ran and found nothing (run: the program's own status)"),
-    (1, "check: an error was found, a task failed, or blaze itself failed (its message says which); run: the program's own status"),
+    (0, "check: every stage `check` is defined to run ran and found nothing (run: the program's own status); clean: each folder it printed was removed, or it printed \"nothing to remove\""),
+    (1, "check: an error was found, a task failed, or blaze itself failed (its message says which); run: the program's own status; clean: a folder was not blaze's, or the disk refused (named), and nothing after it was removed"),
     (3, "check: incomplete: the stages this build runs found nothing, but a stage `check` is defined to run is not built yet (the closing line's \"NOT checked\" names which); not a pass"),
     (4, "check: blaze could not check some items (each named by its cause in the \"not checked because ..\" lines, counted in \"the check is incomplete: blaze could not check N items\"); the code it did check had no error; not a pass"),
     (125, "run and test: blaze did not start the program (the manifest, a finding, a build or the start failed; its message says which); no program returned it"),
@@ -892,6 +901,9 @@ fn request<'f>(
     producers: &blaze_ids::producer::Producers,
     sizes: work::Sizes,
     launch: &program::Launch<'_>,
+    // The sink `blaze run`'s events go to (blaze-screen `Watch`): the live line on a terminal,
+    // else `Unwatched`.
+    watch: &dyn blaze_screen::Watch,
     frame: &'f Frame,
     out: &Out,
     err: &Out,
@@ -907,6 +919,7 @@ fn request<'f>(
 ) -> Result<Finished<'f>, CliError> {
     let cx = cx.span("blaze request");
     let began = phases.now();
+    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
     // The whole tool (the certificate, the pointer, the walk from the last answer, the store's
     // producer name) and each kind's (its tasks' keys): home.rs.
     // `check` lints by the step and the added rules the root manifest names (lints.rs
@@ -1250,6 +1263,7 @@ fn request<'f>(
                 // The program `request` picked once (run_package.rs `pick`), handed down whole:
                 // its root finds its crate, its package names the child (rule 77).
                 let picked = picked.ok_or(CliError::RunNames(run_names::RunNamesError::NonePicked))?;
+                watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
                 let Some(found) = run_names::found(&cx, &req, picked.root, &mut store, &mut facts.bodies, heap, frame).map_err(CliError::RunNames)? else {
                     return Err(CliError::AnswerInFull { again: in_full });
                 };
@@ -1260,6 +1274,7 @@ fn request<'f>(
                 let ids_refused = |error: run_ids::RunIdsError<'static>| {
                     CliError::OwnProcess(own_process::OwnError::Parent(run_parent::ParentError::BodyIds { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) }))
                 };
+                watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
                 let made = match found.list() {
                     Some(list) => {
                         let previous = match last.map(blaze_drive::answers::read_last).transpose().map_err(|error| CliError::Drive(DriveError::LastFile(error)))? {
@@ -1284,7 +1299,7 @@ fn request<'f>(
                         .map_err(|error| run_parent::ParentError::Names { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
                 };
                 let mut ids = || made.take().ok_or_else(|| run_parent::ParentError::BodyIds { shown: Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
-                let ok = match program::run(&cx, root, launch, &picked, units, native, producers.get::<blaze_ids::producer::CodeBuilder>(), lent, today, &mut names, &mut ids, &mut phases.code_records, heap, frame) {
+                let ok = match program::run(&cx, root, launch, &picked, units, native, producers.get::<blaze_ids::producer::CodeBuilder>(), lent, today, &mut names, &mut ids, &mut phases.code_records, watch, heap, frame) {
                     Ok(status) => {
                         *ran = Some(status);
                         status == 0
@@ -1484,9 +1499,7 @@ fn draw<'f>(
             wanted.push(print::Wanted { path, place: print::Place::Counted, words: kept(&finding.message)? });
             continue;
         }
-        let placed = finding.rule == names::UNRESOLVED
-            || finding.rule == names::include_outside::INCLUDE_OUTSIDE_PACKAGE
-            || finding.rule == names::failed_call::FAILED_CALL;
+        let placed = names::placed(finding.rule);
         let (path, place, words) = match placed && finding.file.is_none() {
             true => match names::place_pieces(&finding.message)? {
                 (Some((path, chain, edition)), words) => {
@@ -1958,7 +1971,7 @@ mod tests {
         let opened = store::open_for_command(&cx, io, Some("/h"), &root, "ws", phases.clock(), &err)?;
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
             let workers = WORKERS.with(core::cell::Cell::get);
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, crate::sdk::NONE_IN_TESTS, Err(fetch::ExeDirWhy::NotRead)), None, (&opened.home, &opened.lent, opened.open_ns), command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases, blaze_own::testing::heap(), false);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, crate::sdk::NONE_IN_TESTS, Err(fetch::ExeDirWhy::NotRead)), None, (&opened.home, &opened.lent, opened.open_ns), command, workers, &producers, sizes, &launch, &blaze_screen::Unwatched, frame, said, &err, ran, &mut shown, phases, blaze_own::testing::heap(), false);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {

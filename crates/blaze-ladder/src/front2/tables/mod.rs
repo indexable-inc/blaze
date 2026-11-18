@@ -11,5 +11,6 @@ pub mod head;
 #[cfg(test)]
 mod head_tests;
 pub mod recorder;
+pub mod seeds;
 pub mod task;
 pub mod view;

@@ -481,6 +481,11 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
         item_code_id(item, text)
     }
 
+    /// From the heads' table of statics (heads.rs `statics`, the checker's `Def::Static`).
+    fn is_static(&self, item: ItemKey) -> bool {
+        self.store.statics.contains_key(&item)
+    }
+
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>> {
         self.records.iter().find(|r| r.key == key).ok_or(Missing)
     }

@@ -37,8 +37,9 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             let spell = Spelling::of(&view).map_err(|_| LazyRefusal::Spell { function: function.clone() })?;
             let scope = made.scope(&spell);
             let mut r = self.records(true);
-            check_body(&mut r, &made, &scope).map_err(|error| LazyRefusal::Check { function: function.clone(), error })?
-        };
+            check_body(&mut r, &made, &scope)
+        }
+        .map_err(|error| self.check_refusal(&function, error))?;
         self.counts.checked += 1;
         let i = self.row(key, false)?;
         self.rows.checked[i] = true;
@@ -50,6 +51,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             self.row(callee, of_trait)?;
         }
         self.async_rows(&made)?;
+        self.fmt_rows(&made, key, &function)?;
         self.adt_rows(&checked)?;
         self.body_consts(&checked)?;
         self.body_statics(&checked, &function)?;
@@ -269,6 +271,100 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
 
     /// A fn's name for messages (front2 row_path.rs `shown_name`, the one printer): its row
     /// path, else its `ItemShown`. A row's path is `row`'s `RowPath`, never this text.
+    /// A check of `function`'s body that did not finish clean, as refused: a gap naming an item
+    /// declared in a body as [`LazyRefusal::LocalNotBuilt`] (where it is written, as a user
+    /// reads it), anything else as [`LazyRefusal::Check`].
+    fn check_refusal(&self, function: &str, error: CheckFail) -> LazyRefusal {
+        use crate::front2::world_items::Gap;
+        let local = match &error {
+            CheckFail::Gap { gaps, .. } => gaps.iter().find_map(|g| match g {
+                Gap::Local(l) => Some((*l, gaps.len() - 1)),
+                _ => None,
+            }),
+            _ => None,
+        };
+        // What the gap names: a local item (its head: the body it is declared in, and its head
+        // as written), or a row of a body named by the body's key (a `use`: the body whose
+        // rows hold it, and its text as written, read below from its file).
+        let Some((gap, others)) = local else {
+            return LazyRefusal::Check { function: Box::from(function), error };
+        };
+        let head = self.store.locals.head(crate::front2::keys::checker_of(gap.item)).copied();
+        let (enclosing_key, head_words, row) = match (head, self.store.locals.row_of_gap(&gap)) {
+            (Some(h), _) => {
+                // The head as written: its first line that is no attribute or comment, to its `{`.
+                let first = h.text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//")).unwrap_or("");
+                (h.enclosing, Some(first.split('{').next().unwrap_or("").trim()), None)
+            }
+            (None, Some((body, row))) => (body, None, Some(row)),
+            (None, None) => return LazyRefusal::Check { function: Box::from(function), error },
+        };
+        let names = self.front.names;
+        let keys = &self.front.keys;
+        // `file:line` of the gap's first byte, and the file's text there: its range is relative
+        // to its enclosing item (rule 71); an enclosing item itself declared in a body is at its
+        // own range in ITS enclosing one, out to a module's item, whose file the source names.
+        // Each step out leaves one local item: at most as many steps as there are.
+        let found = (|| {
+            let (mut outer, mut start) = (enclosing_key, gap.range.start);
+            for _ in 0..=self.store.locals.kept() {
+                let Some(up) = self.store.locals.head(outer) else { break };
+                start = start.checked_add(up.range.start)?;
+                outer = up.enclosing;
+            }
+            let lib = keys.library_in(names, outer)?;
+            let place = names.place_of(lib)?;
+            let blaze_scope::resolve::At::File(i) = place.at else { return None };
+            let shown = names.file_shown(place.krate, i)?;
+            let (line, _) = super::seam_rules::source_position(names, keys, outer, start).ok()?;
+            // The text written at the range, when the range is the file's own (an expansion's
+            // row is at its outermost call: the call's text).
+            let written = names.item_start(lib).and_then(|(_, item_start)| {
+                let from = item_start.checked_add(start)? as usize;
+                let to = from.checked_add((gap.range.end - gap.range.start) as usize)?;
+                names.file_text(place.krate, i)?.get(from..to)
+            });
+            Some((format!("{shown}:{line}"), written))
+        })();
+        let (at, written) = match found {
+            Some((at, written)) => (at, written),
+            None => (format!("at {}..{} of its enclosing item, which is in no file the source answers", gap.range.start, gap.range.end), None),
+        };
+        // The words a user reads: the head's first line; a row's text in its file, its runs of
+        // white space one space each (its attributes with it: a `#[cfg(..)]` shows which target
+        // it is for); a row in no file: its path (`use a::b` names what it binds).
+        let mut words = String::new();
+        match (head_words, written, row) {
+            (Some(w), _, _) => words.push_str(w),
+            (None, Some(t), _) => {
+                for (i, w) in t.split_whitespace().enumerate() {
+                    if i > 0 {
+                        words.push(' ');
+                    }
+                    words.push_str(w);
+                }
+            }
+            (None, None, Some(r)) => {
+                words.push_str(if r.abs { "use ::" } else { "use " });
+                for (i, s) in r.path.iter().enumerate() {
+                    if i > 0 {
+                        words.push_str("::");
+                    }
+                    words.push_str(s);
+                }
+            }
+            (None, None, None) => {}
+        }
+        let words = words.into_boxed_str();
+        // A module's item by its whole path (item_shown.rs); one declared in a body has none,
+        // so by the names it is written under (`g::h`).
+        let enclosing = match self.store.locals.head(enclosing_key) {
+            Some(_) => format!("`{}`", self.shown(enclosing_key)).into_boxed_str(),
+            None => self.refused_shown(enclosing_key),
+        };
+        LazyRefusal::LocalNotBuilt { function: Box::from(function), enclosing, form: gap.form, head: words, at: at.into_boxed_str(), others }
+    }
+
     pub(super) fn shown(&self, k: ItemKey) -> String {
         crate::front2::row_path::shown_name(self.front.names, &self.front.keys, &self.store, k)
     }
@@ -377,6 +473,24 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             }
             let of_trait = matches!(self.front.keys.origin(k), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !self.store.impls.contains_key(container));
             self.row(k, of_trait)?;
+        }
+        Ok(())
+    }
+
+    /// For each formatting trait the body's `format_args!` placeholders ask, core's
+    /// `rt::Argument` constructor the builder calls (which no checked body names: the checker
+    /// records no callee for a placeholder), asked by fmt_template.rs `argument_new` (the one
+    /// lookup both programs make, its answer kept in the impl index where the seam's
+    /// `fmt_argument_new` reads it) and tabled as a callee. Not found is refused naming the
+    /// constructor and the body (rule 19), as the eager walk files it failed.
+    fn fmt_rows(&mut self, made: &crate::front2::body::Body<'_>, key: ItemKey, function: &str) -> Result<(), LazyRefusal> {
+        for t in crate::front2::fmt_template::placeholder_traits(made) {
+            let found = {
+                let mut r = self.records(true);
+                crate::front2::fmt_template::argument_new(&mut r, key, t)
+            };
+            let k = found.map_err(|why| LazyRefusal::FmtArgument { function: Box::from(function), why })?;
+            self.row(k, false)?;
         }
         Ok(())
     }

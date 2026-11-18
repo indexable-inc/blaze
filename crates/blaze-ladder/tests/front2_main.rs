@@ -415,7 +415,8 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
             let key = found.ok().and_then(|f| f.whole(segs.len()).map(|d| d.key));
             match key.map(|k| (records.store.maps.aliases.get(&k), records.store.maps.alias_gaps.get(&k))) {
                 Some((Some(Some(_)), _)) => out.push_str("T::X rule: core's ChangeOutputType is made, `T::Residual` read through `T: Try`\n"),
-                Some((_, Some(why))) => {
+                Some((_, Some(gap))) => {
+                    let why = gap.why.as_ref().expect("a refusal lowered here keeps its Why");
                     assert!(!matches!(why, Why::AssocNotFound(..) | Why::AssocAmbiguous(..)), "`T::Residual` through `T: Try` must be found: {why:?}");
                     out.push_str(&format!("T::X rule: core's ChangeOutputType refused for another cause: {why:?}\n"));
                 }

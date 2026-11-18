@@ -690,6 +690,7 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         default_fields: blaze_own::Soa::new_in(a),
         index_mut: blaze_own::Vec::new_in(a),
         findings: blaze_own::Vec::new_in(a),
+        undecided: blaze_own::Vec::new_in(a),
     }
 }
 
@@ -754,5 +755,6 @@ fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
         asm_clobbers: &[],
         asm_text: "",
         call_arg_ints: &[],
+        unsafe_blocks: &[],
     }
 }

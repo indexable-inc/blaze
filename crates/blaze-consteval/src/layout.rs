@@ -52,6 +52,9 @@ pub trait Layout {
     fn tag_write(&mut self, ty: PTy, variant: u32, cx: &mut LayoutCx<'_, '_>) -> Result<Option<TagWrite>, Stop>;
     /// Where `ty`'s tag is read and how it decodes ([`Tag`]).
     fn tag(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<Tag, Stop>;
+    /// Whether `ty` is not `Freeze`: an `UnsafeCell` held by value somewhere in it
+    /// (blaze-build's `Layouts::interior_mut`).
+    fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop>;
 }
 
 fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
@@ -95,6 +98,10 @@ impl<A: Allocator + Clone> Layout for Layouts<A> {
     fn tag_write(&mut self, ty: PTy, variant: u32, cx: &mut LayoutCx<'_, '_>) -> Result<Option<TagWrite>, Stop> {
         let id = self.of(ty, cx).map_err(|e| stop(&e))?;
         Ok(Layouts::tag_write(self, id, variant).map(|w| TagWrite { offset: w.offset, size: w.scalar.prim.size(), value: w.value }))
+    }
+
+    fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop> {
+        Layouts::interior_mut(self, ty, cx).map_err(|e| stop(&e))
     }
 
     fn tag(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<Tag, Stop> {

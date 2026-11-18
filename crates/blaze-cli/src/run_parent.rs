@@ -64,6 +64,7 @@ use blaze_launch::wire::run::{Declared, Down, Failure, Needed, Symbol, Up};
 use blaze_launch::wire::{List, RecordId, WireError, split};
 use blaze_launch::{Slot, Tier};
 use blaze_own::{AVec, Alloc, Vec};
+use blaze_screen::{Answered, Stage, Step, Unwatched, Watch};
 use blaze_typeck::ItemKey;
 use bstd::Cx;
 use bstd::fs::{Content, Dir, Durable, FsError, ReadWrite};
@@ -142,6 +143,17 @@ pub enum ParentError {
     /// nothing for it): the gate before the start must have left it `Clean`, and the parent
     /// never checks or builds it another way.
     NotChecked { function: ItemKey, symbol: [u8; 32], why: Option<Checked> },
+    /// The code record of `symbol` has a row that lands (a cleanup or a catch that unwinding
+    /// must run: its unwind entry needs a personality routine) and no crate of the program
+    /// declares `#[lang = "eh_personality"]` (blaze-ladder personality.rs: a program that never
+    /// lands needs none, so this is refused here, at the record, never at the start).
+    /// `function`: the record's fn (`None`: a special record); `path`: its item path, when the
+    /// names can give it.
+    NoPersonality { function: Option<ItemKey>, path: Option<Box<str>>, symbol: [u8; 32] },
+    /// The code record of `symbol` does not read as a code record (asked whether it lands).
+    Decode { symbol: [u8; 32], why: blaze_code::record::DecodeError },
+    /// The code record of `symbol` has unwind rows that do not read (asked whether it lands).
+    Unwind { symbol: [u8; 32], why: blaze_code::unwind::UnwindError },
     /// The resolver was asked twice for `symbol` (`Needs` asks once: a bug).
     ResolvedTwice { symbol: [u8; 32] },
     /// The special record of `symbol` (the shim, the getter, the ender) names a static: the
@@ -212,6 +224,19 @@ impl fmt::Display for ParentError {
                 }
                 write!(f, "; the gate before the start leaves every body the program reaches `Clean`, and the parent never checks or builds one another way")
             }
+            ParentError::NoPersonality { function, path, symbol } => {
+                match (path, function) {
+                    (Some(path), Some(function)) => write!(f, "{rule}: fn `{path}` ({:#x}, symbol {})", function.0, Hex(symbol))?,
+                    (None, Some(function)) => write!(f, "{rule}: fn {:#x} (symbol {})", function.0, Hex(symbol))?,
+                    (_, None) => write!(f, "{rule}: the run's special record {}", Hex(symbol))?,
+                }
+                write!(
+                    f,
+                    " has a cleanup or a catch that unwinding must run, and no crate of the program declares a `#[lang = \"eh_personality\"]` fn to run it: declare one, or build with `panic = \"abort\"` (blaze-ladder personality.rs)"
+                )
+            }
+            ParentError::Decode { symbol, why } => write!(f, "{rule}: the code record of symbol {} does not read: {why}", Hex(symbol)),
+            ParentError::Unwind { symbol, why } => write!(f, "{rule}: the unwind rows of the code record of symbol {}: {why}", Hex(symbol)),
             ParentError::ResolvedTwice { symbol } => write!(f, "{rule}: the symbol {} was resolved twice (run_parent.rs `Needs` asks once a symbol)", Hex(symbol)),
             ParentError::SpecialStatic { symbol } => write!(f, "{rule}: the run's special record {} names a static, and the specials are made over no program (run.md, \"Statics in the run\")", Hex(symbol)),
             ParentError::StaticServed { symbol } => write!(f, "{rule}: the static {} was served once and is not among the statics told (run_parent.rs `Lazy::resolve`)", Hex(symbol)),
@@ -222,7 +247,7 @@ impl fmt::Display for ParentError {
                 }
                 match touches_tls {
                     true => write!(f, " touches a thread-local and names {}, a static or a thread-local's template", Hex(symbol))?,
-                    false => write!(f, " names static {}", Hex(symbol))?,
+                    false => write!(f, " names {}, a static or a vtable", Hex(symbol))?,
                 }
                 write!(f, ", which no `Data` of this run sent: the walk's declared list for this record does not hold it; refused before its `Publish` (run_parent.rs `Needs::publish`; run.md, \"Statics in the run\")")
             }
@@ -340,6 +365,11 @@ pub(crate) enum Resolved<'r> {
 /// start list. The command's one impl is [`Lazy`].
 pub(crate) trait Resolve {
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError>;
+    /// The sink the run's events go to (blaze-screen [`Watch`]): the loop tells it when the
+    /// program starts and when a need is answered. [`Unwatched`] unless the resolver has one.
+    fn watch(&self) -> &dyn Watch {
+        &Unwatched
+    }
 }
 
 /// THE GATE'S PROOF, read before a row is stepped: which grain a fn's body is keyed at and,
@@ -423,12 +453,46 @@ pub(crate) trait Front {
     fn statics_named(&self, entry: &[u8], out: &mut AVec<'_, Symbol>) -> Result<(), EntryError> {
         blaze_ladder::code_records::statics::each_static_named(entry, |symbol| out.push(Symbol(symbol.0)))
     }
+    /// Each vtable the entry carries, its symbol and its datum's bytes, to `each`: what
+    /// [`Lazy::resolve`] files and sends in the record's `Data` (code_records.rs form 6). A
+    /// malformed entry is refused as `symbol`'s (the instance the entry is of).
+    fn each_vtable(&self, symbol: [u8; 32], entry: &[u8], each: &mut dyn FnMut(Symbol, &[u8]) -> Result<(), ParentError>) -> Result<(), ParentError> {
+        blaze_ladder::code_records::statics::each_vtable_datum(entry, |vtable, datum| each(Symbol(vtable.0), datum), |why| ParentError::Entry { symbol, why })
+    }
+    /// Whether the code record `record` (of `symbol`) has a row that lands, so that its unwind
+    /// entry names a personality routine (blaze-code unwind.rs `Unwind::lands`). Asked only
+    /// when the run's head names no routine ([`no_routine_lands`]).
+    fn lands(&self, symbol: [u8; 32], record: &[u8]) -> Result<bool, ParentError> {
+        let view = blaze_code::record::CodeView::read(record).map_err(|why| ParentError::Decode { symbol, why })?;
+        let unwind = blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?;
+        Ok(unwind.lands())
+    }
+    /// The item path of fn `item` (`krate::module::name`), for a refusal's words: `None` when
+    /// the front cannot name it (the refusal then shows its key). Read only on an error's path.
+    fn path_of(&mut self, _item: ItemKey) -> Option<Box<str>> {
+        None
+    }
+    /// The sink the run's events go to ([`Watch`]): [`Unwatched`] unless the front has one.
+    fn watch(&self) -> &dyn Watch {
+        &Unwatched
+    }
+}
+
+/// A code record that lands, refused when the run names no personality routine
+/// ([`ParentError::NoPersonality`]): `personality` is the run's head's; `function`, the record's
+/// fn (`None`: a special record). Nothing is read when the head names a routine.
+fn no_routine_lands<F: Front>(front: &mut F, personality: Option<CodeSymbol>, function: Option<ItemKey>, symbol: [u8; 32], record: &[u8]) -> Result<(), ParentError> {
+    if personality.is_some() || !front.lands(symbol, record)? {
+        return Ok(());
+    }
+    let path = function.and_then(|item| front.path_of(item));
+    Err(ParentError::NoPersonality { function, path, symbol })
 }
 
 /// The command's [`Front`]: the names records (`names`, opened once on the first need of them
 /// and kept) for the roots and the maker, and the body ids (`ids`, made once, on the first row
 /// stepped). `tables` is the process's heap, where the head store's and the lazy program's
-/// tables live (typed `'static`); `alloc` holds the roots.
+/// tables live (typed `'static`); `alloc` holds the roots; `watch` is told each stage begun.
 pub(crate) struct CommandFront<'h, 'c, 'r> {
     names: &'c mut dyn FnMut() -> Result<NamesRecords<'h>, ParentError>,
     ids: &'c mut dyn FnMut() -> Result<RunIds<'h>, ParentError>,
@@ -436,6 +500,7 @@ pub(crate) struct CommandFront<'h, 'c, 'r> {
     builder: Builder,
     tables: Alloc<'static>,
     alloc: Alloc<'r>,
+    watch: &'c dyn Watch,
 }
 
 impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
@@ -445,14 +510,16 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
         builder: Builder,
         tables: Alloc<'static>,
         alloc: Alloc<'r>,
+        watch: &'c dyn Watch,
     ) -> CommandFront<'h, 'c, 'r> {
-        CommandFront { names, ids, kept: None, builder, tables, alloc }
+        CommandFront { names, ids, kept: None, builder, tables, alloc, watch }
     }
 
     fn names(&mut self) -> Result<NamesRecords<'h>, ParentError> {
         if let Some(names) = self.kept {
             return Ok(names);
         }
+        self.watch.see(Step::Began(Stage::Names));
         let names = (self.names)()?;
         self.kept = Some(names);
         Ok(names)
@@ -466,6 +533,7 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         let names = self.names()?;
+        self.watch.see(Step::Began(Stage::Roots));
         special::run_roots(names.records, names.lang_crates, self.builder.settings.panic, names.frame, self.tables, self.alloc).map_err(ParentError::Roots)
     }
 
@@ -476,6 +544,21 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     fn maker(&mut self, start: &Roots<'r>) -> Result<Maker<'h>, ParentError> {
         let names = self.names()?;
         Ok(Maker::new(names, start.maker_entry(), &self.builder, self.tables))
+    }
+
+    /// From the names records: the checker key's library item (its first 16 bytes,
+    /// front2 keys.rs `checker_of`), its module's path and its name.
+    fn path_of(&mut self, item: ItemKey) -> Option<Box<str>> {
+        use blaze_ladder::front2::source::NamesSource;
+        let records = self.names().ok()?.records;
+        let lib = records.key_beginning(item.0.to_be_bytes())?;
+        let module = records.module_path(records.home_of(lib)?)?;
+        let name = records.name_of(lib)?;
+        Some(std::format!("{module}::{name}").into_boxed_str())
+    }
+
+    fn watch(&self) -> &dyn Watch {
+        self.watch
     }
 }
 
@@ -647,6 +730,7 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         self.placed.dedup();
         self.tally.reached += rows.len();
         self.tally.found += rows.len();
+        self.front.watch().see(Step::Placed { rows: u32::try_from(rows.len()).unwrap_or(u32::MAX) });
     }
 }
 
@@ -687,6 +771,8 @@ fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F:
             why => return Err(ParentError::NotChecked { function: tabled, symbol, why }),
         }
     }
+    let path = if front.watch().paths() { front.path_of(tabled) } else { None };
+    front.watch().see(Step::Resolving { path: path.as_deref() });
     let cx = cx.span(FIRST_CALL_SPAN);
     let one = started
         .walk
@@ -701,6 +787,11 @@ fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F:
         // `one` never answers `Waiting`.
         How::Waiting => FIRST_CALL_SPAN,
     });
+    front.watch().see(Step::Answered(match how {
+        How::Found => Answered::Found,
+        How::Made => Answered::Made,
+        How::Unkeyed(_) | How::Waiting => Answered::Unkeyed,
+    }));
     Ok((how, key))
 }
 
@@ -785,6 +876,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             cx.span(FIRST_CALL_SPAN).event(HOW_SPECIAL);
             let entry = store.get(made.key).map_err(|why| ParentError::Store { symbol: symbol.0, why })?.ok_or(ParentError::NotStored { symbol: symbol.0 })?;
             let record = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
+            no_routine_lands(&mut *front, started.start.head().personality, None, symbol.0, record)?;
             let id = folder.file(record)?;
             started.list.clear();
             front.form().declared(entry, &mut started.list).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
@@ -803,6 +895,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
                 true => tally.found += 1,
                 false => tally.made += 1,
             }
+            front.watch().see(Step::Answered(if made.found { Answered::Found } else { Answered::Made }));
             return Ok(Resolved::Record { key: made.key, record: id, declares: declares.as_slice(), data: &[], named: named.as_slice() });
         }
         // Still unreached (the start list's cap broke the chain to it): walk forward from the
@@ -850,11 +943,22 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             (None, How::Made | How::Unkeyed(_) | How::Waiting) => started.scratch.made(),
         };
         let record = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
+        no_routine_lands(&mut *front, started.start.head().personality, Some(started.walk.tabled(row)), symbol.0, record)?;
         let id = folder.file(record)?;
         // An unkeyed instance's row in the next list: its entry's content key.
         let key = key.unwrap_or_else(|| content_key(entry));
         front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
         callees(&started.walk, row, declares, told, statics);
+        // The vtables the record names: each a datum the entry carries, filed and sent in this
+        // record's `Data` unless this run told it already (its method words' instances are
+        // among the entry's declared rows, so their slots go in the `Declare` before it).
+        front.each_vtable(symbol.0, entry, &mut |vtable, datum| {
+            if let Err(at) = told.binary_search(&vtable.0) {
+                told.insert(at, vtable.0);
+                data.push(Datum { symbol: vtable, record: folder.file(datum)? });
+            }
+            Ok(())
+        })?;
         count(tally, how);
         // The statics the record reaches and this run has not told, each served once and its
         // datum filed; their own callees after them (a static's value names statics, and fns
@@ -882,6 +986,10 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         named.sort_unstable();
         named.dedup();
         Ok(Resolved::Record { key, record: id, declares: declares.as_slice(), data: data.as_slice(), named: named.as_slice() })
+    }
+
+    fn watch(&self) -> &dyn Watch {
+        self.front.watch()
     }
 }
 

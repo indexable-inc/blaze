@@ -943,6 +943,42 @@ impl<A: Allocator + Clone> Layouts<A> {
         Ok(())
     }
 
+    /// Whether `ty` has interior mutability: it is not `Freeze` (core/src/marker.rs: `unsafe
+    /// auto trait Freeze`, `impl<T: PointeeSized> !Freeze for UnsafeCell<T>`), decided
+    /// structurally over what it holds BY VALUE: an `UnsafeCell` (or `UnsafePinned`: the ADTs
+    /// whose repr hides their fields' niches, [`ReprAttrs::hide_niche`]) anywhere among its
+    /// fields, its variants' fields, its elements, its closure's environment. A reference or
+    /// pointer is `Freeze` whatever it points at (its pointee is another allocation), and so is
+    /// `PhantomData` (it holds nothing). The Reference, "Static items": a static of such a type
+    /// is written in place, so it is never placed in read-only memory.
+    ///
+    /// A coroutine is answered by its upvars alone (its saved locals are not parts here):
+    /// TO BUILD when a static holds one.
+    pub fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, LayoutError> {
+        /// The most types one decision visits (rule 18).
+        const MOST: usize = 1 << 16;
+        let mut todo: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut seen: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        todo.push(ty);
+        while let Some(t) = todo.pop() {
+            match seen.binary_search(&t) {
+                Ok(_) => continue,
+                Err(at) => seen.insert(at, t),
+            }
+            if seen.len() > MOST {
+                return Err(LayoutError { ty, why: Refusal::TooLarge });
+            }
+            let node = cx.ground.view().node(t).map_err(|_| LayoutError { ty: t, why: Refusal::Malformed("a type past the ground table") })?;
+            if let PNode::Adt(key, _) = node
+                && cx.facts.repr(key).hide_niche
+            {
+                return Ok(true);
+            }
+            self.parts(t, cx, &mut todo).map_err(|why| LayoutError { ty: t, why })?;
+        }
+        Ok(false)
+    }
+
     /// The types `ty` holds by value, appended to `out`, each laid out: a struct's, tuple's or
     /// union's fields by declaration index, an array's or slice's element once, an enum's
     /// variants' fields one variant after another; nothing for a primitive.

@@ -10,13 +10,6 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
-# Decision D105: every kind's task runner is in this crate today (work.rs, names.rs, macros.rs,
-# body_types.rs map inputs to records and verdicts to findings), so every row holds this crate's
-# own files (not its dependencies: each runner's library is in its row's closure) until the
-# runners move into their producers' crates (remote-read.md piece 6); then each name goes.
-[package.metadata.blaze]
-producer-own = ["expander", "lowering", "body-checker", "names", "code-builder"]
-
 [[bin]]
 name = "blaze"
 path = "src/main.rs"
@@ -88,6 +81,8 @@ blaze-remote = { workspace = true, default-features = false }
 blaze-h1.workspace = true
 # The findings' frames, their wording table and the closing line (blaze_report::frame).
 blaze-report.workspace = true
+# `blaze run`'s live status line: the run's events (`Step`, `Watch`) and the line's sans-IO core.
+blaze-screen.workspace = true
 # The workspace's layout (`layout::Layout`), sans-IO: members, targets, dependencies, each on its
 # line. Without `cargo`: no serde, on blaze's own crates only.
 blaze-manifest = { workspace = true, default-features = false }
@@ -137,14 +132,6 @@ fetch = ["dep:blaze-http"]
 # The proc-macro sandbox (Wasmtime), linked into `blaze`: no helper process, one code path. A
 # command that expands nothing does not run it; without it the binary still looks modules up.
 sandbox = ["blaze-proc-macro/runtime"]
-
-# build/producers.rs: each producer's source digest (decision D105), the sans-IO walk and its
-# inputs' types. By path: the workspace entry of blaze-ids turns on serde adapters. blaze-own's
-# `std` for `Heap::process`, the build step's own entry.
-[build-dependencies]
-blaze-producers = { path = "../blaze-producers" }
-blaze-own = { workspace = true, features = ["std"] }
-blaze-toml.workspace = true
 
 [dev-dependencies]
 # `check` and `control`: the sweep's simulation and its planted-bug control.

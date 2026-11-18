@@ -14,8 +14,11 @@
 //!
 //! Evaluating a nested goal canonicalizes it and looks it up: on the stack (a cycle: the head's
 //! provisional result, or the initial one for the path's kind), in the provisional cache, in
-//! the global cache; else a frame is pushed. A fact the world does not have yet stops the whole
-//! evaluation (`Stop::Need`): every snapshot is rolled back and the caller retries the root.
+//! the global cache; else a frame is pushed. A fact the world does not have yet is pulled: the
+//! step that met it is rolled back (its bindings, rows and frame state: [`Solver::pull`]), the
+//! [`FactSource`] fills it, and the step runs again in the same frame. Only a source that cannot
+//! fill ([`crate::facts::Stopping`]) stops the whole evaluation (`Stop::Need`): then every
+//! snapshot is rolled back and the caller fills the fact and asks the root again.
 
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
@@ -23,7 +26,7 @@ use blaze_own::{Alloc, Vec};
 use crate::assembly::{AStep, Added, Cand, Clause, Cx, Done, EnvId, Goal, Langs, Merger, Rule as CandRule, Source, Step, Via};
 use crate::canon::{self, Canon, Decode, RespGoal, RespId, Responses};
 use crate::error::{Limit, Malformed, SolveError, Stop};
-use crate::facts::{Ask, Facts, Read, TraitFlags};
+use crate::facts::{Ask, Facts, Read, Source as FactSource, Stopping, TraitFlags};
 use crate::fold::{self, Inst, Scratch};
 use crate::readlog::{ReadLog, SegLog};
 use crate::search::{Ans, FIXPOINT_STEP_LIMIT, Heads, Inputs, MAX_DEPTH, PathKind, Prov};
@@ -208,7 +211,16 @@ pub struct Solver<'a> {
     /// each ground root goal's canonical input with its environment's canonical words in place
     /// of the env id, so goals of different bodies (different solvers) compare.
     root_keys: Option<Vec<u64, Alloc<'a>>>,
+    /// The plain-goal memo: a goal with no inference variable, by its own identity (mode,
+    /// env id, interned predicate handles, bound count), to its interned canonical input.
+    /// Such a goal's canonical words are a function of those handles alone (`goal_input`
+    /// reads `tys` only to resolve variables), so a hit skips the canonical walk. Only goals
+    /// whose canonical form has no variable are kept; at most [`MAX_PLAIN`] entries.
+    plain: Map<(TypingMode, Goal), u32, FixedState, Alloc<'a>>,
 }
+
+/// The plain-goal memo's cap (rule 18): past it goals are canonicalized each time.
+pub const MAX_PLAIN: usize = 1 << 16;
 
 /// What the solver did, counted: plain integers, bumped on the paths they name and read by the
 /// caller after a body ([`Solver::stats`]). They live in the scratch (`fold::Scratch::stats`),
@@ -256,6 +268,9 @@ pub struct Stats {
     /// started), and the words written.
     pub canonicalized: u64,
     pub canon_words: u64,
+    /// Goals whose input was found by their plain key, not written in canonical form
+    /// ([`Solver::plain_key`]).
+    pub canon_skipped: u64,
     /// Canonical inputs decoded into the arena (`canon::instantiate_input`, one per frame).
     pub decoded: u64,
     /// Root goals that reached the search with no inference variable, no parameter and no
@@ -266,6 +281,9 @@ pub struct Stats {
     /// away unfinished.
     pub need_stops: u64,
     pub frames_abandoned: u64,
+    /// Facts the source filled inside an evaluation ([`Solver::pull`]): each ran one step of
+    /// one frame again, where a need stop ran the whole root again.
+    pub pulls: u64,
     /// Frames finished with a provisional answer (inside a cycle, not in the global cache).
     pub provisional: u64,
 }
@@ -308,10 +326,12 @@ stats_fields!(
     impl_prematch_rejected,
     canonicalized,
     canon_words,
+    canon_skipped,
     decoded,
     ground_roots,
     need_stops,
     frames_abandoned,
+    pulls,
     provisional,
 );
 
@@ -324,6 +344,28 @@ pub(crate) struct Off {
     /// The impl header pre-match (prefilter.rs `header_may_match`): every surviving header
     /// imported and related.
     pub prematch: bool,
+    /// The plain-goal memo ([`Solver::plain_key`]): every goal written in canonical form.
+    pub memo: bool,
+}
+
+/// The most facts one step may pull before it is refused (rule 18): each fill answers a
+/// question the step had not had answered, so a world never comes near it.
+pub const MAX_PULLS: u32 = 1 << 16;
+
+/// What one pulled step may change, taken before it runs ([`Solver::pull`]).
+struct StepMark<S> {
+    snap: S,
+    frame: Frame,
+    cands: usize,
+    dones: usize,
+    goals: usize,
+    added: usize,
+    deferred: usize,
+    origs: usize,
+    reads: usize,
+    reads_lo: u32,
+    universe: u32,
+    resps: (u32, u32),
 }
 
 fn env_slice<'e>(clauses: &'e [Clause], rows: &[(u32, u32)], env: EnvId) -> &'e [Clause] {
@@ -379,6 +421,7 @@ impl<'a> Solver<'a> {
             marker_reads: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             marker_pool: Vec::new_in(alloc),
             root_keys: None,
+            plain: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
         }
     }
 
@@ -424,6 +467,41 @@ impl<'a> Solver<'a> {
     /// Interns a param env: `clauses` and their supertraits, elaborated transitively
     /// (rustc_type_ir elaborate.rs, as the reference's param envs are), each once.
     pub fn env<T: Tys, F: Facts>(
+        &mut self,
+        tys: &mut T,
+        facts: &F,
+        clauses: &[Clause],
+        reads: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<EnvId, Stop> {
+        self.env_from(tys, &mut Stopping(facts), clauses, reads)
+    }
+
+    /// [`Solver::env`] over a source: a missing fact is filled and the elaboration (terms
+    /// interned only, no bindings) runs again, its reads taken back first.
+    pub fn env_from<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        clauses: &[Clause],
+        reads: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<EnvId, Stop> {
+        let mark = reads.len();
+        for _ in 0..MAX_PULLS {
+            match self.env_once(tys, src.facts(), clauses, reads) {
+                Err(Stop::Need(q)) if S::PULLS => {
+                    reads.truncate(mark);
+                    if !src.fill(tys, q) {
+                        return Err(Stop::Need(q));
+                    }
+                    self.scratch.stats.pulls += 1;
+                }
+                r => return r,
+            }
+        }
+        Err(Stop::Error(SolveError::Limit(Limit::Pulls)))
+    }
+
+    fn env_once<T: Tys, F: Facts>(
         &mut self,
         tys: &mut T,
         facts: &F,
@@ -513,6 +591,19 @@ impl<'a> Solver<'a> {
         goal: Goal,
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<Answer, Stop> {
+        self.evaluate_from(tys, &mut Stopping(facts), mode, goal, reads)
+    }
+
+    /// [`Solver::evaluate`] over a source that may fill a missing fact where it is met
+    /// ([`FactSource`]): `Stop::Need` only when the source does not fill it.
+    pub fn evaluate_from<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+        reads: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<Answer, Stop> {
         self.scratch.stats.evaluations += 1;
         if let Some(a) = self.fast_path(tys, mode, goal, reads) {
             self.scratch.stats.fast_path += 1;
@@ -520,7 +611,7 @@ impl<'a> Solver<'a> {
         }
         let reads_lo = self.reads.seg.len();
         self.reads.lo = reads_lo as u32;
-        let r = self.evaluate_root(tys, facts, mode, goal);
+        let r = self.evaluate_root(tys, src, mode, goal);
         match r {
             Ok((ans, orig_lo)) => {
                 let answer = self.apply_root(tys, ans, orig_lo);
@@ -617,12 +708,38 @@ impl<'a> Solver<'a> {
         })
     }
 
-    /// Runs the root goal to its answer; the root's original values are left on `origs` from
-    /// the returned index.
-    fn evaluate_root<T: Tys, F: Facts>(&mut self, tys: &mut T, facts: &F, mode: TypingMode, goal: Goal) -> Result<(Ans, u32), Stop> {
-        canon::goal_input(&*tys, &mut self.canon, &mut self.words, mode, goal)?;
+    /// The goal's interned canonical input; `canon.orig` holds its original values after. A
+    /// goal with no inference variable is found by its own identity in the plain memo when it
+    /// was seen before (no canonical walk: `canon_skipped`); any other goal is canonicalized
+    /// (`canonicalized`). `self.words` holds the canonical words only after a walk: read them
+    /// back by `Inputs::words_of`.
+    fn input_of<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal) -> Result<u32, Stop> {
+        let mut plain = !self.scratch.off.memo;
+        if plain {
+            pred_terms(tys, goal.pred, &mut |t| {
+                plain &= !tys.flags(t).has(Flags::HAS_INFER | Flags::HAS_RE_INFER);
+                Ok(())
+            })?;
+        }
+        if plain && let Some(&input) = self.plain.get(&(mode, goal)) {
+            self.canon.clear();
+            self.scratch.stats.canon_skipped += 1;
+            return Ok(input);
+        }
+        canon::goal_input(tys, &mut self.canon, &mut self.words, mode, goal)?;
         self.scratch.stats.canonicalized += 1;
         self.scratch.stats.canon_words += self.words.len() as u64;
+        let input = self.inputs.intern(&self.words)?;
+        if plain && self.canon.orig.is_empty() && self.plain.len() < MAX_PLAIN {
+            let _ = self.plain.insert((mode, goal), input);
+        }
+        Ok(input)
+    }
+
+    /// Runs the root goal to its answer; the root's original values are left on `origs` from
+    /// the returned index.
+    fn evaluate_root<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, mode: TypingMode, goal: Goal) -> Result<(Ans, u32), Stop> {
+        let input = self.input_of(&*tys, mode, goal)?;
         if self.root_keys.is_some() && self.canon.orig.is_empty() {
             let mut ground = true;
             pred_terms(&*tys, goal.pred, &mut |t| {
@@ -635,7 +752,8 @@ impl<'a> Solver<'a> {
                     Some(&(s, l)) => crate::search::hash_words(&self.env_words[s as usize..(s + l) as usize]),
                     None => 0,
                 };
-                let key = crate::search::hash_words(&self.words[2..]) ^ env.rotate_left(17) ^ u64::from(self.words[0]);
+                let words = self.inputs.words_of(input);
+                let key = crate::search::hash_words(&words[2..]) ^ env.rotate_left(17) ^ u64::from(words[0]);
                 if let Some(keys) = self.root_keys.as_mut() {
                     keys.push(key);
                 }
@@ -643,7 +761,6 @@ impl<'a> Solver<'a> {
         }
         let orig_lo = self.origs.len() as u32;
         self.origs.extend_from_slice(&self.canon.orig);
-        let input = self.inputs.intern(&self.words)?;
         if let Some(e) = self.inputs.lookup(input, self.limit, true) {
             self.scratch.stats.cache_hits += 1;
             let lo = self.reads.lo;
@@ -653,7 +770,7 @@ impl<'a> Solver<'a> {
         let mut snaps: Vec<T::Snapshot, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut probes: Vec<Option<T::Snapshot>, Alloc<'a>> = Vec::new_in(self.alloc);
         self.push_frame(tys, &mut snaps, &mut probes, input, mode, self.limit, PathKind::Inductive);
-        let r = self.drive(tys, facts, &mut snaps, &mut probes);
+        let r = self.drive(tys, src, &mut snaps, &mut probes);
         match r {
             Ok(ans) => Ok((ans, orig_lo)),
             Err(e) => {
@@ -737,16 +854,16 @@ impl<'a> Solver<'a> {
     }
 
     /// The main loop: runs the top frame until the root frame finishes.
-    fn drive<T: Tys, F: Facts>(
+    fn drive<T: Tys, S: FactSource<T>>(
         &mut self,
         tys: &mut T,
-        facts: &F,
+        src: &mut S,
         snaps: &mut Vec<T::Snapshot, Alloc<'a>>,
         probes: &mut Vec<Option<T::Snapshot>, Alloc<'a>>,
     ) -> Result<Ans, Stop> {
         loop {
             let top = self.frames.len() - 1;
-            match self.drive_one(tys, facts, snaps, probes, top) {
+            match self.drive_one(tys, src, snaps, probes, top) {
                 Ok(Some(done)) => return Ok(done),
                 Ok(None) => {}
                 Err(Stop::Error(SolveError::Malformed(Malformed::Pred { at, goal: None, .. }))) => {
@@ -771,29 +888,93 @@ impl<'a> Solver<'a> {
     }
 
     /// One phase of the top frame: the answer when the root finished.
-    fn drive_one<T: Tys, F: Facts>(
+    fn drive_one<T: Tys, S: FactSource<T>>(
         &mut self,
         tys: &mut T,
-        facts: &F,
+        src: &mut S,
         snaps: &mut Vec<T::Snapshot, Alloc<'a>>,
         probes: &mut Vec<Option<T::Snapshot>, Alloc<'a>>,
         top: usize,
     ) -> Result<Option<Ans>, Stop> {
         let phase = self.frames[top].phase;
         match phase {
-            Phase::Start => self.start(tys, facts, top)?,
-            Phase::Assemble(k) => self.assemble(tys, facts, top, k)?,
-            Phase::NextCand => self.next_cand(tys, facts, probes, top)?,
-            Phase::Step(k) => self.step(tys, facts, probes, top, k)?,
+            Phase::Start => self.pull(tys, src, top, |s, tys, facts| s.start(tys, facts, top))?,
+            Phase::Assemble(k) => self.assemble(tys, src, top, k)?,
+            Phase::NextCand => self.next_cand(tys, src, probes, top)?,
+            Phase::Step(k) => self.step(tys, src, probes, top, k)?,
             Phase::Nested => {
-                self.nested(tys, facts, snaps, probes, top)?;
+                self.nested(tys, snaps, probes, top)?;
             }
             Phase::Merge => {
-                let ans = self.merge(facts, top)?;
+                let ans = self.pull(tys, src, top, |s, _, facts| s.merge(facts, top))?;
                 return self.finish(tys, snaps, probes, top, ans);
             }
         }
         Ok(None)
+    }
+
+    /// Runs one step of frame `top` that may ask the world (`run`), pulling each fact it lacks
+    /// (the module, [`FactSource`]): on `Need(q)` everything the step changed is put back (the
+    /// arena's bindings by a snapshot of the step, the frame's row, the rows it appended:
+    /// candidates, done candidates, pending and added goals, deferred pairs, the original
+    /// values, the read log's open segment, the universe, the response scratch), the source
+    /// fills `q`, and the step runs again. Every step `run` stands for only appends to those
+    /// rows and opens no snapshot it leaves open on success, so the rollback is exact and the
+    /// second run sees what the first did. A source that cannot fill gets the old stop.
+    fn pull<T: Tys, S: FactSource<T>, R>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        top: usize,
+        mut run: impl FnMut(&mut Self, &mut T, &S::Facts) -> Result<R, Stop>,
+    ) -> Result<R, Stop> {
+        if !S::PULLS {
+            return run(self, tys, src.facts());
+        }
+        for _ in 0..MAX_PULLS {
+            let mark = StepMark {
+                snap: tys.snapshot(),
+                frame: self.frames[top],
+                cands: self.cands.len(),
+                dones: self.dones.len(),
+                goals: self.goals.len(),
+                added: self.added.len(),
+                deferred: self.deferred.len(),
+                origs: self.origs.len(),
+                reads: self.reads.seg.len(),
+                reads_lo: self.reads.lo,
+                universe: self.universe,
+                resps: self.resps.scratch_mark(),
+            };
+            match run(self, tys, src.facts()) {
+                Ok(v) => {
+                    tys.commit(mark.snap);
+                    return Ok(v);
+                }
+                // Another stop ends the root, whose unwind rolls back past this snapshot; the
+                // frame stays as the step left it, so the error names the goal it was at.
+                Err(Stop::Error(e)) => return Err(Stop::Error(e)),
+                Err(Stop::Need(q)) => {
+                    tys.rollback_to(mark.snap);
+                    self.frames[top] = mark.frame;
+                    self.cands.truncate(mark.cands);
+                    self.dones.truncate(mark.dones);
+                    self.goals.truncate(mark.goals);
+                    self.added.truncate(mark.added);
+                    self.deferred.truncate(mark.deferred);
+                    self.origs.truncate(mark.origs);
+                    self.reads.seg.truncate(mark.reads);
+                    self.reads.lo = mark.reads_lo;
+                    self.universe = mark.universe;
+                    self.resps.truncate_scratch(mark.resps);
+                    if !src.fill(tys, q) {
+                        return Err(Stop::Need(q));
+                    }
+                    self.scratch.stats.pulls += 1;
+                }
+            }
+        }
+        Err(Stop::Error(SolveError::Limit(Limit::Pulls)))
     }
 
     fn cx<'c, T: Tys, F: Facts>(&'c mut self, tys: &'c mut T, facts: &'c F, top: usize) -> Cx<'c, 'a, T, F> {
@@ -878,17 +1059,17 @@ impl<'a> Solver<'a> {
         self.added.clear();
     }
 
-    fn assemble<T: Tys, F: Facts>(&mut self, tys: &mut T, facts: &F, top: usize, stage: u8) -> Result<(), Stop> {
+    fn assemble<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, top: usize, stage: u8) -> Result<(), Stop> {
         let f = self.frames[top];
         // `out` holds the candidates of earlier stages: a stage may keep a row there for a
-        // later one (alias.rs's stash) and remove it.
-        let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(self.alloc);
-        out.extend_from_slice(&self.cands[f.cands_lo as usize..]);
-        self.cands.truncate(f.cands_lo as usize);
-        let mut st = f.tstate;
-        let r = {
-            let mut cx = self.cx(tys, facts, top);
-            match f.kind {
+        // later one (alias.rs's stash) and remove it. The rows stay in `cands` until the stage
+        // answered, so a pulled stage starts again from them.
+        let (r, out, st) = self.pull(tys, src, top, |s, tys, facts| {
+            let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(s.alloc);
+            out.extend_from_slice(&s.cands[f.cands_lo as usize..]);
+            let mut st = f.tstate;
+            let mut cx = s.cx(tys, facts, top);
+            let r = match f.kind {
                 Kind::Trait => trait_goals::assemble(&mut cx, stage, &mut st, &mut out)?,
                 Kind::Alias => crate::alias::assemble(&mut cx, stage, &mut out)?,
                 Kind::WellFormed => {
@@ -910,8 +1091,10 @@ impl<'a> Solver<'a> {
                     out.push(Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(rule)));
                     AStep::Done
                 }
-            }
-        };
+            };
+            Ok((r, out, st))
+        })?;
+        self.cands.truncate(f.cands_lo as usize);
         self.cands.extend_from_slice(&out);
         self.take_added();
         let fr = &mut self.frames[top];
@@ -940,10 +1123,10 @@ impl<'a> Solver<'a> {
         f.phase = Phase::Nested;
     }
 
-    fn next_cand<T: Tys, F: Facts>(
+    fn next_cand<T: Tys, S: FactSource<T>>(
         &mut self,
         tys: &mut T,
-        facts: &F,
+        src: &mut S,
         probes: &mut [Option<T::Snapshot>],
         top: usize,
     ) -> Result<(), Stop> {
@@ -969,12 +1152,13 @@ impl<'a> Solver<'a> {
             self.frames[top].impls_done = true;
             let done = &self.dones[f.dones_lo as usize..];
             if trait_goals::wants_impls(f.mode, &f.tstate, &self.resps, done) {
-                let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(self.alloc);
                 let st = f.tstate;
-                {
-                    let mut cx = self.cx(tys, facts, top);
+                let out = self.pull(tys, src, top, |s, tys, facts| {
+                    let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(s.alloc);
+                    let mut cx = s.cx(tys, facts, top);
                     trait_goals::assemble_impls(&mut cx, &st, &mut out)?;
-                }
+                    Ok(out)
+                })?;
                 self.scratch.stats.impl_candidates += out.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
                 self.added.clear();
                 self.cands.extend_from_slice(&out);
@@ -985,18 +1169,18 @@ impl<'a> Solver<'a> {
         Ok(())
     }
 
-    fn step<T: Tys, F: Facts>(
+    fn step<T: Tys, S: FactSource<T>>(
         &mut self,
         tys: &mut T,
-        facts: &F,
+        src: &mut S,
         probes: &mut [Option<T::Snapshot>],
         top: usize,
         stage: u8,
     ) -> Result<(), Stop> {
-        let mut cand = self.frames[top].cand;
-        let r = {
-            let mut cx = self.cx(tys, facts, top);
-            match cand.rule {
+        let (r, cand) = self.pull(tys, src, top, |s, tys, facts| {
+            let mut cand = s.frames[top].cand;
+            let mut cx = s.cx(tys, facts, top);
+            let r = match cand.rule {
                 CandRule::Certain(c) => Step::Done(c),
                 CandRule::Trait(r) => trait_goals::step(&mut cx, &mut cand, r, stage)?,
                 CandRule::Builtin(r) => crate::builtin::step(&mut cx, &mut cand, r, stage)?,
@@ -1004,8 +1188,9 @@ impl<'a> Solver<'a> {
                 CandRule::Alias(r) => crate::alias::step(&mut cx, &mut cand, r, stage)?,
                 CandRule::Coherence(r) => crate::coherence::step(&mut cx, &mut cand, r, stage)?,
                 CandRule::Other(r) => step_other(&mut cx, r)?,
-            }
-        };
+            };
+            Ok((r, cand))
+        })?;
         self.take_added();
         let fr = &mut self.frames[top];
         fr.cand = cand;
@@ -1033,15 +1218,13 @@ impl<'a> Solver<'a> {
 
     /// One step of the nested-goal loop (`evaluate_added_goals_step`); `true` when a frame was
     /// pushed or finished (the loop continues with the new top).
-    fn nested<T: Tys, F: Facts>(
+    fn nested<T: Tys>(
         &mut self,
         tys: &mut T,
-        facts: &F,
         snaps: &mut Vec<T::Snapshot, Alloc<'a>>,
         probes: &mut Vec<Option<T::Snapshot>, Alloc<'a>>,
         top: usize,
     ) -> Result<bool, Stop> {
-        let _ = facts;
         loop {
             let n = self.frames[top].nested;
             if (n.i as usize) < self.goals.len() {
@@ -1227,15 +1410,12 @@ impl<'a> Solver<'a> {
     ) -> Result<Got, Stop> {
         let f = self.frames[top];
         let goal = Goal { env: f.goal.env, pred: g.pred, bound: g.bound };
-        canon::goal_input(&*tys, &mut self.canon, &mut self.words, f.mode, goal)?;
-        self.scratch.stats.canonicalized += 1;
-        self.scratch.stats.canon_words += self.words.len() as u64;
+        let input = self.input_of(&*tys, f.mode, goal)?;
         let orig_lo = self.origs.len() as u32;
         self.origs.extend_from_slice(&self.canon.orig);
         self.frames[top].call_orig_lo = orig_lo;
         self.frames[top].call_via_only = g.via_only;
         let vars = self.canon.orig.len() as u32;
-        let input = self.inputs.intern(&self.words)?;
         let step = f.to_nested;
         // A cycle (`lookup_cycle` / `cycle_on_stack`).
         let h = self.inputs.on_stack[input as usize];

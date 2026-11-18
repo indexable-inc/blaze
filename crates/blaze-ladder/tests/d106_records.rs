@@ -283,8 +283,9 @@ fn walk_keeping(f: &Fixture, ids: &dyn BodyIds, entry: ItemKey, store: &mut dyn 
     let names = reader(f);
     let mut maker = Maker::new(names, Some(entry), b, alloc());
     let (_, counts) = walk_records(entry, ids, store, b, &producer(), &mut maker, alloc()).unwrap_or_else(|e| {
-        // Printed too: the test's own output is what a failed run shows first.
-        println!("the record walk: {e}");
+        // Printed too: the test's own output is what a failed run shows first, the records' log
+        // with it (a gap the source filed is often the cause).
+        println!("the record walk: {e}; the records filed {:?}", logged(names.records));
         panic!("the record walk: {e}")
     });
     assert!(logged(names.records).is_empty(), "the records filed {:?}", logged(names.records));
@@ -905,15 +906,15 @@ fn rust_eh_personality() {}
 /// `run_roots`; UNWIND.md 3.3, piece P3): a program whose lang crates declare
 /// `#[lang = \"eh_personality\"]` names that fn in its head, as the last root row at no
 /// arguments (so the walk makes it at its first call); built to abort, the same program names
-/// none. Control: the program without the routine is refused, built to unwind, by
-/// `PersonalityError::Missing` naming the crates searched, and names none built to abort.
+/// none. Control: the program without the routine has roots built to unwind too (rule 4: a
+/// program that never lands needs no routine; the parent refuses the first record that lands,
+/// blaze-cli run_parent.rs `NoPersonality`), naming none and one root fewer; none built to abort.
 ///
-/// Prints: `d106 personality over names records: named <hex>; refused: <error>`
+/// Prints: `d106 personality over names records: named <hex>; none declared: no routine named`
 #[test]
 fn the_personality_routine_is_a_root_over_names_records() {
     use blaze_ladder::code_records::PanicStrategy;
-    use blaze_ladder::personality::PersonalityError;
-    use blaze_ladder::run::special::{RootsError, run_roots};
+    use blaze_ladder::run::special::run_roots;
     let with = fixture(&std::format!("{PROGRAM}{PERSONALITY_ROUTINE}"));
     let names = reader(&with);
     let routine = fn_named(&with, "rust_eh_personality");
@@ -928,14 +929,12 @@ fn the_personality_routine_is_a_root_over_names_records() {
 
     let without = fixture(PROGRAM);
     let names = reader(&without);
-    let refused = match run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, names.frame, alloc(), alloc()) {
-        Err(RootsError::Personality(why @ PersonalityError::Missing { .. })) => why,
-        Err(other) => panic!("a program with no routine was refused for another cause: {other}"),
-        Ok(roots) => panic!("a program with no routine named {:?}", roots.head().personality),
-    };
+    let unwinds = run_roots(names.records, names.lang_crates, PanicStrategy::Unwind, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("a program with no routine, built to unwind, was refused at its start: {e}"));
+    assert_eq!(unwinds.head().personality, None, "a program with no routine named one");
+    assert_eq!(unwinds.len() + 1, got.len(), "a program with no routine has a root row for one");
     let abort = run_roots(names.records, names.lang_crates, PanicStrategy::Abort, names.frame, alloc(), alloc()).unwrap_or_else(|e| panic!("the run's roots, abort, no routine: {e}"));
     assert_eq!(abort.head().personality, None);
-    println!("d106 personality over names records: named {:x}; refused: {refused}", routine.0);
+    println!("d106 personality over names records: named {:x}; none declared: no routine named", routine.0);
 }
 
 /// Two structs no body of [`PROGRAM`] names: `Lone`, holding `Inner` by value.
@@ -1321,4 +1320,492 @@ fn a_static_is_a_record_of_its_own_named_by_the_code() {
     let g = StaticEntryView::read(store.get(walk.key(row).expect("keyed")).expect("reads").expect("put")).expect("reads");
     assert_eq!(g.datum.bytes(), b"hi!!!\n", "the edited value");
     println!("d106 statics: first made 3; AT one word to GREETING; GREETING 6 bytes read-only; second found {}; edit made {}", second.found, third.made);
+}
+
+/// A `format_args!` with a `{}`, a `{:?}` and a `{:x}` placeholder, its library the pinned
+/// core's shape in miniature (library/core/src/fmt/rt.rs: `#[lang = "format_argument"] struct
+/// Argument`, its constructors `new_display<T: Display>(x: &T)`, `new_debug`, `new_lower_hex`
+/// in `impl Argument<'_>`; mod.rs: `#[lang = "format_arguments"] struct Arguments { template,
+/// args }`). Each constructor here writes its own code, so `main` reads which one made each
+/// entry of the array and the byte its reference points at: 42 when the three are 1, 2, 3 and
+/// the values 7, 8, 9.
+const FMT: &str = "#![feature(no_core, lang_items, rustc_attrs)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+
+#[rustc_builtin_macro]
+macro_rules! format_args {
+    ($fmt:expr) => {{ /* compiler built-in */ }};
+    ($fmt:expr, $($args:tt)*) => {{ /* compiler built-in */ }};
+}
+
+pub mod fmt {
+    pub trait Display {}
+    pub trait Debug {}
+    pub trait LowerHex {}
+    impl Display for u32 {}
+    impl Debug for u32 {}
+    impl LowerHex for u32 {}
+
+    #[lang = \"format_arguments\"]
+    pub struct Arguments<'a> {
+        pub template: *const u8,
+        pub args: *const rt::Argument<'a>,
+    }
+
+    pub mod rt {
+        #[lang = \"format_argument\"]
+        pub struct Argument<'a> {
+            pub value: &'a u8,
+            pub code: u32,
+        }
+
+        impl Argument<'_> {
+            pub fn new_display<T: super::Display>(x: &T) -> Argument<'_> {
+                Argument { value: unsafe { &*(x as *const T as *const u8) }, code: 1 }
+            }
+            pub fn new_debug<T: super::Debug>(x: &T) -> Argument<'_> {
+                Argument { value: unsafe { &*(x as *const T as *const u8) }, code: 2 }
+            }
+            pub fn new_lower_hex<T: super::LowerHex>(x: &T) -> Argument<'_> {
+                Argument { value: unsafe { &*(x as *const T as *const u8) }, code: 3 }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let (a, b, c) = (7u32, 8u32, 9u32);
+    let f = format_args!(\"{} {:?} {:x}\", a, b, c);
+    let [x, y, z] = unsafe { &*(f.args as *const [fmt::rt::Argument<'_>; 3]) };
+    if x.code == 1 && y.code == 2 && z.code == 3 && *x.value == 7 && *y.value == 8 && *z.value == 9 { 42 } else { 1 }
+}
+";
+
+/// [`FMT`] through the LAZY program over names records (the `blaze run` path): each
+/// placeholder's `rt::Argument` constructor is asked when `main` is checked (fill.rs
+/// `fmt_rows`, through fmt_template.rs `argument_new`, the one lookup both programs make) and
+/// the build of `main` finds it (`fmt_argument_new`); all five instances are made (`main` and
+/// the three constructors at `u32`), a second walk makes none. Controls: a trait no placeholder
+/// asks (`{:o}`) has no constructor answered (no fallback), and the same program run through
+/// the whole program (`run_with`, the new front) exits 42: the three constructors were called
+/// in order with the arguments' own bytes. Before the fix the lazy walk stopped at `main`:
+/// "`main`: expression ..: needs the `new_display` lang item fn, which the program does not
+/// declare" (hello world's stop at g104400).
+///
+/// Prints: `d106 fmt over names records: first <counts>; again <counts>; run status 42`
+#[test]
+fn format_args_constructors_are_found_over_names_records() {
+    let f = fixture(FMT);
+    let main = fn_named(&f, "main");
+    let b = builder();
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, maker) = walk_keeping(&f, &EveryItem, main, &mut store, &b);
+    assert_eq!((first.reached, first.found, first.made), (4, 0, 4), "`main` and `new_display`, `new_debug`, `new_lower_hex` at `u32` are made: {first}");
+    let program = maker.program().expect("a first run constructs the program");
+    for t in [blaze_typeck::FmtTrait::Display, blaze_typeck::FmtTrait::Debug, blaze_typeck::FmtTrait::LowerHex] {
+        assert!(program.fmt_argument_new(t).is_some(), "the constructor for {t:?} is answered");
+    }
+    assert!(program.fmt_argument_new(blaze_typeck::FmtTrait::Octal).is_none(), "control: no placeholder asks `{{:o}}`, so none is answered");
+    let (again, _) = walk_keeping(&f, &EveryItem, main, &mut store, &b);
+    assert_eq!((again.reached, again.found, again.make_calls()), (4, 4, 0), "a second walk makes none: {again}");
+    let files = [blaze_ladder::refusal::SourceFile { path: "src/main.rs", text: FMT }];
+    let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::Off };
+    let status = blaze_ladder::run::run_with(&files, "src/main.rs", None, blaze_ladder::run::FrontChoice::New(new), blaze_own::testing::heap().shared())
+        .unwrap_or_else(|e| panic!("the whole program's run: {e}"));
+    assert_eq!(status, 42, "each placeholder's entry made by its own constructor, from the argument's own bytes");
+    println!("d106 fmt over names records: first {first}; again {again}; run status {status}");
+}
+
+/// A `&dyn Tr` made of `&S` and called through (the Reference, "Trait objects": the call runs
+/// `S`'s method, found in the vtable). The lang items as the pinned core's (marker.rs,
+/// ops/unsize.rs); no `drop_in_place`, so the table's drop word is 0.
+const DYN: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+
+#[lang = \"dispatch_from_dyn\"]
+trait DispatchFromDyn<T> {}
+
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+
+trait Tr {
+    fn get(&self) -> u32;
+}
+
+struct S {
+    v: u32,
+}
+
+impl Tr for S {
+    fn get(&self) -> u32 {
+        self.v
+    }
+}
+
+fn via(t: &dyn Tr) -> u32 {
+    t.get()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let s = S { v: 7 };
+    via(&s) as i32
+}
+";
+
+/// A vtable is DATA its namer's entry carries (code_records.rs `VtableDatum`, form 6): `main`'s
+/// record names one `Space::Vtable` target, and its entry carries that symbol's datum: read-only,
+/// four words (no drop glue: 0; `S`'s size 4 and alignment 4; `get`'s entry), the method word a
+/// `Space::Func` target by the symbol of an instance `main`'s entry DECLARES (so the run's
+/// parent declares its slot before the datum is filled). Control: an edit of `get`'s body
+/// makes `get` alone; `main` is found, its vtable's datum the same bytes (the datum names the
+/// method by symbol, never by its code).
+/// Prints "d106 vtable: main carries 1 datum of 32 bytes, its method word a declared instance; edit made 1".
+#[test]
+fn a_vtable_is_a_datum_its_namer_carries() {
+    use blaze_code::datum::Place;
+    use blaze_code::record::Space;
+    use blaze_ladder::code_records::EntryView;
+
+    let f = fixture(DYN);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let names = reader(&f);
+    let mut maker = Maker::new(names, Some(main), &builder(), alloc());
+    let (walk, first) = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()).unwrap_or_else(|e| {
+        println!("the record walk: {e}");
+        panic!("the record walk: {e}")
+    });
+    assert!(logged(names.records).is_empty(), "the records filed {:?}", logged(names.records));
+    let main_bytes = store.get(walk.key(0).expect("keyed")).expect("the store reads").expect("put").to_vec();
+    let entry = EntryView::read(&main_bytes).expect("main's entry reads");
+    let named: Vec<_> = (0..entry.record.targets()).map(|i| entry.record.target(i)).filter(|t| t.space == Space::Vtable).map(|t| t.symbol).collect();
+    assert_eq!(named.len(), 1, "main's record names one vtable");
+    let mut carried = Vec::new();
+    entry.each_vtable(|symbol, datum| -> Result<(), ()> {
+        carried.push((symbol, datum.place(), datum.bytes().to_vec(), (0..datum.words()).map(|i| (datum.word(i).at, datum.target(datum.word(i).target as usize))).collect::<Vec<_>>()));
+        Ok(())
+    }, |e| panic!("main's vtables: {e}")).expect("read");
+    assert_eq!(carried.len(), 1, "main's entry carries one vtable");
+    let (symbol, place, bytes, words) = &carried[0];
+    assert_eq!(*symbol, named[0], "the datum is the named vtable's");
+    assert_eq!((*place, bytes.len()), (Place::ReadOnly, 32), "header and one method, read-only");
+    assert_eq!(&bytes[..24], &[0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0][..], "no drop glue; S's size 4, alignment 4");
+    assert_eq!(words.len(), 1, "one address word: get's");
+    let (at, target) = words[0];
+    assert_eq!((at, target.space), (24, Space::Func));
+    let mut declared = Vec::new();
+    entry.each_declared(|d| -> Result<(), ()> { declared.push(blaze_ladder::symbols::fn_symbol_of_name(d.name)); Ok(()) }, |e| panic!("declared: {e}")).expect("read");
+    assert!(declared.contains(&target.symbol), "the method word's instance is declared by main's entry");
+
+    /// `get`'s key moved: a member's key is its impl's and its name's (front2/keys.rs
+    /// `member_key_of`), so each impl's `get` key is listed; only `impl Tr for S` has one.
+    struct Edited(Vec<ItemKey>);
+    impl BodyIds for Edited {
+        fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+            if !self.0.contains(&item) {
+                let every: &'static EveryItem = &EveryItem;
+                return every.body_check(item);
+            }
+            Some(BodyId { key: Hasher::new("d106 test every item").part(&item.0.to_le_bytes()[..]).part(b"edited").finish(), reads: &READS })
+        }
+        fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+            EveryItem.today(fact)
+        }
+        fn crate_fact(&self, item: ItemKey) -> Option<Read> {
+            EveryItem.crate_fact(item)
+        }
+    }
+    let edited = fixture(&DYN.replace("        self.v\n", "        let v = self.v;\n        v\n"));
+    let gets = {
+        let records = reader(&edited).records;
+        let mut gets = Vec::new();
+        assert!(records.each_item(0, &mut |key, _| if records.kind_of_item(key) == Some(ItemKind::Impl) {
+            gets.push(blaze_ladder::front2::keys::member_key_of(checker_of(key), blaze_ladder::front2::keys::MemberKind::Fn, "get"));
+        }));
+        gets
+    };
+    let (walk2, third) = walk_records(main, &Edited(gets),&mut store, &builder(), &producer(), &mut Maker::new(reader(&edited), Some(main), &builder(), alloc()), alloc()).expect("the edited walk");
+    assert_eq!((third.reached, third.made), (first.reached, 1), "the edit made get alone: {third}");
+    let again = store.get(walk2.key(0).expect("keyed")).expect("the store reads").expect("put");
+    assert_eq!(again, &main_bytes[..], "main's entry, its vtable's datum with it, is the same");
+    println!("d106 vtable: main carries 1 datum of {} bytes, its method word a declared instance; edit made {}", bytes.len(), third.made);
+}
+
+/// The pinned std's `panicking::catch_unwind` in miniature (library/std/src/panicking.rs): a
+/// cfg'd-out twin of the same name before it, then a body declaring `union Data<F, R>` with
+/// `ManuallyDrop` fields, writing `Data { f: ManuallyDrop::new(f) }`, passing `&raw mut data` to
+/// the local `do_call` declared after a `return`, and moving the result out of `data.r`.
+/// Built and run (front2_local_union.rs runs the same form whole), 5.
+const CATCH: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+
+#[lang = \"manually_drop\"]
+#[repr(transparent)]
+struct ManuallyDrop<T> {
+    value: T,
+}
+
+impl<T> ManuallyDrop<T> {
+    const fn new(value: T) -> ManuallyDrop<T> {
+        ManuallyDrop { value }
+    }
+
+    const fn into_inner(slot: ManuallyDrop<T>) -> T {
+        slot.value
+    }
+}
+
+#[cfg(any())]
+unsafe fn catch<R: Copy, F: Copy>(f: F) -> R {
+    f
+}
+
+unsafe fn catch<R: Copy, F: Copy>(f: F, call: fn(F) -> R) -> R {
+    union Data<F, R> {
+        f: ManuallyDrop<F>,
+        r: ManuallyDrop<R>,
+    }
+
+    let mut data = Data { f: ManuallyDrop::new(f) };
+    unsafe {
+        do_call(&raw mut data, call);
+        return ManuallyDrop::into_inner(data.r);
+    }
+
+    #[inline]
+    unsafe fn do_call<F: Copy, R: Copy>(data: *mut Data<F, R>, call: fn(F) -> R) {
+        unsafe {
+            let f = (*data).f.value;
+            (*data).r = ManuallyDrop::new(call(f));
+        }
+    }
+}
+
+fn id(x: u32) -> u32 {
+    x
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    unsafe { catch(5u32, id) as i32 }
+}
+";
+
+/// Every struct and union declared in a body is found over NAMES RECORDS: the block's module
+/// binds its name (source.rs `Records::binds`, by blaze-scope `names::binds`, the module's own
+/// table). The cause (2026-11-17, std-hello's `catch_unwind`): `binds` walked a written
+/// `self::P`, and a written `self` passes over a block's module (names.rs `written_up`, since
+/// names record version 3), so no block's own item was ever found and each local struct, enum
+/// or union of a body was refused as "in a block that a macro call wrote". Control: the walk
+/// of `self::P` at the same module does not find `P` (the old reading, removed).
+/// Prints nothing; fails listing each form's walk.
+#[test]
+fn local_types_of_a_body_are_found_over_names_records() {
+    let twin = "#[cfg(any())]\nunsafe fn catch<R: Copy, F: Copy>(f: F) -> R {\n    f\n}\n";
+    assert!(CATCH.contains(twin));
+    let head = &CATCH[..CATCH.find(twin).expect("twin")];
+    let main = "\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {\n    g() as i32\n}\n";
+    let variants = [
+        ("plain struct", format!("{head}fn g() -> u32 {{\n    struct P {{ a: u32 }}\n    let p = P {{ a: 3 }};\n    p.a\n}}\n{main}")),
+        ("generic struct", format!("{head}fn g() -> u32 {{\n    struct P<T> {{ a: T }}\n    let p = P {{ a: 3u32 }};\n    p.a\n}}\n{main}")),
+        ("plain union", format!("{head}fn g() -> u32 {{\n    union P {{ a: u32 }}\n    let p = P {{ a: 3 }};\n    unsafe {{ p.a }}\n}}\n{main}")),
+        ("struct and fn", format!("{head}fn g() -> u32 {{\n    struct P {{ a: u32 }}\n    fn h(p: &P) -> u32 {{ p.a }}\n    h(&P {{ a: 3 }})\n}}\n{main}")),
+        ("unsafe fn struct", format!("{head}unsafe fn g() -> u32 {{\n    struct P {{ a: u32 }}\n    let p = P {{ a: 3 }};\n    p.a\n}}\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    unsafe {{ g() as i32 }}\n}}\n")),
+    ];
+    let mut seen = Vec::new();
+    {
+        let f = fixture(&variants[0].1);
+        let records = reader(&f).records;
+        let mut g = None;
+        assert!(records.each_item(0, &mut |key, _| if records.kind_of_item(key) == Some(ItemKind::Function) && records.name_of(key) == Some("g") {
+            g = Some(key);
+        }));
+        let g = g.expect("g");
+        let text = records.text_of(g).expect("text").text;
+        let nested = blaze_file_items::nested::scan(text, alloc());
+        let modules = blaze_scope::blocks::block_modules(f.keys[0], g, &nested, alloc());
+        let ms: Vec<_> = modules.iter().copied().flatten().collect();
+        assert_eq!(ms.len(), 1, "g's body is one block module");
+        assert!(records.binds(ms[0], blaze_surface::Namespace::Types, "P"), "the block's module binds P");
+        let walked = records.walk(ms[0], blaze_surface::Namespace::Types, blaze_scope::names::Written { kind: blaze_surface::PathKind::SelfMod, segments: &["P"] });
+        assert!(walked.is_err(), "control: a written `self::P` passes over the block's module: {walked:?}");
+        assert!(logged(records).is_empty(), "{:?}", logged(records));
+    }
+    for (name, text) in variants.iter() {
+        let f = fixture(text);
+        let main = fn_named(&f, "main");
+        let mut store = MemoryStore::new_in(alloc());
+        let names = reader(&f);
+        let mut maker = Maker::new(names, Some(main), &builder(), alloc());
+        let got = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc());
+        let shown = format!("{:?}", got.map(|(_, c)| c.to_string()).map_err(|e| e.to_string()));
+        seen.push(format!("PROBE {name}: {}", shown.char_indices().nth(300).map_or(shown.clone(), |(i, _)| shown[..i].to_string())));
+    }
+    assert!(seen.iter().all(|s| s.contains(": Ok(")), "{}", seen.join("\n"));
+}
+
+/// A local item whose form is not built yet is refused as a user reads it (rule 19): the
+/// enclosing item's path, the item's head as written and its `file:line`, never an
+/// item-relative range and raw keys. The form: a struct in the body of a fn that is itself
+/// declared in a body (locals.rs `LocalKind::unplaced`).
+/// Prints "d106 local refusal: <the refusal>".
+#[test]
+fn a_local_item_not_built_is_refused_at_its_file_and_line() {
+    let twin = "#[cfg(any())]";
+    let head = &CATCH[..CATCH.find(twin).expect("twin")];
+    let text = format!(
+        "{head}fn g() -> u32 {{\n    fn h() -> u32 {{\n        struct P {{ a: u32 }}\n        let p = P {{ a: 3 }};\n        p.a\n    }}\n    h()\n}}\n\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    g() as i32\n}}\n"
+    );
+    let line = text[..text.find("struct P").expect("P")].lines().count();
+    let f = fixture(&text);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let mut maker = Maker::new(reader(&f), Some(main), &builder(), alloc());
+    let said = match walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()) {
+        Ok((_, counts)) => panic!("the struct in a local fn's body is not built yet, and the walk made {counts}"),
+        Err(e) => e.to_string(),
+    };
+    println!("d106 local refusal: {said}");
+    assert!(said.contains("`struct P `") || said.contains("`struct P`"), "the head as written: {said}");
+    assert!(said.contains(&format!("main.rs:{line})")), "its file and line {line}: {said}");
+    assert!(said.contains("in `") && said.contains("h"), "the enclosing item: {said}");
+    assert!(!said.contains("Range {"), "no item-relative range: {said}");
+}
+
+/// A fixture whose local fn `h` reads a trait method in a block that also holds `{the_use}`.
+fn block_use(the_use: &str) -> String {
+    let twin = "#[cfg(any())]";
+    let head = &CATCH[..CATCH.find(twin).expect("twin")];
+    format!(
+        "{head}trait Get {{\n    fn get(&self) -> u32;\n}}\n\nimpl Get for u32 {{\n    fn get(&self) -> u32 {{\n        *self\n    }}\n}}\n\nfn g() -> u32 {{\n    fn h() -> u32 {{\n        {the_use}\n        3u32.get()\n    }}\n    h()\n}}\n\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    g() as i32\n}}\n"
+    )
+}
+
+/// A `use` of a block whose traits are not known is refused as a user reads it (rule 19): the
+/// enclosing fn, the `use` as written (its attributes with it) and its `file:line`, never a raw
+/// key or an item-relative range. The form the pinned std's `sanitize_standard_fds` stopped
+/// `blaze run` with (fill.rs `check_refusal`, locals.rs `Locals::row_of_gap`).
+/// Prints "d106 block use refusal: <the refusal>".
+#[test]
+fn a_block_use_not_resolved_is_refused_at_its_file_and_line() {
+    let text = block_use("#[allow(unused_imports)] use nowhere::Missing;");
+    let line = text[..text.find("#[allow(unused_imports)]").expect("the use")].lines().count();
+    let f = fixture(&text);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let mut maker = Maker::new(reader(&f), Some(main), &builder(), alloc());
+    let said = match walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()) {
+        Ok((_, counts)) => panic!("a block's `use` of no item is refused, and the walk made {counts}"),
+        Err(e) => e.to_string(),
+    };
+    println!("d106 block use refusal: {said}");
+    assert!(said.contains("`#[allow(unused_imports)] use nowhere::Missing;`"), "the use as written: {said}");
+    assert!(said.contains(&format!("main.rs:{line})")), "its file and line {line}: {said}");
+    assert!(said.contains("in `") && said.contains("h`"), "the enclosing fn: {said}");
+    assert!(!said.contains("Range {") && !said.contains("ItemKey("), "no raw range or key: {said}");
+}
+
+/// A `use` of a block whose `cfg` is false is removed before anything reads it (the Reference,
+/// "Conditional compilation"): the pinned std's `sanitize_standard_fds` writes `#[cfg(all(
+/// target_os = "linux", target_env = "gnu"))] use libc::open64 as open;`, whose path names
+/// nothing on macOS. The block's method call is checked, built and run: 3. The control is
+/// [`a_block_use_not_resolved_is_refused_at_its_file_and_line`]: the same `use` with no false
+/// `cfg` is refused.
+/// Prints "d106 cfg'd-out block use: {counts}; run status 3".
+#[test]
+fn a_block_use_whose_cfg_is_false_is_not_read() {
+    let text = block_use("#[cfg(any())] use nowhere::Missing;");
+    let f = fixture(&text);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let mut maker = Maker::new(reader(&f), Some(main), &builder(), alloc());
+    let counts = match walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()) {
+        Ok((_, counts)) => counts,
+        Err(e) => panic!("the cfg'd-out use is removed, and the walk refused: {e}"),
+    };
+    let files = [blaze_ladder::refusal::SourceFile { path: "src/main.rs", text: &text }];
+    let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::Off };
+    let status = blaze_ladder::run::run_with(&files, "src/main.rs", None, blaze_ladder::run::FrontChoice::New(new), blaze_own::testing::heap().shared())
+        .unwrap_or_else(|e| panic!("the whole program's run: {e}"));
+    assert_eq!(status, 3);
+    println!("d106 cfg'd-out block use: {counts}; run status {status}");
+}
+
+/// [`CATCH`] over NAMES RECORDS, as `blaze run` makes it: every instance (`main`, `catch`,
+/// `do_call`, `id`, `ManuallyDrop`'s two at their arguments) is made, the local union laid out
+/// from its own `<F, R>` at the caller's arguments; a second walk makes none. Then the same
+/// program run whole: 5.
+/// Prints "d106 local union: first {counts}; again {counts}; run status 5".
+#[test]
+fn a_local_generic_union_is_made_over_names_records() {
+    let f = fixture(CATCH);
+    let main = fn_named(&f, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let b = builder();
+    let (first, _) = walk_keeping(&f, &EveryItem, main, &mut store, &b);
+    assert_eq!(first.made, first.reached, "every instance is made: {first}");
+    let (again, _) = walk_keeping(&f, &EveryItem, main, &mut store, &b);
+    assert_eq!((again.found, again.make_calls()), (again.reached, 0), "a second walk makes none: {again}");
+    let files = [blaze_ladder::refusal::SourceFile { path: "src/main.rs", text: CATCH }];
+    let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::Off };
+    let status = blaze_ladder::run::run_with(&files, "src/main.rs", None, blaze_ladder::run::FrontChoice::New(new), blaze_own::testing::heap().shared())
+        .unwrap_or_else(|e| panic!("the whole program's run: {e}"));
+    assert_eq!(status, 5);
+    println!("d106 local union: first {first}; again {again}; run status {status}");
 }

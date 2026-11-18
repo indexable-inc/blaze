@@ -1,0 +1,15 @@
+{
+ "id": "names-group-reads-depended-on-askers",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CH",
+ "where": "crates/blaze-scope/src/cells/groups.rs (Cells::groups, read_through, globs_digest)",
+ "what": "A names group record's `defines`, `reads` and `cells_read` were built by re-running EVERY decided cell of each member, including the cells another module had asked of it (a `Globs` cell of a name made only because a reader looked it up). So a group not re-solved after an edit could hold fewer defines and reads than a fresh solve: its bytes depended on which readers had asked what (rules 25, 26). Lane CG saw it in `defines`; the same held for the reads, and for the cut itself (a glob cycle that no member's own import read through was one group).",
+ "cost": "none at run time; the stand-in solver's oracle had to relax `defines` to 'agree where both list'",
+ "cause": "a module's reads were taken from its cells, which exist on demand, instead of from its own items and bindings",
+ "whys": "the cell worklist makes a cell where it is asked, and the groups pass treated 'cells of module M' as 'what M's record depends on'",
+ "class": "a record's content taken from a demand-made structure: any lazily made table that is enumerated into a record makes the record a function of the history of demand",
+ "prevention": "done: a module's reads are its items' and own bindings' alone; a lookup of another module is the reader's read, expanded through binding cell -> globs cell -> each source's binding (read_through); `defines` is every own binding, one globs cell, one textual cell; FORM 3; test names_groups_edit_a_new_reader_leaves_the_read_group; the edit oracle compares `defines` whole",
+ "annoyance": "cells/mod.rs is 3.8k lines and the groups pass reaches into most of it; a lane's context goes on reading it",
+ "workaround": "Grep and line ranges only",
+ "state": "fixed"
+}

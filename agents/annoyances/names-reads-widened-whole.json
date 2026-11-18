@@ -1,0 +1,15 @@
+{
+ "id": "names-reads-widened-whole",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane NC",
+ "where": "crates/blaze-cli/src/engine_bodies.rs `widen` (the CrateScope arm) and engine_names.rs (a names task defined only WHOLE)",
+ "what": "on `blaze engine-check`, a private fn added to one file entered every body of the crate (plain3, tag g120452: 'Bodies read moved CrateScope: 11', all identical): bodies recorded names reads by cell, then `widen` turned each into the crate's whole names record, the one cell the names task defined. Second stacked cause found on the way: since green cc7d06c782 a head read is widened to the HEADS cell of each file of the head's crate (lane EV/EW's interim), so the same edit still enters every body that read a head of the edited file, by `FileItems` HEADS.",
+ "cost": "five queue round trips (two conflicts, ~25 minutes waiting in the queue behind slow lanes)",
+ "cause": "the cell table existed in the payload but no task defined its rows to the engine",
+ "whys": "the recorder (E4) and the engine (E1) were built by different lanes, joined by an interim widening documented as 'until the Names stage defines cells'; nobody owned removing it",
+ "class": "an interim widening that outlives the piece it waited for: a read recorded finer than any task defines",
+ "prevention": "done: the names task of a crate whose names read a checkout file defines every row of its cell table plus a CELLS mark (engine_names.rs `cells_of`); `widen` keeps a CrateScope read as its cell when the definer is marked; the cell table gains the names section's whole row (a whole read no row held would be read ABSENT forever). Test: engine_check_tests.rs `adding_a_private_fn_rechecks_one_body` asserts no body is entered for a names cell after a private fn, a pub fn or an unread `use` is added",
+ "annoyance": "the queue's ask is moved to the background after 180 s by the harness and the lane rules forbid wait loops, so a lane has no sanctioned way to block on its own answer",
+ "workaround": "a single bounded wait on the answer file in the REPL",
+ "state": "fixed for names; HEADS interim is lane EW's"
+}

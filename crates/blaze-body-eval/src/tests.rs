@@ -98,6 +98,9 @@ impl ConstWorld for Tw {
     fn code_id(&self, item: ItemKey) -> ContentId {
         self.w.code_id(item)
     }
+    fn is_static(&self, item: ItemKey) -> bool {
+        self.w.is_static(item)
+    }
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>> {
         self.w.record(key)
     }

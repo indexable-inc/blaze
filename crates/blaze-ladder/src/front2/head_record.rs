@@ -28,10 +28,9 @@
 //!
 //! Refused by name ([`HeadRecordError::Unencoded`]), never skipped: an inference hole, a
 //! closure type and an async block's future in a head's terms (body types, never a head's); an
-//! alias whose head was refused (its why is a `Why`, not a record). Not in this form: an impl's
-//! or a trait's lifetime part (`lifetimes::ContainerLife`: its declared names are private to
-//! lifetimes.rs, so it cannot be written from here; no body reads it from the store: the
-//! borrow check reads lifetimes from the text, as `FactKind::BorrowHead` rows), the store's gaps
+//! alias whose head was refused (its why is a `Why`, not a record). Every lifetime part is in
+//! the form (10): a fn's, an ADT's, a trait's and an impl's, made or refused, so an edit of a
+//! lifetime bound alone moves the head's reader digest. Not in this form: the store's gaps
 //! (`fn_gaps`, `alias_gaps`: refusals, not heads). An impl's const parameters are its frame's
 //! (form 9), filed under the impl's library key by whoever holds it (the want).
 
@@ -46,9 +45,9 @@ use blaze_typeck::dyn_compat::{FnFacts, MemberFacts, MemberShape, Receiver, Unre
 use blaze_typeck::{FloatTy, IntTy, ItemKey, List, Name, PClause, PNode, PTy, PTys, PortableTys, UintTy};
 
 use super::gat::{AssocWhere, Outlived, Outlives};
-use super::heads::{AdtRow, CtorSig, FnHead, ImplHead, Maps, MemberFrame, Store, TraitExtra, TraitHead};
+use super::heads::{AdtRow, CtorSig, FnHead, ImplHead, MemberFrame, Store, TraitExtra, TraitHead};
 use super::keys::checker_of;
-use super::lifetimes::{AdtLife, FnLife, LifeVariance, Region, Variance};
+use super::lifetimes::{AdtLife, ContainerLife, FnLife, LifeOf, LifeRefusal, LifeVariance, Region, Variance};
 use super::preds::Preds;
 use super::types::{ParamBound, SelfTy, TraitAliasHead};
 
@@ -73,7 +72,16 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// per associated type in `TraitHead::assoc` order, its own parameter count, outlives clauses
 /// and own const parameters (`Maps::assoc_generics`, `assoc_where`, `assoc_consts`); an impl's,
 /// its members' frame (`Store::member_frame`), whose const parameters are the impl's own.
-pub const VERSION: u32 = 9;
+/// 10: every lifetime part (engine E2a step 4): a fn's (`FnLife`), an ADT's (`AdtLife`), a
+/// trait's and an impl's (`ContainerLife`, after the trait's associated type rows and after the
+/// impl's frame), each a slot of 0 not made, 1 made, 2 refused with its typed reason
+/// (`LifeRefusal`: its rule's tag and two u32s, a range zeroed in the reader digest).
+/// 11: a trait's record holds, per associated type after its own const parameters, its item
+/// bounds (`Store::preds` under the type's key, filed with the members); a trait one of whose
+/// associated types had its bounds refused is refused by name (`Unencoded`).
+/// 12: a type alias whose head was refused is a record too (`K_ALIAS_REFUSED`: its key and its
+/// why as the store keeps it, `Maps::alias_gaps`' text), filed back as refused.
+pub const VERSION: u32 = 12;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -89,6 +97,7 @@ const K_IMPL: u8 = 5;
 const K_ALIAS: u8 = 6;
 const K_TRAIT_ALIAS: u8 = 7;
 const K_OPAQUE: u8 = 8;
+const K_ALIAS_REFUSED: u8 = 9;
 
 // Term tags, one per `PNode` form written.
 const T_BOOL: u8 = 0;
@@ -199,8 +208,9 @@ pub enum HeadAt {
 #[derive(Clone, Copy)]
 pub enum HeadRef<'h, 'n> {
     /// A fn, a const (a fn of no inputs) or a static (`static_` its mutability), with its
-    /// where-clauses and its lifetime part where they are made.
-    Fn { key: ItemKey, head: &'h FnHead<'n>, preds: Option<&'h Preds>, static_: Option<tc::Mutbl>, life: Option<&'h FnLife> },
+    /// where-clauses and its lifetime part (form 10: made or refused; `None` when never made,
+    /// lifetimes.rs `Store::make_lives`).
+    Fn { key: ItemKey, head: &'h FnHead<'n>, preds: Option<&'h Preds>, static_: Option<tc::Mutbl>, life: Option<Result<&'h FnLife, LifeRefusal>> },
     /// A struct, enum or union: its row, its parameters' defaults and const parameters, its
     /// where-clauses and lifetime part.
     Adt {
@@ -212,7 +222,7 @@ pub enum HeadRef<'h, 'n> {
         /// field has one. Each default's own head is the fn record of its key.
         field_defaults: &'h [Option<ItemKey>],
         preds: Option<&'h Preds>,
-        life: Option<&'h AdtLife>,
+        life: Option<Result<&'h AdtLife, LifeRefusal>>,
         /// Its variant count when it is a fieldless enum (`Maps::fieldless_enums`, form 9).
         fieldless: Option<u32>,
     },
@@ -228,12 +238,18 @@ pub enum HeadRef<'h, 'n> {
         const_params: &'h [(u32, PTy)],
         preds: Option<&'h Preds>,
         /// Its associated types' side rows (form 9), one per `head.assoc` name.
-        assoc_side: AssocSides<'h>,
+        assoc_side: AssocSides<'h, 'n>,
+        /// Its lifetime part (form 10).
+        life: Option<Result<&'h ContainerLife, LifeRefusal>>,
     },
-    /// An impl: its header, its where-clauses and its members' frame (form 9).
-    Impl { key: ItemKey, head: &'h ImplHead, preds: Option<&'h Preds>, frame: Option<&'h MemberFrame> },
+    /// An impl: its header, its where-clauses, its members' frame (form 9) and its lifetime
+    /// part (form 10).
+    Impl { key: ItemKey, head: &'h ImplHead, preds: Option<&'h Preds>, frame: Option<&'h MemberFrame>, life: Option<Result<&'h ContainerLife, LifeRefusal>> },
     /// A type alias whose head was made.
     Alias { key: LibKey, generics: u32, ty: PTy, defaults: &'h [Option<PTy>], const_params: &'h [(u32, PTy)] },
+    /// A type alias whose head was refused: its why's text as the store keeps it
+    /// (`Maps::alias_gaps`), as bytes (UTF-8, checked where it is filed: heads.rs `file_heads`).
+    AliasRefused { key: LibKey, why: &'h [u8] },
     TraitAlias { key: LibKey, head: &'h TraitAliasHead },
     /// An `impl Trait` a fn's head made: its fn and index, its bounds (`Self` the opaque).
     Opaque { key: ItemKey, fn_: ItemKey, index: u32, preds: Option<&'h Preds> },
@@ -249,28 +265,41 @@ pub struct AssocSide {
     pub where_: Option<AssocWhere>,
     /// Its own const parameters (`Maps::assoc_consts`).
     pub consts: Option<Vec<(u32, PTy), Mem>>,
+    /// Its item bounds (form 11: `type A: B;` and the implied `Sized`, `Self` the alias), filed
+    /// by the trait's members under the associated type's own key (`Store::preds`); none until
+    /// the members are made.
+    pub bounds: Option<Preds>,
 }
 
 /// Where a trait's [`AssocSide`] rows are read from: the store's maps, or a decoded head's own.
 #[derive(Clone, Copy)]
-pub enum AssocSides<'h> {
-    Store { maps: &'h Maps, trait_: LibKey },
+pub enum AssocSides<'h, 'n> {
+    Store { store: &'h Store<'n>, trait_: LibKey },
     Rows(&'h [AssocSide]),
 }
 
-impl AssocSides<'_> {
+impl AssocSides<'_, '_> {
     /// `name`'s rows: its parameter count, outlives clauses and own const parameters.
     pub fn of(&self, name: Name) -> (Option<u32>, Option<AssocWhere>, Option<&[(u32, PTy)]>) {
         match *self {
-            AssocSides::Store { maps, trait_ } => (
-                maps.assoc_generics.get(&(trait_, name)).copied(),
-                maps.assoc_where.get(&(trait_, name)).copied(),
-                maps.assoc_consts.get(&(trait_, name)).map(|c| &c[..]),
+            AssocSides::Store { store, trait_ } => (
+                store.maps.assoc_generics.get(&(trait_, name)).copied(),
+                store.maps.assoc_where.get(&(trait_, name)).copied(),
+                store.maps.assoc_consts.get(&(trait_, name)).map(|c| &c[..]),
             ),
             AssocSides::Rows(rows) => match rows.iter().find(|r| r.name == name) {
                 Some(r) => (r.generics, r.where_, r.consts.as_deref()),
                 None => (None, None, None),
             },
+        }
+    }
+
+    /// `name`'s item bounds (form 11), filed under its key (`item`, from the trait's members
+    /// part) by the members' making.
+    pub fn bounds(&self, name: Name, item: Option<ItemKey>) -> Option<&Preds> {
+        match *self {
+            AssocSides::Store { store, .. } => item.and_then(|k| store.preds.get(&k)),
+            AssocSides::Rows(rows) => rows.iter().find(|r| r.name == name).and_then(|r| r.bounds.as_ref()),
         }
     }
 }
@@ -287,7 +316,7 @@ impl<'n> HeadRef<'_, 'n> {
 
 /// One head, decoded: the store's own head types, so it is usable where a lowered one is.
 pub enum Head<'n> {
-    Fn { key: ItemKey, head: FnHead<'n>, preds: Option<Preds>, static_: Option<tc::Mutbl>, life: Option<FnLife> },
+    Fn { key: ItemKey, head: FnHead<'n>, preds: Option<Preds>, static_: Option<tc::Mutbl>, life: Option<Result<FnLife, LifeRefusal>> },
     Adt {
         key: LibKey,
         row: AdtRow,
@@ -295,7 +324,7 @@ pub enum Head<'n> {
         const_params: Vec<(u32, PTy), Mem>,
         field_defaults: Vec<Option<ItemKey>, Mem>,
         preds: Option<Preds>,
-        life: Option<AdtLife>,
+        life: Option<Result<AdtLife, LifeRefusal>>,
         fieldless: Option<u32>,
     },
     Ctor { key: ItemKey, sig: CtorSig },
@@ -307,9 +336,12 @@ pub enum Head<'n> {
         const_params: Vec<(u32, PTy), Mem>,
         preds: Option<Preds>,
         assoc_side: Vec<AssocSide, Mem>,
+        life: Option<Result<ContainerLife, LifeRefusal>>,
     },
-    Impl { key: ItemKey, head: ImplHead, preds: Option<Preds>, frame: Option<MemberFrame> },
+    Impl { key: ItemKey, head: ImplHead, preds: Option<Preds>, frame: Option<MemberFrame>, life: Option<Result<ContainerLife, LifeRefusal>> },
     Alias { key: LibKey, generics: u32, ty: PTy, defaults: Vec<Option<PTy>, Mem>, const_params: Vec<(u32, PTy), Mem> },
+    /// Its why's text ([`HeadRef::AliasRefused`]).
+    AliasRefused { key: LibKey, why: Vec<u8, Mem> },
     TraitAlias { key: LibKey, head: TraitAliasHead },
     Opaque { key: ItemKey, fn_: ItemKey, index: u32, preds: Option<Preds> },
 }
@@ -319,7 +351,7 @@ impl<'n> Head<'n> {
     pub fn as_ref(&self) -> HeadRef<'_, 'n> {
         match self {
             Head::Fn { key, head, preds, static_, life } => {
-                HeadRef::Fn { key: *key, head, preds: preds.as_ref(), static_: *static_, life: life.as_ref() }
+                HeadRef::Fn { key: *key, head, preds: preds.as_ref(), static_: *static_, life: life_ref(life) }
             }
             Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless } => HeadRef::Adt {
                 key: *key,
@@ -328,11 +360,11 @@ impl<'n> Head<'n> {
                 const_params: &const_params[..],
                 field_defaults: &field_defaults[..],
                 preds: preds.as_ref(),
-                life: life.as_ref(),
+                life: life_ref(life),
                 fieldless: *fieldless,
             },
             Head::Ctor { key, sig } => HeadRef::Ctor { key: *key, sig },
-            Head::Trait { key, head, extra, supers, const_params, preds, assoc_side } => HeadRef::Trait {
+            Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life } => HeadRef::Trait {
                 key: *key,
                 head,
                 extra: extra.as_ref(),
@@ -340,8 +372,11 @@ impl<'n> Head<'n> {
                 const_params: &const_params[..],
                 preds: preds.as_ref(),
                 assoc_side: AssocSides::Rows(&assoc_side[..]),
+                life: life_ref(life),
             },
-            Head::Impl { key, head, preds, frame } => HeadRef::Impl { key: *key, head, preds: preds.as_ref(), frame: frame.as_ref() },
+            Head::Impl { key, head, preds, frame, life } => {
+                HeadRef::Impl { key: *key, head, preds: preds.as_ref(), frame: frame.as_ref(), life: life_ref(life) }
+            }
             Head::Alias { key, generics, ty, defaults, const_params } => HeadRef::Alias {
                 key: *key,
                 generics: *generics,
@@ -349,10 +384,16 @@ impl<'n> Head<'n> {
                 defaults: &defaults[..],
                 const_params: &const_params[..],
             },
+            Head::AliasRefused { key, why } => HeadRef::AliasRefused { key: *key, why: &why[..] },
             Head::TraitAlias { key, head } => HeadRef::TraitAlias { key: *key, head },
             Head::Opaque { key, fn_, index, preds } => HeadRef::Opaque { key: *key, fn_: *fn_, index: *index, preds: preds.as_ref() },
         }
     }
+}
+
+/// A kept lifetime part, borrowed.
+fn life_ref<T>(l: &Option<Result<T, LifeRefusal>>) -> Option<Result<&T, LifeRefusal>> {
+    l.as_ref().map(|r| r.as_ref().map_err(|w| *w))
 }
 
 /// Every head the store has made, by where it is filed, sorted (no map order leaves here).
@@ -388,16 +429,23 @@ pub fn heads_in<'a>(store: &Store<'_>, alloc: Alloc<'a>) -> Vec<HeadAt, Alloc<'a
     out
 }
 
-/// The head filed at `at`, borrowed from the store, with the lifetime part the caller made
-/// (`Store::fn_life`, `Store::adt_life` take the store mutably, so the caller copies them out
-/// first: [`copy_fn_life`], [`copy_adt_life`]).
-pub fn from_store<'h, 'n>(
-    store: &'h Store<'n>,
-    at: HeadAt,
-    fn_life: Option<&'h FnLife>,
-    adt_life: Option<&'h AdtLife>,
-) -> Result<HeadRef<'h, 'n>, HeadRecordError> {
+/// The head filed at `at`, borrowed from the store, with the lifetime part the store made or
+/// filed for it (lifetimes.rs `Store::make_lives`; `None` when never made).
+pub fn from_store<'h, 'n>(store: &'h Store<'n>, at: HeadAt) -> Result<HeadRef<'h, 'n>, HeadRecordError> {
     let none = E::NotMade { at };
+    let lives = store.lives_of(at);
+    let fn_life = match lives {
+        Some(LifeOf::Fn(l)) => Some(l),
+        _ => None,
+    };
+    let adt_life = match lives {
+        Some(LifeOf::Adt(l)) => Some(l),
+        _ => None,
+    };
+    let container_life = match lives {
+        Some(LifeOf::Container(l)) => Some(l),
+        _ => None,
+    };
     Ok(match at {
         HeadAt::Fn(k) => {
             let head = store.fns.get(&k).ok_or(none)?;
@@ -419,15 +467,36 @@ pub fn from_store<'h, 'n>(
             let head = store.maps.traits.get(&lib).ok_or(none)?;
             let supers = store.maps.supers.get(&lib).map_or(&[][..], |s| &s[..]);
             let const_params = store.maps.const_params.get(&lib).map_or(&[][..], |c| &c[..]);
-            let assoc_side = AssocSides::Store { maps: &store.maps, trait_: lib };
-            HeadRef::Trait { key: lib, head, extra: store.trait_defs.get(&ck), supers, const_params, preds: store.preds.get(&ck), assoc_side }
+            let assoc_side = AssocSides::Store { store, trait_: lib };
+            let extra = store.trait_defs.get(&ck);
+            // An associated type whose bounds were refused (`Store::trait_members` files the
+            // why in `fn_gaps` under its key): its why is a `Why`, not a record.
+            if extra.is_some_and(|x| x.assoc.iter().any(|a| store.fn_gaps.contains_key(&a.item))) {
+                return Err(E::Unencoded { what: "an associated type whose bounds were refused (its why is a `Why`, not a record)" });
+            }
+            HeadRef::Trait {
+                key: lib,
+                head,
+                extra,
+                supers,
+                const_params,
+                preds: store.preds.get(&ck),
+                assoc_side,
+                life: container_life,
+            }
         }
-        HeadAt::Impl(k) => {
-            HeadRef::Impl { key: k, head: store.impls.get(&k).ok_or(none)?, preds: store.preds.get(&k), frame: store.member_frame(k) }
-        }
+        HeadAt::Impl(k) => HeadRef::Impl {
+            key: k,
+            head: store.impls.get(&k).ok_or(none)?,
+            preds: store.preds.get(&k),
+            frame: store.member_frame(k),
+            life: container_life,
+        },
         HeadAt::Alias(lib) => {
             let Some((generics, ty)) = *store.maps.aliases.get(&lib).ok_or(none)? else {
-                return Err(E::Unencoded { what: "a type alias whose head was refused (its why is a `Why`, not a record)" });
+                // Refused: the store keeps its why's text beside it (`Store::step`, `AliasGap`).
+                let gap = store.maps.alias_gaps.get(&lib).ok_or(E::NotMade { at })?;
+                return Ok(HeadRef::AliasRefused { key: lib, why: gap.text.as_bytes() });
             };
             let defaults = store.maps.alias_defaults.get(&lib).map_or(&[][..], |d| &d[..]);
             let const_params = store.maps.const_params.get(&lib).map_or(&[][..], |c| &c[..]);
@@ -559,7 +628,7 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                 o.byte(mutbl_tag(m));
                 Ok(())
             })?;
-            o.opt(life, |o, l| {
+            o.life(life, slot, |o, l| {
                 o.regions(&l.regions, "a fn's regions")?;
                 o.u32s(&l.ends, "a fn's region ends")?;
                 o.region_pairs(&l.bounds, "a fn's lifetime bounds")?;
@@ -612,7 +681,7 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                 })?;
             }
             o.opt(preds, |o, p| o.preds(p))?;
-            o.opt(life, |o, l| {
+            o.life(life, slot, |o, l| {
                 o.u32(l.lifetimes);
                 o.count(l.variances.len(), "an ADT's variances")?;
                 for v in l.variances.iter() {
@@ -641,7 +710,7 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
             o.ty(sig.output)?;
             K_CTOR
         }
-        HeadRef::Trait { key, head, extra, supers, const_params, preds, assoc_side } => {
+        HeadRef::Trait { key, head, extra, supers, const_params, preds, assoc_side, life } => {
             o.lib(key);
             o.u32(head.generics);
             o.defaults(&head.defaults)?;
@@ -694,10 +763,14 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                     Ok(())
                 })?;
                 o.opt(consts, |o, c| o.const_params(c))?;
+                // Form 11: its item bounds, by its key in the members part.
+                let item = extra.and_then(|x| x.assoc.iter().find(|a| a.name == n)).map(|a| a.item);
+                o.opt(assoc_side.bounds(n, item), |o, p| o.preds(p))?;
             }
+            o.container_life(life, slot)?;
             K_TRAIT
         }
-        HeadRef::Impl { key, head, preds, frame } => {
+        HeadRef::Impl { key, head, preds, frame, life } => {
             o.key(key);
             o.u32(head.generics);
             o.ty(head.self_ty)?;
@@ -725,6 +798,7 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
                 o.u32(f.generics);
                 o.scope(&f.params, &f.consts, &f.bounds, f.self_)
             })?;
+            o.container_life(life, slot)?;
             K_IMPL
         }
         HeadRef::Alias { key, generics, ty, defaults, const_params } => {
@@ -734,6 +808,12 @@ fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot:
             o.defaults(defaults)?;
             o.const_params(const_params)?;
             K_ALIAS
+        }
+        HeadRef::AliasRefused { key, why } => {
+            o.lib(key);
+            o.count(why.len(), "an alias's refusal")?;
+            o.body.extend_from_slice(why);
+            K_ALIAS_REFUSED
         }
         HeadRef::TraitAlias { key, head } => {
             o.lib(key);
@@ -808,6 +888,73 @@ impl Out<'_, '_> {
                 one(self, v)
             }
         }
+    }
+    /// A lifetime part (form 10): 0 not made, 1 made (then `one`), 2 refused (then its reason,
+    /// [`Out::refusal`]).
+    fn life<T>(&mut self, v: Option<Result<&T, LifeRefusal>>, slot: Text, one: impl FnOnce(&mut Self, &T) -> Result<(), E>) -> Result<(), E> {
+        match v {
+            None => {
+                self.byte(0);
+                Ok(())
+            }
+            Some(Ok(l)) => {
+                self.byte(1);
+                one(self, l)
+            }
+            Some(Err(why)) => {
+                self.byte(2);
+                self.refusal(why, slot);
+                Ok(())
+            }
+        }
+    }
+    /// A trait's or an impl's lifetime part (form 10).
+    fn container_life(&mut self, life: Option<Result<&ContainerLife, LifeRefusal>>, slot: Text) -> Result<(), E> {
+        self.life(life, slot, |o, l| {
+            o.u32(l.lifetimes);
+            o.u32(l.elided);
+            o.regions(&l.self_regions, "a container's self regions")?;
+            o.region_pairs(&l.bounds, "a container's lifetime bounds")?;
+            o.count(l.names.len(), "a container's lifetime names")?;
+            for &(name, index) in l.names.iter() {
+                o.body.extend_from_slice(&name.to_le_bytes());
+                o.u32(index);
+            }
+            Ok(())
+        })
+    }
+    /// A lifetime refusal: its rule's tag, then its counts or its item-relative range. The
+    /// range is where, not what: zeroed in the reader digest (`Text::Zeroed`), so a comment
+    /// written before it moves no reader.
+    fn refusal(&mut self, why: LifeRefusal, slot: Text) {
+        use LifeRefusal as R;
+        let (tag, a, b) = match why {
+            R::NoHead => (0, 0, 0),
+            R::Text => (1, 0, 0),
+            R::Form => (2, 0, 0),
+            R::TypeTable => (3, 0, 0),
+            R::UnknownAdt => (4, 0, 0),
+            R::ParamCount { text, head } => (5, text, head),
+            R::FieldCount { text, head } => (6, text, head),
+            R::TypeNode => (7, 0, 0),
+            R::Bound => (8, 0, 0),
+            R::Unaligned { at } => (9, at.start, at.end),
+            R::Unresolved { at } => (10, at.start, at.end),
+            R::Alias { at } => (11, at.start, at.end),
+            R::DefaultWithPositions { at } => (12, at.start, at.end),
+            R::LifetimeArgs { at } => (13, at.start, at.end),
+            R::TwoLifetimesOneOrigin { at } => (14, at.start, at.end),
+            R::UnknownLifetime { at } => (15, at.start, at.end),
+            R::ElisionUndecided { at } => (16, at.start, at.end),
+            R::ElidedInField { at } => (17, at.start, at.end),
+            R::ObjectDefault { at } => (18, at.start, at.end),
+            R::SelfRegions { at } => (19, at.start, at.end),
+        };
+        self.byte(tag);
+        let ranged = tag >= 9;
+        let (a, b) = if ranged && slot == Text::Zeroed { (0, 0) } else { (a, b) };
+        self.u32(a);
+        self.u32(b);
     }
     fn ty(&mut self, t: PTy) -> Result<(), E> {
         let at = self.term(t)?;
@@ -1333,6 +1480,14 @@ pub fn decode<'n>(bytes: &[u8], text: Option<&'n str>, tys: &mut PortableTys<'_>
             let const_params = r.const_params_own()?;
             Head::Alias { key, generics, ty, defaults, const_params }
         }
+        K_ALIAS_REFUSED => {
+            let key = r.lib("a refused alias's key")?;
+            let n = r.count("a refused alias's why")?;
+            let text = r.take(n, "a refused alias's why")?;
+            let mut why = Vec::with_capacity_in(n, r.alloc);
+            why.extend_from_slice(text);
+            Head::AliasRefused { key, why }
+        }
         K_TRAIT_ALIAS => {
             let key = r.lib("a trait alias's key")?;
             let generics = r.u32("a trait alias's generics")?;
@@ -1627,6 +1782,57 @@ impl<'r> In<'r, '_, '_> {
             byte => return Err(E::Byte { what: "a region's tag", byte }),
         })
     }
+    /// [`Out::life`] read back.
+    fn life<T>(&mut self, what: &'static str, one: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<Option<Result<T, LifeRefusal>>, E> {
+        Ok(match self.u8(what)? {
+            0 => None,
+            1 => Some(Ok(one(self)?)),
+            2 => Some(Err(self.refusal()?)),
+            byte => return Err(E::Byte { what, byte }),
+        })
+    }
+    /// [`Out::refusal`] read back.
+    fn refusal(&mut self) -> Result<LifeRefusal, E> {
+        use LifeRefusal as R;
+        let tag = self.u8("a lifetime refusal's rule")?;
+        let a = self.u32("a lifetime refusal's first field")?;
+        let b = self.u32("a lifetime refusal's second field")?;
+        let at = blaze_surface::Range::new(a, b);
+        Ok(match tag {
+            0 => R::NoHead,
+            1 => R::Text,
+            2 => R::Form,
+            3 => R::TypeTable,
+            4 => R::UnknownAdt,
+            5 => R::ParamCount { text: a, head: b },
+            6 => R::FieldCount { text: a, head: b },
+            7 => R::TypeNode,
+            8 => R::Bound,
+            9 => R::Unaligned { at },
+            10 => R::Unresolved { at },
+            11 => R::Alias { at },
+            12 => R::DefaultWithPositions { at },
+            13 => R::LifetimeArgs { at },
+            14 => R::TwoLifetimesOneOrigin { at },
+            15 => R::UnknownLifetime { at },
+            16 => R::ElisionUndecided { at },
+            17 => R::ElidedInField { at },
+            18 => R::ObjectDefault { at },
+            19 => R::SelfRegions { at },
+            byte => return Err(E::Byte { what: "a lifetime refusal's rule", byte }),
+        })
+    }
+    /// A trait's or an impl's lifetime part (form 10).
+    fn container_life(&mut self) -> Result<Option<Result<ContainerLife, LifeRefusal>>, E> {
+        self.life("a container's lifetime part", |r| {
+            let lifetimes = r.u32("a container's lifetimes")?;
+            let elided = r.u32("a container's elided lifetimes")?;
+            let self_regions = r.own("a container's self regions", |r| r.region())?;
+            let bounds = r.own("a container's lifetime bounds", |r| Ok((r.region()?, r.region()?)))?;
+            let names = r.own("a container's lifetime names", |r| Ok((r.u64("a lifetime's name")?, r.u32("a lifetime's index")?)))?;
+            Ok(ContainerLife { lifetimes, elided, self_regions, bounds, names })
+        })
+    }
 
     fn fn_head<'n>(&mut self, text: Option<&'n str>) -> Result<Head<'n>, E> {
         let key = self.key("a fn's key")?;
@@ -1674,7 +1880,7 @@ impl<'r> In<'r, '_, '_> {
         };
         let preds = self.opt("a fn's where-clauses", |r| r.preds())?;
         let static_ = self.opt("a static's mutability", |r| mutbl_of(r.u8("a static's mutability")?))?;
-        let life = self.opt("a fn's lifetime part", |r| {
+        let life = self.life("a fn's lifetime part", |r| {
             let regions = r.own("a fn's regions", |r| r.region())?;
             let ends = r.own("a fn's region ends", |r| r.u32("a region end"))?;
             let bounds = r.own("a fn's lifetime bounds", |r| Ok((r.region()?, r.region()?)))?;
@@ -1717,7 +1923,7 @@ impl<'r> In<'r, '_, '_> {
         let const_params = self.const_params_own()?;
         let field_defaults = self.own("an ADT's field defaults", |r| r.opt("a field default", |r| r.key("a field default's key")))?;
         let preds = self.opt("an ADT's where-clauses", |r| r.preds())?;
-        let life = self.opt("an ADT's lifetime part", |r| {
+        let life = self.life("an ADT's lifetime part", |r| {
             let lifetimes = r.u32("an ADT's lifetimes")?;
             let variances = r.own("an ADT's variances", |r| {
                 let variance = match r.u8("a variance")? {
@@ -1855,9 +2061,14 @@ impl<'r> In<'r, '_, '_> {
                 Ok(AssocWhere::of(&clauses[..n]))
             })?;
             let consts = self.opt("an associated type's const parameters", |r| r.const_params_own())?;
-            assoc_side.push(AssocSide { name, generics, where_, consts });
+            let bounds = self.opt("an associated type's item bounds", |r| r.preds())?;
+            if bounds.is_some() && !extra.as_ref().is_some_and(|x| x.assoc.iter().any(|a| a.name == name)) {
+                return Err(E::Shape { what: "an associated type's item bounds with no row in the trait's members part" });
+            }
+            assoc_side.push(AssocSide { name, generics, where_, consts, bounds });
         }
-        Ok(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side })
+        let life = self.container_life()?;
+        Ok(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life })
     }
 
     fn impl_<'n>(&mut self) -> Result<Head<'n>, E> {
@@ -1907,7 +2118,8 @@ impl<'r> In<'r, '_, '_> {
         if head.fn_self.len() != head.fns.len() {
             return Err(E::Shape { what: "an impl's fn `self` flags are not one per fn" });
         }
-        Ok(Head::Impl { key, head, preds, frame })
+        let life = self.container_life()?;
+        Ok(Head::Impl { key, head, preds, frame, life })
     }
 }
 
@@ -2010,16 +2222,9 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(preds(p1, p2), "a fn's where-clauses");
             need!(s1 == s2, "a static's mutability");
             need!(
-                match (l1, l2) {
-                    (None, None) => true,
-                    (Some(x), Some(y)) => {
-                        x.regions[..] == y.regions[..]
-                            && x.ends[..] == y.ends[..]
-                            && x.bounds[..] == y.bounds[..]
-                            && (x.container, x.named) == (y.container, y.named)
-                    }
-                    _ => false,
-                },
+                life_same(l1, l2, |x, y| {
+                    x.regions[..] == y.regions[..] && x.ends[..] == y.ends[..] && x.bounds[..] == y.bounds[..] && (x.container, x.named) == (y.container, y.named)
+                }),
                 "a fn's lifetime part"
             );
             None
@@ -2041,17 +2246,13 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(c1 == c2, "an ADT's const parameters");
             need!(preds(p1, p2), "an ADT's where-clauses");
             need!(
-                match (l1, l2) {
-                    (None, None) => true,
-                    (Some(x), Some(y)) => {
-                        x.lifetimes == y.lifetimes
-                            && x.variances[..] == y.variances[..]
-                            && x.bounds[..] == y.bounds[..]
-                            && x.fields[..] == y.fields[..]
-                            && x.field_ends[..] == y.field_ends[..]
-                    }
-                    _ => false,
-                },
+                life_same(l1, l2, |x, y| {
+                    x.lifetimes == y.lifetimes
+                        && x.variances[..] == y.variances[..]
+                        && x.bounds[..] == y.bounds[..]
+                        && x.fields[..] == y.fields[..]
+                        && x.field_ends[..] == y.field_ends[..]
+                }),
                 "an ADT's lifetime part"
             );
             None
@@ -2062,10 +2263,16 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             None
         }
         (
-            HeadRef::Trait { key: k1, head: h1, extra: x1, supers: u1, const_params: c1, preds: p1, assoc_side: s1 },
-            HeadRef::Trait { key: k2, head: h2, extra: x2, supers: u2, const_params: c2, preds: p2, assoc_side: s2 },
+            HeadRef::Trait { key: k1, head: h1, extra: x1, supers: u1, const_params: c1, preds: p1, assoc_side: s1, life: l1 },
+            HeadRef::Trait { key: k2, head: h2, extra: x2, supers: u2, const_params: c2, preds: p2, assoc_side: s2, life: l2 },
         ) => {
+            need!(life_same(l1, l2, container_same), "a trait's lifetime part");
             need!(h1.assoc.iter().all(|&n| s1.of(n) == s2.of(n)), "a trait's associated types' side rows");
+            let item_of = |x: Option<&TraitExtra>, n: Name| x.and_then(|x| x.assoc.iter().find(|a| a.name == n)).map(|a| a.item);
+            need!(
+                h1.assoc.iter().all(|&n| preds(s1.bounds(n, item_of(x1, n)), s2.bounds(n, item_of(x2, n)))),
+                "a trait's associated types' item bounds"
+            );
             need!(k1 == k2 && h1.generics == h2.generics, "a trait's key or generics");
             need!(h1.defaults[..] == h2.defaults[..], "a trait's parameter defaults");
             need!(h1.assoc[..] == h2.assoc[..], "a trait's associated types");
@@ -2085,7 +2292,8 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(preds(p1, p2), "a trait's where-clauses");
             None
         }
-        (HeadRef::Impl { key: k1, head: h1, preds: p1, frame: m1 }, HeadRef::Impl { key: k2, head: h2, preds: p2, frame: m2 }) => {
+        (HeadRef::Impl { key: k1, head: h1, preds: p1, frame: m1, life: l1 }, HeadRef::Impl { key: k2, head: h2, preds: p2, frame: m2, life: l2 }) => {
+            need!(life_same(l1, l2, container_same), "an impl's lifetime part");
             need!(
                 match (m1, m2) {
                     (None, None) => true,
@@ -2130,6 +2338,25 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(preds(p1, p2), "an opaque type's bounds");
             None
         }
+        (HeadRef::AliasRefused { key: k1, why: w1 }, HeadRef::AliasRefused { key: k2, why: w2 }) => {
+            need!(k1 == k2 && w1 == w2, "a refused alias's key and why");
+            None
+        }
         _ => Some("the head's kind"),
     }
+}
+
+/// Whether two lifetime parts are one: both not made, both refused by one rule at one place,
+/// or both made and `eq`.
+fn life_same<T>(a: Option<Result<&T, LifeRefusal>>, b: Option<Result<&T, LifeRefusal>>, eq: impl Fn(&T, &T) -> bool) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(Ok(x)), Some(Ok(y))) => eq(x, y),
+        (Some(Err(x)), Some(Err(y))) => x == y,
+        _ => false,
+    }
+}
+
+fn container_same(x: &ContainerLife, y: &ContainerLife) -> bool {
+    (x.lifetimes, x.elided) == (y.lifetimes, y.elided) && x.self_regions[..] == y.self_regions[..] && x.bounds[..] == y.bounds[..] && x.names[..] == y.names[..]
 }

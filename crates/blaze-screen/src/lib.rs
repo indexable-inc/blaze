@@ -27,11 +27,13 @@ extern crate alloc;
 mod encode;
 mod event;
 mod frame;
+mod run_line;
 mod screen;
 mod tally;
 pub mod text;
 
 pub use encode::encode;
+pub use run_line::{Answered, Stage, Step, Unwatched, Watch};
 pub use event::{BinaryEnd, Built, Command, Event, Link, Ran, Stamped, Test, Verdict, Why};
 pub use frame::{Ended, Frame, Line, Mark, Progress, Role, Span};
 pub use screen::{

@@ -368,7 +368,8 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
                 ItemDetail::Static { .. } => ("static", make(&mut r, Want::Fn(*k)), None),
                 ItemDetail::TypeAlias => {
                     let got = make(&mut r, Want::Head(*k)).and_then(|()| match r.store.maps.alias_gaps.get(k) {
-                        Some(why) => Err(why_refusal(*k, why)),
+                        // Lowered here, never filed from a record: the builder's `Why` is kept.
+                        Some(gap) => Err(why_refusal(*k, gap.why.as_ref().expect("a refusal lowered here keeps its Why"))),
                         None => Ok(()),
                     });
                     ("type alias", got, None)

@@ -77,6 +77,19 @@ pub fn written_module<N: Name, W: World<N>>(world: &W, module: ItemKey, n: u8) -
     written_up::<N, W>(world, chain, n).ok_or(PathError { module, at: 0, why: Why::SuperPastRoot })
 }
 
+/// Whether `module` itself binds `name` in `ns`: its own binding, then its glob edges, the
+/// table [`crate::resolve::Names::lookup`] reads, for any module a block's included. Not a
+/// written `self::name`: a written `self` passes over a block's module ([`written_up`]), so
+/// that walk never reads the block's own items (the lazy run's "a struct in a block .. in a
+/// local item's body" for every local struct, 2026-11-17). `Ok(false)`: no binding; an error:
+/// the records the answer needs are not held, or the walk was refused.
+pub fn binds<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, name: N, alloc: Alloc<'_>) -> Result<bool, PathError> {
+    match in_source(world, Def::module(module), ns, name, alloc) {
+        Ok(found) => Ok(found.is_some()),
+        Err(why) => Err(PathError { module, at: 0, why }),
+    }
+}
+
 /// Why a path did not resolve; `at` is the index of the segment that did not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Why {

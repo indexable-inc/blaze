@@ -1,0 +1,14 @@
+{
+ "id": "body-task-hands-out-no-findings",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane ES",
+ "where": "crates/blaze-ladder/src/front2/tables/task.rs `check_body` / `BodyOut`; crates/blaze-cli/src/engine_bodies.rs",
+ "what": "The per-body task returns the engine's Done (a findings COUNT), the verdict's Debug bytes and its reads; the verdict itself (diagnostics, findings, borrow findings) is dropped inside check_body. A driver cannot print a body's findings as `check` prints them, so engine-check prints one note per body with findings naming the count. Also `BodyFrame.frame` must live as long as the records ('n, invariant), so a body's frame cannot be reset per body: a run's frame holds every body's lowering until the run ends (runs are cut to 32 bodies for that).",
+ "cost": "the findings-equal check of lane ES's test could not be written; the frame reset per body could not be done",
+ "cause": "the body task was built for the equality tests (bytes and reads), before a printer read it",
+ "class": "an interface sized for its tests, not for its first caller",
+ "prevention": "asked of lane VB: BodyOut carries the verdict's printable findings (rule, range, words) in the shared allocator, and BodyFrame's frame takes its own lifetime apart from the records'",
+ "annoyance": "source::Records is not Sync (RefCell, OnceCell), so 'one Records shared by all workers' means one per run over the shared bytes",
+ "workaround": "one note per body with its count; one Records and one frame per run of at most 32 bodies",
+ "state": "open"
+}

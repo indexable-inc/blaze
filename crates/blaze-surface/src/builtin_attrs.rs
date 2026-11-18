@@ -36,7 +36,9 @@ pub const BUILTIN_ATTRS: &[&str] = &[
 /// The prelude's attribute macros (the pinned library's `#[rustc_builtin_macro] pub macro`s that
 /// core/src/prelude/v1.rs re-exports): read by the lowering itself, resolved as macros, never in
 /// the built-in attribute scope. Sorted.
-pub const PRELUDE_ATTR_MACROS: &[&str] = &["cfg_eval", "define_opaque", "derive", "derive_const", "global_allocator", "test"];
+/// (`bench` is one: core/src/prelude/v1.rs re-exports `bench` beside `test`, the pinned
+/// library's `#[rustc_builtin_macro] pub macro bench($item:item)` under `feature(test)`.)
+pub const PRELUDE_ATTR_MACROS: &[&str] = &["bench", "cfg_eval", "define_opaque", "derive", "derive_const", "global_allocator", "test"];
 
 /// A one-segment attribute name the toolchain reads itself: a built-in attribute, a prelude
 /// attribute macro, or a `rustc_` name (reserved to the toolchain's crates; no table lists them).

@@ -17,6 +17,8 @@ pub enum Limit {
     Walk,
     /// `select_where_possible`'s rounds in the rescan strategy.
     Rounds,
+    /// One step of an evaluation filled `eval::MAX_PULLS` facts and still lacked one.
+    Pulls,
 }
 
 /// Input the solver cannot have been given by a correct world or arena.

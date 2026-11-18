@@ -15,9 +15,10 @@
 //! `select` hands the pending ones to a fresh `Fulfill` (wake lists within the call); the
 //! solver's task cache carries proofs across calls.
 //!
-//! A solver question the cache lacks stops the solve; the cache reads it through `Reads` and
-//! the solve runs again ([`InferCtx::need_rounds`] counts these). A question the world lacks
-//! stops the body with typeck's `Need`, as every read does.
+//! A solver question the cache lacks is pulled (`Pull`, blaze-solve `Source`): the cache reads
+//! it through `Reads` at the step that asked, and the step goes on. Only `ConstHolds` still
+//! stops the solve, filled here and asked again ([`InferCtx::need_rounds`] counts these). A
+//! question the world lacks stops the body with typeck's `Need`, as every read does.
 
 mod facts;
 mod terms;
@@ -81,6 +82,11 @@ pub struct InferCtx<'a> {
     /// A planted bug of the body suite; `InferPlant::None` in every other test.
     #[cfg(test)]
     pub(crate) plant: InferPlant,
+    /// The other strategy (rule 78): the source fills nothing, so every fact the cache lacks
+    /// stops the solve and is filled by the caller's loop, the root asked again
+    /// (tests.rs `pull_and_stop_check_alike`).
+    #[cfg(test)]
+    pub(crate) stop_for_facts: bool,
 }
 
 /// The deepest chain of `Specializes` questions asked while one is answered (an impl's
@@ -160,6 +166,131 @@ fn solve_err(e: blaze_solve::Stop) -> Result<(), CheckError> {
     }
 }
 
+/// The solver's fact source over this context's cache (blaze-solve `Source`, the pull): a
+/// question the cache lacks is read through `Reads` (`FactCache::fill`, the same read the stop
+/// made, so the body's read list is the same set) the moment a solver step meets it, and the
+/// step goes on; no evaluation is asked again from its root for a fact.
+///
+/// Not pulled: `ConstHolds`, whose arguments are terms of this context that `InferCtx::fill`
+/// exports through the whole context (`instance::export`), which the solver holds borrowed
+/// while it runs; that question still stops the evaluation and is filled by the caller's loop
+/// (`blaze`'s `where const` extension only, no Rust goal asks it).
+struct Pull<'x, 'a, 'w, 'r, W: World> {
+    facts: &'x mut FactCache<'a>,
+    reads: &'x mut Reads<'w, 'r, W>,
+    alloc: Alloc<'a>,
+    spec_depth: u8,
+    /// The need rounds of the `Specializes` contexts this source opened.
+    need_rounds: u64,
+    /// The time spent in fills, taken out of the solver's own time.
+    fill_ns: u64,
+    /// Why a fill failed (typeck's `Need` of the world, a malformed record): the solver then
+    /// stops with `Need(q)`, and the caller returns this.
+    err: Option<Stop>,
+    /// `InferCtx::stop_for_facts`: fill nothing.
+    #[cfg(test)]
+    stop: bool,
+}
+
+impl<'x, 'a, 'w, 'r, W: World> Pull<'x, 'a, 'w, 'r, W> {
+    fn new(facts: &'x mut FactCache<'a>, reads: &'x mut Reads<'w, 'r, W>, alloc: Alloc<'a>, spec_depth: u8) -> Self {
+        Pull {
+            facts,
+            reads,
+            alloc,
+            spec_depth,
+            need_rounds: 0,
+            fill_ns: 0,
+            err: None,
+            #[cfg(test)]
+            stop: false,
+        }
+    }
+}
+
+impl<'a, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, '_, '_, W> {
+    type Facts = FactCache<'a>;
+    const PULLS: bool = true;
+
+    fn facts(&self) -> &FactCache<'a> {
+        &*self.facts
+    }
+
+    fn fill(&mut self, _tys: &mut Terms<'a>, q: blaze_solve::facts::Question) -> bool {
+        if self.err.is_some() {
+            return false;
+        }
+        #[cfg(test)]
+        if self.stop {
+            return false;
+        }
+        let at = self.reads.stamp();
+        let r = match q {
+            blaze_solve::facts::Question::ConstHolds(..) => return false,
+            blaze_solve::facts::Question::Specializes(a, b) => {
+                fill_specializes(self.facts, self.reads, self.alloc, self.spec_depth, &mut self.need_rounds, a, b)
+            }
+            _ => self.facts.fill(q, self.reads),
+        };
+        self.fill_ns += self.reads.stamp().saturating_sub(at);
+        match r {
+            Ok(()) => true,
+            Err(e) => {
+                self.err = Some(e);
+                false
+            }
+        }
+    }
+}
+
+/// Answers the solver's `Specializes(a, b)` (specialize.rs `specializes`, RFC 1210) in a
+/// context of its own: impl `a`'s parameters are rigid `Param(i)` there and its
+/// where-clauses the only assumptions, which in the asking context would name the body's own
+/// parameters and stand beside the body's where-clauses. The answer is a fact of the two
+/// impls, kept in `facts` for the rest of the asking context.
+fn fill_specializes<W: World>(
+    facts: &mut FactCache<'_>,
+    reads: &mut Reads<'_, '_, W>,
+    alloc: Alloc<'_>,
+    spec_depth: u8,
+    need_rounds: &mut u64,
+    a: SDef,
+    b: SDef,
+) -> Result<(), Stop> {
+    if facts.has(blaze_solve::facts::Question::Specializes(a, b)) {
+        return Ok(());
+    }
+    if spec_depth >= MAX_SPEC_DEPTH {
+        return Err(CheckError::Limit(crate::error::Limit::Specialization).into());
+    }
+    let (ka, kb) = (ItemKey(a.0), ItemKey(b.0));
+    let Some(ha) = reads.impl_header(ka)? else {
+        return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
+    };
+    let Some(trait_) = ha.trait_ else {
+        return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
+    };
+    let mut inner = InferCtx::new_in(alloc);
+    inner.spec_depth = spec_depth + 1;
+    let got = crate::specialize::specializes(&mut inner, reads, ka, kb, trait_);
+    *need_rounds += inner.need_rounds;
+    let v = match got {
+        Ok(v) => v,
+        Err(crate::instance::ResolveError::Missing(q)) => return Err(Stop::Need(q)),
+        Err(crate::instance::ResolveError::Check(e)) => return Err(e.into()),
+        // Two impls of different traits: the solver asks only of two impl candidates of
+        // one goal, so this is a malformed question.
+        Err(crate::instance::ResolveError::NoImpl { item, .. }) => {
+            return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(item))).into());
+        }
+        Err(crate::instance::ResolveError::Overlap { first, .. } | crate::instance::ResolveError::NotGround { item: first }) => {
+            return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(first))).into());
+        }
+    };
+    facts.keep_specializes(a, b, v);
+    Ok(())
+}
+
 impl<'a> InferCtx<'a> {
     /// The allocator the check's caller handed in (D102): what this check's scratch lives in.
     pub(crate) fn alloc(&self) -> Alloc<'a> {
@@ -190,6 +321,8 @@ impl<'a> InferCtx<'a> {
             malformed: core::cell::Cell::new(None),
             #[cfg(test)]
             plant: InferPlant::None,
+            #[cfg(test)]
+            stop_for_facts: false,
         }
     }
 
@@ -455,44 +588,34 @@ impl<'a> InferCtx<'a> {
         Ok(())
     }
 
-    /// Answers the solver's `Specializes(a, b)` (specialize.rs `specializes`, RFC 1210) in a
-    /// context of its own: impl `a`'s parameters are rigid `Param(i)` there and its
-    /// where-clauses the only assumptions, which in this context would name the body's own
-    /// parameters and stand beside the body's where-clauses. The answer is a fact of the two
-    /// impls, kept for the rest of this context.
+    /// Answers the solver's `Specializes(a, b)` (the free [`fill_specializes`]).
     fn fill_specializes<W: World>(&mut self, a: SDef, b: SDef, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
-        if self.facts.has(blaze_solve::facts::Question::Specializes(a, b)) {
-            return Ok(());
+        fill_specializes(&mut self.facts, reads, self.alloc, self.spec_depth, &mut self.need_rounds, a, b)
+    }
+
+    /// Runs `solve` with this context's pull source, then: the solver's time without the
+    /// fills counted, the solver's own reads dropped, the specializing contexts' rounds added,
+    /// and a failed fill's reason returned before the solver's stop.
+    fn pulled<W: World, R>(
+        &mut self,
+        reads: &mut Reads<'_, '_, W>,
+        solve: impl FnOnce(&mut Solver<'a>, &mut Terms<'a>, &mut Pull<'_, 'a, '_, '_, W>, &mut Vec<blaze_solve::Read, Alloc<'a>>) -> Result<R, blaze_solve::Stop>,
+    ) -> Result<Result<R, blaze_solve::Stop>, Stop> {
+        let at = reads.stamp();
+        let mut src = Pull::new(&mut self.facts, reads, self.alloc, self.spec_depth);
+        #[cfg(test)]
+        {
+            src.stop = self.stop_for_facts;
         }
-        if self.spec_depth >= MAX_SPEC_DEPTH {
-            return Err(CheckError::Limit(crate::error::Limit::Specialization).into());
+        let r = solve(&mut self.solver, &mut self.terms, &mut src, &mut self.solver_reads);
+        let (err, rounds, fill_ns) = (src.err.take(), src.need_rounds, src.fill_ns);
+        reads.count_solve(at.saturating_add(fill_ns));
+        self.solver_reads.clear();
+        self.need_rounds += rounds;
+        match err {
+            Some(e) => Err(e),
+            None => Ok(r),
         }
-        let (ka, kb) = (ItemKey(a.0), ItemKey(b.0));
-        let Some(ha) = reads.impl_header(ka)? else {
-            return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
-        };
-        let Some(trait_) = ha.trait_ else {
-            return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
-        };
-        let mut inner = InferCtx::new_in(self.alloc);
-        inner.spec_depth = self.spec_depth + 1;
-        let got = crate::specialize::specializes(&mut inner, reads, ka, kb, trait_);
-        self.need_rounds += inner.need_rounds;
-        let v = match got {
-            Ok(v) => v,
-            Err(crate::instance::ResolveError::Missing(q)) => return Err(Stop::Need(q)),
-            Err(crate::instance::ResolveError::Check(e)) => return Err(e.into()),
-            // Two impls of different traits: the solver asks only of two impl candidates of
-            // one goal, so this is a malformed question.
-            Err(crate::instance::ResolveError::NoImpl { item, .. }) => {
-                return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(item))).into());
-            }
-            Err(crate::instance::ResolveError::Overlap { first, .. } | crate::instance::ResolveError::NotGround { item: first }) => {
-                return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(first))).into());
-            }
-        };
-        self.facts.keep_specializes(a, b, v);
-        Ok(())
     }
 
     /// The reason an unmet `self: trait_<..>` bound failed, when an impl of `trait_` has a
@@ -546,12 +669,10 @@ impl<'a> InferCtx<'a> {
             return Ok(e);
         }
         for _ in 0..MAX_FILLS {
-            let clauses = &self.env_clauses;
-            let at = reads.stamp();
-            let r = self.solver.env(&mut self.terms, &self.facts, clauses, &mut self.solver_reads);
-            reads.count_solve(at);
-            self.solver_reads.clear();
-            match r {
+            let clauses = core::mem::replace(&mut self.env_clauses, Vec::new_in(self.alloc));
+            let r = self.pulled(reads, |solver, terms, src, sr| solver.env_from(terms, src, &clauses, sr));
+            self.env_clauses = clauses;
+            match r? {
                 Ok(e) => {
                     self.env = Some(e);
                     return Ok(e);
@@ -571,11 +692,8 @@ impl<'a> InferCtx<'a> {
         let env = self.env(reads)?;
         for _ in 0..MAX_FILLS {
             let g = SGoal { env, pred, bound: 0 };
-            let at = reads.stamp();
-            let r = self.solver.evaluate(&mut self.terms, &self.facts, TypingMode::Analysis, g, &mut self.solver_reads);
-            reads.count_solve(at);
-            self.solver_reads.clear();
-            match r {
+            let r = self.pulled(reads, |solver, terms, src, sr| solver.evaluate_from(terms, src, TypingMode::Analysis, g, sr));
+            match r? {
                 Ok(a) => return Ok(a),
                 Err(blaze_solve::Stop::Need(q)) => {
                     self.fill(q, reads)?;
@@ -601,10 +719,9 @@ impl<'a> InferCtx<'a> {
             if ids.is_empty() {
                 return Ok(());
             }
-            let at = reads.stamp();
-            let r = f.select(&mut self.solver, &mut self.terms, &self.facts, TypingMode::Analysis, &mut self.solver_reads);
-            reads.count_solve(at);
-            self.solver_reads.clear();
+            // A fact a goal lacks is pulled where it is met (`Pull`): the obligations are
+            // registered once, and registered again only after a `ConstHolds` stop.
+            let r = self.pulled(reads, |solver, terms, src, sr| f.select_from(solver, terms, src, TypingMode::Analysis, sr))?;
             for (j, &i) in ids.iter().enumerate() {
                 let s = f.state[j];
                 if s == State::Fails && self.state[i] == State::Pending {

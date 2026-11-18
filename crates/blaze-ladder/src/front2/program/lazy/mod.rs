@@ -62,6 +62,12 @@ pub enum LazyRefusal {
     Spell { function: Box<str> },
     /// The body's check found a diagnostic, a gap or a refusal: never built.
     Check { function: Box<str>, error: CheckFail },
+    /// The body's check met an item declared in a body whose form this front end does not
+    /// make (a [`LocalGap`](crate::front2::locals::LocalGap)), printed as a user reads it
+    /// (rule 19): the enclosing item's whole path, the local item's head as written and its
+    /// `file:line` (rule 71: computed only here, from the item-relative range). `others`: the
+    /// check's other gaps, counted.
+    LocalNotBuilt { function: Box<str>, enclosing: Box<str>, form: &'static str, head: Box<str>, at: Box<str>, others: usize },
     /// A row the build asks for (the fn's own, or a callee's head) is refused, as
     /// `program/tabled.rs` `row` refuses it.
     Row { function: Box<str>, refusal: Box<Front2Refusal> },
@@ -92,6 +98,9 @@ pub enum LazyRefusal {
     /// Static `item`'s value or kind is missing from the program's sorted tables after it was
     /// made (fill.rs `static_value`: the two tables are filed together).
     NoStatic { item: ItemKey },
+    /// A `format_args!` placeholder of `function`'s body needs core's `rt::Argument`
+    /// constructor, and it was not found (fill.rs `fmt_rows`).
+    FmtArgument { function: Box<str>, why: crate::front2::fmt_template::ArgumentNewFail },
 }
 
 impl core::fmt::Display for LazyRefusal {
@@ -102,6 +111,13 @@ impl core::fmt::Display for LazyRefusal {
             LazyRefusal::Lower { function, error } => write!(f, "front2 (lazy): `{function}`'s body did not lower: {error:?}"),
             LazyRefusal::Spell { function } => write!(f, "front2 (lazy): `{function}`'s names could not be spelled"),
             LazyRefusal::Check { function, error } => write!(f, "front2 (lazy): `{function}` did not check clean: {error:?}"),
+            LazyRefusal::LocalNotBuilt { function, enclosing, form, head, at, others } => {
+                write!(f, "front2 (lazy): `{function}` did not check: in {enclosing}: `{head}` ({at}), {form}, is not built yet")?;
+                match others {
+                    0 => Ok(()),
+                    n => write!(f, " (and {n} other gaps)"),
+                }
+            }
             LazyRefusal::Row { refusal, .. } => write!(f, "front2 (lazy): {refusal}"),
             LazyRefusal::Head { item, why } => write!(f, "front2 (lazy): the head of `{item}`: {why}"),
             LazyRefusal::Adt { adt, why } => write!(f, "front2 (lazy): the ADT `{adt}`'s row: {why}"),
@@ -115,6 +131,7 @@ impl core::fmt::Display for LazyRefusal {
                 "front2 (lazy): the names records did not answer while the instance of fn {:032x} was made, so it is void: {first} ({kept} errors kept, {dropped} more counted)",
                 tabled.0
             ),
+            LazyRefusal::FmtArgument { function, why } => write!(f, "front2 (lazy): `{function}`: {why}"),
             LazyRefusal::NoStatic { item } => write!(f, "front2 (lazy): the static {:032x} was made, and its value and kind are not both in the program's tables (fill.rs `static_value` files them together)", item.0),
         }
     }

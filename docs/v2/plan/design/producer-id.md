@@ -8,6 +8,21 @@ date: 2026-11-16
 Decision D105. Rules 21 (keys cover every input), 52 (cache by code identity, nothing
 invalidates by hand), 75 (nothing ambient), 73 (a type, then a lint, then a rule).
 
+**2026-11-17: piece 2 is undone; every row is the binary's id again.** A `blaze check` stopped
+with two values under one key: two builds of blaze, with equal Names-row sources and other code
+elsewhere, wrote different `CrateScope` bytes under one key. Every producing function is in
+blaze-cli (work.rs, names/scope.rs, macros.rs, body_types.rs, program.rs), whose rows held its
+own files alone (`producer-own`) while its code called crates in no row (blaze-ladder's
+`native_links::table_digest` is in the `CrateScope` record; body_types.rs maps verdicts through
+blaze-lint) and its features (`sandbox`) change what the producers make. The source closure of
+the crate that holds the function is the binary, and only the binary's linker id also holds its
+features and profile, so the entry keys every row by it (blaze-cli `src/producers.rs`, the table
+in `home.rs` `row_of`); `of_sources`, `Sources` and the entry's build step are gone, and
+blaze-producers refuses `producer-own` by name. A row takes a source digest again only when its
+producing function moves into a crate that names the row, whose closure is then what it runs
+(blaze-producers' `a_row_covers_every_crate_its_producer_calls`). The text below is the piece 2
+design as it was.
+
 ## The problem
 
 On 2026-11-16 three typed-in strings stood for "the code that made this value":

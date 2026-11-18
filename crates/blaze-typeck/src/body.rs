@@ -6,6 +6,8 @@
 //! every other path is a `BodyPath` the driver resolves through the world. Desugarings (`for`,
 //! `while`, `?`, `async`) arrive as the lowering gives them, in terms of these nodes.
 
+use blaze_own::{Alloc, Vec};
+
 use crate::error::{CheckError, Malformed};
 use crate::ids::{
     Edition, ExprId, FloatTy, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range,
@@ -391,6 +393,11 @@ pub struct BodyView<'b> {
     /// `#[rustc_legacy_const_generics]` callee takes as a const generic reads it
     /// (rules/legacy_const.rs); the lowering, which holds the text, fills it.
     pub call_arg_ints: &'b [(ExprId, u128)],
+    /// Every block written `unsafe { .. }` (or made so by a desugaring the lowering owns, as
+    /// `.await`'s), ascending by id: the unsafety check's contexts (rules/unsafety.rs). A block
+    /// written by a macro's expansion is here as any other: an operation inside the expanded
+    /// block is inside it, whoever wrote either (the Reference, "Unsafe blocks").
+    pub unsafe_blocks: &'b [ExprId],
 }
 
 fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], CheckError> {
@@ -504,6 +511,86 @@ impl<'b> BodyView<'b> {
     pub(crate) fn call_arg_int(&self, e: ExprId) -> Option<u128> {
         let i = self.call_arg_ints.binary_search_by_key(&e, |&(x, _)| x).ok()?;
         self.call_arg_ints.get(i).map(|&(_, v)| v)
+    }
+
+    /// Whether the block `e` is written `unsafe` ([`BodyView::unsafe_blocks`]).
+    pub(crate) fn is_unsafe_block(&self, e: ExprId) -> bool {
+        self.unsafe_blocks.binary_search(&e).is_ok()
+    }
+
+    /// The expressions directly under `e`, pushed onto `out` in source order: a block's
+    /// statements' initialisers and `else`s and its tail, a match's guards and arm bodies, a
+    /// struct literal's field values and base, an `asm!`'s operand expressions. Patterns,
+    /// types and items are not expressions and are not pushed.
+    pub(crate) fn children(&self, e: Expr, out: &mut Vec<ExprId, Alloc<'_>>) -> Result<(), CheckError> {
+        match e {
+            Expr::Missing
+            | Expr::Lit(_)
+            | Expr::Local(_)
+            | Expr::Path(_)
+            | Expr::Continue { .. }
+            | Expr::Underscore
+            | Expr::OffsetOf { .. } => {}
+            Expr::Paren(x)
+            | Expr::Await(x)
+            | Expr::Loop { body: x }
+            | Expr::Field { base: x, .. }
+            | Expr::TupleField { base: x, .. }
+            | Expr::Unary { operand: x, .. }
+            | Expr::Ref { operand: x, .. }
+            | Expr::RawRef { operand: x, .. }
+            | Expr::Cast { operand: x, .. }
+            | Expr::AsyncBlock { body: x, .. }
+            | Expr::Closure { body: x, .. }
+            | Expr::Let { init: x, .. } => out.push(x),
+            Expr::Block { stmts, tail, .. } | Expr::ConstBlock { stmts, tail, .. } => {
+                for &s in self.stmt_list(stmts)? {
+                    match self.stmt(s)? {
+                        Stmt::Let { init, else_, .. } => out.extend(init.into_iter().chain(else_)),
+                        Stmt::Expr { expr, .. } => out.push(expr),
+                        Stmt::Item => {}
+                    }
+                }
+                out.extend(tail);
+            }
+            Expr::If { cond, then, else_ } => out.extend([cond, then].into_iter().chain(else_)),
+            Expr::Match { scrutinee, arms } => {
+                out.push(scrutinee);
+                for arm in self.arm_list(arms)? {
+                    out.extend(arm.guard.into_iter().chain([arm.body]));
+                }
+            }
+            Expr::Break { value, .. } | Expr::Return { value } => out.extend(value),
+            Expr::Call { callee, args } => {
+                out.push(callee);
+                out.extend_from_slice(self.expr_list(args)?);
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                out.push(receiver);
+                out.extend_from_slice(self.expr_list(args)?);
+            }
+            Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+                out.extend([lhs, rhs]);
+            }
+            Expr::Index { base, index } => out.extend([base, index]),
+            Expr::Tuple { elems } | Expr::Array { elems } | Expr::FormatArgs { args: elems, .. } => {
+                out.extend_from_slice(self.expr_list(elems)?);
+            }
+            Expr::Asm { operands, .. } => {
+                for o in self.asm_operand_list(operands)? {
+                    out.push(o.expr);
+                    out.extend(o.out_expr);
+                }
+            }
+            Expr::Repeat { elem, count, .. } => out.extend([elem].into_iter().chain(count)),
+            Expr::Struct { fields, base, .. } => {
+                for f in self.field_init_list(fields)? {
+                    out.push(f.expr);
+                }
+                out.extend(base.expr());
+            }
+        }
+        Ok(())
     }
 
     /// The number of nodes, which sizes the frame column.

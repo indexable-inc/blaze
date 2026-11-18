@@ -559,6 +559,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>> = Vec::with_capacity_in(self.typed_findings.len(), alloc);
         findings.extend_from_slice(&self.typed_findings);
         findings.sort_unstable_by_key(|f| f.order());
+        let mut undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>> = Vec::with_capacity_in(self.undecided.len(), alloc);
+        undecided.extend_from_slice(&self.undecided);
+        undecided.sort_unstable_by_key(|u| u.order());
         // The overloaded indexes that are mutable places (rules/mut_places.rs), sorted.
         let mut index_mut: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::with_capacity_in(self.index_mut.len(), alloc);
         index_mut.extend_from_slice(&self.index_mut);
@@ -576,6 +579,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let (reads, needs) = self.reads.finish(alloc);
         Ok(crate::Outcome::Done(Checked {
             findings,
+            undecided,
             index_mut,
             suggests,
             hidden,

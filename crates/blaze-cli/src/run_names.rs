@@ -85,6 +85,8 @@ pub(crate) enum NamesError {
 /// each crate a proc-macro caller by its place and its items record's edition, the texts served
 /// from the checkout at `root`, the list's `packs` and `corrected` files, with `read` the checkout
 /// files already read (a body job's own file), all kept in `frame` for the caller's lifetime.
+/// `env` is the environment of the crate at 0 (a body job's owner, body_types.rs `owner_env`):
+/// what a body's `env!` reads; every other crate's `env!` is refused by name (body_host.rs).
 /// Nothing is read of a crate here: `Records::new` opens each on the first question about it.
 /// COST: one items-record open per crate, for its edition.
 #[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
@@ -96,6 +98,7 @@ pub(crate) fn names_records<'n>(
     corrected: &'n [(u32, &'n str, &'n str)],
     procs: Option<&'n ProcRunner<'static>>,
     read: std::vec::Vec<(&'n str, Option<&'n str>), Global>,
+    env: Option<&'n blaze_scope::crate_env::CrateEnv<'n>>,
     frame: &'n Frame,
     g: Alloc<'static>,
 ) -> Result<Opened<'n>, NamesError> {
@@ -121,7 +124,8 @@ pub(crate) fn names_records<'n>(
             frame,
             packs,
             corrected,
-            env: None,
+            // The first crate's environment (a body job's owner): what its bodies' `env!` reads.
+            env: env.map(|env| (0, env)),
             read: RefCell::new(read),
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
@@ -395,7 +399,7 @@ pub(crate) fn program_of(
         }
     }
     let owner = owner.ok_or_else(|| RunNamesError::NoProgramCrate { root: std::boxed::Box::from(program_root) })?;
-    let input_of = |at: usize| answered.crate_input(at, crate::names::name_of(list.key(at))).ok_or(RunNamesError::NotAnswered { crate_name: CrateGraph::name(&list, at) });
+    let input_of = |at: usize| answered.crate_input(at, blaze_drive::key::crate_scope_name(&list.key(at))).ok_or(RunNamesError::NotAnswered { crate_name: CrateGraph::name(&list, at) });
     let own = input_of(owner)?;
     let records = kept.records(cx, store, &own, list.key(owner), heap).map_err(|why| RunNamesError::Records { crate_name: CrateGraph::name(&list, owner), why })?;
     // A `#![no_core]` program links no sysroot crate (body_types.rs `prepare`, the same read).
@@ -512,7 +516,9 @@ pub(crate) fn open<'n>(
         crates.push(Crate { records, name: crate_name, package: list.shown_from(*at), world_at: *at });
     }
     let (packs, corrected) = kept.trees(cx, env, program.graph.out, list, frame).map_err(|why| RunNamesError::Trees { why })?;
-    let opened = names_records(cx, root, &crates, packs, corrected, procs, std::vec::Vec::new_in(Global), frame, heap.alloc()).map_err(|error| match error {
+    // No crate's environment yet: a run's bodies' `env!` is refused by name (the next piece:
+    // each crate's `CrateList::env_facts`, as body_types.rs `owner_env` makes the owner's).
+    let opened = names_records(cx, root, &crates, packs, corrected, procs, std::vec::Vec::new_in(Global), None, frame, heap.alloc()).map_err(|error| match error {
         NamesError::Items { at, why } => RunNamesError::Items { crate_name: program.crates.get(at).map_or("?", |(at, _)| CrateGraph::name(list, *at)), why },
     })?;
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);

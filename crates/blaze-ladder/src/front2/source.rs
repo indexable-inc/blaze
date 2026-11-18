@@ -1627,21 +1627,20 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     fn binds(self, module: ItemKey, ns: Namespace, name: &'n str) -> bool {
         // The names record holds a block's module as any module: its writer writes a scope row
         // for every finished scope of the crate (`names_record::encode`: `CrateNames::done`),
-        // the table `Names::lookup` itself reads. The walk of `self::name` starts IN `module`
-        // (`names::walk`: `PathKind::SelfMod` is the module the path is written in, a block's
-        // module included) and looks the one segment up there: the module's own binding, then
-        // its glob edges, which is what `Names::lookup` reads. `NotFound` is the answer "no";
-        // any other refusal (the scope is not held, an ambiguous or unbounded glob walk) is
-        // no answer: a typed gap naming the module, never taken for "no".
-        match self.walk(module, ns, Written { kind: blaze_surface::PathKind::SelfMod, segments: &[name] }) {
-            Ok(found) => found.consumed == 1,
-            Err(PathError { why: Why::NotFound, .. }) => false,
+        // the table `Names::lookup` itself reads. `names::binds` looks the name up IN `module`:
+        // its own binding, then its glob edges, as `Names::lookup` does. (A walk of a written
+        // `self::name` is not that: `self` passes over a block's module, so it never read the
+        // block's own items.) `false` is the answer "no"; a refusal (the scope is not held, an
+        // ambiguous or unbounded glob walk) is no answer: a typed gap naming the module, never
+        // taken for "no".
+        match names::binds(&self.paths, module, ns, name, self.alloc) {
+            Ok(bound) => bound,
             Err(PathError { why: Why::NotRead { .. }, .. }) => {
                 self.gap("whether a block's module binds a name: the names record holds no scope row (or no chain) for the module asked", Some(module));
                 false
             }
             Err(_) => {
-                self.gap("whether a block's module binds a name: the walk of `self::name` in the module was refused (private, ambiguous or past its bound), where `Names::lookup` reads the binding itself", Some(module));
+                self.gap("whether a block's module binds a name: the lookup in the module was refused (ambiguous or past its bound), where `Names::lookup` reads the binding itself", Some(module));
                 false
             }
         }

@@ -67,6 +67,45 @@ pub trait Par {
     fn names_groups(&self) -> bool {
         false
     }
+
+    /// E4's one-group solve (cells/edit.rs `OneGroup`): solve only these modules from their
+    /// text, every other module of the crate answered from its group's record, and write the
+    /// members' groups alone. `None` by default: the whole crate.
+    fn names_members(&self) -> Option<crate::cells::Members<'_>> {
+        None
+    }
+
+    /// Inside [`Stage::Solve`]: the calling thread's cell solve passes into `part` (rule 16:
+    /// the solve's own stretches, for the cost of a one-group solve). The part lasts until the
+    /// thread's next mark. The library holds no clock: nothing by default.
+    fn names_part(&self, part: NamesPart) {
+        let _ = part;
+    }
+}
+
+/// The stretches of one crate's solve finer than a [`Stage`] ([`Par::names_part`]), in the
+/// order a solve passes them; `Outside` and `Run` repeat once per round of made modules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamesPart {
+    /// Inside [`Stage::Files`]: the module tree walked over the files read so far.
+    Walk,
+    /// Inside [`Stage::Files`]: the files a walk named read and outlined.
+    Outline,
+    /// The files' blocks made modules, before the cell core.
+    Blocks,
+    /// The cell core loaded: the module tree and the members' texts.
+    Load,
+    /// The modules outside a one-group solve's members filled from their groups' records.
+    Outside,
+    /// The cells decided (expansions included).
+    Run,
+    /// Every module's scope written from the decided cells.
+    Scopes,
+    /// The crate's groups found (`Par::names_groups`).
+    Groups,
+    /// Inside [`Stage::Publish`], after the root's exports and the refused calls: each group's
+    /// record written over the final scopes.
+    Records,
 }
 
 /// The stretches of one crate's solve, in the order a solve passes them ([`Par::stage`]).

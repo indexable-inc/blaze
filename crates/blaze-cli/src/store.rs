@@ -763,6 +763,20 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         }
         Ok(())
     }
+
+    /// The keys the root `name` names, in place (32 bytes each, in order): `None` when there
+    /// is no root of that name (engine_answer.rs reads the engine's stored answer by it).
+    pub fn named(&self, name: &str) -> Result<Option<&'m [u8]>, CliError> {
+        Ok(self.place.root(name)?.map(|held| held.bytes))
+    }
+
+    /// Keeps `keys` under the root `name` from the commit after the answer on: the engine's
+    /// stored answer, its sealed pointer first, then the answer's root and pages
+    /// (engine_answer.rs; the order simulated in blaze-engine pages_sim.rs).
+    pub fn pin(&mut self, name: &str, keys: &[Key]) -> Result<(), CliError> {
+        self.place.pin(name, keys)?;
+        Ok(())
+    }
 }
 
 impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {

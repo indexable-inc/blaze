@@ -24,7 +24,10 @@
 extern crate std;
 
 pub mod engine;
+pub mod pages;
 
+#[cfg(test)]
+mod pages_sim;
 #[cfg(test)]
 mod sim;
 

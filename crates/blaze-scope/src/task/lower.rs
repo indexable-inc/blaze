@@ -453,7 +453,8 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 // compiled when in test mode"; out of it the item is gone as a false `cfg`'s
                 // is (quick-xml's `#[test] fn pi() { use pretty_assertions::assert_eq; .. }`
                 // named a dev-dependency no library build holds).
-                "test" if self.eval("test") != Some(true) => attrs.cfg_ok = false,
+                // `#[bench]` likewise (core's `bench` expands to nothing out of test mode).
+                "test" | "bench" if self.eval("test") != Some(true) => attrs.cfg_ok = false,
                 // `#[lang = stringify!($lang)]` (core's `panic_const!`): kept as a call and
                 // read in `Lower::attrs` (task/attr_value.rs). `doc` and `deprecated` values
                 // are not read here at all: nothing in the build depends on them.
@@ -1710,6 +1711,11 @@ pub struct BodySrc<'t> {
     /// with each slice it copies (crate_roots `remapped`), so a local item's `crate` written for
     /// another crate's `$crate` keeps the mark that names that crate.
     pub marks: Option<crate::crate_roots::TextMarks<'t>>,
+    /// The tokens that place the text `text` is a slice of ([`Fragment::tokens`]): `None` for
+    /// a body written in a file. A block's module text moves them with each slice it copies
+    /// ([`crate::nested_input::ExpansionTokens::moved`]), so a call in a block of a body a
+    /// macro wrote takes its input as the expansion's tokens (a `$crate` in it keeps its crate).
+    pub tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
 }
 
 impl<'t> BodySrc<'t> {
@@ -1724,6 +1730,7 @@ impl<'t> BodySrc<'t> {
         depth: u16,
         place: (ItemKey, u32),
         marks: Option<crate::crate_roots::TextMarks<'t>>,
+        tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
     ) -> Option<BodySrc<'t>> {
         let holds = matches!(
             detail,
@@ -1737,7 +1744,7 @@ impl<'t> BodySrc<'t> {
         const WORDS: [&str; 8] = ["impl", "struct", "enum", "union", "type", "trait", "mod", "extern"];
         // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
         // decides whether one is in statement position.
-        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, written, depth, place, marks })
+        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, written, depth, place, marks, tokens })
     }
 }
 
@@ -2314,7 +2321,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
         }
-        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos), self.marks) {
+        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
             self.out.bodies.push(body);
         }
         match item.detail {
@@ -2610,7 +2617,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
             self.attr_checks(idx, item.range.start, &attrs.checks);
-            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks) {
+            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
                 self.out.bodies.push(body);
             }
             if is_call {

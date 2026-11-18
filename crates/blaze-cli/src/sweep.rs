@@ -462,7 +462,10 @@ fn wanted(last: &str, name: &str, is_dir: bool) -> bool {
         // (blaze-manifest layout/extra.rs `inferred`).
         ("tests" | "examples" | "benches", false) => name.ends_with(".rs"),
         (_, true) => true,
-        (_, false) => name == "lib.rs" || name == "main.rs",
+        // A package's directory: `build.rs` is its build script when `package.build` is not
+        // written (blaze-manifest layout `RawBuild::Auto`). Left out, a member's script was
+        // never seen and its `rustc-cfg` never applied (tests/build_scripts.rs, 2026-11-17).
+        (_, false) => name == "lib.rs" || name == "main.rs" || name == "build.rs",
     }
 }
 
@@ -1206,6 +1209,10 @@ mod tests {
             assert!(super::wanted(folder, "mm.rs", false), "{folder}/mm.rs is not listed");
             assert!(!super::wanted(folder, "notes.txt", false), "control: {folder}/notes.txt is listed");
         }
-        assert!(!super::wanted("m", "mm.rs", false), "control: a package folder lists only lib.rs and main.rs");
+        assert!(!super::wanted("m", "mm.rs", false), "control: a package folder lists only lib.rs, main.rs and build.rs");
+        // A member's build script is found by its file (layout `RawBuild::Auto`); the root
+        // package's folder too.
+        assert!(super::wanted("app", "build.rs", false), "a member's build.rs is not listed");
+        assert!(super::wanted("", "build.rs", false), "the root package's build.rs is not listed");
     }
 }

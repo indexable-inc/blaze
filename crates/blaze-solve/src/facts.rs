@@ -353,6 +353,41 @@ pub trait Facts {
     fn specializes(&self, seal: Seal, a: Def, b: Def) -> Fetch<bool>;
 }
 
+/// Where an evaluation gets a fact the moment it lacks one (the pull): the solver asks
+/// [`Source::facts`] as before and, when a step meets `Missing`, calls [`Source::fill`] and runs
+/// that one step again in the same frame (its partial bindings and rows rolled back first), so
+/// no frame is thrown away and the root is not asked again (eval.rs `Solver::pull`).
+///
+/// Two strategies (rule 78), tested equal in answers and read sets (tests/cost.rs `pull_*`):
+/// a source that fills, and [`Stopping`], which fills nothing, so a missing fact stops the
+/// whole evaluation with `Stop::Need` and the caller fills it and asks the root again.
+pub trait Source<T: crate::tys::Tys> {
+    type Facts: Facts;
+    /// Whether [`Source::fill`] can fill: `false` keeps the solver from marking each step for
+    /// a rollback it never makes.
+    const PULLS: bool;
+    fn facts(&self) -> &Self::Facts;
+    /// Makes the next ask of `q` answer. `false`: not filled now (the source keeps its own
+    /// reason, an error of its world, for its caller); the evaluation stops with `Need(q)`.
+    /// A source must not fill a question with an answer it would not have given before: the
+    /// world's records are read-only for the evaluation (rule 25).
+    fn fill(&mut self, tys: &mut T, q: Question) -> bool;
+}
+
+/// The source that fills nothing: a missing fact stops the evaluation (`Stop::Need`).
+pub struct Stopping<'f, F: Facts>(pub &'f F);
+
+impl<T: crate::tys::Tys, F: Facts> Source<T> for Stopping<'_, F> {
+    type Facts = F;
+    const PULLS: bool = false;
+    fn facts(&self) -> &F {
+        self.0
+    }
+    fn fill(&mut self, _tys: &mut T, _q: Question) -> bool {
+        false
+    }
+}
+
 /// Where the recorder notes a read: a caller's plain list, or the solver's own log
 /// (`readlog::ReadLog`, a set per frame).
 pub trait Log {

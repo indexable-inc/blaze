@@ -188,8 +188,26 @@ const TLS_ROW: u32 = u32::MAX - 1;
 /// The thread-locals each item's entry declares.
 const THREAD_LOCALS: [(u128, &[u128]); 1] = [(THREADY, &[V])];
 
+/// A fn that makes a `&dyn` of a type: its record names vtable [`W`], whose datum its entry
+/// carries (code_records.rs form 6), and calls `leaf` (the vtable's method word's instance).
+const DYN: u128 = 0xA009;
+/// The vtable `DYN` names.
+const W: u128 = 0xA0E4;
+/// The length that marks a vtable row in a toy entry: the vtable's id, its datum the id's bytes.
+const VT_ROW: u32 = u32::MAX - 2;
+
+/// The vtables each item's entry carries.
+const VTABLES: [(u128, &[u128]); 1] = [(DYN, &[W])];
+
+/// A toy vtable's symbol: its own domain, so it is no static's or fn's.
+fn vtable_of(item: u128) -> Symbol {
+    let mut bytes = std::vec::Vec::from(&b"toy vtable "[..]);
+    bytes.extend_from_slice(&item.to_le_bytes());
+    Symbol(blaze_blake3::hash(&bytes))
+}
+
 /// Each fn's callees.
-const CALLS: [(u128, &[u128]); 8] = [(MAIN, &[A, B]), (A, &[LEAF]), (B, &[]), (LEAF, &[]), (SHOUT, &[LEAF]), (HUB, &[ECHO, SHOUT]), (ECHO, &[LEAF]), (THREADY, &[])];
+const CALLS: [(u128, &[u128]); 9] = [(MAIN, &[A, B]), (A, &[LEAF]), (B, &[]), (LEAF, &[]), (SHOUT, &[LEAF]), (HUB, &[ECHO, SHOUT]), (ECHO, &[LEAF]), (THREADY, &[]), (DYN, &[LEAF])];
 
 /// The statics each item's entry declares (a fn's code names them; a static's value does).
 const NAMES: [(u128, &[u128]); 4] = [(SHOUT, &[S]), (S, &[T]), (T, &[S]), (ECHO, &[S])];
@@ -216,9 +234,33 @@ fn toy_named(entry: &[u8]) -> std::vec::Vec<Symbol> {
             at += 20;
             continue;
         }
+        if len == VT_ROW {
+            named.push(vtable_of(u128::from_le_bytes(wide)));
+            at += 20;
+            continue;
+        }
         at += 20 + len as usize;
     }
     named
+}
+
+/// Each vtable row of a toy entry: its id.
+fn toy_vtables(entry: &[u8]) -> std::vec::Vec<u128> {
+    let mut rows = std::vec::Vec::new();
+    let mut at = 0;
+    while at + 16 < entry.len() {
+        let mut wide = [0u8; 16];
+        wide.copy_from_slice(&entry[at..at + 16]);
+        let len = u32::from_le_bytes([entry[at + 16], entry[at + 17], entry[at + 18], entry[at + 19]]);
+        if len == VT_ROW {
+            rows.push(u128::from_le_bytes(wide));
+        }
+        at += match len {
+            u32::MAX | TLS_ROW | VT_ROW => 20,
+            len => 20 + len as usize,
+        };
+    }
+    rows
 }
 
 /// Item `item`'s static rows onto `entry`: each the static's key and the length `u32::MAX`;
@@ -234,6 +276,12 @@ fn static_rows(item: u128, entry: &mut AVec<'_, u8>) {
         for v in locals.iter() {
             entry.extend_from_slice(&v.to_le_bytes());
             entry.extend_from_slice(&TLS_ROW.to_le_bytes());
+        }
+    }
+    for &(_, tables) in VTABLES.iter().filter(|(k, _)| *k == item) {
+        for w in tables.iter() {
+            entry.extend_from_slice(&w.to_le_bytes());
+            entry.extend_from_slice(&VT_ROW.to_le_bytes());
         }
     }
 }
@@ -388,6 +436,11 @@ impl Form for ToyForm {
                 at += 20;
                 continue;
             }
+            // A vtable is carried, not declared (its datum rides in the entry).
+            if len == VT_ROW {
+                at += 20;
+                continue;
+            }
             let len = len as usize;
             out.push(ItemKey(u128::from_le_bytes(wide)), &entry[at + 20..at + 20 + len]);
             at += 20 + len;
@@ -433,6 +486,14 @@ impl<'t> Front for ToyFront<'t> {
 
     fn statics_named(&self, entry: &[u8], out: &mut AVec<'_, Symbol>) -> Result<(), EntryError> {
         out.extend_from_slice(&toy_named(entry));
+        Ok(())
+    }
+
+    /// A toy vtable's datum is its id's bytes.
+    fn each_vtable(&self, _symbol: [u8; 32], entry: &[u8], each: &mut dyn FnMut(Symbol, &[u8]) -> Result<(), ParentError>) -> Result<(), ParentError> {
+        for w in toy_vtables(entry) {
+            each(vtable_of(w), &w.to_le_bytes())?;
+        }
         Ok(())
     }
 }
@@ -944,4 +1005,296 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
     let breach = statics_before_publish(&untold, &folder).expect_err("a Publish naming the descriptor, never told, passed the checker");
     assert!(breach.contains(&std::format!("{:02x?}", &tls[..6])), "the breach does not name the descriptor: {breach}");
     std::println!("wire: every Publish stands on its statics; 5 + 5 + 1 publishes checked; the descriptor told once, before its first namer");
+}
+
+/// Asserts (run.md, "Statics in the run"; code_records.rs `VtableDatum`): a record naming a
+/// vtable (`dyn`'s, `W`) is published only after a `Data` carrying the vtable's datum, the datum
+/// filed in the records folder under its content, and its method word's instance (`leaf`)
+/// declared in the same `Declare`; a namer is no start-list row; a second need of the record
+/// sends the datum no more. CONTROL: the same messages with the `Data` cut out (a parent that
+/// never sent the vtable) fail the wire checker, naming the vtable.
+/// Prints "wire: a vtable's datum is sent before its first namer, once; a cut `Data` is caught".
+#[test]
+fn a_record_naming_a_vtable_stands_on_its_datum() {
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut store = MemoryStore::new_in(alloc);
+    let mut folder = ToyFolder::default();
+    let (calls, starts) = (Cell::new(0), Cell::new(0));
+    let mut out = std::vec::Vec::new();
+    let first = {
+        let mut needs = Needs::new(alloc);
+        let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: DYN }, &mut folder, &mut store, builder(), alloc);
+        let mut inbox = need(Needed::Symbol(symbol_of(DYN)));
+        inbox.extend_from_slice(&need(Needed::Symbol(symbol_of(DYN))));
+        needs.serve(&mut lazy, &inbox, &mut out).expect("a record naming a vtable served");
+        needs.first().len()
+    };
+    let said = frames(&out);
+    let kinds: std::vec::Vec<&str> = said.iter().map(|frame| frame.split(' ').next().unwrap_or("")).collect();
+    assert_eq!(kinds, ["Declare", "Data", "Publish", "Publish"], "{said:?}");
+    assert_eq!(first, 0, "a record naming a vtable was kept as a start-list row");
+    let mut sent = std::vec::Vec::new();
+    let mut at = 0;
+    while let Some((item, len)) = split(&out[at..]).expect("the frames") {
+        match Down::decode(item).expect("a message") {
+            (_, Down::Declare { pairs }) => assert!(pairs.iter().any(|it| it.symbol == symbol_of(LEAF)), "the method word's instance was not declared: {said:?}"),
+            (_, Down::Data { data }) => sent.extend(data.iter().map(|it| (it.symbol, it.record))),
+            _ => {}
+        }
+        at += len;
+    }
+    let datum = W.to_le_bytes();
+    assert_eq!(sent, [(vtable_of(W), RecordId(blaze_blake3::hash(&datum)))], "the Data is not the vtable's datum, filed by its content");
+    assert!(folder.held.contains(&blaze_blake3::hash(&datum)), "the vtable's datum was sent and never filed");
+    assert_eq!(statics_before_publish(&out, &folder), Ok(2), "{said:?}");
+    // The control: the `Data` cut out.
+    let mut cut = std::vec::Vec::new();
+    let mut at = 0;
+    while let Some((item, len)) = split(&out[at..]).expect("the frames") {
+        if !matches!(Down::decode(item), Ok((_, Down::Data { .. }))) {
+            cut.extend_from_slice(&out[at..at + len]);
+        }
+        at += len;
+    }
+    let breach = statics_before_publish(&cut, &folder).expect_err("a Publish naming a vtable never sent passed the checker");
+    assert!(breach.contains(&std::format!("{:02x?}", &vtable_of(W).0[..6])), "the breach does not name the vtable: {breach}");
+    std::println!("wire: a vtable's datum is sent before its first namer, once; a cut `Data` is caught");
+}
+
+/// The model's start with the head's routine chosen: `routine` false is a program built to
+/// unwind whose lang crates declare no `#[lang = "eh_personality"]` fn.
+struct Headed {
+    toy: ToyStart,
+    routine: bool,
+}
+
+impl Start for Headed {
+    fn head(&self) -> StartHead {
+        let head = self.toy.head();
+        StartHead { personality: head.personality.filter(|_| self.routine), ..head }
+    }
+
+    fn root_count(&self) -> usize {
+        self.toy.root_count()
+    }
+
+    fn root_row(&self, i: usize) -> (ItemKey, &[u8]) {
+        self.toy.root_row(i)
+    }
+
+    fn maker_entry(&self) -> Option<ItemKey> {
+        self.toy.maker_entry()
+    }
+
+    fn special(&self, symbol: &CodeSymbol, builder: &Builder, store: &mut dyn CodeStore, alloc: Alloc<'_>) -> Result<Option<SpecialMade>, ParentError> {
+        self.toy.special(symbol, builder, store, alloc)
+    }
+}
+
+/// The model's front end where `a`'s record lands (its entry ends with `a`'s mark): `a` holds a
+/// value whose drop unwinding must run across its call of `leaf`. `main` lands nowhere.
+struct Landing<'t> {
+    toy: ToyFront<'t>,
+    routine: bool,
+}
+
+impl<'t> Front for Landing<'t> {
+    type Start = Headed;
+    type Ids = ToyIds;
+    type Maker = ToyMaker<'t>;
+
+    fn start(&mut self) -> Result<Headed, ParentError> {
+        Ok(Headed { toy: self.toy.start()?, routine: self.routine })
+    }
+
+    fn ids(&mut self) -> Result<ToyIds, ParentError> {
+        self.toy.ids()
+    }
+
+    fn maker(&mut self, start: &Headed) -> Result<ToyMaker<'t>, ParentError> {
+        self.toy.maker(&start.toy)
+    }
+
+    fn form(&self) -> &dyn Form {
+        &ToyForm
+    }
+
+    fn record_of<'e>(&self, entry: &'e [u8]) -> Result<&'e [u8], EntryError> {
+        Ok(entry)
+    }
+
+    fn statics_named(&self, entry: &[u8], out: &mut AVec<'_, Symbol>) -> Result<(), EntryError> {
+        self.toy.statics_named(entry, out)
+    }
+
+    fn each_vtable(&self, symbol: [u8; 32], entry: &[u8], each: &mut dyn FnMut(Symbol, &[u8]) -> Result<(), ParentError>) -> Result<(), ParentError> {
+        self.toy.each_vtable(symbol, entry, each)
+    }
+
+    fn lands(&self, _symbol: [u8; 32], record: &[u8]) -> Result<bool, ParentError> {
+        Ok(record.ends_with(&A.to_le_bytes()))
+    }
+
+    fn path_of(&mut self, item: ItemKey) -> Option<Box<str>> {
+        (item.0 == A).then(|| Box::from("toy::a"))
+    }
+}
+
+/// Rule 4 (blaze-ladder personality.rs): a program built to unwind that declares no personality
+/// routine runs while no record lands. Asserts: with no routine, `main` (no row lands) resolves
+/// to its record, and `a` (a row lands) is refused as `NoPersonality` naming `a` by key and path,
+/// its record never filed; control: the same model with a routine named resolves `a`. A parent
+/// that refused at the start fails the first; one that published `a`'s record fails the second.
+/// Prints "lazy parent: no routine, `main` runs and `a` is refused: <error>".
+#[test]
+fn a_record_that_lands_with_no_routine_is_refused_naming_its_fn() {
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let (calls, starts) = (Cell::new(0), Cell::new(0));
+    let toy = || ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN };
+
+    let mut store = MemoryStore::new_in(alloc);
+    let mut folder = ToyFolder::default();
+    let mut lazy = Lazy::new(&cx, Landing { toy: toy(), routine: false }, &mut folder, &mut store, builder(), alloc);
+    match lazy.resolve(&symbol_of(MAIN)) {
+        Ok(Resolved::Record { .. }) => {}
+        Ok(Resolved::Unknown) => panic!("`main` lands nowhere and was answered Unknown"),
+        Err(why) => panic!("`main` lands nowhere and was refused: {why}"),
+    }
+    let refused = match lazy.resolve(&symbol_of(A)) {
+        Err(why @ ParentError::NoPersonality { .. }) => why,
+        Err(other) => panic!("`a` was refused for another cause: {other}"),
+        Ok(_) => panic!("`a`'s record lands and was answered with no routine named"),
+    };
+    let ParentError::NoPersonality { function, path, symbol } = &refused else { unreachable!("matched above") };
+    assert_eq!((*function, path.as_deref(), *symbol), (Some(ItemKey(A)), Some("toy::a"), symbol_of(A).0));
+    let shown = std::format!("{refused}");
+    assert!(shown.contains("fn `toy::a`") && shown.contains("eh_personality"), "{shown}");
+    drop(lazy);
+    assert_eq!(folder.held.len(), 1, "a record past `main`'s was filed: `a`'s, which was refused");
+
+    let mut store = MemoryStore::new_in(alloc);
+    let mut folder = ToyFolder::default();
+    let mut named = Lazy::new(&cx, Landing { toy: toy(), routine: true }, &mut folder, &mut store, builder(), alloc);
+    named.resolve(&symbol_of(MAIN)).expect("`main` resolves with a routine");
+    assert!(matches!(named.resolve(&symbol_of(A)), Ok(Resolved::Record { .. })), "`a` was refused with a routine named");
+    std::println!("lazy parent: no routine, `main` runs and `a` is refused: {shown}");
+}
+
+/// A sink that writes each event down as its `Debug` text, and says whether it wants paths.
+struct Recorder {
+    seen: std::cell::RefCell<std::vec::Vec<std::string::String>>,
+    paths: bool,
+}
+
+impl blaze_screen::Watch for Recorder {
+    fn see(&self, step: blaze_screen::Step<'_>) {
+        self.seen.borrow_mut().push(std::format!("{step:?}"));
+    }
+
+    fn paths(&self) -> bool {
+        self.paths
+    }
+}
+
+/// The model's front end with a sink: everything is `ToyFront`'s; a fn's path is `toy::<key>`
+/// and each one named is counted.
+struct Watched<'t> {
+    toy: ToyFront<'t>,
+    watch: &'t Recorder,
+    named: &'t Cell<usize>,
+}
+
+fn toy_path(item: u128) -> std::string::String {
+    std::format!("toy::{item:#x}")
+}
+
+impl<'t> Front for Watched<'t> {
+    type Start = ToyStart;
+    type Ids = ToyIds;
+    type Maker = ToyMaker<'t>;
+
+    fn start(&mut self) -> Result<ToyStart, ParentError> {
+        self.toy.start()
+    }
+
+    fn ids(&mut self) -> Result<ToyIds, ParentError> {
+        self.toy.ids()
+    }
+
+    fn maker(&mut self, start: &ToyStart) -> Result<ToyMaker<'t>, ParentError> {
+        self.toy.maker(start)
+    }
+
+    fn form(&self) -> &dyn Form {
+        self.toy.form()
+    }
+
+    fn record_of<'e>(&self, entry: &'e [u8]) -> Result<&'e [u8], EntryError> {
+        self.toy.record_of(entry)
+    }
+
+    fn statics_named(&self, entry: &[u8], out: &mut AVec<'_, Symbol>) -> Result<(), EntryError> {
+        self.toy.statics_named(entry, out)
+    }
+
+    fn each_vtable(&self, symbol: [u8; 32], entry: &[u8], each: &mut dyn FnMut(Symbol, &[u8]) -> Result<(), ParentError>) -> Result<(), ParentError> {
+        self.toy.each_vtable(symbol, entry, each)
+    }
+
+    fn path_of(&mut self, item: ItemKey) -> Option<Box<str>> {
+        self.named.set(self.named.get() + 1);
+        Some(toy_path(item.0).into_boxed_str())
+    }
+
+    fn watch(&self) -> &dyn blaze_screen::Watch {
+        self.watch
+    }
+}
+
+/// Asserts: a recorded run of the model emits, for each first call, the fn being answered
+/// (with its path when the sink wants paths) and then how it was answered, in the order the
+/// program asks: `main` made, then `a` made; a second run over the same store finds `main`.
+/// A sink that wants no paths gets `None` and the front is never asked to name one (the
+/// control: a parent that named paths for a sink that shows nothing pays a lookup per call).
+/// The loop's events ride the same sink through `Resolve::watch`.
+/// Prints "run events: first run [..]; second run [..]".
+#[test]
+fn a_recorded_run_emits_each_first_call_and_how_it_was_answered() {
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut store = MemoryStore::new_in(alloc);
+    let mut folder = ToyFolder::default();
+    let (calls, starts, named) = (Cell::new(0), Cell::new(0), Cell::new(0));
+    let toy = || ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN };
+    let resolving = |item: u128| std::format!("Resolving {{ path: Some({:?}) }}", toy_path(item));
+
+    let first = Recorder { seen: std::cell::RefCell::new(std::vec::Vec::new()), paths: true };
+    let mut lazy = Lazy::new(&cx, Watched { toy: toy(), watch: &first, named: &named }, &mut folder, &mut store, builder(), alloc);
+    assert!(first.seen.borrow().is_empty(), "an event before any need: {:?}", first.seen.borrow());
+    lazy.resolve(&symbol_of(MAIN)).expect("main resolves");
+    lazy.resolve(&symbol_of(A)).expect("a resolves");
+    Resolve::watch(&lazy).see(blaze_screen::Step::Answers);
+    drop(lazy);
+    let made = "Answered(Made)".to_string();
+    assert_eq!(*first.seen.borrow(), [resolving(MAIN), made.clone(), resolving(A), made, "Answers".to_string()]);
+    assert_eq!(named.get(), 2, "each fn stepped is named once");
+
+    let second = Recorder { seen: std::cell::RefCell::new(std::vec::Vec::new()), paths: false };
+    let mut again = Lazy::new(&cx, Watched { toy: toy(), watch: &second, named: &named }, &mut folder, &mut store, builder(), alloc);
+    again.resolve(&symbol_of(MAIN)).expect("main resolves on the second run");
+    drop(again);
+    assert_eq!(*second.seen.borrow(), ["Resolving { path: None }".to_string(), "Answered(Found)".to_string()]);
+    assert_eq!(named.get(), 2, "a sink that wants no paths had one named");
+    std::println!("run events: first run {:?}; second run {:?}", first.seen.borrow(), second.seen.borrow());
 }

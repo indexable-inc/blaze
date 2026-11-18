@@ -19,7 +19,8 @@
 //! | `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH` | set: the root the sandbox serves the files at |
 //! | `CARGO_BIN_NAME` | set for a binary; unset for any other crate |
 //! | `OUT_DIR` and each `cargo::rustc-env` pair | set once the build script's record is joined; `OUT_DIR` unknown before; unset with no script |
-//! | `CARGO`, the `[package]` metadata family (`CARGO_PKG_AUTHORS`, `_DESCRIPTION`, `_HOMEPAGE`, `_LICENSE`, `_LICENSE_FILE`, `_README`, `_REPOSITORY`, `_RUST_VERSION`), `CARGO_PRIMARY_PACKAGE` | unknown: not modelled (cargo sets the metadata ones even when empty, and `CARGO_PRIMARY_PACKAGE` by the command line) |
+//! | `CARGO` | unset by rule: there is no cargo binary; a sandboxed macro could not run one (`proc-macro-crate` then reads the package's own manifest) |
+//! | the `[package]` metadata family (`CARGO_PKG_AUTHORS`, `_DESCRIPTION`, `_HOMEPAGE`, `_LICENSE`, `_LICENSE_FILE`, `_README`, `_REPOSITORY`, `_RUST_VERSION`), `CARGO_PRIMARY_PACKAGE` | unknown: not modelled (cargo sets the metadata ones even when empty, and `CARGO_PRIMARY_PACKAGE` by the command line) |
 //! | `CARGO_TARGET_TMPDIR`, `CARGO_BIN_EXE_<name>` | unknown for an integration test or a bench; unset elsewhere |
 //! | any other name (`PATH`, `HOME`, `DOCS_RS`, `CARGO_CFG_*`, ..) | unset: a build sees no ambient environment (rule 75), the same answer for anyone |
 //!

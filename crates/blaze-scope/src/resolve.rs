@@ -1160,7 +1160,9 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let mut tried: HashMap<&'a str, (), Alloc<'a>> = HashMap::new_in(alloc);
     let mut walked = None;
     for _ in 0..MOST_WALKS {
+        par.names_part(crate::task::NamesPart::Walk);
         let tree = walk(&set, &cfg, input.key, input.name, root_file, &root_dir, edition, alloc);
+        par.names_part(crate::task::NamesPart::Outline);
         let mut read: AVec<'a, (&'a str, &'a str)> = AVec::new_in(alloc);
         for path in tree.missing.iter() {
             if set.find(path).is_some() || tried.contains_key(path.as_str()) {
@@ -1292,13 +1294,15 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         // The cell core solves and writes the scopes. The files' blocks that hold impls are
         // modules before it starts: it is told of them as of any made module.
         par.stage(crate::task::Stage::Solve);
+        par.names_part(crate::task::NamesPart::Blocks);
         make_blocks(&base, &run, &low.bodies);
         let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
         let expand = |call: ItemKey, def: Def| {
             let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
         };
         let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
-        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, par.decide_check(), par.names_groups(), alloc)
+        let names_part = |p: crate::task::NamesPart| par.names_part(p);
+        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, par.decide_check(), par.names_groups(), par.names_members(), &names_part, alloc)
             .map_err(|error| NamesError::Cells { krate: input.name, error })?;
         if let Some(check) = &solved.decide {
             par.decided(input.name, check);
@@ -1330,6 +1334,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     crate::refused::write_refused(&mut done, &expansions_now, alloc);
     // E4: each group's record, over the final scopes and its members' expansions.
     let made_text = |call: ItemKey| expansions_now.get(&call).and_then(|x| x.made).map(|m| m.text);
+    par.names_part(crate::task::NamesPart::Records);
     let groups = crate::write_groups(&shapes, &done, &made_text, alloc).map_err(|error| NamesError::Cells { krate: input.name, error: crate::cells::Unwritten::Groups(error) })?;
     drop(expansions_now);
     let failed = core::mem::replace(&mut fill.failed, HashMap::new_in(alloc));
@@ -2577,8 +2582,13 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         // own, read as before this piece).
         Err(_) => None,
     };
-    let (text, made, column): (&'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>) = match made.outline.errors().first() {
-        None => (text, made, column),
+    // With the tokens that place the text lowered: the rendered text's own, or, for statements
+    // read as items, the same tokens moved with the slices that text copied
+    // ([`crate::nested_input::ExpansionTokens::moved`]), so a call there takes its input as the
+    // expansion's tokens, never as its text lexed again.
+    #[allow(clippy::type_complexity)]
+    let (text, made, column, fragment_tokens): (&'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>, crate::nested_input::ExpansionTokens<'a>) = match made.outline.errors().first() {
+        None => (text, made, column, expansion_tokens),
         Some(error) => {
             // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position:
             // the Reference, "Macro invocation", "Statements": its expansion is statements of
@@ -2596,7 +2606,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                 .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
             if !in_block {
                 note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
-                (text, made, column)
+                (text, made, column, expansion_tokens)
             } else {
                 match crate::expanded_blocks::statements_as_items(text, call, alloc) {
                     Ok(None) => return Some((DeclsBuilder::new_in(alloc), None)),
@@ -2623,7 +2633,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
                             note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
                             return Some((DeclsBuilder::new_in(alloc), None));
                         }
-                        (items, again, column)
+                        (items, again, column, expansion_tokens.moved(items, &copies, alloc))
                     }
                     Err(refused) => {
                         note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
@@ -2644,9 +2654,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         _ => None,
     };
     let written = included.unwrap_or(calling);
-    // The tokens place the rendered text only: statements read as items are another text,
-    // whose calls lex their inputs from it (a stated gap of D122's piece).
-    let fragment_tokens = core::ptr::eq(text, expansion_tokens.text).then_some(expansion_tokens);
+    let fragment_tokens = Some(fragment_tokens);
     let fragment = Fragment {
         tokens: fragment_tokens,
         module: src.module,
@@ -2837,6 +2845,17 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
                 }
             }
         };
+        // A body a macro wrote: the tokens that placed its text move with the same slices, so a
+        // call in the block's module takes its input as the expansion's tokens (bitflags'
+        // `fn all() { .. $crate::__bitflags_expr_safe_attrs!(..) .. }`, written through
+        // `__impl_bitflags!`'s argument). A body outside the text they place is no
+        // expansion's: none.
+        let tokens = body.tokens.and_then(|of| {
+            let at = crate::expansion_origins::offset_in(of.text, body.text)?;
+            let mut shifted: AVec<'a, crate::crate_roots::Copied> = AVec::with_capacity_in(copies.len(), alloc);
+            shifted.extend(copies.iter().map(|c| crate::crate_roots::Copied { from: c.from + at, ..*c }));
+            Some(of.moved(text, &shifted, alloc))
+        });
         let fragment = Fragment {
             module: body.module,
             owner: call,
@@ -2850,13 +2869,11 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
             written: body.written,
             kept: false,
             marks,
-            // A block's module text is rewritten from the body's: no tokens place it (its
-            // calls' inputs are lexed from this text; a stated gap of D122's piece).
-            tokens: None,
+            tokens,
         };
         let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens: None };
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens };
         {
             let mut places = held(run.block_places.lock(), "block places");
             for m in mods.iter() {

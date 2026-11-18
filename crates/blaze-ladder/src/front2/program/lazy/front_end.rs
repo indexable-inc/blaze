@@ -327,23 +327,10 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         self.front.index.lang("format_argument").map(checker_of)
     }
 
-    /// As `Front2Program::fmt_argument_new`. Over records the index files impls only as a
-    /// question's bucket admits them, so this reads the solved names alone; over records no
-    /// answer, and the builder refuses naming the constructor (listed in the notes).
+    /// As `Front2Program::fmt_argument_new`: the answer `check_one` asked for the body's
+    /// placeholders (fill.rs `fmt_rows`), over the solved names or the records alike.
     fn fmt_argument_new(&self, trait_: tc::FmtTrait) -> Option<ItemKey> {
-        self.front.names.solved()?;
-        let name = crate::front2::fmt_template::argument_new_name(trait_);
-        let adt = self.front.index.lang("format_argument")?;
-        let module = self.front.names.home_of(adt)?;
-        let mut found = self
-            .front
-            .index
-            .impls
-            .iter()
-            .filter(|i| i.module == module && crate::front2::fmt_template::inherent_on(i.header, "Argument"))
-            .filter_map(|i| self.front.keys.filed_member(checker_of(i.key), MemberKind::Fn, name));
-        let first = found.next()?;
-        found.next().is_none().then_some(first)
+        crate::front2::fmt_template::argument_new_answered(&self.front.index, self.buckets.as_ref(), trait_)
     }
 
     // (4) Types and items.

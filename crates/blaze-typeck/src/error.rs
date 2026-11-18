@@ -89,6 +89,9 @@ pub enum Malformed {
     /// overlay, or its kept types (`OwnTys::view`) read over a base with fewer than the `base`
     /// nodes or list entries it was made over (`have`): its ids would name other types.
     Overlay { base: u32, have: u32 },
+    /// An intern through `&self` (`PortableTys::intern_shared`) into a table made with owned
+    /// columns (`PortableTys::new_in`), which only `&mut` grows: its maker's fault.
+    SharedIntern,
     /// The context met a handle it cannot read as asked (infer/mod.rs, its `TypeCtx` reads,
     /// which cannot return an error): `node` is the handle, `what` says how it failed. The
     /// read gave the error type in its place and the body's check fails with this (rule 20:

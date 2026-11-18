@@ -40,7 +40,7 @@ use blaze_launch::wire::RecordId;
 use blaze_native::descriptor::DescriptorError;
 use blaze_run::SlotId;
 
-use crate::run_mode::{Memory, RunModeError};
+use crate::run_mode::{CName, Memory, RunModeError};
 
 /// The descriptor's form has one home, blaze-native's descriptor.rs (BNL2: words, pointer rows,
 /// the names table; BNL1 refused by its tag, never read beside it).
@@ -237,10 +237,11 @@ pub fn bind<N: Natives>(natives: Option<&mut N>, symbol: CodeSymbol, name: &str)
         return Err(RunModeError::NoNativeLibrary { symbol });
     };
     if name.len() >= NAME_MOST || name.as_bytes().contains(&0) {
-        return Err(RunModeError::Outside { symbol, why: "its name is longer than 511 bytes or holds a NUL" });
+        return Err(RunModeError::Outside { symbol, name: CName::new(name), why: "its name is longer than 511 bytes or holds a NUL" });
     }
     natives.lookup(name).ok_or(RunModeError::Outside {
         symbol,
+        name: CName::new(name),
         why: "neither the program's native library nor a library it loads defines it (`dlsym` on its handle)",
     })
 }

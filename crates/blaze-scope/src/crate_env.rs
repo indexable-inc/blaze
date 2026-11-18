@@ -22,7 +22,9 @@
 //! - `OUT_DIR` and every `cargo::rustc-env` pair: from the build script's joined outputs record
 //!   (blaze-build-script's `OutputsRef`), a later pair of one name winning as cargo gives it.
 //!
-//! A name cargo always sets whose value this build does not know (`CARGO`, the `[package]`
+//! `CARGO` is unset: there is no cargo binary ([`CARGO_ALWAYS`]'s doc).
+//!
+//! A name cargo always sets whose value this build does not know (the `[package]`
 //! metadata family: `CARGO_PKG_AUTHORS`, `_DESCRIPTION`, ..; `CARGO_PRIMARY_PACKAGE`;
 //! `OUT_DIR` of a unit whose script's record is not joined) is UNKNOWN: a read of it is
 //! refused by name ([`EnvUnknown`]), never answered unset (rule 3: an unset answer would turn a
@@ -47,8 +49,13 @@ use crate::units::{Origin, UnitCrates};
 
 /// Every name cargo sets for every crate it compiles (the cargo book's list for crates), sorted:
 /// one of these a [`CrateEnv`] holds no value for is [`EnvUnknown`], never unset.
+///
+/// Not `CARGO` ("Path to the cargo binary performing the build"): UNSET by rule (coordinator,
+/// 2026-11-17): there is no cargo binary (rule 1), and a sandboxed macro could not run one, so
+/// no value is true and none is unknown. `proc-macro-crate` (jsonrpsee's `#[rpc]`, ..) then
+/// skips `cargo locate-project` and reads the calling package's own manifest, as it does in a
+/// vendored folder; before, its read of `CARGO` refused every such call.
 pub const CARGO_ALWAYS: &[&str] = &[
-    "CARGO",
     "CARGO_CRATE_NAME",
     "CARGO_MANIFEST_DIR",
     "CARGO_MANIFEST_PATH",
@@ -110,6 +117,11 @@ pub struct CrateEnv<'a> {
     /// The folder its files are read under, with its trailing `/` (the caller's path space).
     read_folder: AString<'a>,
     script: Option<OutputsRef<'a>>,
+    /// The facts it was made from that its variables do not give back on their own
+    /// ([`CrateEnv::facts`]): the crate's name, a binary's name, whether it has a build script.
+    crate_name: AString<'a>,
+    bin: Option<AString<'a>>,
+    build_script: bool,
 }
 
 /// A variable cargo sets for the crate whose value this build does not know: a read of it is
@@ -220,7 +232,35 @@ impl<'a> CrateEnv<'a> {
         unknown.sort_unstable();
         unknown.dedup();
         let package = facts.package.map(|(name, version)| (AString::from_str_in(name, alloc), AString::from_str_in(version, alloc)));
-        Ok(CrateEnv { vars, unknown, bin_exe_unknown: facts.test_or_bench, seen: facts.seen, package, read_folder, script: facts.script })
+        Ok(CrateEnv {
+            vars,
+            unknown,
+            bin_exe_unknown: facts.test_or_bench,
+            seen: facts.seen,
+            package,
+            read_folder,
+            script: facts.script,
+            crate_name: AString::from_str_in(facts.crate_name, alloc),
+            bin: facts.bin.map(|bin| AString::from_str_in(bin, alloc)),
+            build_script: facts.build_script,
+        })
+    }
+
+    /// The facts this environment was made from: [`CrateEnv::of`] of them makes it again, equal
+    /// in every answer. What a reader with no world (a body job, blaze-cli body_types.rs) is
+    /// handed through the crate list (blaze-world crate_list.rs), so a body's `env!` is
+    /// answered by the ONE construction an item's is (rule 30), never a second table.
+    pub fn facts(&self) -> EnvFacts<'_> {
+        EnvFacts {
+            crate_name: self.crate_name.as_str(),
+            package: self.package.as_ref().map(|(name, version)| (name.as_str(), version.as_str())),
+            bin: self.bin.as_ref().map(|bin| bin.as_str()),
+            seen: self.seen,
+            read_folder: self.read_folder.as_str(),
+            build_script: self.build_script,
+            script: self.script,
+            test_or_bench: self.bin_exe_unknown,
+        }
     }
 
     /// This environment copied whole into `alloc`, borrowing nothing of `self`: a reader that
@@ -248,7 +288,18 @@ impl<'a> CrateEnv<'a> {
                 Some(OutputsRef::open(bytes.leak())?)
             }
         };
-        Ok(CrateEnv { vars, unknown, bin_exe_unknown: self.bin_exe_unknown, seen, package, read_folder: text(self.read_folder.as_str()), script })
+        Ok(CrateEnv {
+            vars,
+            unknown,
+            bin_exe_unknown: self.bin_exe_unknown,
+            seen,
+            package,
+            read_folder: text(self.read_folder.as_str()),
+            script,
+            crate_name: text(self.crate_name.as_str()),
+            bin: self.bin.as_ref().map(|bin| text(bin.as_str())),
+            build_script: self.build_script,
+        })
     }
 
     /// This environment with its crate's build-script outputs `script` joined (decision D115:
@@ -286,7 +337,18 @@ impl<'a> CrateEnv<'a> {
             SeenRoot::Member { dir } => SeenRoot::Member { dir: blaze_own::Box::leak(text(dir).into_boxed_str()) },
         };
         let package = self.package.as_ref().map(|(name, version)| (text(name.as_str()), text(version.as_str())));
-        CrateEnv { vars, unknown, bin_exe_unknown: self.bin_exe_unknown, seen, package, read_folder: text(self.read_folder.as_str()), script: Some(script) }
+        CrateEnv {
+            vars,
+            unknown,
+            bin_exe_unknown: self.bin_exe_unknown,
+            seen,
+            package,
+            read_folder: text(self.read_folder.as_str()),
+            script: Some(script),
+            crate_name: text(self.crate_name.as_str()),
+            bin: self.bin.as_ref().map(|bin| text(bin.as_str())),
+            build_script: self.build_script,
+        }
     }
 
     /// The variable `name`: its value, `None` when the crate is compiled without it (`env!` of
@@ -502,6 +564,25 @@ mod tests {
         assert_eq!(env.get("OUT_DIR"), Err(EnvUnknown));
         assert_eq!(env.get("CARGO_BIN_EXE_tempo"), Ok(None));
         assert!(CrateEnv::of(facts("1.2"), Alloc::global()).is_err(), "a version without three parts is refused by name");
+    }
+
+    /// `facts` gives back what `of` was given: `of` of them answers every read as the
+    /// original (a body job's environment is made so from the crate list, blaze-world
+    /// crate_list.rs `env_facts`). CONTROL: facts with another version answer
+    /// `CARGO_PKG_VERSION` otherwise. Prints nothing; passes.
+    #[test]
+    fn of_its_facts_answers_as_the_original() {
+        let alloc = Alloc::global();
+        let given = EnvFacts { bin: Some("tempo"), seen: SeenRoot::member("bin/tempo").expect("a plain dir"), build_script: true, test_or_bench: true, ..facts("1.2.3-rc.1") };
+        let env = CrateEnv::of(given, alloc).expect("a SemVer version");
+        let again = CrateEnv::of(env.facts(), alloc).expect("a SemVer version");
+        for name in super::CARGO_ALWAYS.iter().copied().chain(["CARGO_BIN_NAME", "OUT_DIR", "CARGO_TARGET_TMPDIR", "CARGO_BIN_EXE_x", "UNSET"]) {
+            assert_eq!(again.get(name), env.get(name), "{name}");
+        }
+        assert_eq!(again.seen(), env.seen());
+        assert_eq!(again.read_folder(), env.read_folder());
+        let other = CrateEnv::of(EnvFacts { package: Some(("tempo-node", "1.2.4")), ..env.facts() }, alloc).expect("a SemVer version");
+        assert_ne!(other.get("CARGO_PKG_VERSION"), env.get("CARGO_PKG_VERSION"), "CONTROL: another version");
     }
 
     /// D96 (4): `file!()` names a dependency's file `<name>-<version>/<path>` and a member's

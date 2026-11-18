@@ -19,7 +19,7 @@ use blaze_launch::{Slot, Thread, Tier};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::{Nanos, SlotId};
 
-use super::{Act, Event, Memory, Outside, Placing, Plant, RecordSource, RunMode, RunModeError, ThreadKey};
+use super::{Act, Event, Memory, Outside, Placing, Plant, RecordSource, Room, RunMode, RunModeError, ThreadKey};
 use crate::code_unwind::Step;
 
 const ADRP_X0: u32 = 0x9000_0000;
@@ -107,8 +107,15 @@ struct Sim {
     written: AVec<'static, (u64, AVec<'static, u8>)>,
     /// The destructor the key was made with.
     ender: Option<u64>,
+    /// The next free byte of the simulated data area ([`DATA`] up).
+    data_next: u64,
+    /// The room of each static published, in [`Sim::published`]'s order.
+    rooms: AVec<'static, Room>,
     alloc: Alloc<'static>,
 }
+
+/// The simulated writable data area: apart from the reservation, as the native one is.
+const DATA: u64 = 0x9_0000_0000;
 
 impl Memory for Sim {
     fn stub(&mut self, _slot: SlotId) -> Result<(), RunModeError> {
@@ -127,8 +134,8 @@ impl Memory for Sim {
         THUNKS + 16 * u64::from(slot.0)
     }
 
-    fn outside(&mut self, symbol: Symbol, _name: &str) -> Result<Outside, RunModeError> {
-        Err(RunModeError::Outside { symbol, why: "the simulation binds no C names" })
+    fn outside(&mut self, symbol: Symbol, name: &str) -> Result<Outside, RunModeError> {
+        Err(RunModeError::Outside { symbol, name: super::CName::new(name), why: "the simulation binds no C names" })
     }
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
@@ -158,10 +165,17 @@ impl Memory for Sim {
         WORDS - 8 * (u64::from(index) + 1)
     }
 
-    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8]) -> Result<(), RunModeError> {
+    fn reserve_data(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
+        let at = self.data_next.next_multiple_of(align as u64);
+        self.data_next = at + len as u64;
+        Ok(at)
+    }
+
+    fn publish_static(&mut self, index: u32, at: u64, bytes: &[u8], room: Room) -> Result<(), RunModeError> {
         let mut kept = Vec::new_in(self.alloc);
         kept.extend_from_slice(bytes);
         self.published.push((index, at, kept));
+        self.rooms.push(room);
         self.order.push("static");
         Ok(())
     }
@@ -215,6 +229,8 @@ fn run_with(code: AVec<'static, u8>, statics: &[(Symbol, AVec<'static, u8>)], tw
         order: Vec::new_in(alloc),
         written: Vec::new_in(alloc),
         ender: None,
+        data_next: DATA,
+        rooms: Vec::new_in(alloc),
         alloc,
     };
     let mut mode = RunMode::new(alloc);
@@ -265,9 +281,9 @@ fn run_with(code: AVec<'static, u8>, statics: &[(Symbol, AVec<'static, u8>)], tw
 /// Steps 1 and 2: `S` (plain bytes) and `T` (its value `S`'s address, its own byte 8's, and
 /// `f`'s thunk) are placed before `f`, together; `f`'s load reads `S`'s word; each word of `T`
 /// holds what it names. Controls: `f` published with no `Data` is refused naming `S`; the same
-/// static sent twice is refused; a writable static is refused by name (step 3 to come).
+/// static sent twice is refused.
 /// Prints "run mode: 2 statics placed before the record naming them; its load reads S's word;
-/// T holds S, itself and f; 3 controls refused".
+/// T holds S, itself and f; 2 controls refused".
 #[test]
 fn a_static_is_placed_before_the_record_that_names_it() {
     let alloc = Alloc::global();
@@ -312,10 +328,101 @@ fn a_static_is_placed_before_the_record_that_names_it() {
     // Control: a static told twice.
     let again = run(&[(S, datum(Place::ReadOnly, HELLO, &[], alloc))], true);
     assert!(matches!(again.result, Err(RunModeError::StaticTwice { .. })), "a static sent twice: {:?}", again.result);
-    // Control: a writable static.
-    let writable = run(&[(S, datum(Place::Writable, HELLO, &[], alloc))], false);
-    assert!(matches!(writable.result, Err(RunModeError::NotBuilt { .. })), "a writable static: {:?}", writable.result);
-    println!("run mode: 2 statics placed before the record naming them; its load reads S's word; T holds S, itself and f; 3 controls refused");
+    assert_eq!(m.rooms.as_slice(), &[Room::Code, Room::Code], "read-only statics lie in the code area");
+    println!("run mode: 2 statics placed before the record naming them; its load reads S's word; T holds S, itself and f; 2 controls refused");
+}
+
+/// Step 3 (the Reference, "Static items": a `static mut`, or a static whose type holds an
+/// `UnsafeCell`, is written by the program): a writable datum and a zeroed one are placed in the
+/// writable data area, apart from the code area, and published before the record naming them
+/// as a read-only one is; the writable one's bytes are its initializer's, the zeroed one's are
+/// none (its room is zero as reserved), and the record's load still reads the static's word.
+/// Prints "run mode: a writable and a zeroed static placed in the data area before f".
+#[test]
+fn a_written_static_is_placed_in_the_data_area() {
+    let alloc = Alloc::global();
+    let zeroed = {
+        let sealed = Datum::new_in(Place::Zeroed { len: 64 }, 4, alloc).seal().expect("the zeroed datum seals");
+        let mut out = Vec::new_in(alloc);
+        sealed.encode(&mut out);
+        out
+    };
+    let seen = run(&[(S, datum(Place::Writable, HELLO, &[], alloc)), (T, zeroed)], false);
+    assert_eq!(seen.result, Ok(()), "the run placed both statics and f");
+    let m = &seen.memory;
+    assert_eq!(m.rooms.as_slice(), &[Room::Data, Room::Data], "both in the data area");
+    let (s_index, s_at, s_bytes) = &m.published[0];
+    let (_, t_at, t_bytes) = &m.published[1];
+    assert!(*s_at >= DATA && *t_at >= DATA, "apart from the code area: {s_at:#x} {t_at:#x}");
+    assert_eq!(&s_bytes[..], &HELLO[..], "S's bytes are its initializer's");
+    assert!(t_bytes.is_empty(), "a zeroed static copies nothing");
+    assert_eq!(*t_at % 16, 0, "T is aligned as its datum says");
+    assert!(*t_at >= s_at + HELLO.len() as u64, "the two do not overlap");
+    assert_eq!(m.order.last().copied(), Some("store"), "f's word last: {:?}", m.order);
+    let (code_at, code) = &m.copied[0];
+    let first = u32::from_le_bytes(code[0..4].try_into().expect("4 bytes"));
+    let second = u32::from_le_bytes(code[4..8].try_into().expect("4 bytes"));
+    assert_eq!(adrp_ldr_target(first, second, *code_at), Some(m.static_word(*s_index)), "f's load reads S's word");
+    println!("run mode: a writable and a zeroed static placed in the data area before f");
+}
+
+/// A vtable `V` (a `dyn Sub`'s) and its supertrait's `U`: different domains from the statics'
+/// symbols in the real run (symbols.rs `vtable_symbol`), here plain distinct bytes.
+const V: Symbol = Symbol([0x56; 32]);
+const U: Symbol = Symbol([0x55; 32]);
+
+/// `h`: `adrp x0, V@PAGE; ldr x0, [x0, V@PAGEOFF]; ret`: `V`'s address in `x0`, as a `&dyn`'s
+/// metadata is made.
+fn vtable_code(alloc: Alloc<'static>) -> AVec<'static, u8> {
+    let mut r = CodeRecord::new_in(alloc);
+    for inst in [ADRP_X0, LDR_X0, RET] {
+        r.code.extend_from_slice(&inst.to_le_bytes());
+    }
+    let v = r.target(Target { space: Space::Vtable, symbol: V });
+    r.sites.push(Site { at: 0, kind: SiteKind::Load, target: v, addend: 0 });
+    let sealed = r.seal().expect("the record seals");
+    let mut out = Vec::new_in(alloc);
+    sealed.encode(&mut out);
+    out
+}
+
+/// A vtable is a read-only datum the parent sends as `Data` before its first namer (the Reference,
+/// "Trait objects": the pointer's metadata is the vtable's address): `V`'s header is drop glue
+/// (here `f`), size 4, align 4, its method word `f` and its supercast word `U`'s address; the
+/// namer's `Space::Vtable` load reads `V`'s word; each word holds what it names, a fn's thunk
+/// (so a later tier moves no table) and `U`'s placed address. Control: `h` with no `Data` is
+/// refused naming `V`.
+/// Prints "run mode: vtable V placed as a datum before h; h's load reads V's word; V holds f's thunk twice and U; 1 control refused".
+#[test]
+fn a_vtable_is_placed_as_a_datum_before_the_record_that_names_it() {
+    let alloc = Alloc::global();
+    let f = Target { space: Space::Func, symbol: F };
+    let mut header = [0u8; 40];
+    header[8..16].copy_from_slice(&4u64.to_le_bytes());
+    header[16..24].copy_from_slice(&4u64.to_le_bytes());
+    let v = datum(Place::ReadOnly, &header, &[(0, Some(f), 0), (24, Some(f), 0), (32, Some(Target { space: Space::Vtable, symbol: U }), 0)], alloc);
+    let u = datum(Place::ReadOnly, &header[..32], &[(24, Some(f), 0)], alloc);
+    let seen = run_with(vtable_code(alloc), &[(V, v), (U, u)], false, 0);
+    assert_eq!(seen.result, Ok(()), "the run placed the vtables and h");
+    let m = &seen.memory;
+    assert_eq!(m.published.len(), 2, "both vtables placed");
+    assert_eq!(m.order.last().copied(), Some("store"), "h's word last: {:?}", m.order);
+    let (v_index, _, v_bytes) = &m.published[0];
+    let (_, u_at, _) = &m.published[1];
+    let word = |at: usize| u64::from_le_bytes(v_bytes[at..at + 8].try_into().expect("8 bytes"));
+    assert_eq!((word(0), word(8), word(16), word(24), word(32)), (m.thunk(SlotId(0)), 4, 4, m.thunk(SlotId(0)), *u_at), "V's words");
+    let (code_at, code) = &m.copied[0];
+    let first = u32::from_le_bytes(code[0..4].try_into().expect("4 bytes"));
+    let second = u32::from_le_bytes(code[4..8].try_into().expect("4 bytes"));
+    assert_eq!(adrp_ldr_target(first, second, *code_at), Some(m.static_word(*v_index)), "h's load reads V's word");
+
+    let bare = run_with(vtable_code(alloc), &[], false, 0);
+    assert!(
+        matches!(bare.result, Err(RunModeError::StaticNotTold { symbol, .. }) if symbol == V),
+        "a record naming an untold vtable: {:?}",
+        bare.result
+    );
+    println!("run mode: vtable V placed as a datum before h; h's load reads V's word; V holds f's thunk twice and U; 1 control refused");
 }
 
 /// The thread-local descriptor's symbol, the ender's, and thread-local `N` (its template is the

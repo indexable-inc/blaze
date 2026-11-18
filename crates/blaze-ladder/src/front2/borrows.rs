@@ -629,10 +629,20 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
                     ensure_one(r, Want::Fn(lib));
                 }
                 Some(Origin::Member { container, .. }) => {
-                    if let Some(lib) = r.keys.library_in(r.names, container)
-                        && !container_head(r, lib, false)
-                    {
-                        container_head(r, lib, true);
+                    // The container asked by what it is, never tried as one kind and then the
+                    // other: a struct's ctor (made with the struct's head) and an anonymous
+                    // constant (a member of its module) have no container head to make, and a
+                    // refused ask of one is a seed error that refuses a seeded body (lane FM).
+                    if let Some(lib) = r.keys.library_in(r.names, container) {
+                        match r.names.detail_of(lib) {
+                            Some(blaze_surface::ItemDetail::Impl) => {
+                                container_head(r, lib, false);
+                            }
+                            Some(blaze_surface::ItemDetail::Trait) => {
+                                container_head(r, lib, true);
+                            }
+                            _ => {}
+                        }
                     }
                     // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`).
                     if let Some(w) = member_fn_want(r.names, &*r.keys, key) {

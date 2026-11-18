@@ -153,7 +153,7 @@ fn main() {
             }
         }
         Target::LibTests | Target::Test(_) => {
-            let bytes = encode(names.krate(k), alloc).unwrap_or_else(|e| stop(&out_file, &format!("WALK {member} {target_text}: REFUSED: its tests record: {e} (tree {tree})")));
+            let bytes = encode(names.krate(k), alloc).unwrap_or_else(|e| stop(&out_file, &format!("WALK {member} {target_text}: REFUSED: its tests record: {e} (tree {tree})"))).bytes;
             let record = TestsRecord::open(blaze_scope::resolve::aligned(&bytes, alloc))
                 .unwrap_or_else(|e| stop(&out_file, &format!("WALK {member} {target_text}: REFUSED: its tests record does not open: {e} (tree {tree})")));
             for i in 0..record.len() {

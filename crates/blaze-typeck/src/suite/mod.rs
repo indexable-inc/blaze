@@ -265,13 +265,39 @@ struct Want<'s> {
     diags: &'s [(DiagCode, ExprId)],
 }
 
+/// Checks the body with each solver fact pulled where it is met (the context's way), and again
+/// with each stopped for and the goal asked again (`InferCtx::stop_for_facts`, rule 78): the
+/// two must give one record, read list included, so every case of the suite compares them.
 fn check_body(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, plant: Plant, ip: InferPlant) -> Checked<'static> {
+    let (pulled, rounds) = check_body_by(fx, b, owner, root, plant, ip, false);
+    let (stopped, again) = check_body_by(fx, b, owner, root, plant, ip, true);
+    assert!(pulled == stopped, "`{}`: the pull and the stop differ:\n{pulled:?}\n{stopped:?}", fx.name_of(owner));
+    assert!(rounds <= again, "`{}`: the pull asked {rounds} goals again, the stop {again}", fx.name_of(owner));
+    pulled
+}
+
+/// The comparison compares something: the stop asks goals again for facts, the pull asks none
+/// (`ConstHolds` is the one question still stopped for; this body asks none).
+#[test]
+fn pull_asks_no_goal_again() {
+    let (fx, it) = world();
+    let (b, root, owner) = case_where_clause(&it);
+    let (_, pulled) = check_body_by(&fx, &b, owner, root, Plant::None, InferPlant::None, false);
+    let (_, stopped) = check_body_by(&fx, &b, owner, root, Plant::None, InferPlant::None, true);
+    assert_eq!(pulled, 0, "the pull asked goals again");
+    assert!(stopped > 0, "the stop asked no goal again: the suite's comparison compares nothing");
+}
+
+/// One check of the body; `stop`: the stop strategy. Also how many goals were asked again
+/// after a fact was filled.
+fn check_body_by(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, plant: Plant, ip: InferPlant, stop: bool) -> (Checked<'static>, u64) {
     let mut cx = InferCtx::new_in(Alloc::global());
     cx.plant = ip;
+    cx.stop_for_facts = stop;
     cx.facts.first_impl_only = ip == InferPlant::FirstImpl;
     cx.facts.drop_const_clauses = ip == InferPlant::DropConstClauses;
     match check_with(&b.view(owner, root), fx, &mut cx, &Needs::new_in(Alloc::global()), plant, Alloc::global()) {
-        Ok(Outcome::Done(c)) => c,
+        Ok(Outcome::Done(c)) => (c, cx.need_rounds),
         Ok(Outcome::Need(n)) => panic!("`{}`: the world missed {:?}", fx.name_of(owner), n.questions),
         Err(e) => panic!("`{}`: {e:?}", fx.name_of(owner)),
     }

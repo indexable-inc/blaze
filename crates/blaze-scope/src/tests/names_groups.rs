@@ -37,12 +37,12 @@ use crate::{GroupRead, NameGroup};
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One crate's groups, solved from `texts`: each group's members (by path) and record.
-struct Groups {
-    groups: Vec<(Vec<std::string::String>, NameGroup<'static>)>,
+pub(super) struct Groups {
+    pub(super) groups: Vec<(Vec<std::string::String>, NameGroup<'static>)>,
 }
 
 impl Groups {
-    fn solve(texts: &'static Texts) -> Groups {
+    pub(super) fn solve(texts: &'static Texts) -> Groups {
         let g = blaze_own::testing::heap().alloc();
         let inputs = [input("k0", "/k0/lib.rs", &[])];
         let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Grouped, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
@@ -134,8 +134,8 @@ pub mod d {
     pub use crate::c::S as U;
 }
 ";
-static PLAIN_T: Texts = Texts(&[&[("/k0/lib.rs", PLAIN)]]);
-static PLAIN_FN_T: Texts = Texts(&[&[("/k0/lib.rs", PLAIN_FN)]]);
+pub(super) static PLAIN_T: Texts = Texts(&[&[("/k0/lib.rs", PLAIN)]]);
+pub(super) static PLAIN_FN_T: Texts = Texts(&[&[("/k0/lib.rs", PLAIN_FN)]]);
 
 #[test]
 fn a_private_fn_added_rewrites_its_modules_group_alone() {
@@ -147,6 +147,26 @@ fn a_private_fn_added_rewrites_its_modules_group_alone() {
     std::println!("NAMES GROUPS: a private fn added rewrote {} of {} group record(s) (floor 1): {rewritten:?}", rewritten.len(), after.groups.len());
     assert_eq!(rewritten, std::vec![std::vec![std::string::String::from("k0::a")]], "the records rewritten are not `a`'s group alone");
     holds(&before, &after);
+}
+
+/// A record gives each member's finished scope back (what a one-group solve answers a module
+/// outside the group by), and refuses a module that is not a member by name.
+#[test]
+fn names_groups_record_gives_each_members_scope() {
+    for texts in [&PLAIN_T, &CYCLE_T] {
+        let solved = Groups::solve(texts);
+        for (paths, g) in solved.groups.iter() {
+            for &m in g.members.iter() {
+                let bytes = g.scope_of(m).unwrap_or_else(|e| panic!("{paths:?}: {e:?}"));
+                let view = blaze_surface::ScopeView::read(bytes).unwrap_or_else(|e| panic!("{paths:?}: the scope does not read: {e:?}"));
+                assert_eq!(view.module(), m, "{paths:?}: another member's scope");
+            }
+            let other = solved.groups.iter().map(|(_, o)| o.members[0]).find(|k| !g.members.contains(k));
+            if let Some(other) = other {
+                assert_eq!(g.scope_of(other), Err(crate::GroupRecordError::NotMember { module: other }), "{paths:?}: a non-member's scope");
+            }
+        }
+    }
 }
 
 // A `pub use` added to `a` of a name `r` reads through two globs (absent in `a` before);
@@ -184,8 +204,8 @@ pub mod s {
     pub use crate::a::S as V;
 }
 ";
-static USE_T: Texts = Texts(&[&[("/k0/lib.rs", USE)]]);
-static USE_ADDED_T: Texts = Texts(&[&[("/k0/lib.rs", USE_ADDED)]]);
+pub(super) static USE_T: Texts = Texts(&[&[("/k0/lib.rs", USE)]]);
+pub(super) static USE_ADDED_T: Texts = Texts(&[&[("/k0/lib.rs", USE_ADDED)]]);
 
 #[test]
 fn a_pub_use_added_rewrites_its_readers_groups_alone() {
@@ -198,16 +218,20 @@ fn a_pub_use_added_rewrites_its_readers_groups_alone() {
     holds(&before, &after);
 }
 
-// `a` and `b` glob each other, and `c` names `Y` through `a`'s glob and `X` through `b`'s: the
-// cells read each other both ways, one group (a glob no name is asked through reads nothing).
+// `a` and `b` glob each other and each imports a name through its glob from the other: one
+// group. `c` names `Y` through `a`'s glob and `X` through `b`'s: it reads both (a lookup another
+// module asks is the asker's read, never the module's, so a glob no own import reads through
+// makes no cycle).
 const CYCLE: &str = "#![no_core]
 pub mod a {
     pub use crate::b::*;
     pub struct X;
+    use self::Y as Y2;
 }
 pub mod b {
     pub use crate::a::*;
     pub struct Y;
+    use self::X as X2;
 }
 pub mod c {
     pub use crate::a::Y as W;
@@ -218,10 +242,12 @@ const CYCLE_EDIT: &str = "#![no_core]
 pub mod a {
     pub use crate::b::*;
     pub struct X;
+    use self::Y as Y2;
 }
 pub mod b {
     pub use crate::a::*;
     pub struct Y;
+    use self::X as X2;
     pub struct Z;
 }
 pub mod c {
@@ -229,8 +255,8 @@ pub mod c {
     pub use crate::b::X as V;
 }
 ";
-static CYCLE_T: Texts = Texts(&[&[("/k0/lib.rs", CYCLE)]]);
-static CYCLE_EDIT_T: Texts = Texts(&[&[("/k0/lib.rs", CYCLE_EDIT)]]);
+pub(super) static CYCLE_T: Texts = Texts(&[&[("/k0/lib.rs", CYCLE)]]);
+pub(super) static CYCLE_EDIT_T: Texts = Texts(&[&[("/k0/lib.rs", CYCLE_EDIT)]]);
 
 #[test]
 fn a_glob_cycle_of_two_modules_is_one_group() {
@@ -244,31 +270,28 @@ fn a_glob_cycle_of_two_modules_is_one_group() {
     holds(&before, &after);
 }
 
-// `b` reads `a`'s `S` and `Q` (`a` holds both); then `a` holds `Q` no more and globs `b`, which
-// does: `b`'s read of `a`'s `Q` goes through the glob back to `b`, which closes a cycle.
+// `b` reads `a`'s `S`; then `a` imports `b`'s `Q`, which closes a cycle (only `a`'s text moved).
 const CUT: &str = "#![no_core]
 pub mod a {
     pub struct S;
-    pub struct Q;
 }
 pub mod b {
     pub use crate::a::S as T;
-    pub use crate::a::Q as R;
+    pub struct Q;
 }
 ";
 const RECUT: &str = "#![no_core]
 pub mod a {
     pub struct S;
-    pub use crate::b::*;
+    pub use crate::b::Q;
 }
 pub mod b {
     pub use crate::a::S as T;
-    pub use crate::a::Q as R;
     pub struct Q;
 }
 ";
-static CUT_T: Texts = Texts(&[&[("/k0/lib.rs", CUT)]]);
-static RECUT_T: Texts = Texts(&[&[("/k0/lib.rs", RECUT)]]);
+pub(super) static CUT_T: Texts = Texts(&[&[("/k0/lib.rs", CUT)]]);
+pub(super) static RECUT_T: Texts = Texts(&[&[("/k0/lib.rs", RECUT)]]);
 
 #[test]
 fn an_import_that_closes_a_cycle_re_cuts_the_groups() {
@@ -295,8 +318,8 @@ pub mod m {
 }
 macro_rules! mac { () => { pub struct One; } }
 ";
-static RULES_BELOW_T: Texts = Texts(&[&[("/k0/lib.rs", RULES_BELOW)]]);
-static RULES_ABOVE_T: Texts = Texts(&[&[("/k0/lib.rs", RULES_ABOVE)]]);
+pub(super) static RULES_BELOW_T: Texts = Texts(&[&[("/k0/lib.rs", RULES_BELOW)]]);
+pub(super) static RULES_ABOVE_T: Texts = Texts(&[&[("/k0/lib.rs", RULES_ABOVE)]]);
 
 #[test]
 fn a_macro_moved_above_a_mod_line_moves_the_textual_cell() {

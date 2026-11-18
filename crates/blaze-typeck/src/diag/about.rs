@@ -9,7 +9,7 @@
 //! written. The fields stay readable (front2 prints them) and a rule may add a `because` to the
 //! finding it just made (`d.because = Some(..)`), never take content away.
 
-use super::{At, Because, Diag, DiagCode, PendingDiag, PendingGoal, Said};
+use super::{At, Because, Diag, DiagCode, PendingDiag, PendingGoal, Said, UnsafeOp};
 use crate::ids::{Name, Range};
 use crate::portable::PTy;
 use crate::ty::Ty;
@@ -35,6 +35,8 @@ pub(crate) enum About {
     /// A rule of the Rust Reference refuses the construct outright, no type asked
     /// ([`Because::Reference`]: `rule` its identifier, `says` its words, quoted).
     Rule { rule: &'static str, says: &'static str },
+    /// An operation only `unsafe` code may do, met outside it ([`Because::Unsafe`], E0133).
+    Unsafe(UnsafeOp),
 }
 
 impl About {
@@ -91,6 +93,7 @@ impl PendingDiag {
             About::Path { last: None } => (None, None, None, Some(Because::NoSegment)),
             About::Count { expected, got, found } => (None, found, None, Some(Because::Count { expected, got })),
             About::Rule { rule, says } => (None, None, None, Some(Because::Reference { rule, says })),
+            About::Unsafe(op) => (None, None, None, Some(Because::Unsafe(op))),
         };
         PendingDiag { code, at, expected, found, name, because, unmet: None, said: Said(()) }
     }

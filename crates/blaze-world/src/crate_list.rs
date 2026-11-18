@@ -25,13 +25,16 @@
 
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::{AVec, Alloc};
+use blaze_scope::crate_env::{EnvFacts, SeenRoot};
+use blaze_scope::resolve::SourceTexts;
 
 use crate::{Origin, PackOrigin, Side, World};
 
 const MAGIC: &[u8; 4] = b"BZCL";
 /// 2: the tree table and the corrected files (a body job serves its dependencies' texts from
-/// them); a version-1 list is refused by name at [`CrateList::open`].
-pub const VERSION: u16 = 2;
+/// them); a version-1 list is refused by name at [`CrateList::open`]. 3: each row's
+/// environment facts ([`CrateList::env_facts`]: a body's `env!` is answered from them).
+pub const VERSION: u16 = 3;
 /// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16, `t` 4, `c` 4.
 pub const HEADER_LEN: usize = 44;
 /// kind 1 ([`SHELF`] or [`SOURCE`]), pad 3, its name 32 (shelf digest or store key), its files'
@@ -44,8 +47,24 @@ const SHELF: u8 = 1;
 /// A tree whose pack is a record of the sources store ([`PackOrigin::Source`]).
 const SOURCE: u8 = 2;
 /// key 32, name 8, root 8, shown_from 8, deps 8, side 1, flags 1, script kind 1, pad 1, script
-/// subject 32.
-pub const ROW: usize = 100;
+/// subject 32, then the crate's environment facts (blaze-scope `EnvFacts`, from its
+/// `CrateEnv::facts`): crate name 8, package name 8, package version 8, binary name 8, the
+/// member's dir 8, env flags 1 ([`ENV_PACKAGE`] ..), pad 3.
+pub const ROW: usize = 144;
+/// Where a row's environment facts start.
+const ENV_AT: usize = 100;
+
+/// The crate has a package (name and version at 108, 116); a toolchain crate has none.
+const ENV_PACKAGE: u8 = 1;
+/// A binary: its name at 124.
+const ENV_BIN: u8 = 2;
+/// Its package has a build script.
+const ENV_BUILD_SCRIPT: u8 = 4;
+/// An integration test or a bench.
+const ENV_TEST_OR_BENCH: u8 = 8;
+/// It sees its workspace member's dir (at 132; D96 `SeenRoot::Member`), else `/package`.
+const ENV_MEMBER: u8 = 16;
+const ENV_FLAGS: u8 = ENV_PACKAGE | ENV_BIN | ENV_BUILD_SCRIPT | ENV_TEST_OR_BENCH | ENV_MEMBER;
 /// name 8, row 4.
 pub const DEP: usize = 12;
 /// No row (a sysroot crate the world has not).
@@ -113,6 +132,8 @@ pub enum ListError {
     Version { found: u16 },
     /// The world's packs and their origins are not one to one (`Texts::origins`).
     Origins { packs: usize, origins: usize },
+    /// The world holds no environment for its crate `at` (`Texts::crate_env`).
+    NoEnv { at: usize },
 }
 
 impl core::fmt::Display for ListError {
@@ -125,6 +146,7 @@ impl core::fmt::Display for ListError {
             ListError::SameKey { first, second } => write!(f, "crates {first} and {second} of the world have one key (rule 21: its key misses an input)"),
             ListError::TooLarge { what } => write!(f, "the crate list's {what} is past what its form holds"),
             ListError::Form { what, at } => write!(f, "not a crate list of this form: {what} (at byte {at})"),
+            ListError::NoEnv { at } => write!(f, "crate {at} of the world has no environment (blaze-world `Texts::crate_env`)"),
         }
     }
 }
@@ -199,6 +221,36 @@ pub fn encode<'a>(world: &World<'_>, script_of: &dyn Fn(usize) -> Option<[u8; 33
                 rows.extend_from_slice(&[0; 34]);
             }
         }
+        // The environment's facts, as the world made it (its `CrateEnv`, never joined with a
+        // script's record: that is read by each reader as its own input).
+        let env = world.texts.crate_env(at).ok_or(ListError::NoEnv { at })?.facts();
+        let mut env_flags = 0;
+        rows.extend_from_slice(&text(env.crate_name, &mut heap)?);
+        let (package, version) = env.package.unwrap_or(("", ""));
+        if env.package.is_some() {
+            env_flags |= ENV_PACKAGE;
+        }
+        rows.extend_from_slice(&text(package, &mut heap)?);
+        rows.extend_from_slice(&text(version, &mut heap)?);
+        if env.bin.is_some() {
+            env_flags |= ENV_BIN;
+        }
+        rows.extend_from_slice(&text(env.bin.unwrap_or(""), &mut heap)?);
+        let dir = match env.seen {
+            SeenRoot::Package => "",
+            SeenRoot::Member { dir } => {
+                env_flags |= ENV_MEMBER;
+                dir
+            }
+        };
+        rows.extend_from_slice(&text(dir, &mut heap)?);
+        if env.build_script {
+            env_flags |= ENV_BUILD_SCRIPT;
+        }
+        if env.test_or_bench {
+            env_flags |= ENV_TEST_OR_BENCH;
+        }
+        rows.extend_from_slice(&[env_flags, 0, 0, 0]);
     }
     // The trees past the checkout, in the world's order (tree `k` is pack `k - 1`).
     let (packs, origins) = (world.texts.packs(), world.texts.origins());
@@ -343,6 +395,18 @@ impl<'b> CrateList<'b> {
             if row[64] > 1 {
                 return Err(form("a side that is neither target nor macro", HEADER_LEN + r * ROW + 64));
             }
+            for at in [ENV_AT, ENV_AT + 8, ENV_AT + 16, ENV_AT + 24, ENV_AT + 32] {
+                if !text_ok(row, at) {
+                    return Err(form("a row's environment string is outside the heap", HEADER_LEN + r * ROW + at));
+                }
+            }
+            if row[ENV_AT + 40] & !ENV_FLAGS != 0 || row[ENV_AT + 41..ENV_AT + 44] != [0, 0, 0] {
+                return Err(form("a row's environment flags name no fact", HEADER_LEN + r * ROW + ENV_AT + 40));
+            }
+            // The member's dir is checked here once, so the facts read later need no check.
+            if row[ENV_AT + 40] & ENV_MEMBER != 0 && SeenRoot::member(list.text(row, ENV_AT + 32)).is_err() {
+                return Err(form("a row's member dir is not a plain path under the workspace", HEADER_LEN + r * ROW + ENV_AT + 32));
+            }
             if r > 0 && list.row(r - 1)[..32] >= row[..32] {
                 return Err(form("the rows are not strictly by key", HEADER_LEN + r * ROW));
             }
@@ -457,6 +521,37 @@ impl<'b> CrateList<'b> {
         name[1..].copy_from_slice(&row[68..100]);
         Some(name)
     }
+    /// The facts of its environment as the world made it (blaze-scope `CrateEnv::facts`), its
+    /// files read under `shown_from`: `CrateEnv::of` of them answers every `env!` as the
+    /// world's environment of the crate does. No script record is joined (`script: None`): a
+    /// reader with the crate's `Script` input passes its outputs in the facts it hands `of`.
+    pub fn env_facts(&self, r: usize) -> EnvFacts<'b> {
+        let row = self.row(r);
+        let flags = row[ENV_AT + 40];
+        EnvFacts {
+            crate_name: self.text(row, ENV_AT),
+            package: (flags & ENV_PACKAGE != 0).then(|| (self.text(row, ENV_AT + 8), self.text(row, ENV_AT + 16))),
+            bin: (flags & ENV_BIN != 0).then(|| self.text(row, ENV_AT + 24)),
+            // A member's dir was checked a plain path at `open`.
+            seen: if flags & ENV_MEMBER != 0 { SeenRoot::Member { dir: self.text(row, ENV_AT + 32) } } else { SeenRoot::Package },
+            read_folder: self.shown_from(r),
+            build_script: flags & ENV_BUILD_SCRIPT != 0,
+            script: None,
+            test_or_bench: flags & ENV_TEST_OR_BENCH != 0,
+        }
+    }
+}
+
+/// Whether two environments' facts are one (the script record aside): `read_folder` compared
+/// without its trailing `/`, as `CrateEnv::of` keeps it.
+fn same_facts(a: &EnvFacts<'_>, b: &EnvFacts<'_>) -> bool {
+    a.crate_name == b.crate_name
+        && a.package == b.package
+        && a.bin == b.bin
+        && a.seen == b.seen
+        && a.read_folder.trim_end_matches('/') == b.read_folder.trim_end_matches('/')
+        && a.build_script == b.build_script
+        && a.test_or_bench == b.test_or_bench
 }
 
 impl<'b> CrateGraph<'b> for CrateList<'b> {
@@ -488,7 +583,7 @@ impl<'b> CrateGraph<'b> for CrateList<'b> {
 
 /// How many fields of `world`'s crates differ from `list`'s rows (each crate found by its key;
 /// a crate with no row counts once): 0 when the list is the world's. The fields: name, root,
-/// shown_from, side, proc_macro, toolchain, member, refused, sysroot, each dependency's name and
+/// shown_from, side, proc_macro, toolchain, member, refused, the environment's facts, sysroot, each dependency's name and
 /// key, each tree's origin and files, and each corrected file.
 pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
     let mut differ = 0;
@@ -508,7 +603,8 @@ pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
             + usize::from(list.proc_macro(r) != c.proc_macro)
             + usize::from(list.toolchain(r) != world.toolchain(at))
             + usize::from(list.member(r) != c.input.root.starts_with("/0/"))
-            + usize::from(list.refused(r) != world.refused(at));
+            + usize::from(list.refused(r) != world.refused(at))
+            + usize::from(!world.texts.crate_env(at).is_some_and(|env| same_facts(&env.facts(), &list.env_facts(r))));
         let mut deps = list.deps_named(r);
         for (name, dep) in c.input.deps.iter() {
             match deps.next() {

@@ -21,7 +21,7 @@ use blaze_own::Alloc;
 
 use crate::assembly::{Clause, Goal};
 use crate::eval::{Answer, Off, Solver, Stats};
-use crate::facts::Read;
+use crate::facts::{Facts, Read};
 use crate::term::TypingMode;
 use crate::testing::parse::{CheckA, DeclA, parse_file};
 use crate::testing::run::PRELUDE;
@@ -52,16 +52,157 @@ impl Run {
 /// Solves every goal of the one case in `text` (decls first) with one solver, or with
 /// `fresh`, each goal with its own solver and arena (no cache, no fast path).
 pub(crate) fn run(text: &str) -> Result<Run, String> {
-    run_with(text, false, ON)
+    run_with(text, false, ON, Feed::Whole)
+}
+
+/// How the solver gets its facts in a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Feed {
+    /// The whole world, nothing ever missing.
+    Whole,
+    /// [`Shy`] (each question missing at its first ask) with the stop: the evaluation stops
+    /// with `Need`, the caller fills it and asks the root again (`Stopping`).
+    ShyStop,
+    /// [`Shy`] with the pull: the solver fills it where it is met and redoes that step.
+    ShyPull,
+}
+
+/// The world answering `Missing` to each question until it is filled: the stop path's worst
+/// case, every fact a body reads not yet in its cache.
+struct Shy<'w> {
+    world: &'w World,
+    given: std::collections::HashSet<crate::facts::Question>,
+}
+
+impl Shy<'_> {
+    fn gate(&self, q: crate::facts::Question) -> crate::facts::Fetch<()> {
+        if self.given.contains(&q) { Ok(()) } else { Err(crate::facts::Missing) }
+    }
+}
+
+impl crate::facts::Facts for Shy<'_> {
+    fn trait_def(&self, seal: crate::facts::Seal, t: crate::term::Def) -> crate::facts::Fetch<crate::facts::TraitDef<'_>> {
+        self.gate(crate::facts::Question::TraitDef(t))?;
+        self.world.trait_def(seal, t)
+    }
+    fn impls(&self, seal: crate::facts::Seal, t: crate::term::Def, shape: crate::term::Shape) -> crate::facts::Fetch<crate::facts::ImplSet<'_>> {
+        self.gate(crate::facts::Question::Impls(t, shape))?;
+        self.world.impls(seal, t, shape)
+    }
+    fn impl_header(&self, seal: crate::facts::Seal, i: crate::term::Def) -> crate::facts::Fetch<crate::facts::ImplHeader<'_>> {
+        self.gate(crate::facts::Question::ImplHeader(i))?;
+        self.world.impl_header(seal, i)
+    }
+    fn adt(&self, seal: crate::facts::Seal, d: crate::term::Def) -> crate::facts::Fetch<crate::facts::AdtDef<'_>> {
+        self.gate(crate::facts::Question::Adt(d))?;
+        self.world.adt(seal, d)
+    }
+    fn fn_sig(&self, seal: crate::facts::Seal, d: crate::term::Def) -> crate::facts::Fetch<crate::facts::FnSigDef<'_>> {
+        self.gate(crate::facts::Question::FnSig(d))?;
+        self.world.fn_sig(seal, d)
+    }
+    fn assoc(&self, seal: crate::facts::Seal, d: crate::term::Def) -> crate::facts::Fetch<crate::facts::AssocDef> {
+        self.gate(crate::facts::Question::Assoc(d))?;
+        self.world.assoc(seal, d)
+    }
+    fn opaque(&self, seal: crate::facts::Seal, d: crate::term::Def) -> crate::facts::Fetch<crate::facts::OpaqueDef<'_>> {
+        self.gate(crate::facts::Question::Opaque(d))?;
+        self.world.opaque(seal, d)
+    }
+    fn lang(&self, seal: crate::facts::Seal, l: crate::term::Lang) -> crate::facts::Fetch<Option<crate::term::Def>> {
+        self.gate(crate::facts::Question::Lang(l))?;
+        self.world.lang(seal, l)
+    }
+    fn is_local(&self, seal: crate::facts::Seal, d: crate::term::Def) -> crate::facts::Fetch<bool> {
+        self.gate(crate::facts::Question::IsLocal(d))?;
+        self.world.is_local(seal, d)
+    }
+    /// Its question names the caller's terms, not the arguments: answered at once.
+    fn const_holds(&self, seal: crate::facts::Seal, cond: crate::term::Def, args: &[crate::term::Ty]) -> crate::facts::Fetch<crate::facts::ConstHolds> {
+        self.world.const_holds(seal, cond, args)
+    }
+    fn specializes(&self, seal: crate::facts::Seal, a: crate::term::Def, b: crate::term::Def) -> crate::facts::Fetch<bool> {
+        self.gate(crate::facts::Question::Specializes(a, b))?;
+        self.world.specializes(seal, a, b)
+    }
+}
+
+/// The pull over [`Shy`]: a fill gives the question; a second fill of one question is a step
+/// that did not see its fill, refused (`false`) so the run fails with the `Need`.
+struct ShyPull<'s, 'w>(&'s mut Shy<'w>);
+
+impl<'w, T: Tys> crate::facts::Source<T> for ShyPull<'_, 'w> {
+    type Facts = Shy<'w>;
+    const PULLS: bool = true;
+    fn facts(&self) -> &Shy<'w> {
+        &*self.0
+    }
+    fn fill(&mut self, _tys: &mut T, q: crate::facts::Question) -> bool {
+        self.0.given.insert(q)
+    }
+}
+
+/// The most `Need` rounds the stop path's loop takes for one ask (a fixture reads far fewer).
+const MAX_ROUNDS: usize = 1 << 14;
+
+/// `Solver::evaluate` under `feed`: with `ShyStop` the caller's loop, filling each `Need` and
+/// asking the root again, as typeck's `InferCtx::evaluate` did.
+fn eval_fed(
+    feed: Feed,
+    solver: &mut Solver<'static>,
+    tys: &mut TestTys,
+    shy: &mut Shy<'_>,
+    goal: Goal,
+    reads: &mut blaze_own::Vec<Read, Alloc<'static>>,
+) -> Result<Answer, crate::error::Stop> {
+    let mode = TypingMode::Analysis;
+    match feed {
+        Feed::Whole => solver.evaluate(tys, shy.world, mode, goal, reads),
+        Feed::ShyPull => solver.evaluate_from(tys, &mut ShyPull(shy), mode, goal, reads),
+        Feed::ShyStop => {
+            for _ in 0..MAX_ROUNDS {
+                match solver.evaluate(tys, &*shy, mode, goal, reads) {
+                    Err(crate::error::Stop::Need(q)) if shy.given.insert(q) => {}
+                    r => return r,
+                }
+            }
+            Err(crate::error::Stop::Error(crate::error::SolveError::Limit(crate::error::Limit::Rounds)))
+        }
+    }
+}
+
+/// `Solver::env` under `feed` (see [`eval_fed`]).
+fn env_fed(
+    feed: Feed,
+    solver: &mut Solver<'static>,
+    tys: &mut TestTys,
+    shy: &mut Shy<'_>,
+    clauses: &[Clause],
+    reads: &mut blaze_own::Vec<Read, Alloc<'static>>,
+) -> Result<crate::assembly::EnvId, crate::error::Stop> {
+    match feed {
+        Feed::Whole => solver.env(tys, shy.world, clauses, reads),
+        Feed::ShyPull => solver.env_from(tys, &mut ShyPull(shy), clauses, reads),
+        Feed::ShyStop => {
+            for _ in 0..MAX_ROUNDS {
+                reads.clear();
+                match solver.env(tys, &*shy, clauses, reads) {
+                    Err(crate::error::Stop::Need(q)) if shy.given.insert(q) => {}
+                    r => return r,
+                }
+            }
+            Err(crate::error::Stop::Error(crate::error::SolveError::Limit(crate::error::Limit::Rounds)))
+        }
+    }
 }
 
 /// Every shortcut on.
-const ON: Off = Off { summaries: false, prematch: false };
+const ON: Off = Off { summaries: false, prematch: false, memo: false };
 /// Every shortcut off: each step as the rules take it.
-const PLAIN: Off = Off { summaries: true, prematch: true };
+const PLAIN: Off = Off { summaries: true, prematch: true, memo: true };
 
 /// `off`: the shortcuts turned off (eval.rs `Off`).
-fn run_with(text: &str, fresh: bool, off: Off) -> Result<Run, String> {
+fn run_with(text: &str, fresh: bool, off: Off, feed: Feed) -> Result<Run, String> {
     let prelude = parse_file(PRELUDE).map_err(|e| format!("the prelude: {e}"))?;
     let f = parse_file(text).map_err(|e| format!("the fixture: {e}"))?;
     let [case] = f.cases.as_slice() else { return Err(format!("{} cases, want one", f.cases.len())) };
@@ -70,6 +211,7 @@ fn run_with(text: &str, fresh: bool, off: Off) -> Result<Run, String> {
     decls.extend(f.decls.iter().map(|(l, d)| (*l, d)));
     decls.extend(case.decls.iter().map(|(l, d)| (*l, d)));
     let world = World::build(&decls).map_err(|e| format!("the world: {e}"))?;
+    let mut shy = Shy { world: &world, given: std::collections::HashSet::new() };
     let alloc = blaze_own::testing::heap().alloc();
     let mut tys = TestTys::new();
     let mut vars = std::collections::HashMap::new();
@@ -90,7 +232,7 @@ fn run_with(text: &str, fresh: bool, off: Off) -> Result<Run, String> {
         Ok(out)
     };
     let cl0 = clauses(&mut tys, &mut vars)?;
-    let mut env = solver.env(&mut tys, &world, &cl0, &mut reads).map_err(|s| format!("the env: {s:?}"))?;
+    let mut env = env_fed(feed, &mut solver, &mut tys, &mut shy, &cl0, &mut reads).map_err(|s| format!("the env: {s:?}"))?;
     reads.clear();
     let mut answers = Vec::new();
     let mut starts = Vec::new();
@@ -103,7 +245,7 @@ fn run_with(text: &str, fresh: bool, off: Off) -> Result<Run, String> {
             solver.turn_off(off);
             let mut scratch: blaze_own::Vec<Read, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
             let cl = clauses(&mut tys, &mut vars)?;
-            env = solver.env(&mut tys, &world, &cl, &mut scratch).map_err(|s| format!("the env: {s:?}"))?;
+            env = env_fed(feed, &mut solver, &mut tys, &mut shy, &cl, &mut scratch).map_err(|s| format!("the env: {s:?}"))?;
         }
         starts.push(reads.len());
         let mut cl: Vec<Clause> = Vec::new();
@@ -113,8 +255,7 @@ fn run_with(text: &str, fresh: bool, off: Off) -> Result<Run, String> {
         }
         let [c]: [Clause; 1] = cl.try_into().map_err(|_| format!("line {}: a goal is one predicate", g.line))?;
         let snap = tys.snapshot();
-        let a = solver
-            .evaluate(&mut tys, &world, TypingMode::Analysis, Goal { env, pred: c.pred, bound: c.bound }, &mut reads)
+        let a = eval_fed(feed, &mut solver, &mut tys, &mut shy, Goal { env, pred: c.pred, bound: c.bound }, &mut reads)
             .map_err(|s| format!("line {}: the solver stopped: {s:?}", g.line))?;
         tys.rollback_to(snap);
         answers.push(a);
@@ -134,7 +275,7 @@ fn run_with(text: &str, fresh: bool, off: Off) -> Result<Run, String> {
 ///   its set may hold more than the goal-by-goal walk read before its first failing field (a
 ///   larger read list is valid by more facts, never fewer: rule 21).
 fn same_reads(name: &str, text: &str) {
-    let get = |fresh: bool, off: Off| match run_with(text, fresh, off) {
+    let get = |fresh: bool, off: Off| match run_with(text, fresh, off, Feed::Whole) {
         Ok(r) => r,
         Err(e) => panic!("{name} (fresh {fresh}, off {off:?}): {e}"),
     };
@@ -393,7 +534,7 @@ fn cost_fixture_counters() {
         Ok(r) => r,
         Err(e) => panic!("deep: {e}"),
     };
-    let d0 = match run_with(&deep_text(false), false, Off { summaries: false, prematch: true }) {
+    let d0 = match run_with(&deep_text(false), false, Off { summaries: false, prematch: true, memo: false }, Feed::Whole) {
         Ok(r) => r,
         Err(e) => panic!("deep without the pre-match: {e}"),
     };
@@ -434,4 +575,108 @@ fn cost_fixture_counters() {
     ceil("deep terms_imported", d.stats.terms_imported, 160);
     ceil("deep impl_header_mismatch", d.stats.impl_header_mismatch, 0);
     assert_eq!(d.stats.impl_prematch_rejected, 1560, "deep: the pre-match refused other than the 1560 failing headers\n{line}");
+}
+
+/// The pull against the stop (rule 78), over the world that lacks every fact at its first ask
+/// ([`Shy`]): each goal's answer and read set equal the whole world's under both; the stop
+/// path did stop (the control: without the shy world nothing is pulled or stopped for), and
+/// the pull ran every frame once, as many as the whole world's run, none abandoned.
+fn pull_equals_stop(name: &str, text: &str) {
+    let get = |feed: Feed| match run_with(text, false, ON, feed) {
+        Ok(r) => r,
+        Err(e) => panic!("{name} ({feed:?}): {e}"),
+    };
+    let (whole, stop, pull) = (get(Feed::Whole), get(Feed::ShyStop), get(Feed::ShyPull));
+    let line = format!(
+        "{name}: frames whole {} stop {} pull {}; need_stops stop {} pull {}; abandoned stop {} pull {}; pulls {}",
+        whole.stats.frames,
+        stop.stats.frames,
+        pull.stats.frames,
+        stop.stats.need_stops,
+        pull.stats.need_stops,
+        stop.stats.frames_abandoned,
+        pull.stats.frames_abandoned,
+        pull.stats.pulls
+    );
+    std::println!("PULL {line}");
+    assert_eq!(whole.answers, stop.answers, "{line}: answers differ with the stop");
+    assert_eq!(whole.answers, pull.answers, "{line}: answers differ with the pull");
+    for i in 0..whole.answers.len() {
+        let (a, b, c) = (whole.set(i), stop.set(i), pull.set(i));
+        assert!(a == b, "{line}: goal {i} reads {a:?} with the whole world and {b:?} with the stop");
+        assert!(a == c, "{line}: goal {i} reads {a:?} with the whole world and {c:?} with the pull");
+    }
+    assert_eq!((whole.stats.need_stops, whole.stats.pulls), (0, 0), "{line}: the whole world stopped or pulled");
+    assert!(stop.stats.need_stops > 0, "{line}: the shy world never stopped the stop path");
+    assert!(pull.stats.pulls > 0, "{line}: the shy world never pulled");
+    assert_eq!((pull.stats.need_stops, pull.stats.frames_abandoned), (0, 0), "{line}: the pull stopped");
+    assert_eq!(pull.stats.frames, whole.stats.frames, "{line}: the pull ran a frame twice");
+}
+
+/// The plain-goal memo against the canonical walk (eval.rs `Solver::input_of`, rule 78): equal
+/// answers and read sets, each goal asked either walked or skipped (the two sum to the walks
+/// without the memo), and a repeated plain goal costs no walk.
+fn memo_equals_walk(name: &str, text: &str) {
+    const NO_MEMO: Off = Off { summaries: false, prematch: false, memo: true };
+    for feed in [Feed::Whole, Feed::ShyPull] {
+        let get = |off: Off| match run_with(text, false, off, feed) {
+            Ok(r) => r,
+            Err(e) => panic!("{name} (off {off:?}): {e}"),
+        };
+        let (memo, walk) = (get(ON), get(NO_MEMO));
+        let line = format!(
+            "{name}: walked {} skipped {} with the memo, walked {} without",
+            memo.stats.canonicalized, memo.stats.canon_skipped, walk.stats.canonicalized
+        );
+        std::println!("MEMO {line}");
+        assert_eq!(memo.answers, walk.answers, "{line}: answers differ with the memo");
+        for i in 0..memo.answers.len() {
+            let (a, b) = (memo.set(i), walk.set(i));
+            assert!(a == b, "{line}: goal {i} reads {a:?} with the memo and {b:?} without");
+        }
+        assert_eq!(walk.stats.canon_skipped, 0, "{line}: the memo ran while off");
+        assert_eq!(memo.stats.canonicalized + memo.stats.canon_skipped, walk.stats.canonicalized, "{line}: goals asked differ");
+        assert!(memo.stats.canon_skipped > 0, "{line}: no goal was found by its plain key");
+        assert_eq!(memo.stats.frames, walk.stats.frames, "{line}: frames differ with the memo");
+    }
+}
+
+#[test]
+fn memo_equals_walk_nested() {
+    memo_equals_walk("nested", &nested_text());
+}
+
+#[test]
+fn memo_equals_walk_chain() {
+    memo_equals_walk("chain", &chain_text());
+}
+
+#[test]
+fn memo_equals_walk_deep() {
+    memo_equals_walk("deep", &deep_text(true));
+}
+
+#[test]
+fn memo_equals_walk_controls() {
+    memo_equals_walk("controls", &controls_text());
+}
+
+#[test]
+fn pull_equals_stop_nested() {
+    pull_equals_stop("nested", &nested_text());
+}
+
+#[test]
+fn pull_equals_stop_chain() {
+    pull_equals_stop("chain", &chain_text());
+}
+
+#[test]
+fn pull_equals_stop_deep() {
+    pull_equals_stop("deep", &deep_text(true));
+}
+
+#[test]
+fn pull_equals_stop_controls() {
+    pull_equals_stop("controls", &controls_text());
 }

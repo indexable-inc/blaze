@@ -424,9 +424,9 @@ pub fn finding<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], shown: &mut Shown<'f>, 
     // always a note; a finding is one until the check is trusted (`BORROWS_ARE_ERRORS`).
     let borrows_unchecked = l.area == Area::Cli && l.rule == crate::body_types::BORROWS_NOT_CHECKED;
     let borrows_note = borrows_unchecked || (l.area == Area::Cli && l.rule == crate::body_types::BORROWS && !crate::body_types::BORROWS_ARE_ERRORS);
-    // An include read outside its package inside the workspace (names/include_outside.rs,
-    // D111): allowed, a warning; never an error (main.rs `every_rule`).
-    let outside = l.area == Area::Cli && l.rule == crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE;
+    // A names warning (an include read outside its package inside the workspace, D111; a test
+    // marked twice where rustc warns): never an error (main.rs `every_rule`).
+    let outside = l.area == Area::Cli && crate::names::warning(l.rule);
     // A lint finding: the level the step's levels give its rule, now (rule 81). Advice is a
     // warning, and no step's is an error today (main.rs `every_rule`); an `Off` rule is not
     // drawn or counted.
@@ -770,6 +770,8 @@ mod tests {
             (Area::Cli, crate::names::UNRESOLVED),
             (Area::Cli, crate::names::failed_call::FAILED_CALL),
             (Area::Cli, crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE),
+            (Area::Cli, crate::names::test_marks::TEST_REFUSED),
+            (Area::Cli, crate::names::test_marks::TEST_DUPLICATED),
             (Area::Cli, crate::body_types::TYPES),
             (Area::Cli, crate::body_types::TYPES_NOT_CHECKED),
             (Area::Cli, crate::body_types::BORROWS),

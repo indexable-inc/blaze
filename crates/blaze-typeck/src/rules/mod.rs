@@ -49,6 +49,7 @@ pub(crate) mod qpath_defaults;
 pub(crate) mod reify;
 pub(crate) mod self_path;
 pub(crate) mod target_feature;
+pub(crate) mod unsafety;
 pub mod suggest;
 pub(crate) mod writeback;
 

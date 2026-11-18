@@ -396,4 +396,10 @@ impl<'t> Inputs<'t> {
     pub fn resolve_with<P: blaze_scope::task::Par>(&'t self, crates: &[CrateInput<'t>], par: &P, alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
         resolve_crates(crates, self.sysroot, &self.texts, par, alloc)
     }
+
+    /// The names with `roots` (crate indices) solved whole and every other crate's groups on
+    /// demand (E13, blaze-scope cells/lazy_deps.rs).
+    pub fn names_on_demand(&'t self, crates: &[CrateInput<'t>], roots: &[usize], alloc: Alloc<'t>) -> Result<blaze_scope::NamesOnDemand<'t>, blaze_scope::NamesOnDemandError<'t>> {
+        blaze_scope::names_on_demand(crates, self.sysroot, &self.texts, roots, alloc)
+    }
 }

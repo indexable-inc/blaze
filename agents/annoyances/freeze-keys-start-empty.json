@@ -1,0 +1,15 @@
+{
+ "id": "freeze-keys-start-empty",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane FM",
+ "where": "crates/blaze-ladder/src/front2/tables/head.rs freeze_seeded (the constant evaluator), keys.rs library_in, body.rs:909",
+ "what": "Evaluating a free constant inside a head freeze failed twice before it worked: first 'member fn ...: its head is not in the store' (the constant's own head was never made in the freeze's store), then 'has a head but is filed as no member of a trait, an impl or a module (a free fn is lowered by `lower_fn`)'. A freeze's `Keys` starts empty, while `Front2::new` files every item in a body's keys; `library_in` falls back to `names.key_beginning`, which is `None` for `&Names`, so the evaluator's body lowering could not place the constant.",
+ "cost": "two runner rounds (about 15 minutes of queue)",
+ "cause": "two stores (a body's and a freeze's) are built by different code with different starting key tables, and the evaluator assumes the body's",
+ "whys": "nothing states what a store's `Keys` must hold before `eval_len` runs; the fallback in `library_in` hides the difference until a deep refusal",
+ "class": "an implicit precondition on a shared table that only one of its builders meets",
+ "prevention": "done for the freeze: `keys.item(c)` and the constant's `Want::Fn` head made before `eval_const`; wanted: `eval_len` takes a proof type that the constant's key is filed",
+ "annoyance": "the runner's ask waits in the foreground while the queue is long; a 590 s client timeout can end before the answer, which then lands only in runner/ans",
+ "workaround": "read runner/ans/<id>.txt directly",
+ "state": "fixed"
+}

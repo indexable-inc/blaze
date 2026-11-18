@@ -62,7 +62,9 @@ impl core::fmt::Display for KeyClash {
 
 /// The map from checker keys to what they stand for.
 pub struct Keys {
-    origins: HashMap<ItemKey, Origin, Global>,
+    /// Filed through `&self` ([`super::rows::Rows`]): a head imported during a body's check
+    /// files its keys while the check holds the map.
+    origins: super::rows::Rows<ItemKey, Origin>,
     /// The kind of each item declared in a body ([`Keys::local`]): the names library keys no
     /// such item and holds no outline entry for it, so what it is is told here, beside its
     /// origin, and never guessed from a missing entry.
@@ -79,18 +81,18 @@ pub fn checker_of(key: LibKey) -> ItemKey {
 
 impl Keys {
     pub fn new() -> Keys {
-        Keys { origins: HashMap::new_in(Global), locals: HashMap::new_in(Global) }
+        Keys { origins: super::rows::Rows::new_in(Global), locals: HashMap::new_in(Global) }
     }
 
     /// Files `key` and returns its checker key; a different library key already filed under
     /// that checker key is a [`KeyClash`].
-    pub fn item(&mut self, key: LibKey) -> Result<ItemKey, KeyClash> {
+    pub fn item(&self, key: LibKey) -> Result<ItemKey, KeyClash> {
         let k = checker_of(key);
         self.file(k, Origin::Item(key))
     }
 
     /// The key of member `name` of kind `kind` of `container`, filed.
-    pub fn member(&mut self, container: ItemKey, kind: MemberKind, name: &str) -> Result<ItemKey, KeyClash> {
+    pub fn member(&self, container: ItemKey, kind: MemberKind, name: &str) -> Result<ItemKey, KeyClash> {
         let k = member_key(container, kind, name);
         self.file(k, Origin::Member { container, kind, name: Box::from(name) })
     }
@@ -183,7 +185,7 @@ pub fn opaque_key(fn_: ItemKey, index: u32) -> ItemKey {
 }
 
 impl Keys {
-    fn file(&mut self, k: ItemKey, origin: Origin) -> Result<ItemKey, KeyClash> {
+    fn file(&self, k: ItemKey, origin: Origin) -> Result<ItemKey, KeyClash> {
         match self.origins.get(&k) {
             Some(first) if *first == origin => Ok(k),
             Some(first) => Err(KeyClash { key: k, first: first.clone(), second: origin }),

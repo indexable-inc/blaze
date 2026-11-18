@@ -41,6 +41,7 @@ use blaze_launch::wire::LONGEST_FRAME;
 use blaze_own::Alloc;
 use bstd::Cx;
 use bstd::Deadline;
+use blaze_screen::Step;
 use bstd::procs::{ChannelError, Ended, GRACE, Held, Message, ParentDeath, ParentSignals, Relay, RelayAct, RunChild, RunError, RunFault, RunSpec, SignalError, Spawner, Streams};
 
 use crate::run_parent::{Needs, ParentError, Resolve, TICK, WRITE_BOUND, status_of};
@@ -165,6 +166,8 @@ pub(crate) fn run_program<'a, R: Resolve + ?Sized>(
         own_group: false,
         parent_death: ParentDeath::STRONGEST,
     };
+    // The live line erased before the program can write (blaze-screen run_line.rs).
+    resolve.watch().see(Step::Started);
     let mut child = spawner.start_run(cx, &spec).map_err(LoopError::Start)?;
     // A hold refused returns here: the child's drop kills and reaps it (bstd `Run`).
     let mut held = Held::hold().map_err(LoopError::Signals)?;
@@ -248,7 +251,11 @@ fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
         if open {
             match child.recv_message(inbox, LONGEST_FRAME, tick) {
                 Ok(Message::Whole { .. }) => {
+                    // The program is blocked on its need while it is served: the live line may
+                    // show, and is erased before the answer frees it.
+                    resolve.watch().see(Step::Waits);
                     let taken = needs.serve(resolve, &inbox[..], out).map_err(LoopError::Parent)?;
+                    resolve.watch().see(Step::Answers);
                     served += count(&inbox[..taken]);
                     match plant {
                         // The served prefix out, the rest kept in order (`drain` wants the

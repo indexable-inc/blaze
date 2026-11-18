@@ -64,9 +64,11 @@ fn the_tests_record_lists_a_test_units_tests() {
 
     assert!(!has_module(plain, "tests"), "the plain unit's names hold no `tests` module");
     assert!(has_module(tested, "tests"), "the test unit's names hold the `tests` module");
-    assert_eq!(encode(plain, g).map(|b| b.len()), Err(TestsRecordError::NotATestUnit { krate: plain.key }));
+    assert_eq!(encode(plain, g).map(|b| b.bytes.len()), Err(TestsRecordError::NotATestUnit { krate: plain.key }));
 
-    let bytes = encode(tested, g).unwrap_or_else(|e| panic!("encode: {e}"));
+    let section = encode(tested, g).unwrap_or_else(|e| panic!("encode: {e}"));
+    assert!(section.refused.is_empty() && section.duplicated.is_empty(), "no function is refused or doubly marked");
+    let bytes = section.bytes;
     let record = TestsRecord::open(aligned(&bytes, g)).unwrap_or_else(|e| panic!("open: {e}"));
     assert_eq!(record.key(), tested.key);
     let rows: Vec<TestRow<'_>> = (0..record.len()).map(|i| record.row(i).unwrap_or_else(|e| panic!("row {i}: {e}")).expect("a row below len")).collect();
@@ -89,5 +91,46 @@ fn the_tests_record_lists_a_test_units_tests() {
     assert_eq!(record.find("plain"), Ok(None), "a plain function is no test");
     assert_eq!(record.find("tests::helper"), Ok(None), "a function without `#[test]` is no test");
     // Two builders of one key write equal bytes.
-    assert_eq!(encode(tested, g).unwrap_or_else(|e| panic!("encode again: {e}")), bytes);
+    assert_eq!(encode(tested, g).unwrap_or_else(|e| panic!("encode again: {e}")).bytes, bytes);
+}
+
+/// Markers on one function (tempo's e2e suite of 2026-11-17: `#[tokio::test]` writes
+/// `#[::core::prelude::v1::test]` and `#[test_traced]` writes `#[test]` on the same function;
+/// crates `inline` and `deferred` failed "marked `test` or `bench` more than once"): each
+/// function with any number of test markers is one row; rustc's `duplicate_macro_attributes`
+/// warning is noted only where a bare `#[test]` follows another marker; a function marked
+/// both `test` and `bench` is refused alone, and its neighbours keep their rows.
+const MARKS: &str = "#![no_core]
+#[test]
+#[::core::prelude::v1::test]
+fn prelude_after_bare() {}
+#[::core::prelude::v1::test]
+#[test]
+fn bare_after_prelude() {}
+#[test]
+#[test]
+fn bare_twice() {}
+#[test]
+#[bench]
+fn both() {}
+#[test]
+fn once() {}
+";
+
+static MARKS_TEXTS: Texts = Texts(&[&[("/m/lib.rs", MARKS)]]);
+
+#[test]
+fn a_function_marked_twice_is_one_test_and_test_and_bench_is_refused_alone() {
+    let g = Alloc::global();
+    let tested = CrateInput { key: CrateItemKey(ContentId::of("blaze-scope test crate", b"m with test")), cfg: &[("test", None)], ..input("m", "/m/lib.rs", &[]) };
+    let names = resolved(&[tested], &MARKS_TEXTS);
+    let tested = names.krate(0);
+    let section = encode(tested, g).unwrap_or_else(|e| panic!("encode: one function's markers never refuse the unit: {e}"));
+    let record = TestsRecord::open(aligned(&section.bytes, g)).unwrap_or_else(|e| panic!("open: {e}"));
+    let paths: Vec<&str> = (0..record.len()).map(|i| record.row(i).unwrap_or_else(|e| panic!("row {i}: {e}")).expect("a row below len").path).collect();
+    assert_eq!(paths, ["bare_after_prelude", "bare_twice", "once", "prelude_after_bare"], "each doubly marked function once; `both` left out");
+    assert_eq!(&section.refused[..], &[TestsRecordError::TestAndBench { item: key_named(tested, "both") }][..]);
+    let mut warned = std::vec![key_named(tested, "bare_after_prelude"), key_named(tested, "bare_twice")];
+    warned.sort_unstable();
+    assert_eq!(&section.duplicated[..], &warned[..], "rustc warns where a bare `#[test]` follows a marker, not for `#[test] #[::core::prelude::v1::test]`");
 }

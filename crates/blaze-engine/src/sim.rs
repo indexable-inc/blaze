@@ -15,8 +15,10 @@ use blaze_own::{SharedAlloc, Vec};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::engine::{
-    Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Finished, Made, Phase, Plant, Planned, Pool, SVec, Scope, Stage, Task, View, drive,
+    Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Finished, Gen, Made, Phase, Plant, Planned, Pool, SMap, SVec, Scope, Stage, Task, View,
+    drive,
 };
+use crate::pages::{Kept, PagesPlant, Root};
 
 const TOOL: Tool = Tool(ContentId([7; 32]));
 
@@ -388,7 +390,18 @@ struct Mix {
 const EVERY: Mix = Mix { shrink: true, fails: true, pools: true };
 
 fn histories(tape: &Tape, plant: Plant, mix: Mix) -> Result<(), Broke> {
+    histories_paged(tape, plant, mix, PagesPlant::None)
+}
+
+/// Every mix of [`histories`], a bug planted in the stored answer's form (pages_sim.rs).
+pub(crate) fn histories_every(tape: &Tape, pages: PagesPlant) -> Result<(), Broke> {
+    histories_paged(tape, Plant::None, EVERY, pages)
+}
+
+/// [`histories`] with a bug planted in the stored answer's form.
+fn histories_paged(tape: &Tape, plant: Plant, mix: Mix, pages: PagesPlant) -> Result<(), Broke> {
     let mut history = History::new(first_world(tape), plant);
+    history.pages = pages;
     let everything: BTreeSet<usize> = (0..history.world.crates.len()).collect();
     for serial in 0..2 + tape.below(9, "requests") {
         if serial > 0 {
@@ -424,6 +437,12 @@ struct History {
     answer: Option<Answer<'static>>,
     last_plans: BTreeMap<Name, StdVec<Planned>>,
     serial: u32,
+    /// The stored answer (pages.rs): every request starts from the last one's pages, decoded,
+    /// so each oracle below also holds a restore to a fresh build (rule 26).
+    store: BTreeMap<Key, StdVec<u8>>,
+    root: Option<Root<'static>>,
+    causes: SMap<'static, Name, (Gen, Cause)>,
+    pages: PagesPlant,
 }
 
 /// What one request of a history did, for a fixture to look at further.
@@ -437,7 +456,47 @@ struct Step {
 impl History {
     fn new(world: World, plant: Plant) -> History {
         let crate_of = (0..world.files.len()).map(|f| (outline(f), world.files[f].0)).collect();
-        History { world, plant, crate_of, answer: Some(Answer::new_in(alloc())), last_plans: BTreeMap::new(), serial: 0 }
+        History {
+            world,
+            plant,
+            crate_of,
+            answer: Some(Answer::new_in(alloc())),
+            last_plans: BTreeMap::new(),
+            serial: 0,
+            store: BTreeMap::new(),
+            root: None,
+            causes: blaze_own::BTreeMap::new_in(alloc()),
+            pages: PagesPlant::None,
+        }
+    }
+
+    /// `kept` stored as pages over the last root, then read back: what the next request starts
+    /// from. The read equals the write in bytes (its own encoding names the same root).
+    fn store_and_restore(&mut self, kept: Kept<'static>, serial: u32) -> Result<Kept<'static>, Broke> {
+        let encoded = crate::pages::encode_planted(&kept, self.root.as_ref(), self.pages, alloc());
+        for (key, bytes) in encoded.puts.iter() {
+            self.store.insert(*key, bytes.iter().copied().collect());
+        }
+        let store = &self.store;
+        let restored = crate::pages::decode(encoded.root, |key| store.get(&key).map(|bytes| bytes.as_slice()), alloc())
+            .map_err(|error| Broke::Oracle(format!("request {serial}: its stored answer does not read back: {error}")))?;
+        let again = crate::pages::encode_planted(&restored, self.root.as_ref(), self.pages, alloc());
+        oracle(again.root == encoded.root, || format!("request {serial}: the stored answer read back encodes to another root"))?;
+        let (was, now) = (&kept.answer, &restored.answer);
+        for (table, equal) in [
+            ("rows", was.rows == now.rows),
+            ("cells", was.cells == now.cells),
+            ("files", was.by_file == now.by_file),
+            ("owed cells", was.owed_cells == now.owed_cells),
+            ("owed tasks", was.owed_tasks == now.owed_tasks),
+            ("serial", was.serial == now.serial),
+        ] {
+            oracle(equal, || format!("request {serial}: the stored answer read back differs in its {table}"))?;
+        }
+        oracle(restored.answer.readers == kept.answer.readers, || format!("request {serial}: the reverse index made again differs from the engine's"))?;
+        oracle(restored.answer.with_findings == kept.answer.with_findings, || format!("request {serial}: the rows with findings made again differ"))?;
+        self.root = Some(crate::pages::decode_root(encoded.root, &self.store[&encoded.root], alloc()).map_err(|error| Broke::Harness(format!("{error}")))?);
+        Ok(restored)
     }
 
     /// One request on today's world, held to a fresh build of it under the same scope.
@@ -528,7 +587,17 @@ impl History {
             oracle(ours.report.entered == 0, || format!("request {serial}: nothing changed and {} entered", ours.report.entered))?;
         }
         let step = Step { entered: ours.entered.iter().copied().collect(), causes: ours.causes.iter().copied().collect(), prints: here_prints, report: ours.report };
-        self.answer = Some(ours.answer);
+        let causes = core::mem::replace(&mut self.causes, blaze_own::BTreeMap::new_in(alloc()));
+        // A record key a row: the driver's, here one function of the row, so the section is
+        // written and read back with every answer.
+        let mut records = blaze_own::BTreeMap::new_in(alloc());
+        for (name, row) in ours.answer.rows.iter() {
+            records.insert(*name, blaze_drive::key::Key(ContentId::of("sim record key", &[row.key.0.0, row.out.0].concat())));
+        }
+        let kept = Kept::after(causes, ours.answer, &ours.causes, records);
+        let restored = self.store_and_restore(kept, serial)?;
+        self.causes = restored.causes;
+        self.answer = Some(restored.answer);
         Ok(step)
     }
 }

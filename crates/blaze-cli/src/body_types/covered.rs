@@ -115,13 +115,13 @@ impl fmt::Display for Expanded<'_> {
 /// (or its outermost caller) is at: the entry whose check covers it (D122: a macro-written
 /// item's place is its expansion's). `top` is `Err` when the call's origins do not say it.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct WrittenBy<'n> {
-    pub(super) listed: Listed<'n>,
+pub(crate) struct WrittenBy<'n> {
+    pub(crate) listed: Listed<'n>,
     /// The call whose expansion wrote it (the innermost).
-    pub(super) call: ItemKey,
+    pub(crate) call: ItemKey,
     /// That call's macro, as written.
-    pub(super) by: &'n str,
-    pub(super) top: Result<(u32, ItemIndex), &'static str>,
+    pub(crate) by: &'n str,
+    pub(crate) top: Result<(u32, ItemIndex), &'static str>,
 }
 
 /// The key whose place says where a listed body is written: a free fn's own, a member's
@@ -169,7 +169,7 @@ pub(super) fn callers<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut 
 /// at ([`WrittenBy`]): by call, each call's chain walked once. A fn of an impl written in a
 /// file that a macro call inside the impl block wrote is not here (its container's place is
 /// the file): NAMED, not covered yet (heads.rs says the same of its head).
-pub(super) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, WrittenBy<'n>> {
+pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, WrittenBy<'n>> {
     let mut calls: AVec<'n, (ItemKey, Listed<'n>)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
         if let Some(At::Expansion(call)) = NamesSource::place_of(records, placed_by(l.body)).map(|p| p.at) {

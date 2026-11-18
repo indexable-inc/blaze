@@ -26,6 +26,23 @@ pub(crate) fn tools(kinds: &[Tool; blaze_drive::key::KINDS]) -> Tools {
     Tools(kinds.map(|tool| Tool(ContentId::of(ENGINE_FORM, &tool.0.0))))
 }
 
+const RECORD_FORM: &str = "blaze-cli engine record key 2";
+
+/// The store key of the record a task's entry made: its task key (text, tool) and the record's
+/// own bytes (out, read list, payload), so two entries of one task that made other bytes write
+/// under two keys and two values never meet under one (rule 21), whatever the payload read that
+/// its cells do not say. The stored answer keeps each row's key (pages.rs `records`), so a
+/// request reads the record of a row that stands by it.
+pub(crate) fn record_key(key: Key, out: ContentId, reads: &[(Name, ContentId)], payload: &[u8]) -> Key {
+    let mut h = blaze_ids::Hasher::new(RECORD_FORM);
+    h.update(&key.0.0).update(&out.0).update(&(reads.len() as u64).to_le_bytes());
+    for (read, digest) in reads.iter() {
+        h.update(&[read.kind as u8]).update(&read.subject.0).update(&digest.0);
+    }
+    h.update(&(payload.len() as u64).to_le_bytes()).update(payload);
+    Key(h.finish())
+}
+
 /// One record a task of the merged phase made, to put under its task's key.
 pub(crate) struct Put<'r> {
     pub(crate) key: Key,

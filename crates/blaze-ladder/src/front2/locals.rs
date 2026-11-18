@@ -387,6 +387,14 @@ impl<'n> Locals<'n> {
         self.bodies.get(&owner)
     }
 
+    /// The body whose row `gap` names, and that row, when the gap names a row by its body's
+    /// key (a `use` row's key is its body's: [`Self::keep`]): for a refusal's message (rule
+    /// 19), never for a check. One body's rows hold its own key: the answer is the one match
+    /// (a `use` tree of several leaves is several rows at one range: the first).
+    pub fn row_of_gap(&self, gap: &LocalGap) -> Option<(ItemKey, Row<'n>)> {
+        self.bodies.iter().find_map(|(&owner, b)| b.rows.iter().find(|r| r.key == gap.item && r.range == gap.range).map(|r| (owner, *r)))
+    }
+
     /// The key every local item of `at`'s body is derived under: the body's own, by its
     /// item and its checker key (a member's body is not its container's).
     fn parent(crate_key: blaze_id::CrateItemKey, at: Enclosing<'_>) -> LibKey {

@@ -21,7 +21,7 @@
 
 use std::alloc::Global;
 
-use blaze_scope::resolve::{CrateNames, ExpandNote, NamesNote};
+use blaze_scope::resolve::CrateNames;
 
 use super::{Unresolved, find_word};
 
@@ -29,16 +29,31 @@ use super::{Unresolved, find_word};
 /// blaze-report's words, number 22, "macro-call-failed".
 pub(crate) const FAILED_CALL: u16 = 22;
 
-/// The findings of crate `c`'s failed calls in its own files, sorted by (message, range). A call
-/// whose file or item is not found is placed at the crate (an empty file piece), never dropped.
-pub(super) fn findings(c: &CrateNames<'_>) -> blaze_own::Vec<Unresolved, Global> {
+/// The findings of crate `c`'s failed and refused calls in its own files, sorted by (message,
+/// range): one per call the solve stored refused, whatever refused it (its row in the names
+/// record, blaze-scope names_record.rs `refused_row`, the one join of the two). A call whose
+/// file or item is not found is placed at the crate (an empty file piece), never dropped.
+///
+/// Before 2026-11-17 only a call whose expansion RAN and failed was listed: a call refused
+/// before or around its run (a proc macro's read the host could not answer, its module
+/// absent, an expansion that does not read as items) said nothing, and what it would have
+/// written was only "no `X` in `m`" further on (tempo: 28 "no `XApiServer`" behind
+/// jsonrpsee's `#[rpc]`, whose `proc-macro-crate` read of `CARGO` was refused).
+pub(super) fn findings<'n, 'b>(c: &CrateNames<'n>, alloc: blaze_own::Alloc<'b>) -> blaze_own::Vec<Unresolved, Global>
+where
+    'n: 'b,
+{
     let mut own = blaze_own::Vec::new_in(Global);
     if !c.files.iter().any(|file| file.path.starts_with("/0/")) {
         return own;
     }
-    for note in c.notes.iter() {
-        let NamesNote::Expand { at, note: ExpandNote::Failed { path, implicit, failed }, .. } = note else { continue };
-        let (path, implicit) = (*path, *implicit);
+    let mut calls: blaze_own::AVec<'b, blaze_id::ItemKey> = blaze_own::AVec::new_in(alloc);
+    calls.extend(c.expansions.iter().filter(|(_, e)| e.refused.is_some()).map(|(call, _)| *call));
+    calls.sort_unstable();
+    for call in calls.iter() {
+        let Some(row) = blaze_scope::names_record::refused_row(c, *call, alloc) else { continue };
+        let (path, implicit, failed) = (row.path, row.implicit, row.why);
+        let at = c.tables.calls.get(call).map(|src| src.loc);
         let mut message = blaze_own::Vec::new_in(Global);
         let mut range = (0u32, 0u32);
         let file = at.and_then(|loc| c.files.get(loc.file as usize).map(|file| (loc, *file)));
@@ -67,16 +82,17 @@ pub(super) fn findings(c: &CrateNames<'_>) -> blaze_own::Vec<Unresolved, Global>
         message.push(0x1F);
         message.push(b'0' + c.edition.byte());
         message.push(0x1F);
-        let call = match implicit {
-            true => std::format!("the implicit `#[{path}]` over `fn main` (D104: a blaze-edition binary's root `fn main` is its input, the whole item)"),
-            false => std::format!("the call of `{path}`"),
+        let what = match (implicit, row.shape) {
+            (true, _) => std::format!("the implicit `#[{path}]` over `fn main` (D104: a blaze-edition binary's root `fn main` is its input, the whole item)"),
+            (false, blaze_surface::CallShape::FnLike) => std::format!("the call of `{path}`"),
+            (false, shape) => std::format!("the {} call of `{path}`", shape.name()),
         };
-        message.extend_from_slice(call.as_bytes());
+        message.extend_from_slice(what.as_bytes());
         message.push(0x1F);
         message.extend_from_slice(std::format!("{failed}").as_bytes());
         own.push(Unresolved { at: range, message });
     }
-    // The notes are in the solve's order; the record holds them sorted (rule 25).
+    // The record holds them sorted by their words (rule 25).
     own.sort_unstable_by(|a, b| (&a.message[..], a.at).cmp(&(&b.message[..], b.at)));
     own
 }

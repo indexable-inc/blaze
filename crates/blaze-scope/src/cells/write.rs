@@ -158,7 +158,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 (Some(_), None) => {}
             }
         }
-        for md in self.modules.iter() {
+        // A module answered from its record has no fragment here (its scope is the record's).
+        for md in self.modules.iter().filter(|md| md.answered == super::Answered::Text) {
             for (&(ns, name), &(def, _, origin, frag)) in md.explicit.iter() {
                 if origin != Origin::MacroExport {
                     ix.explicit[frag as usize].push((ns, name, def));
@@ -297,6 +298,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                     if macro_use && !c.foreign && !c.unread && c.text != FragId::MAX {
                         stack.push((c.text, 0, 0, false));
+                    } else if macro_use && !c.foreign && !c.unread {
+                        // A `#[macro_use]` child outside a one-group solve's members: its
+                        // flattened sequence as its record holds it; none held is unknown here.
+                        match self.recorded_textual.get(&child) {
+                            Some(r) => out.textual.extend(r.defs.iter().copied()),
+                            None => unknown += 1,
+                        }
                     }
                 }
                 Slot::Call(c) => {

@@ -611,18 +611,18 @@ fn bytes_of_deps(list: &crate::crate_list::CrateList<'_>) -> usize {
     (0..list.len()).map(|r| list.deps_named(r).count()).sum::<usize>() * crate::crate_list::DEP
 }
 
-/// A list of version 1 (no tree table) is refused by name, never read as this form. Prints
+/// A list of version 2 (no environment facts) is refused by name, never read as this form. Prints
 /// `crate list: an old list: <the refusal's words>`.
 #[test]
 fn an_old_crate_list_is_refused_by_name() {
     use crate::crate_list::{CrateList, ListError, VERSION, encode};
     let w = hello(BLAZE);
     let mut bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}")).to_vec();
-    assert_eq!(VERSION, 2);
-    bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
-    let refused = CrateList::open(&bytes).err().expect("a version-1 list is refused");
-    assert_eq!(refused, ListError::Version { found: 1 });
+    assert_eq!(VERSION, 3);
+    bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+    let refused = CrateList::open(&bytes).err().expect("a version-2 list is refused");
+    assert_eq!(refused, ListError::Version { found: 2 });
     let words = std::format!("{refused}");
-    assert!(words.contains("version 1, not 2"), "{words}");
+    assert!(words.contains("version 2, not 3"), "{words}");
     std::println!("crate list: an old list: {words}");
 }

@@ -46,11 +46,14 @@ const VERSION: u32 = 4;
 const ALIGN: usize = 16;
 const NO_CHAIN: u32 = u32::MAX;
 
-/// A dependency as the resolution reads it: finished in this process, or read from its record.
+/// A dependency as the resolution reads it: finished in this process, read from its record, or
+/// solved on demand, group by group (E13, cells/lazy_deps.rs): a read of a module it has not
+/// solved yet is noted there and voids the reader's solve, which is asked again once it is.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Dep<'a> {
     Whole(&'a CrateNames<'a>),
     Record(&'a DepScope<'a>),
+    Lazy(&'a crate::cells::LazyDep<'a>),
 }
 
 impl<'a> Dep<'a> {
@@ -58,6 +61,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.key,
             Dep::Record(d) => d.key,
+            Dep::Lazy(l) => l.key,
         }
     }
 
@@ -65,6 +69,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.root,
             Dep::Record(d) => d.root,
+            Dep::Lazy(l) => l.root,
         }
     }
 
@@ -72,6 +77,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.name,
             Dep::Record(d) => d.name,
+            Dep::Lazy(l) => l.name,
         }
     }
 
@@ -79,6 +85,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.edition,
             Dep::Record(d) => d.edition,
+            Dep::Lazy(l) => l.edition,
         }
     }
 
@@ -86,6 +93,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.proc_key,
             Dep::Record(d) => d.proc_key,
+            Dep::Lazy(l) => l.proc_key,
         }
     }
 
@@ -93,6 +101,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.done.get(&module).map(|r| &r.scope),
             Dep::Record(d) => d.scopes.get(&module),
+            Dep::Lazy(l) => l.scope(module),
         }
     }
 
@@ -100,6 +109,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.chains.get(&module).map(|c| c.as_slice()),
             Dep::Record(d) => d.chains.get(&module).map(|c| c.as_slice()),
+            Dep::Lazy(l) => l.chain(module),
         }
     }
 
@@ -107,6 +117,7 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.tables.enums.get(&key).map(|v| v.as_slice()),
             Dep::Record(d) => d.enums.get(&key).map(|v| v.as_slice()),
+            Dep::Lazy(l) => l.enum_of(key),
         }
     }
 
@@ -114,12 +125,13 @@ impl<'a> Dep<'a> {
         match self {
             Dep::Whole(c) => c.tables.macros.get(&key).copied(),
             Dep::Record(d) => d.macros.get(&key).copied(),
+            Dep::Lazy(l) => l.macro_of(key),
         }
     }
 
     pub(crate) fn reaches(self) -> &'a [CrateItemKey] {
         match self {
-            Dep::Whole(_) => &[],
+            Dep::Whole(_) | Dep::Lazy(_) => &[],
             Dep::Record(d) => &d.reaches,
         }
     }
@@ -1253,6 +1265,103 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     kept: &crate::expansions::KeptExpansions<'_, 'a>,
     alloc: Alloc<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
+    let write = |names: CrateNames<'a>, built: &Built<'_, 'a>| -> Result<_, CrateScopeError<'a>> {
+        par.stage(crate::task::Stage::Write);
+        let Records { exports, inner } = write_records(&names, built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
+        Ok((names, exports, inner))
+    };
+    let ((names, record, inner), asked) = with_names(input, deps, sysroot, sources, source, par, prepares, kept, alloc, write)?;
+    let names: &'a CrateNames<'a> = Box::leak(Box::new_in(names, alloc));
+    Ok(CrateScope { names, record, inner, asked })
+}
+
+/// E4's one-group solve of one crate (cells/edit.rs `OneGroup`): the modules `members` solved
+/// from their text against the dependencies' records `deps` (as [`resolve_crate_with`] takes
+/// them), every other module of the crate answered from its group's record; the answer is the
+/// members' groups alone. No crate record is written or decoded: the groups' records are the
+/// answer (the crate's exports are its groups' business, read by cell).
+#[allow(clippy::too_many_arguments, reason = "the entry's arguments, each named")]
+pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
+    input: &CrateInput<'a>,
+    deps: &[&'a [u8]],
+    sysroot: Sysroot,
+    sources: &S,
+    source: usize,
+    par: &P,
+    members: crate::cells::Members<'_>,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, crate::NameGroup<'a>>, CrateScopeError<'a>> {
+    let mut decoded = AVec::with_capacity_in(deps.len(), alloc);
+    for (at, bytes) in deps.iter().enumerate() {
+        decoded.push(&*Box::leak(Box::new_in(read_record(bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?, alloc)));
+    }
+    let prepares = Prepares::new_in(alloc);
+    let par = OfMembers { par, members };
+    let kept = crate::expansions::KeptExpansions::none(alloc);
+    let members_of = |mut names: CrateNames<'a>, _: &Built<'_, 'a>| {
+        let groups = core::mem::replace(&mut names.groups, AVec::new_in(alloc));
+        // The rest lives in `alloc`, which frees it whole (as a crate solve's names are leaked
+        // there): walking every module's tables to drop them is the cost of the crate, not of
+        // the members (2.7 ms of a 2,000-module crate's one-group solve, 2026-11-17).
+        core::mem::forget(names);
+        Ok(groups)
+    };
+    let (groups, _) = with_names(input, &decoded, sysroot, sources, source, &par, prepares, &kept, alloc, members_of)?;
+    Ok(groups)
+}
+
+/// `par` asked to solve `members` alone, their groups written ([`Par::names_members`]).
+struct OfMembers<'p, P> {
+    par: &'p P,
+    members: crate::cells::Members<'p>,
+}
+
+impl<P: Par> Par for OfMembers<'_, P> {
+    fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
+        self.par.map(n, f, out);
+    }
+
+    fn stage(&self, stage: crate::task::Stage) {
+        self.par.stage(stage);
+    }
+
+    fn expand_part(&self, part: crate::task::ExpandPart, macro_name: &str, size: usize) {
+        self.par.expand_part(part, macro_name, size);
+    }
+
+    fn expand_call(&self, def: ItemKey, input: &str) {
+        self.par.expand_call(def, input);
+    }
+
+    fn names_groups(&self) -> bool {
+        true
+    }
+
+    fn names_members(&self) -> Option<crate::cells::Members<'_>> {
+        Some(self.members)
+    }
+
+    fn names_part(&self, part: crate::task::NamesPart) {
+        self.par.names_part(part);
+    }
+}
+
+/// One crate's names (through [`resolve_one`]) against its dependencies' records, handed to
+/// `then` with the dependencies as the solve read them; the answer is `then`'s, and every
+/// question the solve asked of the dependencies.
+#[allow(clippy::too_many_arguments, reason = "the entry's arguments, each named")]
+fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
+    input: &CrateInput<'a>,
+    deps: &[&'a DepScope<'a>],
+    sysroot: Sysroot,
+    sources: &S,
+    source: usize,
+    par: &P,
+    prepares: &'a Prepares<'a>,
+    kept: &crate::expansions::KeptExpansions<'_, 'a>,
+    alloc: Alloc<'a>,
+    then: impl FnOnce(CrateNames<'a>, &Built<'_, 'a>) -> Result<R, CrateScopeError<'a>>,
+) -> Result<(R, AVec<'a, Question<'a>>), CrateScopeError<'a>> {
     let mut slots: AVec<'a, Option<Dep<'a>>> = AVec::with_capacity_in(deps.len() + 1, alloc);
     let mut by_prefix = HashMap::new_in(alloc);
     let mut graph_crates = AVec::with_capacity_in(deps.len() + 1, alloc);
@@ -1303,8 +1412,6 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
         built.ask(|| Question::krate(*d, alloc));
     }
     let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, kept, alloc).map_err(CrateScopeError::Names)?;
-    par.stage(crate::task::Stage::Write);
-    let Records { exports, inner } = write_records(&names, &built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
-    let names: &'a CrateNames<'a> = Box::leak(Box::new_in(names, alloc));
-    Ok(CrateScope { names, record: exports, inner, asked: asked.take() })
+    let answer = then(names, &built)?;
+    Ok((answer, asked.take()))
 }

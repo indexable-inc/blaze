@@ -1,0 +1,15 @@
+{
+ "id": "names-groups-defines-are-asked-only",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CG",
+ "where": "crates/blaze-scope/src/cells/groups.rs (Cells::groups, the defines loop); tests/names_groups_edit.rs defines_agree",
+ "what": "A group's `defines` lists only the cells some reader asked, so it is not a function of the group's own inputs: after an import that closes a cycle, the root's group (not re-solved, bytes equal) lists one cell fewer than a fresh solve's, because the new reader asks `crate::b` for the first time.",
+ "cost": "one failed ask; the test now requires defines to agree on every cell both list",
+ "cause": "cells are made on demand by readers, and defines is read off the made cells",
+ "whys": "the cold solve has every reader in one pass, so the asked cells were enough; a group solved alone has no outside readers in it",
+ "class": "an index that depends on who asked, kept beside a record that does not",
+ "prevention": "open: a group solved alone must decide every cell the records say outside readers read of its members (the driver's reverse index has them), or defines must list every binding of the members' scopes",
+ "annoyance": "the runner answer hides a passing test's --nocapture output, so floors printed by passing tests are not seen; assert the floor exactly instead",
+ "workaround": "assert the counts in the test",
+ "state": "open"
+}

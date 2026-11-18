@@ -128,16 +128,25 @@ fn put_module(home: &Path) {
     let record = home.join(".blaze/v2/build-script/modules/app-0.1.0-test");
     std::fs::create_dir_all(&record).unwrap_or_else(|error| panic!("making {}: {error}", record.display()));
     std::fs::write(record.join("identity"), "name app\nversion 0.1.0\nfeatures \n").expect("the module's identity");
-    std::fs::write(record.join("module.wasm"), module(LINE)).expect("the module's bytes");
+    let bytes = module(LINE);
+    // The record's digest (script_modules.rs reads it as the lookup's out): the module's SHA-256.
+    let digest: String = blaze_sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(record.join("wasm-sha256"), format!("{digest}\n")).expect("the module's digest");
+    std::fs::write(record.join("module.wasm"), bytes).expect("the module's bytes");
 }
 
 /// `blaze check` in `dir` with the home `home`: whether it exited 0, and its output.
 fn check(dir: &Path, home: &Path) -> (bool, String) {
-    let said = dir.with_extension("said");
+    run(dir, home, "check")
+}
+
+/// `blaze <word>` in `dir` with the home `home`: whether it exited 0, and its output.
+fn run(dir: &Path, home: &Path, word: &str) -> (bool, String) {
+    let said = dir.with_extension(word);
     let file = File::create(&said).unwrap_or_else(|error| panic!("making {}: {error}", said.display()));
     let file_err = file.try_clone().expect("the output file, twice");
     let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
-        .arg("check")
+        .arg(word)
         .current_dir(dir)
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
@@ -160,13 +169,13 @@ fn check(dir: &Path, home: &Path) -> (bool, String) {
                 while child.try_wait().ok().flatten().is_none() && reaped.elapsed() < REAP {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                panic!("`blaze check` in {} did not end within {DEADLINE:?} (rule 18)", dir.display());
+                panic!("`blaze {word}` in {} did not end within {DEADLINE:?} (rule 18)", dir.display());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("waiting for `blaze check` in {}: {error}", dir.display());
+                panic!("waiting for `blaze {word}` in {}: {error}", dir.display());
             }
         }
     };
@@ -182,9 +191,14 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
     put_module(&home);
-    let (ok, said) = check(&at, &home);
+    let (_, said) = check(&at, &home);
     assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
-    assert!(ok && !said.lines().any(|line| line.contains("`made`")), "the script's cfg did not reach #[cfg(from_script)]:\n{said}");
+    // The status is not read: while the borrow check's findings stay notes, every check ends
+    // "incomplete: NOT checked: borrows" (`BORROWS_ARE_ERRORS`). The type check's own line is.
+    assert!(
+        said.contains("0 errors: blaze check") && !said.lines().any(|line| line.contains("`made`")),
+        "the script's cfg did not reach #[cfg(from_script)]:\n{said}"
+    );
     println!("cfg reached");
 }
 
@@ -203,9 +217,73 @@ fn a_failed_script_is_a_finding_naming_it_and_its_unit() {
     // Ruling D115 (6), one shape for every cause (blaze-cli not_checked.rs).
     assert!(
         // Since d115-6 (piece 2c) the cause is the module's lookup, named by its script.
-        said.contains("not checked because the module of the build script `build.rs` of crate `app` failed: crate `app`"),
+        // Since not_checked/waited.rs, the line under the failure names what waited on it.
+        said.lines().any(|line| line.contains("not checked because of it") && line.ends_with("`app`")),
         "the unit whose script failed is not named as not checked:\n{said}"
     );
     assert!(!said.contains("task(s) not run: each needs one that failed above"), "the old count line is still printed:\n{said}");
     println!("failed by name");
+}
+
+/// Each phase `engine-check` ran, from the profile it wrote in `dir` (engine_check.rs
+/// `profile_text`): (stage, wave, planned, entered).
+fn engine_phases(dir: &Path) -> Vec<(String, u32, u32, u32)> {
+    let at = dir.join(".blaze/v2/profile.txt");
+    let text = std::fs::read_to_string(&at).unwrap_or_else(|error| panic!("reading {}: {error}", at.display()));
+    let mut lines = text.lines().skip_while(|line| !line.starts_with("engine phases")).skip(1);
+    let mut phases = Vec::new();
+    while let Some(line) = lines.next().filter(|line| line.starts_with("  ")) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let number = |at: usize| words[at].trim_end_matches(':').parse::<u32>().unwrap_or_else(|_| panic!("a phase row's numbers: {line}"));
+        phases.push((words[0].to_owned(), number(1), number(2), number(3)));
+    }
+    phases
+}
+
+/// The `Scripts` stage of `engine-check` (engine.md E6): the member's script runs as one
+/// `Script` task after its module's lookup, its crate's names read the run, and `engine-check`
+/// lists what `check` lists: nothing for `made()` (the script's cfg reached `#[cfg(from_script)]`).
+/// Every phase entered each task it planned, once. Prints "engine scripts: <phases>". CONTROL:
+/// before the stage, `engine-check` said "a crate with a build script: `engine-check` runs no
+/// build script yet" here.
+#[test]
+fn engine_check_runs_the_script_and_lists_what_check_lists() {
+    let base = fresh_home("build_scripts_engine", true);
+    let (home, at) = (base.join("home"), base.join("ws"));
+    workspace(&at);
+    put_module(&home);
+    let (_, old) = check(&at, &home);
+    // Not the status: every check ends "incomplete: NOT checked: borrows" for now.
+    assert!(old.contains("0 errors: blaze check") && !old.contains("not checked because"), "check of the fixture failed:\n{old}");
+    let (_, said) = run(&at, &home, "engine-check");
+    assert!(!said.contains("runs no build script"), "engine-check refused the build script:\n{said}");
+    assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
+    assert!(!said.lines().any(|line| line.contains("`made`")), "the script's cfg did not reach #[cfg(from_script)] on the engine:\n{said}");
+    assert!(!said.contains("not run: each waits"), "a task waited on a failed one:\n{said}");
+    let phases = engine_phases(&at);
+    for (stage, wave, planned, entered) in phases.iter() {
+        assert_eq!(planned, entered, "{stage} {wave}: tasks planned and entered:\n{phases:?}");
+    }
+    let scripts: Vec<(u32, u32)> = phases.iter().filter(|(stage, ..)| stage == "Scripts").map(|(_, wave, planned, _)| (*wave, *planned)).collect();
+    assert_eq!(scripts, [(0, 1), (1, 1)], "one module lookup, then one run: {phases:?}");
+    println!("engine scripts: {phases:?}");
+}
+
+/// With no module of the script in the store, `engine-check` fails as `check` does: the lookup's
+/// own words name the script's package, and its crate is not resolved. Prints "engine failed by
+/// name".
+#[test]
+fn engine_check_names_a_missing_script_module() {
+    let base = fresh_home("build_scripts_engine_failed", true);
+    let (home, at) = (base.join("home"), base.join("ws"));
+    workspace(&at);
+    let (ok, said) = run(&at, &home, "engine-check");
+    assert!(!ok, "an engine-check whose build script failed exited 0:\n{said}");
+    assert!(said.contains("no build-script module of app 0.1.0"), "the lookup's own failure is not said:\n{said}");
+    assert!(said.contains("not run: each waits on a task that failed"), "the run and its crate did not wait on the lookup:\n{said}");
+    let phases = engine_phases(&at);
+    for (stage, wave, planned, entered) in phases.iter() {
+        assert_eq!(planned, entered, "{stage} {wave}: tasks planned and entered:\n{phases:?}");
+    }
+    println!("engine failed by name");
 }

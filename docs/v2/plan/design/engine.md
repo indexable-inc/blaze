@@ -60,6 +60,21 @@ per-job state; whole reads of `CrateScope` and `Surface`; the items record's buc
    they land, sorted within what has landed. A dependency owes a check only its names and the heads a
    body of yours reads: a dependency's head is made when first read (point 3), its names once a machine
    per version and features, and its bodies never.
+   LAZY OVER WHAT IS NOT YOURS (the owner, 2026-11-17 11:42: "lets actually make blaze check lazy? as
+   well ... and sure take other things from its design", of Zig, which analyses only what is referenced).
+   Your own crates are checked whole: an error in code nothing calls is still an error in Rust. Everything
+   else is made on demand and at the grain asked: a dependency's NAME is resolved when a path walks to it
+   (the cell `(module, namespace, name)`, through its module's named imports and globs), never its whole
+   crate; its head when a body reads it; its bodies never. What Rust does not let be lazy: whether a type
+   implements a trait needs every impl of the crates that could hold one (the orphan rule names them), so
+   such a crate's item-level macros are expanded and its impl headers resolved, once a machine; a crate
+   whose types and traits no goal of yours names is never expanded. `blaze run` already checks only what
+   the program reaches.
+   ASPECTS (from Zig's dependency kinds: a declaration's type, its value, a namespace's one name): a reader
+   depends on the aspect it read, not on the declaration: a fn's parameter and return types, its bounds,
+   its lifetimes; an ADT's existence and generics, its fields, its layout; a constant's type, its value; a
+   trait's head, its member list, each member's signature; an impl's header, its members. Each is a part
+   of the item's cell with its own digest (the cell id already carries a part).
 5. **The coordinator is off the hot path.** It makes the plan, starts each phase, and merges each
    phase's buffers in bulk, sorted by key (rule 25): puts to the store, rows to the answer table. Its
    cost is a constant per phase plus a sort, never a step per task.
@@ -105,9 +120,11 @@ read and one get (0.09 s measured on tempo with no process alive).
 | E7 run and census | the lazy program and the eager program replaced by point 7 | hello world prints; the census equals the last one on the old path |
 | E8 lints | `Stage::Lints`: a task per (lint, body) over the typed result; advice after the answer | a body edit reruns its lints only; a lint's edit reruns that lint only; tempo's lint time beside its check time |
 | E9 tests | `Stage::Tests`: a test's reads are the code records its run reached | one body edit reruns only the tests that reach it; the rest reused |
-| E10 the toolchain's records fetched | std, core, alloc (names with expansions, heads, impl tables, later code) made by CI per toolchain and platform, fetched from R2 on a local miss, verified by digest (D132, remote-read.md) | a fresh home's first check of a small crate spends no time on the shelf's names (4.1 s of 4.4 s today) |
+| E10 published records fetched (D132) | in this order: local names fast first; names records small (core's is 83 MB, 48 MB of it expansions kept as text); then R2 for optimized CODE of std and popular crates (dear to compute, small to ship); names records only by byte range, the pages a check touches (remote-read.md); never a whole pack of names (about 160 MB for a 6 s compute) | a fresh home's first check of a small crate: under 1 s for the shelf's names computed locally; bytes fetched per check quoted |
 | E11 why | the cause of every entered task (new, its key moved, or the first read that moved: cell, old and new digest), a count of tasks redone to the same bytes, an "entered because" table in the profile, and `blaze why <file or item>` printing the chain from the edit (the owner, 10:29: "could u add better telm", on a private fn added costing 113 s with no row saying why) | on tempo, one private fn added: the table names each cause; redone-identical is 0 |
 | E12 `blaze clean` | removes the checkout's `.blaze/v2`; `--store` the home's store; and a two-values refusal names the record's kind and name and says what to run (the owner hit one on 2026-11-17 with no way out) | the refusal's text; the command on a scratch home |
+| E13 lazy names of dependencies | a dependency's names made on demand per cell (then per group as a record), from the paths your crates walk and the impl questions your bodies ask; measured first: the share of each dependency's modules a real project reaches | the first check of a small crate on a fresh home resolves a fraction of the shelf (today 27 crates whole, 6 s: gimli 2.3 s, object 1.8 s, libc 1.5 s, core 1.4 s); answers equal to the whole solve |
+| E14 aspects | a head's cell split into parts with their own digests (types, bounds, lifetimes; existence, fields, layout; type, value; head, member list, member) and each read recorded by part | a field added to a struct enters no body that only names the type; a constant's value edited enters no reader of its type |
 
 Order: E1 to E4 at once; E5 on E2; E6 when E1 and E5 pass their checks; E7 after E6; E8 and E9 on E6.
 

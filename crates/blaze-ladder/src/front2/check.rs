@@ -322,6 +322,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             }
             Outcome::Need(needs) => needs,
         };
+        if let Some(cost) = meter {
+            cost.again(&needs);
+        }
         if let Some(asked) = asked.as_deref_mut() {
             asked.questions.clear();
             asked.questions.extend_from_slice(&needs.questions);
@@ -550,6 +553,13 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
         Some(tc::Because::NoLangItem(l)) => format!("no lang item {l:?}"),
         // E0425: the segment that named nothing, by its spelling (rule 19).
         Some(tc::Because::Path(miss)) => super::path_miss_shown::path_miss_shown(r, spell, d.name, super::path_miss_shown::kind_at(v, d.at), miss),
+        // E0133 in rustc's words: the operation, then where it may be written. Before 2024 an
+        // `unsafe fn`'s body is itself an unsafe context (`unsafe_op_in_unsafe_fn` allowed), so
+        // the words name both (the Edition Guide, "unsafe_op_in_unsafe_fn warning").
+        Some(tc::Because::Unsafe(op)) => {
+            let place = if v.edition >= tc::Edition::E2024 { "unsafe block" } else { "unsafe function or block" };
+            format!("{} is unsafe and requires {place}", unsafe_op_shown(r, op))
+        }
         // Every goal's finding (E0277, E0283) carries `Unmet`; what is left is about a node, not a
         // goal: its reason by its content, then its types and the name it looked up, each only
         // where the finding has it (diag-names-something-1: blaze-typeck builds no finding with
@@ -571,13 +581,28 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
                 tc::Because::Reference { rule, says } => format!("the Reference, `{rule}`: \"{says}\""),
                 tc::Because::Count { expected, got } => format!("{expected} wanted, {got} written"),
                 tc::Because::NoSegment => String::from("the path written here (the body keeps no segment of it to name)"),
-                tc::Because::Unmet { .. } | tc::Because::NoLangItem(_) | tc::Because::Path(_) => format!("{other:?}"),
+                tc::Because::Unmet { .. } | tc::Because::NoLangItem(_) | tc::Because::Path(_) | tc::Because::Unsafe(_) => format!("{other:?}"),
             };
             node_about(Some(why), ty(d.found), ty(d.expected), d.name.map(|n| name_about(r, spell, tys, d.found, n)))
         }
         None => node_about(None, ty(d.found), ty(d.expected), d.name.map(|n| name_about(r, spell, tys, d.found, n))),
     };
     s.into_boxed_str()
+}
+
+/// An operation only `unsafe` code may do, in rustc's words (E0133 and the
+/// `unsafe-op-in-unsafe-fn` lint say it alike), naming the item where there is one (rule 19).
+pub(crate) fn unsafe_op_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, op: tc::UnsafeOp) -> String {
+    match op {
+        tc::UnsafeOp::Call(Some(k)) => format!("call to unsafe function `{}`", item_shown(r, k)),
+        tc::UnsafeOp::Call(None) => String::from("call to unsafe function"),
+        tc::UnsafeOp::TargetFeatureCall(k) => format!("call to function `{}` with `#[target_feature]`", item_shown(r, k)),
+        tc::UnsafeOp::RawDeref => String::from("dereference of raw pointer"),
+        tc::UnsafeOp::MutStatic(k) => format!("use of mutable static `{}`", item_shown(r, k)),
+        tc::UnsafeOp::ExternStatic(k) => format!("use of extern static `{}`", item_shown(r, k)),
+        tc::UnsafeOp::UnionField => String::from("access to union field"),
+        tc::UnsafeOp::InlineAsm => String::from("use of inline assembly"),
+    }
 }
 
 /// The name a finding looked up, by its spelling: the body's where the body wrote it, else the

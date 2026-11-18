@@ -8,9 +8,9 @@
 //! - [`ProducerId<P>`]: one producer's id, typed by its marker ([`Expander`], [`Lowering`],
 //!   [`BodyChecker`], [`Names`], [`CodeBuilder`]): a key that asks for the expander's id does not
 //!   take the lowering's (rule 76).
-//! - [`Producers`]: the table, made once at the entry ([`Producers::of_build`] today,
-//!   [`Producers::of_sources`] once the build hands the entry its source digests) and passed
-//!   down by reference; tests make theirs with [`Producers::for_tests`]. There is no default and
+//! - [`Producers`]: the table, made once at the entry ([`Producers::of_build`]: every row from
+//!   the binary's id while every producing function is in the entry crate) and passed down by
+//!   reference; tests make theirs with [`Producers::for_tests`]. There is no default and
 //!   no global (rule 75).
 
 use core::{fmt, hash, marker::PhantomData};
@@ -45,12 +45,12 @@ impl Row {
     pub const ALL: [Row; Row::COUNT] =
         [Row::Expander, Row::Lowering, Row::BodyChecker, Row::Names, Row::CodeBuilder, Row::Whole];
 
-    /// The rows the build digests from source ([`Sources`]): all but [`Row::Whole`].
+    /// The rows a crate's `[package.metadata.blaze] producer` list may name (blaze-producers):
+    /// all but [`Row::Whole`].
     pub const FROM_SOURCE: [Row; Row::COUNT - 1] =
         [Row::Expander, Row::Lowering, Row::BodyChecker, Row::Names, Row::CodeBuilder];
 
-    /// The row's name: what a manifest's `[package.metadata.blaze] producer` list says and what
-    /// the build's [`Sources`] carries.
+    /// The row's name: what a manifest's `[package.metadata.blaze] producer` list says.
     pub const fn name(self) -> &'static str {
         match self {
             Row::Expander => "expander",
@@ -146,37 +146,7 @@ impl<P: Producer> fmt::Debug for ProducerId<P> {
     }
 }
 
-/// The build's digest of each producer's source ([`Row::FROM_SOURCE`], in that order): what the
-/// entry's build step writes (crates/blaze-cli/build/producers.rs) and the entry hands to
-/// [`Producers::of_sources`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Sources {
-    pub rows: [(&'static str, [u8; 32]); Row::COUNT - 1],
-}
-
-/// [`Sources`] whose row at `at` is not the row the table has there: the build step and this
-/// crate disagree on the rows, a bug of the build, refused by name (rule 3).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SourcesRefused {
-    pub at: usize,
-    pub found: &'static str,
-    pub wanted: &'static str,
-}
-
-impl fmt::Display for SourcesRefused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the build's producer sources name `{}` at row {}, where the table has `{}` (producer-id.md)",
-            self.found, self.at, self.wanted
-        )
-    }
-}
-
-impl core::error::Error for SourcesRefused {}
-
 const BUILD_DOMAIN: &str = "blaze producer of the build";
-const SOURCE_DOMAIN: &str = "blaze producer of its source";
 const TEST_DOMAIN: &str = "blaze producer for a test";
 const TABLE_DOMAIN: &str = "blaze producer table";
 
@@ -187,26 +157,12 @@ pub struct Producers {
 }
 
 impl Producers {
-    /// Piece 1 of D105: every row from the running binary's build id (bstd's `Host::build_id`),
-    /// each under its row's name. A rebuilt blaze has new ids for every producer, so nothing is
-    /// stale and nothing is shared between builds.
+    /// Every row from the running binary's build id (bstd's `Host::build_id`), each under its
+    /// row's name. A rebuilt blaze has new ids for every producer, so nothing is stale and nothing
+    /// is shared between builds. The one constructor outside tests while every producing function
+    /// is in the entry crate (blaze-cli `producers.rs` says why the source rows of piece 2 went).
     pub fn of_build(build_id: &[u8]) -> Producers {
         Producers { rows: Row::ALL.map(|row| row_digest(BUILD_DOMAIN, row, build_id)) }
-    }
-
-    /// Piece 2 of D105: each row from the digest of its producer's source, as the build made it
-    /// ([`Sources`]); [`Row::Whole`] stays the build id. A release that leaves a producer's
-    /// crates alone keeps its id, and the shared cache's records under it.
-    pub fn of_sources(build_id: &[u8], sources: &Sources) -> Result<Producers, SourcesRefused> {
-        let mut rows = [ContentId([0; 32]); Row::COUNT];
-        for (at, (row, (found, digest))) in Row::FROM_SOURCE.into_iter().zip(sources.rows).enumerate() {
-            if found != row.name() {
-                return Err(SourcesRefused { at, found, wanted: row.name() });
-            }
-            rows[row.index()] = row_digest(SOURCE_DOMAIN, row, &digest);
-        }
-        rows[Row::Whole.index()] = row_digest(BUILD_DOMAIN, Row::Whole, build_id);
-        Ok(Producers { rows })
     }
 
     /// A fixed table for a test: every row from `seed`. Two tests with one seed agree; nothing
@@ -270,24 +226,19 @@ mod tests {
         std::println!("producers: each of {} rows moves alone", Row::COUNT);
     }
 
-    /// Typed ids read their own row; the build's sources must name the rows in order.
+    /// Typed ids read their own row; another build id moves every row (rule 21: the build's
+    /// code made every record).
     #[test]
-    fn typed_ids_and_sources_rows() {
+    fn typed_ids_and_every_row_of_the_build() {
         let table = Producers::for_tests(b"test");
         assert_eq!(table.get::<Expander>().id(), table.row(Row::Expander));
         assert_eq!(table.get::<BodyChecker>().id(), table.row(Row::BodyChecker));
-        let mut sources = Sources { rows: Row::FROM_SOURCE.map(|row| (row.name(), [7; 32])) };
-        let made = Producers::of_sources(b"id", &sources).expect("rows in order");
-        assert_eq!(made.row(Row::Whole), Producers::of_build(b"id").row(Row::Whole));
-        assert_ne!(made.row(Row::Expander), Producers::of_build(b"id").row(Row::Expander));
-        sources.rows.swap(0, 1);
-        assert_eq!(
-            Producers::of_sources(b"id", &sources),
-            Err(SourcesRefused { at: 0, found: "lowering", wanted: "expander" })
-        );
+        let (one, other) = (Producers::of_build(b"one"), Producers::of_build(b"other"));
         for row in Row::ALL {
+            assert_ne!(one.row(row), other.row(row), "row {row:?} kept across builds");
             assert_eq!(Row::named(row.name()), Some(row));
         }
-        std::println!("producers: typed ids and sources rows hold");
+        assert_eq!(Producers::of_build(b"one"), one);
+        std::println!("producers: typed ids hold; another build moves all {} rows", Row::COUNT);
     }
 }

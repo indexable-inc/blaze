@@ -23,8 +23,10 @@ pub(crate) struct JobTexts<'n> {
     pub(crate) frame: &'n Frame,
     pub(crate) packs: &'n [PackView<'n>],
     pub(crate) corrected: &'n [(u32, &'n str, &'n str)],
-    /// The environment of the one crate the job is about, by its world index: what `env!`
-    /// reads. `None` (a body job's): every `env!` asked through these texts is refused by name.
+    /// The environment of the one crate the job is about, by its index among the job's crates
+    /// (a names job's world index; a body job's owner, 0: body_types.rs `owner_env`): what
+    /// `env!` reads. Any other crate, or `None` (a run's bodies, run_names.rs): every `env!`
+    /// asked through these texts is refused by name.
     pub(crate) env: Option<(usize, &'n CrateEnv<'n>)>,
     /// Each checkout path asked (tree 0, after `/0/`), in the order first asked, with its text
     /// or `None` when there is no such file.

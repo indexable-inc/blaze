@@ -42,7 +42,7 @@ impl<'a> Scratch<'a> {
             masks: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             stats: crate::eval::Stats::default(),
             auto: crate::auto_summary::Summaries::new_in(alloc),
-            off: crate::eval::Off { summaries: false, prematch: false },
+            off: crate::eval::Off { summaries: false, prematch: false, memo: false },
         }
     }
 

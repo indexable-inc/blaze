@@ -90,6 +90,7 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
     assert_eq!(package.env.get("OUT_DIR"), EnvAnswer::Unknown, "a script whose record is not joined");
     assert_eq!(package.env.get("CARGO_BIN_EXE_app"), EnvAnswer::Unknown, "an integration test's binary path");
     assert_eq!(package.env.get("CARGO_BIN_NAME"), EnvAnswer::Unset, "not a binary");
+    assert_eq!(package.env.get("CARGO"), EnvAnswer::Unset, "no cargo binary: proc-macro-crate reads the package's manifest");
     assert_eq!(package.env.get("PATH"), EnvAnswer::Unset, "no ambient environment (rule 75)");
 
     // The sandbox: an unknown read is a refusal naming the variable and the calling crate.
@@ -108,6 +109,70 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
         NAMES.len(),
         refused.err().and_then(|e| e.krate).unwrap_or_default()
     );
+}
+
+/// `proc-macro-crate` 3.5.0's `crate_name` (jsonrpsee's `#[rpc]`, tempo's 28 "no
+/// `XApiServer`"): it reads `CARGO_MANIFEST_DIR`, then `CARGO` (set: it runs `cargo
+/// locate-project`), then `$CARGO_MANIFEST_DIR/Cargo.toml`. A fetched git package (reth's
+/// `reth-rpc-api`, its manifest as written in the repository, `workspace = true` keys and all)
+/// is served from its record at `/package`: `CARGO` is unset by rule (no cargo binary), and the
+/// manifest is the package's own bytes. CONTROL: the env as it was (`CARGO` among the unknown
+/// names) refuses the read, which stopped every such call before the macro looked.
+///
+/// Expected: `test proc_env_unknown_tests::a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest ... ok`.
+#[test]
+fn a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest() {
+    use blaze_wasi::{Open, ROOT_FD, System};
+
+    const MANIFEST: &[u8] = b"[package]\nname = \"reth-rpc-api\"\nversion.workspace = true\n\n[dependencies]\njsonrpsee = { workspace = true, features = [\"server\", \"macros\"] }\n";
+    let facts = EnvFacts {
+        crate_name: "reth_rpc_api",
+        package: Some(("reth-rpc-api", "1.9.3")),
+        bin: None,
+        seen: SeenRoot::Package,
+        read_folder: "/1/crates/rpc/rpc-api/",
+        build_script: false,
+        script: None,
+        test_or_bench: false,
+    };
+    let env = CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of reth_rpc_api: {e}"));
+    let files = || {
+        let listed: std::vec::Vec<(String, &'static [u8])> = std::vec![(String::from("Cargo.toml"), MANIFEST), (String::from("src/lib.rs"), &b""[..])];
+        Files::Listed(Arc::from(listed))
+    };
+    let package = unit_package(&env, files()).unwrap_or_else(|e| panic!("{e:?}"));
+    let mut sandbox = Sandbox::new(Arc::new(package));
+    let dir = sandbox.var("CARGO_MANIFEST_DIR").unwrap_or_else(|e| panic!("{e:?}")).unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR unset"));
+    assert_eq!(dir, "/package");
+    assert_eq!(sandbox.var("CARGO"), Ok(None), "CARGO is unset by rule: proc-macro-crate skips `cargo locate-project`");
+    const READ_ONLY: Open = Open { dirflags: 1, oflags: 0, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
+    let path = std::format!("{dir}/Cargo.toml");
+    let fd = match sandbox.open(ROOT_FD, path.as_bytes(), READ_ONLY) {
+        Ok(Ok(fd)) => fd,
+        Ok(Err(errno)) => panic!("{path}: errno {errno:?}"),
+        Err(stop) => panic!("{path}: {}", stop.0),
+    };
+    let mut read = std::vec::Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        match sandbox.read(fd, &mut buf) {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => read.extend_from_slice(&buf[..n]),
+            Ok(Err(errno)) => panic!("{path}: read errno {errno:?}"),
+            Err(stop) => panic!("{path}: {}", stop.0),
+        }
+    }
+    assert_eq!(read, MANIFEST, "the macro reads the package's manifest as the repository has it");
+
+    // The control: `CARGO` among the unknown names, as crate_env.rs `CARGO_ALWAYS` had it.
+    let mut old_unknown: std::vec::Vec<String> = env.unknown().map(String::from).collect();
+    old_unknown.push(String::from("CARGO"));
+    let mut set = std::vec::Vec::new();
+    set.extend(unit_env(&env));
+    let old_env = PackageEnv::new(set, old_unknown, env.unknown_prefixes().map(String::from).collect()).unwrap_or_else(|e| panic!("{e}"));
+    let mut old = Sandbox::new(Arc::new(Package::new(files(), old_env).unwrap_or_else(|e| panic!("{e}"))));
+    assert!(old.var("CARGO").is_err(), "the planted old env answered CARGO");
+    println!("git package's macro: CARGO unset, read {} manifest bytes at {path}; the old env refused CARGO", read.len());
 }
 
 /// The set pairs as macro-env-per-unit's `unit_package` gave them (the control's env).

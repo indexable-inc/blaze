@@ -161,17 +161,30 @@ pub(crate) fn discover<'f>(
                     let _cx = cx.span("names: make the world");
                     crate::names::world(&cx, root, record.payload_bytes(), Some(lockfile.lock), Some(graph.member_dirs()), env)
                 };
+                // The record sealed with the crate list as work.rs's arm seals it: its readers
+                // (a `Script` job, a macro module's lookup) open its two sections
+                // (graph_payload.rs); unsealed, they were refused "no trailer mark".
                 match world {
-                    Ok(made) => {
-                        crate::names::tell_public(store, &made);
-                        names = Some(made);
-                    }
+                    Ok(made) => match blaze_world::crate_list::encode(made.world(), &|at| made.script_name_of(at), env.heap.alloc()) {
+                        Ok(list) => {
+                            record.out = crate::work::seal_graph(&mut record, &list);
+                            crate::names::tell_public(store, &made);
+                            names = Some(made);
+                            Ok(record)
+                        }
+                        Err(error) => {
+                            let words = bstd::mem::format_in!(frame, "the crate list of the world could not be written: {error}");
+                            let failure = TaskFailure { name, why: blaze_drive::Why::Refused { what: "the crate list", rule: "crate_list.rs" } };
+                            Err(Failure { failure, words: Some(crate::work::held_str(words.as_str(), frame)) })
+                        }
+                    },
                     Err(error) => {
                         let words = bstd::mem::format_in!(frame, "names not resolved: {error}");
                         record.find(crate::fetch::SOURCE_REFUSED, (0, 0), &[words.as_str()]);
+                        record.out = crate::work::seal_graph(&mut record, &[]);
+                        Ok(record)
                     }
                 }
-                Ok(record)
             }
             Err(failure) => Err(failure),
         };

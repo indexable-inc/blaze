@@ -249,9 +249,11 @@ impl<'b> StaticEntryView<'b> {
 /// thread-local, which no `static` item backs). A `Space::Tls` target is named too: the child
 /// numbers a thread-local from its template, the datum the parent sends under the same symbol.
 /// The run's parent publishes no record before checking each of these was sent (blaze-cli
-/// run_parent.rs `Needs::publish`).
+/// run_parent.rs `Needs::publish`). A `Space::Vtable` target is named too, as is each target
+/// of that kind in the datum of a vtable the code entry carries (a supertrait's table): the
+/// child binds a vtable to its datum, sent as a static's is (form 6, [`each_vtable_datum`]).
 pub fn each_static_named(entry: &[u8], mut each: impl FnMut(Symbol)) -> Result<(), EntryError> {
-    let sent = |space| matches!(space, Space::Static | Space::Tls);
+    let sent = |space| matches!(space, Space::Static | Space::Tls | Space::Vtable);
     match entry.get(..8) {
         Some(magic) if magic == STATIC_ENTRY_MAGIC => {
             let datum = StaticEntryView::read(entry)?.datum;
@@ -263,16 +265,40 @@ pub fn each_static_named(entry: &[u8], mut each: impl FnMut(Symbol)) -> Result<(
             }
         }
         _ => {
-            let record = super::EntryView::read(entry)?.record;
+            let view = super::EntryView::read(entry)?;
+            let record = view.record;
             for i in 0..record.targets() {
                 let target = record.target(i);
                 if sent(target.space) {
                     each(target.symbol);
                 }
             }
+            view.each_vtable(
+                |_, datum| {
+                    for i in 0..datum.targets() {
+                        let target = datum.target(i);
+                        if sent(target.space) {
+                            each(target.symbol);
+                        }
+                    }
+                    Ok(())
+                },
+                |why| why,
+            )?;
         }
     }
     Ok(())
+}
+
+/// Each vtable a code entry carries (form 6): its symbol and its encoded datum, what the run's
+/// parent files and sends in the record's `Data` (blaze-cli run_parent.rs `Lazy::resolve`). A
+/// static's entry carries none.
+pub fn each_vtable_datum<'e, E>(entry: &'e [u8], mut each: impl FnMut(Symbol, &'e [u8]) -> Result<(), E>, malformed: impl Fn(EntryError) -> E) -> Result<(), E> {
+    if entry.get(..8).is_some_and(|magic| magic == STATIC_ENTRY_MAGIC) {
+        return Ok(());
+    }
+    let view = super::EntryView::read(entry).map_err(&malformed)?;
+    view.each_vtable(|symbol, datum| each(symbol, datum.encoded()), malformed)
 }
 
 /// The record an entry of either kind holds: a code record's bytes, or a static's datum.

@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use blaze_drive::key::{ABSENT, Key, Kind, Name};
 use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_ladder::front2::buckets::{TableSet, write_impl_tables};
+use blaze_ladder::front2::buckets::{ImplShelf, ImplShelfOpts, ShelfError, ShelvedTwice, TableSet, framed, impl_tables_name, impl_tables_task, write_impl_tables};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
-use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
+use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::task::{BodyFrame, BodyOut, Facts, Make, MakeRefused, check_body, verdict_bytes};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::Alloc;
@@ -136,6 +136,19 @@ pub fn wrong_one() -> u32 {
 }
 pub fn wrong_two() -> Sq {
     5u32
+}
+pub enum Light {
+    Red,
+    Green(u32),
+}
+pub fn go() -> Light {
+    Light::Green(1)
+}
+pub fn longer<'a, 'b: 'a>(x: &'a u8, _y: &'b u8) -> &'a u8 {
+    x
+}
+pub fn pick_longer(x: &u8) -> &u8 {
+    longer(x, x)
 }
 ";
 
@@ -298,7 +311,7 @@ fn run(records: &'static Records<'static>, impls: Option<&'static TableSet<'stat
 
 fn body_frame(plant: Option<NameCell>) -> BodyFrame<'static> {
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the body's frame")));
-    BodyFrame { frame, alloc: a(), plant_drop: plant, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All }
+    BodyFrame { frame, alloc: a(), plant_drop: plant, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None }
 }
 
 /// What two runs are compared by: each body's whole result, by key.
@@ -391,6 +404,59 @@ fn order_and_workers_give_equal_bytes() {
     assert_eq!(shown(&forward), eight, "8 workers answer otherwise than 1");
 }
 
+/// ONE SHELF, MANY RUNS (engine.md E6, the Heads stage): each crate's tables made ONCE by the
+/// Heads task (`impl_tables_task`), framed as the store holds them and put on one `ImplShelf`;
+/// 8 runs on 8 threads, each with its own reader and its own `TableSet::lent` over that one
+/// shelf, give every body the same result, reads included, as one reader's own tables. A crate
+/// put twice is refused by name.
+#[test]
+fn several_runs_read_one_shelf() {
+    let kept = kept();
+    let records = reader(kept);
+    let list = bodies(records);
+    let make = MapMake { edited: Vec::new() };
+    let own = impl_tables(records);
+    let want: Vec<(ItemKey, BodyOut<'static>)> = list.iter().map(|(k, _)| (*k, run(records, Some(own), *k, &body_frame(None), &make))).collect();
+    let mut shelf = ImplShelf::new(ImplShelfOpts {});
+    for krate in [APP_AT, CORE_AT] {
+        let mut rows = Vec::new();
+        assert!(NamesSource::each_impl_row(records, krate, &mut |r| rows.push(r)), "crate {krate} has impl rows");
+        let done = impl_tables_task(records, krate, &rows, a());
+        assert!(done.failed.is_none(), "crate {krate}'s tables task failed: {:?}", done.failed);
+        let key = NamesSource::crate_key(records, krate).expect("the crate's key");
+        assert_eq!(done.name, impl_tables_name(key), "the task's name is its crate's");
+        let tables = done.records.expect("the task's records");
+        shelf.put_framed(key, &framed(&tables, std::alloc::Global)).unwrap_or_else(|e| panic!("crate {krate}'s framed tables: {e}"));
+        assert!(shelf.holds(key));
+        assert_eq!(shelf.put(key, &tables), Err(ShelvedTwice { krate: key }), "a crate put twice is refused");
+    }
+    assert_eq!(shelf.len(), 2);
+    assert!(matches!(shelf.put_framed(CrateItemKey(ContentId([7; 32])), b"bzimpl1\0\x05"), Err(ShelfError::Malformed { .. })), "a cut payload is refused");
+    let shelf: &'static ImplShelf = Box::leak(Box::new(shelf));
+    let keys: Vec<ItemKey> = list.iter().map(|(k, _)| *k).collect();
+    let mut eight: Vec<String> = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|w| {
+                let keys = &keys;
+                s.spawn(move || {
+                    let records = reader(kept);
+                    let lent: &'static TableSet<'static> = Box::leak(Box::new(TableSet::lent(shelf, a())));
+                    let make = MapMake { edited: Vec::new() };
+                    let mine: Vec<(ItemKey, BodyOut<'static>)> = keys.iter().enumerate().filter(|(i, _)| i % 8 == w).map(|(_, k)| (*k, run(records, Some(lent), *k, &body_frame(None), &make))).collect();
+                    shown(&mine)
+                })
+            })
+            .collect();
+        for h in handles {
+            eight.extend(h.join().expect("a worker panicked"));
+        }
+    });
+    eight.sort();
+    assert_eq!(eight.len(), keys.len(), "entries per result: 1");
+    assert_eq!(shown(&want), eight, "runs over one shelf answer otherwise than one reader's own tables");
+}
+
 /// THE READ LIST IS WHAT MOVES THE ANSWER. `wrong_one` returns `Tri`: its answer is a
 /// function of `Tri`'s item cell. An edit that moves that cell dirties the body (a read of it
 /// saw another digest). PLANTED BUG: a recorder that drops that one read leaves the body
@@ -417,6 +483,96 @@ fn an_edit_dirties_the_body_and_a_dropped_read_is_caught() {
     let planted = run(records, Some(tables), body, &body_frame(Some(cell)), &MapMake { edited: Vec::new() });
     assert!(!dirtied(&planted, &edit), "CONTROL: the planted dropped read must leave the body standing under the edit");
     assert_eq!(planted.bytes.as_slice(), before.bytes.as_slice(), "the planted bug changes only the read list");
+}
+
+/// A FACT'S CELL IS THE CELL THAT HOLDS IT, READ WHOLE. `go` calls one constructor of `Light`:
+/// the constructor's facts are held by `Light`'s head cell (an edit of the variant list moves
+/// that cell), so `go` reads it, part 0; `sides_of` calls a trait member, held by `Shape`'s
+/// cell. Before (lane FI's find): the read named the constructor's and the member's own keys,
+/// cells nothing writes, with the fact's kind as the part, so the edit left `go` standing.
+#[test]
+fn a_fact_reads_the_cell_that_holds_it() {
+    use blaze_ladder::front2::keys::checker_of;
+    use blaze_ladder::front2::tables::head::signature_name;
+    let kept = kept();
+    let records = reader(kept);
+    let tables = impl_tables(records);
+    let root = NamesSource::root_module(records, APP_AT).expect("app's root");
+    let item = |ns: Namespace, name: &str| -> ItemKey {
+        let segments = [name];
+        let found = NamesSource::walk(records, root, ns, Written { kind: PathKind::Plain, segments: &segments[..] }).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
+        found.whole(1).unwrap_or_else(|| panic!("`{name}` names an item")).key
+    };
+    // `pick_longer` calls `longer<'a, 'b: 'a>` and reads `longer`'s head cell (its frozen
+    // meaning holds the lifetime bounds, lane FK's `a_lifetime_bound_alone_moves_the_head`),
+    // so dropping only `'b: 'a` dirties it. (Lane VB's open find was the fixture's: it named
+    // two fns `pick`, and the walk found the generic one, which calls `clone`, not `longer`.)
+    for (body, holder, ns) in [("go", "Light", Namespace::Types), ("sides_of", "Shape", Namespace::Types), ("pick_longer", "longer", Namespace::Values)] {
+        let out = run(records, Some(tables), item(Namespace::Values, body), &body_frame(None), &MapMake { edited: Vec::new() });
+        let want = CellId { of: signature_name(checker_of(item(ns, holder)).0.to_be_bytes()), cell: blaze_drive::cells::Cell([0; 16]) };
+        assert!(out.done.reads.iter().any(|(id, _)| *id == want), "`{body}` does not read `{holder}`'s head cell {want:?}; its head reads: {:?}", out.done.reads.iter().filter(|(id, _)| id.of.kind == Kind::Signature).collect::<Vec<_>>());
+        assert!(dirtied(&out, &MapMake { edited: vec![want] }), "an edit of `{holder}`'s head leaves `{body}` standing");
+    }
+    // ONE PART: every head read of every body is its cell's part 0.
+    for (key, _) in bodies(records) {
+        let out = run(records, Some(tables), key, &body_frame(None), &MapMake { edited: Vec::new() });
+        for (id, _) in out.done.reads.iter().filter(|(id, _)| id.of.kind == Kind::Signature) {
+            assert_eq!(id.cell.0, [0; 16], "{key:x} reads part {:?} of {:?}: a head cell is read whole", id.cell, id.of);
+        }
+    }
+}
+
+/// THE RESULT SAYS WHAT `check` PRINTS: `wrong_one` returns `Tri` where `u32` is declared, a
+/// type error by its code at an item-relative range, its words the verdict's; a clean body
+/// says nothing.
+#[test]
+fn the_result_carries_the_verdicts_lines() {
+    use blaze_ladder::front2::tables::task::SaidWhat;
+    let kept = kept();
+    let records = reader(kept);
+    let tables = impl_tables(records);
+    let root = NamesSource::root_module(records, APP_AT).expect("app's root");
+    let item = |name: &str| -> ItemKey {
+        let segments = [name];
+        let found = NamesSource::walk(records, root, Namespace::Values, Written { kind: PathKind::Plain, segments: &segments[..] }).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
+        found.whole(1).unwrap_or_else(|| panic!("`{name}` names an item")).key
+    };
+    let wrong = run(records, Some(tables), item("wrong_one"), &body_frame(None), &MapMake { edited: Vec::new() });
+    assert!(wrong.done.findings > 0, "`wrong_one` has findings");
+    assert_eq!(wrong.said.len(), wrong.done.findings as usize, "one line a finding: {:?}", wrong.said);
+    let first = wrong.said.first().expect("a line");
+    assert!(matches!(first.what, SaidWhat::Type { .. }) && first.end > first.start && !first.words.is_empty(), "a type error with its range and words: {first:?}");
+    let clean = run(records, Some(tables), item("go"), &body_frame(None), &MapMake { edited: Vec::new() });
+    assert!(clean.said.is_empty(), "a clean body says nothing: {:?}", clean.said);
+}
+
+/// EVERY HEAD A BODY'S CHECK TOUCHES IS A READ (rule 21), for every body of the fixture: a
+/// body's own store makes a head only when the check asks for it, so each head it holds after
+/// the check (`BodyOut::held`, by the store's own keys) must have its cell in the read list.
+/// A head answered without its fact recorded (a cache that answers a later asker, a lookup
+/// beside the recorded question) is a held head with no read, and fails here by name.
+#[test]
+fn every_head_the_check_touches_is_read() {
+    let kept = kept();
+    let records = reader(kept);
+    let tables = impl_tables(records);
+    let mut held = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    for (key, body) in bodies(records) {
+        let out = run(records, Some(tables), key, &body_frame(None), &MapMake { edited: Vec::new() });
+        held += out.held.len();
+        // The program's crate's heads (its checker keys share the body's first 8 bytes): a
+        // `core` head the store holds is made as a NEED of another head (the `Sized` chain a
+        // trait's head needs), which no check reads; whether a head's cell covers its needs is
+        // the head's own read list (tables/head.rs), not the body's.
+        let krate = u128::from(u64::from_be_bytes(key.0.0[..8].try_into().expect("8 bytes")));
+        let lost: Vec<_> = out.held.iter().filter(|(h, k)| k >> 64 == krate && !out.reads.contains(h)).map(|(_, k)| format!("{k:032x}")).collect();
+        if !lost.is_empty() {
+            missing.push(format!("body {key:x} ({body:?}): held, not read {lost:?}; its verdict {}", String::from_utf8_lossy(&out.bytes)));
+        }
+    }
+    assert!(held > 0, "CONTROL: the fixture's bodies hold heads (the instrument saw none)");
+    assert!(missing.is_empty(), "{} bodies hold heads they do not read:\n{}", missing.len(), missing.join("\n"));
 }
 
 /// Whether a result's row is not today's under `edit`: a read whose digest moved.

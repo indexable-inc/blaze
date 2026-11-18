@@ -64,6 +64,29 @@ pub enum Why {
     NeedConst(LibKey, Range),
 }
 
+/// Why a type alias's head was refused ([`Heads::alias_gap`]): the refusal's text, the same
+/// whether the head was lowered here (its `Why`'s `Debug`, the `Why` kept beside it) or filed
+/// from a frozen head record (head_record.rs `K_ALIAS_REFUSED`, which holds the text only). Its
+/// `Debug` is that text, so a message naming the refusal reads alike either way.
+pub struct AliasGap {
+    pub text: Box<str, Global>,
+    /// The builder's own `Why`; `None` for a refusal filed from a record.
+    pub why: Option<Why>,
+}
+
+impl AliasGap {
+    /// A refusal made here.
+    pub fn made(why: Why) -> AliasGap {
+        AliasGap { text: format!("{why:?}").into_boxed_str(), why: Some(why) }
+    }
+}
+
+impl core::fmt::Debug for AliasGap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 impl From<lf::BadRow> for Why {
     fn from(b: lf::BadRow) -> Why {
         Why::Program(format!("blaze-lower's record has a malformed row in column `{}`", b.column).into_boxed_str(), Range::new(0, 0))
@@ -237,7 +260,7 @@ pub trait Heads {
     /// empty before its head is made).
     fn alias_defaults(&self, alias: LibKey) -> &[Option<PTy>];
     /// Why a type alias's head was refused (`Some(None)` from [`Heads::alias`]).
-    fn alias_gap(&self, alias: LibKey) -> Option<&Why>;
+    fn alias_gap(&self, alias: LibKey) -> Option<&AliasGap>;
     /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): what a bound naming it stands
     /// for. `None` when not lowered yet.
     fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead>;

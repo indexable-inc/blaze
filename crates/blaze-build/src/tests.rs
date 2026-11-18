@@ -51,6 +51,10 @@ struct BodyBuf {
     asm_text: &'static str,
     /// Call arguments' literal values for `#[rustc_legacy_const_generics]` (`BodyView::call_arg_ints`).
     call_arg_ints: Vec<(ExprId, u128), Global>,
+    /// Every expression made, as `BodyView::unsafe_blocks`: a test body is checked as written
+    /// inside `unsafe`, so its intrinsic calls and `asm!`s need no block (the unsafety check's
+    /// own tests are blaze-ladder's tests/front2_unsafety.rs).
+    unsafe_blocks: Vec<ExprId, Global>,
 }
 
 impl BodyBuf {
@@ -79,11 +83,13 @@ impl BodyBuf {
             asm_operands: Vec::new_in(Global),
             asm_text: "",
             call_arg_ints: Vec::new_in(Global),
+            unsafe_blocks: Vec::new_in(Global),
         }
     }
 
     fn e(&mut self, e: Expr) -> ExprId {
         let at = self.exprs.len() as u32;
+        self.unsafe_blocks.push(ExprId(at));
         self.exprs.push(e);
         self.expr_ranges.push(Range { start: at, end: at + 1 });
         ExprId(at)
@@ -235,6 +241,7 @@ impl BodyBuf {
             asm_clobbers: &[],
             asm_text: self.asm_text,
             call_arg_ints: &self.call_arg_ints,
+            unsafe_blocks: &self.unsafe_blocks,
         }
     }
 }

@@ -235,6 +235,7 @@ pub(crate) struct MachineSnapshot<S> {
     projected: usize,
     fru_fields: usize,
     default_fields: usize,
+    union_fields: usize,
 }
 
 /// An autoderef step: the type, and whether it was reached by `Deref::deref`.
@@ -365,6 +366,12 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// The typed lints' findings (rules/args_inline.rs), filed after the end sequence: written
     /// back as `Checked::findings`.
     pub typed_findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>>,
+    /// Each field expression whose field is a union's (rules/field.rs), in walk order: read by
+    /// the unsafety pass (rules/unsafety.rs), which sorts it.
+    pub union_fields: Vec<ExprId, Alloc<'a>>,
+    /// What the unsafety pass could not decide (rules/unsafety.rs): written back as
+    /// `Checked::undecided`, never a pass and never an error.
+    pub undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>>,
     pub coerce_many: Vec<CoerceMany, Alloc<'a>>,
     /// Each coercion site's value sources so far, `(site, expression)`, in push order; a `!`
     /// source is not listed. Read when the site's fn items meet at a fn pointer
@@ -475,6 +482,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             default_fields: Vec::new_in(alloc),
             index_mut: Vec::new_in(alloc),
             typed_findings: Vec::new_in(alloc),
+            union_fields: Vec::new_in(alloc),
+            undecided: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
             coerce_sources: Vec::new_in(alloc),
             breaks: Vec::new_in(alloc),
@@ -1185,6 +1194,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             projected: self.projected.len(),
             fru_fields: self.fru_fields.len(),
             default_fields: self.default_fields.len(),
+            union_fields: self.union_fields.len(),
         }
     }
 
@@ -1209,6 +1219,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.projected.truncate(s.projected);
         self.fru_fields.truncate(s.fru_fields);
         self.default_fields.truncate(s.default_fields);
+        self.union_fields.truncate(s.union_fields);
     }
 
     /// Runs `f` in a snapshot that is always rolled back (`probe`).

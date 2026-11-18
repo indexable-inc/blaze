@@ -1817,23 +1817,11 @@ impl FrontEnd for Front2Program<'_> {
         self.front.index.lang("format_argument").map(checker_of)
     }
 
-    /// The constructor by name (blaze-build walk/fmt.rs `argument_new_name`) in rt.rs's one
-    /// inherent `impl Argument<'_>`, found among the impls of `Argument`'s own module whose
-    /// header is inherent on it, as its member key once the impl's head was made. Two such
-    /// impls, or none made, is no answer (the builder refuses naming the constructor).
+    /// The constructor's answer the walk's ask left in the impl index (fmt_template.rs
+    /// `argument_new_answered`, the one reader both programs share); none asked, or not one
+    /// fn, is no answer (the builder refuses naming the constructor).
     fn fmt_argument_new(&self, trait_: tc::FmtTrait) -> Option<ItemKey> {
-        let name = super::fmt_template::argument_new_name(trait_);
-        let adt = self.front.index.lang("format_argument")?;
-        let module = self.front.names.module_of(adt)?;
-        let mut found = self
-            .front
-            .index
-            .impls
-            .iter()
-            .filter(|i| i.module == module && super::fmt_template::inherent_on(i.header, "Argument"))
-            .filter_map(|i| self.front.keys.filed_member(checker_of(i.key), MemberKind::Fn, name));
-        let first = found.next()?;
-        found.next().is_none().then_some(first)
+        super::fmt_template::argument_new_answered(&self.front.index, self.buckets.as_ref(), trait_)
     }
 
     fn float_lit(&self, owner: ItemKey, e: ExprId) -> Option<(u64, u32)> {

@@ -234,6 +234,10 @@ pub struct World {
     fn_once: Option<ItemKey>,
     /// The unit's ground table and layouts, kept between evaluations.
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
+    /// The statics declared ([`ConstWorld::is_static`]).
+    statics: StdVec<ItemKey>,
+    /// The ADTs standing for core's `UnsafeCell` ([`World::unsafe_cell_is`]).
+    cells: StdVec<ItemKey>,
 }
 
 /// A const or a static.
@@ -296,6 +300,8 @@ impl World {
             manually_drop: None,
             fn_once: None,
             unit: None,
+            statics: StdVec::new(),
+            cells: StdVec::new(),
         }
     }
 
@@ -308,6 +314,12 @@ impl World {
     /// ADT `adt` is core's `ManuallyDrop` (`#[lang = "manually_drop"]`) in this world.
     pub fn manually_drop_is(&mut self, adt: ItemKey) {
         self.manually_drop = Some(adt);
+    }
+
+    /// ADT `adt` is core's `UnsafeCell` (`#[lang = "unsafe_cell"]`) in this world: its repr
+    /// hides its field's niche, and a type holding it by value is not `Freeze`.
+    pub fn unsafe_cell_is(&mut self, adt: ItemKey) {
+        self.cells.push(adt);
     }
 
     /// Item `item` is `FnOnce::call_once` in this world ([`ConstWorld::fn_trait_method`]).
@@ -404,6 +416,7 @@ impl World {
         let k = self.fx.func(&std::format!("static {name}"), 0, &[], t, StdVec::new());
         self.fx.use_path(name, Def::Static(k, Mutbl::Not));
         self.declare(name, k);
+        self.statics.push(k);
         self.kinds.push((k, FnKind::NotConst));
         self.texts.push((k, std::format!("static {name}: {ty} = {body};")));
         k
@@ -415,6 +428,7 @@ impl World {
         let k = self.fx.func(&std::format!("static mut {name}"), 0, &[], t, StdVec::new());
         self.fx.use_path(name, Def::Static(k, Mutbl::Mut));
         self.declare(name, k);
+        self.statics.push(k);
         self.kinds.push((k, FnKind::NotConst));
         self.texts.push((k, std::format!("static mut {name}: {ty} = {body};")));
         k
@@ -631,6 +645,9 @@ impl World {
             Value::Static(m) => ("static", Some(m)),
         };
         let k = self.fx.func(&std::format!("{label} {name}"), 0, &[], t, StdVec::new());
+        if def.is_some() {
+            self.statics.push(k);
+        }
         if named {
             self.fx.use_path(name, def.map_or(Def::Const(k), |m| Def::Static(k, m)));
             self.declare(name, k);
@@ -855,7 +872,7 @@ impl LayoutFacts for World {
             PNode::Uint(u) => IntRepr::Unsigned(u),
             _ => panic!("a repr that is not an integer"),
         });
-        ReprAttrs { int, ..ReprAttrs::RUST }
+        ReprAttrs { int, hide_niche: self.cells.contains(&key), ..ReprAttrs::RUST }
     }
 
     /// From the explicit discriminant's record (the machine makes it a need before it asks).
@@ -892,6 +909,10 @@ impl ConstWorld for World {
             h.id(&b.hash);
         }
         h.finish()
+    }
+
+    fn is_static(&self, item: ItemKey) -> bool {
+        self.statics.contains(&item)
     }
 
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>> {

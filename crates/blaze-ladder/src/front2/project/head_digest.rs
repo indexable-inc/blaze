@@ -30,7 +30,7 @@ use blaze_surface::{ItemIndex, ItemKind};
 use blaze_typeck::ItemKey;
 
 use super::ProjectWorld;
-use crate::front2::by_origin::{self, KeyKind};
+use crate::front2::by_origin;
 use crate::front2::fill::FillError;
 use crate::front2::head_record::{self, HeadAt, HeadRecordError};
 use crate::front2::heads::{HeadError, Want};
@@ -192,18 +192,22 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         if !self.store.made(want) {
             self.store.ensure(self.front.names, &mut self.front.keys, want).map_err(|error| HeadDigestError::Ensure { want, error })?;
         }
-        want_digest_in(self.front.names, &self.front.keys, &self.store, want, alloc)
+        want_digest_in(self.front.names, &self.front.keys, &mut self.store, want, alloc)
     }
 
 }
 
 /// The digest of every head `want` made in `store` ([`want_heads`]; see the module docs): the
 /// count, then each head's [`head_record::reader_digest`] in that order. `want` must be made.
-pub fn want_digest_in<'n, N: crate::front2::source::NamesSource<'n>>(names: N, keys: &crate::front2::keys::Keys, store: &crate::front2::heads::Store<'_>, want: Want, alloc: Alloc<'_>) -> Result<ContentId, HeadDigestError> {
-    let heads = want_heads(names, keys, store, want, alloc);
+/// Each head's lifetime part is made first (lifetimes.rs `Store::make_lives`): it is in what
+/// the head means (head_record.rs form 10), so an edit of a lifetime bound alone moves it.
+pub fn want_digest_in<'n, N: crate::front2::source::NamesSource<'n>>(names: N, keys: &crate::front2::keys::Keys, store: &mut crate::front2::heads::Store<'n>, want: Want, alloc: Alloc<'_>) -> Result<ContentId, HeadDigestError> {
+    let heads = want_heads(store, want, alloc);
+    store.make_lives(names, keys, &heads);
+    let store: &crate::front2::heads::Store<'n> = store;
     let mut digests: AVec<'_, ContentId> = AVec::new_in(alloc);
     for at in heads.iter().copied() {
-        let head = head_record::from_store(store, at, None, None).map_err(|error| HeadDigestError::Record { want, at, error })?;
+        let head = head_record::from_store(store, at).map_err(|error| HeadDigestError::Record { want, at, error })?;
         // What the head means, not how it is spelled: a reformat moves no reader.
         digests.push(head_record::reader_digest(head, store.tys.view(), alloc).map_err(|error| HeadDigestError::Record { want, at, error })?);
     }
@@ -232,7 +236,7 @@ pub fn digest_of_heads(count: usize, digests: impl IntoIterator<Item = ContentId
 ///
 /// A trait's associated types' item bounds (filed in `Store::preds` under each type's key) are
 /// no head of their own kind yet (`HeadAt`), so not listed.
-pub fn want_heads<'n, 'a, N: crate::front2::source::NamesSource<'n>>(names: N, keys: &crate::front2::keys::Keys, store: &crate::front2::heads::Store<'_>, want: Want, alloc: Alloc<'a>) -> AVec<'a, HeadAt> {
+pub fn want_heads<'a>(store: &crate::front2::heads::Store<'_>, want: Want, alloc: Alloc<'a>) -> AVec<'a, HeadAt> {
     let mut out: AVec<'a, HeadAt> = AVec::new_in(alloc);
     // Each opaque made by one of `fns`, sorted.
     let opaques_of = |fns: &[ItemKey], out: &mut AVec<'a, HeadAt>| {
@@ -263,13 +267,14 @@ pub fn want_heads<'n, 'a, N: crate::front2::source::NamesSource<'n>>(names: N, k
         Want::Adt(lib) => {
             out.push(HeadAt::Adt(lib));
             let adt = checker_of(lib);
+            // Each variant's ctor fn (a tuple variant's or tuple struct's), by the row's own
+            // variant keys: a struct's is its `MemberKind::Ctor` key, an enum variant's the
+            // first 16 bytes of its library key (heads.rs `Store::adt`), which no key origin
+            // names, so a search by origin left every enum's ctors out of the record and its
+            // seeded readers found no `Ok` (lane FL, the cost test's body `res`).
             let mut ctors: AVec<'a, ItemKey> = AVec::new_in(alloc);
-            for &k in store.ctors.keys() {
-                let Some(Origin::Member { container, .. }) = keys.origin(k) else { continue };
-                let of_this = *container == adt || matches!(by_origin::kind_of_key(names, keys, *container), Ok(KeyKind::Item(by_origin::ItemKind::Variant { enum_, .. })) if enum_ == lib);
-                if of_this {
-                    ctors.push(k);
-                }
+            if let Some(row) = store.adts.get(&adt) {
+                ctors.extend(row.variants.iter().map(|v| v.key).filter(|k| store.ctors.contains_key(k)));
             }
             ctors.sort_unstable();
             out.extend(ctors.iter().map(|k| HeadAt::Ctor(*k)));

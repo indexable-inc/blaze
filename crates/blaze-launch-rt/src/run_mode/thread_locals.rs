@@ -125,7 +125,9 @@ impl RunMode<'_> {
         // The header alone: the rows are written as indexes are given (zero until then, as the
         // reservation is).
         let header = descriptor(key.key, key.root, 0, CAP, at + DESC_BYTES as u64);
-        memory.publish_static(index, at, &header)?;
+        // In the code area: the program only reads the descriptor; its rows are written by the
+        // control thread through the write view ([`super::Memory::write`]).
+        memory.publish_static(index, at, &header, super::Room::Code)?;
         self.statics.insert_shift(pos, (symbol, StaticAt { index, at, len: DESC_BYTES as u64, align: 16 }));
         self.thread_locals = ThreadLocals::Made(Made { at, vars: Vec::new_in(self.alloc) });
         Ok(())

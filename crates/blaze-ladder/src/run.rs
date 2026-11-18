@@ -633,6 +633,10 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
         }
     }
 
+    fn is_static(&self, item: ItemKey) -> bool {
+        self.program.static_item(item).is_some()
+    }
+
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>> {
         self.store.iter().find(|r| r.key == key).ok_or(blaze_typeck::Missing)
     }

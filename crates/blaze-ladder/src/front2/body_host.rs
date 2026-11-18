@@ -5,7 +5,9 @@
 //! - `env!`/`option_env!`: the crate's environment, `blaze_scope::crate_env::CrateEnv` (one per
 //!   unit: the package's name and version, the crate's name, `CARGO_MANIFEST_DIR` as the
 //!   package's stable `/package/N`, `OUT_DIR` and the `rustc-env` pairs of the joined build
-//!   script record), through [`SourceTexts::crate_env`]. A name cargo sets whose value is not
+//!   script record), through [`SourceTexts::crate_env`]: in `blaze check`, the owner crate's
+//!   environment made by `CrateEnv::of` from the crate list's facts of it (blaze-cli
+//!   body_types.rs `owner_env`), the one construction the item host's comes from. A name cargo sets whose value is not
 //!   known, or a source with no environment, is refused (rule 3), never answered unset; a name
 //!   the crate is compiled without is unset, and blaze-expand makes `env!` of it the
 //!   Reference's compile error naming the variable (`Diagnostic::EnvNotDefined`).

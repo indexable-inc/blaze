@@ -1,0 +1,15 @@
+{
+ "id": "one-group-solver-groundwork-ate-three-lanes",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CI",
+ "where": "crates/blaze-scope/src/cells (edit.rs OneGroup, switch.rs record_module, mod.rs load_reading/Answered)",
+ "what": "Three lanes (CELL, CG, CH) spent their context on groundwork before the one-group names solver; the solver itself is small once one sees that a module outside the group can be loaded as a text-less module whose explicit entries and glob edges are its record's scope, so the core's own cell rules answer it unchanged. Traps met: a record's scope must be copied into the solve's allocator at a 16-byte boundary before ScopeView::read (blaze-format checks alignment); its glob edges are merged by source, so its globs cell's digest must come from the record's `defines`, not be recomputed; write_index indexes explicit entries by fragment, so text-less modules must be skipped there.",
+ "cost": "three lanes' context before this one",
+ "cause": "the brief's starting point (a 3,775-line mod.rs) invites reading everything; the seam (Par::names_members into solve_and_write) needed only ~10 places",
+ "whys": "no small map of the cell core's seams existed",
+ "class": "groundwork before the piece in a large file",
+ "prevention": "brief names the exact seams (load, make_cell, line_of/textual, write_index, globs_digest, solve_and_write)",
+ "annoyance": "the runner prints a passing test's stdout never, so the floors' println lines (entered counts) are not seen on a pass",
+ "workaround": "assertions carry the counts",
+ "state": "fixed"
+}

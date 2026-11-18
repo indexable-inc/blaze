@@ -248,6 +248,26 @@ pub const WORDINGS: &[Wording] = &[
         label: "this file is not text blaze reads (UTF-8, under 4 GiB): fix the file",
         args: 1,
     },
+    // A function a test unit's tests record leaves out (blaze-cli names/test_marks.rs): the
+    // function, then why. An error at that function; the unit's other tests keep their rows.
+    Wording {
+        area: Area::Cli,
+        number: 26,
+        name: "test-refused",
+        headline: "{0} is not a test: {1}",
+        label: "this function is left out of the tests",
+        args: 2,
+    },
+    // A bare `#[test]` after another test marker on one function (blaze-cli
+    // names/test_marks.rs; rustc's `duplicate_macro_attributes`): one test. A warning.
+    Wording {
+        area: Area::Cli,
+        number: 27,
+        name: "duplicated-test-attribute",
+        headline: "{0} is marked as a test more than once",
+        label: "duplicated attribute: it is one test; remove one marker",
+        args: 1,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,

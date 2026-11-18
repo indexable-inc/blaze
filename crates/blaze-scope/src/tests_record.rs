@@ -77,8 +77,9 @@ pub enum TestsRecordError {
     /// A function's `cfg_attr` predicate did not read: whether it is a test, ignored or should
     /// panic is not known, and is never guessed.
     CfgUnread { item: ItemKey },
-    /// `#[test]` and `#[bench]` on one function, or one of them twice.
-    TwoKinds { item: ItemKey },
+    /// `#[test]` and `#[bench]` on one function: it is a test or a bench, and which is not
+    /// guessed. (One of them twice is one test: [`TestsSection::duplicated`].)
+    TestAndBench { item: ItemKey },
     /// `#[test]` on a function that is no free function (a member of an impl or trait): the
     /// Reference's attribute is for "free functions that are monomorphic".
     NotAFreeFn { item: ItemKey },
@@ -103,7 +104,7 @@ impl core::fmt::Display for TestsRecordError {
             TestsRecordError::NoOutline { item } => write!(f, "tests record: the item {item:?} has no outline entry"),
             TestsRecordError::NoPath { item } => write!(f, "tests record: the test function {item:?} has no module path or no name"),
             TestsRecordError::CfgUnread { item } => write!(f, "tests record: a `cfg_attr` predicate on the function {item:?} did not read"),
-            TestsRecordError::TwoKinds { item } => write!(f, "tests record: the function {item:?} is marked `test` or `bench` more than once"),
+            TestsRecordError::TestAndBench { item } => write!(f, "tests record: the function {item:?} is marked both `test` and `bench`"),
             TestsRecordError::NotAFreeFn { item } => write!(f, "tests record: `#[test]` on {item:?}, which is no free function"),
             TestsRecordError::Form { item, attr } => write!(f, "tests record: the `{attr}` attribute of {item:?} is in a form not read"),
             TestsRecordError::Unaligned => write!(f, "tests record: the bytes are not 16-aligned"),
@@ -112,6 +113,35 @@ impl core::fmt::Display for TestsRecordError {
             TestsRecordError::Row { row, what } => write!(f, "tests record: row {row}: {what}"),
         }
     }
+}
+
+impl TestsRecordError {
+    /// The function a refusal is about, when it is about one function and not the unit or the
+    /// record: such a refusal leaves that function out of the record and keeps the rest
+    /// ([`TestsSection::refused`]), so one function's attributes never empty a unit's tests.
+    pub fn item(&self) -> Option<ItemKey> {
+        match self {
+            TestsRecordError::NoPath { item }
+            | TestsRecordError::CfgUnread { item }
+            | TestsRecordError::TestAndBench { item }
+            | TestsRecordError::NotAFreeFn { item }
+            | TestsRecordError::Form { item, .. } => Some(*item),
+            _ => None,
+        }
+    }
+}
+
+/// A test unit's tests record, and what it says about single functions beside it.
+pub struct TestsSection<'b> {
+    /// The record ([`TestsRecord::open`] reads it).
+    pub bytes: RecordBytes<'b>,
+    /// Each function refused as a test (an error at that function; [`TestsRecordError::item`]
+    /// names it), sorted by key: it has no row, and every other test keeps its own.
+    pub refused: AVec<'b, TestsRecordError>,
+    /// Each test whose attributes hold a bare `#[test]` (or `#[bench]`) after another marker
+    /// of its kind, sorted by key: one row, and rustc's warning `duplicate_macro_attributes`
+    /// ("duplicated attribute") at the function.
+    pub duplicated: AVec<'b, ItemKey>,
 }
 
 fn u32_of(n: usize, what: &'static str) -> Result<u32, TestsRecordError> {
@@ -231,7 +261,23 @@ struct Found {
 
 /// The tests record of `names`, a unit solved with `test` in its cfg. A unit without it is
 /// refused ([`TestsRecordError::NotATestUnit`]); a test unit with no test writes zero rows.
-pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, TestsRecordError> {
+///
+/// A function's own refusal ([`TestsRecordError::item`]) leaves that function out and is
+/// returned beside the record ([`TestsSection::refused`]); only a refusal of the unit or the
+/// record is an `Err`.
+///
+/// Markers on one function: the Reference, "Testing attributes", says "The `test` attribute
+/// marks a function to be executed as a test", and rustc expands each `test` attribute on its
+/// own, so a function carrying two (tempo's e2e suite: `#[tokio::test]` writes
+/// `#[::core::prelude::v1::test]` and commonware's `#[test_traced]` writes `#[test]`) is
+/// registered twice by rustc, with no change to its environment (the lint listing's words
+/// for `duplicate_macro_attributes`). Here it is ONE row: a second run of the same function
+/// tells nothing the first did not, and a path names one test. rustc warns
+/// (`duplicate_macro_attributes`, warn by default) when the attribute it expands is followed by
+/// one whose path is the bare name (rustc_builtin_macros `warn_on_duplicate_attribute`, by
+/// `attr::find_by_name`): so a bare `test` after an earlier test marker is
+/// [`TestsSection::duplicated`], and `#[test] #[::core::prelude::v1::test]` is silent.
+pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<TestsSection<'b>, TestsRecordError> {
     if names.cfg.eval("test") != Some(true) {
         return Err(TestsRecordError::NotATestUnit { krate: names.key });
     }
@@ -243,19 +289,66 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
 
     let mut strings = RecordBytes::new_in(alloc);
     let mut found: AVec<'b, Found> = AVec::new_in(alloc);
+    let mut refused: AVec<'b, TestsRecordError> = AVec::new_in(alloc);
+    let mut duplicated: AVec<'b, ItemKey> = AVec::new_in(alloc);
     for key in items.iter() {
-        let (it, at) = &tables.texts[key];
-        let (text, outline) = names.outline_at(*at).ok_or(TestsRecordError::NoOutline { item: *key })?;
-        let entry = outline.items().get(it.item.0 as usize).ok_or(TestsRecordError::NoOutline { item: *key })?;
-        if !matches!(entry.detail, ItemDetail::Fn { .. }) {
-            continue;
+        let mark = strings.len();
+        match test_of(names, *key, &mut strings, alloc) {
+            Ok(Some((test, twice))) => {
+                found.push(test);
+                if twice {
+                    duplicated.push(*key);
+                }
+            }
+            Ok(None) => strings.truncate(mark),
+            Err(error) if error.item().is_some() => {
+                strings.truncate(mark);
+                refused.push(error);
+            }
+            Err(error) => return Err(error),
         }
+    }
+
+    let of = |s: (u32, u32)| &strings[s.0 as usize..(s.0 + s.1) as usize];
+    found.sort_unstable_by(|a, b| of(a.path).cmp(of(b.path)).then(a.key.cmp(&b.key)));
+
+    let mut out = RecordBytes::new_in(alloc);
+    out.extend_from_slice(&MAGIC);
+    put32(&mut out, VERSION);
+    put32(&mut out, u32_of(found.len(), "a unit's tests")?);
+    put32(&mut out, u32_of(HEADER + found.len() * ROW, "the rows")?);
+    put32(&mut out, u32_of(strings.len(), "the strings")?);
+    out.resize(KEY_AT, 0);
+    out.extend_from_slice(&names.key.0.0);
+    for t in found.iter() {
+        out.extend_from_slice(&t.key.0.0);
+        for n in [t.path.0, t.path.1, t.expected.0, t.expected.1, t.reason.0, t.reason.1, t.flags, 0] {
+            put32(&mut out, n);
+        }
+    }
+    out.extend_from_slice(&strings);
+    out.resize(out.len().next_multiple_of(ALIGN), 0);
+    Ok(TestsSection { bytes: out, refused, duplicated })
+}
+
+/// The test the item `key` is, its strings pushed onto `strings` (the caller takes them back
+/// out unless a test is returned), and whether rustc warns its markers duplicated; `None` for
+/// an item that is no test.
+fn test_of<'b>(names: &CrateNames<'_>, key: ItemKey, strings: &mut RecordBytes<'b>, alloc: Alloc<'b>) -> Result<Option<(Found, bool)>, TestsRecordError> {
+    let key = &key;
+    let (it, at) = &names.tables.texts[key];
+    let (text, outline) = names.outline_at(*at).ok_or(TestsRecordError::NoOutline { item: *key })?;
+    let entry = outline.items().get(it.item.0 as usize).ok_or(TestsRecordError::NoOutline { item: *key })?;
+    if !matches!(entry.detail, ItemDetail::Fn { .. }) {
+        return Ok(None);
+    }
+    {
         // What the function's attributes say, a true `cfg_attr`'s attributes in its place, in
         // order (a work list: the stack holds the attributes still to read, next on top).
         let (mut test, mut bench) = (0u32, 0u32);
+        let mut twice = false;
         let mut flags = 0u32;
         let (mut expected, mut reason) = ((0u32, 0u32), (0u32, 0u32));
-        let mark = strings.len();
         let mut stack: AVec<'b, &str> = AVec::new_in(alloc);
         for attr in outline.attrs(entry).iter() {
             if attr.kind == AttrKind::Doc {
@@ -280,13 +373,20 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
                         }
                     }
                     "unsafe" => stack.push(args(content).trim()),
-                    "test" => test += 1,
-                    "bench" => bench += 1,
+                    // A bare name after a marker of its kind: rustc's duplicated attribute.
+                    "test" => {
+                        twice |= test > 0 && path.trim() == "test";
+                        test += 1;
+                    }
+                    "bench" => {
+                        twice |= bench > 0 && path.trim() == "bench";
+                        bench += 1;
+                    }
                     "ignore" => {
                         flags |= IGNORE;
                         if !rest.is_empty() {
                             let start = strings.len();
-                            name_value(rest, &mut strings).ok_or(TestsRecordError::Form { item: *key, attr: "ignore" })?;
+                            name_value(rest, strings).ok_or(TestsRecordError::Form { item: *key, attr: "ignore" })?;
                             reason = (u32_of(start, "the strings")?, u32_of(strings.len() - start, "an ignore reason")?);
                             flags |= IGNORE_REASON;
                         }
@@ -297,12 +397,12 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
                             let refused = TestsRecordError::Form { item: *key, attr: "should_panic" };
                             let start = strings.len();
                             if rest.starts_with('=') {
-                                name_value(rest, &mut strings).ok_or(refused)?;
+                                name_value(rest, strings).ok_or(refused)?;
                             } else {
                                 // `(expected = "text")`, a trailing comma allowed.
                                 let inside = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).ok_or(refused.clone())?;
                                 let value = inside.trim_start().strip_prefix("expected").ok_or(refused.clone())?;
-                                let after = value.trim_start().strip_prefix('=').and_then(|v| literal(v, &mut strings)).ok_or(refused.clone())?;
+                                let after = value.trim_start().strip_prefix('=').and_then(|v| literal(v, strings)).ok_or(refused.clone())?;
                                 if !matches!(after.trim(), "" | ",") {
                                     return Err(refused);
                                 }
@@ -316,19 +416,19 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
             }
         }
         if test + bench == 0 {
-            // Its `ignore` or `should_panic` strings, if any, are no test's: taken back out.
-            strings.truncate(mark);
-            continue;
+            // Its `ignore` or `should_panic` strings, if any, are no test's: the caller takes
+            // them back out.
+            return Ok(None);
         }
-        if test + bench > 1 {
-            return Err(TestsRecordError::TwoKinds { item: *key });
+        if test > 0 && bench > 0 {
+            return Err(TestsRecordError::TestAndBench { item: *key });
         }
         if let Some(parent) = entry.parent {
             if !matches!(outline.item(parent).detail, ItemDetail::Mod { .. }) {
                 return Err(TestsRecordError::NotAFreeFn { item: *key });
             }
         }
-        if bench == 1 {
+        if bench > 0 {
             flags |= BENCH;
         }
         // `module::name`: the module's path without the crate's name before it.
@@ -341,29 +441,8 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         }
         strings.extend_from_slice(name.as_bytes());
         let path = (u32_of(start, "the strings")?, u32_of(strings.len() - start, "a test's path")?);
-        found.push(Found { key: *key, path, expected, reason, flags });
+        Ok(Some((Found { key: *key, path, expected, reason, flags }, twice)))
     }
-
-    let of = |s: (u32, u32)| &strings[s.0 as usize..(s.0 + s.1) as usize];
-    found.sort_unstable_by(|a, b| of(a.path).cmp(of(b.path)).then(a.key.cmp(&b.key)));
-
-    let mut out = RecordBytes::new_in(alloc);
-    out.extend_from_slice(&MAGIC);
-    put32(&mut out, VERSION);
-    put32(&mut out, u32_of(found.len(), "a unit's tests")?);
-    put32(&mut out, u32_of(HEADER + found.len() * ROW, "the rows")?);
-    put32(&mut out, u32_of(strings.len(), "the strings")?);
-    out.resize(KEY_AT, 0);
-    out.extend_from_slice(&names.key.0.0);
-    for t in found.iter() {
-        out.extend_from_slice(&t.key.0.0);
-        for n in [t.path.0, t.path.1, t.expected.0, t.expected.1, t.reason.0, t.reason.1, t.flags, 0] {
-            put32(&mut out, n);
-        }
-    }
-    out.extend_from_slice(&strings);
-    out.resize(out.len().next_multiple_of(ALIGN), 0);
-    Ok(out)
 }
 
 fn le32(bytes: &[u8], at: usize) -> u32 {

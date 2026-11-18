@@ -109,8 +109,8 @@ impl Memory for Sim {
         THUNKS + 16 * u64::from(slot.0)
     }
 
-    fn outside(&mut self, symbol: Symbol, _name: &str) -> Result<Outside, RunModeError> {
-        Err(RunModeError::Outside { symbol, why: "the simulation binds no C names" })
+    fn outside(&mut self, symbol: Symbol, name: &str) -> Result<Outside, RunModeError> {
+        Err(RunModeError::Outside { symbol, name: super::CName::new(name), why: "the simulation binds no C names" })
     }
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
@@ -143,7 +143,11 @@ impl Memory for Sim {
         WORDS - 8 * (u64::from(index) + 1)
     }
 
-    fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
+    fn reserve_data(&mut self, _len: usize, _align: usize) -> Result<u64, RunModeError> {
+        Err(RunModeError::NotBuilt { what: "the personality tests place no static" })
+    }
+
+    fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8], _room: super::Room) -> Result<(), RunModeError> {
         Err(RunModeError::NotBuilt { what: "the personality tests place no static" })
     }
 

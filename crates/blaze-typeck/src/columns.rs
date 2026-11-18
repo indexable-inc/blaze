@@ -156,6 +156,9 @@ pub struct Checked<'a> {
     /// so a body with findings and no `diags` still lowers and builds; each has no level
     /// (rule 81) and an item-relative range (rule 71).
     pub findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>>,
+    /// What the unsafety check could not decide (rules/unsafety.rs `Undecided`), sorted by
+    /// place: no type error and no pass; the command files each as "not checked" (rule 3).
+    pub undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -274,6 +277,8 @@ impl<'a> Checked<'a> {
             && soa3_eq(&self.fru_fields, &other.fru_fields)
             && soa3_eq(&self.default_fields, &other.default_fields)
             && self.index_mut == other.index_mut
+            && self.findings == other.findings
+            && self.undecided == other.undecided
     }
 }
 
@@ -307,6 +312,8 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("fru_fields", &self.fru_fields)
             .field("default_fields", &self.default_fields)
             .field("index_mut", &self.index_mut)
+            .field("findings", &self.findings)
+            .field("undecided", &self.undecided)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

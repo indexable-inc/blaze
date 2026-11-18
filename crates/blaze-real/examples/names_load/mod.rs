@@ -324,8 +324,8 @@ fn unit_env(package: &str, version: &str, crate_name: &str, seen: blaze_expand::
 /// Every variable cargo sets for a unit whatever its manifest says (the cargo book's list for
 /// crates; `OUT_DIR` only with a build script): one of these missing from a unit's set is a
 /// fact this run does not know, so `env!` of it is refused, not answered unset.
+/// (`CARGO` is unset by rule, as blaze-scope crate_env.rs `CARGO_ALWAYS` says.)
 pub const CARGO_SET: &[&str] = &[
-    "CARGO",
     "CARGO_PKG_AUTHORS",
     "CARGO_PKG_DESCRIPTION",
     "CARGO_PKG_HOMEPAGE",

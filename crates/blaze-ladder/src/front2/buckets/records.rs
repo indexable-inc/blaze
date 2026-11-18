@@ -570,47 +570,243 @@ impl fmt::Display for TablesReadError {
 
 impl core::error::Error for TablesReadError {}
 
-/// The impl tables of a set of crates, held in memory: the [`ImplRecords`] a test and the
-/// interim reader read ([`Buckets::admit_tables`]), and every read noted.
+/// Every crate's impl tables of one request, made ONCE by the Heads stage's tasks and read in
+/// place by every body on every worker (engine.md, "The design" 1): each record's bytes held in
+/// `Global`, because a task's `Alloc` is not `Sync`; immutable once the stage has put them, so
+/// `Sync` by its fields. A reader reads it through a [`TableSet::lent`], which notes its reads.
+pub struct ImplShelf {
+    /// Sorted by crate key, one each.
+    tables: std::vec::Vec<Shelved, Global>,
+}
+
+/// One crate's tables on an [`ImplShelf`].
+struct Shelved {
+    krate: CrateItemKey,
+    directory: std::vec::Vec<u8, Global>,
+    no_impls_of: std::vec::Vec<u8, Global>,
+    /// Each bucket record by its content id, sorted.
+    buckets: std::vec::Vec<(ContentId, std::vec::Vec<u8, Global>), Global>,
+}
+
+/// [`ImplShelf::new`]'s choices: none yet (rule 83).
+pub struct ImplShelfOpts {}
+
+/// Two tables of one crate put on one shelf: the task is planned once a crate (rule 21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShelvedTwice {
+    pub krate: CrateItemKey,
+}
+
+impl fmt::Display for ShelvedTwice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "crate {:x}'s impl tables were put on the request's shelf twice (front2 buckets/records.rs `ImplShelf::put`)", self.krate.0)
+    }
+}
+
+impl core::error::Error for ShelvedTwice {}
+
+/// Why a crate's framed tables ([`framed`]) were not put on a shelf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShelfError {
+    Twice(ShelvedTwice),
+    /// The bytes are not [`framed`]'s form: cut short, or not its magic, at byte `at`.
+    Malformed { krate: CrateItemKey, at: usize },
+}
+
+impl fmt::Display for ShelfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShelfError::Twice(twice) => twice.fmt(f),
+            ShelfError::Malformed { krate, at } => write!(f, "crate {:x}'s framed impl tables are malformed at byte {at} (front2 buckets/records.rs `framed`)", krate.0),
+        }
+    }
+}
+
+impl core::error::Error for ShelfError {}
+
+/// The first bytes of [`framed`]'s form.
+const FRAMED_MAGIC: &[u8; 8] = b"bzimpl1\0";
+
+/// A crate's three kinds of record as ONE payload (the Heads task's record in the store, which a
+/// later request puts on its shelf by [`ImplShelf::put_framed`]): the magic, the directory and
+/// `NoImplsOf` each as a little-endian u64 length then its bytes, the bucket count (u64), then
+/// each bucket sorted by content id as its id (32 bytes), its length (u64), its bytes.
+pub fn framed<A: core::alloc::Allocator>(records: &CrateImpls<'_>, alloc: A) -> std::vec::Vec<u8, A> {
+    let size = 8 + 16 + records.directory.len() + records.no_impls_of.len() + 8 + records.buckets.iter().map(|b| 40 + b.bytes.len()).sum::<usize>();
+    let mut out = std::vec::Vec::with_capacity_in(size, alloc);
+    out.extend_from_slice(FRAMED_MAGIC);
+    for part in [&records.directory[..], &records.no_impls_of[..]] {
+        out.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        out.extend_from_slice(part);
+    }
+    let mut order: std::vec::Vec<usize, Global> = std::vec::Vec::with_capacity_in(records.buckets.len(), Global);
+    order.extend(0..records.buckets.len());
+    order.sort_unstable_by_key(|at| records.buckets[*at].id);
+    out.extend_from_slice(&(order.len() as u64).to_le_bytes());
+    for at in order {
+        let b = &records.buckets[at];
+        out.extend_from_slice(&b.id.0);
+        out.extend_from_slice(&(b.bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&b.bytes);
+    }
+    out
+}
+
+/// A reader of [`framed`]'s form: each step refuses a cut by its place.
+struct Unframe<'b> {
+    bytes: &'b [u8],
+    at: usize,
+}
+
+impl<'b> Unframe<'b> {
+    fn take(&mut self, n: usize) -> Option<&'b [u8]> {
+        let end = self.at.checked_add(n)?;
+        let part = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(part)
+    }
+
+    fn len(&mut self) -> Option<usize> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.take(8)?);
+        usize::try_from(u64::from_le_bytes(b)).ok()
+    }
+
+    fn owned(&mut self) -> Option<std::vec::Vec<u8, Global>> {
+        let n = self.len()?;
+        let part = self.take(n)?;
+        let mut held = std::vec::Vec::with_capacity_in(n, Global);
+        held.extend_from_slice(part);
+        Some(held)
+    }
+}
+
+impl ImplShelf {
+    pub fn new(_opts: ImplShelfOpts) -> ImplShelf {
+        ImplShelf { tables: std::vec::Vec::new_in(Global) }
+    }
+
+    /// Holds crate `krate`'s three kinds of record, copied once.
+    pub fn put(&mut self, krate: CrateItemKey, records: &CrateImpls<'_>) -> Result<(), ShelvedTwice> {
+        match self.put_framed(krate, &framed(records, Global)) {
+            Ok(()) => Ok(()),
+            Err(ShelfError::Twice(twice)) => Err(twice),
+            // `framed` wrote them this call: a malformed read of its own bytes is this file's fault.
+            Err(ShelfError::Malformed { at, .. }) => panic!("impl tables framed here read back malformed at byte {at} (front2 buckets/records.rs `ImplShelf::put`)"),
+        }
+    }
+
+    /// Holds crate `krate`'s records from their [`framed`] payload (the store's record of its
+    /// Heads task), copied once.
+    pub fn put_framed(&mut self, krate: CrateItemKey, bytes: &[u8]) -> Result<(), ShelfError> {
+        let at = match self.tables.binary_search_by_key(&krate, |t| t.krate) {
+            Ok(_) => return Err(ShelfError::Twice(ShelvedTwice { krate })),
+            Err(at) => at,
+        };
+        let mut r = Unframe { bytes, at: 0 };
+        let malformed = |r: &Unframe<'_>| ShelfError::Malformed { krate, at: r.at };
+        if r.take(8) != Some(&FRAMED_MAGIC[..]) {
+            return Err(ShelfError::Malformed { krate, at: 0 });
+        }
+        let directory = r.owned().ok_or_else(|| malformed(&r))?;
+        let no_impls_of = r.owned().ok_or_else(|| malformed(&r))?;
+        let count = r.len().ok_or_else(|| malformed(&r))?;
+        // Each bucket is at least 40 bytes: a count past the bytes is refused before the room.
+        if count > bytes.len() / 40 {
+            return Err(malformed(&r));
+        }
+        let mut buckets = std::vec::Vec::with_capacity_in(count, Global);
+        for _ in 0..count {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(r.take(32).ok_or_else(|| malformed(&r))?);
+            let held = r.owned().ok_or_else(|| malformed(&r))?;
+            buckets.push((ContentId(id), held));
+        }
+        if r.at != bytes.len() || !buckets.is_sorted_by_key(|(id, _)| *id) {
+            return Err(malformed(&r));
+        }
+        self.tables.insert(at, Shelved { krate, directory, no_impls_of, buckets });
+        Ok(())
+    }
+
+    /// Whether crate `krate`'s tables are on the shelf.
+    pub fn holds(&self, krate: CrateItemKey) -> bool {
+        self.tables.binary_search_by_key(&krate, |t| t.krate).is_ok()
+    }
+
+    /// How many crates' tables it holds.
+    pub fn len(&self) -> usize {
+        self.tables.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+
+    fn of(&self, krate: CrateItemKey, record: RecordKind) -> Result<&Shelved, NoTables> {
+        self.tables.binary_search_by_key(&krate, |t| t.krate).map(|at| &self.tables[at]).map_err(|_| NoTables { krate, record })
+    }
+}
+
+/// Where a [`TableSet`]'s tables are.
+enum Held<'a> {
+    /// Its own, put one by one ([`TableSet::put`]): one reader's set (the fixtures' tests).
+    Own {
+        /// Sorted by crate key.
+        tables: AVec<'a, ImplTables<'a>>,
+        /// Per table, its buckets' content ids with their places, sorted.
+        ids: AVec<'a, AVec<'a, (ContentId, u32)>>,
+    },
+    /// A request's shelf, shared read-only by every reader ([`TableSet::lent`]).
+    Lent(&'a ImplShelf),
+}
+
+/// The impl tables of a set of crates as ONE reader reads them: the [`ImplRecords`] the reader
+/// reads ([`Buckets::admit_tables`]), and every read it made noted. Never shared between
+/// threads (its notes); many readers share one [`ImplShelf`].
 pub struct TableSet<'a> {
-    /// Sorted by crate key.
-    tables: AVec<'a, ImplTables<'a>>,
-    /// Per table, its buckets' content ids with their places, sorted.
-    ids: AVec<'a, AVec<'a, (ContentId, u32)>>,
+    held: Held<'a>,
     notes: RefCell<AVec<'a, ImplRead>>,
     alloc: Alloc<'a>,
 }
 
 impl<'a> TableSet<'a> {
     pub fn new(alloc: Alloc<'a>) -> TableSet<'a> {
-        TableSet { tables: AVec::new_in(alloc), ids: AVec::new_in(alloc), notes: RefCell::new(AVec::new_in(alloc)), alloc }
+        TableSet { held: Held::Own { tables: AVec::new_in(alloc), ids: AVec::new_in(alloc) }, notes: RefCell::new(AVec::new_in(alloc)), alloc }
     }
 
-    /// Holds `tables`, replacing the crate's earlier ones.
+    /// A reader of the shelf `shelf`, its notes in `alloc`: O(1), nothing copied.
+    pub fn lent(shelf: &'a ImplShelf, alloc: Alloc<'a>) -> TableSet<'a> {
+        TableSet { held: Held::Lent(shelf), notes: RefCell::new(AVec::new_in(alloc)), alloc }
+    }
+
+    /// Holds `tables`, replacing the crate's earlier ones. A lent set holds the shelf's alone:
+    /// putting into it is the caller's fault, refused by a panic (its task fails alone).
     pub fn put(&mut self, tables: ImplTables<'a>) {
+        let Held::Own { tables: held, ids: held_ids } = &mut self.held else {
+            panic!("impl tables put into a set lent from a request's shelf (front2 buckets/records.rs `TableSet::put`)");
+        };
         let mut ids: AVec<'a, (ContentId, u32)> = AVec::with_capacity_in(tables.records.buckets.len(), self.alloc);
         ids.extend(tables.records.buckets.iter().enumerate().map(|(at, b)| (b.id, at as u32)));
         ids.sort_unstable();
-        match self.tables.binary_search_by_key(&tables.krate, |t| t.krate) {
+        match held.binary_search_by_key(&tables.krate, |t| t.krate) {
             Ok(at) => {
-                self.tables[at] = tables;
-                self.ids[at] = ids;
+                held[at] = tables;
+                held_ids[at] = ids;
             }
             Err(at) => {
-                self.tables.insert(at, tables);
-                self.ids.insert(at, ids);
+                held.insert(at, tables);
+                held_ids.insert(at, ids);
             }
         }
     }
 
-    /// The crate's tables.
+    /// The crate's tables as written, in a set of its own ([`TableSet::new`]); `None` in a lent
+    /// one, whose shelf holds the records' bytes alone.
     pub fn of(&self, krate: CrateItemKey) -> Option<&ImplTables<'a>> {
-        let at = self.tables.binary_search_by_key(&krate, |t| t.krate).ok()?;
-        Some(&self.tables[at])
-    }
-
-    fn at(&self, krate: CrateItemKey, record: RecordKind) -> Result<usize, NoTables> {
-        self.tables.binary_search_by_key(&krate, |t| t.krate).map_err(|_| NoTables { krate, record })
+        let Held::Own { tables, .. } = &self.held else { return None };
+        let at = tables.binary_search_by_key(&krate, |t| t.krate).ok()?;
+        Some(&tables[at])
     }
 
     /// The reads noted since the last call, and none kept.
@@ -623,20 +819,36 @@ impl ImplRecords for TableSet<'_> {
     type Error = NoTables;
 
     fn no_impls_of(&self, krate: CrateItemKey) -> Result<&[u8], NoTables> {
-        let at = self.at(krate, RecordKind::NoImplsOf)?;
-        Ok(&self.tables[at].records.no_impls_of)
+        let record = RecordKind::NoImplsOf;
+        match &self.held {
+            Held::Own { tables, .. } => tables.binary_search_by_key(&krate, |t| t.krate).map(|at| &tables[at].records.no_impls_of[..]).map_err(|_| NoTables { krate, record }),
+            Held::Lent(shelf) => Ok(&shelf.of(krate, record)?.no_impls_of),
+        }
     }
 
     fn directory(&self, krate: CrateItemKey) -> Result<&[u8], NoTables> {
-        let at = self.at(krate, RecordKind::Directory)?;
-        Ok(&self.tables[at].records.directory)
+        let record = RecordKind::Directory;
+        match &self.held {
+            Held::Own { tables, .. } => tables.binary_search_by_key(&krate, |t| t.krate).map(|at| &tables[at].records.directory[..]).map_err(|_| NoTables { krate, record }),
+            Held::Lent(shelf) => Ok(&shelf.of(krate, record)?.directory),
+        }
     }
 
     fn bucket(&self, krate: CrateItemKey, bucket: ContentId) -> Result<&[u8], NoTables> {
-        let at = self.at(krate, RecordKind::Bucket)?;
-        let ids = &self.ids[at];
-        let place = ids.binary_search_by_key(&bucket, |it| it.0).map_err(|_| NoTables { krate, record: RecordKind::Bucket })?;
-        Ok(&self.tables[at].records.buckets[ids[place].1 as usize].bytes)
+        let missing = NoTables { krate, record: RecordKind::Bucket };
+        match &self.held {
+            Held::Own { tables, ids } => {
+                let at = tables.binary_search_by_key(&krate, |t| t.krate).map_err(|_| missing)?;
+                let ids = &ids[at];
+                let place = ids.binary_search_by_key(&bucket, |it| it.0).map_err(|_| missing)?;
+                Ok(&tables[at].records.buckets[ids[place].1 as usize].bytes)
+            }
+            Held::Lent(shelf) => {
+                let one = shelf.of(krate, RecordKind::Bucket)?;
+                let place = one.buckets.binary_search_by_key(&bucket, |(id, _)| *id).map_err(|_| missing)?;
+                Ok(&one.buckets[place].1)
+            }
+        }
     }
 
     fn note(&self, read: ImplRead) {

@@ -158,6 +158,37 @@ fn every_signature_form_dumps() {
     }
 }
 
+/// An item of a block whose outer `cfg` is false is removed (the Reference, "Conditional
+/// compilation", [cfg.attr.behavior]), as a statement is: it is no row of its block's scope.
+/// The pinned std's `sanitize_standard_fds` writes `#[cfg(all(target_os = "linux", target_env
+/// = "gnu"))] use libc::open64 as open;` beside the `use libc::open;` of every other target,
+/// and the block's imports were read with both. A true `cfg`, a `cfg` after another
+/// attribute, a `cfg_attr` that adds a false `cfg`, and one after a doc comment are read;
+/// each kept item's range still starts at its first attribute. The control: the same body
+/// with every `cfg` true keeps all six.
+#[test]
+fn a_block_item_whose_cfg_is_false_is_no_row() {
+    let items = |text: &str| -> StdVec<String> {
+        let l = body(text);
+        let v = l.view();
+        let mut out = StdVec::new();
+        for s in 0..v.scopes.len() {
+            let scope = v.scope(ScopeId(s as u32)).expect("a scope the lowering wrote");
+            for i in scope.items.start..scope.items.start + scope.items.len {
+                let row = v.row(RowIdx(i)).expect("a local item's row");
+                let item = v.local_item(row).expect("a local item");
+                out.push(String::from(v.text_at(item.range).expect("its text")));
+            }
+        }
+        out
+    };
+    let text = "fn f() -> u32 {\n    #[cfg(windows)]\n    use libc::open64 as open;\n    #[cfg(unix)]\n    use libc::open;\n    #[allow(dead_code)] #[cfg(windows)] fn g() -> u32 { 9 }\n    #[cfg_attr(unix, cfg(windows))] struct S;\n    /// A doc comment.\n    #[cfg(windows)] const C: u32 = 1;\n    #[inline] fn g() -> u32 { 3 }\n    g()\n}";
+    let got = items(text);
+    assert_eq!(got, vec![String::from("#[cfg(unix)]\n    use libc::open;"), String::from("#[inline] fn g() -> u32 { 3 }")], "the kept items of {text}");
+    let all = items(&text.replace("windows", "unix"));
+    assert_eq!(all.len(), 6, "every item with a true cfg is a row: {all:?}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The desugarings, against rustc's (rustc_ast_lowering, as `-Zunpretty=hir` prints them)
 

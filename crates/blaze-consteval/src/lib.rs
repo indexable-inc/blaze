@@ -242,6 +242,9 @@ pub trait ConstWorld: LayoutFacts {
     }
     /// The code identity of an item (its text's id): part of every record key.
     fn code_id(&self, item: ItemKey) -> ContentId;
+    /// Whether `item` is a `static` (or `static mut`): its record is then the static's own
+    /// memory, and the allocations written through it are marked so (`DataAlloc::mutable`).
+    fn is_static(&self, item: ItemKey) -> bool;
     /// The record of value `key`, if it has been made.
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>>;
     /// The body of variant `variant`'s explicit discriminant (`A = expr`), if it has one.

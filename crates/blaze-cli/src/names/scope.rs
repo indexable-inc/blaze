@@ -36,7 +36,9 @@ use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Frame, Tag};
 
-use super::{Names, OUT_DOMAIN, RULE, Resolved, UNRESOLVED, name_of, scope_record, sections, slot_of, surface, tell_public, world};
+use blaze_drive::key::crate_scope_name;
+
+use super::{Names, OUT_DOMAIN, RULE, Resolved, UNRESOLVED, scope_record, sections, slot_of, surface, tell_public, world};
 use crate::CliError;
 use crate::fetch::FetchEnv;
 use crate::job_texts::JobTexts;
@@ -176,7 +178,7 @@ fn locals<'f>(names: &Names<'f>, at: usize, task: &Task<'_>) -> Locals<'f> {
 /// The input of the crate at world index `g`, if the task was handed it. The name is hashed
 /// once per lookup, never per input compared (as body_types.rs `input_at`).
 fn have<'t>(names: &Names<'_>, task: &'t Task<'_>, g: usize) -> Option<&'t Input> {
-    let name = name_of(names.world.crates[g].input.key);
+    let name = crate_scope_name(&names.world.crates[g].input.key);
     task.inputs.iter().find(|input| input.name == name)
 }
 
@@ -257,7 +259,7 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b>(
     let script_handed = script.and_then(|script| task.inputs.iter().find(|input| input.name == script));
     if !missing.is_empty() || (script.is_some() && script_handed.is_none()) {
         let mut wants = blaze_own::Vec::with_capacity_in(missing.len() + 1, held);
-        wants.extend(missing.iter().map(|g| Want { name: name_of(crates[*g].input.key), home: Name::unit_graph() }));
+        wants.extend(missing.iter().map(|g| Want { name: crate_scope_name(&crates[*g].input.key), home: Name::unit_graph() }));
         wants.extend(script.filter(|_| script_handed.is_none()).map(|script| Want { name: script, home: Name::unit_graph() }));
         return Ok(Prepared::Answer(Did::Need(wants)));
     }
@@ -383,6 +385,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
             left_package: blaze_own::Vec::new_in(Global),
             failed: Some(words),
             failed_calls: blaze_own::Vec::new_in(Global),
+            test_marks: blaze_own::Vec::new_in(Global),
         },
         ok: false,
         unresolved: 0,
@@ -424,13 +427,13 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     };
     // The out of a resolved crate: its names record here, its files below ([`OUT_DOMAIN`]);
     // `None`: failed ([`crate::work::failed_out`]).
-    // Each failed macro call of the crate's own code (a `main` the implicit `::std::main` did
-    // not write among them): an error finding at the call with the matcher's reason.
+    // Each failed or refused macro call of the crate's own code (a `main` the implicit
+    // `::std::main` did not write among them): an error finding at the call with its reason.
     let failed_calls = match &done {
-        Ok(done) => crate::names::failed_call::findings(done.names),
+        Ok(done) => crate::names::failed_call::findings(done.names, alloc),
         Err(_) => blaze_own::Vec::new_in(Global),
     };
-    let (out, payload, findings, failed, ok, unresolved) = match done {
+    let (out, payload, findings, failed, ok, unresolved, test_marks) = match done {
         Ok(done) => match scope_record(&done, crate_name, alloc) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
@@ -441,9 +444,17 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
                 let mut out = blaze_ids::Hasher::new(OUT_DOMAIN);
                 out.update(&(done.record.len() as u64).to_le_bytes()).update(&done.record);
                 out.update(&(done.inner.len() as u64).to_le_bytes()).update(&done.inner);
-                (Some(out), record.payload, record.findings, record.tests_refused, true, record.unresolved)
+                (Some(out), record.payload, record.findings, record.tests_refused, true, record.unresolved, record.test_marks)
             }
-            Err(unwritten) => (None, sections::write(0, [&[][..]; sections::SECTIONS]), blaze_own::Vec::new_in(Global), Some(std::format!("{unwritten}")), true, 0),
+            Err(unwritten) => (
+                None,
+                sections::write(0, [&[][..]; sections::SECTIONS]),
+                blaze_own::Vec::new_in(Global),
+                Some(std::format!("{unwritten}")),
+                true,
+                0,
+                blaze_own::Vec::new_in(Global),
+            ),
         },
         Err(CrateScopeError::Need(keys)) => return Resolution::Need(keys.iter().copied().collect()),
         // The crate's typed failure is its answer (work.rs, `filed`): a record whose out
@@ -456,6 +467,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
             Some(std::format!("crate `{crate_name}`: its names could not be resolved: {error:?}")),
             false,
             0,
+            blaze_own::Vec::new_in(Global),
         ),
     };
     // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
@@ -498,7 +510,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         }
         None => crate::work::failed_out(),
     };
-    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls }, ok, unresolved }
+    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, test_marks }, ok, unresolved }
 }
 
 /// A resolution filed on the main thread: a need is the task's answer; a made crate is kept
@@ -511,7 +523,7 @@ fn need_crates<'b>(names: &Names<'_>, name: Name, keys: &[CrateItemKey], held: &
             let failure = TaskFailure { name, why: Why::Refused { what: "a needed crate the world does not hold", rule: RULE } };
             return Did::FailedSaying(failure, "the resolution needs a crate's record this command's world does not hold");
         };
-        wants.push(Want { name: name_of(names.world.crates[names.by_key[i].1].input.key), home: Name::unit_graph() });
+        wants.push(Want { name: crate_scope_name(&names.world.crates[names.by_key[i].1].input.key), home: Name::unit_graph() });
     }
     Did::Need(wants)
 }
@@ -557,7 +569,7 @@ pub(crate) fn answer<'b>(names: &mut Names<'_>, task: &Task<'_>, held: &'b Frame
         let mut wants = blaze_own::Vec::with_capacity_in(unread.len() + unread_data.len() + local.len() + 1, held);
         wants.extend(unread.iter().map(|path| Want { name: surface(path), home: blaze_drive::Name::file(path.as_bytes()) }));
         wants.extend(unread_data.iter().map(|(path, home)| Want { name: blaze_drive::Name::file(path.as_bytes()), home: blaze_drive::Name::file(home.as_bytes()) }));
-        wants.extend(local.iter().map(|g| Want { name: name_of(crates[*g].input.key), home: Name::unit_graph() }));
+        wants.extend(local.iter().map(|g| Want { name: crate_scope_name(&crates[*g].input.key), home: Name::unit_graph() }));
         wants.extend(script.map(|script| Want { name: script, home: Name::unit_graph() }));
         return Ok(Did::Need(wants));
     }
@@ -570,6 +582,10 @@ pub(crate) fn answer<'b>(names: &mut Names<'_>, task: &Task<'_>, held: &'b Frame
     for finding in resolved.failed_calls.iter() {
         let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a failed call's words are not UTF-8" })?;
         made.find(crate::names::failed_call::FAILED_CALL, finding.at, &[words]);
+    }
+    for (rule, finding) in resolved.test_marks.iter() {
+        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a test finding's words are not UTF-8" })?;
+        made.find(*rule, finding.at, &[words]);
     }
     if let Some(words) = &resolved.failed {
         made.find(crate::work::TASK_FAILED, (0, 0), &[words.as_str()]);
@@ -749,6 +765,7 @@ mod tests {
             left_package: blaze_own::Vec::new_in(Global),
             failed: None,
             failed_calls: blaze_own::Vec::new_in(Global),
+            test_marks: blaze_own::Vec::new_in(Global),
         };
         let frame = Frame::with_reserve(FRAME, Tag::Other).expect("a test frame");
         assert!(LEN > frame.reserved(), "the payload ({LEN} bytes) is larger than the frame ({} bytes)", frame.reserved());

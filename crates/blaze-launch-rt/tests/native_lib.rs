@@ -18,7 +18,7 @@ use blaze_launch_rt::native_lib::{
     self, DESCRIPTOR_LEN, Descriptor, Loaded, MAGIC, MAGIC_BNL1, NativeError, Natives, PATH_MOST, POINTER_ROW_LEN,
     PointerRow,
 };
-use blaze_launch_rt::run_mode::{Act, Event, Memory, Outside, Placing, RunMode, RunModeError, ThreadKey};
+use blaze_launch_rt::run_mode::{Act, Event, Memory, Outside, Placing, Room, RunMode, RunModeError, ThreadKey};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::SlotId;
 
@@ -70,7 +70,10 @@ impl Memory for FakeMemory {
     fn static_word(&self, index: u32) -> u64 {
         0x5800_0000 + 8 * u64::from(index)
     }
-    fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8]) -> Result<(), RunModeError> {
+    fn reserve_data(&mut self, _len: usize, _align: usize) -> Result<u64, RunModeError> {
+        Err(RunModeError::NotBuilt { what: "these tests place no static" })
+    }
+    fn publish_static(&mut self, _index: u32, _at: u64, _bytes: &[u8], _room: Room) -> Result<(), RunModeError> {
         Err(RunModeError::NotBuilt { what: "these tests place no static" })
     }
     fn thread_key(&mut self, _ender: u64) -> Result<ThreadKey, RunModeError> {

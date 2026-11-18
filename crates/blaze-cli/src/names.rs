@@ -57,6 +57,7 @@ use crate::work::{Did, Made, held_str};
 pub(crate) mod expansion_texts;
 pub(crate) mod failed_call;
 pub(crate) mod include_outside;
+pub(crate) mod test_marks;
 pub(crate) mod metered;
 mod scope;
 pub(crate) mod sections;
@@ -66,9 +67,11 @@ pub(crate) mod sections;
 // the old name fill, before blaze-scope's cell core became the writer; "4": form 3, without the
 // expansion texts; "5": an out of the names record alone, see [`OUT_DOMAIN`]; "6": a names
 // section of names record version 1, without the failed calls; "7": form 4, without the link
-// table; "8": form 5, without the cell table) are under other names, never found, made again.
-const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 9";
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 9";
+// table; "8": form 5, without the cell table; "9": a cell table without the names section's
+// whole row) are under other names, never found, made again.
+// The subject's domain is blaze-drive key.rs `CRATE_SCOPE_DOMAIN` (the name's one home,
+// `crate_scope_name`): bump it there with this one.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 10";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -79,10 +82,6 @@ const OUT_DOMAIN: &str = "blaze-cli crate scope out 2";
 /// The rule a refusal of this task names.
 const RULE: &str = "names.rs";
 
-/// A crate's `CrateScope` name: its subject is its key.
-pub(crate) fn name_of(key: CrateItemKey) -> Name {
-    Name::new(Kind::CrateScope, ContentId::of(SUBJECT_DOMAIN, &key.0.0))
-}
 
 /// Why the names world of a command could not be made.
 #[derive(Debug)]
@@ -226,6 +225,9 @@ pub(crate) struct Resolved {
     /// Each failed macro call of the crate's own code, as its record's error finding
     /// ([`failed_call::findings`]).
     failed_calls: blaze_own::Vec<Unresolved, Global>,
+    /// What the tests record says about single functions of the crate's own code, each with
+    /// its rule ([`test_marks::findings`]).
+    test_marks: blaze_own::Vec<(u16, Unresolved), Global>,
 }
 
 /// A resolved crate's payload ([`sections::write`]) with its unresolved paths as findings.
@@ -235,6 +237,8 @@ struct ScopeRecord {
     unresolved: u32,
     /// Why the tests section is empty though the unit is a test unit.
     tests_refused: Option<std::string::String>,
+    /// What the tests record says about single functions ([`test_marks::findings`]).
+    test_marks: blaze_own::Vec<(u16, Unresolved), Global>,
 }
 
 /// A section of a resolved crate's record that could not be written: the crate's failure.
@@ -266,18 +270,24 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
     // A test unit's tests, from attributes alone (test.md, "The tests record", piece 6): the
     // fifth section. A unit without `test` in its cfg has none, and its section is empty.
     // A refused tests record is the crate's finding, not its failure: the section stays
-    // empty and the rest of the record is kept, standing until a file it read moves.
+    // empty and the rest of the record is kept, standing until a file it read moves. What it
+    // says of one function (refused, or marked twice) is that function's finding: the other
+    // tests keep their rows.
     let mut tests_refused = None;
     let tests_record = match blaze_scope::tests_record::encode(done.names, alloc) {
-        Ok(bytes) => Some(bytes),
+        Ok(section) => Some(section),
         Err(blaze_scope::tests_record::TestsRecordError::NotATestUnit { .. }) => None,
         Err(error) => {
             tests_refused = Some(std::format!("{}", unwritten("tests", std::format!("{error}"))));
             None
         }
     };
+    let test_marks = match &tests_record {
+        Some(section) => test_marks::findings(done.names, section),
+        None => blaze_own::Vec::new_in(Global),
+    };
     let tests: &[u8] = match &tests_record {
-        Some(bytes) => &bytes[..],
+        Some(section) => &section.bytes[..],
         None => &[],
     };
     // The texts the crate's macro calls made, beside the items rows that name them (piece 16):
@@ -289,17 +299,36 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
     let mut links = blaze_own::AVec::new_in(alloc);
     blaze_ladder::native_links::scope_table(done.names, &mut links, alloc).map_err(|error| unwritten("link table", std::format!("{error:?}")))?;
     // The cell table (drive.md, "Names at module grain" point 3): what a reader by cell is
-    // checked against, over the two records above and, whole, the items and expansions.
-    let wholes = [(blaze_scope::names_cells::Section::Items, &items_record[..]), (blaze_scope::names_cells::Section::Expansions, &expansions[..])];
+    // checked against, over the two records above and, whole, the names, the items and the
+    // expansions. Each section a reader can read whole (`NameCell::Whole`) is a row: a body's
+    // read of a cell the table does not hold is read ABSENT (engine_bodies.rs `widen`), so a
+    // whole section missing here would be a read no edit moves (rule 21).
+    let wholes = [
+        (blaze_scope::names_cells::Section::Names, &names_record[..]),
+        (blaze_scope::names_cells::Section::Items, &items_record[..]),
+        (blaze_scope::names_cells::Section::Expansions, &expansions[..]),
+    ];
     let cells = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, alloc).map_err(|error| unwritten("cell table", std::format!("{error:?}")))?;
     let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, &expansions[..], &links[..], &cells[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
-    Ok(ScopeRecord { payload, findings, unresolved, tests_refused })
+    Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks })
 }
 
 /// The rule of a `use` or macro path in a project's own crate that names nothing.
 pub(crate) const UNRESOLVED: u16 = 14;
+
+/// Whether a finding of `rule` (blaze-cli's area) is placed by [`place_pieces`]: its message
+/// starts with the file, the item chain and the edition. The one list of them.
+pub(crate) fn placed(rule: u16) -> bool {
+    matches!(rule, UNRESOLVED | include_outside::INCLUDE_OUTSIDE_PACKAGE | failed_call::FAILED_CALL | test_marks::TEST_REFUSED | test_marks::TEST_DUPLICATED)
+}
+
+/// Whether a names finding of `rule` (blaze-cli's area) is a warning: drawn after the answer,
+/// never an error (main.rs `every_rule`, print.rs). The one list of them.
+pub(crate) fn warning(rule: u16) -> bool {
+    matches!(rule, include_outside::INCLUDE_OUTSIDE_PACKAGE | test_marks::TEST_DUPLICATED)
+}
 
 /// One unresolved path of a project crate, placed item-relative (rule 71): the range of the
 /// failing segment from its item's start, and the message: the file, the item's chain digest
@@ -693,7 +722,7 @@ pub(crate) fn world<'f>(
     let mut by_subject = std::vec::Vec::new();
     let mut by_key = std::vec::Vec::new();
     for (at, krate) in world.crates.iter().enumerate() {
-        by_subject.push((name_of(krate.input.key).subject, at));
+        by_subject.push((blaze_drive::key::crate_scope_name(&krate.input.key).subject, at));
         by_key.push((krate.input.key, at));
     }
     by_subject.sort_unstable();
@@ -714,7 +743,7 @@ pub(crate) fn world<'f>(
                 blaze_world::Origin::Toolchain(_) => true,
                 blaze_world::Origin::Unit(unit) => from_archive(unit),
             })
-            .map(|krate| name_of(krate.input.key).subject),
+            .map(|krate| blaze_drive::key::crate_scope_name(&krate.input.key).subject),
     );
     // Each crate that reads a build script's run, of ITS side (ruling D115 (2)): the subject
     // is the world's (`blaze_world::script_subject`). Crate order, so sorted by index.
@@ -760,7 +789,7 @@ pub(crate) fn world<'f>(
         };
         let ran_as = placements[i].1;
         script_placed.push(ran_as);
-        let crate_public = public[..crates_public].contains(&name_of(world.crates[*at].input.key).subject);
+        let crate_public = public[..crates_public].contains(&blaze_drive::key::crate_scope_name(&world.crates[*at].input.key).subject);
         if crate::scripts::run_is_public(crate_public, ran_as) {
             public.push(name.subject);
         }
@@ -802,7 +831,7 @@ pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
 pub(crate) fn parts(names: &Names<'_>) -> std::vec::Vec<(Name, ContentId), Global> {
     let mut parts = std::vec::Vec::with_capacity(names.world.crates.len());
     for krate in names.world.crates.iter() {
-        parts.push((name_of(krate.input.key), ContentId::of(SOURCE_DOMAIN, &krate.input.key.0.0)));
+        parts.push((blaze_drive::key::crate_scope_name(&krate.input.key), ContentId::of(SOURCE_DOMAIN, &krate.input.key.0.0)));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);

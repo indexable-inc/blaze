@@ -82,7 +82,23 @@ pub mod statics;
 /// the statics its record names (by item key), and a static has an entry of its own
 /// ([`statics`]). 5: an entry also declares the thread-locals its record names (by item key),
 /// and a thread-local's template has an entry of its own (`statics::make_template_entry`).
-pub const ENTRY_FORM: u32 = 5;
+/// 6: a code entry carries the datum of each vtable its record names ([`VtableDatum`]).
+pub const ENTRY_FORM: u32 = 6;
+
+/// One vtable a code record names, as the entry carries it (run.md, "Statics in the run": a
+/// vtable is data the child places before the record, as a static's datum is): its symbol
+/// (symbols.rs `vtable_symbol`, from the trait reference and the concrete type) and its datum
+/// (blaze-code datum.rs, read-only): the header words (the drop glue's entry, or 0, the size,
+/// the alignment), then each method's entry, each fn word a `Space::Func` target by the
+/// instance's symbol and each supertrait's table a `Space::Vtable` target. The datum names
+/// instances by symbol, never by code, so an edit of a method's body moves that method's record
+/// alone; the datum's bytes are content-named in the records folder, so every record naming one
+/// vtable files it once.
+#[derive(Clone, Copy, Debug)]
+pub struct VtableDatum<'d> {
+    pub symbol: Symbol,
+    pub datum: &'d [u8],
+}
 
 /// The first eight bytes of every entry.
 pub const ENTRY_MAGIC: [u8; 8] = *b"bzcent01";
@@ -405,6 +421,8 @@ pub enum CodeRecordError {
     Reads(reads::ReadsError),
     /// The run's builder names a tier whose emitter does not make entries.
     NotEmitting(NotEmitting),
+    /// A vtable the record names did not make a datum (blaze-code datum.rs names the rule).
+    VtableDatum(blaze_code::datum::DatumError),
 }
 
 impl fmt::Display for CodeRecordError {
@@ -423,6 +441,7 @@ impl fmt::Display for CodeRecordError {
             CodeRecordError::Routine(why) => why.fmt(f),
             CodeRecordError::Reads(why) => why.fmt(f),
             CodeRecordError::NotEmitting(why) => why.fmt(f),
+            CodeRecordError::VtableDatum(why) => write!(f, "a vtable the record names did not make its datum (code_records.rs `VtableDatum`): {why}"),
         }
     }
 }
@@ -441,7 +460,8 @@ impl core::error::Error for CodeRecordError {}
 /// each one's item key (16), ascending and each once: every static `names` holds (form 4: the
 /// parent sends each before the record, run.md "Statics in the run"); the declared
 /// thread-locals in the same form (form 5: every thread-local `names` holds, whose template the
-/// parent sends before the record); then the count of read-list rows (4) and
+/// parent sends before the record); the vtables' data (form 6: [`make_entry_with_vtables`]);
+/// then the count of read-list rows (4) and
 /// each: its question's length (4) and bytes, and its answer's digest (32), sorted by question
 /// and each once ([`reads`]). An entry made here reads nothing beyond its key: no row.
 pub fn make_entry<'a, 'd>(
@@ -459,6 +479,24 @@ pub fn make_entry<'a, 'd>(
 pub fn make_entry_reading<'a, 'd>(
     func: &Func<Global>,
     names: &InstanceNames<'_>,
+    routines: crate::front2::builtins_shim::Routines<'d>,
+    declared: &mut AVec<'_, Declared<'d>>,
+    reads: &ReadList,
+    isa: Isa,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, CodeRecordError> {
+    make_entry_with_vtables(func, names, &mut Vec::new_in(alloc), routines, declared, reads, isa, alloc)
+}
+
+/// [`make_entry_reading`] carrying `vtables`, the datum of each vtable the record names (form 6:
+/// after the thread-locals, their count (4), then each: its symbol (32), its datum's length (4)
+/// and bytes, ascending by symbol and each once). The run's parent sends each before the
+/// record (blaze-cli run_parent.rs `Lazy::resolve`).
+#[expect(clippy::too_many_arguments, reason = "the entry's parts, each its own input")]
+pub fn make_entry_with_vtables<'a, 'd>(
+    func: &Func<Global>,
+    names: &InstanceNames<'_>,
+    vtables: &mut AVec<'_, VtableDatum<'_>>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
     reads: &ReadList,
@@ -495,6 +533,16 @@ pub fn make_entry_reading<'a, 'd>(
     // Form 5: the thread-locals, in the same keys form (each one's template is sent before the
     // record, as a static is).
     put_statics(names.tls, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
+    // Form 6: the vtables' data, ascending by symbol, each once (one vtable named at two sites
+    // is one datum: its symbol is its whole identity).
+    vtables.sort_unstable_by(|a, b| a.symbol.0.cmp(&b.symbol.0));
+    vtables.dedup_by(|a, b| a.symbol == b.symbol);
+    out.extend_from_slice(&len(vtables.len(), "entry's vtables")?.to_le_bytes());
+    for v in vtables.iter() {
+        out.extend_from_slice(&v.symbol.0);
+        out.extend_from_slice(&len(v.datum.len(), "vtable's datum")?.to_le_bytes());
+        out.extend_from_slice(v.datum);
+    }
     out.extend_from_slice(&len(reads.len(), "entry's read list")?.to_le_bytes());
     for (question, answer) in reads.rows() {
         out.extend_from_slice(&len(question.len(), "read-list question")?.to_le_bytes());
@@ -572,6 +620,10 @@ pub enum EntryError {
     StaticsOrder,
     /// A static's entry holds a datum that does not read (blaze-code datum.rs).
     Datum(blaze_code::datum::DatumError),
+    /// The entry's vtables are not ascending by symbol, or one comes twice.
+    VtablesOrder,
+    /// A vtable's datum in a code entry does not read (blaze-code datum.rs).
+    VtableDatum(blaze_code::datum::DatumError),
 }
 
 impl fmt::Display for EntryError {
@@ -587,6 +639,8 @@ impl fmt::Display for EntryError {
             EntryError::Instructions(why) => write!(f, "{rule}: {why}"),
             EntryError::StaticsOrder => write!(f, "{rule}'s declared statics are not ascending by item key, each once"),
             EntryError::Datum(why) => write!(f, "a static's entry (code_records.rs `statics::make_static_entry`) holds a datum that does not read: {why}"),
+            EntryError::VtablesOrder => write!(f, "{rule}'s vtables are not ascending by symbol, each once"),
+            EntryError::VtableDatum(why) => write!(f, "{rule} holds a vtable's datum that does not read: {why}"),
         }
     }
 }
@@ -605,6 +659,9 @@ pub struct EntryView<'b> {
     statics: &'b [u8],
     /// The declared thread-locals' item keys, in the statics' form.
     thread_locals: &'b [u8],
+    /// The vtables' rows' bytes (checked whole, in order, each datum read, by [`EntryView::read`]).
+    vtables: &'b [u8],
+    vtables_count: u32,
     /// The read list's rows' bytes (checked whole and in order by [`EntryView::read`]).
     reads: &'b [u8],
     reads_count: u32,
@@ -670,6 +727,14 @@ impl<'b> Cursor<'b> {
         }
         Ok(keys)
     }
+    /// One vtable row: its symbol and its datum, read (`DatumView::read`).
+    fn vtable(&mut self) -> Result<(Symbol, blaze_code::datum::DatumView<'b>), EntryError> {
+        let mut symbol = [0u8; 32];
+        symbol.copy_from_slice(self.take(32, "vtable's symbol")?);
+        let len = self.u32("vtable's datum length")? as usize;
+        let datum = blaze_code::datum::DatumView::read(self.take(len, "vtable's datum")?).map_err(EntryError::VtableDatum)?;
+        Ok((Symbol(symbol), datum))
+    }
     fn read_row(&mut self) -> Result<(&'b [u8], ContentId), EntryError> {
         let len = self.u32("read-list question's length")? as usize;
         let question = self.take(len, "read-list question")?;
@@ -700,6 +765,17 @@ impl<'b> EntryView<'b> {
         let (declared, count) = c.declared_block()?;
         let statics = c.statics_block()?;
         let thread_locals = c.statics_block()?;
+        let vtables_count = c.u32("count of vtables")?;
+        let vtables_start = c.at;
+        let mut last_vtable: Option<[u8; 32]> = None;
+        for _ in 0..vtables_count {
+            let (symbol, _) = c.vtable()?;
+            if last_vtable.is_some_and(|before| before >= symbol.0) {
+                return Err(EntryError::VtablesOrder);
+            }
+            last_vtable = Some(symbol.0);
+        }
+        let vtables = &bytes[vtables_start..c.at];
         let reads_count = c.u32("count of read-list rows")?;
         let reads_start = c.at;
         let mut last: Option<&[u8]> = None;
@@ -713,7 +789,17 @@ impl<'b> EntryView<'b> {
         if c.at != bytes.len() {
             return Err(EntryError::Trailing);
         }
-        Ok(EntryView { insts, record, declared, count, statics, thread_locals, reads: &bytes[reads_start..], reads_count })
+        Ok(EntryView { insts, record, declared, count, statics, thread_locals, vtables, vtables_count, reads: &bytes[reads_start..], reads_count })
+    }
+
+    /// Each vtable the entry carries: its symbol and its datum, ascending by symbol.
+    pub fn each_vtable<E>(&self, mut each: impl FnMut(Symbol, blaze_code::datum::DatumView<'b>) -> Result<(), E>, malformed: impl Fn(EntryError) -> E) -> Result<(), E> {
+        let mut c = Cursor { bytes: self.vtables, at: 0 };
+        for _ in 0..self.vtables_count {
+            let (symbol, datum) = c.vtable().map_err(&malformed)?;
+            each(symbol, datum)?;
+        }
+        Ok(())
     }
 
     /// Each static the record names, by item key, ascending.

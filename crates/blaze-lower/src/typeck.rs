@@ -347,6 +347,9 @@ pub struct TypeckBody<'a> {
     /// that is one, as written without a sign; ascending by the literal's id
     /// (`BodyView::call_arg_ints`: a `#[rustc_legacy_const_generics]` callee's const argument).
     pub call_arg_ints: AVec<'a, (ExprId, u128)>,
+    /// Every block written `unsafe` (`BlockKind::Unsafe`), ascending: expressions are converted
+    /// in ascending order (`BodyView::unsafe_blocks`, blaze-typeck rules/unsafety.rs).
+    pub unsafe_blocks: AVec<'a, ExprId>,
     pub coroutine: Option<tc::CoroutineKind>,
     /// The `super let` statements, ascending (super_let.rs).
     pub super_lets: AVec<'a, StmtId>,
@@ -390,6 +393,7 @@ impl<'a> TypeckBody<'a> {
             asm_clobbers: &self.asm_clobbers,
             asm_text: self.asm_text.as_str(),
             call_arg_ints: &self.call_arg_ints,
+            unsafe_blocks: &self.unsafe_blocks,
         }
     }
 }
@@ -1000,9 +1004,11 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Paren(i) => tc::Expr::Paren(i),
             Expr::Block { stmts, tail, scope, kind } => match kind {
                 // A `try` block is a block its `?`s break to, its tail already `Try::from_output`.
-                BlockKind::Plain | BlockKind::Unsafe | BlockKind::Try => {
+                BlockKind::Unsafe => {
+                    self.out.unsafe_blocks.push(e);
                     tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope }
                 }
+                BlockKind::Plain | BlockKind::Try => tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope },
                 BlockKind::Const => tc::Expr::ConstBlock { stmts: self.stmts(stmts)?, tail, scope },
             },
             Expr::If { cond, then, else_ } => tc::Expr::If { cond, then, else_ },
@@ -1302,6 +1308,7 @@ pub fn to_typeck<'a>(
         asm_clobbers: Vec::new_in(alloc),
         asm_text: blaze_own::AString::new_in(alloc),
         call_arg_ints: Vec::new_in(alloc),
+        unsafe_blocks: Vec::new_in(alloc),
         coroutine: None,
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),

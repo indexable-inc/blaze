@@ -39,7 +39,8 @@
 //! a dependency's (only a proc-macro crate defines a derive, and none uses its own).
 //!
 //! The record: `BZGR`, form, member count, read count; each member's key; each read; each
-//! member's scope as (length, bytes) in member order. Sorted throughout: two solves of one text
+//! member's scope as (length, zeros to a 16-byte offset, bytes) in member order
+//! ([`NameGroup::scope_of`] reads one in place). Sorted throughout: two solves of one text
 //! write equal bytes (rule 25).
 
 #![blaze::sans_io]
@@ -49,13 +50,25 @@ use blaze_id::{ContentId, ItemKey};
 use blaze_own::{AVec, Alloc};
 
 use super::decide::{Seen, digest};
-use super::{CellId, Cells, FragId, Hold, ItemId, Layer, ModId, Node, Skip, Slot, Step};
+use super::{Cell, CellId, Cells, FragId, Hold, ItemId, Layer, ModId, NAMESPACES, Node, Skip, Slot, Step, Value};
 use crate::cell_key::{CellKey, cell_key};
 use crate::names_cells::NameCell;
 use crate::scope::Resolved;
+use crate::Namespace;
+
+/// A decided value as a group read records it.
+fn group_seen(v: Option<Value>) -> GroupSeen {
+    match v.map(digest) {
+        None | Some(Seen::Absent) => GroupSeen::Absent,
+        Some(Seen::Speculated) => GroupSeen::Speculated,
+        Some(Seen::Digest(d)) => GroupSeen::Digest(d),
+    }
+}
 
 const MAGIC: [u8; 4] = *b"BZGR";
-const FORM: u32 = 2;
+const FORM: u32 = 4;
+/// Where each member's scope starts in a record: a multiple of this from the record's start.
+const SCOPE_ALIGN: usize = 16;
 const TEXTUAL_DOMAIN: &str = "blaze v2 names group textual 1";
 const GROUP_DOMAIN: &str = "blaze v2 names group record 1";
 const EXPANSION_DOMAIN: &str = "blaze v2 names group expansion 1";
@@ -72,11 +85,19 @@ pub enum GroupSeen {
 }
 
 /// One read a group's scopes are valid by: the cell, with what it held.
+///
+/// A lookup of a name in a module of another group reads that module's BINDING cell of the
+/// name (what its own text binds it to: an item, a `mod`, a named import; `Absent` for none);
+/// when that is absent, also the module's GLOBS cell and, through each glob's source, the same
+/// name there, and so on (a lookup that finds nothing reads each cell it passed as absent). So
+/// every cell a record reads is one a group defines as a function of that group ALONE
+/// ([`GroupShape::defines`]): no record depends on which other modules asked it what.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum GroupRead {
-    /// A cell of another group's module or of a dependency: `layer` 0 the full cell, 1 its
-    /// globs alone.
-    Cell { table: ItemKey, cell: CellKey, layer: u8, seen: GroupSeen },
+    /// `table`'s binding cell of `name` (another group's module or a dependency's).
+    Binding { table: ItemKey, name: CellKey, seen: GroupSeen },
+    /// `table`'s globs cell ([`globs_cell`]), by its digest.
+    Globs { table: ItemKey, seen: ContentId },
     /// The textual sequence of `module`'s texts, by [`textual_digest`].
     Textual { module: ItemKey, seen: ContentId },
     /// The expansion of a member's macro call (names_cells.rs `NameCell::Expansion`): its made
@@ -117,8 +138,13 @@ pub struct GroupShape<'a> {
     /// `ModuleDecls` record (a child `mod` by its line alone), what the solve read of its text.
     /// From text before the work: the key's other half.
     pub own: AVec<'a, ContentId>,
-    /// The cells the group decides, in the engine's `Done::defines` form: each member's `Full`
-    /// cell that holds a name, by its [`NameCell::Binding`] key, with its digest; sorted.
+    /// The cells the group decides, in the engine's `Done::defines` form, a function of the
+    /// group ALONE (never of which readers asked it what: rules 25, 26): for each member, every
+    /// binding its own text makes (each name it declares or imports by name, in each namespace
+    /// that binds it, by its [`NameCell::Binding`] key), ONE globs cell ([`globs_cell`]: its glob
+    /// imports' sources and visibilities) and ONE textual cell ([`textual_cell`]), each with its
+    /// digest; sorted. Every cell a group's `cells_read` names in this crate is one of these or
+    /// absent, so an edit's moved cells are found from the records alone (edit.rs).
     pub defines: AVec<'a, ([u8; 16], ContentId)>,
 }
 
@@ -126,7 +152,8 @@ pub struct GroupShape<'a> {
 pub const ABSENT: ContentId = ContentId([0; 32]);
 
 const OWN_DOMAIN: &str = "blaze v2 names group own text 1";
-const GLOBS_CELL_DOMAIN: &str = "blaze v2 names group globs cell 1";
+const GLOBS_CELL_DOMAIN: &str = "blaze v2 names group globs cell 2";
+const GLOBS_DOMAIN: &str = "blaze v2 names group globs 1";
 const TEXTUAL_CELL_DOMAIN: &str = "blaze v2 names group textual cell 1";
 
 /// A member's own-text digest from its `ModuleDecls` record bytes.
@@ -144,23 +171,30 @@ impl GroupRead {
             GroupSeen::Digest(d) => Ok(d),
             GroupSeen::Speculated => Err(of),
         };
-        let cut = |id: ContentId| {
-            let mut k = [0u8; 16];
-            k.copy_from_slice(&id.0[..16]);
-            k
-        };
         Ok(match self {
-            GroupRead::Cell { table, cell, layer: 0, seen: s } => (table, NameCell::Binding { module: table, name: cell }.key(), seen(s, table)?),
-            GroupRead::Cell { table, cell, seen: s, .. } => {
-                let mut b = [0u8; 48];
-                b[..32].copy_from_slice(&table.0.0);
-                b[32..].copy_from_slice(&cell.0);
-                (table, cut(ContentId::of(GLOBS_CELL_DOMAIN, &b)), seen(s, table)?)
-            }
-            GroupRead::Textual { module, seen: s } => (module, cut(ContentId::of(TEXTUAL_CELL_DOMAIN, &module.0.0)), s),
+            GroupRead::Binding { table, name, seen: s } => (table, NameCell::Binding { module: table, name }.key(), seen(s, table)?),
+            GroupRead::Globs { table, seen: s } => (table, globs_cell(table), s),
+            GroupRead::Textual { module, seen: s } => (module, textual_cell(module), s),
             GroupRead::Expansion { call, seen: s } => (call, NameCell::Expansion { call }.key(), seen(s, call)?),
         })
     }
+}
+
+fn cut(id: ContentId) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&id.0[..16]);
+    k
+}
+
+/// The engine's cell of `module`'s glob imports: their sources and visibilities, one cell for
+/// every name (what a glob brings is the source's binding of the name, read there).
+pub fn globs_cell(module: ItemKey) -> [u8; 16] {
+    cut(ContentId::of(GLOBS_CELL_DOMAIN, &module.0.0))
+}
+
+/// The engine's cell of `module`'s textual sequence ([`GroupRead::Textual`]).
+pub fn textual_cell(module: ItemKey) -> [u8; 16] {
+    cut(ContentId::of(TEXTUAL_CELL_DOMAIN, &module.0.0))
 }
 
 /// Each group's record over the crate's final scopes `done` (the published exports and the
@@ -203,6 +237,101 @@ pub enum GroupsError {
     Speculated { module: ItemKey },
     /// A member's own text (its `ModuleDecls`) was not read or not written.
     Own { module: ItemKey, error: OwnError },
+    /// A member has no finished scope to write.
+    NoScope { module: ItemKey },
+}
+
+/// Why a group record's bytes were not read, naming where (rule 19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordError {
+    /// The bytes end before the field at `at`.
+    Short { at: usize },
+    /// Not a names group record.
+    Magic,
+    /// A form this blaze does not read (an old home: rebuilt, never migrated).
+    Form { form: u32 },
+    /// A read row with an unknown tag at `at`.
+    Tag { at: usize, tag: u8 },
+    /// `module` is not a member of the group.
+    NotMember { module: ItemKey },
+}
+
+/// A little-endian field of `b` at `*at`, moving `*at` past it.
+fn take<'b>(b: &'b [u8], at: &mut usize, n: usize) -> Result<&'b [u8], RecordError> {
+    let end = at.checked_add(n).filter(|&e| e <= b.len()).ok_or(RecordError::Short { at: *at })?;
+    let s = &b[*at..end];
+    *at = end;
+    Ok(s)
+}
+
+fn take_u32(b: &[u8], at: &mut usize) -> Result<u32, RecordError> {
+    let s = take(b, at, 4)?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn skip_seen(b: &[u8], at: &mut usize) -> Result<(), RecordError> {
+    let tag = take(b, at, 1)?[0];
+    if tag == 2 {
+        take(b, at, 32)?;
+    }
+    Ok(())
+}
+
+impl<'a> NameGroup<'a> {
+    /// `member`'s finished scope in this record (`ModuleScope` bytes, blaze_surface
+    /// `ScopeView::read`): its own bindings and glob edges, what a one-group solve answers a
+    /// module outside the group by. Bounded by the record's counts.
+    pub fn scope_of(&self, member: ItemKey) -> Result<&[u8], RecordError> {
+        scope_in(&self.members, &self.bytes, member)
+    }
+}
+
+/// `member`'s scope in the record `b` of a group of `members` ([`NameGroup::scope_of`]).
+pub(crate) fn scope_in<'b>(members: &[ItemKey], b: &'b [u8], member: ItemKey) -> Result<&'b [u8], RecordError> {
+    {
+        let index = members.binary_search(&member).map_err(|_| RecordError::NotMember { module: member })?;
+        let mut at = 0usize;
+        if take(b, &mut at, 4)? != MAGIC {
+            return Err(RecordError::Magic);
+        }
+        let form = take_u32(b, &mut at)?;
+        if form != FORM {
+            return Err(RecordError::Form { form });
+        }
+        let members = take_u32(b, &mut at)? as usize;
+        let rows = take_u32(b, &mut at)?;
+        let keys = members.checked_mul(64).ok_or(RecordError::Short { at })?;
+        take(b, &mut at, keys)?;
+        for _ in 0..rows {
+            let row = at;
+            match take(b, &mut at, 1)?[0] {
+                1 => {
+                    take(b, &mut at, 32 + 16)?;
+                    skip_seen(b, &mut at)?;
+                }
+                2 | 4 => {
+                    take(b, &mut at, 64)?;
+                }
+                3 => {
+                    take(b, &mut at, 32)?;
+                    skip_seen(b, &mut at)?;
+                }
+                tag => return Err(RecordError::Tag { at: row, tag }),
+            }
+        }
+        for i in 0..members {
+            let len = take(b, &mut at, 8)?;
+            let len = u64::from_le_bytes([len[0], len[1], len[2], len[3], len[4], len[5], len[6], len[7]]);
+            let len = usize::try_from(len).map_err(|_| RecordError::Short { at })?;
+            let pad = at.next_multiple_of(SCOPE_ALIGN) - at;
+            take(b, &mut at, pad)?;
+            let scope = take(b, &mut at, len)?;
+            if i == index {
+                return Ok(scope);
+            }
+        }
+        Err(RecordError::Short { at })
+    }
 }
 
 /// Why a member's own text was not had.
@@ -221,6 +350,7 @@ impl core::fmt::Display for GroupsError {
             GroupsError::Scope { module, error } => write!(f, "names groups: the scope of module {module:?}: {error:?}"),
             GroupsError::Speculated { module } => write!(f, "names groups: a cell of module {module:?} was read while the module still grew"),
             GroupsError::Own { module, error } => write!(f, "names groups: the own text of module {module:?}: {error:?}"),
+            GroupsError::NoScope { module } => write!(f, "names groups: member {module:?} has no finished scope"),
         }
     }
 }
@@ -253,6 +383,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         let mut stack: AVec<'a, CellId> = AVec::new_in(self.alloc);
         stack.push(first);
+        // What a made cell's rule reads is not the asker's read (the asker reads the cell; the
+        // lookup through it is [`Cells::read_through`]'s): the log is held off meanwhile.
+        let log = self.decide_log.take();
+        let mut settled = true;
         while let Some(&top) = stack.last() {
             match self.cell_value(top, None, Skip::No) {
                 Step::Done(v) => {
@@ -260,10 +394,116 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     stack.pop();
                 }
                 Step::Wait(Node::Cell(d)) if made(d, self) && !stack.contains(&d) && stack.len() < MOST_SETTLED => stack.push(d),
-                Step::Wait(_) => return false,
+                Step::Wait(_) => {
+                    settled = false;
+                    break;
+                }
             }
         }
-        true
+        self.decide_log = log;
+        settled
+    }
+
+    /// `m`'s binding of `name` ([`Cells::own_value`]) over the finished values, each cell the
+    /// pass made on the way settled; `Err` names the undecided node it stopped on.
+    fn settled_own(&mut self, m: ModId, ns: Namespace, name: N, cells_before: usize) -> Result<Option<Value>, Node> {
+        let mut last = None;
+        for _ in 0..=MOST_SETTLED {
+            match self.own_value(m, ns, name, None) {
+                Step::Done(v) => return Ok(v),
+                Step::Wait(on) if self.settle_made(on, cells_before) => last = Some(on),
+                Step::Wait(on) => return Err(on),
+            }
+        }
+        Err(last.unwrap_or(Node::Cell(0)))
+    }
+
+    /// The digest of `m`'s globs cell: each glob's source and visibility (sorted, each once) and
+    /// whether a glob whose path is not followed brings what is unknown (an enum's one in types
+    /// and values alone): what its `Globs` layer is a function of, with its sources' bindings.
+    fn globs_digest(&self, m: ModId) -> ContentId {
+        let module = &self.modules[m as usize];
+        // A module answered from its group's record: the digest that record defines (its
+        // glob edges there are merged by source, so they are not this digest's input).
+        if let super::Answered::Record(d) = module.answered {
+            return d;
+        }
+        let mut rows: AVec<'_, [u8; 65]> = AVec::with_capacity_in(module.edges.len(), self.alloc);
+        for &(src, vis) in module.edges.values() {
+            let mut r = [0u8; 65];
+            r[..32].copy_from_slice(&self.modules[src as usize].key.0.0);
+            let (t, key) = match vis {
+                super::Visibility::Public => (0u8, [0u8; 32]),
+                super::Visibility::Crate(k) => (1, k.0.0),
+                super::Visibility::Restricted(k) => (2, k.0.0),
+            };
+            r[32] = t;
+            r[33..].copy_from_slice(&key);
+            rows.push(r);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        let (mut unknown, mut unknown_enum) = (false, false);
+        for &g in module.glob_items.iter() {
+            if self.items[g as usize].outcome == Some(super::Outcome::Outside) {
+                if self.items[g as usize].of_enum {
+                    unknown_enum = true;
+                } else {
+                    unknown = true;
+                }
+            }
+        }
+        let mut b: AVec<'_, u8> = AVec::with_capacity_in(rows.len() * 65 + 2, self.alloc);
+        b.push(u8::from(unknown));
+        b.push(u8::from(unknown_enum));
+        for r in rows.iter() {
+            b.extend_from_slice(r);
+        }
+        ContentId::of(GLOBS_DOMAIN, &b)
+    }
+
+    /// The rows a read of cell `c` (another module's, or this one's) is valid by, onto `rows`:
+    /// the binding cell of the name where the lookup is; when that is absent, the module's globs
+    /// cell and the same lookup in each glob's source, each module once (bounded by the module
+    /// count). A dependency's cell, an enum's and an unread module's are their decided value.
+    fn read_through(&mut self, c: CellId, rows: &mut AVec<'a, (ModId, GroupRead)>, cells_before: usize) -> Result<(), Node> {
+        let Cell { module: first, ns, name, layer, .. } = self.cells[c as usize];
+        let alloc = self.alloc;
+        let cell = cell_key(ns, name.as_ref());
+        let mut walked: blaze_own::ABTreeSet<'a, ModId> = blaze_own::ABTreeSet::new_in(alloc);
+        // Each entry: a module whose `Full` cell of the name is looked up, or (`true`) its globs.
+        let mut todo: AVec<'a, (ModId, bool)> = AVec::new_in(alloc);
+        todo.push((first, layer == Layer::Globs));
+        while let Some((t, globs)) = todo.pop() {
+            let key = self.modules[t as usize].key;
+            if !globs {
+                if !walked.insert(t) {
+                    continue;
+                }
+                let (foreign, growth) = (self.modules[t as usize].foreign || self.modules[t as usize].unread, self.modules[t as usize].growth);
+                let seen = if foreign {
+                    let made = self.make_cell(t, ns, name, Layer::Full);
+                    group_seen(self.cells[made as usize].value)
+                } else if growth > 0 {
+                    GroupSeen::Speculated
+                } else {
+                    match self.settled_own(t, ns, name, cells_before)? {
+                        Some(v) => group_seen(Some(v)),
+                        None => {
+                            rows.push((t, GroupRead::Binding { table: key, name: cell, seen: GroupSeen::Absent }));
+                            todo.push((t, true));
+                            continue;
+                        }
+                    }
+                };
+                rows.push((t, GroupRead::Binding { table: key, name: cell, seen }));
+                continue;
+            }
+            rows.push((t, GroupRead::Globs { table: key, seen: self.globs_digest(t) }));
+            let module = &self.modules[t as usize];
+            todo.extend(module.edges.values().map(|&(src, _)| (src, false)));
+        }
+        Ok(())
     }
 
     fn node_at(&self, node: Node, cells_before: usize) -> NodeAt {
@@ -284,10 +524,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     }
 }
 
-/// Each module's direct reads: cells of other modules and modules whose text was walked.
+/// Each module's reads: the binding and globs cells its lookups went through
+/// ([`Cells::read_through`]), with the module each is of, and the modules whose text was walked.
 struct Reads<'a> {
-    cells: AVec<'a, CellId>,
+    rows: AVec<'a, (ModId, GroupRead)>,
     texts: AVec<'a, ModId>,
+    /// The cells it defines by its own text: each binding, by its engine key, with its digest.
+    binds: AVec<'a, ([u8; 16], ContentId)>,
 }
 
 impl<'a, N: crate::Name> Cells<'a, N> {
@@ -309,17 +552,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         for (i, &m) in local.iter().enumerate() {
             at.insert(m, i as u32);
         }
-        // Each node's module, taken before any re-run makes a cell.
-        let mut cells_of: AVec<'a, AVec<'a, CellId>> = AVec::new_in(alloc);
+        // Each module's items, taken before any re-run makes a cell. A module's reads are its
+        // items' and its own bindings' alone: a cell some other module asked of it is that
+        // reader's read (through it), never its own, so no record holds who asked what.
         let mut items_of: AVec<'a, AVec<'a, ItemId>> = AVec::new_in(alloc);
         for _ in 0..local.len() {
-            cells_of.push(AVec::new_in(alloc));
             items_of.push(AVec::new_in(alloc));
-        }
-        for (c, cell) in self.cells.iter().enumerate() {
-            if let (Some(&i), Some(_)) = (at.get(&cell.module), cell.value) {
-                cells_of[i as usize].push(c as CellId);
-            }
         }
         for (j, item) in self.items.iter().enumerate() {
             if let (Some(&i), Some(_)) = (at.get(&item.module), item.outcome) {
@@ -333,19 +571,35 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let module_key = self.modules[m as usize].key;
             self.decide_log = Some(AVec::new_in(alloc));
             self.textual_log = Some(AVec::new_in(alloc));
-            for &c in cells_of[i].iter() {
-                loop {
-                    match self.cell_value(c, None, Skip::No) {
-                        Step::Done(_) => break,
-                        Step::Wait(on) if self.settle_made(on, cells_before) => {}
-                        Step::Wait(on) => {
-                            self.decide_log = None;
-                            self.textual_log = None;
-                            return Err(GroupsError::Waited { module: module_key, reader: self.node_at(Node::Cell(c), cells_before), on: self.node_at(on, cells_before) });
+            self.textual_rec_log = Some(AVec::new_in(alloc));
+            // Each binding its own text makes: every name it declares, and every name a named
+            // import binds, in each namespace (what it binds there, or nothing).
+            let mut names: AVec<'a, (Namespace, N)> = AVec::new_in(alloc);
+            names.extend(self.modules[m as usize].explicit.keys().copied());
+            for name in self.modules[m as usize].named.keys() {
+                names.extend(NAMESPACES.iter().map(|&ns| (ns, *name)));
+            }
+            names.sort_unstable();
+            names.dedup();
+            let mut binds: AVec<'a, ([u8; 16], ContentId)> = AVec::with_capacity_in(names.len(), alloc);
+            for &(ns, name) in names.iter() {
+                match self.settled_own(m, ns, name, cells_before) {
+                    Ok(Some(v)) => {
+                        if let GroupSeen::Digest(d) = group_seen(Some(v)) {
+                            binds.push((NameCell::Binding { module: module_key, name: cell_key(ns, name.as_ref()) }.key(), d));
                         }
+                    }
+                    Ok(None) => {}
+                    Err(on) => {
+                        self.decide_log = None;
+                        self.textual_log = None;
+                        self.textual_rec_log = None;
+                        let reader = NodeAt::Cell { module: module_key, ns, name: cell_key(ns, name.as_ref()), layer: 0, made_by_pass: false };
+                        return Err(GroupsError::Waited { module: module_key, reader, on: self.node_at(on, cells_before) });
                     }
                 }
             }
+            binds.sort_unstable();
             for &j in items_of[i].iter() {
                 loop {
                     match self.try_item(j, None, Hold::Undecided) {
@@ -354,27 +608,43 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         Step::Wait(on) => {
                             self.decide_log = None;
                             self.textual_log = None;
+                            self.textual_rec_log = None;
                             return Err(GroupsError::Waited { module: module_key, reader: self.node_at(Node::Item(j), cells_before), on: self.node_at(on, cells_before) });
                         }
                     }
                 }
             }
             let mut cells = self.decide_log.take().unwrap_or_else(|| AVec::new_in(alloc));
-            cells.retain(|c| self.cells[*c as usize].module != m);
             cells.sort_unstable();
             cells.dedup();
             let frags = self.textual_log.take().unwrap_or_else(|| AVec::new_in(alloc));
             let mut texts: AVec<'a, ModId> = AVec::with_capacity_in(frags.len(), alloc);
             texts.extend(frags.iter().map(|&f| self.frags[f as usize].module).filter(|&t| t != m));
+            // The modules outside a one-group solve's members whose sequence a walk read from
+            // their records: the same cells the walk over their texts reads.
+            if let Some(rec) = self.textual_rec_log.take() {
+                texts.extend(rec.iter().copied().filter(|&t| t != m));
+            }
             texts.sort_unstable();
             texts.dedup();
-            reads.push(Reads { cells, texts });
+            // Each cell read, as the binding and globs cells its lookup went through (its own
+            // module's too: a lookup in itself through its globs reads their sources).
+            let mut rows: AVec<'a, (ModId, GroupRead)> = AVec::new_in(alloc);
+            for &c in cells.iter() {
+                if let Err(on) = self.read_through(c, &mut rows, cells_before) {
+                    return Err(GroupsError::Waited { module: module_key, reader: self.node_at(Node::Cell(c), cells_before), on: self.node_at(on, cells_before) });
+                }
+            }
+            rows.retain(|(t, _)| *t != m);
+            rows.sort_unstable();
+            rows.dedup();
+            reads.push(Reads { rows, texts, binds });
         }
         // The graph: a module reads another written module's cell or text.
         let mut edges: AVec<'a, AVec<'a, u32>> = AVec::with_capacity_in(local.len(), alloc);
         for r in reads.iter() {
             let mut out: AVec<'a, u32> = AVec::new_in(alloc);
-            out.extend(r.cells.iter().filter_map(|&c| at.get(&self.cells[c as usize].module).copied()));
+            out.extend(r.rows.iter().filter_map(|(t, _)| at.get(t).copied()));
             out.extend(r.texts.iter().filter_map(|t| at.get(t).copied()));
             out.sort_unstable();
             out.dedup();
@@ -397,6 +667,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             frags_of[frag.module as usize].push(f as FragId);
         }
         let mut textual: HashMap<ModId, ContentId, Alloc<'a>> = HashMap::new_in(alloc);
+        // A module outside a one-group solve's members has no fragment here: its textual
+        // cell's digest is its record's.
+        for (&t, r) in self.recorded_textual.iter() {
+            textual.insert(t, r.digest);
+        }
         let mut comp_of: AVec<'a, u32> = AVec::with_capacity_in(local.len(), alloc);
         comp_of.resize(local.len(), 0);
         for (ci, members) in components.iter().enumerate() {
@@ -414,27 +689,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let mut rows: AVec<'o, GroupRead> = AVec::new_in(out);
             for &i in members.iter() {
                 let r = &reads[i as usize];
-                for &c in r.cells.iter() {
-                    let cell = &self.cells[c as usize];
-                    if inside(cell.module) {
-                        continue;
-                    }
-                    let module = &self.modules[cell.module as usize];
-                    let seen = if module.growth > 0 && !module.foreign {
-                        GroupSeen::Speculated
-                    } else {
-                        match cell.value.map(digest) {
-                            None | Some(Seen::Absent) => GroupSeen::Absent,
-                            Some(Seen::Speculated) => GroupSeen::Speculated,
-                            Some(Seen::Digest(d)) => GroupSeen::Digest(d),
-                        }
-                    };
-                    let layer = match cell.layer {
-                        Layer::Full => 0,
-                        Layer::Globs => 1,
-                    };
-                    rows.push(GroupRead::Cell { table: module.key, cell: cell_key(cell.ns, cell.name.as_ref()), layer, seen });
-                }
+                rows.extend(r.rows.iter().filter(|(t, _)| !inside(*t)).map(|(_, row)| *row));
                 for &t in r.texts.iter() {
                     if !inside(t) {
                         let seen = match textual.get(&t) {
@@ -462,12 +717,19 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         calls.push(call.key);
                     }
                 }
-                for &c in cells_of[i as usize].iter() {
-                    let cell = &self.cells[c as usize];
-                    if let (Layer::Full, Some(Seen::Digest(d))) = (cell.layer, cell.value.map(digest)) {
-                        defines.push((NameCell::Binding { module: key, name: cell_key(cell.ns, cell.name.as_ref()) }.key(), d));
+                defines.extend(reads[i as usize].binds.iter().copied());
+                let m = local[i as usize];
+                defines.push((globs_cell(key), self.globs_digest(m)));
+                // Each member's textual sequence: what a `macro_rules!` lookup walking its text reads.
+                let d = match textual.get(&m) {
+                    Some(&d) => d,
+                    None => {
+                        let d = self.textual_digest(&frags_of[m as usize], &expansion_of);
+                        textual.insert(m, d);
+                        d
                     }
-                }
+                };
+                defines.push((textual_cell(key), d));
             }
             calls.sort_unstable();
             calls.dedup();
@@ -555,12 +817,16 @@ fn record<'a, N: crate::Name>(members: &[ItemKey], own: &[ContentId], rows: &[Gr
     }
     for row in rows.iter() {
         match *row {
-            GroupRead::Cell { table, cell, layer, seen } => {
+            GroupRead::Binding { table, name, seen } => {
                 b.push(1);
                 b.extend_from_slice(&table.0.0);
-                b.extend_from_slice(&cell.0);
-                b.push(layer);
+                b.extend_from_slice(&name.0);
                 seen_bytes(&mut b, seen);
+            }
+            GroupRead::Globs { table, seen } => {
+                b.push(4);
+                b.extend_from_slice(&table.0.0);
+                b.extend_from_slice(&seen.0);
             }
             GroupRead::Textual { module, seen } => {
                 b.push(2);
@@ -575,10 +841,13 @@ fn record<'a, N: crate::Name>(members: &[ItemKey], own: &[ContentId], rows: &[Gr
         }
     }
     for k in members.iter() {
-        // Every member is a key of `done` (the graph's nodes are).
-        let Some(resolved) = done.get(k) else { continue };
+        // Every member is a key of `done` (the graph's nodes are); one missing would misalign
+        // the scopes [`NameGroup::scope_of`] reads.
+        let Some(resolved) = done.get(k) else { return Err(GroupsError::NoScope { module: *k }) };
         let scope = resolved.scope.write(alloc).map_err(|error| GroupsError::Scope { module: *k, error })?;
         b.extend_from_slice(&(scope.len() as u64).to_le_bytes());
+        // Each scope at a 16-byte offset: read in place from a record held aligned.
+        b.resize(b.len().next_multiple_of(SCOPE_ALIGN), 0);
         b.extend_from_slice(&scope);
     }
     Ok(b)

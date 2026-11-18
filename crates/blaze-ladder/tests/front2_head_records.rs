@@ -21,13 +21,13 @@
 #[allow(dead_code)]
 mod rungs;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use blaze_id::ItemKey as LibKey;
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::head_record::{
-    HeadAt, HeadRecordError, HeadRef, copy_adt_life, copy_fn_life, decode, digest, encode, from_store, heads_in, same,
+    HeadAt, HeadRecordError, HeadRef, copy_fn_life, decode, digest, encode, from_store, heads_in, same,
 };
 use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::keys::checker_of;
@@ -36,7 +36,8 @@ use blaze_ladder::resolve::Paths;
 use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
 use blaze_surface::{ItemDetail, Namespace, PathKind};
-use blaze_typeck::{ItemKey, PortableTys};
+use blaze_ladder::front2::lifetimes::LifeOf;
+use blaze_typeck::PortableTys;
 
 const EDITION: &str = "blaze-2026.11";
 
@@ -144,30 +145,14 @@ fn round_trip_all(what: &str, rel: &[(String, String)], edition: &str, cuts: boo
         }
     }
 
-    // The lifetime parts, copied out (the store's accessors take it mutably).
-    let mut fn_lives = HashMap::new();
-    let fn_keys: Vec<ItemKey> = store.fns.keys().copied().collect();
-    for k in fn_keys {
-        if let Ok(l) = store.fn_life(&names, &front.keys, k) {
-            fn_lives.insert(k, copy_fn_life(l, Alloc::global()));
-        }
-    }
-    let mut adt_lives = HashMap::new();
-    let adt_keys: Vec<LibKey> = store.maps.generics.keys().copied().filter(|&k| store.adts.contains_key(&checker_of(k))).collect();
-    for k in adt_keys {
-        if let Ok(l) = store.adt_life(&names, &front.keys, k) {
-            adt_lives.insert(k, copy_adt_life(l, Alloc::global()));
-        }
-    }
-
+    // The lifetime parts of every fn and ADT, made (or refused) in the store: a record holds them.
     let ats: Vec<HeadAt> = heads_in(&store, Alloc::global()).iter().copied().collect();
+    let parts: Vec<HeadAt> = ats.iter().copied().filter(|at| matches!(at, HeadAt::Fn(_) | HeadAt::Adt(_))).collect();
+    store.make_lives(&names, &front.keys, &parts);
+
     for at in ats {
-        let (fl, al) = match at {
-            HeadAt::Fn(k) => (fn_lives.get(&k), None),
-            HeadAt::Adt(k) => (None, adt_lives.get(&k)),
-            _ => (None, None),
-        };
-        let made = from_store(&store, at, fl, al).and_then(|h| Ok((encode(h, store.tys.view(), Alloc::global())?, h.text())));
+        let made_life = matches!(store.lives_of(at), Some(LifeOf::Fn(Ok(_)) | LifeOf::Adt(Ok(_))));
+        let made = from_store(&store, at).and_then(|h| Ok((encode(h, store.tys.view(), Alloc::global())?, h.text())));
         let (bytes, text) = match made {
             Ok(made) => made,
             Err(e @ HeadRecordError::Unencoded { .. }) => {
@@ -177,7 +162,7 @@ fn round_trip_all(what: &str, rel: &[(String, String)], edition: &str, cuts: boo
             Err(e) => panic!("{what}: {at:?}: not encoded: {e}"),
         };
         let decoded = decode(&bytes, text, &mut store.tys, Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded: {e}"));
-        let lowered = from_store(&store, at, fl, al).expect("encoded above");
+        let lowered = from_store(&store, at).expect("encoded above");
         if let Some(part) = same(lowered, decoded.as_ref(), store.tys.view()) {
             panic!("{what}: {at:?}: the decoded head differs from the lowered one in {part}");
         }
@@ -201,7 +186,7 @@ fn round_trip_all(what: &str, rel: &[(String, String)], edition: &str, cuts: boo
         if let HeadAt::Fn(k) = at {
             seen.statics += usize::from(store.statics.contains_key(&k));
         }
-        seen.lives += usize::from(fl.is_some() || al.is_some());
+        seen.lives += usize::from(made_life);
     }
     seen
 }
@@ -266,11 +251,11 @@ fn one_lifetime_moves_the_digest() {
     let (hx, hy) = (&store.fns[&kx], &store.fns[&ky]);
     assert!(hx.inputs[..] == hy.inputs[..] && hx.output == hy.output, "the two fns' erased types are equal: only a lifetime differs");
     assert!(life_x.regions[..] != life_y.regions[..], "the two fns' lifetime parts differ");
-    let Ok(HeadRef::Fn { key, head, preds, static_, .. }) = from_store(&store, HeadAt::Fn(kx), Some(&life_x), None) else {
+    let Ok(HeadRef::Fn { key, head, preds, static_, .. }) = from_store(&store, HeadAt::Fn(kx)) else {
         panic!("`pick_x`: a fn head")
     };
-    let own = HeadRef::Fn { key, head, preds, static_, life: Some(&life_x) };
-    let planted = HeadRef::Fn { key, head, preds, static_, life: Some(&life_y) };
+    let own = HeadRef::Fn { key, head, preds, static_, life: Some(Ok(&life_x)) };
+    let planted = HeadRef::Fn { key, head, preds, static_, life: Some(Ok(&life_y)) };
     let d = |h| digest(&encode(h, store.tys.view(), Alloc::global()).unwrap_or_else(|e| panic!("`pick_x`: not encoded: {e}")));
     assert_eq!(d(own), d(own), "one head, two encodings, one digest");
     assert_ne!(d(own), d(planted), "a head whose lifetime part differs has another digest");
