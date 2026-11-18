@@ -1233,8 +1233,10 @@ struct Kept {
     /// A positional file opened `O_DIRECT`, around the page cache.
     direct: bool,
     /// Opened `O_RDONLY`: kept by a sync or a barrier of a name no request kept
-    /// ([`Wants::Flush`]), of a file that is there. A sync needs no write access, and a file
-    /// sealed read-only (a placed output, mode 0444) refuses an open for writing with `EACCES`.
+    /// ([`Wants::Flush`]), of a file that is there, or a positional file the kernel refused to
+    /// open for writing that no write asked for ([`Kept::writes`]). Neither needs write access,
+    /// and a file sealed read-only (a placed output, mode 0444) refuses an open for writing
+    /// with `EACCES`.
     /// Cleared where its open found the file missing and made it, as an append's open does
     /// (`O_RDWR | O_APPEND | O_CREAT`).
     ///
@@ -1242,9 +1244,13 @@ struct Kept {
     /// Upheld by [`Uring::file`], the one way a request reaches a kept file by name: one that
     /// writes ([`Wants::Append`]) and finds the name kept read-only lets that file go (its
     /// requests in flight keep it until they end) and keeps the name opened to append; reads
-    /// and syncs take it as it is. A positional file is kept apart ([`Uring::positional`])
-    /// and is never read-only.
+    /// and syncs take it as it is. A positional file is kept apart ([`Uring::positional`]),
+    /// under the same rule: a write from memory that finds it read-only lets it go and keeps
+    /// the name opened for writing ([`Uring::positional_file`]).
     read_only: bool,
+    /// A positional file a write from memory asked for: one whose open for writing the kernel
+    /// refuses fails, where one only read is opened again read-only ([`Uring::opened`]).
+    writes: bool,
 }
 
 /// What a request asks of the file kept under its name ([`Uring::file`]).
@@ -2075,6 +2081,7 @@ impl Uring {
             positional: false,
             direct: false,
             read_only: wants != Wants::Append,
+            writes: false,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.names.insert(name.clone(), file);
@@ -2087,12 +2094,25 @@ impl Uring {
     }
 
     /// The file kept under `name` for reads into and writes from memory at offsets, around the
-    /// page cache where `direct`; its open through the ring started where none is, or where the
-    /// one kept goes through the cache the other way (that one is let go once its requests end).
-    /// Never made: a missing file fails every request waiting for it, naming it.
-    fn positional_file(&mut self, name: &FileName, direct: bool) -> io::Result<Handle<Kept>> {
+    /// page cache where `direct`, asked for by a write where `write` ([`Kept::writes`]); its
+    /// open through the ring started where none is, where the one kept goes through the cache
+    /// the other way, or where a write finds it kept read-only (the one kept is let go once its
+    /// requests end). Opened for reading and writing; one the kernel refuses so and no write
+    /// asked for is opened read-only ([`Kept::read_only`]). Never made: a missing file fails
+    /// every request waiting for it, naming it.
+    fn positional_file(
+        &mut self,
+        name: &FileName,
+        direct: bool,
+        write: bool,
+    ) -> io::Result<Handle<Kept>> {
         if let Some(&file) = self.positional.get(name) {
-            if self.kept.get(file).is_some_and(|it| it.direct == direct) {
+            // `Kept::read_only`'s invariant: a write never goes through a read-only file.
+            if let Some(kept) = self.kept.get_mut(file)
+                && kept.direct == direct
+                && !(write && kept.read_only)
+            {
+                kept.writes |= write;
                 return Ok(file);
             }
             forget(&mut self.positional, &mut self.kept, name);
@@ -2108,6 +2128,7 @@ impl Uring {
             positional: true,
             direct,
             read_only: false,
+            writes: write,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.positional.insert(name.clone(), file);
@@ -2145,7 +2166,7 @@ impl Uring {
             // alloc: an error path.
             .map_err(|why| io::Error::other(why.0))?;
         let direct = cache == crate::Cache::Bypassed;
-        let file = self.positional_file(name, direct)?;
+        let file = self.positional_file(name, direct, kind == Kind::WriteFrom)?;
         let file = self.hold(file);
         let mut hot = Hot::new(tag, kind, file.to_bits());
         if direct {

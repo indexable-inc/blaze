@@ -372,6 +372,70 @@ fn memory_script(driver: &mut impl Driver) -> Vec<String> {
     seen
 }
 
+/// The invariant: a read into memory of a file sealed read-only (a placed output, mode 0444)
+/// succeeds on each driver of the machine's files, through the page cache and around it, and
+/// a write from memory to it once it is writable again goes through: the ring keeps a
+/// positional file read-only for reads (`Kept::read_only`) and lets it go for the write.
+#[cfg(unix)]
+fn reads_into_memory_of_a_sealed_file(driver: &mut impl Driver, root: &std::path::Path) {
+    use crate::{Cache, Priority};
+    let block = crate::DIRECT_ALIGN;
+    let mut memory = script_memory();
+    let pack = name("placed/pack");
+    let mut one = |effect: Effect| {
+        let mut ended = None;
+        run_until_idle(&mut *driver, &mut vec![effect], |done, _| ended = Some(done.done))
+            .expect("the effects end");
+        ended.expect("the step ended")
+    };
+    one(Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) });
+    crate::fs::seal(&root.join("placed/pack"), 0o444).unwrap();
+    let read = |at, into, cache| Effect::ReadInto {
+        file: pack.clone(),
+        at,
+        into,
+        cache,
+        priority: Priority::Demand,
+        tag: Tag(1),
+    };
+    assert_eq!(
+        one(read(0, memory.span(0, 2 * block as u32), Cache::Kept)),
+        Done::ReadInto { len: 2 * block as u32 }
+    );
+    assert_eq!(
+        one(read(2 * block, memory.span(2 * block, block as u32), Cache::Bypassed)),
+        Done::ReadInto { len: block as u32 }
+    );
+    let mut held = vec![0; 3 * block as usize];
+    memory.read(0, &mut held);
+    assert_eq!(held, pack_bytes()[..held.len()]);
+    crate::fs::seal(&root.join("placed/pack"), 0o644).unwrap();
+    memory.write(0, &vec![b'w'; block as usize]);
+    let write = Effect::WriteFrom {
+        file: pack.clone(),
+        at: 0,
+        from: memory.span(0, block as u32),
+        cache: Cache::Kept,
+        tag: Tag(2),
+    };
+    assert_eq!(one(write), Done::Written);
+    let written = std::fs::read(root.join("placed/pack")).unwrap();
+    assert_eq!(written[..block as usize], vec![b'w'; block as usize]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_into_memory_of_a_sealed_file_succeeds_on_each_driver() {
+    let threads = dir("memory-sealed-threads");
+    reads_into_memory_of_a_sealed_file(&mut Threads::new(threads.path(), 2), threads.path());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let native = dir("memory-sealed-native");
+        let mut driver = crate::native(native.path(), 2).unwrap();
+        reads_into_memory_of_a_sealed_file(&mut driver, native.path());
+    }
+}
+
 /// A short stand-in for bytes, so a mismatch is readable: their length and a hash.
 fn digest(bytes: &[u8]) -> (usize, u32) {
     (bytes.len(), blaze_ids::crc32c::crc32c(bytes))
