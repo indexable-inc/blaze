@@ -100,11 +100,16 @@ pub fn place(
     if relro.len() != want {
         return Err(PlaceError::Size { symbol, what: "relro", want, got: relro.len() });
     }
-    if at.code % 4 != 0 {
-        return Err(PlaceError::Misaligned { symbol, what: "the code", at: at.code, align: 4 });
+    // Each part where its record says (record.rs `code_align`, `relro_align`): a data row
+    // aligned to 64 is at a multiple of 64 from its part's first byte, so only that byte's
+    // alignment makes the row's address one.
+    let align = 1u64 << record.code_align();
+    if at.code % align != 0 {
+        return Err(PlaceError::Misaligned { symbol, what: "the code", at: at.code, align });
     }
-    if at.relro % 8 != 0 {
-        return Err(PlaceError::Misaligned { symbol, what: "the relro part", at: at.relro, align: 8 });
+    let align = 1u64 << record.relro_align();
+    if at.relro % align != 0 {
+        return Err(PlaceError::Misaligned { symbol, what: "the relro part", at: at.relro, align });
     }
     code.copy_from_slice(record.code());
     relro.copy_from_slice(record.relro());

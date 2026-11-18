@@ -680,9 +680,10 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
 
     /// The item [`FrontAdts`]'s `fn_trait_method` answers the builder: the program's lang
     /// trait's method, by the one map (front2/langs.rs `fn_trait_method`).
-    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> blaze_consteval::FnTraitMethod {
+        use blaze_consteval::FnTraitMethod::{Absent, Found};
         let (lang, name) = crate::front2::langs::fn_trait_method(which);
-        self.program.lang_trait_fn(lang, name)
+        self.program.lang_trait_fn(lang, name).map_or(Absent, Found)
     }
 }
 

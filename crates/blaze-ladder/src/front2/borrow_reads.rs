@@ -24,7 +24,7 @@
 
 use core::cell::RefCell;
 
-use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, FieldLead, Region, SigLife, SigRefusal};
+use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, FieldLead, FieldRegion, Region, SigLife, SigRefusal, Variance};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use blaze_typeck::StableHasher;
@@ -33,11 +33,16 @@ use super::project::BodyVerdict;
 use super::reads::{Fact, FactKind, Read, ReadsError};
 
 /// The domain of a [`FactKind::BorrowAdt`] answer.
-const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v2";
+/// v3 (lane B11): an ADT's row also holds its fields' regions, its `Copy` impl's needs, and what
+/// reading its fields' written types asked (ADT lifetime counts, path answers).
+/// v4 (lane B13): and its lifetime parameters' variances (`Facts::adt_variances`).
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v4";
 /// The domain of a [`FactKind::BorrowHead`] answer.
 /// v2 (piece RB8): a head's verdict now also reads its trait bounds' lifetime arguments
 /// (borrows_ties.rs), so a list filed under v1 never answers for one checked since.
-const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v2";
+/// v3 (lane B11): the head's text is read through the front end's world (borrow_sig_world.rs):
+/// each path answer it took is in the row.
+const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v3";
 
 /// What the borrow check took about one ADT.
 pub enum AdtAnswer<'f> {
@@ -57,6 +62,19 @@ pub enum AdtAnswer<'f> {
         field_params: &'f [Option<u32>],
         /// Beside `fields`: how each one's declared type begins (blaze-flow-lower `FieldLead`).
         field_leads: &'f [FieldLead],
+        /// Beside `fields`: each one's regions as `(start, len)` into `region_list`, or
+        /// `(u32::MAX, 0)` for none (borrow_fields.rs `NO_ROW`).
+        field_regions: &'f [(u32, u32)],
+        region_list: &'f [FieldRegion],
+        /// Which arguments its one `Copy` impl needs `Copy` (`None`: not read).
+        copy_args: Option<&'f [bool]>,
+        /// Its lifetime parameters' variances, in head order (`None`: not read; borrows.rs
+        /// `adt_variances_of`).
+        variances: Option<&'f [Variance]>,
+        /// What reading its fields' written types asked: each ADT's lifetime count, sorted,
+        /// and each path answer's digest, sorted (borrow_sig_world.rs).
+        asked_adts: &'f [(u128, u32)],
+        asked_paths: &'f [u64],
     },
 }
 
@@ -70,6 +88,8 @@ pub enum HeadAnswer<'s> {
         sig: Result<SigLife<'s>, SigRefusal>,
         /// Each ADT the reading asked about, sorted, with how many lifetimes its head declares.
         adts: &'s [(u128, u32)],
+        /// Each path answer the reading took, as its digest, sorted (borrow_sig_world.rs).
+        paths: &'s [u64],
     },
 }
 
@@ -122,7 +142,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
     let mut h = StableHasher::new(ADT_DOMAIN);
     match answer {
         AdtAnswer::NotMade => h.tag(0),
-        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads } => {
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, variances, asked_adts, asked_paths } => {
             h.tag(1);
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
@@ -161,6 +181,59 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
                 h.u32(a);
                 h.u32(b);
             }
+            // Each field's regions, resolved (the row says what was taken, not where it lives).
+            h.u32(field_regions.len() as u32);
+            for &(start, len) in field_regions {
+                match region_list.get(start as usize..start as usize + len as usize) {
+                    Some(rs) if start != u32::MAX => {
+                        h.tag(1);
+                        h.u32(len);
+                        for &fr in rs {
+                            let (tag, n) = match fr {
+                                FieldRegion::Lifetime(i) => (0, i),
+                                FieldRegion::Static => (1, 0),
+                                FieldRegion::Arg(i) => (2, i),
+                            };
+                            h.tag(tag);
+                            h.u32(n);
+                        }
+                    }
+                    _ => h.tag(0),
+                }
+            }
+            match copy_args {
+                None => h.tag(0),
+                Some(need) => {
+                    h.tag(1);
+                    h.u32(need.len() as u32);
+                    for &n in need {
+                        flag(&mut h, n);
+                    }
+                }
+            }
+            match variances {
+                None => h.tag(0),
+                Some(vs) => {
+                    h.tag(1);
+                    h.u32(vs.len() as u32);
+                    for &v in vs {
+                        h.tag(match v {
+                            Variance::Co => 0,
+                            Variance::Contra => 1,
+                            Variance::In => 2,
+                        });
+                    }
+                }
+            }
+            h.u32(asked_adts.len() as u32);
+            for &(a, lifetimes) in asked_adts {
+                h.u128(a);
+                h.u32(lifetimes);
+            }
+            h.u32(asked_paths.len() as u32);
+            for &p in asked_paths {
+                h.u64(p);
+            }
         }
     }
     Read { fact: Fact { kind: FactKind::BorrowAdt, key: adt, detail: 0 }, answer: Some(h.finish()) }
@@ -171,7 +244,7 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
     let mut h = StableHasher::new(HEAD_DOMAIN);
     match answer {
         HeadAnswer::NotMade => h.tag(0),
-        HeadAnswer::Made { callee, sig, adts } => {
+        HeadAnswer::Made { callee, sig, adts, paths } => {
             h.tag(1);
             let CalleeFacts { writes_lifetimes, self_ref } = callee;
             flag(&mut h, writes_lifetimes);
@@ -217,6 +290,10 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
             for &(adt, lifetimes) in adts {
                 h.u128(adt);
                 h.u32(lifetimes);
+            }
+            h.u32(paths.len() as u32);
+            for &p in paths {
+                h.u64(p);
             }
         }
     }

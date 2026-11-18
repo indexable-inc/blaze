@@ -26,7 +26,7 @@ use core::alloc::Allocator;
 use blaze_lir::func::{DataId, RefId, RefKind};
 use blaze_own::Vec;
 
-use super::{Label, MOST_DATA_ALIGN, Pass, unsupported};
+use super::{DATA_ALIGN_PAST, Label, MOST_DATA_ALIGN, Pass, unsupported};
 use crate::{
     EmitError, RelocTo,
     enc::{self, Reg, Size, X16},
@@ -76,8 +76,15 @@ pub(crate) struct WordRow {
 pub(crate) struct Form<A: Allocator> {
     /// In the order emitted, so by offset.
     pub(crate) sites: Vec<SiteRow, A>,
-    /// The data rows holding addresses, each at its alignment (8 at least, 16 at most).
+    /// The data rows holding addresses, each at its alignment (8 at least, a 4 KiB page at
+    /// most) from the part's first byte.
     pub(crate) relro: Vec<u8, A>,
+    /// log2 of the alignment the code's first byte is placed at: the most of the code's data
+    /// rows' (blaze-code record.rs `CodeRecord::code_align`), at least 16 bytes.
+    pub(crate) code_align: u8,
+    /// log2 of the alignment the relro part's first byte is placed at, as `code_align` for
+    /// its rows, at least 8 bytes.
+    pub(crate) relro_align: u8,
     pub(crate) words: Vec<WordRow, A>,
     /// Per placed data row, where it starts: in the code for a row holding no address, in the
     /// relro part for one that does.
@@ -101,6 +108,8 @@ impl<A: Allocator + Clone> Form<A> {
         Form {
             sites: Vec::new_in(alloc.clone()),
             relro: Vec::new_in(alloc.clone()),
+            code_align: blaze_code::record::LEAST_CODE_ALIGN,
+            relro_align: blaze_code::record::LEAST_RELRO_ALIGN,
             words: Vec::new_in(alloc.clone()),
             data_at: Vec::new_in(alloc.clone()),
             inner: Vec::new_in(alloc.clone()),
@@ -197,21 +206,26 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let row = self.placed[at];
             let rec = view.datas[row as usize];
             if rec.align > MOST_DATA_ALIGN {
-                return Err(EmitError::Data { row, why: "data aligned past 16 bytes (a segment aligns a record's code and relro part to 16)" });
+                return Err(EmitError::Data { row, why: DATA_ALIGN_PAST });
             }
             let align = 8usize.max(1 << rec.align);
+            // The row's part asks its placement for the row's alignment (record.rs
+            // `code_align`, `relro_align`): its offset there is a multiple of it.
+            let log2 = rec.align as u8;
             if !view.data_positions_of(DataId(row)).is_empty() {
                 return Err(EmitError::Data { row, why: RECORD_POSITION });
             }
             let relocs = view.data_relocs_of(DataId(row));
             let bytes = view.data_bytes_of(DataId(row));
             if relocs.is_empty() {
+                form.code_align = form.code_align.max(log2);
                 self.pad_to(align);
                 form.data_at.push(self.here());
                 self.code.extend_from_slice(bytes);
                 at += 1;
                 continue;
             }
+            form.relro_align = form.relro_align.max(log2);
             while form.relro.len() % align != 0 {
                 form.relro.push(0);
             }

@@ -627,7 +627,7 @@ fn refused_by_name() {
     w.const_fn("dangle", &[], "&u8", "{ let x = 5u8; &x }");
     w.konst("NC", "u8", "not_const()");
     w.stat_mut("SM", "u8", "1");
-    w.konst("RSM", "u8", "SM");
+    w.konst("RSM", "u8", "unsafe { SM }");
     w.konst("A", "u8", "1");
     w.konst("B", "u8", "2");
     w.konst("PC", "bool", "&A as *const u8 == &B as *const u8");

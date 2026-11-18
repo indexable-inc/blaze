@@ -634,11 +634,17 @@ impl Load<'static> for Kept {
         self.expansions.iter().find(|m| m.0 == call).map(|m| m.1)
     }
 
-    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<&'static [u8]> {
+    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<(&'static [u8], &'static [u8])> {
         if krate != 0 {
             return None;
         }
-        self.expansions.iter().find(|m| m.0 == call).map(|m| m.2)
+        let bytes = self.expansions.iter().find(|m| m.0 == call).map(|m| m.2)?;
+        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
+        // the text keeps none).
+        if bytes.is_empty() {
+            return Some((&[], &[]));
+        }
+        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
     }
 }
 

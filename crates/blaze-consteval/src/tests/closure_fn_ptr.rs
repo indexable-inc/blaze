@@ -9,7 +9,7 @@
 //! a world that names no `call_once` answered with a guess instead of the named refusal.
 
 use super::{refusal, world};
-use crate::Refusal;
+use crate::{FnTraitMethod, Refusal};
 use crate::record::DataTarget;
 
 fn fn_target(w: &mut crate::fixture::World, name: &str) -> blaze_build::InstanceKey {
@@ -53,4 +53,24 @@ fn no_call_once_is_refused_by_name() {
             Refusal::Unsupported { what: "a closure as a fn pointer in a world that names no `FnOnce::call_once` (ConstWorld::fn_trait_method)" }
         )
     );
+}
+
+#[test]
+fn pending_call_once_names_the_trait_and_resolves_when_loaded() {
+    let mut w = world();
+    let trait_ = w.fx.tr("FnOnce", 2, std::vec![], &[]);
+    let self_ty = w.fx.param(0);
+    let args = w.fx.param(1);
+    let output = w.ty("u32");
+    let call_once = w.fx.trait_fn(trait_, "call_once", true, &[self_ty, args], output);
+    w.konst("A", "fn(u32) -> u32", "|x| x");
+    w.build();
+
+    w.fn_once = FnTraitMethod::Pending { trait_ };
+    let e = w.eval("A").expect_err("the trait's members are pending");
+    assert!(matches!(e.refusal, Refusal::Missing { item, .. } if item == trait_), "{e:?}");
+
+    w.fn_once_is(call_once);
+    let record = w.eval("A").expect("the trait's members are now available");
+    assert!(matches!(&record.fns[..], [f] if f.instance.item == call_once));
 }

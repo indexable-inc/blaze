@@ -24,13 +24,30 @@ use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
 /// The first eight bytes of every encoded record: the form's version. `bzcode04` added the trap
-/// table ([`TrapRow`]), `bzcode05` its held values ([`Held`]) and subjects ([`Subject`]); `02`
+/// table ([`TrapRow`]), `bzcode05` its held values ([`Held`]) and subjects ([`Subject`]),
+/// `bzcode06` the alignment each part asks of its placement ([`CodeRecord::code_align`],
+/// [`CodeRecord::relro_align`]: data aligned past 16, as `vzipq_u8`'s 64-aligned table); `02`
 /// and `03` are blaze-tier's own forms (record/form.rs), so this form skips them and a record
-/// of one form is never read as another's.
-pub const MAGIC: [u8; 8] = *b"bzcode05";
+/// of one form is never read as another's. A record of an older form of this one is refused
+/// naming its form ([`DecodeError::Older`]) and rebuilt, never read (rule 26).
+pub const MAGIC: [u8; 8] = *b"bzcode06";
 
-/// The bytes before the sections: magic, frame, flags, ten counts (so the first section starts
-/// 8-aligned).
+/// The forms before [`MAGIC`] that were this record's: refused by name, never read.
+const OLDER: [[u8; 8]; 2] = [*b"bzcode04", *b"bzcode05"];
+
+/// The least alignment, as log2, of a record's code: 16 bytes, what every placement gives
+/// (image.rs `lay_out`, blaze-launch-rt run_mode.rs) and what a 16-aligned data row of the code
+/// needed before the field existed.
+pub const LEAST_CODE_ALIGN: u8 = 4;
+/// The least alignment, as log2, of a record's relro part: 8 bytes, its words'.
+pub const LEAST_RELRO_ALIGN: u8 = 3;
+/// The most alignment, as log2, a part may ask: a 4 KiB page, the least page a target has
+/// (image.rs `lay_out` starts every segment on a page of at least 4096 bytes), so any
+/// segment layout can give it; blaze-code datum.rs `MOST_ALIGN` is the same bound for statics.
+pub const MOST_PART_ALIGN: u8 = 12;
+
+/// The bytes before the sections: magic, frame, the two parts' alignments and two zero bytes,
+/// ten counts (so the first section starts 8-aligned).
 const HEAD: usize = 56;
 
 /// A [`Word`]'s target meaning this record's own code: the word holds the address of code byte
@@ -350,6 +367,9 @@ pub enum RecordError {
     TrapSite { at: u32 },
     /// A trap row's held value names register `reg`, past `x30`.
     HeldReg { at: u32, reg: u8 },
+    /// The `part`'s (`"code"` or `"relro part"`) alignment `align` (log2) is below its least
+    /// ([`LEAST_CODE_ALIGN`], [`LEAST_RELRO_ALIGN`]) or past [`MOST_PART_ALIGN`].
+    Align { part: &'static str, align: u8 },
 }
 
 impl fmt::Display for RecordError {
@@ -369,6 +389,10 @@ impl fmt::Display for RecordError {
             RecordError::TrapOutside { at, code } => write!(f, "a code record's trap row at {at} is not an instruction of its {code} bytes of code"),
             RecordError::TrapsTwice { at } => write!(f, "a code record has two trap rows at {at}"),
             RecordError::TrapSite { at } => write!(f, "a code record's trap row at {at} names site byte {NO_SITE}, the form's word for no site"),
+            RecordError::Align { part, align } => write!(
+                f,
+                "a code record's {part} asks an alignment of 2^{align}: below its least (code 2^{LEAST_CODE_ALIGN}, relro 2^{LEAST_RELRO_ALIGN}) or past a page (2^{MOST_PART_ALIGN})"
+            ),
             RecordError::HeldReg { at, reg } => write!(f, "a code record's trap row at {at} says register x{reg} holds the switched value, past x{MOST_REG}"),
         }
     }
@@ -385,6 +409,14 @@ pub struct CodeRecord<'a> {
     pub sites: AVec<'a, Site>,
     pub words: AVec<'a, Word>,
     pub frame: u32,
+    /// log2 of the alignment the code's first byte is placed at: the most its data rows ask
+    /// (each row's offset in `code` is a multiple of its own alignment), at least
+    /// [`LEAST_CODE_ALIGN`], at most [`MOST_PART_ALIGN`]. Every placement honours it
+    /// (image.rs `lay_out`; place.rs `place` refuses an address that does not).
+    pub code_align: u8,
+    /// log2 of the alignment the relro part's first byte is placed at, as `code_align` for its
+    /// rows; at least [`LEAST_RELRO_ALIGN`].
+    pub relro_align: u8,
     pub pads: AVec<'a, Pad>,
     /// Per `unreachable`'s `brk`, the construct it ends, in any order (sealed by offset).
     pub traps: AVec<'a, TrapRow>,
@@ -403,6 +435,8 @@ impl<'a> CodeRecord<'a> {
             sites: Vec::new_in(alloc),
             words: Vec::new_in(alloc),
             frame: 0,
+            code_align: LEAST_CODE_ALIGN,
+            relro_align: LEAST_RELRO_ALIGN,
             pads: Vec::new_in(alloc),
             traps: Vec::new_in(alloc),
             names: Vec::new_in(alloc),
@@ -430,7 +464,13 @@ impl<'a> CodeRecord<'a> {
     /// sites and words sorted by offset, pads by start, names by symbol; every rule of the form
     /// checked once here, so a [`Sealed`] needs no check again (rule 74).
     pub fn seal(self) -> Result<Sealed<'a>, RecordError> {
-        let CodeRecord { code, relro, targets, mut sites, mut words, frame, mut pads, mut traps, names, text, alloc } = self;
+        let CodeRecord { code, relro, targets, mut sites, mut words, frame, code_align, relro_align, mut pads, mut traps, names, text, alloc } = self;
+        if !(LEAST_CODE_ALIGN..=MOST_PART_ALIGN).contains(&code_align) {
+            return Err(RecordError::Align { part: "code", align: code_align });
+        }
+        if !(LEAST_RELRO_ALIGN..=MOST_PART_ALIGN).contains(&relro_align) {
+            return Err(RecordError::Align { part: "relro part", align: relro_align });
+        }
         fits(code.len(), "code")?;
         fits(relro.len(), "relro part")?;
         // Sort the targets by value through an index list; equal targets become one.
@@ -565,7 +605,21 @@ impl<'a> CodeRecord<'a> {
             }
         }
         fits(packed.len(), "names' text")?;
-        Ok(Sealed(CodeRecord { code, relro, targets: sorted, sites, words, frame, pads, traps, names: packed_names, text: packed, alloc }))
+        Ok(Sealed(CodeRecord {
+            code,
+            relro,
+            targets: sorted,
+            sites,
+            words,
+            frame,
+            code_align,
+            relro_align,
+            pads,
+            traps,
+            names: packed_names,
+            text: packed,
+            alloc,
+        }))
     }
 }
 
@@ -591,7 +645,7 @@ impl<'a> Sealed<'a> {
         let start = out.len();
         out.extend_from_slice(&MAGIC);
         put32(out, r.frame);
-        put32(out, 0);
+        out.extend_from_slice(&[r.code_align, r.relro_align, 0, 0]);
         let subjects = r.traps.iter().filter(|t| t.subject.is_some()).count();
         for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len(), r.traps.len(), subjects] {
             put32(out, count as u32);
@@ -694,12 +748,27 @@ pub enum DecodeError {
     Held { row: u32 },
     /// Subject row `row` is not the subject of a trap row (offsets rising, each a trap row's).
     Subject { row: u32 },
+    /// The bytes are a record of an older form of this one (`form` its eight-byte head, e.g.
+    /// `bzcode05`, which held no part alignments): never read, rebuilt (rule 26).
+    Older { form: [u8; 8] },
+    /// The head's `part` alignment `align` (log2) is outside what [`CodeRecord::seal`] allows,
+    /// or the two bytes after the alignments are not zero (`align` is then the first such byte).
+    Align { part: &'static str, align: u8 },
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode05` head (an older form is rebuilt, never read)"),
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode06` head"),
+            DecodeError::Older { form } => write!(
+                f,
+                "the bytes are a code record of the older form `{}`, which held no part alignments: rebuilt, never read (rule 26)",
+                core::str::from_utf8(&form).unwrap_or("bzcode0?")
+            ),
+            DecodeError::Align { part, align } => write!(
+                f,
+                "a code record's head gives its {part} the alignment byte {align}: outside code 2^{LEAST_CODE_ALIGN}..2^{MOST_PART_ALIGN}, relro 2^{LEAST_RELRO_ALIGN}..2^{MOST_PART_ALIGN}, or a byte after them not zero"
+            ),
             DecodeError::TrapKind { row, byte } => write!(f, "a code record's trap row {row} has the unknown kind {byte}"),
             DecodeError::Held { row } => write!(f, "a code record's trap row {row} has a malformed held value (an unknown tag or a register past x30)"),
             DecodeError::Subject { row } => write!(f, "a code record's subject row {row} is not the subject of one of its trap rows"),
@@ -713,7 +782,8 @@ impl fmt::Display for DecodeError {
 impl core::error::Error for DecodeError {}
 
 /// An encoded record read in place. Layout (little-endian; every section starts 8-aligned from
-/// the record's first byte): `MAGIC`; `frame: u32`, `flags: u32` (0); ten `u32` counts (code
+/// the record's first byte): `MAGIC`; `frame: u32`, `code_align: u8`, `relro_align: u8` (log2
+/// of each part's placement alignment), two zero bytes; ten `u32` counts (code
 /// bytes, relro bytes, targets, sites, words, pads, names, text bytes, traps, subjects); the
 /// code; the relro part; targets (space `u8`, 7 zero bytes, symbol 32); sites (`at: u32`, kind
 /// `u8`, 3 zero bytes, `target: u32`, `addend: u32`); words (`at: u32`, `target: u32`, `addend:
@@ -722,11 +792,13 @@ impl core::error::Error for DecodeError {}
 /// none), held stack offset `u32`, `item: u128`, 0 for none), by `at`; subjects (`at: u32` of
 /// its trap row, `count: u32`, `item: u128`, eight `u64` discriminants), by `at`; names
 /// (symbol 32, text `at: u32`, `len: u32`); the text. `bzcode05` added the held value and the
-/// subjects.
+/// subjects, `bzcode06` the two alignments (in the word `bzcode05` held as a zero `flags`).
 #[derive(Clone, Copy)]
 pub struct CodeView<'b> {
     bytes: &'b [u8],
     frame: u32,
+    code_align: u8,
+    relro_align: u8,
     code: &'b [u8],
     relro: &'b [u8],
     targets: &'b [u8],
@@ -773,9 +845,24 @@ impl<'b> CodeView<'b> {
             return Err(DecodeError::Length { need: HEAD, have: bytes.len() });
         }
         if bytes[..8] != MAGIC {
-            return Err(DecodeError::Magic);
+            let mut form = [0u8; 8];
+            form.copy_from_slice(&bytes[..8]);
+            return Err(match OLDER.contains(&form) {
+                true => DecodeError::Older { form },
+                false => DecodeError::Magic,
+            });
         }
         let frame = get32(bytes, 8);
+        let (code_align, relro_align) = (bytes[12], bytes[13]);
+        if !(LEAST_CODE_ALIGN..=MOST_PART_ALIGN).contains(&code_align) {
+            return Err(DecodeError::Align { part: "code", align: code_align });
+        }
+        if !(LEAST_RELRO_ALIGN..=MOST_PART_ALIGN).contains(&relro_align) {
+            return Err(DecodeError::Align { part: "relro part", align: relro_align });
+        }
+        if let Some(&byte) = bytes[14..16].iter().find(|&&b| b != 0) {
+            return Err(DecodeError::Align { part: "head's zero bytes", align: byte });
+        }
         let count = |i: usize| get32(bytes, 16 + 4 * i) as usize;
         let lens = [
             up8(count(0)),
@@ -836,7 +923,18 @@ impl<'b> CodeView<'b> {
                 return Err(DecodeError::Kind { row: row as u32, byte });
             }
         }
-        Ok(CodeView { bytes, frame, code, relro, targets, sites, words, pads, traps, subjects, names, text })
+        Ok(CodeView { bytes, frame, code_align, relro_align, code, relro, targets, sites, words, pads, traps, subjects, names, text })
+    }
+
+    /// log2 of the alignment the code's first byte must be placed at ([`CodeRecord::code_align`]).
+    pub fn code_align(&self) -> u8 {
+        self.code_align
+    }
+
+    /// log2 of the alignment the relro part's first byte must be placed at
+    /// ([`CodeRecord::relro_align`]).
+    pub fn relro_align(&self) -> u8 {
+        self.relro_align
     }
 
     /// The whole encoding: equal records are equal bytes.

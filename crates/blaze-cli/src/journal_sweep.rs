@@ -439,6 +439,8 @@ impl<'a> Index<'a> {
             // A build script's read (engine_script_reads.rs): a file's bytes and a path's stat
             // move only with the path or a folder above it; a listing with any entry of it.
             LeafKind::ScriptFile | LeafKind::ScriptStat => self.touched(rel),
+            // A git fact is read from `.git` files the journal may not see: always followed.
+            LeafKind::ScriptGit => true,
             LeafKind::ScriptListing => self.touched(rel) || self.children_of(rel).next().is_some(),
             // Decided by its files' and folders' rows (macro_files.rs `proven`).
             LeafKind::MacroFiles => false,

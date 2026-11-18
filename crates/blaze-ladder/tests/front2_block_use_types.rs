@@ -270,7 +270,7 @@ impl Load<'static> for Kept {
         None
     }
 
-    fn expansion_origins(&self, _krate: usize, _call: LibKey) -> Option<&'static [u8]> {
+    fn expansion_origins(&self, _krate: usize, _call: LibKey) -> Option<(&'static [u8], &'static [u8])> {
         None
     }
 }

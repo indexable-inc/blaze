@@ -8,7 +8,9 @@
 //! WHICH routines a function calls is an output of emitting it (main's decision, 2026-11-16):
 //! only legalize maps an operation to its routine, so nothing here predicts it.
 //! - [`find`] (asked once a run, through the seam's `FrontEnd::soft_float_routines`) finds each
-//!   of the 24 routines among compiler_builtins' fns by its exported name;
+//!   routine of `SoftFloat::ALL` (the tf routines and libm's `fmodf128`, which compiler_builtins
+//!   exports too: src/math/mod.rs `full_availability`) among the fns of the compiler_builtins
+//!   the program links, by its exported name;
 //! - [`Bound`] holds each found routine's instance name and symbol (symbols.rs, a fn with no
 //!   generic arguments), made once a run by the record walk's maker;
 //! - [`Bound::bind`] appends one callee per found routine to an instance's function
@@ -55,10 +57,17 @@ pub enum Found {
     Missing,
     /// Two fns of compiler_builtins export this name.
     Twice,
-    /// The program's crate graph holds no crate named `compiler_builtins`.
+    /// The program (the link closure of its roots, linked.rs) links no crate named
+    /// `compiler_builtins`.
     NoCrate,
-    /// Two crates of the graph are named `compiler_builtins`.
+    /// The program links two crates named `compiler_builtins`. Two in the GRAPH are not this:
+    /// a workspace's graph holds every program's crates (and a unit of another side or
+    /// feature set); only the ones the program links are its (the rule its lang rows follow,
+    /// index.rs `Index::new`).
     CrateTwice,
+    /// The program's roots did not make a link closure (a root of no crate: linked.rs
+    /// `RootsError`).
+    Roots,
     /// A fn named the routine's symbol whose signature's attributes do not read.
     Attrs,
     /// The names source did not answer (a crate's kind, its items, cfg or edition): the error
@@ -114,8 +123,9 @@ impl fmt::Display for BuiltinsRefused {
             Found::Key(_) => "found, yet not bound (a bug of front2/builtins_shim.rs)",
             Found::Missing => "compiler_builtins exports no fn of this name (`#[no_mangle]`): its cfg left it out, or the toolchain's compiler_builtins lacks it",
             Found::Twice => "compiler_builtins exports two fns of this name",
-            Found::NoCrate => "the program's crate graph holds no `compiler_builtins`",
-            Found::CrateTwice => "two crates of the graph are named `compiler_builtins`",
+            Found::NoCrate => "the program links no crate named `compiler_builtins`",
+            Found::CrateTwice => "the program links two crates named `compiler_builtins`",
+            Found::Roots => "the program's roots make no link closure (a root of no crate)",
             Found::Attrs => "a compiler_builtins fn of this name whose attributes do not read",
             Found::Unanswered => "the names records did not answer about compiler_builtins (the error is in the source's log)",
             Found::NotLookedUp => "this front end does not look compiler_builtins' routines up (the record walk over front2 does)",
@@ -126,14 +136,24 @@ impl fmt::Display for BuiltinsRefused {
 
 impl core::error::Error for BuiltinsRefused {}
 
-/// Each routine's exported fn in the graph's compiler_builtins. Reads that one crate's item
-/// rows once (`each_item`: no text), then lowers the signature of only the fns named one of the
-/// 24 symbols (two each in the pinned crate) to read their `no_mangle`. `alloc` holds the
-/// candidates and the lowerings, dropped on return.
-pub fn find<'n, S: NamesSource<'n>>(names: S, alloc: Alloc<'_>) -> Builtins {
+/// Each routine's exported fn in the compiler_builtins the program of `roots` links (the link
+/// closure of `roots`, linked.rs: the one reading of the link rule, which the program's lang
+/// rows follow too; callers pass the roots their index was filed for, index.rs
+/// `Index::scope`). A crate of the graph the program does not link is never looked at: the
+/// census of tempo (port27/tempo-run/build-census-g002415.txt) refused 41 fns with
+/// "two crates of the graph are named `compiler_builtins`" when the whole graph was read.
+/// Reads that one crate's item rows once (`each_item`: no text), then lowers the signature of
+/// only the fns named one of the routines' symbols (two each in the pinned crate) to read their
+/// `no_mangle`. `alloc` holds the closure, the candidates and the lowerings, dropped on return.
+pub fn find<'n, S: NamesSource<'n>>(names: S, roots: &[usize], alloc: Alloc<'_>) -> Builtins {
     let all = |found: Found| Builtins { found: [found; COUNT], libs: [None; COUNT] };
+    let linked = match names.linked(roots, alloc) {
+        Some(Ok(linked)) => linked,
+        Some(Err(_)) => return all(Found::Roots),
+        None => return all(Found::Unanswered),
+    };
     let mut krate = None;
-    for k in 0..names.crate_count() {
+    for k in linked.crates() {
         match names.proc_macro(k) {
             Some(true) => continue,
             Some(false) => {}

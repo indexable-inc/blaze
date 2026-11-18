@@ -742,11 +742,14 @@ pub trait Load<'n> {
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str>;
     /// The text the macro call `call` of the crate expanded to.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str>;
-    /// The origins of that text (`blaze_scope::expansion_origins` form; empty: the text keeps
-    /// none). No default (rule 3): every loader says what it serves; `None` is "this loader holds
-    /// no origins for the call", which a finding in the text files by name
+    /// The origins of that text as the TWO parts they are stored in, never a joined copy: the
+    /// call part (where the call stands and the macro's path: an expansion record's crate
+    /// directory keeps it) and the origin column (the record's, beside the text), what
+    /// `blaze_scope::expansion_origins::OriginsView::open_parts` reads in place. An empty call
+    /// part: the text keeps none. No default (rule 3): every loader says what it serves; `None`
+    /// is "this loader holds no origins for the call", which a finding in the text files by name
     /// (front2 expansion_origin.rs `Unmapped::NotServed`), never a quiet nothing.
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'n [u8]>;
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'n [u8], &'n [u8])>;
     /// The entry of the crate's file at `path`, as it is now, whose item chain is `chain`: what
     /// an items record row whose file changed is checked against, item by item
     /// (`blaze_scope::items_record::ItemsRecord::item_now`). This one outlines the file's text
@@ -1490,7 +1493,9 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn text_marks(self, krate: usize, call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::item_site::MarksLost> {
-        use super::item_site::{MarksLost, marks_of};
+        use super::item_site::{MarksLost, marks_of_column};
+        use blaze_scope::crate_roots::RootsLost;
+        use blaze_scope::expansion_origins::OriginsView;
         // Asked before: the opened view, O(1) (the field's docs).
         if let Some(answer) = self.marks.borrow().get(&(krate, call)) {
             return *answer;
@@ -1501,14 +1506,16 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         let answer = (|| -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, MarksLost> {
             let text = self.load.expansion(krate, call).ok_or(MarksLost::NoExpansion { call })?;
             // `Load::expansion_origins`: `None` is a loader that holds no origins for the call
-            // and empty bytes a text that keeps none; both are a text with no column, as
+            // and an empty call part a text that keeps none; both are a text with no column, as
             // `item_site::marks_of`'s `Ok(None)` (OPEN: the records loaders of tests/ serve none,
-            // so a def-site head over records resolves at its module until they do).
+            // so a def-site head over records resolves at its module until they do). The two
+            // parts are opened where they lie (`OriginsView::open_parts`): no joined copy.
             match self.load.expansion_origins(krate, call) {
-                None | Some([]) => Ok(None),
-                Some(bytes) => {
+                None | Some(([], _)) => Ok(None),
+                Some((call_part, column)) => {
                     self.origins_opened.set(self.origins_opened.get() + 1);
-                    marks_of(call, text, &Ok(bytes))
+                    let column = OriginsView::open_parts(call_part, column).map(|view| view.column).map_err(|error| RootsLost::NoOrigins { error });
+                    marks_of_column(call, text, column)
                 }
             }
         })();

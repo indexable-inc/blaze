@@ -31,7 +31,7 @@ use crate::lit;
 use crate::mem::{PTR, Scalar};
 use crate::record::{ConstFn, RecordKey};
 use crate::soft::Format;
-use crate::{ConstWorld, FnKind, Intrinsic, Typed};
+use crate::{ConstWorld, FnKind, FnTraitMethod, Intrinsic, Typed};
 
 // `let` in a condition: `if let`, `while let`, let chains (machine/lets.rs).
 #[path = "lets.rs"]
@@ -1995,17 +1995,16 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         return Err(malformed("a closure's fn pointer made of a value that is not a closure"));
                     };
                     let PNode::FnPtr(sig, _) = self.node(next)? else { return Err(malformed("a closure coerced to a type that is not a fn pointer")) };
-                    // Not answered yet is PENDING, never final: a world whose `FnOnce` trait's
-                    // head is not made notes it and answers `None` (blaze-ladder front2
-                    // consts.rs `ConstsWorld::fn_trait_method`); the front end makes it and this
-                    // code is compiled again (late.rs `Wait::Missing`). A final refusal here was
-                    // kept with the code, so the second round refused though the trait was made.
-                    // A world with no `fn_once` lang trait at all notes nothing, and the front
-                    // end refuses this by name.
-                    let call_once = self
-                        .world
-                        .fn_trait_method(blaze_build::FnTrait::FnOnce)
-                        .ok_or(Stop::Refused(Refusal::Missing { what: "the `FnOnce::call_once` lang method a closure coerced to a fn pointer names (ConstWorld::fn_trait_method)", item: owner }))?;
+                    let call_once = match self.world.fn_trait_method(blaze_build::FnTrait::FnOnce) {
+                        FnTraitMethod::Found(item) => item,
+                        FnTraitMethod::Absent => return Err(unsupported(
+                            "a closure as a fn pointer in a world that names no `FnOnce::call_once` (ConstWorld::fn_trait_method)",
+                        )),
+                        FnTraitMethod::Pending { trait_ } => return Err(Stop::Refused(Refusal::Missing {
+                            what: "the trait members for `FnOnce::call_once` (ConstWorld::fn_trait_method)",
+                            item: trait_,
+                        })),
+                    };
                     let mut inputs: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
                     let all = self.ground.view().list(sig).map_err(|_| malformed("a list past the ground table"))?;
                     let (_, ins) = all.split_last().ok_or(malformed("a fn pointer type without its output"))?;

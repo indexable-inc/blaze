@@ -1,7 +1,7 @@
 //! Segments and the program image (run.md, "End state", "The segment" and "The image").
 //!
-//! - [`lay_out`] places sealed code records together as one [`Segment`]: their code 16-aligned
-//!   in the order given, then, on the next page, the import table (one word per distinct target)
+//! - [`lay_out`] places sealed code records together as one [`Segment`]: their code at the
+//!   alignment each record asks (`CodeView::code_align`, at least 16) in the order given, then, on the next page, the import table (one word per distinct target)
 //!   and the records' relro parts. It completes every site's instructions against that layout.
 //!   A segment's bytes do not depend on where it is mapped: `adrp` reaches by 4 KiB page
 //!   difference and every segment starts on a page. Equal records are placed once (folding at
@@ -144,15 +144,22 @@ pub fn lay_out<'a>(members: &[Member<'_>], kind: Kind, page: u64, alloc: Alloc<'
     let mut relro_off: AVec<'_, u64> = Vec::from_elem_in(0, n, alloc);
     let mut homes: AVec<'a, (Symbol, u64)> = Vec::with_capacity_in(n, alloc);
     let mut local: ABTreeMap<'_, Symbol, u64> = BTreeMap::new_in(alloc);
+    // The most any placed relro part asks: where the relro region starts.
+    let mut most_relro = 16u64;
     for (i, m) in members.iter().enumerate() {
         let r = rep[i] as usize;
         if r == i {
-            while code.len() % 16 != 0 {
+            // Each part at the alignment its record asks (at least 16 and 8, at most a 4 KiB
+            // page, which the segment's first byte and `relro_at` give: record.rs `seal`).
+            let code_align = 1usize << m.record.code_align();
+            while code.len() % code_align != 0 {
                 code.push(0);
             }
             code_at[i] = code.len() as u64;
             code.extend_from_slice(m.record.code());
-            while relro.len() % 16 != 0 {
+            let relro_align = 16usize.max(1 << m.record.relro_align());
+            most_relro = most_relro.max(relro_align as u64);
+            while relro.len() % relro_align != 0 {
                 relro.push(0);
             }
             relro_off[i] = relro.len() as u64;
@@ -192,7 +199,7 @@ pub fn lay_out<'a>(members: &[Member<'_>], kind: Kind, page: u64, alloc: Alloc<'
     imports.sort_unstable();
     imports.dedup();
     let imports_at = up(code.len() as u64, page);
-    let relro_at = up(imports_at + 8 * imports.len() as u64, 16);
+    let relro_at = up(imports_at + 8 * imports.len() as u64, most_relro);
     let size = up(relro_at + relro.len() as u64, page);
     // Complete every placed record's sites against the layout.
     let mut words: AVec<'a, (u64, Bound, i64)> = Vec::new_in(alloc);

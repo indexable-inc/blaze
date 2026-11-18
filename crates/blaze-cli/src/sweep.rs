@@ -159,13 +159,17 @@ pub enum LeafKind {
     /// A checkout path a member's build script stat'd (`stat:`): its id its kind, and a file's
     /// size; a folder's does not depend on what is in it (engine_script_reads.rs).
     ScriptStat = 9,
+    /// A git fact a member's build script asked (`git:`): its id the answer the run saw, as the
+    /// sandbox digests it (engine_script_reads.rs `ReadKind::Git`). Read from `.git` files the
+    /// journal may not see, so it is always followed (journal_sweep.rs).
+    ScriptGit = 10,
 }
 
 impl LeafKind {
     /// A row a build script's read made: followed by engine_script_reads.rs `now`, read by a
     /// `Given` cell and never by the layout.
     pub fn by_script(self) -> bool {
-        matches!(self, LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat)
+        matches!(self, LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit)
     }
 }
 
@@ -669,7 +673,7 @@ impl<S: Stamps> Follow<S> {
                     (old.flags, None, old.id)
                 }
                 LeafKind::MacroFolder => crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, Some(&old), frame)?,
-                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat => {
+                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => {
                     let kind = crate::engine_script_reads::ReadKind::of_leaf(old.kind).ok_or(CliError::Text { what: "a script read's leaf row has no read kind (sweep.rs `follow_marked`)" })?;
                     crate::engine_script_reads::now(&cx, root, &self.stamps, self.plant, kind, path, Some((old.stamp, old.id)), frame)?
                 }
@@ -775,7 +779,7 @@ impl<'f> Leaves<'f> {
             }
             start = end;
             let at = row_at + ROW * k;
-            if bytes[at] > LeafKind::ScriptStat as u8 {
+            if bytes[at] > LeafKind::ScriptGit as u8 {
                 return Err(refuse(at, WireWhy::Tag(bytes[at])));
             }
             if bytes[at + 1] & !FLAGS != 0 {
@@ -818,7 +822,8 @@ impl<'f> Leaves<'f> {
             6 => LeafKind::MacroFolder,
             7 => LeafKind::ScriptFile,
             8 => LeafKind::ScriptListing,
-            _ => LeafKind::ScriptStat,
+            9 => LeafKind::ScriptStat,
+            _ => LeafKind::ScriptGit,
         };
         let stamp = Stamp::get(&row[4..4 + Stamp::BYTES]);
         let mut id = [0; 32];
@@ -1008,7 +1013,7 @@ mod tests {
                 // No member proc-macro crate in this sweep's workspace: no such row is made.
                 LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder => (ABSENT, ContentId([0; 32])),
                 // No build script in this sweep's workspace: no such row is made.
-                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat => (ABSENT, ContentId([0; 32])),
+                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => (ABSENT, ContentId([0; 32])),
             }
         };
         let sweep = |round: &str| -> Result<(std::vec::Vec<(LeafKind, String)>, u64), Broke> {

@@ -243,7 +243,7 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// Over the source's questions: compiler_builtins' item rows, then the signatures of the
     /// fns named a routine's symbol (front2/builtins_shim.rs).
     fn soft_float_routines(&self, alloc: blaze_own::Alloc<'_>) -> crate::front2::builtins_shim::Builtins {
-        crate::front2::builtins_shim::find(self.front.names, alloc)
+        crate::front2::builtins_shim::find(self.front.names, self.front.index.scope(), alloc)
     }
 
     fn body_reads(&self, i: usize, _checked: &Checked<'static>) -> Option<crate::front2::body_reads::ReadsDigest> {

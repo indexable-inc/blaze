@@ -181,10 +181,15 @@ fn oracle_moves(flow: &Flow<Global>) -> Result<Found, Broke> {
         };
         let mut dest = None;
         let mut moved = Vec::new();
+        // Operands are read left to right, each after the moves of those before it.
+        let mut seen = un.clone();
         match flow.stmt(s).kind {
             StmtKind::Assign { dest: d, value } => {
                 crate::moves::for_each_operand(flow, value, |o| {
-                    operand(&un, o);
+                    operand(&seen, o);
+                    if let Operand::Move(p) = o {
+                        set(&mut seen, p, true);
+                    }
                     moved.push(o);
                 });
                 if let crate::flow::Value::Borrow { place, .. } = value
@@ -196,7 +201,10 @@ fn oracle_moves(flow: &Flow<Global>) -> Result<Found, Broke> {
             }
             StmtKind::Call { args, dest: d } => {
                 for o in flow.ops(args) {
-                    operand(&un, *o);
+                    operand(&seen, *o);
+                    if let Operand::Move(p) = *o {
+                        set(&mut seen, p, true);
+                    }
                     moved.push(*o);
                 }
                 dest = Some(d);

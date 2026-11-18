@@ -152,7 +152,9 @@ pub(crate) fn holds(func: View<'_>, isa: Isa) -> Option<(usize, usize)> {
     let mut most = 0;
     for row in 0..func.datas.len() as u32 {
         if func.data_relocs_of(DataId(row)).is_empty() {
-            most += func.data_bytes_of(DataId(row)).len() + 15;
+            // A row is padded to its own alignment (pass/sites.rs: `8.max(1 << align)`), 16 at
+            // the least here.
+            most += func.data_bytes_of(DataId(row)).len() + 15.max((1usize << func.datas[row as usize].align) - 1);
         }
     }
     assert!(

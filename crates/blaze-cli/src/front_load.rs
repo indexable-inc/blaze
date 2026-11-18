@@ -200,8 +200,6 @@ pub(crate) struct StoreLoad<'n> {
     /// directory names one ([`ExpansionRecordsError::Missing`]: the store lacks its record; a
     /// damaged row); `None`: the crate made no text for the call.
     unserved: RefCell<AVec<'n, Unserved>>,
-    /// Each (crate, call)'s origins in their joined form, made at its first ask; sorted.
-    joined: RefCell<AVec<'n, (usize, ItemKey, &'n [u8])>>,
     alloc: Alloc<'n>,
 }
 
@@ -215,7 +213,7 @@ pub(crate) struct Unserved {
 
 impl<'n> StoreLoad<'n> {
     pub(crate) fn new(crates: &'n [CrateRecords<'n>], packages: &'n [&'n str], texts: &'n dyn SourceTexts<'n>, alloc: Alloc<'n>) -> StoreLoad<'n> {
-        StoreLoad { crates, packages, texts, unserved: RefCell::new(AVec::new_in(alloc)), joined: RefCell::new(AVec::new_in(alloc)), alloc }
+        StoreLoad { crates, packages, texts, unserved: RefCell::new(AVec::new_in(alloc)), alloc }
     }
 
     /// The crates' keys in reader order: `Records::new`'s `keys`.
@@ -262,23 +260,27 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         self.served(krate, call, self.crates.get(krate).map(|c| c.expansions.text(call)))
     }
 
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'n [u8]> {
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'n [u8], &'n [u8])> {
         // Asked only of a text `expansion` served: one it cannot serve is filed as that is. The
-        // joined form the ladder reads (its call part, then its record's column) is made once a
-        // call, in the load's allocator, and kept: the ladder asks again at each mark it reads
-        // (blaze-ladder front2 source.rs `text_marks`).
-        let at = {
-            let joined = self.joined.borrow();
-            match joined.binary_search_by(|(k, c, _)| (*k, *c).cmp(&(krate, call))) {
-                Ok(at) => return Some(joined[at].2),
-                Err(at) => at,
-            }
-        };
-        let bytes = self.served(krate, call, self.crates.get(krate).map(|c| c.expansions.joined_origins(call, self.alloc)))?;
-        self.joined.borrow_mut().insert(at, (krate, call, bytes));
-        Some(bytes)
+        // two parts are handed where they lie (the directory's call part, the record's column:
+        // `ExpansionTexts::origins_parts`), copied nowhere; the ladder opens them once a call
+        // and keeps the view (blaze-ladder front2 source.rs `text_marks`). A text that keeps no
+        // origins is an empty call part (the trait's docs).
+        let parts = self.crates.get(krate).map(|c| {
+            c.expansions.origins_parts(call).map(|row| {
+                row.map(|kept| match kept {
+                    Some(parts) => parts,
+                    None => (&[][..], &[][..]),
+                })
+            })
+        });
+        self.served(krate, call, parts)
     }
 }
+
+#[cfg(test)]
+#[path = "names/origins_parts_tests.rs"]
+mod origins_parts_tests;
 
 #[cfg(test)]
 mod tests {
@@ -308,7 +310,7 @@ mod tests {
     const APP: &str = "#![no_core]\nuse lib::m::make;\npub struct Own;\nfn main() { let _ = make(); }\nmod inner { pub fn g() {} }\n";
 
     /// The files of the two crates, at their world paths.
-    struct Files;
+    pub(super) struct Files;
 
     impl<'a> SourceTexts<'a> for Files {
         fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
@@ -337,7 +339,7 @@ mod tests {
         }
     }
 
-    fn solved() -> Names<'static> {
+    pub(super) fn solved() -> Names<'static> {
         let inputs = [input("app", "/0/app/lib.rs", &[("lib", 1)]), input("lib", "/1/lib/lib.rs", &[])];
         let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
         let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, Alloc::global());
@@ -345,7 +347,7 @@ mod tests {
     }
 
     /// Each crate's `CrateScope` payload as names.rs `run` writes it.
-    fn payloads(names: &Names<'_>) -> std::vec::Vec<blaze_own::Vec<u8, std::alloc::Global>> {
+    pub(super) fn payloads(names: &Names<'_>) -> std::vec::Vec<blaze_own::Vec<u8, std::alloc::Global>> {
         let g = Alloc::global();
         let mut out = std::vec::Vec::new();
         for c in names.crates().iter() {
@@ -359,7 +361,7 @@ mod tests {
 
     /// The expansion records the crates' directories name, as a store holds them after their
     /// puts: every one (`all`), or (the planted bug: their puts skipped) none.
-    struct Kept(std::vec::Vec<(ContentId, std::vec::Vec<u8>)>);
+    pub(super) struct Kept(std::vec::Vec<(ContentId, std::vec::Vec<u8>)>);
 
     impl<'s> RecordSource<'s> for Kept {
         fn record(&mut self, key: ContentId, alloc: Alloc<'s>) -> Result<Option<&'s [u8]>, ServeError> {
@@ -367,7 +369,7 @@ mod tests {
         }
     }
 
-    fn kept(names: &Names<'_>, all: bool) -> Kept {
+    pub(super) fn kept(names: &Names<'_>, all: bool) -> Kept {
         let mut kept = std::vec::Vec::new();
         for c in names.crates().iter().filter(|_| all) {
             let split = blaze_scope::expansion_records::write(c, Alloc::global()).unwrap_or_else(|e| panic!("expansions of `{}`: {e}", c.name));
@@ -376,7 +378,7 @@ mod tests {
         Kept(kept)
     }
 
-    fn scope_name(key: CrateItemKey) -> Name {
+    pub(super) fn scope_name(key: CrateItemKey) -> Name {
         blaze_drive::key::crate_scope_name(&key)
     }
 

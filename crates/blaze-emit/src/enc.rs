@@ -594,6 +594,28 @@ pub(crate) const fn stxr(size: Size, rel: bool, rs: Reg, rt: Reg, rn: Reg) -> u3
     0x0800_7c00 | ((size as u32) << 30) | (rs << 16) | ((rel as u32) << 15) | (rn << 5) | rt
 }
 
+/// `ld{a}xp xt, xt2, [rn]` (C6.2, LDXP/LDAXP, 64-bit: `1 sz=1 001000 0 L=1 1 Rs=11111 o0 Rt2
+/// Rn Rt`): an exclusive load of the pair at `rn` (16 bytes, 16-aligned), acquiring when `acq`
+/// (`o0`). Single-copy atomic only once a store-exclusive of the pair succeeds.
+pub(crate) const fn ldxp(acq: bool, rt: Reg, rt2: Reg, rn: Reg) -> u32 {
+    0xc87f_0000 | ((acq as u32) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `st{l}xp ws, xt, xt2, [rn]` (C6.2, STXP/STLXP, 64-bit: `1 sz=1 001000 0 L=0 1 Rs o0 Rt2 Rn
+/// Rt`): an exclusive store of the pair, releasing when `rel`; `ws` is 0 when it stored, 1 when
+/// it lost the reservation. `ws` differs from `xt`, `xt2` and `rn`.
+pub(crate) const fn stxp(rel: bool, rs: Reg, rt: Reg, rt2: Reg, rn: Reg) -> u32 {
+    0xc820_0000 | (rs << 16) | ((rel as u32) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `casp{a,l,al} xs, x(s+1), xt, x(t+1), [rn]` (C6.2, CASP, FEAT_LSE, 64-bit: `0 sz=1 001000 0
+/// L 1 Rs o0 Rt2=11111 Rn Rt`): if the 16 bytes at `rn` equal `xs:x(s+1)` (low word first),
+/// they become `xt:x(t+1)`; `xs:x(s+1)` get the old pair either way. `rs` and `rt` are even.
+/// Acquires when `acq` (`L`), releases when `rel` (`o0`).
+pub(crate) const fn casp(acq: bool, rel: bool, rs: Reg, rt: Reg, rn: Reg) -> u32 {
+    0x4820_7c00 | ((acq as u32) << 22) | (rs << 16) | ((rel as u32) << 15) | (rn << 5) | rt
+}
+
 /// `clrex`: drops this core's exclusive reservation.
 pub(crate) const fn clrex() -> u32 {
     0xd503_3f5f

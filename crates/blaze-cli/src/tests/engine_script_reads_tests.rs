@@ -60,6 +60,7 @@ fn run(io: &Io, script: &[(ReadKind, &str)], plant: ReadsPlant) -> (std::vec::Ve
             ReadKind::File => "file",
             ReadKind::Listing => "dir",
             ReadKind::Stat => "stat",
+            ReadKind::Git => "git",
         };
         // The sandbox records no digest for nothing there.
         recorded.push((format!("{word}:{path}"), (answer != reads::NONE).then_some(answer)));
@@ -188,7 +189,10 @@ fn control_a_dropped_file_read_misses_the_edit() {
 /// here (the sandbox records none).
 #[test]
 fn reads_with_no_cell_are_refused_by_name() {
-    assert!(matches!(reads::parse("git:pkg\nrev-parse HEAD", None), Err(NoCell::Git { .. })));
+    // A git fact read from `.git` files has a cell (lane NR2); `status` reads every tracked
+    // file's stat and has none yet.
+    assert!(reads::parse("git:pkg\nrev-parse HEAD", None).is_ok(), "a git fact has a cell");
+    assert!(matches!(reads::parse("git:pkg\nstatus --porcelain", None), Err(NoCell::Git { .. })));
     assert!(matches!(reads::parse("env:HOME", None), Err(NoCell::Kind { .. })));
     assert!(matches!(reads::parse("file:/etc/passwd", None), Err(NoCell::Path { .. })));
     assert!(matches!(reads::parse("file:pkg/../x", None), Err(NoCell::Path { .. })));

@@ -921,6 +921,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             map.push(o);
         }
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut vars: Vec<crate::Variance, A> = Vec::new_in(self.alloc.clone());
         lo = 0;
         for i in 0..=vs.len() {
             let hi = map_ends[i];
@@ -940,15 +941,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 continue;
             }
             let s = self.info(place);
-            let top_ref = ty.wrap.is_some() || matches!(self.node(ty.ty, e)?, PNode::Ref(..));
+            // Each position by its variance in the argument's or the destination's type
+            // (variance.rs): an argument a subtype of the input, the output of the destination.
+            self.variances_for(ty, s.len, &mut vars, e)?;
             for k in 0..s.len {
                 let here = self.origs[(s.start + k) as usize];
                 let there = map[(lo + k) as usize];
                 let (from, into) = if into_callee { (here, there) } else { (there, here) };
-                self.b.subset(from, into);
-                if !(k == 0 && top_ref) {
-                    self.b.subset(into, from);
-                }
+                self.relate_one(from, into, vars[k as usize]);
             }
             // The instantiated types are well formed: each referent's positions outlive the
             // reference's (as `call_by_signature`).

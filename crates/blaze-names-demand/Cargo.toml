@@ -1,0 +1,31 @@
+[package]
+name = "blaze-names-demand"
+description = "Names resolved on demand (decision D134): one asked path is resolved by a sans-IO machine that asks for one module's outline, one macro call's expansion or one crate's root at a time, makes only the cells (module, namespace, name) the answer needs, and settles glob cycles by a bounded stratified fixpoint; each cell keyed from text with the reads it made"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `ItemKey` and `CrateItemKey`: what a module, an item and a crate are named by.
+blaze-id.workspace = true
+# `ContentId` and `Hasher`: a cell's key and its answer's digest, in named domains.
+blaze-ids.workspace = true
+# `AVec`, `ABTreeMap` and `Alloc`: the machine's tables, in the allocator its caller hands in.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# The simulation: generated worlds of crates, the demand answer against a whole-world oracle.
+blaze-sim.workspace = true
+# `Frame`: each case's allocator, its memory from the OS, made at the case's top.
+blaze-mem.workspace = true
+
+[lints]
+workspace = true

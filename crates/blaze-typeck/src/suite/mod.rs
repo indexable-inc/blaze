@@ -91,6 +91,7 @@ mod panic_hook_closure;
 mod suggest;
 mod where_const;
 mod where_projection;
+mod env_shadow_projection;
 mod promote;
 mod impl_for_object;
 mod blanket_beside_own_impl;

@@ -225,6 +225,15 @@ impl core::fmt::Display for Fact {
 /// fn); any other row is refused by its name.
 pub use blaze_build::intrinsics::Which as Intrinsic;
 
+/// The result of looking up a method on a function lang trait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FnTraitMethod {
+    Found(ItemKey),
+    Absent,
+    /// The trait exists, but its members have not been loaded yet.
+    Pending { trait_: ItemKey },
+}
+
 /// Everything the evaluator reads from outside the body. Implemented by the driver over the
 /// item layer's and the checker's records; by [`fixture::World`] in the tests.
 pub trait ConstWorld: LayoutFacts {
@@ -270,11 +279,10 @@ pub trait ConstWorld: LayoutFacts {
     /// The trait method `which` names (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once`), as
     /// `blaze_build::Adts::fn_trait_method` answers the builder (rule 30: the same item). A
     /// closure coerced to a fn pointer in a constant points to `FnOnce::call_once` at
-    /// `[closure, (args..)]`, the instance blaze-build's `closure_fn_addr` builds. `None`, the
-    /// default: that coercion is refused by name.
-    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
-        let _ = which;
-        None
+    /// `[closure, (args..)]`, the instance blaze-build's `closure_fn_addr` builds.
+    /// An absent method refuses the coercion. A pending lookup names the trait to load.
+    fn fn_trait_method(&self, _which: blaze_build::FnTrait) -> FnTraitMethod {
+        FnTraitMethod::Absent
     }
 
     /// The names `type_name` prints a type with (blaze-build type_name.rs): the paths of

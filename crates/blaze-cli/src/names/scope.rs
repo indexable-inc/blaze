@@ -416,18 +416,27 @@ pub(crate) fn prepare<'f: 'j, 'j, 'b, 's>(
 /// and read lists, owned, and what its frame held by the stretch of the solve that took it
 /// ([`super::metered`]). Reads nothing but `job` and the checkout files the crate names.
 pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame) -> (Resolution, super::metered::ScopeBytes) {
-    let metered = super::metered::Metered::new(frame);
+    // Each macro call's working memory, beside the crate's frame (blaze-scope task/fill.rs
+    // `Par::call_scratch`): reserved here, committed as used, rolled back after each call and
+    // dropped with this resolve (its blocks back to the chunk cache). A frame that cannot be
+    // reserved fails this crate, naming the frame (rules 3, 19), never a solve without it.
+    let scratch = match Frame::with_reserve(CALL_SCRATCH, Tag::Expand) {
+        Ok(scratch) => scratch,
+        Err(error) => return (failed_with(std::format!("crate `{}`: its macro calls' scratch frame ({CALL_SCRATCH} bytes) could not be reserved: {error:?}", job.input.name)), super::metered::ScopeBytes::default()),
+    };
+    let metered = super::metered::Metered::new(frame, scratch, super::metered::CallScratch::Reset);
     let resolution = resolve_metered(cx, root, job, frame, &metered);
     let of = crate::phases::byte_rows::Label::of(format_args!("{}", job.input.name));
     (resolution, metered.finish(of))
 }
 
-fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame, metered: &super::metered::Metered<'_>) -> Resolution {
-    let cx = cx.span("crate scope: resolve one crate's names");
-    let erased = Erased::new(frame);
-    let alloc = erased.handle();
-    let crate_name = job.input.name;
-    let failed_with = |words: String| Resolution::Made {
+/// The most one macro call's working memory holds ([`resolve`]'s call scratch): address space
+/// reserved, committed as used. Past it the call's allocation fails as a crate frame's does.
+pub(crate) const CALL_SCRATCH: usize = 4 << 30;
+
+/// A crate whose resolution failed before or around its solve, `words` saying why.
+fn failed_with(words: String) -> Resolution {
+    Resolution::Made {
         resolved: Resolved {
             out: crate::work::failed_out(),
             payload: sections::write(0, [&[][..]; sections::SECTIONS]),
@@ -443,7 +452,14 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         },
         ok: false,
         unresolved: 0,
-    };
+    }
+}
+
+fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &Frame, metered: &super::metered::Metered<'_>) -> Resolution {
+    let cx = cx.span("crate scope: resolve one crate's names");
+    let erased = Erased::new(frame);
+    let alloc = erased.handle();
+    let crate_name = job.input.name;
     let env = match job.env {
         None => None,
         Some(lent) => match lent.copy_in(alloc) {

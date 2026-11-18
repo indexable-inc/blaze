@@ -44,10 +44,16 @@ pub enum SoftFloat {
     GtTf2,
     GeTf2,
     UnordTf2,
+    /// `frem` of `f128`: libm's `fmodf128`, which compiler_builtins exports under its
+    /// `#[no_mangle]` name as it does the tf routines (src/math/mod.rs, `full_availability`,
+    /// `#[cfg(f128_enabled)] libm_intrinsics! { .. fn fmodf128(x: f128, y: f128) -> f128; .. }`,
+    /// through the same `intrinsics!` macro). Exact, as C's `fmod` is: the result has the
+    /// dividend's sign, which Rust's `%` of floats is (LIR's `frem`).
+    FmodF128,
 }
 
 impl SoftFloat {
-    pub const ALL: [SoftFloat; 24] = [
+    pub const ALL: [SoftFloat; 25] = [
         SoftFloat::AddTf3,
         SoftFloat::SubTf3,
         SoftFloat::MulTf3,
@@ -72,6 +78,7 @@ impl SoftFloat {
         SoftFloat::GtTf2,
         SoftFloat::GeTf2,
         SoftFloat::UnordTf2,
+        SoftFloat::FmodF128,
     ];
 
     /// Its `#[no_mangle]` symbol in compiler_builtins.
@@ -101,6 +108,7 @@ impl SoftFloat {
             SoftFloat::GtTf2 => "__gttf2",
             SoftFloat::GeTf2 => "__getf2",
             SoftFloat::UnordTf2 => "__unordtf2",
+            SoftFloat::FmodF128 => "fmodf128",
         }
     }
 
@@ -114,7 +122,7 @@ impl SoftFloat {
     pub const fn signature(self) -> (&'static [Ty], Ty) {
         const Q: Ty = Ty::F128;
         match self {
-            SoftFloat::AddTf3 | SoftFloat::SubTf3 | SoftFloat::MulTf3 | SoftFloat::DivTf3 => (&[Q, Q], Q),
+            SoftFloat::AddTf3 | SoftFloat::SubTf3 | SoftFloat::MulTf3 | SoftFloat::DivTf3 | SoftFloat::FmodF128 => (&[Q, Q], Q),
             SoftFloat::ExtendHfTf2 => (&[Ty::F16], Q),
             SoftFloat::ExtendSfTf2 => (&[Ty::F32], Q),
             SoftFloat::ExtendDfTf2 => (&[Ty::F64], Q),
@@ -191,7 +199,7 @@ impl Out<'_, '_, '_> {
             }
             Op::FptoSi | Op::FptoUi => self.to_int(inst, op == Op::FptoSi, ty, args[0])?,
             Op::SitoFp | Op::UitoFp => self.from_int(inst, op == Op::SitoFp, src, args[0])?,
-            Op::Frem => return Err(self.refuse(inst, "an `f128` remainder (no compiler_builtins routine; libm's `fmodf128` is not bound)")),
+            Op::Frem => self.routine(inst, SoftFloat::FmodF128, args)?,
             Op::Sqrt => return Err(self.refuse(inst, "an `f128` square root (no compiler_builtins routine; libm's `sqrtf128` is not bound)")),
             Op::Fma => return Err(self.refuse(inst, "an `f128` fused multiply-add (no compiler_builtins routine; libm's `fmaf128` is not bound)")),
             Op::Floor | Op::Ceil | Op::Ftrunc | Op::Nearest | Op::Fround => {

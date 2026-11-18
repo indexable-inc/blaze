@@ -108,7 +108,7 @@ impl<'n> Load<'n> for Kept<'n> {
         None
     }
 
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'n [u8]> {
+    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'n [u8], &'n [u8])> {
         None
     }
 }

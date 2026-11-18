@@ -34,6 +34,8 @@ mod wide;
 
 pub(crate) use float_width::FloatWidth;
 pub(crate) use reach::Reach;
+#[cfg(test)]
+pub(crate) use atomic::WIDE_OFF;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
 /// immediate, so codes from here up are refused. Their one home is blaze-code trap.rs, which
@@ -46,8 +48,14 @@ pub(crate) const BRK_UNREACHABLE: u32 = blaze_code::trap::UNREACHABLE;
 const FRAME_LIMIT: u64 = 1 << 24;
 /// The most alignment a stack slot may ask: a page.
 const MOST_SLOT_ALIGN: u8 = 12;
-/// The most alignment a data row may ask: what placement promises the code's first byte.
-const MOST_DATA_ALIGN: u32 = 4;
+/// The most alignment a data row may ask, as log2: a 4 KiB page, the most a code record's part
+/// may ask of its placement (blaze-code record.rs `MOST_PART_ALIGN`). A row is placed at a
+/// multiple of its alignment from its part's first byte, and the part asks the most of its
+/// rows' alignments of placement: [`crate::Code::align`] in the literal-word form, the
+/// record's `code_align` and `relro_align` in the record form (pass/sites.rs).
+const MOST_DATA_ALIGN: u32 = blaze_code::record::MOST_PART_ALIGN as u32;
+/// The refusal of a row aligned past [`MOST_DATA_ALIGN`].
+pub(crate) const DATA_ALIGN_PAST: &str = "data aligned past a 4 KiB page (the most a code record's part asks of its placement)";
 
 /// What a patched field reaches.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1158,7 +1166,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 let row = rec.place;
                 let data = view.datas[row as usize];
                 if data.align > MOST_DATA_ALIGN {
-                    return Err(unsupported(inst, op, "data aligned past 16 bytes (placement aligns the code to 16)"));
+                    return Err(unsupported(inst, op, DATA_ALIGN_PAST));
                 }
                 let index = self.place_data(row);
                 if self.in_record() && !view.data_relocs_of(DataId(row)).is_empty() {
@@ -1563,7 +1571,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let row = self.placed[at];
             let rec = self.view.datas[row as usize];
             if rec.align > MOST_DATA_ALIGN {
-                return Err(EmitError::Data { row, why: "data aligned past 16 bytes (placement aligns the code to 16)" });
+                return Err(EmitError::Data { row, why: DATA_ALIGN_PAST });
             }
             self.pad_to(8usize.max(1 << rec.align));
             let start = self.here();

@@ -1,0 +1,30 @@
+[package]
+name = "blaze-native-load"
+description = "The in-process load of a program's native image (docs/v2/plan/design/native.md): from blaze-native's laid image (base 0) to a load plan (segments and their protections, the cells to write, imports to look up, thread-local descriptors, initializers in order, unwind sections), then bound at a base into the exact writes a launcher's driver performs; sans-IO, no unsafe, no second object reader"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec` and `Alloc`: every table in the allocator the caller names.
+blaze-own.workspace = true
+# The one object model, reader, resolver and layout (NATIVE.md W1..W3): this crate starts from
+# its `image::Image` and reads no object bytes itself.
+blaze-native = { path = "../blaze-native" }
+
+[dev-dependencies]
+# `frame::Frame`: the tests' allocator, made at the top of each test (no ambient heap).
+blaze-mem.workspace = true
+# `check`: random layouts, every branch decoded back to its symbol.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

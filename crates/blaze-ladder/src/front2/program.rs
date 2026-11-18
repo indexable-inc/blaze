@@ -922,7 +922,7 @@ impl<'n> Front2Program<'n> {
         // operation is a call of one, made by the emitter's legalize, so no body names them;
         // each found one is reached beside the roots, so its row and body are the build's
         // (run.rs `build_from` binds them as the record walk does, run/make_one.rs).
-        let builtins = super::builtins_shim::find(names, alloc);
+        let builtins = super::builtins_shim::find(names, linked.roots(), alloc);
         for r in blaze_lir::legalize::SoftFloat::ALL {
             let Some(lib) = builtins.lib(r) else { continue };
             let k = records.keys.item(lib).map_err(|clash| Front2Refusal::Unchecked {
@@ -1644,7 +1644,7 @@ impl FrontEnd for Front2Program<'_> {
     /// As the lazy program's: the graph's compiler_builtins exports (their rows were reached
     /// beside the roots, `make_from`).
     fn soft_float_routines(&self, alloc: Alloc<'_>) -> super::builtins_shim::Builtins {
-        super::builtins_shim::find(self.front.names, alloc)
+        super::builtins_shim::find(self.front.names, self.front.index.scope(), alloc)
     }
 
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {

@@ -750,6 +750,10 @@ pub(crate) struct PooledScript {
     /// The run's reads of the checkout as cells, its record's `Given` reads in the same order:
     /// filled only for a kept member run ([`CheckoutReads::Kept`]) that made its record.
     pub(crate) checkout: std::vec::Vec<crate::engine_script_reads::CheckoutRead>,
+    /// Why the record made is right for this command only: a read no cell names, so no read
+    /// list makes it stand. The engine uses it this command, owes its row so it runs again next
+    /// command, and hands on none of its reads (engine_scripts.rs `run_phase`).
+    pub(crate) unkept: Option<crate::engine_script_reads::NoCell>,
 }
 
 /// `job` on a pool worker, in the worker's task frame: a panic or a full frame fails this
@@ -758,25 +762,33 @@ pub(crate) fn pooled(cx: &Cx, job: &ScriptJob<'_>, clock: &bstd::clock::Clock) -
     let began = clock.now();
     let scratch = cx.frame();
     let mut checkout = std::vec::Vec::new();
-    let ran = crate::work::unwinding(|| run(cx, job, scratch, &mut checkout));
+    let mut unkept = None;
+    let ran = crate::work::unwinding(|| run(cx, job, scratch, &mut checkout, &mut unkept));
     let (used, limit) = (scratch.peak(), scratch.reserved());
     let did = ran.map_err(|crate::work::Panicked| blaze_drive::Why::Panicked { used: used as u64, limit: limit as u64 });
-    // Only a record stands on its reads: a failure's or a panic's are not handed on.
-    if !matches!(did, Ok(Ran::Made(_))) {
+    // Only a kept record stands on its reads: a failure's, a panic's or an unkept record's are
+    // not handed on.
+    if !matches!(did, Ok(Ran::Made(_))) || unkept.is_some() {
         checkout.clear();
     }
-    PooledScript { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)), checkout }
+    if !matches!(did, Ok(Ran::Made(_))) {
+        unkept = None;
+    }
+    PooledScript { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)), checkout, unkept }
 }
 
-fn failed(what: &'static str, words: core::fmt::Arguments<'_>, hole: bool) -> Ran {
+/// A run's failure with its words; `hole` when its cause is outside its key and its reads (it is
+/// asked again next command). Also a test's runner's (engine_scripts.rs `ScriptRunner`).
+pub(crate) fn failed(what: &'static str, words: core::fmt::Arguments<'_>, hole: bool) -> Ran {
     let mut held = blaze_own::Vec::new_in(Global);
     let text = std::fmt::format(words);
     held.extend_from_slice(text.as_bytes());
     Ran::Failed { what, words: held, hole }
 }
 
-/// The run on the worker; a kept member run's reads of the checkout onto `checkout`.
-fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut std::vec::Vec<crate::engine_script_reads::CheckoutRead>) -> Ran {
+/// The run on the worker; a kept member run's reads of the checkout onto `checkout`, or why its
+/// record is right for this command only onto `unkept`.
+fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut std::vec::Vec<crate::engine_script_reads::CheckoutRead>, unkept: &mut Option<crate::engine_script_reads::NoCell>) -> Ran {
     let _cx = cx.span("script: run one build script");
     let erased = Erased::new(scratch);
     let alloc = erased.handle();
@@ -855,23 +867,26 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut std::vec::V
     // alone would keep it failed past the edit that fixes it (rule 21). The old path keeps its
     // filed failure as before.
     let failed_hole = member && matches!(job.checkout, CheckoutReads::Kept(_));
-    let ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
+    let mut ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
     };
-    let outputs = &ran.outputs;
-    if let Some(error) = outputs.errors.first() {
+    if let Some(error) = ran.outputs.errors.first() {
         return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), failed_hole);
     }
-    let mut made = Record::new_in(job.name, Global);
+    // The record's reads, in the run's frame until the record is made.
+    let mut reads: blaze_own::Vec<(Name, ContentId), &Frame> = blaze_own::Vec::with_capacity_in(ran.reads.len() + job.producers.len(), scratch);
     // A member's tree is the checkout: what it read there is a read of today's file. A fetched
     // package's tree is its record, pinned by the lock in the graph's source: its reads (files,
     // listings, git facts from the lock's commit) are functions of that pin.
     //
-    // On the engine a member's `file:`, `dir:` and `stat:` reads are cells whose digests are the
-    // sandbox's own answers (engine_script_reads.rs), so the record stands until one moves; a
-    // `git:` fact has no cell yet and stays a hole. On the old path (work.rs) every read of the
-    // checkout is a hole: its outputs serve nothing and it runs again next command.
+    // On the engine a member's `file:`, `dir:`, `stat:` and `git:` reads are cells whose digests
+    // are the sandbox's own answers (engine_script_reads.rs), so the record stands until one
+    // moves. A read no cell names (a `status`, a member producer's file served to a fetched
+    // package) leaves the record right for this command only: used now and not kept, its row
+    // owed, so it runs again next command (`unkept`; engine_scripts.rs `run_phase`); it fails no
+    // dependent. On the old path (work.rs) every read of the checkout is a hole: its outputs
+    // serve nothing and it runs again next command.
     let reads_checkout = member || job.producers.iter().any(|p| matches!(p.files, Files::Member { .. }));
     match (job.checkout, member) {
         // The engine keeps a member's reads: every read is of the checkout (its own tree, and a
@@ -880,17 +895,21 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut std::vec::V
         (CheckoutReads::Kept(plant), true) => match crate::engine_script_reads::cells_of(ran.reads.iter().map(|read| (read.subject.as_str(), read.digest)), plant) {
             Ok(cells) => {
                 for read in cells.iter() {
-                    made.reads.push((read.name(), read.answer));
+                    reads.push((read.name(), read.answer));
                 }
                 *checkout = cells;
             }
-            Err(no_cell) => {
-                return failed("a member's build script made a read no cell names", format_args!("the build script of {package} is run again next command, its outputs not kept: {no_cell}"), true);
-            }
+            Err(no_cell) => *unkept = Some(no_cell),
         },
-        // The old path; and a fetched package served a member producer's files, whose reads are
-        // among its own pinned tree's subjects and told apart by nothing yet: a hole.
-        (CheckoutReads::Hole, _) | (CheckoutReads::Kept(_), false) => {
+        // A fetched package served a member producer's files: those reads are among its own
+        // pinned tree's subjects, told apart by nothing yet, so its record is this command's.
+        (CheckoutReads::Kept(_), false) => {
+            if reads_checkout && let Some(read) = ran.reads.first_mut() {
+                *unkept = Some(crate::engine_script_reads::NoCell::Served { subject: core::mem::take(&mut read.subject) });
+            }
+        }
+        // The old path: a hole.
+        (CheckoutReads::Hole, _) => {
             if reads_checkout && let Some(read) = ran.reads.first() {
                 return failed(
                     "a member's build script read a checkout file the drive cannot name yet",
@@ -903,18 +922,20 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut std::vec::V
     // Every producer of the closure, by its out (dep_paths.rs: per producer mounted, its outputs
     // record's id; a fetched tree is under the graph's source, a member's is a hole above).
     for producer in job.producers.iter() {
-        made.reads.push((producer.name, producer.out));
+        reads.push((producer.name, producer.out));
     }
-    outputs_record(made, ran_as, outputs, &package)
+    outputs_record(job.name, &reads[..], ran_as, &ran.outputs, &package)
 }
 
-/// The record of a run that made `outputs`, its reads already on `made`: how it ran, then the
+/// The record `name` of a run that read `reads` and made `outputs`: how it ran, then the
 /// outputs record ([`payload_parts`]); the out is the outputs' alone, so a reader moves only
 /// when what it reads moves. Encoded on the heap and handed whole to the record, which outlives
 /// the worker's frame (rules 11 and 51): never encoded in the frame and copied out. The one
 /// maker of a script's record: the real run's and a test's runner's (engine_scripts.rs
 /// `ScriptRunner`).
-pub(crate) fn outputs_record(mut made: Record<Global>, ran_as: RanAs, outputs: &blaze_build_script::outputs::Outputs<'_>, package: &str) -> Ran {
+pub(crate) fn outputs_record(name: Name, reads: &[(Name, ContentId)], ran_as: RanAs, outputs: &blaze_build_script::outputs::Outputs<'_>, package: &str) -> Ran {
+    let mut made = Record::new_in(name, Global);
+    made.reads.extend_from_slice(reads);
     let heap = Erased::new(Global);
     let mut payload: AVec<'_, u8> = AVec::new_in(heap.handle());
     payload.push(ran_as as u8);

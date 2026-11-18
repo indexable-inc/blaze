@@ -33,6 +33,51 @@ pub const DETAIL: u64 = 2;
 /// The domain of this module's row answers.
 const DOMAIN: &str = "blaze-ladder front2 borrow impl text read v1";
 
+/// Each impl's texts as one body's facts read them ([`impl_texts`]), read ONCE per impl per
+/// body (B12's question, decided 2026-11-18: rule 67's floor is one read of an impl's texts a
+/// body, however many of its members the body calls and however many calls the type check
+/// selected it at). Sorted by checker key; the misses are counted ([`ImplTextsMemo::reads`]),
+/// which a test reads. Bounded by the body's own callees and selected rows, each already
+/// capped (rule 18: `MOST_PROJECTED`, the callees column).
+pub struct ImplTextsMemo<'n, 'a> {
+    /// `(impl, texts)`: the item text and where its `(name, text)` members are in `pairs`;
+    /// `None` when the source does not give the impl's text.
+    rows: AVec<'a, (u128, Option<(&'n str, u32, u32)>)>,
+    pairs: AVec<'a, (&'n str, &'n str)>,
+    reads: u32,
+}
+
+impl<'n, 'a> ImplTextsMemo<'n, 'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> ImplTextsMemo<'n, 'a> {
+        ImplTextsMemo { rows: AVec::new_in(alloc), pairs: AVec::new_in(alloc), reads: 0 }
+    }
+
+    /// Impl `imp`'s texts: read from the source on the first ask in this body, kept after.
+    pub fn get<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, imp: tc::ItemKey, alloc: Alloc<'a>) -> Option<(&'n str, &[(&'n str, &'n str)])> {
+        let at = match self.rows.binary_search_by_key(&imp.0, |r| r.0) {
+            Ok(at) => at,
+            Err(at) => {
+                self.reads += 1;
+                let row = impl_texts(names, keys, imp, alloc).map(|(text, assoc)| {
+                    let lo = self.pairs.len() as u32;
+                    self.pairs.extend_from_slice(&assoc[..]);
+                    (text, lo, self.pairs.len() as u32)
+                });
+                // Linear in the impls a body names (a handful): kept sorted for the lookups.
+                self.rows.insert_shift(at, (imp.0, row));
+                at
+            }
+        };
+        let (text, lo, hi) = self.rows.get(at)?.1?;
+        Some((text, self.pairs.get(lo as usize..hi as usize)?))
+    }
+
+    /// How many impls' texts were read from the source (each once).
+    pub fn reads(&self) -> u32 {
+        self.reads
+    }
+}
+
 /// The impl a fn's signature is read with.
 pub enum ImplRead<'n, 'a> {
     /// A free fn, or a trait's: its signature names no impl.
@@ -63,12 +108,25 @@ impl<'n, 'a> ImplRead<'n, 'a> {
     }
 }
 
-/// The impl the fn `key` (its head `f`) is a member of, with its texts.
-pub fn impl_of<'n, 'a, S: NamesSource<'n>>(names: S, keys: &Keys, key: tc::ItemKey, f: &FnHead<'_>, alloc: Alloc<'a>) -> ImplRead<'n, 'a> {
+/// The impl the fn `key` (its head `f`) is a member of, with its texts (through the body's
+/// `memo`: one read an impl a body).
+pub fn impl_of<'n, 'a, S: NamesSource<'n>>(names: S, keys: &Keys, key: tc::ItemKey, f: &FnHead<'_>, memo: &mut ImplTextsMemo<'n, 'a>, alloc: Alloc<'a>) -> ImplRead<'n, 'a> {
     let &SelfTy::Ty(self_ty, _) = &f.self_ else { return ImplRead::NotMember };
     let Some(Origin::Member { container, .. }) = keys.origin(key) else { return ImplRead::NotMember };
-    let Some(lib) = keys.library_in(names, *container) else { return ImplRead::NoText };
-    let Some(text) = names.text_of(lib).map(|t| t.text) else { return ImplRead::NoText };
+    let Some((text, kept)) = memo.get(names, keys, *container, alloc) else { return ImplRead::NoText };
+    let mut assoc: AVec<'a, (&'n str, &'n str)> = AVec::new_in(alloc);
+    assoc.extend_from_slice(kept);
+    ImplRead::Member { container: *container, text, self_ty, assoc }
+}
+
+/// The texts of impl `imp`: its item text and each associated type member's `(name, text)`,
+/// sorted. THE ONE HOME of this reading: a member fn's signature ([`impl_of`]) and a call the
+/// type check selected `imp` for (blaze-flow-lower `Facts::impl_source`, borrows.rs) take
+/// it from here, so their rows ([`impl_read`], [`impl_source_read`]) say the same of one impl.
+/// `None`: the source does not give the impl's text.
+pub fn impl_texts<'n, 'a, S: NamesSource<'n>>(names: S, keys: &Keys, imp: tc::ItemKey, alloc: Alloc<'a>) -> Option<(&'n str, AVec<'a, (&'n str, &'n str)>)> {
+    let lib = keys.library_in(names, imp)?;
+    let text = names.text_of(lib).map(|t| t.text)?;
     let mut assoc: AVec<'a, (&'n str, &'n str)> = AVec::new_in(alloc);
     // A container with no member has no row: no associated type, which the list says.
     names.each_member(lib, &mut |m| {
@@ -79,7 +137,43 @@ pub fn impl_of<'n, 'a, S: NamesSource<'n>>(names: S, keys: &Keys, key: tc::ItemK
         }
     });
     assoc.sort_unstable();
-    ImplRead::Member { container: *container, text, self_ty, assoc }
+    Some((text, assoc))
+}
+
+/// What a read of an impl's texts took (rule 21): the header (to its first `{`, as the reader
+/// cuts it, or the whole text when it does not lex) and every associated type member's name
+/// and text, in the order given (sorted by [`impl_texts`]).
+fn hash_impl_texts(h: &mut StableHasher, t: &str, assoc: &[(&str, &str)], alloc: Alloc<'_>) {
+    match impl_header_end(t, alloc) {
+        Some(end) => {
+            h.tag(2);
+            text(h, t.get(..end).unwrap_or(t));
+        }
+        // The header does not lex: the reader refuses it; the whole text is what it saw.
+        None => {
+            h.tag(3);
+            text(h, t);
+        }
+    }
+    h.u32(assoc.len() as u32);
+    for &(name, body) in assoc {
+        text(h, name);
+        text(h, body);
+    }
+}
+
+/// The row of what the borrow check took of impl `imp`'s texts at a call the type check
+/// selected it for (`Facts::impl_source`), keyed by the impl, the same row [`impl_read`] files
+/// for a member of it (one key, one answer: rule 21). `texts`: what [`impl_texts`] gave, or
+/// `None` when the source does not give it (then each call that needs it is refused by name,
+/// `ImplUnread`, and the row says it was not read).
+pub fn impl_source_read(imp: tc::ItemKey, texts: Option<(&str, &[(&str, &str)])>, alloc: Alloc<'_>) -> Read {
+    let mut h = StableHasher::new(DOMAIN);
+    match texts {
+        Some((t, assoc)) => hash_impl_texts(&mut h, t, assoc, alloc),
+        None => h.tag(1),
+    }
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: imp.0, detail: DETAIL }, answer: Some(h.finish()) }
 }
 
 fn text(h: &mut StableHasher, s: &str) {
@@ -168,25 +262,8 @@ pub fn impl_read(item: u128, read: &ImplRead<'_, '_>, alloc: Alloc<'_>) -> Read 
     match read {
         ImplRead::NotMember => h.tag(0),
         ImplRead::NoText => h.tag(1),
-        ImplRead::Member { text: t, self_ty: _, assoc, .. } => {
-            // The self type's erased form is the head's own (a row of the type check's list).
-            match impl_header_end(t, alloc) {
-                Some(end) => {
-                    h.tag(2);
-                    text(&mut h, t.get(..end).unwrap_or(t));
-                }
-                // The header does not lex: the reader refuses it; the whole text is what it saw.
-                None => {
-                    h.tag(3);
-                    text(&mut h, t);
-                }
-            }
-            h.u32(assoc.len() as u32);
-            for &(name, body) in assoc.iter() {
-                text(&mut h, name);
-                text(&mut h, body);
-            }
-        }
+        // The self type's erased form is the head's own (a row of the type check's list).
+        ImplRead::Member { text: t, self_ty: _, assoc, .. } => hash_impl_texts(&mut h, t, &assoc[..], alloc),
     }
     Read { fact: Fact { kind: FactKind::BorrowHead, key, detail: DETAIL }, answer: Some(h.finish()) }
 }

@@ -98,6 +98,23 @@ impl core::fmt::Display for MakeError {
     }
 }
 
+/// Where [`ProcRunner::keep`] writes: the store [`make`] opens under the home.
+pub(crate) const ANSWERS_STORE: &str = "<home>/.blaze/v2/proc-macro/expansions";
+
+/// The answers this command's proc-macro calls made could not be written to their store
+/// ([`ProcRunner::keep`]): names the store and the record that refused (rule 19). The command
+/// fails with it, never quietly leaving the next command to run the calls again (rule 3).
+#[derive(Debug)]
+pub(crate) struct KeepError {
+    pub error: blaze_proc_macro::record::RecordError,
+}
+
+impl core::fmt::Display for KeepError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the proc-macro answers of this command could not be written to their store ({ANSWERS_STORE}): {}", self.error)
+    }
+}
+
 #[cfg(feature = "sandbox")]
 pub(crate) use with_sandbox::{ProcRunner, make};
 #[cfg(not(feature = "sandbox"))]
@@ -163,6 +180,17 @@ mod with_sandbox {
                 return Some(std::format!("the calling crate (index {krate} of the names world) was given no package, so no proc macro runs for it (proc_env.rs)"));
             }
             self.procs.refusal_of(def).map(|finding| finding.to_string())
+        }
+
+        /// The answers this command's calls ran, written to the answers store
+        /// ([`super::ANSWERS_STORE`]) once every stage that expands (names, heads, bodies) is
+        /// done: each crate whose calls ran something new has its results table written again,
+        /// whole (blaze-proc-macro `ProcMacros::keep_all`), so the next command finds each call
+        /// by its key and reads its answer instead of running the macro (rule 77). A crate with
+        /// nothing new is not written. Before lane M14 nothing called it: every command expanded
+        /// every proc macro again.
+        pub(crate) fn keep(&self) -> Result<blaze_proc_macro::hook::KeptAll, super::KeepError> {
+            self.procs.keep_all().map_err(|error| super::KeepError { error })
         }
     }
 
@@ -258,6 +286,12 @@ mod without_sandbox {
         }
 
         pub(crate) fn unusable(&self, _: usize, _: &MacroDefinition<'_>) -> Option<std::string::String> {
+            match self {
+                ProcRunner::Never(never, _) => match *never {},
+            }
+        }
+
+        pub(crate) fn keep(&self) -> Result<blaze_proc_macro::hook::KeptAll, super::KeepError> {
             match self {
                 ProcRunner::Never(never, _) => match *never {},
             }

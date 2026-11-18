@@ -23,6 +23,9 @@ pub enum Plant {
     KnownIgnored,
     /// A relation the signature does not state is taken as known: every pair of placeholders.
     AllKnown,
+    /// A statement's operands are all checked against its entry state, not each after the
+    /// moves of the ones before it (moves.rs `check_moves_planted`): `(p, p)` is clean.
+    OperandsAtEntry,
 }
 
 /// The proof that a body passed the move and borrow checks: only [`check`] makes one, and the

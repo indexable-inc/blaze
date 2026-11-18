@@ -231,6 +231,13 @@ pub(crate) mod run {
                 out[at..at + 8].copy_from_slice(&to.wrapping_add_signed(r.addend).to_le_bytes());
             }
         })
+        .map(|exec| {
+            // Placement honours what the code asks (lib.rs `Code::align`): the mapping starts
+            // on a page, which is at least the most a code asks (4 KiB).
+            let align = 1u64 << code.align;
+            assert_eq!(exec.code_address() % align, 0, "the code placed off the 2^{} it asks", code.align);
+            exec
+        })
         .expect("the code maps")
     }
 

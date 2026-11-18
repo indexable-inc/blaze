@@ -117,6 +117,11 @@ mod callee_value_tests;
 #[cfg(test)]
 mod closure_requirements_tests;
 
+mod variance;
+pub use variance::Variance;
+#[cfg(test)]
+mod variance_tests;
+
 /// What the lowering needs to know about an ADT (flow.md section 7, question (e)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdtFacts {
@@ -206,6 +211,14 @@ pub trait Facts {
     /// the body's read list, keyed by the impl (rule 21). `None`: not given, and such a call is
     /// refused by name (`Form::CallHiddenInput`).
     fn impl_source(&self, _imp: ItemKey) -> Option<ImplSource<'_>> {
+        None
+    }
+    /// The variance of each generic parameter of ADT `adt` (the Reference, "Subtyping and
+    /// Variance": an ADT is variant in a parameter as its fields are), its lifetime parameters
+    /// first, then its type parameters, in head order (variance.rs). A slice shorter than the
+    /// parameters leaves the rest invariant, as `None` leaves every one (the sound answer).
+    /// Whoever answers files the read of what the variances were computed from (rule 21).
+    fn adt_variances(&self, _adt: ItemKey) -> Option<&[Variance]> {
         None
     }
     /// The text of the body's own fn, from its attributes or `fn` keyword on (what
@@ -581,6 +594,9 @@ pub enum Plant {
     /// every other (pattern_forms.rs): `let [x, y] = a;` with `a: &mut [S; 2]` then holds two
     /// conflicting mutable loans.
     SliceElementsOverlap,
+    /// Every position below the top of a value related both ways, as before piece B13
+    /// (variance.rs): the top reference one way, all else invariant, ADTs' variances unasked.
+    NoVariance,
 }
 
 /// Lowers one checked body.
@@ -1529,22 +1545,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     }
 
     /// `dst = src` relates `src`'s type to `dst`'s at the statement just added: position by
-    /// position when both are exact, the first covariantly when it is a reference, every other
-    /// both ways (invariant: more relations refuse more, never less); else all made equal.
+    /// position when both are exact, each by its variance in `dst`'s type (variance.rs: the
+    /// Reference's "Subtyping and Variance"; an unknown one invariant: more relations refuse
+    /// more, never less); else all made equal.
     fn relate(&mut self, src: Place, dst: Place, dst_ty: TyD, e: ExprId) -> Result<(), Refusal> {
         let (s, d) = (self.info(src), self.info(dst));
         if s.len == 0 || d.len == 0 || self.plant == Plant::NoRelate {
             return Ok(());
         }
         if s.exact && d.exact && s.len == d.len {
-            let top_ref = dst_ty.wrap.is_some() || matches!(self.node(dst_ty.ty, e)?, PNode::Ref(..));
-            for k in 0..s.len {
-                let (a, b) = (self.origs[(s.start + k) as usize], self.origs[(d.start + k) as usize]);
-                self.b.subset(a, b);
-                if !(k == 0 && top_ref) {
-                    self.b.subset(b, a);
-                }
+            let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
+            self.position_variances(dst_ty, &mut vs, e)?;
+            if vs.len() as u32 != s.len {
+                return self.refuse(Form::Malformed, e);
             }
+            self.relate_by(s.start, d.start, &vs);
             return Ok(());
         }
         self.unify(&[src, dst]);
@@ -1625,15 +1640,26 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 // Related both ways, every `out.put(..)` through a `&mut dyn Buf` tied its loan to
                 // `out`'s own object lifetime, live for the whole body (tempo class B, E0499).
                 let object = pty.wrap.is_none() && matches!(self.node(pty.ty, e)?, PNode::Dynamic(_));
-                for k in 0..pi.len {
-                    let (a, b) = (self.origs[(pi.start + k) as usize], self.origs[(ti.start + 1 + k) as usize]);
-                    self.b.subset(a, b);
-                    if object {
-                        continue;
+                if object {
+                    for k in 0..pi.len {
+                        let (a, b) = (self.origs[(pi.start + k) as usize], self.origs[(ti.start + 1 + k) as usize]);
+                        self.b.subset(a, b);
                     }
-                    if kind != BorrowKind::Shared || k > 0 || !matches!(self.node(pty.ty, e)?, PNode::Ref(..)) {
-                        self.b.subset(b, a);
+                } else {
+                    // `&'r P` is covariant in `P` and `&'r mut P` invariant (the Reference,
+                    // "Subtyping and Variance"): a shared borrow's referent positions are
+                    // related by their variance in `P` (variance.rs), a mutable one's both ways.
+                    let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
+                    self.position_variances(pty, &mut vs, e)?;
+                    if vs.len() as u32 != pi.len {
+                        return self.refuse(Form::Malformed, e);
                     }
+                    if kind != BorrowKind::Shared {
+                        for v in vs.iter_mut() {
+                            *v = Variance::In;
+                        }
+                    }
+                    self.relate_by(pi.start, ti.start + 1, &vs);
                 }
             } else {
                 let hub = self.b.origin(false);
@@ -2027,6 +2053,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             self.tie_impl_relations(&impl_ties, &mut inst, |_, _, _| None, e)?;
         }
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut vars: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
         lo = 0;
         for i in 0..=vs.len() {
             // The operands, then the destination.
@@ -2044,15 +2071,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 (dest, dest_ty, false)
             };
             let s = self.info(place);
-            let top_ref = ty.wrap.is_some() || matches!(self.node(ty.ty, e)?, PNode::Ref(..));
+            // An argument's type is a subtype of the callee's input there, the callee's output
+            // of the destination's: each position by its variance (variance.rs).
+            self.variances_for(ty, s.len, &mut vars, e)?;
             for k in 0..s.len {
                 let here = self.origs[(s.start + k) as usize];
                 let there = self.instance(&mut inst, life.regions[lo + k as usize]);
                 let (from, into) = if into_callee { (here, there) } else { (there, here) };
-                self.b.subset(from, into);
-                if !(k == 0 && top_ref) {
-                    self.b.subset(into, from);
-                }
+                self.relate_one(from, into, vars[k as usize]);
             }
             self.ref_ranges(ty, e, &mut ranges)?;
             for j in 0..ranges.len() {
@@ -2282,6 +2308,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             Task::DerefDone(e, m) => {
                 let v = self.pop(e)?;
                 let ty = TyD::of(self.expr_ty(e)?);
+                // An overloaded `*x` (`Box`, `Rc`, any `Deref`) is the type check's adjustment of
+                // the OPERAND (`Deref { overloaded: Some(_) }`, typeck rules/op.rs): the operand's
+                // value is already the place `*Deref::deref(&x)` (or `*x` of a box, `deref`),
+                // of the expression's type. Derefed again here, `*Box::from_raw(p)` was a deref
+                // of the `T` and a move out of it E0507 (lane B11's class H; blaze-build's
+                // walk.rs `deref_on_operand` reads the same row).
+                if let Expr::Unary { operand, .. } = self.expr(e)? {
+                    let (lo, hi) = self.adjust_rows(operand);
+                    let ck: &'c Checked<'c> = self.ck;
+                    if matches!(ck.adjusts.column::<1>()[lo..hi].last(), Some(AdjustKind::Deref { overloaded: Some(_) })) {
+                        let p = self.as_place(v, e)?;
+                        self.push_place(p, ty);
+                        return Ok(());
+                    }
+                }
                 let p = self.deref(v, ty, m, None, e)?;
                 self.push_place(p, ty);
                 Ok(())
@@ -2748,6 +2789,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// its result (whose lifetime is the receiver's, by elision).
     fn deref(&mut self, v: Val, out: TyD, m: bool, overloaded: Option<Mutbl>, e: ExprId) -> Result<Place, Refusal> {
         let p = self.as_place(v, e)?;
+        // `*b` of a `Box` is builtin whatever the type check recorded (it records the operand's
+        // deref as overloaded, `Deref for Box`): the Reference, "Dereference expressions":
+        // "On non-pointer types `*x` is equivalent to `*std::ops::Deref::deref(&x)`" except for
+        // `Box`, whose deref is a place that may be moved out of ("Moved and copied types").
+        if overloaded.is_some()
+            && v.ty.wrap.is_none()
+            && let PNode::Adt(k, _) = self.node(v.ty.ty, e)?
+            && self.adt_facts(k, e)?.is_box
+        {
+            return self.project(p, v.ty, Proj::DerefBox, out, false, e);
+        }
         if overloaded.is_none() {
             if v.ty.wrap.is_some() {
                 return self.project(p, v.ty, Proj::Deref, out, false, e);
@@ -3265,14 +3317,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             return Ok(());
         }
         if s.exact && s.len == n {
-            let top_ref = dst_ty.wrap.is_some() || matches!(self.node(dst_ty.ty, e)?, PNode::Ref(..));
-            for k in 0..n {
-                let (a, b) = (self.origs[(s.start + k) as usize], self.origs[(start + k) as usize]);
-                self.b.subset(a, b);
-                if !(k == 0 && top_ref) {
-                    self.b.subset(b, a);
-                }
+            // Each position by its variance in the destination's type (variance.rs).
+            let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
+            self.position_variances(dst_ty, &mut vs, e)?;
+            if vs.len() as u32 != n {
+                return self.refuse(Form::Malformed, e);
             }
+            self.relate_by(s.start, start, &vs);
             return Ok(());
         }
         let hub = self.b.origin(false);

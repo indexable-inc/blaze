@@ -200,33 +200,13 @@ impl<'s> ExpansionTexts<'s> {
         CallView::open(entry.call_part).map(|view| Some(Some(view))).map_err(|error| ExpansionRecordsError::Origins { call, error })
     }
 
-    /// The origins of the text `call` made in their joined form (blaze-scope expansion_origins.rs
-    /// `OriginsView::open`'s: the call part, then the column), copied into `alloc`: what the
-    /// ladder's `Load::expansion_origins` hands its reader. `None` when the crate made no text
-    /// for it, `Some(&[])` when the text keeps no origins.
-    pub(crate) fn joined_origins<'a>(&self, call: ItemKey, alloc: Alloc<'a>) -> Result<Option<&'a [u8]>, ExpansionRecordsError>
-    where
-        's: 'a,
-    {
-        let Some((entry, record)) = self.row(call)? else { return Ok(None) };
-        entry.text(&record)?;
-        if entry.call_part.is_empty() {
-            return Ok(Some(&[][..]));
-        }
-        let mut joined: AVec<'a, u8> = AVec::with_capacity_in(entry.call_part.len() + record.column.len(), alloc);
-        joined.extend_from_slice(entry.call_part);
-        joined.extend_from_slice(record.column);
-        Ok(Some(&*joined.leak()))
-    }
-
     /// The origins of the text `call` made as the two parts they lie in, read in place and
     /// copied nowhere: the call part (the directory's) and the column (the record's), what
-    /// blaze-scope expansion_origins.rs `OriginsView::open_parts` takes. `Ok(None)`: the crate
-    /// made no text for it; `Ok(Some(None))`: its text keeps no origins. The joined form
-    /// ([`Self::joined_origins`]) copies both into an allocator held to the command's end (295
-    /// MB on tempo's 2026-11-18 heap log); this is its replacement, 0 bytes, once the ladder's
-    /// `Load::expansion_origins` hands parts (the port: this lane's report, NOT DONE 1).
-    #[expect(dead_code, reason = "the ladder's `Load::expansion_origins` port takes it (M13 NOT DONE 1)")]
+    /// blaze-scope expansion_origins.rs `OriginsView::open_parts` takes and the ladder's
+    /// `Load::expansion_origins` hands its reader (front_load.rs `StoreLoad`). `Ok(None)`: the
+    /// crate made no text for it; `Ok(Some(None))`: its text keeps no origins. It replaced a
+    /// joined copy of the two (295 MB on tempo's 2026-11-18 heap log, held to the command's
+    /// end): 0 bytes.
     pub(crate) fn origins_parts(&self, call: ItemKey) -> Result<Option<Option<(&'s [u8], &'s [u8])>>, ExpansionRecordsError> {
         let Some((entry, record)) = self.row(call)? else { return Ok(None) };
         entry.text(&record)?;

@@ -25,7 +25,7 @@ use blaze_typeck::{
 
 use crate::machine::{Answer, Codes, Need, NeedKind, Settle, value_of};
 use crate::record::{ConstRecord, RecordKey};
-use crate::{ConstError, ConstWorld, FnKind, IntRepr, Intrinsic, LayoutFacts, Layouts, Limits, ReprAttrs, Typed, ValidRange};
+use crate::{ConstError, ConstWorld, FnKind, FnTraitMethod, IntRepr, Intrinsic, LayoutFacts, Layouts, Limits, ReprAttrs, Typed, ValidRange};
 use blaze_build::instance_key;
 use blaze_typeck::PTys;
 
@@ -230,8 +230,8 @@ pub struct World {
     drop_impls: StdVec<ItemKey>,
     /// The ADT standing for core's `ManuallyDrop` ([`World::manually_drop_is`]).
     manually_drop: Option<ItemKey>,
-    /// The item standing for `FnOnce::call_once` ([`World::fn_once_is`]).
-    fn_once: Option<ItemKey>,
+    /// The fixture's answer for `FnOnce::call_once`.
+    pub(crate) fn_once: FnTraitMethod,
     /// The unit's ground table and layouts, kept between evaluations.
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
     /// The statics declared ([`ConstWorld::is_static`]).
@@ -298,7 +298,7 @@ impl World {
             anon: 0,
             drop_impls: StdVec::new(),
             manually_drop: None,
-            fn_once: None,
+            fn_once: FnTraitMethod::Absent,
             unit: None,
             statics: StdVec::new(),
             cells: StdVec::new(),
@@ -324,7 +324,7 @@ impl World {
 
     /// Item `item` is `FnOnce::call_once` in this world ([`ConstWorld::fn_trait_method`]).
     pub fn fn_once_is(&mut self, item: ItemKey) {
-        self.fn_once = Some(item);
+        self.fn_once = FnTraitMethod::Found(item);
     }
 
     /// The item declared as `name`.
@@ -936,10 +936,10 @@ impl ConstWorld for World {
         Some(self.manually_drop)
     }
 
-    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> FnTraitMethod {
         match which {
             blaze_build::FnTrait::FnOnce => self.fn_once,
-            blaze_build::FnTrait::Fn | blaze_build::FnTrait::FnMut => None,
+            blaze_build::FnTrait::Fn | blaze_build::FnTrait::FnMut => FnTraitMethod::Absent,
         }
     }
 }

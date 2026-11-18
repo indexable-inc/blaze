@@ -20,7 +20,8 @@
 
 use blaze_flow::Flow;
 use blaze_flow_lower::{
-    AdtFacts, CallBounds, CalleeFacts, Facts, ParamOrigin, Refusal, Shape, SigLife, lower, lower_async, lower_async_fn, lower_closure,
+    AdtFacts, CallBounds, CalleeFacts, ClosureFlow, Facts, FieldRegion, ParamOrigin, Refusal, Requirement, Shape, SigLife, lower, lower_async,
+    lower_async_fn, lower_closure, lower_closure_external,
 };
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
@@ -54,12 +55,95 @@ impl FlowOf {
 /// (module doc: only `borrows_of`, which checks each, asks with these).
 pub struct NestedFacts<'f, 'a> {
     facts: &'f BorrowFacts<'a>,
+    /// Each closure's requirements, from its own flow checked first ([`Requirements`]): two
+    /// columns sorted by (closure, requirement), `needs[i]` closure `closures[i]`'s.
+    closures: &'f [tc::ExprId],
+    needs: &'f [Requirement],
 }
 
 impl<'f, 'a> NestedFacts<'f, 'a> {
+    /// No closure's requirements known: what a caller that checks no closure first asks with.
     pub fn new(facts: &'f BorrowFacts<'a>) -> NestedFacts<'f, 'a> {
-        NestedFacts { facts }
+        NestedFacts { facts, closures: &[], needs: &[] }
     }
+
+    /// With the requirements of every closure checked so far.
+    pub fn with_requirements(facts: &'f BorrowFacts<'a>, requirements: &'f Requirements<'_>) -> NestedFacts<'f, 'a> {
+        NestedFacts { facts, closures: &requirements.closures, needs: &requirements.needs }
+    }
+}
+
+/// The closure requirements of one body (the NLL RFC, "Closures": the closure's creator must
+/// prove the relations among the closure's external regions its body needs): each closure's
+/// flow is checked BEFORE the flow that makes it (innermost first: [`closures_inner_first`]),
+/// and each of its outlives results between two positions of the closure VALUE (or `'static`)
+/// is mapped through blaze-flow-lower `requirement` into this table, which the making flow's
+/// lowering emits at the closure expression (`Facts::closure_requirements`). A result that maps
+/// to none (the environment's reference, the closure's signature) stays `NestedOutlives`.
+pub struct Requirements<'a> {
+    closures: AVec<'a, tc::ExprId>,
+    needs: AVec<'a, Requirement>,
+}
+
+impl<'a> Requirements<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> Requirements<'a> {
+        Requirements { closures: AVec::new_in(alloc), needs: AVec::new_in(alloc) }
+    }
+
+    /// Files closure `closure`'s requirement `r` (each once, the columns kept sorted).
+    pub fn add(&mut self, closure: tc::ExprId, r: Requirement) {
+        let (lo, hi) = run_of(&self.closures, closure);
+        let at = match self.needs[lo..hi].binary_search(&r) {
+            Ok(_) => return,
+            Err(i) => lo + i,
+        };
+        self.closures.insert(at, closure);
+        self.needs.insert(at, r);
+    }
+
+    /// Closure `closure`'s requirements, in order.
+    pub fn of(&self, closure: tc::ExprId) -> &[Requirement] {
+        let (lo, hi) = run_of(&self.closures, closure);
+        &self.needs[lo..hi]
+    }
+}
+
+/// Where closure `closure`'s rows are in a sorted column of closures.
+fn run_of(closures: &[tc::ExprId], closure: tc::ExprId) -> (usize, usize) {
+    (closures.partition_point(|&e| e < closure), closures.partition_point(|&e| e <= closure))
+}
+
+/// Every closure of the body (not `async`, whose flow is no closure's: `Form::AsyncClosure`),
+/// innermost first: by the length of its range, shorter first (a closure written inside
+/// another's body has a range strictly inside it), then by expression. What
+/// [`Requirements`] is filled in the order of.
+pub fn closures_inner_first<'a>(view: &tc::BodyView<'_>, alloc: Alloc<'a>) -> AVec<'a, tc::ExprId> {
+    let mut out: AVec<'a, (u32, tc::ExprId)> = AVec::new_in(alloc);
+    for (i, x) in view.exprs.iter().enumerate() {
+        if let tc::Expr::Closure { is_async: false, .. } = x {
+            let e = tc::ExprId(i as u32);
+            let len = view.expr_ranges.get(i).map_or(u32::MAX, |r| r.end - r.start);
+            out.push((len, e));
+        }
+    }
+    out.sort_unstable();
+    let mut ids: AVec<'a, tc::ExprId> = AVec::new_in(alloc);
+    for &(_, e) in out.iter() {
+        ids.push(e);
+    }
+    ids
+}
+
+/// A closure's flow with what each of its placeholders stands for in its owner
+/// (blaze-flow-lower `lower_closure_external`): its requirements are mapped through these.
+pub fn closure_flow_of<'a>(
+    view: &tc::BodyView<'_>,
+    done: &tc::Checked<'_>,
+    closure: tc::ExprId,
+    facts: &NestedFacts<'_, '_>,
+    alloc: Alloc<'a>,
+) -> Result<ClosureFlow<Alloc<'a>>, Refusal> {
+    lower_closure_external(view, done, closure, facts, alloc)
 }
 
 impl Facts for NestedFacts<'_, '_> {
@@ -107,6 +191,26 @@ impl Facts for NestedFacts<'_, '_> {
     }
     fn object_trait_lifetimes(&self, trait_: tc::ItemKey) -> Option<bool> {
         self.facts.object_trait_lifetimes(trait_)
+    }
+    // Every fact the body's facts answer, forwarded (a nested flow asks what the owner's does).
+    fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
+        self.facts.ties(item)
+    }
+    fn impl_source(&self, imp: tc::ItemKey) -> Option<blaze_flow_lower::ImplSource<'_>> {
+        self.facts.impl_source(imp)
+    }
+    fn adt_variances(&self, adt: tc::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
+        self.facts.adt_variances(adt)
+    }
+    fn field_regions(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<&[FieldRegion]> {
+        self.facts.field_regions(adt, variant, field)
+    }
+    fn copy_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        self.facts.copy_args(adt)
+    }
+    fn closure_requirements(&self, closure: tc::ExprId) -> &[Requirement] {
+        let (lo, hi) = run_of(self.closures, closure);
+        self.needs.get(lo..hi).unwrap_or(&[])
     }
 }
 

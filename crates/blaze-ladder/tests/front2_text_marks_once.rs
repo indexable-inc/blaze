@@ -42,8 +42,13 @@ impl<'n> Load<'n> for OneExpansion<'n> {
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str> {
         (krate == 0 && call == self.call).then_some(self.text)
     }
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'n [u8]> {
-        (krate == 0 && call == self.call).then_some(self.origins)
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'n [u8], &'n [u8])> {
+        if krate != 0 || call != self.call {
+            return None;
+        }
+        // The fixture keeps the joined form `write` made: its two parts, cut where the column
+        // starts.
+        Some(blaze_scope::expansion_origins::split(self.origins).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
     }
 }
 

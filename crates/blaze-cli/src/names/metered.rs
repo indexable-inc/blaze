@@ -7,12 +7,18 @@
 //! largest crate scope frame of the command (phases.rs, the `scope frame by stretch` row).
 //!
 //! Nothing is allocated to count: fixed tables of `Cell`s, the crate's name a [`Label`].
+//!
+//! It is also the solve's CALL SCRATCH ([`Par::call_scratch`], blaze-scope task/fill.rs): each
+//! macro call's working memory (its input, the matcher's expansion, the rendering, the origin
+//! column) is made in a frame of its own, rolled back once the call's results are copied out
+//! into the crate's frame at their exact size; so the crate frame's peak is what the names keep,
+//! and the scratch's peak is one call's high-water. Both are in the profile's row.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::fmt;
 
-use blaze_own::AVec;
-use blaze_scope::task::{ExpandPart, Par, Stage};
+use blaze_own::{AVec, Alloc, Erased};
+use blaze_scope::task::{ExpandPart, Par, Scratch, Stage};
 use bstd::mem::Frame;
 
 use crate::phases::byte_rows::Label;
@@ -39,7 +45,21 @@ struct Slot {
     entries: u64,
 }
 
-/// A serial [`Par`] over `frame` that charges each stretch the frame's growth across it.
+/// Where a macro call's working memory is held under a [`Metered`]: the planted switch of the
+/// call scratch's test (rule 23: the cause removed, the crate frame's peak holds every call's
+/// work again).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallScratch {
+    /// In the scratch, rolled back after each call: the driver's.
+    Reset,
+    /// The CONTROL: no work run in the scratch ([`Scratch::Kept`]), each call's work in the
+    /// crate's frame, as before the hook.
+    #[cfg(test)]
+    Kept,
+}
+
+/// A serial [`Par`] over `frame` that charges each stretch the frame's growth across it, and
+/// runs each macro call's work in `scratch`, rolled back after the call.
 pub(crate) struct Metered<'f> {
     frame: &'f Frame,
     /// The slot being charged now.
@@ -48,17 +68,26 @@ pub(crate) struct Metered<'f> {
     used: Cell<usize>,
     gone: Cell<u64>,
     slots: [Cell<Slot>; SLOTS],
+    /// The call scratch, its caller's (made fallibly beside the crate's frame: scope.rs
+    /// `resolve`): borrowed for one call at a time.
+    scratch: RefCell<Frame>,
+    mode: CallScratch,
+    /// How many calls ran in the scratch.
+    scratch_calls: Cell<u64>,
 }
 
 impl<'f> Metered<'f> {
-    /// Charging starts now, to [`Outside::Before`].
-    pub(crate) fn new(frame: &'f Frame) -> Metered<'f> {
+    /// Charging starts now, to [`Outside::Before`]; each macro call's work runs in `scratch`.
+    pub(crate) fn new(frame: &'f Frame, scratch: Frame, mode: CallScratch) -> Metered<'f> {
         let metered = Metered {
             frame,
             at: Cell::new(STAGES + PARTS),
             used: Cell::new(frame.used()),
             gone: Cell::new(frame.abandoned().bytes),
             slots: [const { Cell::new(Slot { grown: 0, abandoned: 0, entries: 0 }) }; SLOTS],
+            scratch: RefCell::new(scratch),
+            mode,
+            scratch_calls: Cell::new(0),
         };
         metered.enter(STAGES + PARTS);
         metered
@@ -99,7 +128,9 @@ impl<'f> Metered<'f> {
         for (slot, cell) in slots.iter_mut().zip(self.slots.iter()) {
             *slot = cell.get();
         }
-        ScopeBytes { slots, peak: self.frame.peak() as u64, abandoned: self.frame.abandoned().bytes, of }
+        // `finish` runs after the solve, no call open: the scratch is not borrowed.
+        let scratch_peak = self.scratch.borrow().peak() as u64;
+        ScopeBytes { slots, peak: self.frame.peak() as u64, abandoned: self.frame.abandoned().bytes, scratch_peak, scratch_calls: self.scratch_calls.get(), of }
     }
 }
 
@@ -117,6 +148,24 @@ impl Par for Metered<'_> {
     fn expand_part(&self, part: ExpandPart, _macro_name: &str, _size: usize) {
         self.enter(STAGES + part as usize);
     }
+
+    fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        match self.mode {
+            CallScratch::Reset => {}
+            #[cfg(test)]
+            CallScratch::Kept => return Scratch::Kept,
+        }
+        // blaze-scope resolve.rs `expand_decls` never opens a call inside a call (a call's work
+        // expands nothing): a second borrow is that promise broken, a bug that fails this
+        // crate's job alone (rule 20: the solve runs under the pool's `unwinding`).
+        let mut scratch = self.scratch.try_borrow_mut().unwrap_or_else(|_| panic!("a macro call's scratch was asked inside another call (blaze-scope resolve.rs `expand_decls` is not re-entered)"));
+        scratch.scope(|frame| {
+            let erased = Erased::new(frame);
+            work(erased.handle());
+        });
+        self.scratch_calls.set(self.scratch_calls.get() + 1);
+        Scratch::Reset
+    }
 }
 
 /// One crate scope frame's bytes by stretch ([`Metered`]), its peak and its crate.
@@ -125,12 +174,15 @@ pub(crate) struct ScopeBytes {
     slots: [Slot; SLOTS],
     peak: u64,
     abandoned: u64,
+    /// The call scratch's peak (one call's high-water) and how many calls ran in it.
+    scratch_peak: u64,
+    scratch_calls: u64,
     of: Label,
 }
 
 impl Default for ScopeBytes {
     fn default() -> ScopeBytes {
-        ScopeBytes { slots: [Slot::default(); SLOTS], peak: 0, abandoned: 0, of: Label::of(format_args!("")) }
+        ScopeBytes { slots: [Slot::default(); SLOTS], peak: 0, abandoned: 0, scratch_peak: 0, scratch_calls: 0, of: Label::of(format_args!("")) }
     }
 }
 
@@ -181,14 +233,23 @@ fn slot_name(i: usize) -> &'static str {
 }
 
 /// The profile's row, one line: `scope frame by stretch (the largest: <crate>; peak <n>;
-/// abandoned by growth <n>) <stretch> <grown> <abandoned> <entries>x · ...`, the stretches that
-/// grew the frame, largest first. Nothing when no crate scope ran on the pool.
+/// abandoned by growth <n>; call scratch peak <n> over <n> calls) <stretch> <grown> <abandoned>
+/// <entries>x · ...`, the stretches that grew the crate's frame, largest first (a call's own
+/// work is in the scratch, not there). Nothing when no crate scope ran on the pool.
 impl fmt::Display for ScopeBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.peak == 0 {
             return Ok(());
         }
-        write!(f, "scope frame by stretch (the largest: {}; peak {}; abandoned by growth {}) (grown, abandoned, entries):", self.of.as_str(), self.peak, self.abandoned)?;
+        write!(
+            f,
+            "scope frame by stretch (the largest: {}; peak {}; abandoned by growth {}; call scratch peak {} over {} calls) (grown, abandoned, entries):",
+            self.of.as_str(),
+            self.peak,
+            self.abandoned,
+            self.scratch_peak,
+            self.scratch_calls
+        )?;
         let mut order = [0usize; SLOTS];
         for (i, at) in order.iter_mut().enumerate() {
             *at = i;
@@ -206,6 +267,10 @@ impl fmt::Display for ScopeBytes {
 }
 
 #[cfg(test)]
+#[path = "metered_scratch_tests.rs"]
+mod scratch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bstd::mem::Tag;
@@ -215,7 +280,7 @@ mod tests {
     #[test]
     fn each_stretch_is_charged_its_own_growth() {
         let frame = Frame::with_reserve(1 << 20, Tag::Other).expect("a test frame");
-        let metered = Metered::new(&frame);
+        let metered = Metered::new(&frame, Frame::with_reserve(1 << 20, Tag::Expand).expect("a test scratch"), CallScratch::Reset);
         metered.stage(Stage::Solve);
         let _solve = frame.alloc_slice_copy(&[0u8; 4096]);
         metered.stage(Stage::Expand);

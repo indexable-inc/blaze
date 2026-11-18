@@ -201,6 +201,8 @@ pub enum CliError {
     Pool(bstd::task::TaskError),
     /// `blaze engine-check` stopped (engine_check.rs).
     EngineCheck(engine_check::EngineCheckError),
+    /// This command's proc-macro answers could not be written (proc_runner.rs `ProcRunner::keep`).
+    ProcAnswers(proc_runner::KeepError),
     /// `blaze clean` refused (clean.rs): the path that is not blaze's, named.
     Clean(clean::CleanError),
     /// A settled input a task needed could not be read (work.rs, `payload`).
@@ -268,6 +270,7 @@ impl fmt::Display for CliError {
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
             CliError::Pool(error) => write!(f, "{error}"),
             CliError::EngineCheck(error) => write!(f, "engine-check: {error}"),
+            CliError::ProcAnswers(error) => write!(f, "{error}"),
             CliError::Clean(error) => write!(f, "{error}"),
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
             CliError::TaskInput { task, name, why } => write!(f, "the input {name} of the task {task} could not be read while its job was made: {why}"),
@@ -915,7 +918,7 @@ fn kept<'f>(req: &Request<'_>, followed: &sweep::Followed<'_>, rows: &Rows<'_>, 
                 LeafKind::Manifest | LeafKind::Listing | LeafKind::HomeListing | LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder => !slots_only,
                 // This path keeps no build script's outputs (scripts.rs `CheckoutReads::Hole`),
                 // so no read of one: the engine's request makes them again.
-                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat => false,
+                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => false,
             };
             if keep {
                 kept.push(leaf.kind, leaf.flags, path, leaf.stamp, leaf.id);
@@ -1938,6 +1941,7 @@ mod tests {
     mod engine_check_tests;
     mod engine_script_reads_tests;
     mod engine_script_reads_e2e_tests;
+    mod engine_script_hole_tests;
     mod engine_memory_tests;
     mod engine_status_tests;
     mod engine_phase_mem_tests;

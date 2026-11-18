@@ -439,7 +439,6 @@ fn on_big_stack(body: fn()) {
 }
 
 #[test]
-#[ignore = "OPEN (first run, 2026-11-18): asked: whole 1893, lazy 1899, common 1889, differing 1; code records: both built 8, equal 8, differing 0; programs: 1 built by both, 7 with a gap. The ONE differing answer: x0-async-trait-01 `check_one` of a trait method with no body (`Source::get`): whole none / lazy refused `NoBody` (lazy/fill.rs `row` lacks tabled.rs's `NoBody` arm: docs/v2/plan/design/one-front-end.md step S1). The gaps: the x0 rungs declare no `panic_cannot_unwind` lang item, so both programs refuse `main` and no code is compared."]
 fn whole_and_lazy_answer_alike() {
     on_big_stack(answer_alike);
 }

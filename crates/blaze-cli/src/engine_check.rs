@@ -973,6 +973,11 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     }
     // Every phase's arena made and dropped by now (each ended in its iteration).
     phase_mem.counts = request_mem.counts();
+    // Every expansion of this command is done: its proc-macro answers to their store, once, so
+    // the next command reads them by key (proc_runner.rs `keep`, lane M14).
+    if let Some(procs) = names.as_ref().and_then(|stage| stage.names.as_ref()).and_then(|world| world.procs()) {
+        procs.keep().map_err(CliError::ProcAnswers)?;
+    }
     let finishing = clock.now();
     let mut finished = engine.finish()?;
     finished.report.settle.finish_ns = clock.now().since(finishing).map_or(0, crate::engine_times::ns);
@@ -1098,6 +1103,10 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
     }
     // The plan's notes (a file no unit holds), no task's: made now, or kept (engine_body_plan.rs).
     bodies.plan_lines(&outlined, last_lines.as_ref(), &mut lines);
+    // A build script whose outputs this command uses and does not keep says so, once (lane NR2).
+    for (name, why) in scripts.unkept() {
+        lines.note(name, crate::engine_lines::Class::Told, bstd::mem::format_in!(frame, "{}", crate::engine_scripts::UnkeptWords(name, why)).as_bytes());
+    }
     // PHASE-MEM-DEBT(Request): as the certificate's print, the printer's lists on the process
     // heap (engine_lines.rs `print_all`): to take the request's `SharedAlloc<'_>`.
     let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, heap, frame, out)?;

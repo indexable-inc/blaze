@@ -15,23 +15,36 @@ use crate::front2::keys::Origin;
 use crate::front2::lower_made::{LowerTarget, lower_made};
 
 impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
-    /// The seam's `check_one` (module docs, step 1). `Ok(None)` is never answered: a key this
-    /// program cannot find (lazy/locate.rs searched its crate's records) is
-    /// [`LazyRefusal::NotFound`], naming what was searched.
+    /// The seam's `check_one` (module docs, step 1). A declaration with no body answers
+    /// `Ok(None)`. A key the records search cannot find gives [`LazyRefusal::NotFound`].
     pub(super) fn check_one_key(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, LazyRefusal> {
         if let Some(&i) = self.rows.by_key.get(&key)
             && self.rows.checked[i as usize]
         {
             return Err(LazyRefusal::AskedTwice { key });
         }
-        let (target, _) = self.target_of(key)?;
+        let (target, want) = self.target_of(key)?;
         let function: Box<str> = self.shown(key).into_boxed_str();
         let prepared = self.prepared;
-        let made = {
+        let lowered = {
             let mut r = self.records(true);
             lower_made(&mut r, prepared, target)
-        }
-        .map_err(|error| LazyRefusal::Lower { function: function.clone(), error })?;
+        };
+        let made = match lowered {
+            Ok(body) => body,
+            Err(BodyError::NoBody(owner)) if owner == key => {
+                // A free fn can reach lowering before its head has been made. Its declaration
+                // decides whether the missing body is expected.
+                if !self.store.fns.contains_key(&key) {
+                    self.make_want(want, key)?;
+                }
+                if self.store.fns.get(&key).is_some_and(|head| !head.has_body) {
+                    return Ok(None);
+                }
+                return Err(LazyRefusal::Lower { function, error: BodyError::NoBody(owner) });
+            }
+            Err(error) => return Err(LazyRefusal::Lower { function, error }),
+        };
         let checked = {
             let view = made.lowered.view();
             let spell = Spelling::of(&view).map_err(|_| LazyRefusal::Spell { function: function.clone() })?;
@@ -196,7 +209,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let Some(head) = self.store.fns.get(&key) else {
             return Err(refuse(Front2Refusal::NoHead { function: Box::from(path.as_str()) }));
         };
-        let (lib, text, in_container) = (head.lib, head.text, head.container.is_some());
+        let (lib, text, in_container, has_body) = (head.lib, head.text, head.container.is_some(), head.has_body);
         let symbols = symbols_of(self.front.names, lib, text, &path).map_err(&refuse)?;
         let (at, foreign) = self.placed_of(key, lib, &path)?;
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
@@ -217,17 +230,14 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             let (_, want) = self.target_of(default)?;
             self.make_want(want, default)?;
         }
-        // As tabled.rs `row`, less its `NoBody` arm: a fn with a body is `Free` here whether or
-        // not `check_one` made the body yet (the seam's `function(i).body` is `Some` once it has).
         let (kind, symbol) = if panic_entry || alloc_shim.is_some() {
             (FnKind::Free, Box::<str>::from(""))
         } else if foreign.is_some() && !in_container {
             let symbol = symbols.link_name.clone().unwrap_or_else(|| declared_name.unwrap_or(row_path.ident()).into());
             (FnKind::Foreign, symbol)
-        } else if of_trait {
-            (FnKind::Trait(0), Box::<str>::from(""))
         } else {
-            (FnKind::Free, Box::<str>::from(""))
+            let kind = seam_rules::rust_row_kind(of_trait, has_body || symbols.intrinsic, &path).map_err(&refuse)?;
+            (kind, Box::<str>::from(""))
         };
         // A `#[rustc_intrinsic]` fn is built by the ONE rule (front2/intrinsic_rule.rs): the
         // table's row when the table names it; else, when its declaration has a fallback body

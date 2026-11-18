@@ -155,13 +155,10 @@ fn row<'n>(
             let symbol = symbols.link_name.unwrap_or_else(|| declared_name.unwrap_or(row_path.ident()).into());
             (None, None, FnKind::Foreign, symbol, Literals::default())
         }
-        // A trait's fn called on a parameter or `dyn`: never built (each instance resolves to
-        // an impl's fn); its container index is the old front's and front2 numbers no traits,
-        // so it reads 0, which nothing asks.
-        None if of_trait => (None, None, FnKind::Trait(0), Box::<str>::from(""), Literals::default()),
-        // An intrinsic: the build makes each call from its table, by the fn's name.
-        None if symbols.intrinsic => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
-        None => return Err(Front2Refusal::NoBody { function: function() }),
+        None => {
+            let kind = lazy::seam_rules::rust_row_kind(of_trait, symbols.intrinsic, path)?;
+            (None, None, kind, Box::<str>::from(""), Literals::default())
+        }
     };
     let intrinsic = match (symbols.intrinsic, &body) {
         // The rule of front2/intrinsic_rule.rs. A fn this walk lowered a body for is built from

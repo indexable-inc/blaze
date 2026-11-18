@@ -222,7 +222,7 @@ impl Load<'static> for Kept {
         self.expansions.get(krate)?.get(&call).copied()
     }
 
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'static [u8]> {
+    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
         None
     }
 }

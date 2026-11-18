@@ -514,21 +514,32 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     /// noted as a fill (its want's refusal as a gap) in `project`, which [`Consts::value`]
     /// makes before it evaluates the need again, or refuses by name. `None` with nothing noted:
     /// the library declares no such lang trait, and the evaluator refuses the coercion by name.
-    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> blaze_consteval::FnTraitMethod {
+        use blaze_consteval::FnTraitMethod::{Absent, Found, Pending};
         let (lang, name) = super::langs::fn_trait_method(which);
-        let lib = self.index.lang(super::langs::lang_name(lang)?)?;
+        let Some(lib) = super::langs::lang_name(lang).and_then(|n| self.index.lang(n)) else { return Absent };
         let trait_ = super::keys::checker_of(lib);
         if let Some(method) = self.keys.filed_member(trait_, super::keys::MemberKind::Fn, name) {
-            return Some(method);
+            return Found(method);
         }
         let mut fills = Vec::new_in(Global);
         let mut gaps = Vec::new_in(Global);
-        match super::fill::want_of_item(self.names, lib) {
-            Ok(want) => fills.push(super::world_items::Fill::Store(want)),
-            Err(e) => gaps.push(super::world_items::Gap::Fill(e)),
-        }
+        // The trait's head made and still no such member: the trait declares none (`Absent`,
+        // which the evaluator refuses by name); not made yet: noted as a fill, and the
+        // evaluation is asked again once it is (`Pending`, naming the trait).
+        let method = match super::fill::want_of_item(self.names, lib) {
+            Ok(want) if self.store.made(want) => return Absent,
+            Ok(want) => {
+                fills.push(super::world_items::Fill::Store(want));
+                Pending { trait_ }
+            }
+            Err(e) => {
+                gaps.push(super::world_items::Gap::Fill(e));
+                Absent
+            }
+        };
         self.project.note(fills, gaps);
-        None
+        method
     }
 }
 

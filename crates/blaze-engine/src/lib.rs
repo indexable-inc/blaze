@@ -44,6 +44,8 @@ mod last_sim;
 #[cfg(test)]
 mod owed_by_generation_sim;
 #[cfg(test)]
+mod owed_rows_sim;
+#[cfg(test)]
 mod pages_sim;
 #[cfg(test)]
 mod readers_sim;
@@ -52,7 +54,7 @@ mod sim;
 
 pub use crate::engine::{
     Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Entered, Everything, Finished, Gen, Made, Phase, Plant,
-    Planned, Pool, Report, Row, SMap, SSet, STAGES, SVec, Scope, Settle, Stage, StageCount, Task, Tools, View, by_cell, drive, drive_growing, GROWN_CAP,
+    Planned, Pool, Report, Row, SMap, SSet, STAGES, SVec, Scope, Settle, Stage, StageCount, Stands, Task, Tools, View, by_cell, drive, drive_growing, GROWN_CAP,
     READS_CAP, WAVE_CAP,
 };
 pub use crate::last::{Found, LastAnswer, LastError, LastRow, ReadOf, Touched, search};

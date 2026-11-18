@@ -78,6 +78,18 @@ pub(crate) struct ScriptsStage<'f> {
     kept_runs: u32,
     /// Runs this request that were holes, and the first one's words (its package, why).
     holes: (u32, Option<std::string::String>),
+    /// Runs this request whose record is right for this command only (scripts.rs
+    /// `PooledScript::unkept`), each with why, in the order run: used, owed, said once each.
+    unkept: Vec<(Name, crate::engine_script_reads::NoCell), &'f Frame>,
+}
+
+/// The note of a run whose outputs this command used and did not keep (rule 19: what, why).
+pub(crate) struct UnkeptWords<'n>(pub(crate) Name, pub(crate) &'n crate::engine_script_reads::NoCell);
+
+impl core::fmt::Display for UnkeptWords<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: its outputs are used by this command and not kept, and it runs again next command: {} (engine_scripts.rs `run_phase`)", self.0, self.1)
+    }
 }
 
 /// What runs a `Script` task in a test: in place of its job (which opens the wasm runtime and
@@ -121,7 +133,14 @@ impl<'f> ScriptsStage<'f> {
             runner: RUNNER.with(|cell| cell.get()),
             kept_runs: 0,
             holes: (0, None),
+            unkept: Vec::new_in(frame),
         }
+    }
+
+    /// Each run this request whose outputs it used and did not keep, with why: one note each
+    /// (engine_check.rs prints them, [`UnkeptWords`]).
+    pub(crate) fn unkept(&self) -> impl Iterator<Item = (Name, &crate::engine_script_reads::NoCell)> + '_ {
+        self.unkept.iter().map(|(name, why)| (*name, why))
     }
 
     /// The profile's line of the scripts' reads of the checkout: the cells this request planned
@@ -137,8 +156,8 @@ impl<'f> ScriptsStage<'f> {
             cells.insert(read.name(), read.kind);
         }
         let count = |kind: ReadKind| cells.values().filter(|one| **one == kind).count();
-        let (files, listings, stats) = (count(ReadKind::File), count(ReadKind::Listing), count(ReadKind::Stat));
-        let _ = write!(text, "  Scripts: script reads: {} cells ({files} files, {listings} listings, {stats} stats); kept {} runs; holes {}", cells.len(), self.kept_runs, self.holes.0);
+        let (files, listings, stats, gits) = (count(ReadKind::File), count(ReadKind::Listing), count(ReadKind::Stat), count(ReadKind::Git));
+        let _ = write!(text, "  Scripts: script reads: {} cells ({files} files, {listings} listings, {stats} stats, {gits} git facts); kept {} runs; unkept {}; holes {}", cells.len(), self.kept_runs, self.unkept.len(), self.holes.0);
         let _ = match &self.holes.1 {
             Some(first) => writeln!(text, " (first: {first})"),
             None => writeln!(text),
@@ -394,6 +413,8 @@ impl<'f> ScriptsStage<'f> {
         let mut finished: Vec<(usize, crate::scripts::PooledScript), &Frame> = Vec::new_in(frame);
         #[cfg(test)]
         finished.extend(doubled.drain(..));
+        // The tasks (by index) whose record is right for this command only: used, and owed.
+        let mut unkept: Vec<usize, &Frame> = Vec::new_in(frame);
         if !ready.is_empty() {
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
@@ -423,13 +444,25 @@ impl<'f> ScriptsStage<'f> {
                 let i = &i;
                 let name = drives[*i].name;
                 times.push(name, pooled.ns);
-                // A made record's reads of the checkout (empty for anything else: scripts.rs
-                // `pooled`), each with its reader.
-                self.fresh.extend(core::mem::take(&mut pooled.checkout).into_iter().map(|read| (name, read)));
+                // A kept record's reads of the checkout (empty for anything else: scripts.rs
+                // `pooled`), each with its reader; an unkept record's none, so no leaf row or
+                // `Given` cell stands on a run that is not kept.
+                let why_unkept = pooled.unkept.take();
+                if why_unkept.is_none() {
+                    self.fresh.extend(core::mem::take(&mut pooled.checkout).into_iter().map(|read| (name, read)));
+                }
                 let did = match pooled.did {
                     Err(why) => Did::Failed(TaskFailure { name, why }),
                     Ok(Ran::Made(record)) => {
-                        self.kept_runs += u32::from(self.reads_planned);
+                        match why_unkept {
+                            // Right for this command: its dependents read it now (a read no cell
+                            // names fails no one), and it runs again next command.
+                            Some(why) => {
+                                unkept.push(*i);
+                                self.unkept.push((name, why));
+                            }
+                            None => self.kept_runs += u32::from(self.reads_planned),
+                        }
                         record.into_held(frame).map_or_else(|_| work::held_refused(name), Did::Done)
                     }
                     Ok(Ran::Failed { what, words, hole }) => {
@@ -479,6 +512,15 @@ impl<'f> ScriptsStage<'f> {
                                 buffer.made.push(crate::engine_script_reads::made(read, name, &tools, alloc));
                             }
                         }
+                    }
+                    // Right for this command only: its row is kept and owed (blaze-engine
+                    // `Buffer::owed`), so the next request enters it again whatever moved and no
+                    // certificate stands on it (the answer's owed count). Its record is put this
+                    // command under its bytes' key (engine_store.rs `record_key`), which a reader
+                    // finds only by this row's out: no later command reads it but through a
+                    // rerun that made the same bytes.
+                    if unkept.contains(&i) {
+                        buffer.owed.push(name);
                     }
                     Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false }
                 }

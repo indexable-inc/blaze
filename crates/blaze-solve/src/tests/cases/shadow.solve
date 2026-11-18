@@ -1,0 +1,75 @@
+# A pin of the reference's rule (rustc_next_trait_solver assembly/mod.rs
+# `assemble_and_merge_candidates`, the `TraitGoalProvenVia::ParamEnv | AliasBound` arm): "If the
+# trait goal has been proven by using the environment, we want to treat aliases as rigid if
+# there are no applicable projection bounds in the environment" - for EVERY self type, one an
+# impl names too. core's `impl<'a, T> Iterator for Iter<'a, T>` (slice/iter/macros.rs)
+# `rposition` writes `Self: ExactSizeIterator + DoubleEndedIterator`; its elaborated
+# `Iter<'a, T>: Iterator` proves the trait goal, so `<Iter<'a, T> as Iterator>::Item` is rigid
+# there, and core checks because both sides of `predicate(x)` are that same rigid alias (the
+# front end lowers `Self::Item` in the impl as the projection, never as the impl's text).
+# Lifetimes are erased.
+
+trait It { type Item; }
+trait Back: It
+struct Iter<T>(T)
+impl<T> It for Iter<T> { type Item = &T; }
+impl<T> Back for Iter<T>
+
+# --- a self type an impl names, under a where-bound that proves the goal: rigid ---
+
+case shadowed_concrete_rigid = assembly/mod.rs assemble_and_merge_candidates (inject_normalize_to_rigid_candidate, an impl's self type)
+params T
+env Iter<T>: Back
+goal <Iter<T> as It>::Item == ?0 => yes ?0 = rigid <Iter<T> as It>::Item
+
+case shadowed_concrete_not_the_impls_value = assembly/mod.rs assemble_and_merge_candidates (the impl's value is not taken)
+params T
+env Iter<T>: Back
+goal <Iter<T> as It>::Item == &T => no
+
+case shadowed_concrete_equals_itself = project_goals/mod.rs normalize_associated_term (both sides the same rigid alias)
+params T
+env Iter<T>: Back
+goal <Iter<T> as It>::Item == <Iter<T> as It>::Item => yes
+
+case shadowed_concrete_direct_bound_rigid = assembly/mod.rs assemble_and_merge_candidates (the bound written, not elaborated)
+params T
+env Iter<T>: It
+goal <Iter<T> as It>::Item == &T => no
+
+case shadowed_concrete_projection_bound_wins = normalizes_to.rs match_assumption (a where-bound's value is taken)
+params T
+env Iter<T>: It; <Iter<T> as It>::Item == u8
+goal <Iter<T> as It>::Item == u8 => yes
+
+# --- no shadowing where-bound: the impl decides ---
+
+case unshadowed_concrete_impl = normalizes_to.rs consider_impl_candidate
+params T
+goal <Iter<T> as It>::Item == ?0 => yes ?0 = &T
+
+case unshadowed_concrete_impl_negative = normalizes_to.rs consider_impl_candidate (the impl's value is the only one)
+params T
+goal <Iter<T> as It>::Item == &u8 => no
+
+# --- a self type that is a parameter: rigid ---
+
+case env_param_rigid = assembly/mod.rs assemble_and_merge_candidates (inject_normalize_to_rigid_candidate)
+params T
+env T: Back
+goal <T as It>::Item == ?0 => yes ?0 = rigid <T as It>::Item
+
+case env_param_rigid_equals_itself = project_goals/mod.rs normalize_associated_term
+params T
+env T: Back
+goal <T as It>::Item == <T as It>::Item => yes
+
+case env_param_rigid_unequal = assembly/mod.rs assemble_and_merge_candidates (a rigid alias is no other type)
+params T
+env T: Back
+goal <T as It>::Item == &T => no
+
+case env_param_rigid_nested = project_goals/mod.rs normalize_associated_term (the same rigid alias inside an argument)
+params T
+env T: Back
+goal Vec<<T as It>::Item> == Vec<<T as It>::Item> => yes

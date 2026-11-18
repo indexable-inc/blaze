@@ -1059,13 +1059,29 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let args = intern_list(tys, &args)?;
                     self.trait_self_assoc(tys, env, tr, args, Name::of(texts[1]), r, shown)
                 }
-                // The impl's own associated type; else, in a trait impl, the one its trait or a
-                // supertrait declares (the Reference, "Paths", "`Self`" and "Paths in types":
-                // core's `impl DoubleEndedIterator for X { fn rfold(..) -> Self::Item }`, where
-                // `Item` is `Iterator`'s, given by another impl).
-                (2, SelfTy::Ty(_, tr)) => match (env.self_assoc.iter().find(|(n, _)| *n == Name::of(texts[1])), tr) {
-                    (Some(&(_, t)), _) => Ok(t),
-                    (None, Some((tr, args))) => self.self_assoc(tys, tr, args, Name::of(texts[1]), r, shown),
+                // In a trait impl, `Self::X` is the PROJECTION `<SelfTy as Tr>::X` of the trait
+                // (or the one supertrait) declaring `X`, never the impl's `type X = ..` text
+                // (the Reference, "Paths", "`Self`" and "Paths in types"; rustc lowers it so
+                // and normalizes it where it is used). Its value comes from normalization in
+                // the environment of the use: the impl's type where no where-bound shadows the
+                // impl, the rigid alias where one does (core's `rposition` in `impl Iterator
+                // for Iter<'a, T>`, `Self: ExactSizeIterator + DoubleEndedIterator`): the same
+                // answer on every side. Reading the impl's text here made the bound's
+                // `FnMut(Self::Item)` `&'a T` beside a rigid `x`: a false E0308. Arguments on
+                // the segment are the associated type's own (`Self::Out<A>`). Core's `impl
+                // DoubleEndedIterator for X { fn rfold(..) -> Self::Item }`, `Item`
+                // `Iterator`'s, is the supertrait's projection the same way. An inherent impl
+                // has no trait: its own associated type is its text (inherent associated
+                // types, unstable).
+                (2, SelfTy::Ty(_, tr)) => match (tr, env.self_assoc.iter().find(|(n, _)| *n == Name::of(texts[1]))) {
+                    (Some((tr, args)), _) => {
+                        let name = Name::of(texts[1]);
+                        match self.assoc_owner(tys, tr, args, name, r, shown)? {
+                            Some((t, a)) => self.assoc_with_args(tys, t, name, a, kids, r, shown),
+                            None => Err(program(format!("`{shown}` names no associated type of the trait or its supertraits"), r)),
+                        }
+                    }
+                    (None, Some(&(_, t))) => Ok(t),
                     (None, None) => Err(program(format!("`{shown}` names no associated type of the impl"), r)),
                 },
                 _ => Err(Why::Unsupported(SELF_HERE, r)),
@@ -1137,16 +1153,6 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             // blaze-typeck's `IntTy` has the standard widths only.
             Kind::WideInt { signed, bits } => Err(Why::NoCheckerType(format!("{}{bits}", if signed { "i" } else { "u" }).into_boxed_str(), r)),
             _ => Err(program(format!("`{shown}` is not a type"), r)),
-        }
-    }
-
-    /// `Self::name` in the trait `tr` (its arguments `args`): the trait's own associated type,
-    /// else the one supertrait (searched through the supertraits' supertraits, by a work list)
-    /// that declares it, its arguments substituted; two that declare it are ambiguous.
-    fn self_assoc(&self, tys: &mut PortableTys<'_>, tr: LibKey, args: List, name: Name, r: Range, shown: &str) -> Result<PTy, Why> {
-        match self.assoc_owner(tys, tr, args, name, r, shown)? {
-            Some((t, a)) => self.alias(tys, t, name, a, r, shown),
-            None => Err(program(format!("`{shown}` names no associated type of the trait or its supertraits"), r)),
         }
     }
 

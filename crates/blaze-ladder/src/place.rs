@@ -537,7 +537,9 @@ pub fn place(
     let stops = Box::new(crate::stub::Stops::new(said));
     let vtables = Vtables::write(vtables)?;
     let page = blaze_launch_rt::sys::page().map_err(|e| PlaceError::Launcher(e.into()))? as u64;
-    let code_len: u64 = bodies.iter().map(|b| (b.code.bytes.len() as u64).next_multiple_of(16)).sum();
+    // Each body on its own alignment (blaze-emit `Code::align`, log2: 16 bytes unless a datum of
+    // it asks more).
+    let code_len: u64 = bodies.iter().map(|b| (b.code.bytes.len() as u64).next_multiple_of(1u64 << b.code.align)).sum();
     let area = (code_len + page).next_multiple_of(page).max(16 * page);
     let slots = u32::try_from(bodies.len()).unwrap_or(u32::MAX).max(1);
     let mut driver = Driver::new(Config { slots, area }).map_err(PlaceError::Launcher)?;
@@ -557,7 +559,7 @@ pub fn place(
             code: CodeId(id),
             tier: Tier::Zero,
             len: body.code.bytes.len() as u64,
-            align: 16,
+            align: 1 << body.code.align,
             refs: List::of(&[]),
         });
     }

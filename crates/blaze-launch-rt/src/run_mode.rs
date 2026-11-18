@@ -941,10 +941,12 @@ impl<'a> RunMode<'a> {
         let view = CodeView::read(bytes).map_err(|why| RunModeError::Decode { record, why })?;
         let unwind = blaze_code::unwind::read(view).map_err(|why| RunModeError::Unwind { record, why })?;
         let code_at = match region {
-            Region::Area => memory.reserve(view.code().len(), 16)?,
-            Region::Hot => memory.reserve_hot(view.code().len(), 16)?,
+            // The record states its own alignments (blaze-code record.rs, form `bzcode06`: a
+            // datum aligned past 16 raises the code part's; log2 in the head).
+            Region::Area => memory.reserve(view.code().len(), 1 << view.code_align())?,
+            Region::Hot => memory.reserve_hot(view.code().len(), 1 << view.code_align())?,
         };
-        let relro_at = memory.reserve(view.relro().len(), 8)?;
+        let relro_at = memory.reserve(view.relro().len(), 1 << view.relro_align())?;
         let mut code: AVec<'_, u8> = Vec::from_elem_in(0, view.code().len(), self.alloc);
         let mut relro: AVec<'_, u8> = Vec::from_elem_in(0, view.relro().len(), self.alloc);
         let symbol = self.slots.symbol(slot);

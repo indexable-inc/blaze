@@ -319,11 +319,18 @@ impl Load<'static> for StoreLoad {
         Some(core::str::from_utf8(bytes).unwrap_or_else(|_| panic!("crate `{}`: the expansion text of {call:?} in the test store is not UTF-8", self.crates[krate].name)))
     }
 
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'static [u8]> {
-        if krate == 0 {
-            return self.expansions.iter().find(|(c, _, _)| *c == call).map(|(_, _, o)| *o);
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
+        let bytes = if krate == 0 {
+            self.expansions.iter().find(|(c, _, _)| *c == call).map(|(_, _, o)| *o)?
+        } else {
+            self.toolchain(krate, call_key(self.shelf, self.crates.get(krate)?.key, "origins", call))?
+        };
+        // The fixture and its shelf keep the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none).
+        if bytes.is_empty() {
+            return Some((&[], &[]));
         }
-        self.toolchain(krate, call_key(self.shelf, self.crates.get(krate)?.key, "origins", call))
+        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
     }
 }
 

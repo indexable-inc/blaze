@@ -226,9 +226,11 @@ fn proc_macro_attributes_read_as_the_reference_says() {
     assert_eq!(ProcAttr::read("proc_macro_derive()"), None, "a derive with no name exports nothing");
 }
 
-/// Without a runner for its crate, a proc macro still resolves; its call has no definition.
+/// Without a runner for its crate, a proc macro still resolves and each call reports the missing runner.
 #[test]
 fn a_proc_macro_without_a_runner_resolves_and_is_not_run() {
+    use crate::resolve::{ExpandNote, NamesNote, ProcUnusable};
+
     struct NoRunner;
     impl SourceTexts<'static> for NoRunner {
         fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
@@ -240,8 +242,13 @@ fn a_proc_macro_without_a_runner_resolves_and_is_not_run() {
     let names = resolved(&crates, &NONE);
     let user = names.krate(0);
     assert!(user.tables.impls.is_empty(), "nothing derived without a runner");
-    let notes = format!("{:?}", names.notes(0));
-    assert!(notes.contains("NoDefinition"), "each call is noted: {notes}");
+    let notes = names.notes(0);
+    let mut without_runner: Vec<_> = notes.iter().filter_map(|note| match note {
+        NamesNote::Expand { note: ExpandNote::ProcModule { macro_name, why: ProcUnusable::NoRunner }, .. } => Some(*macro_name),
+        _ => None,
+    }).collect();
+    without_runner.sort_unstable();
+    assert_eq!(without_runner, ["Show", "make", "replace", "sol"], "each call is noted: {notes:?}");
     let errors = &user.done.get(&names.root(0)).expect("the root is done").scope.errors;
     assert!(
         !errors.iter().any(|e| matches!(e, crate::ScopeError::Macro { why: crate::Unresolved::NotFound, .. })),

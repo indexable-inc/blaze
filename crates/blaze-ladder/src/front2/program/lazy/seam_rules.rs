@@ -25,6 +25,19 @@ use crate::front2::keys::Keys;
 use crate::front2::source::NamesSource;
 use crate::seam::PositionGap;
 
+/// A trait declaration supplies the call signature until dispatch selects an implementation.
+/// For other Rust rows the builder needs a body or an intrinsic. The lazy row can count a
+/// body declared in the head before checking it. Foreign symbols and shims have their own rows.
+pub(in crate::front2::program) fn rust_row_kind(of_trait: bool, body_or_intrinsic: bool, path: &str) -> Result<FnKind, Front2Refusal> {
+    if of_trait {
+        Ok(FnKind::Trait(0))
+    } else if body_or_intrinsic {
+        Ok(FnKind::Free)
+    } else {
+        Err(Front2Refusal::NoBody { function: path.into() })
+    }
+}
+
 /// THE ABI RULE: `tabled` is the row's ABI when `key` has a row; else the head's (head_abi.rs
 /// `head_abi`). `None`: no head, or an ABI the builder spreads no arguments of (the builder's
 /// `NoAbi` names the fn).

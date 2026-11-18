@@ -27,6 +27,8 @@ pub mod record;
 pub mod suspend;
 
 #[cfg(test)]
+mod operand_order_tests;
+#[cfg(test)]
 mod place_mark_tests;
 #[cfg(test)]
 mod suspend_tests;

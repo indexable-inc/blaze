@@ -61,13 +61,14 @@ impl crate::engine_scripts::ScriptRunner for Double {
                 ReadKind::File => "file",
                 ReadKind::Listing => "dir",
                 ReadKind::Stat => "stat",
+                ReadKind::Git => "git",
             };
             recorded.push((format!("{word}:{path}"), (answer != reads::NONE).then_some(answer)));
             if *kind == ReadKind::File && answer == blaze_proc_macro::script_sandbox::file_answer(b"one\n") {
                 flag = true;
             }
         }
-        let pooled = |did: crate::scripts::Ran, checkout| crate::scripts::PooledScript { did: Ok(did), used: 0, ns: 0, checkout };
+        let pooled = |did: crate::scripts::Ran, checkout| crate::scripts::PooledScript { did: Ok(did), used: 0, ns: 0, checkout, unkept: None };
         let Some(stage_plant) = kept else {
             let mut words = blaze_own::Vec::new_in(std::alloc::Global);
             words.extend_from_slice(b"the double read the checkout on a path that keeps no reads");
@@ -75,14 +76,11 @@ impl crate::engine_scripts::ScriptRunner for Double {
         };
         let plant = if self.plant == ReadsPlant::None { stage_plant } else { self.plant };
         let cells = reads::cells_of(recorded.iter().map(|(subject, digest)| (subject.as_str(), *digest)), plant).expect("every read has a cell");
-        let mut made = crate::work::Record::new_in(name, std::alloc::Global);
-        for read in cells.iter() {
-            made.reads.push((read.name(), read.answer));
-        }
+        let read_rows: std::vec::Vec<_> = cells.iter().map(|read| (read.name(), read.answer)).collect();
         let erased = blaze_own::Erased::new(std::alloc::Global);
         let printed: &[u8] = if flag { b"cargo::rustc-cfg=pkg_flag\n" } else { b"" };
         let outputs = blaze_build_script::outputs::Outputs::read(printed, "/out", blaze_build_script::instr::OutputLimits::DEFAULT, erased.handle()).expect("the double's output reads");
-        match crate::scripts::outputs_record(made, crate::scripts::RanAs::Wasm, &outputs, "pkg") {
+        match crate::scripts::outputs_record(name, &read_rows[..], crate::scripts::RanAs::Wasm, &outputs, "pkg") {
             made @ crate::scripts::Ran::Made(_) => pooled(made, cells),
             failed => pooled(failed, std::vec::Vec::new()),
         }

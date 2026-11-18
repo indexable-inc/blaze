@@ -21,7 +21,8 @@
 //!   literal words and reached PC-relatively (`adr`): no fixup.
 //!
 //! - The code is followed by its literal words (8-aligned) and its data rows (each at least
-//!   8-aligned, at most 16): placement puts the code's first byte at a 16-aligned address.
+//!   8-aligned, at most a 4 KiB page): placement puts the code's first byte at the alignment
+//!   [`Code::align`] says (at least 16, the most any row asks).
 //! - No function is refused for its size below `b`'s ±128 MiB of instructions: a conditional
 //!   branch, literal load or `adr` whose target may pass its ±1 MiB is reached through an
 //!   island of veneers placed in the code, or a long form (pass/reach.rs).
@@ -107,6 +108,12 @@
 //! cached in a register across one), so there is nothing for it to order. Sizes 8, 16, 32
 //! and 64 bits (and `ptr`); an atomic of an `i1` is refused.
 //!
+//! An atomic of an `i128` (pass/atomic.rs `atomic_wide`) is one exclusive-pair loop
+//! (`ld{a}xp; ..; st{l}xp; cbnz`) for `atomic_load` (the pair stored back: Armv8.0's
+//! 16-byte access is single-copy atomic only when the store-exclusive succeeds),
+//! `atomic_store` and every `atomic_rmw`; `cmpxchg` is `casp{a,l,al}` with LSE, else the
+//! loop, which stores the old pair back on a mismatch.
+//!
 //! # Bulk memory
 //!
 //! `memcpy`, `memmove` and `memset` of a length defined by an `iconst` of at most
@@ -170,6 +177,8 @@
 //! guess.
 
 #![feature(allocator_api)]
+// quad_run_tests.rs calls emitted `f128` functions and names the routines' `f128` signatures.
+#![cfg_attr(test, feature(f128))]
 
 use core::alloc::Allocator;
 use core::fmt;
@@ -267,6 +276,19 @@ mod tier_tests;
 /// Branches and references past ±1 MiB, run (pass/reach.rs).
 #[cfg(all(test, target_arch = "aarch64"))]
 mod reach_tests;
+
+/// Data rows aligned past 16 in both forms, run (lib.rs `Code::align`, pass/sites.rs).
+#[cfg(all(test, target_arch = "aarch64"))]
+mod data_align_tests;
+
+/// Atomics of an `i128`, run (pass/atomic.rs `atomic_wide`).
+#[cfg(all(test, target_arch = "aarch64"))]
+mod atomic_wide_tests;
+
+/// `f128` operations as calls of the test binary's own compiler_builtins routines, run
+/// (blaze-lir legalize/quad.rs, routines.rs).
+#[cfg(all(test, target_arch = "aarch64"))]
+mod quad_run_tests;
 
 
 /// The most bytes a `memcpy` or `memset` of a constant length is emitted inline; past it, the
@@ -463,11 +485,19 @@ pub struct Code<A: Allocator> {
     pub relocs: Vec<Reloc, A>,
     /// Source position fields placement fills, by offset.
     pub positions: Vec<PositionFix, A>,
+    /// log2 of the alignment placement gives `bytes[0]`: at least [`CODE_ALIGN`] (16), and
+    /// the most any data row of the function asks (up to a 4 KiB page), so a row aligned to 64
+    /// is at an address that is a multiple of 64.
+    pub align: u8,
 }
+
+/// The least alignment, as log2, of a literal-word form's code: 16 bytes.
+pub const CODE_ALIGN: u8 = 4;
 
 impl<A: Allocator + Clone> Code<A> {
     pub fn new_in(alloc: A) -> Code<A> {
         Code {
+            align: CODE_ALIGN,
             bytes: Vec::new_in(alloc.clone()),
             fixups: Vec::new_in(alloc.clone()),
             relocs: Vec::new_in(alloc.clone()),
@@ -575,5 +605,11 @@ pub(crate) fn emit_reaching<A: Allocator>(
     };
     // The pass's own rows (the pending short fields, the islands' copies) in the same scratch.
     pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, &mut out.positions, None, reach, heap.handle())?;
+    // What the code asks of its placement: the most any of its data rows asks (each is placed
+    // at a multiple of its own alignment from the code's first byte), at least 16. Over every
+    // row rather than the placed ones: a row the code never reaches only over-aligns it.
+    // A row past a page was refused by the pass if placed, and is capped if not.
+    let page = blaze_code::record::MOST_PART_ALIGN;
+    out.align = func.datas.iter().fold(CODE_ALIGN, |most, d| most.max(d.align.min(u32::from(page)) as u8));
     Ok(called)
 }

@@ -228,6 +228,17 @@ pub fn check_moves_planted<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Vec<MoveFinding, A>, Bound> {
     let st = inits(flow, plant, alloc.clone())?;
+    // A statement's operands are read in order, each after the moves of those before it (the
+    // Reference, "Evaluation order of operands": left to right; MIR borrowck checks `(move p,
+    // move p)` operand by operand, E0382). Checked all against the statement's entry state,
+    // `(p, p)` and `h(p, p)` of a non-`Copy` `p` were clean (lane B11's `twice_p`). `seen` is
+    // the entry state with the earlier operands' moves applied; `scratch` takes `deinit`'s
+    // init half, unused.
+    let w = st.uninit.words();
+    let mut seen: Vec<u64, A> = Vec::with_capacity_in(w, alloc.clone());
+    seen.resize(w, 0u64);
+    let mut scratch: Vec<u64, A> = Vec::with_capacity_in(w, alloc.clone());
+    scratch.resize(w, 0u64);
     let mut out = Vec::new_in(alloc);
     for s in 0..flow.stmts.len() {
         if !st.reached[s] {
@@ -236,15 +247,23 @@ pub fn check_moves_planted<A: Allocator + Clone>(
         let stmt = Stmt(s as u32);
         let (at, span) = (Point::start(stmt), flow.stmt(stmt).span);
         let uninit = st.uninit.row(s);
+        if plant == Plant::OperandsAtEntry {
+            seen.fill(0);
+        } else {
+            seen.copy_from_slice(uninit);
+        }
         let mut found =
             |place: Place, kind: MoveFindingKind| out.push(MoveFinding { at, place, kind, span });
-        let operand =|o: Operand, found: &mut dyn FnMut(Place, MoveFindingKind)| match o {
+        let mut operand = |o: Operand, found: &mut dyn FnMut(Place, MoveFindingKind)| match o {
             Operand::Copy(p) | Operand::Move(p) => {
-                if maybe_uninit(flow, uninit, p) {
+                if maybe_uninit(flow, uninit, p) || maybe_uninit(flow, &seen, p) {
                     found(p, MoveFindingKind::UseOfMoved);
                 }
                 if let (Operand::Move(_), Some(why)) = (o, move_out(flow, p)) {
                     found(p, MoveFindingKind::MoveOut(why));
+                }
+                if matches!(o, Operand::Move(_)) && plant != Plant::OperandsAtEntry {
+                    deinit(flow, p, &mut scratch, &mut seen);
                 }
             }
             Operand::Const => {}

@@ -37,7 +37,15 @@
 //! 7. **A failure is a row.** A failed task's result is its failure and its reads: it defines
 //!    nothing (its old cells move to absent), prints as a finding, and stands until its key or a
 //!    read moves, so the request after a failure with nothing changed is the certificate (tempo,
-//!    tag g090627). The rest of the request is merged and compared like any (finding 6).
+//!    tag g090627). The rest of the request is merged and compared like any (finding 6). A
+//!    failure is a record like a success (rule 81's spirit): it is valid by its key, or else by
+//!    its read list, or else it is owed. Only the stage knows which, so the stage says it
+//!    ([`Stands`]): [`Stands::ByKey`] (a function of the task's key alone: a parse refusal, a
+//!    module the store's listing lacks, the listing being in the key), [`Stands::ByReads`] (its
+//!    read list covers it), or [`Stands::OwedNextRequest`] (a panic, a machine or network fault,
+//!    a missing home, a stage that could not start the work: listed on [`Buffer::owed`]; invariant
+//!    13). The engine never guesses from the read list's length: an empty list is a key-covered
+//!    failure as often as a hole (blaze-cli's `MacroModule` lookup that found no module is one).
 //! 8. **Inline needs.** A result may carry records the plan did not name ([`Made`]), each keyed
 //!    from its own text, with a name, key, out, defines and reads like a task's; the merge takes
 //!    them like any result, equal duplicates once. Two records under one name in a request (two
@@ -75,6 +83,27 @@
 //!    cells is [`EngineError::HitWithoutReads`]. So an edit to a cell only the made record read
 //!    re-validates the record, and its user is entered only when the record's bytes moved
 //!    (`a_hit_is_one_read`).
+//! 13. **A record right for this request only is owed WITH its row.** A task's stage may answer
+//!    it with a record that holds for this request and no longer (a build script that asked a
+//!    question no cell names, such as git's; a failure on a fault, invariant 7): the stage
+//!    names it on [`Buffer::owed`] ([`Stands::OwedNextRequest`]). Its row is put like any (its
+//!    record is in the answer and every reader uses it this request) and then owed by name, AFTER
+//!    the row's own `unowe` in `apply`, so the mark the row was made with survives the merge.
+//!    Beside an owed task with no row (its key moved and the scope did not run it, invariant 5),
+//!    an owed ROW differs in one thing: it holds a record. Both are entered by the next request
+//!    whose scope reaches them, whatever their reads say, with [`Cause::Owed`] when nothing else
+//!    moved, until a request answers them [`Stands::ByReads`]; a request that does not reach one
+//!    leaves it owed, under today's plan (a key that moves while it is held re-plans it, and one
+//!    that moves back makes it an owed row again, never a standing one); a request that holds
+//!    any owed task at its finish, with a row or not, is never certified ([`Report::owed_rows`]
+//!    counts the rows under today's key). Its READERS are not owed: a reader's row saw the owed row's cell
+//!    by digest, which is the record's bytes, so when the owed task runs again and makes equal
+//!    bytes no cell moves and its readers stand (early cutoff), and when it makes other bytes its
+//!    cells move and its readers are entered through them (invariant 4). The digest covers the
+//!    reader; owing it as well would only enter it for nothing (owed_rows_sim.rs proves both
+//!    halves against fresh builds). The owed names are sorted and kept once (rule 25: the
+//!    answer is the same whatever the workers' order), and a name the phase did not enter is
+//!    [`EngineError::Unplanned`]; a made record is never owed (its maker makes it again).
 //!
 //! # The last answer and this request's writes
 //!
@@ -94,7 +123,8 @@
 //!
 //! # Cost
 //!
-//! A phase costs a sort of its results and a constant; an edit costs its changed files' plans,
+//! A phase costs a sort of its results and a constant, and one sort of its owed names (their own
+//! length, [`Report::owed_merged`]; matched to the tasks in one walk); an edit costs its changed files' plans,
 //! the moved cells and their readers. Nothing scans the answer's rows: each question to the last
 //! answer names one row, one cell or one file ([`Finished::touched`] counts the rows asked).
 //!
@@ -310,15 +340,48 @@ impl Made<'_> {
     }
 }
 
+/// How a task's row stands after the request that answered it (invariants 7 and 13).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stands {
+    /// On its key and its read list, until one of them moves: a success, or a failure whose read
+    /// list covers what it depended on (a type error on the reads it made).
+    ByReads,
+    /// On its key alone, until it moves: a result that is a function of the task's key (a parse
+    /// refusal of its own text, a lookup in a listing the key holds). Its read list may be empty;
+    /// the engine treats it as [`Stands::ByReads`] over that list, the name saying why it holds.
+    ByKey,
+    /// Right for this request only: its row is put and used this request, and owed, so the next
+    /// request that reaches it enters it again whatever its key and reads say (a panic, a machine
+    /// or network fault, a missing home, a question no cell names). Its name is on
+    /// [`Buffer::owed`]; nothing else makes a task owed, and the engine never guesses it.
+    OwedNextRequest,
+}
+
 /// One worker's results for a phase: `Send`, so a worker thread fills it.
 pub struct Buffer<'a> {
     pub done: SVec<'a, Done<'a>>,
     pub made: SVec<'a, Made<'a>>,
+    /// Tasks answered with a record right for this request only: their rows are kept owed
+    /// (invariant 13, [`Stands::OwedNextRequest`]). Each a task of the phase (else
+    /// [`EngineError::Unplanned`]), in any order, a name any number of times: the merge sorts
+    /// and dedups the phase's whole list.
+    pub owed: SVec<'a, Name>,
 }
 
 impl<'a> Buffer<'a> {
     pub fn new_in(alloc: SharedAlloc<'a>) -> Buffer<'a> {
-        Buffer { done: Vec::new_in(alloc), made: Vec::new_in(alloc) }
+        Buffer { done: Vec::new_in(alloc), made: Vec::new_in(alloc), owed: Vec::new_in(alloc) }
+    }
+
+    /// `done` with how it stands, as its stage says: [`Stands::OwedNextRequest`] lists its name on
+    /// [`Buffer::owed`]; [`Stands::ByKey`] and [`Stands::ByReads`] list nothing and stand on the
+    /// key and the read list. A result put on [`Buffer::done`] directly stands the same way.
+    pub fn push(&mut self, done: Done<'a>, stands: Stands) {
+        match stands {
+            Stands::OwedNextRequest => self.owed.push(done.name),
+            Stands::ByKey | Stands::ByReads => {}
+        }
+        self.done.push(done);
     }
 }
 
@@ -399,7 +462,9 @@ pub struct Answer<'a> {
     pub by_file: SMap<'a, Name, SVec<'a, Name>>,
     /// Cells that moved while a reader of them was not run, with the request they moved in.
     pub owed_cells: SMap<'a, CellId, Gen>,
-    /// Tasks whose key moved while the scope did not run them: no row of today's.
+    /// Tasks whose key moved while the scope did not run them (no row of today's), and tasks
+    /// answered with a record right for one request only (invariant 13: their row is today's
+    /// record, kept, and entered again by the next request that reaches it).
     pub owed_tasks: SMap<'a, Name, Planned>,
     pub with_findings: SSet<'a, Name>,
 }
@@ -531,6 +596,16 @@ pub enum Plant {
     /// The column reader index (readers.rs `Paired`) loses the last reader of a cell from each
     /// question's answer: readers_sim.rs's differential test, against the old index, catches it.
     LastReaderDropped,
+    /// An owed row is owed BEFORE its result is applied, so `apply`'s `unowe` takes the mark the
+    /// row was made with (invariant 13): owed_rows_sim.rs's control.
+    OwedBeforeUnowe,
+    /// A request that holds an owed task is certified when nothing else moved (invariant 13):
+    /// owed_rows_sim.rs's control.
+    OwedRowCertified,
+    /// A result its stage pushed owed ([`Stands::OwedNextRequest`], a fault in the simulation) is
+    /// left standing on its key and reads instead of owed (invariants 7 and 13): owed_rows_sim.rs's
+    /// control.
+    PushedOwedLeftStanding,
 }
 
 /// What one request did.
@@ -544,8 +619,17 @@ pub struct Report {
     pub not_run: u32,
     pub failed: u32,
     pub phases: u32,
-    /// Nothing entered and nothing moved: the answer is the last one.
+    /// Nothing entered, nothing moved and no owed task held: the answer is the last one, and
+    /// nothing in it is right for one request only or owed to a later scope (invariant 13).
     pub certified: bool,
+    /// Owed rows the answer holds at the finish: owed tasks whose row is under today's key (the
+    /// plan this request gave, else the one owed), a record right for one request only or a row
+    /// owed while its key moved and moved back (invariant 13).
+    pub owed_rows: u32,
+    /// Owed names the merges took from the buffers, before the dedup: the length of the one sort
+    /// a merge does for them (the floor, rule 67: O(k log k) a phase for k names, and nothing
+    /// when none is listed).
+    pub owed_merged: u32,
     /// Each stage's entries, by [`Stage::index`].
     pub stages: [StageCount; STAGES],
     /// Reads looked up to decide whether a candidate stands: each candidate's walk stops at its
@@ -996,7 +1080,10 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         let key = self.tools.key(planned.name, &planned.source);
         if !self.scope.runs(&planned) {
             self.report.not_run += 1;
-            if self.view.row(name)?.is_none_or(|row| row.key != key) {
+            // Owed when its row is not under today's key; an owed task stays owed, its plan
+            // made today's (invariant 13: an owed row whose key moved and moved back is owed
+            // under today's plan, never under the one it was owed with).
+            if self.view.owed(name).is_some() || self.view.row(name)?.is_none_or(|row| row.key != key) {
                 self.view.owe(planned);
             }
             return Ok(None);
@@ -1224,14 +1311,27 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         let index_before = self.index.cost().allocations;
         let mut done: SVec<'a,Done<'a>> = Vec::new_in(self.alloc);
         let mut made: SVec<'a,Made<'a>> = Vec::new_in(self.alloc);
+        let mut owed: SVec<'a, Name> = Vec::new_in(self.alloc);
         for buffer in buffers.iter_mut() {
             done.append(&mut buffer.done);
             made.append(&mut buffer.made);
+            owed.append(&mut buffer.owed);
         }
         done.sort_unstable_by_key(|d| d.name);
         made.sort_unstable_by_key(|m| m.planned.name);
+        // The owed names whatever the workers' order (rule 25): one sort of their own length.
+        self.report.owed_merged = self.report.owed_merged.saturating_add(u32::try_from(owed.len()).unwrap_or(u32::MAX));
+        owed.sort_unstable();
+        owed.dedup();
         let tasks = core::mem::replace(&mut self.tasks, Vec::new_in(self.alloc));
         let opened = core::mem::replace(&mut self.opened, Vec::new_in(self.alloc));
+        // Each owed name is a task this phase entered (invariant 13), refused before anything is
+        // written; a made record is never owed.
+        for name in owed.iter() {
+            if tasks.binary_search_by_key(name, |task| task.planned.name).is_err() {
+                return Err(EngineError::Unplanned { name: *name });
+            }
+        }
         // Both sorted by name: matched one to one, or the first mismatch named.
         for at in 0..tasks.len().max(done.len()) {
             match (tasks.get(at), done.get(at)) {
@@ -1309,11 +1409,35 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         let mut changes: SVec<'a, (CellId, Option<ContentId>)> = Vec::new_in(self.alloc);
         self.report.results += done.len() as u32;
         let mut done_iter = done.into_iter();
+        // `owed` and `tasks` are both sorted by name: one walk matches them.
+        let mut owed_at = 0usize;
         for (task, cause) in tasks.iter().zip(opened.iter()) {
             let result = done_iter.next().ok_or(EngineError::NoResult { name: task.planned.name })?;
+            let name = task.planned.name;
+            while owed.get(owed_at).is_some_and(|one| *one < name) {
+                owed_at += 1;
+            }
+            // Owed only as its stage said (invariant 7): a name on the list. Anything else stands on
+            // its key and its read list, as before owed rows existed; the engine never guesses one
+            // from the read list's length (an empty list is a key-covered failure as often as not).
+            let listed = owed.get(owed_at) == Some(&name);
+            let stands = match listed && self.plant != Plant::PushedOwedLeftStanding {
+                true => Stands::OwedNextRequest,
+                // The planted bug, when listed: a result pushed owed stands like one on reads.
+                false => Stands::ByReads,
+            };
+            if stands == Stands::OwedNextRequest && self.plant == Plant::OwedBeforeUnowe {
+                // The planted bug: owed before `apply`, whose `unowe` then takes the mark.
+                self.view.owe(task.planned);
+            }
             // A made row re-validated as a task stays a made row (invariant 10).
-            let inline = !self.planned.contains_key(&task.planned.name) && self.view.row(task.planned.name)?.is_some_and(|row| row.inline);
+            let inline = !self.planned.contains_key(&name) && self.view.row(name)?.is_some_and(|row| row.inline);
             let identical = self.apply(task.planned, result, phase, inline, &mut changes)?;
+            // Right for this request only (invariant 13): owed AFTER `apply`'s `unowe`, so the row
+            // made this request keeps its mark.
+            if stands == Stands::OwedNextRequest && self.plant != Plant::OwedBeforeUnowe {
+                self.view.owe(task.planned);
+            }
             self.count(task.planned, *cause, identical);
         }
         for one in kept.into_iter() {
@@ -1613,7 +1737,23 @@ impl<'a, S: Scope, L: Fold<'a>, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         if self.plant == Plant::OwedForgotten {
             self.view.forget_owed_cells();
         }
-        self.report.certified = self.report.entered == 0 && self.moved.is_empty();
+        // The owed rows held (invariant 13): each owed task whose row is under today's key. The
+        // owed set is small by construction (read whole by `Overlay::new_in`): one lookup each.
+        // Today's key is the plan's this request gave, else the plan the task was owed with.
+        let owed_tasks = self.view.owed_tasks();
+        let mut owed_rows = 0u32;
+        for owed in owed_tasks.iter() {
+            let planned = self.planned.get(&owed.name).copied().unwrap_or(*owed);
+            let key = self.tools.key(planned.name, &planned.source);
+            if self.view.row(planned.name)?.is_some_and(|row| row.key == key) {
+                owed_rows = owed_rows.saturating_add(1);
+            }
+        }
+        self.report.owed_rows = owed_rows;
+        // Any owed task held, with a row under today's key or not, refuses the certificate: its
+        // row is not today's answer for its plan until a request reaches it.
+        let holds_owed = !owed_tasks.is_empty() && self.plant != Plant::OwedRowCertified;
+        self.report.certified = self.report.entered == 0 && self.moved.is_empty() && !holds_owed;
         // The reverse index's writes, one sorted column, to the working set the form folds.
         let mut cost = self.index.cost();
         cost.phase_allocations_max = self.report.index.phase_allocations_max;
