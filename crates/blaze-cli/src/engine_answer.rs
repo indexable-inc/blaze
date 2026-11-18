@@ -258,6 +258,8 @@ pub(crate) struct Saved {
     /// The answer's pages in all, and their bytes.
     pub(crate) pages: u32,
     pub(crate) bytes: u64,
+    /// The pages this write put: those whose bytes the last root does not hold.
+    pub(crate) new_pages: u32,
 }
 
 /// `kept` and the leaf table of `rows` stored under the root `name` over `last` (its pages not
@@ -276,7 +278,9 @@ pub(crate) fn save<'m, D: Driver, S: Sharing>(
     frame: &Frame,
 ) -> Result<Saved, CliError> {
     let encoded = pages::encode(kept, last, alloc);
-    let mut saved = Saved { puts: 0, pages: 0, bytes: encoded.bytes };
+    // The encoder's puts are the new pages and the root (pages.rs `encode`).
+    let new_pages = u32::try_from(encoded.puts.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    let mut saved = Saved { puts: 0, pages: 0, bytes: encoded.bytes, new_pages };
     for (key, bytes) in encoded.puts.iter() {
         store.put(cx, *key, bytes)?;
         saved.puts += 1;

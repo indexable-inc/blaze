@@ -29,7 +29,7 @@ use super::heads::{Store, Want};
 use super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::source::NamesSource;
 use super::types::Why;
-use super::world_items::{BodyWorld, Fill, Gap};
+use super::world_items::{BodyWorld, Gap};
 
 /// A library item by what its outline says it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -547,7 +547,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
     /// The one place an [`Unmade`] becomes the world's fill or gap.
     pub(super) fn unmade<T>(&self, u: Unmade<'_>) -> blaze_typeck::Fetch<T> {
         match u {
-            Unmade::Want(w) => self.fill(Fill::Store(w)),
+            Unmade::Want(w) => self.store_want(w),
             Unmade::Refused(Refusal::Fill(e)) => self.gap(Gap::Fill(e)),
             Unmade::Refused(Refusal::Kind(g)) => self.gap(Gap::Kind(g)),
             Unmade::Refused(Refusal::FnHead(k, why)) => self.gap(Gap::FnHead(k, format!("{why:?}").into_boxed_str())),

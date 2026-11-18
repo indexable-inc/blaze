@@ -193,10 +193,16 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// it is (rule 25); with other bytes it is refused (rule 21). Past [`COMMIT_BYTES`]
     /// uncommitted, one commit first.
     pub fn put(&mut self, key: Key, all_names_public: bool, bytes: &[u8]) -> Result<(), PlaceError> {
+        self.put_parts(key, all_names_public, &[bytes])
+    }
+
+    /// [`PlainPlace::put`] of the concatenation of `parts`, never joined (blaze-cas
+    /// `Lent::put_parts`).
+    pub fn put_parts(&mut self, key: Key, all_names_public: bool, parts: &[&[u8]]) -> Result<(), PlaceError> {
         if self.lent.uncommitted_bytes() > COMMIT_BYTES {
             self.commit()?;
         }
-        self.lent.put(&CasKey(key.0), self.namespace(all_names_public), DRIVE_TAG, bytes)?;
+        self.lent.put_parts(&CasKey(key.0), self.namespace(all_names_public), DRIVE_TAG, parts)?;
         Ok(())
     }
 

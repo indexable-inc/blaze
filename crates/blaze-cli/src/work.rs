@@ -176,8 +176,9 @@ pub(crate) struct Record<A: Allocator + Copy> {
     /// and 51): a crate's `CrateScope` payload, made by its resolution in `Global` and held by
     /// the command's names state until its task answers. Copied into a task's frame it would
     /// be bounded by that frame, not by the record (`core`'s is 76 MB against a 64 MiB frame,
-    /// 2026-11-16). Set only by [`Record::hand`], and then `payload` is empty.
-    handed: Option<Vec<u8, Global>>,
+    /// 2026-11-16). Set only by [`Record::hand`], and then `payload` is empty; freed by
+    /// [`Record::release_handed`], after which no read of the payload answers bytes.
+    handed: Handed,
     /// The path of each `Locate::File` part: (its name, start and end in `path_bytes`, a module
     /// slot), so the drive can open it ([`PathOf`]).
     pub(crate) paths: Vec<(Name, u32, u32, bool), A>,
@@ -193,6 +194,15 @@ pub(crate) struct Record<A: Allocator + Copy> {
     pub(crate) covered: Vec<blaze_typeck::ItemKey, A>,
 }
 
+/// A record's handed payload, in its three states: none handed (the built payload is the
+/// record's), handed and kept, or freed after its put. The freed state keeps only the length, so
+/// a reader must match it and cannot be answered empty bytes (rule 76).
+pub(crate) enum Handed {
+    None,
+    Kept(Vec<u8, Global>),
+    Released { bytes: usize },
+}
+
 /// What one task made, held in the frame until its batch is answered.
 pub(crate) type Made<'f> = Record<&'f Frame>;
 
@@ -205,7 +215,7 @@ impl<A: Allocator + Copy> Record<A> {
             findings: Vec::new_in(alloc),
             messages: Vec::new_in(alloc),
             payload: Vec::new_in(alloc),
-            handed: None,
+            handed: Handed::None,
             paths: Vec::new_in(alloc),
             path_bytes: Vec::new_in(alloc),
             reads: Vec::new_in(alloc),
@@ -226,8 +236,19 @@ impl<A: Allocator + Copy> Record<A> {
             parts: copied_in(&self.parts, frame)?,
             findings: copied_in(&self.findings, frame)?,
             messages: copied_in(&self.messages, frame)?,
-            payload: copied_in(self.payload_bytes(), frame)?,
-            handed: None,
+            // A handed payload is copied as the clone's built one; a released one stays released
+            // in the clone (its length only), so the clone's reads are refused as the record's.
+            payload: copied_in(
+                match &self.handed {
+                    Handed::Kept(handed) => &**handed,
+                    Handed::None | Handed::Released { .. } => &*self.payload,
+                },
+                frame,
+            )?,
+            handed: match self.handed {
+                Handed::Released { bytes } => Handed::Released { bytes },
+                Handed::None | Handed::Kept(_) => Handed::None,
+            },
             paths: copied_in(&self.paths, frame)?,
             path_bytes: copied_in(&self.path_bytes, frame)?,
             reads: copied_in(&self.reads, frame)?,
@@ -236,11 +257,13 @@ impl<A: Allocator + Copy> Record<A> {
     }
 
     /// The record's payload: the bytes handed to it ([`Record::hand`]), else those it built.
-    /// The one read of a record's payload (the store's write, a test's digest).
-    pub(crate) fn payload_bytes(&self) -> &[u8] {
+    /// The one read of a record's payload (the store's write, a test's digest). A payload freed
+    /// after its put is refused, naming the record ([`InputWhy::Released`]), never read as empty.
+    pub(crate) fn payload_bytes(&self) -> Result<&[u8], CliError> {
         match &self.handed {
-            Some(handed) => &**handed,
-            None => &*self.payload,
+            Handed::Kept(handed) => Ok(&**handed),
+            Handed::None => Ok(&*self.payload),
+            Handed::Released { bytes } => Err(CliError::Input { name: self.name, why: InputWhy::Released { bytes: *bytes } }),
         }
     }
 
@@ -248,11 +271,30 @@ impl<A: Allocator + Copy> Record<A> {
     /// allocator that made them until the record is dropped. Refused (rule 3) when the record
     /// already has a payload, built or handed: two payloads would be one record's two answers.
     pub(crate) fn hand(&mut self, bytes: Vec<u8, Global>) -> Result<(), CliError> {
-        if !self.payload.is_empty() || self.handed.is_some() {
+        if !self.payload.is_empty() || !matches!(self.handed, Handed::None) {
             return Err(CliError::Text { what: "a record handed a payload already has one (rule 3, work.rs `Record::hand`)" });
         }
-        self.handed = Some(bytes);
+        self.handed = Handed::Kept(bytes);
         Ok(())
+    }
+
+    /// The handed payload freed, once the record is in the store and every later reader reads
+    /// it there (rule 51: engine_check.rs, after a phase's put): how many bytes went. A payload
+    /// built in the record's own allocator stays, as do its lists (findings, reads, paths). A
+    /// later [`Record::payload_bytes`] is refused ([`InputWhy::Released`]).
+    pub(crate) fn release_handed(&mut self) -> usize {
+        match core::mem::replace(&mut self.handed, Handed::None) {
+            Handed::Kept(bytes) => {
+                let len = bytes.len();
+                self.handed = Handed::Released { bytes: len };
+                len
+            }
+            Handed::None => 0,
+            Handed::Released { bytes } => {
+                self.handed = Handed::Released { bytes };
+                0
+            }
+        }
     }
 
     /// The part `name`'s file is at `path`.
@@ -273,9 +315,9 @@ impl Record<Global> {
     /// head, not its body. A frame that refuses a copy is a typed failure ([`HELD_REFUSED`]).
     pub(crate) fn into_held<'g>(self, frame: &'g Frame) -> Result<Made<'g>, blaze_own::AllocFailure> {
         let handed = match self.handed {
-            Some(handed) => Some(handed),
-            None if self.payload.is_empty() => None,
-            None => Some(self.payload),
+            Handed::None if self.payload.is_empty() => Handed::None,
+            Handed::None => Handed::Kept(self.payload),
+            kept_or_released => kept_or_released,
         };
         Ok(Record {
             name: self.name,
@@ -317,8 +359,12 @@ pub(crate) fn held_refused<'f>(name: Name) -> Did<'f> {
 /// beside it. Returns the record's out.
 pub(crate) fn seal_graph<A: Allocator + Copy>(record: &mut Record<A>, list: &[u8]) -> ContentId {
     match &mut record.handed {
-        Some(payload) => crate::graph_payload::seal(payload, list),
-        None => crate::graph_payload::seal(&mut record.payload, list),
+        Handed::Kept(payload) => crate::graph_payload::seal(payload, list),
+        Handed::None => crate::graph_payload::seal(&mut record.payload, list),
+        // Every caller seals the record it has just made, before its put; a released record
+        // sealed would be an out over no payload. A panic fails its one job (rule 20), never a
+        // quiet seal.
+        Handed::Released { .. } => panic!("work.rs `seal_graph`: the record {:?} was sealed after its payload was released (rule 3)", record.name),
     }
 }
 
@@ -439,6 +485,9 @@ pub enum InputWhy {
     /// The store refused the read: its bytes would pass the frame read into, or the read
     /// itself failed.
     Store(crate::store::StoreFailure),
+    /// Its record's payload was freed once it was put ([`Record::release_handed`]): it is read
+    /// from the store now, never from the record (rule 51).
+    Released { bytes: usize },
 }
 
 impl core::fmt::Display for InputWhy {
@@ -449,6 +498,7 @@ impl core::fmt::Display for InputWhy {
             InputWhy::Shape => f.write_str("its record is a shape, with no payload"),
             InputWhy::Graph(error) => write!(f, "{error}"),
             InputWhy::Store(failure) => write!(f, "{failure}"),
+            InputWhy::Released { bytes } => write!(f, "its record's payload ({bytes} bytes) was freed once put; read it from the store (work.rs `Record::release_handed`)"),
         }
     }
 }
@@ -1223,7 +1273,9 @@ pub(crate) fn with_outcomes<'d, R>(did: &'d [(blaze_drive::Ticket, Did<'_>)], to
     }
     let mut outputs: Vec<Output<'_>, &Frame> = Vec::with_capacity_in(did.len(), frame);
     for (((_, done), findings), paths) in did.iter().zip(findings.iter()).zip(paths.iter()) {
-        if let Did::Done(made) = done {
+        if let Did::Done(made) = done
+            && let Ok(payload) = made.payload_bytes()
+        {
             outputs.push(Output {
                 name: made.name,
                 out: made.out,
@@ -1232,7 +1284,7 @@ pub(crate) fn with_outcomes<'d, R>(did: &'d [(blaze_drive::Ticket, Did<'_>)], to
                 parts: &made.parts,
                 paths,
                 findings,
-                payload: made.payload_bytes(),
+                payload,
             });
         }
     }
@@ -1240,6 +1292,8 @@ pub(crate) fn with_outcomes<'d, R>(did: &'d [(blaze_drive::Ticket, Did<'_>)], to
     let mut at = 0;
     for ((ticket, done), ns) in did.iter().zip(took.iter()) {
         let ran = match done {
+            // A record whose payload was released after its put is no answer: refused, named.
+            Did::Done(made) if made.payload_bytes().is_err() => Ran::Failed(TaskFailure { name: made.name, why: Why::Refused { what: "its record's payload was released after its put", rule: "work.rs `Record::release_handed`" } }),
             Did::Done(_) => {
                 at += 1;
                 Ran::Done(&outputs[at - 1..at])
@@ -1316,7 +1370,7 @@ pub(crate) mod answers_for_test {
         let row = (
             made.name,
             made.out,
-            ContentId::of("blaze-cli order test payload", made.payload_bytes()),
+            ContentId::of("blaze-cli order test payload", made.payload_bytes().unwrap()),
             ContentId::of("blaze-cli order test findings", &findings),
             ContentId::of("blaze-cli order test reads", &reads),
         );
@@ -1369,7 +1423,12 @@ fn tally(records: &mut crate::phases::byte_rows::Records, req: &Request<'_>, nam
             _ => Label::of(format_args!("{}", task.name)),
         }
     };
-    let payload = made.payload_bytes();
+    // Tallied as the old machine answers, before any put; only the engine releases a payload
+    // and it tallies nothing here. A released one has no bytes to count: its record is counted
+    // by the engine's ledger (engine_store.rs `Ledger`).
+    let Ok(payload) = made.payload_bytes() else {
+        return;
+    };
     if task.name.kind == Kind::CrateScope && !payload.is_empty() {
         match sections(payload) {
             Ok(read) => records.scope(Section::ALL.map(|section| read.part(section).len()), payload.len(), label),
@@ -1575,7 +1634,7 @@ fn run<'f, 'b>(
                 // be made names no part: the closing note says why.
                 let world = {
                     let _cx = cx.span("names: make the world");
-                    crate::names::world(&cx, root, record.payload_bytes(), Some(lock), Some(graph.member_dirs()), &facts.fetch_env)
+                    crate::names::world(&cx, root, record.payload_bytes()?, Some(lock), Some(graph.member_dirs()), &facts.fetch_env)
                 };
                 match world {
                     Ok(names) => {
@@ -1899,7 +1958,7 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 .map_err(|_| Unread::Text("the outline is not one of its file"))?;
             let payload = Vec::from_slice_in(&record, held);
             let out = parts_out(&parts);
-            Ok(Ok(Record { name: job.name, out, parts, findings, messages, payload, handed: None, paths, path_bytes, reads: Vec::new_in(held), covered: Vec::new_in(held) }))
+            Ok(Ok(Record { name: job.name, out, parts, findings, messages, payload, handed: Handed::None, paths, path_bytes, reads: Vec::new_in(held), covered: Vec::new_in(held) }))
         }
     }
 }
@@ -1929,8 +1988,8 @@ const COVERED_KEY: usize = 16;
 /// and deduplicated in place first (two owners reach one fn alike), so the bytes are one
 /// function of the set (rule 25). Refused when the record already has a payload (rule 3).
 pub(crate) fn seal_body_payload<A: Allocator + Copy>(made: &mut Record<A>, file: Name, text: ContentId) -> Result<(), Why> {
-    if !made.payload_bytes().is_empty() {
-        return Err(Why::Refused { what: "a `BodyCheck` record sealed twice: it already has a payload", rule: "blaze-cli work.rs, seal_body_payload" });
+    if !matches!(made.payload_bytes(), Ok(bytes) if bytes.is_empty()) {
+        return Err(Why::Refused { what: "a `BodyCheck` record sealed twice: it already has a payload (or had one, released)", rule: "blaze-cli work.rs, seal_body_payload" });
     }
     made.covered.sort_unstable();
     made.covered.dedup();

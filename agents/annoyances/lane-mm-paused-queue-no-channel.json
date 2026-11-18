@@ -1,0 +1,15 @@
+{
+ "id": "lane-mm-paused-queue-no-channel",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane MM",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/runner.py ask (queue paused on battery); crates/blaze-cli/src/engine_store.rs put_all",
+ "what": "The lane's first ask (152905-MM-e3f6ef) sat in the paused queue for its whole context, so no piece's numbers came back and none was admitted. Three pieces were written on an unanswered tree. The lane also had no message tool loaded, so the change to put_all's signature could not be announced to the coordinator before it was made.",
+ "cost": "the whole lane's context with nothing admitted; pieces 2 and 3 are in the directory un-asked",
+ "cause": "the brief's one-ask rule, with a queue that does not run while the Mac is on battery",
+ "whys": "a lane cannot see when the queue will resume, and cannot tell the coordinator anything mid-task without SendMessage",
+ "class": "a lane's work outruns its only feedback channel",
+ "prevention": "a lane's brief should say whether the queue is running; give lanes SendMessage (or a notes file the coordinator reads) for the signature changes the brief asks to be told about first",
+ "annoyance": "the queue was paused and no message tool was loaded",
+ "workaround": "everything is reported in the lane's final message",
+ "state": "open"
+}

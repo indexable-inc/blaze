@@ -1045,6 +1045,14 @@ impl Sim {
         self.crash_with(cut);
     }
 
+    /// The simulation's processes died and the machine stayed up: every lock they held goes,
+    /// as `flock`'s do at a process's exit, and nothing else changes (the page cache keeps every
+    /// write; another process's locks, [`Sim::hold_lock`], stay). For a test that cuts a process
+    /// (blaze-cas phase_commit_tests.rs) and then has a new one commit, which takes the lock.
+    pub fn processes_died(&mut self) {
+        self.locks.clear();
+    }
+
     /// The first half of a crash: everything in flight and everything a process holds is
     /// gone, and what each file keeps is drawn, the files in the order of their names.
     /// [`Sim::crash_with`] makes the disk of it. The two are apart so that the disk world's

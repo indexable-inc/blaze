@@ -128,6 +128,28 @@ pub fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     }
 }
 
+/// Whether `bytes` are the concatenation of `parts`, read in place.
+fn parts_equal(bytes: &[u8], parts: &[&[u8]]) -> bool {
+    let mut rest = bytes;
+    for part in parts {
+        match rest.split_at_checked(part.len()) {
+            Some((head, tail)) if head == *part => rest = tail,
+            _ => return false,
+        }
+    }
+    rest.is_empty()
+}
+
+/// The concatenation of `parts`, on the global heap: only for a refusal, which names the first
+/// byte where a put differs from what its key holds (rule 19).
+fn joined(parts: &[&[u8]]) -> Vec<u8, Global> {
+    let mut all = Vec::new_in(Global);
+    for part in parts {
+        all.extend_from_slice(part);
+    }
+    all
+}
+
 /// A record lent in place for `'l`, a borrow of the [`Lent`].
 #[derive(Clone, Copy, Debug)]
 pub struct Lend<'l> {
@@ -148,7 +170,15 @@ pub struct LentCounts {
     pub puts: u64,
     /// A put of a key already held with equal bytes: nothing kept.
     pub puts_same: u64,
+    /// Bytes copied into the arena (each put's, rounded to its blocks), ever.
     pub arena_bytes: u64,
+    /// Puts and points copied into the arena: each one a copy of its bytes in this process's
+    /// heap (rule 51's measure; blaze-cli engine_store.rs `Ledger`).
+    pub copied: u64,
+    /// Bytes of the arena's puts alive now: a commit frees every chunk that lent nothing.
+    pub held_bytes: u64,
+    /// Chunks freed by commits.
+    pub freed_chunks: u32,
     pub chunks: u32,
 }
 
@@ -167,6 +197,9 @@ pub(crate) enum LentPlant {
     /// name (pointer_tests: a cut between the two leaves a pointer to a target no generation
     /// holds).
     PointerFirst,
+    /// The commit frees every chunk, a chunk a get lent from too (lent_tests: the held bytes
+    /// after a commit under a live lend show it; the freed lend is never read).
+    FreesLent,
 }
 
 /// Sixteen bytes at sixteen-byte alignment: a put's payload starts as a segment's does.
@@ -191,6 +224,10 @@ struct Inner<D: Driver, A: Allocator + Clone> {
     store: Driven<D>,
     /// Each chunk made at its capacity and never pushed past it: its buffer never moves.
     chunks: Vec<Vec<Block, A>, A>,
+    /// Each chunk's: whether a get lent bytes of it. A chunk that lent is kept to the `Lent`'s
+    /// end and takes no more puts; one that lent nothing is freed by the commit that writes its
+    /// puts ([`Lent::commit`]), so no put's bytes stay in the heap past their commit (rule 51).
+    lent: Vec<bool, A>,
     puts: Map<[u8; 32], PutAt, BuildKeyHasher, A>,
     /// The puts in the order they came: a commit lays out `order[committed..]`.
     order: Vec<[u8; 32], A>,
@@ -213,10 +250,14 @@ pub struct Lent<D: Driver, A: Allocator + Clone> {
 /// The one assumption the lend rests on. `ptr..ptr + len` lies in a segment mapping held by
 /// the [`Driven`] inside a [`Lent`], or in one of that `Lent`'s arena chunks. The store never
 /// unmaps a segment while it is open; a retired file may be unlinked and its mapping stands.
-/// A chunk is never moved (made at its capacity, pushed only within it, never freed before the
-/// `Lent`). The caller borrows that `Lent` for `'l`, so it lives, with nothing of it dropped,
-/// for `'l`; no `&mut` to those bytes is ever made (a mapping is read-only, a block is written
-/// once, before its first lend).
+/// A chunk is never moved (made at its capacity, pushed only within it), and a chunk any lend
+/// was made from is never freed before the `Lent`: [`Lent::get`], the one place arena bytes
+/// are lent beyond a call, marks the chunk (`Inner::lent`) before it lends, and a commit frees
+/// only an unmarked chunk (whose bytes no reference outlives: every other read of a chunk, a
+/// put's compare, a commit's layout, a pointer's decode, ends inside its call), dropping its
+/// keys from `Inner::puts` so no later get reaches it. The caller borrows that `Lent` for `'l`,
+/// so it lives, with nothing lent of it dropped, for `'l`; no `&mut` to those bytes is ever made
+/// (a mapping is read-only, a block is written once, before its first lend).
 unsafe fn lend<'l>(ptr: *const u8, len: usize) -> &'l [u8] {
     // SAFETY: the function's contract, above.
     unsafe { core::slice::from_raw_parts(ptr, len) }
@@ -241,6 +282,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         let inner = Inner {
             store,
             chunks: Vec::new_in(alloc.clone()),
+            lent: Vec::new_in(alloc.clone()),
             puts: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: alloc.clone(), capacity: None }),
             order: Vec::new_in(alloc.clone()),
             committed: 0,
@@ -264,8 +306,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             let bytes = block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize);
             let (ptr, len) = (bytes.as_ptr(), bytes.len());
             inner.counts.from_puts += 1;
+            // Marked before the lend: this chunk is kept to the `Lent`'s end (`lend`'s contract).
+            inner.lent[at.chunk as usize] = true;
             // SAFETY: `ptr..ptr + len` is in this `Lent`'s arena chunk `at.chunk`, written by
-            // the put before this lend; the lend is for `&self` (`lend`'s contract).
+            // the put before this lend, marked lent just now; the lend is for `&self` (`lend`'s
+            // contract).
             return Ok(Some(Lend { tag: at.tag, namespace: at.namespace, bytes: unsafe { lend(ptr, len) }, own: true }));
         }
         let Some(found) = inner.store.get(key).map_err(stopped("reading a record"))? else {
@@ -290,6 +335,13 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// commit. A key held with equal bytes is left as it is (rule 25); with other bytes it is
     /// refused (rule 21). The store is asked too (it maps at a first probe, as a get does).
     pub fn put(&self, key: &Key, namespace: Namespace, tag: Tag, bytes: &[u8]) -> Result<Put, LentError> {
+        self.put_parts(key, namespace, tag, &[bytes])
+    }
+
+    /// [`Lent::put`] of the concatenation of `parts`, never joined first: each part copied
+    /// once, in order, into the arena (a record's head and its payload, blaze-cli
+    /// engine_store.rs). Only a refusal joins them, to name the first differing byte.
+    pub fn put_parts(&self, key: &Key, namespace: Namespace, tag: Tag, parts: &[&[u8]]) -> Result<Put, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
         if !inner.store.core().writes().contains(&namespace) {
@@ -299,73 +351,95 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             return Err(LentError::PointerTag { key: *key });
         }
         inner.counts.puts += 1;
+        let total: usize = parts.iter().map(|part| part.len()).sum();
         if let Some(at) = inner.puts.get(&key.0.0).copied() {
             let kept = block_bytes(&inner.chunks[at.chunk as usize][at.block as usize..], at.len as usize);
-            if kept == bytes && at.namespace == namespace && at.tag == tag {
+            if parts_equal(kept, parts) && at.namespace == namespace && at.tag == tag {
                 inner.counts.puts_same += 1;
                 return Ok(Put::Same);
             }
             let held = Held { namespace: at.namespace, tag: at.tag, bytes: kept, own: true };
-            return Err(held.against(key, namespace, tag, bytes));
+            return Err(held.against(key, namespace, tag, &joined(parts)));
         }
         if let Some(found) = inner.store.get(key).map_err(stopped("checking a put against the store"))? {
             let got = inner.store.got(found);
-            if got.bytes == bytes && got.tag == tag {
+            if parts_equal(got.bytes, parts) && got.tag == tag {
                 inner.counts.puts_same += 1;
                 return Ok(Put::Same);
             }
             let held = Held { namespace: got.namespace, tag: got.tag, bytes: got.bytes, own: false };
-            return Err(held.against(key, namespace, tag, bytes));
+            return Err(held.against(key, namespace, tag, &joined(parts)));
         }
-        let (chunk, block, len) = self.copy_in(inner, bytes)?;
+        let (chunk, block, len) = self.copy_in(inner, parts)?;
         let at = PutAt { chunk, block, len, tag, namespace, order: inner.order.len() as u32 };
         inner.puts.insert(key.0.0, at);
         inner.order.push(key.0.0);
-        inner.uncommitted_bytes += bytes.len() as u64;
+        inner.uncommitted_bytes += total as u64;
         Ok(Put::Written)
     }
 
-    /// `bytes` copied into the arena, within a chunk's capacity (`lend`'s contract), with room
-    /// reserved for one more put and its place in the order: `(chunk, block, len)`.
-    fn copy_in(&self, inner: &mut Inner<D, A>, bytes: &[u8]) -> Result<(u32, u32, u32), LentError> {
-        let need = bytes.len().div_ceil(16).max(1);
+    /// The concatenation of `parts` copied into the arena, within a chunk's capacity (`lend`'s
+    /// contract), with room reserved for one more put and its place in the order:
+    /// `(chunk, block, len)`.
+    fn copy_in(&self, inner: &mut Inner<D, A>, parts: &[&[u8]]) -> Result<(u32, u32, u32), LentError> {
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        let need = total.div_ceil(16).max(1);
         let chunk_at = match self.plant {
             LentPlant::OneBuffer => {
                 if inner.chunks.is_empty() {
-                    inner.chunks.try_reserve(1).map_err(|_| LentError::Arena { bytes: bytes.len() })?;
+                    inner.chunks.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
+                    inner.lent.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
                     inner.chunks.push(Vec::new_in(self.alloc.clone()));
+                    inner.lent.push(false);
                 }
                 // The planted bug: one buffer, grown in place or moved.
-                inner.chunks[0].try_reserve(need).map_err(|_| LentError::Arena { bytes: bytes.len() })?;
+                inner.chunks[0].try_reserve(need).map_err(|_| LentError::Arena { bytes: total })?;
                 0
             }
-            LentPlant::None | LentPlant::RootFirst | LentPlant::PointerFirst => {
-                let fits = inner.chunks.last().is_some_and(|chunk| chunk.capacity() - chunk.len() >= need);
+            LentPlant::None | LentPlant::RootFirst | LentPlant::PointerFirst | LentPlant::FreesLent => {
+                // A chunk that lent takes no more puts: they would be kept with it.
+                let fits = inner.chunks.last().is_some_and(|chunk| chunk.capacity() - chunk.len() >= need) && inner.lent.last() == Some(&false);
                 if !fits {
                     let mut chunk: Vec<Block, A> = Vec::new_in(self.alloc.clone());
-                    chunk.try_reserve_exact(need.max(CHUNK_BLOCKS)).map_err(|_| LentError::Arena { bytes: bytes.len() })?;
-                    inner.chunks.try_reserve(1).map_err(|_| LentError::Arena { bytes: bytes.len() })?;
+                    chunk.try_reserve_exact(need.max(CHUNK_BLOCKS)).map_err(|_| LentError::Arena { bytes: total })?;
+                    inner.chunks.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
+                    inner.lent.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
                     inner.chunks.push(chunk);
+                    inner.lent.push(false);
                     inner.counts.chunks += 1;
                 }
                 inner.chunks.len() - 1
             }
         };
-        inner.puts.try_reserve(1).map_err(|_| LentError::Arena { bytes: bytes.len() })?;
-        inner.order.try_reserve(1).map_err(|_| LentError::Arena { bytes: bytes.len() })?;
-        let len = u32::try_from(bytes.len()).map_err(|_| LentError::Arena { bytes: bytes.len() })?;
+        inner.puts.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
+        inner.order.try_reserve(1).map_err(|_| LentError::Arena { bytes: total })?;
+        let len = u32::try_from(total).map_err(|_| LentError::Arena { bytes: total })?;
         let chunk = &mut inner.chunks[chunk_at];
         let block = chunk.len();
-        // Within the capacity reserved above: the buffer does not move (`lend`'s contract).
-        if bytes.is_empty() {
-            chunk.push(Block([0; 16]));
+        // Within the capacity reserved above: the buffer does not move (`lend`'s contract). A
+        // block may take the end of one part and the start of the next.
+        let mut one = Block([0; 16]);
+        let mut fill = 0usize;
+        for part in parts {
+            let mut rest: &[u8] = part;
+            while !rest.is_empty() {
+                let take = (16 - fill).min(rest.len());
+                one.0[fill..fill + take].copy_from_slice(&rest[..take]);
+                fill += take;
+                rest = &rest[take..];
+                if fill == 16 {
+                    chunk.push(one);
+                    one = Block([0; 16]);
+                    fill = 0;
+                }
+            }
         }
-        for piece in bytes.chunks(16) {
-            let mut one = Block([0; 16]);
-            one.0[..piece.len()].copy_from_slice(piece);
+        if fill > 0 || total == 0 {
             chunk.push(one);
         }
         inner.counts.arena_bytes += (need * 16) as u64;
+        inner.counts.held_bytes += (need * 16) as u64;
+        inner.counts.copied += 1;
         Ok((chunk_at as u32, block as u32, len))
     }
 
@@ -395,7 +469,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             inner.counts.puts_same += 1;
             return Ok(Put::Same);
         }
-        let (chunk, block, len) = self.copy_in(inner, &target.0.0)?;
+        let (chunk, block, len) = self.copy_in(inner, &[&target.0.0])?;
         let order = kept.unwrap_or(inner.order.len());
         inner.puts.insert(name.0.0, PutAt { chunk, block, len, tag: POINTER_TAG, namespace: Namespace::LOCAL, order: order as u32 });
         if kept.is_none() {
@@ -462,7 +536,8 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     }
 
     /// What is not yet committed, one segment per namespace, one flip (a whole store: the
-    /// commit maps what is left first). The arena keeps every byte: what it lent stays lent.
+    /// commit maps what is left first). Then every arena chunk no get lent from is freed and
+    /// its puts are read from the segment; what it lent stays lent (`lend`'s contract).
     pub fn commit(&self) -> Result<Committed, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
@@ -496,6 +571,25 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         let committed = inner.store.commit_with(&refs).map_err(stopped("committing"))?;
         inner.committed = upto;
         inner.uncommitted_bytes = 0;
+        drop(refs);
+        drop(batches);
+        // Every put is in a segment now, read from its mapping: each chunk no get lent from is
+        // freed, and its keys leave `puts` so a later get reads the segment (`lend`'s contract).
+        // A chunk that lent stays, with its keys, to the `Lent`'s end.
+        let free_lent = self.plant == LentPlant::FreesLent;
+        let Inner { chunks, lent, puts, counts, .. } = inner;
+        let mut freed_any = false;
+        for (chunk, lent) in chunks.iter_mut().zip(lent.iter()) {
+            if (!*lent || free_lent) && chunk.capacity() > 0 {
+                counts.held_bytes = counts.held_bytes.saturating_sub(chunk.len() as u64 * 16);
+                counts.freed_chunks += 1;
+                *chunk = Vec::new_in(self.alloc.clone());
+                freed_any = true;
+            }
+        }
+        if freed_any {
+            puts.retain(|_, at| chunks[at.chunk as usize].capacity() > 0);
+        }
         Ok(committed)
     }
 

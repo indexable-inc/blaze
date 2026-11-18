@@ -1143,10 +1143,10 @@ impl<'n> FileTypes<'n> {
                 let prefix = match place {
                     Some(_) if r.within.is_none() => bstd::mem::format_in!(frame, ""),
                     Some(_) => bstd::mem::format_in!(frame, "in `{shown}`: "),
-                    None => bstd::mem::format_in!(
-                        frame,
-                        "in `{shown}`, a body a macro wrote (where its text came from in yours is not in the records yet: blaze-scope expansion_origins.rs), shown at the item's start: "
-                    ),
+                    None => {
+                        let unplaced = covered::WRITTEN_UNPLACED;
+                        bstd::mem::format_in!(frame, "in `{shown}`, {unplaced}")
+                    }
                 };
                 let at_entry = |start: u32, end: u32| -> (u32, u32) {
                     match place.and_then(|shift| Some((shift.checked_add(start)?, shift.checked_add(end)?))) {

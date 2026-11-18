@@ -9,13 +9,20 @@
 //! (engine_answer.rs), its bytes pinned with the answer's pages.
 //!
 //! ```text
-//! record  "BEF1" | blocks u32 | per block, by name: kind u8 | subject [32] | bytes u32 | entries
+//! record  "BEF2" | blocks u32 | per block, by name: kind u8 | subject [32] | bytes u32 | entries
 //! entry   0 | rule u16 | start u32 | end u32 | path bytes u32 (NO_PATH: none) | path | words u32 | words
 //!         1 | class u8 | words u32 | words
+//!         2 | rule u16 | start u32 | end u32 | path u32 | path | chain u64 | edition u8 | words u32 | words
 //! ```
 //!
 //! A finding's words are its record's message as stored (a names record's place pieces in
-//! them); a finding with a path is an outline's, placed at its file's start.
+//! them); a finding with a path is an outline's, placed at its file's start. A PLACED finding
+//! (2) is a body's: `start..end` from its item's start (rule 71), the item named by its chain
+//! (work.rs `item_chain`) in the outline of `edition`, found in the file as it is when printed,
+//! so a finding that stands while lines above its item moved is drawn where the item is now.
+//! A block's entries are in the order its maker sorted them (a body's by start, end, rule and
+//! words: rule 25). (2: the placed finding; a "BEF1" record is refused as another form, and the
+//! request is answered in full.)
 
 use core::fmt;
 
@@ -31,12 +38,13 @@ use bstd::out::Out;
 use crate::{CliError, print, work};
 
 /// The record's form.
-pub(crate) const LINES_MAGIC: &[u8; 4] = b"BEF1";
+pub(crate) const LINES_MAGIC: &[u8; 4] = b"BEF2";
 const LINES_DOMAIN: &str = "blaze-cli engine-check lines";
 /// A finding with no path of its own.
 const NO_PATH: u32 = u32::MAX;
 const FINDING: u8 = 0;
 const NOTE: u8 = 1;
+const PLACED: u8 = 2;
 
 /// What a note counts as in the command's status (main.rs `close`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,6 +119,24 @@ impl<'a> Lines<'a> {
             }
             None => word(block, NO_PATH),
         }
+        word(block, len_of(words));
+        block.extend_from_slice(words);
+    }
+
+    /// A finding of `name` (a body's) placed in an item of the file at `path`: `start..end` from
+    /// the item's start, the item the one whose chain is `chain` (work.rs `item_chain`) in the
+    /// file's outline of `edition`.
+    #[expect(clippy::too_many_arguments, reason = "one entry's fields, each written as it is stored")]
+    pub(crate) fn placed(&mut self, name: Name, rule: u16, start: u32, end: u32, path: &[u8], chain: u64, edition: blaze_surface::Edition, words: &[u8]) {
+        let block = self.block(name);
+        block.push(PLACED);
+        block.extend_from_slice(&rule.to_le_bytes());
+        word(block, start);
+        word(block, end);
+        word(block, len_of(path));
+        block.extend_from_slice(path);
+        block.extend_from_slice(&chain.to_le_bytes());
+        block.push(edition.byte());
         word(block, len_of(words));
         block.extend_from_slice(words);
     }
@@ -195,6 +221,12 @@ impl<'m> Reader<'m> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    fn u64(&mut self, what: &'static str) -> Result<u64, LinesError> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.take(8, what)?);
+        Ok(u64::from_le_bytes(b))
+    }
+
     fn sized(&mut self, what: &'static str) -> Result<&'m [u8], LinesError> {
         let len = self.u32(what)?;
         self.take(len as usize, what)
@@ -205,6 +237,8 @@ impl<'m> Reader<'m> {
 enum Entry<'m> {
     Finding { rule: u16, start: u32, end: u32, path: Option<&'m [u8]>, words: &'m [u8] },
     Note { class: Class, words: &'m [u8] },
+    /// A body's finding, placed by its item's chain (module docs).
+    Placed { rule: u16, start: u32, end: u32, path: &'m str, chain: u64, edition: blaze_surface::Edition, words: &'m [u8] },
 }
 
 fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
@@ -232,7 +266,19 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
             }
             Ok(Entry::Note { class, words })
         }
-        _ => Err(LinesError { at: reader.at - 1, what: "an entry's tag is neither a finding nor a note" }),
+        PLACED => {
+            let rule = reader.u16("a placed finding's rule")?;
+            let start = reader.u32("a placed finding's start")?;
+            let end = reader.u32("a placed finding's end")?;
+            let at = reader.at;
+            let path = core::str::from_utf8(reader.sized("a placed finding's path")?).map_err(|_| LinesError { at, what: "a placed finding's path is not UTF-8" })?;
+            let chain = reader.u64("a placed finding's item chain")?;
+            let at = reader.at;
+            let edition = blaze_surface::Edition::from_byte(reader.byte("a placed finding's edition")?).ok_or(LinesError { at, what: "a placed finding's edition byte is no edition" })?;
+            let words = reader.sized("a placed finding's words")?;
+            Ok(Entry::Placed { rule, start, end, path, chain, edition, words })
+        }
+        _ => Err(LinesError { at: reader.at - 1, what: "an entry's tag is none of finding, note and placed finding" }),
     }
 }
 
@@ -240,7 +286,7 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
 pub(crate) fn decode<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<Last<'m, 'a>, LinesError> {
     let mut reader = Reader { bytes, at: 0 };
     if reader.take(4, "the form")? != LINES_MAGIC {
-        return Err(LinesError { at: 0, what: "the form is not BEF1" });
+        return Err(LinesError { at: 0, what: "the form is not BEF2" });
     }
     let count = reader.u32("the block count")?;
     let mut blocks: SVec<'a, (Name, &'m [u8])> = SVec::new_in(alloc);
@@ -315,7 +361,9 @@ pub(crate) fn print_all<'f, 'b>(
     for (name, block) in blocks {
         let mut reader = Reader { bytes: block, at: 0 };
         while reader.at < block.len() {
-            match entry(&mut reader).map_err(refused)? {
+            // A finding's rule, range and message, and where it is drawn: its file, its place and
+            // the words drawn (the message but for its place pieces).
+            let (rule, start, end, message, path, place, words): (u16, u32, u32, &[u8], Option<&'f str>, print::Place, &[u8]) = match entry(&mut reader).map_err(refused)? {
                 Entry::Note { class, words } => {
                     // Checked UTF-8 at the decode, and made from a `str` at the write.
                     let words = core::str::from_utf8(words).map_err(|_| CliError::Text { what: "a note's words are not UTF-8" })?;
@@ -333,6 +381,7 @@ pub(crate) fn print_all<'f, 'b>(
                             tally.waited += 1;
                         }
                     }
+                    continue;
                 }
                 Entry::Finding { rule, start, end, path, words: message } => {
                     let (path, place, words): (Option<&'f str>, print::Place, &[u8]) = match path {
@@ -348,30 +397,33 @@ pub(crate) fn print_all<'f, 'b>(
                             }
                         }
                     };
-                    let kept: &'f [u8] = Vec::from_slice_in(words, frame).leak();
-                    let at = prints.len();
-                    let at_item = match place {
-                        print::Place::Chain(chain, _) => (1, chain),
-                        print::Place::At(start) => (0, u64::from(start)),
-                        print::Place::Counted => (2, 0),
-                    };
-                    let what = Seen { path, at_item, rule, start, end, words: kept };
-                    if let Some(&first) = seen.get(&what) {
-                        if prints[first].name != name && !prints[first].also.contains(&name) {
-                            prints[first].also.push(name);
-                        }
-                        continue;
-                    }
-                    seen.insert(what, at);
-                    let mut whole = Vec::new_in(listed);
-                    whole.extend_from_slice(message);
-                    prints.push(Print { name, also: Vec::new_in(listed), condition: Condition::ANY, file: None, place: 0, rule, start, end, message: whole });
-                    wanted.push(print::Wanted { path, place, words: kept });
-                    match runs.last_mut() {
-                        Some(run) if run.0 == path && run.2 == at => run.2 = at + 1,
-                        _ => runs.push((path, at, at + 1)),
-                    }
+                    (rule, start, end, message, path, place, words)
                 }
+                // A body's finding: in its item, found by its chain in the file as it is now.
+                Entry::Placed { rule, start, end, path, chain, edition, words } => (rule, start, end, words, Some(work::held_str(path, frame)), print::Place::Chain(chain, edition), words),
+            };
+            let kept: &'f [u8] = Vec::from_slice_in(words, frame).leak();
+            let at = prints.len();
+            let at_item = match place {
+                print::Place::Chain(chain, _) => (1, chain),
+                print::Place::At(start) => (0, u64::from(start)),
+                print::Place::Counted => (2, 0),
+            };
+            let what = Seen { path, at_item, rule, start, end, words: kept };
+            if let Some(&first) = seen.get(&what) {
+                if prints[first].name != name && !prints[first].also.contains(&name) {
+                    prints[first].also.push(name);
+                }
+                continue;
+            }
+            seen.insert(what, at);
+            let mut whole = Vec::new_in(listed);
+            whole.extend_from_slice(message);
+            prints.push(Print { name, also: Vec::new_in(listed), condition: Condition::ANY, file: None, place: 0, rule, start, end, message: whole });
+            wanted.push(print::Wanted { path, place, words: kept });
+            match runs.last_mut() {
+                Some(run) if run.0 == path && run.2 == at => run.2 = at + 1,
+                _ => runs.push((path, at, at + 1)),
             }
         }
     }

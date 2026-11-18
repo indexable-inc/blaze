@@ -219,3 +219,27 @@ fn walk(names: &Names<'_, '_, '_>, target: &str, text: &mut blaze_own::String<&F
     }
     Ok(Status::OK)
 }
+
+/// The checkout's stored answer handed to `with`, opened as [`explain`] opens it (`None`: none
+/// stored, or one that does not read): what a command-level test asks of the rows' read lists
+/// and definitions (engine_check_tests.rs `names_reads_of_bodies`). Nothing is written.
+#[cfg(test)]
+pub(crate) fn with_kept<R>(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, phases: &mut Phases, err: &Out, with: impl FnOnce(&Kept<'_>) -> R) -> Result<Option<R>, CliError> {
+    let frame = cx.frame();
+    let erased = blaze_own::Erased::new(frame);
+    let place = &opts.place;
+    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err)?;
+    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
+    let answer_root = crate::engine_answer::root_name(place.checkout, &opts.tools, frame);
+    let got = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
+        Some(Ok(pointer)) => match crate::engine_answer::load_answer(cx, &mut store, pointer.root, opts.heap.shared())? {
+            Ok((kept, _)) => Some(with(&kept)),
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
+    drop(store);
+    crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
+    Ok(got)
+}

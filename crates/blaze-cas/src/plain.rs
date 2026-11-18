@@ -135,6 +135,8 @@ mod verified;
 #[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]
+mod phase_commit_tests;
+#[cfg(test)]
 mod pointer_tests;
 #[cfg(test)]
 mod root_commit_tests;

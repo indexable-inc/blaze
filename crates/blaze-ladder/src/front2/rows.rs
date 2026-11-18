@@ -226,6 +226,68 @@ mod tests {
         let _: PTy = last;
     }
 
+    /// A LIVE view (blaze-typeck `PTys`, lane VH): a view of a stable table taken, then 1,000
+    /// types and their lists interned through `&self` (what an import during a body's check
+    /// does): (a) each is read through the OLD view, equal to a fresh view, and through a
+    /// seeded body's view (`OwnTys::in_base`) taken before them; (b) their ids are dense and
+    /// unique; (c) the owned form reads the same nodes and lists through the same accessors.
+    /// The control (d): a view of the same snapshot WITHOUT the column (`PTys::flat`) refuses a
+    /// late id by type of error (`Malformed::TypeOrder`; a late list: `Malformed::List`).
+    #[test]
+    fn a_view_taken_before_an_import_reads_it() {
+        use blaze_typeck::{CheckError, List, Malformed, OwnTys, PNode, PTy, PTys, PortableTys};
+        let g = blaze_own::Alloc::global();
+        let stable = stable_tys(g).expect("the stable table");
+        let mut owned = PortableTys::new_in(g);
+        let unit = PNode::Tuple(List::EMPTY);
+        let first = stable.intern_shared(unit).expect("interned");
+        assert_eq!(owned.intern(unit).expect("interned"), first);
+        let old = stable.view();
+        let old_len = old.len();
+        let seeded = OwnTys::in_base(g);
+        let body_view = seeded.view(&stable).expect("a seeded body's view");
+        let mut made: Vec<(PTy, List), Global> = Vec::new_in(Global);
+        let mut last = first;
+        for _ in 0..1_000u32 {
+            let list = stable.intern_list_shared(&[last, first]).expect("a list");
+            let t = stable.intern_shared(PNode::Tuple(list)).expect("interned");
+            assert_eq!(owned.intern_list(&[last, first]).expect("a list"), list);
+            assert_eq!(owned.intern(PNode::Tuple(list)).expect("interned"), t);
+            made.push((t, list));
+            last = t;
+        }
+        // (b) Dense and unique: the k-th type made is `PTy(k + 1)`, after `()`.
+        for (k, &(t, _)) in made.iter().enumerate() {
+            assert_eq!(t.0 as usize, k + 1, "ids dense and unique");
+        }
+        let fresh = stable.view();
+        let owned_view = owned.view();
+        assert_eq!(old.len(), old_len, "the old view's snapshot is as it was");
+        assert_eq!(old.len_now(), fresh.len(), "the old view's column as it stands");
+        for &(t, list) in made.iter() {
+            assert_eq!(old.node(t).ok(), Some(PNode::Tuple(list)), "(a) read through the old view");
+            assert_eq!(old.node(t).ok(), fresh.node(t).ok());
+            assert_eq!(body_view.node(t).ok(), fresh.node(t).ok(), "(a) through the seeded body's view");
+            assert_eq!(old.list(list).ok(), fresh.list(list).ok());
+            assert_eq!(body_view.list(list).ok(), fresh.list(list).ok());
+            for i in list.range() {
+                assert_eq!(old.list_slot(i), fresh.list_slot(i));
+            }
+            // (c) The owned form, through the same accessors.
+            assert_eq!(owned_view.node(t).ok(), Some(PNode::Tuple(list)));
+            assert_eq!(owned_view.list(list).ok(), fresh.list(list).ok());
+        }
+        // (d) The control: the old snapshot without the column.
+        let mut nodes = Vec::new_in(Global);
+        nodes.extend(old.nodes().copied());
+        let mut lists = Vec::new_in(Global);
+        lists.extend(old.lists().copied());
+        let snapshot = PTys::flat(&nodes, &lists);
+        assert_eq!(snapshot.node(first).ok(), Some(unit));
+        assert!(matches!(snapshot.node(made[0].0), Err(CheckError::Malformed(Malformed::TypeOrder { .. }))), "a late id past a snapshot is refused");
+        assert!(matches!(snapshot.list(made[0].1), Err(CheckError::Malformed(Malformed::List { .. }))), "a late list past a snapshot is refused");
+    }
+
     /// A row read before many more are filed (past the first commit, and past the index map's
     /// growth), replaced and removed, is still at its address with its value: the property the
     /// on-the-spot head rests on. The control: the same through a `Vec` moves the row.

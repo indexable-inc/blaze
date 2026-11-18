@@ -66,6 +66,8 @@ mod run_parent;
 #[allow(dead_code, reason = "program.rs `run` calls run_program in the next step (wiring run-parent-io-1, 'Not wired')")]
 mod run_loop;
 mod run_ids;
+// `blaze run`'s live status line on stderr: blaze-screen's `RunStatus` driven by the run's events.
+mod run_line;
 mod run_names;
 // `blaze run`'s program: `-p`, `--bin` and the workspace's defaults.
 mod run_package;
@@ -88,6 +90,7 @@ mod work;
 mod engine_answer;
 mod engine_check;
 mod engine_bodies;
+mod engine_heads;
 mod engine_lines;
 mod engine_why;
 mod engine_names;
@@ -207,6 +210,8 @@ pub enum CliError {
     /// full, once (`command`'s `ask`). `again`: it was already asked in full, which walks and
     /// never stands, so this is blaze's bug.
     AnswerInFull { again: bool },
+    /// `blaze run`'s live status line failed (run_line.rs): its thread, or a write of it.
+    RunLine(run_line::RunLineError),
 }
 
 impl fmt::Display for CliError {
@@ -245,6 +250,7 @@ impl fmt::Display for CliError {
             CliError::Draw(error) => write!(f, "{error}"),
             CliError::Lints(error) => write!(f, "{error}"),
             CliError::RunNames(error) => write!(f, "{error}"),
+            CliError::RunLine(error) => write!(f, "{error}"),
             CliError::AnswerInFull { again: false } => {
                 write!(f, "the run stood on its certificate and the store holds no record of its program's names rows (run_names.rs `stood`): it is asked again in full")
             }
@@ -555,14 +561,14 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
     // records and the roots, comes after the answer is printed (below).
     let opened = store::open_for_command(cx, io, var("HOME"), &root, checkout_at, phases.clock(), err)?;
     // The request as this command makes it; it takes what it prints into and gives it back.
-    let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
+    let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases, watch: &dyn blaze_screen::Watch| {
         let exe_dir = exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why);
         // A run that stood on its certificate with no record of its program's names rows is
         // dropped before its program starts and asked again in full, once (run_names.rs; a
         // request asked in full walks, so a second one is blaze's bug, named).
         let mut in_full = false;
         loop {
-            let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, sdk, exe_dir), origin.as_ref(), (&opened.home, &opened.lent, opened.open_ns), (command, word), workers, &producers, work::Sizes::USUAL, &launch, &blaze_screen::Unwatched, frame, out, err, ran, &mut shown, phases, heap, in_full);
+            let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, sdk, exe_dir), origin.as_ref(), (&opened.home, &opened.lent, opened.open_ns), (command, word), workers, &producers, work::Sizes::USUAL, &launch, watch, frame, out, err, ran, &mut shown, phases, heap, in_full);
             if !in_full && matches!(finished, Err(CliError::AnswerInFull { .. })) {
                 in_full = true;
                 continue;
@@ -570,21 +576,29 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
             break finished.map(|finished| (finished, shown));
         }
     };
+    // `blaze run`'s live status line on the error stream when it is a terminal (run_line.rs):
+    // the run's events go to it; it is erased, and its thread joined, before `asked` is had.
+    let line = run_line::LineOpts::new(&|name| var(name).map(std::string::String::from), err, flags.color);
+    let line = run_line::LineOpts { live: line.live && command == Command::Run, ..line };
+    let clock = phases.clock().clone();
     // The whole request, behind the command's one edge for a panic (rule 20): a command that
     // fails or panics still leaves its profile, so why it stopped is read, not guessed (rule 17).
-    let asked = work::unwinding(|| match flags.fix {
-        None => ask(shown, &mut ran, phases).map(Some),
-        Some((start, end)) => {
-            if command != Command::Check {
-                return Err(CliError::Usage("--fix is `blaze check`'s"));
+    let asked = work::unwinding(|| {
+        let lined = run_line::watched(cx, io, err, &clock, line, |watch| match flags.fix {
+            None => ask(shown, &mut ran, phases, watch).map(Some),
+            Some((start, end)) => {
+                if command != Command::Check {
+                    return Err(CliError::Usage("--fix is `blaze check`'s"));
+                }
+                let mut selectors: Vec<&str, &Frame> = Vec::with_capacity_in(end - start, frame);
+                selectors.extend((start..end).filter_map(|at| args.get(at)));
+                match fix_then_check::<fix::Atomic>(cx, &root, &selectors, (caps, view, shown_root.as_str()), frame, out, &mut |shown| ask(shown, &mut ran, phases, watch))? {
+                    Fixed::Refused => Ok(None),
+                    Fixed::Checked(finished, again) => Ok(Some((finished, again))),
+                }
             }
-            let mut selectors: Vec<&str, &Frame> = Vec::with_capacity_in(end - start, frame);
-            selectors.extend((start..end).filter_map(|at| args.get(at)));
-            match fix_then_check::<fix::Atomic>(cx, &root, &selectors, (caps, view, shown_root.as_str()), frame, out, &mut |shown| ask(shown, &mut ran, phases))? {
-                Fixed::Refused => Ok(None),
-                Fixed::Checked(finished, again) => Ok(Some((finished, again))),
-            }
-        }
+        });
+        lined.map_err(CliError::RunLine).and_then(|asked| asked)
     });
     let (mut finished, shown) = match asked {
         Ok(Ok(Some(done))) => done,

@@ -1,0 +1,15 @@
+{
+ "id": "engine-body-findings-dropped-to-a-count",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane SD",
+ "where": "crates/blaze-cli/src/engine_bodies.rs (Ran, run_bodies, note), engine_lines.rs (the lines record), engine_check.rs (the print loop)",
+ "what": "the real run g125544: a callee's parameter type changed, two callers stopped type-checking, and `engine-check` printed two notes 'the body of `mean` has 1 finding(s) ... their words are not carried out of the body task yet' above '0 errors: blaze check'. The body task already returned each line (task.rs BodyOut::said); the engine driver kept only the count, and the notes were counted as failures, never as errors, so the closing line read 0.",
+ "cost": "one lane",
+ "cause": "the body task's findings reached the driver as a count and a note, not as findings of the lines record, so the counting printer (engine_lines.rs print_all) never saw them",
+ "whys": "a placeholder note stood where the finding's words were owed; the closing line counts only what goes through `print::finding`",
+ "class": "a stage whose findings reach the printer as a note: it prints a pass count beside a failure",
+ "prevention": "done: a body's findings are placed findings of the lines record (BEF2, tag 2: rule, item-relative range, path, item chain, edition, words), printed and counted by print_all like an outline's; the 'has N finding(s)' note is deleted; tests engine_check_prints_a_body_error_as_check_does and engine_check_prints_a_lint_and_a_borrow_finding_as_check_does",
+ "annoyance": "the old path's message pieces for a body finding (code 0x1F prefix words) live inline in body_types.rs; the engine mirrors them in engine_bodies.rs `found_of` (one place each, cited)",
+ "workaround": "none",
+ "state": "fixed, pending the queue"
+}

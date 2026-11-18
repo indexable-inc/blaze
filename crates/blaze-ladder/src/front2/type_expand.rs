@@ -69,7 +69,7 @@ pub(super) fn expand_type_text<'n, 'a, 't, S: NamesSource<'n>>(names: S, module:
     let krate = names.crate_of(module).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the crate of module {module:x} is not read").into_boxed_str(), r))?;
     let atoms = names.cfg_atoms(krate).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the cfg of the crate of module {module:x} is not read").into_boxed_str(), r))?;
     let edition = names.edition_of(krate).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the edition of the crate of module {module:x} is not read").into_boxed_str(), r))?;
-    let scoped = ScopedBy { names, module, prepared: None };
+    let scoped = ScopedBy { names, module, prepared: None, blocks: &[] };
     let mut expand = ByName::with_names(&scoped, NoHost, alloc);
     let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, alloc)
         .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;

@@ -22,7 +22,7 @@ use blaze_typeck::{
 
 use super::buckets::Buckets;
 use super::fill::FillError;
-use super::heads::{Store, Want};
+use super::heads::{Seeded, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::langs::{lang_name, trait_lang};
@@ -30,6 +30,10 @@ use super::spell::{Spelling, Unspelled};
 use super::types::SelfTy;
 use super::source::NamesSource;
 use crate::resolve::{Paths, ResolveError};
+
+/// How many heads one question of a seeded body's world imports at most before its answer
+/// ([`BodyWorld::again`]; rule 18).
+pub const MOST_IMPORTS_A_QUESTION: usize = 256;
 
 /// What the check loop makes before it checks the body again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +292,43 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         Err(Missing)
     }
 
+    /// Want `w` made, the one seam between the two ways a body's check meets a head it does
+    /// not hold (rule 78; the cost test runs both and asserts equal answers and read lists):
+    /// - IMPORT NOW: over a seeded store (`Store::seeds`, a body task's frozen heads) `w`'s
+    ///   cell is filed from its frozen record through shared borrows, the same `HeadSeed::seed`
+    ///   `Store::ensure` calls between rounds, and the answer is `Missing` with no fill:
+    ///   [`Self::again`] asks the question again at once, and the round goes on;
+    /// - NEXT ROUND: over a lowering store (no `seeds`), the fill `Store::ensure` makes
+    ///   between rounds (`check.rs` `make_round`). A seed that files nothing, or refuses, is
+    ///   left to that same fill: `Store::ensure` asks the seed again and stops the body with
+    ///   its typed refusal naming the head (`HeadError::Seed`), as before (rule 3).
+    pub(super) fn store_want<T>(&self, w: Want) -> Fetch<T> {
+        if let Some(seeds) = self.store.seeds {
+            let _cost = super::tables::cost::Cost::enter_want(self.store.cost, w);
+            let filed = seeds.seed(self.store, self.keys, w, self.store.tys.alloc());
+            if matches!(filed, Ok(Seeded::Filed)) && self.store.made(w) {
+                self.store.imported.set(self.store.imported.get() + 1);
+                return Err(Missing);
+            }
+        }
+        self.fill(Fill::Store(w))
+    }
+
+    /// `ask` answered, asked again after each head it imported ([`Self::store_want`]). Each
+    /// import files a cell not filed before (`want_unmade` asks only an unmade want), so the
+    /// asks are bounded by the cells the question reads; past [`MOST_IMPORTS_A_QUESTION`] the
+    /// last `Missing` stands and the round ends (check.rs `check_rounds_as` goes on).
+    fn again<T>(&self, ask: impl Fn() -> Fetch<T>) -> Fetch<T> {
+        for _ in 0..MOST_IMPORTS_A_QUESTION {
+            let before = self.store.imported.get();
+            let got = ask();
+            if got.is_ok() || self.store.imported.get() == before {
+                return got;
+            }
+        }
+        ask()
+    }
+
     /// `Missing`, noting the want that makes `key`'s record, by what `key` is
     /// ([`super::by_origin::want_unmade`]): a kind no want makes is its named gap, and a want
     /// already made (whose answer is still not in the store) is `KindGap::MadeWithoutRow`,
@@ -355,8 +396,83 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
     }
 }
 
+/// The world's answers, each asked again after an import on the spot ([`BodyWorld::again`]).
 impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     fn fn_sig(&self, _: Seal, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
+        self.again(|| self.fn_sig_once(item))
+    }
+    fn predicates(&self, _: Seal, item: ItemKey) -> Fetch<Predicates<'_>> {
+        self.again(|| self.predicates_once(item))
+    }
+    fn field_defaults(&self, _: Seal, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
+        self.again(|| self.field_defaults_once(adt))
+    }
+    fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
+        self.again(|| self.adt_once(item))
+    }
+    fn impls_of(&self, _: Seal, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
+        self.again(|| self.impls_of_once(trait_, shape))
+    }
+    fn impl_header(&self, _: Seal, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
+        self.again(|| self.impl_header_once(item))
+    }
+    fn inherent(&self, _: Seal, shape: Shape, name: Name) -> Fetch<&[AssocItem]> {
+        self.again(|| self.inherent_once(shape, name))
+    }
+    fn assoc_item(&self, _: Seal, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>> {
+        self.again(|| self.assoc_item_once(container, name))
+    }
+    fn traits_in_scope(&self, _: Seal, scope: ScopeId) -> Fetch<&[ItemKey]> {
+        self.traits_in_scope_once(scope)
+    }
+    fn resolve_path(&self, _: Seal, scope: ScopeId, p: PathIdx, segments: &[Name]) -> Fetch<tc::PathAnswer> {
+        self.again(|| self.path(scope, p, segments))
+    }
+    fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
+        self.lang_item_once(item)
+    }
+    fn lang_path(&self, _: Seal, item: LangItem) -> Fetch<Option<Def>> {
+        self.again(|| self.lang_path_once(item))
+    }
+    fn const_value(&self, _: Seal, item: ItemKey) -> Fetch<Option<u64>> {
+        self.gap(Gap::BodyRecord(tc::Question::Const(item)))
+    }
+    fn opaque_hidden(&self, _: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
+        self.opaque_hidden_once(item)
+    }
+    fn coroutine(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::CoroutineFacts<'_>>> {
+        self.coroutine_once(owner, ordinal)
+    }
+    fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
+        self.closure_once(owner, ordinal)
+    }
+    fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
+        self.again(|| self.attrs_once(item))
+    }
+    fn trait_def(&self, _: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
+        self.again(|| self.trait_def_once(trait_))
+    }
+    fn assoc_parent(&self, _: Seal, item: ItemKey) -> Fetch<Option<AssocParent>> {
+        self.again(|| self.assoc_parent_once(item))
+    }
+    fn const_holds(&self, _: Seal, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<tc::ConstHolds> {
+        self.const_holds_once(cond, args, types)
+    }
+    fn const_params(&self, _: Seal, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
+        self.again(|| self.const_params_once(item))
+    }
+    fn assoc_generics(&self, _: Seal, trait_: ItemKey, name: Name) -> Fetch<Option<tc::AssocGenerics>> {
+        self.again(|| self.assoc_generics_once(trait_, name))
+    }
+    fn type_alias(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::AliasDef<'_>>> {
+        self.again(|| self.type_alias_once(item))
+    }
+}
+
+/// Each question answered once: `Missing` with a fill or a gap noted, or with a head imported
+/// on the spot ([`BodyWorld::store_want`]), which the trait's method above asks again.
+impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
+    fn fn_sig_once(&self, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
         if let Some(f) = self.store.fns.get(&item) {
             return Ok(Some(FnSig {
                 parent_count: f.parent,
@@ -419,7 +535,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn predicates(&self, _: Seal, item: ItemKey) -> Fetch<Predicates<'_>> {
+    fn predicates_once(&self, item: ItemKey) -> Fetch<Predicates<'_>> {
         // A ctor fn's where-clauses are its type's.
         let item = self.store.ctors.get(&item).map_or(item, |c| c.adt);
         match self.store.preds.get(&item) {
@@ -437,7 +553,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn field_defaults(&self, _: Seal, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
+    fn field_defaults_once(&self, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
         if let Some(d) = self.store.field_defaults.get(&adt) {
             return Ok(&d[..]);
         }
@@ -451,7 +567,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
+    fn adt_once(&self, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
         if let Some(a) = self.store.adts.get(&item) {
             return Ok(Some(tc::Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.types() }));
         }
@@ -461,7 +577,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn impls_of(&self, _: Seal, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
+    fn impls_of_once(&self, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
         if let Some((k, why)) = self.buckets.and_then(|b| b.trait_gap(trait_, shape)) {
             let asked = match self.keys.library_in(self.names, trait_) {
                 Some(lib) => format!("the impls of the trait {lib:x} at {shape:?}"),
@@ -475,7 +591,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn impl_header(&self, _: Seal, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
+    fn impl_header_once(&self, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
         if let Some(i) = self.store.impls.get(&item) {
             return Ok(Some(ImplHeader {
                 generics: i.generics,
@@ -493,7 +609,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn inherent(&self, _: Seal, shape: Shape, name: Name) -> Fetch<&[AssocItem]> {
+    fn inherent_once(&self, shape: Shape, name: Name) -> Fetch<&[AssocItem]> {
         if let Some((k, why)) = self.buckets.and_then(|b| b.inherent_gap(shape, name)) {
             return self.gap(self.failed_impl(k, why, &format!("the inherent items of {shape:?} named {name:?}")));
         }
@@ -503,7 +619,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn assoc_item(&self, _: Seal, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>> {
+    fn assoc_item_once(&self, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>> {
         if let Some(i) = self.store.impls.get(&container) {
             // The fn's `self` from its text (`ImplHead::fn_self`): naming a member makes no
             // signature; `fn_sig` asks for it (`Want::MemberFn`) when the fn is used.
@@ -550,7 +666,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// The module's traits, or the block's when a `use` of the block or of one around it brings
     /// in more ([`super::block_traits`]); a block whose imports are not known is the gap
     /// naming the import.
-    fn traits_in_scope(&self, _: Seal, scope: ScopeId) -> Fetch<&[ItemKey]> {
+    fn traits_in_scope_once(&self, scope: ScopeId) -> Fetch<&[ItemKey]> {
         match self.blocks.at(scope.0) {
             super::block_traits::InScope::Module => Ok(self.traits),
             super::block_traits::InScope::Traits(t) => Ok(t),
@@ -558,18 +674,14 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn resolve_path(&self, _: Seal, scope: ScopeId, p: PathIdx, segments: &[Name]) -> Fetch<tc::PathAnswer> {
-        self.path(scope, p, segments)
-    }
-
-    fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
+    fn lang_item_once(&self, item: LangItem) -> Fetch<Option<ItemKey>> {
         match super::langs::find(self.index, self.resolver(), item) {
             Ok(found) => Ok(found.map(checker_of)),
             Err(why) => self.gap(Gap::Lang(item, why)),
         }
     }
 
-    fn lang_path(&self, _: Seal, item: LangItem) -> Fetch<Option<Def>> {
+    fn lang_path_once(&self, item: LangItem) -> Fetch<Option<Def>> {
         let Some(name) = lang_name(item) else { return self.gap(Gap::Lang(item, "no `#[lang]` name is known for it")) };
         let Some(lib) = self.index.lang(name) else { return self.gap(Gap::Lang(item, "no item of the program's crates is `#[lang]` under its name")) };
         match self.resolver().detail(lib) {
@@ -586,14 +698,14 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                     let name = Name::of(name);
                     return match self.resolver().detail(owner) {
                         Some(ItemDetail::Trait) => {
-                            let Some(t) = self.store.maps.traits.get(&owner) else { return self.fill(Fill::Store(Want::Head(owner))) };
+                            let Some(t) = self.store.maps.traits.get(&owner) else { return self.store_want(Want::Head(owner)) };
                             match t.fns.iter().find(|(n, _)| *n == name) {
                                 Some(&(_, f)) => Ok(Some(Def::Fn(f))),
                                 None => self.gap(Gap::Lang(item, "the trait's head holds no fn of its `#[lang]` name")),
                             }
                         }
                         Some(ItemDetail::Impl) => {
-                            let Some(i) = self.store.impls.get(&checker_of(owner)) else { return self.fill(Fill::Store(Want::Impl(owner))) };
+                            let Some(i) = self.store.impls.get(&checker_of(owner)) else { return self.store_want(Want::Impl(owner)) };
                             match i.fns.iter().find(|(n, _)| *n == name) {
                                 Some(&(_, f)) => Ok(Some(Def::Fn(f))),
                                 None => self.gap(Gap::Lang(item, "the impl holds no fn of its `#[lang]` name")),
@@ -610,17 +722,13 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn const_value(&self, _: Seal, item: ItemKey) -> Fetch<Option<u64>> {
-        self.gap(Gap::BodyRecord(tc::Question::Const(item)))
-    }
-
     /// An opaque type a fn's head made: `None` (a body sees only its bounds: the Reference,
     /// "Impl trait", "Abstract return types") unless the running check's own leak list holds it
     /// (an auto trait of it was asked: "Auto trait leakage") or the world is a ground
     /// resolution's ([`super::opaque_auto::Reveal::All`]), then its hidden type from its
     /// defining body's filed check ([`super::opaque_auto`]). A filed record with no hidden type
     /// for it, and any key no head made, is a gap.
-    fn opaque_hidden(&self, _: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
+    fn opaque_hidden_once(&self, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
         let Some(&(owner, _)) = self.store.opaques.get(&item) else {
             return self.gap(Gap::BodyRecord(tc::Question::Opaque(item)));
         };
@@ -633,7 +741,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// Async block `ordinal` of `owner` (an `async fn`'s hidden type is its root block by
     /// identity, `PNode::Coroutine`): its output and interior from the owner's filed check
     /// (`Store::hidden`); a gap while that body is not filed.
-    fn coroutine(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::CoroutineFacts<'_>>> {
+    fn coroutine_once(&self, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::CoroutineFacts<'_>>> {
         match self.store.hidden.coroutine(owner, ordinal) {
             Some(f) => Ok(Some(f)),
             None => self.gap(Gap::BodyRecord(tc::Question::Coroutine(owner, ordinal))),
@@ -644,7 +752,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// closure's identity"). The checker records the question with its answer's digest, so it
     /// is in this body's read list (rule 21). An owner with no clean record, or an ordinal it
     /// does not hold, is a gap naming the owner by its path and the ordinal (rule 19).
-    fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
+    fn closure_once(&self, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
         match self.store.closures.get(owner, ordinal) {
             Ok((kind, sig)) => Ok(Some(tc::ClosureFacts { kind, sig, types: self.store.tys.view() })),
             Err(why) => {
@@ -664,7 +772,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// its made head's text ([`super::fn_attrs::fn_type_attrs`], `#[rustc_promotable]`,
     /// `#[rustc_intrinsic]`, `#[target_feature]`); a ctor fn carries none. A fn's key is never
     /// asked for as an ADT (rung x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
-    fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
+    fn attrs_once(&self, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {
             // `#[blaze::args]` (rule 83): the options-struct mark, from the made head or its record.
             let args = if a.args { TypeAttrs::ARGS } else { 0 };
@@ -694,11 +802,11 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
             Some(Origin::Item(_)) | None => match self.keys.library_in(self.names, item) {
                 None => self.gap(Gap::Fill(FillError::UnknownKey(item))),
                 Some(lib) => match self.resolver().detail(lib) {
-                    Some(ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => self.fill(Fill::Store(Want::Adt(lib))),
+                    Some(ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => self.store_want(Want::Adt(lib)),
                     Some(ItemDetail::Fn { .. }) => self.want(item),
                     // A variant's ctor: its enum's head makes its row.
                     None => match self.enum_of(lib) {
-                        Some((e, _)) => self.fill(Fill::Store(Want::Adt(e))),
+                        Some((e, _)) => self.store_want(Want::Adt(e)),
                         None => self.gap(Gap::Fill(FillError::UnknownKey(item))),
                     },
                     Some(_) => self.gap(Gap::Fill(FillError::NotAHead(tc::Question::Attrs(item)))),
@@ -707,7 +815,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn trait_def(&self, _: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
+    fn trait_def_once(&self, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
         let Some(lib) = self.keys.library_in(self.names, trait_) else { return Ok(None) };
         let (Some(t), Some(extra)) = (self.store.maps.traits.get(&lib), self.store.trait_defs.get(&trait_)) else {
             return match self.resolver().detail(lib) {
@@ -729,7 +837,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }))
     }
 
-    fn assoc_parent(&self, _: Seal, item: ItemKey) -> Fetch<Option<AssocParent>> {
+    fn assoc_parent_once(&self, item: ItemKey) -> Fetch<Option<AssocParent>> {
         let Some(Origin::Member { container, kind, name }) = self.keys.origin(item) else { return Ok(None) };
         let kind = match kind {
             MemberKind::Fn => AssocKind::Fn { self_param: self.fn_row(item)?.self_param },
@@ -741,7 +849,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         Ok(Some(AssocParent { container: *container, name: Name::of(name), kind }))
     }
 
-    fn const_holds(&self, _: Seal, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<tc::ConstHolds> {
+    fn const_holds_once(&self, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<tc::ConstHolds> {
         self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, tc::ground_args_digest(args, types))))
     }
 
@@ -749,7 +857,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// fn's with its container's first), by what the item is
     /// ([`super::by_origin::const_params_of`]): a head not made is wanted, never answered "no
     /// const parameters"; a kind with none to give is refused by name.
-    fn const_params(&self, _: Seal, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
+    fn const_params_once(&self, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
         match super::by_origin::const_params_of(self.names, self.keys, self.store, item) {
             Ok(params) => Ok(tc::ConstParams { params, types: self.types() }),
             Err(u) => self.unmade(u),
@@ -761,7 +869,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// lifetime is none, as a portable type holds no region): the Reference, "Associated
     /// Types": "Associated types may include generic parameters and where clauses". A trait
     /// whose head is not made is asked for; a trait that declares no such type has no count.
-    fn assoc_generics(&self, _: Seal, trait_: ItemKey, name: Name) -> Fetch<Option<tc::AssocGenerics>> {
+    fn assoc_generics_once(&self, trait_: ItemKey, name: Name) -> Fetch<Option<tc::AssocGenerics>> {
         let Some(lib) = self.keys.library_in(self.names, trait_) else { return Ok(None) };
         let Some(t) = self.store.maps.traits.get(&lib) else {
             return match self.resolver().detail(lib) {
@@ -775,7 +883,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// A type alias's definition from its head (`Maps::aliases`, `Maps::alias_defaults`, made
     /// by `Store::alias`): asked for while its head is not made, the gap naming it when its head
     /// was refused (as `BodyWorld::path` names it), `None` for an item that is no alias.
-    fn type_alias(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::AliasDef<'_>>> {
+    fn type_alias_once(&self, item: ItemKey) -> Fetch<Option<tc::AliasDef<'_>>> {
         let Some(lib) = self.keys.library_in(self.names, item) else { return Ok(None) };
         match self.store.maps.aliases.get(&lib) {
             Some(&Some((generics, ty))) => {
@@ -787,7 +895,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                 self.gap(Gap::AliasHead(lib, why))
             }
             None => match self.resolver().detail(lib) {
-                Some(ItemDetail::TypeAlias) => self.fill(Fill::Store(Want::Head(lib))),
+                Some(ItemDetail::TypeAlias) => self.store_want(Want::Head(lib)),
                 _ => Ok(None),
             },
         }

@@ -1271,7 +1271,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// for dyn compatibility and reported there ([`Machine::check_dyn`]).
     fn lower_at(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause, dyn_at: Option<At>) -> Result<Ty, Stop> {
         let n = root.0 as usize + 1;
-        if n > types.len() {
+        // `len_now`: a live view's later types are lowered too (portable.rs `PTys`).
+        if n > types.len_now() {
             return Err(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into());
         }
         let mut low = Lowered { memo: blaze_hash::HashMap::new_in(self.alloc), pool: Vec::new_in(self.alloc) };
@@ -1288,7 +1289,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         stack.push((root.0, false));
         // Each node is expanded once and finished once; each list entry is pushed at most once
         // per expansion of its parent.
-        let bound = 2 * (n + types.lists_len()) + 2;
+        let bound = 2 * (n + types.lists_len_now()) + 2;
         let mut steps = 0usize;
         while let Some((at, expanded)) = stack.pop() {
             steps += 1;

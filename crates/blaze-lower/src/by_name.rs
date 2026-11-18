@@ -226,6 +226,12 @@ impl core::fmt::Display for NotExpanded<'_> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PathAt {
     pub mark: Option<crate::mark_site::TextMark>,
+    /// The whole call's range in the body's own text (item-relative, rule 71) when the call is
+    /// written there; `None` for a call an expansion lowered in the body wrote. A resolver
+    /// that knows the body's blocks reads a call-site path in the innermost block holding the
+    /// range (the Reference, "Statements": an item a block declares is in scope in that block
+    /// only; an `extern crate .. as` in a derive's `const _: () = { .. };` is one).
+    pub written: Option<blaze_surface::Range>,
 }
 
 impl PathAt {
@@ -243,13 +249,13 @@ impl PathAt {
                 _ => break,
             }
         }
-        PathAt { mark: first.and_then(|it| stream.hygiene(tokens[it].ctx).mark).map(crate::mark_site::TextMark::of) }
+        PathAt { mark: first.and_then(|it| stream.hygiene(tokens[it].ctx).mark).map(crate::mark_site::TextMark::of), written: None }
     }
 
     /// The first token of `start..end` (a nested call's path) in `stream`.
     fn of(stream: &TokenStream<'_>, start: u32) -> PathAt {
         let mark = stream.tokens().get(start as usize).and_then(|t| stream.hygiene(t.ctx).mark);
-        PathAt { mark: mark.map(crate::mark_site::TextMark::of) }
+        PathAt { mark: mark.map(crate::mark_site::TextMark::of), written: None }
     }
 }
 
@@ -430,7 +436,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
     /// wrote is the word `crate` there, its crate only in the mark).
     fn path_at(&self, call: &BodyCall<'_>) -> PathAt {
         match call.input {
-            CallInput::Text(_) => PathAt { mark: call.path_mark },
+            CallInput::Text(_) => PathAt { mark: call.path_mark, written: Some(call.range) },
             CallInput::Expanded { expansion, start, .. } => {
                 self.expansions.get(expansion as usize).map_or(PathAt::default(), |(_, tokens)| PathAt::before(tokens, start))
             }
@@ -649,7 +655,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         cfg: &mut dyn crate::Cfg,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
-        let at = PathAt { mark: path_mark };
+        let at = PathAt { mark: path_mark, written: None };
         let result = self
             .input(CallInput::Text(input), edition)
             .and_then(|input| self.call(path, at, &input, edition, Inside::Plain, 0, &[], Some(cfg)));
@@ -720,7 +726,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         edition: Edition,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
-        let Ok(resolved) = self.resolve(path, PathAt { mark: path_mark }, ProcKind::Attr) else { return Expansion::Unsupported };
+        let Ok(resolved) = self.resolve(path, PathAt { mark: path_mark, written: None }, ProcKind::Attr) else { return Expansion::Unsupported };
         let def;
         let own;
         let prepared = match resolved {
@@ -765,7 +771,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         edition: Edition,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
-        let def = match self.resolve(path, PathAt { mark: path_mark }, ProcKind::Derive) {
+        let def = match self.resolve(path, PathAt { mark: path_mark, written: None }, ProcKind::Derive) {
             Ok(Resolved::Def(def)) => def,
             // A `macro_rules!` is no derive.
             Ok(Resolved::Prepared(_)) => return Expansion::Failed,

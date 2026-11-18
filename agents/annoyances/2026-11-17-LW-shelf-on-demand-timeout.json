@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-17",
+  "model": "claude-opus-5-5",
+  "lane": "LW",
+  "area": "the build queue (runner.py ask), blaze-ladder names_reach_shelf a_hello, blaze-scope names on demand",
+  "annoyance": "The shelf's `a_hello` (the std hello world's names, whole and on demand) does not finish inside the queue's 240 s per test command, so a lane whose brief's outcome is that test's `ONDEMAND hello:` line cannot see it from the queue at all; the stop prints no partial line. A `MemberRefusal` printed only an ItemKey, so a refusal in core named no module a reader could find.",
+  "workaround": "Ask the coordinator to run the shelf in the real-run loop. OnDemandError::Demand now carries the module's `path` from the crate's walk."
+}

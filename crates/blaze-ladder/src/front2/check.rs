@@ -228,6 +228,8 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     let meter = r.store.cost;
     for round in 0..MOST_ROUNDS {
         r.store.hidden.set_leaking(&leaks);
+        // Heads imported on the spot this round (world_items.rs `BodyWorld::store_want`).
+        let imported_at = r.store.imported.get();
         let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
         let view: BodyView<'_> = body.typeck.view(tys);
         let world = world_at(r, scope);
@@ -331,6 +333,12 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         }
         if fills.is_empty() && !all_gaps.is_empty() {
             return Err(CheckFail::Gap { owner, gaps: all_gaps });
+        }
+        // A question that met more than `MOST_IMPORTS_A_QUESTION` heads stands `Missing` with
+        // its heads imported: the next round finds them made (the cost test counts the round).
+        if fills.is_empty() && r.store.imported.get() != imported_at {
+            hints = needs;
+            continue;
         }
         if fills.is_empty() {
             let mut questions = Vec::new_in(Global);

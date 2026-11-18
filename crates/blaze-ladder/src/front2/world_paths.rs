@@ -232,7 +232,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 // `Trait::f`: the trait's fn.
                 if let Some(&next) = segments.get(consumed as usize) {
                     let Some(t) = self.store.maps.traits.get(&target.key) else {
-                        return self.fill(Fill::Store(Want::Head(target.key)));
+                        return self.store_want(Want::Head(target.key));
                     };
                     if let Some(&(_, f)) = t.fns.iter().find(|(n, _)| *n == next) {
                         return Ok(Ok(PathRes { def: Def::Fn(f), consumed: consumed + 1 }));
@@ -249,7 +249,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // alias's definition (`World::type_alias`) and the segment's arguments as the
             // alias's own (blaze-typeck rules/alias_path.rs).
             Kind::TypeAlias => match self.store.maps.aliases.get(&target.key) {
-                None => return self.fill(Fill::Store(Want::Head(target.key))),
+                None => return self.store_want(Want::Head(target.key)),
                 Some(None) => {
                     let why = self.store.maps.alias_gaps.get(&target.key).map_or_else(|| "(no why recorded)".into(), |w| format!("{w:?}").into_boxed_str());
                     return self.gap(Gap::AliasHead(target.key, why));

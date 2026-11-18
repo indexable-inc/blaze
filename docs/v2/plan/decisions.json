@@ -1106,6 +1106,14 @@
    "recommended": "engine.md pieces E13 (measured first: the share of each dependency's modules a real project reaches; then names on demand through the one-group solver's missing-record seam) and E14 (parts of a head's cell, each read recorded by part).",
    "why": "The owner, 2026-11-17 11:42, after asking what Zig still has over blaze: \"lets actually make blaze check lazy? as well ??? and sure takeo ther tings from its design\". Measured the same morning: the first check of a 20-line crate resolves the names of 27 crates whole in 6 s (gimli 2.3 s, object 1.8 s, libc 1.5 s, core 1.4 s), almost none of which it reads.",
    "state": "written into engine.md; lane LZ measures the reach; E14 waits for the frozen-heads lane to finish its current piece."
+  },
+  {
+   "id": "D135",
+   "date": "2026-11-17",
+   "decision": "A lint task is one per body: every selected lint runs in one walk over the body's typed result, dispatched by node kind, and the record holds the findings per lint. It replaces engine.md's first form, one task per (lint, body). Three more engine pieces come from the same survey: trait goals and instantiations as request-wide records, never per worker (E15); every cache hit appends its reads, with an audit mode that re-makes each hit (E16); an impl added enters only the bodies whose recorded trait questions it can answer (E17); toolchain and registry facts settled once per (toolchain, lock entry) by one digest (E18).",
+   "recommended": "engine.md point 8 and pieces E8, E15 to E18. The lint record is keyed by the body and the hash of the selected lints' code ids; each lint's cost is counted in the profile. E16's audit runs on the 58 real bodies of the cost test first.",
+   "why": "The owner asked on 2026-11-17 for a survey of the fastest compilers, checkers, linters and formatters and how to apply it. Its evidence: ast-grep measured one walk per rule against one walk for all rules at 3.6 s against 0.98 s; rustc and Clippy merged their lint passes into one statically combined pass for the same reason; on one real project Clippy's lints were 72% of CPU where type checking was 4%. The native TypeScript port keeps type caches per checker thread and its instantiations and memory grow with the thread count. Lean re-runs cache hits to check their recorded dependencies. Pyrefly cut an update from 3.6 s to under 0.2 s by tracking the lookups a module made instead of the module.",
+   "state": "decided by the main agent 2026-11-17 18:05 from the survey; engine.md edited; no lints lane has started, so nothing is rebuilt. The owner may overrule."
   }
  ]
 }

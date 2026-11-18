@@ -1442,10 +1442,13 @@ fn mutbl_tag(m: tc::Mutbl) -> u8 {
 // Reading.
 
 /// The head in `bytes`, its terms interned into `tys` through the table's own constructors
-/// (`intern`, `intern_list`, `dynamic`), so equal structure is an equal `PTy` there. A fn
-/// head's `text` is handed in and checked against the record's digest of it; `alloc` holds the
-/// head's own lists and its lifetime part.
-pub fn decode<'n>(bytes: &[u8], text: Option<&'n str>, tys: &mut PortableTys<'_>, alloc: Mem) -> Result<Head<'n>, HeadRecordError> {
+/// (`intern_shared`, `intern_list_shared`, `dynamic_shared`), so equal structure is an equal
+/// `PTy` there. Through a SHARED borrow: `tys` is a table over stable columns (heads.rs
+/// `Store::new`), so a head is imported into a body's table while the body's check holds a
+/// view of it (blaze-typeck `PTys`, live); a table over owned columns refuses
+/// (`Malformed::SharedIntern`). A fn head's `text` is handed in and checked against the
+/// record's digest of it; `alloc` holds the head's own lists and its lifetime part.
+pub fn decode<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableTys<'_>, alloc: Mem) -> Result<Head<'n>, HeadRecordError> {
     let mut r = In { bytes, at: 0, tys, locals: Vec::new_in(alloc), scratch: Vec::new_in(alloc), alloc };
     if r.take(4, "the magic")? != &MAGIC[..] {
         return Err(E::NotThisRecord);
@@ -1514,7 +1517,7 @@ pub fn decode<'n>(bytes: &[u8], text: Option<&'n str>, tys: &mut PortableTys<'_>
 struct In<'r, 't, 'a> {
     bytes: &'r [u8],
     at: usize,
-    tys: &'t mut PortableTys<'a>,
+    tys: &'t PortableTys<'a>,
     /// The record's term `i` is `locals[i]` in `tys`.
     locals: Vec<PTy, Mem>,
     scratch: Vec<PTy, Mem>,
@@ -1614,10 +1617,10 @@ impl<'r> In<'r, '_, '_> {
     /// A list, interned into the table.
     fn list(&mut self, what: &'static str) -> Result<List, E> {
         self.tys_into_scratch(what)?;
-        self.tys.intern_list(&self.scratch).map_err(E::Table)
+        self.tys.intern_list_shared(&self.scratch).map_err(E::Table)
     }
     fn intern(&mut self, n: PNode) -> Result<(), E> {
-        let t = self.tys.intern(n).map_err(E::Table)?;
+        let t = self.tys.intern_shared(n).map_err(E::Table)?;
         self.locals.push(t);
         Ok(())
     }
@@ -1689,7 +1692,7 @@ impl<'r> In<'r, '_, '_> {
             T_DYNAMIC => {
                 // Through the table's own constructor, which keeps the one canonical form.
                 self.tys_into_scratch("a trait object's predicates")?;
-                let t = self.tys.dynamic(&self.scratch).map_err(E::Table)?;
+                let t = self.tys.dynamic_shared(&self.scratch).map_err(E::Table)?;
                 self.locals.push(t);
                 return Ok(());
             }
@@ -2088,7 +2091,7 @@ impl<'r> In<'r, '_, '_> {
             None => return Err(E::Shape { what: "an inherent impl with trait arguments" }),
             Some(_) => {
                 // The trait reference's whole list, `Self` first, split as the lowering does.
-                let with_self = self.tys.intern_list(&self.scratch).map_err(E::Table)?;
+                let with_self = self.tys.intern_list_shared(&self.scratch).map_err(E::Table)?;
                 tc::ArgsAfterSelf::split(self.tys.view(), with_self, self_ty)
                     .map_err(|_| E::Shape { what: "an impl's trait arguments do not follow its self type" })?
             }

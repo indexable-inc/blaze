@@ -312,7 +312,8 @@ fn cells_of<'a>(name: Name, record: &work::Made<'_>, alloc: SharedAlloc<'a>) -> 
     if !record.reads.iter().any(|(read, _)| read.kind == Kind::Surface) {
         return Ok(defines);
     }
-    let parts = crate::names::sections::sections(record.payload_bytes()).map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload whose sections do not read" })?;
+    let payload = record.payload_bytes().map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload released after its put" })?;
+    let parts = crate::names::sections::sections(payload).map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload whose sections do not read" })?;
     let table = parts.cells;
     let row = blaze_scope::names_cells::TABLE_ROW;
     if table.len() % row != 0 {

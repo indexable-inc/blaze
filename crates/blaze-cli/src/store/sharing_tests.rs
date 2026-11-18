@@ -49,19 +49,19 @@ fn a_native_script_record_and_its_reader_stay_local() {
 
     // A public crate's wasm-placed run, on a trusted builder: both shared.
     let wasm = sharing_for(true, RanAs::Wasm, crate_subject, script_subject, dep_subject);
-    assert!(wasm.all_names_public(&record_of(RanAs::Wasm)), "a public crate's wasm `Script` record was local");
-    assert!(wasm.all_names_public(&reader_record), "the reader of a public crate's wasm `Script` was local");
+    assert!(wasm.all_names_public(&[&record_of(RanAs::Wasm)]), "a public crate's wasm `Script` record was local");
+    assert!(wasm.all_names_public(&[&reader_record]), "the reader of a public crate's wasm `Script` was local");
 
     // The same crate placed native: both this machine's.
     let native = sharing_for(true, RanAs::Native, crate_subject, script_subject, dep_subject);
-    assert!(!native.all_names_public(&record_of(RanAs::Native)), "a natively placed `Script` record was public");
-    assert!(!native.all_names_public(&reader_record), "the reader of a natively placed `Script` was public");
+    assert!(!native.all_names_public(&[&record_of(RanAs::Native)]), "a natively placed `Script` record was public");
+    assert!(!native.all_names_public(&[&reader_record]), "the reader of a natively placed `Script` was public");
 
     // A private (workspace) crate: local either way.
     for ran_as in [RanAs::Wasm, RanAs::Native] {
         let private = sharing_for(false, ran_as, crate_subject, script_subject, dep_subject);
-        assert!(!private.all_names_public(&record_of(ran_as)), "a private crate's `Script` record ({ran_as:?}) was public");
-        assert!(!private.all_names_public(&reader_record), "a private crate's `CrateScope` ({ran_as:?}) was public");
+        assert!(!private.all_names_public(&[&record_of(ran_as)]), "a private crate's `Script` record ({ran_as:?}) was public");
+        assert!(!private.all_names_public(&[&reader_record]), "a private crate's `CrateScope` ({ran_as:?}) was public");
     }
     std::println!("wasm public, native local, private local");
 }

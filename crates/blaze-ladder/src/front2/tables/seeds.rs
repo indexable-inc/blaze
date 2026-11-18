@@ -23,7 +23,7 @@ use super::head::{FreezeError, FrozenHead, HeadSource, SeededHeads, cell_of, see
 pub trait HeadSeed<'n> {
     /// Need `need`'s cell filed into `store` from its frozen record ([`Seeded::Filed`]);
     /// `scratch` holds the import's work.
-    fn seed(&self, store: &mut Store<'n>, keys: &mut Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError>;
+    fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError>;
 }
 
 /// Why a head could not be seeded.
@@ -136,7 +136,7 @@ impl HeadSource for OneCell<'_> {
 }
 
 impl<'n, N: NamesSource<'n>> HeadSeed<'n> for TableView<'_, '_, N> {
-    fn seed(&self, store: &mut Store<'n>, keys: &mut Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
+    fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
         let cell = cell_of(self.names, need).map_err(SeedError::Freeze)?;
         let bytes = self.table.bytes_of(cell).ok_or(SeedError::NotFrozen { need, cell })?;
         seed(self.names, None, need, &mut OneCell { cell, bytes }, store, keys, scratch).map_err(SeedError::Freeze)
@@ -156,7 +156,7 @@ impl<'n, 'a, N: NamesSource<'n>> Freezing<'n, 'a, N> {
 }
 
 impl<'n, N: NamesSource<'n>> HeadSeed<'n> for Freezing<'n, '_, N> {
-    fn seed(&self, store: &mut Store<'n>, keys: &mut Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
+    fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
         let mut heads = self.heads.borrow_mut();
         seed(self.names, None, need, &mut *heads, store, keys, scratch).map_err(SeedError::Freeze)
     }

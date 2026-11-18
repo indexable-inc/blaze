@@ -37,7 +37,7 @@ use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
 use blaze_surface::{ItemDetail, Namespace, PathKind};
 use blaze_ladder::front2::lifetimes::LifeOf;
-use blaze_typeck::PortableTys;
+use blaze_ladder::front2::rows::stable_tys;
 
 const EDITION: &str = "blaze-2026.11";
 
@@ -161,21 +161,21 @@ fn round_trip_all(what: &str, rel: &[(String, String)], edition: &str, cuts: boo
             }
             Err(e) => panic!("{what}: {at:?}: not encoded: {e}"),
         };
-        let decoded = decode(&bytes, text, &mut store.tys, Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded: {e}"));
+        let decoded = decode(&bytes, text, &store.tys, Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded: {e}"));
         let lowered = from_store(&store, at).expect("encoded above");
         if let Some(part) = same(lowered, decoded.as_ref(), store.tys.view()) {
             panic!("{what}: {at:?}: the decoded head differs from the lowered one in {part}");
         }
         let again = encode(decoded.as_ref(), store.tys.view(), Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: decoded, not encoded again: {e}"));
         assert!(bytes[..] == again[..], "{what}: {at:?}: encoded again, the bytes differ");
-        let mut fresh = PortableTys::new_in(Alloc::global());
-        let elsewhere = decode(&bytes, text, &mut fresh, Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded into a fresh table: {e}"));
+        let fresh = stable_tys(Alloc::global()).expect("a fresh stable table");
+        let elsewhere = decode(&bytes, text, &fresh, Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded into a fresh table: {e}"));
         let from_fresh = encode(elsewhere.as_ref(), fresh.view(), Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not encoded from a fresh table: {e}"));
         assert!(bytes[..] == from_fresh[..], "{what}: {at:?}: encoded from a fresh table, the bytes differ");
         if cuts {
             for cut in 0..bytes.len() {
-                let mut scratch = PortableTys::new_in(Alloc::global());
-                match decode(&bytes[..cut], text, &mut scratch, Alloc::global()) {
+                let scratch = stable_tys(Alloc::global()).expect("a fresh stable table");
+                match decode(&bytes[..cut], text, &scratch, Alloc::global()) {
                     Err(HeadRecordError::Short { .. }) => {}
                     Ok(_) => panic!("{what}: {at:?}: cut at {cut} of {} bytes, decoded", bytes.len()),
                     Err(e) => panic!("{what}: {at:?}: cut at {cut} of {} bytes, refused but not as short: {e}", bytes.len()),

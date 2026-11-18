@@ -206,8 +206,9 @@ pub enum OnDemandError<'a> {
     Graph(NamesError<'a>),
     /// A root crate's solve, or a dependency's walk, failed with nothing wanted.
     Names(NamesError<'a>),
-    /// The in-crate driver stopped.
-    Demand { krate: &'a str, error: DemandError<OneGroupRefusal<Refused<'a>>> },
+    /// The in-crate driver stopped; `path`: the module path of the module the error names,
+    /// from the crate's walk (rule 19), when it names one the walk holds.
+    Demand { krate: &'a str, path: Option<&'a str>, error: DemandError<OneGroupRefusal<Refused<'a>>> },
     /// A kept group's record did not give `module`'s scope.
     Record { krate: &'a str, module: ItemKey, error: RecordError },
     Scope { krate: &'a str, module: ItemKey, error: FormatError },
@@ -350,10 +351,22 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
                         self.satisfy(demanded, w, depth + 1)?;
                     }
                 }
-                Err(error) => return Err(OnDemandError::Demand { krate: name, error }),
+                Err(error) => {
+                    let path = demand_module(&error).and_then(|m| self.held[k].borrow().solves.iter().find_map(|&c| c.path_of(m)));
+                    return Err(OnDemandError::Demand { krate: name, path, error });
+                }
             }
         }
         Err(OnDemandError::Rounds { krate: name, most: MOST_ROUNDS })
+    }
+}
+
+/// The module a demand's error names, if it names one.
+fn demand_module(e: &DemandError<OneGroupRefusal<Refused<'_>>>) -> Option<ItemKey> {
+    match e {
+        DemandError::Depth { module, .. } | DemandError::Recorded { module } | DemandError::NotCovered { module } | DemandError::Recut { module } => Some(*module),
+        DemandError::Solver(OneGroupRefusal::Crate(Refused::Names(NamesError::Cells { error: super::switch::Unwritten::Member(r), .. }))) => r.module(),
+        _ => None,
     }
 }
 

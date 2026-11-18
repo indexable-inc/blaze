@@ -21,7 +21,7 @@ use crate::crate_scope::{Ready, resolve_by_records};
 use crate::graph::Sysroot;
 use crate::names::{Written, path};
 use crate::items_record::{ItemsRecord, TextOf, encode as items_encode};
-use crate::names_cells::{Log, Logged, NameCell, Section, seen_by_record, seen_in, table};
+use crate::names_cells::{Log, Logged, NameCell, Section, beginning_digest, first_16, seen_by_record, seen_in, table};
 use crate::names_record::{LoadNames, NamesRecord, RecordNames, Verified, encode};
 use crate::resolve::aligned;
 use crate::task::Serial;
@@ -248,12 +248,13 @@ fn a_private_fn_added_moves_its_own_binding_cell_alone() {
     let a_item = a_item.unwrap_or_else(|| panic!("k0's items record has no row of `mod a`"));
     // The row of `mod a` holds its head only (`module_head`): the fn added inside it moves the
     // module's own cells, never the parent's cell of that row.
-    let mut floor = std::vec![added, NameCell::Item { key: z }.key(), NameCell::Whole { krate: before.keys[0].prefix(), section: Section::Items }.key()];
+    // And the new key's own `Beginning` (its 16-byte prefix now begins a key: lane ND).
+    let mut floor = std::vec![added, NameCell::Item { key: z }.key(), NameCell::Beginning { first: first_16(z) }.key(), NameCell::Whole { krate: before.keys[0].prefix(), section: Section::Items }.key()];
     floor.sort_unstable();
     let items_moved = moved(&before.with_items[0], &after.with_items[0]);
-    std::println!("NAMES CELLS: with the items record, {} cell(s) of k0 moved (floor 3: the binding, the item row, the whole section)", items_moved.len());
+    std::println!("NAMES CELLS: with the items record, {} cell(s) of k0 moved (floor 4: the binding, the item row, its prefix's beginning, the whole section)", items_moved.len());
     assert!(!items_moved.contains(&NameCell::Item { key: a_item }.key()), "the row of `mod a` moved with an item added inside it");
-    let mut candidates: Vec<(std::string::String, [u8; 16])> = std::vec![("Item(added)".into(), NameCell::Item { key: z }.key())];
+    let mut candidates: Vec<(std::string::String, [u8; 16])> = std::vec![("Item(added)".into(), NameCell::Item { key: z }.key()), ("Beginning(added)".into(), NameCell::Beginning { first: first_16(z) }.key())];
     let g = blaze_own::testing::heap().alloc();
     let items_after = ItemsRecord::open(after.items[0], g).unwrap_or_else(|e| panic!("{e:?}"));
     for i in 0..items_after.items() {
@@ -301,4 +302,125 @@ fn control_a_get_not_logged_is_caught() {
     let (before, after) = (Side::solve(&BEFORE), Side::solve(&AFTER));
     let (unsound, _, _, _) = judge(&before, &after, true);
     assert!(!unsound.is_empty(), "the oracle did not see the binding cells left out of the logs");
+}
+
+/// THE HOLE `key_beginning` HAD (rule 21), at the cell level: two real keys (BLAKE3) cannot be
+/// made to share 16 bytes in a fixture, so the keys here are made by hand. A body asking
+/// `key_beginning(p)` is answered "the one key beginning so" only while no second key begins
+/// so; the found path read only `Item(a)`, a row keyed by `a` alone, which a second key `b`
+/// added with the prefix does not touch (it adds a row of its own key). `Beginning(p)` holds
+/// every key beginning so, in each list, so adding `b` to any list moves it.
+#[test]
+fn a_second_key_with_a_prefix_moves_its_beginning() {
+    let key = |tail: u8| {
+        let mut bytes = [7u8; 32];
+        bytes[20] = tail;
+        ItemKey(ContentId(bytes))
+    };
+    let (a, b) = (key(1), key(2));
+    let p = first_16(a);
+    assert_eq!(p, first_16(b), "the two hand-made keys share their first 16 bytes");
+    // The old read: `Item(a)` names `a` alone, and `b` is another cell.
+    assert_ne!(NameCell::Item { key: a }.key(), NameCell::Item { key: b }.key());
+    let one = beginning_digest(p, [&[a], &[], &[]]);
+    assert!(one.is_some(), "a prefix one key begins is a row");
+    for (list, lists) in [("items", [&[a, b][..], &[][..], &[][..]]), ("modules", [&[a][..], &[b][..], &[][..]]), ("variants", [&[a][..], &[][..], &[b][..]])] {
+        assert_ne!(one, beginning_digest(p, lists), "a second key with the prefix in the {list} did not move `Beginning`");
+    }
+    // A key in another list is another answer (an item row is searched before a module row).
+    assert_ne!(beginning_digest(p, [&[a], &[], &[]]), beginning_digest(p, [&[], &[a], &[]]));
+    // No key beginning so: absent, and a key with another prefix leaves the cell alone.
+    let mut other = [7u8; 32];
+    other[3] = 9;
+    let other = ItemKey(ContentId(other));
+    assert_eq!(beginning_digest(p, [&[], &[], &[]]), None);
+    assert_eq!(beginning_digest(p, [&[], &[other], &[]]), None);
+    let mut sorted = [a, other];
+    sorted.sort_unstable();
+    assert_eq!(one, beginning_digest(p, [&sorted, &[], &[]]), "a key of another prefix moved `Beginning`");
+}
+
+/// k0 with a trait and an impl, so the member owners section has rows.
+const K0_MEMBERS: &str = "#![no_core]
+pub mod a {
+    pub struct S;
+    pub mod b {
+        pub fn f() {}
+        pub use super::S as T;
+    }
+}
+pub mod c {
+    pub use crate::a::b::*;
+    pub use crate::a::*;
+    pub enum E { V, W {} }
+}
+pub use c::E;
+pub trait Tr {
+    fn m(&self);
+    const C: u8;
+}
+impl Tr for a::S {
+    fn m(&self) {}
+    const C: u8 = 0;
+}
+";
+
+static MEMBERS: Texts = Texts(&[&[("/k0/lib.rs", K0_MEMBERS)], &[("/k1/lib.rs", K1)]]);
+
+/// Every `MemberOf`, `VariantOf` and `Beginning` a key of the crates' records can name, found
+/// and absent, holds the same digest in the table as read from the record by its own search
+/// (`seen_by_record`, the cell's second home).
+#[test]
+fn the_items_search_cells_agree_with_the_record() {
+    let side = Side::solve(&MEMBERS);
+    let g = blaze_own::testing::heap().alloc();
+    let (mut members, mut variants, mut beginnings, mut absent) = (0usize, 0usize, 0usize, 0usize);
+    for krate in 0..side.keys.len() {
+        let items = ItemsRecord::open(side.items[krate], g).unwrap_or_else(|e| panic!("crate {krate}'s items record: {e:?}"));
+        let text: &'static str = MEMBERS.0[krate][0].1;
+        let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
+        let record = side.record(krate);
+        let wholes = [(Section::Items, side.items[krate])];
+        let mut cells: Vec<NameCell> = Vec::new();
+        let mut fake = [0xeeu8; 32];
+        fake[..8].copy_from_slice(&side.keys[krate].prefix());
+        let fake = ItemKey(ContentId(fake));
+        cells.extend([NameCell::MemberOf { member: fake }, NameCell::VariantOf { variant: fake }, NameCell::Beginning { first: first_16(fake) }]);
+        for i in 0..items.items() {
+            if let Ok(Some(row)) = items.item_at(i) {
+                cells.extend([NameCell::MemberOf { member: row.key }, NameCell::VariantOf { variant: row.key }, NameCell::Beginning { first: first_16(row.key) }]);
+            }
+        }
+        for i in 0..items.modules() {
+            if let Ok(Some(row)) = items.module_at(i) {
+                cells.push(NameCell::Beginning { first: first_16(row.key) });
+            }
+        }
+        for i in 0..items.variant_rows() {
+            if let Ok(Some((variant, ..))) = items.variant_at(i) {
+                cells.extend([NameCell::VariantOf { variant }, NameCell::Beginning { first: first_16(variant) }, NameCell::MemberOf { member: variant }]);
+            }
+        }
+        for i in 0..items.owned_members() {
+            if let Ok(Some(member)) = items.owned_key_at(i) {
+                cells.extend([NameCell::MemberOf { member }, NameCell::VariantOf { variant: member }]);
+            }
+        }
+        for cell in cells {
+            let in_table = seen_in(&side.with_items[krate], cell.key()).unwrap_or_else(|e| panic!("crate {krate}'s table: {e:?}"));
+            let by_record = seen_by_record(&record, Some((&items, &read)), &wholes, cell).unwrap_or_else(|e| panic!("{cell:?}: {e:?}"));
+            assert_eq!(in_table, by_record, "crate {krate} {cell:?}: the table and the record disagree");
+            match (cell, in_table) {
+                (_, None) => absent += 1,
+                (NameCell::MemberOf { .. }, Some(_)) => members += 1,
+                (NameCell::VariantOf { .. }, Some(_)) => variants += 1,
+                (NameCell::Beginning { .. }, Some(_)) => beginnings += 1,
+                _ => {}
+            }
+        }
+    }
+    std::println!("NAMES CELLS: search cells found: {members} member, {variants} variant, {beginnings} beginning; {absent} absent");
+    assert!(members >= 4, "the impl's and the trait's members are not all `MemberOf` rows: {members}");
+    assert!(variants >= 2, "`E`'s variants are not `VariantOf` rows: {variants}");
+    assert!(beginnings > 0 && absent > 0, "no beginning found ({beginnings}) or none absent ({absent})");
 }

@@ -159,6 +159,12 @@ fn a() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 
+/// A fresh table a head is imported into: over stable columns, as a store's is (head.rs
+/// `import` interns through a shared borrow).
+fn fresh_table() -> PortableTys<'static> {
+    crate::front2::rows::stable_tys(a()).expect("a table over fresh stable columns")
+}
+
 fn input(name: &'static str, root: &'static str, deps: &'static [(&'static str, usize)]) -> CrateInput<'static> {
     CrateInput {
         name,
@@ -414,7 +420,7 @@ fn a_frozen_head_imports_as_today_s_head() {
         }
         let mut text_of = |at: HeadAt| texts.iter().find(|(t, _)| *t == at).map(|(_, s)| *s);
         // Into the store's own table: equal to the head filed there, term for term.
-        let heads = import(&frozen, &mut text_of, &mut store.tys, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
+        let heads = import(&frozen, &mut text_of, &store.tys, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for (at, head) in heads.iter() {
             let filed = head_record::from_store(&store, *at).unwrap_or_else(|e| panic!("{at:?}: {e}"));
             if let Some(what) = head_record::same(head.as_ref(), filed, store.tys.view()) {
@@ -423,8 +429,8 @@ fn a_frozen_head_imports_as_today_s_head() {
             compared += 1;
         }
         // Into a fresh table: written again, the same record.
-        let mut fresh = PortableTys::new_in(a());
-        let again = import(&frozen, &mut text_of, &mut fresh, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
+        let fresh = fresh_table();
+        let again = import(&frozen, &mut text_of, &fresh, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for ((at, head), e) in again.iter().zip(frozen.heads()) {
             let bytes = head_record::encode(head.as_ref(), fresh.view(), a()).unwrap_or_else(|e| panic!("{at:?}: {e}"));
             assert!(bytes[..] == e.record[..], "ORACLE: {w:?}, head {at:?} read into a fresh table writes other bytes");
@@ -460,8 +466,8 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
             }
         }
         let mut text_of = |at: HeadAt| texts.iter().find(|(t, _)| *t == at).map(|(_, s)| *s);
-        let mut fresh = PortableTys::new_in(a());
-        let heads = import(&frozen, &mut text_of, &mut fresh, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
+        let fresh = fresh_table();
+        let heads = import(&frozen, &mut text_of, &fresh, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for (at, head) in heads.iter() {
             match head {
                 head_record::Head::Trait { assoc_side, life, .. } => {
@@ -611,10 +617,10 @@ fn a_store_filed_from_frozen_heads_alone_lowers_nothing() {
     let alone = alone(names, sized, frame, &cells, Plant::None);
     let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
     let mut store = Store::new(sized, frame, a());
-    let mut keys = Keys::new();
+    let keys = Keys::new();
     for w in cells.iter().copied() {
         if !store.made(w) {
-            let s = super::head::seed(names, None, w, &mut source, &mut store, &mut keys, a()).unwrap_or_else(|e| panic!("seed {w:?}: {e}"));
+            let s = super::head::seed(names, None, w, &mut source, &store, &keys, a()).unwrap_or_else(|e| panic!("seed {w:?}: {e}"));
             assert_eq!(s, crate::front2::heads::Seeded::Filed, "{w:?}");
         }
         assert!(store.made(w), "ORACLE: {w:?} filed from its frozen head is not made");
@@ -750,11 +756,11 @@ fn a_seeded_store_answers_every_ctor_lookup_as_lowering() {
         lowered.ensure(names, &mut lkeys, w).unwrap_or_else(|e| panic!("ensure {w:?}: {e}"));
     }
     let mut source = SeededHeads::new(SeededHeadsOpts { names, sized, frame, scratch: a(), alloc: a(), consts: None });
-    let mut seeded = Store::new(sized, frame, a());
-    let mut skeys = Keys::new();
+    let seeded = Store::new(sized, frame, a());
+    let skeys = Keys::new();
     for w in cells.iter().copied() {
         if !seeded.made(w) {
-            super::head::seed(names, None, w, &mut source, &mut seeded, &mut skeys, a()).unwrap_or_else(|e| panic!("seed {w:?}: {e}"));
+            super::head::seed(names, None, w, &mut source, &seeded, &skeys, a()).unwrap_or_else(|e| panic!("seed {w:?}: {e}"));
         }
     }
     let (mut enums, mut structs, mut adts) = (0, 0, 0);

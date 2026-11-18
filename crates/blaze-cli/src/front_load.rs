@@ -405,6 +405,12 @@ mod tests {
                 Ok(())
             }
             fn public_crates(&mut self, _subjects: &[ContentId]) {}
+            fn put_parts(&mut self, _cx: &Cx, _key: Key, _parts: &[&[u8]]) -> Result<(), CliError> {
+                Ok(())
+            }
+            fn kept(&self) -> crate::store::StoreKept {
+                crate::store::StoreKept::default()
+            }
         }
         let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");

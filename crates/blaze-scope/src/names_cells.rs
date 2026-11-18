@@ -17,6 +17,13 @@
 //!   `#[macro_export]` macros, the head) but the root file's content, which moves with every
 //!   edit of that file and which [`Logged`] does not hand out ([`walked_head`]);
 //! - `Variants(owner)`: an enum's variants, absent for no enum.
+//! - From the items record (lane ND): `MemberOf(member)`, `VariantOf(variant)` and
+//!   `Beginning(first 16 bytes)`, the three by-key searches whose "not found" was a read of the
+//!   whole items section: each a row only where the search finds something, so "not found" is
+//!   the cell absent, and the name added defines it. `Beginning` holds every key beginning so,
+//!   in full: the found answer depends on no OTHER key beginning alike, so a second key added
+//!   with the prefix moves it (before, the found path read only the key's own `Item` cell,
+//!   which that edit does not move: rule 21).
 //!
 //! A private fn added moves exactly one cell, its own `Binding`, which a walk consulted only if
 //! it looked that name up in that module.
@@ -72,6 +79,18 @@ pub enum NameCell {
     Members { owner: ItemKey },
     /// A macro call's expansion row (its text's content id and length); absent for none.
     Expansion { call: ItemKey },
+    /// Which trait or impl owns the named member `member`, and its name
+    /// ([`ItemsRecord::member_owner`]); absent for no named member of that key: the "not
+    /// found" a reader asking of a free item reads.
+    MemberOf { member: ItemKey },
+    /// Which enum `variant` is of, and its index ([`ItemsRecord::variant_home`]); absent for
+    /// no variant of that key.
+    VariantOf { variant: ItemKey },
+    /// Every key of the crate's item, module and variant rows whose first 16 bytes are
+    /// `first`, each list's in full: what `key_beginning(first)` answers (one key, none, or two
+    /// refused), so the cell moves when a second key with the prefix is added. Absent: no key
+    /// begins so.
+    Beginning { first: [u8; 16] },
     /// A section of the crate's record read WHOLE, by a question no cell answers (every impl,
     /// every item, the lang rows, the files): its digest is the section's bytes'.
     Whole { krate: [u8; 8], section: Section },
@@ -99,6 +118,9 @@ impl NameCell {
             NameCell::Members { owner } => h.update(&[6]).id(&owner.0),
             NameCell::Expansion { call } => h.update(&[7]).id(&call.0),
             NameCell::Whole { krate, section } => h.update(&[8, section as u8]).update(&krate),
+            NameCell::MemberOf { member } => h.update(&[9]).id(&member.0),
+            NameCell::VariantOf { variant } => h.update(&[10]).id(&variant.0),
+            NameCell::Beginning { first } => h.update(&[11]).update(&first),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -113,6 +135,13 @@ impl NameCell {
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
+            NameCell::MemberOf { member } => member.crate_prefix(),
+            NameCell::VariantOf { variant } => variant.crate_prefix(),
+            NameCell::Beginning { first } => {
+                let mut krate = [0u8; 8];
+                krate.copy_from_slice(&first[..8]);
+                krate
+            }
         }
     }
 }
@@ -267,6 +296,106 @@ fn expansion_digest(items: &ItemsRecord<'_>, call: ItemKey) -> Option<ContentId>
     items.expansion(call).map(|row| Hasher::of(&DIGESTS).update(&[7]).std(&row).finish())
 }
 
+/// The first 16 bytes of a key: what [`NameCell::Beginning`] is keyed by (`key_beginning`'s
+/// question).
+pub fn first_16(key: ItemKey) -> [u8; 16] {
+    let mut first = [0u8; 16];
+    first.copy_from_slice(&key.0.0[..16]);
+    first
+}
+
+/// What `MemberOf(member)` holds, `None` for no named member of that key: the answer of
+/// [`ItemsRecord::member_owner`] (the owner's key and the member's name), whole.
+fn member_of_digest(items: &ItemsRecord<'_>, member: ItemKey) -> Result<Option<ContentId>, ItemsRecordError> {
+    Ok(items.member_owner(member)?.map(|(owner, name)| Hasher::of(&DIGESTS).update(&[9]).id(&owner.0).std(name).finish()))
+}
+
+/// What `VariantOf(variant)` holds for the variant table's rows of one key: `None` for none,
+/// the enum and the index for one ([`ItemsRecord::variant_home`]'s answer), and a "refused"
+/// digest for two or more (`variant_home` refuses the key by name; the table is still
+/// written, and the key's readers move when it stops being refused).
+fn variant_of_digest(rows: &[(ItemKey, u32)]) -> Option<ContentId> {
+    match rows {
+        [] => None,
+        [(owner, index)] => Some(Hasher::of(&DIGESTS).update(&[10, 1]).id(&owner.0).update(&index.to_le_bytes()).finish()),
+        _ => Some(Hasher::of(&DIGESTS).update(&[10, 0xff]).finish()),
+    }
+}
+
+/// The variant table's rows of `variant` (at most two: a second is the refusal), by one binary
+/// search of the table as [`ItemsRecord::variant_home`] does it.
+fn variant_rows_of(items: &ItemsRecord<'_>, variant: ItemKey) -> Result<([(ItemKey, u32); 2], usize), ItemsRecordError> {
+    let count = items.variant_rows();
+    let row = |i: usize| -> Result<(ItemKey, ItemKey, u32), ItemsRecordError> { items.variant_at(i)?.ok_or(ItemsRecordError::Short { what: "the variant table", at: i }) };
+    let (mut lo, mut hi) = (0usize, count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if row(mid)?.0 < variant {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut out = [(variant, 0u32); 2];
+    let mut n = 0;
+    while n < 2 && lo + n < count {
+        let (key, owner, index) = row(lo + n)?;
+        if key != variant {
+            break;
+        }
+        out[n] = (owner, index);
+        n += 1;
+    }
+    Ok((out, n))
+}
+
+/// What `Beginning(first)` holds, `None` when no key of the three lists begins with `first`:
+/// each list's run of keys beginning so, in full and in order, with its length. `lists` are the
+/// crate's item, module and variant rows' keys, each sorted (as the record holds them, and
+/// as `key_beginning` searches them: one key, none, or two refused, a function of these runs).
+pub fn beginning_digest(first: [u8; 16], lists: [&[ItemKey]; 3]) -> Option<ContentId> {
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[11]);
+    let mut any = false;
+    for list in lists {
+        let from = list.partition_point(|key| first_16(*key) < first);
+        let run = &list[from..from + list[from..].iter().take_while(|key| first_16(**key) == first).count()];
+        any |= !run.is_empty();
+        h.update(&(run.len() as u64).to_le_bytes());
+        for key in run {
+            h.id(&key.0);
+        }
+    }
+    any.then(|| h.finish())
+}
+
+/// The keys of the crate's item rows, module rows and variant rows, each in the record's order,
+/// refused unless sorted (every search of them, `key_beginning`'s among them, assumes it).
+fn beginning_lists<'b>(items: &ItemsRecord<'_>, alloc: Alloc<'b>) -> Result<[AVec<'b, ItemKey>; 3], CellsError> {
+    let mut lists = [AVec::with_capacity_in(items.items(), alloc), AVec::with_capacity_in(items.modules(), alloc), AVec::with_capacity_in(items.variant_rows(), alloc)];
+    for i in 0..items.items() {
+        if let Some(row) = items.item_at(i).map_err(CellsError::Items)? {
+            lists[0].push(row.key);
+        }
+    }
+    for i in 0..items.modules() {
+        if let Some(row) = items.module_at(i).map_err(CellsError::Items)? {
+            lists[1].push(row.key);
+        }
+    }
+    for i in 0..items.variant_rows() {
+        if let Some(row) = items.variant_at(i).map_err(CellsError::Items)? {
+            lists[2].push(row.0);
+        }
+    }
+    for (list, what) in lists.iter().zip(["the item rows", "the module rows", "the variant rows"]) {
+        if list.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(CellsError::Unsorted { what });
+        }
+    }
+    Ok(lists)
+}
+
 /// What `Whole(section)` holds: the digest of the section's bytes as the record holds them.
 pub fn whole_digest(section: Section, bytes: &[u8]) -> ContentId {
     Hasher::of(&DIGESTS).update(&[8, section as u8]).part(bytes).finish()
@@ -396,7 +525,15 @@ pub enum CellsError {
     NoItemsRecord,
     /// The names record just written does not check.
     Names(NamesRecordError),
+    /// A list of the items record every search of assumes sorted is not (a writer's bug).
+    Unsorted { what: &'static str },
+    /// A crate's cell table past [`MAX_ROWS`] (rule 18).
+    TooManyRows { rows: usize },
 }
+
+/// The most rows one crate's cell table holds: four of each item, module, variant and member
+/// row of a crate several times `core`'s size (rule 18: every table has a cap).
+pub const MAX_ROWS: usize = 1 << 24;
 
 /// The cell table of a crate just solved, from the two records written of it: what the crate's
 /// `CrateScope` record files beside them (blaze-cli names.rs). Item texts are read from the
@@ -452,6 +589,48 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
                 }
             }
         }
+        // One `MemberOf` a named member (the owners section is sorted by member key; a key
+        // under two owners is one cell, its answer `member_owner`'s).
+        let mut last: Option<ItemKey> = None;
+        for i in 0..items.owned_members() {
+            let Some(member) = items.owned_key_at(i).map_err(CellsError::Items)? else { break };
+            if last == Some(member) {
+                continue;
+            }
+            last = Some(member);
+            if let Some(digest) = member_of_digest(items, member).map_err(CellsError::Items)? {
+                rows.push((NameCell::MemberOf { member }.key(), digest));
+            }
+        }
+        // One `VariantOf` a variant key, over its run of the (sorted) variant table.
+        let mut i = 0;
+        while i < items.variant_rows() {
+            let Some((variant, ..)) = items.variant_at(i).map_err(CellsError::Items)? else { break };
+            let (run, n) = variant_rows_of(items, variant).map_err(CellsError::Items)?;
+            if let Some(digest) = variant_of_digest(&run[..n]) {
+                rows.push((NameCell::VariantOf { variant }.key(), digest));
+            }
+            // Past the whole run (a refused key may have more than the two rows read).
+            i += 1;
+            while i < items.variant_rows() && items.variant_at(i).map_err(CellsError::Items)?.is_some_and(|row| row.0 == variant) {
+                i += 1;
+            }
+        }
+        // One `Beginning` a 16-byte prefix any item, module or variant key has.
+        let lists = beginning_lists(items, alloc)?;
+        let mut firsts: AVec<'_, [u8; 16]> = AVec::with_capacity_in(lists.iter().map(|list| list.len()).sum(), alloc);
+        for list in lists.iter() {
+            for key in list.iter() {
+                firsts.push(first_16(*key));
+            }
+        }
+        firsts.sort_unstable();
+        firsts.dedup();
+        for first in firsts.iter() {
+            if let Some(digest) = beginning_digest(*first, [&lists[0][..], &lists[1][..], &lists[2][..]]) {
+                rows.push((NameCell::Beginning { first: *first }.key(), digest));
+            }
+        }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
@@ -470,6 +649,9 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         }
     }
     rows.push((NameCell::Root { krate: record.key().prefix() }.key(), root_digest(record)));
+    if rows.len() > MAX_ROWS {
+        return Err(CellsError::TooManyRows { rows: rows.len() });
+    }
     rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut bytes = AVec::with_capacity_in(rows.len() * TABLE_ROW, alloc);
     for (i, (key, digest)) in rows.iter().enumerate() {
@@ -679,5 +861,51 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::Members { owner } => members_digest(items_of()?, owner, read_of()?).map_err(CellsError::Items)?,
         NameCell::Expansion { call } => expansion_digest(items_of()?, call),
         NameCell::Whole { section, .. } => wholes.iter().find(|(s, _)| *s == section).map(|(s, bytes)| whole_digest(*s, bytes)),
+        NameCell::MemberOf { member } => member_of_digest(items_of()?, member).map_err(CellsError::Items)?,
+        NameCell::VariantOf { variant } => {
+            let items = items_of()?;
+            let (run, n) = variant_rows_of(items, variant).map_err(CellsError::Items)?;
+            // One row: the record's own search answers it (the second home of the cell).
+            if n == 1 {
+                let home = items.variant_home(variant).map_err(CellsError::Items)?;
+                variant_of_digest(home.as_slice())
+            } else {
+                variant_of_digest(&run[..n])
+            }
+        }
+        NameCell::Beginning { first } => beginning_by_record(items_of()?, first)?,
     })
+}
+
+/// `Beginning(first)` read from the record by three binary searches, nothing allocated: the
+/// second home of [`beginning_digest`] (equal by construction of the same runs).
+fn beginning_by_record(items: &ItemsRecord<'_>, first: [u8; 16]) -> Result<Option<ContentId>, CellsError> {
+    let item = |i: usize| -> Result<ItemKey, CellsError> { items.item_at(i).map_err(CellsError::Items)?.map(|row| row.key).ok_or(CellsError::Items(ItemsRecordError::Short { what: "the item rows", at: i })) };
+    let module = |i: usize| -> Result<ItemKey, CellsError> { items.module_at(i).map_err(CellsError::Items)?.map(|row| row.key).ok_or(CellsError::Items(ItemsRecordError::Short { what: "the module rows", at: i })) };
+    let variant = |i: usize| -> Result<ItemKey, CellsError> { items.variant_at(i).map_err(CellsError::Items)?.map(|row| row.0).ok_or(CellsError::Items(ItemsRecordError::Short { what: "the variant rows", at: i })) };
+    let lists: [(usize, &dyn Fn(usize) -> Result<ItemKey, CellsError>); 3] = [(items.items(), &item), (items.modules(), &module), (items.variant_rows(), &variant)];
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[11]);
+    let mut any = false;
+    for (count, key_at) in lists {
+        let (mut lo, mut hi) = (0usize, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if first_16(key_at(mid)?) < first {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut end = lo;
+        while end < count && first_16(key_at(end)?) == first {
+            end += 1;
+        }
+        any |= end > lo;
+        h.update(&((end - lo) as u64).to_le_bytes());
+        for i in lo..end {
+            h.id(&key_at(i)?.0);
+        }
+    }
+    Ok(any.then(|| h.finish()))
 }

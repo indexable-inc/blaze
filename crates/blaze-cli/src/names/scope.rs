@@ -631,7 +631,7 @@ pub(crate) fn answer<'b>(names: &mut Names<'_>, task: &Task<'_>, held: &'b Frame
     // Last, after every step that can fail: a payload handed is gone from `names`.
     hand_payload(&mut names.made[i].1, &mut made)?;
     #[cfg(test)]
-    MADE.with(|kept| kept.borrow_mut().push((name.subject, made.out, blaze_ids::ContentId::of("names scope test", made.payload_bytes()))));
+    MADE.with(|kept| kept.borrow_mut().push((name.subject, made.out, blaze_ids::ContentId::of("names scope test", made.payload_bytes().expect("a record just made holds its payload")))));
     Ok(Did::Done(made))
 }
 
@@ -774,12 +774,12 @@ mod tests {
         let before = frame.used();
         super::hand_payload(&mut resolved, &mut made).expect("the payload handed");
         let grew = frame.used() - before;
-        assert!(made.payload_bytes() == &bytes[..], "the record reads the payload's exact bytes");
-        assert_eq!(made.payload_bytes().as_ptr(), at, "the record reads the payload where it was made: it was copied");
+        assert!(made.payload_bytes().unwrap() == &bytes[..], "the record reads the payload's exact bytes");
+        assert_eq!(made.payload_bytes().unwrap().as_ptr(), at, "the record reads the payload where it was made: it was copied");
         assert_eq!(grew, 0, "the task's frame grew by the payload");
         let mut again = crate::work::Made::new_in(name, &frame);
         assert!(super::hand_payload(&mut resolved, &mut again).is_err(), "a second answer of the crate was not refused");
-        assert!(again.payload_bytes().is_empty(), "a refused answer holds no payload");
-        println!("scope payload lent: {} bytes, frame grew by {grew}", made.payload_bytes().len());
+        assert!(again.payload_bytes().unwrap().is_empty(), "a refused answer holds no payload");
+        println!("scope payload lent: {} bytes, frame grew by {grew}", made.payload_bytes().unwrap().len());
     }
 }

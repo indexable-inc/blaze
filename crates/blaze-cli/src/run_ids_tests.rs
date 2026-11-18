@@ -82,6 +82,12 @@ impl<'m> Store<'m> for Empty {
         Ok(())
     }
     fn public_crates(&mut self, _subjects: &[ContentId]) {}
+    fn put_parts(&mut self, _cx: &Cx, _key: Key, _parts: &[&[u8]]) -> Result<(), CliError> {
+        Ok(())
+    }
+    fn kept(&self) -> crate::store::StoreKept {
+        crate::store::StoreKept::default()
+    }
 }
 
 fn tools() -> [Tool; blaze_drive::key::KINDS] {
@@ -322,6 +328,14 @@ fn a_table_is_put_at_its_certificate_and_absent_is_none() {
             Ok(())
         }
         fn public_crates(&mut self, _subjects: &[ContentId]) {}
+        fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
+            self.0.push((key, parts.concat()));
+            Ok(())
+        }
+        fn kept(&self) -> crate::store::StoreKept {
+            let bytes = self.0.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+            crate::store::StoreKept { copies: self.0.len() as u64, copy_bytes: bytes, held_bytes: bytes }
+        }
     }
     let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
     let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");

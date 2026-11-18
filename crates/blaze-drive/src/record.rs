@@ -119,7 +119,61 @@ pub fn write_plain<'a>(
     write_whole(&Whole { name, source, out, reads, cells: &[], parts: &[], paths: &[], findings: &[], payload, split: None }, alloc)
 }
 
+/// What a record lists besides its reads and payload: its parts, the path of each file part,
+/// and its findings, read back through [`WholeView::parts`], [`WholeView::paths`] and
+/// [`WholeView::findings`].
+#[derive(Clone, Copy, Debug)]
+pub struct Listed<'a> {
+    pub parts: &'a [Part],
+    pub paths: &'a [PathOf<'a>],
+    pub findings: &'a [Finding<'a>],
+}
+
+/// A whole record with the parts, paths and findings of `listed`, and no cell reads or split:
+/// the bytes a consumer puts for a task whose later readers walk its parts (the cli's
+/// `blaze engine-check` puts each file's outline so, and a later request that finds the file
+/// unchanged reads the outline back instead of reading the file).
+pub fn write_listed<'a>(
+    name: Name,
+    source: ContentId,
+    out: ContentId,
+    reads: &[(Name, ContentId)],
+    listed: &Listed<'_>,
+    payload: &[u8],
+    alloc: Alloc<'a>,
+) -> AVec<'a, u8> {
+    let Listed { parts, paths, findings } = *listed;
+    write_whole(&Whole { name, source, out, reads, cells: &[], parts, paths, findings, payload, split: None }, alloc)
+}
+
+/// The head of [`write_listed`]'s record for a payload of `payload_len` bytes: every byte before
+/// the payload, so the record is this head followed by the payload's bytes, equal to
+/// [`write_listed`]'s (blaze-cli engine_store.rs puts the two as two slices, never joined).
+pub fn write_listed_head<'a>(name: Name, source: ContentId, out: ContentId, reads: &[(Name, ContentId)], listed: &Listed<'_>, payload_len: usize, alloc: Alloc<'a>) -> AVec<'a, u8> {
+    let Listed { parts, paths, findings } = *listed;
+    let whole = Whole { name, source, out, reads, cells: &[], parts, paths, findings, payload: &[], split: None };
+    write_head(&whole, payload_len, alloc).finish()
+}
+
+/// The head of [`write_plain`]'s record for a payload of `payload_len` bytes: every byte before
+/// the payload, so the record is this head followed by the payload's bytes, equal to
+/// [`write_plain`]'s (one writer: [`write_whole`] is this head and the payload). For a writer
+/// that hands the store the head and the payload as two slices, never joined (blaze-cli
+/// engine_store.rs); read back by [`open`], or by [`open_parts`] over the two.
+pub fn write_plain_head<'a>(name: Name, source: ContentId, out: ContentId, reads: &[(Name, ContentId)], payload_len: usize, alloc: Alloc<'a>) -> AVec<'a, u8> {
+    let whole = Whole { name, source, out, reads, cells: &[], parts: &[], paths: &[], findings: &[], payload: &[], split: None };
+    write_head(&whole, payload_len, alloc).finish()
+}
+
 pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u8> {
+    let mut w = write_head(whole, whole.payload.len(), alloc);
+    w.raw(whole.payload);
+    w.finish()
+}
+
+/// Every byte of `whole`'s record before its payload (of `payload_len` bytes; `whole.payload`
+/// is not read).
+fn write_head<'a>(whole: &Whole<'_>, payload_len: usize, alloc: Alloc<'a>) -> Writer<'a> {
     let mut w = Writer::new_in(MAGIC, alloc);
     w.u8(WHOLE);
     w.name(whole.name);
@@ -171,10 +225,9 @@ pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u
         w.u32(finding.end);
         w.bytes(finding.message);
     }
-    w.count(whole.payload.len());
+    w.count(payload_len);
     w.pad_to(PAYLOAD_ALIGN);
-    w.raw(whole.payload);
-    w.finish()
+    w
 }
 
 /// Where a payload starts: a multiple of this from the record's first byte, so a blaze-format
@@ -232,6 +285,19 @@ pub struct ShapeView<'a> {
 
 /// `bytes` as a record of the drive's, checked whole.
 pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
+    open_in(bytes, None)
+}
+
+/// A whole record held as two slices, `head` ([`write_plain_head`]: every byte before the
+/// payload) and `payload`, checked as [`open`] checks their concatenation, read in place: for a
+/// writer that puts the two without joining them (blaze-cli engine_store.rs). A shape has no
+/// payload: one handed with it is refused.
+pub fn open_parts<'a>(head: &'a [u8], payload: &'a [u8]) -> Result<Stored<'a>, WireError> {
+    open_in(head, Some(payload))
+}
+
+/// [`open`] over `bytes`, or over `bytes` as a head followed by `payload`.
+fn open_in<'a>(bytes: &'a [u8], payload: Option<&'a [u8]>) -> Result<Stored<'a>, WireError> {
     let mut r = Reader::new(bytes, MAGIC, "drive record")?;
     let tag = r.u8()?;
     match tag {
@@ -280,9 +346,22 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
                 r.bytes()?;
             }
             let findings = &bytes[start..r.position()];
-            let len = r.count(1)?;
-            r.pad_to(PAYLOAD_ALIGN)?;
-            let payload = r.take_bytes(len)?;
+            let payload = match payload {
+                None => {
+                    let len = r.count(1)?;
+                    r.pad_to(PAYLOAD_ALIGN)?;
+                    r.take_bytes(len)?
+                }
+                // The head ends where the payload starts: its length said, its padding read.
+                Some(payload) => {
+                    let len = r.u32()?;
+                    if len as usize != payload.len() {
+                        return Err(r.error(WireWhy::Count(len)));
+                    }
+                    r.pad_to(PAYLOAD_ALIGN)?;
+                    payload
+                }
+            };
             r.done()?;
             Ok(Stored::Whole(WholeView { name, source, out, split, reads, cells, parts, paths, npaths, findings, nfindings, payload }))
         }
@@ -294,6 +373,9 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
                 read_cell(r).map(|_| ())
             })?;
             r.done()?;
+            if payload.is_some_and(|payload| !payload.is_empty()) {
+                return Err(r.error(WireWhy::Trailing));
+            }
             Ok(Stored::Shape(ShapeView { name, names, cells }))
         }
         tag => Err(r.error(WireWhy::Tag(tag))),
@@ -408,5 +490,32 @@ impl<'a> Iterator for Findings<'a> {
         let end = self.r.u32().expect(CHECKED);
         let message = self.r.bytes().expect(CHECKED);
         Some(Finding { rule, start, end, message })
+    }
+}
+
+#[cfg(test)]
+mod head_tests {
+    use super::*;
+
+    /// [`write_plain_head`] and the payload are [`write_plain`]'s bytes, for payloads of each
+    /// length around the alignment; [`open_parts`] over the two reads what [`open`] reads of the
+    /// whole. CONTROL: a payload of another length than the head says is refused.
+    #[test]
+    fn a_plain_record_is_its_head_then_its_payload() {
+        let heap = blaze_own::testing::heap();
+        let reads = [(Name::units(), ContentId([3; 32]))];
+        for len in [0usize, 1, 15, 16, 17, 100] {
+            let payload: std::vec::Vec<u8> = (0..len).map(|at| at as u8).collect();
+            let whole = write_plain(Name::units(), ContentId([1; 32]), ContentId([2; 32]), &reads, &payload, heap.alloc());
+            let head = write_plain_head(Name::units(), ContentId([1; 32]), ContentId([2; 32]), &reads, len, heap.alloc());
+            let mut joined = head.to_vec();
+            joined.extend_from_slice(&payload);
+            assert_eq!(&whole[..], &joined[..], "a payload of {len} bytes: head then payload is the record");
+            let (Ok(Stored::Whole(a)), Ok(Stored::Whole(b))) = (open(&whole), open_parts(&head, &payload)) else { panic!("both open as whole records ({len} bytes)") };
+            assert_eq!((a.name, a.out, a.payload), (b.name, b.out, b.payload), "{len} bytes");
+            assert_eq!(a.reads().collect::<std::vec::Vec<_>>(), b.reads().collect::<std::vec::Vec<_>>());
+            let longer = [payload.as_slice(), &[9]].concat();
+            assert!(open_parts(&head, &longer).is_err(), "control: a payload one byte longer than the head says is refused");
+        }
     }
 }

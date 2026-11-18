@@ -20,8 +20,11 @@
 //!
 //! OPEN (the next pieces): the cross-crate seam (a dependent crate's read of a dependency's
 //! module with no record, cells/deps.rs `DepNames::name_in`, refused the same way and answered
-//! by this driver in the dependency); a `macro_rules!` lookup walking into a module outside
-//! the members ([`MemberRefusal::Textual`]) is still refused, not demanded.
+//! by this driver in the dependency). A `macro_rules!` lookup walking into a module outside
+//! the members reads that module's textual sequence from its record (cells/mod.rs
+//! `textual_recorded`, logged as its `GroupRead::Textual`); one with no record is refused
+//! [`MemberRefusal::NoRecord`] and so demanded like a scope read; one whose record does not
+//! give the sequence the walk needs stays [`MemberRefusal::Textual`].
 
 #![blaze::sans_io]
 

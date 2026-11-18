@@ -67,6 +67,7 @@ mod names_groups;
 mod names_groups_edit;
 mod names_groups_lazy;
 mod names_groups_lazy_deps;
+mod names_groups_lazy_textual;
 mod name_rules;
 mod oracle;
 /// The reference solver's seam a solver core is compared through (oracle.rs).

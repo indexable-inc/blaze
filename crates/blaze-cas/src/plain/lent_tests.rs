@@ -146,3 +146,82 @@ fn equal_bytes_under_one_key_are_kept_and_other_bytes_refused_by_offset() {
     let LentError::TwoValues { two: TwoValues { differs_at: None, .. }, .. } = refused else { panic!("equal bytes not said equal: {refused}") };
     println!("lent, one key: equal bytes kept over two commits and the arena; refused at byte 3 (committed), at {own_len} (own), equal bytes of another tag refused");
 }
+
+/// A put of parts is the put of their concatenation: the same bytes lent (split at every offset,
+/// so a part ends inside a block and between blocks), the same value for a whole put of the
+/// joined bytes, and a refusal of other parts naming the first differing byte of the whole.
+#[test]
+fn a_put_of_parts_is_the_put_of_their_concatenation() {
+    use super::LentError;
+    use blaze_keyed::store::Put;
+    let lent = lent(24, LentPlant::None);
+    for n in 2000u32..2040 {
+        let whole = value(n);
+        let at = (n as usize - 2000) % whole.len();
+        let (head, tail) = whole.split_at(at);
+        assert!(matches!(lent.put_parts(&key(n), Namespace::LOCAL, TAG, &[head, tail]), Ok(Put::Written)), "parts split at {at}");
+        assert_eq!(lent.get(&key(n)).unwrap().expect("held").bytes, &whole[..], "the bytes lent are the parts joined (split at {at})");
+        assert!(matches!(lent.put(&key(n), Namespace::LOCAL, TAG, &whole), Ok(Put::Same)), "the joined bytes are the same value (split at {at})");
+        let mut other = whole.clone();
+        other[whole.len() - 1] ^= 1;
+        let (head, tail) = other.split_at(at);
+        let refused = lent.put_parts(&key(n), Namespace::LOCAL, TAG, &[head, tail]).expect_err("other parts under a held key were kept");
+        let LentError::TwoValues { two, .. } = refused else { panic!("not a two-values refusal: {refused}") };
+        assert_eq!(two.differs_at, Some(whole.len() as u64 - 1), "{refused}");
+    }
+    // A committed key: parts of its bytes are the same value (the commit's segment).
+    let whole = value(7);
+    assert!(matches!(lent.put_parts(&key(7), Namespace::LOCAL, TAG, &[&whole[..5], &whole[5..]]), Ok(Put::Same)));
+}
+
+/// THE ARENA HOLDS NO PUT PAST ITS COMMIT (rule 51): puts no get lent from are freed by the
+/// commit that writes them, and every later get reads them from the segment's mapping, byte-equal
+/// (`own: false`); a put of the same bytes again is the same value, of other bytes the refusal.
+/// A chunk a get lent from is kept with its lend standing (address and bytes), and takes no more
+/// puts. CONTROL: `LentPlant::FreesLent` (the commit frees a chunk under a live lend) leaves no
+/// held bytes where the kept chunk must be (its lend is never read).
+#[test]
+fn a_commit_frees_every_put_no_get_lent() {
+    use blaze_keyed::store::Put;
+    for plant in [LentPlant::None, LentPlant::FreesLent] {
+        let lent = lent(25, plant);
+        // One put read before the commit (its chunk kept), then many puts no one read: a big one
+        // in a chunk of its own, and small ones in a fresh chunk after the lent one.
+        lent.put(&key(3000), Namespace::LOCAL, TAG, &value(3000)).unwrap();
+        let early = lent.get(&key(3000)).unwrap().expect("held");
+        lent.put(&key(3001), Namespace::LOCAL, TAG, &big(3001)).unwrap();
+        for n in 3002u32..3100 {
+            lent.put(&key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
+        }
+        let before = lent.counts();
+        assert!(before.held_bytes >= (big(3001).len() + 98 * 40) as u64, "the arena holds its puts before the commit: {before:?}");
+        lent.commit().unwrap();
+        let after = lent.counts();
+        if plant == LentPlant::FreesLent {
+            assert_eq!(after.held_bytes, 0, "planted: the lent chunk was freed too");
+            continue;
+        }
+        // The lent chunk alone is kept: it holds key 3000 and nothing put after the lend.
+        assert!(after.held_bytes > 0 && after.held_bytes <= 1 << 20, "only the lent chunk is held: {after:?}");
+        assert!(after.freed_chunks >= 2, "the big put's chunk and the small puts' chunk freed: {after:?}");
+        assert_eq!(early.bytes, &value(3000)[..], "the early lend stands");
+        assert_eq!(address(&lent, &key(3000)), early.bytes.as_ptr() as usize, "the early lend is still lent from its kept chunk");
+        let gets = lent.counts().from_segments;
+        for n in 3001u32..3100 {
+            let want = if n == 3001 { big(n) } else { value(n) };
+            let got = lent.get(&key(n)).unwrap().expect("committed");
+            assert!(!got.own, "key {n} is read from the segment, not the arena");
+            assert_eq!(got.bytes, &want[..], "key {n}'s bytes from the segment");
+            assert!(matches!(lent.put(&key(n), Namespace::LOCAL, TAG, &want), Ok(Put::Same)), "key {n} again: the same value");
+        }
+        assert_eq!(lent.counts().from_segments - gets, 99, "every freed put read from its segment");
+        let mut other = value(3050);
+        other[0] ^= 1;
+        assert!(lent.put(&key(3050), Namespace::LOCAL, TAG, &other).is_err(), "other bytes under a freed put's key: refused");
+        // A put after the commit goes to a fresh chunk, never into the lent one.
+        lent.put(&key(3100), Namespace::LOCAL, TAG, &value(3100)).unwrap();
+        lent.commit().unwrap();
+        assert_eq!(lent.counts().held_bytes, after.held_bytes, "the second commit frees the put after the first: {:?}", lent.counts());
+        println!("lent: {} bytes held before the commit, {} after (the lent chunk), {} chunks freed", before.held_bytes, after.held_bytes, lent.counts().freed_chunks);
+    }
+}

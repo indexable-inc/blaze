@@ -663,6 +663,10 @@ pub struct Store<'n> {
     /// not counting those filed from frozen records ([`Store::file_heads`]): the measure a
     /// seeded freeze is held to (front2/tables/head_tests.rs).
     pub lowered: u32,
+    /// The cells a body's world imported while a check ran (front2 world_items.rs
+    /// `BodyWorld::store_want`, a store with `seeds`): a question that met one is asked
+    /// again at once, never in a round more (`BodyWorld::again`).
+    pub imported: core::cell::Cell<u64>,
 }
 
 /// How [`Store::ensure`] meets the needs of a trait's members (front2_tables_cost.rs runs
@@ -980,6 +984,7 @@ impl<'n> Store<'n> {
             // strategies` nor by the cost test's real core).
             needs: NeedsMet::First,
             lowered: 0,
+            imported: core::cell::Cell::new(0),
         }
     }
 

@@ -144,7 +144,7 @@ fn an_options_struct_from_another_crate() {
     let filed: Vec<_> = store.field_defaults.get(&checker_of(lib)).expect("`opts::Opts` files its field defaults").iter().copied().collect();
     assert_eq!(filed.iter().filter(|d| d.is_some()).count(), 2, "`width` and `wrap` have defaults, `name` none: {filed:?}");
     let bytes = encode(from_store(&store, HeadAt::Adt(lib)).expect("made"), store.tys.view(), alloc).unwrap_or_else(|e| panic!("`opts::Opts` not encoded: {e}"));
-    let decoded = decode(&bytes, None, &mut store.tys, alloc).unwrap_or_else(|e| panic!("`opts::Opts` not decoded: {e}"));
+    let decoded = decode(&bytes, None, &store.tys, alloc).unwrap_or_else(|e| panic!("`opts::Opts` not decoded: {e}"));
     let lowered = from_store(&store, HeadAt::Adt(lib)).expect("made");
     if let Some(part) = same(lowered, decoded.as_ref(), store.tys.view()) {
         panic!("`opts::Opts`: the decoded head differs from the lowered one in {part}");
@@ -155,12 +155,12 @@ fn an_options_struct_from_another_crate() {
         let text = head.text().expect("a default's head keeps its text");
         assert!(text.starts_with("const _: "), "the default {k:?}'s text is its constant: {text:?}");
         let fn_bytes = encode(head, store.tys.view(), alloc).unwrap_or_else(|e| panic!("the default {k:?} not encoded: {e}"));
-        decode(&fn_bytes, Some(text), &mut store.tys, alloc).unwrap_or_else(|e| panic!("the default {k:?} not decoded: {e}"));
+        decode(&fn_bytes, Some(text), &store.tys, alloc).unwrap_or_else(|e| panic!("the default {k:?} not decoded: {e}"));
     }
     // A record of the old form (7: no field defaults) is another version: refused, never read.
     let mut old = bytes.to_vec();
     old[4..8].copy_from_slice(&7u32.to_le_bytes());
-    match decode(&old, None, &mut store.tys, alloc) {
+    match decode(&old, None, &store.tys, alloc) {
         Err(HeadRecordError::Version { found: 7 }) => {}
         Err(e) => panic!("a form-7 record: refused, but not as another version: {e}"),
         Ok(_) => panic!("a form-7 record was read"),

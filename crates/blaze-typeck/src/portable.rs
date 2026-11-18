@@ -97,42 +97,114 @@ pub enum PNode {
 /// for a table read whole). One numbering over both: `PTy(i)` below the base's length is the
 /// base's node `i`, from it up the own node `i - base`; a list lies wholly in one part. The
 /// parts are private, so no reader can take the base for the whole table.
+///
+/// LIVE (lane VH, 2026-11-17): a view of a table over [`Stable`] columns
+/// ([`PortableTys::new_stable`]) also holds the column itself, so a type interned through
+/// `&self` AFTER the view was taken is readable through it: a lookup indexes the snapshot as
+/// before and reads the column only past the snapshot's end (one never-taken branch for a body
+/// that imports nothing). The lengths (`len`, `lists_len`) and the walks (`nodes`, `lists`) are
+/// the snapshot's: a later entry is found by its id, never by counting.
 #[derive(Clone, Copy, Debug)]
 pub struct PTys<'a> {
-    nodes: &'a [PNode],
-    lists: &'a [PTy],
-    own_nodes: &'a [PNode],
-    own_lists: &'a [PTy],
+    nodes: Col<'a, PNode>,
+    lists: Col<'a, PTy>,
+}
+
+/// One column of a [`PTys`]: the base's part and the own part as they stood (one numbering),
+/// and, for a stable table, the column they are a prefix of.
+#[derive(Clone, Copy, Debug)]
+struct Col<'a, T> {
+    base: &'a [T],
+    own: &'a [T],
+    live: Option<Live<'a, T>>,
+}
+
+/// A [`Stable`] column a view reads past its snapshot: its element `i` is the view's entry
+/// `from + i` (`from`: the start of the part the column holds, 0 for a table of its own).
+/// Entries never move once written ([`Stable`]'s promise), so what it reads stays read.
+#[derive(Clone, Copy)]
+struct Live<'a, T> {
+    col: &'a dyn Stable<T>,
+    from: usize,
+}
+
+impl<T> core::fmt::Debug for Live<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Live").field("from", &self.from).field("len", &self.col.as_slice().len()).finish()
+    }
+}
+
+impl<'a, T> Col<'a, T> {
+    const EMPTY: Col<'a, T> = Col { base: &[], own: &[], live: None };
+
+    /// The snapshot's length.
+    #[inline]
+    fn len(&self) -> usize {
+        self.base.len() + self.own.len()
+    }
+
+    /// The length with the live column as it stands (the snapshot's without one).
+    fn len_now(&self) -> usize {
+        match &self.live {
+            Some(l) => self.len().max(l.from + l.col.as_slice().len()),
+            None => self.len(),
+        }
+    }
+
+    /// THE ONE READ of a column: the entries in `r`, from the base's part, the own part, or,
+    /// past the snapshot, the live column; `None` past all of them or across the base's end (a
+    /// list never straddles it, and one appended after the snapshot lies wholly past it).
+    #[inline]
+    fn at(&self, r: core::ops::Range<usize>) -> Option<&'a [T]> {
+        let b = self.base.len();
+        if r.end <= b {
+            return self.base.get(r);
+        }
+        let own = r.start.checked_sub(b)?..r.end - b;
+        if own.end <= self.own.len() {
+            return self.own.get(own);
+        }
+        let live = self.live.as_ref()?;
+        let col: &'a dyn Stable<T> = live.col;
+        col.as_slice().get(r.start.checked_sub(live.from)?..r.end - live.from)
+    }
 }
 
 impl<'a> PTys<'a> {
     /// The empty table.
-    pub const EMPTY: PTys<'static> = PTys { nodes: &[], lists: &[], own_nodes: &[], own_lists: &[] };
+    pub const EMPTY: PTys<'static> = PTys { nodes: Col::EMPTY, lists: Col::EMPTY };
 
     /// A table held in two columns, nodes and list entries.
     pub const fn flat(nodes: &'a [PNode], lists: &'a [PTy]) -> PTys<'a> {
-        PTys { nodes, lists, own_nodes: &[], own_lists: &[] }
+        PTys { nodes: Col { base: nodes, own: &[], live: None }, lists: Col { base: lists, own: &[], live: None } }
     }
 
-    /// The base `base` with `own_nodes` and `own_lists` numbered on after it.
+    /// The base `base` with `own_nodes` and `own_lists` numbered on after it. The base's
+    /// snapshot only: a base under an overlay does not grow while the overlay lives.
     pub(crate) const fn overlay(base: PTys<'a>, own_nodes: &'a [PNode], own_lists: &'a [PTy]) -> PTys<'a> {
-        PTys { nodes: base.nodes, lists: base.lists, own_nodes, own_lists }
+        PTys { nodes: Col { base: base.nodes.base, own: own_nodes, live: None }, lists: Col { base: base.lists.base, own: own_lists, live: None } }
+    }
+
+    /// This view reading on past its snapshot in `nodes` and `lists`, the columns its last
+    /// part is a prefix of: the own part of an overlay (`over`), else the whole table.
+    fn with_live(mut self, over: bool, nodes: &'a dyn Stable<PNode>, lists: &'a dyn Stable<PTy>) -> PTys<'a> {
+        let (nf, lf) = if over { (self.nodes.base.len(), self.lists.base.len()) } else { (0, 0) };
+        self.nodes.live = Some(Live { col: nodes, from: nf });
+        self.lists.live = Some(Live { col: lists, from: lf });
+        self
     }
 
     /// The node of `t`, borrowed; `None` past the table.
     #[inline]
     pub fn get(&self, t: PTy) -> Option<&'a PNode> {
         let i = t.0 as usize;
-        match i.checked_sub(self.nodes.len()) {
-            None => self.nodes.get(i),
-            Some(own) => self.own_nodes.get(own),
-        }
+        self.nodes.at(i..i + 1)?.first()
     }
 
-    /// The number of nodes.
+    /// The number of nodes in the snapshot (a live view may read later ones by id).
     #[inline]
     pub fn len(&self) -> usize {
-        self.nodes.len() + self.own_nodes.len()
+        self.nodes.len()
     }
 
     /// Whether the table has no node.
@@ -142,51 +214,54 @@ impl<'a> PTys<'a> {
 
     /// The number of nodes in the base (the first own node's index).
     pub fn base_len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.base.len()
     }
 
-    /// Every node, in index order (`PTy(0)` first).
+    /// Every node of the snapshot, in index order (`PTy(0)` first).
     pub fn nodes(&self) -> impl Iterator<Item = &'a PNode> + Clone + 'a {
-        self.nodes.iter().chain(self.own_nodes.iter())
+        self.nodes.base.iter().chain(self.nodes.own.iter())
     }
 
-    /// Every list entry, in the list column's order.
+    /// Every list entry of the snapshot, in the list column's order.
     pub fn lists(&self) -> impl Iterator<Item = &'a PTy> + Clone + 'a {
-        self.lists.iter().chain(self.own_lists.iter())
+        self.lists.base.iter().chain(self.lists.own.iter())
     }
 
-    /// The number of list entries (the list column's length).
+    /// The number of list entries in the snapshot (the list column's length).
     pub fn lists_len(&self) -> usize {
-        self.lists.len() + self.own_lists.len()
+        self.lists.len()
+    }
+
+    /// The number of nodes now: the snapshot's, or a live view's column's as it stands (for a
+    /// bound over what an id may reach; never a count to walk, which is the snapshot's).
+    pub fn len_now(&self) -> usize {
+        self.nodes.len_now()
+    }
+
+    /// [`PTys::len_now`] for the list entries.
+    pub fn lists_len_now(&self) -> usize {
+        self.lists.len_now()
     }
 
     /// The list entry at `i` of the list column; `None` past it.
     #[inline]
     pub fn list_slot(&self, i: usize) -> Option<PTy> {
-        match i.checked_sub(self.lists.len()) {
-            None => self.lists.get(i).copied(),
-            Some(own) => self.own_lists.get(own).copied(),
-        }
+        self.lists.at(i..i + 1)?.first().copied()
     }
 
     /// The list entries in `r`; `None` when `r` is not within one part of the column (a list
     /// never straddles the base's end).
     pub fn list_at(&self, r: core::ops::Range<usize>) -> Option<&'a [PTy]> {
-        let base = self.lists.len();
-        if r.end <= base {
-            self.lists.get(r)
-        } else if r.start >= base {
-            self.own_lists.get(r.start - base..r.end - base)
-        } else {
-            None
-        }
+        self.lists.at(r)
     }
 
     /// The table's identity while it is borrowed: two views of one table are one identity. For
     /// a memo only; never part of a key, a record or an output. Two overlays of one base
-    /// differ in their own parts' addresses (an empty own part has nothing to tell apart).
+    /// differ in their own parts' addresses (an empty own part has nothing to tell apart). A
+    /// live view's later entries are of the same table (they never change an earlier entry),
+    /// so a memo by identity stays true while it grows.
     pub fn identity(&self) -> (usize, usize) {
-        (self.nodes.as_ptr() as usize, self.own_nodes.as_ptr() as usize)
+        (self.nodes.base.as_ptr() as usize, self.nodes.own.as_ptr() as usize)
     }
 
     /// The node of `t`.
@@ -647,6 +722,9 @@ trait StableOwn {
     fn intern(&self, base: Option<&PortableTys<'_>>, n: PNode) -> Result<PTy, CheckError>;
     fn intern_list(&self, base: Option<&PortableTys<'_>>, hash: u64, tys: &[PTy]) -> Result<List, CheckError>;
     fn list_rows(&self, each: &mut dyn FnMut(List) -> Result<(), CheckError>) -> Result<(), CheckError>;
+    /// The columns themselves, for a live view ([`PTys`]).
+    fn node_col(&self) -> &dyn Stable<PNode>;
+    fn list_col(&self) -> &dyn Stable<PTy>;
 }
 
 fn table_full(_: Full) -> CheckError {
@@ -688,6 +766,14 @@ impl StableOwn for StableCols<'_> {
 
     fn list_rows(&self, each: &mut dyn FnMut(List) -> Result<(), CheckError>) -> Result<(), CheckError> {
         self.index.borrow().list_rows.iter().try_for_each(|&l| each(l))
+    }
+
+    fn node_col(&self) -> &dyn Stable<PNode> {
+        &*self.nodes
+    }
+
+    fn list_col(&self) -> &dyn Stable<PTy> {
+        &*self.lists
     }
 }
 
@@ -852,11 +938,16 @@ impl<'a> PortableTys<'a> {
         }
     }
 
-    /// The table, borrowed.
+    /// The table, borrowed. Over [`Stable`] columns the view is LIVE ([`PTys`]): what is
+    /// interned through `&self` after it is readable through it by id.
     pub fn view(&self) -> PTys<'_> {
-        match self.base {
+        let snap = match self.base {
             Some(b) => PTys::overlay(b.view(), self.own.nodes(), self.own.lists()),
             None => PTys::flat(self.own.nodes(), self.own.lists()),
+        };
+        match &self.own {
+            Own::Owned { .. } => snap,
+            Own::Stable(s) => snap.with_live(self.base.is_some(), s.node_col(), s.list_col()),
         }
     }
 
@@ -870,7 +961,7 @@ impl<'a> PortableTys<'a> {
         nodes.extend_from_slice(self.own.nodes());
         let mut lists = Vec::with_capacity_in(self.own.lists().len(), alloc);
         lists.extend_from_slice(self.own.lists());
-        Ok(OwnTys { base_nodes: u32::try_from(bn).map_err(limit)?, base_lists: u32::try_from(bl).map_err(limit)?, nodes, lists })
+        Ok(OwnTys { base_nodes: u32::try_from(bn).map_err(limit)?, base_lists: u32::try_from(bl).map_err(limit)?, nodes, lists, whole: false })
     }
 
     /// The node `n`, interned. Its children must already be in the table.
@@ -954,49 +1045,66 @@ impl<'a> PortableTys<'a> {
         self.dynamic_rows(preds, false)
     }
 
+    /// [`PortableTys::dynamic`] through a shared borrow (as [`PortableTys::intern_shared`]): a
+    /// head decoded into a body's table while the body's check reads it.
+    pub fn dynamic_shared(&self, preds: &[PTy]) -> Result<PTy, CheckError> {
+        let (list, n) = object_rows(self.view(), preds, true)?;
+        let list = self.intern_list_shared(&list[..n])?;
+        self.intern_shared(PNode::Dynamic(list))
+    }
+
     /// `dynamic`, its rows sorted by `object_pred_key` (`sort`) or, the planted bug, as written.
     fn dynamic_rows(&mut self, preds: &[PTy], sort: bool) -> Result<PTy, CheckError> {
-        if preds.len() > MAX_OBJECT_PREDS {
-            return Err(CheckError::Limit(crate::error::Limit::ObjectPreds));
-        }
-        let mut rows = [((0u8, 0u128, 0u64), PTy(0)); MAX_OBJECT_PREDS];
-        let mut n = 0;
-        for &p in preds {
-            let bad = || CheckError::Malformed(crate::error::Malformed::ObjectPreds { node: p.0 });
-            let key = object_pred_key(self.view().node(p)?).ok_or_else(bad)?;
-            // Insertion by key; an equal key is a repeat (one row per auto trait) unless the rows
-            // differ: two principals are two non-auto traits ("There may not be more than one
-            // non-auto trait"), two bindings of one (trait, name) to two terms are E0719.
-            let mut at = n;
-            while sort && at > 0 && rows[at - 1].0 > key {
-                at -= 1;
-            }
-            let same = match sort {
-                true => (at > 0 && rows[at - 1].0 == key).then(|| at - 1),
-                false => rows[..n].iter().position(|r| r.0 == key),
-            };
-            if let Some(j) = same {
-                if key.0 != 2 && rows[j].1 != p {
-                    return Err(bad());
-                }
-                continue;
-            }
-            let mut i = n;
-            while i > at {
-                rows[i] = rows[i - 1];
-                i -= 1;
-            }
-            rows[at] = (key, p);
-            n += 1;
-        }
-        let mut list = [PTy(0); MAX_OBJECT_PREDS];
-        for i in 0..n {
-            list[i] = rows[i].1;
-        }
+        let (list, n) = object_rows(self.view(), preds, sort)?;
         let list = self.intern_list(&list[..n])?;
         self.intern(PNode::Dynamic(list))
     }
+}
 
+/// A trait object's rows in its one order (`sort`; the planted bug: as written), repeats
+/// dropped: the list `PNode::Dynamic` holds, its first `n` entries.
+fn object_rows(view: PTys<'_>, preds: &[PTy], sort: bool) -> Result<([PTy; MAX_OBJECT_PREDS], usize), CheckError> {
+    if preds.len() > MAX_OBJECT_PREDS {
+        return Err(CheckError::Limit(crate::error::Limit::ObjectPreds));
+    }
+    let mut rows = [((0u8, 0u128, 0u64), PTy(0)); MAX_OBJECT_PREDS];
+    let mut n = 0;
+    for &p in preds {
+        let bad = || CheckError::Malformed(crate::error::Malformed::ObjectPreds { node: p.0 });
+        let key = object_pred_key(view.node(p)?).ok_or_else(bad)?;
+        // Insertion by key; an equal key is a repeat (one row per auto trait) unless the rows
+        // differ: two principals are two non-auto traits ("There may not be more than one
+        // non-auto trait"), two bindings of one (trait, name) to two terms are E0719.
+        let mut at = n;
+        while sort && at > 0 && rows[at - 1].0 > key {
+            at -= 1;
+        }
+        let same = match sort {
+            true => (at > 0 && rows[at - 1].0 == key).then(|| at - 1),
+            false => rows[..n].iter().position(|r| r.0 == key),
+        };
+        if let Some(j) = same {
+            if key.0 != 2 && rows[j].1 != p {
+                return Err(bad());
+            }
+            continue;
+        }
+        let mut i = n;
+        while i > at {
+            rows[i] = rows[i - 1];
+            i -= 1;
+        }
+        rows[at] = (key, p);
+        n += 1;
+    }
+    let mut list = [PTy(0); MAX_OBJECT_PREDS];
+    for i in 0..n {
+        list[i] = rows[i].1;
+    }
+    Ok((list, n))
+}
+
+impl<'a> PortableTys<'a> {
     /// The list `tys`, interned.
     pub fn intern_list(&mut self, tys: &[PTy]) -> Result<List, CheckError> {
         if tys.is_empty() {
@@ -1079,12 +1187,22 @@ pub struct OwnTys<'a> {
     base_lists: u32,
     nodes: Vec<PNode, Alloc<'a>>,
     lists: Vec<PTy, Alloc<'a>>,
+    /// The body's types are the base's own (lowered straight into it): read it whole.
+    whole: bool,
 }
 
 impl<'a> OwnTys<'a> {
     /// No types: a body whose types went into another table (`lower_again`).
     pub fn none(alloc: Alloc<'a>) -> OwnTys<'a> {
-        OwnTys { base_nodes: 0, base_lists: 0, nodes: Vec::new_in(alloc), lists: Vec::new_in(alloc) }
+        OwnTys { base_nodes: 0, base_lists: 0, nodes: Vec::new_in(alloc), lists: Vec::new_in(alloc), whole: false }
+    }
+
+    /// A body lowered straight into the table it is read over (the seeded path: one body's
+    /// private store, its table over [`Stable`] columns, no overlay): [`OwnTys::view`] is
+    /// that table's own view, LIVE ([`PTys`]), so one table numbers every type once and a
+    /// head imported into it during the check is read through a view taken before.
+    pub fn in_base(alloc: Alloc<'a>) -> OwnTys<'a> {
+        OwnTys { whole: true, ..OwnTys::none(alloc) }
     }
 
     /// The number of own nodes.
@@ -1110,6 +1228,9 @@ impl<'a> OwnTys<'a> {
         let have = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         if base.base.is_some() {
             return Err(CheckError::Malformed(Malformed::Overlay { base: self.base_nodes, have: have(base.len()) }));
+        }
+        if self.whole {
+            return Ok(base.view());
         }
         let (bn, bl) = (self.base_nodes as usize, self.base_lists as usize);
         let (base_nodes, base_lists) = (base.own.nodes(), base.own.lists());

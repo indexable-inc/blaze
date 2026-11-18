@@ -121,6 +121,23 @@ pub enum MemberRefusal {
     DecideCheck,
 }
 
+impl MemberRefusal {
+    /// The module the refusal names (its path is printed with it: rule 19).
+    pub fn module(&self) -> Option<ItemKey> {
+        match *self {
+            MemberRefusal::Textual { module }
+            | MemberRefusal::NoRecord { module }
+            | MemberRefusal::Record { module, .. }
+            | MemberRefusal::Scope { module }
+            | MemberRefusal::NoGlobsCell { module }
+            | MemberRefusal::MacroExports { module }
+            | MemberRefusal::Ambiguous { module }
+            | MemberRefusal::GlobSource { module, .. } => Some(module),
+            MemberRefusal::DecideCheck => None,
+        }
+    }
+}
+
 /// The one-group solve over a crate solve: `solve_crate` solves the members it is given from
 /// their text, every other module from `records` ([`Members`]), and answers with the members'
 /// groups. A member that reads a module outside whose group reads back into the members (an

@@ -348,9 +348,9 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
         Ok(Entry::Made(made)) => {
             let mut record = Made::new_in(name, held);
             hand_graph(&mut record, made.record)?;
-            record.out = ContentId::of(GRAPH_OUT_DOMAIN, record.payload_bytes());
+            record.out = ContentId::of(GRAPH_OUT_DOMAIN, record.payload_bytes()?);
             // One `MacroModule` part per proc-macro crate (macros.rs): the module lookups.
-            match crate::macros::parts(graph.source, record.payload_bytes(), env.heap.alloc()) {
+            match crate::macros::parts(graph.source, record.payload_bytes()?, env.heap.alloc()) {
                 Ok(parts) => record.parts.extend(parts.iter().map(|(name, source)| Part { name: *name, locate: Locate::Source(*source), place: 0 })),
                 Err(refused) => {
                     let words = bstd::mem::format_in!(held, "the dependency graph's own record does not decode at byte {}: {}", refused.at, refused.why);
@@ -410,13 +410,18 @@ mod tests {
         let before = frame.used();
         super::hand_graph(&mut made, graph).expect("the graph's record handed");
         let grew = frame.used() - before;
-        assert!(made.payload_bytes() == &bytes[..], "the record reads the graph's exact bytes");
-        assert_eq!(made.payload_bytes().as_ptr(), at, "the record reads the graph where it was made: it was copied");
+        assert!(made.payload_bytes().unwrap() == &bytes[..], "the record reads the graph's exact bytes");
+        assert_eq!(made.payload_bytes().unwrap().as_ptr(), at, "the record reads the graph where it was made: it was copied");
         assert_eq!(grew, 0, "the task's frame grew by the graph's record");
         let other = blaze_own::Erased::new(Global);
         let mut refused = crate::work::Made::new_in(name, &frame);
         assert!(super::hand_graph(&mut refused, blaze_own::Vec::from_slice_in(&bytes[..16], other.handle())).is_err(), "bytes over another allocator were taken");
-        assert!(refused.payload_bytes().is_empty(), "a refused hand holds no payload");
-        println!("graph record handed: {} bytes, frame grew by {grew}", made.payload_bytes().len());
+        assert!(refused.payload_bytes().unwrap().is_empty(), "a refused hand holds no payload");
+        println!("graph record handed: {} bytes, frame grew by {grew}", made.payload_bytes().unwrap().len());
+        // A released payload is refused, never read as empty bytes (rule 76).
+        let freed = made.payload_bytes().unwrap().len();
+        assert_eq!(made.release_handed(), freed, "the release frees the handed bytes");
+        assert!(made.payload_bytes().is_err(), "a released payload is refused");
+        assert_eq!(made.release_handed(), 0, "a second release frees nothing");
     }
 }

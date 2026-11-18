@@ -70,6 +70,9 @@ pub trait Store<'m> {
     /// `bytes` at `key`. A key already held with equal bytes is left as it is (rule 25); other
     /// bytes are refused (rule 21).
     fn put(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError>;
+    /// [`Store::put`] of the concatenation of `parts` (a record's head and payload), never
+    /// joined first: the bytes go to the store from where their writer made them.
+    fn put_parts(&mut self, cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError>;
     /// Every segment the head names mapped, and every parked one checked: asked once, when the
     /// request's first pool task is about to start (work.rs `run_batches`); later asks do
     /// nothing.
@@ -81,6 +84,20 @@ pub trait Store<'m> {
     /// toolchain's), told by the names step once its world is made: a trusted builder puts
     /// their records in the public namespace.
     fn public_crates(&mut self, subjects: &[ContentId]);
+    /// What this store's puts cost the process so far (rules 50, 51): the copies of records it
+    /// made into the heap and the bytes of them it holds now, counted where it copies.
+    fn kept(&self) -> StoreKept;
+}
+
+/// The bytes of records a [`Store`] copied into this process's heap, and holds now (a gauge):
+/// read at each phase's merge by engine_store.rs `Ledger`.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct StoreKept {
+    /// Puts copied into the heap, ever.
+    pub copies: u64,
+    pub copy_bytes: u64,
+    /// Bytes of those copies alive now (outside a mapping).
+    pub held_bytes: u64,
 }
 
 /// blaze's folder in the user's home, made by the first file made in it.
@@ -528,9 +545,10 @@ pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout
 pub trait Sharing {
     /// The crates whose records hold nothing of a project, by their `CrateScope` subjects.
     fn add_public(&mut self, subjects: &[ContentId]);
-    /// Whether `bytes`, a record about to be put, holds only public names: it goes to the
-    /// public namespace when this machine is a trusted builder, else to `LOCAL`.
-    fn all_names_public(&self, bytes: &[u8]) -> bool;
+    /// Whether the record about to be put, the concatenation of `parts` (one slice, or a whole
+    /// record's head and payload), holds only public names: it goes to the public namespace
+    /// when this machine is a trusted builder, else to `LOCAL`.
+    fn all_names_public(&self, parts: &[&[u8]]) -> bool;
 }
 
 /// A drive record's names are all public when its name and every name it reads are on a
@@ -559,9 +577,16 @@ impl Sharing for ToolchainCrates {
         self.subjects.dedup();
     }
 
-    fn all_names_public(&self, bytes: &[u8]) -> bool {
+    fn all_names_public(&self, parts: &[&[u8]]) -> bool {
         let public = |name: Name| matches!(name.kind, Kind::CrateScope | Kind::Script) && self.subjects.binary_search(&name.subject).is_ok();
-        let (name, all_public) = match blaze_drive::record::open(bytes) {
+        // One record whole, or a whole record's head and payload (engine_store.rs `put_all`);
+        // anything else is not a drive record.
+        let opened = match parts {
+            [bytes] => blaze_drive::record::open(bytes),
+            [head, payload] => blaze_drive::record::open_parts(head, payload),
+            _ => return false,
+        };
+        let (name, all_public) = match opened {
             // A cell read names its record as a whole read does, so both must be public.
             Ok(Stored::Whole(view)) => (
                 view.name,
@@ -770,6 +795,16 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(self.place.root(name)?.map(|held| held.bytes))
     }
 
+    /// What is put so far written now, one segment a namespace and one flip, and every arena
+    /// chunk no get lent from freed (blaze-cas `Lent::commit`): the engine's phase loop asks it
+    /// after each phase's puts, so no record stays in the heap past its phase (rule 51). A crash
+    /// after it keeps these records, valid by their keys; the answer's pointer is still written
+    /// last, by the commit after the answer.
+    pub fn commit_puts(&mut self) -> Result<(), CliError> {
+        self.place.commit()?;
+        Ok(())
+    }
+
     /// Keeps `keys` under the root `name` from the commit after the answer on: the engine's
     /// stored answer, its sealed pointer first, then the answer's root and pages
     /// (engine_answer.rs; the order simulated in blaze-engine pages_sim.rs).
@@ -782,6 +817,12 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
 impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     fn public_crates(&mut self, subjects: &[ContentId]) {
         self.sharing.add_public(subjects);
+    }
+
+    fn kept(&self) -> StoreKept {
+        let lent = self.place.counts().lent;
+        // A commit frees each arena chunk no get lent from (blaze-cas plain/lent.rs).
+        StoreKept { copies: lent.copied, copy_bytes: lent.arena_bytes, held_bytes: lent.held_bytes }
     }
 
     fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError> {
@@ -818,13 +859,22 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         Ok(found)
     }
 
-    fn put(&mut self, _cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
-        let public = self.sharing.all_names_public(bytes);
-        match self.place.put(key, public, bytes) {
+    fn put(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
+        self.put_parts(cx, key, &[bytes])
+    }
+
+    fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
+        let public = self.sharing.all_names_public(parts);
+        match self.place.put_parts(key, public, parts) {
             Ok(()) => Ok(()),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
                 let held = self.place.get(key)?;
-                let clash = Clash::of(held.map(|held| held.bytes), bytes);
+                // A refusal alone joins the parts, to name the first differing byte.
+                let mut bytes = Vec::new_in(Global);
+                for part in parts {
+                    bytes.extend_from_slice(part);
+                }
+                let clash = Clash::of(held.map(|held| held.bytes), &bytes);
                 Err(CliError::Store(StoreFailure::TwoValues { key, lent, clash }))
             }
             Err(error) => Err(error.into()),

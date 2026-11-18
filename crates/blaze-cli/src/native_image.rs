@@ -110,7 +110,7 @@ pub(crate) fn links<'b>(cx: &Cx, store: &mut dyn Store<'_>, task: &Task<'_>, hel
     made.payload.extend_from_slice(table);
     made.out = task.source;
     #[cfg(test)]
-    watch_links(task.name, made.payload_bytes(), payload);
+    watch_links(task.name, made.payload_bytes()?, payload);
     Ok(Did::Done(made))
 }
 

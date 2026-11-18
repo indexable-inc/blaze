@@ -91,6 +91,17 @@ impl<'n> Root<'n> {
     }
 }
 
+/// The label of a body a macro wrote at module level ([`Expanded`]'s words), for a check of it
+/// outside this module (engine_bodies.rs).
+pub(crate) fn written_label<'n>(records: &'n Records<'n>, written: &WrittenBy<'n>) -> impl fmt::Display + 'n {
+    Expanded { records, root: Root::Expanded { listed: written.listed, by: written.by } }
+}
+
+/// What a finding of a body a macro wrote says after "in `<the body's path>`, ": its text's place
+/// in yours is not known, so it is shown at the item's start (module doc, "WHERE A FINDING
+/// GOES"). The one wording, for `check` and `engine-check`.
+pub(crate) const WRITTEN_UNPLACED: &str = "a body a macro wrote (where its text came from in yours is not in the records yet: blaze-scope expansion_origins.rs), shown at the item's start: ";
+
 /// An expanded root's label ([`Root::label`]): the expansion by its macro, then the body by
 /// its name, `{the expansion of `write_f!`}::f`; a member, `{..}::clone`. What a finding in
 /// expanded code names, at the call (module doc, "WHERE A FINDING GOES").

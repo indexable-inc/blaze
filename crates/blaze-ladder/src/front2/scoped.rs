@@ -44,6 +44,50 @@ pub struct ScopedBy<'d, 'n: 'd, S> {
     /// The definitions prepared so far, shared by every body over `names`; `None` prepares a
     /// definition at each call (a signature's type macro, which has no place to keep them).
     pub prepared: Option<&'d Prepares<'n>>,
+    /// The body's written blocks ([`written_blocks`]), in text order: a call-site path of a
+    /// call written inside one is read at the innermost one's module, which declares the
+    /// block's items (blaze-scope blocks.rs) and reaches the blocks around it and the module
+    /// through its `use super::*`. Empty for a text with no block of the names library (a
+    /// signature, a local item's own body).
+    pub blocks: &'d [WrittenBlock],
+}
+
+/// A block of a body that the names library made a module (blaze-scope blocks.rs): where it is
+/// in the body's text, and its module's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrittenBlock {
+    /// The offset of its `{` in the body's text.
+    pub open: u32,
+    /// The offset after its `}`.
+    pub close: u32,
+    pub module: ItemKey,
+}
+
+/// The written blocks of `text`, the whole text of the names library's item or member `body`
+/// of the crate `krate`, in text order: the same scan of the same text the library made its
+/// block modules from, so the same keys (blaze-scope `blocks::block_modules`, as front2
+/// locals.rs `Locals::keep` names them). A text whose scan does not end whole has none: its
+/// blocks are not the library's either.
+pub fn written_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str, alloc: Alloc<'a>) -> AVec<'a, WrittenBlock> {
+    let mut out: AVec<'a, WrittenBlock> = Vec::new_in(alloc);
+    let nested = blaze_file_items::nested::scan(text, alloc);
+    if nested.end != blaze_file_items::nested::NestedEnd::Whole {
+        return out;
+    }
+    let modules = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+    for (block, module) in nested.blocks.iter().zip(modules.iter()) {
+        if let Some(module) = *module {
+            out.push(WrittenBlock { open: block.open, close: block.close, module });
+        }
+    }
+    out
+}
+
+/// The module a call-site path of the call written at `call` (item-relative) is read at: the
+/// innermost written block holding the call (the last in text order of those that hold it:
+/// a block inside another opens after it), or the body's module when none does.
+fn block_module(blocks: &[WrittenBlock], call: blaze_surface::Range, module: ItemKey) -> ItemKey {
+    blocks.iter().filter(|b| b.open < call.start && call.end <= b.close).last().map_or(module, |b| b.module)
 }
 
 /// A kept definition as this resolver answers it.
@@ -91,7 +135,16 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
             ProcKind::Attr => CallShape::Attr,
             ProcKind::Derive => CallShape::Derive,
         };
-        let module = site.module;
+        // A path read at the call site (no opaque mark, no `$crate`) of a call written in the
+        // body's text is read in the innermost written block around the call: an `extern
+        // crate .. as` or `use` there binds its first segment (serde's derive writes
+        // `extern crate serde as _serde; _serde::__require_serde_not_serde_core!();` in its
+        // `const _` block). Every cell of that walk is the block module's (rule 21).
+        let at_call = site.dollar_crate.is_none() && !matches!(at.mark, Some(m) if m.transparency == blaze_expand::Transparency::Opaque);
+        let module = match at.written {
+            Some(call) if at_call => block_module(self.blocks, call, site.module),
+            _ => site.module,
+        };
         let found = self.names.macro_at(module, written).map_err(|e| NoMacro::Names(MacroDefError::Path(e)))?;
         let Some(src) = found.src else {
             // A procedural macro with no source row: its crate's runner, by the name it is
@@ -127,5 +180,37 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
     fn local_site(&self) -> Option<DefSite> {
         let krate = self.names.crate_of(self.module)?;
         Some(DefSite { krate: self.names.crate_key(krate)?, module: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_id::{ContentId, CrateItemKey, ItemKey};
+    use blaze_surface::Range;
+
+    use super::{block_module, written_blocks};
+
+    /// A derive's `const _: () = { extern crate dep as _dep; _dep::m!(); impl .. };`: its block
+    /// is written (a statement call, an impl), and a call inside it is read at the block's
+    /// module, an inner block's call at the inner block's; a call outside every block at the
+    /// body's module (the control: the rule before this fix, for every call).
+    #[test]
+    fn a_call_reads_its_innermost_written_block() {
+        let text = "const _: () = { extern crate dep as _dep; _dep::m!(); impl T for U { fn f(&self) { { _dep::n!(); } } } };";
+        let alloc = blaze_own::testing::heap().alloc();
+        let key = |s: &[u8]| ContentId::of("blaze-ladder scoped test", s);
+        let blocks = written_blocks(CrateItemKey(key(b"app")), ItemKey(key(b"body")), text, alloc);
+        let module = ItemKey(key(b"module"));
+        let at = |s: &str| {
+            let start = u32::try_from(text.find(s).unwrap_or_else(|| panic!("`{s}` in the text"))).unwrap_or(u32::MAX);
+            Range::new(start, start + u32::try_from(s.len()).unwrap_or(u32::MAX))
+        };
+        let outer = blocks.first().copied().unwrap_or_else(|| panic!("the constant's block is written: {blocks:?}"));
+        assert_eq!(outer.open as usize, text.find('{').unwrap_or(0), "the first written block is the constant's: {blocks:?}");
+        assert_eq!(block_module(&blocks, at("_dep::m!();"), module), outer.module, "the call in the constant's block: {blocks:?}");
+        assert_ne!(outer.module, module, "a block's module is not the body's");
+        assert_eq!(block_module(&blocks, at("const _"), module), module, "a range outside every block is read at the body's module");
+        let inner = block_module(&blocks, at("_dep::n!();"), module);
+        assert!(blocks.iter().any(|b| b.module == inner), "the inner call reads a written block's module: {blocks:?}");
     }
 }

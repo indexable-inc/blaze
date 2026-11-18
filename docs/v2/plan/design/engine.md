@@ -83,9 +83,12 @@ per-job state; whole reads of `CrateScope` and `Surface`; the items record's buc
    cells did not move is not entered. Nothing changed is the certificate and nothing else.
 7. **One front end.** `check` plans every body asked; `run` plans the entry and makes the rest on first
    call through the same inline rule; the census is `run` with every instance asked.
-8. **Lints and tests are stages too.** A lint is a task after Bodies: one per (lint, body), reading that
-   body's typed result record and the cells the lint asks, its findings a record keyed like the check
-   (rule 81); an edited body reruns its own lints, a changed lint reruns that lint alone. Errors print
+8. **Lints and tests are stages too.** A lint task comes after Bodies and is ONE PER BODY (D135; it was one
+   per (lint, body) until the survey of 2026-11-17): every selected lint runs in one walk over that body's
+   typed result record, dispatched by node kind (each lint names the kinds it wants; the lints are
+   compiled in, no dynamic call per node), reading the cells the lints ask. The record is keyed by the body
+   and the hash of the selected lints' code ids, and holds the findings per lint (rule 81), so an edited
+   body reruns its own walk and nothing else; a lint's cost is counted per lint in the profile. Errors print
    with the answer; advice and whole-program analyses are later phases that never hold the answer back.
    A test is a task whose reads are the code records its run reached (the run's reach list), so a
    request reruns exactly the tests whose reached code moved, and the rest are reused by key.
@@ -118,7 +121,7 @@ read and one get (0.09 s measured on tempo with no process alive).
 | E5 tasks | names, heads, impls and body as functions over `Tables` with inline needs through claims | entries per result is 1.0 for planned kinds |
 | E6 the switch | `blaze check` on the engine beside the old path, equal answers on fixtures and tempo; then the old path deleted | tempo cold seconds, GB and the edit loop quoted before and after; the deletion list above gone |
 | E7 run and census | the lazy program and the eager program replaced by point 7 | hello world prints; the census equals the last one on the old path |
-| E8 lints | `Stage::Lints`: a task per (lint, body) over the typed result; advice after the answer | a body edit reruns its lints only; a lint's edit reruns that lint only; tempo's lint time beside its check time |
+| E8 lints | `Stage::Lints`: one task per body running every selected lint in one walk dispatched by node kind (D135); findings per lint in one record; suppressions as records (an unused one is a finding); fixes with a safety level, applied to a fixed point of at most 100 rounds with the body checked again; advice after the answer | a body edit reruns that body's walk only; the profile gives each lint's cost; tempo's lint time beside its check time |
 | E9 tests | `Stage::Tests`: a test's reads are the code records its run reached | one body edit reruns only the tests that reach it; the rest reused |
 | E10 published records fetched (D132) | in this order: local names fast first; names records small (core's is 83 MB, 48 MB of it expansions kept as text); then R2 for optimized CODE of std and popular crates (dear to compute, small to ship); names records only by byte range, the pages a check touches (remote-read.md); never a whole pack of names (about 160 MB for a 6 s compute) | a fresh home's first check of a small crate: under 1 s for the shelf's names computed locally; bytes fetched per check quoted |
 | E11 why | the cause of every entered task (new, its key moved, or the first read that moved: cell, old and new digest), a count of tasks redone to the same bytes, an "entered because" table in the profile, and `blaze why <file or item>` printing the chain from the edit (the owner, 10:29: "could u add better telm", on a private fn added costing 113 s with no row saying why) | on tempo, one private fn added: the table names each cause; redone-identical is 0 |
@@ -126,7 +129,25 @@ read and one get (0.09 s measured on tempo with no process alive).
 | E13 lazy names of dependencies | a dependency's names made on demand per cell (then per group as a record), from the paths your crates walk and the impl questions your bodies ask; measured first: the share of each dependency's modules a real project reaches | the first check of a small crate on a fresh home resolves a fraction of the shelf (today 27 crates whole, 6 s: gimli 2.3 s, object 1.8 s, libc 1.5 s, core 1.4 s); answers equal to the whole solve |
 | E14 aspects | a head's cell split into parts with their own digests (types, bounds, lifetimes; existence, fields, layout; type, value; head, member list, member) and each read recorded by part | a field added to a struct enters no body that only names the type; a constant's value edited enters no reader of its type |
 
+| E15 shared goals and instances | trait goals (canonical form) and generic instantiations are request-wide records made once through claims and read by every body, never a cache per worker or per body (the native TypeScript port keeps one per checker: instantiations and memory grow with the thread count) | goals solved per request against goals asked; memory flat from 1 to 16 workers on tempo |
+| E16 every hit is a read | a cache hit of any kind (a solver memo, a claimed record, a frozen head imported, an impl table) appends the reads of what it returned to the reader's read list; an audit mode re-makes every hit and compares result and reads (Lean's differential check) | a planted "hit without its reads" is caught; the audit on the 58 real bodies reads equal |
+| E17 an impl added | adding or removing an impl enters only the bodies whose recorded trait questions (trait, self shape) it can answer | an impl added for an unrelated type enters 0 bodies; for a queried shape, exactly its askers |
+| E18 settled classes | facts of the toolchain and of registry packages are settled once per (toolchain, lock entry) and checked by one digest, never by read lists (salsa's durability, as records) | a second project on the same toolchain reads no dependency read list |
+
 Order: E1 to E4 at once; E5 on E2; E6 when E1 and E5 pass their checks; E7 after E6; E8 and E9 on E6.
+
+From the survey of 2026-11-17 (the owner asked for it; the report "Fast compiler and tooling architectures" and
+its six sourced notes are kept with the session's notes, outside the tree): no surveyed system keeps fine-grained semantic state across a restart and reads it in place
+(Zig, Buck2, Bazel, rust-analyzer lose it with the process; rustc rewrites its 77 MB dependency graph each
+session), so that part of this design has no model to copy and every piece of it is measured here. What the
+survey changed: point 8 (one lint walk per body) and pieces E15 to E18. What it confirmed with numbers: no
+restarts (Skyframe restarts; DICE and Zig do not), heads computed without bodies with a cutoff on equal bytes
+(Flow types-first: about 6x at p90), reads at name grain with absence (Zinc, Pyrefly: 3.6 s to under 0.2 s), no
+positions in a head (Flow's blank-line rechecks), small records packed and never one mapping a file on macOS
+(Lean: 7.6 s of a 10.2 s warm import spent mapping 52,490 files), no global lock on an interner (oxc: +30%),
+whole-graph facts as keyed records (Zig: 30 ms of a 37 ms update is one reachability walk), deterministic work
+caps in the solver (Swift dropped wall-clock limits), and that a faster back end alone moves little (the
+Cranelift back end: 5 to 12% end to end on a large Rust project).
 
 State, 2026-11-17 10:00: E1 admitted (crates/blaze-engine, simulated; a failed task is a row). E3's writer,
 reader and equality proof admitted on one fixture. E4's cell table and recorder seam admitted. E2 in two

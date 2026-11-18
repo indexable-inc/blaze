@@ -176,7 +176,7 @@ fn the_mark_survives_the_head_record() {
         assert_eq!(row.args, marked, "`{n}`'s made head");
         let bytes = encode(head, store.tys.view(), Alloc::global()).unwrap_or_else(|e| panic!("`{n}`: not encoded: {e}"));
         let text = head.text();
-        let decoded = decode(&bytes, text, &mut store.tys, Alloc::global()).unwrap_or_else(|e| panic!("`{n}`: not decoded: {e}"));
+        let decoded = decode(&bytes, text, &store.tys, Alloc::global()).unwrap_or_else(|e| panic!("`{n}`: not decoded: {e}"));
         let HeadRef::Adt { row, .. } = decoded.as_ref() else { panic!("`{n}` decoded as no ADT head") };
         assert_eq!(row.args, marked, "`{n}`'s head read back from its record");
         println!("args-inline: `{n}` marked {marked}, kept through its head record");

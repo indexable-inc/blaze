@@ -68,10 +68,11 @@ pub(crate) mod sections;
 // expansion texts; "5": an out of the names record alone, see [`OUT_DOMAIN`]; "6": a names
 // section of names record version 1, without the failed calls; "7": form 4, without the link
 // table; "8": form 5, without the cell table; "9": a cell table without the names section's
-// whole row) are under other names, never found, made again.
+// whole row; "10": a cell table without the `MemberOf`, `VariantOf` and `Beginning` rows, whose
+// readers would read those cells absent) are under other names, never found, made again.
 // The subject's domain is blaze-drive key.rs `CRATE_SCOPE_DOMAIN` (the name's one home,
 // `crate_scope_name`): bump it there with this one.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 10";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 11";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at

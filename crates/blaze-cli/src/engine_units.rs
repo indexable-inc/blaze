@@ -159,7 +159,7 @@ pub(crate) fn discover<'f>(
                 // The names world (work.rs's `UnitGraph` arm): every crate of the build.
                 let world = {
                     let _cx = cx.span("names: make the world");
-                    crate::names::world(&cx, root, record.payload_bytes(), Some(lockfile.lock), Some(graph.member_dirs()), env)
+                    crate::names::world(&cx, root, record.payload_bytes()?, Some(lockfile.lock), Some(graph.member_dirs()), env)
                 };
                 // The record sealed with the crate list as work.rs's arm seals it: its readers
                 // (a `Script` job, a macro module's lookup) open its two sections

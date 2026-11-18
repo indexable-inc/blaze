@@ -225,15 +225,11 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.variants(owner)
     }
 
-    /// Found: the enum's variants cell. Not found: the crate's items whole (no cell says "no
-    /// enum has this variant").
+    /// The variant's `VariantOf` cell on both paths: its digest is the answer (enum and index,
+    /// or the refusal of a key under two enums), and absent is "no variant of that key".
     fn variant_of(self, variant: ItemKey) -> Option<(ItemKey, u32)> {
-        let found = self.records.variant_of(variant);
-        match found {
-            Some((owner, _)) => self.cell(NameCell::Variants { owner }),
-            None => self.whole_of(variant, Section::Items),
-        }
-        found
+        self.cell(NameCell::VariantOf { variant });
+        self.records.variant_of(variant)
     }
 
     fn has_text(self, key: ItemKey) -> bool {
@@ -295,6 +291,8 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     /// hold.
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
         self.item(key);
+        // Whether it is a member, and of which owner: its `MemberOf` cell on both paths.
+        self.cell(NameCell::MemberOf { member: key });
         if let Some((owner, _)) = self.records.member_owner(key) {
             self.cell(NameCell::Members { owner });
         } else if matches!(self.records.kind_of_item(key), Some(ItemKind::Function | ItemKind::Static)) && !self.records.text_of(key).is_some_and(|t| t.text.trim_end().ends_with('}')) {
@@ -323,14 +321,11 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.each_member(owner, each)
     }
 
-    /// Found: the owner's members cell. Not found: the crate's items whole.
+    /// The member's `MemberOf` cell on both paths: its digest is the answer (owner and name),
+    /// and absent is "no named member of that key".
     fn member_owner(self, member: ItemKey) -> Option<(ItemKey, &'n str)> {
-        let found = self.records.member_owner(member);
-        match found {
-            Some((owner, _)) => self.cell(NameCell::Members { owner }),
-            None => self.whole_of(member, Section::Items),
-        }
-        found
+        self.cell(NameCell::MemberOf { member });
+        self.records.member_owner(member)
     }
 
     /// WHOLE: every impl of the crate.
@@ -433,19 +428,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.binds(module, ns, name)
     }
 
-    /// Found: its item cell. Not found: the crate's items whole (no cell says "no key begins
-    /// so").
+    /// The prefix's `Beginning` cell on both paths: every key of the crate beginning so, so a
+    /// second key added with the prefix (which turns the answer into a refusal) moves it, and
+    /// absent is "no key begins so".
     fn key_beginning(self, first: [u8; 16]) -> Option<ItemKey> {
-        let found = self.records.key_beginning(first);
-        match found {
-            Some(key) => self.item(key),
-            None => {
-                let mut krate = [0u8; 8];
-                krate.copy_from_slice(&first[..8]);
-                self.cell(NameCell::Whole { krate, section: Section::Items });
-            }
-        }
-        found
+        self.cell(NameCell::Beginning { first });
+        self.records.key_beginning(first)
     }
 }
 

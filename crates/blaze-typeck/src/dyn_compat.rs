@@ -361,8 +361,9 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
     } else {
         return Err(CheckError::Malformed(Malformed::NoRecord(Question::FnSig(item))).into());
     };
-    let mut seen_nodes: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(types.len(), alloc);
-    seen_nodes.resize(types.len(), false);
+    // `len_now`: a live view's later types are walked too (portable.rs `PTys`).
+    let mut seen_nodes: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(types.len_now(), alloc);
+    seen_nodes.resize(types.len_now(), false);
     let mut traits: Vec<ItemKey, Alloc<'_>> = Vec::new_in(alloc);
     let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     // Children are pushed reversed so the walk meets types in written order.

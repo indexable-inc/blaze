@@ -744,12 +744,20 @@ fn cost_of_one_body() {
     let (mut equal_sum, mut equal_n, mut equal_us, mut lowered_us) = (Spent::default(), 0u64, 0u64, 0u64);
     let start = Instant::now();
     let seeded_n = (kept_outs.len() - refused.len()) as u64;
+    // Per seeded body: its rounds, the heads it asked (imports on the spot and between rounds,
+    // `Part::Heads` entries) and its impl questions filed (`Part::Impls` entries), its name.
+    let mut per_body: Vec<(u64, u64, u64, String)> = Vec::new();
     for (key, bytes, _) in kept_outs.iter().filter(|(k, _, _)| !refused.contains_key(k)) {
         let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None };
         let (before, t0) = (cost.spent(), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("seeded, the body task of {key:x}: {e}"));
         let spent = cost.spent().since(&before);
         seeded_sum.add(&spent);
+        {
+            use blaze_ladder::front2::tables::cost::Part;
+            let label = NamesSource::name_of(task_records, *key).unwrap_or("?").to_string();
+            per_body.push((spent.rounds, spent.entries[Part::Heads as usize], spent.entries[Part::Impls as usize], label));
+        }
         if out.bytes.as_slice() == bytes.as_slice() {
             equal_sum.add(&spent);
             equal_n += 1;
@@ -771,6 +779,25 @@ fn cost_of_one_body() {
         }
     }
     let total = start.elapsed();
+    {
+        let mut by_rounds: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+        for (rounds, _, _, _) in per_body.iter() {
+            *by_rounds.entry(*rounds).or_default() += 1;
+        }
+        let most = |f: fn(&(u64, u64, u64, String)) -> u64| per_body.iter().map(f).max().unwrap_or(0);
+        let sum = |f: fn(&(u64, u64, u64, String)) -> u64| per_body.iter().map(f).sum::<u64>();
+        let n = per_body.len().max(1) as u64;
+        let mut over: Vec<&(u64, u64, u64, String)> = per_body.iter().filter(|b| b.0 > 1).collect();
+        over.sort_by(|a, b| b.0.cmp(&a.0).then(a.3.cmp(&b.3)));
+        let over: Vec<String> = over.iter().take(8).map(|b| format!("`{}` {} rounds {} heads {} impls", b.3, b.0, b.1, b.2)).collect();
+        say!(
+            "SEEDED ROUNDS a body (rounds: bodies) {by_rounds:?}; heads asked a body {} (most {}); impl questions a body {} (most {}); most rounds: {over:?}",
+            sum(|b| b.1) / n,
+            most(|b| b.1),
+            sum(|b| b.2) / n,
+            most(|b| b.2)
+        );
+    }
     say!("SEEDED {seeded_n} bodies in {} ms: {} us a body;{}", total.as_millis(), total.as_micros() as u64 / seeded_n.max(1), parts(&seeded_sum, seeded_n));
     say!("SEEDED EQUAL {equal_n} bodies: {} us a body (today's one world: {} us a body for the same);{}", equal_us / equal_n.max(1), lowered_us / equal_n.max(1), parts(&equal_sum, equal_n));
     let mut seeded_gaps: Vec<(String, usize)> = seeded_gaps.into_iter().collect();

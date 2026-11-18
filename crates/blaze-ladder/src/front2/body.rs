@@ -807,6 +807,17 @@ pub fn lower_fn<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys:
     lower_fn_into(names, prepared, keys, store, item, None)
 }
 
+/// Where a lowering's types go: THE ONE SEAM between the paths (rule 78), each tested equal
+/// by the cost test (crates/blaze-ladder/tests/front2_tables_cost.rs: equal answers).
+enum TypesInto<'t> {
+    /// A fresh overlay of the store's table each round; the body keeps its own part.
+    Overlay,
+    /// The store's own table (the seeded path: a body's private store over stable columns).
+    Store,
+    /// Another, finished table (`lower_again`).
+    Again(&'t mut PortableTys<'static>),
+}
+
 /// Lowers `body`'s fn again, its types into `into` (a copy of `store.tys` made after every
 /// head it needs: a head it would still need is a refusal), for a driver that reads every
 /// body and record from one table (the run path's seam). The returned body's own `tys` is
@@ -993,6 +1004,25 @@ fn defaults_gate<'n, S: NamesSource<'n>>(names: S, krate: usize, typeck: &Typeck
     }
 }
 
+/// The names library's key of the body whose text is `text`, lowered under `item`: `item`
+/// itself when its text is that slice, or the first member of `item` whose text is (a member's
+/// body is lowered under its container). `None`: a text the library lists under `item` as no
+/// body (a local item's own, an anonymous constant's rendering). The rule of front2 locals.rs
+/// `Locals::library_body`, by the same slice test.
+fn library_body<'n, S: NamesSource<'n>>(names: S, item: LibKey, text: &str) -> Option<LibKey> {
+    let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
+    if names.text_of(item).is_some_and(|it| same(it.text)) {
+        return Some(item);
+    }
+    let mut found = None;
+    names.each_member(item, &mut |m| {
+        if found.is_none() && same(m.text) {
+            found = Some(m.key);
+        }
+    });
+    found
+}
+
 fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
     let Site { item, owner, krate, module, text, marks, params, consts, bounds, self_, self_assoc } = site;
     // The body's local items keep these marks for their own heads and bodies (locals.rs
@@ -1009,7 +1039,14 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
-    let scoped = ScopedBy { names, module, prepared: Some(prepared) };
+    // The body's blocks the names library made modules: a call written in one reads its path
+    // there (scoped.rs `written_blocks`). Only for a text that is the library's item's or
+    // member's own (a local item's body, an anonymous constant's rendering: none).
+    let blocks = match (library_body(names, item, text), names.crate_key(krate)) {
+        (Some(body), Some(crate_key)) => super::scoped::written_blocks(crate_key, body, text, alloc),
+        _ => blaze_own::AVec::new_in(alloc),
+    };
+    let scoped = ScopedBy { names, module, prepared: Some(prepared), blocks: &blocks };
     // The crate's host, the one item-level expansion answers from (census 13, brief 13): env,
     // includes, proc macros; `NoHost` refused them all.
     let host = super::body_host::BodyHost::of(names, store.sources, krate, item, module, alloc);
@@ -1104,10 +1141,27 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
         // Each round converts into a fresh overlay of the records' table (read in place, never
         // copied): a refused round's types are dropped with it, none reaches `store.tys`, and
         // what the body keeps is only its own types (`OwnTys`), read over `store.tys` again.
+        // THE SEEDED PATH (a body's private store, seeded from frozen head records: tables
+        // task.rs `check_body`) has NO OVERLAY: the store's table is over stable columns and
+        // only this body's check reads it, so the body is lowered straight into it, as
+        // `lower_again` lowers into its table, and one table numbers every type once: a head
+        // imported into it during the check gets an id no body type has, and the check's view
+        // (`OwnTys::in_base`, live) reads it. A refused round's types stay in that private
+        // table, unread. The lowering path keeps its overlay (`TypesInto`, the one seam).
         let again_now = into.is_some();
-        let (converted, kept) = match into.as_deref_mut() {
-            Some(t) => (to_typeck(&view, owner, t, &mut types, alloc), None),
-            None => {
+        let target = match (into.as_deref_mut(), store.seeds.is_some()) {
+            (Some(t), _) => TypesInto::Again(t),
+            (None, true) => TypesInto::Store,
+            (None, false) => TypesInto::Overlay,
+        };
+        let (converted, kept) = match target {
+            TypesInto::Again(t) => (to_typeck(&view, owner, t, &mut types, alloc), None),
+            TypesInto::Store => {
+                let converted = to_typeck(&view, owner, &mut store.tys, &mut types, alloc);
+                let kept = converted.is_ok().then(|| OwnTys::in_base(alloc));
+                (converted, kept)
+            }
+            TypesInto::Overlay => {
                 let mut own = PortableTys::over(&store.tys, alloc).map_err(|error| BodyError::Table { item, error })?;
                 let converted = to_typeck(&view, owner, &mut own, &mut types, alloc);
                 let kept = match converted {

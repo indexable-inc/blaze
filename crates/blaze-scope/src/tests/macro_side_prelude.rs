@@ -84,12 +84,12 @@ struct Texts<'c> {
 }
 
 impl<'c> Texts<'c> {
-    fn of(crates: &'c UnitCrates<'_>) -> Texts<'c> {
+    fn of(crates: &'c UnitCrates<'_>, dep: &'static str) -> Texts<'c> {
         let mut roots = blaze_own::AVec::with_capacity_in(crates.crates.len(), a());
         for c in crates.crates.iter() {
             let text = match c.name {
                 "core" => CORE,
-                "dep" => DEP,
+                "dep" => dep,
                 _ => EMPTY,
             };
             roots.push((c.root.as_str(), text));
@@ -134,7 +134,7 @@ fn a_macro_side_glob_of_cores_macros_beside_the_preludes_is_no_ambiguity() {
     assert!(side_dep >= crates.macro_from && target_dep < crates.macro_from, "one `dep` per side");
     let core_of = |at: usize| crates.crates[at].name == "core";
 
-    let texts = Texts::of(&crates);
+    let texts = Texts::of(&crates, DEP);
     let inputs = crates.inputs();
     let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     for name in ["checked", "panicked", "Shown", "Made"] {
@@ -150,5 +150,62 @@ fn a_macro_side_glob_of_cores_macros_beside_the_preludes_is_no_ambiguity() {
             "the control, `{name}` on the target side: {target:?}, the rule: the target's `core` (notes {:?})",
             names.notes(target_dep)
         );
+    }
+}
+
+/// alloy 2.5.0's root (src/lib.rs:16-20) in a 2021 `#![no_std]` crate: `pub use alloy_core as
+/// core; pub use self::core::primitives;` (here `alloy_core` is a module of its own). tempo's
+/// precompiles-macros takes alloy with `default-features = false`, so its host unit has no
+/// `std` and no `#![no_std]` lifted: "no `primitives` in `alloy`" x3.
+const SHADOWS_CORE: &str = "#![no_std]
+pub mod alloy_core {
+    pub mod primitives {
+        pub struct U256;
+    }
+}
+pub use self::alloy_core as core;
+pub use self::core::primitives;
+";
+
+/// The control: the same root with `std` injected (no `#![no_std]`), so no injected `core`.
+const SHADOWS_CORE_STD: &str = "pub mod alloy_core {
+    pub mod primitives {
+        pub struct U256;
+    }
+}
+pub use self::alloy_core as core;
+pub use self::core::primitives;
+";
+
+/// The crate of the type-namespace binding `name` in crate `krate`'s root, if any.
+fn type_in(names: &Names<'_>, krate: usize, name: &'static str) -> Option<usize> {
+    names.lookup(names.root(krate), Namespace::Types, name).and_then(|b| names.crate_of(b.def.key))
+}
+
+/// Expected line: `test units::macro_side_prelude::a_written_core_stands_beside_the_injected_one_from_2018 ... ok`.
+///
+/// From 2018 the injected `extern crate core;` is def-site (rustc's `std_inject`), so a root's
+/// own `core` stands and `self::core::primitives` is the root's. Before: the injected item won
+/// over the import (an item beside an import stands), `self::core` was the toolchain's `core`
+/// and `primitives` was unbound (`None`). CONTROL: with `std` injected there is no second
+/// `core`, and `primitives` is bound before and after.
+#[test]
+fn a_written_core_stands_beside_the_injected_one_from_2018() {
+    let lock = Lock::read(LOCK.as_bytes(), a()).expect("the lock");
+    let members = [Member::new(LockId(0), "m0").expect("a plain dir"), Member::new(LockId(2), "m2").expect("a plain dir")];
+    let g = graph();
+    let bytes = toolchain(true);
+    let view = ToolchainView::open(&bytes, ToolchainView::id_of_bytes(&bytes)).expect("its own id");
+    let crates = unit_crates(&g, &lock, &members, view, HOST, a()).expect("the crates");
+    let pm = index_of(&crates, "pm", 0);
+    let deps = [index_of(&crates, "dep", 0), index_of(&crates, "dep", pm + 1)];
+    for (text, what) in [(SHADOWS_CORE, "no_std"), (SHADOWS_CORE_STD, "the control, std")] {
+        let texts = Texts::of(&crates, text);
+        let inputs = crates.inputs();
+        let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        for dep in deps {
+            let bound = type_in(&names, dep, "primitives");
+            assert_eq!(bound, Some(dep), "{what}: `primitives` in dep #{dep}'s root is its own module (notes {:?})", names.notes(dep));
+        }
     }
 }

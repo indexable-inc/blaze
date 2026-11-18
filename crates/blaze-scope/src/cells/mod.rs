@@ -3250,7 +3250,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                                 Ok(Some(def)) => return Step::Done(Some(def)),
                                 Ok(None) => {}
                                 Err(module) => {
-                                    self.member_refusal.get_or_insert(edit::MemberRefusal::Textual { module });
+                                    let refusal = self.textual_refusal(module);
+                                    self.member_refusal.get_or_insert(refusal);
                                 }
                             }
                             continue;
@@ -3295,7 +3296,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             Ok(Some(def)) => return Step::Done(Some(def)),
                             Ok(None) => at = p,
                             Err(module) => {
-                                self.member_refusal.get_or_insert(edit::MemberRefusal::Textual { module });
+                                let refusal = self.textual_refusal(module);
+                                self.member_refusal.get_or_insert(refusal);
                                 return Step::Done(None);
                             }
                         }
@@ -3386,6 +3388,19 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         Ok(found.map(|(_, def)| def))
     }
 
+    /// The refusal of a textual walk that needs the sequence of `module`, outside a one-group
+    /// solve's members, and was not given it: `NoRecord` when no record holds the module (the
+    /// lazy driver demands its group and asks again, lazy.rs; the edit driver solves whole),
+    /// `Textual` when its record holds it but not the sequence the walk needs.
+    fn textual_refusal(&mut self, module: ItemKey) -> edit::MemberRefusal {
+        let Some(&m) = self.by_key.get(&module) else { return edit::MemberRefusal::Textual { module } };
+        self.fill_pending(m);
+        match self.modules[m as usize].answered {
+            Answered::NoRecord => edit::MemberRefusal::NoRecord { module },
+            _ => edit::MemberRefusal::Textual { module },
+        }
+    }
+
     /// Where module `m`'s own text stands in the text around it: its `mod` line, or, for a
     /// block's module, the place of its body (every entry at or before the body's place is
     /// before the block). A body an expansion writes is found once its call has grown: until
@@ -3399,11 +3414,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             && self.modules[m as usize].block_at.is_none()
             && self.modules[p as usize].text == FragId::MAX
         {
-            // The walk goes out into a parent whose text is not read here (a one-group solve's
-            // module outside the group): its `textual` and `marks` are not read from its record
-            // yet (rule 3: refused, never taken as the end of the scope).
+            // The walk goes out into a parent whose text is not read here and whose record did
+            // not answer its sequence before this line ([`Cells::textual`] read it from its
+            // record where one holds it): a parent with no record is demanded (`NoRecord`,
+            // lazy.rs), one whose record does not give it refused (rule 3: never taken as the
+            // end of the scope).
             let module = self.modules[p as usize].key;
-            self.member_refusal.get_or_insert(edit::MemberRefusal::Textual { module });
+            let refusal = self.textual_refusal(module);
+            self.member_refusal.get_or_insert(refusal);
             return Step::Done(None);
         }
         let Some((owner, pos)) = self.modules[m as usize].block_at else { return Step::Done(None) };

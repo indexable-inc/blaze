@@ -581,7 +581,7 @@ fn finish<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Store<'
 /// `need`'s cell filed from `source`'s frozen record, or (its own cell, or one `source` is
 /// making) lowered there. The seed a body's store passes to heads.rs `Store::ensure_seeded`,
 /// as [`freeze_seeded`] does (stash the error, hand back `SeedFailed`).
-pub fn seed<'n, N: NamesSource<'n>, H: HeadSource>(names: N, own: Option<Want>, need: Want, source: &mut H, store: &mut Store<'n>, keys: &mut Keys, scratch: Alloc<'static>) -> Result<Seeded, FreezeError> {
+pub fn seed<'n, N: NamesSource<'n>, H: HeadSource>(names: N, own: Option<Want>, need: Want, source: &mut H, store: &Store<'n>, keys: &Keys, scratch: Alloc<'static>) -> Result<Seeded, FreezeError> {
     let cell = cell_of(names, need)?;
     if Some(cell) == own || source.open(cell) {
         return Ok(Seeded::Lower);
@@ -589,7 +589,7 @@ pub fn seed<'n, N: NamesSource<'n>, H: HeadSource>(names: N, own: Option<Want>, 
     let frozen = source.frozen(cell)?;
     let members = members_of(names, cell, scratch);
     let mut text_of = |at: HeadAt| fn_text(names, cell, &members, at);
-    let heads = import(&frozen, &mut text_of, &mut store.tys, scratch, scratch)?;
+    let heads = import(&frozen, &mut text_of, &store.tys, scratch, scratch)?;
     file_keys(cell, &members, &heads, keys)?;
     store.file_heads(cell, heads).map_err(|error| FreezeError::Head { want: cell, error })?;
     Ok(Seeded::Filed)
@@ -781,11 +781,13 @@ impl<'b> FrozenHead<'b> {
 /// The heads of `frozen` read into `tys`, a body's own type table: each record's terms
 /// interned there in one pass (head_record.rs `decode`, linear in the record), so equal
 /// structure is an equal `PTy` of `tys`. A fn head is checked against its item's text, which
-/// `text_of` hands (the body has it: it lowers bodies from it).
+/// `text_of` hands (the body has it: it lowers bodies from it). Through a shared borrow of
+/// `tys` (head_record.rs `decode`): a table over stable columns, read by a live view while
+/// this imports into it.
 pub fn import<'n, 'a>(
     frozen: &FrozenHead<'_>,
     text_of: &mut dyn FnMut(HeadAt) -> Option<&'n str>,
-    tys: &mut PortableTys<'_>,
+    tys: &PortableTys<'_>,
     alloc: Alloc<'static>,
     out: Alloc<'a>,
 ) -> Result<AVec<'a, (HeadAt, Head<'n>)>, FreezeError> {

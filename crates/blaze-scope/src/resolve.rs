@@ -1197,7 +1197,15 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let mut low = lower_modules(input.key, input.implicit.entry, edition, &cfg, &tools, &set, &tree, listed, &mut notes, par, alloc);
     let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
     let plan = root_plan(graph, id, root_attrs, built, &mut notes, alloc)?;
-    if let Some(name) = plan.injected {
+    // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
+    // edition >= Edition2018 { span } else { call_site }`, `span` with the pass's def-site
+    // context): a name the root writes itself is a different name and stands, no duplicate.
+    // alloy 2.5.0 under `#![no_std]` (a host unit's features, tempo's precompiles-macros):
+    // `pub use alloy_core as core; pub use self::core::primitives;` bound `self::core` to the
+    // injected `core` (an item beside an import wins, made.rs), so `alloy::primitives` was not
+    // there. The written name is read from the root's own text; one a root macro call writes
+    // is not seen (stated gap).
+    if let Some(name) = plan.injected.filter(|name| edition == Edition::E2015 || !root_binds_type(&low.decls[0], name)) {
         low.decls[0].extern_crates.push(ExternCrateDecl { target: ExternTarget::Dep(name), rename: Rename::Same, vis: WrittenVis::Private });
     }
     let root_input = RootInput {
@@ -1456,6 +1464,24 @@ fn lower_modules<'a, P: Par>(
         out.decls.push(decls);
     }
     out
+}
+
+/// Whether the root's own text binds `name` in the type namespace: an item, a `mod`, a named
+/// `use` (as its last segment or its rename) or an `extern crate` (the injected one is added
+/// after this is asked).
+fn root_binds_type(root: &DeclsBuilder<'_, &str>, name: &str) -> bool {
+    root.items.iter().any(|item| item.ns == Namespace::Types && item.name == name)
+        || root.mods.iter().any(|m| m.name == name)
+        || root.uses.iter().any(|u| match &u.leaf {
+            blaze_surface::UseForm::Named { rename: Rename::Same, .. } => u.path.segments.last().is_some_and(|last| *last == name),
+            blaze_surface::UseForm::Named { rename: Rename::To(to), .. } => *to == name,
+            _ => false,
+        })
+        || root.extern_crates.iter().any(|ec| match (&ec.rename, &ec.target) {
+            (Rename::To(to), _) => *to == name,
+            (Rename::Same, ExternTarget::Dep(dep)) => *dep == name,
+            _ => false,
+        })
 }
 
 /// The crate root's plan from the graph and the finished crates.

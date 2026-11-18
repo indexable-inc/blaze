@@ -56,6 +56,20 @@ impl<'a> ItemsRecord<'a> {
         self.field(F_OWNED_COUNT) as usize
     }
 
+    /// The member key of row `i` of the section (rows sorted by member key; one key under two
+    /// owners is two rows): what a reader's `MemberOf` cells are written from (names_cells.rs).
+    /// `Ok(None)` past the section's end.
+    pub fn owned_key_at(&self, i: usize) -> Result<Option<ItemKey>, ItemsRecordError> {
+        let (base, count) = (self.field(F_OWNED_AT) as usize, self.owned_members());
+        if count.checked_mul(OWNED_ROW).and_then(|len| base.checked_add(len)).is_none_or(|end| end > self.bytes.len()) {
+            return Err(ItemsRecordError::Short { what: "the member owners section", at: base });
+        }
+        if i >= count {
+            return Ok(None);
+        }
+        Ok(Some(key_at(self.bytes, base + i * OWNED_ROW)))
+    }
+
     /// The trait or impl that owns the named member `member`, and the member's name: one
     /// binary search of the section, then one owner row and one member row read in place (no
     /// member list is decoded, no text is opened). `Ok(None)`: no named member of the crate
