@@ -382,33 +382,87 @@ fn sidebar_meter(slot: View<'_>, sid: u64, context: Option<&harness_proto::event
 }
 
 impl App {
-    /// Every visible agent owns its context meter and popover, so inspecting one never depends on pane focus.
-    pub(in crate::app) fn fill_sidebar_context(&self, row: View<'_>, sid: u64, t: &Transcript, kind: &str, working: bool, summary: Option<model::AgentContext>) {
+    /// The composer's bar of chat `sid` (hn.ChatPane's `foot.card.bar`): the model it runs and the effort it thinks with
+    /// (each a control that opens its menu, while the chat is `editable`), how full its context is (the ring, its
+    /// breakdown while `ctx_open` or under the pointer) and the one button: stop while a turn runs, send while there is
+    /// something to send (`can_send`), a faint disc else. Everything that says how a chat runs is here, with the words
+    /// it will run on, and nowhere on its sidebar row.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::app) fn fill_composer_bar(
+        &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, eff: &mut EffortState, listed: (&str, &str),
+        ended: bool, editable: bool, ctx_open: bool, menu_open: bool, can_send: bool, summary: Option<model::AgentContext>,
+    ) {
+        use harness_native_ui_input_api::Pressable;
+        let w = self.world.world_ref();
+        let kept = self.link.agent_models();
+        let label = Label::of(t, kind, &kept, listed);
+        let effort = eff.shown(t, ended, label.effort, self.time);
+        let (mut profile, tip, level) = sidebar_label(&label, &effort);
+        if profile.is_empty() {
+            profile = "Model".to_owned();
+        }
+        if let Some(l) = bar.part("label") {
+            if let Some(slot) = l.part("icon") {
+                model_icon(slot, &profile, kind);
+            }
+            if let Some(text) = l.part("text") {
+                text.text(&profile);
+            }
+        }
+        for (part, page) in [("label", "model"), ("effort", "effort")] {
+            let Some(control) = bar.part(part) else { continue };
+            let active = editable && (part != "effort" || level.is_some());
+            if active {
+                control.add(Pressable::id()).action(&format!("chat:pick:{sid}:{page}"));
+            } else {
+                control.entity().remove(Pressable::id());
+                control.action("");
+            }
+            let model = tip.lines().next().unwrap_or(&profile);
+            let said = tip.lines().find(|line| line.ends_with("thinking effort"));
+            let about = if part == "effort" {
+                format!("{}\n{model}", said.unwrap_or("Thinking effort"))
+            } else {
+                tip.lines().filter(|line| !line.ends_with("thinking effort")).collect::<Vec<_>>().join("\n")
+            };
+            let hint = match (active, part) {
+                (false, _) => "Read-only transcript",
+                (true, "effort") => "Click to choose · swipe to adjust",
+                (true, _) => "Choose model · ⌘/",
+            };
+            control.set(Tooltip { text: format!("{about}\n{hint}").as_str().into() });
+        }
+        if let Some(slot) = bar.part("effort") {
+            view::for_each_of(slot, level.map(|l| ("meter", "hn.ChatEffort", l)), |meter, l, _| {
+                effort_meter(meter, Some(l), tone(w, "ink_muted"), tone(w, "ink_faint"));
+            });
+        }
+        // A loaded transcript supplies the breakdown when it is current; else the daemon's summary.
         let summary = summary.filter(|c| c.window > 0).map(|c| harness_proto::event::ContextUse { used: c.used, window: c.window, ..Default::default() });
         let rich = t.context.as_ref().filter(|c| c.window > 0);
-        // An unselected chat needs only its current summary. A loaded transcript supplies the breakdown when current.
         let context = match (rich, summary.as_ref()) {
             (Some(rich), Some(summary)) if rich.used != summary.used || rich.window != summary.window => Some(summary),
             (rich, summary) => rich.or(summary),
         };
-        let Some(slot) = row.part("context") else { return };
-        sidebar_meter(slot, sid, context, working);
-        let (open, menu) = self.chat.borrow().get(&sid).map_or((false, false), |s| (s.ctx_open, s.pick.is_some()));
-        if let Some(pop) = row.part("context_pop") {
-            super::context::fill_context_pop(pop, slot.part("meter"), context, if t.agent.is_empty() { kind } else { &t.agent }, menu || !self.side_open || self.palette.is_some(), open, (self.pointer.x, self.pointer.y));
+        if let Some(slot) = bar.part("context") {
+            sidebar_meter(slot, sid, context, t.busy);
+            if let Some(pop) = bar.part("context_pop") {
+                let agent = if t.agent.is_empty() { kind } else { &t.agent };
+                super::context::fill_context_pop(pop, slot.part("meter"), context, agent, menu_open || self.palette.is_some(), ctx_open, (self.pointer.x, self.pointer.y));
+            }
         }
-    }
-
-    /// The inline row follows a pending effort immediately, using the same state as the menu and keyboard shortcut.
-    pub(in crate::app) fn sidebar_profile(
-        &self, sid: u64, transcript: Option<&Transcript>, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>,
-        listed: (&str, &str), ended: bool,
-    ) -> (String, String, Option<(usize, usize)>) {
-        let empty = Transcript::default();
-        let t = transcript.unwrap_or(&empty);
-        let label = Label::of(t, kind, kept, listed);
-        let effort = self.chat.borrow_mut().entry(sid).or_default().effort.shown(t, ended, label.effort, self.time);
-        sidebar_label(&label, &effort)
+        if let Some(slot) = bar.part("send") {
+            let (key, prefab, action) = match (t.busy && !ended, can_send && editable) {
+                (true, _) => ("stop", "hn.ChatSendStop", format!("chat:stop:{sid}")),
+                (false, true) => ("go", "hn.ChatSend", format!("chat:send:{sid}")),
+                (false, false) => ("off", "hn.ChatSendOff", String::new()),
+            };
+            view::for_each_of(slot, [(key, prefab, ())], |v, (), _| {
+                if !action.is_empty() {
+                    v.action(&action);
+                }
+            });
+        }
     }
 
     /// The selected row's model/effort menu, hosted outside tree clipping and anchored to its inline control.
@@ -1292,55 +1346,6 @@ mod tests {
 
     /// The invariant: missing, zero and reported context occupy identical columns; zero never paints a usage arc.
     /// Activity and optional effort must not push the model controls away from the row's trailing edge.
-    #[test]
-    fn sidebar_columns_stay_aligned_before_and_after_usage_arrives() {
-        use harness_native_ui_layout_api::{Padding, Viewport};
-        let world = super::super::scene_world().unwrap();
-        let w = world.world_ref();
-        harness_native_ui_layout::install(w);
-        world.set(Viewport { w: 360.0, h: 200.0 });
-        let list = View::root(w, "ui.Column");
-        let zero = harness_proto::event::ContextUse { used: 0, window: 200000, ..Default::default() };
-        let used = harness_proto::event::ContextUse { used: 24000, window: 200000, ..Default::default() };
-        let rows: Vec<_> = [None, Some(&zero), Some(&used)].into_iter().enumerate().map(|(i, context)| {
-            let row = list.child("hn.ObjRow");
-            row.props("hn.ObjRow", &[("name", Prop::Str("New chat")), ("profile", Prop::Str("Fable")), ("meta", Prop::Str(if i == 2 { "Editing code" } else { "" }))]);
-            let profile = row.part("profile").unwrap();
-            sidebar_meter(profile.part("context").unwrap(), i as u64, context, i == 2);
-            let meter = profile.part("context").unwrap().part("meter").unwrap();
-            let path = meter.part("ring").unwrap().part("arc").unwrap().entity().try_cloned::<&Vector>().unwrap();
-            assert_eq!(path.d.as_str().is_empty(), i != 2);
-            assert_eq!(meter.entity().has(harness_native_ui_input_api::Pressable::id()), context.is_some());
-            let tip = meter.entity().try_cloned::<&Tooltip>().unwrap();
-            assert!(tip.text.as_str().contains(match i { 0 => "not arrived", 1 => "0% used", _ => "12% used" }));
-            let effort = profile.part("effort").unwrap();
-            view::for_each_of(effort, (i != 0).then_some(("meter", "hn.ChatEffort", ())), |v, (), _| {
-                effort_meter(v, Some((i, if i == 1 { 4 } else { 7 })), tone(w, "ink"), tone(w, "ink_faint"));
-            });
-            row
-        }).collect(); // alloc: the three cases in this headless layout check
-        for _ in 0..4 { world.progress_time(1.0 / 60.0); }
-        let laid = |v: View<'_>| v.entity().try_cloned::<&Laid>().unwrap();
-        let parts = |row: View<'_>| {
-            let profile = row.part("profile").unwrap();
-            [laid(profile.part("label").unwrap()).x, laid(profile.part("effort").unwrap()).x, laid(profile.part("context").unwrap()).x]
-        };
-        assert_eq!(parts(rows[0]), parts(rows[1]));
-        assert_eq!(parts(rows[1]), parts(rows[2]));
-        let row = rows[0];
-        let pad = row.entity().try_cloned::<&Padding>().unwrap();
-        let kind = row.part("kind_icon").unwrap();
-        assert_eq!(laid(row.part("name").unwrap()).x, laid(row).x + pad.l + laid(kind).w, "empty optional slots add no spacing");
-        assert_eq!(laid(row).h, 28.0, "tabs remain one line");
-        // In-place data updates preserve the same target and clear a previous nonzero arc.
-        let profile = rows[2].part("profile").unwrap();
-        let slot = profile.part("context").unwrap();
-        let id = slot.part("meter").unwrap().id();
-        sidebar_meter(slot, 2, Some(&zero), false);
-        assert_eq!(slot.part("meter").unwrap().id(), id);
-        assert!(slot.part("meter").unwrap().part("ring").unwrap().part("arc").unwrap().entity().try_cloned::<&Vector>().unwrap().d.as_str().is_empty());
-    }
-
     #[test]
     fn a_models_line_splits_into_its_version_and_the_rest() {
         let s = |n: &str, a: &str| split_about(n, a);

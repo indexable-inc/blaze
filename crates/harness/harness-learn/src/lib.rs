@@ -20,6 +20,7 @@
 pub mod course;
 pub mod memory;
 pub mod run;
+pub mod tutor;
 
 pub use course::{Course, CourseError, Lesson, Step};
 pub use memory::{Day, Memory, Progress};

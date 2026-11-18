@@ -117,6 +117,10 @@ const HANDLERS: &[(&str, Handler)] = &[
     ("SearchClear", |a, _, _| a.archive_search(SearchEdit::Clear)),
     ("SearchErase", |a, _, _| a.archive_search(SearchEdit::Erase)),
     ("ArchiveOpenFirst", |a, _, _| a.archive_open_first()),
+    ("LearnNext", |a, _, _| a.learn_key("next")),
+    ("LearnForward", |a, _, _| a.learn_key("forward")),
+    ("LearnBack", |a, _, _| a.learn_key("back")),
+    ("LearnErase", |a, _, _| a.learn_key("erase")),
     ("SendBytes", |a, act, _| {
         let bytes = a
             .world
@@ -238,6 +242,9 @@ impl App {
             &[keys::BROWSER]
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
+        } else if self.learn_focused() && !self.renaming() {
+            // Learn, the home, has the keys: Return checks or goes on, Escape leaves, the rest is typed.
+            &[keys::LEARN]
         } else if self.renaming() {
             // A name being renamed in its row has the keys: the chat input's edits act on it (chat/rename.rs).
             &[keys::CHAT]

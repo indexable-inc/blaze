@@ -27,6 +27,8 @@ ctx {
   // The new-object picker (File > New…) while it is open.
   Picker {}
   Archive {}
+  // Learn, the home (no session selected), has the keyboard: Return checks or goes on, Escape leaves.
+  Learn {}
   // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape or Cmd+. interrupts.
   Chat {}
   // A harness browser view has the keyboard (the pane, or a card clicked into: BrowserFocus, src/app/browser.rs): keys
@@ -132,6 +134,12 @@ act {
   SearchClear {}
   SearchErase {}
   ArchiveOpenFirst {}
+  // Learn (src/app/learn.rs): start the course typed, check the answer in hand or go on; leave; erase a character.
+  LearnNext {}
+  // The right arrow: on to the next screen, only where nothing is left to answer.
+  LearnForward {}
+  LearnBack {}
+  LearnErase {}
 
   // Natural text editing (iTerm2's and Ghostty's preset), whatever the program's keyboard mode. Bytes are in caret
   // notation: ^[ is escape, ^? is DEL, ^A..^_ are the control characters.
@@ -394,6 +402,22 @@ key {
   archive_enter { Keybind: {key: "enter"}
     (Does, act.ArchiveOpenFirst)
     (When, ctx.Archive) }
+
+  learn_return { Keybind: {key: "return"}
+    (Does, act.LearnNext)
+    (When, ctx.Learn) }
+  learn_enter { Keybind: {key: "enter"}
+    (Does, act.LearnNext)
+    (When, ctx.Learn) }
+  learn_right { Keybind: {key: "right"}
+    (Does, act.LearnForward)
+    (When, ctx.Learn) }
+  learn_escape { Keybind: {key: "escape"}
+    (Does, act.LearnBack)
+    (When, ctx.Learn) }
+  learn_backspace { Keybind: {key: "backspace"}
+    (Does, act.LearnErase)
+    (When, ctx.Learn) }
 
   word_left { Keybind: {key: "left", opt: 1}
     (Does, act.WordLeft)

@@ -35,6 +35,7 @@ mod library;
 mod floats;
 mod fold;
 mod keys;
+mod learn;
 mod maps;
 pub use floats::Float;
 #[cfg(target_os = "macos")]
@@ -76,6 +77,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/steps.flecs", include_str!("../scene/widgets/steps.flecs")),
     ("scene/widgets/web.flecs", include_str!("../scene/widgets/web.flecs")),
+    ("scene/widgets/learn.flecs", include_str!("../scene/widgets/learn.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
@@ -322,6 +324,8 @@ pub struct App {
     tree: sidebar::TreeScroll,
     /// The Archive list's scroll (app/archive.rs).
     arch_scroll: archive::ListScroll,
+    /// Learn, the home: its courses, what was learned, the lesson being walked (app/learn.rs).
+    learn: std::cell::RefCell<learn::Learn>,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
     fold: fold::TreeFold,
     /// The tree has the keyboard (a tree row was pressed): arrows move in it until a pane is pressed or another key typed.
@@ -541,6 +545,8 @@ impl App {
         let foot = side.child("hn.SideFoot");
         let link_note = foot.child("hn.LinkNote");
         let status = foot.child("hn.SideStatus");
+        // The way home (scene/widgets/learn.flecs): no session selected, the main card shows Learn.
+        status.child("hn.LearnHomeButton");
         let archive_row = status
             .child("hn.ArchiveRow")
             .props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
@@ -640,6 +646,7 @@ impl App {
             headroom: harness_native_render::hdr::Headroom::SDR,
             tree: sidebar::TreeScroll::default(),
             arch_scroll: archive::ListScroll::default(),
+            learn: std::cell::RefCell::new(learn::Learn::default()),
             fold: fold::TreeFold::default(),
             tree_focus: false,
             press: (0, KeyMods::default()),
@@ -995,7 +1002,6 @@ impl App {
         let info = self.fold.merge(info, w);
         let menu_for = self.row_menu_for();
         let me = &*self;
-        let agent_models = self.link.agent_models();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
@@ -1107,16 +1113,6 @@ impl App {
                 // Its name being renamed (chat/rename.rs): the field's words in its place, alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
-                let sid = o.try_cloned::<&model::Object>().map(|ob| ob.id);
-                let (mut profile, profile_tip, profile_effort) = if edit.is_none() && o.has(model::ChatMode::id()) {
-                    let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
-                    let chats = me.chats.borrow();
-                    let transcript = o.try_cloned::<&model::Object>().and_then(|ob| chats.get(&ob.id));
-                    me.sidebar_profile(sid.expect("chat row has no session identity"), transcript, kind, &agent_models, (listed.s.as_str(), listed.effort.as_str()), status != "running")
-                } else {
-                    (String::new(), String::new(), None)
-                };
-                if profile.is_empty() && edit.is_none() && o.has(model::ChatMode::id()) { profile = "Model".to_owned(); }
                 let (name, meta, hint) = match &edit {
                     Some((shown, _)) => (shown.clone(), String::new(), String::new()),
                     None => (name, meta, hint),
@@ -1133,53 +1129,10 @@ impl App {
                             ("hint", Prop::Str(&hint)),
                             ("edit", Prop::Bool(edit.is_some())),
                             ("mark", Prop::Str(mark)),
-                            ("profile", Prop::Str(&profile)),
-                            ("profile_tip", Prop::Str(&profile_tip)),
                         ],
                     ]
                     .concat(),
                 );
-                if let Some(controls) = row.part("profile") {
-                    if let Some(icon) = controls.part("label").and_then(|p| p.part("icon")) {
-                        chat::model_icon(icon, &profile, kind);
-                    }
-                    if let Some(sid) = sid.filter(|_| edit.is_none() && o.has(model::ChatMode::id())) {
-                        let chats = me.chats.borrow();
-                        let empty = model::chat::Transcript::default();
-                        me.fill_sidebar_context(controls, sid, chats.get(&sid).unwrap_or(&empty), kind, busy, o.try_cloned::<&model::AgentContext>());
-                    } else {
-                        for name in ["context", "context_pop"] {
-                            if let Some(slot) = controls.part(name) { view::for_each_of(slot, std::iter::empty::<(&str, &str, ())>(), |_, (), _| {}); }
-                        }
-                    }
-                    let editable = sid.is_some_and(|sid| me.external_session(sid).is_none()) && !profile.is_empty();
-                    for (part, page) in [("label", "model"), ("effort", "effort")] {
-                        if let Some(control) = controls.part(part) {
-                            let active = editable && (part != "effort" || profile_effort.is_some());
-                            if active {
-                                control.add(harness_native_ui_input_api::Pressable::id()).action(&format!("chat:pick:{}:{page}", sid.unwrap()));
-                            } else {
-                                control.entity().remove(harness_native_ui_input_api::Pressable::id());
-                                control.action("");
-                            }
-                            let mut lines = profile_tip.lines();
-                            let model = lines.next().unwrap_or(&profile);
-                            let effort = profile_tip.lines().find(|line| line.ends_with("thinking effort"));
-                            let description = if part == "effort" {
-                                format!("{}\n{model}", effort.unwrap_or("Thinking effort"))
-                            } else {
-                                profile_tip.lines().filter(|line| !line.ends_with("thinking effort")).collect::<Vec<_>>().join("\n")
-                            };
-                            let hint = if !active { "Read-only transcript" } else if part == "effort" { "Click to choose · swipe to adjust" } else { "Choose model · ⌘/" };
-                            control.set(harness_native_ui_input_api::Tooltip { text: format!("{description}\n{hint}").as_str().into() });
-                        }
-                    }
-                }
-                if let Some(slot) = row.part("profile").and_then(|p| p.part("effort")) {
-                    view::for_each_of(slot, profile_effort.map(|level| ("meter", "hn.ChatEffort", level)), |meter, level, _| {
-                        chat::effort_meter(meter, Some(level), tone(w, "ink_muted"), tone(w, "ink_faint"));
-                    });
-                }
                 // Before its title, a mark only when there is something to say, so a quiet tree is plain words: a dot in
                 // the strong ink while its agent works, the same dot in the error ink when it failed (the row's one
                 // colour: its trailing words stay faint), nothing else. The dot is the chat's own running glyph
@@ -2458,6 +2411,16 @@ impl App {
             } else if a == "chat:tuck" {
                 // Put the window away until the chat in front is done (src/window/mini.rs).
                 self.tuck = self.focused_chat().map(|(_, _, sid)| sid);
+            } else if let Some(sid) = a.strip_prefix("chat:send:").and_then(|s| s.parse::<u64>().ok()) {
+                // The composer's button (hn.ChatSend): what Return does.
+                self.tree_focus = false;
+                self.chat_send_draft(sid);
+            } else if let Some(sid) = a.strip_prefix("chat:stop:").and_then(|s| s.parse::<u64>().ok()) {
+                // The composer's button while a turn runs (hn.ChatSendStop): what Escape does.
+                self.link.chat_interrupt(sid);
+            } else if let Some(what) = a.strip_prefix("learn:") {
+                // A press in Learn, the home (app/learn.rs).
+                self.learn_action(what);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {

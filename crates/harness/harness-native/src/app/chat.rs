@@ -1959,7 +1959,17 @@ impl App {
                 sky.set(on);
             }
         }
-        // Its status bar is the sidebar's (hn.SideChat): the chat in front fills it.
+        // The composer's bar: its model, effort, context and the send button, for this chat.
+        if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
+            let o = w.entity_from_id(e);
+            let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
+            let can_send = !st.draft.text.trim().is_empty() || !st.images.is_empty();
+            self.fill_composer_bar(
+                bar, sid, t, model::kind_name(o), &mut st.effort, (listed.s.as_str(), listed.effort.as_str()), ended, true,
+                st.ctx_open, st.pick.is_some(), can_send, o.try_cloned::<&model::AgentContext>(),
+            );
+        }
+        // The model and effort menus hang off the bar's controls; hn.SideChat hosts them outside every clip.
         if let Some(bar) = (self.focused_pane() == Some(pv.id())).then(|| View::of(w.entity_from_id(self.ids.side_chat))) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last

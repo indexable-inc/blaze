@@ -70,7 +70,7 @@ hn {
       // (src/app/chat.rs sets its Fill and Edge from hn.Theme.aside and aside_line).
       card : ui.Column {
         Fill: $tone_card
-        Edge: {dark: $tone_line.dark, light: $tone_line.light}
+        Edge: {dark: $tone_line_strong.dark, light: $tone_line_strong.light}
         Shape: {radius: $chat_composer_radius, n: 4, border: 1, feather: 0}
         Cursor: {shape: Text}
         Pressable
@@ -97,6 +97,30 @@ hn {
           area : ui.field.GrowingTextArea {
             GrowLimit: {share: $textarea_grow_share, keep: $chat_input_keep}
           }
+        }
+        // The composer's own bar (src/app/chat/pick.rs fill_composer_bar): everything that says how this chat runs sits
+        // with the words it will run on, never on a sidebar row. Leading, the model (its mark and family; pressed, the
+        // model menu) and the effort it thinks with (a small meter; pressed or swiped, the effort menu); trailing, how
+        // full its context is (a ring; pressed, its breakdown) and the one round button: send while there is a draft,
+        // stop while a turn runs.
+        bar : ui.Row {
+          Cursor: {shape: Arrow}
+          Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send, min: 0, max: 0}}
+          label : hn.ChatBarControl {
+            icon : hn.ModelIconSlot {}
+            text : hn.ChatBarWord {}
+          }
+          effort : hn.ChatBarControl {
+            Size: {w: {kind: Fixed, value: $tree_effort_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+            Padding: {l: 0, r: 0, t: 0, b: 0}
+          }
+          spacer : ui.Spacer {}
+          context : ui.Row {
+            Padding: {l: 0, r: $chat_bar_trail, t: 0, b: 0}
+          }
+          context_pop : ui.Node { Overlay }
+          send : ui.Row {}
         }
       }
     }
@@ -303,6 +327,69 @@ hn {
     }
   }
 
+  // A control on the composer's bar: a quiet pill hugging its words, a wash under the pointer.
+  prefab ChatBarControl : ui.Row {
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $chat_pick_radius, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+    Padding: {l: $chat_pick_pad_x, r: $chat_pick_pad_x, t: 0, b: 0}
+  }
+  prefab ChatBarWord : ui.Line {
+    Fill: $tone_ink_muted
+    FixedSize: {h: true, v: false}
+    TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0, weight: $weight_row}
+  }
+
+  // The composer's one button, a disc chat_send across at the bar's trailing edge. hn.ChatSend: there is a draft, so
+  // it is lit (the strong ink, its arrow in the ground's) and a press sends. hn.ChatSendOff: nothing to send, a faint
+  // disc that takes no press. hn.ChatSendStop: a turn runs, so it is a square to press to stop it.
+  prefab ChatSendLook : ui.Row {
+    Cursor: {shape: Arrow}
+    Shape: {radius: $chat_send / 2, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $chat_send, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send, min: 0, max: 0}}
+  }
+  prefab ChatSend : hn.ChatSendLook {
+    Pressable
+    Action: {name: ""}
+    Tooltip: {text: "Send"}
+    Fill: $tone_ink_strong
+    PressLook: {dark: $tone_ink.dark, light: $tone_ink.light}
+    arrow : ui.Node {
+      Fill: $tone_clear
+      Stroke: {dark: $tone_ground.dark, light: $tone_ground.light}
+      Size: {w: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}}
+      Vector: {d: "M8 13 V3.5 M3.75 7.5 L8 3.25 L12.25 7.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+        inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: $chat_send_stroke}
+    }
+  }
+  prefab ChatSendOff : hn.ChatSendLook {
+    Fill: $tone_wash
+    arrow : ui.Node {
+      Fill: $tone_clear
+      Stroke: {dark: $tone_ink_faint.dark, light: $tone_ink_faint.light}
+      Size: {w: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_icon, min: 0, max: 0}}
+      Vector: {d: "M8 13 V3.5 M3.75 7.5 L8 3.25 L12.25 7.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16,
+        inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: $chat_send_stroke}
+    }
+  }
+  prefab ChatSendStop : hn.ChatSendLook {
+    Pressable
+    Action: {name: ""}
+    Tooltip: {text: "Stop"}
+    Fill: $tone_ink_strong
+    PressLook: {dark: $tone_ink.dark, light: $tone_ink.light}
+    square : ui.Node {
+      Fill: $tone_ground
+      Shape: {radius: 2, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: $chat_send_stop, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_stop, min: 0, max: 0}}
+    }
+  }
+
   // While the agent works, a ring at the bar's trailing edge breathing gently in the bar's muted ink (src/app/chat.rs
   // keeps it in `bar.act`): the composer's one sign of work, and not a button: Return sends and Escape stops. With the
   // agent idle the slot is empty, so the window rests and the composer keeps its room.
@@ -342,7 +429,7 @@ hn {
       Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       text : ui.Words {
         Cursor: {shape: Text}
-        Fill: $tone_ink
+        Fill: $tone_ink_strong
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
