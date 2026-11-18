@@ -8,6 +8,8 @@
 
 use super::*;
 use super::chat::Draft;
+
+mod page;
 use harness_learn::{Course, Input, Lesson, Mark, Progress, Run, Step, tutor};
 use harness_native_ui_layout_api::{Size, SizeKind, Sizing};
 
@@ -86,6 +88,11 @@ pub struct Learn {
     /// The session this launch started, and how many it started: at most one, ever.
     started: Option<u64>,
     starts: u32,
+    /// The web page that draws Learn (learn/page.rs): its view (0 until the host opened it), the node showing it this
+    /// frame (0 when none), and the screen last sent to it.
+    page_view: std::cell::Cell<u64>,
+    page_node: std::cell::Cell<u64>,
+    page_sent: String,
 }
 
 impl Default for Learn {
@@ -109,6 +116,9 @@ impl Default for Learn {
             starting: false,
             started: None,
             starts: 0,
+            page_view: std::cell::Cell::new(0),
+            page_node: std::cell::Cell::new(0),
+            page_sent: String::new(),
         }
     }
 }
@@ -836,9 +846,34 @@ not the transcript.\n\nThe conversation:\n{}",
         });
     }
 
+    /// Draw Learn into `pane` (hn.LearnPane): the web page (learn/page.rs) as one browser node filling it.
     pub(super) fn fill_learn_pane(&self, pane: u64) {
         self.learn.borrow_mut().load();
         self.learn_arrivals();
+        let w = self.world.world_ref();
+        let Some(page) = View::of(w.entity_from_id(pane)).part("page") else { return };
+        let l = self.learn.borrow();
+        let view = l.page_view.get();
+        view::for_each_of(page, [("web", "hn.LearnWeb", ())], |v, (), _| {
+            let want = harness_native_ui_browser_api::BrowserView { view, src: Default::default() };
+            if v.entity().try_cloned::<&harness_native_ui_browser_api::BrowserView>().as_ref() != Some(&want) {
+                v.set(want);
+            }
+            l.page_node.set(v.id());
+        });
+    }
+
+    /// Give the page's node the keys (the pane in front has them).
+    fn learn_page_focus(&mut self) {
+        let node = self.learn.borrow().page_node.get();
+        if node != 0 && !self.world.entity_from_id(node).has(harness_native_ui_browser_api::BrowserFocus::id()) {
+            self.browser_focus(Some(node));
+        }
+    }
+
+    /// The native screens, drawn by flecs (hn.LearnHome and the rest): what the web page replaces.
+    #[expect(dead_code, reason = "deleted once the web page is verified in the app")]
+    fn fill_learn_native(&self, pane: u64) {
         let w = self.world.world_ref();
         let Some(page) = View::of(w.entity_from_id(pane)).part("page") else { return };
         let l = self.learn.borrow();

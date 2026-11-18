@@ -8,14 +8,19 @@
 
 @tree ChildOf
 hn {
+  // The start page and lessons: one web page (crates/harness/web) drawn by the harness browser, filling the pane edge
+  // to edge (the page lays out its own column).
   prefab LearnPane : hn.Pane {
     Fill: $tone_ground
-    Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
-    Padding: {l: $learn_pad, r: $learn_pad, t: 0, b: $learn_pad}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     page : ui.List {
-      Size: {w: {kind: Grow, value: 1, min: 0, max: $learn_w}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     }
+  }
+  prefab LearnWeb : ui.Browser {
+    Fill: $tone_ground
+    Shape: {radius: 0, n: 4, border: 0, feather: 0}
   }
 
   // ---- shared parts ----

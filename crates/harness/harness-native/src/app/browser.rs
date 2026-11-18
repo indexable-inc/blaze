@@ -52,7 +52,7 @@ mod drag;
 mod fileview;
 
 /// The `file://` URL of absolute path `path`: each byte outside the unreserved set and `/` percent-encoded.
-fn file_url(path: &str) -> String {
+pub(super) fn file_url(path: &str) -> String {
     let mut out = String::from("file://");
     for b in path.bytes() {
         if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
@@ -576,7 +576,7 @@ impl App {
     }
 
     /// Give BrowserFocus to `node` (None: to nothing), telling the views that gain and lose the keyboard.
-    fn browser_focus(&mut self, node: Option<u64>) {
+    pub(super) fn browser_focus(&mut self, node: Option<u64>) {
         if self.browser.focus == node {
             return;
         }

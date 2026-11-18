@@ -34,7 +34,9 @@
     const q = new URLSearchParams(location.search);
     const name = q.get("mock");
     if (!name) {
-      index = true;
+      // `?mock` alone lists the fixtures. Nothing at all is the app's page loaded before its binding is in (the host
+      // reloads it once it is): it draws nothing.
+      index = q.has("mock");
       return;
     }
     try {

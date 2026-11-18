@@ -410,10 +410,10 @@ pub enum WaiterSpec {
 /// Open a view: the page goes in the table first (CEF asks for its rect while it creates the browser), then the
 /// browser, its DevTools observer, and the `Target.getTargetInfo` whose answer gives the waiter its `Opened`.
 ///
-/// A UI view's browser is made with no url, and its DevTools session is sent `Runtime.enable` and
-/// `Runtime.addBinding { name: "harnessPost" }` before anything loads; the binding's answer loads its url
-/// ([`devtools`]). So the binding is in the page's first document before any of its script runs: a page that checks
-/// for `harnessPost` at start never finds it missing inside the app.
+/// A UI view's browser is made at its url, and its DevTools session is sent `Runtime.enable` and
+/// `Runtime.addBinding { name: "harnessPost" }` at once; the binding's answer loads its url again ([`devtools`]). So
+/// the binding is in that document before any of its script runs. The first load may have no binding: the page draws
+/// nothing without it (crates/harness/web), and the reload replaces it.
 ///
 /// # Errors
 /// CEF refused the browser or the observer, naming the view and the url; a UI view at a url that is not `file://`,
@@ -463,8 +463,10 @@ pub fn open(spec: OpenSpec) -> Result<u64, String> {
         Ok(view)
     })
     .unwrap_or_else(|| Err(format!("opening {url}: the host is not running")))?;
-    // A UI view loads nothing until its binding is in (the function's doc).
-    let first = if spec.ui { "" } else { url.as_str() };
+    // A UI view starts at its page too: a browser made with no url has no renderer to answer the Runtime domain, and
+    // one made on about:blank turns the load of a file:// page into a new window. Its binding comes with the reload
+    // once the binding is in (the function's doc); the page draws nothing until it has the binding.
+    let first = url.as_str();
 
     let fail = |e: String| {
         with("a view that failed to open", |h| h.pages.remove(&view));
@@ -1226,7 +1228,7 @@ pub fn navigation_refused(view: u64, url: &str) -> bool {
     let no = with("a navigation", |h| {
         let u = h.pages.get(&view)?.ui.as_ref()?;
         if !u.loaded {
-            Some(No::Early)
+            (!u.origin.admits(url)).then_some(No::Early)
         } else if !u.origin.admits(url) {
             Some(No::Outside)
         } else {

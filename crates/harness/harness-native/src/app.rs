@@ -2131,6 +2131,9 @@ impl App {
         self.sync_side_status();
         self.step_archive_scroll();
         self.step_learn_scroll();
+        // The start page and lessons' web page: opened, sent its screen, its messages done (app/learn/page.rs).
+        let focused = self.learn_focused();
+        self.learn_page(focused);
         self.step_chat_scroll();
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {

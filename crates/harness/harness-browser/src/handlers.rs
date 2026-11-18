@@ -401,13 +401,14 @@ wrap_request_handler! {
         }
 
         fn on_open_urlfrom_tab(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, target_url: Option<&CefString>, _target_disposition: WindowOpenDisposition, _user_gesture: c_int) -> c_int {
-            // A new tab or window asked for by a middle or cmd click: a UI view opens none, it hands the url to the app.
-            // Other views keep CEF's own handling (it goes on to OnBeforePopup).
+            // A UI view's own page, loaded from the blank page it is made on, comes here too (a cross-process load):
+            // it goes on in the view. Any other url (a middle or cmd click, a new window) goes to the app as a link, as
+            // a navigation out of the page does (host::navigation_refused). Other views keep CEF's own handling.
             if !host::is_ui(self.view) {
                 return 0;
             }
-            host::ui_link(self.view, target_url.map(ToString::to_string).unwrap_or_default());
-            1
+            let url = target_url.map(ToString::to_string).unwrap_or_default();
+            c_int::from(host::navigation_refused(self.view, &url))
         }
 
         fn on_render_process_terminated(&self, _browser: Option<&mut Browser>, status: TerminationStatus, error_code: c_int, error_string: Option<&CefString>) {
