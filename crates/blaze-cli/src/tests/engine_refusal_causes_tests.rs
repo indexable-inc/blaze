@@ -102,7 +102,7 @@ fn a_head_constant_of_a_dependency_or_an_expansion_is_placed() {
 
 /// One package `seeded`: `uses` calls the toolchain's `fixture_len`, whose head holds a
 /// constant (blaze-world fixture.rs `CORE`): a head the body's seed freezes, never a head task.
-fn toolchain_constant(io: &Io) {
+pub(super) fn toolchain_constant(io: &Io) {
     write(io, "Cargo.toml", "[package]\nname = \"seeded\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write(io, "src/lib.rs", "pub fn uses() -> u8 {\n    ::core::fixture_len([1; 2])\n}\n");
 }
@@ -133,7 +133,7 @@ fn the_seed_freezer_evaluates_a_constant_under_both_strategies() {
 
 /// One package `again`: `bad`'s signature holds a constant with no value, and two other
 /// members of its impl call it, each body asking `bad`'s head in one stretch (one worker).
-fn asked_twice(io: &Io) {
+pub(super) fn asked_twice(io: &Io) {
     write(io, "Cargo.toml", "[package]\nname = \"again\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write(
         io,
@@ -212,4 +212,57 @@ fn a_standing_refusal_keeps_its_stage_not_whole() {
     let (_, cert_lines, cert) = said(&io, false);
     assert_eq!(not_checked(&cert_lines), cold_not, "the certificate prints the cold request's NOT-checked lines");
     println!("certificate: {} (certified {})", entries(&cert), cert.certified);
+}
+
+/// Two members, `a` and `b`, each with one body reading the toolchain's `FixtureBad`, whose
+/// field's length (`FIXTURE_BAD = 0 - 1`) does not evaluate (blaze-world fixture.rs `CORE`): a
+/// dependency's head no head task freezes, frozen (and failed) by each crate's body stretch.
+fn two_readers_of_a_failed_dependency_head(io: &Io) {
+    write(io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n");
+    write(io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(io, "a/src/lib.rs", "pub fn first(x: &::core::FixtureBad) -> u8 {\n    x.x[0]\n}\n");
+    write(io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(io, "b/src/lib.rs", "pub fn second(x: &::core::FixtureBad) -> u8 {\n    x.x[0]\n}\n");
+}
+
+/// A DEPENDENCY HEAD'S FAILURE KEEPS ITS REASON ACROSS STRETCHES, WORKERS AND CALLERS: on 1
+/// and on 8 workers, `first` (in `a`) and `second` (in `b`, another stretch) are each refused
+/// with a note quoting `FixtureBad`'s own reason ("the value of a constant its type holds"),
+/// none says "was not kept" or "never told why", and the closing lines group the failed head
+/// ("heads: 1 head(s) failed: ..: first `..FixtureBad`"), the head a body froze, not a head task.
+/// Rule 23: a body's check first asks the head on the spot (front2 world_items.rs
+/// `store_want`, check.rs `make`), which drops the freeze's error and leaves it to the round's
+/// fill; that fill's ask is `FreezeError::Again`, which carries no reason. With the reason kept
+/// only where a body's task error carried it (the per-stretch table before), every body met
+/// only `Again` and printed "its reason was not kept"; without `RequestSeed::seed` telling the
+/// request (front2 tables/seeds.rs, `RequestHeads::refused`), each prints "never told why".
+#[test]
+fn a_failed_dependency_head_keeps_its_reason_for_every_reader() {
+    for workers in [1, 8] {
+        let io = Io::simulated(SimWorld::new(67, Limits::USUAL));
+        two_readers_of_a_failed_dependency_head(&io);
+        let (text, checked) = printed_with(&io, opts(&io, workers, true));
+        println!("{workers} worker(s): {}\n{text}", entries(&checked));
+        for (member, body) in [("a/src/lib.rs", "first"), ("b/src/lib.rs", "second")] {
+            let note = text.lines().find(|line| line.contains(member) && line.contains(body)).unwrap_or_else(|| panic!("{workers}: `{body}` is refused with a note:\n{text}"));
+            // Since a body never freezes a member's head itself (lanes RU1..RU3), `first` is
+            // refused for ITS OWN head (`a::first`, whose signature names `FixtureBad`: its head
+            // task failed for the constant's reason), not for `core::FixtureBad` frozen by its
+            // seed: the note names the member head and quotes the same reason. OWED: a row whose
+            // body alone names `FixtureBad` (not its signature), so a dependency head frozen by a
+            // seed and failing is exercised again (the path this test was written for).
+            assert!((note.contains("FixtureBad`") || note.contains(&std::format!("::{body}`"))) && note.contains("the value of a constant its type holds"), "{workers}: `{body}`'s note quotes the head's own reason: {note}");
+        }
+        assert!(!text.contains("was not kept"), "{workers}: no reason lost below the cap:\n{text}");
+        assert!(!text.contains("never told why"), "{workers}: every failure told the request:\n{text}");
+        let grouped: std::vec::Vec<&str> = text.lines().filter(|line| line.contains("heads: ") && line.contains("head(s) failed: ")).collect();
+        assert_eq!(grouped.len(), 1, "{workers}: one grouped reason:\n{text}");
+        // One reason, three heads: `core::FixtureBad` (frozen by the bodies' seeds) and the two
+        // fns whose signatures name it (`a::first`, `b::second`: their head tasks fail for the
+        // same cause), as the first run printed: "heads: 3 head(s) failed: ..: first `a::first`,
+        // `b::second`, `core::FixtureBad`".
+        // Under the strict member-head rule the group is the two member heads (`a::first`,
+        // `b::second`): no body's seed reaches `core::FixtureBad` any more (see above).
+        assert!(grouped[0].contains("head(s) failed: ") && grouped[0].contains("the value of a constant its type holds") && grouped[0].contains("`a::first`") && grouped[0].contains("`b::second`"), "{workers}: the group names each failed head once: {}", grouped[0]);
+    }
 }

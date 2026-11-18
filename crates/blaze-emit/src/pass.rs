@@ -1233,7 +1233,13 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 }
                 self.put(enc::brk(code));
             }
-            Op::Unreachable => self.put(enc::brk(BRK_UNREACHABLE)),
+            Op::Unreachable => {
+                let at = self.here();
+                self.put(enc::brk(BRK_UNREACHABLE));
+                if let Some(form) = self.record.as_deref_mut() {
+                    form.unreachables.push(at);
+                }
+            }
             Op::Param => return Err(unsupported(inst, op, "a parameter after a block's first instruction")),
             // A promise only allows UB, so it is dropped (as `Freeze`'s flags are).
             Op::Assume => {}

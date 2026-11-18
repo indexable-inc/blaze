@@ -414,14 +414,14 @@ fn work<L: LastAnswer>(world: &World, plant: Plant, view: View<'_, 'static, L>, 
 
 /// One request on the engine, over the last answer in any form `L` (last_sim.rs runs the same
 /// history over two forms and holds them equal).
-pub(crate) fn request<L: Fold<'static, Out = Answer<'static>> + Sync>(
+pub(crate) fn request<L: Fold<'static> + Sync>(
     world: &World,
     answer: L,
     changed: &BTreeMap<Name, StdVec<Planned>>,
     scope: Crates,
     plant: Plant,
     pool: Pools,
-) -> Result<Finished<'static>, EngineError> {
+) -> Result<Finished<'static, L::Out>, EngineError> {
     let files: StdVec<(Name, &[Planned])> = changed.iter().map(|(name, plan)| (*name, plan.as_slice())).collect();
     let mut engine = Engine::new_in(crate::engine::Tools([TOOL; key::KINDS]), answer, &Edit { files: &files }, scope, plant, alloc())?;
     let mut buffers: StdVec<Buffer<'static>> = (0..4).map(|_| Buffer::new_in(alloc())).collect();

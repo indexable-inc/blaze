@@ -9,15 +9,24 @@ use blaze_launch::wire::run::Symbol;
 use blaze_own::{Erased, Inline, Vec};
 use blaze_typeck::ItemKey;
 
-use super::{Named, report};
+use super::{Named, Places, SiteShown, report};
 
 const FUNCTION: [u8; 32] = [0x66; 32];
 const CALLEE: [u8; 32] = [0x5a; 32];
 
-fn names(symbol: [u8; 32]) -> Named {
-    match symbol {
-        FUNCTION => Named::Item(ItemKey(0x1234)),
-        _ => Named::NoRow,
+/// FUNCTION is item 0x1234; nothing else has a row; no site is placed.
+struct Names;
+
+impl Places for Names {
+    fn named(&mut self, symbol: [u8; 32]) -> Named {
+        match symbol {
+            FUNCTION => Named::Item(ItemKey(0x1234)),
+            _ => Named::NoRow,
+        }
+    }
+
+    fn site(&mut self, _item: ItemKey, _at: u32) -> Option<SiteShown> {
+        None
     }
 }
 
@@ -48,7 +57,7 @@ fn a_trap_is_said_by_its_reason_and_the_call_it_ends() {
 
     let at = Spot { placed: Placed::Code, symbol: Symbol(FUNCTION), record: RecordId([0x2d; 32]), offset: 0x3fc };
     let fault = Fault { signal: Signal::Trap, pc: Some(0x70_02ae_a76c), at: Some(at), address: 0x70_02ae_a76c, touched: Some(at), write: None };
-    let said = std::format!("{}", report(fault, &mut names, Some(Ok(bytes.as_slice()))));
+    let said = std::format!("{}", report(fault, &mut Names, Some(Ok(bytes.as_slice()))));
     assert!(said.starts_with("blaze run: the program was killed by SIGTRAP: it struck at +0x3fc in fn of item 0x1234"), "{said}");
     assert!(said.contains("`brk #0xff02`: an `unreachable` reached"), "{said}");
     assert!(said.contains("right after the call of a fn this run has no row for") && said.contains("(symbol 5a5a5a5a5a5a)"), "{said}");
@@ -57,11 +66,11 @@ fn a_trap_is_said_by_its_reason_and_the_call_it_ends() {
 
     let abort = Spot { offset: 0x400, ..at };
     let fault = Fault { at: Some(abort), touched: Some(abort), ..fault };
-    let aborted = std::format!("{}", report(fault, &mut names, Some(Ok(bytes.as_slice()))));
+    let aborted = std::format!("{}", report(fault, &mut Names, Some(Ok(bytes.as_slice()))));
     assert!(aborted.contains("`brk #0xfe00`: an abort") && !aborted.contains("right after the call"), "{aborted}");
 
     let nowhere = Fault { signal: Signal::Segv, pc: Some(0x10), at: None, address: 0x20, touched: None, write: Some(true) };
-    let lost = std::format!("{}", report(nowhere, &mut names, None));
+    let lost = std::format!("{}", report(nowhere, &mut Names, None));
     assert_eq!(lost, "blaze run: the program was killed by SIGSEGV: its pc 0x10 is in no placed function");
     std::println!("{said}");
 }

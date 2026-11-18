@@ -9,6 +9,7 @@ use std::alloc::Global;
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
 use blaze_lir::func::{BlockKind, Conv, Ext, RefId, RefKind, SlotId, SlotKind};
 use blaze_lir::{Block, Builder, Flags, Full, IntCond, Op, Ty, Value};
+use blaze_code::record::{TrapKind, TrapSource};
 use blaze_own::Alloc;
 use blaze_typeck::{
     AdjustKind, AdtKind, BinOp, BodyView, Checked, CtorKind, Def, Edition, Expr, ExprId, FnSig, IntTy, ItemKey, LangItem, List, Lit, Mutbl,
@@ -370,8 +371,9 @@ enum Task {
     /// `let`-`else` statement (walk/lets.rs), its scrutinee on top.
     LetElse(StmtId),
     /// The end of a `let`-`else`'s diverging block: the statement goes on in the block given,
-    /// its entries set aside for the `else` block (`let_else_held` from the index) put back.
-    LetElseEnd(Block, u32),
+    /// its entries set aside for the `else` block (`let_else_held` from the index) put back;
+    /// the `else` block last.
+    LetElseEnd(Block, u32, ExprId),
     LoopEnd(ExprId),
     Break(ExprId, bool),
     Return(bool),
@@ -462,6 +464,8 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     thread_locals: Vec<ItemKey, A>,
     /// By `Vtable` reference place: the table.
     vtables: Vec<crate::vtable::VtableRef, A>,
+    /// Each `unreachable` written to end a construct ([`Walk::unreachable_of`]), in order.
+    trap_marks: Vec<TrapMark, A>,
     /// The one layout of every type (rule 30): the walk's rows read their sizes, alignments,
     /// offsets, strides, tags and niches from it.
     ls: Layouts<A>,
@@ -656,13 +660,67 @@ pub(crate) fn build<A: Allocator + Clone>(
             w.run_closure(closure, which)?;
         }
     }
-    let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
-    let func = b.finish().map_err(|error| match error {
-        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
-        other => BuildError::Lir(other),
-    })?;
-    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
-    Ok(Built { func, refs, statics, thread_locals, vtables })
+    w.into_built()
+}
+
+/// One `unreachable` a walk wrote to end a construct: its instruction, kind and site.
+type TrapMark = (u32, TrapKind, Option<(u128, u32)>);
+
+impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+    /// An `unreachable` ending the construct of `kind` at expression `at`, and its row of the
+    /// trap table: its site is `at`'s first byte from its item's (`Adts::caller_site`, for one
+    /// in a macro's expansion its outermost call's; rule 71), `None` when the world does not
+    /// say or there is no expression.
+    pub(crate) fn unreachable_of(&mut self, kind: TrapKind, at: Option<ExprId>) {
+        let inst = self.b.unreachable_inst();
+        self.mark_trap(inst.0, kind, at);
+    }
+
+    /// [`Walk::unreachable_of`] for the `unreachable` just written by another lowering (the
+    /// intrinsic's, intrinsics.rs): the function's last instruction must be it.
+    pub(crate) fn mark_last_unreachable(&mut self, kind: TrapKind, at: Option<ExprId>) -> Result<(), BuildError> {
+        let ops = &self.b.func().ops;
+        let last = ops.len().checked_sub(1).filter(|&i| ops[i] == Op::Unreachable as u8);
+        let inst = last.ok_or(malformed("a diverging lowering that did not end in `unreachable` (a build bug)"))?;
+        self.mark_trap(inst as u32, kind, at);
+        Ok(())
+    }
+
+    fn mark_trap(&mut self, inst: u32, kind: TrapKind, at: Option<ExprId>) {
+        let site = at.and_then(|e| self.adts.caller_site(self.body.owner, e)).map(|s| (s.item.0, s.offset));
+        self.trap_marks.push((inst, kind, site));
+    }
+
+    /// The walk's function, finished and verified, with its tables: every walk ends here.
+    pub(crate) fn into_built(self) -> Result<Built<A>, BuildError> {
+        let Walk { b, refs, statics, thread_locals, vtables, trap_marks, alloc, .. } = self;
+        let func = b.finish().map_err(|error| match error {
+            blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
+            other => BuildError::Lir(other),
+        })?;
+        blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
+        let traps = trap_sources(&func, &trap_marks, alloc)?;
+        Ok(Built { func, refs, statics, thread_locals, vtables, traps })
+    }
+}
+
+/// The walk's marks as the trap table: each `unreachable`'s ordinal among the function's
+/// `unreachable` instructions in layout order (what the emitter counts them by).
+fn trap_sources<A: Allocator + Clone>(func: &blaze_lir::Func<A>, marks: &[TrapMark], alloc: A) -> Result<Vec<TrapSource, A>, BuildError> {
+    let unreachable = Op::Unreachable as u8;
+    let mut out = Vec::with_capacity_in(marks.len(), alloc);
+    let (mut ordinal, mut next) = (0u32, 0usize);
+    for &(inst, kind, site) in marks {
+        let at = inst as usize;
+        if at < next || func.ops.get(at) != Some(&unreachable) {
+            return Err(BuildError::Malformed { what: "a trap mark that is not the function's next `unreachable`" });
+        }
+        ordinal += func.ops[next..at].iter().filter(|&&op| op == unreachable).count() as u32;
+        out.push(TrapSource { ordinal, kind, site });
+        ordinal += 1;
+        next = at + 1;
+    }
+    Ok(out)
 }
 
 /// An unsizing adjustment's types: the pointer before and after, its pointee before and after.
@@ -726,6 +784,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         statics: Vec::new_in(alloc.clone()),
         thread_locals: Vec::new_in(alloc.clone()),
         vtables: Vec::new_in(alloc.clone()),
+        trap_marks: Vec::new_in(alloc.clone()),
         ls: Layouts::new_in(alloc.clone()),
         layouts: Vec::new_in(alloc.clone()),
         layout_fields: Vec::new_in(alloc.clone()),
@@ -1694,7 +1753,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             self.switch(d, none, &cases);
                             // No variant has another discriminant: holding one is UB.
                             self.begin(none);
-                            self.b.unreachable();
+                            self.unreachable_of(TrapKind::Discriminant, None);
                         }
                     }
                 }
@@ -2868,7 +2927,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if self.live {
             self.ret_value(v)?;
         } else {
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::BodyEnd, Some(self.body.root));
         }
         if let Some(error) = self.b.error() {
             return Err(BuildError::Lir(error.clone()));
@@ -3367,7 +3426,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::LetLink { expr, fail } => self.let_link(expr, fail)?,
             Task::CondLink(fail) => self.cond_link(fail)?,
             Task::LetElse(s) => self.let_else_test(s)?,
-            Task::LetElseEnd(cont, from) => self.let_else_end(cont, from)?,
+            Task::LetElseEnd(cont, from, els) => self.let_else_end(cont, from, els)?,
             Task::LoopEnd(e) => {
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a loop's target out of order"))?;
                 let header = t.header.ok_or(malformed("a loop without its head"))?;
@@ -3421,7 +3480,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let st = self.matches.pop().ok_or(malformed("a match's state out of order"))?;
                 let none = self.arm_blocks[(st.first + st.arms) as usize];
                 self.begin(none);
-                self.b.unreachable();
+                self.unreachable_of(TrapKind::MatchNoArm, Some(st.expr));
                 self.arm_blocks.truncate(st.first as usize);
                 self.begin(st.join);
                 let v = self.join_param(st.repr);
@@ -3842,7 +3901,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     // never gets here: the block ends, and the coerced value below is built in
                     // the dead block after it (a call returning `!` already ended its block).
                     if self.live {
-                        self.b.unreachable();
+                        self.unreachable_of(TrapKind::NeverValue, Some(e));
                         self.dead_block();
                     }
                     let v = match repr.kept() {
@@ -4045,7 +4104,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // called as every unwinding call is, so the live values are dropped on the way out
         // (walk/unwind.rs; the Reference, "Panic": unwinding runs destructors).
         self.call_unwinding(Callee::Direct(reference), sig, &values)?;
-        self.b.unreachable();
+        self.unreachable_of(TrapKind::AfterPanic, Some(e));
         self.begin(ok);
         let (stride, _) = self.size_align(elem);
         let v = if stride == 0 {
@@ -4269,6 +4328,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             IntrinsicError::Unsupported { which, why } => BuildError::Intrinsic { expr: e, which, why, unsupported: true },
             IntrinsicError::Layout(error) => Self::ty_err(e, layout_err(error)),
         })?;
+        if which == Which::Unreachable {
+            self.mark_last_unreachable(TrapKind::Intrinsic, Some(e))?;
+        }
         let v = match out {
             Out::None => V::None,
             Out::Diverges => {
@@ -5459,7 +5521,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.call_instance(Some(e), instance, &reprs, &passes, declared, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));
             self.dead_block();
             self.push_val(V::None, None);
         }
@@ -5563,7 +5625,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.emit_call(Callee::Pointer(f), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));
             self.dead_block();
             self.push_val(V::None, None);
         }
@@ -5630,7 +5692,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.emit_call(Callee::Pointer(p), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));
             self.dead_block();
             self.push_val(V::None, None);
         }

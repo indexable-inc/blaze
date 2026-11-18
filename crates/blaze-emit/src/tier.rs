@@ -58,6 +58,10 @@ fn refused(error: RecordEmitError) -> TierError {
         RecordEmitError::CAddend { of: _, addend: _ } => {
             TierError::Refused { tier: TIER, inst: None, what: "data holding a C name's address plus an addend" }
         }
+        // The seam hands no trap sources (`emit_record`'s are none), so none is past the end.
+        RecordEmitError::TrapOrdinal { ordinal: _, unreachables: _ } => {
+            TierError::Refused { tier: TIER, inst: None, what: "a trap source past the function's `unreachable` instructions" }
+        }
     }
 }
 

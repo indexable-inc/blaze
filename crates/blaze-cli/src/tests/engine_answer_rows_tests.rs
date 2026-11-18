@@ -22,11 +22,11 @@ use crate::engine_answer_rows::{
     write_effects,
 };
 
-type List<T> = std::vec::Vec<T>;
+pub(super) type List<T> = std::vec::Vec<T>;
 
 /// The command's store on the checkout `ws`, opened as `blaze why` opens it (engine_why.rs
 /// `explain`), handed to `f`, then committed: what `f` put and pinned is visible to the next.
-fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &'s mut crate::store::CommandStore<'m, 'r, bstd::io::LentDriver>, &engine_check::Opts<'static>) -> R) -> R {
+pub(super) fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &'s mut crate::store::CommandStore<'m, 'r, bstd::io::LentDriver>, &engine_check::Opts<'static>) -> R) -> R {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let frame = cx.frame();
     let erased = blaze_own::Erased::new(frame);
@@ -46,24 +46,24 @@ fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &'s mut crat
 /// Every answer a form gives, in names (a form's own ids are its own), sorted where the forms
 /// keep another order, and the serials (each form's own numbering) zeroed.
 #[derive(PartialEq, Eq, Debug, Default)]
-struct Asked {
-    rows: List<(Name, Option<LastRow>)>,
-    reads: List<(Name, Option<List<CellId>>)>,
-    defines: List<(Name, Option<List<(CellId, CellDigest)>>)>,
-    stands: List<(Name, Option<bool>)>,
-    saw: List<(Name, CellId, bool)>,
-    digests: List<(CellId, CellDigest)>,
-    readers: List<(CellId, List<Name>)>,
-    file_tasks: List<(Name, List<Name>)>,
-    owed: List<Planned>,
-    owed_cells: List<CellId>,
-    with_findings: List<(Name, u32)>,
+pub(super) struct Asked {
+    pub(super) rows: List<(Name, Option<LastRow>)>,
+    pub(super) reads: List<(Name, Option<List<CellId>>)>,
+    pub(super) defines: List<(Name, Option<List<(CellId, CellDigest)>>)>,
+    pub(super) stands: List<(Name, Option<bool>)>,
+    pub(super) saw: List<(Name, CellId, bool)>,
+    pub(super) digests: List<(CellId, CellDigest)>,
+    pub(super) readers: List<(CellId, List<Name>)>,
+    pub(super) file_tasks: List<(Name, List<Name>)>,
+    pub(super) owed: List<Planned>,
+    pub(super) owed_cells: List<CellId>,
+    pub(super) with_findings: List<(Name, u32)>,
     /// The certificate for the tree the answer answers, and for another.
-    certificate: (bool, bool),
+    pub(super) certificate: (bool, bool),
 }
 
 /// Every question of the seam, asked of `form` for each of `names`, `cells` and `files`.
-fn ask<L: LastAnswer>(form: &L, names: &[Name], cells: &[CellId], files: &[Name], tree: &TreeDigest, other: &TreeDigest) -> Asked {
+pub(super) fn ask<L: LastAnswer>(form: &L, names: &[Name], cells: &[CellId], files: &[Name], tree: &TreeDigest, other: &TreeDigest) -> Asked {
     let alloc = blaze_own::testing::heap().alloc();
     let named = |task: L::Task| form.name(task).expect("every task a form lists has a name");
     let id_of = |cell: L::Cell| form.cell_id(cell).expect("every cell a form lists has an id");
@@ -87,7 +87,7 @@ fn ask<L: LastAnswer>(form: &L, names: &[Name], cells: &[CellId], files: &[Name]
         asked.stands.push((*name, task.and_then(|t| form.stands(t))));
         for cell in cells {
             let saw = match (task, form.cell(cell)) {
-                (Some(t), Some(c)) => form.saw(t, c),
+                (Some(t), Some(c)) => form.saw(t, c).expect("a read found by search"),
                 _ => false,
             };
             asked.saw.push((*name, *cell, saw));
@@ -123,7 +123,7 @@ fn ask<L: LastAnswer>(form: &L, names: &[Name], cells: &[CellId], files: &[Name]
 
 /// What the questions are asked of: every name with a row or owed (and one with neither),
 /// every cell read, defined or digested, every file with a plan.
-fn universe(answer: &Answer<'_>) -> (List<Name>, List<CellId>, List<Name>) {
+pub(super) fn universe(answer: &Answer<'_>) -> (List<Name>, List<CellId>, List<Name>) {
     let mut names: List<Name> = answer.rows.keys().copied().chain(answer.owed_tasks.keys().copied()).collect();
     names.push(Name::new(Kind::BodyCheck, ContentId::of("engine_answer_rows_tests absent", b"none")));
     names.sort();
@@ -139,12 +139,12 @@ fn universe(answer: &Answer<'_>) -> (List<Name>, List<CellId>, List<Name>) {
 }
 
 /// Hundredths of `n / d`, printed as `x.yy`.
-fn ratio(n: u64, d: u64) -> std::string::String {
+pub(super) fn ratio(n: u64, d: u64) -> std::string::String {
     let h = n * 100 / d.max(1);
     format!("{}.{:02}", h / 100, h % 100)
 }
 
-fn n64(n: usize) -> u64 {
+pub(super) fn n64(n: usize) -> u64 {
     u64::try_from(n).expect("a count fits")
 }
 
@@ -163,9 +163,9 @@ fn both_forms_answer_alike() {
         let name = crate::engine_answer::root_name(opts.place.checkout, &opts.tools, frame);
         let pointer = crate::engine_answer::load_pointer(cx, store, &name).expect("the store reads").expect("engine-check stored an answer").expect("its pointer reads");
         let (kept, _) = crate::engine_answer::load_answer(cx, store, pointer.root, opts.heap.shared()).expect("the store reads").expect("its pages read");
-        let empty = AnswerView::empty(Plant::None, alloc);
+        let empty = AnswerView::empty(Plant::None, opts.heap.shared());
         let mut next = RowsNext::new(&empty, Counts::default(), Plant::None, alloc);
-        put_whole(&kept.answer, &mut next).expect("every row is put");
+        put_whole(&kept.answer, &|_| None, &mut next).expect("every row is put");
         let counts = next.counts();
         let effects = next.finish(&tree, &summary(&pointer.facts), &LinesKey(pointer.lines.0.0)).expect("the commit");
         let names = root_names(opts.place.checkout, &opts.tools, &tree, frame);
@@ -189,7 +189,7 @@ fn both_forms_answer_alike() {
         let whole = facts.owed == 0 && facts.printed.replayable;
         assert_eq!(certified(&stored, &tree).expect("the root's summary reads"), whole, "the certificate from the root alone");
         assert!(!certified(&stored, &other).expect("the root's summary reads"), "no certificate for another tree");
-        let rows = load_rows(cx, store, &stored, alloc).expect("the store reads").expect("the rows read");
+        let rows = load_rows(cx, store, &stored, opts.heap.shared()).expect("the store reads").expect("the rows read");
         assert_eq!(rows.facts(), pointer.facts, "the root's summary holds the pointer's facts");
         let paged = PagesAnswer::new(&kept, root.bytes, pointer.facts, Some(tree));
         let (names_asked, cells, files) = universe(&kept.answer);
@@ -236,7 +236,7 @@ fn both_forms_answer_alike() {
 
 /// One write of a commit, as a test's sink saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Op {
+pub(super) enum Op {
     Put(Key, List<u8>),
     Pin(std::string::String, List<Key>),
 }
@@ -244,13 +244,13 @@ enum Op {
 /// The store as a model: records by key, names to keys, each op applied at once (no generation
 /// flip: what a cut leaves is what the ops before it did).
 #[derive(Clone, Default)]
-struct Memory {
-    records: StdMap<[u8; 32], List<u8>>,
-    pins: StdMap<std::string::String, List<Key>>,
+pub(super) struct Memory {
+    pub(super) records: StdMap<[u8; 32], List<u8>>,
+    pub(super) pins: StdMap<std::string::String, List<Key>>,
 }
 
 impl Memory {
-    fn apply(&mut self, ops: &[Op]) {
+    pub(super) fn apply(&mut self, ops: &[Op]) {
         for op in ops {
             match op {
                 Op::Put(key, bytes) => {
@@ -263,23 +263,23 @@ impl Memory {
         }
     }
 
-    fn root(&self, name: &str) -> Option<&[u8]> {
+    pub(super) fn root(&self, name: &str) -> Option<&[u8]> {
         let keys = self.pins.get(name)?;
         assert_eq!(keys.len(), 1, "{name} pins one root");
         self.records.get(&keys[0].0.0).map(|bytes| bytes.as_slice())
     }
 
     /// The rows answer `name` pins (a root must be pinned).
-    fn open(&self, name: &str) -> Result<RowsAnswer<'_>, RowsUnreadable> {
+    pub(super) fn open(&self, name: &str) -> Result<RowsAnswer<'_>, RowsUnreadable> {
         let root = self.root(name).unwrap_or_else(|| panic!("{name} pins a root"));
-        RowsAnswer::open(root, |one: &SegmentRef| self.records.get(&one.id.0).map(|bytes| bytes.as_slice()), Plant::None, blaze_own::testing::heap().alloc())
+        RowsAnswer::open(root, |one: &SegmentRef| self.records.get(&one.id.0).map(|bytes| bytes.as_slice()), Plant::None, blaze_own::testing::heap().shared())
     }
 }
 
 /// A sink that records the writes in order.
 #[derive(Default)]
-struct Recording {
-    ops: List<Op>,
+pub(super) struct Recording {
+    pub(super) ops: List<Op>,
 }
 
 impl AnswerSink for Recording {
@@ -296,21 +296,21 @@ impl AnswerSink for Recording {
     }
 }
 
-const CELL: Cell = Cell([1; 16]);
+pub(super) const CELL: Cell = Cell([1; 16]);
 
-fn task_name(i: u32) -> Name {
+pub(super) fn task_name(i: u32) -> Name {
     Name::new(Kind::BodyCheck, ContentId::of("engine_answer_rows_tests task", &i.to_le_bytes()))
 }
 
-fn file_name() -> Name {
+pub(super) fn file_name() -> Name {
     Name::new(Kind::FileItems, ContentId::of("engine_answer_rows_tests file", b"src/lib.rs"))
 }
 
-fn cell_of(i: u32) -> CellId {
+pub(super) fn cell_of(i: u32) -> CellId {
     CellId { of: task_name(i), cell: CELL }
 }
 
-fn digest(i: u32, version: u32) -> ContentId {
+pub(super) fn digest(i: u32, version: u32) -> ContentId {
     let mut input = [0u8; 8];
     input[..4].copy_from_slice(&i.to_le_bytes());
     input[4..].copy_from_slice(&version.to_le_bytes());
@@ -318,18 +318,18 @@ fn digest(i: u32, version: u32) -> ContentId {
 }
 
 /// A row to put: its name, what it read, what it defines.
-type Put = (Name, List<CellId>, List<(Cell, ContentId)>);
+pub(super) type Put = (Name, List<CellId>, List<(Cell, ContentId)>);
 
-fn put_of(i: u32, reads: impl Iterator<Item = u32>, version: u32) -> Put {
+pub(super) fn put_of(i: u32, reads: impl Iterator<Item = u32>, version: u32) -> Put {
     (task_name(i), reads.map(cell_of).collect(), vec![(CELL, digest(i, version))])
 }
 
-fn tools() -> Tools {
+pub(super) fn tools() -> Tools {
     Tools([blaze_drive::Tool(ContentId::of("engine_answer_rows_tests tool", b"t")); blaze_drive::key::KINDS])
 }
 
 /// One request over `last` putting `puts` for `tree`, written to a recording sink: its ops.
-fn commit(last: &AnswerView<'_>, counts: Counts, plant: Plant, tree: &TreeDigest, puts: &[Put], names: &RootNames<'_>) -> List<Op> {
+pub(super) fn commit(last: &AnswerView<'_>, counts: Counts, plant: Plant, tree: &TreeDigest, puts: &[Put], names: &RootNames<'_>) -> List<Op> {
     let alloc = blaze_own::testing::heap().alloc();
     let mut next = RowsNext::new(last, counts, plant, alloc);
     for (name, reads, defines) in puts {
@@ -341,6 +341,7 @@ fn commit(last: &AnswerView<'_>, counts: Counts, plant: Plant, tree: &TreeDigest
             source: ContentId::of("engine_answer_rows_tests source", &name.subject.0),
             flags: Flags(0),
             findings: 0,
+            record: Key(ContentId::of("engine_answer_rows_tests record", &name.subject.0)),
         };
         next.put(*name, &row, reads.iter().copied(), defines).expect("a row is put");
     }
@@ -358,14 +359,15 @@ fn commit(last: &AnswerView<'_>, counts: Counts, plant: Plant, tree: &TreeDigest
 }
 
 /// The ops of one request over the answer `memory` pins under the checkout's name.
-fn commit_over(memory: &Memory, plant: Plant, tree: &TreeDigest, puts: &[Put], names: &RootNames<'_>) -> List<Op> {
+pub(super) fn commit_over(memory: &Memory, plant: Plant, tree: &TreeDigest, puts: &[Put], names: &RootNames<'_>) -> List<Op> {
     let last = memory.open(names.checkout.as_str()).expect("the last answer opens");
     commit(last.view(), last.counts(), plant, tree, puts, names)
 }
 
 /// NOTHING WHOLE: on a 2,000-task answer, one row's question touches one row, and one row and
-/// one cell's readers under 1% of the answer's bytes; a question that walks every row (the
-/// control) touches them all.
+/// one cell's readers under 1% of the answer's bytes; the rows with findings, from their own
+/// column, touch no row when none has findings (engine_answer_columns_tests.rs holds every
+/// column's count against the answer's size).
 #[test]
 fn one_question_touches_one_row() {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
@@ -374,7 +376,7 @@ fn one_question_touches_one_row() {
     let names = root_names("ws", &tools(), &tree, cx.frame());
     let puts: List<Put> = (0..2000).map(|i| put_of(i, i.saturating_sub(20)..i, 0)).collect();
     let alloc = blaze_own::testing::heap().alloc();
-    let empty = AnswerView::empty(Plant::None, alloc);
+    let empty = AnswerView::empty(Plant::None, super::engine_check_tests::opts(&io, 2, false).heap.shared());
     let mut memory = Memory::default();
     memory.apply(&commit(&empty, Counts::default(), Plant::None, &tree, &puts, &names));
     let answer = memory.open(names.checkout.as_str()).expect("the answer opens");
@@ -389,9 +391,9 @@ fn one_question_touches_one_row() {
     println!("one row and one cell's readers of 2,000 rows: {touched:?} of {total} B");
     assert_eq!(touched.rows, 1, "one row's question touched one row: {touched:?}");
     assert!(touched.bytes * 100 < total, "under 1% of the answer's {total} B: {touched:?}");
-    // Control: a question with no column of its own walks every row.
-    let _ = answer.with_findings(alloc).expect("the rows with findings read");
-    assert!(answer.touched().rows > 2000, "a walk of every row is counted: {:?}", answer.touched());
+    // The rows with findings come from their column: none here, so no row is read.
+    assert!(answer.with_findings(alloc).expect("the rows with findings read").is_empty(), "no row has findings");
+    assert_eq!(answer.touched().rows, 1, "the findings column read no row: {:?}", answer.touched());
 }
 
 /// A root for another tree: no certificate for the tree it does not answer, `nothing_changed`
@@ -404,7 +406,7 @@ fn another_tree_is_no_certificate() {
     let (first, second) = (TreeDigest([1; 32]), TreeDigest([2; 32]));
     let (names_1, names_2) = (root_names("ws", &tools(), &first, cx.frame()), root_names("ws", &tools(), &second, cx.frame()));
     let alloc = blaze_own::testing::heap().alloc();
-    let empty = AnswerView::empty(Plant::None, alloc);
+    let empty = AnswerView::empty(Plant::None, super::engine_check_tests::opts(&io, 2, false).heap.shared());
     let mut memory = Memory::default();
     memory.apply(&commit(&empty, Counts::default(), Plant::None, &first, &[put_of(0, 0..0, 0), put_of(1, 0..1, 0)], &names_1));
     let ops = commit_over(&memory, Plant::None, &second, &[], &names_2);
@@ -425,8 +427,9 @@ fn another_tree_is_no_certificate() {
 }
 
 /// Control: a row whose read moved after it (a stale generation) is not served as standing, nor
-/// its read as seen, and the cell is owed; the same digest put again moves nothing, and the
-/// reader put again stands.
+/// its read as seen; the same digest put again moves nothing, and the reader put again stands.
+/// The owed cells are the engine's to give (`Work::owed_cells`, `RowsNext::owe_cells`): a commit
+/// that gives none owes none (engine_answer_columns_tests.rs gives them).
 #[test]
 fn a_stale_row_does_not_stand() {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
@@ -434,7 +437,7 @@ fn a_stale_row_does_not_stand() {
     let tree = TreeDigest([1; 32]);
     let names = root_names("ws", &tools(), &tree, cx.frame());
     let alloc = blaze_own::testing::heap().alloc();
-    let empty = AnswerView::empty(Plant::None, alloc);
+    let empty = AnswerView::empty(Plant::None, super::engine_check_tests::opts(&io, 2, false).heap.shared());
     let mut base = Memory::default();
     // Task 1 reads task 0's cell.
     base.apply(&commit(&empty, Counts::default(), Plant::None, &tree, &[put_of(0, 0..0, 0), put_of(1, 0..1, 0)], &names));
@@ -446,9 +449,9 @@ fn a_stale_row_does_not_stand() {
         let reader = answer.task(&task_name(1)).expect("task 1 is named");
         let cell = answer.cell(&cell_of(0)).expect("task 0's cell is named");
         let owed = answer.owed_cells(alloc).expect("the owed cells read").iter().map(|(c, _)| answer.cell_id(*c).expect("a cell's id")).collect();
-        (answer.stands(reader), answer.saw(reader, cell), owed)
+        (answer.stands(reader), answer.saw(reader, cell).expect("a read found by search"), owed)
     };
-    assert_eq!(stands(&[put_of(0, 0..0, 1)]), (Some(false), false, vec![cell_of(0)]), "task 0's cell moved after task 1's row");
+    assert_eq!(stands(&[put_of(0, 0..0, 1)]), (Some(false), false, vec![]), "task 0's cell moved after task 1's row");
     assert_eq!(stands(&[put_of(0, 0..0, 0)]), (Some(true), true, vec![]), "the same digest put again moves nothing (early cutoff)");
     assert_eq!(stands(&[put_of(0, 0..0, 1), put_of(1, 0..1, 0)]), (Some(true), true, vec![]), "task 1 put again after the move stands");
 }
@@ -464,7 +467,7 @@ fn a_cut_write_leaves_a_whole_answer() {
     let tree = TreeDigest([1; 32]);
     let names = root_names("ws", &tools(), &tree, cx.frame());
     let alloc = blaze_own::testing::heap().alloc();
-    let empty = AnswerView::empty(Plant::None, alloc);
+    let empty = AnswerView::empty(Plant::None, super::engine_check_tests::opts(&io, 2, false).heap.shared());
     let mut base = Memory::default();
     base.apply(&commit(&empty, Counts::default(), Plant::None, &tree, &[put_of(0, 0..0, 0), put_of(1, 0..1, 0)], &names));
     let first = base.open(names.checkout.as_str()).expect("the first answer opens").serial();

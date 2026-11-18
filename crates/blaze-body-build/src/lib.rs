@@ -214,6 +214,9 @@ pub fn build<A: Allocator + Clone>(
         refs: cx.refs,
         statics: Vec::new_in(alloc.clone()),
         thread_locals: Vec::new_in(alloc.clone()),
+        // This builder marks no `unreachable` with its construct yet: its records carry no trap
+        // rows (blaze-code record.rs `TrapSource`), so a fault in them is said by its code alone.
+        traps: Vec::new_in(alloc.clone()),
         vtables: Vec::new_in(alloc),
     })
 }

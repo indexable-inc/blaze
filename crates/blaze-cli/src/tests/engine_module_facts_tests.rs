@@ -88,7 +88,7 @@ pub fn body_len() -> u8 {
 const APP_BODIES: u32 = 13;
 
 /// Three members: `dep` with `pub mod m`, `dep2` re-exporting it as `shown`, `app` naming it.
-fn three_members(io: &Io) {
+pub(super) fn three_members(io: &Io) {
     write(io, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"dep2\", \"app\"]\nresolver = \"2\"\n");
     write(io, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write(io, "dep/src/lib.rs", DEP);

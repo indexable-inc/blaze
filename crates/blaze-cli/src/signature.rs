@@ -18,7 +18,8 @@
 //! Nothing of its siblings: what its paths resolve through (the file's `use`s and declarations)
 //! is read by its task, never keyed. Two entries of one name are told apart by their names
 //! ([`signature_name`]: each step's disambiguator counts the earlier siblings of the same kind
-//! and name), never by their keys. A body edit leaves it equal; any edit to the head moves it.
+//! and name, and an unnamed step (an impl, an `extern` block, a macro call) holds its head, as
+//! the chain does), never by their keys. A body edit leaves it equal; any edit to the head moves it.
 //!
 //! ITS OUT ([`signature_out`]): the digest of the head records the want makes
 //! (`ProjectWorld::want_digest`) with [`unencoded`], the head's tokens without whitespace or
@@ -69,8 +70,9 @@ use blaze_file_items::Outline;
 use blaze_ids::{ContentId, Hasher};
 use blaze_surface::{Edition, Item, ItemIndex, ItemKind};
 
-/// The domain of a `Signature`'s subject ([`signature_name`]).
-const NAME_DOMAIN: &str = "blaze-cli signature name 1";
+/// The domain of a `Signature`'s subject ([`signature_name`]). 2: the subject is the file and
+/// the entry's chain, which holds an unnamed entry's head (lane RU3).
+const NAME_DOMAIN: &str = "blaze-cli signature name 2";
 /// The domain of a `Signature` part's source ([`signature_source`]).
 const SOURCE_DOMAIN: &str = "blaze-cli signature source 2";
 /// The domain of a head's tokens ([`unencoded`]). 2: each piece is its `token_digest`
@@ -197,9 +199,31 @@ pub(crate) fn file_subject(real: &str) -> ContentId {
 }
 
 /// The `Signature` of `item` (an entry passing [`is_signature_entry`]) in the file of subject
-/// `file` (its [`file_subject`]), over its `outline` of `text`.
+/// `file` (its [`file_subject`]), over its `outline` of `text`: the file and the entry's chain
+/// (blaze-file-items chain.rs `item_chain`, the one identity of an entry by names, rule 30).
+///
+/// INJECTIVE OVER A FILE'S ENTRIES (lane RU3): the chain holds an UNNAMED entry's head (an
+/// impl, an `extern` block, a macro call), whose disambiguator counts only its siblings of the
+/// same head (blaze-file-items digest.rs `sibling_keys`). The walk this replaced hashed kind,
+/// name and disambiguator alone, so two impls with different headers in one file (`impl Pair`
+/// and `impl crate::Measure for Pair`, both unnamed, both disambiguator 0) were ONE entry name:
+/// one head task, its source one impl's (rule 21), its rows two impl headers under one cell
+/// (engine_heads.rs `heads_of`: "two heads of its entry fall under one cell"), and every body
+/// reading either header refused; each fn of the two impls named alike (`fn measure` of two
+/// `impl Measure for ..`) shared one name too. 2: the chain's form, so no task or record named
+/// by the old form is read by its key.
 pub(crate) fn signature_name(file: ContentId, outline: &Outline<'_>, item: &Item, text: &str) -> Name {
     let mut h = Hasher::new(NAME_DOMAIN);
+    h.update(&file.0).update(&blaze_file_items::item_chain(outline, item, text).0);
+    Name::new(Kind::Signature, h.finish())
+}
+
+/// THE PLANT (rule 23): [`signature_name`]'s form before lane RU3 (kind, name and disambiguator
+/// of each entry up the chain, no unnamed entry's head), so the tests show two unnamed siblings
+/// under one name with it and none without (tests/engine_head_cells_tests.rs).
+#[cfg(test)]
+pub(crate) fn signature_name_before(file: ContentId, outline: &Outline<'_>, item: &Item, text: &str) -> Name {
+    let mut h = Hasher::new("blaze-cli signature name 1");
     h.update(&file.0);
     let mut at = Some(item);
     while let Some(entry) = at {

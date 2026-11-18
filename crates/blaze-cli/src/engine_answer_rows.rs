@@ -30,6 +30,14 @@
 //! that cannot be read is [`RowsUnreadable`]: a note says which and why, and the request answers
 //! in full and writes the answer anew (a stated path, rule 3); a root of another form is an old
 //! home's, reported and rebuilt (rule 26).
+//!
+//! The engine over this form: `Engine<RowsAnswer>`'s finish folds the request's writes into a
+//! [`RowsFolded`] (blaze-engine overlay.rs `Fold`); the command then hands it what only the
+//! request's end knows ([`Close`]: the tree, what it printed, the lines record, each row's record
+//! key) and [`RowsFolded::commit`] writes the next answer's segments, each row the request put at
+//! the serial blaze-engine's `Generations` gives it. A file's plan, the owed tasks and cells and
+//! the rows with findings are each read from their own column (blaze-answer kinds 5 to 8), so no
+//! question walks the rows (engine_answer_columns_tests.rs counts them).
 #![cfg_attr(not(test), expect(dead_code, reason = "the rows form waits on the switch (runtime.md D5); its tests use it today"))]
 
 use core::fmt;
@@ -38,17 +46,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use blaze_answer::{
     AnswerError, AnswerView, CellDigest, CellNo, Commit, DEFINE_BYTES, Effects, Flags, LinesKey, MAX_READS_PER_ROW, Plant, ROW_COLD_BYTES, ROW_FIXED_BYTES, RowIn, RowView, RunWriter, SegmentKind,
-    SegmentRef, Serial, TaskId, TreeDigest, Write,
+    SegmentRef, Serial, TaskId, TreeDigest, Write, has_findings,
 };
 use blaze_core::Driver;
 use blaze_drive::cells::Cell;
 use blaze_drive::key::ABSENT;
 use blaze_drive::{Key, Name};
-use blaze_engine::last::{LastAnswer, LastError, LastRow, NextAnswer, NextRow, Touched};
+use blaze_engine::last::{Found, LastAnswer, LastError, LastRow, NextAnswer, NextRow, ReadOf, Touched};
 use blaze_engine::pages::Kept;
-use blaze_engine::{Answer, CellId, Phase, Planned, Stage, Tools};
+use blaze_engine::{Answer, CellId, EngineError, Fold, Phase, Planned, Row, Stage, Tools, Work};
 use blaze_ids::ContentId;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
 use bstd::Cx;
 use bstd::mem::Frame;
 
@@ -199,7 +207,7 @@ pub(crate) fn certified(root: &RowsRoot<'_>, tree: &TreeDigest) -> Result<bool, 
 
 /// The answer `root` names, its segments as the store holds them (mapped where committed). A
 /// store's own error stops the command; an answer that cannot be read is the stated path.
-pub(crate) fn load_rows<'m: 'a, 'a, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, root: &RowsRoot<'m>, alloc: Alloc<'a>) -> Result<Result<RowsAnswer<'a>, RowsUnreadable>, CliError> {
+pub(crate) fn load_rows<'m: 'a, 'a, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, root: &RowsRoot<'m>, alloc: SharedAlloc<'a>) -> Result<Result<RowsAnswer<'a>, RowsUnreadable>, CliError> {
     let mut failed: Option<CliError> = None;
     let opened = RowsAnswer::open(
         root.bytes,
@@ -278,11 +286,6 @@ fn is_file(stage: u8, flags: Flags, key: Key) -> bool {
     stage == stage_byte(Stage::Outlines) && !(has(flags, Flags::OWED) && key == Key::default())
 }
 
-/// A row counted as one with findings: it made findings or failed (engine.rs `apply`).
-fn has_findings(findings: u32, flags: Flags) -> bool {
-    findings > 0 || has(flags, Flags::FAILED)
-}
-
 /// The last answer in blaze-answer's form, read in place: every question probes the segments
 /// newest to oldest and reads the fields it needs, nothing decoded whole.
 pub(crate) struct RowsAnswer<'a> {
@@ -294,6 +297,8 @@ pub(crate) struct RowsAnswer<'a> {
     cells_segments: u64,
     dicts: u64,
     runs: u64,
+    plans: u64,
+    findings: u64,
     counters: Counters,
 }
 
@@ -336,14 +341,22 @@ impl Iterator for RowDefines<'_> {
 impl<'a> RowsAnswer<'a> {
     /// The answer `root` names, each segment's bytes from `fetch`: blaze-answer's `open` (each
     /// bound checked once), then the summary read as the certificate's facts.
-    pub(crate) fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &'a [u8], fetch: F, plant: Plant, alloc: Alloc<'a>) -> Result<RowsAnswer<'a>, RowsUnreadable> {
+    pub(crate) fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &'a [u8], fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<RowsAnswer<'a>, RowsUnreadable> {
         let view = AnswerView::open(root, fetch, plant, alloc).map_err(|why| RowsUnreadable::Answer(why.into()))?;
         let facts = facts_of(view.summary()).ok_or(RowsUnreadable::Summary { bytes: view.summary().len() })?;
         let segments = view.segments();
         let count = |kind: SegmentKind| len64(segments.iter().filter(|one| one.kind == kind).count());
         let bytes = len64(root.len()) + segments.iter().map(|one| one.len).sum::<u64>();
         let (rows_segments, cells_segments, dicts, runs) = (count(SegmentKind::Rows), count(SegmentKind::Cells), count(SegmentKind::Dict), count(SegmentKind::Run));
-        Ok(RowsAnswer { view, facts, bytes, rows_segments, cells_segments, dicts, runs, counters: Counters::default() })
+        let (plans, findings) = (count(SegmentKind::Plans), count(SegmentKind::Findings));
+        Ok(RowsAnswer { view, facts, bytes, rows_segments, cells_segments, dicts, runs, plans, findings, counters: Counters::default() })
+    }
+
+    /// No answer yet (a first request, or one the store could not read): no row, no segment,
+    /// serial 0.
+    pub(crate) fn empty(alloc: SharedAlloc<'a>) -> RowsAnswer<'a> {
+        let view = AnswerView::empty(Plant::None, alloc);
+        RowsAnswer { view, facts: Facts::default(), bytes: 0, rows_segments: 0, cells_segments: 0, dicts: 0, runs: 0, plans: 0, findings: 0, counters: Counters::default() }
     }
 
     /// The view: what the next request's [`RowsNext`] is made over.
@@ -380,12 +393,6 @@ impl<'a> RowsAnswer<'a> {
     fn moved(&self, cell: CellNo) -> Serial {
         Counters::add(&self.counters.bytes, self.cells_segments * (PROBE_BYTES + 8));
         self.view.moved(cell)
-    }
-
-    /// The rows of every task id, each counted: the walk the questions without a column of
-    /// their own make today (see the module's `NOT DONE` in the lane report).
-    fn every_row(&self) -> impl Iterator<Item = RowView<'_>> + '_ {
-        (0..self.view.tasks()).filter_map(move |t| self.row_view(TaskId(t)))
     }
 
     fn name_of(&self, task: TaskId, what: &'static str) -> Result<Name, LastError> {
@@ -478,10 +485,18 @@ impl<'a> LastAnswer for RowsAnswer<'a> {
         Some(reads.all(|cell| self.moved(cell) <= serial))
     }
 
-    fn saw(&self, task: TaskId, cell: CellNo) -> bool {
-        let Some(row) = self.row_view(task) else { return false };
-        let mut reads = self.counted(row);
-        reads.any(|read| read == cell) && self.moved(cell) <= row.serial()
+    /// The read list is in read order: the read is found in the reverse index, in place, one
+    /// binary search for the cell and one for the task in each run (blaze-answer
+    /// `AnswerView::reads_cell`), O(runs log), never a walk of the row's reads (plan row B1).
+    fn read_of(&self, task: TaskId, cell: CellNo) -> Result<ReadOf, LastError> {
+        let Some(row) = self.row_view(task) else { return Ok(ReadOf { found: Found::NotRead, compared: 0 }) };
+        let (read, compared) = self.view.reads_cell(cell, task)?;
+        Counters::add(&self.counters.bytes, self.runs * (2 * PROBE_BYTES + 8));
+        let found = match read {
+            true => Found::ReadAt(row.serial()),
+            false => Found::NotRead,
+        };
+        Ok(ReadOf { found, compared })
     }
 
     fn digest(&self, cell: CellNo) -> CellDigest {
@@ -514,45 +529,41 @@ impl<'a> LastAnswer for RowsAnswer<'a> {
         Ok(found)
     }
 
+    /// The file's plan: the plans runs (kind 5), one binary search each, O(the plan).
     fn file_tasks<'m>(&self, file: TaskId, alloc: Alloc<'m>) -> Result<AVec<'m, TaskId>, LastError> {
-        let mut out = Vec::new_in(alloc);
-        // The file's plan (engine.rs `Engine::new_in` keeps `by_file` so): a task made inline is
-        // in no file's plan.
-        out.extend(self.every_row().filter(|row| row.file() == file && !has(row.flags(), Flags::INLINE)).map(|row| row.task()));
+        let out = self.view.file_tasks(file, alloc)?;
+        Counters::add(&self.counters.bytes, self.plans * (PROBE_BYTES + 8) + 4 * len64(out.len()));
         Ok(out)
     }
 
+    /// The owed tasks segment (kind 7), then each owed task's row for its plan: O(owed).
     fn owed<'m>(&self, alloc: Alloc<'m>) -> Result<AVec<'m, Planned>, LastError> {
         let mut out = Vec::new_in(alloc);
-        for row in self.every_row() {
-            if has(row.flags(), Flags::OWED) {
-                out.push(self.planned(row.task(), row)?);
-            }
+        for task in self.view.owed() {
+            Counters::add(&self.counters.bytes, 4);
+            let row = self.row_view(task).ok_or(LastError::Answer(AnswerError::NoRow { task }))?;
+            out.push(self.planned(task, row)?);
         }
         Ok(out)
     }
 
+    /// The owed cells segment (kind 8): O(owed cells), no row read.
     fn owed_cells<'m>(&self, alloc: Alloc<'m>) -> Result<AVec<'m, (CellNo, Serial)>, LastError> {
-        // A cell is owed while a reader's row is older than the cell's last move: the reader
-        // has not seen it (the generation rule; engine.rs `finish` settles by the digests).
         let mut out = Vec::new_in(alloc);
-        for c in 0..self.view.cells() {
-            let cell = CellNo(c);
-            let moved = self.moved(cell);
-            if moved == Serial(0) {
-                continue;
-            }
-            let readers = self.readers(cell, alloc)?;
-            if readers.iter().any(|reader| self.row_view(*reader).is_some_and(|row| row.serial() < moved)) {
-                out.push((cell, moved));
-            }
-        }
+        out.extend(self.view.owed_cells());
+        Counters::add(&self.counters.bytes, 12 * len64(out.len()));
         Ok(out)
     }
 
+    /// The findings runs (kind 6), then each such row's count (cold): O(rows with findings).
     fn with_findings<'m>(&self, alloc: Alloc<'m>) -> Result<AVec<'m, (TaskId, u32)>, LastError> {
-        let mut out = Vec::new_in(alloc);
-        out.extend(self.every_row().filter(|row| has_findings(row.findings(), row.flags())).map(|row| (row.task(), row.findings())));
+        let tasks = self.view.with_findings(alloc)?;
+        Counters::add(&self.counters.bytes, self.findings * (PROBE_BYTES + 8) + 4 * len64(tasks.len()));
+        let mut out = Vec::with_capacity_in(tasks.len(), alloc);
+        for task in tasks.iter() {
+            let row = self.row_view(*task).ok_or(LastError::Answer(AnswerError::NoRow { task: *task }))?;
+            out.push((*task, row.findings()));
+        }
         Ok(out)
     }
 
@@ -573,6 +584,7 @@ pub(crate) struct RowsNext<'v, 'a, 'm> {
     reads: AVec<'m, CellNo>,
     defines: AVec<'m, (CellNo, CellDigest)>,
     counts: Counts,
+    alloc: Alloc<'m>,
 }
 
 impl<'v, 'a, 'm> RowsNext<'v, 'a, 'm> {
@@ -580,7 +592,7 @@ impl<'v, 'a, 'm> RowsNext<'v, 'a, 'm> {
     pub(crate) fn new(last: &'v AnswerView<'a>, counts: Counts, plant: Plant, alloc: Alloc<'m>) -> RowsNext<'v, 'a, 'm> {
         let commit = Commit::new(last, plant, alloc);
         let run = RunWriter::new(commit.serial(), alloc);
-        RowsNext { last, commit, run, reads: Vec::new_in(alloc), defines: Vec::new_in(alloc), counts }
+        RowsNext { last, commit, run, reads: Vec::new_in(alloc), defines: Vec::new_in(alloc), counts, alloc }
     }
 
     /// The running counts after the rows put so far: the next summary's files and findings.
@@ -606,6 +618,17 @@ impl<'v, 'a, 'm> RowsNext<'v, 'a, 'm> {
         self.counts.findings = step(self.counts.findings, was_finding, finding_now);
     }
 
+    /// The owed cells from this request on, whole, each with the request it moved in (engine
+    /// `Work::owed_cells`): the owed cells segment (kind 8).
+    pub(crate) fn owe_cells<I: IntoIterator<Item = (CellId, Serial)>>(&mut self, cells: I) -> Result<(), LastError> {
+        let mut given: AVec<'m, (CellNo, Serial)> = Vec::new_in(self.alloc);
+        for (id, at) in cells {
+            let of = self.commit.task(id.of)?;
+            given.push((self.commit.cell(of, id.cell)?, at));
+        }
+        Ok(self.commit.owe_cells(&given)?)
+    }
+
     fn read_in(&mut self, cell: CellNo) -> Result<(), LastError> {
         if self.reads.len() >= MAX_READS_PER_ROW {
             return Err(AnswerError::Cap { what: "reads a row", cap: len64(MAX_READS_PER_ROW) }.into());
@@ -619,27 +642,8 @@ impl<'m> NextAnswer for RowsNext<'_, '_, 'm> {
     type Done = Effects<'m>;
 
     fn put<R: IntoIterator<Item = CellId>>(&mut self, name: Name, row: &NextRow, reads: R, defines: &[(Cell, ContentId)]) -> Result<(), LastError> {
-        let task = self.commit.task(name)?;
-        let file = self.commit.task(row.file)?;
-        self.reads.clear();
-        for id in reads {
-            let of = self.commit.task(id.of)?;
-            let cell = self.commit.cell(of, id.cell)?;
-            self.read_in(cell)?;
-        }
-        self.defines.clear();
-        for (cell, digest) in defines.iter() {
-            let no = self.commit.cell(task, *cell)?;
-            self.defines.push((no, CellDigest::of(digest)));
-        }
-        let last = self.last;
-        let old = last.row(task);
-        let stage = stage_byte(row.phase.stage);
-        let input = RowIn { key: row.key, out: row.out, file, stage, wave: row.phase.wave, flags: row.flags, source: row.source, findings: row.findings };
-        self.commit.put_row(task, &input, &self.reads, &self.defines)?;
-        self.run.row_reads(task, old, &self.reads);
-        self.recount(old, Some((stage, row.flags, row.key, row.findings)));
-        Ok(())
+        let serial = self.commit.serial();
+        self.put_from(name, row, reads, defines, serial)
     }
 
     fn owe(&mut self, planned: &Planned) -> Result<(), LastError> {
@@ -660,8 +664,15 @@ impl<'m> NextAnswer for RowsNext<'_, '_, 'm> {
         let key = old.map_or(Key::default(), |row| row.key());
         let findings = old.map_or(0, |row| row.findings());
         let stage = stage_byte(planned.phase.stage);
-        let input = RowIn { key, out: old.map_or(ABSENT, |row| row.out()), file, stage, wave: planned.phase.wave, flags, source: planned.source, findings };
-        self.commit.put_row(task, &input, &self.reads, &self.defines)?;
+        let record = old.map_or(Key::default(), |row| row.record());
+        let input = RowIn { key, out: old.map_or(ABSENT, |row| row.out()), file, stage, wave: planned.phase.wave, flags, source: planned.source, findings, record };
+        // Owing a row re-validates nothing: it keeps the serial its reads were checked at, so
+        // whether it stands stays the generation rule's (a cell its row read that moved in this
+        // request or before is still after the row). Stamped with this request's serial, a row
+        // owed because a read moved would read as standing: a stale answer (lane RD9, history
+        // test, request 2). A plan never made has no reads: this request's serial.
+        let from = old.map_or(self.commit.serial(), |row| row.serial());
+        self.commit.put_row_from(task, &input, &self.reads, &self.defines, from)?;
         // Its reads are its last row's: no reverse entry changes.
         self.recount(old, Some((stage, flags, key, findings)));
         Ok(())
@@ -686,32 +697,203 @@ impl<'m> NextAnswer for RowsNext<'_, '_, 'm> {
     }
 }
 
+impl<'m> RowsNext<'_, '_, 'm> {
+    /// [`NextAnswer::put`] with the serial the row stands from (blaze-answer
+    /// `Commit::put_row_from`): this request's, or the one before for a row already stale.
+    pub(crate) fn put_from<R: IntoIterator<Item = CellId>>(&mut self, name: Name, row: &NextRow, reads: R, defines: &[(Cell, ContentId)], from: Serial) -> Result<(), LastError> {
+        let task = self.commit.task(name)?;
+        let file = self.commit.task(row.file)?;
+        self.reads.clear();
+        for id in reads {
+            let of = self.commit.task(id.of)?;
+            let cell = self.commit.cell(of, id.cell)?;
+            self.read_in(cell)?;
+        }
+        self.defines.clear();
+        for (cell, digest) in defines.iter() {
+            let no = self.commit.cell(task, *cell)?;
+            self.defines.push((no, CellDigest::of(digest)));
+        }
+        let last = self.last;
+        let old = last.row(task);
+        let stage = stage_byte(row.phase.stage);
+        let input = RowIn { key: row.key, out: row.out, file, stage, wave: row.phase.wave, flags: row.flags, source: row.source, findings: row.findings, record: row.record };
+        self.commit.put_row_from(task, &input, &self.reads, &self.defines, from)?;
+        self.run.row_reads(task, old, &self.reads);
+        self.recount(old, Some((stage, row.flags, row.key, row.findings)));
+        Ok(())
+    }
+
+    /// `name` is owed no more though this request did not enter it: a plan never made is
+    /// retired; a made row is carried with [`Flags::OWED`] cleared and its own serial (its
+    /// generation is unchanged: no read of it was checked).
+    pub(crate) fn unowe(&mut self, name: Name) -> Result<(), LastError> {
+        let last = self.last;
+        let Some(task) = last.task(&name) else { return Ok(()) };
+        let Some(old) = last.row(task) else { return Ok(()) };
+        if has(old.flags(), Flags::UNMADE) {
+            return NextAnswer::retire(self, name);
+        }
+        self.reads.clear();
+        for cell in old.reads() {
+            self.read_in(cell)?;
+        }
+        self.defines.clear();
+        self.defines.extend(old.defines());
+        let flags = Flags(old.flags().0 & !Flags::OWED);
+        let input = RowIn { key: old.key(), out: old.out(), file: old.file(), stage: old.stage(), wave: old.wave(), flags, source: old.source(), findings: old.findings(), record: old.record() };
+        self.commit.put_row_from(task, &input, &self.reads, &self.defines, old.serial())?;
+        self.recount(Some(old), Some((old.stage(), flags, old.key(), old.findings())));
+        Ok(())
+    }
+
+    /// `id` moves in this request though no define of it changed (blaze-answer
+    /// `Commit::move_cell`). `true`: no define had moved it already.
+    pub(crate) fn move_cell(&mut self, id: &CellId) -> Result<bool, LastError> {
+        let of = self.commit.task(id.of)?;
+        let cell = self.commit.cell(of, id.cell)?;
+        Ok(self.commit.move_cell(cell)?)
+    }
+}
+
 /// `answer` whole, as rows: the path a request takes when no rows answer is kept (the first
 /// request after the switch, an unreadable answer, an old home). Every row is put; an owed task
-/// with no row is owed.
-pub(crate) fn put_whole<N: NextAnswer>(answer: &Answer<'_>, next: &mut N) -> Result<(), LastError> {
+/// with no row is owed; the owed cells are given whole. `records` is the command's record key of
+/// each row (pages.rs `records`); a row it holds none for keeps zeros, as an unmade plan does.
+pub(crate) fn put_whole(answer: &Answer<'_>, records: &dyn Fn(&Name) -> Option<Key>, next: &mut RowsNext<'_, '_, '_>) -> Result<(), LastError> {
     for (name, row) in answer.rows.iter() {
-        let owed = answer.owed_tasks.get(name);
-        let mut flags = 0u8;
-        if row.failed {
-            flags |= Flags::FAILED;
-        }
-        if row.inline {
-            flags |= Flags::INLINE;
-        }
-        if owed.is_some() {
-            flags |= Flags::OWED;
-        }
-        let (phase, file, source) = owed.map_or((row.phase, row.file, row.source), |planned| (planned.phase, planned.file, planned.source));
-        let next_row = NextRow { key: row.key, out: row.out, phase, file, source, flags: Flags(flags), findings: row.findings };
-        next.put(*name, &next_row, row.reads.iter().map(|(id, _)| *id), &row.defines)?;
+        let put = next_row(row, answer.owed_tasks.get(name), records(name).unwrap_or_default());
+        next.put(*name, &put, row.reads.iter().map(|(id, _)| *id), &row.defines)?;
     }
     for (name, planned) in answer.owed_tasks.iter() {
         if !answer.rows.contains_key(name) {
             next.owe(planned)?;
         }
     }
-    Ok(())
+    next.owe_cells(answer.owed_cells.iter().map(|(id, at)| (*id, Serial(at.0))))
+}
+
+/// A row of the engine's as the rows form's [`NextRow`]: its flags from the row and whether it
+/// is owed, its plan the owed one's when owed (engine.rs keeps both so).
+fn next_row(row: &Row<'_>, owed: Option<&Planned>, record: Key) -> NextRow {
+    let mut flags = 0u8;
+    if row.failed {
+        flags |= Flags::FAILED;
+    }
+    if row.inline {
+        flags |= Flags::INLINE;
+    }
+    if owed.is_some() {
+        flags |= Flags::OWED;
+    }
+    let (phase, file, source) = owed.map_or((row.phase, row.file, row.source), |planned| (planned.phase, planned.file, planned.source));
+    NextRow { key: row.key, out: row.out, phase, file, source, flags: Flags(flags), findings: row.findings, record }
+}
+
+/// What only a request's end gives the rows form's commit: the tree it answers, what it printed,
+/// its lines record's key, and each row's record key.
+pub(crate) struct Close<'c> {
+    pub(crate) tree: TreeDigest,
+    pub(crate) printed: Printed,
+    pub(crate) lines: LinesKey,
+    pub(crate) records: &'c dyn Fn(&Name) -> Option<Key>,
+}
+
+/// A request's end in the rows form (blaze-engine overlay.rs `Fold`): the last answer and the
+/// request's writes. The engine's `finish` gives it before the command knows its summary, its
+/// lines and its records' keys; [`RowsFolded::commit`] then writes the next answer.
+pub(crate) struct RowsFolded<'w, 'a> {
+    last: RowsAnswer<'a>,
+    work: Work<'w>,
+}
+
+impl<'w, 'a> Fold<'w> for RowsAnswer<'a> {
+    type Out = RowsFolded<'w, 'a>;
+
+    fn fold(self, work: Work<'w>) -> Result<RowsFolded<'w, 'a>, EngineError> {
+        Ok(RowsFolded { last: self, work })
+    }
+}
+
+/// What a rows commit wrote, for the request's report.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct RowsWritten {
+    /// Rows put (entered or re-validated), owed afresh, or carried with their owing cleared.
+    pub(crate) put: u64,
+    pub(crate) retired: u64,
+    /// Cells moved by the generation rule alone: a row put saw another digest than the end's.
+    pub(crate) stale_moves: u64,
+}
+
+impl<'w, 'a> RowsFolded<'w, 'a> {
+    /// The last answer the request read.
+    pub(crate) fn last(&self) -> &RowsAnswer<'a> {
+        &self.last
+    }
+
+    /// The request's writes.
+    pub(crate) fn work(&self) -> &Work<'w> {
+        &self.work
+    }
+
+    /// The next answer's segments and root: each row the request entered or re-validated, put
+    /// at the serial the generation rule gives it (blaze-engine overlay.rs `Generations::row`);
+    /// each it took out, retired; each newly owed task, owed; each owed no more and not entered,
+    /// carried with its owing cleared; the owed cells whole; the cells the generation rule moves
+    /// that no define moved; then the summary of the counts kept row by row. A row the request
+    /// did not touch is carried by its generation: not rewritten, not read.
+    pub(crate) fn commit<'m>(&self, close: &Close<'_>, plant: Plant, alloc: Alloc<'m>) -> Result<(Effects<'m>, RowsWritten), LastError> {
+        let view = self.last.view();
+        let generations = self.work.generations();
+        let mut next = RowsNext::new(view, self.last.counts(), plant, alloc);
+        let mut written = RowsWritten::default();
+        for (name, row) in self.work.rows.iter() {
+            match row {
+                Some(row) => {
+                    let record = (close.records)(name).unwrap_or_default();
+                    let put = next_row(row, self.work.owed_tasks.get(name), record);
+                    next.put_from(*name, &put, row.reads.iter().map(|(id, _)| *id), &row.defines, Serial(generations.row(row).0))?;
+                    written.put += 1;
+                }
+                None => {
+                    NextAnswer::retire(&mut next, *name)?;
+                    written.retired += 1;
+                }
+            }
+        }
+        for (name, planned) in self.work.owed_tasks.iter() {
+            if self.work.rows.contains_key(name) {
+                continue;
+            }
+            let kept = self.last.view().task(name).filter(|task| view.is_owed(*task)).and_then(|task| view.row(task)).is_some_and(|row| {
+                stage_byte(planned.phase.stage) == row.stage() && planned.phase.wave == row.wave() && planned.source == row.source() && view.task(&planned.file) == Some(row.file())
+            });
+            if !kept {
+                next.owe(planned)?;
+                written.put += 1;
+            }
+        }
+        for task in view.owed() {
+            let name = self.last.name_of(task, "an owed task")?;
+            if !self.work.owed_tasks.contains_key(&name) && !self.work.rows.contains_key(&name) {
+                next.unowe(name)?;
+                written.put += 1;
+            }
+        }
+        next.owe_cells(self.work.owed_cells.iter().map(|(id, at)| (*id, Serial(at.0))))?;
+        let before = |id: &CellId| self.last.view().cell(&id.of, &id.cell).map_or(CellDigest::ABSENT, |cell| view.digest(cell));
+        let moved = generations.moved(before);
+        for id in moved.iter() {
+            if next.move_cell(id)? {
+                written.stale_moves += 1;
+            }
+        }
+        let counts = next.counts();
+        let owed = len32(self.work.owed_tasks.len() + self.work.owed_cells.len());
+        let facts = Facts { files: counts.files, printed: close.printed, findings: counts.findings, owed };
+        let effects = NextAnswer::finish(next, &close.tree, &summary(&facts), &close.lines)?;
+        Ok((effects, written))
+    }
 }
 
 /// Where a commit's writes go: the command's store ([`StoreSink`]), or a test's record of them.
@@ -949,11 +1131,15 @@ impl LastAnswer for PagesAnswer<'_, '_> {
     }
 
     /// A read list is in read order (engine.rs invariant 9), not sorted: the cell is found by a
-    /// walk (a binary search here missed reads out of cell order).
-    fn saw(&self, task: Name, cell: CellId) -> bool {
-        let answer = &self.kept.answer;
-        let now = answer.cell(&cell);
-        answer.rows.get(&task).is_some_and(|row| row.reads.iter().any(|(read, seen)| *read == cell && *seen == now))
+    /// binary search over the row's order by cell (`Row::read_of`), O(log reads).
+    fn read_of(&self, task: Name, cell: CellId) -> Result<ReadOf, LastError> {
+        Ok(match self.kept.answer.rows.get(&task) {
+            Some(row) => {
+                let (seen, compared) = row.read_of(&cell);
+                ReadOf { found: seen.map_or(Found::NotRead, Found::Saw), compared }
+            }
+            None => ReadOf { found: Found::NotRead, compared: 0 },
+        })
     }
 
     fn digest(&self, cell: CellId) -> CellDigest {

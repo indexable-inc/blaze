@@ -37,6 +37,10 @@ const TAIL: core::ops::Range<usize> = 8..14;
 pub struct ItemShown {
     /// The item's path, whole; `None`: the names source holds none for the key.
     path: Option<Box<str>>,
+    /// For an item with no path, WHERE it is written ([`written`]: its module, and its file and
+    /// line or the macro call that wrote it), so a path-less item is still named by a place a
+    /// person can open (rule 19). `None` when it has a path, or the source holds no place.
+    written: Option<Box<str>>,
     /// The key's first 16 bytes (a checker key is all of them, a library key's first 16).
     key: [u8; 16],
 }
@@ -44,29 +48,48 @@ pub struct ItemShown {
 impl ItemShown {
     /// A checker key `k` over the key map `keys` (which files members) and `names`.
     pub fn of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, k: ItemKey) -> ItemShown {
+        // The library key a place is read from: the item's own, or a member's container's.
+        let mut placed = keys.library_in(names, k);
         let path = match keys.origin(k) {
             Some(Origin::Member { container, name, .. }) => {
-                let owner = keys.library_in(names, *container).and_then(|c| lib_path(names, c));
-                Some(match owner {
-                    Some(o) => format!("{o}::{name}"),
-                    None => format!("<a container the names source holds no path for>::{name}"),
-                })
+                let c = keys.library_in(names, *container);
+                placed = placed.or(c);
+                c.and_then(|c| lib_path(names, c)).map(|o| format!("{o}::{name}"))
             }
-            _ => keys.library_in(names, k).and_then(|lib| lib_path(names, lib)),
+            _ => placed.and_then(|lib| lib_path(names, lib)),
         };
-        ItemShown { path: path.map(String::into_boxed_str), key: k.0.to_be_bytes() }
+        let written = match path {
+            Some(_) => None,
+            None => placed.and_then(|lib| written(names, lib)),
+        };
+        ItemShown { path: path.map(String::into_boxed_str), written, key: k.0.to_be_bytes() }
     }
 
     /// A library key `lib` over `names`.
     pub fn of_lib<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> ItemShown {
         let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, ..] = lib.0.0;
         let key = [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15];
-        ItemShown { path: lib_path(names, lib).map(String::into_boxed_str), key }
+        let path = lib_path(names, lib);
+        let written = match path {
+            Some(_) => None,
+            None => written(names, lib),
+        };
+        ItemShown { path: path.map(String::into_boxed_str), written, key }
     }
 
     /// The path, when the names source gave one.
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref()
+    }
+
+    /// The key's first 16 bytes, as [`Display`](fmt::Display) shows them.
+    pub fn key(&self) -> [u8; 16] {
+        self.key
+    }
+
+    /// Where a path-less item is written ([`written`]), when the source holds its place.
+    pub fn written(&self) -> Option<&str> {
+        self.written.as_deref()
     }
 
     /// The text a refusal's field holds (`Front2Refusal`'s `function`, `adt`, ...).
@@ -84,12 +107,66 @@ impl fmt::Display for ItemShown {
                 write!(f, ")")
             }
             None => {
-                write!(f, "an item the names source holds no path for (key ")?;
+                match &self.written {
+                    Some(w) => write!(f, "an item with no path, {w} (key ")?,
+                    None => write!(f, "an item the names source holds no path for (key ")?,
+                }
                 self.key.iter().try_for_each(|b| write!(f, "{b:02x}"))?;
                 write!(f, ")")
             }
         }
     }
+}
+
+/// At most this many macro calls are followed out to a file (rule 18): an expansion's item is
+/// placed at its call, which may itself be an expansion's.
+const MOST_CALLS: usize = 16;
+
+/// WHERE the path-less item `lib` is written, as words: `written in `core::fmt` at
+/// library/core/src/fmt/mod.rs:420`, or `written by a macro call in `core::fmt`, the call at
+/// library/core/src/fmt/mod.rs:420` (each call out to the outermost, by [`MOST_CALLS`] steps,
+/// never recursion), with whichever part the source holds. Read only for a message: the line is
+/// counted in the file's text the source already holds (rule 71: no `file:line` is kept).
+/// `None`: the source holds neither the item's module path nor its place.
+fn written<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<Box<str>> {
+    use blaze_scope::resolve::At;
+    let module = names.home_of(lib).and_then(|m| names.module_path(m)).filter(|p| !p.is_empty());
+    let mut k = lib;
+    let mut by_macro = false;
+    let mut at: Option<String> = None;
+    for _ in 0..MOST_CALLS {
+        let Some(place) = names.place_of(k) else { break };
+        match place.at {
+            At::File(file) => {
+                let shown = names.file_shown(place.krate, file);
+                let line = names.item_start(k).and_then(|(_, start)| {
+                    let text = names.file_text(place.krate, file)?;
+                    let before = text.as_bytes().get(..start as usize)?;
+                    Some(before.iter().filter(|c| **c == b'\n').count() + 1)
+                });
+                at = match (shown, line) {
+                    (Some(s), Some(l)) => Some(format!("{s}:{l}")),
+                    (Some(s), None) => Some(format!("{s}")),
+                    (None, _) => None,
+                };
+                break;
+            }
+            At::Expansion(call) => {
+                by_macro = true;
+                k = call;
+            }
+        }
+    }
+    let how = if by_macro { "written by a macro call" } else { "written" };
+    let text = match (module, at) {
+        (Some(m), Some(a)) if by_macro => format!("{how} in `{m}`, the call at {a}"),
+        (Some(m), Some(a)) => format!("{how} in `{m}` at {a}"),
+        (Some(m), None) => format!("{how} in `{m}`"),
+        (None, Some(a)) if by_macro => format!("{how}, the call at {a}"),
+        (None, Some(a)) => format!("{how} at {a}"),
+        (None, None) => return None,
+    };
+    Some(text.into_boxed_str())
 }
 
 /// `k` as a refusal's field holds it ([`ItemShown::boxed`]), over a body's records: what

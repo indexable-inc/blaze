@@ -97,28 +97,34 @@ fn every_unit_reads_heads_frozen_under_its_own_keys() {
 
 /// (b) THE PLANT (rule 23: remove the cause, watch the effect come back): the head tasks
 /// freeze under ONE unit alone, the first by crate prefix or the last (the form before the
-/// rule). `f` is held by two units, so one of the two plants freezes it under the lib unit
-/// alone, and `helper` (the test unit's) asks a cell no run covers: refused by path, naming the
-/// units that froze it ("... and not under this body's unit ..."), never handed the lib unit's
-/// bytes (which named keys its names hold no path for: green's "no path for (key ..)" note).
+/// rule). `f` is held by two units, so each plant leaves one unit's body asking a cell no run
+/// covers (`helper`, the test unit's, under the lib unit alone; `f`'s own body, the lib unit's,
+/// under the test unit alone): refused by path, naming the units that froze it ("... and not
+/// under this body's unit ..."), never frozen by the body itself ("frozen now ... a member's"
+/// stays 0) nor handed the other unit's bytes (green's "no path for (key ..)" note).
 /// CONTROL: the rule's run on the same fixture is clean (case (a)).
 #[test]
-#[ignore = "OPEN (2026-11-17): neither plant makes a refusal: with a head frozen under one unit alone the body's stretch froze the missing member head itself (`member heads taken from the table: 0; heads not in it read 2, frozen now 1`), so `NotInItsUnit` is never reached: the bodies' own freeze of a MEMBER head the table lacks must be that refusal (lane RU1's next piece)"]
 fn a_head_frozen_under_one_unit_alone_is_refused_by_path() {
     let mut refused = 0u32;
     for plant in [HeadUnits::OnlyFirst, HeadUnits::OnlyLast] {
         let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
         one_crate(&io);
         let (_, text, checked) = run(&io, 2, true, plant);
-        println!("{plant:?}: {}\n{}\n{text}", entries(&checked), heads_lines(&checked));
+        println!("{plant:?}: {}\n{}\n{text}\nnotes: {:?}", entries(&checked), heads_lines(&checked), checked.bodies.0);
         assert_eq!(checked.seeds.units.shared, 0, "{plant:?}: the plant freezes no item under two units:\n{}", heads_lines(&checked));
         assert!(!text.contains("holds no path for"), "{plant:?}: no body is handed another unit's bytes:\n{text}");
+        // A body never freezes a member's head (engine_seeds.rs `StretchHeads::known`): the
+        // head the table lacks for its unit is a refusal, never "frozen now ... a member's".
+        assert_eq!(checked.seeds.not_put.member, 0, "{plant:?}: no member head frozen by a body:\n{}", heads_lines(&checked));
+        // Either plant leaves one unit uncovered: the lib unit alone refuses `helper` (`f`'s
+        // head and its own, the test unit's), the test unit alone refuses `f`'s own body.
+        assert!(checked.seeds.bodies.refused > 0, "{plant:?}: a body of the unit the plant left out is refused: {:?}\n{}", checked.bodies.0, heads_lines(&checked));
         if let Some(note) = checked.bodies.0.iter().find(|note| note.contains(OTHER_UNITS)) {
             assert!(note.contains("the head of `") && note.contains("was frozen by its head task under unit(s) "), "{plant:?}: the refusal names the head by path and the units that froze it: {note}");
             refused += 1;
         }
     }
-    assert!(refused > 0, "one of the two plants freezes `f` under the lib unit alone, and `helper` is refused for it");
+    assert_eq!(refused, 2, "each plant leaves a unit's body asking a head frozen under the other unit only: refused as `NotInItsUnit`");
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
     one_crate(&io);
     let (_, text, checked) = run(&io, 2, true, HeadUnits::Each);
@@ -152,7 +158,7 @@ fn bodies_by_cause(checked: &engine_check::Checked) -> (u32, u32) {
 /// the lib unit no longer holds it, so `f`'s head task drops the lib unit's cell (its defines
 /// shrink); a lib body that read it is entered (the definer gone) and reports the unresolved
 /// name, exactly as a fresh run does; and no body of the stored answer reads a cell no task
-/// defines. Right for ANY checking unit of `user` (lane RP1 picks the lib's first).
+/// defines. Pinned to lane RP1's rule: the lib unit checks `user`.
 #[test]
 fn a_head_edit_and_a_cfg_move_each_unit_s_readers() {
     let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
@@ -189,9 +195,11 @@ fn a_head_edit_and_a_cfg_move_each_unit_s_readers() {
     println!("fresh: {}\n{fresh_text}", entries(&fresh));
     assert_eq!((cfg_ids, error_lines(&cfg_text)), (fresh_ids, error_lines(&fresh_text)), "`f` under cfg(test): the incremental errors are a fresh run's\n{}", entries(&cfg));
     assert_eq!(cfg.bodies.0, fresh.bodies.0, "`f` under cfg(test): the incremental notes are a fresh run's");
-    // When the lib unit checks `user` (a fresh run reports `f` unresolved there), the
-    // incremental request entered it: the cell it read is no longer defined.
-    if !error_lines(&fresh_text).is_empty() {
-        assert!(cfg.stages[blaze_engine::Stage::Bodies.index()].entered >= 1, "`user` entered for the lib unit's cell gone: {}", entries(&cfg));
-    }
+    // PINNED: the lib unit checks `user` (engine_body_plan.rs: a body is checked by the first
+    // unit, in rank order, whose records hold it; non-test units first), where `f` is gone: a
+    // fresh run reports it unresolved, and the incremental request entered `user` because the
+    // lib unit's cell of `f` it read is no longer defined.
+    assert_eq!(error_lines(&fresh_text).len(), 1, "a fresh run: `user`'s unresolved `f`, the lib unit's, alone:\n{fresh_text}");
+    assert!(cfg.stages[blaze_engine::Stage::Bodies.index()].entered >= 1, "`user` entered for the lib unit's cell gone: {}", entries(&cfg));
+    assert_eq!(cfg.seeds.not_put.member, 0, "`f` under cfg(test): no member head frozen by a body:\n{}", heads_lines(&cfg));
 }

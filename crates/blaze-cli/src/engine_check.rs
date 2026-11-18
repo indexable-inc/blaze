@@ -792,7 +792,9 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
         }
         phase_times.push(times.fold(phase, wall, merge, clock.now().since(putting).map_or(0, crate::engine_times::ns)));
     }
-    let finished = engine.finish()?;
+    let finishing = clock.now();
+    let mut finished = engine.finish()?;
+    finished.report.settle.finish_ns = clock.now().since(finishing).map_or(0, crate::engine_times::ns);
     // Rule 21 over the whole answer: a cell read is DEFINED by a task, or ABSENT by intent: its
     // record's task has a row and states the cell's absence (a bucket its crate files no impl
     // in). A read of a record no task has a row for is one no edit can ever move.
@@ -1098,6 +1100,8 @@ fn profile_text<'f>(ran: &[(Phase, u32, u32)], report: &blaze_engine::Report, be
             let _ = writeln!(text, "  {stage:?}: {:>7} {:>7}", count.entered, count.identical);
         }
     }
+    let settle = report.settle;
+    let _ = writeln!(text, "finish: owed cells {}, settled {}, saw calls {}, reads compared {}, {} ms", settle.owed, settle.settled, settle.saw_calls, settle.compared, settle.finish_ns / 1_000_000);
     let _ = writeln!(text, "entered because (stage, cause, the moved cell's task and kind: tasks), top {BECAUSE_SHOWN}");
     for (group, count) in because.iter().take(BECAUSE_SHOWN) {
         let kind = group.cell.map_or("", crate::engine_scope_reads::CellKind::words);

@@ -271,7 +271,7 @@ pub struct Unwind<'b> {
 /// Where an [`Unwind`]'s rows are.
 #[derive(Clone, Copy)]
 enum RowsIn<'b> {
-    /// A `bzcode01` record's pads.
+    /// A code record's pads (record.rs, `bzcode04`).
     View(CodeView<'b>),
     /// Rows in memory, for `code_len` bytes of code.
     Rows { rows: &'b [Row], code_len: u32 },

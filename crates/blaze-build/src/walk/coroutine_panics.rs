@@ -14,6 +14,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_code::record::TrapKind;
 use blaze_lir::coroutine::Panics;
 use blaze_lir::func::RefKind;
 use blaze_lir::{Block, Flags};
@@ -53,7 +54,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let place = self.ref_place(callee);
         let reference = self.b.reference(RefKind::Func, place);
         self.b.call(Flags::NONE, reference, sig, &values);
-        self.b.unreachable();
+        self.unreachable_of(TrapKind::AfterPanic, Some(root));
         if let Some(error) = self.b.error() {
             return Err(BuildError::Lir(error.clone()));
         }

@@ -229,17 +229,9 @@ impl<'f> Holders<'f> {
         self.bodies[from..].iter().take_while(|one| one.name == name).filter(|one| one.is == BodyIs::Held).nth(1).is_some()
     }
 
-    /// The cell that says unit `unit` does not hold a file or an entry: its items section's
-    /// cell when its crate's names task defines a cell table ([`CELLS`]), else its names record
-    /// whole ([`WHOLE`]), which that section is part of.
+    /// The cell that says unit `unit` does not hold a file or an entry ([`not_held_cell`]).
     pub(crate) fn not_held_cell(&self, view: View<'_, '_>, unit: u32) -> Option<CellId> {
-        let one = self.units.get(unit as usize)?;
-        let table = CellId { of: one.name, cell: CELLS };
-        let cell = match view.cell(&table) != ABSENT {
-            true => Cell(NameCell::Whole { krate: one.prefix, section: Section::Items }.key()),
-            false => WHOLE,
-        };
-        Some(CellId { of: one.name, cell })
+        self.units.get(unit as usize).map(|one| not_held_cell(view, one.name, one.prefix))
     }
 
     /// What a decision is a function of: each `passed` unit's not-held cell and the refusals'
@@ -252,6 +244,43 @@ impl<'f> Holders<'f> {
         ids.dedup();
         &*ids.leak()
     }
+}
+
+/// THE ONE HOME of "which cell says a unit does not hold a file": the unit's items section's
+/// cell when its crate's names task (`name`, of crate prefix `prefix`) defines a cell table
+/// ([`CELLS`]), else its names record whole ([`WHOLE`]), which that section is part of. Both
+/// rules that turn on a unit holding a file read it: who checks a body ([`Holders`]) and under
+/// which units a head task freezes its heads (engine_heads.rs `run_items`, lane RU2): a unit
+/// that comes to hold the file (a `#[cfg(test)]` taken off its `mod`) moves this cell, so the
+/// row that skipped that unit is entered again (rule 21).
+pub(crate) fn not_held_cell(view: View<'_, '_>, name: Name, prefix: [u8; 8]) -> CellId {
+    let table = CellId { of: name, cell: CELLS };
+    let cell = match view.cell(&table) != ABSENT {
+        true => Cell(NameCell::Whole { krate: prefix, section: Section::Items }.key()),
+        false => WHOLE,
+    };
+    CellId { of: name, cell }
+}
+
+/// The outlines (by index, sorted) a crate's module tree reaches from its root file `root`: the
+/// root and every file a reached outline names as a file part, transitively, as the planner
+/// walked them (engine_check.rs `plan`), cfg-blind: a file two crates reach is in both crates'
+/// walks, and a unit whose cfg cuts a `mod` still reaches its file (whether it HOLDS it is its
+/// items record's word, [`not_held_cell`]). In `g`.
+pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc<'static>) -> Vec<u32, blaze_own::Alloc<'static>> {
+    let mut seen: Vec<u32, blaze_own::Alloc<'static>> = Vec::new_in(g);
+    let mut next: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
+    next.push(root);
+    while let Some(name) = next.pop() {
+        let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name)) else { continue };
+        let at32 = u32::try_from(at).unwrap_or(u32::MAX);
+        let Err(slot) = seen.binary_search(&at32) else { continue };
+        seen.insert_shift(slot, at32);
+        if let Ok(record) = &outlined[at].made {
+            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. })).map(|part| part.name));
+        }
+    }
+    seen
 }
 
 /// `cells` added to a checked body's reads (each with the digest the view holds), sorted, each

@@ -1,4 +1,5 @@
-//! The four segment kinds (lib.rs, "The form"): each a builder that writes its bytes from sorted
+//! The segment kinds (lib.rs, "The form"; plans and findings in the run's bytes, owed cells in
+//! the cells segment's): each a builder that writes its bytes from sorted
 //! columns, and a view over `&[u8]` that checks its bounds once at open and then reads every
 //! field in place, infallibly.
 
@@ -22,6 +23,16 @@ pub enum SegmentKind {
     Cells = 3,
     /// A run of signed reverse entries (cell, reader, +1 or -1).
     Run = 4,
+    /// The file plans: a run of (a file's task id, a task its plan lists, +1 or -1), in the run's
+    /// bytes.
+    Plans = 5,
+    /// The rows with findings: a run of (0, a task with findings or failed, +1 or -1).
+    Findings = 6,
+    /// The owed tasks, whole: the newest such segment is the answer's set (one per root).
+    Owed = 7,
+    /// The owed cells, whole, each with the request it moved in, in the cells segment's bytes: the
+    /// newest such segment is the answer's set (one per root).
+    OwedCells = 8,
 }
 
 impl SegmentKind {
@@ -31,8 +42,22 @@ impl SegmentKind {
             2 => Some(SegmentKind::Rows),
             3 => Some(SegmentKind::Cells),
             4 => Some(SegmentKind::Run),
+            5 => Some(SegmentKind::Plans),
+            6 => Some(SegmentKind::Findings),
+            7 => Some(SegmentKind::Owed),
+            8 => Some(SegmentKind::OwedCells),
             _ => None,
         }
+    }
+
+    /// A kind whose segments are runs of signed entries, counted against [`crate::MAX_RUNS`].
+    pub fn is_run(self) -> bool {
+        matches!(self, SegmentKind::Run | SegmentKind::Plans | SegmentKind::Findings)
+    }
+
+    /// A kind whose newest segment is the whole set: a new one replaces the last's in the root.
+    pub fn is_whole(self) -> bool {
+        matches!(self, SegmentKind::Owed | SegmentKind::OwedCells)
     }
 }
 
@@ -42,6 +67,7 @@ const DICT_HEAD: usize = HEAD + 24;
 const ROWS_HEAD: usize = HEAD + 16;
 const CELLS_HEAD: usize = HEAD + 4;
 const RUN_HEAD: usize = HEAD + 8;
+const IDS_HEAD: usize = HEAD + 4;
 /// Bit 31 of a run entry: the entry is -1.
 const MINUS: u32 = 1 << 31;
 
@@ -325,6 +351,7 @@ pub(crate) struct RowHead {
     pub(crate) wave: u16,
     pub(crate) source: [u8; 32],
     pub(crate) findings: u32,
+    pub(crate) record: [u8; 32],
 }
 
 struct RowRec {
@@ -376,7 +403,7 @@ impl<'m> RowsBuilder<'m> {
         self.recs.sort_unstable_by_key(|rec| rec.head.task);
         self.tombs.sort_unstable();
         let at = rows_layout(n, t, r, d);
-        let mut out = Vec::with_capacity_in(at[15], alloc);
+        let mut out = Vec::with_capacity_in(at[END], alloc);
         put_head(&mut out, SegmentKind::Rows, serial);
         for v in [n, t, r, d] {
             put_u32(&mut out, v as u32);
@@ -420,6 +447,9 @@ impl<'m> RowsBuilder<'m> {
         for rec in recs.iter() {
             put_u32(&mut out, rec.head.findings);
         }
+        for rec in recs.iter() {
+            out.extend_from_slice(&rec.head.record);
+        }
         for tomb in self.tombs.iter() {
             put_u32(&mut out, *tomb);
         }
@@ -451,16 +481,17 @@ const READS_META: usize = 7;
 const DEFINES_END: usize = 8;
 const SOURCE: usize = 9;
 const FINDINGS: usize = 10;
-const TOMB: usize = 11;
-const READS: usize = 12;
-const DEF_CELL: usize = 13;
-const DEF_DIGEST: usize = 14;
-const END: usize = 15;
+const RECORD: usize = 11;
+const TOMB: usize = 12;
+const READS: usize = 13;
+const DEF_CELL: usize = 14;
+const DEF_DIGEST: usize = 15;
+const END: usize = 16;
 
 /// Where each rows column starts, and the end (the column order of lib.rs, "The form").
-fn rows_layout(n: usize, t: usize, r: usize, d: usize) -> [usize; 16] {
-    let widths = [4 * n, 32 * n, 32 * n, 8 * n, 4 * n, 4 * n, 4 * n, 4 * n, 4 * n, 32 * n, 4 * n, 4 * t, r, 4 * d, DIGEST_BYTES * d];
-    let mut at = [0usize; 16];
+fn rows_layout(n: usize, t: usize, r: usize, d: usize) -> [usize; 17] {
+    let widths = [4 * n, 32 * n, 32 * n, 8 * n, 4 * n, 4 * n, 4 * n, 4 * n, 4 * n, 32 * n, 4 * n, 32 * n, 4 * t, r, 4 * d, DIGEST_BYTES * d];
+    let mut at = [0usize; 17];
     at[0] = ROWS_HEAD;
     for (i, w) in widths.iter().enumerate() {
         at[i + 1] = at[i] + w;
@@ -476,7 +507,7 @@ pub struct RowsView<'a> {
     n: usize,
     t: usize,
     r: usize,
-    at: [usize; 16],
+    at: [usize; 17],
 }
 
 /// Where a rows segment's bytes go, for the size test and the profile.
@@ -641,6 +672,12 @@ impl<'v> RowView<'v> {
         u32_at(self.seg.bytes, self.field(FINDINGS, 4))
     }
 
+    /// The store key of the record its last entry made (cold): what a restart reads its result
+    /// and findings from.
+    pub fn record(&self) -> Key {
+        Key(ContentId(arr(self.seg.bytes, self.field(RECORD, 32))))
+    }
+
     fn meta(&self) -> u32 {
         u32_at(self.seg.bytes, self.field(READS_META, 4))
     }
@@ -729,10 +766,11 @@ impl ExactSizeIterator for Reads<'_> {}
 // ---------------------------------------------------------------------------------------------
 // Cells.
 
-/// The cells segment of `moved`, each (cell, the serial it last moved at), ascending by cell.
-pub(crate) fn encode_cells<'m>(moved: &[(u32, u64)], serial: Serial, alloc: Alloc<'m>) -> AVec<'m, u8> {
+/// The segment of `kind` ([`SegmentKind::Cells`] or [`SegmentKind::OwedCells`]) of `moved`, each
+/// (cell, the serial it last moved at), ascending by cell.
+pub(crate) fn encode_cells<'m>(kind: SegmentKind, moved: &[(u32, u64)], serial: Serial, alloc: Alloc<'m>) -> AVec<'m, u8> {
     let mut out = Vec::with_capacity_in(CELLS_HEAD + 12 * moved.len(), alloc);
-    put_head(&mut out, SegmentKind::Cells, serial);
+    put_head(&mut out, kind, serial);
     put_u32(&mut out, moved.len() as u32);
     for (cell, _) in moved.iter() {
         put_u32(&mut out, *cell);
@@ -751,8 +789,8 @@ pub struct CellsView<'a> {
 }
 
 impl<'a> CellsView<'a> {
-    pub(crate) fn open(bytes: &'a [u8], segment: u32) -> Result<CellsView<'a>, AnswerError> {
-        check_head(bytes, SegmentKind::Cells, CELLS_HEAD, segment)?;
+    pub(crate) fn open(bytes: &'a [u8], kind: SegmentKind, segment: u32) -> Result<CellsView<'a>, AnswerError> {
+        check_head(bytes, kind, CELLS_HEAD, segment)?;
         let n = count(bytes, HEAD);
         if CELLS_HEAD + 12 * n != bytes.len() {
             return Err(AnswerError::SegmentSize { segment, section: "columns" });
@@ -763,6 +801,11 @@ impl<'a> CellsView<'a> {
     pub(crate) fn find(&self, cell: CellNo) -> Option<Serial> {
         let i = search_u32(self.bytes, CELLS_HEAD, self.n, cell.0).ok()?;
         Some(Serial(u64_at(self.bytes, CELLS_HEAD + 4 * self.n + 8 * i)))
+    }
+
+    /// Every (cell, serial), ascending by cell.
+    pub(crate) fn all(&self) -> impl Iterator<Item = (CellNo, Serial)> + '_ {
+        (0..self.n).map(move |i| (CellNo(u32_at(self.bytes, CELLS_HEAD + 4 * i)), Serial(u64_at(self.bytes, CELLS_HEAD + 4 * self.n + 8 * i))))
     }
 
     pub(crate) fn verify(&self, segment: u32) -> Result<(), AnswerError> {
@@ -787,9 +830,10 @@ pub(crate) enum RunSums {
     Whole,
 }
 
-/// The run of `entries` (cell, task, +1 or -1), sorted and summed per (cell, task); `None` when
-/// every entry cancels. A sum outside `sums` is [`AnswerError::ReadersSum`].
-pub(crate) fn encode_run<'m>(entries: &mut AVec<'_, (u32, u32, i32)>, sums: RunSums, plant: Plant, serial: Serial, alloc: Alloc<'m>) -> Result<Option<AVec<'m, u8>>, AnswerError> {
+/// The run of `kind` (a [`SegmentKind::is_run`] kind) of `entries` (key, task, +1 or -1): the key
+/// a cell, a file's task id or 0. Sorted and summed per (key, task); `None` when every entry
+/// cancels. A sum outside `sums` is [`AnswerError::ReadersSum`].
+pub(crate) fn encode_run<'m>(kind: SegmentKind, entries: &mut AVec<'_, (u32, u32, i32)>, sums: RunSums, plant: Plant, serial: Serial, alloc: Alloc<'m>) -> Result<Option<AVec<'m, u8>>, AnswerError> {
     entries.sort_unstable_by_key(|(cell, task, _)| (*cell, *task));
     let mut cells: AVec<'m, u32> = Vec::new_in(alloc);
     let mut starts: AVec<'m, u32> = Vec::new_in(alloc);
@@ -807,7 +851,7 @@ pub(crate) fn encode_run<'m>(entries: &mut AVec<'_, (u32, u32, i32)>, sums: RunS
             (-1, RunSums::Request) => Some(task | MINUS),
             (0, RunSums::Whole) if plant == Plant::CancelledKept => Some(task),
             (0, _) => None,
-            _ => return Err(AnswerError::ReadersSum { cell: CellNo(cell), task: TaskId(task), sum }),
+            _ => return Err(AnswerError::ReadersSum { kind, cell: CellNo(cell), task: TaskId(task), sum }),
         };
         if let Some(entry) = entry {
             if cells.last() != Some(&cell) {
@@ -825,7 +869,7 @@ pub(crate) fn encode_run<'m>(entries: &mut AVec<'_, (u32, u32, i32)>, sums: RunS
     }
     starts.push(kept.len() as u32);
     let mut out = Vec::with_capacity_in(RUN_HEAD + 4 * (cells.len() + starts.len() + kept.len()), alloc);
-    put_head(&mut out, SegmentKind::Run, serial);
+    put_head(&mut out, kind, serial);
     put_u32(&mut out, cells.len() as u32);
     put_u32(&mut out, kept.len() as u32);
     for column in [&cells, &starts, &kept] {
@@ -844,8 +888,8 @@ pub struct RunView<'a> {
 }
 
 impl<'a> RunView<'a> {
-    pub(crate) fn open(bytes: &'a [u8], segment: u32) -> Result<RunView<'a>, AnswerError> {
-        check_head(bytes, SegmentKind::Run, RUN_HEAD, segment)?;
+    pub(crate) fn open(bytes: &'a [u8], kind: SegmentKind, segment: u32) -> Result<RunView<'a>, AnswerError> {
+        check_head(bytes, kind, RUN_HEAD, segment)?;
         let (k, e) = (count(bytes, HEAD), count(bytes, HEAD + 4));
         if RUN_HEAD + 4 * (k + k + 1 + e) != bytes.len() {
             return Err(AnswerError::SegmentSize { segment, section: "columns" });
@@ -890,6 +934,40 @@ impl<'a> RunView<'a> {
         range.map(|at| self.entry(at))
     }
 
+    /// `task`'s entry under `cell` in this run (+1, -1, or 0 for none), and the fields compared:
+    /// a binary search for the cell, then one for the task among its entries (ascending by task,
+    /// [`RunView::verify`]), read in place.
+    pub(crate) fn sign_of(&self, cell: CellNo, task: TaskId) -> (i32, u32) {
+        let mut compared = 0u32;
+        let (mut lo, mut hi) = (0usize, self.k);
+        let mut found = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            compared += 1;
+            match self.cell(mid).cmp(&cell.0) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    found = Some(mid);
+                    break;
+                }
+            }
+        }
+        let Some(j) = found else { return (0, compared) };
+        let (mut lo, mut hi) = (self.start(j), self.start(j + 1));
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            compared += 1;
+            let (at, sign) = self.entry(mid);
+            match at.0.cmp(&task.0) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return (sign, compared),
+            }
+        }
+        (0, compared)
+    }
+
     /// Every entry: (cell, task, +1 or -1).
     pub(crate) fn all(&self) -> impl Iterator<Item = (u32, u32, i32)> + '_ {
         (0..self.k).flat_map(move |j| (self.start(j)..self.start(j + 1)).map(move |at| {
@@ -907,6 +985,55 @@ impl<'a> RunView<'a> {
                 if self.entry(at - 1).0 >= self.entry(at).0 {
                     return Err(AnswerError::Unsorted { segment, section: "run entries", at });
                 }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Owed tasks.
+
+/// The owed tasks segment of `tasks`, ascending.
+pub(crate) fn encode_owed<'m>(tasks: &[u32], serial: Serial, alloc: Alloc<'m>) -> AVec<'m, u8> {
+    let mut out = Vec::with_capacity_in(IDS_HEAD + 4 * tasks.len(), alloc);
+    put_head(&mut out, SegmentKind::Owed, serial);
+    put_u32(&mut out, tasks.len() as u32);
+    for task in tasks.iter() {
+        put_u32(&mut out, *task);
+    }
+    out
+}
+
+/// One owed tasks segment read in place: the answer's owed tasks, ascending.
+#[derive(Clone, Copy)]
+pub struct OwedView<'a> {
+    bytes: &'a [u8],
+    n: usize,
+}
+
+impl<'a> OwedView<'a> {
+    pub(crate) fn open(bytes: &'a [u8], segment: u32) -> Result<OwedView<'a>, AnswerError> {
+        check_head(bytes, SegmentKind::Owed, IDS_HEAD, segment)?;
+        let n = count(bytes, HEAD);
+        if IDS_HEAD + 4 * n != bytes.len() {
+            return Err(AnswerError::SegmentSize { segment, section: "owed tasks" });
+        }
+        Ok(OwedView { bytes, n })
+    }
+
+    pub(crate) fn contains(&self, task: TaskId) -> bool {
+        search_u32(self.bytes, IDS_HEAD, self.n, task.0).is_ok()
+    }
+
+    pub(crate) fn all(&self) -> impl Iterator<Item = TaskId> + '_ {
+        (0..self.n).map(move |i| TaskId(u32_at(self.bytes, IDS_HEAD + 4 * i)))
+    }
+
+    pub(crate) fn verify(&self, segment: u32) -> Result<(), AnswerError> {
+        for i in 1..self.n {
+            if u32_at(self.bytes, IDS_HEAD + 4 * (i - 1)) >= u32_at(self.bytes, IDS_HEAD + 4 * i) {
+                return Err(AnswerError::Unsorted { segment, section: "owed tasks", at: i });
             }
         }
         Ok(())

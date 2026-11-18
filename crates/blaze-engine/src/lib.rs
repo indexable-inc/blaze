@@ -34,7 +34,13 @@ pub mod overlay;
 pub mod pages;
 
 #[cfg(test)]
+mod finish_scale_sim;
+#[cfg(test)]
+mod last_gen_sim;
+#[cfg(test)]
 mod last_sim;
+#[cfg(test)]
+mod owed_by_generation_sim;
 #[cfg(test)]
 mod pages_sim;
 #[cfg(test)]
@@ -42,8 +48,9 @@ mod sim;
 
 pub use crate::engine::{
     Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Entered, Everything, Finished, Gen, Made, Phase, Plant,
-    Planned, Pool, Report, Row, SMap, SSet, STAGES, SVec, Scope, Stage, StageCount, Task, Tools, View, drive, drive_growing, GROWN_CAP, WAVE_CAP,
+    Planned, Pool, Report, Row, SMap, SSet, STAGES, SVec, Scope, Settle, Stage, StageCount, Task, Tools, View, by_cell, drive, drive_growing, GROWN_CAP,
+    READS_CAP, WAVE_CAP,
 };
-pub use crate::last::{LastAnswer, LastError, LastRow, Touched};
+pub use crate::last::{Found, LastAnswer, LastError, LastRow, ReadOf, Touched, search};
 pub use crate::last_mem::{MemDefines, MemReads, MemSeen};
-pub use crate::overlay::{Fold, Overlay, RowFacts, Taken, Work};
+pub use crate::overlay::{Fold, Generations, Overlay, RowFacts, Taken, Work};

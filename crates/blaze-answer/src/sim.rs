@@ -1,7 +1,8 @@
 //! The answer's simulation (rules 43, 64): random requests (rows made, re-made and retired, cells
 //! moved and moved back, readers added and removed, compactions, crashes between the segments and
 //! the root) are committed to a store of bytes and applied to a plain in-memory model; after every
-//! step the views over the stored bytes equal the model. Four planted bugs, each caught. The size
+//! step the views over the stored bytes equal the model (rows, cells, readers, and the plans,
+//! findings, owed tasks and owed cells columns). Nine planted bugs, each caught. The size
 //! test prints what an answer of 24,000 rows costs.
 
 use std::collections::BTreeMap;
@@ -13,16 +14,26 @@ use std::vec::Vec as StdVec;
 use blaze_drive::cells::Cell;
 use blaze_drive::key::{Key, Kind, Name};
 use blaze_id::ContentId;
-use blaze_own::Alloc;
+use blaze_own::{Alloc, SharedAlloc};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::{
-    AnswerError, AnswerView, CellDigest, CellNo, Commit, DEFINE_BYTES, Effects, Flags, Health, LinesKey, Plant, ROW_FIXED_BYTES, RowIn, RunWriter, SegmentKind, TaskId, TreeDigest, Write, compact,
-    nothing_changed, summary_of,
+    AnswerError, AnswerView, CellDigest, CellNo, Commit, DEFINE_BYTES, Effects, Flags, Health, LinesKey, Plant, ROW_FIXED_BYTES, RowIn, RunWriter, SegmentKind, Serial, TaskId, TreeDigest, Write,
+    compact, has_findings, nothing_changed, summary_of,
 };
 
+/// The simulation's one heap: what [`alloc`] and [`shared`] hand out.
+fn heap() -> &'static blaze_own::Heap {
+    blaze_own::testing::heap()
+}
+
 fn alloc() -> Alloc<'static> {
-    blaze_own::testing::heap().alloc()
+    heap().alloc()
+}
+
+/// The allocator a view's own tables take: shared, so a view is `Sync`.
+fn shared() -> SharedAlloc<'static> {
+    heap().shared()
 }
 
 fn oracle(holds: bool, why: impl FnOnce() -> String) -> Result<(), Broke> {
@@ -70,6 +81,7 @@ struct Draft {
     out: u8,
     source: u8,
     findings: u32,
+    record: u8,
     /// (definer body, tag), in read order.
     reads: StdVec<(usize, usize)>,
     /// (tag, digest value).
@@ -88,6 +100,9 @@ struct Request {
     tree: [u8; 32],
     lines: [u8; 32],
     summary: StdVec<u8>,
+    /// The owed cells, whole (cell numbers given before the request, each with a serial), or
+    /// `None`: the last set stands.
+    owed_cells: Option<StdVec<(u32, u64)>>,
 }
 
 fn row_in(d: &Draft, file: TaskId) -> RowIn {
@@ -100,11 +115,12 @@ fn row_in(d: &Draft, file: TaskId) -> RowIn {
         flags: Flags(d.flags),
         source: ContentId([d.source; 32]),
         findings: d.findings,
+        record: Key(ContentId([d.record; 32])),
     }
 }
 
 fn draft(reads: StdVec<(usize, usize)>, defines: StdVec<(usize, u64)>) -> Draft {
-    Draft { file: 0, stage: 5, wave: 0, flags: 0, key: 1, out: 1, source: 1, findings: 0, reads, defines }
+    Draft { file: 0, stage: 5, wave: 0, flags: 0, key: 1, out: 1, source: 1, findings: 0, record: 1, reads, defines }
 }
 
 fn draw_request(tape: &Tape, model: &Model, serial: u64) -> Request {
@@ -145,6 +161,7 @@ fn draw_request(tape: &Tape, model: &Model, serial: u64) -> Request {
             out: tape.below(250, "out") as u8,
             source: tape.below(250, "source") as u8,
             findings: tape.below(3, "findings") as u32,
+            record: 1 + tape.below(250, "record") as u8,
             reads,
             defines,
         };
@@ -156,7 +173,17 @@ fn draw_request(tape: &Tape, model: &Model, serial: u64) -> Request {
     let mut lines = [0u8; 32];
     lines[0] = tape.below(256, "lines") as u8;
     let summary = (0..tape.below(9, "summary")).map(|i| i as u8).collect();
-    Request { ops, tree, lines, summary }
+    let owed_cells = match model.cells.is_empty() || !tape.one_in(3, "owe cells") {
+        true => None,
+        false => {
+            let mut set: BTreeMap<u32, u64> = BTreeMap::new();
+            for _ in 0..tape.below(4, "owed cells") {
+                set.insert(tape.index(model.cells.len(), "owed cell") as u32, 1 + tape.below(serial, "owed at"));
+            }
+            Some(set.into_iter().collect())
+        }
+    };
+    Request { ops, tree, lines, summary, owed_cells }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -182,9 +209,23 @@ struct Model {
     cells: StdVec<(u32, [u8; 16])>,
     rows: BTreeMap<u32, MRow>,
     moved: BTreeMap<u32, u64>,
+    owed_cells: BTreeMap<u32, u64>,
 }
 
 impl Model {
+    /// The tasks `file`'s plan lists: its rows not made inline.
+    fn plan(&self, file: u32) -> StdVec<u32> {
+        self.rows.iter().filter(|(_, row)| row.head.file.0 == file && row.head.flags.0 & Flags::INLINE == 0).map(|(task, _)| *task).collect()
+    }
+
+    fn with_findings(&self) -> StdVec<u32> {
+        self.rows.iter().filter(|(_, row)| has_findings(row.head.findings, row.head.flags)).map(|(task, _)| *task).collect()
+    }
+
+    fn owed(&self) -> StdVec<u32> {
+        self.rows.iter().filter(|(_, row)| row.head.flags.0 & Flags::OWED != 0).map(|(task, _)| *task).collect()
+    }
+
     fn task_of(&self, name: &Name) -> Option<u32> {
         self.tasks.iter().position(|one| one == name).map(|at| at as u32)
     }
@@ -274,6 +315,9 @@ impl Model {
             let saw = self.rows[&id].reads.iter().map(|cell| self.digest(*cell)).collect();
             self.rows.get_mut(&id).expect("made above").saw = saw;
         }
+        if let Some(cells) = &req.owed_cells {
+            self.owed_cells = cells.iter().copied().collect();
+        }
         self.serial = serial;
         self.tree = req.tree;
         self.lines = req.lines;
@@ -293,8 +337,8 @@ struct Store {
 impl Store {
     fn open(&self, plant: Plant) -> Result<AnswerView<'_>, AnswerError> {
         match &self.root {
-            None => Ok(AnswerView::empty(plant, alloc())),
-            Some(root) => AnswerView::open(root, |at| self.segments.get(&at.id.0).map(|bytes| &bytes[..]), plant, alloc()),
+            None => Ok(AnswerView::empty(plant, shared())),
+            Some(root) => AnswerView::open(root, |at| self.segments.get(&at.id.0).map(|bytes| &bytes[..]), plant, shared()),
         }
     }
 
@@ -358,6 +402,10 @@ fn commit_request(view: &AnswerView<'_>, req: &Request, split: &[usize], plant: 
             commit.add_run(&run)?;
         }
     }
+    if let Some(cells) = &req.owed_cells {
+        let given: StdVec<(CellNo, Serial)> = cells.iter().map(|(cell, at)| (CellNo(*cell), Serial(*at))).collect();
+        commit.owe_cells(&given)?;
+    }
     commit.finish(&TreeDigest(req.tree), &req.summary, &LinesKey(req.lines))
 }
 
@@ -392,10 +440,17 @@ fn compare(view: &AnswerView<'_>, model: &Model, at: &str) -> Result<(), Broke> 
                     flags: row.flags(),
                     source: row.source(),
                     findings: row.findings(),
+                    record: row.record(),
                 };
                 oracle(head == m.head && row.serial().0 == m.serial, || format!("{at}: row of task {t}: {head:?} at {}, the model's {:?} at {}", row.serial().0, m.head, m.serial))?;
                 let reads: StdVec<u32> = row.reads().map(|cell| cell.0).collect();
                 oracle(reads == m.reads, || format!("{at}: row of task {t} reads {reads:?}, the model's {:?}", m.reads))?;
+                // One read found by search, not by a walk (`AnswerView::reads_cell`, plan row B1):
+                // every cell asked, the row's reads alone answer yes.
+                for c in 0..model.cells.len() as u32 {
+                    let (found, _) = view.reads_cell(CellNo(c), task).map_err(refused("a read found by search"))?;
+                    oracle(found == m.reads.contains(&c), || format!("{at}: task {t}: reads_cell({c}) is {found}, the model's reads {:?}", m.reads))?;
+                }
                 let defines: StdVec<(u32, [u8; 20])> = row.defines().map(|(cell, d)| (cell.0, d.0)).collect();
                 let want: StdVec<(u32, [u8; 20])> = m.defines.iter().map(|(cell, d)| (*cell, *d)).collect();
                 oracle(defines == want, || format!("{at}: row of task {t} defines {defines:?}, the model's {want:?}"))?;
@@ -418,6 +473,24 @@ fn compare(view: &AnswerView<'_>, model: &Model, at: &str) -> Result<(), Broke> 
         let want = model.readers(c);
         oracle(readers == want, || format!("{at}: readers of cell {c}: {readers:?}, the model's {want:?}"))?;
     }
+    // The columns of kinds 5 to 8: each against the model's derivation.
+    for t in 0..model.tasks.len() as u32 {
+        let plan: StdVec<u32> = view.file_tasks(TaskId(t), alloc()).map_err(refused("a file's plan"))?.iter().map(|task| task.0).collect();
+        let want = model.plan(t);
+        oracle(plan == want, || format!("{at}: plan of file {t}: {plan:?}, the model's {want:?}"))?;
+    }
+    let findings: StdVec<u32> = view.with_findings(alloc()).map_err(refused("the rows with findings"))?.iter().map(|task| task.0).collect();
+    let want = model.with_findings();
+    oracle(findings == want, || format!("{at}: rows with findings {findings:?}, the model's {want:?}"))?;
+    let owed: StdVec<u32> = view.owed().map(|task| task.0).collect();
+    let want = model.owed();
+    oracle(owed == want, || format!("{at}: owed tasks {owed:?}, the model's {want:?}"))?;
+    for t in 0..model.tasks.len() as u32 {
+        oracle(view.is_owed(TaskId(t)) == want.contains(&t), || format!("{at}: owed tasks: is_owed({t}) disagrees with the list"))?;
+    }
+    let owed_cells: StdVec<(u32, u64)> = view.owed_cells().map(|(cell, s)| (cell.0, s.0)).collect();
+    let want: StdVec<(u32, u64)> = model.owed_cells.iter().map(|(cell, s)| (*cell, *s)).collect();
+    oracle(owed_cells == want, || format!("{at}: owed cells {owed_cells:?}, the model's {want:?}"))?;
     Ok(())
 }
 
@@ -429,11 +502,11 @@ fn check_root(store: &Store, model: &Model, plant: Plant, at: &str) -> Result<()
     let same = nothing_changed(root, &TreeDigest(model.tree)).map_err(refused("nothing_changed"))?;
     let changed = nothing_changed(root, &TreeDigest(other)).map_err(refused("nothing_changed"))?;
     oracle(same && !changed, || format!("{at}: nothing_changed is wrong about the root's tree"))?;
-    let adopted = AnswerView::adopt(&TreeDigest(model.tree), root, |one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), plant, alloc()).map_err(refused("adopt"))?;
+    let adopted = AnswerView::adopt(&TreeDigest(model.tree), root, |one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), plant, shared()).map_err(refused("adopt"))?;
     compare(&adopted, model, at)?;
     // The root alone gives the summary the opened answer gives (blaze-cli's certificate reads it so).
     oracle(summary_of(root).ok() == Some(adopted.summary()), || format!("{at}: summary_of disagrees with the opened root's summary"))?;
-    let wrong = AnswerView::adopt(&TreeDigest(other), root, |one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), plant, alloc());
+    let wrong = AnswerView::adopt(&TreeDigest(other), root, |one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), plant, shared());
     oracle(matches!(wrong, Err(AnswerError::TreeMismatch)), || format!("{at}: adopt took a root of another tree"))
 }
 
@@ -459,7 +532,7 @@ fn step(tape: &Tape, store: &mut Store, model: &mut Model, req: &Request, plant:
     let other: StdVec<usize> = req.ops.iter().map(|_| tape.index(n, "other worker")).collect();
     let effects = {
         let view = store.open(plant).map_err(refused("open"))?;
-        // A history is at most 16 requests of at most four segments each, and compacts when
+        // A history is at most 16 requests of at most eight segments (three runs) each, and compacts when
         // health says so: compaction owed here is a broken cap, not a state to handle.
         let effects = commit_request(&view, req, &split, plant).map_err(refused("commit"))?;
         let again = commit_request(&view, req, &other, plant).map_err(refused("commit"))?;
@@ -513,7 +586,7 @@ fn move_back(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let t = tape.index(TAGS, "tag");
     let a = 1 + tape.below(2, "a");
     let b = 3 - a;
-    let request = |ops: StdVec<Op>, serial: u64| Request { ops, tree: [serial as u8; 32], lines: [0; 32], summary: StdVec::new() };
+    let request = |ops: StdVec<Op>, serial: u64| Request { ops, tree: [serial as u8; 32], lines: [0; 32], summary: StdVec::new(), owed_cells: None };
     let history = [
         request(StdVec::from([Op::Put { task: 0, row: draft(StdVec::new(), StdVec::from([(t, a)])) }]), 1),
         request(StdVec::from([Op::Put { task: 0, row: draft(StdVec::new(), StdVec::from([(t, b)])) }, Op::Put { task: 1, row: draft(StdVec::from([(0, t)]), StdVec::new()) }]), 2),
@@ -566,6 +639,33 @@ fn control_root_first() {
     control(SimConfig::cases(300), Plant::None, Plant::RootFirst, "after a crash", histories);
 }
 
+// One planted bug per column of kinds 5 to 8 and the record key, each caught by `compare`.
+
+#[test]
+fn control_plan_kept_on_retire() {
+    control(SimConfig::cases(300), Plant::None, Plant::PlanKeptOnRetire, "plan of file", histories);
+}
+
+#[test]
+fn control_findings_kept_on_clear() {
+    control(SimConfig::cases(300), Plant::None, Plant::FindingsKeptOnClear, "rows with findings", histories);
+}
+
+#[test]
+fn control_owed_kept_on_retire() {
+    control(SimConfig::cases(300), Plant::None, Plant::OwedKeptOnRetire, "owed tasks", histories);
+}
+
+#[test]
+fn control_owed_cells_empty_dropped() {
+    control(SimConfig::cases(300), Plant::None, Plant::OwedCellsEmptyDropped, "owed cells", histories);
+}
+
+#[test]
+fn control_record_dropped() {
+    control(SimConfig::cases(300), Plant::None, Plant::RecordDropped, "row of task", histories);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Size.
 
@@ -591,7 +691,7 @@ fn size_of_the_answer() {
     const READS: usize = 300;
     const DISTINCT: usize = 200;
     let mut mix = Mix(17);
-    let empty = AnswerView::empty(Plant::None, alloc());
+    let empty = AnswerView::empty(Plant::None, shared());
     let mut commit = Commit::new(&empty, Plant::None, alloc());
     let mut tasks = StdVec::with_capacity(ROWS);
     for i in 0..ROWS {
@@ -631,7 +731,7 @@ fn size_of_the_answer() {
             d[..8].copy_from_slice(&mix.next().to_le_bytes());
             defines.push((cells[c], CellDigest(d)));
         }
-        let row = RowIn { key: Key(ContentId([1; 32])), out: ContentId([2; 32]), file, stage: 5, wave: 0, flags: Flags(0), source: ContentId([3; 32]), findings: 0 };
+        let row = RowIn { key: Key(ContentId([1; 32])), out: ContentId([2; 32]), file, stage: 5, wave: 0, flags: Flags(0), source: ContentId([3; 32]), findings: 0, record: Key(ContentId([4; 32])) };
         commit.put_row(*task, &row, &reads, &defines).expect("a row");
         worker.row_reads(*task, None, &reads);
     }

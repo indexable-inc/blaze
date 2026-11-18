@@ -480,6 +480,24 @@ pub(crate) trait Front {
     fn path_of(&mut self, _item: ItemKey) -> Option<Box<str>> {
         None
     }
+    /// Instance `name` (its walk row's name bytes) of fn `tabled`, for a crash's words
+    /// (run_fault.rs): `maker` is the walk's, when a row was stepped. This default names the
+    /// item by [`Front::path_of`] alone; a front with a printer names it by that and gives the
+    /// instance's arguments. Read only on a crash's path.
+    fn named(&mut self, maker: Option<&Self::Maker>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+        let _ = (maker, name);
+        match self.path_of(tabled) {
+            Some(path) => crate::run_fault::Named::Path(path),
+            None => crate::run_fault::Named::Item(tabled),
+        }
+    }
+    /// Byte `site` of item `item`'s text (a code record's trap row, item-relative: rule 71)
+    /// for a crash's words: its file, line and column today. This default places nothing.
+    /// Read only on a crash's path.
+    fn site_shown(&mut self, maker: Option<&Self::Maker>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+        let _ = (maker, item, site);
+        None
+    }
     /// The sink the run's events go to ([`Watch`]): [`Unwatched`] unless the front has one.
     fn watch(&self) -> &dyn Watch {
         &Unwatched
@@ -557,16 +575,43 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     /// From the names records: the checker key's library item (its first 16 bytes,
     /// front2 keys.rs `checker_of`), its module's path and its name.
     fn path_of(&mut self, item: ItemKey) -> Option<Box<str>> {
-        use blaze_ladder::front2::source::NamesSource;
-        let records = self.names().ok()?.records;
-        let lib = records.key_beginning(item.0.to_be_bytes())?;
-        let module = records.module_path(records.home_of(lib)?)?;
-        let name = records.name_of(lib)?;
-        Some(std::format!("{module}::{name}").into_boxed_str())
+        self.records_shown(item)?.path().map(Box::from)
+    }
+
+    /// By the lazy program's printer when the maker made it (its key map files every member,
+    /// so a fn of an impl is named by the impl's header), else from the records alone.
+    fn named(&mut self, maker: Option<&Maker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+        use crate::run_fault::Named;
+        if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
+            return Named::Shown { item: shown.item, args: shown.args };
+        }
+        match self.records_shown(tabled) {
+            Some(item) => Named::Shown { item, args: None },
+            None => Named::Item(tabled),
+        }
+    }
+
+    /// By the lazy program the maker made (its key map places members too); none without it.
+    fn site_shown(&mut self, maker: Option<&Maker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+        let (file, line, column) = maker?.site_shown(item, site)?;
+        Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
     }
 
     fn watch(&self) -> &dyn Watch {
         self.watch
+    }
+}
+
+impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
+    /// The checker key `item` by the one printer (front2 item_shown.rs `ItemShown`) over the
+    /// names records alone: its library item (the key's first 16 bytes, front2 keys.rs
+    /// `checker_of`). `None`: no library item begins so (a member's key, which only a key map
+    /// files: [`Front::named`] asks the maker's program first).
+    fn records_shown(&mut self, item: ItemKey) -> Option<blaze_ladder::front2::item_shown::ItemShown> {
+        use blaze_ladder::front2::source::NamesSource;
+        let records = self.names().ok()?.records;
+        let lib = records.key_beginning(item.0.to_be_bytes())?;
+        Some(blaze_ladder::front2::item_shown::ItemShown::of_lib(records, lib))
     }
 }
 
@@ -834,14 +879,17 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
     /// placed from today's start list and never stepped.
     pub(crate) fn name_of(&mut self, symbol: [u8; 32]) -> crate::run_fault::Named {
         use crate::run_fault::Named;
-        let item = match self.started.as_ref().and_then(|started| started.walk.row_of(&CodeSymbol(symbol)).map(|row| started.walk.tabled(row))) {
-            Some(item) => item,
-            None => return Named::NoRow,
-        };
-        match self.front.path_of(item) {
-            Some(path) => Named::Path(path),
-            None => Named::Item(item),
-        }
+        let Some(started) = self.started.as_ref() else { return Named::NoRow };
+        let Some(row) = started.walk.row_of(&CodeSymbol(symbol)) else { return Named::NoRow };
+        let maker = started.heavy.as_ref().map(|heavy| &heavy.maker);
+        self.front.named(maker, started.walk.tabled(row), started.walk.name(row))
+    }
+
+    /// Byte `site` of item `item`'s text for a crash's words (run_fault.rs: a trap row's
+    /// construct), by the front and the walk's maker; `None` when neither places it.
+    pub(crate) fn site_of(&mut self, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+        let maker = self.started.as_ref()?.heavy.as_ref().map(|heavy| &heavy.maker);
+        self.front.site_shown(maker, item, site)
     }
 
     /// `lines` placed ahead from today's start list: each code row's symbol among the placed
@@ -869,6 +917,18 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         self.tally.reached += rows;
         self.tally.found += rows;
         self.front.watch().see(Step::Placed { rows: u32::try_from(rows).unwrap_or(u32::MAX) });
+    }
+}
+
+/// The walk names a crash's places while it is alive (own_process.rs builds the report before
+/// the walk is dropped).
+impl<F: Front, D: Folder> crate::run_fault::Places for Lazy<'_, '_, F, D> {
+    fn named(&mut self, symbol: [u8; 32]) -> crate::run_fault::Named {
+        self.name_of(symbol)
+    }
+
+    fn site(&mut self, item: ItemKey, at: u32) -> Option<crate::run_fault::SiteShown> {
+        self.site_of(item, at)
     }
 }
 

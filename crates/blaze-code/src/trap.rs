@@ -4,17 +4,18 @@
 //! A trap in a code record is an AArch64 `brk #imm16`: LIR's `trap code` is its own immediate
 //! (blaze-emit pass.rs refuses a LIR code at or past [`DIV_ZERO`]), and the emitter's own traps
 //! (`unreachable`, a division's checks) take the codes from [`DIV_ZERO`] up. So the reason a
-//! program stopped on a trap is read from the instruction it stopped on: no side table is kept,
-//! and the record's bytes (and so its key's meaning) do not change for it. What a code means is
-//! [`Reason`]; what a trap at an offset of a record is, with the call it follows when it ends a
-//! call to a fn that never returns, is [`at`].
+//! program stopped on a trap is read from the instruction it stopped on. WHICH construct an
+//! `unreachable` ends is not in the instruction: the record's trap table holds it (record.rs
+//! `TrapRow`, data only, the key unchanged by it). What a code means is [`Reason`]; what a trap
+//! at an offset of a record is, with the call it follows when it ends a call to a fn that never
+//! returns and its trap row, is [`at`].
 //!
 //! Every producer names its code from here: blaze-emit's `BRK_*`, blaze-build's
 //! `ABORT_TRAP`, `NO_MEMORY_TRAP`, `SET_FAILED_TRAP` and `BAD_ROW_TRAP`. blaze-lir's coroutine
 //! codes (`RESUMED_TRAP`, `TAG_TRAP`) are held equal to [`ASYNC_RESUMED`] and [`NO_STATE`] by
 //! blaze-emit's trap_codes_tests.rs (blaze-lir depends on no crate that could hold them).
 
-use crate::record::{CodeView, SiteKind, Space, Symbol};
+use crate::record::{CodeView, SiteKind, Space, Symbol, TrapRow};
 
 /// `core::intrinsics::abort` (and `abort_immediate`), and a zero-sized `offset_from`.
 pub const ABORT: u32 = 0xfe00;
@@ -120,6 +121,8 @@ pub struct TrapAt {
     /// is a trap (the callee's type says it never returns, or the call is an abort's). `None`
     /// when the instruction before the trap is not one of the record's call sites.
     pub after_call: Option<Symbol>,
+    /// The record's trap row for the `brk` (WHICH construct it ends), when it has one.
+    pub construct: Option<TrapRow>,
 }
 
 /// What the instruction at `offset` of `view`'s code is, when it is a trap: `None` when the
@@ -144,7 +147,9 @@ pub fn at(view: &CodeView<'_>, offset: u64) -> Option<TrapAt> {
             break;
         }
     }
-    Some(TrapAt { reason, after_call })
+    // `at` is inside the code, whose length a u32 counts (record.rs `seal`).
+    let construct = u32::try_from(at).ok().and_then(|at| view.trap_at(at));
+    Some(TrapAt { reason, after_call, construct })
 }
 
 #[cfg(test)]
@@ -192,8 +197,8 @@ mod tests {
         let mut bytes = Vec::new_in(alloc);
         sealed.encode(&mut bytes);
         let view = CodeView::read(&bytes).expect("the record reads back");
-        assert_eq!(at(&view, 12), Some(TrapAt { reason: Reason::Unreachable, after_call: Some(callee) }));
-        assert_eq!(at(&view, 20), Some(TrapAt { reason: Reason::Abort, after_call: None }));
+        assert_eq!(at(&view, 12), Some(TrapAt { reason: Reason::Unreachable, after_call: Some(callee), construct: None }));
+        assert_eq!(at(&view, 20), Some(TrapAt { reason: Reason::Abort, after_call: None, construct: None }));
         assert_eq!(at(&view, 16), None, "a nop is no trap");
         assert_eq!(at(&view, 14), None, "an offset inside an instruction");
         assert_eq!(at(&view, 24), None, "past the code");

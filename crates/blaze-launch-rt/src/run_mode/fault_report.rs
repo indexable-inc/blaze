@@ -1,8 +1,10 @@
 //! What a run's crash says (rule 19: a crash in a run says what and where). A program under
 //! `blaze run` that faults (SIGSEGV, SIGBUS), runs an undefined instruction (SIGILL) or a trap
 //! (SIGTRAP: `brk`, what `core::intrinsics::abort` and a failed check lower to) dies by that
-//! signal, as it would linked; before it dies the handler here writes ONE line to standard
-//! error naming the signal, the pc and the faulting address, each as WHAT IS PLACED THERE:
+//! signal, as it would linked; before it dies the handler here tells the parent where it
+//! struck (below), and the parent's line is the run's one report. Only when the parent cannot
+//! be told does the handler write its own line to standard error naming the signal, the pc and
+//! the faulting address, each as WHAT IS PLACED THERE:
 //!
 //!     blaze run: the program was killed by SIGBUS: pc 0x7002aa78c0 is +0x40 in the code of
 //!     function 3f2a.. (record 9c01..); it wrote 0x7002aa6410, which is +0x0 in the read-only
@@ -189,20 +191,24 @@ extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void
         edges[i] = edge.load(Ordering::Relaxed);
     }
     let struck = Struck { sig, pc, address, write };
-    let mut line = Line::new();
-    report(&mut line, struck, placed, &Regions { edges }, DROPPED.load(Ordering::Relaxed));
-    // SAFETY: `at` live bytes of the buffer to descriptor 2; `write` is async-signal-safe.
-    unsafe { libc::write(2, line.bytes.as_ptr().cast(), line.at) };
-    if let Some(fault) = fault_of(struck, placed) {
-        let told = tell_parent(&fault);
-        if let Err(why) = told {
-            let mut said = Line::new();
-            said.put(b"blaze run: (the parent was not told where: ");
-            said.put(why.as_bytes());
-            said.put(b")\n");
-            // SAFETY: as the write above.
-            unsafe { libc::write(2, said.bytes.as_ptr().cast(), said.at) };
-        }
+    // ONE report (rule 30): the parent's, which names paths and reasons (blaze-cli
+    // run_fault.rs). The child's own line is written only when the parent could not be told:
+    // a signal the frame does not carry, no socket, or a failed write (then with why).
+    let told = match fault_of(struck, placed) {
+        Some(fault) => tell_parent(&fault),
+        None => Err("a signal the parent's report does not carry"),
+    };
+    if let Err(why) = told {
+        let mut line = Line::new();
+        report(&mut line, struck, placed, &Regions { edges }, DROPPED.load(Ordering::Relaxed));
+        // SAFETY: `at` live bytes of the buffer to descriptor 2; `write` is async-signal-safe.
+        unsafe { libc::write(2, line.bytes.as_ptr().cast(), line.at) };
+        let mut said = Line::new();
+        said.put(b"blaze run: (the parent was not told where: ");
+        said.put(why.as_bytes());
+        said.put(b")\n");
+        // SAFETY: as the write above.
+        unsafe { libc::write(2, said.bytes.as_ptr().cast(), said.at) };
     }
     hand_on(sig, info, ctx);
 }

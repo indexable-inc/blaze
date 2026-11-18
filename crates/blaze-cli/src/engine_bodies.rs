@@ -152,6 +152,10 @@ pub(crate) struct Ran<'f> {
     /// findings, or 1 for a body refused.
     pub(crate) findings: u32,
     pub(crate) said: Option<Said>,
+    /// The head a seed could not freeze for it, with that head's own reason, when no head task
+    /// keeps that reason (a dependency's, or a head frozen by a body): a [`crate::engine_lines::Class::Head`]
+    /// note of its block, so the closing lines group it with the head tasks' ([`BodiesStage::lines`]).
+    pub(crate) head_failed: Option<crate::engine_seeds::FirstFailure>,
     /// Its entry's chain (work.rs `item_chain`; 0 when it was not found).
     chain: u64,
     /// Its verdict's findings, sorted by (start, end, rule, message): printed as `check` prints
@@ -665,7 +669,7 @@ impl<'f> BodiesStage<'f> {
                             // (engine_body_plan.rs `Outside::lines`), so the row keeps the certificate.
                             buffer.done.push(Done { name, key: task.key, out: crate::engine_body_plan::outside_out(name), defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
                             self.outside.push(name, file, is);
-                            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, chain: 0, found: Vec::new_in(Global), items: 0 });
+                            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, head_failed: None, chain: 0, found: Vec::new_in(Global), items: 0 });
                             continue;
                         }
                         // No member crate's records hold the body's file: checked by no crate. It
@@ -683,7 +687,7 @@ impl<'f> BodiesStage<'f> {
                             }
                             let out = ContentId::of(OWNERLESS_DOMAIN, &name.subject.0);
                             buffer.done.push(Done { name, key: task.key, out, defines: SVec::new_in(alloc), reads, findings: 0, failed: false });
-                            self.ran.push(Ran { name, label: "", file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, chain: 0, found: Vec::new_in(Global), items: 0 });
+                            self.ran.push(Ran { name, label: "", file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 0, said: None, head_failed: None, chain: 0, found: Vec::new_in(Global), items: 0 });
                             continue;
                         }
                     }
@@ -700,7 +704,7 @@ impl<'f> BodiesStage<'f> {
                 true => planned_label(&mut labels, &cx, handles.root, handles.outlined, file, name, frame),
                 false => label,
             };
-            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(refused)), chain: 0, found: Vec::new_in(Global), items: 0 });
+            self.ran.push(Ran { name, label, file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(refused)), head_failed: None, chain: 0, found: Vec::new_in(Global), items: 0 });
         }
         self.outside.finish();
         // 3. Your code first is the next piece (engine.md 4); today: by member, file, name.
@@ -845,7 +849,7 @@ impl<'f> BodiesStage<'f> {
             // The member's files: what its module tree reaches from its root, the walk the
             // planner took (the `Owners` fact `check` reads, blaze-drive owners.rs): each is
             // this member's, checked or refused by name, never in "no crate holds" (rule 3).
-            let reach = reached(handles.outlined, Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes()));
+            let reach = crate::engine_body_plan::reached(handles.outlined, Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes()), g);
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
             let unit = u32::try_from(units.len()).unwrap_or(u32::MAX);
             units.push(crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) });
@@ -1125,6 +1129,9 @@ impl<'f> BodiesStage<'f> {
             let class = if self.not_checked(name) { crate::engine_lines::Class::Unchecked } else { crate::engine_lines::Class::Failure };
             lines.note(name, class, words.as_bytes());
         }
+        if let Some(first) = one.head_failed {
+            lines.note(name, crate::engine_lines::Class::Head, crate::engine_head_notes::seed_words(first.head, first.why, frame).as_bytes());
+        }
         Ok(())
     }
 
@@ -1285,6 +1292,9 @@ fn unmade_head(error: &FreezeError) -> Unmade {
         | FreezeError::Steps { want, .. } => Unmade::Head(*want),
         // Not made again: the cell whose first freeze failed is the head to name.
         FreezeError::Again { failed, .. } => Unmade::Head(*failed),
+        // A member's head not frozen for this body's unit (engine_seeds.rs `StretchHeads`):
+        // seeded as `SeedError::NotInItsUnit`/`NoMemberCell`, here only as its kind.
+        FreezeError::NotTheirs { want, .. } => Unmade::Head(*want),
         FreezeError::TooDeep { outermost, .. } => Unmade::Head(*outermost),
         FreezeError::NoWant { .. } => Unmade::Unnamed,
         // A cell asked that is no cell, bytes that do not read, or the driver's own signal
@@ -1333,7 +1343,7 @@ fn refuse<'a, 'f>(rest: &[One<'f>], why: &'static str, out: &mut Buffer<'a>, ran
         // A machine's refusal (a frame not reserved, records not opened in the run): a function
         // of no cell, so no read; owed (empty reads), entered again by the next request.
         out.done.push(crate::engine_tasks::failed(&one.task, alloc));
-        ran.push(Ran { name: one.task.planned.name, label: one.label, file: one.file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(why)), chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+        ran.push(Ran { name: one.task.planned.name, label: one.label, file: one.file, ns: 0, bytes: 0, stretch: InStretch::No, findings: 1, said: Some(Said::Refused(why)), head_failed: None, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
     }
     rest.len()
 }
@@ -1369,7 +1379,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     // frame runs no drop: the freezer's lists are in the frame too, through `fa`). A want is
     // placed by this stretch's names the one way `widen` places a read (engine_seeds.rs
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
-    let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, opened.records, shared.heads, g));
+    let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, g));
     // The seed freezer's constant evaluator: the head tasks' own (engine_head_consts.rs), its
     // lang index built by the one function a head task builds it by, once a stretch, and what
     // it reads kept as it grows (`EvalSink`), so each body's read list takes it ([`add_eval_reads`]).
@@ -1407,10 +1417,6 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
     let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed, sources: Some(opened.sources), goals: None };
     let mut owners = crate::engine_heads::Owners::new(shared.heads);
-    // Each head whose first freeze in this stretch failed, with its own reason (key-free,
-    // engine_head_notes.rs `Reason`): what a body that asks it again quotes ([`own_reason`]).
-    // At most [`MOST_STRETCH_REASONS`]; past it a body says its reason was not kept.
-    let mut first_reasons: Vec<(Want, &'static str), blaze_own::Alloc<'static>> = Vec::new_in(g);
     let mut taken = 0usize;
     for one in run {
         if taken > 0 && frame.used() > STRETCH_FULL {
@@ -1523,6 +1529,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             // should hold and does not, bytes that do not read) stays the body's failure.
             tally.refused = tally.refused.saturating_add(1);
             let mut head: Option<Want> = None;
+            let mut head_failed: Option<crate::engine_seeds::FirstFailure> = None;
             let said = match said {
                 Some(Said::Task(TaskError::Seed { body, error: SeedError::Freeze(error) })) => {
                     let words = match unmade_head(&error) {
@@ -1534,31 +1541,37 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                             head = Some(want);
                             let shown = ItemShown::of_lib(opened.records, want.key());
                             // The head's OWN reason, once a body (rule 19): its head task's when
-                            // a member's head failed there, else its first freeze's in this
-                            // stretch (a second ask is `FreezeError::Again`, which says only
-                            // that it failed before).
-                            let own = own_reason(want, &first_reasons, shared.heads_failed, &mut owners, opened.records, g);
-                            // A first freeze's reason, kept for the bodies that ask again.
-                            if !matches!(error, FreezeError::Again { .. }) && !first_reasons.iter().any(|(one, _)| *one == want) && first_reasons.len() < MOST_STRETCH_REASONS {
-                                first_reasons.push((want, crate::engine_head_notes::leak(g, format_args!("{}", crate::engine_head_notes::Reason(&error)))));
+                            // a member's head failed there, else its first freeze's this request,
+                            // by any stretch or worker (engine_seeds.rs `RequestTable::first_failure`,
+                            // told at the failure itself: front2 tables/seeds.rs `RequestSeed::seed`).
+                            if matches!(error, FreezeError::Const { .. }) {
+                                tally.refused_const = tally.refused_const.saturating_add(1);
                             }
-                            match (own, &error) {
-                                (Some((head, why)), _) => {
-                                    if matches!(error, FreezeError::Const { .. }) {
-                                        tally.refused_const = tally.refused_const.saturating_add(1);
-                                    }
+                            match (own_reason(want, shared.seeds, shared.heads_failed, &mut owners, opened.records, g), &error) {
+                                (Own::Task { head, why }, _) => {
                                     Some(bstd::mem::format_in!(g, "not checked because the head of `{head}` it reads could not be frozen: {why} (its head's own reason; engine_bodies.rs `own_reason`)"))
                                 }
-                                (None, FreezeError::Again { .. }) => Some(bstd::mem::format_in!(
+                                (Own::Request(first), _) => {
+                                    // Grouped in the closing lines with the head tasks' (its block's
+                                    // `Class::Head` note, engine_head_notes.rs `print_grouped`).
+                                    head_failed = Some(first);
+                                    Some(bstd::mem::format_in!(g, "not checked because the head of `{}` it reads could not be frozen: {} (its head's own reason; engine_bodies.rs `own_reason`)", first.head, first.why))
+                                }
+                                (Own::PastCap { kept }, _) => Some(bstd::mem::format_in!(
                                     g,
-                                    "not checked because a head it reads could not be made: the head of `{shown}` failed when first frozen, and its reason was not kept (this stretch keeps at most {MOST_STRETCH_REASONS}, and a head task's are kept by engine_head_notes.rs; engine_bodies.rs `own_reason`)"
+                                    "not checked because a head it reads could not be made: the head of `{shown}` failed when first frozen, and its reason was not kept: the request keeps the reasons of {kept} failed heads, its cap (engine_seeds.rs `MOST_FIRST_FAILED`)"
                                 )),
-                                (None, FreezeError::Const { c, error: reason, .. }) => {
-                                    tally.refused_const = tally.refused_const.saturating_add(1);
+                                // The request was told no failure of the head the freezer says
+                                // failed: the engine's own fault, said as such (rule 3).
+                                (Own::None, FreezeError::Again { .. }) => Some(bstd::mem::format_in!(
+                                    g,
+                                    "not checked because a head it reads could not be made: the head of `{shown}` failed when first frozen, and the request was never told why (an engine fault: front2 tables/seeds.rs `RequestSeed::seed` hands each failure to engine_seeds.rs `RequestHeads::refused`)"
+                                )),
+                                (Own::None, FreezeError::Const { c, error: reason, .. }) => {
                                     let constant = ItemShown::of_lib(opened.records, *c);
                                     Some(bstd::mem::format_in!(g, "not checked: refused at a seed for a constant: the head of `{shown}` needs the value of constant `{constant}`: {reason} (engine_seeds.rs; front2 tables/head.rs `FreezeError::Const`)"))
                                 }
-                                (None, _) => Some(bstd::mem::format_in!(g, "not checked because a head it reads could not be made: the head of `{shown}`: {error} (its head's own refusal says why; engine_bodies.rs `unmade_head`)")),
+                                (Own::None, _) => Some(bstd::mem::format_in!(g, "not checked because a head it reads could not be made: the head of `{shown}`: {error} (its head's own refusal says why; engine_bodies.rs `unmade_head`)")),
                             }
                         }
                         Unmade::Unnamed => Some(bstd::mem::format_in!(g, "not checked because a head it reads could not be made: {error} (engine_bodies.rs `unmade_head`)")),
@@ -1603,7 +1616,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
                 false => crate::engine_tasks::failed_with(&one.task, reads, alloc),
                 true => crate::engine_tasks::failed(&one.task, alloc),
             });
-            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said, head_failed, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
             continue;
         }
         // What the seed's constant evaluator read until now (module docs of
@@ -1624,7 +1637,7 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
             // A panic or a `TaskError` (check_body returns no reads with it): owed, never filed
             // on a partial read list (work.rs: panics and machine faults stay holes).
             out.done.push(crate::engine_tasks::failed(&one.task, alloc));
-            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said: Some(said), chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
+            ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: 1, said: Some(said), head_failed: None, chain: one.place.chain, found: Vec::new_in(Global), items: 0 });
             continue;
         }
         // Rule 25: the lines record's bytes a function of the findings alone.
@@ -1668,29 +1681,10 @@ fn run_stretch<'a, 'f>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_>, run: &[One<'f>]
         // as a finding): in the request's heap, as the labels are.
         let said = (done.failed || !why.is_empty()).then(|| Said::Unchecked(core::str::from_utf8(bstd::mem::format_in!(g, "{why}").into_bytes().leak()).unwrap_or("")));
         let items = u32::try_from(one.items.len()).unwrap_or(u32::MAX);
-        ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: done.findings, said, chain: one.place.chain, found, items });
+        ran.push(Ran { name, label: one.label, file: one.file, ns, bytes, stretch, findings: done.findings, said, head_failed: None, chain: one.place.chain, found, items });
         out.done.push(done);
     }
     taken
-}
-
-/// The outlines (by index, sorted) a crate's module tree reaches from its root file `root`: the
-/// root and every file a reached outline names as a file part, transitively, as the planner
-/// walked them (engine_check.rs `plan`). A file two crates reach is in both crates' walks.
-fn reached(outlined: &[Outlined<'_>], root: Name) -> Vec<u32, Global> {
-    let mut seen: Vec<u32, Global> = Vec::new_in(Global);
-    let mut next: Vec<Name, Global> = Vec::new_in(Global);
-    next.push(root);
-    while let Some(name) = next.pop() {
-        let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name)) else { continue };
-        let at32 = u32::try_from(at).unwrap_or(u32::MAX);
-        let Err(slot) = seen.binary_search(&at32) else { continue };
-        seen.insert(slot, at32);
-        if let Ok(record) = &outlined[at].made {
-            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. })).map(|part| part.name));
-        }
-    }
-    seen
 }
 
 /// A verdict's line as `check` files it (body_types.rs, where a body's findings are filed; the
@@ -1739,31 +1733,43 @@ fn env_in<'l: 'n, 'n>(lent: Option<EnvLent<'_, 'l>>, frame: &'n Frame) -> Result
     Ok(Some(&*blaze_own::Box::leak(blaze_own::Box::new_in(env, frame))))
 }
 
-/// [`widen`] by the command's strategy (engine_scope_reads.rs, rule 78): the one dispatch from
-/// the runtime choice to a [`crate::engine_scope_reads::ScopeReads`] instantiation.
-#[expect(clippy::too_many_arguments, reason = "the strategy, a body's reads and every table that names them")]
-/// The most first-freeze reasons one stretch keeps ([`own_reason`], rule 18).
-const MOST_STRETCH_REASONS: usize = 1 << 12;
+/// Where a body refused at a seed finds the own reason of the head it could not take
+/// ([`own_reason`]).
+enum Own {
+    /// Its head task's: a member's head the Heads stage could not freeze (engine_head_notes.rs
+    /// `Failed`), grouped in the closing lines from that task's block.
+    Task { head: &'static str, why: &'static str },
+    /// The request's: its first freeze, by any stretch or worker, failed for it
+    /// (engine_seeds.rs `RequestTable::first_failure`).
+    Request(crate::engine_seeds::FirstFailure),
+    /// Not kept: the request's table was past its cap, `kept` reasons kept.
+    PastCap { kept: usize },
+    /// Neither was told a failure of it.
+    None,
+}
 
 /// Head `want`'s own reason, the head named as its notes name it, for a body refused at a seed
-/// for it: its head task's (a member's head the Heads stage could not freeze, engine_head_notes.rs
-/// `Failed`), placed as `widen` places a head read; else the reason its first freeze in this
-/// stretch failed for (`first`). `None`: neither holds it.
+/// for it: its head task's, placed as `widen` places a head read; else the request's first
+/// freeze's (`seeds`, the one home of a seed failure's reason: every stretch and worker tells
+/// it at the failure, front2 tables/seeds.rs `RequestSeed::seed`).
 fn own_reason<'n>(
     want: Want,
-    first: &[(Want, &'static str)],
+    seeds: Option<&crate::engine_seeds::RequestTable>,
     heads_failed: &crate::engine_head_notes::Failed,
     owners: &mut crate::engine_heads::Owners<'_>,
     records: &'n blaze_ladder::front2::source::Records<'n>,
     g: blaze_own::Alloc<'static>,
-) -> Option<(&'static str, &'static str)> {
+) -> Own {
     if let Some(crate::engine_heads::HeadAt::Cell { cell, .. }) = owners.place(records, &head_cell_id(want), g)
         && let Some(one) = heads_failed.find(cell.of, cell.cell)
     {
-        return Some((one.head, one.why));
+        return Own::Task { head: one.head, why: one.why };
     }
-    let why = first.iter().find(|(one, _)| *one == want)?.1;
-    Some((crate::engine_head_consts::head_label(records, want, g), why))
+    match seeds.map(|table| table.first_failure(want)) {
+        Some(crate::engine_seeds::FirstFailed::Kept(first)) => Own::Request(first),
+        Some(crate::engine_seeds::FirstFailed::PastCap { kept }) => Own::PastCap { kept },
+        Some(crate::engine_seeds::FirstFailed::None) | None => Own::None,
+    }
 }
 
 /// What a stretch's seed evaluator read until now ([`crate::engine_head_consts::EvalSink`]),
@@ -1804,6 +1810,9 @@ fn add_eval_reads<'a, 'n>(
     })
 }
 
+/// [`widen`] by the command's strategy (engine_scope_reads.rs, rule 78): the one dispatch from
+/// the runtime choice to a [`crate::engine_scope_reads::ScopeReads`] instantiation.
+#[expect(clippy::too_many_arguments, reason = "the strategy, a body's reads and every table that names them")]
 fn widen_as<'a, 'n>(
     reads_as: crate::engine_scope_reads::ScopeReadsAs,
     reads: &[(CellId, ContentId)],

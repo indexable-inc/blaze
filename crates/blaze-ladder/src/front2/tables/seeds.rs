@@ -25,7 +25,7 @@ use blaze_own::{AVec, Alloc};
 use super::super::heads::{Seeded, Store, Want};
 use super::super::keys::Keys;
 use super::super::source::NamesSource;
-use super::head::{FreezeError, FrozenHead, HeadSource, KnownHeads, SeededHeads, cell_of, seed, want_bytes};
+use super::head::{FreezeError, FrozenHead, HeadSource, Known, KnownHeads, NotTheirs, SeededHeads, cell_of, seed, want_bytes};
 
 /// What a body's store asks for each head it needs (heads.rs `Store::seeds`).
 pub trait HeadSeed<'n> {
@@ -52,6 +52,26 @@ pub enum SeedError {
     /// bytes name that unit's keys, so none is taken. `said`: the head by path, the units that
     /// froze it and the reader's (rule 19).
     NotInItsUnit { cell: Want, said: &'static str },
+    /// Member cell `cell`'s head has no cell of its head task this request for the reader's
+    /// unit (the task failed, was not planned, holds no such cell, or no task covers it:
+    /// `said` names which): a body never freezes a member's head, so it is refused (rule 3).
+    NoMemberCell { cell: Want, said: &'static str },
+}
+
+impl SeedError {
+    /// A freeze's error as the seed's: a cell refused as not the asker's to freeze keeps its
+    /// typed reason ([`NotTheirs`]): the engine's own lack as [`SeedError::NotInItsUnit`] or
+    /// [`SeedError::NoMemberCell`] (the body's failure), a head its task could not freeze as the
+    /// freeze's error (the project's head: the body not checked, as when it froze the head
+    /// itself and failed). Every other is the freeze's.
+    pub fn of_freeze(error: FreezeError) -> SeedError {
+        match error {
+            FreezeError::NotTheirs { want, why: NotTheirs::OtherUnits { said } } => SeedError::NotInItsUnit { cell: want, said },
+            FreezeError::NotTheirs { want, why: NotTheirs::NoCell { said } } => SeedError::NoMemberCell { cell: want, said },
+            // `NotTheirs::Failed` among them: the project's head, said by its task's reason.
+            error => SeedError::Freeze(error),
+        }
+    }
 }
 
 impl core::fmt::Display for SeedError {
@@ -61,7 +81,7 @@ impl core::fmt::Display for SeedError {
             SeedError::NotFrozen { need, cell } => write!(f, "{need:?} needs cell {cell:?}, which the request's frozen heads do not hold (front2 tables/seeds.rs)"),
             SeedError::Unequal { cell } => write!(f, "cell {cell:?} was frozen twice in one request to other bytes: its freeze is not a function of its cell (front2 tables/seeds.rs `RequestHeads::publish`)"),
             SeedError::Full { cell, most } => write!(f, "cell {cell:?}: the request's heads frozen now already hold {most} cells (front2 tables/seeds.rs `RequestHeads::publish`)"),
-            SeedError::NotInItsUnit { said, .. } => write!(f, "{said}"),
+            SeedError::NotInItsUnit { said, .. } | SeedError::NoMemberCell { said, .. } => write!(f, "{said}"),
         }
     }
 }
@@ -236,6 +256,13 @@ pub trait RequestHeads: KnownHeads {
     /// `crate_key`), `None` when they hold it in none: what decides whether the head is a
     /// dependency's, kept beyond the request, by the names' own answer, not by a key's bytes.
     fn publish(&self, cell: Want, krate: Option<blaze_id::CrateItemKey>, bytes: &[u8]) -> Result<(), SeedError>;
+
+    /// Cell `cell`'s first freeze failed with `error`, on one worker: handed to the request so
+    /// every later ask of it (here [`FreezeError::Again`], which carries no reason; another
+    /// stretch's) quotes its own reason, whichever caller met the failure first. Handed by
+    /// [`RequestSeed::seed`] at the failure itself, so a caller that leaves the failure to a
+    /// later fill (front2 check.rs `make`, world_items.rs `store_want`) loses no reason.
+    fn refused(&self, cell: Want, error: &FreezeError);
 }
 
 /// One stretch's seed on the engine (module docs): `names` is the stretch's records, `heads`
@@ -274,20 +301,36 @@ impl<'k, 'n, 'a, N: NamesSource<'n>, H: RequestHeads> RequestSeed<'k, 'n, 'a, N,
 impl<'n, N: NamesSource<'n>, H: RequestHeads> HeadSeed<'n> for RequestSeed<'_, 'n, '_, N, H> {
     fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
         let cell = cell_of(self.names, need).map_err(SeedError::Freeze)?;
-        if let Some(bytes) = self.heads.known(cell) {
-            self.known.set(self.known.get().saturating_add(1));
-            return seed(self.names, None, need, &mut OneCell { cell, bytes }, store, keys, scratch).map_err(SeedError::Freeze);
+        match self.heads.known(cell) {
+            Known::Bytes(bytes) => {
+                self.known.set(self.known.get().saturating_add(1));
+                return seed(self.names, None, need, &mut OneCell { cell, bytes }, store, keys, scratch).map_err(SeedError::Freeze);
+            }
+            // Not this stretch's to freeze (a member crate's head its task did not freeze for
+            // this unit): refused, typed, before any freeze (rule 3).
+            Known::Refused(why) => return Err(SeedError::of_freeze(FreezeError::NotTheirs { want: cell, why })),
+            Known::Freeze => {}
         }
-        // Not known: frozen here (its needs taken from the request where known), then each
-        // cell this ask froze published, needs first, before the body reads on.
+        // Not known and the stretch's to freeze: frozen here (its needs taken from the request
+        // where known, a need not the stretch's refused there), then each cell this ask froze
+        // published, needs first, before the body reads on.
         let mut freezer = self.freezer.borrow_mut();
         let from = freezer.kept_len();
+        let failed_from = freezer.failed_len();
         let seeded = seed(self.names, None, need, &mut *freezer, store, keys, scratch);
         for (w, bytes) in freezer.frozen_from(from) {
             let krate = NamesSource::crate_of(self.names, w.key()).and_then(|k| NamesSource::crate_key(self.names, k));
             self.heads.publish(w, krate, bytes)?;
         }
+        // A freeze that failed on this ask: its reason handed to the request with the cell it
+        // is about, before any caller can drop it (`RequestHeads::refused`).
+        if let Err(error) = &seeded
+            && !matches!(error, FreezeError::Again { .. })
+            && let Some(failed) = freezer.failed_since(failed_from)
+        {
+            self.heads.refused(failed, error);
+        }
         self.froze.set(self.froze.get().saturating_add(1));
-        seeded.map_err(SeedError::Freeze)
+        seeded.map_err(SeedError::of_freeze)
     }
 }

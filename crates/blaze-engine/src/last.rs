@@ -22,7 +22,8 @@
 //!
 //! What the seam does not carry, by design:
 //! - The causes (why each row was last entered): the profile's, not the answer's.
-//! - The record key of each row (pages.rs `records`): the rows form has no column for it yet.
+//! - The record key of each row on the read side (pages.rs `records`): it is written
+//!   ([`NextRow::record`], the rows form's cold column) and read by the command, not the engine.
 //!
 //! A row the seam returns for an owed task carries [`Flags::OWED`] and the plan's phase, file
 //! and source; one owed with no row made carries [`Flags::UNMADE`] too, and is no row to the
@@ -60,6 +61,44 @@ pub struct LastRow {
     pub findings: u32,
     pub reads: u32,
     pub defines: u32,
+}
+
+/// A row's read of one cell, as [`LastAnswer::read_of`] found it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Found {
+    /// The row did not read the cell, or there is no row.
+    NotRead,
+    /// It read the cell and saw this digest (a form that keeps seen digests).
+    Saw(ContentId),
+    /// It read the cell, and its row stands from this serial: a form that keeps no seen digest,
+    /// whose row saw what the cell holds unless the cell moved after it (the generation rule).
+    ReadAt(Serial),
+}
+
+/// What [`LastAnswer::read_of`] found and what finding it cost.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReadOf {
+    pub found: Found,
+    /// Entries compared to find it: a binary search's probes (summed over the runs searched,
+    /// in the rows form).
+    pub compared: u32,
+}
+
+/// The binary search every form's [`LastAnswer::read_of`] and the engine's `Row::read_of` use:
+/// over `n` entries in order, `probe(i)` comparing entry `i` with the needle. The place found,
+/// and the entries compared (at most `floor(log2 n) + 1`).
+pub fn search(n: usize, mut probe: impl FnMut(usize) -> core::cmp::Ordering) -> (Option<usize>, u32) {
+    let (mut lo, mut hi, mut compared) = (0usize, n, 0u32);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        compared += 1;
+        match probe(mid) {
+            core::cmp::Ordering::Less => lo = mid + 1,
+            core::cmp::Ordering::Greater => hi = mid,
+            core::cmp::Ordering::Equal => return (Some(mid), compared),
+        }
+    }
+    (None, compared)
 }
 
 /// What the seam's questions cost, summed since the answer was opened (the profile's counts).
@@ -104,10 +143,10 @@ impl fmt::Display for LastError {
     }
 }
 
-/// What a request asks of the last answer. Nothing here reads the answer whole; the methods
-/// that walk rows today ([`LastAnswer::file_tasks`], [`LastAnswer::owed`],
-/// [`LastAnswer::owed_cells`], [`LastAnswer::with_findings`]) are counted in [`Touched::rows`]
-/// as they walk, so a profile shows them.
+/// What a request asks of the last answer. Nothing here reads the answer whole: the questions
+/// over a set ([`LastAnswer::file_tasks`], [`LastAnswer::owed`], [`LastAnswer::owed_cells`],
+/// [`LastAnswer::with_findings`]) are each read from the set's own column in the rows form
+/// (blaze-answer kinds 5 to 8), and a row each reads is counted in [`Touched::rows`].
 pub trait LastAnswer {
     /// A task inside this answer.
     type Task: Copy + Eq + Ord + fmt::Debug;
@@ -153,9 +192,21 @@ pub trait LastAnswer {
     /// Whether `task`'s row stands: no cell it read moved after the row (`Answer::today`).
     /// `None`: no row. An owed row's answer is not consulted: an owed task is entered anyway.
     fn stands(&self, task: Self::Task) -> Option<bool>;
-    /// Whether `task`'s row read `cell` and saw what it holds today (`Engine::finish`'s
-    /// settling of an owed cell).
-    fn saw(&self, task: Self::Task, cell: Self::Cell) -> bool;
+    /// `task`'s read of `cell`, found by a search and never by a walk of the read list (plan row
+    /// B1: a walk per reader per owed cell ran `finish` past 14 minutes on tempo): what the row
+    /// saw of it, or the serial its row stands from when the form keeps no seen digest. The
+    /// cost is [`ReadOf::compared`]: O(log reads) a row (a sorted order of the reads, or the
+    /// rows form's reverse index, sorted by task in each of its runs).
+    fn read_of(&self, task: Self::Task, cell: Self::Cell) -> Result<ReadOf, LastError>;
+    /// Whether `task`'s row read `cell` and saw what it holds today: [`LastAnswer::read_of`]
+    /// against [`LastAnswer::content`], or by generation against [`LastAnswer::moved`].
+    fn saw(&self, task: Self::Task, cell: Self::Cell) -> Result<bool, LastError> {
+        Ok(match self.read_of(task, cell)?.found {
+            Found::NotRead => false,
+            Found::Saw(seen) => seen == self.content(cell),
+            Found::ReadAt(serial) => self.moved(cell) <= serial,
+        })
+    }
     /// What `cell` holds today ([`CellDigest::ABSENT`]: nothing defines it).
     fn digest(&self, cell: Self::Cell) -> CellDigest;
     /// What `cell` holds today, whole: what a task reading it through the engine's view is
@@ -203,6 +254,8 @@ pub struct NextRow {
     pub source: ContentId,
     pub flags: Flags,
     pub findings: u32,
+    /// The store key of the record the row's entry made (the command's `records`).
+    pub record: Key,
 }
 
 /// What a request writes for the next. A row this request did not put, owe or retire is

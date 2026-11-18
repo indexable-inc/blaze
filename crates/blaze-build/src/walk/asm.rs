@@ -34,6 +34,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_code::record::TrapKind;
 use blaze_lir::builder::{AsmOperand, AsmPiece, MemAttrs, RegKind};
 use blaze_lir::func::{AsmOperandKind, AsmRec, RefKind};
 use blaze_lir::{Block, Flags, Scalar, Ty, Value};
@@ -322,7 +323,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if labels.is_empty() {
             let v = self.b.asm(id, ty, &inputs);
             if noreturn {
-                self.b.unreachable();
+                self.unreachable_of(TrapKind::NoreturnAsm, Some(e));
                 self.dead_block();
             } else {
                 self.asm_stores(v, single, &stores)?;
@@ -341,7 +342,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let v = self.b.asm_br(id, ty, fall, &blocks, &inputs);
         self.begin(fall);
         if noreturn {
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::NoreturnAsm, Some(e));
         } else {
             self.asm_stores(v, single, &stores)?;
             self.jump(join, &[]);

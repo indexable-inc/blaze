@@ -90,6 +90,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
         if findings > 0 {
             kept.answer.with_findings.insert(me);
         }
+        let by_cell = crate::engine::by_cell(me, &reads, a).expect("the fixture's reads are sorted and each once");
         kept.answer.rows.insert(
             me,
             Row {
@@ -101,6 +102,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
                 serial: Gen(serial),
                 defines,
                 reads,
+                by_cell,
                 findings,
                 inline: false,
                 failed: false,

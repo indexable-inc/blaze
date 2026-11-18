@@ -603,13 +603,17 @@ fn decode_page<'a>(bytes: &[u8], page: u32, bits: u8, kept: &mut Kept<'a>, alloc
             defines.push(one);
         }
         let mut reads: SVec<'a, (CellId, ContentId)> = Vec::with_capacity_in(n_reads, alloc);
-        for _ in 0..n_reads {
+        // Strictly by cell (each cell once, engine.rs invariant 9): the order by cell a search
+        // takes (`Row::by_cell`) is then the list's own.
+        let mut by_cell: SVec<'a, u32> = Vec::with_capacity_in(n_reads, alloc);
+        for at_read in (0u32..).take(n_reads) {
             let at = r.at;
             let one = (r.cell_id()?, r.id()?);
-            if reads.last().is_some_and(|prev| prev.0 > one.0) {
+            if reads.last().is_some_and(|prev| prev.0 >= one.0) {
                 return Err(unsorted(ROWS, at));
             }
             reads.push(one);
+            by_cell.push(at_read);
         }
         for (id, _) in reads.iter() {
             answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc)).insert(name);
@@ -618,7 +622,7 @@ fn decode_page<'a>(bytes: &[u8], page: u32, bits: u8, kept: &mut Kept<'a>, alloc
         if findings > 0 || failed {
             answer.with_findings.insert(name);
         }
-        answer.rows.insert(name, Row { key, phase, file, source, out, serial, defines, reads, findings, inline: flags & INLINE != 0, failed });
+        answer.rows.insert(name, Row { key, phase, file, source, out, serial, defines, reads, by_cell, findings, inline: flags & INLINE != 0, failed });
     }
     let mut last: Option<CellId> = None;
     for _ in 0..counts[CELLS] {

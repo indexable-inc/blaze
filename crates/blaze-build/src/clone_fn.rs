@@ -158,11 +158,5 @@ pub(crate) fn build_builtin_clone<A: Allocator + Clone>(
     let body = super::empty_view(clone, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_builtin_clone(clone, copy)?;
-    let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
-    let func = b.finish().map_err(|error| match error {
-        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
-        other => BuildError::Lir(other),
-    })?;
-    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
-    Ok(Built { func, refs, statics, thread_locals, vtables })
+    w.into_built()
 }

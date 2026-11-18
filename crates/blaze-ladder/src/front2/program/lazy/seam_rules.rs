@@ -71,6 +71,16 @@ pub(in crate::front2::program) fn caller_site<'n, S: NamesSource<'n>>(names: S, 
     Some(blaze_build::CallerSite { file, item: owner, offset })
 }
 
+/// The file item `item`'s text is in, as the program observes it (`file!()`, as
+/// [`caller_site`] gives it): what a fault's report names a trap's construct by, with
+/// [`source_position`]'s line and column. `None` for an item written by a macro's expansion.
+pub(in crate::front2::program) fn item_file<'n, S: NamesSource<'n>>(names: S, keys: &Keys, item: ItemKey) -> Option<&'n str> {
+    let lib = keys.library_in(names, item)?;
+    let place = names.place_of(lib)?;
+    let blaze_scope::resolve::At::File(i) = place.at else { return None };
+    names.file_shown(place.krate, i)
+}
+
 /// THE POSITION RULE: the line and column (each from 1; the column in chars) of byte `site` of
 /// item `item`'s text: the item's first byte today (`NamesSource::item_start`) plus `site`, in
 /// today's text of its file (`NamesSource::file_text`), counted there. What a `#[track_caller]`

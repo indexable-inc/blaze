@@ -90,6 +90,9 @@ pub(crate) struct Form<A: Allocator> {
     pub(crate) insts: u32,
     /// The calls' unwind rows (pass/unwind.rs).
     pub(crate) unwind: super::unwind::Rows<A>,
+    /// Per `unreachable` instruction in layout order, its `brk`'s offset: what a build's
+    /// `TrapSource` ordinal names (record.rs makes the trap rows).
+    pub(crate) unreachables: Vec<u32, A>,
 }
 
 impl<A: Allocator + Clone> Form<A> {
@@ -101,7 +104,8 @@ impl<A: Allocator + Clone> Form<A> {
             data_at: Vec::new_in(alloc.clone()),
             inner: Vec::new_in(alloc.clone()),
             insts: 0,
-            unwind: super::unwind::Rows::new_in(alloc),
+            unwind: super::unwind::Rows::new_in(alloc.clone()),
+            unreachables: Vec::new_in(alloc),
         }
     }
 }

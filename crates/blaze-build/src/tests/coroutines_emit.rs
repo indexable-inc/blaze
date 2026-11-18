@@ -492,7 +492,8 @@ fn forward3(to: ItemKey) -> Built<Global> {
     let func = b.finish().unwrap_or_else(|e| panic!("the forwarder is not LIR: {e:?}"));
     let mut refs = StdVec::new_in(Global);
     refs.push(Instance { item: to, args: List::EMPTY });
-    Built { func, refs, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global) }
+    let traps = StdVec::new_in(*refs.allocator());
+    Built { func, refs, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global), traps }
 }
 
 /// `main`, in LIR: a slot of the state's size and alignment; the `async fn` called with it as
@@ -521,7 +522,8 @@ fn main_lir(state: StateShape, refs: [Instance; 4]) -> Built<Global> {
     let func = b.finish().unwrap_or_else(|e| panic!("main is not LIR: {e:?}"));
     let mut all = StdVec::new_in(Global);
     all.extend(refs);
-    Built { func, refs: all, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global) }
+    let traps = StdVec::new_in(*all.allocator());
+    Built { func, refs: all, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global), traps }
 }
 
 /// What one run gave: the executor's value (`u64::MAX`: never ready), its polls, the drops of

@@ -9,7 +9,7 @@ use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc, BTreeMap, BTreeSet, Vec};
 
 use crate::answer::{AnswerView, SegmentRef, encode_root};
 use crate::bytes::{bits, pack, put_u32};
-use crate::segment::{DictBuilder, RowHead, RowView, RowsBuilder, RunSums, RunView, SegmentKind, encode_cells, encode_run};
+use crate::segment::{DictBuilder, RowHead, RowView, RowsBuilder, RunSums, RunView, SegmentKind, encode_cells, encode_owed, encode_run};
 use crate::{AnswerError, CellDigest, CellNo, DIGEST_BYTES, Flags, INPUT, LinesKey, MAX_CELLS, MAX_READS_PER_ROW, MAX_RUNS, MAX_SEGMENTS, MAX_SUMMARY, MAX_TASKS, Plant, Serial, TaskId, TreeDigest};
 
 /// A row's fields as the engine's `Row` gives them, less its reads and defines (passed beside it
@@ -30,6 +30,22 @@ pub struct RowIn {
     pub source: ContentId,
     /// How many findings its record holds.
     pub findings: u32,
+    /// The store key of the record its last entry made (zeros: a plan never made).
+    pub record: Key,
+}
+
+/// Whether a row with `findings` and `flags` is one with findings: it made some or failed
+/// (blaze-engine engine.rs `apply`).
+pub fn has_findings(findings: u32, flags: Flags) -> bool {
+    findings > 0 || flags.0 & Flags::FAILED != 0
+}
+
+/// The file whose plan lists a row of `file` and `flags`: none when made inline.
+fn plan_of(file: TaskId, flags: Flags) -> Option<u32> {
+    match flags.0 & Flags::INLINE {
+        0 => Some(file.0),
+        _ => None,
+    }
 }
 
 /// One write of a commit, in the order [`Effects::writes`] lists it.
@@ -79,6 +95,13 @@ pub struct Commit<'v, 'a, 'm> {
     touched: ABTreeSet<'m, TaskId>,
     moved: ABTreeMap<'m, u32, u64>,
     entries: AVec<'m, (u32, u32, i32)>,
+    /// The plans' and the findings' changes: (file or 0, task, +1 or -1).
+    plans: AVec<'m, (u32, u32, i32)>,
+    findings: AVec<'m, (u32, u32, i32)>,
+    /// Whether each task this request put or retired is owed from now on.
+    owed: ABTreeMap<'m, u32, bool>,
+    /// The owed cells, whole, when this request gave them ([`Commit::owe_cells`]).
+    owed_cells: Option<AVec<'m, (u32, u64)>>,
 }
 
 impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
@@ -96,7 +119,67 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             touched: BTreeSet::new_in(alloc),
             moved: BTreeMap::new_in(alloc),
             entries: Vec::new_in(alloc),
+            plans: Vec::new_in(alloc),
+            findings: Vec::new_in(alloc),
+            owed: BTreeMap::new_in(alloc),
+            owed_cells: None,
         }
+    }
+
+    /// The plans, findings and owed changes of `task` going from `old` to `new` (its file, flags
+    /// and findings; `None`: retired): kinds 5 to 7 derived from the rows, never given apart.
+    fn index(&mut self, task: TaskId, old: Option<RowView<'_>>, new: Option<(TaskId, Flags, u32)>) {
+        let was = old.and_then(|row| plan_of(row.file(), row.flags()));
+        let now = new.and_then(|(file, flags, _)| plan_of(file, flags));
+        if was != now {
+            if let Some(file) = was {
+                if !(self.plant == Plant::PlanKeptOnRetire && new.is_none()) {
+                    self.plans.push((file, task.0, -1));
+                }
+            }
+            if let Some(file) = now {
+                self.plans.push((file, task.0, 1));
+            }
+        }
+        let had = old.is_some_and(|row| has_findings(row.findings(), row.flags()));
+        let has = new.is_some_and(|(_, flags, findings)| has_findings(findings, flags));
+        match (had, has) {
+            (false, true) => self.findings.push((0, task.0, 1)),
+            (true, false) if self.plant != Plant::FindingsKeptOnClear => self.findings.push((0, task.0, -1)),
+            _ => {}
+        }
+        let owed_now = new.is_some_and(|(_, flags, _)| flags.0 & Flags::OWED != 0);
+        let kept = self.plant == Plant::OwedKeptOnRetire && new.is_none() && self.last.is_owed(task);
+        self.owed.insert(task.0, owed_now || kept);
+    }
+
+    /// The owed cells from this request on, whole, each with the request it moved in. Not given:
+    /// the last answer's stand.
+    pub fn owe_cells(&mut self, cells: &[(CellNo, Serial)]) -> Result<(), AnswerError> {
+        let mut sorted: AVec<'m, (u32, u64)> = Vec::with_capacity_in(cells.len(), self.alloc);
+        for (cell, at) in cells.iter() {
+            if cell.0 >= self.cells() {
+                return Err(AnswerError::UnknownCell { cell: *cell });
+            }
+            sorted.push((cell.0, at.0));
+        }
+        sorted.sort_unstable();
+        for j in 1..sorted.len() {
+            if sorted[j - 1].0 == sorted[j].0 {
+                return Err(AnswerError::OwedTwice { cell: CellNo(sorted[j].0) });
+            }
+        }
+        self.owed_cells = Some(sorted);
+        Ok(())
+    }
+
+    /// The owed tasks after this request, ascending: the last's under this request's changes.
+    fn owed_after(&self) -> AVec<'m, u32> {
+        let mut out: AVec<'m, u32> = Vec::new_in(self.alloc);
+        out.extend(self.last.owed().map(|task| task.0).filter(|task| !self.owed.contains_key(task)));
+        out.extend(self.owed.iter().filter(|(_, owed)| **owed).map(|(task, _)| *task));
+        out.sort_unstable();
+        out
     }
 
     pub fn serial(&self) -> Serial {
@@ -180,6 +263,17 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
     /// order. Each define whose digest differs from the cell's today moves the cell, and each cell
     /// the old row defined and this one does not moves to absent.
     pub fn put_row(&mut self, task: TaskId, row: &RowIn, reads: &[CellNo], defines: &[(CellNo, CellDigest)]) -> Result<(), AnswerError> {
+        self.put_row_from(task, row, reads, defines, self.serial)
+    }
+
+    /// [`Commit::put_row`] with the serial the row stands from: this request's, or an earlier one
+    /// (blaze-engine overlay.rs "Generations": a row that saw a digest the request does not end
+    /// with stands from the one before; a carried row's plan changed keeps its own). Past this
+    /// request's serial is [`AnswerError::RowSerial`].
+    pub fn put_row_from(&mut self, task: TaskId, row: &RowIn, reads: &[CellNo], defines: &[(CellNo, CellDigest)], from: Serial) -> Result<(), AnswerError> {
+        if from > self.serial {
+            return Err(AnswerError::RowSerial { task, serial: from });
+        }
         self.give_value(task)?;
         self.known_task(row.file)?;
         if reads.len() > MAX_READS_PER_ROW {
@@ -231,15 +325,17 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             task: task.0,
             key: row.key.0.0,
             out: row.out.0,
-            serial: self.serial.0,
+            serial: from.0,
             file: row.file.0,
             stage: row.stage,
             flags: row.flags.0,
             wave: row.wave,
             source: row.source.0,
             findings: row.findings,
+            record: row.record.0.0,
         };
         self.rows.push(head, meta, &packed, &kept);
+        self.index(task, old, Some((row.file, row.flags, row.findings)));
         Ok(())
     }
 
@@ -255,12 +351,13 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             }
         }
         self.rows.tomb(task);
+        self.index(task, Some(old), None);
         Ok(())
     }
 
     /// A worker's run ([`RunWriter::finish`]): merged into this request's one run.
     pub fn add_run(&mut self, bytes: &[u8]) -> Result<(), AnswerError> {
-        let run = RunView::open(bytes, INPUT)?;
+        let run = RunView::open(bytes, SegmentKind::Run, INPUT)?;
         run.verify(INPUT)?;
         for (cell, task, sign) in run.all() {
             self.known_task(TaskId(task))?;
@@ -270,6 +367,16 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             self.entries.push((cell, task, sign));
         }
         Ok(())
+    }
+
+    /// `cell` moves in this request though no define of it changed: a row this request put saw
+    /// another digest of it than the request ends with (blaze-engine overlay.rs "Generations").
+    /// `true`: no define had moved it already.
+    pub fn move_cell(&mut self, cell: CellNo) -> Result<bool, AnswerError> {
+        if cell.0 >= self.cells() {
+            return Err(AnswerError::UnknownCell { cell });
+        }
+        Ok(self.moved.insert(cell.0, self.serial.0).is_none())
     }
 
     /// The cells this request moved so far, ascending: whose readers the engine runs again.
@@ -287,13 +394,28 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
         let alloc = self.alloc;
         let serial = self.serial;
         let mut segments: AVec<'m, (SegmentKind, AVec<'m, u8>)> = Vec::new_in(alloc);
-        if let Some(run) = encode_run(&mut self.entries, RunSums::Request, self.plant, serial, alloc)? {
-            segments.push((SegmentKind::Run, run));
+        for (kind, entries) in [(SegmentKind::Run, &mut self.entries), (SegmentKind::Plans, &mut self.plans), (SegmentKind::Findings, &mut self.findings)] {
+            if let Some(run) = encode_run(kind, entries, RunSums::Request, self.plant, serial, alloc)? {
+                segments.push((kind, run));
+            }
         }
         if !self.moved.is_empty() {
             let mut moved: AVec<'m, (u32, u64)> = Vec::with_capacity_in(self.moved.len(), alloc);
             moved.extend(self.moved.iter().map(|(cell, at)| (*cell, *at)));
-            segments.push((SegmentKind::Cells, encode_cells(&moved, serial, alloc)));
+            segments.push((SegmentKind::Cells, encode_cells(SegmentKind::Cells, &moved, serial, alloc)));
+        }
+        // The whole sets: written when they changed, the last's then dropped from the root; an
+        // emptied set is an empty segment, so it shadows the last's.
+        let owed = self.owed_after();
+        if !owed.iter().copied().eq(self.last.owed().map(|task| task.0)) {
+            segments.push((SegmentKind::Owed, encode_owed(&owed, serial, alloc)));
+        }
+        if let Some(cells) = self.owed_cells.as_ref() {
+            let changed = !cells.iter().copied().eq(self.last.owed_cells().map(|(cell, at)| (cell.0, at.0)));
+            let dropped = self.plant == Plant::OwedCellsEmptyDropped && cells.is_empty();
+            if changed && !dropped {
+                segments.push((SegmentKind::OwedCells, encode_cells(SegmentKind::OwedCells, cells, serial, alloc)));
+            }
         }
         if !self.rows.is_empty() {
             segments.push((SegmentKind::Rows, self.rows.encode(serial, alloc)?));
@@ -301,21 +423,21 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
         if self.dict.tasks() > 0 || self.dict.cells() > 0 {
             segments.push((SegmentKind::Dict, self.dict.encode(serial, alloc)));
         }
-        let runs = self.last.segments().iter().filter(|one| one.kind == SegmentKind::Run).count() + segments.iter().filter(|(kind, _)| *kind == SegmentKind::Run).count();
-        if runs > MAX_RUNS {
-            return Err(AnswerError::CompactionOwed { what: "runs", count: runs, cap: MAX_RUNS });
-        }
-        let count = self.last.segments().len() + segments.len();
-        if count > MAX_SEGMENTS {
-            return Err(AnswerError::CompactionOwed { what: "segments", count, cap: MAX_SEGMENTS });
-        }
-        let mut refs: AVec<'m, SegmentRef> = Vec::with_capacity_in(count, alloc);
+        let replaced = |kind: SegmentKind| kind.is_whole() && segments.iter().any(|(new, _)| *new == kind);
+        let mut refs: AVec<'m, SegmentRef> = Vec::with_capacity_in(self.last.segments().len() + segments.len(), alloc);
         for (kind, bytes) in segments.iter() {
             refs.push(SegmentRef::of(*kind, bytes));
         }
-        refs.extend_from_slice(self.last.segments());
+        refs.extend(self.last.segments().iter().filter(|one| !replaced(one.kind)).copied());
+        let runs = refs.iter().filter(|one| one.kind.is_run()).count();
+        if runs > MAX_RUNS {
+            return Err(AnswerError::CompactionOwed { what: "runs", count: runs, cap: MAX_RUNS });
+        }
+        if refs.len() > MAX_SEGMENTS {
+            return Err(AnswerError::CompactionOwed { what: "segments", count: refs.len(), cap: MAX_SEGMENTS });
+        }
         let root = encode_root(serial, tree, lines, summary, &refs, alloc);
-        Ok(effects(serial, refs.len() - self.last.segments().len(), &refs, segments, root, self.plant, alloc))
+        Ok(effects(serial, segments.len(), &refs, segments, root, self.plant, alloc))
     }
 }
 
@@ -400,7 +522,7 @@ impl<'m> RunWriter<'m> {
 
     /// The worker's run; `None` when it changed no reader.
     pub fn finish(mut self) -> Result<Option<AVec<'m, u8>>, AnswerError> {
-        encode_run(&mut self.entries, RunSums::Request, Plant::None, self.serial, self.alloc)
+        encode_run(SegmentKind::Run, &mut self.entries, RunSums::Request, Plant::None, self.serial, self.alloc)
     }
 }
 
@@ -430,6 +552,7 @@ pub fn compact<'m>(last: &AnswerView<'_>, plant: Plant, alloc: Alloc<'m>) -> Res
             wave: row.wave(),
             source: row.source().0,
             findings: row.findings(),
+            record: if plant == Plant::RecordDropped { [0; 32] } else { row.record().0.0 },
         };
         let (meta, packed) = row.packed();
         rows.push(head, meta, packed, &kept);
@@ -444,16 +567,27 @@ pub fn compact<'m>(last: &AnswerView<'_>, plant: Plant, alloc: Alloc<'m>) -> Res
             moved.push((c, at.0));
         }
     }
-    let mut entries: AVec<'m, (u32, u32, i32)> = Vec::new_in(alloc);
-    for run in last.runs() {
-        entries.extend(run.all());
-    }
     let mut segments: AVec<'m, (SegmentKind, AVec<'m, u8>)> = Vec::new_in(alloc);
-    if let Some(run) = encode_run(&mut entries, RunSums::Whole, plant, serial, alloc)? {
-        segments.push((SegmentKind::Run, run));
+    let mut entries: AVec<'m, (u32, u32, i32)> = Vec::new_in(alloc);
+    for kind in [SegmentKind::Run, SegmentKind::Plans, SegmentKind::Findings] {
+        entries.clear();
+        for run in last.runs(kind) {
+            entries.extend(run.all());
+        }
+        if let Some(run) = encode_run(kind, &mut entries, RunSums::Whole, plant, serial, alloc)? {
+            segments.push((kind, run));
+        }
     }
     if !moved.is_empty() {
-        segments.push((SegmentKind::Cells, encode_cells(&moved, serial, alloc)));
+        segments.push((SegmentKind::Cells, encode_cells(SegmentKind::Cells, &moved, serial, alloc)));
+    }
+    let owed: AVec<'m, u32> = Vec::from_iter_in(last.owed().map(|task| task.0), alloc);
+    if !owed.is_empty() {
+        segments.push((SegmentKind::Owed, encode_owed(&owed, serial, alloc)));
+    }
+    let owed_cells: AVec<'m, (u32, u64)> = Vec::from_iter_in(last.owed_cells().map(|(cell, at)| (cell.0, at.0)), alloc);
+    if !owed_cells.is_empty() {
+        segments.push((SegmentKind::OwedCells, encode_cells(SegmentKind::OwedCells, &owed_cells, serial, alloc)));
     }
     if !rows.is_empty() {
         segments.push((SegmentKind::Rows, rows.encode(serial, alloc)?));

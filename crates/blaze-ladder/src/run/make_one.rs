@@ -543,7 +543,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     for (symbol, datum) in vtable_data.iter() {
         carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
     }
-    let made = make_entry_with_vtables(&built.func, &names, &mut carried, routines, &mut declared, &crate::code_records::reads::ReadList::empty(), work.isa, work.alloc)
+    let made = make_entry_with_vtables(&built.func, &names, &mut carried, routines, &mut declared, &crate::code_records::reads::ReadList::empty(), &built.traps, work.isa, work.alloc)
         .map_err(|error| RunError::CodeRecord { function: name(), error })?;
     entry.extend_from_slice(&made);
     // The coroutine's part leaves the stash with its entry made, not before.
@@ -881,6 +881,13 @@ pub type RecordsProgram<'n> = crate::front2::program::lazy::LazyProgram<'n, &'n 
 /// What the records could not answer is in their log (front2 source.rs): after each make the
 /// log is read, and a make over a log that is not empty is refused
 /// ([`LazyRefusal::RecordsVoid`]), as is every make after it (the session is void).
+/// An instance for a person ([`Maker::instance_shown`]): its item by the one printer, and its
+/// ground arguments as Rust spells them (`None`: it has none).
+pub struct InstanceShown {
+    pub item: crate::front2::item_shown::ItemShown,
+    pub args: Option<Box<str>>,
+}
+
 pub struct Maker<'n> {
     names: NamesRecords<'n>,
     entry: Option<ItemKey>,
@@ -930,6 +937,38 @@ impl<'n> Maker<'n> {
     /// The lazy program, once a miss made it.
     pub fn program(&self) -> Option<&RecordsProgram<'n>> {
         self.made.as_ref().map(|(p, _)| p)
+    }
+
+    /// Instance `name` (symbols.rs `encode_instance` bytes) of fn `tabled`, for a person
+    /// (rule 19: a crash names the fn and, since generics matter for a miscompile, its ground
+    /// arguments): the item its name holds by the one printer (front2 item_shown.rs
+    /// `ItemShown`: a path, or where a path-less item is written) and its arguments as Rust
+    /// spells them (callee_shown.rs `args_shown`: a closure as `<closure N of owner>`). `None`
+    /// before a make built the program (a run whose every record was found): the caller then
+    /// names the item from the records alone. Read only on a crash's path.
+    pub fn instance_shown(&self, tabled: ItemKey, name: &[u8]) -> Option<InstanceShown> {
+        let program = self.program()?;
+        let mut ground = PortableTys::new_in(self.alloc);
+        let (item, args) = match decode_instance(name, &mut ground, self.alloc) {
+            Ok((item, args)) => {
+                let view = ground.view();
+                let args = match view.list(args) {
+                    Ok([]) => None,
+                    _ => Some(crate::callee_shown::args_shown(view, args, &|k| program.item_named(k))),
+                };
+                (item, args)
+            }
+            Err(_) => (tabled, None),
+        };
+        Some(InstanceShown { item: program.item_shown(item), args })
+    }
+
+    /// Byte `site` of item `item`'s text (a code record's trap row, item-relative) for a
+    /// person: its file, line and column today (lazy fill.rs `site_shown`). `None` before a
+    /// make built the program, or when the item's text is in no file. Read only on a crash's
+    /// path.
+    pub fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'n str, u32, u32)> {
+        self.program()?.site_shown(item, site)
     }
 
     /// The refusal of a make over records whose log is not empty, naming its first error.

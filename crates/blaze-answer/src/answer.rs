@@ -6,10 +6,14 @@
 use blaze_drive::cells::Cell;
 use blaze_drive::key::Name;
 use blaze_id::ContentId;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
+
+/// A view's own table: on [`SharedAlloc`], so an [`AnswerView`] is `Sync` and a phase's workers
+/// read it at once.
+type Table<'a, T> = Vec<T, SharedAlloc<'a>>;
 
 use crate::bytes::{arr, put_u32, put_u64, u32_at, u64_at};
-use crate::segment::{CellsView, DictView, RowView, RowsBytes, RowsView, RunView, SegmentKind};
+use crate::segment::{CellsView, DictView, OwedView, RowView, RowsBytes, RowsView, RunView, SegmentKind};
 use crate::{AnswerError, COMPACT_AT, CellDigest, CellNo, FORMAT, LinesKey, MAX_RUNS, MAX_SEGMENTS, Plant, ROOT, ROOT_MAGIC, Serial, TaskId, TreeDigest};
 
 /// The domain of a segment's id: the content digest of its bytes.
@@ -140,13 +144,19 @@ pub struct AnswerView<'a> {
     tree: TreeDigest,
     lines: LinesKey,
     summary: &'a [u8],
-    segments: AVec<'a, SegmentRef>,
+    segments: Table<'a, SegmentRef>,
     /// Oldest first: id order. Each with its index in the root's list.
-    dicts: AVec<'a, (u32, DictView<'a>)>,
+    dicts: Table<'a, (u32, DictView<'a>)>,
     /// Newest first, as the root lists them.
-    rows: AVec<'a, (u32, RowsView<'a>)>,
-    cells: AVec<'a, (u32, CellsView<'a>)>,
-    runs: AVec<'a, (u32, RunView<'a>)>,
+    rows: Table<'a, (u32, RowsView<'a>)>,
+    cells: Table<'a, (u32, CellsView<'a>)>,
+    runs: Table<'a, (u32, RunView<'a>)>,
+    /// The file plans' runs and the findings' runs, newest first.
+    plans: Table<'a, (u32, RunView<'a>)>,
+    findings: Table<'a, (u32, RunView<'a>)>,
+    /// The one owed tasks segment and the one owed cells segment, when the root lists one.
+    owed: Option<(u32, OwedView<'a>)>,
+    owed_cells: Option<(u32, CellsView<'a>)>,
     tasks: u32,
     cell_count: u32,
     plant: Plant,
@@ -154,7 +164,7 @@ pub struct AnswerView<'a> {
 
 impl<'a> AnswerView<'a> {
     /// The answer before any request: serial 0, no task, no cell, no segment.
-    pub fn empty(plant: Plant, alloc: Alloc<'a>) -> AnswerView<'a> {
+    pub fn empty(plant: Plant, alloc: SharedAlloc<'a>) -> AnswerView<'a> {
         AnswerView {
             serial: Serial(0),
             tree: TreeDigest::default(),
@@ -165,6 +175,10 @@ impl<'a> AnswerView<'a> {
             rows: Vec::new_in(alloc),
             cells: Vec::new_in(alloc),
             runs: Vec::new_in(alloc),
+            plans: Vec::new_in(alloc),
+            findings: Vec::new_in(alloc),
+            owed: None,
+            owed_cells: None,
             tasks: 0,
             cell_count: 0,
             plant,
@@ -174,7 +188,7 @@ impl<'a> AnswerView<'a> {
     /// The answer `root` names, each segment's bytes from `fetch` (a mapping of the store's
     /// segment of that id). Checks the root, each segment's head and length against the root, and
     /// every bound an accessor indexes by (rule 74: once, here); each refusal names the segment.
-    pub fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &'a [u8], mut fetch: F, plant: Plant, alloc: Alloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
+    pub fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &'a [u8], mut fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
         let parsed = RootView::parse(root)?;
         if parsed.count > MAX_SEGMENTS {
             return Err(AnswerError::Cap { what: "segments a root", cap: MAX_SEGMENTS as u64 });
@@ -194,12 +208,22 @@ impl<'a> AnswerView<'a> {
             match one.kind {
                 SegmentKind::Dict => view.dicts.push((segment, DictView::open(bytes, segment)?)),
                 SegmentKind::Rows => view.rows.push((segment, RowsView::open(bytes, segment)?)),
-                SegmentKind::Cells => view.cells.push((segment, CellsView::open(bytes, segment)?)),
-                SegmentKind::Run => view.runs.push((segment, RunView::open(bytes, segment)?)),
+                SegmentKind::Cells => view.cells.push((segment, CellsView::open(bytes, SegmentKind::Cells, segment)?)),
+                SegmentKind::Run => view.runs.push((segment, RunView::open(bytes, SegmentKind::Run, segment)?)),
+                SegmentKind::Plans => view.plans.push((segment, RunView::open(bytes, SegmentKind::Plans, segment)?)),
+                SegmentKind::Findings => view.findings.push((segment, RunView::open(bytes, SegmentKind::Findings, segment)?)),
+                SegmentKind::Owed => match view.owed {
+                    None => view.owed = Some((segment, OwedView::open(bytes, segment)?)),
+                    Some(_) => return Err(AnswerError::TwoWhole { kind: one.kind, segment }),
+                },
+                SegmentKind::OwedCells => match view.owed_cells {
+                    None => view.owed_cells = Some((segment, CellsView::open(bytes, SegmentKind::OwedCells, segment)?)),
+                    Some(_) => return Err(AnswerError::TwoWhole { kind: one.kind, segment }),
+                },
             }
             view.segments.push(one);
         }
-        if view.runs.len() > MAX_RUNS {
+        if view.run_count() > MAX_RUNS {
             return Err(AnswerError::Cap { what: "runs a root", cap: MAX_RUNS as u64 });
         }
         view.dicts.reverse();
@@ -219,7 +243,7 @@ impl<'a> AnswerView<'a> {
     /// Another checkout's answer for `tree` (a second worktree at the same commit, a branch
     /// switched back, a tree CI checked), its root found in the shared store by the tree's digest:
     /// [`AnswerView::open`], then the tree it answers held to the one asked.
-    pub fn adopt<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(tree: &TreeDigest, root: &'a [u8], fetch: F, plant: Plant, alloc: Alloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
+    pub fn adopt<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(tree: &TreeDigest, root: &'a [u8], fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
         let view = AnswerView::open(root, fetch, plant, alloc)?;
         match view.tree == *tree {
             true => Ok(view),
@@ -261,16 +285,53 @@ impl<'a> AnswerView<'a> {
         self.cell_count
     }
 
+    /// The runs of every run kind (reverse index, plans, findings): what [`MAX_RUNS`] caps.
+    pub(crate) fn run_count(&self) -> usize {
+        self.runs.len() + self.plans.len() + self.findings.len()
+    }
+
     pub fn health(&self) -> Health {
-        let (segments, runs) = (self.segments.len(), self.runs.len());
+        let (segments, runs) = (self.segments.len(), self.run_count());
         match segments >= COMPACT_AT || runs >= MAX_RUNS / 2 {
             true => Health::CompactionDue { segments, runs },
             false => Health::Fine,
         }
     }
 
-    pub(crate) fn runs(&self) -> impl Iterator<Item = &RunView<'a>> {
-        self.runs.iter().map(|(_, run)| run)
+    /// The runs of `kind` ([`SegmentKind::is_run`]), newest first.
+    pub(crate) fn runs(&self, kind: SegmentKind) -> impl Iterator<Item = &RunView<'a>> {
+        let list = match kind {
+            SegmentKind::Plans => &self.plans,
+            SegmentKind::Findings => &self.findings,
+            _ => &self.runs,
+        };
+        list.iter().map(|(_, run)| run)
+    }
+
+    /// The owed tasks, ascending: the newest owed segment's.
+    pub fn owed(&self) -> impl Iterator<Item = TaskId> + '_ {
+        self.owed.iter().flat_map(|(_, owed)| owed.all())
+    }
+
+    /// Whether `task` is owed: one binary search.
+    pub fn is_owed(&self, task: TaskId) -> bool {
+        self.owed.is_some_and(|(_, owed)| owed.contains(task))
+    }
+
+    /// The owed cells, ascending, each with the request it moved in: the newest owed cells
+    /// segment's.
+    pub fn owed_cells(&self) -> impl Iterator<Item = (CellNo, Serial)> + '_ {
+        self.owed_cells.iter().flat_map(|(_, cells)| cells.all())
+    }
+
+    /// The tasks `file`'s plan lists, ascending: every plans run's entries for the file, summed.
+    pub fn file_tasks<'m>(&self, file: TaskId, alloc: Alloc<'m>) -> Result<AVec<'m, TaskId>, AnswerError> {
+        summed(SegmentKind::Plans, &self.plans, file.0, alloc)
+    }
+
+    /// The tasks whose row made findings or failed, ascending: every findings run, summed.
+    pub fn with_findings<'m>(&self, alloc: Alloc<'m>) -> Result<AVec<'m, TaskId>, AnswerError> {
+        summed(SegmentKind::Findings, &self.findings, 0, alloc)
     }
 
     /// The id of the task `name`.
@@ -347,27 +408,26 @@ impl<'a> AnswerView<'a> {
     /// cell, summed per task (at most [`MAX_RUNS`] runs, each a binary search). A sum other than
     /// 0 or 1 is [`AnswerError::ReadersSum`].
     pub fn readers<'m>(&self, cell: CellNo, alloc: Alloc<'m>) -> Result<AVec<'m, TaskId>, AnswerError> {
-        let mut entries: AVec<'m, (TaskId, i32)> = Vec::new_in(alloc);
+        summed(SegmentKind::Run, &self.runs, cell.0, alloc)
+    }
+
+    /// Whether `task`'s row reads `cell`, and the fields compared: the task's signed entries under
+    /// the cell in every run, summed, each run two binary searches in place (at most
+    /// [`MAX_RUNS`] runs). The read list is in read order, so this is how one read is found
+    /// without a walk (blaze-engine `LastAnswer::read_of`). A sum other than 0 or 1 is
+    /// [`AnswerError::ReadersSum`].
+    pub fn reads_cell(&self, cell: CellNo, task: TaskId) -> Result<(bool, u32), AnswerError> {
+        let (mut sum, mut compared) = (0i32, 0u32);
         for (_, run) in self.runs.iter() {
-            entries.extend(run.of(cell));
+            let (sign, probes) = run.sign_of(cell, task);
+            sum += sign;
+            compared = compared.saturating_add(probes);
         }
-        entries.sort_unstable_by_key(|(task, _)| *task);
-        let mut out = Vec::new_in(alloc);
-        let mut i = 0;
-        while i < entries.len() {
-            let task = entries[i].0;
-            let mut sum = 0;
-            while i < entries.len() && entries[i].0 == task {
-                sum += entries[i].1;
-                i += 1;
-            }
-            match sum {
-                0 => {}
-                1 => out.push(task),
-                _ => return Err(AnswerError::ReadersSum { cell, task, sum }),
-            }
+        match sum {
+            0 => Ok((false, compared)),
+            1 => Ok((true, compared)),
+            _ => Err(AnswerError::ReadersSum { kind: SegmentKind::Run, cell, task, sum }),
         }
-        Ok(out)
     }
 
     /// Whether `task`'s row stands: no cell it read moved after the row's serial, walked in read
@@ -407,9 +467,42 @@ impl<'a> AnswerView<'a> {
         for (segment, cells) in self.cells.iter() {
             cells.verify(*segment)?;
         }
-        for (segment, run) in self.runs.iter() {
+        for (segment, run) in self.runs.iter().chain(self.plans.iter()).chain(self.findings.iter()) {
             run.verify(*segment)?;
+        }
+        if let Some((segment, owed)) = self.owed {
+            owed.verify(segment)?;
+        }
+        if let Some((segment, cells)) = self.owed_cells {
+            cells.verify(segment)?;
         }
         Ok(())
     }
+}
+
+/// The tasks under `key` in `runs` (of `kind`), ascending: each run's entries for the key (one
+/// binary search a run), summed per task. A sum other than 0 or 1 is
+/// [`AnswerError::ReadersSum`].
+fn summed<'m>(kind: SegmentKind, runs: &[(u32, RunView<'_>)], key: u32, alloc: Alloc<'m>) -> Result<AVec<'m, TaskId>, AnswerError> {
+    let mut entries: AVec<'m, (TaskId, i32)> = Vec::new_in(alloc);
+    for (_, run) in runs.iter() {
+        entries.extend(run.of(CellNo(key)));
+    }
+    entries.sort_unstable_by_key(|(task, _)| *task);
+    let mut out = Vec::new_in(alloc);
+    let mut i = 0;
+    while i < entries.len() {
+        let task = entries[i].0;
+        let mut sum = 0;
+        while i < entries.len() && entries[i].0 == task {
+            sum += entries[i].1;
+            i += 1;
+        }
+        match sum {
+            0 => {}
+            1 => out.push(task),
+            _ => return Err(AnswerError::ReadersSum { kind, cell: CellNo(key), task, sum }),
+        }
+    }
+    Ok(out)
 }

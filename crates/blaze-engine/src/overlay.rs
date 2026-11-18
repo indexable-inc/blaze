@@ -25,11 +25,56 @@
 //! engine never walks the last answer's rows, and the seam counts the rows it was asked for
 //! ([`Touched`]).
 //!
+//! # Generations (rule 53: the rule, stated once)
+//!
+//! A form that keeps no digest a row saw (the rows form; last_gen_sim.rs's `GenLast`) judges a
+//! row of the last answer by generation, and this is the whole rule:
+//!
+//! **A row stands iff every cell it read has a moved-at no later than the row's serial. A cell's
+//! moved-at becomes the request's serial `s` only when `s` ends with another digest in it than
+//! `s` began with, or when a row `s` put read it and saw another digest than `s` ends with; a
+//! cell re-made to equal bytes keeps its moved-at. A row `s` put gets serial `s` when every read
+//! it holds saw the digest `s` ends with, else `s - 1`.**
+//!
+//! Inside a request no finer serial is needed: a row this request put is judged by the digests
+//! it saw, which [`Work`] keeps until the end, and a row of the last answer was made before
+//! anything of this request, so one of its reads moved iff the cell moved after the row in the
+//! last answer, or this request left another digest in it than the last answer held
+//! ([`Overlay::moved_now`]: a cell this request re-made to equal bytes did not move). At the end
+//! [`Work::generations`] turns the kept digests into the rule's serials: a row put this request
+//! that saw a digest the request then moved on is already stale, and `s - 1` keeps it so (its
+//! stale read's cell moved at `s`, by the second clause). The cost of the rule against digests:
+//! a cell that moved and moved back re-enters a reader that saw the first digest, whose result
+//! then comes out identical (last_gen_sim.rs counts them).
+//!
+//! # Stale counts (plan row B1)
+//!
+//! A cell is owed until every reader's row saw what it holds (engine.rs invariant 5). The
+//! overlay keeps, for each cell the engine visited (`Engine::readers_of`: each owed cell of the
+//! last answer when the request opens, and each cell after it moves), the number of its readers
+//! whose row did not see what it holds ([`Overlay::saw`] `== Some(false)`). The invariant, from
+//! a visit to the request's end: **a counted cell's count is the number of its readers, under
+//! shadowing rule 3, whose row read it and saw another digest than it holds now.** It holds
+//! because:
+//! - the visit sets it so, asking each reader (`count_stale`);
+//! - a cell's digest changes only by [`Overlay::set_cell`], and the engine visits the cell after
+//!   each (`move_cell`), setting the count again;
+//! - a reader's freshness for a cell depends only on the reader's row and that cell's digest
+//!   (by digest: the seen digest against today's; by generation: the cell's moved-at and
+//!   [`Overlay::moved_now`] of that cell alone), and a row changes only by [`Overlay::take_row`]
+//!   (its stale reads of counted cells leave the counts) and [`Overlay::put_row`] (its stale
+//!   reads join them), the reverse index changing with them (`read_by`, `unread_by`).
+//!
+//! So `Engine::finish` settles a cell when its count is 0 and asks no reader again: what it once
+//! asked of every reader of every owed cell, each a walk of the reader's read list, is a lookup
+//! a cell. A count below zero, or an owed cell never counted, is [`EngineError::StaleCount`].
+//! `Plant::StaleKeptOnTake` drops the first bullet of `take_row`; finish_scale_sim.rs catches it.
+//!
 //! # The end
 //!
 //! [`Fold`] says how a form takes a finished request's [`Work`]: the in-memory form applies it
-//! to its maps ([`Work::apply_to`]); the rows form will hand it to `NextAnswer` (lane RD8's
-//! report, NOT DONE: `NextAnswer::put` carries no seen digests and nothing names the owed cells).
+//! to its maps ([`Work::apply_to`]); a form by generation takes [`Work::generations`] with it
+//! (last_gen_sim.rs `GenLast`, blaze-cli's `RowsAnswer` through `NextAnswer`).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -39,8 +84,8 @@ use blaze_drive::key::{ABSENT, Key, Name};
 use blaze_id::ContentId;
 use blaze_own::{Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
 
-use crate::engine::{Answer, Cause, CellId, EngineError, Gen, Phase, Plant, Planned, Row, SMap, SVec};
-use crate::last::{LastAnswer, LastRow, Touched};
+use crate::engine::{Answer, Cause, CellId, EngineError, Gen, Phase, Plant, Planned, Row, SMap, SSet, SVec};
+use crate::last::{Found, LastAnswer, LastRow, Touched};
 
 /// A row's fixed fields as the engine asks for them, from this request's row or the last
 /// answer's: what a worker's view and the engine's walk read without the row's lists.
@@ -110,20 +155,98 @@ pub struct Taken<'a> {
     pub defines: SVec<'a, (Cell, CellDigest)>,
 }
 
-/// What this request wrote (the module's "The working set").
+/// What this request wrote (the module's "The working set"). Its tables are open to a form's
+/// [`Fold`], which reads them once at the end; nothing else writes them but the overlay.
 pub struct Work<'a> {
     alloc: SharedAlloc<'a>,
     serial: Gen,
-    rows: SMap<'a, Name, Option<Row<'a>>>,
-    cells: SMap<'a, CellId, Option<(ContentId, Gen)>>,
-    readers: SMap<'a, CellId, SMap<'a, Name, bool>>,
-    by_file: SMap<'a, Name, Option<SVec<'a, Name>>>,
-    findings: SMap<'a, Name, bool>,
-    owed_tasks: SMap<'a, Name, Planned>,
-    owed_cells: SMap<'a, CellId, Gen>,
+    /// The bug the simulation plants (overlay.rs and [`Work::generations`] read it).
+    plant: Plant,
+    /// The rows this request put (`Some`) or took out (`None`), by name.
+    pub rows: SMap<'a, Name, Option<Row<'a>>>,
+    /// The cells this request moved: their digest and this request's serial, or `None`: absent.
+    pub cells: SMap<'a, CellId, Option<(ContentId, Gen)>>,
+    /// Each cell's readers this request added (`true`) or dropped (`false`).
+    pub readers: SMap<'a, CellId, SMap<'a, Name, bool>>,
+    /// The file plans this request replaced (`Some`, sorted) or took (`None`).
+    pub by_file: SMap<'a, Name, Option<SVec<'a, Name>>>,
+    /// Whether each row this request touched is one with findings or failed, from now on.
+    pub findings: SMap<'a, Name, bool>,
+    /// The owed tasks, whole: the last answer's under this request's changes.
+    pub owed_tasks: SMap<'a, Name, Planned>,
+    /// The owed cells, whole, with the request each moved in.
+    pub owed_cells: SMap<'a, CellId, Gen>,
+}
+
+/// The generation rule at a request's end (the module's "Generations"): the serial each row this
+/// request put stands from, and the cells whose moved-at becomes this request's serial. A form
+/// that keeps no seen digests takes both from here, so the rule has one home (rule 30).
+pub struct Generations<'w, 'a> {
+    work: &'w Work<'a>,
+    /// The cells a row this request put read and saw another digest of than the request ends with.
+    stale: SSet<'a, CellId>,
+}
+
+impl<'a> Generations<'_, 'a> {
+    /// The serial `row`, put this request, stands from: this request's when every read it holds
+    /// saw the digest the request ends with, else the one before (it is stale already).
+    pub fn row(&self, row: &Row<'_>) -> Gen {
+        let serial = self.work.serial;
+        match row.reads.iter().any(|(id, seen)| self.work.ends_other(id, seen)) {
+            true => Gen(serial.0.saturating_sub(1)),
+            false => serial,
+        }
+    }
+
+    /// The cells whose moved-at becomes this request's serial, ascending: each this request
+    /// touched that ends with another digest than `before` gives (the last answer's), or that a
+    /// row put this request saw another digest of. `Plant::GenIdenticalMoves`: every cell touched
+    /// and every cell a row put this request defines, equal bytes or not.
+    pub fn moved(&self, before: impl Fn(&CellId) -> CellDigest) -> SVec<'a, CellId> {
+        let planted = self.work.plant == Plant::GenIdenticalMoves;
+        let mut out: SVec<'a, CellId> = Vec::new_in(self.work.alloc);
+        for (id, now) in self.work.cells.iter() {
+            let end = CellDigest::of(&now.map_or(ABSENT, |(digest, _)| digest));
+            if planted || end != before(id) || self.stale.contains(id) {
+                out.push(*id);
+            }
+        }
+        if planted {
+            for (name, row) in self.work.rows.iter() {
+                if let Some(row) = row {
+                    for (cell, _) in row.defines.iter() {
+                        out.push(CellId { of: *name, cell: *cell });
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+        }
+        out
+    }
 }
 
 impl<'a> Work<'a> {
+    /// The generation rule's serials for this request's writes (the module's "Generations").
+    pub fn generations(&self) -> Generations<'_, 'a> {
+        let mut stale: SSet<'a, CellId> = BTreeSet::new_in(self.alloc);
+        for row in self.rows.values().flatten() {
+            for (id, seen) in row.reads.iter() {
+                if self.ends_other(id, seen) {
+                    stale.insert(*id);
+                }
+            }
+        }
+        Generations { work: self, stale }
+    }
+
+    /// Whether this request moved `id` and ends with another digest in it than `seen`. A cell
+    /// this request did not touch holds what the last answer held, which is what any row of this
+    /// request saw of it.
+    fn ends_other(&self, id: &CellId, seen: &ContentId) -> bool {
+        self.cells.get(id).is_some_and(|now| now.map_or(ABSENT, |(digest, _)| digest) != *seen)
+    }
+
     /// The allocator the working set is over.
     pub fn alloc(&self) -> SharedAlloc<'a> {
         self.alloc
@@ -216,6 +339,19 @@ impl<'a> Fold<'a> for Answer<'a> {
     }
 }
 
+/// The walk `Plant::LinearSaw` restores: what the first read matching `is` holds, and the reads
+/// compared to reach it (all of them when none matches).
+fn walked<C, T>(reads: impl Iterator<Item = (C, T)>, mut is: impl FnMut(&C) -> bool) -> (Option<T>, u32) {
+    let mut compared = 0u32;
+    for (read, what) in reads {
+        compared = compared.saturating_add(1);
+        if is(&read) {
+            return (Some(what), compared);
+        }
+    }
+    (None, compared)
+}
+
 /// The last answer `L` under this request's [`Work`] (the module's shadowing rules). `Sync`
 /// when `L` is: a phase's workers read it at once through the engine's `View`.
 pub struct Overlay<'a, L> {
@@ -225,6 +361,11 @@ pub struct Overlay<'a, L> {
     /// A worker's view question the last answer refused (a `LastError`): the next merge stops
     /// with [`EngineError::ViewRefused`]. A view answers infallibly, so the refusal is kept here.
     refused: AtomicBool,
+    /// Each visited cell's stale readers (the module's "Stale counts").
+    stale: SMap<'a, CellId, u32>,
+    /// The `saw` questions `take_row` asked and the reads they compared, for the engine's report.
+    saw_calls: u64,
+    compared: u64,
 }
 
 impl<'a, L: LastAnswer> Overlay<'a, L> {
@@ -243,6 +384,7 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
         let work = Work {
             alloc,
             serial,
+            plant,
             rows: BTreeMap::new_in(alloc),
             cells: BTreeMap::new_in(alloc),
             readers: BTreeMap::new_in(alloc),
@@ -251,7 +393,7 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
             owed_tasks,
             owed_cells,
         };
-        Ok(Overlay { last, work, plant, refused: AtomicBool::new(false) })
+        Ok(Overlay { last, work, plant, refused: AtomicBool::new(false), stale: BTreeMap::new_in(alloc), saw_calls: 0, compared: 0 })
     }
 
     /// The last answer and this request's writes, for the form's [`Fold`].
@@ -340,8 +482,12 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
         if let Some(slot) = self.work.rows.get_mut(&name) {
             let Some(row) = slot.take() else { return Ok(None) };
             let mut reads = Vec::with_capacity_in(row.reads.len(), alloc);
-            for (id, _) in row.reads.iter() {
+            for (id, seen) in row.reads.iter() {
                 reads.push(*id);
+                // Its stale reads of counted cells leave the counts (the module's "Stale counts").
+                if self.stale.contains_key(id) && *seen != self.digest(id) {
+                    self.unstale(*id)?;
+                }
             }
             let mut defines = Vec::with_capacity_in(row.defines.len(), alloc);
             for (cell, digest) in row.defines.iter() {
@@ -363,13 +509,62 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
                 defines.push((self.id_of(cell, name)?.cell, digest));
             }
         }
+        // Its stale reads of counted cells leave the counts, asked while the row is still the
+        // last answer's (the module's "Stale counts").
+        for id in reads.iter() {
+            if !self.stale.contains_key(id) {
+                continue;
+            }
+            let (saw, compared) = self.saw(name, *id, self.digest(id))?;
+            self.saw_calls += 1;
+            self.compared += u64::from(compared);
+            if saw == Some(false) {
+                self.unstale(*id)?;
+            }
+        }
         self.work.rows.insert(name, None);
         Ok(Some(Taken { facts, reads, defines }))
     }
 
-    /// Puts `name`'s row as this request made it.
+    /// Puts `name`'s row as this request made it; its stale reads of counted cells join the
+    /// counts (the module's "Stale counts").
     pub fn put_row(&mut self, name: Name, row: Row<'a>) {
+        for (id, seen) in row.reads.iter() {
+            if self.stale.contains_key(id) && *seen != self.digest(id)
+                && let Some(count) = self.stale.get_mut(id)
+            {
+                *count += 1;
+            }
+        }
         self.work.rows.insert(name, Some(row));
+    }
+
+    /// `id`'s stale readers from this visit on: `Engine::readers_of` asked each.
+    pub fn count_stale(&mut self, id: CellId, stale: u32) {
+        self.stale.insert(id, stale);
+    }
+
+    /// `id`'s stale readers, `None` when it was never visited.
+    pub fn stale_of(&self, id: &CellId) -> Option<u32> {
+        self.stale.get(id).copied()
+    }
+
+    /// A stale reader of the counted cell `id` left it. `Plant::StaleKeptOnTake`: it stays.
+    fn unstale(&mut self, id: CellId) -> Result<(), EngineError> {
+        if self.plant == Plant::StaleKeptOnTake {
+            return Ok(());
+        }
+        let count = self.stale.get_mut(&id).ok_or(EngineError::StaleCount { cell: id })?;
+        *count = count.checked_sub(1).ok_or(EngineError::StaleCount { cell: id })?;
+        Ok(())
+    }
+
+    /// The `saw` questions `take_row` asked and the reads they compared, since the last take.
+    pub fn take_cost(&mut self) -> (u64, u64) {
+        let cost = (self.saw_calls, self.compared);
+        self.saw_calls = 0;
+        self.compared = 0;
+        cost
     }
 
     // Validity: what a row saw against what the cells hold today.
@@ -430,35 +625,77 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
     }
 
     /// Whether the read of `cell` by `name`'s last row (made at `serial`) moved: by digest when
-    /// the form kept what the row saw, else by generation (moved this request, or in the last
-    /// answer after the row; its `was` is then the last answer's digest).
+    /// the form kept what the row saw, else by generation (the module's "Generations": moved in
+    /// the last answer after the row, or left another digest by this request; its `was` is then
+    /// the last answer's digest).
     fn moved_read(&self, name: Name, serial: Gen, cell: L::Cell, saw: Option<ContentId>) -> Result<Option<Cause>, EngineError> {
         let id = self.id_of(cell, name)?;
         let now = self.digest(&id);
         Ok(match saw {
             Some(saw) => (now != saw).then_some(Cause::ReadMoved { read: id, was: saw, now }),
             None => {
-                let moved = self.work.cells.contains_key(&id) || self.last.moved(cell) > Serial(serial.0);
+                let moved = self.moved_now(&id, cell) || self.last.moved(cell) > Serial(serial.0);
                 moved.then(|| Cause::ReadMoved { read: id, was: self.last.content(cell), now })
             }
         })
     }
 
+    /// Whether this request moved the cell `id` (`cell` in the last answer) for a row of the last
+    /// answer: it holds another digest now than the last answer held. A cell re-made to equal
+    /// bytes, or moved and moved back inside this request, did not move (early cutoff, engine.rs
+    /// invariant 12). `Plant::GenIdenticalMoves`: any cell this request touched moved.
+    pub fn moved_now(&self, id: &CellId, cell: L::Cell) -> bool {
+        match self.work.cells.get(id) {
+            None => false,
+            Some(_) if self.plant == Plant::GenIdenticalMoves => true,
+            Some(now) => CellDigest::of(&now.map_or(ABSENT, |(digest, _)| digest)) != self.last.digest(cell),
+        }
+    }
+
     /// Whether `reader`'s row read `id` and saw `now`: `None` for no row (engine.rs `readers_of`
-    /// skips a reader that saw today's digest; `finish` settles a cell every row saw).
-    pub fn saw(&self, reader: Name, id: CellId, now: ContentId) -> Result<Option<bool>, EngineError> {
+    /// skips a reader that saw today's digest and counts the rest, the module's "Stale counts"),
+    /// and the reads compared to say so: a binary search, O(log reads), in this request's row
+    /// (`Row::read_of`) and in the last answer's (`LastAnswer::read_of`). `Plant::LinearSaw`
+    /// walks the read list, as before plan row B1.
+    pub fn saw(&self, reader: Name, id: CellId, now: ContentId) -> Result<(Option<bool>, u32), EngineError> {
+        let linear = self.plant == Plant::LinearSaw;
         if let Some(slot) = self.work.rows.get(&reader) {
-            return Ok(slot.as_ref().map(|row| row.reads.iter().any(|(read, seen)| *read == id && *seen == now)));
+            let Some(row) = slot else { return Ok((None, 0)) };
+            let (seen, compared) = match linear {
+                true => walked(row.reads.iter().map(|(read, seen)| (*read, *seen)), |read| *read == id),
+                false => row.read_of(&id),
+            };
+            return Ok((Some(seen == Some(now)), compared));
         }
-        let Some(task) = self.last.task(&reader) else { return Ok(None) };
-        if self.last_facts(task)?.is_none() {
-            return Ok(None);
-        }
-        let Some(cell) = self.last.cell(&id) else { return Ok(Some(false)) };
-        Ok(Some(match self.last.seen(task) {
-            Some(mut seen) => seen.any(|(read, saw)| read == cell && saw == now),
-            None => !self.work.cells.contains_key(&id) && self.last.saw(task, cell),
-        }))
+        let Some(task) = self.last.task(&reader) else { return Ok((None, 0)) };
+        let Some(facts) = self.last_facts(task)? else { return Ok((None, 0)) };
+        let Some(cell) = self.last.cell(&id) else { return Ok((Some(false), 0)) };
+        let (found, compared) = match linear {
+            true => match self.last.seen(task) {
+                Some(seen) => {
+                    let (saw, compared) = walked(seen, |read| *read == cell);
+                    (saw.map_or(Found::NotRead, Found::Saw), compared)
+                }
+                None => {
+                    let (read, compared) = walked(self.last.reads(task).into_iter().flatten().map(|read| (read, ())), |read| *read == cell);
+                    (read.map_or(Found::NotRead, |()| Found::ReadAt(Serial(facts.serial.0))), compared)
+                }
+            },
+            false => {
+                let read = self.last.read_of(task, cell)?;
+                (read.found, read.compared)
+            }
+        };
+        // By generation: the row saw what the last answer held of the cell (no move after the
+        // row), and this request left the cell holding that (`moved_now`).
+        // `Plant::GenSawIgnoresRequest` drops the second.
+        let saw = match found {
+            Found::NotRead => false,
+            Found::Saw(seen) => seen == now,
+            Found::ReadAt(serial) if self.plant == Plant::GenSawIgnoresRequest => self.last.moved(cell) <= serial,
+            Found::ReadAt(serial) => !self.moved_now(&id, cell) && self.last.moved(cell) <= serial,
+        };
+        Ok((Some(saw), compared))
     }
 
     // Cells (rule 2).

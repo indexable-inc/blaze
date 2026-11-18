@@ -17,6 +17,22 @@
 //!   is a crate of its own, under a key of its own (the side's domain, units/macro_side.rs
 //!   `side_key`), so each side's copy is an owner with its own scope. An owner that links
 //!   nothing but proc macros is checked on its own side.
+//! - A DEPENDENCY's proc macro on the target side (a registry or git proc macro the program
+//!   names: `clap_derive`, `serde_derive`, `thiserror_impl`) has no check scope
+//!   ([`ScopeError::MacrosOnly`], [`has_check_scope`]): the list keeps it for its macros only
+//!   (blaze-scope units.rs `unit_crates`, "a dependency's come from the module store"), holds
+//!   none of its dependencies, and gives it the target toolchain's `proc_macro` only so that its
+//!   names resolve (list.rs `world`). Nothing of it is compiled or checked from this list, and
+//!   by Rust's rule its code is built for the side its macros run on with that side's
+//!   `proc_macro`, which this list does not hold for it: a scope made of what the list holds
+//!   would be the target side's, which is not where its bodies are built. So nothing asks for
+//!   one: every planner of per-crate work over the list asks [`has_check_scope`] first (rule
+//!   77: a task that can only fail is not planned), and no reader needs its impls (a proc macro
+//!   is never linked: [`Seen::MacrosOnly`]). Before, its scope was asked and refused as
+//!   [`ScopeError::OtherSide`] (`clap_derive` -> `proc_macro`, 2026-11-17, the three derive
+//!   projects), which read as a broken list. A macro-side copy of a dependency's proc macro
+//!   (reached from a member's proc macro) is given the macro side's toolchain crates by the
+//!   list (units/macro_side.rs `add_side_externs`), so its scope is its side's.
 //! - The owner sees its dependency closure on that side: its dependencies followed to the end
 //!   (a work list, no recursion), and, on the target side, the target's sysroot
 //!   ([`World::sysroot`]: core, alloc, std, bstd), which the Reference's extern prelude adds
@@ -122,6 +138,10 @@ pub enum ScopeError<'w> {
     /// The owner is a crate the world could not make ([`World::refused`]: a member proc macro
     /// with no `wasm32-wasip1` cut on the shelf): its bodies have no side to be checked on.
     Refused { krate: &'w str },
+    /// The owner is a dependency's proc macro on the target side, kept for its macros only
+    /// (the module's rule): nothing of it is checked from this list, so it has no scope.
+    /// [`has_check_scope`] says so before any task is planned for it.
+    MacrosOnly { krate: &'w str },
     /// The owner's scope holds an edge `from` -> `krate` to a crate of the other side than the
     /// owner's check side `side`, with no proc macro between (`from` is the owner itself for its
     /// own edges and the target's sysroot).
@@ -139,6 +159,10 @@ impl core::fmt::Display for ScopeError<'_> {
             ScopeError::Refused { krate } => {
                 write!(f, "the crate `{krate}` was refused by the crate list (its refusal is in the world), so its bodies have no side to be checked on (blaze-world check_scope.rs)")
             }
+            ScopeError::MacrosOnly { krate } => write!(
+                f,
+                "the crate `{krate}` is a dependency's proc macro, kept in the crate list for its macros only: none of its bodies is checked from this list (its dependencies are not in it), so it has no check scope, and no task should ask for one (blaze-world check_scope.rs `has_check_scope`)"
+            ),
             ScopeError::OtherSide { owner, from, krate, side } => write!(
                 f,
                 "the bodies of `{owner}` are checked on the {side:?} side, and the edge `{from}` -> `{krate}` reaches `{krate}` of the other side with no proc macro between: the crate list broke its promise (blaze-world check_scope.rs, list.rs)"
@@ -155,6 +179,7 @@ impl ScopeError<'_> {
         match self {
             ScopeError::NoSuchCrate { .. } => "an owner past the world's crates (blaze-world check_scope.rs)",
             ScopeError::Refused { .. } => "the owner was refused by the crate list, so its bodies have no side to be checked on (blaze-world check_scope.rs)",
+            ScopeError::MacrosOnly { .. } => "a dependency's proc macro is kept for its macros only and has no check scope (blaze-world check_scope.rs `has_check_scope`)",
             ScopeError::OtherSide { .. } => "an edge of an owner's check scope crosses to the other side with no proc macro between (blaze-world check_scope.rs `OtherSide`)",
             ScopeError::Memory { .. } => "the allocator refused the memory of an owner's check scope (blaze-world check_scope.rs `check_scope_in`)",
         }
@@ -165,8 +190,12 @@ impl ScopeError<'_> {
 /// it links (its edges to crates that are not proc macros), all of which must be on one side;
 /// a proc-macro crate's is the macro side (rule 10), and its edges must be the macro side's
 /// too; an owner that links nothing is checked on its own side. Two edges to two sides are
-/// [`ScopeError::OtherSide`] naming the owner and the edge that differs.
+/// [`ScopeError::OtherSide`] naming the owner and the edge that differs. A dependency's proc
+/// macro has no side to be checked on: [`ScopeError::MacrosOnly`].
 pub fn check_side<'n, G: CrateGraph<'n>>(graph: &G, owner: usize) -> Result<Side, ScopeError<'n>> {
+    if macros_only(graph, owner) {
+        return Err(ScopeError::MacrosOnly { krate: graph.name(owner) });
+    }
     let mut side = if graph.proc_macro(owner) { Some(Side::Macro) } else { None };
     for dep in graph.deps(owner) {
         if graph.proc_macro(dep) {
@@ -180,6 +209,24 @@ pub fn check_side<'n, G: CrateGraph<'n>>(graph: &G, owner: usize) -> Result<Side
         }
     }
     Ok(side.unwrap_or(graph.side(owner)))
+}
+
+/// Crate `at` is a dependency's proc macro, kept for its macros only (the module's rule): a
+/// proc macro whose row the list put on the target side. A member's proc macro the list builds
+/// is on the macro side (list.rs `world`: `UnitCrates::macro_side`), and one it refused for want
+/// of that side is refused ([`ScopeError::Refused`]), so the row's side tells the two apart.
+fn macros_only<'n, G: CrateGraph<'n>>(graph: &G, at: usize) -> bool {
+    graph.proc_macro(at) && graph.side(at) == Side::Target && !graph.refused(at)
+}
+
+/// Whether crate `at` of `graph` has a check scope ([`check_scope_in`] makes one): it is a
+/// crate of the graph, the list did not refuse it ([`ScopeError::Refused`]: its refusal is
+/// reported where its names are asked), and it is not a dependency's proc macro kept for its
+/// macros only ([`ScopeError::MacrosOnly`]). A planner of per-crate work that needs a crate's
+/// scope (the Heads stage's impl tables, blaze-cli engine_heads.rs `plan`) plans none for a
+/// crate without one (rule 77): such a task could only fail, and nothing reads its result.
+pub fn has_check_scope<'n, G: CrateGraph<'n>>(graph: &G, at: usize) -> bool {
+    at < graph.len() && !graph.refused(at) && !macros_only(graph, at)
 }
 
 /// How the owner's walk sees crate `at`, reached by an edge from `from`, a crate of its scope:

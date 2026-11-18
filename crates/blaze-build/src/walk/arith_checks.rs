@@ -40,6 +40,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_code::record::TrapKind;
 use blaze_lir::func::RefKind;
 use blaze_lir::{Flags, IntCond, Op, Ty, Value};
 use blaze_typeck::{BinOp, ExprId, List};
@@ -123,7 +124,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let place = self.ref_place(callee);
         let reference = self.b.reference(RefKind::Func, place);
         self.call_unwinding(Callee::Direct(reference), sig, &values)?;
-        self.b.unreachable();
+        self.unreachable_of(TrapKind::AfterPanic, Some(e));
         self.begin(ok);
         Ok(())
     }

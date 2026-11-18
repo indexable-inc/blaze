@@ -10,22 +10,24 @@
 
 use core::fmt;
 
-use blaze_code::record::{CodeRecord, CodeView, SiteKind};
+use blaze_code::record::{CodeRecord, CodeView, SiteKind, TrapSource};
 use blaze_lir::View;
 use blaze_own::Alloc;
 
-use crate::{BULK_INLINE_MOST, Called, Isa, Names, RecordEmitError, RoutinePlaces, record::emit_record_up_to};
+use crate::{BULK_INLINE_MOST, Called, Isa, Names, RecordEmitError, RoutinePlaces, record::emit_record_sourced};
 
 /// [`crate::emit_record`], and the bytes of instructions at the start of the record's code;
-/// the routines the record calls ([`Called`]) last.
+/// the routines the record calls ([`Called`]) last. Each of the build's `traps` becomes its
+/// `unreachable`'s trap row (blaze-code record.rs `TrapSource`).
 pub fn emit_record_measured<'a>(
     func: View<'_>,
     names: &dyn Names,
     routines: &RoutinePlaces,
     isa: Isa,
+    traps: &[TrapSource],
     alloc: Alloc<'a>,
 ) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
-    emit_record_up_to(func, names, routines, isa, BULK_INLINE_MOST, alloc)
+    emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)
 }
 
 /// The first broken promise of a record's instructions, by its offset in the code.

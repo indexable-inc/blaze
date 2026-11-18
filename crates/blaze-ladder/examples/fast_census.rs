@@ -442,7 +442,7 @@ fn census(heap: &'static blaze_own::Heap) -> Result<i32, CensusError> {
         let callees = body.callees();
         let names = InstanceNames { funcs: &callees, statics: &body.statics, vtables: &body.vtables, tls: &body.tls };
         let made = catch_unwind(AssertUnwindSafe(|| {
-            emit_record_measured(body.func.view(), &names, &RoutinePlaces::NONE, isa, alloc).map(|(record, insts, _called)| (u64::from(insts), record.code.len() as u64))
+            emit_record_measured(body.func.view(), &names, &RoutinePlaces::NONE, isa, &[], alloc).map(|(record, insts, _called)| (u64::from(insts), record.code.len() as u64))
         }));
         let reference = match made {
             Ok(Ok(sizes)) => Ok(sizes),

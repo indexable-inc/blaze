@@ -884,14 +884,20 @@ pub(crate) fn build<A: Allocator + Clone>(
         None => (StateShape::of(&split.layout), crate::niche_of(&split.layout)),
     };
     let poll = {
-        let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc);
+        let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc.clone());
         w.run_poll_entry(block)?;
-        let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
-        let func = b.finish().map_err(lir)?;
-        blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
-        Built { func, refs, statics, thread_locals, vtables }
+        w.into_built()?
     };
-    let resume = Built { func: split.poll, refs: refs.clone(), statics: statics.clone(), thread_locals: thread_locals.clone(), vtables: vtables.clone() };
-    let drop = Built { func: split.drop, refs, statics, thread_locals, vtables };
+    // The split's functions are blaze-lir's rewrite of the walk's: its `unreachable`s are not
+    // the walk's one for one, so they carry no trap table (a fault there names no construct).
+    let resume = Built {
+        func: split.poll,
+        refs: refs.clone(),
+        statics: statics.clone(),
+        thread_locals: thread_locals.clone(),
+        vtables: vtables.clone(),
+        traps: Vec::new_in(alloc.clone()),
+    };
+    let drop = Built { func: split.drop, refs, statics, thread_locals, vtables, traps: Vec::new_in(alloc) };
     Ok(crate::BuiltCoroutine { poll, resume, drop, state, niche })
 }

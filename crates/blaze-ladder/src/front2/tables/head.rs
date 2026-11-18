@@ -125,6 +125,10 @@ pub enum FreezeError {
     /// Cell `want` is not frozen again: it failed before, as cell `failed`'s freeze did (the
     /// first asker was handed that failure).
     Again { want: Want, failed: Want },
+    /// Cell `want` is not the asker's to freeze, and its knower holds no bytes of it
+    /// ([`Known::Refused`]): a member crate's head a body asked that its head task did not
+    /// freeze for the body's unit.
+    NotTheirs { want: Want, why: NotTheirs },
 }
 
 impl core::fmt::Display for FreezeError {
@@ -145,6 +149,7 @@ impl core::fmt::Display for FreezeError {
             }
             FreezeError::Steps { want, most } => write!(f, "frozen head of {want:?}: more than {most} freeze attempts"),
             FreezeError::Again { want, failed } => write!(f, "frozen head of {want:?}: not made again, as cell {failed:?} failed when first frozen"),
+            FreezeError::NotTheirs { why, .. } => write!(f, "{}", why.said()),
         }
     }
 }
@@ -1039,9 +1044,9 @@ pub struct SeededHeads<'n, 'a, N> {
     /// The cells being frozen now, innermost last: the driver's explicit stack ([`MOST_MAKING`]
     /// deep at most), each cell frozen after the needs it met unfrozen.
     making: AVec<'a, Want>,
-    /// Each cell whose freeze failed, with the cell whose failure it was (itself, or a need of
-    /// it): asked again, it is refused by name ([`FreezeError::Again`]), never frozen twice.
-    failed: AVec<'a, (Want, Want)>,
+    /// Each cell whose freeze failed, with why: asked again, it is refused by that, never
+    /// frozen twice.
+    failed: AVec<'a, (Want, Unmade)>,
     /// Every freeze begun, made or given up for a need frozen first (`attempts - cells` were
     /// begun again).
     pub attempts: u32,
@@ -1061,13 +1066,72 @@ pub struct SeededHeads<'n, 'a, N> {
     alloc: Alloc<'a>,
 }
 
+/// Why a [`SeededHeads`] cell was not made, kept for every later ask of it.
+#[derive(Clone, Copy, Debug)]
+enum Unmade {
+    /// The freeze of this cell (itself, or a need of it on its stack) failed: asked again it
+    /// is [`FreezeError::Again`], naming that cell.
+    Failed(Want),
+    /// A need of it was not the asker's to freeze ([`Known::Refused`]): asked again it is
+    /// that same typed refusal ([`FreezeError::NotTheirs`]), never `Again`, so every body that
+    /// meets it is told the refusal's own words and class (blaze-cli engine_seeds.rs).
+    Refused { want: Want, why: NotTheirs },
+}
+
+impl Unmade {
+    /// The error a later ask of cell `want` is handed.
+    fn again(self, want: Want) -> FreezeError {
+        match self {
+            Unmade::Failed(failed) => FreezeError::Again { want, failed },
+            Unmade::Refused { want, why } => FreezeError::NotTheirs { want, why },
+        }
+    }
+}
+
 /// Frozen heads a [`SeededHeads`] takes before it freezes a cell itself: the request's table
 /// and what other workers froze (seeds.rs `RequestSeed`). The bytes handed back are the cell's
 /// frozen head as [`freeze_seeded`] would make it: a freeze is a function of its cell and the
 /// names, so a known head and one made here are equal bytes.
 pub trait KnownHeads {
-    /// Cell `cell`'s frozen bytes (the `BZFZ` form), if known.
-    fn known(&self, cell: Want) -> Option<&[u8]>;
+    /// Cell `cell`'s frozen bytes (the `BZFZ` form) when known; else whether the asker may
+    /// freeze it itself, or must not (a head only its owner's task freezes).
+    fn known(&self, cell: Want) -> Known<'_>;
+}
+
+/// What [`KnownHeads::known`] answers of one cell.
+#[derive(Clone, Copy, Debug)]
+pub enum Known<'k> {
+    /// Its frozen bytes (the `BZFZ` form).
+    Bytes(&'k [u8]),
+    /// Not known: the asker freezes it (a dependency's head: one unit, frozen once a machine).
+    Freeze,
+    /// Not known, and not the asker's to freeze: refused, typed ([`FreezeError::NotTheirs`]).
+    Refused(NotTheirs),
+}
+
+/// Why a cell is not the asker's to freeze (blaze-cli engine_seeds.rs `StretchHeads`: a body
+/// never freezes a member crate's head; it is its head task's run for the body's unit, or the
+/// body is refused). `said`: the head by path and the reason, in the knower's words (rule 19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotTheirs {
+    /// Its head task froze it under other units than the asker's only.
+    OtherUnits { said: &'static str },
+    /// Its head task defines no cell of it this request (not planned, no such cell, or no task
+    /// covers it): which, in `said`. The engine's own inconsistency, never the project's.
+    NoCell { said: &'static str },
+    /// Its head task ran for the asker's unit and could not freeze it: `said` quotes that
+    /// task's own reason (blaze-cli engine_head_notes.rs `Failed`). The project's head, not
+    /// the engine: the asker is not checked, as a head it froze itself and could not make
+    /// (blaze-cli engine_bodies.rs `unmade_head`), the head reported once, at its task.
+    Failed { said: &'static str },
+}
+
+impl NotTheirs {
+    pub fn said(self) -> &'static str {
+        match self {
+            NotTheirs::OtherUnits { said } | NotTheirs::NoCell { said } | NotTheirs::Failed { said } => said,
+        }
+    }
 }
 
 /// What a [`SeededHeads`] is made over: [`freeze`]'s inputs and the constant evaluator.
@@ -1119,6 +1183,24 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         self.kept.cells.len()
     }
 
+    /// How many cells' freezes failed until now (a mark for [`SeededHeads::failed_since`]).
+    pub fn failed_len(&self) -> usize {
+        self.failed.len()
+    }
+
+    /// The cell whose freeze failed last among the failures recorded from mark `from` on: the
+    /// cell the failure handed to that ask is about (the top of its stack, `drive`), which a
+    /// later ask of it, or of any cell that needed it, is refused for as [`FreezeError::Again`]
+    /// (`failed`). `None`: no freeze failed since `from`.
+    pub fn failed_since(&self, from: usize) -> Option<Want> {
+        // A cell whose need was refused as not the asker's (`Unmade::Refused`) is told its own
+        // typed refusal when asked again, never `Again`; the cell named here is the need.
+        self.failed.get(from..)?.last().map(|(_, unmade)| match unmade {
+            Unmade::Failed(failed) => *failed,
+            Unmade::Refused { want, .. } => *want,
+        })
+    }
+
     /// Each cell kept from index `from` on that this source froze itself (not one taken from
     /// its known heads), with its frozen bytes, in the order finished: what a caller publishes
     /// after an ask (seeds.rs `RequestSeed`).
@@ -1135,12 +1217,18 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         if let Some(at) = self.kept.cells.iter().position(|(w, _)| *w == want) {
             return Ok(at);
         }
-        if let Some(&(_, failed)) = self.failed.iter().find(|(w, _)| *w == want) {
-            return Err(FreezeError::Again { want, failed });
+        if let Some(&(_, unmade)) = self.failed.iter().find(|(w, _)| *w == want) {
+            return Err(unmade.again(want));
         }
         // Known already (the request's table, another worker's freeze): copied in, so its
         // bytes are read like a cell frozen here, and never frozen again.
-        if let Some(bytes) = self.known.and_then(|known| known.known(want)) {
+        // Not the asker's to freeze: refused by the knower's words, never frozen here.
+        let bytes = match self.known.map(|known| known.known(want)) {
+            Some(Known::Bytes(bytes)) => Some(bytes),
+            Some(Known::Refused(why)) => return Err(FreezeError::NotTheirs { want, why }),
+            Some(Known::Freeze) | None => None,
+        };
+        if let Some(bytes) = bytes {
             let mut copy = RecordBytes::with_capacity_in(bytes.len(), self.alloc);
             copy.extend_from_slice(bytes);
             self.kept.cells.push((want, copy));
@@ -1193,7 +1281,13 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
                 }
                 Err(e) => {
                     let making = core::mem::replace(&mut self.making, AVec::new_in(alloc));
-                    self.failed.extend(making.iter().map(|w| (*w, top)));
+                    // A need refused as not the asker's: each cell on the stack keeps that
+                    // refusal itself, so a later ask meets its words and class, not `Again`.
+                    let unmade = match &e {
+                        FreezeError::NotTheirs { want, why } => Unmade::Refused { want: *want, why: *why },
+                        _ => Unmade::Failed(top),
+                    };
+                    self.failed.extend(making.iter().map(|w| (*w, unmade)));
                     return Err(e);
                 }
             }

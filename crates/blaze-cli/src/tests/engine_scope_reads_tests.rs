@@ -28,10 +28,10 @@ const B: &str = "pub fn scaled(n: u32) -> u32 {\n    helper(n).wrapping_add(2)\n
 
 const C: &str = "use crate::a::f;\nuse crate::a::Pair;\n\npub struct Meter {\n    pub n: u32,\n}\n\nimpl Meter {\n    pub fn read(&self) -> u32 {\n        f(self.n)\n    }\n}\n\nfn twice(n: u32) -> u32 {\n    n.wrapping_add(n)\n}\n\npub fn total(p: &Pair) -> u32 {\n    twice(p.sum())\n}\n";
 
-const D: &str = "use crate::Measure;\nuse crate::Res;\nuse crate::b::*;\nuse crate::c::*;\n\npub fn side() -> u32 {\n    scaled(3)\n}\n\npub fn all(p: &crate::a::Pair) -> u32 {\n    total(p)\n}\n\npub fn wrap(n: u32) -> Res {\n    Res::Good(n)\n}\n\npub fn m(p: &crate::a::Pair) -> u32 {\n    p.measure()\n}\n";
+pub(super) const D: &str ="use crate::Measure;\nuse crate::Res;\nuse crate::b::*;\nuse crate::c::*;\n\npub fn side() -> u32 {\n    scaled(3)\n}\n\npub fn all(p: &crate::a::Pair) -> u32 {\n    total(p)\n}\n\npub fn wrap(n: u32) -> Res {\n    Res::Good(n)\n}\n\npub fn m(p: &crate::a::Pair) -> u32 {\n    p.measure()\n}\n";
 
 /// The fixture, with `d` given (the control adds a body to it).
-fn meters(io: &Io, d: &str) {
+pub(super) fn meters(io: &Io, d: &str) {
     write(io, "Cargo.toml", MANIFEST_SR);
     write(io, "src/lib.rs", LIB);
     write(io, "src/a.rs", A);

@@ -52,6 +52,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_code::record::TrapKind;
 use blaze_own::Vec;
 use blaze_typeck::{BinOp, Expr, ExprId, Mutbl, PNode, UnOp};
 
@@ -239,7 +240,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.call_instance(Some(e), instance, &reprs, &passes, None, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));
             self.dead_block();
             self.push_val(V::None, None);
         }

@@ -23,8 +23,17 @@
 //!   crate's names record key today, the head's cell, the freezing tool): valid by its key,
 //!   nothing of a dependency moves unless its names record does.
 //!
-//! ON FIRST READ of a head neither holds (a dependency's never frozen here before; a member's
-//! that no entry covers): the body's worker
+//! A MEMBER'S HEAD IS NEVER FROZEN BY A BODY: the table holds its head task's run for the
+//! body's unit, or the body is refused, typed, before any freeze (`StretchHeads::known` answers
+//! `Known::Refused`): a head its task ran for and could not freeze is that failure, the task's
+//! own reason quoted (`NotTheirs::Failed`, seeded as the freeze's error: the body is NOT
+//! CHECKED, as `check` leaves it, never a second failure); the engine's own lack fails the
+//! body: `SeedError::NotInItsUnit` when the task froze it under other units only,
+//! `SeedError::NoMemberCell` otherwise, naming which (the task has no record this request, or
+//! holds no such cell). Each cell's refusal words are made once a request.
+//!
+//! ON FIRST READ of a DEPENDENCY's head neither the store nor another worker holds (one never
+//! frozen here before): the body's worker
 //! freezes it on the spot (front2 tables/seeds.rs `RequestSeed`) and publishes the bytes into
 //! `fresh`, the request-wide map, so no other body freezes it again. The map only ever inserts:
 //! a freeze is a function of its cell and the names (head.rs `freeze_seeded`: the cell's key
@@ -53,14 +62,15 @@ use blaze_ids::ContentId;
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::item_shown::ItemShown;
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::front2::tables::head::{FrozenHead, KnownHeads, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
+use blaze_ladder::front2::tables::head::{FreezeError, FrozenHead, Known, KnownHeads, NotTheirs, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
 use blaze_ladder::front2::tables::seeds::{MOST_CELLS, RequestHeads, SeedError};
-use blaze_own::Alloc;
+use blaze_own::{Alloc, SharedAlloc};
 use blaze_world::crate_list::{CrateGraph, CrateList};
 use bstd::cx::Cx;
 use bstd::mem::Frame;
 
 use crate::CliError;
+use crate::engine_head_notes::Failed;
 use crate::engine_heads::{HeadAt, Owners, Subjects};
 use crate::engine_names::NamesStage;
 use crate::store::{CommandStore, Sharing, Store as _};
@@ -341,6 +351,13 @@ pub(crate) struct RequestTable {
     read: blaze_core::SharedSet<ContentId, Global>,
     /// The member heads frozen now, as the profile says each (path, want kind, why).
     shown: blaze_core::SharedMap<ContentId, &'static str, Global>,
+    /// Each cell whose first freeze failed this request, by any stretch (`first_failure`).
+    first_failed: blaze_core::SharedMap<ContentId, FirstFailure, blaze_own::SharedAlloc<'static>>,
+    /// Failures past [`MOST_FIRST_FAILED`], counted, their reasons not kept.
+    first_past_cap: AtomicU32,
+    /// Each member cell refused to a body, with its words, made once a request
+    /// (`StretchHeads::not_theirs`): a cell a thousand bodies ask is formatted once.
+    refused: blaze_core::SharedMap<CellId, NotTheirs, SharedAlloc<'static>>,
     twice: AtomicU32,
     heap: &'static blaze_own::Heap,
 }
@@ -411,6 +428,9 @@ impl RequestTable {
             fresh: blaze_core::SharedMap::new_in("engine.frozen heads, made this request", Global),
             read: blaze_core::SharedSet::new_in("engine.heads not in the head tasks' records, read", Global),
             shown: blaze_core::SharedMap::new_in("engine.member heads frozen now, as said", Global),
+            first_failed: blaze_core::SharedMap::new_in("engine.heads whose first freeze failed, with their reasons", heap.shared()),
+            first_past_cap: AtomicU32::new(0),
+            refused: blaze_core::SharedMap::new_in("engine.member heads refused to a body, as said", heap.shared()),
             twice: AtomicU32::new(0),
             heap,
         })
@@ -474,14 +494,6 @@ impl RequestTable {
         }
     }
 
-    /// Why member cell `id` was not taken from the head tasks' records, once it was asked.
-    fn lack_of(&self, id: CellId) -> Option<Lack> {
-        match self.members.pin().get(&id) {
-            Some(MemberRead::Lacked(lack)) => Some(*lack),
-            Some(MemberRead::Found { .. } | MemberRead::Bad(_)) | None => None,
-        }
-    }
-
     /// Dependency head `cell` of crate `krate` (as a stretch's names give it): its record
     /// frozen by an earlier request, looked up under its key on the first ask. `None`: no
     /// record (or its crate is a member's, or has no names record today).
@@ -524,6 +536,29 @@ impl RequestTable {
             Ok(_) => DependencyRead::Bad("a dependency head's record holds another cell than its key names (engine_seeds.rs `dependency_key`)"),
             Err(_) => DependencyRead::Bad("a dependency head's record does not read as a frozen head (engine_seeds.rs `RequestTable::read_dependency`)"),
         }
+    }
+
+    /// Cell `cell`'s first failed freeze this request, by any worker's stretch (front2
+    /// tables/seeds.rs `RequestHeads::refused`): the head named and its own reason, what a body
+    /// that meets the failure again quotes (engine_bodies.rs `own_reason`). Past the cap, the
+    /// count kept: the one case a reason is not kept (rule 18).
+    pub(crate) fn first_failure(&self, cell: Want) -> FirstFailed {
+        match self.first_failed.pin().get(&cell_key(cell)) {
+            Some(one) => FirstFailed::Kept(*one),
+            None if self.first_past_cap.load(Ordering::Relaxed) > 0 => FirstFailed::PastCap { kept: self.first_failed.len() },
+            None => FirstFailed::None,
+        }
+    }
+
+    /// Cell `cell`'s first failed freeze kept (the first worker's words; another's for the
+    /// same cell are the same reason), or counted past [`MOST_FIRST_FAILED`].
+    fn keep_first_failure(&self, cell: Want, one: FirstFailure) {
+        let failed = self.first_failed.pin();
+        if failed.len() >= MOST_FIRST_FAILED {
+            self.first_past_cap.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let _first = failed.try_insert(cell_key(cell), one).is_ok();
     }
 
     /// Cell `cell`'s bytes frozen this request by any worker.
@@ -794,6 +829,9 @@ enum Placed {
 /// [`dependency_key`]. One worker's (its `Owners` fills on first ask), over the shared table.
 pub(crate) struct StretchHeads<'t, 's, 'n> {
     table: &'t RequestTable,
+    /// The heads the Heads stage could not freeze, each with its own reason
+    /// (engine_head_notes.rs `Failed`): what a refusal of such a head quotes.
+    failed: &'t Failed,
     names: &'n Records<'n>,
     owners: RefCell<Owners<'s>>,
     g: Alloc<'static>,
@@ -801,9 +839,9 @@ pub(crate) struct StretchHeads<'t, 's, 'n> {
 
 impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
     /// `subjects`: the member crates' files (engine_heads.rs `Subjects`), as the Bodies stage
-    /// lists them for `widen`.
-    pub(crate) fn new(table: &'t RequestTable, names: &'n Records<'n>, subjects: &'s Subjects, g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
-        StretchHeads { table, names, owners: RefCell::new(Owners::new(subjects)), g }
+    /// lists them for `widen`; `failed`: the heads the Heads stage could not freeze.
+    pub(crate) fn new(table: &'t RequestTable, failed: &'t Failed, names: &'n Records<'n>, subjects: &'s Subjects, g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
+        StretchHeads { table, failed, names, owners: RefCell::new(Owners::new(subjects)), g }
     }
 
     /// Where `want`'s head is, by this stretch's names: the one placing (module docs).
@@ -828,6 +866,67 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
         let words: &'static str = core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head (its words are not text)");
         // The first words kept (not first: another worker's for the same cell, the same words).
         let _first = self.table.shown.pin().try_insert(cell_key(cell), words).is_ok();
+    }
+
+    /// Why member cell `id` (of want `cell`) was not taken from its head task's record, as
+    /// the body's typed refusal (rule 19), its words made ONCE a cell a request: the first kept
+    /// in the table's `refused` map is every asker's (another worker's for the same cell is the
+    /// same: the read and the stage's failures are the request's, not the asker's).
+    fn not_theirs(&self, cell: Want, id: CellId) -> NotTheirs {
+        if let Some(why) = self.table.refused.pin().get(&id).copied() {
+            return why;
+        }
+        let why = self.not_theirs_now(cell, id);
+        match self.table.refused.pin().try_insert(id, why) {
+            Ok(_) => why,
+            Err(occupied) => *occupied.current,
+        }
+    }
+
+    /// [`StretchHeads::not_theirs`]'s words, made: a head its task ran for this unit and could
+    /// not freeze is that failure, its task's own reason quoted (the project's head, the body
+    /// not checked: engine_bodies.rs `unmade_head`); else another unit's runs only, or which
+    /// lack (the engine's own inconsistency, the body's failure).
+    fn not_theirs_now(&self, cell: Want, id: CellId) -> NotTheirs {
+        // First: a failed head defines its cell but writes no run (engine_heads.rs `heads_of`),
+        // so the read alone would call it "no such cell", or another unit's when every head of
+        // this unit failed.
+        if let Some(refused) = self.failed.find(id.of, id.cell) {
+            return NotTheirs::Failed { said: self.could_not_freeze(cell, refused.why) };
+        }
+        let read = self.table.members.pin().get(&id).copied();
+        match read {
+            Some(MemberRead::Lacked(Lack::OtherUnits(units))) => NotTheirs::OtherUnits { said: self.other_units(cell, units) },
+            Some(MemberRead::Lacked(lack)) => NotTheirs::NoCell { said: self.no_cell(cell, lack.words()) },
+            Some(MemberRead::Bad(why)) => NotTheirs::NoCell { said: self.no_cell(cell, why) },
+            Some(MemberRead::Found { .. }) => NotTheirs::NoCell { said: self.no_cell(cell, "its head task's record was found and its bytes could not be read back from the store's snapshot") },
+            None => NotTheirs::NoCell { said: self.no_cell(cell, "its head task's record was not read") },
+        }
+    }
+
+    /// The refusal's words for a member head its head task ran for and could not freeze: its
+    /// want's kind and the task's own reason `why` (rule 19). The head's path is the body
+    /// note's ("the head of `X`: ", engine_bodies.rs `unmade_head`), not said twice.
+    fn could_not_freeze(&self, cell: Want, why: &'static str) -> &'static str {
+        let words = bstd::mem::format_in!(
+            self.table.heap.alloc(),
+            "a member crate's head ({}); its head task could not freeze it: {why} (said at its head task; a body never freezes a member's head: engine_seeds.rs `StretchHeads::known`)",
+            kind_words(cell)
+        );
+        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head its head task could not freeze (its words are not text)")
+    }
+
+    /// The refusal's words for a member head no head task defines a cell of for this
+    /// stretch's unit this request: its path, its want's kind, the unit and `why` (rule 19).
+    fn no_cell(&self, cell: Want, why: &'static str) -> &'static str {
+        let shown = ItemShown::of_lib(self.names, cell.key());
+        let words = bstd::mem::format_in!(
+            self.table.heap.alloc(),
+            "the head of `{shown}` ({}) is a member crate's, and its head task defines no cell of it for this body's unit {} this request: {why} (a body never freezes a member's head; engine_seeds.rs `StretchHeads::known`)",
+            kind_words(cell),
+            UnitWords(unit_of(cell))
+        );
+        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head its head task defines no cell of (its words are not text)")
     }
 
     /// The refusal's words for a member head its task froze under `units` only, none this
@@ -861,36 +960,88 @@ fn kind_words(cell: Want) -> &'static str {
 }
 
 impl KnownHeads for StretchHeads<'_, '_, '_> {
-    fn known(&self, cell: Want) -> Option<&[u8]> {
+    /// A MEMBER crate's head is its head task's run for the reader's unit, or the body is
+    /// refused, typed (`Known::Refused`): a body never freezes a member's head (rule 3; the
+    /// lazy freeze the table replaced). Only a DEPENDENCY's head is frozen by the asker when
+    /// neither the store nor another worker holds it (one unit, frozen once a machine).
+    fn known(&self, cell: Want) -> Known<'_> {
         let table = self.table;
-        let held = match self.place(cell) {
+        match self.place(cell) {
             Placed::Member(id) => match table.member(id, unit_of(cell)) {
-                Some(bytes) => return Some(bytes),
-                None => None,
+                Some(bytes) => Known::Bytes(bytes),
+                None => Known::Refused(self.not_theirs(cell, id)),
             },
-            Placed::Dependency => self.krate(cell).and_then(|krate| table.dependency(cell, krate)),
-            Placed::Unplaced => None,
-        };
-        // Not a head task's: a head read outside the table (rule 53: found or frozen, once).
-        table.mark_read(cell_key(cell));
-        held.or_else(|| table.fresh_of(cell))
+            // An item a macro wrote: no outline entry covers it, so no head task freezes its head
+            // YET (the next piece: a head task freezes the items its entry's expansions write).
+            // Until then its body's stretch freezes it, as before this rule: said by name and
+            // counted every time (`publish`: the profile's "frozen now and not put: N a
+            // member's"), so the count is the work left, never a silent path (the coordinator's
+            // decision, 2026-11-17: refusing every macro-written body would fail real projects).
+            Placed::Unplaced => match table.fresh_of(cell) {
+                Some(bytes) => Known::Bytes(bytes),
+                None => Known::Freeze,
+            },
+            Placed::Dependency => {
+                let held = self.krate(cell).and_then(|krate| table.dependency(cell, krate));
+                // Not a head task's: a head read outside the table (rule 53: found or frozen,
+                // once).
+                table.mark_read(cell_key(cell));
+                match held.or_else(|| table.fresh_of(cell)) {
+                    Some(bytes) => Known::Bytes(bytes),
+                    None => Known::Freeze,
+                }
+            }
+        }
     }
 }
 
 impl RequestHeads for StretchHeads<'_, '_, '_> {
     fn publish(&self, cell: Want, krate: Option<blaze_id::CrateItemKey>, bytes: &[u8]) -> Result<(), SeedError> {
         match self.place(cell) {
-            // A member's head its task froze under other units only: refused by path, never
-            // taken from another unit nor kept as frozen here (rule 3, rule 19).
-            Placed::Member(id) => match self.table.lack_of(id) {
-                Some(Lack::OtherUnits(units)) => return Err(SeedError::NotInItsUnit { cell, said: self.other_units(cell, units) }),
-                lack => self.say_member(cell, lack.map_or("its head task's record was not read", Lack::words)),
-            },
-            Placed::Unplaced => self.say_member(cell, "no outline entry covers it (a macro wrote it)"),
-            Placed::Dependency => {}
+            // `known` refuses every member head the table lacks before a freeze, so a member's
+            // head here is the engine's own fault: said and refused, never kept (rule 3).
+            Placed::Member(_) => {
+                self.say_member(cell, "a body's freeze reached it though `known` refuses a member's head the table lacks");
+                Err(SeedError::NoMemberCell { cell, said: self.no_cell(cell, "a body's freeze reached it though a member's head is only its head task's (engine_seeds.rs `StretchHeads::known`)") })
+            }
+            // A macro-written item's head, frozen by its body's stretch until head tasks cover
+            // expansions (`known`): said and counted, then kept for the request's other bodies.
+            Placed::Unplaced => {
+                self.say_member(cell, "no outline entry covers it (a macro wrote it)");
+                self.table.publish(cell, krate, bytes)
+            }
+            Placed::Dependency => self.table.publish(cell, krate, bytes),
         }
-        self.table.publish(cell, krate, bytes)
     }
+
+    fn refused(&self, cell: Want, error: &FreezeError) {
+        let g = self.table.heap.alloc();
+        let head = crate::engine_head_consts::head_label(self.names, cell, g);
+        let why = crate::engine_head_notes::leak(g, format_args!("{}", crate::engine_head_notes::Reason(error)));
+        self.table.keep_first_failure(cell, FirstFailure { head, why });
+    }
+}
+
+/// The most first-failed freezes a request keeps ([`RequestTable::first_failure`]): one a cell
+/// the table can hold.
+const MOST_FIRST_FAILED: usize = MOST_CELLS;
+
+/// A head whose first freeze failed this request: its path as a finding shows it, and its own
+/// reason in words that hold no key (engine_head_notes.rs `Reason`, so equal reasons group).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FirstFailure {
+    pub(crate) head: &'static str,
+    pub(crate) why: &'static str,
+}
+
+/// What [`RequestTable::first_failure`] knows of a cell.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FirstFailed {
+    Kept(FirstFailure),
+    /// Not kept: the table was past [`MOST_FIRST_FAILED`] (`kept` reasons kept).
+    PastCap { kept: usize },
+    /// No freeze of it failed this request, as the table was told.
+    None,
 }
 
 impl RequestTable {

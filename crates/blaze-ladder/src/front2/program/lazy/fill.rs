@@ -407,7 +407,23 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// `k` for a refusal (rule 19): its whole path and its key (front2 item_shown.rs
     /// `ItemShown`); [`Self::shown`] stays the bare name a row's path is made from.
     pub(super) fn refused_shown(&self, k: ItemKey) -> Box<str> {
-        crate::front2::item_shown::ItemShown::of(self.front.names, &self.front.keys, k).boxed()
+        self.item_shown(k).boxed()
+    }
+
+    /// `k` for a person (front2 item_shown.rs `ItemShown`, the one printer): its path, or for
+    /// a path-less item where it is written, and its key.
+    pub fn item_shown(&self, k: ItemKey) -> crate::front2::item_shown::ItemShown {
+        crate::front2::item_shown::ItemShown::of(self.front.names, &self.front.keys, k)
+    }
+
+    /// Byte `site` of item `item`'s text (item-relative, as a code record's trap row holds it,
+    /// rule 71) for a person: its file as the program observes it (`file!()`), and its line and
+    /// column today (seam_rules.rs, THE POSITION RULE). `None`: the item's text is in no file
+    /// (a macro's expansion) or the names do not place it.
+    pub fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'n str, u32, u32)> {
+        let file = super::seam_rules::item_file(self.front.names, &self.front.keys, item)?;
+        let (line, column) = super::seam_rules::source_position(self.front.names, &self.front.keys, item, site).ok()?;
+        Some((file, line, column))
     }
 
     /// The row of every ADT `checked`'s types and the heads' table name, in rounds as a row's

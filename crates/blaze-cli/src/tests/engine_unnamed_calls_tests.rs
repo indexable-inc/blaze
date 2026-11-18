@@ -16,7 +16,7 @@ use super::*;
 
 /// Two macros, each writing one fn, called side by side. `p_wrong` and `q_wrong` choose which
 /// written fn returns its `u8` argument as a `u16` (one type error each).
-fn two_calls(p_wrong: bool, q_wrong: bool) -> std::string::String {
+pub(super) fn two_calls(p_wrong: bool, q_wrong: bool) -> std::string::String {
     let ty = |wrong: bool| if wrong { "u16" } else { "u8" };
     format!(
         "macro_rules! write_p {{\n    () => {{\n        pub fn p(x: u8) -> {} {{ x }}\n    }};\n}}\nmacro_rules! write_q {{\n    () => {{\n        pub fn q(x: u8) -> {} {{ x }}\n    }};\n}}\nwrite_p!();\nwrite_q!();\n",

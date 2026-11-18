@@ -405,16 +405,10 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     /// `crate::module::Name`, over the source's questions (module path, name).
     fn item_named(&self, key: ItemKey) -> Option<Box<str>> {
-        // A member (a trait's fn: what a resolve refusal names) by its container's path.
-        if let Some(crate::front2::keys::Origin::Member { container, name, .. }) = self.front.keys.origin(key) {
-            let container = self.item_named(*container)?;
-            return Some(format!("{container}::{name}").into_boxed_str());
-        }
-        let names = self.front.names;
-        let lib = self.front.keys.library_in(names, key)?;
-        let name = names.name_of(lib)?;
-        let module = names.module_path(names.home_of(lib)?)?;
-        Some(format!("{module}::{name}").into_boxed_str())
+        // The one printer of an item (front2 item_shown.rs, rule 30): a member by its trait's or
+        // impl's path (an impl by its header, `<impl Display for Arguments<'_>>`, which this
+        // printed as no path before: every fn of an impl), a variant by its enum's.
+        self.item_shown(key).path().map(Box::from)
     }
 
     /// A run leaves nothing out: a fn that does not check is `check_one`'s refusal.

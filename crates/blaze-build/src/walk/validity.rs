@@ -9,6 +9,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_code::record::TrapKind;
 use blaze_lir::builder::{MemAttrs, Param};
 use blaze_lir::func::RefKind;
 use blaze_lir::{Flags, Ty};
@@ -69,7 +70,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let reference = self.b.reference(RefKind::Func, place);
         // `panic_nounwind` is `#[rustc_nounwind]` and returns `!`: a plain call, then nothing.
         self.b.call(Flags::NONE, reference, sig, &values);
-        self.b.unreachable();
+        self.unreachable_of(TrapKind::AfterPanic, Some(e));
         self.dead_block();
         self.push_val(V::None, None);
         Ok(())

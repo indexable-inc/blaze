@@ -26,6 +26,9 @@ use edition::{BlazeEdition, Edition as Syntax, PackageEdition};
 use super::{Side, open_list, world};
 use crate::{Packages, Place, Tree, World, WorldError};
 
+#[path = "check_scope_macro_tests.rs"]
+mod check_scope_macro_tests;
+
 const TRIPLE: &str = "aarch64-apple-darwin";
 const MACRO: &str = "wasm32-wasip1";
 const TARGET_CFG: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];

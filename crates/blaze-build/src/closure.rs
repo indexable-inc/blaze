@@ -307,7 +307,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.call_instance(Some(e), instance, &reprs, &passes, None, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));
             self.dead_block();
             self.push_val(V::None, None);
         }
@@ -518,7 +518,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)?;
         let v = self.pop()?;
         if let PNode::Never = self.ground_node(output).map_err(|error| Self::ty_err(closure, error))? {
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::AfterDivergingCall, Some(closure));
         } else {
             if let Some(at) = owned
                 && self.needs_drop(g).map_err(|error| Self::ty_err(closure, error))?
@@ -650,7 +650,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.emit_call(callee_ref, &treprs, &tpasses, rrepr, rpass)?;
         let v = self.pop()?;
         if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
-            self.b.unreachable();
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
         } else {
             self.ret_value(v)?;
         }
@@ -711,13 +711,7 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
     let body = empty_view(owner, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_fn_shim(callee, tuple, which, sig)?;
-    let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
-    let func = b.finish().map_err(|error| match error {
-        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
-        other => BuildError::Lir(other),
-    })?;
-    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
-    Ok(Built { func, refs, statics, thread_locals, vtables })
+    w.into_built()
 }
 
 /// The body of a function the language makes, with no text of its own (a fn shim, a ctor's fn:

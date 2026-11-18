@@ -334,6 +334,9 @@ pub struct Row<'a> {
     pub defines: SVec<'a, (Cell, ContentId)>,
     /// In read order, as the result gave them (invariant 9).
     pub reads: SVec<'a, (CellId, ContentId)>,
+    /// The positions in `reads` sorted by cell ([`by_cell`]): a read of one cell is found by a
+    /// binary search ([`Row::read_of`]), never a walk (plan row B1).
+    pub by_cell: SVec<'a, u32>,
     pub findings: u32,
     /// Made inline: no file's plan lists it.
     pub inline: bool,
@@ -346,6 +349,35 @@ impl Row<'_> {
     fn planned(&self, name: Name) -> Planned {
         Planned { name, phase: self.phase, source: self.source, file: self.file }
     }
+
+    /// What this row saw of `id`, `None` when it did not read it, and the reads compared: a
+    /// binary search over [`Row::by_cell`], at most `floor(log2 reads) + 1`.
+    pub fn read_of(&self, id: &CellId) -> (Option<ContentId>, u32) {
+        let (at, compared) = crate::last::search(self.by_cell.len(), |i| self.reads[self.by_cell[i] as usize].0.cmp(id));
+        (at.map(|i| self.reads[self.by_cell[i] as usize].1), compared)
+    }
+}
+
+/// The most reads one row holds (rule 18): the rows form's cap, so every form refuses alike.
+pub const READS_CAP: usize = blaze_answer::MAX_READS_PER_ROW;
+
+/// The positions of `reads` sorted by cell: the order [`Row::read_of`] searches, built once
+/// where a row is made (`Engine::apply`) or read back (pages.rs `decode`). `name`'s list past
+/// [`READS_CAP`] is refused, and so is one holding a cell twice (invariant 9; the sort finds it
+/// for free, in every build).
+pub fn by_cell<'a>(name: Name, reads: &[(CellId, ContentId)], alloc: SharedAlloc<'a>) -> Result<SVec<'a, u32>, EngineError> {
+    if reads.len() > READS_CAP {
+        return Err(EngineError::ReadsTooMany { name, count: reads.len() });
+    }
+    let mut order: SVec<'a, u32> = Vec::with_capacity_in(reads.len(), alloc);
+    for (at, _) in (0u32..).zip(reads.iter()) {
+        order.push(at);
+    }
+    order.sort_unstable_by_key(|at| reads[*at as usize].0);
+    if let Some(pair) = order.windows(2).find(|pair| reads[pair[0] as usize].0 == reads[pair[1] as usize].0) {
+        return Err(EngineError::ReadTwice { name, read: reads[pair[0] as usize].0 });
+    }
+    Ok(order)
 }
 
 /// The answer: every row, every cell's digest, the reverse index, and what is owed. `Sync`: a
@@ -481,6 +513,20 @@ pub enum Plant {
     /// this request dropped (overlay.rs, shadowing rule 3): a row that no longer reads a made
     /// record still keeps it (last_sim.rs's control).
     ReadersStale,
+    /// A cell re-made to equal bytes counts as moved for the generation rule (overlay.rs
+    /// "Generations"): inside the request (`Overlay::moved_now`) and at its end
+    /// (`Generations::moved`), every define of a row put again advances (last_gen_sim.rs's control).
+    GenIdenticalMoves,
+    /// `Overlay::saw`'s generation branch ignores this request's moves: a reader of the last
+    /// answer is taken to have seen a cell this request moved (last_gen_sim.rs's control).
+    GenSawIgnoresRequest,
+    /// `Overlay::saw` walks the read list again, as before plan row B1, in place of the search
+    /// (finish_scale_sim.rs's control: its reads-compared bound breaks).
+    LinearSaw,
+    /// A row taken out of the tables does not leave the stale counts of the cells it read
+    /// (overlay.rs "Stale counts"): a cell every reader now saw stays owed (finish_scale_sim.rs's
+    /// control).
+    StaleKeptOnTake,
 }
 
 /// What one request did.
@@ -505,6 +551,24 @@ pub struct Report {
     pub retired: u32,
     /// Tasks grown into later phases by merged results (invariant 11).
     pub grown: u32,
+    /// What settling the owed cells cost (plan row B1).
+    pub settle: Settle,
+}
+
+/// What settling the owed cells cost: the profile's `finish:` line (plan row B1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Settle {
+    /// Owed cells at the finish, before settling.
+    pub owed: u32,
+    /// Of those, the cells every reader's row saw: no longer owed.
+    pub settled: u32,
+    /// `Overlay::saw` questions: each reader of each cell visited (`readers_of`), and each read
+    /// of a counted cell by a row taken out (overlay.rs "Stale counts").
+    pub saw_calls: u64,
+    /// Reads compared to answer them: a binary search's probes each (`LastAnswer::read_of`).
+    pub compared: u64,
+    /// The finish's wall time: set by the caller, which holds the clock (rule 75); 0 here.
+    pub finish_ns: u64,
 }
 
 /// The most tasks one grower may grow in a request (rule 18): a crate's macros made more items
@@ -561,6 +625,11 @@ pub enum EngineError {
     /// `Overlay::refuse`): the phase's merge stops (`None`: found at the finish, before any
     /// phase merged).
     ViewRefused { phase: Option<Phase> },
+    /// `name`'s result reads `count` cells, past [`READS_CAP`] (rule 18).
+    ReadsTooMany { name: Name, count: usize },
+    /// The stale count of `cell` (overlay.rs "Stale counts") went below zero, or the cell is owed
+    /// at the finish and was never counted: the reverse index and the rows disagree.
+    StaleCount { cell: CellId },
 }
 
 impl From<LastError> for EngineError {
@@ -613,6 +682,13 @@ impl fmt::Display for EngineError {
             EngineError::ViewRefused { phase } => {
                 write!(f, "a task of {phase:?} asked the stored answer through its view and was refused: the answer contradicts itself (overlay.rs `refuse`)")
             }
+            EngineError::ReadsTooMany { name, count } => {
+                write!(f, "{name:?}'s result reads {count} cells, past the cap of {READS_CAP} (rule 18, engine.rs `by_cell`)")
+            }
+            EngineError::StaleCount { cell } => write!(
+                f,
+                "the stale readers of {cell:?} were miscounted (below zero, or owed and never counted): the reverse index and the rows disagree (overlay.rs \"Stale counts\")"
+            ),
         }
     }
 }
@@ -1269,17 +1345,26 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
         let readers = self.view.readers(id)?;
         let now = self.view.digest(&id);
         let mut found: SVec<'a,Planned> = Vec::with_capacity_in(readers.len(), self.alloc);
+        let mut stale = 0u32;
         for reader in readers.iter() {
             // A reader whose row saw today's digest of the cell is today's for it: the maker of
             // an inline record, or a reader merged in the same phase (invariant 4). A made row
             // is a candidate like any; the phase decides whether it is still needed (invariant 10).
-            if self.view.saw(*reader, id, now)? == Some(true) {
-                continue;
+            let (saw, compared) = self.view.saw(*reader, id, now)?;
+            self.report.settle.saw_calls += 1;
+            self.report.settle.compared += u64::from(compared);
+            match saw {
+                Some(true) => continue,
+                Some(false) => stale += 1,
+                None => {}
             }
             if let Some(planned) = self.planned_of(*reader)? {
                 found.push(planned);
             }
         }
+        // The cell's stale count from this visit on (overlay.rs "Stale counts"): `finish` settles
+        // the cell when it is 0, asking no reader again.
+        self.view.count_stale(id, stale);
         for planned in found.iter() {
             self.candidate(*planned, moved_in.map(|phase| (phase, id)))?;
         }
@@ -1345,6 +1430,8 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
         }
         self.view.unowe(name);
         let alloc = self.alloc;
+        // Refused before anything is written: a list past the cap, or one holding a cell twice.
+        let by_cell = by_cell(name, &done.reads, alloc)?;
         let old = self.view.take_row(name)?;
         // The reverse index: old reads out, new reads in.
         if let Some(old) = old.as_ref() {
@@ -1398,6 +1485,7 @@ impl<'a, S: Scope, L: LastAnswer> Engine<'a, S, L> {
                 serial: self.serial,
                 defines: done.defines,
                 reads: done.reads,
+                by_cell,
                 findings: done.findings,
                 inline,
                 failed: done.failed,
@@ -1427,21 +1515,25 @@ impl<'a, S: Scope, L: Fold<'a>> Engine<'a, S, L> {
         for id in self.moved.iter() {
             self.view.owe_cell(*id, self.serial);
         }
+        // A cell is settled when every reader's row saw its digest: its stale count is 0. The
+        // count is exact (overlay.rs "Stale counts"): every owed cell was visited, by `new_in`
+        // (the last answer's owed cells) or by `move_cell` (this request's), a visit follows each
+        // change of the cell's digest, and every change of a reader's row since goes through
+        // `take_row` and `put_row`, which move the count; no reader is asked again here.
+        let owed = self.view.owed_cells();
         let mut settled: SVec<'a,CellId> = Vec::new_in(self.alloc);
-        for id in self.view.owed_cells().iter() {
-            let digest = self.view.digest(id);
-            // A reader with no row reads nothing: it does not keep the cell owed.
-            let mut all = true;
-            for reader in self.view.readers(*id)?.iter() {
-                if self.view.saw(*reader, *id, digest)? == Some(false) {
-                    all = false;
-                    break;
-                }
-            }
-            if all {
-                settled.push(*id);
+        for id in owed.iter() {
+            match self.view.stale_of(id) {
+                Some(0) => settled.push(*id),
+                Some(_) => {}
+                None => return Err(EngineError::StaleCount { cell: *id }),
             }
         }
+        let (saw_calls, compared) = self.view.take_cost();
+        self.report.settle.saw_calls += saw_calls;
+        self.report.settle.compared += compared;
+        self.report.settle.owed = u32::try_from(owed.len()).unwrap_or(u32::MAX);
+        self.report.settle.settled = u32::try_from(settled.len()).unwrap_or(u32::MAX);
         for id in settled.iter() {
             self.view.settle(*id);
         }

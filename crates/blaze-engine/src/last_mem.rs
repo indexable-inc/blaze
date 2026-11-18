@@ -15,7 +15,7 @@ use blaze_id::ContentId;
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::engine::{Answer, CellId, Planned, Row};
-use crate::last::{LastAnswer, LastError, LastRow, Touched};
+use crate::last::{Found, LastAnswer, LastError, LastRow, ReadOf, Touched};
 
 /// A row's reads as the seam's cells, in read order.
 pub struct MemReads<'r> {
@@ -169,9 +169,16 @@ impl<'a> LastAnswer for Answer<'a> {
         }
     }
 
-    /// A read list is in read order (engine.rs invariant 9): the cell is found by a walk.
-    fn saw(&self, task: Name, cell: CellId) -> bool {
-        self.rows.get(&task).is_some_and(|row| row.reads.iter().any(|(read, seen)| *read == cell && *seen == Answer::cell(self, &cell)))
+    /// A read list is in read order (engine.rs invariant 9): the cell is found by a binary search
+    /// over the row's order by cell (`Row::read_of`), O(log reads).
+    fn read_of(&self, task: Name, cell: CellId) -> Result<ReadOf, LastError> {
+        Ok(match self.rows.get(&task) {
+            Some(row) => {
+                let (seen, compared) = row.read_of(&cell);
+                ReadOf { found: seen.map_or(Found::NotRead, Found::Saw), compared }
+            }
+            None => ReadOf { found: Found::NotRead, compared: 0 },
+        })
     }
 
     fn digest(&self, cell: CellId) -> CellDigest {

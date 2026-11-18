@@ -9,7 +9,7 @@
 //!
 //! | module | what |
 //! |---|---|
-//! | [`segment`] | the four segment kinds: their builders and their views over `&[u8]` |
+//! | [`segment`] | the eight segment kinds: their builders and their views over `&[u8]` |
 //! | [`answer`] | the root, [`AnswerView`] (open, adopt), lookups, validity, readers |
 //! | [`commit`] | a request's [`Commit`], a worker's [`RunWriter`], [`compact`]: operations to effects |
 //!
@@ -45,8 +45,9 @@
 //!                 file [n] u32 (a TaskId) | phase [n] (stage u8 | flags u8 | wave u16) |
 //!                 reads_at [n] u32 | reads_meta [n] u32 (count: low 24 bits; width: high 8) |
 //!                 defines_end [n] u32
-//!   cold, 36 B a row (read to plan an owed task again and to print):
-//!                 source [n] 32 B | findings [n] u32
+//!   cold, 68 B a row (read to plan an owed task again, to print, and after a restart):
+//!                 source [n] 32 B | findings [n] u32 | record [n] 32 B (the store key of the
+//!                 record the row's last entry made; zeros for a plan never made)
 //!   lists:        tomb [t] u32 (ascending) | reads [r] bytes | define_cell [d] u32 |
 //!                 define_digest [d] 20 B
 //!                 (a row's reads: base u32, then its CellNos less base, `width` bits each, in
@@ -57,13 +58,27 @@
 //! run (kind 4)    cells k | entries e | cell [k] u32 (ascending) | start [k + 1] u32 |
 //!                 entry [e] u32 (a TaskId, ascending in its cell; bit 31 set: -1, else +1)
 //!
+//! plans (kind 5)     a run's bytes, keyed by a file's TaskId: the tasks its plan lists (a row
+//!                    not made inline, by its `file`). 4 B a planned task plus 8 B a file.
+//! findings (kind 6)  a run's bytes, one key 0: the tasks whose row made findings or failed.
+//!                    4 B a task plus 8 B. The count is the row's cold `findings`.
+//!                    (plans, findings and run: each request writes the changes it made, +1 or
+//!                    -1; a lookup sums every run of its kind, one binary search each; all three
+//!                    count against MAX_RUNS; compaction merges each kind to one)
+//! owed (kind 7)      tasks n | task [n] u32 (ascending): the owed tasks, WHOLE (4 B a task)
+//! owed cells (kind 8)  the cells segment's bytes: the owed cells, WHOLE, each with the serial it
+//!                    moved at (12 B a cell)
+//!                    (owed and owed cells: small; a request that changes the set writes it whole
+//!                    and its root drops the last's, so a root lists at most one of each, which
+//!                    open checks)
+//!
 //! root            magic "BAR1" | format u32 | serial u64 | tree 32 B | lines 32 B |
 //!                 summary_len u32 | summary | segments u32 |
 //!                 segments x (kind u8 | len u64 | id 32 B: ContentId of the segment's bytes)
 //! ```
 //!
 //! What things cost (the size test in sim.rs prints them for 24,000 rows of 300 reads over
-//! 60,000 cells): a row's fixed part 96 B ([`ROW_FIXED_BYTES`]) plus 36 B cold; a read
+//! 60,000 cells): a row's fixed part 96 B ([`ROW_FIXED_BYTES`]) plus 68 B cold; a read
 //! `width / 8` B plus 4 B a row (2.01 B at 300 reads over 200 distinct cells of 60,000: 16 bits);
 //! a defined cell 24 B in its row ([`DEFINE_BYTES`]) and 12 B in a cells segment when it moves;
 //! a reader 4 B in a run plus 8 B per distinct cell of the run.
@@ -98,11 +113,11 @@
 //!
 //! blaze-engine, engine.rs, reads `Answer`/`Row` today at:
 //! - `Answer` (265-279): `rows`, `cells`, `readers`, `by_file`, `owed_cells`, `owed_tasks`,
-//!   `with_findings` become an [`AnswerView`] of the last answer plus the request's [`Commit`];
-//!   `by_file`, `owed_cells`, `owed_tasks` and `with_findings` have no column yet: `by_file` is a
-//!   second reverse index (file TaskId to its tasks: a [`RunWriter`] over the row's `file`), the
-//!   owed tasks are the row flag [`Flags::OWED`], the owed cells and the rows with findings two
-//!   small sorted u32 columns to add to the rows segment (next piece).
+//!   `with_findings` become an [`AnswerView`] of the last answer plus the request's [`Commit`]:
+//!   `by_file` is [`AnswerView::file_tasks`] (kind 5), `with_findings`
+//!   [`AnswerView::with_findings`] (kind 6), `owed_tasks` [`AnswerView::owed`] (kind 7, the rows
+//!   flagged [`Flags::OWED`]), `owed_cells` [`AnswerView::owed_cells`] (kind 8, given whole by
+//!   [`Commit::owe_cells`]). The commit derives kinds 5 to 7 from each row it puts or retires.
 //! - `Answer::prints` (302-312, `rows.get` at 305): the findings count is the cold column.
 //! - `Answer::today` / `first_moved` (315 on): [`AnswerView::stands`] (the serial rule replaces
 //!   the digest compare; `Cause::ReadMoved`'s `was` comes from the task's record in the store).
@@ -128,8 +143,8 @@
 //! leave the answer (a cause is the profile's, not the row's); the root and its segments are put
 //! in the shared store under the tree's digest for [`AnswerView::adopt`].
 //!
-//! The view's tables hold [`Alloc`](blaze_own::Alloc); for workers on many threads the wiring
-//! makes them [`SharedAlloc`](blaze_own::SharedAlloc) (a type change, no logic).
+//! The view's own tables hold [`SharedAlloc`](blaze_own::SharedAlloc): an [`AnswerView`] is
+//! `Sync`, so a phase's workers read one at once.
 
 #![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
@@ -154,12 +169,13 @@ use core::fmt;
 use blaze_id::ContentId;
 
 pub use crate::answer::{AnswerView, Health, SegmentRef, nothing_changed, summary_of};
-pub use crate::commit::{Commit, Effects, RowIn, RunWriter, Write, compact};
+pub use crate::commit::{Commit, Effects, RowIn, RunWriter, Write, compact, has_findings};
 pub use crate::segment::{Reads, RowView, RowsBytes, SegmentKind};
 
 /// The form's version: a segment or root of another is refused ([`AnswerError::Format`]); an old
 /// home is reported and rebuilt, never migrated (rule 26).
-pub const FORMAT: u32 = 1;
+/// 2: the record key in the cold column and kinds 5 to 8.
+pub const FORMAT: u32 = 2;
 /// A segment's first bytes.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"BAS1";
 /// A root's first bytes.
@@ -168,8 +184,8 @@ pub const ROOT_MAGIC: [u8; 4] = *b"BAR1";
 pub const DIGEST_BYTES: usize = 20;
 /// A row's fixed part: task, key, out, serial, file, phase and flags, and its lists' offsets.
 pub const ROW_FIXED_BYTES: usize = 4 + 32 + 32 + 8 + 4 + 4 + 4 + 4 + 4;
-/// A row's cold part: its source and its findings count.
-pub const ROW_COLD_BYTES: usize = 32 + 4;
+/// A row's cold part: its source, its findings count and its record's key.
+pub const ROW_COLD_BYTES: usize = 32 + 4 + 32;
 /// One defined cell in its row: its CellNo and its digest.
 pub const DEFINE_BYTES: usize = 4 + DIGEST_BYTES;
 
@@ -260,6 +276,16 @@ pub enum Plant {
     GenerationByDigest,
     /// The root is written before the segments it names.
     RootFirst,
+    /// A retired task stays in its file's plan: the commit writes no -1 plans entry for it.
+    PlanKeptOnRetire,
+    /// A row whose findings went keeps its findings entry: the commit writes no -1 for it.
+    FindingsKeptOnClear,
+    /// A retired owed task stays owed.
+    OwedKeptOnRetire,
+    /// Owed cells emptied write no segment, so the last set still answers.
+    OwedCellsEmptyDropped,
+    /// Compaction writes each row's record key as zeros.
+    RecordDropped,
 }
 
 /// Why an answer cannot be read or a request cannot be committed. Each names the thing: the
@@ -308,9 +334,17 @@ pub enum AnswerError {
     UnknownCell { cell: CellNo },
     /// A task with no row was retired.
     NoRow { task: TaskId },
-    /// The reverse index's entries for `(cell, task)` sum to `sum`, outside what its runs allow
-    /// (0 or 1 over every run; -1, 0 or 1 inside one request's).
-    ReadersSum { cell: CellNo, task: TaskId, sum: i32 },
+    /// The entries of a run of `kind` for `(cell, task)` sum to `sum`, outside what its runs allow
+    /// (0 or 1 over every run; -1, 0 or 1 inside one request's). `cell` is the run's key: a cell
+    /// for the reverse index, a file's task id for the plans, 0 for the findings.
+    ReadersSum { kind: SegmentKind, cell: CellNo, task: TaskId, sum: i32 },
+    /// One request gave the owed cells twice the same cell.
+    OwedTwice { cell: CellNo },
+    /// A row put to stand from a serial past its request's.
+    RowSerial { task: TaskId, serial: Serial },
+    /// A root lists two segments of a whole-set kind ([`SegmentKind::is_whole`]): a commit
+    /// replaces the last's.
+    TwoWhole { kind: SegmentKind, segment: u32 },
 }
 
 /// The segment index an error of a run handed to [`Commit::add_run`] names.
@@ -341,7 +375,10 @@ impl fmt::Display for AnswerError {
             AnswerError::UnknownTask { task } => write!(f, "task {} is not in the answer's dictionary", task.0),
             AnswerError::UnknownCell { cell } => write!(f, "cell {} is not in the answer's dictionary", cell.0),
             AnswerError::NoRow { task } => write!(f, "task {} has no row to retire", task.0),
-            AnswerError::ReadersSum { cell, task, sum } => write!(f, "the reverse index of cell {} sums to {sum} for task {}", cell.0, task.0),
+            AnswerError::ReadersSum { kind, cell, task, sum } => write!(f, "the {kind:?} run of key {} sums to {sum} for task {}", cell.0, task.0),
+            AnswerError::OwedTwice { cell } => write!(f, "cell {} is owed twice in one request", cell.0),
+            AnswerError::RowSerial { task, serial } => write!(f, "task {}'s row put to stand from serial {}, past its request's", task.0, serial.0),
+            AnswerError::TwoWhole { kind, segment } => write!(f, "answer segment {segment}: a second {kind:?} segment in one root (the newest is the whole set)"),
         }
     }
 }

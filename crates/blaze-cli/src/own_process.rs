@@ -266,7 +266,7 @@ pub(crate) fn run_own<F: Front>(
             Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.folder().read(&spot.record, &mut struck_in).map(|()| struck_in.as_slice())),
             _ => None,
         };
-        crate::run_fault::report(fault, &mut |symbol| lazy.name_of(symbol), record)
+        crate::run_fault::report(fault, &mut lazy, record)
     });
     // The walk is over: what the code store served and made is final (the program root's half).
     drop(lazy);

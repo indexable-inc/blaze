@@ -104,7 +104,7 @@ fn engine_unit_files_decide_by_what_each_unit_holds() {
 /// module, `src/orphan.rs` no `mod` names, a statement-level `#[cfg(test)]` item, a gated `fn`,
 /// and an inline `#[cfg(test)]` module. `two` is the body of `src/tests.rs`'s second test, a
 /// type error when `wrong`. `cut`: `mod tests;` without its `#[cfg(test)]`.
-fn units_fixture(io: &Io, wrong: bool, cut: bool) {
+pub(super) fn units_fixture(io: &Io, wrong: bool, cut: bool) {
     write(io, "Cargo.toml", &format!("{MANIFEST}\n[features]\nx = []\n"));
     let tests_mod = if cut { "mod tests;\n" } else { "#[cfg(test)]\nmod tests;\n" };
     write(

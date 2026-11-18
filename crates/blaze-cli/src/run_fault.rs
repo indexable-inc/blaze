@@ -11,10 +11,13 @@
 //!     that call returned, though the code after it is never to run
 //!
 //! (one line). The trap's reason is read from the instruction at the pc in the record's own
-//! code (blaze-code trap.rs, the codes' one home): no side table, so the record's bytes and its
-//! key's meaning are unchanged. The function's name is the walk's row for its symbol (the
-//! instance's tabled item) and the names records' path for that item
-//! ([`crate::run_parent::Lazy::name_of`]).
+//! code (blaze-code trap.rs, the codes' one home), and WHICH construct it ends from the
+//! record's trap table (blaze-code record.rs `TrapRow`: the pc's offset to the construct's
+//! item-relative range and kind), its `file:line:col` made only here, for the message (rule
+//! 71). The function's name is the walk's row for its symbol: the instance its name holds, by
+//! the one printer of an item and with its ground arguments
+//! ([`crate::run_parent::Lazy::name_of`]). The child's own line is written only when it could
+//! not tell the parent (one report, rule 30).
 //!
 //! Pure: [`report`] is given the names and the record's bytes; own_process.rs reads them.
 
@@ -30,13 +33,27 @@ use crate::run_parent::ParentError;
 /// What names a symbol of the run.
 #[derive(Debug)]
 pub(crate) enum Named {
-    /// The item's path, from the names records.
+    /// The item by the one printer (front2 item_shown.rs `ItemShown`: its path, or for a
+    /// path-less item WHERE it is written), and the instance's ground arguments as Rust spells
+    /// them when it has any (`[u8, <closure 0 of core::fmt::..>]`).
+    Shown { item: blaze_ladder::front2::item_shown::ItemShown, args: Option<Box<str>> },
+    /// A path a front gave with no printer of its own (`Front::path_of`).
     Path(Box<str>),
-    /// A row's item whose path the names records do not give.
+    /// A row's item the names give neither a path nor a place for.
     Item(ItemKey),
     /// No row this run: a special record (the C entry shim, the thread-local getter or ender),
     /// or a row placed from today's start list and never stepped.
     NoRow,
+}
+
+/// Where a trap's construct is written, for the message (rule 71: made only here, from the trap
+/// row's item-relative site).
+#[derive(Debug)]
+pub(crate) struct SiteShown {
+    /// The file as the program observes it (`file!()`).
+    pub file: Box<str>,
+    pub line: u32,
+    pub column: u32,
 }
 
 /// Why the trap at the pc was not read from its record.
@@ -58,18 +75,30 @@ pub(crate) struct Report {
     trap: Option<TrapAt>,
     /// The function whose call the trap follows.
     callee: Option<Named>,
+    /// Where the trap row's construct is written, when the row has a site `sites` placed.
+    site: Option<SiteShown>,
     /// Why the pc's record was not read, when it was not.
     unread: Option<Unread>,
 }
 
-/// The report of `fault`: each place named by `names`, the trap read from `record` (the bytes
-/// of the record the pc is in: `None` when the pc is in no function's code).
-pub(crate) fn report(fault: Fault, names: &mut dyn FnMut([u8; 32]) -> Named, record: Option<Result<&[u8], ParentError>>) -> Report {
-    let at = fault.at.map(|spot| names(spot.symbol.0));
+/// What names a run's places for a report: the walk (run_parent.rs `Lazy`), while it is alive.
+pub(crate) trait Places {
+    /// The fn or static of code symbol `symbol`.
+    fn named(&mut self, symbol: [u8; 32]) -> Named;
+    /// Byte `at` of item `item`'s text (a trap row's item-relative site), placed in today's
+    /// text; `None` when it cannot be.
+    fn site(&mut self, item: ItemKey, at: u32) -> Option<SiteShown>;
+}
+
+/// The report of `fault`: each place named by `places`, the trap read from `record` (the bytes
+/// of the record the pc is in: `None` when the pc is in no function's code), and its trap row's
+/// construct placed by `places` too.
+pub(crate) fn report(fault: Fault, places: &mut dyn Places, record: Option<Result<&[u8], ParentError>>) -> Report {
+    let at = fault.at.map(|spot| places.named(spot.symbol.0));
     let touched = match (fault.touched, fault.at) {
         // The address is the pc's own place (a trap's `si_addr` is its pc): said once.
         (Some(touched), Some(at)) if touched == at => None,
-        (Some(touched), _) => Some(names(touched.symbol.0)),
+        (Some(touched), _) => Some(places.named(touched.symbol.0)),
         (None, _) => None,
     };
     let mut trap = None;
@@ -82,8 +111,9 @@ pub(crate) fn report(fault: Fault, names: &mut dyn FnMut([u8; 32]) -> Named, rec
         (Some(Err(why)), _) => unread = Some(Unread::File(why)),
         (Some(Ok(_)), None) | (None, _) => {}
     }
-    let callee = trap.and_then(|trap| trap.after_call).map(|symbol| names(symbol.0));
-    Report { fault, at, touched, trap, callee, unread }
+    let callee = trap.and_then(|trap| trap.after_call).map(|symbol| places.named(symbol.0));
+    let site = trap.and_then(|trap| trap.construct).and_then(|row| row.site).and_then(|(item, at)| places.site(ItemKey(item), at));
+    Report { fault, at, touched, trap, callee, site, unread }
 }
 
 /// The first six bytes in hex.
@@ -95,6 +125,16 @@ impl fmt::Display for Short<'_> {
     }
 }
 
+/// A key's 16 bytes in hex, `0x` first.
+struct Hex16<'b>(&'b [u8; 16]);
+
+impl fmt::Display for Hex16<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("0x")?;
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
 /// `kind `name``, or what stands for a name.
 struct Thing<'n>(&'n Named, &'static str);
 
@@ -102,8 +142,19 @@ impl fmt::Display for Thing<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Thing(named, kind) = self;
         match *named {
+            Named::Shown { item, args } => {
+                match (item.path(), item.written()) {
+                    (Some(path), _) => write!(f, "{kind} `{path}`")?,
+                    (None, Some(written)) => write!(f, "{kind} with no path, {written} (key {})", Hex16(&item.key()))?,
+                    (None, None) => write!(f, "{kind} of item {} (the names give it neither a path nor a place)", Hex16(&item.key()))?,
+                }
+                match args {
+                    Some(args) => write!(f, " at {args}"),
+                    None => Ok(()),
+                }
+            }
             Named::Path(path) => write!(f, "{kind} `{path}`"),
-            Named::Item(item) => write!(f, "{kind} of item {:#x} (the names records give no path)", item.0),
+            Named::Item(item) => write!(f, "{kind} of item {:#x} (the names give it neither a path nor a place)", item.0),
             Named::NoRow => write!(f, "a {kind} this run has no row for (a special record: the C entry shim, the thread-local getter or ender; or a row placed from the start list)"),
         }
     }
@@ -134,6 +185,16 @@ impl fmt::Display for Report {
         }
         if let Some(trap) = self.trap {
             write!(f, ": `brk #{:#x}`: {}", trap.reason.code(), trap.reason.says())?;
+            // WHICH construct, from the record's trap table: only what the row says.
+            if let Some(row) = trap.construct {
+                write!(f, ": {}", row.kind.construct())?;
+                match (&self.site, row.site) {
+                    (Some(site), _) => write!(f, " at {}:{}:{}", site.file, site.line, site.column)?,
+                    (None, Some((item, at))) => write!(f, " at byte {at} of item {} (not placed in today's text)", Hex16(&item.to_be_bytes()))?,
+                    (None, None) => {}
+                }
+                write!(f, " {}", row.kind.happened())?;
+            }
             if let Some(callee) = &self.callee {
                 write!(f, ", right after the call of {}", Thing(callee, "fn"))?;
                 if let Some(symbol) = trap.after_call {
@@ -167,3 +228,7 @@ impl fmt::Display for Report {
 #[cfg(test)]
 #[path = "run_fault_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "run_fault_trap_tests.rs"]
+mod trap_tests;

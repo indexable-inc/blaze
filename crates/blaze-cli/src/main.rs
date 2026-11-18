@@ -1930,14 +1930,18 @@ mod tests {
     mod engine_body_frames_tests;
     mod engine_seeds_tests;
     mod engine_answer_rows_tests;
+    mod engine_answer_columns_tests;
     mod engine_module_facts_tests;
     mod engine_unnamed_calls_tests;
     mod engine_expansion_tests;
     mod engine_head_notes_tests;
     mod engine_refusal_causes_tests;
+    mod engine_macro_scope_tests;
     mod engine_builtin_reads_tests;
     mod engine_unit_heads_tests;
     mod engine_unit_files_tests;
+    mod engine_member_heads_tests;
+    mod engine_head_cells_tests;
     mod engine_scope_reads_tests;
     mod engine_scope_reads_tables_tests;
     mod engine_edit_rows_tests;

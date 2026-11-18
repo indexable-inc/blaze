@@ -723,6 +723,10 @@ pub struct Built<A: Allocator> {
     /// By `Vtable` reference place: the (concrete type, principal) table whose address the
     /// function takes. One place per table, however often it is named.
     pub vtables: Vec<vtable::VtableRef, A>,
+    /// Per `unreachable` the walk wrote to end a construct, which construct (blaze-code
+    /// record.rs `TrapSource`: by its ordinal among the function's `unreachable`s, its kind and
+    /// its item-relative site): the code record's trap table, what a fault's report says.
+    pub traps: Vec<blaze_code::record::TrapSource, A>,
 }
 
 /// What a panic does. The Reference, "Panic": "unwind — unwinds the stack and is potentially

@@ -166,6 +166,33 @@ pub(crate) fn is_head_task(name: Name) -> bool {
     matches!(name.kind, blaze_drive::Kind::Signature | blaze_drive::Kind::ImplBucket)
 }
 
+/// The words of the [`Class::Head`] note a body's block holds for a head its seed could not
+/// freeze and no head task keeps (engine_bodies.rs `Ran::head_failed`): no cell (`-`), the head
+/// and its own reason, so [`print_grouped`] groups it with the head tasks'.
+pub(crate) fn seed_words<'f>(head: &'static str, why: &'static str, frame: &'f Frame) -> blaze_own::text::String<&'f Frame> {
+    let mut out = blaze_own::text::String::new_in(frame);
+    out.push('-');
+    push_parts(&mut out, head, why);
+    out
+}
+
+/// A note's head and reason after its cell, each after the separator, kept out of them.
+fn push_parts(out: &mut blaze_own::text::String<&Frame>, head: &str, why: &str) {
+    for part in [head, why] {
+        out.push(SEP);
+        // The separator kept out of a part: a space in its place.
+        for ch in part.chars() {
+            out.push(if ch == SEP { ' ' } else { ch });
+        }
+    }
+}
+
+/// Whether `name`'s block may hold [`Class::Head`] notes the closing lines group: a head
+/// task's, or a body's for a head its seed could not freeze ([`seed_words`]).
+fn holds_head_notes(name: Name) -> bool {
+    is_head_task(name) || name.kind == blaze_drive::Kind::BodyCheck
+}
+
 /// A note's words (module docs), the separator kept out of its parts.
 fn words<'f>(one: Refused, frame: &'f Frame) -> blaze_own::text::String<&'f Frame> {
     let mut out = blaze_own::text::String::new_in(frame);
@@ -178,13 +205,7 @@ fn words<'f>(one: Refused, frame: &'f Frame) -> blaze_own::text::String<&'f Fram
         }
         None => out.push('-'),
     }
-    for part in [one.head, one.why] {
-        out.push(SEP);
-        // The separator kept out of a part: a space in its place.
-        for ch in part.chars() {
-            out.push(if ch == SEP { ' ' } else { ch });
-        }
-    }
+    push_parts(&mut out, one.head, one.why);
     out
 }
 
@@ -223,7 +244,7 @@ pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b
     // (why, head) of every note.
     let mut all: std::vec::Vec<(&'b str, &'b str), &Frame> = std::vec::Vec::new_in(frame);
     for (name, block) in blocks {
-        if !is_head_task(name) {
+        if !holds_head_notes(name) {
             continue;
         }
         let mut bad = false;
@@ -315,6 +336,7 @@ impl fmt::Display for Reason<'_> {
             FreezeError::TooDeep { .. } => write!(f, "a chain of cells, each needing the next, deeper than a freeze follows"),
             FreezeError::Steps { most, .. } => write!(f, "more than {most} freeze attempts"),
             FreezeError::Again { .. } => write!(f, "a head it reads failed when first frozen"),
+            FreezeError::NotTheirs { why, .. } => write!(f, "{}", why.said()),
         }
     }
 }

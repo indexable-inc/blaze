@@ -29,6 +29,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_code::record::TrapKind;
 use blaze_lir::Block;
 use blaze_own::Vec;
 use blaze_typeck::{BinOp, Expr, ExprId, Stmt, StmtId};
@@ -275,16 +276,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let from = self.let_else_held.len() as u32;
         self.let_else_held.extend_from_slice(&self.scope_pats[mark..]);
         self.scope_pats.truncate(mark);
-        self.work.push(Task::LetElseEnd(cont, from));
+        self.work.push(Task::LetElseEnd(cont, from, els));
         self.work.push(Task::Eval(els));
         Ok(())
     }
 
     /// `Task::LetElseEnd`: the `else` block's value (of type `!`) on top; nothing follows it,
     /// and the statement goes on in `cont` with its entries (`let_else_held` from `from`) back.
-    pub(super) fn let_else_end(&mut self, cont: Block, from: u32) -> Result<(), BuildError> {
+    /// `els` is the `else` block, the trap's site if its end is ever reached.
+    pub(super) fn let_else_end(&mut self, cont: Block, from: u32, els: ExprId) -> Result<(), BuildError> {
         self.pop()?;
-        self.b.unreachable();
+        self.unreachable_of(TrapKind::LetElse, Some(els));
         self.begin(cont);
         let mark = *self.temp_marks.last().ok_or(malformed("a `let`-`else` end outside its statement"))? as usize;
         if self.scope_pats.len() != mark {

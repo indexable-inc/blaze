@@ -32,8 +32,10 @@ pub fn pack(files: &[(&str, &str)], alloc: Alloc<'_>) -> StdVec<u8> {
 ///
 /// And `fixture_len`, whose signature holds a constant (`[u8; FIXTURE_LEN]`): a toolchain
 /// head a body's seed freezes only with a constant evaluator (blaze-cli
-/// engine_refusal_causes_tests.rs).
-pub const CORE: &str = "#![no_core]\n#![feature(rustc_attrs)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\n";
+/// engine_refusal_causes_tests.rs). And `FixtureBad`, whose field's length (`FIXTURE_BAD`,
+/// `0 - 1`) does not evaluate: a toolchain head whose freeze fails for a reason a body that
+/// reads it must quote (the same file).
+pub const CORE: &str = "#![no_core]\n#![feature(rustc_attrs)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\npub const FIXTURE_BAD: usize = 0 - 1;\npub struct FixtureBad {\n    pub x: [u8; FIXTURE_BAD],\n}\n";
 
 /// The text of the fixture's std when a test does not give its own.
 pub const STD: &str = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";

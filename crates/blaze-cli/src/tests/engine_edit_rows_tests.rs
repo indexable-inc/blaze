@@ -215,10 +215,10 @@ fn seen(io: &Io, row: &str, target: &str) -> Seen {
 // about six fns, one generic fn, one trait with an impl, and a `#[cfg(test)] mod tests` of two
 // tests.
 
-const WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n";
-const A_MANIFEST: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
-const B_MANIFEST: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n";
-const C_MANIFEST: &str = "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nb = { path = \"../b\" }\n";
+pub(super) const WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n";
+pub(super) const A_MANIFEST: &str ="[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+pub(super) const B_MANIFEST: &str ="[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n";
+pub(super) const C_MANIFEST: &str ="[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nb = { path = \"../b\" }\n";
 /// [`C_MANIFEST`] re-formatted (R15): the same keys and values, other whitespace.
 const C_MANIFEST_REFORMATTED: &str = "[package]\nname    = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\n[dependencies]\nb = {path=\"../b\"}\n";
 
@@ -246,7 +246,7 @@ macro_rules! a_lib {
 }
 
 const BASE_BODY: &str = "    7\n";
-const A_LIB: &str = a_lib!("", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "");
+pub(super) const A_LIB: &str = a_lib!("", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "");
 /// R2: a comment inside `base`'s body.
 const A_LIB_COMMENT: &str = a_lib!("", "    // the base is seven\n    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base();\n", "");
 /// R3: [`A_LIB`] with one wrong body at its end (one type error, whose line R3 moves).
@@ -266,13 +266,13 @@ const A_LIB_GENERIC: &str = a_lib!("", "    7\n", "u32", "    let y = x;\n    y\
 /// R13: the first `#[cfg(test)]` test's body edited.
 const A_LIB_TEST: &str = a_lib!("", "    7\n", "u32", "    x\n", "", "        let _x: u32 = super::base() + 0;\n", "");
 
-const A_SHAPES: &str = "pub struct Square {\n    pub side: u32,\n}\n\npub struct Marker {\n    pub tag: u8,\n}\n\npub trait Area {\n    fn area(&self) -> u32;\n}\n\nimpl Area for Square {\n    fn area(&self) -> u32 {\n        self.side * self.side\n    }\n}\n\npub fn unit() -> Square {\n    Square { side: 1 }\n}\n\npub fn scaled(n: u32) -> u32 {\n    n + 1\n}\n";
+pub(super) const A_SHAPES: &str = "pub struct Square {\n    pub side: u32,\n}\n\npub struct Marker {\n    pub tag: u8,\n}\n\npub trait Area {\n    fn area(&self) -> u32;\n}\n\nimpl Area for Square {\n    fn area(&self) -> u32 {\n        self.side * self.side\n    }\n}\n\npub fn unit() -> Square {\n    Square { side: 1 }\n}\n\npub fn scaled(n: u32) -> u32 {\n    n + 1\n}\n";
 /// R4: [`A_SHAPES`] re-indented and re-wrapped: the same tokens in the same order.
 const A_SHAPES_REFORMATTED: &str = "pub struct Square { pub side: u32, }\n\npub struct Marker\n{\n  pub tag: u8,\n}\n\npub trait Area { fn area(&self) -> u32; }\n\nimpl Area for Square\n{\n  fn area(&self) -> u32 { self.side   *   self.side }\n}\n\npub fn unit() -> Square { Square { side: 1 } }\n\npub fn scaled(\n  n: u32\n) -> u32 {\n  n + 1\n}\n";
 /// R10: a private field added to `Marker`, which nothing constructs and no body reads a field of.
 const A_SHAPES_FIELD: &str = "pub struct Square {\n    pub side: u32,\n}\n\npub struct Marker {\n    pub tag: u8,\n    hidden: u16,\n}\n\npub trait Area {\n    fn area(&self) -> u32;\n}\n\nimpl Area for Square {\n    fn area(&self) -> u32 {\n        self.side * self.side\n    }\n}\n\npub fn unit() -> Square {\n    Square { side: 1 }\n}\n\npub fn scaled(n: u32) -> u32 {\n    n + 1\n}\n";
 
-const B_LIB: &str = "pub mod wrap;\n\npub fn doubled() -> u32 {\n    a::twice(3)\n}\n\npub fn from_base() -> u32 {\n    a::base() + 1\n}\n\npub fn first<T>(x: T) -> T {\n    a::pick(x)\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn doubled_runs() {\n        let _x: u32 = super::doubled();\n    }\n\n    #[test]\n    fn first_runs() {\n        let _y: u8 = super::first(1u8);\n    }\n}\n";
+pub(super) const B_LIB: &str ="pub mod wrap;\n\npub fn doubled() -> u32 {\n    a::twice(3)\n}\n\npub fn from_base() -> u32 {\n    a::base() + 1\n}\n\npub fn first<T>(x: T) -> T {\n    a::pick(x)\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn doubled_runs() {\n        let _x: u32 = super::doubled();\n    }\n\n    #[test]\n    fn first_runs() {\n        let _y: u8 = super::first(1u8);\n    }\n}\n";
 
 /// `b/src/wrap.rs` with a tail (R11's impl).
 macro_rules! b_wrap {
@@ -286,7 +286,7 @@ macro_rules! b_wrap {
 
 const B_WRAP: &str = b_wrap!("");
 /// R11: an impl of `Measure` added for a new type no body asks about.
-const B_WRAP_IMPL: &str = b_wrap!("\npub struct Fresh;\n\nimpl Measure for Fresh {\n    fn measure(&self) -> u32 {\n        0\n    }\n}\n");
+pub(super) const B_WRAP_IMPL: &str =b_wrap!("\npub struct Fresh;\n\nimpl Measure for Fresh {\n    fn measure(&self) -> u32 {\n        0\n    }\n}\n");
 
 /// `c/src/lib.rs` declaring its second module as `$module`.
 macro_rules! c_lib {
@@ -299,10 +299,10 @@ macro_rules! c_lib {
     };
 }
 
-const C_LIB: &str = c_lib!("use_b");
+pub(super) const C_LIB: &str = c_lib!("use_b");
 /// R14: the module file moved to `counting.rs`, its `mod` line changed to match.
 const C_LIB_MOVED: &str = c_lib!("counting");
-const C_MODULE: &str = "pub struct Count {\n    pub n: u32,\n}\n\npub trait Bump {\n    fn bump(&self) -> u32;\n}\n\nimpl Bump for Count {\n    fn bump(&self) -> u32 {\n        self.n + 1\n    }\n}\n\npub fn start() -> u32 {\n    0\n}\n\npub fn measured() -> u32 {\n    b::wrap::Measure::measure(&b::wrap::Boxed { inner: 2 })\n}\n";
+pub(super) const C_MODULE: &str ="pub struct Count {\n    pub n: u32,\n}\n\npub trait Bump {\n    fn bump(&self) -> u32;\n}\n\nimpl Bump for Count {\n    fn bump(&self) -> u32 {\n        self.n + 1\n    }\n}\n\npub fn start() -> u32 {\n    0\n}\n\npub fn measured() -> u32 {\n    b::wrap::Measure::measure(&b::wrap::Boxed { inner: 2 })\n}\n";
 
 /// The fixture's world, with `a/src/lib.rs` as `a_lib`.
 fn world(a_lib: &str) -> Io {
@@ -557,11 +557,13 @@ fn r11_an_unrelated_impl_added_enters_no_existing_body() {
     let row = settle(&io, "R11 an unrelated impl added", &now, Oracle::Equal);
     println!("row R11: bodies entered that existed before {existing}, new {}", row.bodies.saturating_sub(existing));
     // FLOOR: 0 existing bodies, at most the new method's body (plan row D3, question cells, not
-    // built). Today 2 existing bodies are entered by a `Signature` cell (`c::measured` one of
-    // them) and 2 by a `CrateScope` read: 4 existing, 5 in all with the new method.
-    assert_eq!((measured, area_of), (Seen::Last, Seen::Earlier), "R11: floor no existing body that asks a trait question entered (plan row D3): {PINNED}");
-    assert_eq!(existing, 4, "R11: floor 0 existing bodies entered (plan row D3): {PINNED}");
-    assert_eq!(row.bodies, 5, "R11: floor at most the new impl's one method body: {PINNED}");
+    // built). Today 2 existing bodies are entered by a `CrateScope` read: 2 existing, 3 in all
+    // with the new method. (Until lane RU3's naming fix, 2026-11-17 22:50, two impls of one trait
+    // in a file shared ONE head task, so the new `impl Measure for Fresh` re-froze `impl Measure
+    // for Boxed` and entered its readers too, `c::measured` among them: 4 existing, 5 in all.)
+    assert_eq!((measured, area_of), (Seen::Earlier, Seen::Earlier), "R11: floor no existing body that asks a trait question entered (plan row D3): {PINNED}");
+    assert_eq!(existing, 2, "R11: floor 0 existing bodies entered (plan row D3): {PINNED}");
+    assert_eq!(row.bodies, 3, "R11: floor at most the new impl's one method body: {PINNED}");
 }
 
 /// R12, X1 "A BRANCH SWITCHED AWAY AND BACK": R5's edit, a request, then the original bytes

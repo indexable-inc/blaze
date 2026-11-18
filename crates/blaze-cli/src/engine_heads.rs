@@ -48,7 +48,11 @@
 //! its unit's prefix. A head task (one an entry, by text) freezes its heads once for EACH member
 //! unit whose items record lists its file, under that unit's records, and defines one cell a
 //! (unit, head) ([`head_cell`] holds the unit); its payload is each unit's runs, its reads the
-//! union of each unit's, and a unit that stops holding an item (a `cfg`) drops its cell. A
+//! union of each unit's, and a unit that stops holding an item (a `cfg`) drops its cell. Which
+//! units hold the file is read too (lane RU2): each unit whose module walk reaches the file but
+//! whose items record does not list it is read by its not-held cell (engine_body_plan.rs
+//! `not_held_cell`, the one home the body plan reads), so a `cfg` taken off a `mod` enters the
+//! task again and the newly holding unit gets its cell (rule 21). A
 //! reader finds the cell by its own key ([`Owners::place`]), so it is never handed bytes frozen
 //! under another unit's keys. The profile counts it: "heads frozen: N for M items in U units
 //! (K items held by 2+ units)" ([`UnitCounts`]).
@@ -97,6 +101,12 @@ pub(crate) fn plan<'h>(names: &NamesStage<'_>, alloc: SharedAlloc<'h>) -> Result
     let Some(world) = names.names.as_ref() else { return Ok(planned) };
     for (name, source) in crate::names::parts(world).iter() {
         let at = world.crate_at(name.subject).ok_or(EngineCheckError::Unseen { task: *name, read: *name })?;
+        // A crate with no check scope (refused by the list, or a dependency's proc macro kept for
+        // its macros only) has no tables task: it could only fail, and no body asks a proc
+        // macro's or a refused crate's impls (blaze-world check_scope.rs `has_check_scope`).
+        if !blaze_world::check_scope::has_check_scope(world.world(), at) {
+            continue;
+        }
         let tables = impl_tables_name(world.world().crates[at].input.key);
         planned.push(Planned { name: tables, phase: Phase::new(Stage::Heads, 0), source: *source, file: *name });
     }
@@ -517,7 +527,11 @@ const HEAD_TOOL_DOMAIN: &str = "blaze-cli engine head task";
 /// `a::one` apart from `a`'s own check scope, where its head task runs, so a cell by key was one
 /// no task defines (lane EY, the callers test). `part`: `WHOLE`, the whole head, the only part
 /// today, hashed in so a head can be split later (engine.md "ASPECTS"). Two heads of one entry
-/// under one cell are refused ([`heads_of`]).
+/// under one cell are refused, both named ([`heads_of`]). The cell is injective over one
+/// entry's heads because an entry is ONE item of its text: its own head, or an impl fn's, or
+/// an `extern` block's foreign items (one namespace's names, distinct). That rests on each
+/// entry having a task name of its own (signature.rs `signature_name`, lane RU3: before it, two
+/// unnamed impls of one file were one entry, their two headers one cell).
 ///
 /// ONE CELL A UNIT (lane RU1): a member's item is held by each unit whose records list its file
 /// (the lib, the test harness, a bin that `mod`s it), and its keys there hold that unit's crate
@@ -672,7 +686,7 @@ impl<'s> Owners<'s> {
 }
 
 /// One head cell [`heads_of_crate`] lists.
-struct HeadRow {
+struct HeadRow<'n> {
     /// Its item's head name in the records read (front2 head.rs `cell_id`; of their unit).
     sig: Name,
     /// The task of the outline entry that covers it.
@@ -684,12 +698,47 @@ struct HeadRow {
     /// Its item, of no unit ([`head_item`]).
     item: Cell,
     want: Want,
+    /// Its item's name and an impl fn's name, as its entry's text names them (what
+    /// [`head_item`] hashed): the words a refusal of two heads under one cell prints.
+    name: &'n str,
+    member: Option<&'n str>,
+}
+
+/// What a head's want is, in words, for a refusal that names it ([`heads_of`]).
+fn want_words(want: Want) -> &'static str {
+    match want {
+        Want::Head(_) => "the alias",
+        Want::Adt(_) => "the type",
+        Want::Impl(_) => "the impl header",
+        Want::Fn(_) => "the fn, const or static",
+        Want::Members(_) => "the trait",
+        Want::MemberFn(..) => "the impl fn",
+    }
+}
+
+/// A head as its entry's text names it, for a refusal ([`heads_of`]): its want's kind in words,
+/// its item's name and an impl fn's name. `want: None`: no row of the head (never, as
+/// `heads_of` asks only of its own rows; said, not hidden).
+struct HeadLabel<'n> {
+    want: Option<Want>,
+    name: &'n str,
+    member: Option<&'n str>,
+}
+
+impl core::fmt::Display for HeadLabel<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let words = self.want.map_or("a head with no row", want_words);
+        match self.member {
+            Some(member) => write!(f, "{words} `{}::{member}`", self.name),
+            None => write!(f, "{words} `{}`", self.name),
+        }
+    }
 }
 
 /// Every head cell of crate `k` of `records` whose item is written in a file of `subjects`, in
 /// file order. An item a macro wrote (its text an expansion's) or one no entry covers is not
 /// listed ([`HeadAt::Unplaced`]).
-fn heads_of_crate<'n>(records: &'n Records<'n>, k: usize, prefix: [u8; 8], subjects: &Subjects, g: Alloc<'static>, each: &mut dyn FnMut(HeadRow)) {
+fn heads_of_crate<'n>(records: &'n Records<'n>, k: usize, prefix: [u8; 8], subjects: &Subjects, g: Alloc<'static>, each: &mut dyn FnMut(HeadRow<'n>)) {
     let mut keys: Vec<blaze_id::ItemKey, Alloc<'static>> = Vec::new_in(g);
     NamesSource::each_item(records, k, &mut |key, _| keys.push(key));
     // (file, item index, want, the item's name, an impl fn's name).
@@ -719,7 +768,16 @@ fn heads_of_crate<'n>(records: &'n Records<'n>, k: usize, prefix: [u8; 8], subje
         for (_, item, want, name, member) in run.iter() {
             let Some(cover) = crate::signature::covering_entry(&outline, ItemIndex(*item)) else { continue };
             let entry = crate::signature::signature_name(outline_name.subject, &outline, outline.item(cover), text);
-            each(HeadRow { sig: head_cell_id(*want).of, entry, file: outline_name, cell: head_cell(*want, name, *member, WHOLE), item: head_item(*want, name, *member, WHOLE), want: *want });
+            each(HeadRow {
+                sig: head_cell_id(*want).of,
+                entry,
+                file: outline_name,
+                cell: head_cell(*want, name, *member, WHOLE),
+                item: head_item(*want, name, *member, WHOLE),
+                want: *want,
+                name: *name,
+                member: *member,
+            });
         }
     }
 }
@@ -954,7 +1012,17 @@ impl HeadsStage {
         // crate named) and how many were not: what a task no unit holds then prints (rule 19).
         let mut unread: Option<&'static str> = None;
         let mut unread_count = 0u32;
+        // Each member unit's cfg-blind walk of its module tree (engine_body_plan.rs `reached`,
+        // the planner's walk): with its names task and crate prefix. A unit whose walk reaches a
+        // task's file but whose items record does not list it (a `#[cfg(test)]` on its `mod`)
+        // is a unit the task's heads are NOT frozen under, and that is a fact of the unit's
+        // records: the row reads the unit's not-held cell (engine_body_plan.rs `not_held_cell`,
+        // the one home Bodies reads too), so a cfg taken off enters the task again (rule 21).
+        let mut walks: Vec<(Name, [u8; 8], Vec<u32, Alloc<'static>>), Alloc<'static>> = Vec::new_in(g);
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
+            let root = list.root(member);
+            let reach = crate::engine_body_plan::reached(handles.outlined, Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes()), g);
+            walks.push((blaze_drive::key::crate_scope_name(&list.key(member)), list.key(member).prefix(), reach));
             no_member.push(CellId { of: blaze_drive::key::crate_scope_name(&list.key(member)), cell: WHOLE });
             let (scope, whole) = match crate::engine_bodies::scope_of(read, cx, store, names, &list, member, heap) {
                 Ok(made) => made,
@@ -1049,6 +1117,18 @@ impl HeadsStage {
                         match jobs[at].whole {
                             true => jobs[at].tasks.push(*task),
                             false => made.reads.extend(jobs[at].cells.iter().copied()),
+                        }
+                    }
+                    // The units its file is NOT frozen under though their walk reaches it: their
+                    // not-held cells, so one that comes to hold the file moves the row.
+                    let held = &by_file[at..];
+                    let held = &held[..held.partition_point(|(file, _)| *file == task.planned.file)];
+                    if let Ok(file_at) = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)) {
+                        let file_at = u32::try_from(file_at).unwrap_or(u32::MAX);
+                        for (unit, prefix, reach) in walks.iter() {
+                            if reach.binary_search(&file_at).is_ok() && !held.iter().any(|(_, one)| one == prefix) {
+                                made.reads.push(crate::engine_body_plan::not_held_cell(view, *unit, *prefix));
+                            }
                         }
                     }
                     accs.push((*task, made));
@@ -1261,9 +1341,21 @@ fn heads_of(
     }
     // (entry, its cell, head name, want, its item) of the crate at 0 (this job's unit), sorted.
     let mut rows: std::vec::Vec<(Name, Cell, Name, Want, Cell), Global> = std::vec::Vec::new_in(Global);
-    heads_of_crate(records, 0, job.prefix, subjects, g, &mut |one| rows.push((one.entry, one.cell, one.sig, one.want, one.item)));
+    // Each row's words (want, item name, impl fn name) by the same (entry, cell, head name):
+    // what a refusal of two heads under one cell names them by.
+    let mut labels: Vec<(Name, Cell, Name, Want, &str, Option<&str>), Alloc<'static>> = Vec::new_in(g);
+    heads_of_crate(records, 0, job.prefix, subjects, g, &mut |one| {
+        rows.push((one.entry, one.cell, one.sig, one.want, one.item));
+        labels.push((one.entry, one.cell, one.sig, one.want, one.name, one.member));
+    });
     rows.sort_unstable_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
     rows.dedup_by_key(|(entry, cell, sig, _, _)| (*entry, *cell, *sig));
+    labels.sort_unstable_by_key(|(entry, cell, sig, _, _, _)| (*entry, *cell, *sig));
+    labels.dedup_by_key(|(entry, cell, sig, _, _, _)| (*entry, *cell, *sig));
+    let label = |entry: Name, cell: Cell, sig: Name| match labels.binary_search_by_key(&(entry, cell, sig), |(e, c, s, _, _, _)| (*e, *c, *s)) {
+        Ok(at) => HeadLabel { want: Some(labels[at].3), name: labels[at].4, member: labels[at].5 },
+        Err(_) => HeadLabel { want: None, name: "", member: None },
+    };
     let mut owners = Owners::new(subjects);
     let tool = blaze_drive::key::Tool(ContentId::of(HEAD_TOOL_DOMAIN, b""));
     let mut done = std::vec::Vec::with_capacity_in(job.tasks.len(), Global);
@@ -1274,9 +1366,11 @@ fn heads_of(
         let mut worked = WorkedHead { out: ContentId([0; 32]), defines: std::vec::Vec::new_in(Global), items: SVec::new_in(heap.shared()), reads: std::vec::Vec::new_in(Global), payload: std::vec::Vec::new_in(Global), failed: std::vec::Vec::new_in(Global) };
         let mut failed: Option<&'static str> = None;
         let mine = &rows[from..from + rows[from..].iter().take_while(|(entry, _, _, _, _)| *entry == name).count()];
-        // Two heads under one cell would be two values under one key (rule 21).
-        if mine.windows(2).any(|two| two[0].1 == two[1].1) {
-            failed = Some("two heads of its entry fall under one cell: the same kind and name (engine_heads.rs `head_cell`)");
+        // Two heads under one cell would be two values under one key (rule 21): the whole
+        // entry is refused, the two heads named as its text names them.
+        if let Some(two) = mine.windows(2).find(|two| two[0].1 == two[1].1) {
+            let (one, other) = (label(two[0].0, two[0].1, two[0].2), label(two[1].0, two[1].1, two[1].2));
+            failed = Some(crate::engine_head_notes::leak(g, format_args!("two heads of its entry fall under one cell: {one} and {other}, the same kind and name (engine_heads.rs `head_cell`)")));
         }
         let mine = if failed.is_some() { &mine[..0] } else { mine };
         for (_, cell, _, want, item) in mine.iter() {

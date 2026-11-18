@@ -11,6 +11,13 @@
 //! pointer to pointer or address, address to pointer, fn item or pointer to pointer or address,
 //! `&[T; N]` to `*const T`. A non-primitive side is E0605, anything else E0606.
 //!
+//! A target written with holes (`x as _`, `p as *const _`; the Reference, "Type cast
+//! expressions", and "Inferred type": `_` "asks the compiler to infer the type if possible")
+//! is lowered with a fresh type variable per hole, and the cast expression has that type, so
+//! the body's later uses decide it (`let y = 7u8 as _; let z: u16 = y;`). When the casts are
+//! judged, a side whose head is still a variable is E0282 (rustc's `structurally_resolve_type`
+//! in `CastCheck::check`): a hole is never given the operand's type by the trivial cast.
+//!
 //! A fn item source (rustc's `do_check`, its `FnDef` case): an intrinsic has no address
 //! (core/src/intrinsics/mod.rs: "The actual implementations live in the compiler."), so any
 //! cast of it is E0606 (the coercion's `IntrinsicCast` becomes the cast's `IllegalCast`), a fn
@@ -96,8 +103,18 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         while i < self.casts.len() {
             let c = self.casts[i];
             i += 1;
-            let from = self.ty.resolve(c.from)?;
-            let to = self.ty.resolve(c.to)?;
+            // rustc's `CastCheck::check` first `structurally_resolve_type`s both sides: a cast
+            // decides its kind on known types only. A side whose head is still a type variable
+            // here (after fallback: `let w = 7u8 as _;` that nothing constrains) is E0282 at
+            // the cast, never settled by the trivial-cast coercion below: that coercion would
+            // unify the variable with the other side, giving `_` the operand's own type
+            // (`E::V as _` typed `E`, so `u32 == (E::V as _)` became `u32: PartialEq<E>`). A
+            // head that is known with holes inside (`&x as *const _`) is the coercion's to
+            // fill, as rustc's `try_coercion_cast` fills it.
+            let from = self.structurally_resolve(c.from, At::Expr(c.operand))?;
+            let to = self.structurally_resolve(c.to, At::Expr(c.expr))?;
+            let from = self.ty.resolve(from)?;
+            let to = self.ty.resolve(to)?;
             if self.is_err(from) || self.is_err(to) {
                 continue;
             }

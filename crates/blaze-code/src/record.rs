@@ -9,6 +9,10 @@
 //! - `frame`: the function's compact unwind word (the emitter's encoding, opaque here) and
 //!   `pads`: its landing pads, item-relative.
 //! - Outside names (the C library's) are kept as text by symbol, for the launcher's `dlsym`.
+//! - `traps`: per `brk` of an `unreachable` the code holds, WHICH construct it ends ([`TrapRow`]:
+//!   its kind, and the construct's first byte counted from its item's first byte, rule 71):
+//!   what `blaze run` says when the program strikes one (blaze-cli run_fault.rs). Data only:
+//!   no instruction reads it, and the key is the function's, unchanged by it.
 //!
 //! [`CodeRecord`] is the builder; [`CodeRecord::seal`] checks it and puts it in its one canonical
 //! form ([`Sealed`]), which alone encodes, so two builders of one record write equal bytes
@@ -19,11 +23,14 @@ use core::fmt;
 use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
-/// The first eight bytes of every encoded record.
-pub const MAGIC: [u8; 8] = *b"bzcode01";
+/// The first eight bytes of every encoded record: the form's version. `bzcode04` added the trap
+/// table ([`TrapRow`]); `02` and `03` are blaze-tier's own forms (record/form.rs), so this form
+/// skips them and a record of one form is never read as another's.
+pub const MAGIC: [u8; 8] = *b"bzcode04";
 
-/// The bytes before the sections: magic, frame, flags, eight counts.
-const HEAD: usize = 48;
+/// The bytes before the sections: magic, frame, flags, nine counts, a zero word (so the first
+/// section starts 8-aligned).
+const HEAD: usize = 56;
 
 /// A [`Word`]'s target meaning this record's own code: the word holds the address of code byte
 /// `addend`.
@@ -149,6 +156,110 @@ pub struct Pad {
     pub action: u32,
 }
 
+/// Which construct an `unreachable`'s `brk` ends: what the walk that built the function knew
+/// when it wrote the `unreachable` (blaze-build `TrapSite`). The order is the encoding's.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(u8)]
+pub enum TrapKind {
+    /// A `match` whose scrutinee matched none of its arms.
+    MatchNoArm = 0,
+    /// A `let`-`else` whose `else` block ran to its end (it must diverge).
+    LetElse = 1,
+    /// An expression of type `!` produced a value.
+    NeverValue = 2,
+    /// A call typed to never return (`-> !`) returned.
+    AfterDivergingCall = 3,
+    /// `core::intrinsics::unreachable` was called (as `core::hint::unreachable_unchecked` does).
+    Intrinsic = 4,
+    /// An enum's discriminant was none of its variants'.
+    Discriminant = 5,
+    /// A slice's length matched none of the slice patterns.
+    SliceLength = 6,
+    /// An `asm!` block marked `noreturn` ran to its end.
+    NoreturnAsm = 7,
+    /// The body's end, past its last live statement, was reached.
+    BodyEnd = 8,
+    /// A panic call the build made (a bounds, arithmetic, validity or unwinding check's) returned.
+    AfterPanic = 9,
+}
+
+impl TrapKind {
+    const ALL: [TrapKind; 10] = [
+        TrapKind::MatchNoArm,
+        TrapKind::LetElse,
+        TrapKind::NeverValue,
+        TrapKind::AfterDivergingCall,
+        TrapKind::Intrinsic,
+        TrapKind::Discriminant,
+        TrapKind::SliceLength,
+        TrapKind::NoreturnAsm,
+        TrapKind::BodyEnd,
+        TrapKind::AfterPanic,
+    ];
+
+    fn from_byte(byte: u8) -> Option<TrapKind> {
+        TrapKind::ALL.get(usize::from(byte)).copied()
+    }
+
+    /// The construct, as the end of a sentence that starts with it (`the `match` at F:L:C`).
+    pub fn construct(self) -> &'static str {
+        match self {
+            TrapKind::MatchNoArm => "the `match`",
+            TrapKind::LetElse => "the `let`-`else`",
+            TrapKind::NeverValue => "the `!`-typed expression",
+            TrapKind::AfterDivergingCall => "the call of a fn typed `-> !`",
+            TrapKind::Intrinsic => "the call of `core::intrinsics::unreachable`",
+            TrapKind::Discriminant => "the read of the enum's discriminant",
+            TrapKind::SliceLength => "the slice pattern",
+            TrapKind::NoreturnAsm => "the `noreturn` `asm!` block",
+            TrapKind::BodyEnd => "the body",
+            TrapKind::AfterPanic => "the check's panic call",
+        }
+    }
+
+    /// What happened there, after [`TrapKind::construct`] and its place.
+    pub fn happened(self) -> &'static str {
+        match self {
+            TrapKind::MatchNoArm => "took no arm",
+            TrapKind::LetElse => "ran its `else` to the end (it must diverge)",
+            TrapKind::NeverValue => "produced a value",
+            TrapKind::AfterDivergingCall => "returned",
+            TrapKind::Intrinsic => "ran (as `unreachable_unchecked` does): the caller promised it never would",
+            TrapKind::Discriminant => "found no variant's discriminant",
+            TrapKind::SliceLength => "matched no length",
+            TrapKind::NoreturnAsm => "ran to its end",
+            TrapKind::BodyEnd => "ran past its last live statement",
+            TrapKind::AfterPanic => "returned",
+        }
+    }
+}
+
+/// One `unreachable`'s `brk` in the code: WHICH construct it ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TrapRow {
+    /// The `brk`'s offset from the code's first byte (4-aligned).
+    pub at: u32,
+    pub kind: TrapKind,
+    /// The construct's place, item-relative (rule 71): the item whose text holds it (the body's
+    /// owner, by its `ItemKey`'s bits) and its first byte counted from the item's first byte;
+    /// for one inside a macro's expansion its outermost call's. `None`: the build did not know.
+    pub site: Option<(u128, u32)>,
+}
+
+/// What a build knows of one `unreachable` it wrote, before the code exists: its `ordinal`
+/// among the function's `unreachable` instructions in layout order (what every rewrite between
+/// the build and the emitter keeps: legalize copies each one as it is), its kind and site. The
+/// emitter makes it the [`TrapRow`] of that instruction's `brk` (blaze-emit record.rs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TrapSource {
+    pub ordinal: u32,
+    pub kind: TrapKind,
+    pub site: Option<(u128, u32)>,
+}
+
+/// A [`TrapRow`]'s encoded site field meaning none.
+const NO_SITE: u32 = u32::MAX;
+
 /// Why a record was not sealed: the first broken rule, naming the offset it is about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecordError {
@@ -174,6 +285,12 @@ pub enum RecordError {
     NameMissing { symbol: Symbol },
     /// A part (`what`) longer than a `u32` counts.
     TooLarge { what: &'static str },
+    /// A trap row's `brk` at `at` is not a whole instruction inside the code (`code` bytes).
+    TrapOutside { at: u32, code: u32 },
+    /// Two trap rows at `at`.
+    TrapsTwice { at: u32 },
+    /// A trap row's site names byte `NO_SITE`, the encoding's word for none.
+    TrapSite { at: u32 },
 }
 
 impl fmt::Display for RecordError {
@@ -190,6 +307,9 @@ impl fmt::Display for RecordError {
             RecordError::PadOutside { start } => write!(f, "a code record's landing pad from {start} is not inside its code"),
             RecordError::NameMissing { symbol } => write!(f, "a code record names the outside symbol {symbol} but keeps no name for it"),
             RecordError::TooLarge { what } => write!(f, "a code record's {what} is longer than a u32 counts"),
+            RecordError::TrapOutside { at, code } => write!(f, "a code record's trap row at {at} is not an instruction of its {code} bytes of code"),
+            RecordError::TrapsTwice { at } => write!(f, "a code record has two trap rows at {at}"),
+            RecordError::TrapSite { at } => write!(f, "a code record's trap row at {at} names site byte {NO_SITE}, the form's word for no site"),
         }
     }
 }
@@ -206,6 +326,8 @@ pub struct CodeRecord<'a> {
     pub words: AVec<'a, Word>,
     pub frame: u32,
     pub pads: AVec<'a, Pad>,
+    /// Per `unreachable`'s `brk`, the construct it ends, in any order (sealed by offset).
+    pub traps: AVec<'a, TrapRow>,
     /// Each outside name: its symbol and its text's range in `text`.
     names: AVec<'a, (Symbol, u32, u32)>,
     text: AVec<'a, u8>,
@@ -222,6 +344,7 @@ impl<'a> CodeRecord<'a> {
             words: Vec::new_in(alloc),
             frame: 0,
             pads: Vec::new_in(alloc),
+            traps: Vec::new_in(alloc),
             names: Vec::new_in(alloc),
             text: Vec::new_in(alloc),
             alloc,
@@ -247,7 +370,7 @@ impl<'a> CodeRecord<'a> {
     /// sites and words sorted by offset, pads by start, names by symbol; every rule of the form
     /// checked once here, so a [`Sealed`] needs no check again (rule 74).
     pub fn seal(self) -> Result<Sealed<'a>, RecordError> {
-        let CodeRecord { code, relro, targets, mut sites, mut words, frame, mut pads, names, text, alloc } = self;
+        let CodeRecord { code, relro, targets, mut sites, mut words, frame, mut pads, mut traps, names, text, alloc } = self;
         fits(code.len(), "code")?;
         fits(relro.len(), "relro part")?;
         // Sort the targets by value through an index list; equal targets become one.
@@ -329,6 +452,19 @@ impl<'a> CodeRecord<'a> {
                 return Err(RecordError::PadOutside { start: pad.start });
             }
         }
+        fits(traps.len(), "trap table")?;
+        traps.sort_unstable_by_key(|t| t.at);
+        for (i, trap) in traps.iter().enumerate() {
+            if trap.at % 4 != 0 || u64::from(trap.at) + 4 > u64::from(code_len) {
+                return Err(RecordError::TrapOutside { at: trap.at, code: code_len });
+            }
+            if i > 0 && traps[i - 1].at == trap.at {
+                return Err(RecordError::TrapsTwice { at: trap.at });
+            }
+            if let Some((_, NO_SITE)) = trap.site {
+                return Err(RecordError::TrapSite { at: trap.at });
+            }
+        }
         // Names by symbol, each once, the text rebuilt in that order.
         let mut by_symbol = names;
         by_symbol.sort_unstable_by_key(|n| n.0);
@@ -357,7 +493,7 @@ impl<'a> CodeRecord<'a> {
             }
         }
         fits(packed.len(), "names' text")?;
-        Ok(Sealed(CodeRecord { code, relro, targets: sorted, sites, words, frame, pads, names: packed_names, text: packed, alloc }))
+        Ok(Sealed(CodeRecord { code, relro, targets: sorted, sites, words, frame, pads, traps, names: packed_names, text: packed, alloc }))
     }
 }
 
@@ -384,9 +520,10 @@ impl<'a> Sealed<'a> {
         out.extend_from_slice(&MAGIC);
         put32(out, r.frame);
         put32(out, 0);
-        for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len()] {
+        for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len(), r.traps.len()] {
             put32(out, count as u32);
         }
+        put32(out, 0);
         out.extend_from_slice(&r.code);
         pad8(out, start);
         out.extend_from_slice(&r.relro);
@@ -413,6 +550,15 @@ impl<'a> Sealed<'a> {
                 put32(out, v);
             }
         }
+        for t in r.traps.iter() {
+            put32(out, t.at);
+            out.push(t.kind as u8);
+            out.extend_from_slice(&[0; 3]);
+            let (item, site) = t.site.unwrap_or((0, NO_SITE));
+            put32(out, site);
+            put32(out, 0);
+            out.extend_from_slice(&item.to_le_bytes());
+        }
         for &(symbol, at, len) in r.names.iter() {
             out.extend_from_slice(&symbol.0);
             put32(out, at);
@@ -438,6 +584,7 @@ const SITE_ROW: usize = 16;
 const WORD_ROW: usize = 16;
 const PAD_ROW: usize = 16;
 const NAME_ROW: usize = 40;
+const TRAP_ROW: usize = 32;
 
 /// Why bytes are not a code record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -450,12 +597,15 @@ pub enum DecodeError {
     Space { row: u32, byte: u8 },
     /// Site `row` has the kind byte `byte`.
     Kind { row: u32, byte: u8 },
+    /// Trap row `row` has the kind byte `byte`.
+    TrapKind { row: u32, byte: u8 },
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode01` head"),
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode04` head (an older form is rebuilt, never read)"),
+            DecodeError::TrapKind { row, byte } => write!(f, "a code record's trap row {row} has the unknown kind {byte}"),
             DecodeError::Length { need, have } => write!(f, "a code record's head counts {need} bytes; it has {have}"),
             DecodeError::Space { row, byte } => write!(f, "a code record's target {row} has the unknown space {byte}"),
             DecodeError::Kind { row, byte } => write!(f, "a code record's site {row} has the unknown kind {byte}"),
@@ -466,11 +616,13 @@ impl fmt::Display for DecodeError {
 impl core::error::Error for DecodeError {}
 
 /// An encoded record read in place. Layout (little-endian; every section starts 8-aligned from
-/// the record's first byte): `MAGIC`; `frame: u32`, `flags: u32` (0); eight `u32` counts (code
-/// bytes, relro bytes, targets, sites, words, pads, names, text bytes); the code; the relro part;
-/// targets (space `u8`, 7 zero bytes, symbol 32); sites (`at: u32`, kind `u8`, 3 zero bytes,
-/// `target: u32`, `addend: u32`); words (`at: u32`, `target: u32`, `addend: i64`); pads (four
-/// `u32`); names (symbol 32, text `at: u32`, `len: u32`); the text.
+/// the record's first byte): `MAGIC`; `frame: u32`, `flags: u32` (0); nine `u32` counts (code
+/// bytes, relro bytes, targets, sites, words, pads, names, text bytes, traps) and a zero `u32`;
+/// the code; the relro part; targets (space `u8`, 7 zero bytes, symbol 32); sites (`at: u32`,
+/// kind `u8`, 3 zero bytes, `target: u32`, `addend: u32`); words (`at: u32`, `target: u32`,
+/// `addend: i64`); pads (four `u32`); traps (`at: u32`, kind `u8`, 3 zero bytes, `site: u32`
+/// (`u32::MAX` for none), 4 zero bytes, `item: u128`, 0 for none), by `at`; names (symbol 32,
+/// text `at: u32`, `len: u32`); the text.
 #[derive(Clone, Copy)]
 pub struct CodeView<'b> {
     bytes: &'b [u8],
@@ -481,6 +633,7 @@ pub struct CodeView<'b> {
     sites: &'b [u8],
     words: &'b [u8],
     pads: &'b [u8],
+    traps: &'b [u8],
     names: &'b [u8],
     text: &'b [u8],
 }
@@ -532,6 +685,7 @@ impl<'b> CodeView<'b> {
             count(5) * PAD_ROW,
             count(6) * NAME_ROW,
             up8(count(7)),
+            count(8) * TRAP_ROW,
         ];
         let need = HEAD + lens.iter().sum::<usize>();
         if need != bytes.len() {
@@ -544,8 +698,15 @@ impl<'b> CodeView<'b> {
         let sites = part(bytes, &mut at, lens[3], lens[3]);
         let words = part(bytes, &mut at, lens[4], lens[4]);
         let pads = part(bytes, &mut at, lens[5], lens[5]);
+        let traps = part(bytes, &mut at, lens[8], lens[8]);
         let names = part(bytes, &mut at, lens[6], lens[6]);
         let text = part(bytes, &mut at, lens[7], count(7));
+        for row in 0..count(8) {
+            let byte = traps[row * TRAP_ROW + 4];
+            if TrapKind::from_byte(byte).is_none() {
+                return Err(DecodeError::TrapKind { row: row as u32, byte });
+            }
+        }
         for row in 0..count(2) {
             let byte = targets[row * TARGET_ROW];
             if Space::from_byte(byte).is_none() {
@@ -558,7 +719,7 @@ impl<'b> CodeView<'b> {
                 return Err(DecodeError::Kind { row: row as u32, byte });
             }
         }
-        Ok(CodeView { bytes, frame, code, relro, targets, sites, words, pads, names, text })
+        Ok(CodeView { bytes, frame, code, relro, targets, sites, words, pads, traps, names, text })
     }
 
     /// The whole encoding: equal records are equal bytes.
@@ -618,6 +779,41 @@ impl<'b> CodeView<'b> {
     pub fn pad(&self, i: usize) -> Pad {
         let row = i * PAD_ROW;
         Pad { start: get32(self.pads, row), len: get32(self.pads, row + 4), landing: get32(self.pads, row + 8), action: get32(self.pads, row + 12) }
+    }
+
+    pub fn traps(&self) -> usize {
+        self.traps.len() / TRAP_ROW
+    }
+
+    pub fn trap(&self, i: usize) -> TrapRow {
+        let row = i * TRAP_ROW;
+        let Some(kind) = TrapKind::from_byte(self.traps[row + 4]) else {
+            unreachable!("CodeView::read checked every trap row's kind byte");
+        };
+        let site = match get32(self.traps, row + 8) {
+            NO_SITE => None,
+            site => {
+                let mut item = [0u8; 16];
+                item.copy_from_slice(&self.traps[row + 16..row + 32]);
+                Some((u128::from_le_bytes(item), site))
+            }
+        };
+        TrapRow { at: get32(self.traps, row), kind, site }
+    }
+
+    /// The trap row of the `brk` at code offset `at`, by halving over the rows (sorted by
+    /// offset when sealed).
+    pub fn trap_at(&self, at: u32) -> Option<TrapRow> {
+        let (mut lo, mut hi) = (0usize, self.traps());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match get32(self.traps, mid * TRAP_ROW).cmp(&at) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return Some(self.trap(mid)),
+            }
+        }
+        None
     }
 
     /// The name kept for an outside target's symbol, by halving over the sorted names.

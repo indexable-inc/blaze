@@ -10,7 +10,7 @@
 
 use core::fmt;
 
-use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, Space, Target, Word};
+use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, Space, Target, TrapRow, TrapSource, Word};
 use blaze_lir::View;
 use blaze_lir::legalize::LegalizeError;
 use blaze_own::Alloc;
@@ -46,6 +46,9 @@ pub enum RecordEmitError {
     /// blaze-lir's legalize refused the function (a vector, `f16` or `f128` form it does not
     /// make scalar, or an `f128` routine not bound).
     Legalize(LegalizeError),
+    /// The build's trap source `ordinal` names an `unreachable` past the function's
+    /// `unreachables` (blaze-code record.rs `TrapSource`): the build and the function disagree.
+    TrapOrdinal { ordinal: u32, unreachables: u32 },
 }
 
 impl fmt::Display for RecordEmitError {
@@ -56,6 +59,7 @@ impl fmt::Display for RecordEmitError {
             RecordEmitError::CName { of } => write!(f, "{of} was given a C name: only a function or a static is bound by `dlsym`"),
             RecordEmitError::CAddend { of, addend } => write!(f, "data holds the address of {of}, a C name, plus {addend}: a C name is bound by `dlsym` alone, with no addend"),
             RecordEmitError::Legalize(why) => why.fmt(f),
+            RecordEmitError::TrapOrdinal { ordinal, unreachables } => write!(f, "the build's trap source names `unreachable` {ordinal}, and the function has {unreachables}: the build's trap table and its function are out of step"),
         }
     }
 }
@@ -92,6 +96,21 @@ pub(crate) fn emit_record_up_to<'a>(
     routines: &RoutinePlaces,
     isa: Isa,
     inline_most: u64,
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+    emit_record_sourced(func, names, routines, isa, inline_most, &[], alloc)
+}
+
+/// [`emit_record_up_to`] with the build's `traps`: each becomes the trap row of its
+/// `unreachable`'s `brk` (blaze-code record.rs `TrapRow`); an `unreachable` no source names
+/// gets no row.
+pub(crate) fn emit_record_sourced<'a>(
+    func: View<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    isa: Isa,
+    inline_most: u64,
+    traps: &[TrapSource],
     alloc: Alloc<'a>,
 ) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
     // The Reference tier takes no vector, `f16` or `f128` arithmetic (INTRINSICS.md 3.2): a
@@ -139,6 +158,12 @@ pub(crate) fn emit_record_up_to<'a>(
         record.words.push(Word { at: row.at, target, addend: row.addend });
     }
     pass::unwind::into_record(&form.unwind, &mut record).map_err(RecordEmitError::Emit)?;
+    for source in traps {
+        let Some(&at) = form.unreachables.get(source.ordinal as usize) else {
+            return Err(RecordEmitError::TrapOrdinal { ordinal: source.ordinal, unreachables: form.unreachables.len() as u32 });
+        };
+        record.traps.push(TrapRow { at, kind: source.kind, site: source.site });
+    }
     Ok((record, form.insts, called))
 }
 

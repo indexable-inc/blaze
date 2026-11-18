@@ -1313,7 +1313,13 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     }
 
     pub fn unreachable(&mut self) {
-        self.push(Op::Unreachable, Flags::NONE, Ty::NONE, 0, |_| {});
+        self.unreachable_inst();
+    }
+
+    /// [`Builder::unreachable`], answering the instruction (its index in layout order, as
+    /// every instruction's): what a build's trap table counts its `unreachable`s by.
+    pub fn unreachable_inst(&mut self) -> Value {
+        self.push(Op::Unreachable, Flags::NONE, Ty::NONE, 0, |_| {})
     }
 
     pub fn trap(&mut self, code: u32) {

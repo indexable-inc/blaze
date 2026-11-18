@@ -25,7 +25,7 @@ use blaze_own::{AVec, Alloc, BTreeSet as OwnSet, SharedAlloc, Vec};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::engine::{Answer, CellId, EngineError, Gen, Phase, Plant, Planned, Row};
-use crate::last::{LastAnswer, LastError, LastRow, Touched};
+use crate::last::{Found, LastAnswer, LastError, LastRow, ReadOf, Touched, search};
 use crate::overlay::{Fold, Work};
 use crate::sim::{Crates, Item, POISON, Pools, World, alloc, edit, first_world, oracle, request};
 
@@ -43,6 +43,9 @@ struct SimRow {
     inline: bool,
     failed: bool,
     reads: StdVec<(u32, ContentId)>,
+    /// The positions in `reads` sorted by cell: the in-memory row's (a handle's order is its
+    /// cell's), so a search here compares as many reads as there (the twin's reports are equal).
+    by_cell: StdVec<u32>,
     defines: StdVec<(u32, ContentId)>,
 }
 
@@ -136,6 +139,7 @@ impl SimLast {
                     inline: row.inline,
                     failed: row.failed,
                     reads,
+                    by_cell: row.by_cell.iter().copied().collect(),
                     defines,
                 };
                 (task(name), kept)
@@ -180,6 +184,8 @@ impl SimLast {
             for (cell, digest) in row.defines.iter() {
                 defines.push((self.cells[*cell as usize].cell, *digest));
             }
+            let mut by_cell = Vec::with_capacity_in(row.by_cell.len(), alloc);
+            by_cell.extend(row.by_cell.iter().copied());
             let kept = Row {
                 key: row.key,
                 phase: row.phase,
@@ -189,6 +195,7 @@ impl SimLast {
                 serial: Gen(row.serial),
                 defines,
                 reads,
+                by_cell,
                 findings: row.findings,
                 inline: row.inline,
                 failed: row.failed,
@@ -367,10 +374,15 @@ impl LastAnswer for SimLast {
         }
     }
 
-    fn saw(&self, task: u32, cell: u32) -> bool {
+    fn read_of(&self, task: u32, cell: u32) -> Result<ReadOf, LastError> {
         self.touch(task);
-        let now = self.content(cell);
-        self.found_row(task).is_some_and(|row| row.reads.iter().any(|(read, seen)| *read == cell && *seen == now))
+        Ok(match self.found_row(task) {
+            Some(row) => {
+                let (at, compared) = search(row.by_cell.len(), |i| row.reads[row.by_cell[i] as usize].0.cmp(&cell));
+                ReadOf { found: at.map_or(Found::NotRead, |i| Found::Saw(row.reads[row.by_cell[i] as usize].1)), compared }
+            }
+            None => ReadOf { found: Found::NotRead, compared: 0 },
+        })
     }
 
     fn digest(&self, cell: u32) -> CellDigest {
