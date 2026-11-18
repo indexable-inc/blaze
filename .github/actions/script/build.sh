@@ -36,7 +36,14 @@ for name in $(env | sed -nE 's/^(CARGO_PROFILE_[A-Z0-9_]*|CARGO_TARGET_[A-Z0-9_]
 unset CARGO_TARGET_DIR
 said="$dir.build.json"
 mkdir -p "$(dirname "$dir")"
-blaze build -p scripts --bins --message-format=json > "$said" || die "blaze build -p scripts --bins --message-format=json failed (its JSON lines: $said)"
+# `BLAZE_LOCK=write`: this build of the repository's scripts is the job's own scaffolding, not a
+# build of the workspace whose lock file it is — and the pinned release writes `Cargo.lock`'s
+# `[[patch.unused]]` blocks in an order of its own, so under `CI` (which refuses any change to the
+# lock file) the build stopped before building anything, saying the file "would be rewritten with
+# the same contents in blaze's format". `blaze lock`'s file is cargo's order, which the release
+# then rewrites: neither order can be committed, so the build writes and says so (docs/cargo.md,
+# "Lock files"; the harnesses set the same variable for their throwaway workspaces).
+BLAZE_LOCK=write blaze build -p scripts --bins --message-format=json > "$said" || die "blaze build -p scripts --bins --message-format=json failed (its JSON lines: $said)"
 
 fresh="$dir.new"
 rm -rf "$fresh"

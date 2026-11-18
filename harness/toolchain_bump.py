@@ -241,11 +241,13 @@ def replace_tree(src, dst):
     shutil.copytree(src, dst, symlinks=True)
 
 
-async def vendor(new):
-    """crates/rustc_abi/src and crates/rustc_lexer/src as rust-lang/rust has them at `new`."""
-    repo = await checkout(new, [ABI[1], LEXER[1]])
-    root, marker, count = ABI_ROOT
-    root = os.path.join(ROOT, root)
+def vendored(repo, root, marker, count):
+    """[`vendor`]'s file work: blaze's lines read, the trees replaced, the root written.
+
+    A plain function, not a coroutine: the `open`s are ruff's ASYNC230 in an `async def`, and
+    the tree replacement (`rmtree` then `copytree`) must not run on a thread either — a bump
+    cancelled or stopped mid-way has to take that deletion with it, not leave a thread still
+    deleting the workspace's trees behind a script that has ended."""
     with open(root, encoding="utf-8") as f:
         kept = f.read().splitlines(keepends=True)[:count]
     if not kept or not kept[0].startswith(marker):
@@ -256,6 +258,16 @@ async def vendor(new):
         upstream = f.read()
     with open(root, "w", encoding="utf-8") as f:
         f.write("".join(kept) + upstream)
+
+
+async def vendor(new):
+    """crates/rustc_abi/src and crates/rustc_lexer/src as rust-lang/rust has them at `new`.
+
+    The bump awaits its steps one at a time, so [`vendored`]'s blocking work holds no other task
+    while it runs."""
+    repo = await checkout(new, [ABI[1], LEXER[1]])
+    root, marker, count = ABI_ROOT
+    vendored(repo, os.path.join(ROOT, root), marker, count)
 
 
 async def lints(new):
